@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>切り取りで出力範囲を決める — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>切り取りで出力範囲を決める</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">切り取りで出力範囲を決める</h1>
+    <p class="page-desc">
+      画像の一部だけを出力したいときに使う「加工用の切り取り」です。範囲を決めると、表示では範囲外が
+      暗くなり、<strong>書き出し・本棚に切り取った画像が入ります</strong>。元画像は書き換えない非破壊なので、
+      切り取り範囲はあとから何度でも変更できます。左パネルの<strong>表示トリム</strong>（読むための表示専用の
+      余白カット）とは別機能で、こちらは<strong>出力に反映される</strong>のが違いです。
+    </p>
+
+    <h2>切り取りを始める</h2>
+    <p>
+      画像・ZIP 内画像・PDF ページをフルスクリーン表示中に、左パネル（画像補正パネル）上部の
+      <strong>切り取りアイコン</strong>から始めます。左パネルの出し方は、上部バーの <strong>ℹ</strong> ボタン
+      （<kbd>I</kbd> または <kbd>Tab</kbd>）で「通常ホバー」と「クリック表示」を切り替えられます。通常ホバーでは
+      画面左端にマウスを寄せると開き、クリック表示では左端に現れる呼び出しバーをクリックすると開きます。
+    </p>
+
+    <h2>範囲を決める</h2>
+    <ul>
+      <li><strong>ドラッグ：</strong>画像の上をドラッグして切り取り範囲を作成します。枠やハンドルを掴めば、あとから移動・リサイズできます。</li>
+      <li><strong>自動クロップ：</strong>四辺の単色余白を検出して範囲を自動で設定します。スキャンの黒枠や白い余白を落としたいときに便利です。</li>
+      <li><strong>アスペクト比：</strong>パネル上部で「自由」のほか固定比率を選ぶと、範囲がその比率に保たれます。</li>
+      <li><strong>数値で指定：</strong>パネルの X・Y・W・H に数値を入れて、位置とサイズを正確に合わせられます。</li>
+      <li><strong>一時パン：</strong><kbd>Space</kbd>+左ドラッグで表示位置を動かせます。マウスホイール / <kbd>Ctrl</kbd>+ホイールでズームして、細かく合わせられます。</li>
+    </ul>
+    <p>
+      範囲を決めている間は<strong>範囲外が暗く表示</strong>されるので、仕上がりのフレーミングをその場で確認できます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-crop-1.webp" alt="フルスクリーンの切り取りモード。左に「切り取り」パネル（アスペクト比『自由』、有効化・解除、自動クロップ、X・Y・W・H の数値入力）。画像には切り取り枠と四隅・各辺のハンドルがあり、枠の外側が暗く表示されている">
+      <figcaption>切り取り範囲を決めると範囲外が暗くなり、仕上がりのフレーミングをその場で確認できます。枠の四隅・各辺のハンドルで移動・リサイズ、左「切り取り」パネルの X・Y・W・H で数値指定、アスペクト比の固定もできます。</figcaption>
+    </figure>
+
+    <h2>表示トリムとの違い</h2>
+    <p>
+      mImageViewer には「切り取り」と「表示トリム」の 2 つがあり、出力に反映されるかどうかが違います。取り違えに注意してください。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th></th><th>役割</th><th>出力（保存・書き出し・本棚）</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>切り取り（このページ）</td><td>出力する範囲そのものを決める</td><td><strong>反映される</strong>（切り取った画像になる）</td></tr>
+          <tr><td>表示トリム</td><td>読むための表示専用の余白カット</td><td>反映されない（元画像も出力も変わらない）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      表示トリムの使い方は<a href="tut-adjust.html">明るさ・色を補正する（＋表示トリム）</a>で説明しています。
+    </p>
+
+    <h2>切り取った結果を残す</h2>
+    <p>
+      切り取りは表示上の設定なので、実際のファイルにするには次のどちらかで焼き込みます。
+    </p>
+    <ul>
+      <li><strong>エクスポート（<kbd>Ctrl</kbd>+<kbd>E</kbd>）：</strong>切り取りを確定し、いま見えている表示結果を、切り取った範囲で別ファイルへ書き出します。</li>
+      <li><strong>本棚に追加：</strong>本のページとして原寸で焼き込むときにも、切り取りが反映されます。</li>
+    </ul>
+    <p>
+      切り取りモードは <kbd>Esc</kbd> で終了できます。加工結果をファイルにする流れ全体は
+      <a href="tut-edit-overview.html">加工の全体像（非破壊編集の流れ）</a>を参照してください。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        切り取りは加工パイプラインの最終段として扱われます。位置づけの詳細は
+        <a href="adjustment.html">画像補正</a>、フルスクリーンでの操作は
+        <a href="fullscreen.html">フルスクリーン表示</a>、書き出しの詳細は
+        <a href="export.html">エクスポート</a>リファレンスを参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

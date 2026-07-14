@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>加工の全体像（非破壊編集の流れ） — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>加工の全体像（非破壊編集の流れ）</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">加工の全体像（非破壊編集の流れ）</h1>
+    <p class="page-desc">
+      mImageViewer の加工（補正・消しゴム・補正レイヤー・隠蔽加工・テキスト注釈）は、すべて
+      <strong>元ファイルを書き換えない非破壊編集</strong>です。まずここで「どこから始めるか」「編集結果は
+      どこに記録されるか」「最後にどうやってファイルにするか」の 3 点だけ押さえておけば、あとは
+      <strong>使いたい加工のページだけ</strong>を読めば迷いません。
+    </p>
+
+    <h2>1. 起点は左パネル上部のツール</h2>
+    <p>
+      編集ツールはすべて、フルスクリーン表示中の <strong>左パネル</strong>から始めます。左パネルの上部には、
+      画像補正・消しゴム・補正レイヤー・隠蔽加工・切り取り・テキスト注釈・エクスポートのツールアイコンが
+      並んでいて、ここから各編集に入ります。
+    </p>
+    <p>
+      左パネルの出し方は、上部バーの <strong>ℹ</strong> ボタン（<kbd>I</kbd> または <kbd>Tab</kbd>）で
+      「通常ホバー」と「クリック表示」を切り替えられます。通常ホバーでは画面左端にマウスを寄せると開き、
+      クリック表示では左端に現れる呼び出しバーをクリックすると開きます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ツール</th><th>できること</th><th>詳しく</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>画像補正</td><td>明るさ・コントラスト・色・レベルの全体補正、AI アップスケール、表示トリム</td><td><a href="tut-adjust.html">明るさ・色を補正する</a></td></tr>
+          <tr><td>消しゴム</td><td>不要物をマスクして AI で自然に補完</td><td><a href="tut-erase.html">不要物を自然に消す</a></td></tr>
+          <tr><td>補正レイヤー</td><td>マスクで範囲を決めて「背景だけ」「人物だけ」など部分的に補正</td><td><a href="tut-local-adjust.html">補正レイヤーで部分的に補正</a></td></tr>
+          <tr><td>隠蔽加工</td><td>モザイク・白 / 黒塗り・ぼかしを重ねる</td><td><a href="tut-conceal.html">モザイク・白塗りで隠蔽加工</a></td></tr>
+          <tr><td>切り取り</td><td>出力する範囲を決める。表示では範囲外が暗くなり、書き出し・本棚に切り取った画像が反映されます</td><td><a href="tut-crop.html">切り取りで出力範囲を決める</a></td></tr>
+          <tr><td>テキスト注釈</td><td>吹き出し・装飾テキスト・赤枠 / 矢印 / 蛍光マーカーなどの図形</td><td><a href="tut-annotation.html">吹き出し・テキスト・注釈を入れる</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      エクスポート（書き出し）は「結果をファイルにする」段の機能なので、下の 3 節で扱います。
+    </p>
+
+    <h2>2. 編集結果は非破壊で記録される（＝移動すると消える項目がある）</h2>
+    <p>
+      補正・補正レイヤー・消しゴムマスク・隠蔽加工・テキスト注釈・回転などは、<strong>元の画像ファイルを
+      一切書き換えず</strong>、mImageViewer 内部にファイル / フォルダの<strong>パスをキーにして</strong>
+      別途記録されます。だから元画像はいつでも無傷で、加工はあとから何度でも編集し直せます。
+    </p>
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        記録の目印はパス（置き場所と名前）です。そのため、<strong>エクスプローラなどでファイルやフォルダを
+        移動・リネームすると、加工との紐付けが切れて設定がリセットされたように見えます</strong>。
+        元の場所・名前に戻せば再び参照できます。ZIP / PDF 内の加工は「アーカイブのパス＋内部のページ名」で
+        記録されるため、アーカイブ自体をリネームすると同様に切れます。
+      </div>
+    </div>
+    <p>
+      フォルダを丸ごと別の場所へ移したいときのために、<strong>各フォルダに設定のバックアップを残す仕組み</strong>が
+      あります。環境設定 → ライブラリ → フォルダ の
+      <strong>「フォルダに補正・マスク設定のバックアップを保存する」</strong>（既定 ON）を有効にしておくと、
+      フォルダ直下に隠しファイル（<code>mimageviewer.dat</code>）が作られ、画像補正・補正レイヤー・消しゴムマスクの
+      設定がそのフォルダと一緒に移動します。フォルダごと別ドライブへ移しても加工が保たれます。
+    </p>
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        普段の記録はアプリ内部が主で、このバックアップはフォルダ移動に備えたフォールバックです。時間をかけた
+        補正やマスクを残したいなら ON のままにしておくと安心です。保存先やキーの詳しい規則は
+        <a href="settings.html">設定リファレンス</a>を参照してください。
+      </div>
+    </div>
+
+    <h2>3. 加工結果をファイルにする 2 つの方法</h2>
+    <p>
+      非破壊編集はそのままだと mImageViewer の中でだけ効く「表示上の加工」です。実際の画像ファイルとして
+      焼き込むには、次の 2 つの方法があります。<strong>焼き込む範囲（表示系を含むかどうか）が違う</strong>のがポイントです。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>方法</th><th>焼き込む範囲</th><th>向いている用途</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>本棚に追加</td>
+            <td>補正・回転・消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・加工用の切り取りを<strong>原寸</strong>で焼き込み。
+            AI アップスケール・ポストフィルタ・シャープ化・ノイズ除去などの<strong>表示系は焼き込みません</strong></td>
+            <td>加工したページを 1 冊の本にまとめて整理する（SNS アップロード用の画像整理など）。表示設定を変えても本の中の画像サイズは一定 → <a href="tut-books.html">本棚に集めて 1 冊にまとめる</a></td>
+          </tr>
+          <tr>
+            <td>左パネルのエクスポートアイコン<br>（または <kbd>Ctrl</kbd>+<kbd>E</kbd>）</td>
+            <td>いま見えている<strong>表示結果そのまま</strong>を別ファイルへ。上の内容に加えて
+            <strong>AI アップスケール・ポストフィルタなどの表示系も含めて</strong>焼き込みます</td>
+            <td>見えているとおりに 1 枚を書き出す。隠蔽加工のプリセット違いをまとめて出力することもできます → <a href="export.html">エクスポート（リファレンス）</a></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      どちらの方法でも、<strong>表示トリム</strong>（左パネルの表示専用の余白カット）と、右 <kbd>Ctrl</kbd> を
+      押している間だけ出る一時的な元画像確認表示は焼き込まれません。表示トリムと加工用の切り取りの違いは
+      <a href="tut-adjust.html">明るさ・色を補正する（＋表示トリム）</a>で説明しています。
+    </p>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        つまり「元画像はそのままに、アプリ内で自由に加工 → 気に入ったら本棚に集めるか、エクスポートで
+        書き出す」という流れです。次は、使いたい加工のページへ進んでください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -185,37 +185,42 @@
 
     <!-- ── 4. 写真・イラストを加工する ─────────── -->
     <h2>4. 写真・イラストを加工する（非破壊）</h2>
-    <p class="tut-cat-desc">元ファイルは触らず、表示だけに効果を重ねる編集ツール群。書き出して初めて焼き込まれます。</p>
+    <p class="tut-cat-desc">元ファイルは触らず、表示だけに効果を重ねる編集ツール群。まず「加工の全体像」で流れをつかみ、あとは使いたい加工だけ読めば OK。</p>
     <div class="toc-grid">
+      <a class="toc-card" href="tut-edit-overview.html">
+        <div class="toc-icon">🗺️</div>
+        <div class="toc-title">加工の全体像（非破壊編集の流れ）</div>
+        <div class="toc-desc">編集の起点（左パネル）、非破壊で記録される仕組み（移動で消える設定・バックアップ）、結果をファイルにする 2 つの方法。最初にここを。</div>
+      </a>
       <a class="toc-card" href="tut-adjust.html">
         <div class="toc-icon">🎨</div>
         <div class="toc-title">明るさ・色を補正する（＋表示トリム）</div>
         <div class="toc-desc">明るさ・コントラスト・色・レベルの全体補正、プリセット保存、表示トリム。まず押さえたい表示の基本。</div>
-      </a>
-      <a class="toc-card" href="tut-local-adjust.html">
-        <div class="toc-icon">◐</div>
-        <div class="toc-title">補正レイヤーで部分的に補正<span class="toc-chip tricky">戸惑いやすい</span></div>
-        <div class="toc-desc">マスク付きレイヤーで「背景だけぼかす」「人物だけ明るく」。マスクの作り方と重ね方。</div>
       </a>
       <a class="toc-card" href="tut-erase.html">
         <div class="toc-icon">🩹</div>
         <div class="toc-title">消しゴムで不要物を自然に消す</div>
         <div class="toc-desc">汚れやノイズをマスクして AI で補完。筆・囲みツールとマスクスロット・Undo。</div>
       </a>
+      <a class="toc-card" href="tut-local-adjust.html">
+        <div class="toc-icon">◐</div>
+        <div class="toc-title">補正レイヤーで部分的に補正<span class="toc-chip tricky">戸惑いやすい</span></div>
+        <div class="toc-desc">マスク付きレイヤーで「背景だけぼかす」「人物だけ明るく」。マスクの作り方と重ね方。</div>
+      </a>
       <a class="toc-card" href="tut-conceal.html">
         <div class="toc-icon">▦</div>
         <div class="toc-title">モザイク・白塗りで隠蔽加工</div>
         <div class="toc-desc">モザイク・白 / 黒塗り・ぼかしを非破壊で重ねる。タイルサイズやオブジェクト編集。</div>
       </a>
+      <a class="toc-card" href="tut-crop.html">
+        <div class="toc-icon">✂️</div>
+        <div class="toc-title">切り取りで出力範囲を決める</div>
+        <div class="toc-desc">出力に反映される切り取り。範囲外が暗くなり、書き出し・本棚に切り取った画像が入る。自動クロップも。</div>
+      </a>
       <a class="toc-card" href="tut-annotation.html">
         <div class="toc-icon">💬</div>
         <div class="toc-title">吹き出し・テキスト・注釈を入れる</div>
         <div class="toc-desc">吹き出し・装飾テキスト・オノマトペ・赤枠 / 矢印 / 蛍光マーカーなどの図形を重ねる。</div>
-      </a>
-      <a class="toc-card" href="tut-export.html">
-        <div class="toc-icon">💾</div>
-        <div class="toc-title">加工結果を書き出す<span class="toc-chip hidden">見つけづらい</span></div>
-        <div class="toc-desc"><kbd>Ctrl</kbd>+<kbd>E</kbd> で補正・消しゴム・注釈・切り取りを反映して別ファイルへ。プリセット別の一括出力も。</div>
       </a>
     </div>
 
@@ -225,7 +230,7 @@
     <div class="toc-grid">
       <a class="toc-card" href="tut-video.html">
         <div class="toc-icon">🎬</div>
-        <div class="toc-title">動画をインライン再生する<span class="toc-chip hidden">見つけづらい</span></div>
+        <div class="toc-title">動画をインライン再生する</div>
         <div class="toc-desc">フルスクリーンでそのまま再生。シーク・倍速・ループと、映像を止めて音声だけ聴く（<kbd>Z</kbd>）モード。</div>
       </a>
       <a class="toc-card" href="tut-video-power.html">
