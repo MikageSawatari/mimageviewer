@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>吹き出し・テキスト・注釈を入れる — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>吹き出し・テキスト・注釈を入れる</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">吹き出し・テキスト・注釈を入れる</h1>
+    <p class="page-desc">
+      画像の上に、漫画のような吹き出し・メッセージウィンドウ・装飾テキスト・スタンプを重ねたり、
+      スクリーンショットの説明に使う強調枠・矢印・蛍光マーカー・番号バッジ・カーソルを配置したりできる機能です。
+      元の画像ファイルは一切書き換えず、保存・コピー・エクスポート時にだけ画像へ焼き込まれます。
+    </p>
+
+    <h2>1. テキスト注釈モードを開始する</h2>
+    <p>
+      フルスクリーン表示中に <kbd>Ctrl</kbd>+<kbd>T</kbd> を押すとテキスト注釈モードに入ります
+      （画像補正パネルのヘッダー右側にある吹き出しアイコンからも開始できます）。
+      左側に注釈の一覧と追加ボタン、右側に編集パネルが表示されます。
+    </p>
+    <ol class="step-list">
+      <li><kbd>Ctrl</kbd>+<kbd>T</kbd> でテキスト注釈モードを開始します。</li>
+      <li>左パネルの追加ボタンから、配置したい注釈の種類を選びます。</li>
+      <li>配置した注釈はクリックで選択し、右パネルで内容を編集。キャンバス上ではドラッグで移動、ハンドルで拡大縮小・回転できます。</li>
+      <li><kbd>Esc</kbd> または <kbd>Ctrl</kbd>+<kbd>T</kbd> でモードを終了します（フルスクリーンは継続したままです）。</li>
+    </ol>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: Ctrl+T で開いたテキスト注釈モード（左に注釈一覧と追加ボタン、右に編集パネル）</div>
+      <figcaption>モード中は左右にパネルが並びます。通常のフルスクリーンショートカットは無効になり、注釈編集用のキーだけが働きます。</figcaption>
+    </figure>
+
+    <h2>2. 吹き出し・テキスト・スタンプを配置する</h2>
+    <p>
+      左パネルの追加ボタンで、目的に応じた注釈を配置します。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>追加ボタン</th><th>できること</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>吹き出し追加</td><td>セリフを入れる吹き出し。16 種類の形から選べ、しっぽの向きも調整可能。すぐ下の吹き出しと結合してひと続きに見せることもできます</td></tr>
+          <tr><td>ウィンドウ追加</td><td>ノベルゲーム風の文章枠。背景・枠・名前プレートなどを設定できます</td></tr>
+          <tr><td>テキスト追加</td><td>枠のない装飾文字（袋文字・影・発光など）</td></tr>
+          <tr><td>オノマトペ追加</td><td>効果音のような装飾文字（装飾フォントの追加パックが必要）</td></tr>
+          <tr><td>注釈追加</td><td>強調枠・矢印・蛍光マーカー・下線・番号バッジ・カーソル</td></tr>
+          <tr><td>スタンプ追加</td><td>絵文字や好みの画像を貼り付け</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      吹き出し・ウィンドウ・テキスト・オノマトペの本文は共通の「セリフ」タブで編集します。フォント・文字サイズ・
+      文字色に加え、横書き / 縦書き、袋文字や外フチ・影・発光といった文字効果も設定できます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 「吹き出し追加」で開いた形状選択ダイアログ（楕円・角丸・トゲ・雲など 16 種類）</div>
+      <figcaption>吹き出しは形の見本から選ぶだけで配置できます。配置後は本体・しっぽタブで細かく調整できます。</figcaption>
+    </figure>
+
+    <h2>3. 注目箇所を示す図形注釈</h2>
+    <p>
+      「注釈追加」を押すと、ソフトの操作説明でボタンを囲む、写真の注目箇所を指す、文書の文字を目立たせるといった
+      用途に向いたプリセットが並びます。
+    </p>
+    <ul>
+      <li><strong>枠</strong>（長方形 / 角丸 / 楕円）: 輪郭だけの図形。塗りつぶしもオンにできます</li>
+      <li><strong>矢印</strong>: 回転ハンドルで向きを変えられる、説明図用の矢印</li>
+      <li><strong>蛍光マーカー・下線</strong>: 下の文字を潰さずに色が重なる半透明の帯。一覧の重なり順どおりに塗り重ねられます</li>
+      <li><strong>番号バッジ</strong>: 手順の説明に使う丸数字。追加するたびに続きの番号が自動で入ります</li>
+      <li><strong>カーソル</strong>: 白矢印・黒矢印・指差し・I ビーム・クリックリングの 5 種類</li>
+    </ul>
+    <p>
+      色は赤・橙・黄・緑・青・ピンクのパレットまたはカスタム色、線太さは細・標準・太から選べます。
+      前回選んだプリセット・色・線太さはアプリを終了するまで引き継がれるので、同じ調子で複数個所を説明するのも簡単です。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 赤い強調枠・矢印・番号バッジでスクリーンショットの操作説明を書き込んだ状態</div>
+      <figcaption>図形注釈を組み合わせると、ソフトの使い方説明やレビュー用の指摘画像がその場で作れます。</figcaption>
+    </figure>
+
+    <h2>4. 位置・大きさ・重なり順を調整する</h2>
+    <p>
+      配置した注釈は、ほかの注釈と同じ操作で調整できます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>キャンバスでドラッグ</td><td>選択中の注釈を移動</td></tr>
+          <tr><td>四隅ハンドル</td><td>拡大・縮小</td></tr>
+          <tr><td>回転ノブ</td><td>回転</td></tr>
+          <tr><td>左パネルの <kbd>↑</kbd> / <kbd>↓</kbd></td><td>選択中の注釈を前面 / 背面へ（重なり順の変更）</td></tr>
+          <tr><td>複製 / 削除</td><td>選択中の注釈をコピー、または削除</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>元に戻す / やり直し</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        4K など解像度の高い画像で編集がもたつくときは、左パネル上部のプレビュー解像度を「1/2」や「1/4」に下げると
+        ドラッグや文字入力がスムーズになります。保存・コピー・比較・エクスポートは常にフル解像度で行われるので、
+        出来上がりの画質には影響しません。
+      </div>
+    </div>
+
+    <h2>5. 保存とエクスポート</h2>
+    <p>
+      注釈はページごとに自動でデータベースに保存され、次に同じページを開いたときに再描画されます。
+      元の画像ファイルには一切手を加えません。
+    </p>
+    <ul>
+      <li>注釈のあるページには、サムネイル左上にピンク色の「文」バッジが表示され、どのページに注釈を付けたか一目で分かります</li>
+      <li>保存・コピー・比較、および <kbd>Ctrl</kbd>+<kbd>E</kbd> のエクスポートでは、注釈が画面の表示どおりに画像へ焼き込まれて出力されます</li>
+      <li>ZIP / PDF 内のページにも同じように注釈を付けられます</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: サムネイル一覧でピンク色の「文」バッジが付いたページ</div>
+      <figcaption>注釈を付けたページにはピンクの「文」バッジが表示されます。エクスポートすると注釈込みの画像として書き出されます。</figcaption>
+    </figure>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        テキスト注釈モードは、画像分析・画像補正・消しゴム・隠蔽加工・動画再生中は使用できません。
+        より詳しい仕様（吹き出しの結合条件、メッセージウィンドウの部品、フォントの扱いなど）は
+        <a href="annotation.html">テキスト注釈</a>リファレンスを参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

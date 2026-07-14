@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZIP / RAR / 7z / LZH を直接開く — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>ZIP / RAR / 7z / LZH を直接開く</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">ZIP / RAR / 7z / LZH を直接開く</h1>
+    <p class="page-desc">
+      漫画・イラスト集の配布でよく使われる書庫形式をそのままダブルクリックして読む方法です。
+      ZIP はそのまま開けます。RAR / CBR も多くはそのまま開けますが、ソリッド圧縮など一部のものと 7z / LZH は、一度 ZIP へ変換してから閲覧します。
+      変換の始め方とキャッシュの扱いを押さえておくと、次回以降つまずきません。
+    </p>
+
+    <h2>ZIP / CBZ はそのまま開ける</h2>
+    <p>
+      <code>.zip</code> と <code>.cbz</code> は変換不要です。ファイルをダブルクリックすると、
+      展開せずにその場でアーカイブ内の画像が一覧表示されます。中にサブフォルダや別の ZIP が
+      入っている場合は、それぞれを「開いて中に入れるフォルダ」としてツリー状に表示します。
+    </p>
+    <p>
+      ZIP の外に出るには <kbd>BS</kbd>（Backspace）キーを押します。
+    </p>
+
+    <h2>RAR / 7z / LZH の開き方</h2>
+    <p>
+      <code>.rar</code> / <code>.cbr</code> のうち、<strong>ソリッド圧縮でなく・入れ子アーカイブを含まず・パスワードなし</strong>のものは、変換せずそのまま直接閲覧できます。
+      それ以外の RAR / CBR（ソリッド圧縮・入れ子あり・パスワード付き）と、<code>.7z</code> / <code>.cb7</code> / <code>.lzh</code> / <code>.lha</code> は、
+      ZIP のように直接ブラウズできないため、<strong>一度 ZIP に変換してから閲覧する方式</strong>になります。
+      対象のファイルをダブルクリックすると変換が始まります（元ファイルはそのまま残ります）。
+    </p>
+    <ul>
+      <li>変換は初回だけで、2 回目以降は変換済みの ZIP キャッシュから高速に開きます。</li>
+      <li>変換時に画像ファイルのみを取り出し、音声・動画・テキストなど画像以外は破棄されます。</li>
+      <li>パスワード付きの RAR / CBR では、変換前にパスワード入力ダイアログが表示されます。パスワード自体は保存されません。</li>
+    </ul>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        RAR / CBR のうち、ソリッド圧縮でなく入れ子アーカイブも含まない場合は、変換せずそのまま直接閲覧できることがあります。
+        ソリッド圧縮・入れ子あり・パスワード付きの場合は設定に応じて ZIP キャッシュへ変換されます。
+      </div>
+    </div>
+
+    <h2>変換には 2 つの方法があります</h2>
+    <p>
+      変換が必要なアーカイブ（ソリッド RAR・7z・LZH など）を ZIP へ変換する方法は 2 通りあります。用途に合わせて好きな方を選べます。
+    </p>
+    <ul>
+      <li><strong>方法 1 — その場で開く（一時キャッシュ）：</strong>ダブルクリックすると、自動で一時キャッシュに変換してすぐ閲覧できます。手軽ですが、変換した ZIP は <code>%APPDATA%</code> のキャッシュに溜まります（あとで管理ダイアログから掃除できます）。</li>
+      <li><strong>方法 2 — ZIP ファイルとして残す：</strong>メニュー「変換」→「ZIP ファイルに変換」で、元と同じ場所に本物の <code>.zip</code> を作ります。一時キャッシュを作りたくない人や、変換済み ZIP をそのまま保管・持ち運びしたい人向けです。</li>
+    </ul>
+
+    <h3>方法 1: その場で開く（一時キャッシュ）</h3>
+    <p>
+      対象のファイルをダブルクリックすると変換が始まります。変換前にダイアログで確認するか、確認せず自動で変換するかは環境設定で選べます（環境設定 → パフォーマンス → キャッシュ）。
+    </p>
+    <ul>
+      <li><strong>開く前に確認する（既定）：</strong>ダブルクリックすると確認ダイアログが表示され、変換を実行するか選べます。「次回から表示しない」を選ぶと、以降は確認せず自動で変換する設定に切り替わります。</li>
+      <li><strong>確認せずに変換する：</strong>ダブルクリックした瞬間に変換が始まります。</li>
+      <li><strong>RAR / 7z / LZH を無視する：</strong>これらの形式が一覧やフォルダ移動の対象から外れ（サムネイル一覧にも表示されません）、作成済みの変換キャッシュも開かなくなります。</li>
+    </ul>
+    <p>変換中は進捗が表示されます。</p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-archive-1.webp" alt="「7z を ZIP に変換」確認ダイアログ。「変換して開く」「キャンセル」ボタンと「次回から表示しない」チェックがある">
+      <figcaption>方法 1 の確認ダイアログ。「変換して開く」で一時キャッシュに変換して閲覧します。「次回から表示しない」を選ぶと、以降は確認せず自動変換に切り替わります。</figcaption>
+    </figure>
+
+    <h3>方法 2: ZIP ファイルとして残す</h3>
+    <p>
+      グリッドで対象を選び、メニュー「変換」→「ZIP ファイルに変換」を実行すると、<strong>元ファイルと同じフォルダに同名の <code>.zip</code> を作成</strong>します。
+      こちらは一時キャッシュではなく通常のファイル出力なので、キャッシュを溜めたくないときや、変換結果を ZIP として手元に残したいときに向いています。
+      <kbd>Space</kbd> キーで複数選択すれば、まとめて変換することもできます。
+    </p>
+    <ul>
+      <li>中の画像は再圧縮せずそのまま格納するので、無劣化・高速です。</li>
+      <li>同名の ZIP が既にある場合は、そのファイルの変換をスキップして上書きしません。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-archive-2.webp" alt="「ZIP ファイルに変換」ダイアログ。同じフォルダに同名の ZIP を作成する確認画面で、ボタンは「ZIP ファイルに変換」">
+      <figcaption>方法 2 のダイアログ。メニュー「変換」から実行すると、同じフォルダに同名の ZIP を作る確認が出ます。「ZIP ファイルに変換」で、一時キャッシュではなく通常の <code>.zip</code> ファイルとして残せます。</figcaption>
+    </figure>
+
+    <h2>変換済みアーカイブのキャッシュ管理</h2>
+    <p>
+      ダブルクリックによる変換で作られる ZIP キャッシュは <code>%APPDATA%\mimageviewer\archive_cache\</code> に保存されます。
+      一覧の確認や削除は「設定 → 変換済みアーカイブキャッシュ管理…」から行います。
+    </p>
+    <ul>
+      <li>変換済みキャッシュの一覧と合計サイズを表示</li>
+      <li>チェックボックスで個別選択して削除</li>
+      <li>元ファイルが既に存在しないエントリを一括削除</li>
+      <li>全キャッシュの削除</li>
+    </ul>
+    <p>
+      環境設定 → パフォーマンス → キャッシュで、容量上限（MB 単位）を設定すると、変換完了後に古いキャッシュから
+      自動的に削除されます。既定は無制限です。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-archive-3.webp" alt="「変換済みアーカイブキャッシュ管理」ダイアログ。元ファイル・形式・キャッシュサイズ・画像数の一覧と、合計サイズ・削除ボタンがある">
+      <figcaption>変換済みキャッシュの一覧。合計サイズを確認し、個別削除・不要エントリの一括削除・全削除ができます。</figcaption>
+    </figure>
+
+    <h2>変換後の再読み込み</h2>
+    <p>
+      一度変換されたアーカイブは、以降は通常の ZIP と同じ扱いになります。フォルダに戻ると変換済みのアーカイブとして
+      サムネイルが表示され、開くと変換済みキャッシュから高速に読み込まれます。
+    </p>
+    <p>
+      「同名の ZIP/CBZ と RAR/7z/LZH がある場合、ZIP/CBZ だけ表示」を有効にしている環境設定では、
+      一覧には変換後の ZIP だけが表示されます。元のアーカイブから読み直したい・再変換したい場合は、
+      この設定を一時的に OFF にして元ファイルを選択してください。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        対応形式の一覧・入れ子アーカイブの扱いは<a href="formats.html">対応フォーマット</a>の「アーカイブ」節、
+        変換方式を採用している理由や RAR 展開の詳細は<a href="faq.html#archive-7z-lzh">FAQ: RAR / 7z / LZH アーカイブに対応していますか？</a>を参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

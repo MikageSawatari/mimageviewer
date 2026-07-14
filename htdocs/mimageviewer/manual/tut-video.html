@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>動画をインライン再生する — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>動画をインライン再生する</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">動画をインライン再生する</h1>
+    <p class="page-desc">
+      フォルダの中に動画ファイルがあれば、画像を見るのと同じ感覚でそのままフルスクリーン再生できます。
+      シーク・倍速・ループといった基本操作に加えて、映像を止めて音だけを聴く「音声モード」も用意されています。
+      ここではローカルに保存済みの動画ファイルを開いてからの基本的な使い方を紹介します。
+    </p>
+
+    <h2>動画ファイルを開く</h2>
+    <p>
+      フォルダ一覧に並んでいる動画ファイルをダブルクリック（または <kbd>Enter</kbd>）すると、
+      フルスクリーンで自動的に再生が始まります。前回途中まで見ていた動画は、続きの位置から再開されます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: フルスクリーンで動画を再生中の画面（下部にシークバーと再生コントロールが並んだ状態）</div>
+      <figcaption>動画ファイルを開くと自動的にフルスクリーン再生が始まります。下部にシークバーと再生コントロールが表示されます。</figcaption>
+    </figure>
+
+    <h2>基本の再生操作</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Space</kbd> / <kbd>Enter</kbd> / 画面クリック</td><td>再生 / 一時停止をトグル</td></tr>
+          <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>5 秒シーク（前 / 次）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>1 秒シーク（細かい）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>30 秒シーク（大きい）</td></tr>
+          <tr><td><kbd>↑</kbd> / <kbd>↓</kbd> / マウスホイール</td><td>前 / 次のファイルへ移動</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      下部 HUD のシークバーはホバーするとその位置のサムネイル プレビューが表示されるので、
+      目的の場面を探しながら頭出しできます。再生中はしばらく操作がないと HUD が自動的に隠れ、
+      マウスを動かすかキーを押すと再表示されます。
+    </p>
+
+    <h2>倍速再生とループ</h2>
+    <p>
+      下部 HUD の速度ボタンから 0.5x〜3.0x の 11 段階で再生速度を切り替えられます。
+      音声は音の高さ（ピッチ）を保ったまま再生速度だけが上がるので、声が甲高くならず、自然な声質のまま早見できます（話すテンポ自体は速くなります）。
+      速度ボタンを右クリックまたはダブルクリックすると、通常速度（1.0x）にすぐ戻せます。
+    </p>
+    <p>
+      <kbd>L</kbd> キーまたは下部 HUD のループボタンで、
+      ループなし → 全体ループ → チャプターループ → ブックマークループの順に切り替えられます。
+      チャプターやブックマークが無い動画では、該当する段階を自動でスキップします。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 速度ボタンをクリックして 0.5x〜3.0x の候補が並んだ状態</div>
+      <figcaption>速度ボタンから 11 段階の再生速度を選べます。ピッチが保たれるので声質は変わりません。</figcaption>
+    </figure>
+
+    <h2>映像を止めて音声だけで聴く（音声モード）</h2>
+    <p>
+      動画を再生しているときに上部バーの <strong>♪ ボタン</strong>、または <kbd>Z</kbd> キーを押すと、
+      映像を止めて音だけを聴く「音声モード」に切り替わります。作業用 BGM として動画の音声だけを
+      流したいときや、波形・スペクトラムで音を確認したいときに便利です。
+    </p>
+    <ul>
+      <li>音は途切れず、再生位置・音量・音量自動調整の状態はそのまま引き継がれます</li>
+      <li>上部バーの <strong>▶ ボタン</strong>、または再度 <kbd>Z</kbd> キーで映像表示に戻ります</li>
+      <li>音声モードのまま前 / 次のファイルへ移動でき、連続再生中もそのまま音声モードを保ちます</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: Z キーで音声モードに切り替わり、波形とスペクトラムが表示された画面</div>
+      <figcaption>音声モードに切り替えると波形とスペクトラムの画面になります。音は途切れず、そのまま続きます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        音声を対応プラグインのチェーンに通してから再生する機能もあります。既定は OFF で、
+        使わない場合は表示・動作とも何も変わりません。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        タイル モード・ブックマーク・音量自動調整・AI 動画アップスケールなど、動画のより詳しい機能は
+        <a href="video.html">動画再生</a>リファレンスにまとまっています。
+        音声モードの画面構成や操作は<a href="music.html#audio-mode">音楽再生 → 動画→音声モード</a>を参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

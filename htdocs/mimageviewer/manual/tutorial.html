@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>チュートリアル — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>チュートリアル</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html" class="active">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">チュートリアル</h1>
+    <p class="page-desc">
+      スクリーンショットを見ながら、具体的なシナリオに沿って主要機能の使い方を紹介します。
+      「ボタンを押せばすぐ分かる」操作は省き、<strong>少し設定が必要なもの</strong>・
+      <strong>最初は見つけにくい / 戸惑いやすいもの</strong>を中心にまとめています。
+      各項目をクリックすると、画面を広く使った解説ページが開きます。
+    </p>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        ラベルの見方 —
+        <span class="toc-chip setup">要設定</span> 事前にちょっと準備が要る /
+        <span class="toc-chip hidden">見つけづらい</span> 導線が分かりにくい /
+        <span class="toc-chip tricky">戸惑いやすい</span> 動きに最初とまどう
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">⌨️</span>
+      <div class="box-body">
+        本チュートリアルに出てくるキーは<strong>既定の割り当て</strong>です。操作をカスタマイズしている場合、
+        いま実際に効くキーは各画面で <kbd>?</kbd>（ショートカット一覧）を押すと確認できます。
+      </div>
+    </div>
+
+    <!-- ── 1. 基本機能 ─────────────────────────── -->
+    <h2>1. 基本機能 — まずここから</h2>
+    <p class="tut-cat-desc">どの使い方でも土台になる、最初の流れ・フォルダの行き来・フルスクリーン閲覧・アーカイブ・初期設定。</p>
+    <div class="toc-grid">
+      <a class="toc-card" href="tut-first-run.html">
+        <div class="toc-icon">🚀</div>
+        <div class="toc-title">はじめての 10 分</div>
+        <div class="toc-desc">起動してフォルダを開き、選択・表示・移動・戻るまでをひと通り体験する導入シナリオ。</div>
+      </a>
+      <a class="toc-card" href="tut-navigation.html">
+        <div class="toc-icon">🧭</div>
+        <div class="toc-title">フォルダを開く・移動する<span class="toc-chip tricky">戸惑いやすい</span></div>
+        <div class="toc-desc">ドライブから開く、フォルダバー、そして <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> のツリー移動・<kbd>BS</kbd> で親フォルダ。「今どこにいるか」を見失わないコツ。</div>
+      </a>
+      <a class="toc-card" href="tut-fullscreen-basics.html">
+        <div class="toc-icon">🔍</div>
+        <div class="toc-title">フルスクリーン閲覧の基本</div>
+        <div class="toc-desc">フィット切替（<kbd>0</kbd>）・部分拡大（<kbd>Z</kbd>）・<kbd>Ctrl</kbd>+ホイール・パン・回転・<kbd>?</kbd> の一覧。拡大表示の土台。</div>
+      </a>
+      <a class="toc-card" href="tut-archive.html">
+        <div class="toc-icon">🗜️</div>
+        <div class="toc-title">ZIP / RAR / 7z / LZH を直接開く<span class="toc-chip setup">要設定</span></div>
+        <div class="toc-desc">ZIP はそのまま、RAR は多くが直接、それ以外は「変換」して読む。変換キャッシュの管理と再読み込みの流れ。</div>
+      </a>
+      <a class="toc-card" href="tut-favorites.html">
+        <div class="toc-icon">⭐</div>
+        <div class="toc-title">お気に入りで素早くアクセス</div>
+        <div class="toc-desc">よく見るフォルダをお気に入り登録し、横断検索（<kbd>Ctrl</kbd>+<kbd>G</kbd>）の対象にする。追加・並べ替え・編集の基本。</div>
+      </a>
+      <a class="toc-card" href="tut-settings-basics.html">
+        <div class="toc-icon">⚙️</div>
+        <div class="toc-title">環境設定と操作カスタマイズ<span class="toc-chip setup">要設定</span></div>
+        <div class="toc-desc">最初に見ておきたい設定項目と、キー割り当ての変え方、変えた設定を元に戻す方法。テーマや表示倍率もここで。</div>
+      </a>
+    </div>
+
+    <!-- ── 2. 画像・漫画・コミック閲覧 ──────────── -->
+    <h2>2. 画像・漫画・コミックを見る</h2>
+    <p class="tut-cat-desc">大量の画像やアーカイブ、漫画をストレスなく閲覧するための機能。</p>
+    <div class="toc-grid">
+      <a class="toc-card" href="tut-spread.html">
+        <div class="toc-icon">📖</div>
+        <div class="toc-title">見開きで漫画を読む<span class="toc-chip tricky">戸惑いやすい</span></div>
+        <div class="toc-desc">右綴じ / 左綴じの切り替えと、表紙がズレるときの先頭ページ調整。本読みのページ順について。</div>
+      </a>
+      <a class="toc-card" href="tut-reading.html">
+        <div class="toc-icon">📚</div>
+        <div class="toc-title">快適に読み続ける</div>
+        <div class="toc-desc">縦 / 横連結、フィット、余白トリム、読書位置の復元、読書履歴。長い作品を読み進めるための設定。</div>
+      </a>
+      <a class="toc-card" href="tut-upscale-view.html">
+        <div class="toc-icon">🪄</div>
+        <div class="toc-title">AI アップスケールで拡大して見る<span class="toc-chip setup">要設定</span></div>
+        <div class="toc-desc">低解像度の画像や古い CG を、AI で高精細化して鑑賞する。モデル選びとメモリの目安。</div>
+      </a>
+      <a class="toc-card" href="tut-stack.html">
+        <div class="toc-icon">🗂️</div>
+        <div class="toc-title">ファイル名スタックで一覧をすっきり<span class="toc-chip tricky">戸惑いやすい</span></div>
+        <div class="toc-desc">同じ接頭辞・連番を 1 セルに畳む仕組み。集約⇔フラット切り替えと <kbd>Shift</kbd>+<kbd>↓</kbd>/<kbd>↑</kbd> ジャンプ。</div>
+      </a>
+      <a class="toc-card" href="tut-compare.html">
+        <div class="toc-icon">🔀</div>
+        <div class="toc-title">2 枚を並べて比較する<span class="toc-chip hidden">見つけづらい</span></div>
+        <div class="toc-desc"><kbd>X</kbd> でピン留め →<kbd>C</kbd> 切り替え・<kbd>Shift</kbd>+<kbd>C</kbd> ワイプ・<kbd>Alt</kbd>+<kbd>C</kbd> 差分。加工前後の見比べに。</div>
+      </a>
+      <a class="toc-card" href="tut-analysis.html">
+        <div class="toc-icon">🔬</div>
+        <div class="toc-title">画像分析モードで色・ピクセルを調べる<span class="toc-chip hidden">見つけづらい</span></div>
+        <div class="toc-desc"><kbd>Shift</kbd>+<kbd>Z</kbd> で起動。カラーピッカー・ヒストグラム・等倍拡大。<kbd>Z</kbd>（ズーム）との違いも整理。</div>
+      </a>
+      <a class="toc-card" href="tut-search.html">
+        <div class="toc-icon">🔎</div>
+        <div class="toc-title">検索で目的のファイルを探す<span class="toc-chip tricky">戸惑いやすい</span></div>
+        <div class="toc-desc"><kbd>Ctrl</kbd>+<kbd>F</kbd>（現在地の絞り込み）/<kbd>Ctrl</kbd>+<kbd>S</kbd>（フォルダ・ZIP・PDF を名前で）/<kbd>Ctrl</kbd>+<kbd>G</kbd>（画像・動画・音声をメタ情報で）の使い分けと AND / OR / NOT。</div>
+      </a>
+    </div>
+
+    <!-- ── 3. 画像を整理する ──────────────────── -->
+    <h2>3. 画像を整理する</h2>
+    <p class="tut-cat-desc">増えていく画像に印を付けて、あとから探し出すためのワークフロー。</p>
+    <div class="toc-grid">
+      <a class="toc-card" href="tut-tags.html">
+        <div class="toc-icon">🏷️</div>
+        <div class="toc-title">タグを付けて分類する</div>
+        <div class="toc-desc">ファイル本体を書き換えずに「#タグ」で分類。付与のしかたとタグビュー（<kbd>Ctrl</kbd>+<kbd>T</kbd>）。</div>
+      </a>
+      <a class="toc-card" href="tut-color-search.html">
+        <div class="toc-icon">🎨</div>
+        <div class="toc-title">色で絞り込む（カラー検索）<span class="toc-chip hidden">見つけづらい</span></div>
+        <div class="toc-desc">表示中の一覧を色でフィルタ。使う瞬間にスキャンして、許容範囲を調整しながら絞り込む。</div>
+      </a>
+      <a class="toc-card" href="tut-rating.html">
+        <div class="toc-icon">⭐</div>
+        <div class="toc-title">レーティングで星付け・横断一覧</div>
+        <div class="toc-desc">☆1〜5 を付けて、場所をまたいだフラット一覧で見返す。設定日時での並べ替え。</div>
+      </a>
+      <a class="toc-card" href="tut-books.html">
+        <div class="toc-icon">📕</div>
+        <div class="toc-title">本棚に集めて 1 冊にまとめる</div>
+        <div class="toc-desc">バラの画像・ZIP/PDF ページ・動画フレームを本へ集約。追加先の切り替えと読書。</div>
+      </a>
+    </div>
+
+    <!-- ── 4. 写真・イラストを加工する ─────────── -->
+    <h2>4. 写真・イラストを加工する（非破壊）</h2>
+    <p class="tut-cat-desc">元ファイルは触らず、表示だけに効果を重ねる編集ツール群。書き出して初めて焼き込まれます。</p>
+    <div class="toc-grid">
+      <a class="toc-card" href="tut-adjust.html">
+        <div class="toc-icon">🎨</div>
+        <div class="toc-title">明るさ・色を補正する（＋表示トリム）</div>
+        <div class="toc-desc">明るさ・コントラスト・色・レベルの全体補正、プリセット保存、表示トリム。まず押さえたい表示の基本。</div>
+      </a>
+      <a class="toc-card" href="tut-local-adjust.html">
+        <div class="toc-icon">◐</div>
+        <div class="toc-title">補正レイヤーで部分的に補正<span class="toc-chip tricky">戸惑いやすい</span></div>
+        <div class="toc-desc">マスク付きレイヤーで「背景だけぼかす」「人物だけ明るく」。マスクの作り方と重ね方。</div>
+      </a>
+      <a class="toc-card" href="tut-erase.html">
+        <div class="toc-icon">🩹</div>
+        <div class="toc-title">消しゴムで不要物を自然に消す</div>
+        <div class="toc-desc">汚れやノイズをマスクして AI で補完。筆・囲みツールとマスクスロット・Undo。</div>
+      </a>
+      <a class="toc-card" href="tut-conceal.html">
+        <div class="toc-icon">▦</div>
+        <div class="toc-title">モザイク・白塗りで隠蔽加工</div>
+        <div class="toc-desc">モザイク・白 / 黒塗り・ぼかしを非破壊で重ねる。タイルサイズやオブジェクト編集。</div>
+      </a>
+      <a class="toc-card" href="tut-annotation.html">
+        <div class="toc-icon">💬</div>
+        <div class="toc-title">吹き出し・テキスト・注釈を入れる</div>
+        <div class="toc-desc">吹き出し・装飾テキスト・オノマトペ・赤枠 / 矢印 / 蛍光マーカーなどの図形を重ねる。</div>
+      </a>
+      <a class="toc-card" href="tut-export.html">
+        <div class="toc-icon">💾</div>
+        <div class="toc-title">加工結果を書き出す<span class="toc-chip hidden">見つけづらい</span></div>
+        <div class="toc-desc"><kbd>Ctrl</kbd>+<kbd>E</kbd> で補正・消しゴム・注釈・切り取りを反映して別ファイルへ。プリセット別の一括出力も。</div>
+      </a>
+    </div>
+
+    <!-- ── 5. 動画・音楽 ──────────────────────── -->
+    <h2>5. 動画・音楽を楽しむ</h2>
+    <p class="tut-cat-desc">ビューアのままメディアを再生。隠れた便利機能もここで紹介します。</p>
+    <div class="toc-grid">
+      <a class="toc-card" href="tut-video.html">
+        <div class="toc-icon">🎬</div>
+        <div class="toc-title">動画をインライン再生する<span class="toc-chip hidden">見つけづらい</span></div>
+        <div class="toc-desc">フルスクリーンでそのまま再生。シーク・倍速・ループと、映像を止めて音声だけ聴く（<kbd>Z</kbd>）モード。</div>
+      </a>
+      <a class="toc-card" href="tut-video-power.html">
+        <div class="toc-icon">🎞️</div>
+        <div class="toc-title">動画をもっと使いこなす</div>
+        <div class="toc-desc">タイルモード（<kbd>S</kbd>）、ブックマーク、チャプター移動、現在フレームの保存。基本再生の先の機能。</div>
+      </a>
+      <a class="toc-card" href="tut-music.html">
+        <div class="toc-icon">🎵</div>
+        <div class="toc-title">音楽を波形・スペクトラムで再生</div>
+        <div class="toc-desc">上部の ♪ から音楽ビューへ。波形・スペクトラム・鍵盤表示で聴く。</div>
+      </a>
+    </div>
+
+    <!-- ── 6. さらに使いこなす ────────────────── -->
+    <h2>6. さらに使いこなす・最適化</h2>
+    <p class="tut-cat-desc">大量のコレクションを快適に扱うための、一歩進んだ設定と運用。</p>
+    <div class="toc-grid">
+      <a class="toc-card" href="tut-grid-power.html">
+        <div class="toc-icon">🧰</div>
+        <div class="toc-title">一覧を掘り下げる（並べ替え・絞り込み）</div>
+        <div class="toc-desc">並べ替え・詳細表示・スマートフィルタ・サブフォルダ展開・代表サムネイル固定で、グリッドを使い倒す。</div>
+      </a>
+      <a class="toc-card" href="tut-cache.html">
+        <div class="toc-icon">⚡</div>
+        <div class="toc-title">サムネイルキャッシュで高速表示<span class="toc-chip setup">要設定</span></div>
+        <div class="toc-desc">Off / Auto / Always の違いと、大きなフォルダを一括でキャッシュ作成しておく運用。</div>
+      </a>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        各機能のすべての項目・設定は、左メニューの<strong>機能別リファレンス</strong>（グリッド表示・検索機能など）に網羅しています。
+        このチュートリアルは「よく使う流れ」を抜き出したガイドです。
+      </div>
+    </div>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

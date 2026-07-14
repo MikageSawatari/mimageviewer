@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>検索で目的のファイルを探す — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>検索で目的のファイルを探す</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">検索で目的のファイルを探す</h1>
+    <p class="page-desc">
+      枚数やフォルダが増えてくると、「あれ、どこだっけ」が一番の悩みになります。検索の対象は
+      画像だけではありません。mImageViewer には
+      <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> /
+      <kbd>Ctrl</kbd>+<kbd>T</kbd> の 4 つの検索があり、それぞれ探す対象（今のフォルダ /
+      フォルダ・ZIP・PDF / 画像・動画・音声 / タグ）がまったく違います。
+      最初にこの使い分けさえ覚えてしまえば、あとは迷わず目的のファイルにたどり着けます。
+    </p>
+
+    <h2>まずは使い分けを覚える</h2>
+    <p>
+      「今見ているフォルダの中だけ」なのか「お気に入り全体」なのかで、押すキーが変わります。
+      迷ったら下の表で探している範囲を確認してください。
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>やりたいこと</th><th>キー</th><th>探す範囲</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>今開いているフォルダの中身を絞り込みたい</td><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>表示中のグリッドのみ（索引不要）</td></tr>
+          <tr><td>フォルダ・ZIP・PDF を名前で呼び出したい</td><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>索引を付けたお気に入り配下のフォルダ / ZIP / PDF</td></tr>
+          <tr><td>画像・動画・音声を掘り出したい</td><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>索引を付けたお気に入り配下の画像 / PDF / 動画 / 音声</td></tr>
+          <tr><td>付けておいたタグから探したい</td><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td><td>mIV タグが付いた項目</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        迷ったらまず <kbd>Ctrl</kbd>+<kbd>F</kbd> で十分です。今見ている場所の中だけを絞り込む
+        用途で、索引の準備なしにすぐ使えます。お気に入り全体を横断したくなったら
+        <kbd>Ctrl</kbd>+<kbd>G</kbd>（画像・動画・音声）や <kbd>Ctrl</kbd>+<kbd>S</kbd>
+        （フォルダ・ZIP・PDF）に進みましょう。
+      </div>
+    </div>
+
+    <h2>Ctrl+F: 今のフォルダを絞り込む</h2>
+    <p>
+      表示中のグリッドに何が並んでいても、そのままキーワードで絞り込めます。フォルダ・ZIP・PDF
+      はファイル名、画像・動画はファイル名に加えて EXIF / XMP / AI プロンプト / PDF メタ /
+      動画メタ / サイドカーの中身まで見てくれます。索引を作っていなくてもその場で動くので、
+      「とりあえず今開いているフォルダで探したい」ときの一番手軽な方法です。
+    </p>
+    <ul>
+      <li>メニュー「ファイル」→「現在地フィルタ」、または <kbd>Ctrl</kbd>+<kbd>F</kbd> で検索バーが開きます。</li>
+      <li>キーワードを入力して <kbd>Enter</kbd> を押すと絞り込まれます（入力の途中では実行されません）。</li>
+      <li>「検索対象」ドロップダウンで、ファイル名だけ・EXIF だけ、のように見る情報を絞れます。</li>
+      <li>検索バーの右に「◯/◯ 件」とヒット数が表示されます。</li>
+      <li><kbd>Esc</kbd> または × ボタンで閉じ、絞り込み前の一覧に戻ります。</li>
+    </ul>
+    <p>
+      ZIP を開いているときはファイル名検索のみに固定され、PDF のページ一覧を表示中は
+      <kbd>Ctrl</kbd>+<kbd>F</kbd> 自体が無効になります。
+    </p>
+
+    <h2>Ctrl+S: フォルダ・ZIP・PDF を名前で呼び出す</h2>
+    <p>
+      「あのフォルダ、どこに置いたっけ」を名前だけで横断的に探すのが <kbd>Ctrl</kbd>+<kbd>S</kbd>
+      のコンテナ検索です。お気に入り配下のフォルダ・ZIP・PDF が対象で、動画やコンテナでない
+      画像ファイルは対象外です。
+    </p>
+    <ul>
+      <li>メニュー「お気に入り」→「コンテナ検索」、または <kbd>Ctrl</kbd>+<kbd>S</kbd> で検索バーが開きます。</li>
+      <li>入力した文字で部分一致・大小区別なしに絞り込まれます。</li>
+      <li>「お気に入り」「種別（フォルダ / ZIP / PDF）」のドロップダウンでさらに絞れます。</li>
+    </ul>
+
+    <h2>Ctrl+G: お気に入り全体から画像・動画・音声を探す</h2>
+    <p>
+      お気に入り全体を横断して、画像・PDF・動画・音声 1 件ずつを探すのが
+      <kbd>Ctrl</kbd>+<kbd>G</kbd> のアイテム検索です。索引を使うため、数万件規模でも
+      すぐに結果が返ります。ZIP そのものは対象外なので、ZIP を探したいときは
+      <kbd>Ctrl</kbd>+<kbd>S</kbd> を使います。
+    </p>
+    <ul>
+      <li><kbd>Ctrl</kbd>+<kbd>G</kbd> で検索バーが開き、入力後 300ms ほどで自動的に検索されます。</li>
+      <li>結果は「一覧」（フラットなサムネイル並び）と「集約」（フォルダ単位にまとめてヒット件数バッジ表示）を切り替えられます。</li>
+      <li>ヒットが多いときは自動的に集約表示になり、タイルをダブルクリックすると絞り込んで表示（ドリルイン）できます。</li>
+      <li>検索語には最小文字数があります（日本語などは 2 文字以上、英数字は 3 文字以上）。</li>
+    </ul>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <kbd>Ctrl</kbd>+<kbd>G</kbd> と <kbd>Ctrl</kbd>+<kbd>S</kbd> は、事前に索引を ON に
+        したお気に入りだけが対象です。索引は既定で OFF なので、まだの場合は
+        <a href="#index">下の「索引を作る」</a>を先に済ませてください。<kbd>Ctrl</kbd>+<kbd>F</kbd>
+        には索引は不要です。
+      </div>
+    </div>
+
+    <h2>Ctrl+T: タグから探す</h2>
+    <p>
+      画像・動画・音声・フォルダ・ZIP/PDF に付けた mIV タグから探すのが
+      <kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビューです。タグは
+      <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> の検索対象には含まれないため、
+      タグで探したいときは必ずこちらを使います。
+    </p>
+    <ul>
+      <li>入力欄の右の「一覧▼」から、ピン留めしたタグ・最近使ったタグ・件数の多いタグを選べます。</li>
+      <li><code>#cat #dog</code> のように複数タグを入力すると AND 検索になります。</li>
+      <li>タグメニューやメタデータパネルでタグを右クリックし「このタグで探す」からも開けます。</li>
+    </ul>
+    <p>タグの付け方など詳しい使い方は<a href="tags.html">タグ機能</a>を参照してください。</p>
+
+    <h2>★（レーティング）で一覧する</h2>
+    <p>
+      検索キーではありませんが、付けておいた ★（レーティング）でも、場所をまたいだ一覧を開けます。
+      ファイルメニューの「レーティング一覧」、またはフォルダバーの「場所▼」→「レーティング」から
+      ★1〜★5 のいずれかを選ぶと、その★が付いた画像・動画・音声・フォルダ・ZIP / PDF などを、
+      置いてある場所に関係なく 1 つの一覧にまとめて見返せます。タグのように名前を付ける手間がなく、
+      キー（<kbd>F1</kbd>〜<kbd>F5</kbd>）で手早く付けられるのが特徴です。
+    </p>
+    <p>★の付け方や一覧の並べ替えなど詳しくは<a href="tut-rating.html">レーティングで星付け・横断一覧</a>を参照してください。</p>
+
+    <h2>AND・OR・NOT・フレーズでクエリを組み立てる</h2>
+    <p>
+      <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>
+      は共通のクエリ構文を使えます。単語を並べるだけで AND 検索になり、以下の書き方で
+      絞り込みを調整できます。
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>書き方</th><th>意味</th><th>例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>word1 word2</code></td><td>AND: すべて含む</td><td><code>夕焼け 海辺</code></td></tr>
+          <tr><td><code>-word</code></td><td>NOT: 含まない（除外は常に AND）</td><td><code>夕焼け -曇り</code></td></tr>
+          <tr><td><code>"word1 word2"</code></td><td>フレーズ: 連続する文字列</td><td><code>"golden hour"</code></td></tr>
+          <tr><td><code>-"word1 word2"</code></td><td>フレーズの NOT</td><td><code>-"low quality"</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      検索バー右端の <code>□OR</code> チェックを入れると、含める語同士が AND ではなく
+      OR で結合されます（除外語は OR モードでも常に AND）。「同じ対象を別表記でまとめて拾いたい」
+      ときに便利です。
+    </p>
+
+    <h2>絞り込みドロップダウンでさらに狭める</h2>
+    <p>
+      各検索バーの右側には、対象をさらに絞るドロップダウンがあります。バーごとに持っている
+      項目が異なります。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ドロップダウン</th><th>Ctrl+S</th><th>Ctrl+F</th><th>Ctrl+G</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>お気に入り</td><td>◯</td><td>—</td><td>◯</td></tr>
+          <tr><td>種別（フォルダ/ZIP/PDF）</td><td>◯</td><td>—</td><td>—</td></tr>
+          <tr><td>種別（画像/PDF/動画/音声）</td><td>—</td><td>—</td><td>◯</td></tr>
+          <tr><td>検索対象（ファイル名/EXIF/XMP/…）</td><td>—</td><td>◯</td><td>◯</td></tr>
+          <tr><td>集約トグル</td><td>—</td><td>—</td><td>◯</td></tr>
+          <tr><td>OR 検索チェック</td><td>◯</td><td>◯</td><td>◯</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      「検索対象」を EXIF だけ・AI プロンプトだけのように絞ると、その情報を持たないアイテムは
+      結果から消えます。「レンズ名だけで探したい」「プロンプトに EXIF が混ざって困る」といった
+      場面で役立ちます。
+    </p>
+
+    <h2 id="index">索引を作る（Ctrl+S / Ctrl+G を使う前に）</h2>
+    <p>
+      <kbd>Ctrl</kbd>+<kbd>S</kbd>（コンテナ索引）と <kbd>Ctrl</kbd>+<kbd>G</kbd>
+      （アイテム索引）は、お気に入りごとに個別に ON にする索引を使います。どちらも既定は OFF です。
+    </p>
+    <ol class="step-list">
+      <li><span>メニュー「お気に入り」→「編集」でお気に入りダイアログを開きます。</span></li>
+      <li><span>お気に入りごとに並んだ「コンテナ索引」「アイテム索引」のチェックボックスを ON にします。</span></li>
+      <li><span>ON にした瞬間からその場で配下を再帰的に走査して索引を作成し、以降はファイルの追加・削除・変更に自動で追従します。</span></li>
+    </ol>
+    <p>
+      大容量のお気に入り（数万枚）では初回スキャンに数分〜数十分かかることがあります。
+      スキャン中はウィンドウタイトルバーに <code>(インデックス更新中)</code> が表示され、
+      途中で終了しても次回起動時に続きから再開されます。
+    </p>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        アプリを頻繁に閉じたり開いたりする使い方で、起動直後のスキャン待ちが気になる場合は、
+        環境設定の「タスクトレイ常駐」で <strong>「アプリを閉じる代わりに、タスクトレイに常駐する」</strong>
+        を ON にしておくのがおすすめです。<kbd>×</kbd> で閉じてもウィンドウが隠れるだけで、
+        バックグラウンドに常駐したままファイルの変更を追い続けます。次に開いたときは索引がそのまま
+        使えるので、再スキャンの待ち時間がなくなります（完全に終了したいときは、タスクトレイの
+        アイコンを右クリックして「終了」を選びます）。
+      </div>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        索引が壊れた・怪しいと感じたら、チェックを一度 OFF → ON にすると該当お気に入りだけ
+        フル走査し直せます。正常運用では自動監視で追従するため、手動での再構築は通常不要です。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        検索対象の種類・結果の読み方（一覧 / 集約）・関連ショートカットの詳細は
+        <a href="search.html">検索機能</a>リファレンスにまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

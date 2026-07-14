@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>レーティングで星付け・横断一覧 — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>レーティングで星付け・横断一覧</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">レーティングで星付け・横断一覧</h1>
+    <p class="page-desc">
+      気に入った画像や動画に ☆1〜☆5 の評価を付けておくと、後から「お気に入りだけ」をフォルダをまたいで
+      1 つの一覧に集めて見返せます。タグのように名前を付ける手間がなく、キー 1 つで済むのが特徴です。
+    </p>
+
+    <h2>キー操作で ☆ を付ける</h2>
+    <p>
+      サムネイル一覧・フルスクリーンのどちらでも、同じキーで評価を付けられます。対象は画像ファイル・動画・音声・ZIP 内画像・
+      PDF ページのほか、フォルダ / ZIP / PDF ファイル本体にも「コンテナ★」として個別に付けられます
+      （中身のページ単位の★とは独立に管理されます）。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>F1</kbd>〜<kbd>F5</kbd></td><td>選択中（またはチェック済み）のアイテムに ★1〜★5 を付与</td></tr>
+          <tr><td><kbd>F6</kbd></td><td>★を解除（未評価に戻す）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd></td><td>現在一覧表示中のフォルダ / ZIP / PDF 本体にコンテナ★を付与</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F6</kbd></td><td>コンテナ★を解除</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>直前のレーティング操作を取り消す / やり直す（一括付与も 1 回で元に戻ります）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul>
+      <li>チェック済みアイテムがある状態で押すと、まとめて一括付与できます（操作後チェックは解除されます）</li>
+      <li>フルスクリーン表示中も同じキーで付けられます。<kbd>Shift</kbd>+<kbd>Fn</kbd> は「今見ている画像が入っているコンテナ」が対象です</li>
+      <li>ドライブ一覧ではレーティング操作は無効です</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-rating-1.webp" alt="サムネイルの左下に金色の ★★★ バッジ、フォルダバー右端に青色の ★5 のコンテナ★バッジが表示され、それぞれ赤枠で示されている">
+      <figcaption>アイテムの★はサムネイル左下に<strong>金色の★</strong>で表示され（左の赤枠）、フォルダ / ZIP / PDF 本体に付けたコンテナ★はフォルダバー右端に<strong>青色の 📁★</strong>で表示されます（右の赤枠）。両者は独立して管理されるため、この例のように「画像は★3・フォルダ本体は★5」と別々の値になります。</figcaption>
+    </figure>
+
+    <h2>場所をまたいで見返す — レーティング一覧</h2>
+    <p>
+      ファイルメニューの「レーティング一覧」、またはフォルダバーの「場所▼」→「レーティング」から ★1〜★5 のいずれかを選ぶと、
+      その★が付いた画像・動画・音声・フォルダ・ZIP / PDF 本体などを、置いてある場所に関係なく 1 つの一覧として開けます。
+    </p>
+    <ul>
+      <li>一覧の既定ソートは<strong>「★設定時刻 ↓」</strong>（最近★を付けた順）です</li>
+      <li>レーティング一覧を開いている間だけ、ソートメニューに「★設定時刻 ↓」「★設定時刻 ↑」が追加されます</li>
+      <li>XMP から取り込まれただけの★や旧バージョンで付けた★は設定時刻なしとして扱われ、時刻順では時刻ありの項目より後ろに並びます</li>
+      <li>一覧を開いている間は選んだ★が固定条件になるため、ツールバーの★フィルタは操作できません。通常のフォルダへ移動すると元の操作に戻ります</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-rating-2.webp" alt="フォルダバーの「場所▼」メニューを開いた状態。「レーティング」の項目にサブメニューが開き、★1〜★5 のそれぞれに件数（★★★ は 1 件、★★★★★ は 1 件など）が表示されている">
+      <figcaption>「場所▼」→「レーティング」から★を選ぶと、場所をまたいだフラットな一覧が開きます。サブメニューには★ごとの件数も表示されます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        通常のフォルダ表示でも、ツールバーの「★:」セクションで表示するレーティングを絞り込めます。バッジを
+        <kbd>Ctrl</kbd>+クリックで「そのレーティングだけ」、<kbd>Shift</kbd>+クリックで「そのレーティング以上」に絞れます。
+        画像系・コンテナ系の両方に同じフィルタが効くので、「★4 以上のフォルダだけ表示」といった使い方もできます。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        レーティングの詳しい仕様（絞り込みフィルタの各種クリック操作、フォルダ配下の★件数バッジ、XMP への
+        書き込み設定など）は<a href="grid.html">グリッド表示</a>リファレンスの「レーティング（★）」にまとまっています。
+        キー割り当ての一覧は<a href="shortcuts.html">キーボードショートカット</a>を、変更したい場合は
+        <a href="settings.html">操作カスタマイズ</a>を参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>加工結果を書き出す — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>加工結果を書き出す</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">加工結果を書き出す</h1>
+    <p class="page-desc">
+      画像補正・消しゴム・補正レイヤー・隠蔽加工・テキスト注釈で仕上げた表示結果は、元ファイルを書き換えることなく
+      別ファイルとして保存できます。ここでは、その書き出し（エクスポート）機能の使い方をひととおり確認します。
+    </p>
+
+    <h2>エクスポートダイアログを開く</h2>
+    <p>
+      画像・ZIP 内画像・PDF ページをフルスクリーン表示している状態で <kbd>Ctrl</kbd>+<kbd>E</kbd> を押します。
+    </p>
+    <ul>
+      <li>画面左端にマウスを近づけると表示される画像補正パネルのヘッダーにも、エクスポート用のアイコン（トレイへの下向き矢印）があります。
+      アイコンは左から消しゴム・補正レイヤー・隠蔽加工・切り取り・テキスト注釈・エクスポートの順に並んでいます。</li>
+      <li>補正パネルを開いている間は <kbd>Ctrl</kbd>+<kbd>E</kbd> は効きません。その場合は上記のアイコンから開きます。</li>
+      <li>動画、消しゴムモード、隠蔽加工モード、画像分析モード中はエクスポートの対象外です。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 画像補正パネルのヘッダーに並ぶアイコン列とエクスポートアイコン（右端）</div>
+      <figcaption>補正パネルのヘッダー右端にあるエクスポートアイコン。クリックするとパネルを閉じてダイアログが開きます。</figcaption>
+    </figure>
+
+    <h2>書き出される内容を確認する</h2>
+    <p>
+      エクスポートは、その時点の表示結果をそのまま画像ファイルに焼き込みます。次のものすべてが反映されます。
+    </p>
+    <ul>
+      <li>画像補正・AI アップスケール・ポストフィルタ</li>
+      <li>消しゴムで補完した箇所</li>
+      <li>補正レイヤー（部分的な調整）</li>
+      <li>隠蔽加工（モザイクなど）</li>
+      <li>テキスト注釈</li>
+      <li>切り取り（トリミングした範囲での書き出し）</li>
+    </ul>
+    <p>
+      右 <kbd>Ctrl</kbd> を押している間だけ表示される「元画像の一時確認表示」は書き出しの対象になりません。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: エクスポートダイアログ（ファイル名・保存先・形式・出力サイズの入力欄）</div>
+      <figcaption>ダイアログの基本項目。ファイル名は元の名前に <code>_edited</code> を付けたものが既定で入力されます。</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ファイル名</td><td>既定は元の名前 + <code>_edited</code>。拡張子は選んだ形式に合わせて自動で付きます</td></tr>
+          <tr><td>保存先</td><td>既定は元画像と同じフォルダ。別フォルダを選ぶと次回の候補として記憶されます</td></tr>
+          <tr><td>形式</td><td>JPEG / PNG / WebP から選択。元の形式のまま書き出せない場合は JPEG または PNG に切り替わります</td></tr>
+          <tr><td>メタデータ保持</td><td>同じ形式で書き出す場合、元画像の EXIF や XMP などを引き継げます</td></tr>
+          <tr><td>出力サイズ</td><td>そのまま / 1/2 / 1/4、または長辺を px 指定して縮小できます（指定より小さい画像は拡大しません）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>バリエーションを一括で書き出す</h2>
+    <p>
+      ダイアログの「バリエーション」では、現在の表示設定に加えて隠蔽加工プリセット 1〜4 を選び、まとめて書き出せます。
+      複数選んだ場合は 1 つずつ順番に保存され、ファイル名の末尾に番号が付きます。
+    </p>
+    <ul>
+      <li><code>_0</code>: 現在の表示設定</li>
+      <li><code>_1</code>〜<code>_4</code>: 隠蔽加工プリセット 1〜4</li>
+    </ul>
+    <p>
+      同名ファイルがすでにある場合は上書きせず、<code>sample_edited_0001_0.jpg</code> のように連番を挟んだ名前で保存します。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: バリエーション欄で「現在の表示設定」と隠蔽加工プリセット 1〜4 にチェックを入れた状態</div>
+      <figcaption>複数のプリセットにチェックを入れると、1 回の操作でまとめて書き出せます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        保存中は進捗ダイアログが表示されます。途中でキャンセルしても、すでに保存済みのファイルはそのまま残り、
+        まだ始まっていない分だけが作成されません。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        現在開いている実フォルダに保存した場合、フルスクリーンを閉じて一覧に戻るタイミングで再読み込みされ、
+        新しいファイルのサムネイルが表示されます（ZIP・PDF・検索結果などの仮想フォルダでは自動再読み込みされません）。
+        対応形式やメタデータ保持の詳しい組み合わせは<a href="export.html">エクスポート</a>リファレンスを参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

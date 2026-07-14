@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>はじめての 10 分 — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>はじめての 10 分</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">はじめての 10 分</h1>
+    <p class="page-desc">
+      初めて mImageViewer を開いた方向けに、フォルダを開いてから画像を 1 枚見て、
+      またフォルダ一覧に戻ってくるまでの一連の流れをまとめました。
+      ここに出てくる操作だけ覚えれば、あとの機能は使いたくなったときにチュートリアル一覧から拾えば十分です。
+    </p>
+
+    <h2>全体の流れ</h2>
+    <ol class="step-list">
+      <li>フォルダを開く</li>
+      <li>サムネイル一覧（グリッド表示）を眺める</li>
+      <li>カーソルでの「選択」と <kbd>Space</kbd> の「チェック」の違いを知る</li>
+      <li><kbd>Enter</kbd> で画像をフルスクリーン表示する</li>
+      <li>矢印キーで次のページ・次のファイルへ進む</li>
+      <li><kbd>Esc</kbd> でフルスクリーンを抜け、<kbd>BS</kbd> で親フォルダへ戻る</li>
+    </ol>
+
+    <h2>1. フォルダを開く</h2>
+    <p>
+      見たい画像の入ったフォルダを開きます。ふだんは画面上部の<strong>フォルダバー</strong>を使うのが一番手軽です。
+    </p>
+    <ul>
+      <li>フォルダバーに<strong>フォルダのパスを入力</strong>して <kbd>Enter</kbd>（空欄のまま <kbd>Enter</kbd> を押すとドライブ一覧が出ます）</li>
+      <li>パスが分からなければ、フォルダバーの <strong>場所▼</strong> →「ドライブ一覧」からたどっていく</li>
+    </ul>
+    <p>
+      フォルダを開くと画像ファイルのサムネイルが一覧表示されます。2 回目以降の起動時は、
+      既定では前回表示していた場所が自動的に復元されるので、毎回パスを入力し直す必要はありません（この動作は環境設定で変更できます）。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-first-run-1.webp" alt="mImageViewer のフォルダバー（赤枠）にパスを入力してフォルダを開いた画面。グリッドに画像のサムネイルが並んでいる">
+      <figcaption>画面上部のフォルダバー（赤枠）にパスを入力して <kbd>Enter</kbd>。開いたフォルダの中身がサムネイルで一覧表示されます。</figcaption>
+    </figure>
+
+    <h2>2. サムネイル一覧（グリッド表示）を眺める</h2>
+    <p>
+      フォルダ・ZIP・PDF などは先頭のブロックに、画像・動画ファイルはその後のブロックに、
+      それぞれサムネイル付きのタイルとして並びます。サブフォルダはダブルクリックで中に入れます。
+    </p>
+
+    <h2>3. 「カーソル位置」と「チェック」の違い</h2>
+    <p>
+      mImageViewer には見た目が似ている 2 つの選び方があるので、最初に区別しておくと迷いません。
+    </p>
+    <ul>
+      <li><strong>カーソル位置（青いハイライト）：</strong>サムネイルをクリックすると、その 1 つが「今の位置」になります。矢印キーでカーソルのように移動します。</li>
+      <li><strong>チェック（複数選択）：</strong><kbd>Ctrl</kbd>+クリック、または <kbd>Space</kbd> キーでチェックを ON/OFF します。<kbd>Shift</kbd>+矢印キーで範囲をまとめてチェックできます。</li>
+    </ul>
+    <p>
+      「今どれを見ているか」を示すのがカーソル位置、「複数まとめて操作したいものに印を付ける」のがチェック、
+      という役割分担です。コピーや削除などのファイル操作は、チェックしたアイテムがあればそちらが優先されます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-first-run-2.webp" alt="サムネイル一覧。青いハイライトが『カーソル位置』、緑のチェックが付いた2枚が『チェックした画像』として赤枠で示されている">
+      <figcaption>青枠が<strong>カーソル位置</strong>（今どれを見ているか）、緑のチェックが付いた画像が<strong>チェックした画像</strong>（まとめて操作する対象）です。</figcaption>
+    </figure>
+
+    <h2>4. <kbd>Enter</kbd> で画像をフルスクリーン表示する</h2>
+    <p>
+      見たい画像にカーソルを合わせて <kbd>Enter</kbd> を押すか、サムネイルをダブルクリックすると、
+      フルスクリーン表示に切り替わります。
+    </p>
+    <p>
+      上部にマウスを近づけると<strong>ホバーバー</strong>が現れます。その右端（<kbd>×</kbd> の左）にある
+      <strong>ウィンドウ表示切り替えボタン</strong>、または <kbd>F11</kbd> キーで、全画面表示とウィンドウ内表示を切り替えられます。
+      ほかのアプリと画面を並べて見たいときに便利です。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-first-run-3.webp" alt="画像のフルスクリーン表示。右上ホバーバーの「ウィンドウ内表示に切り替え（F11）」ボタンが赤枠で強調されている">
+      <figcaption>フルスクリーン表示。右上ホバーバーの赤枠が<strong>ウィンドウ表示切り替えボタン</strong>で、<kbd>F11</kbd> でも同じく全画面 ↔ ウィンドウ内表示を切り替えられます。</figcaption>
+    </figure>
+
+    <h2>5. 矢印キーで次のページ・次のファイルへ進む</h2>
+    <p>
+      フルスクリーン表示中は、矢印キーで前後のファイル（複数ページの本なら次のページ）へ移動できます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>→</kbd> / <kbd>↓</kbd></td><td>次の画像へ</td></tr>
+          <tr><td><kbd>←</kbd> / <kbd>↑</kbd></td><td>前の画像へ</td></tr>
+          <tr><td>マウスホイール</td><td>下で次の画像へ、上で前の画像へ</td></tr>
+          <tr><td>画面の右半分 / 左半分をクリック</td><td>次の画像 / 前の画像へ</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      前後の画像はバックグラウンドで先読みされるため、キーを連打してもスムーズに切り替わります。
+    </p>
+
+    <h2>6. <kbd>Esc</kbd> でフルスクリーンを抜け、<kbd>BS</kbd> で親フォルダへ戻る</h2>
+    <p>
+      一通り見終わったら、フルスクリーンからグリッド表示へ戻り、必要なら 1 つ上のフォルダへ移動します。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Esc</kbd></td><td>フルスクリーンを抜けてグリッド表示に戻ります。今見ていた画像にカーソルが戻った状態になります</td></tr>
+          <tr><td><kbd>BS</kbd>（Backspace）</td><td>グリッド表示で押すと親フォルダへ移動します。フルスクリーン中に押すとフルスクリーンを 1 段閉じてグリッド表示に戻ります</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        グリッド表示に戻ったとき、直前まで見ていた画像はそのまま選択された状態になっています。
+        続きから見たいときは、その場でもう一度 <kbd>Enter</kbd> を押すだけで再開できます。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        フォルダの行き来をもっと詳しく知りたい方は<a href="tut-navigation.html">フォルダを開く・移動する</a>を、
+        フルスクリーン表示の操作を一通り確認したい方は<a href="fullscreen.html">フルスクリーン表示</a>リファレンスを、
+        グリッド画面の各要素を確認したい方は<a href="grid.html">グリッド表示</a>リファレンスをご覧ください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

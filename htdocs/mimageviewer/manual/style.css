@@ -316,6 +316,68 @@ footer {
 }
 footer a { color: #aaa; }
 
+/* ── Tutorial hub (目次ページ) ────────────────── */
+/* カテゴリ見出し（h2 を流用）に添える補足文 */
+.tut-cat-desc { font-size: 0.85rem; color: #888; margin: -0.4rem 0 1rem; }
+
+/* カードは .toc-card を流用。カードに付ける小さなラベル */
+.toc-chip {
+  display: inline-block;
+  font-size: 0.66rem;
+  font-weight: 700;
+  padding: 0.08rem 0.42rem;
+  border-radius: 4px;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.toc-chip.setup  { color: #b06a00; background: #fff3d9; } /* 要設定 */
+.toc-chip.hidden { color: #0a6ea0; background: #e2f2fb; } /* 見つけづらい */
+.toc-chip.tricky { color: #7a4bc0; background: #f0e8fb; } /* 戸惑いやすい */
+
+/* ── Tutorial detail (説明ページ: サイドバー無し・全幅) ── */
+.layout.tut-wide { max-width: 1040px; }
+.layout.tut-wide .content { max-width: none; }
+
+.tut-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  color: var(--pink);
+  margin-bottom: 1.25rem;
+}
+.tut-back:hover { text-decoration: none; color: var(--accent); }
+
+/* スクリーンショット図版 */
+.tut-shot {
+  margin: 1.5rem 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #fff;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.07);
+}
+.tut-shot img { display: block; width: 100%; height: auto; }
+.tut-shot figcaption {
+  font-size: 0.8rem;
+  color: #888;
+  padding: 0.5rem 0.9rem;
+  border-top: 1px solid var(--border);
+  background: #fafafa;
+}
+/* 画像を差し込むまでのプレースホルダ */
+.tut-shot-ph {
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #b5b5bd;
+  font-size: 0.85rem;
+  letter-spacing: 0.03em;
+  background: repeating-linear-gradient(45deg, #f7f7f9, #f7f7f9 12px, #f1f1f4 12px, #f1f1f4 24px);
+}
+
 /* ── Responsive ──────────────────────────────── */
 @media (max-width: 768px) {
   .layout { flex-direction: column; }

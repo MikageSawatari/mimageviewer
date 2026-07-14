@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>フルスクリーン閲覧の基本 — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>フルスクリーン閲覧の基本</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">フルスクリーン閲覧の基本</h1>
+    <p class="page-desc">
+      画像をダブルクリックしてフルスクリーンで開いたあと、まず覚えておきたい操作をまとめました。
+      表示サイズの切り替え、部分拡大、拡大縮小とパン、そして「今の画面で使えるキー」を確認する方法まで、
+      キーボードだけでサクサク読み進めるための基本です。
+    </p>
+
+    <h2>表示サイズを切り替える（<kbd>0</kbd> キー）</h2>
+    <p>
+      フルスクリーンで画像を開くと、既定では画面にフィットするサイズで表示されます。
+      <kbd>0</kbd> キーを押すたびに、次の順番で表示サイズが切り替わります（末尾まで行くと先頭に戻る循環）。
+    </p>
+    <ol>
+      <li>ページ全体フィット</li>
+      <li>横幅フィット</li>
+      <li>縦幅フィット</li>
+      <li>100%原寸</li>
+    </ol>
+    <p>
+      画面上部のホバーバーに出るズーム/フィットボタンをクリックしても、同じ 4 つのモードをメニューから選べます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-fullscreen-basics-1.webp" alt="フルスクリーン表示で開いたズーム/フィットメニュー。ページ全体・横幅フィット・縦幅フィット・100%原寸の選択肢が赤枠で示されている">
+      <figcaption>ホバーバーのズーム/フィットボタンで開くメニュー（赤枠）。<kbd>0</kbd> キーはこの「ページ全体 → 横幅フィット → 縦幅フィット → 100%原寸」を順に切り替えます。</figcaption>
+    </figure>
+
+    <h2>部分拡大ズーム（<kbd>Z</kbd> キー）</h2>
+    <p>
+      漫画や図版の一部を画面いっぱいに拡大し、マウスを動かすだけで拡大位置をパンできる機能です。
+      細かい描き込みを、ページをめくりながら拡大したまま読み進められます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動き</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Z</kbd> を押している間</td><td>画像全体の上に、拡大される範囲を示す枠が表示されます。マウスで枠を移動、ホイールで枠の大きさ（＝拡大倍率）を変えられます</td></tr>
+          <tr><td><kbd>Z</kbd> を離す</td><td>枠で選んだ範囲が画面いっぱいに拡大されます。以降はマウスを動かすだけで拡大位置がパンします</td></tr>
+          <tr><td><kbd>Z</kbd> を短く押す</td><td>枠で範囲を決めなくても、その場ですぐ拡大表示に入れます</td></tr>
+          <tr><td>拡大中のマウスホイール</td><td>通常どおり前後のページへ移動します（拡大したまま読み進められます）</td></tr>
+          <tr><td>拡大中の <kbd>Ctrl</kbd>+ホイール</td><td>拡大倍率を変更します</td></tr>
+          <tr><td>もう一度 <kbd>Z</kbd></td><td>拡大を解除して、元のフィット表示に戻ります</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <img src="images/tut-fullscreen-basics-2.webp" alt="Z キーを押している間の画面。拡大される範囲が青い枠で示されている">
+      <figcaption>Z を押している間はこの枠を動かして拡大したい範囲を選びます。ホイールで枠のサイズ（倍率）を調整できます。</figcaption>
+    </figure>
+
+    <figure class="tut-shot">
+      <img src="images/tut-fullscreen-basics-3.webp" alt="Z キーを離した後の拡大表示。イラストの上半分が画面いっぱいに拡大されている">
+      <figcaption>拡大表示中。マウスを動かすだけで拡大位置が画像の範囲内でパンします。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        <strong><kbd>Z</kbd> と <kbd>Shift</kbd>+<kbd>Z</kbd> は別の機能です。</strong>
+        <kbd>Z</kbd> はページを読み進めながら一部分を拡大するための機能ですが、
+        <kbd>Shift</kbd>+<kbd>Z</kbd> はカラーピッカーやヒストグラムなど画像を分析するための
+        「画像分析モード」を開きます。分析モードの使い方は
+        <a href="analysis.html">画像分析モード</a>のページで解説しています。
+      </div>
+    </div>
+
+    <h2>拡大縮小とパン（<kbd>Ctrl</kbd>+ホイール / ドラッグ）</h2>
+    <p>
+      部分拡大ズームとは別に、通常表示のまま任意の倍率まで拡大・縮小することもできます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動き</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+マウスホイール</td><td>マウス位置を中心にズーム（0.1〜50 倍）</td></tr>
+          <tr><td>左ドラッグ（ズーム中）</td><td>パン（拡大した画像を動かして見たい部分を表示）</td></tr>
+          <tr><td>ダブルクリック</td><td>ズーム / パン / 回転をリセットして元の表示に戻す</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      拡大中に画像を切り替えると、<kbd>Ctrl</kbd>+ホイールのズームとパンはリセットされ、次の画像は通常表示から始まります。<kbd>R</kbd> / <kbd>L</kbd> の 90° 回転は画像ごとに保存されるため、移動先ではその画像に保存された回転が使われます。
+    </p>
+
+    <h2>回転・背景を切り替える（<kbd>R</kbd> / <kbd>L</kbd> / <kbd>B</kbd>）</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動き</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>R</kbd></td><td>右に 90° 回転</td></tr>
+          <tr><td><kbd>L</kbd></td><td>左に 90° 回転</td></tr>
+          <tr><td><kbd>B</kbd></td><td>透過部分の背景色を黒 → 白 → 市松の順で切り替え（透過のない画像では無効）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <kbd>R</kbd> / <kbd>L</kbd> の回転は元のファイルを書き換えず、専用のデータベースに保存されます。
+      画面上部のホバーバーにも回転ボタンがあります。
+    </p>
+
+    <h2>スライドショーで自動送りする（<kbd>S</kbd> キー）</h2>
+    <p>
+      <kbd>S</kbd> キーでスライドショーの再生 / 停止を切り替えます。再生中は画面右上の小さな円で、
+      次の切り替えまでの進み具合が分かります。動画は自動でスキップして次の画像へ進みます。
+    </p>
+    <ul>
+      <li>間隔や終わり方を決めてから始めたいときは、上部ホバーバーの <strong>▶</strong> ボタン（停止中）をクリックします。ページ送り間隔・連結読みのスクロール量・末尾動作を確認するポップアップが開きます。</li>
+      <li><strong>末尾動作</strong>は「フォルダ内でループ / 次のフォルダへ進む / 最後で停止」から選べます。</li>
+      <li>再生中にホイール・クリック・矢印・<kbd>Home</kbd> / <kbd>End</kbd> でフォルダ内を移動しても、再生は止まりません（見たくない画像を飛ばしながら流し見できます）。止めるときは <kbd>S</kbd> / <kbd>Space</kbd> / <kbd>Esc</kbd>、またはフォルダ移動（<kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd>）です。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-fullscreen-basics-4.webp" alt="ホバーバーの ▶ ボタン（赤枠）から開いたスライドショー設定ポップアップ。ページ送り間隔や末尾動作の選択肢が並んでいる">
+      <figcaption>▶ ボタン（赤枠・停止中）で設定ポップアップが開きます。<kbd>S</kbd> キーなら設定を開かずにすぐ再生 / 停止します。</figcaption>
+    </figure>
+
+    <h2>今使えるキーを確認する（<kbd>?</kbd> キー）</h2>
+    <p>
+      操作を覚えきれなくても大丈夫です。<kbd>?</kbd> キーを押すと、今のフルスクリーン画面で使える
+      ショートカット一覧がその場に表示されます。表示中のモード（通常閲覧・消しゴム・隠蔽加工など）ごとに
+      内容が変わるので、迷ったらまず <kbd>?</kbd> を押す習慣をつけると安心です。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-fullscreen-basics-5.webp" alt="? キーで表示されたショートカット一覧のポップアップ。現在のコンテキスト『画像フルスクリーン』のキー割り当てが一覧表示されている">
+      <figcaption>? キーで、今の画面で使えるショートカットの一覧がすぐに確認できます（画面上部に「現在のコンテキスト」が表示されます）。</figcaption>
+    </figure>
+
+    <h2>操作早見表</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>できること</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>0</kbd></td><td>ページ全体 → 横幅フィット → 縦幅フィット → 100%原寸で表示サイズを循環</td></tr>
+          <tr><td><kbd>Z</kbd>（押す/離す）</td><td>画面いっぱいの部分拡大ズーム。押している間に範囲を選び、離すと拡大・マウスでパン</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+ホイール</td><td>マウス位置を中心に拡大縮小（0.1〜50 倍）</td></tr>
+          <tr><td>左ドラッグ（ズーム中）</td><td>パン</td></tr>
+          <tr><td><kbd>R</kbd> / <kbd>L</kbd></td><td>右 / 左に 90° 回転</td></tr>
+          <tr><td><kbd>B</kbd></td><td>透過背景色を黒 / 白 / 市松で切り替え</td></tr>
+          <tr><td><kbd>S</kbd></td><td>スライドショーの再生 / 停止（<kbd>Space</kbd> / <kbd>Esc</kbd> で停止）</td></tr>
+          <tr><td><kbd>?</kbd></td><td>今の画面で使えるショートカット一覧を表示</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        フルスクリーン表示のすべての操作（フォルダ移動・見開き表示・比較ビュー・メタデータパネルなど）は
+        <a href="fullscreen.html">フルスクリーン表示</a>リファレンスにまとまっています。
+        キー割り当ては<a href="settings.html">操作カスタマイズ</a>で変更できます。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

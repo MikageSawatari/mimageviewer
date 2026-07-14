@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>サムネイルキャッシュで高速表示 — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>サムネイルキャッシュで高速表示</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">サムネイルキャッシュで高速表示</h1>
+    <p class="page-desc">
+      一度読み込んだサムネイルはキャッシュに保存され、次回同じフォルダを開いたときの表示が大幅に高速化されます。
+      写真が数千枚あるフォルダや、外付けドライブ・NAS 上のフォルダを何度も開き直す人ほど効果を実感しやすい機能です。
+      ここでは動作モードの違いと、大きいフォルダを先回りしてキャッシュしておく方法、たまったキャッシュの整理方法を順に見ていきます。
+    </p>
+
+    <h2>3 つの動作モード（Off / Auto / Always）</h2>
+    <p>
+      環境設定 → パフォーマンス → キャッシュの「キャッシュポリシー」で、キャッシュを作るかどうかの方針を選べます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>モード</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Off</strong></td><td>キャッシュを使用しません。毎回元画像からサムネイルを作り直します</td></tr>
+          <tr><td><strong>Auto</strong>（既定）</td><td>読み込み時間やファイルサイズが閾値を超えた場合だけキャッシュします。軽い画像はキャッシュを作らず、時間のかかる画像だけを対象にする、バランス型の設定です</td></tr>
+          <tr><td><strong>Always</strong></td><td>すべてのフォルダでキャッシュを生成します。とにかく毎回速く開きたい場合に</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Auto モードのしきい値（既定：読み込み時間 25 ms、ファイルサイズ 2 MB）は同じ設定画面で調整できます。
+      また WebP・PDF・ZIP はそれぞれ「常にキャッシュ」の個別スイッチがあり、既定で有効です。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 環境設定 → パフォーマンス → キャッシュ画面（キャッシュポリシーの Off / Auto / Always 選択とAuto のしきい値）</div>
+      <figcaption>キャッシュポリシーの切り替えと、Auto モードのしきい値設定。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        サムネイル画質の設定（サムネイル長辺サイズ・WebP 品質）は A/B 比較プレビューで見比べながら調整できます。
+        画質を上げるとキャッシュの容量も増えるので、様子を見ながら決めるのがおすすめです。
+      </div>
+    </div>
+
+    <h2>大きいフォルダを先回りしてキャッシュしておく</h2>
+    <p>
+      よく開くフォルダは、開く前にまとめてキャッシュを作っておくと、実際に開いたときに待ち時間がありません。
+      お気に入りメニューの「キャッシュ作成」から、お気に入りフォルダのキャッシュを一括生成できます。
+    </p>
+    <ul>
+      <li><strong>ZIP ファイルの中身もキャッシュ</strong> — ZIP 内の全画像をキャッシュします</li>
+      <li><strong>PDF ファイルの中身もキャッシュ</strong> — PDF 内の全ページをキャッシュします</li>
+    </ul>
+    <p>
+      どちらもチェックしない場合でも、ZIP・PDF の先頭 1 枚 / 1 ページはキャッシュされ、フォルダ一覧でサムネイルが表示されます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: お気に入りメニューの「キャッシュ作成」ダイアログ（ZIP / PDF の中身もキャッシュのチェックボックス）</div>
+      <figcaption>一括キャッシュ作成ダイアログ。お気に入りフォルダをまとめて先読みキャッシュできます。</figcaption>
+    </figure>
+
+    <h2>たまったキャッシュを確認・整理する</h2>
+    <p>
+      設定 → サムネイルキャッシュ管理から、キャッシュの状態を確認して整理できます。
+    </p>
+    <div class="step-list">
+      <ol>
+        <li>キャッシュの合計フォルダ数・容量を確認する（動画のタイムラインサムネ分も表示されます）</li>
+        <li>指定日数以上更新されていないキャッシュだけをまとめて削除する</li>
+        <li>現在開いているフォルダのキャッシュだけを削除する</li>
+        <li>すべてのキャッシュを削除する</li>
+      </ol>
+    </div>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: サムネイルキャッシュ管理ダイアログ（合計容量表示・古いキャッシュ削除・現在のフォルダ削除・すべて削除の各ボタン）</div>
+      <figcaption>サムネイルキャッシュ管理ダイアログ。容量を見ながら不要な分だけ削除できます。</figcaption>
+    </figure>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        フルスクリーン中に <kbd>S</kbd> キーで開ける動画のタイムラインサムネ（動画タイルモード）のキャッシュは別ファイルで管理されますが、
+        「現在のフォルダのキャッシュを削除」「すべてのキャッシュを削除」を行うと同時に削除されます
+        （「現在のフォルダ」削除はサブフォルダ配下の動画タイルサムネも対象になります）。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        キャッシュ生成のしきい値・WebP 品質・キャッシュ管理の詳しい項目一覧は<a href="settings.html#cache">設定リファレンス「サムネイルキャッシュ」</a>を、
+        検索・アーカイブ表示との関係は<a href="grid.html">サムネイル一覧</a>リファレンスを参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

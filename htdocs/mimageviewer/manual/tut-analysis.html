@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>画像分析モードで色・ピクセルを調べる — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>画像分析モード</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">画像分析モードで色・ピクセルを調べる</h1>
+    <p class="page-desc">
+      イラストや写真の色を拾ったり、ヒストグラムで明暗の分布を見たり、キャラクターの等身を測ったり、
+      色の階調差を強調して塗りのムラを確認したりできる分析ツールです。
+      呼び出しは <kbd>Shift</kbd>+<kbd>Z</kbd>。よく似た <kbd>Z</kbd>（ズーム）と混同しやすいので、まず違いを押さえておきましょう。
+    </p>
+
+    <h2>Z と Shift+Z の違い</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>機能</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Z</kbd></td><td>ズームモード（押している間、拡大したい範囲を指定）</td><td>細部を大きく見る</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>Z</kbd></td><td>画像分析モードの ON / OFF</td><td>色・ヒストグラムなどを<strong>調べる</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>分析モードに入る / 出る</h2>
+    <ul>
+      <li><kbd>Shift</kbd>+<kbd>Z</kbd> で ON / OFF を切り替え</li>
+      <li>上部ホバーバーの <strong>🔬</strong> ボタンでも ON / OFF</li>
+      <li>分析パネル右上の <strong>×</strong> で分析モードだけ終了（フルスクリーンは維持）</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-analysis-1.webp" alt="画像分析モードの全体画面。右のパネルにカラー情報（ホバー色と固定色のカラーホイール、RGB / HSV / L*a*b* の数値）、色相・彩度・明度のヒストグラム、彩度・明度マップが縦に並んでいる">
+      <figcaption>分析モードの画面。右のパネルに、カラー情報（色の取得・比較）／色相・彩度・明度のヒストグラム／彩度・明度マップがまとまっており、最初の画面で主なツールをひと通り見渡せます。</figcaption>
+    </figure>
+
+    <h2>使えるツール</h2>
+    <p>
+      画像の上にマウスを移動すればその位置の色（RGB / HSV / L*a*b*）を読み取れ、右クリックで固定した色との差も比べられます。
+      <kbd>G</kbd> でグレースケール表示、<kbd>M</kbd> でモザイクの目安グリッドなど、ほかにも複数のツールがそろっています。
+      ここでは特に使いどころの多い <strong>等身計測</strong> と <strong>色差強調</strong> の 2 つを紹介します。
+    </p>
+
+    <h2>キャラクターの等身を測る（スケールグリッド）</h2>
+    <p>
+      修飾キーを押しながら画像の上を左ドラッグすると、ドラッグした長さを 1 単位にした等間隔の平行線と同心円を引けます。
+      キャラクターの頭のてっぺんから顎までをドラッグすれば、そのまま何頭身かを目で数えられます。線の色は背景に合わせて選べます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-analysis-2.webp" alt="キャラクターのイラストの上に赤い同心円と十字の目盛りが重なり、ドラッグした距離「209px」を1単位とした等身グリッドが描かれている">
+      <figcaption>頭の大きさを基準にドラッグすると、赤いグリッド（同心円と平行線）が描かれ、全身が何頭身かをひと目で確認できます。</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>働き</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Shift</kbd> + 左ドラッグ</td><td>赤色のグリッドを描く</td></tr>
+          <tr><td><kbd>Ctrl</kbd> + 左ドラッグ</td><td>黒色のグリッドを描く</td></tr>
+          <tr><td><kbd>Alt</kbd> + 左ドラッグ</td><td>白色のグリッドを描く</td></tr>
+          <tr><td>右クリック</td><td>表示中のグリッドを消す</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>色の階調差を強調する（色差強調）</h2>
+    <p>
+      修飾キーを押しながら画像の上を右クリックすると、その位置の色を基準に、画面全体の色の違いを誇張して表示します。
+      ぱっと見では気づけない塗りのムラやグラデーションの段差が、はっきり見えるようになります。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-analysis-3.webp" alt="色差強調フィルターを掛けた画面。淡い色の差が黄・マゼンタ・シアンなどに大きく誇張され、パネル右上に強調倍率「[10x]」が表示されている">
+      <figcaption>基準色との違いを誇張表示した状態（この例は ×10）。パネル右上に強調倍率が出ます。基準色に近い部分は暗く、離れた部分ほど鮮やかに表示されます。</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>強調の強さ</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Shift</kbd> + 右クリック</td><td>×2（軽い強調）</td></tr>
+          <tr><td><kbd>Ctrl</kbd> + 右クリック</td><td>×5</td></tr>
+          <tr><td><kbd>Alt</kbd> + 右クリック</td><td>×10</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd> + 右クリック</td><td>×20（最大）</td></tr>
+          <tr><td>右クリック（修飾キーなし）</td><td>強調を解除</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        <strong>分析は「加工前の元画像」に対して行われます。</strong>
+        明るさ・色補正、AI アップスケール、テキスト注釈、隠蔽加工、消しゴムなどを掛けていても、
+        分析モード中は一時的にそれらを外した状態の色・ヒストグラムが出ます。モードを抜けると加工後の表示に戻ります。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        分析モード中はホイールが画像送りではなく<strong>ズーム</strong>になります。
+        通常表示で <kbd>Ctrl</kbd>+ホイール拡大 → <kbd>Shift</kbd>+<kbd>Z</kbd> で分析、と続けると同じ倍率・位置のまま調べられます。
+        全機能は<a href="analysis.html">画像分析モード</a>リファレンスを参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

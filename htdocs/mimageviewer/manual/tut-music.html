@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>音楽を波形・スペクトラムで再生 — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>音楽を波形・スペクトラムで再生</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">音楽を波形・スペクトラムで再生</h1>
+    <p class="page-desc">
+      音声ファイルは、フルスクリーンの「音楽ビュー」で波形とスペクトラムを見ながら再生できます。
+      動画を流しながら映像だけを消して音に集中することもできます。ここでは音楽ビューへの入り方と、
+      波形・スペクトラムを使った聴き方、基本の再生操作を紹介します。
+    </p>
+
+    <h2>音楽ビューを開く</h2>
+    <p>
+      音楽ビューに入る方法は 2 通りあります。
+    </p>
+    <ul>
+      <li><strong>音声ファイルを直接開く：</strong>MP3 / FLAC / WAV / M4A / AAC / OGG / Opus / WMA は
+      グリッド一覧に画像や動画と一緒に並びます。ダブルクリック（または <kbd>Enter</kbd>）で開くと、
+      フルスクリーンの音楽ビューが開いて自動再生が始まります。</li>
+      <li><strong>動画から音声だけに切り替える：</strong>動画を再生しているとき、上部バーの
+      <strong>♪ ボタン</strong>（または <kbd>Z</kbd> キー）を押すと、映像を消して音声だけを音楽ビューで
+      聴けます。音は途切れず、再生位置や音量はそのまま引き継がれます。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 動画再生中の上部バーにある ♪ ボタン</div>
+      <figcaption>動画再生中に ♪ ボタン（または Z キー）を押すと、映像を消して音声モードに切り替わります。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        音声モードのまま前後のファイルへ移動できます。作業用 BGM として動画を流したいときは、
+        ♪ ボタンで音だけにしておくと画面が煩わしくなりません。元の動画表示に戻るには、上部バーの
+        <strong>▶ ボタン</strong>か、もう一度 <kbd>Z</kbd> キーを押します。
+      </div>
+    </div>
+
+    <h2>波形・スペクトラムで聴く</h2>
+    <p>
+      音楽ビューを開くと、画面中央に曲全体の波形タイムラインが、画面下部にリアルタイムのスペクトラムが
+      表示されます。
+    </p>
+    <ul>
+      <li><strong>波形タイムライン（中央）：</strong>曲全体を行に分けて表示する波形です。再生位置には
+      縦線（プレイヘッド）が表示され、曲の盛り上がりどころを見ながら好きな位置へ移動できます。
+      1 行あたりの長さは上部バーのセレクタで切り替えられます。</li>
+      <li><strong>スペクトラム（下部）：</strong>再生位置周辺の周波数を音の高さごとのバーで表示し、
+      88 鍵のピアノ鍵盤が鳴っている音にあわせて発光します。どの音域が鳴っているかがひと目で分かります。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 音楽ビュー中央の波形タイムライン全体</div>
+      <figcaption>波形タイムライン。再生位置の縦線を見ながら、盛り上がる箇所を探せます。</figcaption>
+    </figure>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 下部のスペクトラムバーと発光するピアノ鍵盤</div>
+      <figcaption>スペクトラムと鍵盤表示。鳴っている音程・音域を視覚的に確認できます。</figcaption>
+    </figure>
+
+    <h2>再生操作</h2>
+    <p>
+      音楽ビューのキーボード操作は動画再生と共通です。主な操作は次のとおりです。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Space</kbd> / <kbd>Enter</kbd></td><td>再生 / 一時停止をトグル</td></tr>
+          <tr><td><kbd>W</kbd></td><td>先頭へ移動して再生</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>1 秒シーク（細かい）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>30 秒シーク（大きい）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd></td><td>音量を上げる / 下げる</td></tr>
+          <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>前 / 次のファイルへ移動</td></tr>
+          <tr><td><kbd>M</kbd></td><td>ミュートのトグル</td></tr>
+          <tr><td><kbd>Z</kbd></td><td>音声モードの切り替え（動画再生中は映像を消す / 音声モード中は動画表示へ戻す）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 下部 HUD のシークバーと再生コントロール</div>
+      <figcaption>下部 HUD。シークバーはクリックやドラッグで頭出しできます。マウスを止めると自動的に隠れます。</figcaption>
+    </figure>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        ループ・連続再生・ブックマーク・VST3 プラグイン処理・レーティングやタグなど、より詳しい機能は
+        <a href="music.html">音楽再生</a>リファレンスにまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

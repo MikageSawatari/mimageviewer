@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>見開きで漫画を読む — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>見開きで漫画を読む</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">見開きで漫画を読む</h1>
+    <p class="page-desc">
+      漫画やスキャン画像集を、本のように 2 ページ並べて読める機能です。読む方向（左から右／右から左）を選べるほか、
+      表紙のせいでページの組み合わせがずれてしまったときの直し方も覚えておくと快適に読めます。
+    </p>
+
+    <h2>見開き表示を始める</h2>
+    <p>
+      数字キー <kbd>1</kbd>〜<kbd>5</kbd>、またはホバーバーの表示モード切替ボタン（クリックでモード一覧のポップアップが開きます）で切り替えます。
+      ポップアップにはショートカットキーが併記されているので、確認しながら選べます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>モード</th><th>ページの並び</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>1</kbd></td><td>1ページ表示</td><td>通常の単独表示</td></tr>
+          <tr><td><kbd>2</kbd></td><td>見開き 左→右</td><td>[1,2] [3,4] [5,6] ...</td></tr>
+          <tr><td><kbd>3</kbd></td><td>見開き 左→右（表紙あり）</td><td>[1] [2,3] [4,5] ...</td></tr>
+          <tr><td><kbd>4</kbd></td><td>見開き 右→左</td><td>[2,1] [4,3] [6,5] ...（<kbd>←</kbd> キーで次のページへ進む）</td></tr>
+          <tr><td><kbd>5</kbd></td><td>見開き 右→左（表紙あり）</td><td>[1] [3,2] [5,4] ...（<kbd>←</kbd> キーで次のページへ進む）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <img src="images/tut-spread-1.webp" alt="ホバーバーの表示モードボタンから開いたポップアップ。「ページ構成」に 1ページ表示・見開き 左→右・見開き 左→右（表紙あり）・見開き 右→左・見開き 右→左（表紙あり）、「連結方式」にページ単位・縦連結・横連結、「横方向」に左→右・右→左が並び、それぞれショートカットキーが併記されている">
+      <figcaption>表示モードボタン（赤枠）から開いたモード一覧ポップアップ。各項目にはショートカットキーが併記されていて、クリックでも切り替えられます。現在のモードがハイライト表示されます。</figcaption>
+    </figure>
+
+    <p>
+      見開き表示中は、矢印キー・マウスホイール・クリック・スライドショーのいずれで送っても 2 ページずつ進みます。
+    </p>
+
+    <h2>右綴じ・左綴じを切り替える</h2>
+    <p>
+      洋書のように左から右へ読む本は「見開き 左→右」（<kbd>2</kbd> / <kbd>3</kbd>）、
+      日本の漫画のように右から左へ読む本は「見開き 右→左」（<kbd>4</kbd> / <kbd>5</kbd>）を選びます。
+      <kbd>7</kbd> キーでも左→右 / 右→左をすばやく切り替えられます。
+    </p>
+    <p>
+      右→左モードでは矢印キーの意味が反転し、<kbd>←</kbd> が次のページ、<kbd>→</kbd> が前のページになります（漫画の読み方向と一致します）。
+      <kbd>↑</kbd> / <kbd>↓</kbd> キーはそのままです。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-spread-2.webp" alt="見開き 右→左モードでサンプル本を表示。左に 2 ページ目、右に 1 ページ目が並び、画面右下に「2, 1 / 10」と表示されている">
+      <figcaption>右→左表示の例。左に 2 ページ目、右に 1 ページ目が並び、画面右下のページ番号「2, 1 / 10」も画面上で左に見えているページから順に表記されます。</figcaption>
+    </figure>
+
+    <p>
+      画面右下には現在ページ / 総ページ数が表示されます。左→右表示では <code>12-13 / 180</code>、
+      右→左表示では <code>13,12 / 180</code> のように、画面上で左に見えているページから順に表記されます。
+    </p>
+
+    <h2>表紙や先頭ページのズレを直す</h2>
+    <p>
+      表紙が単独ページになっている本を見開き表示すると、2ページ目以降の組み合わせが 1 ページぶんずれてしまうことがあります。
+      直し方は 2 通りあります。
+    </p>
+    <ol class="step-list">
+      <li>表紙を単独ページのまま表示したい場合は、最初から「見開き 左→右（表紙あり）」（<kbd>3</kbd>）または「見開き 右→左（表紙あり）」（<kbd>5</kbd>）を選びます。1ページ目だけ単独表示され、2ページ目以降がペアになります。</li>
+      <li>すでに見開き表示中で組み合わせがずれてしまった場合は、<kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd> を押します。押すたびに見開きが 1 ページぶんずれて合わせ直されます（右→左表示では左右の意味が反転します）。</li>
+    </ol>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        横長（幅が高さより広い）ページは自動的に単独ページで表示されます。見開き用に結合スキャンされた画像が混ざっていても、そこだけ自然に単独表示され、次のページから通常の見開きペアに戻ります。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        見開きモードそのもの（<kbd>1</kbd>〜<kbd>5</kbd> の綴じ方向・表紙あり／なし）は、本（フォルダや ZIP、ZIP の中の作品）ごとに記憶され、次に同じ本を開いたときも再現されます。
+        ただし <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd> による 1 ページずらしは<strong>その場かぎりの一時的な調整</strong>で、本を閉じて開き直すと元に戻ります。表紙を常に単独表示したいときは、ずらしではなく「表紙あり」モード（<kbd>3</kbd> / <kbd>5</kbd>）を選んでおくと確実です。
+        表示モードの既定値は環境設定の「表示 → 閲覧表示」で変更できます。詳しい仕様やその他のキー操作は<a href="fullscreen.html#spread">フルスクリーン表示</a>リファレンスの「表示モード」節にまとまっています。キー割り当ては<a href="settings.html">操作カスタマイズ</a>で変更できます。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

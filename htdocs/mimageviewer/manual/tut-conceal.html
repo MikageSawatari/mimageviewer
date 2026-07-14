@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>モザイク・白塗りで隠蔽加工 — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>モザイク・白塗りで隠蔽加工</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">モザイク・白塗りで隠蔽加工</h1>
+    <p class="page-desc">
+      画像の一部をモザイクや塗りつぶしで隠したいときの機能です。元画像は書き換えず、
+      表示のたびにマスクと設定を重ねて合成するので、範囲や強さを何度でも調整し直せます。
+    </p>
+
+    <h2>モードに入る</h2>
+    <ol>
+      <li>フルスクリーンで画像を開き、<kbd>Ctrl</kbd>+<kbd>M</kbd> を押します</li>
+      <li>左パネルに加工タイプとツールの一覧が表示されます</li>
+      <li>隠したい範囲をツールで指定します</li>
+      <li><kbd>Ctrl</kbd>+<kbd>M</kbd> または <kbd>Esc</kbd> でモードを終了します</li>
+    </ol>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: Ctrl+M で隠蔽加工モードに入り、左パネルに加工タイプとツール一覧が出ている状態</div>
+      <figcaption>モードに入ると左側にパネルが現れ、加工タイプとツールをここから選びます。</figcaption>
+    </figure>
+
+    <h2>加工タイプを選ぶ</h2>
+    <p>
+      <kbd>T</kbd> キーで加工タイプを順に切り替えられます。それぞれ処理内容が異なります。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>タイプ</th><th>処理内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>モザイク</td><td>指定範囲をタイル状に平均化します。タイルサイズは固定ピクセルまたは画像長辺比率で指定できます</td></tr>
+          <tr><td>白塗り</td><td>指定範囲を白で塗ります。不透明度と境界のなじませ方を調整できます</td></tr>
+          <tr><td>黒塗り</td><td>指定範囲を黒で塗ります。不透明度と境界のなじませ方を調整できます</td></tr>
+          <tr><td>ぼかし</td><td>指定範囲にぼかしをかけます。半径や範囲外の色の拾い方を調整できます</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: モザイクのタイルサイズ・白塗りの不透明度など、加工タイプごとの調整項目</div>
+      <figcaption>加工タイプごとに用意された調整項目。タイルサイズや不透明度、境界のなじませ方をその場で変えられます。</figcaption>
+    </figure>
+
+    <h2>範囲を指定するツール</h2>
+    <p>
+      筆・囲みは 1 枚のビットマップ下地を直接塗り消します。直線・縦線・横線・矩形・楕円は
+      オブジェクトとして残り、ビットマップ下地の上に作成順で重なります。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ツール</th><th>ショートカット</th><th>特徴</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>選択</td><td><kbd>S</kbd></td><td>オブジェクトを選択・移動・サイズ変更・回転します</td></tr>
+          <tr><td>筆</td><td><kbd>B</kbd></td><td>自由に塗ります。ビットマップ下地に直接反映されます</td></tr>
+          <tr><td>囲み</td><td><kbd>L</kbd></td><td>自由に囲んだ範囲を塗ります。ビットマップ下地に直接反映されます</td></tr>
+          <tr><td>直線</td><td><kbd>I</kbd></td><td>太い直線オブジェクトを作成します。中点の菱形ハンドルで太さを変えられます</td></tr>
+          <tr><td>縦線</td><td><kbd>V</kbd></td><td>画像の上下をまたぐ縦方向のオブジェクトを作成します</td></tr>
+          <tr><td>横線</td><td><kbd>H</kbd></td><td>画像の左右をまたぐ横方向のオブジェクトを作成します</td></tr>
+          <tr><td>矩形</td><td><kbd>R</kbd></td><td>矩形オブジェクトを作成します</td></tr>
+          <tr><td>楕円</td><td><kbd>O</kbd></td><td>楕円オブジェクトを作成します</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <kbd>D</kbd> で描画、<kbd>F</kbd> で消去に切り替えます。描画はマスクを足し、消去はマスクを削ります。
+      消去モードで作ったオブジェクトも、既存のオブジェクトを削除するのではなく上から削る形として残るので、
+      あとから細かく調整し直せます。
+    </p>
+
+    <h2>プリセットとマスクスロットで手早く使う</h2>
+    <p>
+      加工タイプ・タイルサイズ・不透明度・ぼかし半径などの設定は 4 つまでプリセットに保存でき、
+      <kbd>1</kbd>〜<kbd>4</kbd> で呼び出せます。マスク自体も保存 1 / 保存 2 のスロットに一時保存でき、
+      別ページへ読み込めます（読み込みは現在のマスクを置き換えます）。フルスクリーン表示中は
+      <kbd>F9</kbd> / <kbd>F10</kbd> で隠蔽スロット 1 / 2 を即適用でき、<kbd>Shift</kbd>+<kbd>F9</kbd> /
+      <kbd>Shift</kbd>+<kbd>F10</kbd> で現在ページの隠蔽マスクを削除できます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: プリセット 1〜4 のボタン列と、選択ツールでオブジェクトの枠・ハンドルが見えている状態</div>
+      <figcaption>プリセットで設定一式を呼び出せます。選択ツールに切り替えると、すべてのオブジェクトが枠で確認できます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        直線・縦線・横線・矩形・楕円は描いたあともハンドルで調整できます。矢印キーで 1 px 移動、
+        <kbd>[</kbd> / <kbd>]</kbd> で少し回転、<kbd>Del</kbd> で削除、<kbd>Ctrl</kbd>+<kbd>Z</kbd> で
+        直前のマスク操作を取り消せます。直近に描いた 1 つは描画ツールのまま操作できます。
+      </div>
+    </div>
+
+    <h2>書き出す</h2>
+    <p>
+      隠蔽加工のマスクは自動保存され、同じ画像を開くと再び適用されます。加工済みの見た目を別ファイルとして
+      残したい場合は、モードを閉じてから <kbd>Ctrl</kbd>+<kbd>E</kbd>、または画像補正パネル
+      （画面左端にマウスを寄せると表示）のヘッダー右側にあるエクスポートアイコンで書き出します。
+      現在の設定だけでなく、プリセット 1〜4 の見た目をまとめて書き出すこともできます。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        加工タイプ・ツール・プリセット・マスクスロットの詳しい仕様は
+        <a href="conceal.html">隠蔽加工</a>リファレンスにまとまっています。書き出し方法は
+        <a href="export.html">エクスポート</a>を参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>タグを付けて分類する — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>タグを付けて分類する</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">タグを付けて分類する</h1>
+    <p class="page-desc">
+      画像・動画・音声・フォルダ・ZIP/PDF に「#原神」「#風景」のような自由なタグを付けて分類する機能です。
+      タグはファイル本体を書き換えず mImageViewer 内部に保存されるので、気軽に付け外しできます。
+      付けたタグはタグビューやスマートフィルタからいつでも呼び出せます。
+    </p>
+
+    <h2>1. 対象を選んでタグを付ける</h2>
+    <p>
+      グリッドで対象を選び、<kbd>T</kbd> キーでタグ付けダイアログを開きます。複数選択にも対応しているので、
+      同じ作品・同じ被写体をまとめてタグ付けできます。
+    </p>
+    <ol class="step-list">
+      <li>グリッドで対象の画像・動画・音声・フォルダ・ZIP/PDF を選択します（複数選択も可）。</li>
+      <li><kbd>T</kbd> キー、またはメニュー「タグ」→「タグを付ける/外す…」でダイアログを開きます。</li>
+      <li>作品名・作者名などのタグ名を入力し、「付ける」を押します。入力欄が空のときは、ピン留めしたタグや過去に使ったタグの候補から選べます。</li>
+      <li>不要になったタグは、表示されている <code>× #タグ名</code> を押すと外せます。</li>
+    </ol>
+
+    <figure class="tut-shot">
+      <img src="images/tut-tags-1.webp" alt="T キーで開いた「タグを付ける/外す」ダイアログ。タグ名の入力欄、現在の選択タグ、ピン留めしたタグ・最近使ったタグの候補欄が並んでいる">
+      <figcaption><kbd>T</kbd> キーで開く「タグを付ける/外す」ダイアログ。入力欄が空のときは、左に「ピン留めしたタグ」、右に「最近使ったタグ」の候補が並びます。</figcaption>
+    </figure>
+
+    <h2>2. ピン留めタグですばやくトグルする</h2>
+    <p>
+      よく使うタグはメニュー「タグ」→「ピン留めタグの管理…」で登録しておくと、ダイアログを開かずに
+      メニューやツールバーから直接トグル（付与⇔削除）できるようになります。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-tags-2.webp" alt="「ピン留めタグの管理」ダイアログ。タグ名・プレビュー・表示（ピン留めのチェック）・並べ替えと削除の操作列が並び、下に「＋タグを追加」ボタンがある">
+      <figcaption>メニュー「タグ」→「ピン留めタグの管理…」の登録画面。ここで登録したタグが、メニューとツールバーに並ぶようになります。<kbd>↑</kbd> <kbd>↓</kbd> で並び順も変えられます。</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>効き方</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>T</kbd></td><td>選択中の対象に対してタグ付けダイアログを開く</td></tr>
+          <tr><td>メニュー「タグ」→ ピン留めタグ名をクリック</td><td>選択中の対象にそのタグをトグル（単一選択）／チェック済み全体にトグル（複数選択）</td></tr>
+          <tr><td>ツールバーのタグボタンを<strong>右クリック</strong></td><td>選択・チェック済みの対象にそのタグをトグル</td></tr>
+          <tr><td>ツールバーのタグボタンを<strong>左クリック</strong></td><td>そのタグのタグビューを開く（探す側の操作）</td></tr>
+          <tr><td><kbd>Shift</kbd>+ツールバーのタグボタンを右クリック</td><td>今いるフォルダ・ZIP・PDF 自体にそのタグをトグル</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td><td>タグビューを開く</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <img src="images/tut-tags-3.webp" alt="ツールバーの「タグ:」欄。「設定」「検索」ボタンに続けて、ピン留めした #うちのこ・#投稿候補 のタグボタンが並んでいる（赤枠）">
+      <figcaption>ツールバーの「タグ:」欄。ピン留めしたタグ（#うちのこ・#投稿候補）が並び、右クリックで即トグルできます。左端の「設定」は管理画面、「検索」はタグビューを開きます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        複数選択で右クリックトグルすると、レーティングと同じ要領で <kbd>Space</kbd> や <kbd>Shift</kbd>+矢印で
+        チェックした項目すべてに一括で反映されます。対象すべてに付いている場合は全削除、それ以外は全付与になります。
+        誤操作しても <kbd>Ctrl</kbd>+<kbd>Z</kbd> でまとめて取り消せます。
+      </div>
+    </div>
+
+    <h2>3. タグビューとスマートフィルタで探す</h2>
+    <p>
+      タグを付けた後は、<kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビューで見つけます。フルスクリーンのメタデータ
+      パネルやグリッドのタグバッジをクリックしても、そのタグのタグビューを直接開けます。
+    </p>
+    <ul>
+      <li>タグビューの入力欄に <code>#猫 #風景</code> のように複数入力すると AND 検索になります。</li>
+      <li>「すべての種類」プルダウンで画像・動画・フォルダ・ZIP/PDF・アーカイブに絞り込めます。</li>
+      <li>今表示中の一覧だけを絞りたいときは、グリッド上部の「絞り込み: タグ」メニュー（スマートフィルタ）を使います。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-tags-4.webp" alt="Ctrl+T で開いたタグビュー。上部にタグ名の入力欄・「一覧▼」ボタン・「すべての種類」プルダウンが並び、「一覧▼」からピン留めしたタグ・最近使ったタグ・数が多いタグの候補が表示されている">
+      <figcaption>タグビュー。入力欄にタグ名を入れて絞り込みます。「一覧▼」からピン留め・最近使った・数が多いタグをその場で選べ、「すべての種類」で画像・動画・ZIP/PDF などに絞れます。</figcaption>
+    </figure>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        タグの付与・削除は mImageViewer 内部のカタログを更新するだけです。<strong>元の画像・動画ファイル、
+        ZIP/PDF 本体は書き換えません。</strong> ZIP 内の画像や PDF のページ単位ではタグを付けられず、
+        本体ファイル（ZIP/PDF そのもの）にタグが付きます。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        タグ名のルールやツールバーのカスタマイズ、他ソフトとの互換性など詳しい仕様は
+        <a href="tags.html">タグ機能</a>リファレンスを参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

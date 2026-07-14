@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>明るさ・色を補正する（＋表示トリム） — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>明るさ・色を補正する（＋表示トリム）</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">明るさ・色を補正する（＋表示トリム）</h1>
+    <p class="page-desc">
+      薄暗いスキャン画像を読みやすくしたり、写真の色味を整えたり、余分な余白を表示だけカットして中身を大きく見たり——
+      フルスクリーン表示中に画面左のパネルを開くだけで、画像全体にリアルタイムで補正をかけられます。
+      元のファイルは書き換えないので、気軽に触って好みの見た目を探せます。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        ここで説明するのは画像<strong>全体</strong>にかかる補正です。マスクで範囲を決めて部分的にかける補正は、
+        別チュートリアルの<a href="tut-local-adjust.html">補正レイヤーで部分的に補正</a>を参照してください。
+      </div>
+    </div>
+
+    <h2>補正パネルを開く</h2>
+    <p>
+      画像・ZIP 内画像・PDF ページをフルスクリーンで表示中に、画面の<strong>左端</strong>にマウスを寄せると画像補正パネルが現れます
+      （右端は情報パネル、上端はホバーバーです）。「画像補正」タブでスライダーを操作します。
+      クリック表示モードにしている場合は、左端の呼び出しバーをクリックします。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-adjust-1.webp" alt="フルスクリーン左端に表示された画像補正パネル。上部に「画像補正」「表示トリム」タブ、フォルダ適用ボタン、補正モードのラジオ、明るさ・コントラスト・ガンマ・彩度・色温度・レベル補正のスライダーが並んでいる">
+      <figcaption>画面左端に現れる補正パネル（赤枠）。上部の「画像補正」「表示トリム」タブで切り替えます。スライダーを動かした瞬間に、今開いているページの補正として反映されます。</figcaption>
+    </figure>
+
+    <h2>スライダーで明るさ・色を整える</h2>
+    <p>
+      次のパラメータをスライダーで調整できます。動かすとすぐにプレビューへ反映されます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>パラメータ</th><th>範囲</th><th>効果</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>明るさ</td><td>-100〜+100</td><td>画像全体の明るさを調整</td></tr>
+          <tr><td>コントラスト</td><td>-100〜+100</td><td>明暗の差を強調・抑制</td></tr>
+          <tr><td>ガンマ</td><td>0.2〜5.0</td><td>中間調の明るさを調整</td></tr>
+          <tr><td>彩度</td><td>-100〜+100</td><td>色の鮮やかさを調整</td></tr>
+          <tr><td>色温度</td><td>-100〜+100</td><td>暖色（赤み）↔ 寒色（青み）を調整</td></tr>
+          <tr><td>黒点 / 白点</td><td>0〜255</td><td>レベル補正の入力範囲</td></tr>
+          <tr><td>中間点</td><td>0.1〜10.0</td><td>レベル補正のガンマ</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      スライダー右の「↩」ボタンで、そのパラメータだけをデフォルト値に戻せます。
+    </p>
+
+    <h2>補正モードを切り替える</h2>
+    <p>
+      パネル上部のラジオボタンで、手動調整以外の補正モードにも切り替えられます。
+    </p>
+    <ul>
+      <li><strong>手動：</strong>上記のスライダーを自分で調整します</li>
+      <li><strong>自動補正：</strong>ヒストグラムから黒点・白点を自動設定します</li>
+      <li><strong>モノクロ漫画補正：</strong>グレースケール化・紙色除去・黒強化・S 字カーブをまとめて適用し、漫画スキャンの読みやすさを底上げします</li>
+    </ul>
+    <p>自動補正・モノクロ漫画補正を選んでいる間は、手動スライダーは無効になります。</p>
+
+    <h2>ページ個別の補正と、標準設定</h2>
+    <p>
+      スライダーを動かすと、まずは<strong>今開いているページだけの個別設定</strong>として保存されます。
+      補正なしで開いたページには「標準設定」が適用されます。標準には<strong>アプリ全体</strong>のものと、<strong>お気に入りフォルダごと</strong>のものがあり、
+      <strong>個別設定 → お気に入りの標準 → アプリ全体の標準</strong>の順で優先されます。
+    </p>
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        パネル上部には「<strong>標準設定を適用中</strong>」「お気に入り「xxx」の標準を適用中」「<strong>個別設定を適用中</strong>」の
+        いずれかが表示されます。今どのスコープの補正が効いているのか迷ったら、ここを見れば分かります。
+      </div>
+    </div>
+    <p>パネル上部の 6 つのボタンで、今の補正をどの範囲に反映するかを選べます。</p>
+    <ul>
+      <li><strong>このフォルダの全画像に適用：</strong>今のパラメータを、開いているフォルダ / ZIP / PDF の全ページへ一括で設定します（ファイル自体は書き換えません）</li>
+      <li><strong>このフォルダの全画像から解除：</strong>そのフォルダ / ZIP / PDF の全ページの個別設定を削除し、標準に戻します</li>
+      <li><strong>このお気に入りの標準にする：</strong>今のパラメータを、そのお気に入りフォルダ配下だけの既定値にします（お気に入り配下にいないときは無効）</li>
+      <li><strong>このお気に入りの標準を解除：</strong>そのお気に入りの標準を削除し、アプリ全体の標準に戻します</li>
+      <li><strong>標準にする：</strong>今のパラメータを<strong>アプリ全体</strong>の既定値にします（すべてのフォルダに影響します）</li>
+      <li><strong>個別設定を解除：</strong>今のページの個別補正を消して標準値に戻します（<kbd>Q</kbd> または <kbd>Ctrl</kbd>+<kbd>Backspace</kbd>）</li>
+    </ul>
+    <p>
+      迷ったら、まず 1 枚で気に入る補正を作り込みます。特定のフォルダ（お気に入り登録済み）だけに効かせたいなら
+      <strong>「このお気に入りの標準にする」</strong>が安全です。アプリ全体に効く「標準にする」で初期値を変えてしまっても、
+      パネルの<strong>「すべてリセット」</strong>を押してスライダーを既定値（補正なし）に戻してから、もう一度<strong>「標準にする」</strong>を
+      押せば、アプリ全体の標準を元の状態に戻せます。
+    </p>
+
+    <h2>保存スロットに保存して呼び出す</h2>
+    <p>
+      気に入った補正の組み合わせは、10 個の名前付きスロットに保存しておけます。別のフォルダを開いたときも、
+      同じ補正をすぐに呼び出せます。
+    </p>
+    <ul>
+      <li>パネル下部の <strong>💾</strong> ボタンで保存ダイアログを開き、スロット名を付けて保存します</li>
+      <li><kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> でスロット 1〜10 を適用します
+        <ul>
+          <li>フルスクリーン表示中：今開いているページに適用（＝そのページの個別設定になります）</li>
+          <li>サムネイル一覧：チェック済みの画像があれば一括適用、なければカーソル位置の 1 枚に適用</li>
+        </ul>
+      </li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-adjust-2.webp" alt="パネル下部の保存スロット欄（1〜0 の10枠）と、スロットに名前を付ける「保存スロット名」ダイアログ">
+      <figcaption>パネル下部の保存スロット欄（赤枠）。名前を付けて保存すると、<kbd>Ctrl</kbd>+数字キーで別の画像にもすぐ呼び出せます。</figcaption>
+    </figure>
+
+    <h2>表示トリム（読むための余白カット）</h2>
+    <p>
+      パネル上部の<strong>「表示トリム」タブ</strong>（「画像補正」の隣）に切り替えると、画像まわりの余白を
+      <strong>表示だけ</strong>カットして中身を大きく表示できます。スキャン漫画の白い縁や、周囲に余白の多い
+      イラストを読むときに便利です。切り方は次の 4 つから選べます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>モード</th><th>効果</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>トリムなし</td><td>余白を切らずそのまま表示します（初期状態）</td></tr>
+          <tr><td>自動余白カット</td><td>画像の周囲の単色余白を自動で検出して切り、中身を画面いっぱいに表示します</td></tr>
+          <tr><td>本全体の設定を適用</td><td>今開いている本（フォルダ / ZIP / PDF）の全ページに、手動で決めた余白量をまとめて効かせます。見開き表示では左右ページを別々に調整することもできます</td></tr>
+          <tr><td>このページの個別設定を適用<br>（チェック）</td><td>今開いているページだけに個別の余白量を効かせます。チェックしている間は上のモード選択が一時的に無効になります</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <img src="images/tut-adjust-3.webp" alt="左パネルの「表示トリム」タブ。トリムなし・自動余白カット・本全体の設定を適用のラジオボタンと、このページの個別設定を適用のチェックボックスが並んでいる">
+      <figcaption>「表示トリム」タブ（赤枠）。余白の切り方を「自動」「本全体」「このページだけ」から選べます。これは表示だけの余白カットで、保存・エクスポートした画像には反映されません。</figcaption>
+    </figure>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        mImageViewer には切り取りが<strong>2 種類</strong>あり、用途が違うので取り違えに注意してください。
+        <ul>
+          <li><strong>表示トリム（このページで紹介）：</strong>読みやすくするための<strong>表示専用</strong>の余白カット。元画像も、保存・エクスポートした画像も一切変わりません。</li>
+          <li><strong>加工用の切り取り：</strong>実際に画像を切り出して<strong>出力に反映</strong>する切り取り。エクスポート（<kbd>Ctrl</kbd>+<kbd>E</kbd>）やキャプチャ保存（<kbd>Ctrl</kbd>+<kbd>S</kbd>）で切り出した画像を書き出せます。消しゴム・隠蔽加工・テキスト注釈などと並ぶ加工機能の一つで、加工の流れとあわせて別ページで紹介します。</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2>キー操作の早見表</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>できること</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Q</kbd> / <kbd>Ctrl</kbd>+<kbd>Backspace</kbd></td><td>今のページの個別補正を解除して標準値に戻す</td></tr>
+          <tr><td><kbd>U</kbd></td><td>AI アップスケールモデルをサイクル切替</td></tr>
+          <tr><td><kbd>N</kbd></td><td>AI ノイズ除去の ON / OFF を切替</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd></td><td>保存スロット 1〜10 を適用</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>E</kbd></td><td>補正・加工（加工用の切り取り含む）を反映してエクスポート（書き出し）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>補正・加工を反映してキャプチャ保存フォルダへ保存</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        補正パラメータの詳しい範囲・スコープの解決順（個別設定 → お気に入り標準 → 標準設定）・AI アップスケール各モデルの特徴・
+        ポストフィルタの全プリセットは<a href="adjustment.html">画像補正</a>リファレンスにまとまっています。
+        書き出し時のファイル名規則・対応形式・メタデータの扱いは<a href="export.html">エクスポート</a>を参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

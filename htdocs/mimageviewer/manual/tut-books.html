@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>本棚に集めて 1 冊にまとめる — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>本棚に集めて 1 冊にまとめる</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">本棚に集めて 1 冊にまとめる</h1>
+    <p class="page-desc">
+      バラバラのフォルダに散らばった画像、ZIP・PDF の中の 1 ページ、動画の 1 フレーム、
+      クリップボード上の画像。出どころの違うページを 1 冊の本へ集めて、番号順の画像フォルダとして
+      まとめて読み返せるようにする機能です。元ファイルへのリンクではなく、追加した時点のページを
+      コピーして本棚に保存します。
+    </p>
+
+    <h2>本棚とページの集め方</h2>
+    <p>
+      本棚ルート直下の各フォルダが 1 冊の本です。ページは番号付きのファイル名で保存されるため、
+      本の中は常に番号順で表示されます。次に追加する先を「追加先の本」として選んでおくと、
+      あとは見つけたページを都度そこへ流し込んでいくだけです。
+    </p>
+    <p>
+      ページの追加元はグリッド（一覧）だけではありません。画像・動画のフルスクリーン表示中や、
+      他のアプリでコピーしたクリップボード画像からも、同じ「追加先の本」へ流し込めます。
+      どの経路でも、追加した時点のページがコピーされて追加先の本に入ります。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>追加元</th><th>追加されるもの</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>グリッド（一覧）</td><td>チェックした（またはカーソル位置の）画像・ZIP / PDF ページ</td><td>ツールバーの「追加」ボタン、製本メニュー「追加先の本に追加」、または <kbd>Ctrl</kbd>+<kbd>B</kbd></td></tr>
+          <tr><td>画像のフルスクリーン</td><td>今表示しているページ</td><td><kbd>Ctrl</kbd>+<kbd>B</kbd></td></tr>
+          <tr><td>動画のフルスクリーン</td><td>今のフレーム（1 枚の画像として保存）</td><td><kbd>Ctrl</kbd>+<kbd>B</kbd></td></tr>
+          <tr><td>他アプリからコピー</td><td>クリップボード上の画像</td><td>製本メニュー「クリップボードの画像を本に追加」</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      グリッドで <kbd>Ctrl</kbd>+<kbd>B</kbd> を押すと、チェック済みアイテム（なければカーソル位置の 1 件）が追加先の本へ入ります。
+      ツールバーに固定した本があれば、右クリックで直接その本へ追加することもできます（後述）。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-books-1.webp" alt="ツールバーの「本棚:」セクション。追加先の本の名前を選ぶドロップダウンと「追加」「開く」ボタンが赤枠で囲まれている">
+      <figcaption>上の表の「グリッドから追加」の入口が、ツールバーの「本棚:」セクション（赤枠）です。ドロップダウンで追加先の本を選び、グリッドで選んだページを「追加」で流し込みます。「開く」でその本を表示します。</figcaption>
+    </figure>
+
+    <h2>追加先の本を切り替える</h2>
+    <p>
+      メニュー「製本」、またはツールバーの「本棚:」セクションから次の操作を行います。
+    </p>
+    <ul>
+      <li><strong>追加先の本に追加：</strong>選択中・チェック済みの画像やページを、現在の追加先の本へ追加します。</li>
+      <li><strong>クリップボードの画像を本に追加：</strong>クリップボード上の画像を新しいページとして追加します。</li>
+      <li><strong>追加先の本を開く：</strong>今の追加先の本をそのまま mImageViewer 内で開いて確認します。</li>
+      <li><strong>製本の管理：</strong>本の作成・名前変更・削除、追加先の本の切り替えをここで行います。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-books-2.webp" alt="「製本の管理」ダイアログ。本棚フォルダのパス、現在の追加先の本、「新しい本」の作成欄、本一覧（各本にページ数と固定・名前変更・追加先の本にする・削除・開くのボタン）が並ぶ">
+      <figcaption>「製本の管理」ダイアログ。本の作成・名前変更・削除に加え、各本の「追加先の本にする」で流し込み先を切り替えられます。ページ数（例: 16p / 2p）も一覧で確認できます。</figcaption>
+    </figure>
+
+    <p>
+      よく使う本はツールバーに固定（クイック追加）しておくと便利です。「製本の管理」で各本の
+      「固定」ボタンを押すとツールバーにボタンとして並び、左クリックでその本を開き、
+      右クリックで選択中・チェック済み・表示中のページをその本へ直接追加できます。
+      追加先の本を切り替えなくても、複数の本へ並行して仕分けられます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-books-3.webp" alt="ツールバーの「本棚:」セクションに、固定した本のクイック追加ボタン「名前なし」「test」が並んでいる（赤枠）">
+      <figcaption>「固定」した本はツールバーにボタンとして並びます（赤枠の「名前なし」「test」）。左クリックでその本を開き、右クリックで選択中・チェック済み・表示中のページを直接その本へ追加できます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        補正・消しゴム・隠蔽加工・注釈など編集を加えたページは、追加時にその見た目のまま 1 枚の画像に焼き込んで保存されます。
+        編集していない通常の画像ファイルや ZIP 内の画像は、無劣化のままコピーされます（再エンコードなし）。
+        PDF のページと動画のフレームは、画像として描き出して保存されます。
+        追加後のページにも、タグ・★・補正・消しゴム・隠蔽加工・注釈を重ねて編集できます。
+      </div>
+    </div>
+
+    <h2>本の中を並べ替える</h2>
+    <p>
+      本を開いた状態で「この本を並べ替え」を選ぶと、専用ウィンドウでページ順を編集できます。
+      小サムネイルをドラッグして挿入位置へ移動し、<kbd>Ctrl</kbd>クリックで複数選択、
+      <kbd>Shift</kbd>クリックで範囲選択ができます。上部の本一覧を使えば、選択したページを
+      別の本へコピーまたは移動することもできます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-books-4.webp" alt="「ページ並べ替え」ウィンドウ。ページの小サムネイル（0001・0002）が並び、サムネサイズのスライダー、「このページを『test』へ コピー / 移動」ボタンがある">
+      <figcaption>「ページ並べ替え」ウィンドウ。選択したページをまとめてドラッグして挿入位置へ移動します。上部の「このページを ○○ へ」からは、選択ページを別の本へコピー / 移動もできます。</figcaption>
+    </figure>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        本棚ルートと本の中は、通常のお気に入りや検索の自動索引対象にはなりません。本の中を探すときは
+        通常のツールバー検索や現在フォルダ検索を使います。すべての項目・設定は
+        <a href="books.html">製本・本棚</a>リファレンスにまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

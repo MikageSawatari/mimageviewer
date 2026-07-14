@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>2 枚を並べて比較する — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>2 枚を並べて比較する</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">2 枚を並べて比較する</h1>
+    <p class="page-desc">
+      「加工の前後でどう変わったか」「よく似た 2 枚のどちらを残すか」を見比べたいときの機能です。
+      ボタンではなくキー操作で呼び出すため気づきにくいのですが、覚えるとレタッチや選別が一気にはかどります。
+    </p>
+
+    <h2>まず比較する 1 枚をピン留めする</h2>
+    <p>
+      比較したい 1 枚目を「比較スロット」に固定（ピン留め）します。<kbd>X</kbd> キーを押すだけです。
+    </p>
+    <ul>
+      <li><strong>フルスクリーン中：</strong>表示中の画像・ZIP 内の画像・PDF ページを <kbd>X</kbd> でピン留め。もう一度 <kbd>X</kbd> で解除。</li>
+      <li><strong>サムネイル一覧：</strong>画像にカーソルを合わせて <kbd>X</kbd> でもピン留めできます。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-compare-1.webp" alt="フルスクリーン表示中の画像。右下に「比較中: nekorayxl_claude_2_3_…」とピン画像のサムネイルが表示されている（赤枠）">
+      <figcaption>1 枚目をピン留めした状態。右下（赤枠）に「比較中」としてピン画像のサムネイルが表示され、以降はこのピン画像を基準に見比べます。</figcaption>
+    </figure>
+
+    <h2>もう 1 枚と切り替え・重ねて比べる</h2>
+    <p>
+      ピン留め後、別の画像を表示した状態で次のキーを使います。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>比較の仕方</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>C</kbd></td><td>現在の画像とピン画像を<strong>交互に切り替え</strong>て表示（パラパラ見比べ）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>C</kbd></td><td>左右の<strong>ワイプ比較</strong>。境界線はドラッグで動かせます</td></tr>
+          <tr><td><kbd>Alt</kbd>+<kbd>C</kbd></td><td>RGB チャンネル別の<strong>色付き差分強調</strong>（違うところだけ光る）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <img src="images/tut-compare-2.webp" alt="同じ画像の中央に縦の境界線が引かれ、左半分がピン画像・右半分が現在の画像として左右に分かれて表示されている">
+      <figcaption>ワイプ比較。中央の境界線をドラッグして、同じ位置の差を左右で確認できます。</figcaption>
+    </figure>
+
+    <figure class="tut-shot">
+      <img src="images/tut-compare-3.webp" alt="画像全体が青緑・紫の疑似カラーに変換され、ピン画像との違いがある箇所ほど強い色で浮かび上がっている">
+      <figcaption>差分強調。変化のあった箇所ほど強い色で浮かび上がります。加工の効き具合の確認に。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        サイズの違う 2 枚を比較すると、ピン画像は<strong>現在表示中の画像のサイズに合わせて</strong>リサイズされて重なります。
+        ワイプ比較中は、じゃまにならないよう左の補正パネル・右のメタデータパネルが自動的に閉じます。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        動画のフルスクリーン中は比較キーは働きません。キー割り当ては<a href="settings.html">操作カスタマイズ</a>で変更できます。
+        関連する操作は<a href="fullscreen.html">フルスクリーン表示</a>リファレンスにまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

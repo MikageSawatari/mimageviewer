@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>フォルダを開く・移動する — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>フォルダを開く・移動する</span>
+  </nav>
+</header>
+
+<!-- 詳細ページは tut-wide でサイドバー無し・全幅 -->
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">フォルダを開く・移動する</h1>
+    <p class="page-desc">
+      mImageViewer で最初に戸惑いやすいのが「フォルダの行き来」です。
+      キーボードのツリー移動を覚えると、マウスに持ち替えずに大量のフォルダを一気に見て回れます。
+      ここでは開き方から、隣のフォルダ・親フォルダへの移動までを順番に見ていきます。
+    </p>
+
+    <h2>まずフォルダを開く</h2>
+    <p>
+      起動直後の画面から、見たい画像の入ったフォルダを開きます。方法はいくつかあります。
+    </p>
+    <ul>
+      <li>画面上部の<strong>フォルダバー</strong>にフォルダのパスを入力して <kbd>Enter</kbd>（空欄のまま <kbd>Enter</kbd> を押すとドライブ一覧が出ます）</li>
+      <li>フォルダバーの <strong>場所▼</strong> →「ドライブ一覧」から、目的のドライブを選んでたどる</li>
+      <li>よく見る場所は<strong>お気に入り</strong>から一発で開く（<a href="tut-favorites.html">お気に入りで素早くアクセス</a>）</li>
+    </ul>
+    <p>既定では、次回起動時に前回表示していた場所が自動で復元されます（この動作は環境設定で変更できます）。</p>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>フォルダのドラッグ＆ドロップでは「開け」ません。</strong>
+        エクスプローラーから mImageViewer のウィンドウへドロップする操作は、
+        「今表示しているフォルダへ<strong>ファイルをコピーする</strong>」動きになります。
+        安全のためフォルダのドロップは無効化されており、フォルダを落とすと
+        「フォルダのドロップは現在無効です」と表示されてスキップされます。
+        フォルダを<em>開きたい</em>ときは、上のいずれかの方法を使ってください。
+      </div>
+    </div>
+
+    <figure class="tut-shot">
+      <img src="images/tut-navigation-1.webp" alt="mImageViewer のメイン画面。上部のフォルダバー（パス入力欄と「場所▼」）が赤枠で強調されている">
+      <figcaption>赤枠が上部のフォルダバー。ここにパスを入力して <kbd>Enter</kbd>、または「場所▼」から移動先を選べます。</figcaption>
+    </figure>
+
+    <h2>キーボードでフォルダを渡り歩く</h2>
+    <p>
+      一覧を見ながら隣のフォルダへ移りたいときは、マウスを使わずキーボードだけで移動できます。
+      <kbd>Ctrl</kbd>+<kbd>↓</kbd> / <kbd>Ctrl</kbd>+<kbd>↑</kbd> は、フォルダツリーを
+      <strong>上から順にたどる</strong>ように動きます（深い階層も自動的に潜ります）。
+    </p>
+
+    <ol class="step-list">
+      <li><span>まず適当な親フォルダを開きます。サブフォルダが並んでいる状態が分かりやすいです。</span></li>
+      <li><span><kbd>Ctrl</kbd>+<kbd>↓</kbd> を押すと、次のフォルダ（最初の子 → 無ければ次の兄弟 → …）へ移動します。押し続けると先へ進めますが、画像などを含まないフォルダは自動的に読み飛ばされます（飛ばす深さは設定で調整できます）。同じ階層の兄弟フォルダだけを順に見たいときは <kbd>Ctrl</kbd>+<kbd>PageDown</kbd> / <kbd>PageUp</kbd> を使います（空フォルダも飛ばしません）。</span></li>
+      <li><span><kbd>Ctrl</kbd>+<kbd>↑</kbd> は逆順にたどります。行き過ぎたときはこれで 1 つ戻ります。</span></li>
+      <li><span><kbd>BS</kbd>（Backspace）はいつでも<strong>親フォルダ</strong>へ。階層を一段上がりたいときはこちら。</span></li>
+    </ol>
+
+    <figure class="tut-shot">
+      <img src="images/tut-navigation-2.webp" alt="ツールバーの「ツリー」ボタンで表示したフォルダツリー。miv の下に 01_風景・02_キャラクター・03_季節 が階層表示されている">
+      <figcaption>左上の「ツリー」ボタンでフォルダツリーを表示できます。<kbd>Ctrl</kbd>+<kbd>↓</kbd> は、このツリーを前順（親 → 子 → 兄弟）にたどって“次”のフォルダへ進みます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        <strong>「今どこにいるか」を見失ったら</strong> ── フォルダバーのパスを見れば現在地が分かります。
+        まったく別の場所へ飛びたいときは <kbd>BS</kbd> で親へ戻るより、フォルダバーやお気に入りから開き直す方が速いことがあります。
+      </div>
+    </div>
+
+    <h2>ショートカット早見表</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>次のフォルダへ（ツリーを前順にたどる。画像なしフォルダは読み飛ばす）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>前のフォルダへ</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>PageDown</kbd> / <kbd>PageUp</kbd></td><td>同じ階層の次 / 前の兄弟フォルダへ（空フォルダも飛ばさない）</td></tr>
+          <tr><td><kbd>BS</kbd></td><td>親フォルダへ戻る</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>選択中のフォルダを開く / 画像をフルスクリーン表示</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        よく見るフォルダは<strong>お気に入り</strong>に登録しておくと一発で開けます。詳しくは
+        <a href="tut-favorites.html">お気に入りで素早くアクセス</a>へ。
+        すべての操作は<a href="shortcuts.html">キーボードショートカット</a>と<a href="grid.html">グリッド表示</a>のリファレンスにまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

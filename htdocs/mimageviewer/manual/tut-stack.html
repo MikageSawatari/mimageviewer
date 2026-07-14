@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ファイル名スタックで一覧をすっきり — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>ファイル名スタックで一覧をすっきり</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">ファイル名スタックで一覧をすっきり</h1>
+    <p class="page-desc">
+      同じ投稿の連番ページや連写した写真が並ぶと、一覧が縦に長くなって見渡しにくくなります。
+      「スタック」表示は、似たファイル名・連番・撮影タイミングの画像を自動でひとまとめにして、
+      1 つのセルに畳んでくれる機能です。
+    </p>
+
+    <h2>スタックを ON にする</h2>
+    <p>
+      <strong>フォルダバー右端</strong>にある <strong>「スタック」</strong> トグルを ON にするだけです。
+      畳まれたスタックには、まとめた枚数のバッジが右上に付きます。まとめる相手がいない 1 枚だけの画像は、
+      畳まれずにそのまま表示されます。
+    </p>
+    <p>
+      何が 1 つのセルに畳まれるかは自動判定です。下の例では、<code>01_01</code>〜<code>06_05</code> という
+      「番号＋<code>_</code>＋番号」の名前を付けた画像が、先頭の番号ごとに 6 つのスタックへ畳まれています
+      （スタックごとに背景色を変えたサンプルです）。複数枚のスタックには右上に枚数バッジが付き、
+      まとめる相手がいない <code>04</code> だけは畳まれず、バッジも付かずにそのまま並びます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-stack-1.webp" alt="「05_ファイル名スタック」フォルダをスタック表示 ON にした集約グリッド。01〜06 の 6 つのスタックがそれぞれ別の背景色で並び、複数枚のスタック（3枚・4枚・2枚・3枚・5枚）は右上に枚数バッジが付いている。1 枚だけの 04 はバッジなしでそのまま表示され、フォルダバー右端の「スタック」トグルが ON になっている">
+      <figcaption>「スタック」トグル（フォルダバー右端）を ON にした状態。似たファイル名の画像がスタックごとにまとまり、複数枚には右上に枚数バッジが付きます。1 枚だけの <code>04</code> は畳まれずそのまま並びます。</figcaption>
+    </figure>
+
+    <h2>どんな画像がまとまる？（既定のルール）</h2>
+    <p>
+      まとめ方は、いくつかのルールを<strong>上から順に試して</strong>決まります。あるルールがフォルダ内の
+      <strong>すべての画像</strong>に当てはまったとき、それを採用します。どれにも当てはまらなければ
+      <strong>何も畳みません</strong>。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>順</th><th>まとまり方</th><th>ファイル名の例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>決まった形のファイル名（配布ダウンローダの命名など、末尾の飾りが同じで番号だけ変わるもの）</td><td><code>…_p01_m01_@user</code> / <code>…_p02_m01_@user</code></td></tr>
+          <tr><td>2</td><td>ファイル名の<strong>末尾が連番・ページ番号</strong>。番号の手前でまとめます</td><td><code>name_001</code> / <code>name_002</code>、<code>id_p0</code> / <code>id_p1</code></td></tr>
+          <tr><td>3</td><td>ファイル名の<strong>先頭が連番</strong>。番号が途切れずに続くかたまりごとにまとめます</td><td><code>0001_xxx</code> / <code>0002_xxx</code></td></tr>
+          <tr><td>4</td><td><strong>更新時刻が近い</strong>連写写真（既定は 5 秒以内）</td><td>連写した <code>IMG_1234</code> / <code>IMG_1235</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      上のサンプルは、ルール 2（末尾が連番）がすべての画像に当てはまった例です。判定はフォルダ内の様子を見て
+      決まるので、フォルダごとに畳まれ方が変わることがあります。
+    </p>
+
+    <h2>集約表示とフラット表示を切り替える</h2>
+    <p>
+      「スタック」トグルの ON / OFF が、そのまま集約表示（畳む）とフラット表示（畳まず全部並べる）の切り替えです。
+      この ON / OFF は今のフォルダだけの一時的な見せ方で、別のフォルダへ移動すると自動的に解除されます。
+      ファイルそのものが移動・変更されるわけではありません。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        スタック表示が使えるのは、通常のフォルダ表示と、サブフォルダをまとめて展開した表示のときです。検索結果・タグビュー・読書履歴・ZIP / PDF の中・ドライブ一覧では使えません。
+      </div>
+    </div>
+
+    <h2>スタックを開いて続けて読む</h2>
+    <p>
+      畳まれたスタックをダブルクリック、または <kbd>Enter</kbd> で開くと、フルスクリーン表示に入ります。
+      スタックの中だけでなく、フォルダ全体を 1 枚ずつ続けて読み進められます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>↓</kbd> / <kbd>↑</kbd></td><td>すべての画像を 1 枚ずつ順送り（スタックの境界を越えて進みます）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>↓</kbd> / <kbd>↑</kbd></td><td>次 / 前のスタックの先頭画像へジャンプ</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        既定の分類ルールで狙ったとおりにまとまらない場合は、スクリプトを書いて自分のファイル名の付け方に
+        合わせた分割ルールを定義できます（上級者向け）。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        既定の分類ルールの詳細やスクリプトによるカスタマイズ方法は<a href="stack.html">スタック表示</a>リファレンスにまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

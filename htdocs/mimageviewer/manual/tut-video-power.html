@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>動画をもっと使いこなす — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>動画をもっと使いこなす</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">動画をもっと使いこなす</h1>
+    <p class="page-desc">
+      再生・シーク・倍速といった基本操作に慣れたら、次はもう一歩進んだ機能を使ってみましょう。
+      長い動画の中身を一目で見渡せる「タイル モード」、気になる場面に印を付ける「ブックマーク」、
+      チャプターへのジャンプ、そして今見ている場面をそのまま画像として保存する「フレーム キャプチャ」を紹介します。
+      基本の再生操作は<a href="video.html#playback">動画再生</a>のリファレンスを参照してください。
+    </p>
+
+    <h2>タイル モードで全体を見渡す</h2>
+    <p>
+      動画フルスクリーン中に <kbd>S</kbd> キー（または上部ホバーバーの ▦ ボタン）を押すと、
+      動画全体を一定間隔のサムネイルで一覧表示する「タイル モード」に切り替わります。
+      長い動画の展開を素早く把握したいときや、複数の動画を次々に見比べたいときに便利です。
+      間隔は動画の長さと画面サイズから自動的に選ばれます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: タイル モードで動画全体をサムネイル一覧表示している状態</div>
+      <figcaption>タイル モードの表示例。黄色い枠と時刻ラベルが付いた強調カーソルが、現在位置より後の最初のサムネイルを指しています。</figcaption>
+    </figure>
+
+    <p>
+      サムネイルをクリックするとその時刻へ移動し、もう一度クリックするとタイル モードを抜けて続きから再生します。
+      マウスホイールまたは <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> で前後の動画へ移動でき、タイル表示はそのまま維持されます。
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー / 操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>強調カーソルを前 / 次のサムネイルへ移動</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>強調カーソルを 1 行分移動</td></tr>
+          <tr><td><kbd>Space</kbd> / <kbd>Enter</kbd></td><td>強調カーソルの位置から再生</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+ホイール</td><td>列数（4 / 6 / 10 / 16 / 20 / 26 / 30）を切り替え</td></tr>
+          <tr><td><kbd>S</kbd> 再押下 / <kbd>Esc</kbd> / × ボタン</td><td>タイル モードを解除（再生位置は変更されません）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        上部バー右側の細かいグリッド / 大きいグリッドのアイコンボタンでも列数を切り替えられます。
+        一度抽出したサムネイルは動画ファイルごとにキャッシュされるので、同じ動画を再度タイル表示したときはすぐに表示されます。
+      </div>
+    </div>
+
+    <h2>ブックマークで気になる場面に印を付ける</h2>
+    <p>
+      再生中に <kbd>B</kbd> キーを押すと、現在位置にブックマーク（🔖）を追加できます。
+      追加したブックマークへは <kbd>J</kbd> / <kbd>K</kbd> キーで前後にジャンプでき、
+      移動先のタイトルが画面右上にトーストで一瞬表示されます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: J/K キーでブックマークへジャンプした際に右上に表示されるトースト</div>
+      <figcaption>J / K キーでチャプターやブックマークへジャンプすると、移動先のタイトルが右上に一瞬表示されます。</figcaption>
+    </figure>
+
+    <p>
+      画面左端にカーソルを近づけると「左ジャンプパネル」が現れます。
+      ピン留め（📌）・ブックマーク（🔖）・チャプター（📑）の各位置がサムネイル付きで並び、
+      行をクリックするとその位置へ移動できます。ブックマークは ✏ で名前を編集、× で個別に削除できます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 画面左端に表示したジャンプパネル（ピン・ブックマーク・チャプターの一覧）</div>
+      <figcaption>左ジャンプパネル。ピン留め・ブックマーク・チャプターの位置へサムネイルを見ながら一気に移動できます。</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>B</kbd></td><td>現在位置にブックマークを追加</td></tr>
+          <tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>前 / 次のチャプター・ブックマーク・ピンへジャンプ</td></tr>
+          <tr><td><kbd>P</kbd></td><td>現在のフレームを動画のグリッドサムネイルにピン留め（左ジャンプパネルの 📌 ボタンと同じ）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        動画のコメント欄などに時刻付きの一覧テキストがある場合は、左ジャンプパネル上部の一括登録ボタンから貼り付けて、
+        まとめてブックマーク化することもできます。逆に、現在のブックマーク一覧をクリップボードへエクスポートすることも可能です。
+      </div>
+    </div>
+
+    <h2>チャプターへ移動する</h2>
+    <p>
+      動画にチャプター情報が埋め込まれていれば、ブックマークと同じ <kbd>J</kbd> / <kbd>K</kbd> キーで
+      前後のチャプターへ直接ジャンプできます。左ジャンプパネルにも 📑 アイコン付きでチャプター位置が並びます。
+    </p>
+    <p>
+      画面右端にカーソルを近づけるとメタ情報パネルが開きます。動画にチャプター・タイトル・説明文が埋め込まれていれば、
+      その内容がここに一覧表示され、チャプター行をクリックしてその位置へ頭出しすることもできます。
+      <kbd>I</kbd> / <kbd>Tab</kbd> キーで、左右パネルの呼び出し方を「通常ホバー」と「クリック表示」で切り替えられます。
+    </p>
+
+    <h2>現在のフレームを保存する</h2>
+    <p>
+      気に入った場面をそのまま画像として残したいときは、<kbd>Ctrl</kbd>+<kbd>S</kbd> キーか、
+      下部 HUD の「キャプチャ パレット」にある保存ボタンを使います。
+      クリップボードへコピーしたいだけの場合は、同じキャプチャ パレットのコピー ボタンを使います。
+      保存先のフォルダや画像形式は設定メニュー →「環境設定…」→ キャプチャ保存で変更できます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 下部 HUD のキャプチャ パレットでフレームを保存している状態</div>
+      <figcaption>キャプチャ パレット。前フレーム / クリップボードへコピー / ファイルへ保存 / 次フレーム のボタンが並びます。</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー / 操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd> / パレットの保存ボタン</td><td>現在のフレームをキャプチャ保存フォルダへ保存</td></tr>
+          <tr><td>パレットのコピー ボタン</td><td>現在のフレームをクリップボードへコピー</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>1 フレーム単位で前後へ移動して一時停止（保存したい場面の微調整に）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        タイル モード・ブックマーク・チャプター・メタ情報パネルの詳しい仕様は
+        <a href="video.html#tile">動画再生 → タイル モード</a>、
+        <a href="video.html#loop">動画再生 → ループ・チャプター・ブックマーク・ピン留め</a>、
+        <a href="video.html#meta">動画再生 → メタ情報パネル</a> にまとまっています。
+        キー割り当ては<a href="settings.html">操作カスタマイズ</a>で変更できます。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

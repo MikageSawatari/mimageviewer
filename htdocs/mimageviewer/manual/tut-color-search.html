@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>色で絞り込む（カラー検索） — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>色で絞り込む（カラー検索）</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">色で絞り込む（カラー検索）</h1>
+    <p class="page-desc">
+      「青空の写真だけ集めたい」「赤っぽいイラストを探したい」というときは、色そのもので絞り込めます。
+      タグや日付では拾えない「見た目の色」を条件にできるのが特徴で、いま表示しているフォルダ・ZIP・PDF に対してその場で使えます。
+    </p>
+
+    <h2>「絞り込み:」バーの「画像色」を開く</h2>
+    <p>
+      ツールバーの下にある「絞り込み:」バーから「画像色」メニューを開きます。ボタンが見当たらないときは、
+      「絞り込み:」ラベルを右クリックして表示するボタンを選び直してください。
+    </p>
+    <ul>
+      <li>カラーピッカーから色を選ぶほか、プリセット色や HEX / RGB / HSL の入力でも色を指定できます。</li>
+      <li>許容範囲スライダーで、選んだ色にどれだけ近い色まで許すかを調整します。</li>
+      <li>タグ・日付・状態など、他のスマートフィルタの条件と組み合わせて使えます。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-color-search-1.webp" alt="「絞り込み:」バーで開いた「画像色」フィルタメニュー。カラーピッカー、プリセット色、HEX / RGB / HSL の色入力、許容範囲スライダー（28.0）があり、青 #81ADFC で絞り込んだ結果、左のグリッドに青空の画像が 1 件だけ残っている">
+      <figcaption>「絞り込み:」バーの「画像色」メニュー。プリセット色か HEX / RGB / HSL 入力で色を選び、許容範囲スライダーで近さを決めます。ここでは青で絞り込み、条件に合う画像だけが残っています。</figcaption>
+    </figure>
+
+    <h2>使った瞬間にその場で調べる</h2>
+    <p>
+      色や許容範囲を操作すると、いま表示中の画像をその場で調べて主要色を求めます。調べ終わった後の
+      色や許容範囲の変更は、保存済みの一時結果にすぐ反映されるので、スライダーを動かしながら絞り込み具合を確かめられます。
+    </p>
+    <ul>
+      <li>調査中は「絞り込み準備中 ◯/◯」の進捗が表示され、途中でキャンセルできます。</li>
+      <li>調べた結果は保存されません。別のフォルダへ移動すると破棄され、設定やデータベースには何も追加されません。</li>
+      <li>サムネイルのキャッシュがあればそれを使うため、表示済みのフォルダでは高速に絞り込めます。</li>
+    </ul>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        未調査の画像が非常に多いフォルダでは、いきなり調べ始めずに「スキャン開始」の確認が入ります。
+        「キャンセル」を選べば調査せずに戻れます。
+      </div>
+    </div>
+
+    <h2>フルスクリーンのメタデータパネルから起動する</h2>
+    <p>
+      1 枚を見ながら「この色で他の画像も探したい」と思ったら、フルスクリーン表示のメタデータパネルが近道です。
+    </p>
+    <ul>
+      <li>フルスクリーン表示中は、右のメタデータパネルにその画像の主要色スウォッチが並びます。</li>
+      <li>スウォッチをクリックすると、その色で画像色フィルタがそのまま開始されます。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-color-search-2.webp" alt="フルスクリーン表示の右側メタデータパネル。「画像色 8色」の見出しの下に、その画像から抽出された主要色のスウォッチが 8 個並んでいる">
+      <figcaption>メタデータパネルの主要色スウォッチ。クリックした色を起点に画像色フィルタが始まります。</figcaption>
+    </figure>
+
+    <h2>対象になる範囲</h2>
+    <p>
+      画像色での絞り込みは、通常のフォルダ・ZIP・PDF を表示しているときに使えます。動画やフォルダ、
+      ZIP / PDF などのコンテナ自体は色で絞り込む対象に含まれず、色フィルタを使うと一覧から外れます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>状況</th><th>画像色フィルタ</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>通常のフォルダ / ZIP / PDF を表示中</td><td>使える</td></tr>
+          <tr><td>絞り込み対象そのものが画像</td><td>対象になる</td></tr>
+          <tr><td>動画・フォルダ・ZIP / PDF などのコンテナ</td><td>対象外（一覧から外れる）</td></tr>
+          <tr><td>タグビュー・全文検索結果などの横断ビュー</td><td>使えない</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        スマートフィルタの他の条件（種類・タグ・日付・状態など）との組み合わせ方は
+        <a href="grid.html#color-filter">サムネイル一覧</a>リファレンスの「画像色で絞り込む」にまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

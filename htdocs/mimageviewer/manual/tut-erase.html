@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>消しゴムで不要物を自然に消す — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>消しゴムで不要物を自然に消す</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">消しゴムで不要物を自然に消す</h1>
+    <p class="page-desc">
+      スキャン画像に写り込んだ汚れやノイズ線、写真の隅に入り込んだ不要物を、塗って囲むだけで消せます。
+      塗った部分は AI が周囲の絵柄から自然に補完するので、細かくレタッチする必要はありません。
+      元の画像ファイルは変更されないので、気軽に試して後から取り消せます。
+    </p>
+
+    <h2>消しゴムモードを開く</h2>
+    <p>
+      フルスクリーン表示中に <kbd>E</kbd> キーを押すと消しゴムモードに入り、左上にツールパネルが表示されます。
+      モード中は矢印ナビや回転などの通常のフルスクリーン操作は無効になり、マスク編集専用のキーだけが働くので、誤操作の心配なく作業に集中できます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: フルスクリーンで E キーを押し、左上に消しゴムツールパネルが表示された状態</div>
+      <figcaption>消しゴムモードに入った直後。左上のパネルからツールを選びます。</figcaption>
+    </figure>
+
+    <h2>ツールを選んで塗る</h2>
+    <p>
+      消したい範囲の形に合わせてツールを使い分けます。筆と囲みはその場でビットマップに直接塗り、
+      直線・縦線・横線・矩形・楕円は後から位置や太さを調整できる図形として作られます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ツール</th><th>キー</th><th>使いどころ</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>筆</td><td><kbd>B</kbd></td><td>円形ブラシで自由に塗る（汚れ・シミなど不定形の範囲）</td></tr>
+          <tr><td>囲み</td><td><kbd>L</kbd></td><td>ドラッグで囲んだ内側をまとめて塗りつぶす（広い範囲・複雑な輪郭）</td></tr>
+          <tr><td>直線</td><td><kbd>I</kbd></td><td>始点と終点を結ぶ太い直線（斜めのスキャンノイズ線など）</td></tr>
+          <tr><td>縦線 / 横線</td><td><kbd>V</kbd> / <kbd>H</kbd></td><td>画像の端から端まで一直線に塗りつぶす（綴じ跡・縦横のスキャンノイズ）</td></tr>
+          <tr><td>矩形 / 楕円</td><td><kbd>R</kbd> / <kbd>O</kbd></td><td>整った形の不要物（スタンプ、ロゴ、丸いシミなど）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 筆ツールで汚れの上を赤い半透明オーバーレイで塗っている途中</div>
+      <figcaption>マスク範囲は赤い半透明オーバーレイで表示されます。塗り漏れがないか確認しながら進めます。</figcaption>
+    </figure>
+
+    <p>
+      パネル上部の「描画」「消去」ボタン（<kbd>D</kbd> / <kbd>F</kbd> キー）で、マスクを追加するか塗りすぎた部分を消すかを切り替えられます。
+      直線・縦線・横線・矩形・楕円で作った図形は、作成後も <kbd>S</kbd> キー（選択ツール）でクリックして選び直し、
+      ハンドルドラッグで位置・端点・線幅・サイズ・回転を調整できます。
+    </p>
+
+    <h2>AI 補完を実行して終了する</h2>
+    <p>
+      マスクを塗り終えたら、もう一度 <kbd>E</kbd> キー（または <kbd>Esc</kbd> キー）を押します。
+      AI がマスク部分を周囲の絵柄から自然に補完し、消しゴムモードを終了します（フルスクリーン表示自体は続きます）。
+      補完後は画像の左下に「消去補完済み」というステータスが表示されます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: AI 補完後、汚れが消えて左下に「消去補完済み」ステータスが出ている画面</div>
+      <figcaption>マスクした部分が周囲となじむ形で自然に補完されます。</figcaption>
+    </figure>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        マスクを塗っている途中（<kbd>E</kbd> / <kbd>Esc</kbd> で確定する前）なら、<kbd>Ctrl</kbd>+<kbd>Z</kbd> で直前のマスク操作を最大 20 手まで取り消せます。
+        取り消し履歴は消しゴムモードを抜けると消えるので、補完後にやり直したいときは、もう一度 <kbd>E</kbd> キーで消しゴムモードに入り、マスクを修正するか「マスク全削除」で元の画像に戻します。
+      </div>
+    </div>
+
+    <h2>同じ汚れを複数ページに繰り返し適用する</h2>
+    <p>
+      スキャンした本などで、偶数ページ全体・奇数ページ全体に同じ位置の汚れが出ることがあります。
+      消しゴムパネルの「マスクスロット」欄で現在のマスクを保存しておけば、他のページで呼び出して貼り付けられます。
+      さらにフルスクリーン表示中（消しゴムモードに入っていない状態）に <kbd>F7</kbd> / <kbd>F8</kbd> キーを押すと、
+      保存 1 / 2 のマスクを現在のページへ即座に適用して AI 補完まで実行できるので、ページをめくりながらテンポよく処理できます。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        マスクは非破壊です。修復情報は画像ファイルとは別に保存され、いつでも「マスク全削除」で元の画像に戻せます。
+        補完結果を画像ファイルとして書き出したい場合は、消しゴムモードを閉じてから <a href="export.html">エクスポート</a> を使います。
+        ツールの詳細・ショートカット一覧・マスクスロットの使い方は<a href="erase.html">消しゴムモードリファレンス</a>にまとまっています。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

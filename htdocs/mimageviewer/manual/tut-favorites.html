@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>お気に入りで素早くアクセス — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>お気に入りで素早くアクセス</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">お気に入りで素早くアクセス</h1>
+    <p class="page-desc">
+      よく使うフォルダをお気に入りに登録しておくと、メニューやツールバーからワンクリックで開けるようになります。
+      並べ替えて整理できるほか、登録した場所をまとめて横断検索することもできます。
+    </p>
+
+    <h2>フォルダをお気に入りに登録する</h2>
+    <p>
+      登録したいフォルダを開いた状態で、メニュー「お気に入り」→「このフォルダを追加…」を選び、
+      表示名を付けて登録します。登録できるのは実フォルダだけです（ZIP / PDF ファイル自体を
+      お気に入りとして直接登録することはできません。ただし、お気に入りフォルダの中にある
+      ZIP / PDF は、後述の横断検索で見つけられるようになります）。
+    </p>
+    <ul>
+      <li>登録できるお気に入りは最大 100 件です。</li>
+      <li>操作カスタマイズで番号から直接開けるお気に入り枠は 1〜20 です。</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-favorites-1.webp" alt="「お気に入りに追加」ダイアログ。追加するフォルダのパス、表示名の入力欄、コンテナ索引・アイテム索引のチェックボックス、追加・キャンセルボタンがある">
+      <figcaption>現在開いているフォルダを、好きな表示名でお気に入りに登録します。ここで「コンテナ索引」「アイテム索引」にチェックを入れると、そのまま後述の横断検索の対象にできます。</figcaption>
+    </figure>
+
+    <h2>登録したお気に入りを開く</h2>
+    <p>
+      登録済みのフォルダは、次のいずれかから素早く開けます。
+    </p>
+    <ul>
+      <li>メニュー「お気に入り」の一覧から選ぶ</li>
+      <li>ツールバーの「お気に入り:」セクションから選ぶ</li>
+      <li>フォルダバーの <strong>♡</strong> / <strong>♥</strong> ボタン（♡ は未登録、♥ は登録済みを表し、クリックで現在のフォルダの登録・解除を切り替えられます）</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-favorites-2.webp" alt="ツールバーの「お気に入り:」欄に登録済みの「miv」ボタンが並び、フォルダバー右側の ♥ ボタンが登録済み（赤）で表示されている">
+      <figcaption>ツールバーの「お気に入り:」欄（赤枠）やフォルダバーの <strong>♥</strong> ボタンから、登録済みのお気に入りをすぐに開けます。</figcaption>
+    </figure>
+
+    <h2>並べ替え・編集する</h2>
+    <p>
+      メニュー「お気に入り」→「編集」でお気に入りダイアログを開くと、登録したフォルダの並び替え・削除・
+      インデックス管理（後述のコンテナ索引 / アイテム索引の ON・OFF）をまとめて行えます。番号列は、
+      操作カスタマイズでお気に入り 1〜20 を開く操作を割り当てるときの順番に対応します。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-favorites-3.webp" alt="お気に入りダイアログ。表示名・パスの一覧に「コンテナ索引 (Ctrl+S)」「アイテム索引 (Ctrl+G)」のチェック列、並べ替え・削除ボタン、一括操作、サムネ一括作成がある">
+      <figcaption>お気に入りダイアログ。並び順の変更や、「コンテナ索引（Ctrl+S）」「アイテム索引（Ctrl+G）」の ON/OFF をここで管理します。一括操作でまとめて切り替えることもできます。</figcaption>
+    </figure>
+
+    <h2>お気に入り全体を横断検索する</h2>
+    <p>
+      登録したお気に入りをまたいで、フォルダ・ZIP・PDF や画像・動画・音声を名前やメタ情報で
+      横断検索できます。用途に応じて 2 つのキーを使い分けます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>検索対象</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>フォルダ / ZIP / PDF を <strong>フォルダ名・ファイル名</strong>で（コンテナ検索）</td><td>「あのフォルダ・本、どこに置いたっけ？」を名前で呼び出す</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>画像 / PDF / 動画 / 音声 を <strong>メタ情報（タイトル・AI プロンプト等）</strong>やファイル名で（アイテム検索）</td><td>プロンプトやタイトルから「昔見たあの画像」を掘り出す</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        コンテナ索引・アイテム索引はどちらも既定で <strong>OFF</strong> です。Ctrl+S / Ctrl+G を使うには、
+        お気に入りダイアログで対象のお気に入りごとに索引を ON にしておく必要があります
+        （ON にするとその場で再帰的に走査し、以後は自動で追従します）。
+      </div>
+    </div>
+
+    <h2>大量のファイルに索引を張るときの注意</h2>
+    <p>
+      索引は、mImageViewer が起動している間だけファイルの変更を追い続けます。アプリを完全に終了すると
+      追跡も止まるため、次に起動したときに変更点を確認し直して最新の状態に追いつきます。索引の対象が
+      非常に多い（数万ファイル規模など）と、この起動直後の再スキャンに時間がかかることがあります。
+    </p>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        アプリを頻繁に閉じたり開いたりする使い方で、起動直後のスキャン待ちが気になる場合は、
+        環境設定の「タスクトレイ常駐」で <strong>「アプリを閉じる代わりに、タスクトレイに常駐する」</strong>
+        を ON にしておくのがおすすめです。<kbd>×</kbd> で閉じてもウィンドウが隠れるだけで、
+        バックグラウンドに常駐したままファイルの変更を追い続けます。次に開いたときは索引がそのまま
+        使えるので、再スキャンの待ち時間がなくなります（完全に終了したいときは、タスクトレイの
+        アイコンを右クリックして「終了」を選びます）。
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        お気に入りの登録・編集の詳細は<a href="grid.html#お気に入り">グリッド表示 → お気に入り</a>、
+        検索モードの詳しい使い分けは<a href="search.html">検索機能</a>のリファレンスを参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
