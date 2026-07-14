@@ -383,6 +383,7 @@ mod tests {
         };
         let mut tb = TextBlock {
             text: "本文は保持".to_string(),
+            v_center_ink: true,
             ..TextBlock::default()
         };
         preset.apply_to(&mut tb);
@@ -396,12 +397,44 @@ mod tests {
         assert!(tb.glow.is_some());
         assert!(tb.background.is_some());
         assert!(tb.echo.is_some());
+        assert!(tb.v_center_ink, "上下中央補正は対象側の設定を保持する");
         assert_eq!(
             tb.markup_rules,
             comic_core::markup_rules_angle(),
             "記号セットもプリセットから復元される"
         );
         assert_eq!(tb.preset_link.as_deref(), Some("user:t1"));
+
+        let mut legacy_centering = TextBlock::default();
+        preset.apply_to(&mut legacy_centering);
+        assert!(!legacy_centering.v_center_ink, "従来配置の設定も保持する");
+    }
+
+    #[test]
+    fn shape_preset_apply_preserves_embedded_text_vertical_centering() {
+        let preset = ShapeStylePreset {
+            id: "user:shape1".to_string(),
+            name: "shape".to_string(),
+            shape: BubbleShape::RoundRect {
+                half_w: 120.0,
+                half_h: 80.0,
+                corner_px: 12.0,
+            },
+            tail_kind: None,
+            fill: Some(Rgba::WHITE),
+            fill_opacity: 1.0,
+            outline: StrokeStyle::default(),
+            padding_px: 16.0,
+        };
+        let mut bubble = BubbleObject::default();
+        bubble.text.v_center_ink = true;
+
+        preset.apply_to(&mut bubble, comic_core::Tail::default());
+
+        assert!(
+            bubble.text.v_center_ink,
+            "本体プリセットは embedded text の補正設定に触れない"
+        );
     }
 
     #[test]

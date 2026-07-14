@@ -324,6 +324,10 @@ fn build_annotation_bubble(
         text: TextBlock {
             font_key: font_key.to_string(),
             align: TextAlign::Center,
+            v_center_ink: matches!(
+                preset,
+                AnnotationPreset::Rect | AnnotationPreset::RoundRect | AnnotationPreset::Ellipse
+            ),
             ..TextBlock::default()
         },
         auto_size: false,
@@ -4896,6 +4900,7 @@ impl BubblePreset {
                 color: self.text_color(),
                 align: self.text_align(),
                 orientation: Orientation::Vertical,
+                v_center_ink: true,
                 markup_enabled: true,
                 outline: self.text_outline(),
                 ..TextBlock::default()
@@ -6202,7 +6207,7 @@ fn edit_object_ui(
             // テキストは セリフ のみ (タブ行なし)。スタイルを色帯で。
             draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
                 let snap = t.clone();
-                text_block_ui(ui, t, changed, open_font_picker);
+                text_block_ui(ui, t, changed, open_font_picker, false);
                 // 個別スタイル編集でプリセットリンクを解除 (本文内容の編集では外さない)。
                 if t.preset_link.is_some() && text_style_diverged(&snap, t) {
                     t.preset_link = None;
@@ -6244,7 +6249,7 @@ fn edit_object_ui(
             draw_section_bar(ui, cur.color(), |ui| match cur {
                 TextPropTab::Serifu => {
                     let snap = b.text.clone();
-                    text_block_ui(ui, &mut b.text, changed, open_font_picker);
+                    text_block_ui(ui, &mut b.text, changed, open_font_picker, true);
                     if b.text.preset_link.is_some() && text_style_diverged(&snap, &b.text) {
                         b.text.preset_link = None;
                     }
@@ -6290,7 +6295,7 @@ fn edit_object_ui(
                 TextPropTab::Serifu => {
                     // 本文スタイル編集でウィンドウリンクを解除 (本文内容では外さない)。
                     let snap = w.text.clone();
-                    text_block_ui(ui, &mut w.text, changed, open_font_picker);
+                    text_block_ui(ui, &mut w.text, changed, open_font_picker, false);
                     if w.style_preset_link.is_some() && text_style_diverged(&snap, &w.text) {
                         w.style_preset_link = None;
                     }
@@ -6767,6 +6772,7 @@ fn text_block_ui(
     t: &mut TextBlock,
     changed: &mut bool,
     open_font_picker: &mut bool,
+    show_v_center_ink: bool,
 ) {
     // フォント選択 (現在のフォント名 + 選択ボタン)。ピッカーは別ダイアログで開く。
     ui.horizontal(|ui| {
@@ -6844,6 +6850,14 @@ fn text_block_ui(
             *changed = true;
         }
     });
+    if show_v_center_ink
+        && ui
+            .checkbox(&mut t.v_center_ink, "文字を上下中央に補正")
+            .on_hover_text("文字の見た目に合わせて上下中央に配置します。オフは従来の配置です")
+            .changed()
+    {
+        *changed = true;
+    }
     // 袋文字。
     let mut has_outline = t.outline.is_some();
     if ui.checkbox(&mut has_outline, "袋文字").changed() {
@@ -8508,6 +8522,46 @@ mod tests {
         let mut bubble = BubbleObject::default();
         bubble.text.text = text.to_string();
         AnnotationObject::new_bubble(id, (100.0, 100.0), bubble)
+    }
+
+    #[test]
+    fn new_bubble_presets_enable_visual_vertical_centering() {
+        for &preset in BubblePreset::ALL {
+            let bubble = preset.build_bubble((500.0, 250.0), "test");
+            assert!(
+                bubble.text.v_center_ink,
+                "{} should opt in to ink centering",
+                preset.label()
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_frame_presets_enable_visual_vertical_centering() {
+        for preset in [
+            AnnotationPreset::Rect,
+            AnnotationPreset::RoundRect,
+            AnnotationPreset::Ellipse,
+        ] {
+            let frame = build_annotation_bubble(
+                preset,
+                ANNOTATION_DEFAULT_COLOR,
+                4.0,
+                (1000.0, 500.0),
+                1,
+                "test",
+            );
+            assert!(frame.text.v_center_ink, "{}", preset.label());
+        }
+    }
+
+    #[test]
+    fn text_style_divergence_ignores_visual_vertical_centering() {
+        let legacy = TextBlock::default();
+        let mut ink_centered = legacy.clone();
+        ink_centered.v_center_ink = true;
+
+        assert!(!text_style_diverged(&legacy, &ink_centered));
     }
 
     #[test]

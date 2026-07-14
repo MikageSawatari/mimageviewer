@@ -85,6 +85,7 @@ Inc 8 (仕上げ・回帰) 完了 (2026-06-07): マニュアル (`annotation.htm
   `None` は従来比率と完全に同じ形状とし、旧 JSON との互換性を維持する。
 - 円は `BubbleShape::Ellipse` の `#[serde(default)] circle: bool` で明示し、値から推測しない。
   このフラグは UI 専用で、tessellate / raster の描画結果には影響させない。
+- `TextBlock::v_center_ink` (`#[serde(default)]`) は横書きのグリフ実測範囲を上下中央に合わせ、新規吹き出しは ON、既存データはフラグなし = OFF の互換を保つ。
 - 蛍光マーカー / 下線は `BubbleObject::blend: FillBlend` (`#[serde(default)]`、既定
   `Normal`) でオブジェクト全体の描画モードを保持する。`Multiply` は fill・outline・text を
   分離せず、z 順の連続セグメントとして `bake_annotation_layers` で焼き、表示・本フルベイク・
