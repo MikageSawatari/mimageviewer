@@ -14,7 +14,7 @@ const CORNER_SEGMENTS: usize = 12;
 pub fn tessellate_bubble(shape: &BubbleShape, pivot: (f32, f32)) -> Vec<(f32, f32)> {
     let (cx, cy) = pivot;
     match *shape {
-        BubbleShape::Ellipse { rx, ry } => {
+        BubbleShape::Ellipse { rx, ry, .. } => {
             let mut pts = Vec::with_capacity(ELLIPSE_SEGMENTS);
             for i in 0..ELLIPSE_SEGMENTS {
                 let t = (i as f32) / (ELLIPSE_SEGMENTS as f32) * std::f32::consts::TAU;
@@ -250,9 +250,10 @@ pub fn fit_bubble_shape(
         (hw, hh)
     };
     match *shape {
-        BubbleShape::Ellipse { .. } => BubbleShape::Ellipse {
+        BubbleShape::Ellipse { circle, .. } => BubbleShape::Ellipse {
             rx: hw * SQRT2,
             ry: hh * SQRT2,
+            circle,
         },
         BubbleShape::RoundRect { corner_px, .. } => BubbleShape::RoundRect {
             half_w: hw,
@@ -621,7 +622,7 @@ pub struct BubbleGeometry {
 /// The bubble's half-extents (rx/ry or half_w/half_h), regardless of variant.
 fn shape_half_extents(shape: &BubbleShape) -> (f32, f32) {
     match *shape {
-        BubbleShape::Ellipse { rx, ry } => (rx, ry),
+        BubbleShape::Ellipse { rx, ry, .. } => (rx, ry),
         BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
         BubbleShape::Burst { rx, ry, .. } => (rx, ry),
         BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
@@ -1154,7 +1155,14 @@ mod tests {
 
     #[test]
     fn ellipse_has_points() {
-        let pts = tessellate_bubble(&BubbleShape::Ellipse { rx: 10.0, ry: 5.0 }, (0.0, 0.0));
+        let pts = tessellate_bubble(
+            &BubbleShape::Ellipse {
+                rx: 10.0,
+                ry: 5.0,
+                circle: false,
+            },
+            (0.0, 0.0),
+        );
         assert_eq!(pts.len(), ELLIPSE_SEGMENTS);
     }
 
@@ -1184,10 +1192,20 @@ mod tests {
         // within MAX_ASPECT so the aspect clamp doesn't widen it (exact extents).
         let pad = 10.0;
         let (tw, th) = (200.0, 130.0);
-        let fitted = fit_bubble_shape(&BubbleShape::Ellipse { rx: 1.0, ry: 1.0 }, tw, th, pad);
-        let BubbleShape::Ellipse { rx, ry } = fitted else {
+        let fitted = fit_bubble_shape(
+            &BubbleShape::Ellipse {
+                rx: 1.0,
+                ry: 1.0,
+                circle: true,
+            },
+            tw,
+            th,
+            pad,
+        );
+        let BubbleShape::Ellipse { rx, ry, circle } = fitted else {
             panic!("ellipse stays ellipse");
         };
+        assert!(circle, "circle flag is preserved by fit");
         let hw = tw * 0.5 + pad;
         let hh = th * 0.5 + pad;
         let cover = (hw / rx).powi(2) + (hh / ry).powi(2);
@@ -1250,8 +1268,17 @@ mod tests {
         // stays within MAX_ASPECT (4.5) — a tall, manga-like bubble that still
         // hugs the column, while containing the text.
         let pad = 12.0;
-        let fitted = fit_bubble_shape(&BubbleShape::Ellipse { rx: 1.0, ry: 1.0 }, 40.0, 400.0, pad);
-        let BubbleShape::Ellipse { rx, ry } = fitted else {
+        let fitted = fit_bubble_shape(
+            &BubbleShape::Ellipse {
+                rx: 1.0,
+                ry: 1.0,
+                circle: false,
+            },
+            40.0,
+            400.0,
+            pad,
+        );
+        let BubbleShape::Ellipse { rx, ry, .. } = fitted else {
             panic!("ellipse stays ellipse");
         };
         assert!(ry >= rx, "tall text still taller than wide");
@@ -1273,6 +1300,7 @@ mod tests {
         let shape = BubbleShape::Ellipse {
             rx: 200.0,
             ry: 120.0,
+            circle: false,
         };
         let pivot = (0.0, 0.0);
         let inside = Tail {
@@ -1332,6 +1360,7 @@ mod tests {
         let shape = BubbleShape::Ellipse {
             rx: 40.0,
             ry: 160.0,
+            circle: false,
         };
         let pivot = (0.0, 0.0);
         let bottom = effective_tail_base_width(&shape, pivot, (0.0, 300.0), 200.0);
@@ -1567,7 +1596,8 @@ mod tests {
         // Polygon-bodied shapes (incl. the new 線 / 二重線) merge fine.
         assert!(shape_is_mergeable(&BubbleShape::Ellipse {
             rx: 10.0,
-            ry: 10.0
+            ry: 10.0,
+            circle: false,
         }));
         assert!(shape_is_mergeable(&BubbleShape::Strokes {
             half_w: 10.0,
@@ -1610,7 +1640,8 @@ mod tests {
         }));
         assert!(shape_renders_tail(&BubbleShape::Ellipse {
             rx: 10.0,
-            ry: 10.0
+            ry: 10.0,
+            circle: false,
         }));
         assert!(shape_renders_tail(&BubbleShape::Strokes {
             half_w: 10.0,
@@ -1781,6 +1812,7 @@ mod tests {
         let shape = BubbleShape::Ellipse {
             rx: 100.0,
             ry: 60.0,
+            circle: false,
         };
         let body = tessellate_bubble(&shape, (0.0, 0.0));
         let tail = Tail {
@@ -1812,6 +1844,7 @@ mod tests {
         let shape = BubbleShape::Ellipse {
             rx: 100.0,
             ry: 60.0,
+            circle: false,
         };
         let body = tessellate_bubble(&shape, (0.0, 0.0));
         // Tip below -> base near the bottom crossing (~0.25).
@@ -1844,6 +1877,7 @@ mod tests {
         let shape = BubbleShape::Ellipse {
             rx: 100.0,
             ry: 60.0,
+            circle: false,
         };
         // A point just outside the bottom maps to the bottom crossing (~0.25).
         let t = nearest_base_t(&shape, (0.0, 0.0), (0.0, 90.0));

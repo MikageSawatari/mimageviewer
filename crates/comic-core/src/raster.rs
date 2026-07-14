@@ -971,7 +971,7 @@ fn bubble_decorations(
         return;
     }
     let short_side = match *shape {
-        BubbleShape::Ellipse { rx, ry } => rx.min(ry),
+        BubbleShape::Ellipse { rx, ry, .. } => rx.min(ry),
         BubbleShape::RoundRect { half_w, half_h, .. } => half_w.min(half_h),
         BubbleShape::Burst { rx, ry, .. } => rx.min(ry),
         BubbleShape::Cloud { rx, ry, .. } => rx.min(ry),
@@ -1089,7 +1089,7 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
             // Decoration extents.
             if !bubble.decorations.is_empty() {
                 let short_side = match shape {
-                    BubbleShape::Ellipse { rx, ry } => rx.min(ry),
+                    BubbleShape::Ellipse { rx, ry, .. } => rx.min(ry),
                     BubbleShape::RoundRect { half_w, half_h, .. } => half_w.min(half_h),
                     BubbleShape::Burst { rx, ry, .. } => rx.min(ry),
                     BubbleShape::Cloud { rx, ry, .. } => rx.min(ry),
@@ -2689,7 +2689,11 @@ mod tests {
     fn baked_badge_text_ink_center_y(fonts: &FontSet, text: &str, v_center_ink: bool) -> f32 {
         let pivot = (64.0, 64.0);
         let bubble = BubbleObject {
-            shape: BubbleShape::Ellipse { rx: 20.0, ry: 20.0 },
+            shape: BubbleShape::Ellipse {
+                rx: 20.0,
+                ry: 20.0,
+                circle: false,
+            },
             fill: Some(Rgba::new(220, 0, 0, 255)),
             fill_opacity: 1.0,
             outline: StrokeStyle {
@@ -2807,6 +2811,29 @@ mod tests {
         assert!(ov.pixels.iter().all(|&p| p == 0));
     }
 
+    #[test]
+    fn ellipse_circle_flag_does_not_change_bake_bytes() {
+        let fonts = FontSet::new();
+        let bake = |circle| {
+            let mut bubble = BubbleObject::default();
+            bubble.shape = BubbleShape::Ellipse {
+                rx: 24.0,
+                ry: 24.0,
+                circle,
+            };
+            bubble.text = TextBlock::default();
+            bubble.auto_size = false;
+            bake_overlay(
+                &[AnnotationObject::new_bubble(1, (40.0, 40.0), bubble)],
+                80,
+                80,
+                &fonts,
+            )
+        };
+
+        assert_eq!(bake(false).pixels, bake(true).pixels);
+    }
+
     fn marker_object(
         id: u64,
         z: i32,
@@ -2836,7 +2863,11 @@ mod tests {
     fn annotation_layers_normal_only_match_legacy_bake_byte_for_byte() {
         let fonts = FontSet::new();
         let mut lower = BubbleObject::default();
-        lower.shape = BubbleShape::Ellipse { rx: 14.0, ry: 10.0 };
+        lower.shape = BubbleShape::Ellipse {
+            rx: 14.0,
+            ry: 10.0,
+            circle: false,
+        };
         lower.fill = Some(Rgba::new(20, 80, 160, 180));
         lower.text = TextBlock::default();
         let mut upper = lower.clone();
@@ -3004,7 +3035,11 @@ mod tests {
     fn bubble_fill_writes_pixels() {
         let fonts = FontSet::new();
         let mut b = BubbleObject::default();
-        b.shape = BubbleShape::Ellipse { rx: 20.0, ry: 12.0 };
+        b.shape = BubbleShape::Ellipse {
+            rx: 20.0,
+            ry: 12.0,
+            circle: false,
+        };
         b.fill = Some(Rgba::WHITE);
         b.text = TextBlock::default(); // empty text -> no glyphs
         let obj = AnnotationObject::new_bubble(1, (32.0, 24.0), b);
@@ -3324,7 +3359,11 @@ mod tests {
         // merge erase pass).
         let fonts = FontSet::new();
         let mut lower = BubbleObject::default();
-        lower.shape = BubbleShape::Ellipse { rx: 40.0, ry: 30.0 };
+        lower.shape = BubbleShape::Ellipse {
+            rx: 40.0,
+            ry: 30.0,
+            circle: false,
+        };
         lower.fill = Some(Rgba::WHITE);
         lower.auto_size = false;
         lower.text = TextBlock::default();
@@ -3658,7 +3697,11 @@ mod tests {
         let fonts = FontSet::new();
         let mk = |x: f32, id: u64, z: i32, merge: bool| {
             let mut b = BubbleObject::default();
-            b.shape = BubbleShape::Ellipse { rx: 35.0, ry: 22.0 };
+            b.shape = BubbleShape::Ellipse {
+                rx: 35.0,
+                ry: 22.0,
+                circle: false,
+            };
             b.fill = Some(Rgba::WHITE);
             b.outline = crate::model::StrokeStyle {
                 color: Rgba::BLACK,
@@ -3758,7 +3801,11 @@ mod tests {
         let fonts = FontSet::new();
         let mk = |x: f32, id: u64, z: i32, merge: bool, rot: f32| {
             let mut b = BubbleObject::default();
-            b.shape = BubbleShape::Ellipse { rx: 35.0, ry: 22.0 };
+            b.shape = BubbleShape::Ellipse {
+                rx: 35.0,
+                ry: 22.0,
+                circle: false,
+            };
             b.fill = Some(Rgba::WHITE);
             b.outline = crate::model::StrokeStyle {
                 color: Rgba::BLACK,
@@ -3826,7 +3873,11 @@ mod tests {
         // merge stroke. Far-apart members (no overlap) so each full outline survives;
         // the top one (z=1) merges down → both bake through the merge path.
         for shape in [
-            BubbleShape::Ellipse { rx: 40.0, ry: 26.0 },
+            BubbleShape::Ellipse {
+                rx: 40.0,
+                ry: 26.0,
+                circle: false,
+            },
             BubbleShape::Strokes {
                 half_w: 40.0,
                 half_h: 26.0,
@@ -3858,7 +3909,11 @@ mod tests {
         let fonts = FontSet::new();
         let make = |rot: f32| {
             let mut b = BubbleObject::default();
-            b.shape = BubbleShape::Ellipse { rx: 40.0, ry: 10.0 };
+            b.shape = BubbleShape::Ellipse {
+                rx: 40.0,
+                ry: 10.0,
+                circle: false,
+            };
             b.fill = Some(Rgba::WHITE);
             b.text = TextBlock::default();
             b.auto_size = false;
@@ -3914,7 +3969,11 @@ mod tests {
             (DecoKind::Bubble, 0.0, true),
         ] {
             let mut b = BubbleObject::default();
-            b.shape = BubbleShape::Ellipse { rx: 80.0, ry: 60.0 };
+            b.shape = BubbleShape::Ellipse {
+                rx: 80.0,
+                ry: 60.0,
+                circle: false,
+            };
             b.fill = None; // isolate decoration pixels
             b.outline.width_px = 0.0;
             b.decorations.push(DecorationLayer {

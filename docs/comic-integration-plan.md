@@ -83,6 +83,8 @@ Inc 8 (仕上げ・回帰) 完了 (2026-06-07): マニュアル (`annotation.htm
 - 注釈矢印は `BubbleShape::Arrow` に `#[serde(default)]` の
   `head_len_px: Option<f32>` / `shaft_half_px: Option<f32>` を加えて表現する。
   `None` は従来比率と完全に同じ形状とし、旧 JSON との互換性を維持する。
+- 円は `BubbleShape::Ellipse` の `#[serde(default)] circle: bool` で明示し、値から推測しない。
+  このフラグは UI 専用で、tessellate / raster の描画結果には影響させない。
 - 蛍光マーカー / 下線は `BubbleObject::blend: FillBlend` (`#[serde(default)]`、既定
   `Normal`) でオブジェクト全体の描画モードを保持する。`Multiply` は fill・outline・text を
   分離せず、z 順の連続セグメントとして `bake_annotation_layers` で焼き、表示・本フルベイク・
@@ -95,7 +97,7 @@ Inc 8 (仕上げ・回帰) 完了 (2026-06-07): マニュアル (`annotation.htm
 
 ## 3. 機能の全体像（ラボで完成済み）
 
-吹き出し（16 形状）/ しっぽ / テキスト（縦横・縦中横・袋文字・記法・単体）/ スタンプ（GPU quad）/
+吹き出し（17 形状）/ しっぽ / テキスト（縦横・縦中横・袋文字・記法・単体）/ スタンプ（GPU quad）/
 メッセージウィンドウ / 飾り / プリセット。詳細は §7 のモデル項目ベース表と §12 の設計ドキュメント。
 
 ---

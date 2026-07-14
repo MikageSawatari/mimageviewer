@@ -36,6 +36,14 @@ use crate::settings::{
 };
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
+fn fs_loupe_suppressed_by_edit_mode(
+    analysis_mode: bool,
+    adjustment_mode: bool,
+    text_mode: bool,
+) -> bool {
+    analysis_mode || adjustment_mode || text_mode
+}
+
 #[cfg(windows)]
 fn window_geometry_pos_to_viewport(pos: egui::Pos2, ui_scale: f32) -> egui::Pos2 {
     egui::pos2(
@@ -8010,7 +8018,7 @@ impl App {
                             is_spread_double,
                         );
                         // ── ルーペ (Shift ホールド / M トグル) ──
-                        // 見開き・分析・補正モードでは内部で早期 return する。
+                        // パノラマ・分析・補正・テキスト注釈モードでは内部で早期 return する。
                         // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
                         self.draw_fs_loupe_if_active(
                             ui, ctx, image_rect, fs_idx,
@@ -16646,7 +16654,7 @@ impl App {
     /// 有効条件:
     /// - `fs_loupe_locked` が true (M キーでトグル) か、keymap のルーペ保持修飾キー押下中
     /// - ビューポートにフォーカスがある
-    /// - 分析モード・補正モードに入っていない
+    /// - 分析モード・補正モード・テキスト注釈モードに入っていない
     /// - カーソルが `full_rect` 内
     /// - 画像が回転 0 / 任意回転なし (回転時は UV 逆変換が複雑なため v0.7.0 では非対応)
     /// - 現在 Single (非見開き) 表示で、テクスチャが存在する
@@ -16665,7 +16673,11 @@ impl App {
         if self.is_panorama_mode_active(fs_idx) {
             return;
         }
-        if self.analysis_mode || self.adjustment_mode {
+        if fs_loupe_suppressed_by_edit_mode(
+            self.analysis_mode,
+            self.adjustment_mode,
+            self.text_mode,
+        ) {
             return;
         }
         // 動画は egui 側にテクスチャが無く、ルーペで拡大できるのはポスターサムネ (ライブ再生
@@ -22660,6 +22672,12 @@ mod tests {
     use super::*;
     use crate::grid_item::GridItem;
     use std::path::PathBuf;
+
+    #[test]
+    fn loupe_is_suppressed_in_text_annotation_mode() {
+        assert!(fs_loupe_suppressed_by_edit_mode(false, false, true));
+        assert!(!fs_loupe_suppressed_by_edit_mode(false, false, false));
+    }
 
     #[test]
     fn music_panel_visibility_uses_hover_or_explicit_click_state_by_mode() {

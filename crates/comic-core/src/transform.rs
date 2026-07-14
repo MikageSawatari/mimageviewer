@@ -135,9 +135,10 @@ fn scale_text(t: &TextBlock, s: f32) -> TextBlock {
 
 fn scale_shape(shape: BubbleShape, s: f32) -> BubbleShape {
     match shape {
-        BubbleShape::Ellipse { rx, ry } => BubbleShape::Ellipse {
+        BubbleShape::Ellipse { rx, ry, circle } => BubbleShape::Ellipse {
             rx: rx * s,
             ry: ry * s,
+            circle,
         },
         BubbleShape::RoundRect {
             half_w,
@@ -409,6 +410,7 @@ mod tests {
             shape: BubbleShape::Ellipse {
                 rx: 160.0,
                 ry: 90.0,
+                circle: false,
             },
             fill: Some(Rgba::WHITE),
             fill_opacity: 0.5,
@@ -623,10 +625,11 @@ mod tests {
         let AnnotationKind::Bubble(b) = &b_obj.kind else {
             panic!("expected bubble");
         };
-        let BubbleShape::Ellipse { rx, ry } = b.shape else {
+        let BubbleShape::Ellipse { rx, ry, circle } = b.shape else {
             panic!("expected ellipse");
         };
         assert_eq!((rx, ry), (320.0, 180.0), "shape rx/ry doubled");
+        assert!(!circle, "circle flag preserved");
         assert_eq!(b.fill_opacity, 0.5, "fill_opacity is a ratio (unchanged)");
         assert_eq!(b.outline.width_px, 8.0, "outline width doubled");
         assert_eq!(b.padding_px, 32.0, "padding doubled");
@@ -795,7 +798,11 @@ mod tests {
         // Guards against forgetting a shape variant: every length field of every
         // BubbleShape must double under s=2 while counts/ratios/angles stay.
         let shapes = [
-            BubbleShape::Ellipse { rx: 10.0, ry: 20.0 },
+            BubbleShape::Ellipse {
+                rx: 10.0,
+                ry: 20.0,
+                circle: true,
+            },
             BubbleShape::RoundRect {
                 half_w: 10.0,
                 half_h: 20.0,
@@ -875,7 +882,10 @@ mod tests {
         ];
         for shape in shapes {
             match scale_shape(shape, 2.0) {
-                BubbleShape::Ellipse { rx, ry } => assert_eq!((rx, ry), (20.0, 40.0)),
+                BubbleShape::Ellipse { rx, ry, circle } => {
+                    assert_eq!((rx, ry), (20.0, 40.0));
+                    assert!(circle);
+                }
                 BubbleShape::RoundRect {
                     half_w,
                     half_h,

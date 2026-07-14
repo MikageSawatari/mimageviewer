@@ -320,6 +320,10 @@ pub enum BubbleShape {
     Ellipse {
         rx: f32,
         ry: f32,
+        /// UI 上「円」として扱う (半径 1 本で編集・等比リサイズ)。
+        /// 描画には影響しない。
+        #[serde(default)]
+        circle: bool,
     },
     RoundRect {
         half_w: f32,
@@ -349,21 +353,11 @@ pub enum BubbleShape {
         shape_seed: u32,
     },
     /// Regular polygon (多角形) inscribed in the rx/ry ellipse. `sides` >= 3.
-    Polygon {
-        rx: f32,
-        ry: f32,
-        sides: u32,
-    },
+    Polygon { rx: f32, ry: f32, sides: u32 },
     /// Diamond / rhombus (ダイヤ) through the four axis points.
-    Diamond {
-        half_w: f32,
-        half_h: f32,
-    },
+    Diamond { half_w: f32, half_h: f32 },
     /// Heart (ハート) parametric curve fitted to rx/ry.
-    Heart {
-        rx: f32,
-        ry: f32,
-    },
+    Heart { rx: f32, ry: f32 },
     /// Arrow (矢印): a shaft + head pointing toward `dir_rad` (0 = +x / right,
     /// -PI/2 = up), sized by half_w (length axis) / half_h (cross axis).
     Arrow {
@@ -417,10 +411,7 @@ pub enum BubbleShape {
     /// centered text. `half_w`/`half_h` define the movable & selectable region and
     /// the auto-size box. Lets the user place free text that can later be switched
     /// to any other shape (it rides the bubble pipeline, unlike a Text object).
-    TextOnly {
-        half_w: f32,
-        half_h: f32,
-    },
+    TextOnly { half_w: f32, half_h: f32 },
     /// 意識 (concentration / awareness): a soft, fuzzy-edged ellipse drawn with a
     /// feathered fill rim + a soft outline ring (no hard edge), evoking an inner
     /// monologue / dazed feeling. `shape_seed` jitters the rim wobble.
@@ -472,6 +463,7 @@ impl Default for BubbleShape {
         BubbleShape::Ellipse {
             rx: 160.0,
             ry: 100.0,
+            circle: false,
         }
     }
 }
@@ -1315,6 +1307,30 @@ mod tests {
                 dir_rad: 0.25,
                 head_len_px: None,
                 shaft_half_px: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ellipse_circle_serde_round_trip_and_legacy_default() {
+        let shape = BubbleShape::Ellipse {
+            rx: 48.0,
+            ry: 48.0,
+            circle: true,
+        };
+        let json = serde_json::to_string(&shape).expect("serialize circle ellipse");
+        let decoded: BubbleShape = serde_json::from_str(&json).expect("deserialize circle ellipse");
+        assert_eq!(decoded, shape);
+
+        let legacy_json = r#"{"Ellipse":{"rx":48.0,"ry":48.0}}"#;
+        let legacy: BubbleShape =
+            serde_json::from_str(legacy_json).expect("deserialize legacy ellipse");
+        assert_eq!(
+            legacy,
+            BubbleShape::Ellipse {
+                rx: 48.0,
+                ry: 48.0,
+                circle: false,
             }
         );
     }

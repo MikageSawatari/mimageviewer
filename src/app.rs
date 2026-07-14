@@ -8663,6 +8663,9 @@ pub struct App {
     /// 右詳細パネルのカテゴリタブ選択 (セリフ/本体/しっぽ/枠)。アプリ単位で 1 つ保持し、
     /// 補正レイヤーの section-accent と同じカラー分類を右パネルに与える (Inc 4b)。
     pub(crate) text_prop_tab: crate::ui_text::TextPropTab,
+    /// `text_prop_tab` の既定値を最後に適用した選択 id。選択が変化した瞬間だけ既定タブを
+    /// 選び、同じオブジェクトの編集中はユーザーが選んだタブを上書きしないために使う。
+    pub(crate) text_prop_tab_selection: Option<u64>,
     /// キャンバス上のドラッグ移動の進行状態 (Inc 3c)。`last_img` は直近のポインタ画像
     /// 座標で、毎フレームの差分でオブジェクトを動かす。
     pub(crate) text_drag: Option<TextDrag>,
@@ -10356,6 +10359,7 @@ impl App {
             text_mode: false,
             text_selected: None,
             text_prop_tab: crate::ui_text::TextPropTab::Serifu,
+            text_prop_tab_selection: None,
             text_drag: None,
             text_dirty_at: None,
             text_add_bubble_dialog: false,

@@ -4556,7 +4556,7 @@ impl ComicLab {
         // Per-shape fine-tuning sliders for the active shape. Every individual
         // change feeds `edited` (which clears the link below) as well as `dirty`.
         match &mut b.shape {
-            BubbleShape::Ellipse { rx, ry } => {
+            BubbleShape::Ellipse { rx, ry, .. } => {
                 if !auto {
                     edited |= ui
                         .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
@@ -5317,7 +5317,7 @@ impl ComicLab {
             return None;
         };
         let (hw, hh) = match effective_bubble_shape(b, &self.fonts) {
-            BubbleShape::Ellipse { rx, ry } => (rx, ry),
+            BubbleShape::Ellipse { rx, ry, .. } => (rx, ry),
             BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
             BubbleShape::Burst { rx, ry, .. } => (rx, ry),
             BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
@@ -5938,7 +5938,7 @@ fn inv_rotate_about(p: (f32, f32), pivot: (f32, f32), theta: f32) -> (f32, f32) 
 /// variant + its other params. Used by corner-resize dragging.
 fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
     match &mut b.shape {
-        BubbleShape::Ellipse { rx, ry } => {
+        BubbleShape::Ellipse { rx, ry, .. } => {
             *rx = hw;
             *ry = hh;
         }
@@ -6568,6 +6568,7 @@ impl BubblePreset {
             BubblePreset::Normal | BubblePreset::Whisper => BubbleShape::Ellipse {
                 rx: 160.0,
                 ry: 100.0,
+                circle: false,
             },
             BubblePreset::RoundRect => BubbleShape::RoundRect {
                 half_w: 160.0,
@@ -6640,6 +6641,7 @@ impl BubblePreset {
             BubblePreset::MindEllipse => BubbleShape::Ellipse {
                 rx: 165.0,
                 ry: 110.0,
+                circle: false,
             },
             BubblePreset::Strokes => BubbleShape::Strokes {
                 half_w: 165.0,

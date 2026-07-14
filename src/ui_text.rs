@@ -161,6 +161,7 @@ pub(crate) enum AnnotationStrokePreset {
     Thin,
     Standard,
     Thick,
+    ExtraThick,
 }
 
 impl Default for AnnotationStrokePreset {
@@ -170,13 +171,14 @@ impl Default for AnnotationStrokePreset {
 }
 
 impl AnnotationStrokePreset {
-    const ALL: [Self; 3] = [Self::Thin, Self::Standard, Self::Thick];
+    const ALL: [Self; 4] = [Self::Thin, Self::Standard, Self::Thick, Self::ExtraThick];
 
     fn label(self) -> &'static str {
         match self {
             Self::Thin => "細",
             Self::Standard => "標準",
             Self::Thick => "太",
+            Self::ExtraThick => "極太",
         }
     }
 
@@ -187,6 +189,7 @@ impl AnnotationStrokePreset {
                 Self::Thin => 0.6,
                 Self::Standard => 1.0,
                 Self::Thick => 1.8,
+                Self::ExtraThick => 3.0,
             }
     }
 }
@@ -206,6 +209,7 @@ fn build_annotation_bubble(
             shape: BubbleShape::Ellipse {
                 rx: radius,
                 ry: radius,
+                circle: true,
             },
             fill: Some(color),
             fill_opacity: 1.0,
@@ -262,6 +266,7 @@ fn build_annotation_bubble(
             BubbleShape::Ellipse {
                 rx: frame_half_w,
                 ry: frame_half_h,
+                circle: false,
             },
             None,
             frame_outline,
@@ -380,6 +385,31 @@ impl TextPropTab {
             TextPropTab::Parts => "部品",
             TextPropTab::Deco => "飾り",
         }
+    }
+}
+
+/// 選択変更時だけ右詳細パネルの既定タブを選ぶ。
+///
+/// 本文が空の Bubble は形状編集が主目的なので「本体」、それ以外は従来どおり「セリフ」。
+/// 選択解除時は現在タブを保ちつつ追跡側だけ `None` へ進めるため、ここでは上書きしない。
+fn text_prop_tab_after_selection_change(
+    previous_selection: Option<u64>,
+    selection: Option<u64>,
+    current_tab: TextPropTab,
+    objects: &[AnnotationObject],
+) -> TextPropTab {
+    if selection == previous_selection {
+        return current_tab;
+    }
+    let Some(id) = selection else {
+        return current_tab;
+    };
+    match objects.iter().find(|object| object.id == id) {
+        Some(AnnotationObject {
+            kind: AnnotationKind::Bubble(bubble),
+            ..
+        }) if bubble.text.text.trim().is_empty() => TextPropTab::Body,
+        _ => TextPropTab::Serifu,
     }
 }
 
@@ -833,7 +863,7 @@ fn handle_half_extents(
         AnnotationKind::Bubble(b) => {
             let fonts = fonts?;
             let (hw, hh) = match comic_core::effective_bubble_shape(b, fonts) {
-                BubbleShape::Ellipse { rx, ry } => (rx, ry),
+                BubbleShape::Ellipse { rx, ry, .. } => (rx, ry),
                 BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
                 BubbleShape::Burst { rx, ry, .. } => (rx, ry),
                 BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
@@ -916,7 +946,7 @@ fn tail_handle_points(
 /// 吹き出し形状の半径を設定する (corner-resize 用)。ラボ `set_bubble_half_extents`。
 fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
     match &mut b.shape {
-        BubbleShape::Ellipse { rx, ry }
+        BubbleShape::Ellipse { rx, ry, .. }
         | BubbleShape::Burst { rx, ry, .. }
         | BubbleShape::Cloud { rx, ry, .. }
         | BubbleShape::Polygon { rx, ry, .. }
@@ -967,6 +997,8 @@ fn corner_signs(corner_idx: usize) -> (f32, f32) {
 ///
 /// `symmetric` では開始時 pivot を固定する。反対角アンカーモードでは開始時の反対角を
 /// 固定し、最小寸法のクランプ後に中心を求めるため、クランプ中もアンカーが動かない。
+/// `preserve_aspect` では開始時 half extents に対する一様スケールを使い、両軸の最小寸法を
+/// 満たす最小 scale でクランプする。
 fn corner_resize_from_start(
     start_pivot: (f32, f32),
     hw0: f32,
@@ -975,13 +1007,48 @@ fn corner_resize_from_start(
     corner_idx: usize,
     cursor_img: (f32, f32),
     symmetric: bool,
+    preserve_aspect: bool,
     min_hw: f32,
     min_hh: f32,
 ) -> ((f32, f32), f32, f32) {
+    let base_hw = hw0.max(1e-3);
+    let base_hh = hh0.max(1e-3);
     let (sin, cos) = rotation_rad.sin_cos();
     let relx = cursor_img.0 - start_pivot.0;
     let rely = cursor_img.1 - start_pivot.1;
     let cursor_local = (relx * cos + rely * sin, -relx * sin + rely * cos);
+    let (sx, sy) = corner_signs(corner_idx);
+
+    if preserve_aspect {
+        let (scale_x, scale_y, anchor_local) = if symmetric {
+            (
+                cursor_local.0.abs() / base_hw,
+                cursor_local.1.abs() / base_hh,
+                None,
+            )
+        } else {
+            let anchor = (-sx * base_hw, -sy * base_hh);
+            (
+                (cursor_local.0 - anchor.0).abs() / (2.0 * base_hw),
+                (cursor_local.1 - anchor.1).abs() / (2.0 * base_hh),
+                Some(anchor),
+            )
+        };
+        let min_scale = (min_hw / base_hw).max(min_hh / base_hh);
+        let scale = scale_x.max(scale_y).max(min_scale);
+        let new_hw = base_hw * scale;
+        let new_hh = base_hh * scale;
+
+        let Some(anchor_local) = anchor_local else {
+            return (start_pivot, new_hw, new_hh);
+        };
+        let center_local = (anchor_local.0 + sx * new_hw, anchor_local.1 + sy * new_hh);
+        let new_pivot = (
+            start_pivot.0 + center_local.0 * cos - center_local.1 * sin,
+            start_pivot.1 + center_local.0 * sin + center_local.1 * cos,
+        );
+        return (new_pivot, new_hw, new_hh);
+    }
 
     if symmetric {
         return (
@@ -991,59 +1058,9 @@ fn corner_resize_from_start(
         );
     }
 
-    let (sx, sy) = corner_signs(corner_idx);
-    let anchor_local = (-sx * hw0, -sy * hh0);
+    let anchor_local = (-sx * base_hw, -sy * base_hh);
     let new_hw = ((cursor_local.0 - anchor_local.0).abs() * 0.5).max(min_hw);
     let new_hh = ((cursor_local.1 - anchor_local.1).abs() * 0.5).max(min_hh);
-    let center_local = (anchor_local.0 + sx * new_hw, anchor_local.1 + sy * new_hh);
-    let new_pivot = (
-        start_pivot.0 + center_local.0 * cos - center_local.1 * sin,
-        start_pivot.1 + center_local.0 * sin + center_local.1 * cos,
-    );
-    (new_pivot, new_hw, new_hh)
-}
-
-/// Stamp の開始時アスペクト比を保ったまま、一様スケールで四隅リサイズする。
-fn stamp_corner_resize_from_start(
-    start_pivot: (f32, f32),
-    hw0: f32,
-    hh0: f32,
-    rotation_rad: f32,
-    corner_idx: usize,
-    cursor_img: (f32, f32),
-    symmetric: bool,
-) -> ((f32, f32), f32, f32) {
-    const MIN_HALF_EXTENT: f32 = 8.0;
-    let base_hw = hw0.max(1e-3);
-    let base_hh = hh0.max(1e-3);
-    let (sin, cos) = rotation_rad.sin_cos();
-    let relx = cursor_img.0 - start_pivot.0;
-    let rely = cursor_img.1 - start_pivot.1;
-    let cursor_local = (relx * cos + rely * sin, -relx * sin + rely * cos);
-    let (sx, sy) = corner_signs(corner_idx);
-
-    let (scale_x, scale_y, anchor_local) = if symmetric {
-        (
-            cursor_local.0.abs() / base_hw,
-            cursor_local.1.abs() / base_hh,
-            None,
-        )
-    } else {
-        let anchor = (-sx * base_hw, -sy * base_hh);
-        (
-            (cursor_local.0 - anchor.0).abs() / (2.0 * base_hw),
-            (cursor_local.1 - anchor.1).abs() / (2.0 * base_hh),
-            Some(anchor),
-        )
-    };
-    let min_scale = (MIN_HALF_EXTENT / base_hw).max(MIN_HALF_EXTENT / base_hh);
-    let scale = scale_x.max(scale_y).max(min_scale);
-    let new_hw = base_hw * scale;
-    let new_hh = base_hh * scale;
-
-    let Some(anchor_local) = anchor_local else {
-        return (start_pivot, new_hw, new_hh);
-    };
     let center_local = (anchor_local.0 + sx * new_hw, anchor_local.1 + sy * new_hh);
     let new_pivot = (
         start_pivot.0 + center_local.0 * cos - center_local.1 * sin,
@@ -1097,6 +1114,7 @@ fn apply_text_drag(
     img: (f32, f32),
     fonts: Option<&FontSet>,
     symmetric_corner_resize: bool,
+    preserve_aspect_corner_resize: bool,
 ) -> bool {
     // 借用衝突を避けるため、可変借用の前に不変参照から必要値を読む。
     let rot_center = objs
@@ -1147,6 +1165,9 @@ fn apply_text_drag(
                         let Some((hw0, hh0)) = drag.start_half_extents else {
                             return false;
                         };
+                        let preserve_aspect = preserve_aspect_corner_resize
+                            || b.shape_preset_link.as_deref() == Some("miv:step-badge")
+                            || matches!(b.shape, BubbleShape::Ellipse { circle: true, .. });
                         let (pivot, hw, hh) = corner_resize_from_start(
                             drag.start_pivot,
                             hw0,
@@ -1155,6 +1176,7 @@ fn apply_text_drag(
                             corner_idx,
                             img,
                             symmetric_corner_resize,
+                            preserve_aspect,
                             10.0,
                             10.0,
                         );
@@ -1176,6 +1198,7 @@ fn apply_text_drag(
                             corner_idx,
                             img,
                             symmetric_corner_resize,
+                            preserve_aspect_corner_resize,
                             20.0,
                             12.0,
                         );
@@ -1191,7 +1214,7 @@ fn apply_text_drag(
                         let Some((hw0, hh0)) = drag.start_half_extents else {
                             return false;
                         };
-                        let (pivot, hw, hh) = stamp_corner_resize_from_start(
+                        let (pivot, hw, hh) = corner_resize_from_start(
                             drag.start_pivot,
                             hw0,
                             hh0,
@@ -1199,6 +1222,9 @@ fn apply_text_drag(
                             corner_idx,
                             img,
                             symmetric_corner_resize,
+                            true,
+                            8.0,
+                            8.0,
                         );
                         o.pivot = pivot;
                         s.half_w = hw;
@@ -1544,6 +1570,7 @@ impl App {
 
         self.text_mode = true;
         self.text_selected = None;
+        self.text_prop_tab_selection = None;
         self.text_drag = None;
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
@@ -1587,6 +1614,7 @@ impl App {
 
         self.text_mode = false;
         self.text_selected = None;
+        self.text_prop_tab_selection = None;
         self.text_drag = None;
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
@@ -2027,9 +2055,10 @@ impl App {
                 if drag.armed || (pos - drag.start).length() >= DRAG_ARM_PX {
                     drag.armed = true;
                     let img = view.screen_to_image(pos);
-                    // FS キャンバスでは egui modifiers が stale になり得るため、Ctrl は
+                    // FS キャンバスでは egui modifiers が stale になり得るため、Ctrl / Shift は
                     // ドラッグ中の各フレームで OS から直接読む。
                     let symmetric_corner_resize = modifier_held_via_os(ModKind::Ctrl);
+                    let preserve_aspect_corner_resize = modifier_held_via_os(ModKind::Shift);
                     let changed = self
                         .comic_docs
                         .get_mut(&key)
@@ -2040,6 +2069,7 @@ impl App {
                                 img,
                                 fonts.as_deref(),
                                 symmetric_corner_resize,
+                                preserve_aspect_corner_resize,
                             )
                         })
                         .unwrap_or(false);
@@ -2440,6 +2470,16 @@ impl App {
                         object_list_actions_ui(ui, &mut objects, &mut selected, &mut changed);
                     });
             });
+
+        // 選択変更の既定タブ適用はここに集約する。一覧クリックは左パネル closure 内で
+        // `selected` を更新するため、その完了後かつ右詳細パネル描画前なら同じフレームで反映できる。
+        prop_tab = text_prop_tab_after_selection_change(
+            self.text_prop_tab_selection,
+            selected,
+            prop_tab,
+            &objects,
+        );
+        self.text_prop_tab_selection = selected;
 
         // ── 右パネル: 詳細設定 (選択オブジェクトの編集) ──
         // 選択が窓なら、本文が枠から溢れているかを fonts 込みで判定 (常時表示の本文欄を
@@ -4696,6 +4736,7 @@ impl BubblePreset {
             BubblePreset::Normal | BubblePreset::Whisper => BubbleShape::Ellipse {
                 rx: 160.0,
                 ry: 100.0,
+                circle: false,
             },
             BubblePreset::RoundRect => BubbleShape::RoundRect {
                 half_w: 160.0,
@@ -4768,6 +4809,7 @@ impl BubblePreset {
             BubblePreset::MindEllipse => BubbleShape::Ellipse {
                 rx: 165.0,
                 ry: 110.0,
+                circle: false,
             },
             BubblePreset::Strokes => BubbleShape::Strokes {
                 half_w: 165.0,
@@ -7198,14 +7240,26 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     // 向き・線の間隔・seed) は自動サイズでも調整可能。
     let auto = b.auto_size;
     match &mut b.shape {
-        BubbleShape::Ellipse { rx, ry } => {
+        BubbleShape::Ellipse { rx, ry, circle } => {
             if !auto {
-                *changed |= ui
-                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
-                    .changed();
-                *changed |= ui
-                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
-                    .changed();
+                if *circle {
+                    let mut radius = *rx;
+                    if ui
+                        .add(egui::Slider::new(&mut radius, 20.0..=800.0).text("半径"))
+                        .changed()
+                    {
+                        *rx = radius;
+                        *ry = radius;
+                        *changed = true;
+                    }
+                } else {
+                    *changed |= ui
+                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .changed();
+                    *changed |= ui
+                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .changed();
+                }
             }
         }
         BubbleShape::RoundRect {
@@ -8233,9 +8287,10 @@ fn stamp_ui(
 
 // ── 吹き出し形状の種別 (コンボ用) ────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShapeKind {
     Ellipse,
+    Circle,
     RoundRect,
     Burst,
     Cloud,
@@ -8253,8 +8308,9 @@ enum ShapeKind {
 }
 
 impl ShapeKind {
-    const ALL: [ShapeKind; 15] = [
+    const ALL: [ShapeKind; 16] = [
         ShapeKind::Ellipse,
+        ShapeKind::Circle,
         ShapeKind::RoundRect,
         ShapeKind::Burst,
         ShapeKind::Cloud,
@@ -8274,6 +8330,7 @@ impl ShapeKind {
     fn label(self) -> &'static str {
         match self {
             ShapeKind::Ellipse => "楕円",
+            ShapeKind::Circle => "円",
             ShapeKind::RoundRect => "角丸四角",
             ShapeKind::Burst => "爆発",
             ShapeKind::Cloud => "雲(思考)",
@@ -8293,7 +8350,8 @@ impl ShapeKind {
 
     fn from_shape(s: &BubbleShape) -> ShapeKind {
         match s {
-            BubbleShape::Ellipse { .. } => ShapeKind::Ellipse,
+            BubbleShape::Ellipse { circle: true, .. } => ShapeKind::Circle,
+            BubbleShape::Ellipse { circle: false, .. } => ShapeKind::Ellipse,
             BubbleShape::RoundRect { .. } => ShapeKind::RoundRect,
             BubbleShape::Burst { .. } => ShapeKind::Burst,
             BubbleShape::Cloud { .. } => ShapeKind::Cloud,
@@ -8314,7 +8372,16 @@ impl ShapeKind {
     /// half 範囲 `(hw, hh)` を保ったまま当該形状を構築する (パラメータは既定値)。
     fn to_shape(self, hw: f32, hh: f32) -> BubbleShape {
         match self {
-            ShapeKind::Ellipse => BubbleShape::Ellipse { rx: hw, ry: hh },
+            ShapeKind::Ellipse => BubbleShape::Ellipse {
+                rx: hw,
+                ry: hh,
+                circle: false,
+            },
+            ShapeKind::Circle => BubbleShape::Ellipse {
+                rx: hw,
+                ry: hw,
+                circle: true,
+            },
             ShapeKind::RoundRect => BubbleShape::RoundRect {
                 half_w: hw,
                 half_h: hh,
@@ -8398,7 +8465,7 @@ impl ShapeKind {
 /// 形状の half 範囲 (comic-core 内部の `shape_half_extents` と同値)。
 fn shape_half(shape: &BubbleShape) -> (f32, f32) {
     match *shape {
-        BubbleShape::Ellipse { rx, ry } => (rx, ry),
+        BubbleShape::Ellipse { rx, ry, .. } => (rx, ry),
         BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
         BubbleShape::Burst { rx, ry, .. } => (rx, ry),
         BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
@@ -8437,6 +8504,12 @@ mod tests {
         AnnotationObject::new_bubble(id, (100.0, 100.0), bubble)
     }
 
+    fn bubble_object_with_text(id: u64, text: &str) -> AnnotationObject {
+        let mut bubble = BubbleObject::default();
+        bubble.text.text = text.to_string();
+        AnnotationObject::new_bubble(id, (100.0, 100.0), bubble)
+    }
+
     #[test]
     fn step_badge_number_uses_max_valid_integer_plus_one() {
         let objects = vec![
@@ -8455,12 +8528,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_bubble_selection_defaults_to_body_tab() {
+        let objects = vec![bubble_object_with_text(1, " \n")];
+        assert_eq!(
+            text_prop_tab_after_selection_change(None, Some(1), TextPropTab::Serifu, &objects,),
+            TextPropTab::Body
+        );
+    }
+
+    #[test]
+    fn nonempty_bubble_selection_defaults_to_serifu_tab() {
+        let objects = vec![bubble_object_with_text(1, "本文")];
+        assert_eq!(
+            text_prop_tab_after_selection_change(None, Some(1), TextPropTab::Body, &objects),
+            TextPropTab::Serifu
+        );
+    }
+
+    #[test]
+    fn unchanged_selection_preserves_user_selected_tab() {
+        let objects = vec![bubble_object_with_text(1, "")];
+        assert_eq!(
+            text_prop_tab_after_selection_change(Some(1), Some(1), TextPropTab::Serifu, &objects,),
+            TextPropTab::Serifu
+        );
+    }
+
+    #[test]
     fn annotation_stroke_width_tracks_image_long_edge() {
         assert_eq!(AnnotationStrokePreset::Standard.width_px(800.0), 3.0);
         assert!((AnnotationStrokePreset::Standard.width_px(1920.0) - 4.8).abs() < 1e-5);
         assert_eq!(AnnotationStrokePreset::Standard.width_px(10_000.0), 12.0);
         assert!((AnnotationStrokePreset::Thin.width_px(1920.0) - 4.8 * 0.6).abs() < 1e-5);
         assert!((AnnotationStrokePreset::Thick.width_px(1920.0) - 4.8 * 1.8).abs() < 1e-5);
+        assert!((AnnotationStrokePreset::ExtraThick.width_px(1920.0) - 4.8 * 3.0).abs() < 1e-5);
     }
 
     #[test]
@@ -8561,6 +8662,39 @@ mod tests {
     }
 
     #[test]
+    fn shape_kind_ellipse_circle_mapping_uses_only_explicit_flag() {
+        let equal_ellipse = BubbleShape::Ellipse {
+            rx: 40.0,
+            ry: 40.0,
+            circle: false,
+        };
+        let flagged_circle = BubbleShape::Ellipse {
+            rx: 40.0,
+            ry: 20.0,
+            circle: true,
+        };
+
+        assert_eq!(ShapeKind::from_shape(&equal_ellipse), ShapeKind::Ellipse);
+        assert_eq!(ShapeKind::from_shape(&flagged_circle), ShapeKind::Circle);
+        assert_eq!(
+            ShapeKind::Circle.to_shape(40.0, 20.0),
+            BubbleShape::Ellipse {
+                rx: 40.0,
+                ry: 40.0,
+                circle: true,
+            }
+        );
+        assert_eq!(
+            ShapeKind::Ellipse.to_shape(40.0, 20.0),
+            BubbleShape::Ellipse {
+                rx: 40.0,
+                ry: 20.0,
+                circle: false,
+            }
+        );
+    }
+
+    #[test]
     fn annotation_presets_build_stage_one_models() {
         let round = build_annotation_bubble(
             AnnotationPreset::RoundRect,
@@ -8596,7 +8730,14 @@ mod tests {
             12,
             "test",
         );
-        assert_eq!(badge.shape, BubbleShape::Ellipse { rx: 20.0, ry: 20.0 });
+        assert_eq!(
+            badge.shape,
+            BubbleShape::Ellipse {
+                rx: 20.0,
+                ry: 20.0,
+                circle: true,
+            }
+        );
         assert_eq!(badge.fill, Some(ANNOTATION_DEFAULT_COLOR));
         assert_eq!(badge.fill_opacity, 1.0);
         assert_eq!(badge.outline.color, Rgba::WHITE);
@@ -9192,6 +9333,7 @@ mod tests {
             corner_idx,
             cursor,
             false,
+            false,
             10.0,
             10.0,
         );
@@ -9217,6 +9359,7 @@ mod tests {
             corner_idx,
             cursor,
             false,
+            false,
             10.0,
             10.0,
         );
@@ -9241,6 +9384,7 @@ mod tests {
             1,
             cursor,
             true,
+            false,
             10.0,
             10.0,
         );
@@ -9254,12 +9398,42 @@ mod tests {
     fn corner_resize_ctrl_toggle_recomputes_without_drift() {
         let start_pivot = (100.0, 80.0);
         let cursor = (180.0, 135.0);
-        let anchored_before =
-            corner_resize_from_start(start_pivot, 40.0, 20.0, 0.0, 2, cursor, false, 10.0, 10.0);
-        let symmetric =
-            corner_resize_from_start(start_pivot, 40.0, 20.0, 0.0, 2, cursor, true, 10.0, 10.0);
-        let anchored_after =
-            corner_resize_from_start(start_pivot, 40.0, 20.0, 0.0, 2, cursor, false, 10.0, 10.0);
+        let anchored_before = corner_resize_from_start(
+            start_pivot,
+            40.0,
+            20.0,
+            0.0,
+            2,
+            cursor,
+            false,
+            false,
+            10.0,
+            10.0,
+        );
+        let symmetric = corner_resize_from_start(
+            start_pivot,
+            40.0,
+            20.0,
+            0.0,
+            2,
+            cursor,
+            true,
+            false,
+            10.0,
+            10.0,
+        );
+        let anchored_after = corner_resize_from_start(
+            start_pivot,
+            40.0,
+            20.0,
+            0.0,
+            2,
+            cursor,
+            false,
+            false,
+            10.0,
+            10.0,
+        );
 
         assert_ne!(anchored_before, symmetric);
         assert_eq!(anchored_after, anchored_before);
@@ -9280,12 +9454,138 @@ mod tests {
             corner_idx,
             anchor,
             false,
+            false,
             20.0,
             12.0,
         );
 
         assert_eq!((hw, hh), (20.0, 12.0));
         assert_point_close(corner_image_point(pivot, hw, hh, 0.0, 0), anchor);
+    }
+
+    #[test]
+    fn corner_resize_aspect_keeps_ratio_and_opposite_anchor() {
+        let rotation_rad = 30.0_f32.to_radians();
+        let start_pivot = (100.0, 80.0);
+        let (hw0, hh0) = (40.0, 20.0);
+        let corner_idx = 2;
+        let opposite_idx = 0;
+        let anchor = corner_image_point(start_pivot, hw0, hh0, rotation_rad, opposite_idx);
+        let cursor = local_to_image(start_pivot, (80.0, 25.0), rotation_rad);
+
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            rotation_rad,
+            corner_idx,
+            cursor,
+            false,
+            true,
+            10.0,
+            10.0,
+        );
+
+        assert!((hw / hh - hw0 / hh0).abs() < 1e-4);
+        assert_point_close(
+            corner_image_point(pivot, hw, hh, rotation_rad, opposite_idx),
+            anchor,
+        );
+    }
+
+    #[test]
+    fn corner_resize_symmetric_aspect_keeps_ratio_and_pivot() {
+        let rotation_rad = 30.0_f32.to_radians();
+        let start_pivot = (120.0, 90.0);
+        let (hw0, hh0) = (40.0, 20.0);
+        let cursor = local_to_image(start_pivot, (55.0, -40.0), rotation_rad);
+
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            rotation_rad,
+            1,
+            cursor,
+            true,
+            true,
+            10.0,
+            10.0,
+        );
+
+        assert_eq!(pivot, start_pivot);
+        assert!((hw / hh - hw0 / hh0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn corner_resize_aspect_clamp_preserves_ratio() {
+        let start_pivot = (100.0, 80.0);
+        let (hw0, hh0) = (40.0, 20.0);
+        let corner_idx = 2;
+        let opposite_idx = 0;
+        let anchor = corner_image_point(start_pivot, hw0, hh0, 0.0, opposite_idx);
+
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            0.0,
+            corner_idx,
+            anchor,
+            false,
+            true,
+            30.0,
+            18.0,
+        );
+
+        assert_eq!((hw, hh), (36.0, 18.0));
+        assert!((hw / hh - hw0 / hh0).abs() < 1e-4);
+        assert_point_close(corner_image_point(pivot, hw, hh, 0.0, opposite_idx), anchor);
+    }
+
+    #[test]
+    fn corner_resize_shift_toggle_recomputes_without_drift() {
+        let start_pivot = (100.0, 80.0);
+        let cursor = (180.0, 105.0);
+        let free_before = corner_resize_from_start(
+            start_pivot,
+            40.0,
+            20.0,
+            0.0,
+            2,
+            cursor,
+            false,
+            false,
+            10.0,
+            10.0,
+        );
+        let proportional = corner_resize_from_start(
+            start_pivot,
+            40.0,
+            20.0,
+            0.0,
+            2,
+            cursor,
+            false,
+            true,
+            10.0,
+            10.0,
+        );
+        let free_after = corner_resize_from_start(
+            start_pivot,
+            40.0,
+            20.0,
+            0.0,
+            2,
+            cursor,
+            false,
+            false,
+            10.0,
+            10.0,
+        );
+
+        assert_ne!(free_before, proportional);
+        assert_eq!(free_after, free_before);
     }
 
     #[test]
@@ -9297,15 +9597,117 @@ mod tests {
         let anchor = corner_image_point(start_pivot, hw0, hh0, 0.0, opposite_idx);
         let cursor = local_to_image(start_pivot, (80.0, -40.0), 0.0);
 
-        let (pivot, hw, hh) =
-            stamp_corner_resize_from_start(start_pivot, hw0, hh0, 0.0, corner_idx, cursor, false);
-        let (symmetric_pivot, symmetric_hw, symmetric_hh) =
-            stamp_corner_resize_from_start(start_pivot, hw0, hh0, 0.0, corner_idx, cursor, true);
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            0.0,
+            corner_idx,
+            cursor,
+            false,
+            true,
+            8.0,
+            8.0,
+        );
+        let (symmetric_pivot, symmetric_hw, symmetric_hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            0.0,
+            corner_idx,
+            cursor,
+            true,
+            true,
+            8.0,
+            8.0,
+        );
 
         assert!((hw / hh - hw0 / hh0).abs() < 1e-4);
         assert_point_close(corner_image_point(pivot, hw, hh, 0.0, opposite_idx), anchor);
         assert_eq!(symmetric_pivot, start_pivot);
         assert!((symmetric_hw / symmetric_hh - hw0 / hh0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn step_badge_corner_drag_preserves_aspect_without_shift() {
+        let mut badge = badge_object(1, "7", true);
+        if let AnnotationKind::Bubble(bubble) = &mut badge.kind {
+            bubble.shape = BubbleShape::Ellipse {
+                rx: 40.0,
+                ry: 20.0,
+                circle: false,
+            };
+        }
+        let mut objects = vec![badge];
+        let drag = TextDrag {
+            id: 1,
+            kind: TextDragKind::Corner(2),
+            start: egui::pos2(0.0, 0.0),
+            start_pivot: (100.0, 100.0),
+            start_half_extents: Some((40.0, 20.0)),
+            start_rotation_rad: 0.0,
+            last_img: (0.0, 0.0),
+            armed: true,
+            moved: false,
+        };
+
+        assert!(apply_text_drag(
+            &mut objects,
+            &drag,
+            (180.0, 105.0),
+            None,
+            false,
+            false,
+        ));
+
+        let AnnotationKind::Bubble(bubble) = &objects[0].kind else {
+            panic!("not a bubble");
+        };
+        let (hw, hh) = shape_half(&bubble.shape);
+        assert!((hw / hh - 2.0).abs() < 1e-4);
+        assert_eq!(bubble.shape_preset_link.as_deref(), Some("miv:step-badge"));
+    }
+
+    #[test]
+    fn circle_bubble_corner_drag_preserves_equal_radii_without_shift() {
+        let mut bubble = BubbleObject::default();
+        bubble.shape = BubbleShape::Ellipse {
+            rx: 40.0,
+            ry: 40.0,
+            circle: true,
+        };
+        bubble.shape_preset_link = None;
+        let mut objects = vec![AnnotationObject::new_bubble(1, (100.0, 100.0), bubble)];
+        let drag = TextDrag {
+            id: 1,
+            kind: TextDragKind::Corner(2),
+            start: egui::pos2(0.0, 0.0),
+            start_pivot: (100.0, 100.0),
+            start_half_extents: Some((40.0, 40.0)),
+            start_rotation_rad: 0.0,
+            last_img: (0.0, 0.0),
+            armed: true,
+            moved: false,
+        };
+
+        assert!(apply_text_drag(
+            &mut objects,
+            &drag,
+            (180.0, 105.0),
+            None,
+            false,
+            false,
+        ));
+
+        let AnnotationKind::Bubble(bubble) = &objects[0].kind else {
+            panic!("not a bubble");
+        };
+        let BubbleShape::Ellipse { rx, ry, circle } = bubble.shape else {
+            panic!("not an ellipse");
+        };
+        assert!(circle);
+        assert_eq!(rx, ry);
+        assert_eq!(bubble.shape_preset_link, None);
     }
 
     #[test]
@@ -9330,10 +9732,11 @@ mod tests {
             (200.0, 100.0),
             None,
             false,
+            false,
         ));
         assert!((objs[0].rotation_rad - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
         // 中心の真上 (画面 y は下向き) → atan2(-1,0) + π/2 = 0。
-        apply_text_drag(&mut objs, &drag, (100.0, 50.0), None, false);
+        apply_text_drag(&mut objs, &drag, (100.0, 50.0), None, false, false);
         assert!(objs[0].rotation_rad.abs() < 1e-4);
     }
 
@@ -9358,6 +9761,7 @@ mod tests {
             (180.0, 100.0),
             None,
             true,
+            false,
         ));
         if let AnnotationKind::Stamp(s) = &objs[0].kind {
             assert!((s.half_w - 80.0).abs() < 1e-3, "half_w={}", s.half_w);
