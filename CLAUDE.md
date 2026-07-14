@@ -1835,8 +1835,14 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
 一方の `git reset` が他方の commit を HEAD から落とした (2 回発生)。ファイル編集自体は
 衝突していなくても、index・HEAD の取り合いで起きる。
 
-**推奨 = セッションごとに `git worktree` を分ける**。index・HEAD が独立し、取り合いが
-原理的に起きなくなる:
+**運用実態 (2026-07 追記)**: 実際には ClaudeCode / Codex の複数セッションで **互いに独立した
+領域** を並行開発するのが常態化している。大きな変更や編集ファイルが重なる作業では worktree を
+分けるが、**多くは独立した部分の修正なので、確認作業のしやすさを優先して単一の master 作業
+ツリー上で並行**させている。worktree は「やむを得ず」ではなく状況次第で選ぶ選択肢であり、
+master 共有で進めるときは下記「1 つの作業ツリーを共有する場合の規律」を **通常運用として** 守る。
+
+**推奨 = 編集が重なる / 大規模なときは `git worktree` を分ける**。index・HEAD が独立し、
+取り合いが原理的に起きなくなる:
 
 - ラボ用 worktree は **vendor/ 不要**。`cargo {check,test} -p comic_lab -p comic-core`
   は本体パッケージ (`mimageviewer`) をビルドしないので **root の build.rs が走らず**、
@@ -1869,6 +1875,15 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
   いたら相手の操作に巻き込まれている → `git reflog` か退避ブランチから復旧する。
 - **大きめの作業は退避ブランチを作っておく**: `git branch -f <name> HEAD`。相手の reset で
   master が巻き戻っても `git reset --hard <name>` で復旧できる (2026-06 はこれで救済した)。
+- **`git diff` / `git status` に出る変更を、自分 (や自分の subagent = Codex) の変更と決めつけない**。
+  共有ツリーでは **別セッションの concurrent 編集が混ざって見える**。想定外の変更を「subagent が
+  スコープ逸脱した」と誤認して `git checkout HEAD -- <path>` / `git restore` で消すと、**別セッションの
+  未コミット作業を破壊する (未コミットなので git で復元不能)**。2026-07 実害: 別セッションの MS Store
+  作業 (index.html の 35 行) を「Codex の逸脱」と誤認して `git checkout HEAD` で破棄した (Codex の
+  「触っていない」報告は実は正確だった)。**対処**: 想定外ファイルは **working tree から消さず、
+  自分の pathspec commit から外すだけ** にする。subagent の変更範囲は subagent 自身の report と
+  突き合わせる (diff に出た ≠ 自分の subagent の変更)。判断が付かなければユーザーに「これは別
+  セッションの作業か」を確認してから触る。
 
 ### worktree + Windows junction の地雷 ⚠️
 
