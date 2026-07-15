@@ -12,6 +12,7 @@ members = [
     "tools/comic_lab",
     "tools/music_lab",
 ]
+exclude = ["crates/unrar-patched"]
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + launcher = `mimageviewer.exe`) の
 # バージョンは workspace 経由で 1 箇所で管理する。launcher は `%APPDATA%/mimageviewer/
@@ -157,7 +158,10 @@ webp = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.20"
 delharc = "0.6"
-unrar = "0.5.8"
+# `unrar 0.5.8` の UCM_CHANGEVOLUMEW callback は P1 を固定長 2048 文字で読み、
+# 分割 RAR の短い通知文字列で allocation 境界を越える。ローカルパッチの説明は
+# crates/unrar-patched/PATCHES.md を参照。
+unrar = { path = "crates/unrar-patched", version = "0.5.8" }
 # アーカイブ変換の入れ子展開で、内側アーカイブを一時ファイル化するのに使用
 # (unrar / sevenz / delharc はファイルパス前提のため)。dev-dependencies にも別掲あり。
 tempfile = "3"

@@ -415,4 +415,32 @@ mod tests {
         assert_eq!(second_entries, first_entries);
         assert!(!from_first.entries.is_empty());
     }
+
+    #[test]
+    fn real_split_volume_can_be_read_concurrently_from_both_visible_parts() {
+        use std::sync::{Arc, Barrier};
+
+        let root = multipart_filename_fixture_root().join("real-split-control");
+        let first = root.join("real-split-control.part1.rar");
+        let second = root.join("real-split-control.part2.rar");
+        let expected = read_first_image_bytes(&first).expect("fixture must contain an image");
+        for _ in 0..8 {
+            let paths = [first.clone(), first.clone(), second.clone(), second.clone()];
+            let barrier = Arc::new(Barrier::new(paths.len()));
+            let handles: Vec<_> = paths
+                .into_iter()
+                .map(|path| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        read_first_image_bytes(&path)
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Some(expected.clone()));
+            }
+        }
+    }
 }
