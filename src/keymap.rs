@@ -8468,6 +8468,14 @@ mod tests {
 
     #[test]
     fn rating_actions_are_exact_and_customizable() {
+        // consume_action consults the process-global Win32 key frame on Windows;
+        // serialize against the native-frame tests and clear the frame so a
+        // concurrent test cannot divert our egui-only key events to the KeySlot
+        // path. Same idiom as the native_video_shortcut_test_guard tests above.
+        #[cfg(windows)]
+        let _serial = native_video_shortcut_test_guard();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
 
