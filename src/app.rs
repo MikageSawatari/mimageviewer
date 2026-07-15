@@ -1391,7 +1391,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    #[cfg(windows)]
     pub(crate) fn refresh_parked_detached_window_hwnd_liveness(&mut self) {
         let ids = self
             .detached_image_windows
