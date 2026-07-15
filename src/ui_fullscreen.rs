@@ -44,7 +44,6 @@ fn fs_loupe_suppressed_by_edit_mode(
     analysis_mode || adjustment_mode || text_mode
 }
 
-#[cfg(windows)]
 fn window_geometry_pos_to_viewport(pos: egui::Pos2, ui_scale: f32) -> egui::Pos2 {
     egui::pos2(
         crate::settings::window_geometry_to_viewport_points(pos.x, ui_scale),
@@ -52,7 +51,6 @@ fn window_geometry_pos_to_viewport(pos: egui::Pos2, ui_scale: f32) -> egui::Pos2
     )
 }
 
-#[cfg(windows)]
 fn window_geometry_size_to_viewport(size: egui::Vec2, ui_scale: f32) -> egui::Vec2 {
     egui::vec2(
         crate::settings::window_geometry_to_viewport_points(size.x, ui_scale),

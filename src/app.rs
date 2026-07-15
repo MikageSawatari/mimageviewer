@@ -9563,6 +9563,7 @@ impl App {
             detached_viewer_main_history_suppression_depth: 0,
             #[cfg(windows)]
             detached_image_window_close_pending: Vec::new(),
+            #[cfg(windows)]
             parked_live_media_close_after_poll: Vec::new(),
             #[cfg(windows)]
             next_detached_image_window_id: 1,
@@ -21015,6 +21016,7 @@ impl App {
         self.settings
             .video_resume_positions
             .retain(|key, _| !matches_key(key));
+        #[cfg(windows)]
         self.video_resume_thumb_last_request
             .retain(|key, _| !matches_key(key));
     }
@@ -21509,6 +21511,7 @@ impl App {
             return;
         }
         migrate_key_map_for_rename(&mut self.settings.video_resume_positions, &old_k, &new_k);
+        #[cfg(windows)]
         migrate_key_map_for_rename(&mut self.video_resume_thumb_last_request, &old_k, &new_k);
     }
 
