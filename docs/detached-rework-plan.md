@@ -216,6 +216,23 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 - **連動 park 画像窓の復帰フォールバック**: 連動セッション由来の parked still (descriptor=none) は main の一覧変更で stamp_not_resolved になり復帰不能だった。`ViewerContextDescriptor::Image` を parked snapshot 専用フォールバックとして追加 (open ルーティングは不変)。activation は stamp 優先・解決不能時のみ親フォルダを窓内コンテキストとして開き直す。
 - **stage-media-window (旧バックログ §1.7) 前倒し実装**: フル機能モードのサブオプション「動画・音声は別ウィンドウで再生」(`Settings::fullfeature_media_window` + 派生述語 `effective_media_in_media_window()`)。メディア窓インフラはモード非依存のまま、入口 (`requested_viewer_presentation_for_open` / F12 / カーソル同期 skip / grid open 前の unbundled live-park) だけ実効述語化。
 
+### 9.1 DetachedWindowManager 構造分離 (2026-07-15)
+
+`App` が直接所有していた window_id ごとの runtime map、activation watcher、HWND 生存判定用の
+テスト状態を `src/app/detached_window_manager.rs` の `DetachedWindowManager` へ移した。
+`DetachedWindowRuntime` と watcher の型・worker 実装も同モジュールへ移し、`App` は設定への
+placement 永続化、メディア presenter、ログなど複数領域をまたぐオーケストレーションだけを担う。
+
+- runtime の生成、state / linked / placement / trim bbox / builder latch / HWND / deferred activation
+  の変更は Manager の意味付き API を経由する。runtime map への直接変更は残さない。
+- gamepad の固定入力は Manager が保持する最後の入力面を fallback に使う。通常は OS 前面 HWND
+  を優先し、メイン HWND ならグリッド、それ以外の自プロセス HWND なら viewer を対象にする。
+- マウス割り当てボタンは grid / viewer の呼び出し元が面を明示し、同じ context resolver へ渡す。
+- gamepad picker overlay と中ボタン短クリック状態も発火面を所有する。別 viewport の描画・
+  空入力 pass が、所有面の picker を二重描画したり短クリック開始状態を消したりしない。
+- `ViewerContextBundle` の swap 廃止、`ViewerSession` / `MediaWindowSession` 導入、native presenter
+  再設計はこの段階の対象外。Manager 抽出後も既存の表示・park / resume 意味論は維持する。
+
 ## 10. ゲート C 後の候補ステージ (別機能、リワーク出荷スコープ外)
 
 - **音声ファイルの detached 対応** (stage-audio): Phase S 検収合格後、Phase I で実装。

@@ -6581,12 +6581,20 @@ impl App {
             // keystroke として届くケース (mouse driver や AutoHotkey が変換する経路)、または
             // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。マウス戻る/進む設定を通す。
             0xA6 => {
-                self.mouse_ring_nav =
-                    self.apply_mouse_back_forward_button(ctx, false, "native-video-key");
+                self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+                    ctx,
+                    false,
+                    crate::app::ActionSurface::Viewer,
+                    "native-video-key",
+                );
             }
             0xA7 => {
-                self.mouse_ring_nav =
-                    self.apply_mouse_back_forward_button(ctx, true, "native-video-key");
+                self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+                    ctx,
+                    true,
+                    crate::app::ActionSurface::Viewer,
+                    "native-video-key",
+                );
             }
             _ if self
                 .keymap
@@ -8616,14 +8624,22 @@ impl App {
             match event.button {
                 NativeVideoMouseButton::Extra1 => {
                     self.native_video_pointer_down = None;
-                    self.mouse_ring_nav =
-                        self.apply_mouse_back_forward_button(ctx, false, "native-video-mouse");
+                    self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+                        ctx,
+                        false,
+                        crate::app::ActionSurface::Viewer,
+                        "native-video-mouse",
+                    );
                     return;
                 }
                 NativeVideoMouseButton::Extra2 => {
                     self.native_video_pointer_down = None;
-                    self.mouse_ring_nav =
-                        self.apply_mouse_back_forward_button(ctx, true, "native-video-mouse");
+                    self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+                        ctx,
+                        true,
+                        crate::app::ActionSurface::Viewer,
+                        "native-video-mouse",
+                    );
                     return;
                 }
                 _ => {}
@@ -8660,6 +8676,7 @@ impl App {
                 self.mouse_ring_nav = self.apply_mouse_button(
                     ctx,
                     crate::ring_shortcut::MouseButtonSlot::Middle,
+                    crate::app::ActionSurface::Viewer,
                     "native-video-middle-mouse",
                 );
                 ctx.request_repaint();

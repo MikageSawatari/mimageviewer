@@ -30,6 +30,8 @@ fn folder_media_sort_order(
 
 mod cache_ops;
 mod color_filter;
+#[cfg(windows)]
+mod detached_window_manager;
 mod folder_scan;
 mod gamepad_input;
 mod grid_paint;
@@ -47,6 +49,15 @@ pub(crate) use startup_ops::{
     startup_file_should_open_fullscreen, startup_openable_should_auto_fullscreen,
 };
 
+#[cfg(windows)]
+pub(crate) use detached_window_manager::{
+    DetachedActivationClickCandidate, DetachedActivationClickIntent,
+    DetachedActivationCloseHitTest, DetachedActivationRequest, DetachedActivationWatchDiagnostic,
+    DetachedActivationWatchSample, DetachedActivationWatchState, DetachedActivationWatchStepResult,
+    DetachedActivationWatchTarget, DetachedActivationWatchTargetRect, DetachedCloseRequest,
+    DetachedWindowHwndDiff, DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState,
+    MainFontAtlasResyncFrameSafety,
+};
 use folder_scan::is_miv_upscaled_derivative;
 #[cfg(test)]
 pub(crate) use folder_scan::scan_directory;
@@ -408,462 +419,12 @@ impl DetachedImageWindowSnapshot {
 }
 
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DetachedWindowHwndDiff {
-    Created(u64),
-    NoChange,
-    Ambiguous(Vec<u64>),
-}
-
-#[cfg(windows)]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetachedWindowState {
-    Opening,
-    Active,
-    Parked,
-    ParkedLive,
-    Resuming,
-    Closing,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MainFontAtlasResyncFrameSafety {
-    pub(crate) placement_pending: bool,
-    pub(crate) cloak_or_backdrop_active: bool,
-    pub(crate) opening_count: usize,
-    pub(crate) closing_count: usize,
-}
-
-#[cfg(windows)]
-impl MainFontAtlasResyncFrameSafety {
-    pub(crate) fn is_settled(self) -> bool {
-        !self.placement_pending
-            && !self.cloak_or_backdrop_active
-            && self.opening_count == 0
-            && self.closing_count == 0
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetachedActivationCloseHitTest {
-    ImageBar,
-    MusicChrome,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchTarget {
-    pub(crate) window_id: u64,
-    pub(crate) hwnd: u64,
-    pub(crate) eligible: bool,
-    pub(crate) close_hit_test: DetachedActivationCloseHitTest,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchTargetRect {
-    pub(crate) window_id: u64,
-    pub(crate) hwnd: u64,
-    pub(crate) eligible: bool,
-    pub(crate) close_hit_test: DetachedActivationCloseHitTest,
-    pub(crate) left: i32,
-    pub(crate) top: i32,
-    pub(crate) right: i32,
-    pub(crate) bottom: i32,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchSample {
-    pub(crate) left_button_down: bool,
-    pub(crate) foreground_hwnd: u64,
-    pub(crate) cursor_root_hwnd: u64,
-    pub(crate) native_close_hit_hwnd: u64,
-    pub(crate) cursor_pos: Option<(i32, i32)>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetachedActivationClickIntent {
-    Activate,
-    Close,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationClickCandidate {
-    pub(crate) window_id: u64,
-    pub(crate) hwnd: u64,
-    pub(crate) repair_hwnd: Option<u64>,
-    pub(crate) start_screen_pos: Option<(i32, i32)>,
-    pub(crate) drag_sensitive: bool,
-    pub(crate) intent: DetachedActivationClickIntent,
-    pub(crate) moved_too_far: bool,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchState {
-    pub(crate) left_button_was_down: bool,
-    pub(crate) active_click: Option<DetachedActivationClickCandidate>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchDiagnostic {
-    pub(crate) reason: &'static str,
-    pub(crate) foreground_hwnd: u64,
-    pub(crate) cursor_root_hwnd: u64,
-    pub(crate) cursor_pos: Option<(i32, i32)>,
-    pub(crate) target_window_id: Option<u64>,
-    pub(crate) target_hwnd: Option<u64>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationRequest {
-    pub(crate) window_id: u64,
-    pub(crate) repair_hwnd: Option<u64>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedCloseRequest {
-    pub(crate) window_id: u64,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchStepResult {
-    pub(crate) activation: Option<DetachedActivationRequest>,
-    pub(crate) close: Option<DetachedCloseRequest>,
-    pub(crate) diagnostic: Option<DetachedActivationWatchDiagnostic>,
-}
-
-#[cfg(all(windows, not(test)))]
-struct DetachedActivationWatchCommand {
-    targets: Vec<DetachedActivationWatchTarget>,
-    main_hwnd: u64,
-    claimed_hwnds: Vec<u64>,
-    repaint_ctx: egui::Context,
-}
-
-#[cfg(windows)]
-pub(crate) struct DetachedActivationWatcher {
-    #[cfg(not(test))]
-    command_tx: std::sync::mpsc::Sender<DetachedActivationWatchCommand>,
-    activation_rx: std::sync::mpsc::Receiver<DetachedActivationRequest>,
-    close_rx: std::sync::mpsc::Receiver<DetachedCloseRequest>,
-    diagnostic_rx: std::sync::mpsc::Receiver<DetachedActivationWatchDiagnostic>,
-}
-
-#[cfg(windows)]
-impl DetachedActivationWatcher {
-    fn new() -> Self {
-        let (activation_tx, activation_rx) = std::sync::mpsc::channel();
-        let (close_tx, close_rx) = std::sync::mpsc::channel();
-        let (diagnostic_tx, diagnostic_rx) = std::sync::mpsc::channel();
-        #[cfg(not(test))]
-        {
-            let (command_tx, command_rx) = std::sync::mpsc::channel();
-            std::thread::Builder::new()
-                .name("detached-activation-watch".to_string())
-                .spawn(move || {
-                    Self::watch_thread(command_rx, activation_tx, close_tx, diagnostic_tx);
-                })
-                .expect("failed to spawn detached activation watcher");
-            Self {
-                command_tx,
-                activation_rx,
-                close_rx,
-                diagnostic_rx,
-            }
-        }
-        #[cfg(test)]
-        {
-            let _ = (activation_tx, close_tx, diagnostic_tx);
-            Self {
-                activation_rx,
-                close_rx,
-                diagnostic_rx,
-            }
-        }
-    }
-
-    fn update_targets(
-        &self,
-        targets: Vec<DetachedActivationWatchTarget>,
-        main_hwnd: u64,
-        claimed_hwnds: Vec<u64>,
-        ctx: &egui::Context,
-    ) {
-        #[cfg(not(test))]
-        {
-            let _ = self.command_tx.send(DetachedActivationWatchCommand {
-                targets,
-                main_hwnd,
-                claimed_hwnds,
-                repaint_ctx: ctx.clone(),
-            });
-        }
-        #[cfg(test)]
-        {
-            let _ = (targets, main_hwnd, claimed_hwnds, ctx);
-        }
-    }
-
-    fn drain_activation_requests(&self) -> Vec<DetachedActivationRequest> {
-        let mut requests = Vec::new();
-        loop {
-            match self.activation_rx.try_recv() {
-                Ok(request) => requests.push(request),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        requests
-    }
-
-    fn drain_close_requests(&self) -> Vec<DetachedCloseRequest> {
-        let mut requests = Vec::new();
-        loop {
-            match self.close_rx.try_recv() {
-                Ok(request) => requests.push(request),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        requests
-    }
-
-    fn drain_diagnostics(&self) -> Vec<DetachedActivationWatchDiagnostic> {
-        let mut diagnostics = Vec::new();
-        loop {
-            match self.diagnostic_rx.try_recv() {
-                Ok(diagnostic) => diagnostics.push(diagnostic),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        diagnostics
-    }
-
-    #[cfg(not(test))]
-    fn watch_thread(
-        command_rx: std::sync::mpsc::Receiver<DetachedActivationWatchCommand>,
-        activation_tx: std::sync::mpsc::Sender<DetachedActivationRequest>,
-        close_tx: std::sync::mpsc::Sender<DetachedCloseRequest>,
-        diagnostic_tx: std::sync::mpsc::Sender<DetachedActivationWatchDiagnostic>,
-    ) {
-        let mut targets = Vec::new();
-        let mut main_hwnd = 0;
-        let mut claimed_hwnds = Vec::new();
-        let mut repaint_ctx: Option<egui::Context> = None;
-        let mut state = DetachedActivationWatchState::default();
-        loop {
-            if targets.is_empty() {
-                match command_rx.recv() {
-                    Ok(command) => {
-                        targets = command.targets;
-                        main_hwnd = command.main_hwnd;
-                        claimed_hwnds = command.claimed_hwnds;
-                        repaint_ctx = Some(command.repaint_ctx);
-                        state = DetachedActivationWatchState::default();
-                    }
-                    Err(_) => break,
-                }
-                continue;
-            }
-
-            while let Ok(command) = command_rx.try_recv() {
-                targets = command.targets;
-                main_hwnd = command.main_hwnd;
-                claimed_hwnds = command.claimed_hwnds;
-                repaint_ctx = Some(command.repaint_ctx);
-                if targets.is_empty() {
-                    state = DetachedActivationWatchState::default();
-                    break;
-                }
-            }
-            if targets.is_empty() {
-                continue;
-            }
-
-            let rects = Self::os_target_rects(&targets);
-            let sample = Self::os_sample();
-            let result = App::detached_activation_watch_step_result_with_context(
-                &mut state,
-                sample,
-                &rects,
-                main_hwnd,
-                &claimed_hwnds,
-            );
-            if let Some(diagnostic) = result.diagnostic {
-                let _ = diagnostic_tx.send(diagnostic);
-            }
-            if let Some(request) = result.activation {
-                let _ = activation_tx.send(request);
-                if let Some(ctx) = repaint_ctx.as_ref() {
-                    ctx.request_repaint();
-                }
-            }
-            if let Some(request) = result.close {
-                let _ = close_tx.send(request);
-                if let Some(ctx) = repaint_ctx.as_ref() {
-                    ctx.request_repaint();
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(8));
-        }
-    }
-
-    #[cfg(not(test))]
-    fn os_sample() -> DetachedActivationWatchSample {
-        use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, HTCLOSE, SMTO_ABORTIFHUNG,
-            SendMessageTimeoutW, WM_NCHITTEST, WindowFromPoint,
-        };
-
-        let left_button_down =
-            unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
-        let foreground_hwnd = unsafe { GetForegroundWindow().0 as u64 };
-        let mut point = POINT::default();
-        let cursor_ok = unsafe { GetCursorPos(&mut point) }.is_ok();
-        let cursor_pos = cursor_ok.then_some((point.x, point.y));
-        let cursor_root_hwnd = if cursor_ok {
-            unsafe {
-                let hwnd = WindowFromPoint(point);
-                if hwnd.0.is_null() {
-                    0
-                } else {
-                    let root = GetAncestor(hwnd, GA_ROOT);
-                    root.0 as u64
-                }
-            }
-        } else {
-            0
-        };
-        let native_close_hit_hwnd = if cursor_ok && cursor_root_hwnd != 0 {
-            let packed = ((point.y as u32 & 0xffff) << 16) | (point.x as u32 & 0xffff);
-            let mut hit_test_result = 0usize;
-            let send_result = unsafe {
-                SendMessageTimeoutW(
-                    HWND(cursor_root_hwnd as *mut _),
-                    WM_NCHITTEST,
-                    WPARAM(0),
-                    LPARAM(packed as isize),
-                    SMTO_ABORTIFHUNG,
-                    50,
-                    Some(&mut hit_test_result),
-                )
-            };
-            if send_result.0 != 0 && hit_test_result as u32 == HTCLOSE {
-                cursor_root_hwnd
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        DetachedActivationWatchSample {
-            left_button_down,
-            foreground_hwnd,
-            cursor_root_hwnd,
-            native_close_hit_hwnd,
-            cursor_pos,
-        }
-    }
-
-    #[cfg(not(test))]
-    fn os_target_rects(
-        targets: &[DetachedActivationWatchTarget],
-    ) -> Vec<DetachedActivationWatchTargetRect> {
-        use windows::Win32::Foundation::{HWND, RECT};
-        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow};
-
-        targets
-            .iter()
-            .filter_map(|target| {
-                let hwnd = HWND(target.hwnd as *mut _);
-                unsafe {
-                    if !IsWindow(Some(hwnd)).as_bool() {
-                        return None;
-                    }
-                    let mut rect = RECT::default();
-                    if GetWindowRect(hwnd, &mut rect).is_err() {
-                        return None;
-                    }
-                    Some(DetachedActivationWatchTargetRect {
-                        window_id: target.window_id,
-                        hwnd: target.hwnd,
-                        eligible: target.eligible,
-                        close_hit_test: target.close_hit_test,
-                        left: rect.left,
-                        top: rect.top,
-                        right: rect.right,
-                        bottom: rect.bottom,
-                    })
-                }
-            })
-            .collect()
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone)]
-pub(crate) struct DetachedTrimBBoxEntry {
-    pub(crate) item_key: String,
-    pub(crate) bbox: Option<egui::Rect>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone)]
-pub(crate) struct DetachedWindowRuntime {
-    pub(crate) window_id: u64,
-    pub(crate) state: DetachedWindowState,
-    pub(crate) hwnd: u64,
-    pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
-    pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
-    pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
-    pub(crate) linked: bool,
-    pub(crate) pending_deferred_activation: bool,
-}
-
-#[cfg(windows)]
-impl DetachedWindowRuntime {
-    fn new(window_id: u64, linked: bool) -> Self {
-        Self {
-            window_id,
-            state: DetachedWindowState::Opening,
-            hwnd: 0,
-            placement: None,
-            builder_placement_latch: None,
-            trim_bboxes: std::collections::HashMap::new(),
-            linked,
-            pending_deferred_activation: false,
-        }
-    }
-}
-
-#[cfg(windows)]
 impl App {
     const EGUI_VIEWPORT_CLASS: &'static str = "Window Class";
     const DETACHED_PHYSICAL_ACTIVATION_MAX_DRAG_PX: i32 = 8;
 
     fn detached_window_runtime_default_linked(&self) -> bool {
         !self.detached_viewer_independent_active
-    }
-
-    fn detached_window_runtime_entry_mut(&mut self, window_id: u64) -> &mut DetachedWindowRuntime {
-        let linked = self.detached_window_runtime_default_linked();
-        self.detached_window_runtimes
-            .entry(window_id)
-            .or_insert_with(|| DetachedWindowRuntime::new(window_id, linked))
     }
 
     fn detached_window_runtime_placement_is_usable(
@@ -877,9 +438,8 @@ impl App {
         &self,
         window_id: u64,
     ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
-        self.detached_window_runtimes
-            .get(&window_id)
-            .and_then(|runtime| runtime.placement)
+        self.detached_window_manager
+            .placement(window_id)
             .filter(|placement| Self::detached_window_runtime_placement_is_usable(*placement))
     }
 
@@ -896,9 +456,10 @@ impl App {
             ));
             return;
         }
-        let runtime = self.detached_window_runtime_entry_mut(window_id);
-        let previous = runtime.placement;
-        runtime.placement = Some(placement);
+        let default_linked = self.detached_window_runtime_default_linked();
+        let previous =
+            self.detached_window_manager
+                .set_placement(window_id, placement, default_linked);
         self.log_detached_image_window_debug(format!(
             "runtime_placement window_id={window_id} reason={reason} \
              from={previous:?} to={placement:?}"
@@ -932,11 +493,8 @@ impl App {
         idx: usize,
     ) -> Option<Option<egui::Rect>> {
         let item_key = self.items.get(idx)?.perf_key();
-        self.detached_window_runtimes
-            .get(&window_id)
-            .and_then(|runtime| runtime.trim_bboxes.get(&idx))
-            .filter(|entry| entry.item_key == item_key)
-            .map(|entry| entry.bbox)
+        self.detached_window_manager
+            .trim_bbox(window_id, idx, &item_key)
     }
 
     pub(crate) fn set_detached_window_runtime_trim_bbox(
@@ -950,10 +508,9 @@ impl App {
             return;
         };
         let bbox_label = Self::format_detached_trim_bbox_for_log(bbox);
-        let runtime = self.detached_window_runtime_entry_mut(window_id);
-        runtime
-            .trim_bboxes
-            .insert(idx, DetachedTrimBBoxEntry { item_key, bbox });
+        let default_linked = self.detached_window_runtime_default_linked();
+        self.detached_window_manager
+            .set_trim_bbox(window_id, idx, item_key, bbox, default_linked);
         self.log_detached_image_window_debug(format!(
             "detached_trim_bbox_bake window_id={window_id} idx={idx} bbox={bbox_label} \
              reason={reason}"
@@ -997,21 +554,21 @@ impl App {
             return live;
         };
 
-        let (previous, placement, refreshed) = {
-            let runtime = self.detached_window_runtime_entry_mut(window_id);
-            let previous = runtime.builder_placement_latch;
-            let latch_usable = runtime
-                .builder_placement_latch
-                .is_some_and(Self::detached_window_runtime_placement_is_usable);
-            let refreshed = refresh_latch || !latch_usable;
-            if refreshed {
-                runtime.builder_placement_latch = Some(live);
-            }
-            (
-                previous,
-                runtime.builder_placement_latch.unwrap_or(live),
-                refreshed,
-            )
+        let previous = self
+            .detached_window_manager
+            .builder_placement_latch(window_id);
+        let latch_usable = previous.is_some_and(Self::detached_window_runtime_placement_is_usable);
+        let refreshed = refresh_latch || !latch_usable;
+        let placement = if refreshed {
+            let default_linked = self.detached_window_runtime_default_linked();
+            self.detached_window_manager.set_builder_placement_latch(
+                window_id,
+                live,
+                default_linked,
+            );
+            live
+        } else {
+            previous.unwrap_or(live)
         };
 
         if Self::detached_image_window_debug_enabled() {
@@ -1033,12 +590,12 @@ impl App {
         reason: &'static str,
     ) -> crate::settings::DetachedViewerWindowPlacement {
         let live = self.ensure_detached_window_runtime_placement(window_id, reason);
-        let previous = {
-            let runtime = self.detached_window_runtime_entry_mut(window_id);
-            let previous = runtime.builder_placement_latch;
-            runtime.builder_placement_latch = Some(live);
-            previous
-        };
+        let default_linked = self.detached_window_runtime_default_linked();
+        let previous = self.detached_window_manager.set_builder_placement_latch(
+            window_id,
+            live,
+            default_linked,
+        );
         if Self::detached_image_window_debug_enabled() {
             self.log_detached_viewport_placement_event(
                 reason,
@@ -1050,58 +607,33 @@ impl App {
     }
 
     fn detached_window_hwnd_get_raw(&self, window_id: u64) -> Option<u64> {
-        self.detached_window_runtimes
-            .get(&window_id)
-            .map(|runtime| runtime.hwnd)
-            .filter(|hwnd| *hwnd != 0)
+        self.detached_window_manager.hwnd_raw(window_id)
     }
 
     fn detached_window_hwnd_alive(&self, window_id: u64) -> Option<u64> {
-        let hwnd = self.detached_window_hwnd_get_raw(window_id)?;
-        self.detached_window_hwnd_is_alive(hwnd).then_some(hwnd)
+        self.detached_window_manager.hwnd_alive(window_id)
     }
 
     fn detached_window_hwnd_is_alive(&self, hwnd: u64) -> bool {
-        #[cfg(test)]
-        return self.detached_window_live_hwnds_for_test.contains(&hwnd);
-        #[cfg(not(test))]
-        crate::video::native_window::is_window_alive(hwnd)
+        self.detached_window_manager.hwnd_is_alive(hwnd)
     }
 
     fn detached_window_hwnd_clear(&mut self, window_id: u64) -> Option<u64> {
-        let runtime = self.detached_window_runtimes.get_mut(&window_id)?;
-        let hwnd = std::mem::take(&mut runtime.hwnd);
-        (hwnd != 0).then_some(hwnd)
+        self.detached_window_manager.clear_hwnd(window_id)
     }
 
     fn detached_window_hwnd_clear_if_dead(&mut self, window_id: u64) -> Option<u64> {
-        let hwnd = self.detached_window_hwnd_get_raw(window_id)?;
-        if self.detached_window_hwnd_is_alive(hwnd) {
-            None
-        } else {
-            if let Some(runtime) = self.detached_window_runtimes.get_mut(&window_id) {
-                runtime.hwnd = 0;
-            }
-            Some(hwnd)
-        }
+        self.detached_window_manager.clear_hwnd_if_dead(window_id)
     }
 
     fn detached_window_hwnd_set(&mut self, window_id: u64, hwnd: u64) -> Option<u64> {
-        if hwnd == 0 {
-            return self.detached_window_hwnd_clear(window_id);
-        }
-        let runtime = self.detached_window_runtime_entry_mut(window_id);
-        let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
-        runtime.hwnd = hwnd;
-        previous
+        let default_linked = self.detached_window_runtime_default_linked();
+        self.detached_window_manager
+            .set_hwnd(window_id, hwnd, default_linked)
     }
 
     fn detached_window_registered_hwnds(&self) -> std::collections::HashSet<u64> {
-        self.detached_window_runtimes
-            .values()
-            .map(|runtime| runtime.hwnd)
-            .filter(|hwnd| *hwnd != 0)
-            .collect()
+        self.detached_window_manager.registered_hwnds()
     }
 
     fn select_detached_created_hwnd(
@@ -1244,7 +776,7 @@ impl App {
     where
         I: IntoIterator<Item = u64>,
     {
-        self.detached_window_live_hwnds_for_test = hwnds.into_iter().collect();
+        self.detached_window_manager.set_live_hwnds_for_test(hwnds);
     }
 
     pub(crate) fn transition_detached_window_state(
@@ -1253,18 +785,20 @@ impl App {
         new_state: DetachedWindowState,
         reason: &'static str,
     ) {
-        let runtime = self.detached_window_runtime_entry_mut(window_id);
-        let from = runtime.state;
-        runtime.state = new_state;
-        let runtime_window_id = runtime.window_id;
-        let hwnd = runtime.hwnd;
-        let linked = runtime.linked;
-        let entering_active =
-            from != DetachedWindowState::Active && new_state == DetachedWindowState::Active;
+        let default_linked = self.detached_window_runtime_default_linked();
+        let transition =
+            self.detached_window_manager
+                .transition_state(window_id, new_state, default_linked);
+        let entering_active = transition.from != DetachedWindowState::Active
+            && transition.to == DetachedWindowState::Active;
         self.log_detached_image_window_debug(format!(
-            "state_transition window_id={runtime_window_id} from={from:?} to={new_state:?} \
+            "state_transition window_id={} from={:?} to={:?} \
              reason={reason} hwnd=0x{:x} linked={}",
-            hwnd, linked
+            transition.window_id,
+            transition.from,
+            transition.to,
+            transition.hwnd,
+            transition.linked
         ));
         if entering_active {
             self.refresh_detached_builder_placement_latch_for_active_entry(
@@ -1275,9 +809,7 @@ impl App {
     }
 
     pub(crate) fn detached_window_state(&self, window_id: u64) -> Option<DetachedWindowState> {
-        self.detached_window_runtimes
-            .get(&window_id)
-            .map(|runtime| runtime.state)
+        self.detached_window_manager.state(window_id)
     }
 
     pub(crate) fn active_detached_window_id(&self) -> Option<u64> {
@@ -1303,9 +835,10 @@ impl App {
         linked: bool,
         reason: &'static str,
     ) {
-        let runtime = self.detached_window_runtime_entry_mut(window_id);
-        let old_linked = runtime.linked;
-        runtime.linked = linked;
+        let default_linked = self.detached_window_runtime_default_linked();
+        let old_linked = self
+            .detached_window_manager
+            .set_linked(window_id, linked, default_linked);
         if old_linked != linked {
             self.log_detached_image_window_debug(format!(
                 "runtime_flags window_id={window_id} linked={old_linked}->{linked} reason={reason}"
@@ -1320,10 +853,10 @@ impl App {
         reason: &'static str,
     ) {
         let frame = self.frame_counter;
-        let runtime = self.detached_window_runtime_entry_mut(window_id);
-        let was_pending = runtime.pending_deferred_activation;
-        runtime.pending_deferred_activation = true;
-        let state = runtime.state;
+        let default_linked = self.detached_window_runtime_default_linked();
+        let (was_pending, state) = self
+            .detached_window_manager
+            .queue_deferred_activation(window_id, default_linked);
         self.log_detached_image_window_debug(format!(
             "deferred_activate_queued frame={frame} id={window_id} reason={reason} \
              duplicate={was_pending} state={:?}",
@@ -1728,9 +1261,9 @@ impl App {
             return false;
         }
         if self
-            .detached_window_runtimes
-            .iter()
-            .any(|(&id, runtime)| id != window_id && runtime.hwnd == hwnd)
+            .detached_window_manager
+            .hwnd_claimed_by_other(window_id, hwnd)
+            .is_some()
         {
             return false;
         }
@@ -1762,9 +1295,9 @@ impl App {
             return false;
         }
         if self
-            .detached_window_runtimes
-            .iter()
-            .any(|(&id, runtime)| id != window_id && runtime.hwnd == hwnd)
+            .detached_window_manager
+            .hwnd_claimed_by_other(window_id, hwnd)
+            .is_some()
         {
             return false;
         }
@@ -1834,7 +1367,7 @@ impl App {
             .iter()
             .filter(|window| window.can_activate())
             .filter_map(|window| {
-                let runtime = self.detached_window_runtimes.get(&window.id)?;
+                let runtime = self.detached_window_manager.runtime(window.id)?;
                 if runtime.state != DetachedWindowState::Parked {
                     return None;
                 }
@@ -1858,14 +1391,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_activation_watcher_claimed_hwnds(&self) -> Vec<u64> {
-        self.detached_window_runtimes
-            .values()
-            .map(|runtime| runtime.hwnd)
-            .filter(|hwnd| *hwnd != 0)
-            .collect()
-    }
-
     #[cfg(windows)]
     pub(crate) fn refresh_parked_detached_window_hwnd_liveness(&mut self) {
         let ids = self
@@ -1898,19 +1423,19 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn sync_deferred_detached_activation_watcher(&self, ctx: &egui::Context) {
-        self.detached_activation_watcher.update_targets(
-            self.deferred_detached_activation_watch_targets(),
-            self.main_hwnd
-                .and_then(|hwnd| u64::try_from(hwnd).ok())
-                .unwrap_or(0),
-            self.detached_activation_watcher_claimed_hwnds(),
-            ctx,
-        );
+        self.detached_window_manager
+            .update_activation_watch_targets(
+                self.deferred_detached_activation_watch_targets(),
+                self.main_hwnd
+                    .and_then(|hwnd| u64::try_from(hwnd).ok())
+                    .unwrap_or(0),
+                ctx,
+            );
     }
 
     #[cfg(windows)]
     pub(crate) fn drain_deferred_detached_activation_watcher(&mut self, ctx: &egui::Context) {
-        for diagnostic in self.detached_activation_watcher.drain_diagnostics() {
+        for diagnostic in self.detached_window_manager.drain_watch_diagnostics() {
             let cursor = diagnostic
                 .cursor_pos
                 .map(|(x, y)| format!("({x},{y})"))
@@ -1936,7 +1461,7 @@ impl App {
             ));
         }
         let close_ids = self
-            .detached_activation_watcher
+            .detached_window_manager
             .drain_close_requests()
             .into_iter()
             .map(|request| request.window_id)
@@ -1950,19 +1475,16 @@ impl App {
                 None,
             );
         }
-        for request in self.detached_activation_watcher.drain_activation_requests() {
+        for request in self.detached_window_manager.drain_activation_requests() {
             let id = request.window_id;
             if let Some(repair_hwnd) = request.repair_hwnd
                 && !self.repair_detached_window_hwnd_from_watcher(id, repair_hwnd)
             {
                 let known_hwnd = self.detached_window_hwnd_raw_for_window_id(id);
                 let known_state = self.detached_window_state(id);
-                let claimed_by =
-                    self.detached_window_runtimes
-                        .iter()
-                        .find_map(|(&other_id, runtime)| {
-                            (other_id != id && runtime.hwnd == repair_hwnd).then_some(other_id)
-                        });
+                let claimed_by = self
+                    .detached_window_manager
+                    .hwnd_claimed_by_other(id, repair_hwnd);
                 self.log_detached_image_window_debug(format!(
                     "deferred_activate_watcher_dropped id={id} reason=repair_failed \
                      observed_hwnd=0x{repair_hwnd:x} observed_state=\"{}\" \
@@ -1994,27 +1516,14 @@ impl App {
 
     #[cfg(all(windows, test))]
     pub(crate) fn detached_window_deferred_activation_pending(&self, window_id: u64) -> bool {
-        self.detached_window_runtimes
-            .get(&window_id)
-            .is_some_and(|runtime| runtime.pending_deferred_activation)
+        self.detached_window_manager
+            .deferred_activation_pending(window_id)
     }
 
     #[cfg(windows)]
     fn take_pending_deferred_detached_window_activation(&mut self) -> Option<u64> {
-        let mut ids = self
-            .detached_window_runtimes
-            .iter()
-            .filter(|(_, runtime)| {
-                runtime.pending_deferred_activation && runtime.state != DetachedWindowState::Closing
-            })
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        let id = ids.into_iter().next()?;
-        if let Some(runtime) = self.detached_window_runtimes.get_mut(&id) {
-            runtime.pending_deferred_activation = false;
-        }
-        Some(id)
+        self.detached_window_manager
+            .take_pending_deferred_activation()
     }
 
     #[cfg(windows)]
@@ -2059,7 +1568,7 @@ impl App {
     ) -> Option<DetachedWindowRuntime> {
         self.discard_parked_native_video_pending_for_window(window_id, reason);
         self.cancel_media_navigation_pending_for_owner(Some(window_id), reason);
-        let runtime = self.detached_window_runtimes.remove(&window_id);
+        let runtime = self.detached_window_manager.remove(window_id);
         if let Some(runtime) = runtime.as_ref() {
             if let Some(placement) = runtime
                 .placement
@@ -4848,6 +4357,28 @@ pub(crate) fn subfolder_expansion_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__subfolder_expansion__")
 }
 
+fn main_window_title(
+    effective_folder: Option<&Path>,
+    reading_history_view: bool,
+    subfolder_expansion_view: bool,
+    indexing_active: bool,
+) -> String {
+    let base = if reading_history_view {
+        "読書履歴 - mimageviewer".to_string()
+    } else if subfolder_expansion_view {
+        "サブフォルダ展開 - mimageviewer".to_string()
+    } else if let Some(path) = effective_folder {
+        format!("{} - mimageviewer", path.display())
+    } else {
+        "mimageviewer".to_string()
+    };
+    if indexing_active {
+        format!("{base}  (インデックス更新中)")
+    } else {
+        base
+    }
+}
+
 /// 実フォルダではない仮想フラットビューの合成パスか。
 ///
 /// 検索固有の分岐には使わず、`delete_missing` / `last_folder` 保存 / コンテナ★など
@@ -6333,8 +5864,6 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) deferred_detached_image_window_views:
         HashMap<u64, Arc<DeferredDetachedImageWindowShared>>,
-    #[cfg(windows)]
-    pub(crate) detached_activation_watcher: DetachedActivationWatcher,
     /// メイン一覧から独立して動く active detached viewer の item/cache context。
     ///
     /// `App` の既存 fullscreen 実装は `self.items[self.fullscreen_idx]` 前提が広いため、
@@ -6721,7 +6250,7 @@ pub struct App {
     /// (累積誤差防止 + pivot 位置が安定)。マウスを右手だけで拡大縮小する用途。
     pub(crate) fs_middle_zoom_drag: Option<crate::ui_fullscreen::MiddleZoomDrag>,
     /// 中ボタン短クリック候補。移動量がドラッグしきい値を超えた場合は cancel する。
-    pub(crate) mouse_middle_click_start: Option<(egui::Pos2, std::time::Instant, bool)>,
+    mouse_middle_click_start: Option<gamepad_input::MouseMiddleClickState>,
 
     // ── 削除確認ダイアログ ───────────────────────────────────────
     pub(crate) show_delete_confirm: bool,
@@ -7465,9 +6994,7 @@ pub struct App {
     /// eframe は child viewport の HWND を公開しないため、`show_viewport_immediate`
     /// の前後で UI スレッド上の window 差分を取り、生成された HWND を window_id 単位で保持する。
     #[cfg(windows)]
-    pub(crate) detached_window_runtimes: std::collections::HashMap<u64, DetachedWindowRuntime>,
-    #[cfg(test)]
-    pub(crate) detached_window_live_hwnds_for_test: std::collections::HashSet<u64>,
+    pub(crate) detached_window_manager: DetachedWindowManager,
     /// detached viewer host HWND が変わるたびに +1 する世代。host capture を lifecycle
     /// event として観測し、stale host 由来イベントを識別するための App 側カウンタ
     /// (native presenter 世代とは別物)。
@@ -9556,8 +9083,6 @@ impl App {
             #[cfg(windows)]
             deferred_detached_image_window_views: HashMap::new(),
             #[cfg(windows)]
-            detached_activation_watcher: DetachedActivationWatcher::new(),
-            #[cfg(windows)]
             active_detached_viewer_context: None,
             #[cfg(windows)]
             detached_viewer_main_history_suppression_depth: 0,
@@ -9962,9 +9487,7 @@ impl App {
             #[cfg(windows)]
             fs_viewport_virtual_desktop_synced_hwnd: 0,
             #[cfg(windows)]
-            detached_window_runtimes: std::collections::HashMap::new(),
-            #[cfg(test)]
-            detached_window_live_hwnds_for_test: std::collections::HashSet::new(),
+            detached_window_manager: DetachedWindowManager::new(),
             #[cfg(windows)]
             detached_viewer_host_generation: 0,
             #[cfg(windows)]
@@ -25192,12 +24715,18 @@ impl App {
         let mouse_nav_back = mouse_back || browser_back;
         let mouse_nav_forward = mouse_forward || browser_forward;
         if mouse_nav_back || mouse_nav_forward {
-            return self.apply_mouse_back_forward_button(ctx, mouse_nav_forward, "grid-mouse");
+            return self.apply_mouse_back_forward_button(
+                ctx,
+                mouse_nav_forward,
+                ActionSurface::MainWindow,
+                "grid-mouse",
+            );
         }
-        if self.update_mouse_middle_short_click(ctx, true) {
+        if self.update_mouse_middle_short_click(ctx, true, ActionSurface::MainWindow) {
             return self.apply_mouse_button(
                 ctx,
                 crate::ring_shortcut::MouseButtonSlot::Middle,
+                ActionSurface::MainWindow,
                 "grid-middle-mouse",
             );
         }
@@ -27691,10 +27220,7 @@ impl App {
 
     #[cfg(windows)]
     fn detached_window_runtime_state_count(&self, state: DetachedWindowState) -> usize {
-        self.detached_window_runtimes
-            .values()
-            .filter(|runtime| runtime.state == state)
-            .count()
+        self.detached_window_manager.state_count(state)
     }
 
     #[cfg(windows)]
@@ -28502,7 +28028,7 @@ impl App {
             || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
             || self.fs_viewport_shown
             || !self.detached_image_windows.is_empty()
-            || !self.detached_window_runtimes.is_empty()
+            || !self.detached_window_manager.is_empty()
             || self.pending_detached_video_host_switch.is_some()
             || self.pending_detached_video_host_resync;
         if !had_detached {
@@ -28518,7 +28044,7 @@ impl App {
             self.viewer_presentation,
             self.fs_viewport_shown,
             self.detached_image_windows.len(),
-            self.detached_window_runtimes.len(),
+            self.detached_window_manager.len(),
             self.pending_detached_video_host_switch.is_some()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
@@ -28598,11 +28124,7 @@ impl App {
         self.native_video_parked_live_left_down_window_id = None;
         self.native_video_parked_live_input_window_id = None;
 
-        let runtime_ids = self
-            .detached_window_runtimes
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+        let runtime_ids = self.detached_window_manager.ids();
         for id in runtime_ids {
             if self.detached_window_state(id) != Some(DetachedWindowState::Closing) {
                 self.transition_detached_window_state(
@@ -28644,7 +28166,7 @@ impl App {
             self.viewer_presentation,
             self.fs_viewport_shown,
             self.detached_image_windows.len(),
-            self.detached_window_runtimes.len()
+            self.detached_window_manager.len()
         ));
         true
     }
@@ -33037,7 +32559,7 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(pos, window)| {
-                let runtime = self.detached_window_runtimes.get(&window.id)?;
+                let runtime = self.detached_window_manager.runtime(window.id)?;
                 (window.paused_bundle.is_none()
                     && runtime.linked
                     && runtime.state == DetachedWindowState::Parked)
@@ -51490,16 +51012,12 @@ impl eframe::App for App {
         // 名前索引 / メタ索引の supervisor が `in_full_scan=true` を示している間は
         // 「(インデックス更新中)」をサフィックスに付け、検索結果が不完全である
         // 可能性をユーザーに示唆する (notify-rs の watcher 待ちだけなら付けない)。
-        let indexing_active = self.any_indexer_in_full_scan();
-        let base = match self.effective_folder() {
-            Some(p) => format!("{} - mimageviewer", p.display()),
-            None => "mimageviewer".to_string(),
-        };
-        let title = if indexing_active {
-            format!("{base}  (インデックス更新中)")
-        } else {
-            base
-        };
+        let title = main_window_title(
+            self.effective_folder().as_deref(),
+            self.items_are_reading_history_view,
+            self.items_are_subfolder_expansion_view,
+            self.any_indexer_in_full_scan(),
+        );
         // タイトルが変わったときだけ送信する (2026-05-10 修正)。
         // 無条件に send_viewport_cmd(Title(...)) すると egui 内部の `request_repaint_of`
         // が毎フレーム発火し、App::update が 60fps で回り続けて他アプリ FPS を奪う。

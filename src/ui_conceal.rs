@@ -2636,7 +2636,7 @@ impl App {
                                             多角形:始点クリック/右クリック/Enterで確定 Escで取消\n\
                                             Ctrl+Z:戻す  Delete:選択削除\n\
                                             Esc:解除/終了  Ctrl+M:終了\n\
-                                            終了時はDB保存";
+                                            終了時に保存";
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(help)

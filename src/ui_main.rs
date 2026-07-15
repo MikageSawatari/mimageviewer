@@ -9864,10 +9864,18 @@ impl App {
             full_rect,
             crate::ring_shortcut::RightDragContext::Grid,
         );
-        self.draw_gamepad_ring_overlay(ui, full_rect);
-        self.draw_gamepad_picker_overlay(ui, full_rect);
-        self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
-        self.draw_gamepad_location_picker_overlay(ui, full_rect);
+        self.draw_gamepad_ring_overlay(ui, full_rect, crate::app::ActionSurface::MainWindow);
+        self.draw_gamepad_picker_overlay(ui, full_rect, crate::app::ActionSurface::MainWindow);
+        self.draw_gamepad_favorite_picker_overlay(
+            ui,
+            full_rect,
+            crate::app::ActionSurface::MainWindow,
+        );
+        self.draw_gamepad_location_picker_overlay(
+            ui,
+            full_rect,
+            crate::app::ActionSurface::MainWindow,
+        );
         self.draw_feedback_toast(ui, full_rect, ctx, crate::app::ActionSurface::MainWindow);
         self.render_details_thumbnail_tooltip(ctx, hovered_preview);
 
@@ -10874,10 +10882,26 @@ impl App {
                         full_rect,
                         crate::ring_shortcut::RightDragContext::Grid,
                     );
-                    self.draw_gamepad_ring_overlay(ui, full_rect);
-                    self.draw_gamepad_picker_overlay(ui, full_rect);
-                    self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
-                    self.draw_gamepad_location_picker_overlay(ui, full_rect);
+                    self.draw_gamepad_ring_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
+                    self.draw_gamepad_picker_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
+                    self.draw_gamepad_favorite_picker_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
+                    self.draw_gamepad_location_picker_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
                     self.draw_feedback_toast(
                         ui,
                         full_rect,
@@ -10915,10 +10939,26 @@ impl App {
                         full_rect,
                         crate::ring_shortcut::RightDragContext::Grid,
                     );
-                    self.draw_gamepad_ring_overlay(ui, full_rect);
-                    self.draw_gamepad_picker_overlay(ui, full_rect);
-                    self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
-                    self.draw_gamepad_location_picker_overlay(ui, full_rect);
+                    self.draw_gamepad_ring_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
+                    self.draw_gamepad_picker_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
+                    self.draw_gamepad_favorite_picker_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
+                    self.draw_gamepad_location_picker_overlay(
+                        ui,
+                        full_rect,
+                        crate::app::ActionSurface::MainWindow,
+                    );
                     self.draw_feedback_toast(
                         ui,
                         full_rect,
@@ -11179,10 +11219,26 @@ impl App {
                     full_rect,
                     crate::ring_shortcut::RightDragContext::Grid,
                 );
-                self.draw_gamepad_ring_overlay(ui, full_rect);
-                self.draw_gamepad_picker_overlay(ui, full_rect);
-                self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
-                self.draw_gamepad_location_picker_overlay(ui, full_rect);
+                self.draw_gamepad_ring_overlay(
+                    ui,
+                    full_rect,
+                    crate::app::ActionSurface::MainWindow,
+                );
+                self.draw_gamepad_picker_overlay(
+                    ui,
+                    full_rect,
+                    crate::app::ActionSurface::MainWindow,
+                );
+                self.draw_gamepad_favorite_picker_overlay(
+                    ui,
+                    full_rect,
+                    crate::app::ActionSurface::MainWindow,
+                );
+                self.draw_gamepad_location_picker_overlay(
+                    ui,
+                    full_rect,
+                    crate::app::ActionSurface::MainWindow,
+                );
                 self.draw_feedback_toast(ui, full_rect, ctx, crate::app::ActionSurface::MainWindow);
 
                 nav

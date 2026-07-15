@@ -3,6 +3,29 @@ use crate::archive_converter::ArchiveFormat;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[test]
+fn main_window_title_hides_internal_synthetic_paths() {
+    let internal = PathBuf::from(r"C:\data\__reading_history__");
+    assert_eq!(
+        main_window_title(Some(&internal), true, false, false),
+        "読書履歴 - mimageviewer"
+    );
+    assert_eq!(
+        main_window_title(Some(&internal), false, true, false),
+        "サブフォルダ展開 - mimageviewer"
+    );
+}
+
+#[test]
+fn main_window_title_preserves_real_path_and_indexing_suffix() {
+    let folder = PathBuf::from(r"C:\Pictures");
+    assert_eq!(
+        main_window_title(Some(&folder), false, false, true),
+        r"C:\Pictures - mimageviewer  (インデックス更新中)"
+    );
+    assert_eq!(main_window_title(None, false, false, false), "mimageviewer");
+}
+
 /// `App::new_for_test` に渡すテスト設定。
 ///
 /// Phase C では実プロセスの `data_dir::init` を経由せず、`set_test_override` で
@@ -22481,8 +22504,8 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].id, 1);
         assert_eq!(
-            app.detached_window_runtimes
-                .get(&1)
+            app.detached_window_manager
+                .runtime(1)
                 .map(|runtime| runtime.linked),
             Some(false),
             "always-new passive snapshots must be independent; linked snapshots are forbidden after CUT"
@@ -26098,7 +26121,7 @@ mod still_window_mode_key_tests {
         assert!(app.active_detached_session.is_none());
         assert!(app.active_detached_viewer_context.is_none());
         assert!(app.detached_image_windows.is_empty());
-        assert!(app.detached_window_runtimes.is_empty());
+        assert!(app.detached_window_manager.is_empty());
         assert_eq!(app.detached_viewer_window_id, None);
         assert_eq!(app.last_active_detached_window_id, None);
         assert!(!app.detached_viewer_independent_active);
@@ -26117,7 +26140,7 @@ mod still_window_mode_key_tests {
         assert!(!app.close_all_detached_viewers_for_mode_change(&ctx));
         assert!(app.fs_feedback_toast.is_none());
         assert!(app.detached_image_windows.is_empty());
-        assert!(app.detached_window_runtimes.is_empty());
+        assert!(app.detached_window_manager.is_empty());
     }
 
     #[test]
@@ -26818,8 +26841,8 @@ mod still_window_mode_key_tests {
 
         let media_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, video);
         assert_eq!(
-            app.detached_window_runtimes
-                .get(&111)
+            app.detached_window_manager
+                .runtime(111)
                 .map(|runtime| (runtime.state, runtime.linked)),
             Some((DetachedWindowState::Parked, true))
         );

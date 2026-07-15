@@ -14,36 +14,20 @@
 
 ## 1. 優先候補
 
-### 1.7 detached 中の発火面解決の残り (ゲームパッド / マウス割当ボタン) — BA 報告
+### 1.7 detached 中の発火面解決の残り (? / トースト / スタック) — BA 報告
 
-- 背景: v2.3.0 出荷前監査 (2026-07-09/10、docs/review-v2.3.0/claude-audit-selection.md)。
-  監査当初の指摘のうち、以下は 2026-07-10 に**解決/反証済み**:
-  - コンテナ★ (viewer 内 Shift+F1-F6) / FsPin (P): **誤検出と確定**。native キー処理は
-    `with_active_detached_viewer_context` 内 (bundle マウント) で走り、`current_folder` /
-    `zip_nav` は bundle swap 対象のため、窓自身のフォルダに正しく付く。契約テスト
-    `container_rating_in_bundled_media_window_targets_window_folder` で固定済み。
-  - グリッド Delete キー無効 / スタック集約の保留: **修正済み** (v2.3.0)。
-  - マウス右ドラッグリング/ジェスチャ: **問題なしを検証済み** (開始時に面を焼き付け、
-    ガイド描画と適用は面不一致で棄却。tests.rs の cross-surface テストで固定)。
-- 残り (設計判断が要る、detached リワーク後続で対応):
-  1. **グローバル入力のコンテキスト解決** (P2×2): `current_ring_shortcut_context`
-     (src/app/gamepad_input.rs) が fullscreen_idx 優先のため、unbundled detached 窓の
-     表示中にゲームパッド X リング (ItemRating 等) やマウス割当ボタン (中クリック=回転等の
-     カスタム割当時) がグリッド操作のつもりでも窓のアイテムに効く。付随して detached 中は
-     パッドでグリッド操作が一切できない + パッドリングガイドがグリッド上に FS 用ラベルで
-     出る。対応 = パッド/マウス割当にも発火面 (前面ウィンドウ or 最後に触った面へ追従) の
-     設計を導入する (ユーザー方針 2026-07-10: 前面 or 最後に触った場所追従が自然)。
-  2. **? キーのショートカット一覧** (P3): detached 中にグリッドから開くと FS 用一覧が
+- 残り (P3、発火面の window_id 粒度が必要):
+  1. **? キーのショートカット一覧**: detached 中にグリッドから開くと FS 用一覧が
      出る。修正には発火元の面情報を consume サイトから通す必要がある。
-  3. **トーストの面粒度** (P3): 発火面のビューアを閉じた後に完了したバッチのトーストが
+  2. **トーストの面粒度**: 発火面のビューアを閉じた後に完了したバッチのトーストが
      不可視のまま消える / active detached + main fullscreen 同時表示時に Viewer 面が
      両ビューアに出る (2 値 enum の粒度の限界)。許容中。
-  4. **複数ウィンドウ×スタックの理想形** (P3 改善): スタックをクリックするとメイン一覧が
+  3. **複数ウィンドウ×スタックの理想形**: スタックをクリックするとメイン一覧が
      フラット読書ビューに切り替わる (フル機能と同じ挙動)。理想は「メインは集約のまま、
      窓側だけフラット文脈を持つ」だが、窓が自前のフラット items 文脈 (bundle 化された
      stack 状態) を持つ設計が必要 (複数ウィンドウの bundle 化と同系統)。現行でも
      Shift+↓↑ ジャンプは動作する。
-- 優先度: P2〜P3。detached リワークの後続ステージ (発火面設計の一般化) で対応。
+- 優先度: P3。
 
 ### 1.9 parked 窓のリソース制御 (サムネ pipeline 停止 / VRAM 合算予算) — 角度⑥送り
 
@@ -205,22 +189,6 @@
 - 規模 / 優先度: **Large** (複数選択 = 中 + 整列/配置 = 小 + スマートガイド = 大)。P2 candidate。
   段階実装推奨 (① 複数選択 → ② 整列/配置ボタン → ③ スマートガイド)。
 
-### 1.19 内部パス / UI 文字列の露出 (マニュアルスクショ QA 由来)
-
-- 出典: チュートリアル全体レビュー (2026-07-15、Codex Sol)。公開マニュアルのスクショ撮影中に
-  露出した、ユーザーには不要な内部表現。実害は軽微だが、見た目・国際公開/ストア審査の観点で
-  次回以降に整えたい。
-- 対象:
-  1. **Windows タイトルバーに内部仮想パスが出る**: サブフォルダ展開ビュー表示中に
-     `data\__subfolder_expansion__`、読書履歴ビュー表示中に `data\__reading_history__` が
-     タイトルバーへ出る。これらは実フォルダではない内部ビューの sentinel パス。タイトルバーには
-     ビュー名 (例:「サブフォルダ展開」「読書履歴」) を出すか、パスを省くのが望ましい。
-  2. **隠蔽加工パネルのヘルプ文言に `DB` 表記**: 左パネル下部のキー説明に「終了時はDB保存」。
-     内部語 `DB` を避け「終了時に保存」等へ (CLAUDE.md「UI 文字列」方針)。
-- 非対象 (誤検出と確認済み): お気に入りダイアログの「I/O 並列度」「バックグラウンドインデクサ」
-  「起動時の整合性チェック」は通常の索引ステータス表示で、隠す必要はない。
-- 優先度: P3 (表示上の体裁のみ)。
-
 ### 2.1 folder pane scan worker の thread 構成判断
 
 - 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。
@@ -253,6 +221,39 @@
 - 方針: 具体的な再現手順が出るまではコード修正しない。再報告時は、変更したパラメータが色調補正 /
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
+
+### 3.3 画像単位の編集内容をコピー / 貼り付け
+
+- 出典: ユーザー要望 (2026-07-15)。ある画像で作った編集内容一式をコピーし、別の画像へ
+  貼り付けて再利用したい。対象は通常画像 / ZIP 内画像 / PDF ページのうち、既存の画像編集を
+  利用できる単一ページとする。
+- 基本 UX:
+  1. コピー元を 1 件選び、「編集内容をコピー」でその時点の編集内容をアプリ内に snapshot する。
+  2. コピー先を 1 件選び、「編集内容を貼り付け」で snapshot 全体を適用する。
+  3. コピー先に対象の編集内容が 1 種類でもあれば、「現在の編集内容をすべて消して上書きする」
+     ことを明記した確認ダイアログを出す。既定はキャンセルとし、明示確認後だけ置換する。
+  4. コピー先に編集内容が無ければ確認なしで適用してよい。複数選択 / チェック済み項目への
+     一括貼り付け、複数ファイル間のバッチ処理は初期スコープ外。
+- **コピー単位は部分マージではなく、ページ単位の編集 bundle 全置換**とする。初期定義は既存
+  `SidecarEntry` と同じ 6 系統: ページ個別補正 (`adjust`)、消しゴム (`mask`)、隠蔽加工
+  (`conceal`)、補正レイヤー (`local_adjust_layers`)、切り取り (`export_crop`)、テキスト注釈
+  (`comic`)。コピー元に存在しない系統はコピー先でも削除し、「元の隠蔽だけ残る」等の混在を
+  起こさない。★ / タグ / 読書位置 / 表示トリム / グローバル設定・プリセット / 非破壊回転は
+  編集 bundle に含めない。
+- コピー後にコピー元を編集しても snapshot は変化しない。OS のファイルコピー用 Ctrl+C / V と
+  衝突させず、まずは「編集内容をコピー / 貼り付け」と明示した UI 導線を設ける。
+- 実装上の不変条件:
+  - 6 系統を論理的に一括置換し、途中失敗で新旧の編集内容が混在しないこと。中央 DB の更新、
+    `mimageviewer.dat` への dual-write (設定のバックアップ ON 時)、メモリ上の page-key presence、
+    edit / final / comic cache の無効化を同じ成功境界で扱う。
+  - 製本ページ転送用の `copy_book_page_edit_key` / 各 DB の `copy_entry_key` は再利用候補だが、
+    現状は同一画素のページ複製を前提にした raw key copy で、★ / タグも含むため、そのまま公開
+    操作には使わない。
+  - コピー元と先で画像サイズ / 縦横比が違う場合は、pixel 座標のマスク・図形・注釈・crop を
+    raw row のまま複製しない。座標と太さの正規化変換、ラスターマスクの再サンプル、はみ出しの
+    clip 規則を詳細設計で確定し、同サイズ / 異サイズの双方に回帰テストを置く。
+- 規模 / リスク: Medium / 中 (複数 DB の全置換、サイドカー同期、異サイズ座標変換、
+  キャッシュ無効化)。優先度: P2 candidate。
 
 ### 3.4 トーン漫画の縮小モアレ対策 (手動 post_filter 縮小 → 将来 LOD)
 
@@ -351,6 +352,7 @@
 | 入力カスタマイズ / マウス / ゲームパッド | `docs/keymap-spec.md`, `docs/key-customization-impl-plan.md`, `docs/ring-shortcut-plan.md`, `docs/operation-customize-share-plan.md` |
 | フルスクリーン / F12 別ウィンドウ / 連結読み | `docs/display-pipeline.md`, `docs/detached-viewer-implementation-plan.md`, `docs/fullscreen-navigation-consistency.md` |
 | 表示 / AI / 補正 | `docs/display-pipeline.md`, `docs/preset-and-adjustment.md` |
+| 編集内容のコピー / 貼り付け | `docs/display-pipeline.md`, `docs/preset-and-adjustment.md`, `docs/local-adjustment-layer-v1.1.0-plan.md`, `docs/comic-integration-plan.md`, `src/sidecar.rs` |
 | 詳細表示 / スマートフィルタ | `docs/details-view-and-filter-plan.md`, `CLAUDE.md` の UI / スクロール節 |
 | タグ / フルスクリーン右パネル / 動画 overlay | `docs/tag-catalog-redesign-plan.md`, `docs/display-pipeline.md`, `docs/video-architecture.md`, `docs/detached-viewer-implementation-plan.md` |
 | 注釈の整列・配置 / 複数選択 / スマートガイド | `docs/comic-integration-plan.md`, `docs/annotation-shapes-plan.md`, `docs/keymap-spec.md` |

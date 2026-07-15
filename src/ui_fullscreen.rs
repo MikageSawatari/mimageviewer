@@ -8576,23 +8576,44 @@ impl App {
                         }
 
                         // ── 右上フィードバックトースト ──
+                        let ring_surface_context = self.ring_shortcut_context_for_surface(
+                            crate::app::ActionSurface::Viewer,
+                        );
                         if self.mouse_ring_flick.is_some()
-                            && self.current_ring_shortcut_context()
+                            && ring_surface_context
                                 == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
                         {
-                            self.sync_native_video_ring_guide_overlay(ctx);
+                            self.sync_native_video_ring_guide_overlay_for_context(
+                                ctx,
+                                ring_surface_context,
+                            );
                         }
-                        let ring_surface_context = self.current_ring_shortcut_context();
                         self.draw_mouse_ring_flick_overlay(ui, full_rect, ring_surface_context);
                         self.draw_mouse_gesture_overlay(
                             ui,
                             full_rect,
                             self.current_right_drag_context(),
                         );
-                        self.draw_gamepad_ring_overlay(ui, full_rect);
-                        self.draw_gamepad_picker_overlay(ui, full_rect);
-                        self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
-                        self.draw_gamepad_video_marker_picker_overlay(ui, full_rect);
+                        self.draw_gamepad_ring_overlay(
+                            ui,
+                            full_rect,
+                            crate::app::ActionSurface::Viewer,
+                        );
+                        self.draw_gamepad_picker_overlay(
+                            ui,
+                            full_rect,
+                            crate::app::ActionSurface::Viewer,
+                        );
+                        self.draw_gamepad_favorite_picker_overlay(
+                            ui,
+                            full_rect,
+                            crate::app::ActionSurface::Viewer,
+                        );
+                        self.draw_gamepad_video_marker_picker_overlay(
+                            ui,
+                            full_rect,
+                            crate::app::ActionSurface::Viewer,
+                        );
                         self.draw_feedback_toast(
                             ui,
                             full_rect,
@@ -11663,6 +11684,7 @@ impl App {
             action.mouse_nav = self.apply_mouse_back_forward_button(
                 ctx,
                 mouse_nav_forward,
+                crate::app::ActionSurface::Viewer,
                 "fullscreen-egui-mouse",
             );
             return action;
@@ -12116,7 +12138,11 @@ impl App {
         // 分析モード中でも同じ操作感で動かす (書き戻し先はドラッグ開始時の mode で固定)。
         // パネル上で「開始」された中ボタンは無視して下流に流すが、既にドラッグが
         // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
-        let middle_short_click = self.update_mouse_middle_short_click(ctx, !cursor_in_panel);
+        let middle_short_click = self.update_mouse_middle_short_click(
+            ctx,
+            !cursor_in_panel,
+            crate::app::ActionSurface::Viewer,
+        );
         if !cursor_in_panel || self.fs_middle_zoom_drag.is_some() {
             self.handle_middle_drag_zoom(ctx, default_image_rect);
         }
@@ -12124,6 +12150,7 @@ impl App {
             if let Some(nav) = self.apply_mouse_button(
                 ctx,
                 crate::ring_shortcut::MouseButtonSlot::Middle,
+                crate::app::ActionSurface::Viewer,
                 "fullscreen-middle-mouse",
             ) {
                 self.mouse_ring_nav = Some(nav);

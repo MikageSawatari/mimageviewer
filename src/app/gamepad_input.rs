@@ -232,35 +232,120 @@ enum PadDir {
     Right,
 }
 
-/// mIV のいずれかのウィンドウ (メイン / フルスクリーン) が OS の前面ウィンドウかどうか。
-/// 前面ウィンドウの所有プロセスが自プロセスなら true。gilrs はフォーカス非依存で
-/// グローバル入力を拾うため、別アプリ前面時にコントローラ入力で mIV が動かないようにする。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MouseMiddleClickState {
+    start: egui::Pos2,
+    started_at: Instant,
+    cancelled: bool,
+    surface: crate::app::ActionSurface,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseMiddleInputSample {
+    is_down: bool,
+    is_pressed: bool,
+    is_released: bool,
+    current_pos: Option<egui::Pos2>,
+}
+
+fn update_mouse_middle_click_state(
+    state: &mut Option<MouseMiddleClickState>,
+    sample: MouseMiddleInputSample,
+    surface: crate::app::ActionSurface,
+    allow_start: bool,
+    now: Instant,
+) -> bool {
+    if sample.is_pressed {
+        *state = if allow_start {
+            sample.current_pos.map(|start| MouseMiddleClickState {
+                start,
+                started_at: now,
+                cancelled: false,
+                surface,
+            })
+        } else {
+            None
+        };
+    }
+
+    let owned_by_surface = state.as_ref().is_some_and(|click| click.surface == surface);
+    if !owned_by_surface {
+        return false;
+    }
+
+    if sample.is_down || sample.is_released {
+        if let Some(click) = state.as_mut()
+            && let Some(pos) = sample.current_pos
+            && pos.distance(click.start) > crate::ui_fullscreen::MIDDLE_DRAG_THRESHOLD_PX
+        {
+            click.cancelled = true;
+        }
+    }
+    if sample.is_released {
+        return matches!(
+            state.take(),
+            Some(MouseMiddleClickState {
+                started_at,
+                cancelled: false,
+                ..
+            }) if now.duration_since(started_at) <= Duration::from_millis(500)
+        );
+    }
+    if !sample.is_down && !sample.is_pressed {
+        *state = None;
+    }
+    false
+}
+
+/// mIV のいずれかのウィンドウが OS の前面なら、その HWND を返す。
+/// gilrs はフォーカス非依存でグローバル入力を拾うため、別アプリ前面時の入力を
+/// ブロックすると同時に、detached viewer とメイングリッドのどちらが入力面かを決める。
 #[cfg(windows)]
-fn app_window_is_foreground() -> bool {
+fn foreground_app_hwnd() -> Option<u64> {
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
-            return false;
+            return None;
         }
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        pid != 0 && pid == GetCurrentProcessId()
+        (pid != 0 && pid == GetCurrentProcessId()).then_some(hwnd.0 as u64)
     }
 }
 
 #[cfg(not(windows))]
-fn app_window_is_foreground() -> bool {
-    true
+fn foreground_app_hwnd() -> Option<u64> {
+    Some(1)
+}
+
+fn ring_shortcut_context_for_surface_state(
+    surface: crate::app::ActionSurface,
+    detached_dual_surface: bool,
+    viewer_context: Option<RingShortcutContext>,
+) -> RingShortcutContext {
+    if surface == crate::app::ActionSurface::MainWindow && detached_dual_surface {
+        RingShortcutContext::Grid
+    } else {
+        viewer_context.unwrap_or(RingShortcutContext::Grid)
+    }
 }
 
 impl App {
-    pub(crate) fn draw_gamepad_ring_overlay(&self, ui: &mut egui::Ui, full_rect: egui::Rect) {
+    pub(crate) fn draw_gamepad_ring_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        surface: crate::app::ActionSurface,
+    ) {
         if self.ring_picker.is_some() || !self.gamepad_state.west_ring_active() {
             return;
         }
-        let context = self.current_ring_shortcut_context();
+        if self.current_input_surface() != surface {
+            return;
+        }
+        let context = self.ring_shortcut_context_for_surface(surface);
         let selected = self.gamepad_state.west_ring_direction();
         let painter = ui.painter();
         let center = full_rect.center();
@@ -273,6 +358,63 @@ impl App {
                 .unwrap_or_default()
                 .label_for_context(context)
         });
+    }
+
+    fn current_input_surface(&self) -> crate::app::ActionSurface {
+        #[cfg(windows)]
+        {
+            return self.detached_window_manager.resolve_input_surface(
+                self.viewer_session_is_detached_or_switching()
+                    || self.active_detached_viewer_context.is_some(),
+                self.main_hwnd.and_then(|hwnd| u64::try_from(hwnd).ok()),
+                foreground_app_hwnd(),
+                self.fullscreen_idx.is_some(),
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            if self.fullscreen_idx.is_some() {
+                crate::app::ActionSurface::Viewer
+            } else {
+                crate::app::ActionSurface::MainWindow
+            }
+        }
+    }
+
+    fn note_input_surface(&mut self, surface: crate::app::ActionSurface) {
+        #[cfg(windows)]
+        self.detached_window_manager.note_input_surface(surface);
+        #[cfg(not(windows))]
+        let _ = surface;
+    }
+
+    fn gamepad_targets_viewer(&self) -> bool {
+        self.fullscreen_idx.is_some()
+            && self.current_input_surface() == crate::app::ActionSurface::Viewer
+    }
+
+    pub(crate) fn ring_shortcut_context_for_surface(
+        &self,
+        surface: crate::app::ActionSurface,
+    ) -> RingShortcutContext {
+        let detached_dual_surface = self.viewer_session_is_detached_or_switching() || {
+            #[cfg(windows)]
+            {
+                self.active_detached_viewer_context.is_some()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
+        let viewer_context = self.fullscreen_idx.map(|fs_idx| {
+            if self.fullscreen_uses_video_ring_context(fs_idx) {
+                RingShortcutContext::VideoFullscreen
+            } else {
+                RingShortcutContext::ImageFullscreen
+            }
+        });
+        ring_shortcut_context_for_surface_state(surface, detached_dual_surface, viewer_context)
     }
 
     /// `surface_context` identifies which window is drawing: `Grid` for the main
@@ -476,7 +618,7 @@ impl App {
         self.mouse_ring_flick = Some(MouseFlickState::new(context, Instant::now(), pos));
         self.mouse_ring_grid_target_idx = grid_target_idx;
         self.mouse_ring_suppress_context_menu_once = false;
-        self.sync_native_video_ring_guide_overlay(ctx);
+        self.sync_native_video_ring_guide_overlay_for_context(ctx, context);
         request_ring_overlay_repaint_after(ctx, mouse_flick_guide_delay());
     }
 
@@ -615,12 +757,12 @@ impl App {
         }
 
         if !armed && moved < MOUSE_FLICK_NEUTRAL_RADIUS_PX && elapsed >= mouse_flick_menu_delay() {
-            self.sync_native_video_ring_guide_overlay(ctx);
+            self.sync_native_video_ring_guide_overlay_for_context(ctx, context);
             self.request_mouse_ring_flick_repaint(ctx);
             return MouseFlickOutcome::None;
         }
 
-        self.sync_native_video_ring_guide_overlay(ctx);
+        self.sync_native_video_ring_guide_overlay_for_context(ctx, context);
         self.request_mouse_ring_flick_repaint(ctx);
         MouseFlickOutcome::None
     }
@@ -904,10 +1046,18 @@ impl App {
         }
     }
 
-    pub(crate) fn draw_gamepad_picker_overlay(&self, ui: &mut egui::Ui, full_rect: egui::Rect) {
+    pub(crate) fn draw_gamepad_picker_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        surface: crate::app::ActionSurface,
+    ) {
         let Some(picker) = self.ring_picker.as_ref() else {
             return;
         };
+        if self.ring_shortcut_context_for_surface(surface) != picker.context {
+            return;
+        }
         let painter = ui.painter();
         painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
 
@@ -996,10 +1146,14 @@ impl App {
         &self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
+        surface: crate::app::ActionSurface,
     ) {
         let Some(picker) = self.gamepad_favorite_picker.as_ref() else {
             return;
         };
+        if self.current_input_surface() != surface {
+            return;
+        }
         let painter = ui.painter();
         painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
 
@@ -1116,10 +1270,14 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
+        surface: crate::app::ActionSurface,
     ) {
         let Some(picker) = self.gamepad_video_marker_picker.clone() else {
             return;
         };
+        if self.current_input_surface() != surface {
+            return;
+        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
@@ -1241,10 +1399,14 @@ impl App {
         &self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
+        surface: crate::app::ActionSurface,
     ) {
         let Some(picker) = self.gamepad_location_picker.as_ref() else {
             return;
         };
+        if surface != crate::app::ActionSurface::MainWindow {
+            return;
+        }
         let painter = ui.painter();
         painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
 
@@ -1521,6 +1683,8 @@ impl App {
         let mut nav = None;
         let mut dispatched = false;
         if dispatch_allowed {
+            let surface = self.current_input_surface();
+            self.note_input_surface(surface);
             self.consume_gamepad_directional_neutral_gate(now);
             for action in actions {
                 if let Some(next_nav) = self.dispatch_gamepad_button(ctx, action) {
@@ -1555,13 +1719,13 @@ impl App {
         // 無いときにバックグラウンドのコントローラ入力で操作されないよう OS の前面
         // プロセスでゲートする。フルスクリーンは別ウィンドウ (別ビューポート) なので
         // egui の viewport().focused (= メインビューポート) では正しく判定できない。
-        if !app_window_is_foreground() {
+        if foreground_app_hwnd().is_none() {
             return false;
         }
         if self.ime_input_active() {
             return false;
         }
-        if self.fullscreen_idx.is_some() {
+        if self.gamepad_targets_viewer() {
             return !self.any_modal_dialog_open_for_fullscreen_keys()
                 && self.fs_context_menu_idx.is_none()
                 && !self.erase_mode
@@ -1660,7 +1824,7 @@ impl App {
                     return None;
                 }
                 if let Some(dir) = button_dir(action.button) {
-                    if self.fullscreen_idx.is_none()
+                    if !self.gamepad_targets_viewer()
                         && self.handle_gamepad_folder_tree_direction(dir)
                     {
                         return None;
@@ -1733,8 +1897,11 @@ impl App {
             self.sync_native_video_ring_guide_overlay(ctx);
             return true;
         }
-        let Some(fs_idx) = self.fullscreen_idx else {
+        if !self.gamepad_targets_viewer() {
             return self.dispatch_gamepad_grid_analog(now);
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return false;
         };
         if self.current_fullscreen_is_video(fs_idx) {
             return self.dispatch_gamepad_video_analog(ctx, fs_idx, now);
@@ -1919,7 +2086,9 @@ impl App {
     }
 
     fn handle_gamepad_accept(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
-        if let Some(fs_idx) = self.fullscreen_idx {
+        if self.gamepad_targets_viewer()
+            && let Some(fs_idx) = self.fullscreen_idx
+        {
             if self.current_fullscreen_is_video(fs_idx) {
                 self.dispatch_native_video_key(ctx, fs_idx, 0x0D, false, false, false);
             } else {
@@ -1931,7 +2100,9 @@ impl App {
     }
 
     fn handle_gamepad_back(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
-        if let Some(fs_idx) = self.fullscreen_idx {
+        if self.gamepad_targets_viewer()
+            && let Some(fs_idx) = self.fullscreen_idx
+        {
             if self.current_fullscreen_is_video(fs_idx) {
                 self.dispatch_native_video_key(ctx, fs_idx, 0x1B, false, false, false);
             } else {
@@ -3092,9 +3263,17 @@ impl App {
     }
 
     pub(crate) fn sync_native_video_ring_guide_overlay(&mut self, ctx: &egui::Context) {
+        let context = self.current_ring_shortcut_context();
+        self.sync_native_video_ring_guide_overlay_for_context(ctx, context);
+    }
+
+    pub(crate) fn sync_native_video_ring_guide_overlay_for_context(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+    ) {
         #[cfg(windows)]
         {
-            let context = self.current_ring_shortcut_context();
             // 音楽ビュー (音声ファイル or Inc 7 動画→音声モード) は VideoFullscreen context だが
             // native video presenter/HUD が無い / hidden なので、native ガイドは出さず egui
             // オーバーレイ (draw_mouse_ring_flick_overlay) が音楽ビュー上に直接リングを描く。
@@ -3725,21 +3904,14 @@ impl App {
     }
 
     pub(crate) fn current_ring_shortcut_context(&self) -> RingShortcutContext {
-        if let Some(fs_idx) = self.fullscreen_idx {
-            if self.fullscreen_uses_video_ring_context(fs_idx) {
-                RingShortcutContext::VideoFullscreen
-            } else {
-                RingShortcutContext::ImageFullscreen
-            }
-        } else {
-            RingShortcutContext::Grid
-        }
+        self.ring_shortcut_context_for_surface(self.current_input_surface())
     }
 
     pub(crate) fn apply_mouse_back_forward_button(
         &mut self,
         ctx: &egui::Context,
         forward: bool,
+        surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> Option<AddressBarNav> {
         self.apply_mouse_button(
@@ -3749,6 +3921,7 @@ impl App {
             } else {
                 MouseButtonSlot::Back
             },
+            surface,
             source,
         )
     }
@@ -3757,52 +3930,32 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         allow_start: bool,
+        surface: crate::app::ActionSurface,
     ) -> bool {
-        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
-            (
-                i.pointer.button_down(egui::PointerButton::Middle),
-                i.pointer.button_pressed(egui::PointerButton::Middle),
-                i.pointer.button_released(egui::PointerButton::Middle),
-                i.pointer.interact_pos(),
-            )
+        let sample = ctx.input(|i| MouseMiddleInputSample {
+            is_down: i.pointer.button_down(egui::PointerButton::Middle),
+            is_pressed: i.pointer.button_pressed(egui::PointerButton::Middle),
+            is_released: i.pointer.button_released(egui::PointerButton::Middle),
+            current_pos: i.pointer.interact_pos(),
         });
-
-        if is_pressed {
-            self.mouse_middle_click_start = if allow_start {
-                current_pos.map(|pos| (pos, Instant::now(), false))
-            } else {
-                None
-            };
-        }
-        if is_down || is_released {
-            if let Some((start, _, cancelled)) = self.mouse_middle_click_start.as_mut() {
-                if let Some(pos) = current_pos {
-                    if pos.distance(*start) > crate::ui_fullscreen::MIDDLE_DRAG_THRESHOLD_PX {
-                        *cancelled = true;
-                    }
-                }
-            }
-        }
-        if is_released {
-            return matches!(
-                self.mouse_middle_click_start.take(),
-                Some((_, started_at, false))
-                    if started_at.elapsed() <= Duration::from_millis(500)
-            );
-        }
-        if !is_down && !is_pressed {
-            self.mouse_middle_click_start = None;
-        }
-        false
+        update_mouse_middle_click_state(
+            &mut self.mouse_middle_click_start,
+            sample,
+            surface,
+            allow_start,
+            Instant::now(),
+        )
     }
 
     pub(crate) fn apply_mouse_button(
         &mut self,
         ctx: &egui::Context,
         slot: MouseButtonSlot,
+        surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        let context = self.current_ring_shortcut_context();
+        self.note_input_surface(surface);
+        let context = self.ring_shortcut_context_for_surface(surface);
         let action = self
             .settings
             .ring_shortcuts
@@ -4913,8 +5066,11 @@ impl App {
     }
 
     fn handle_gamepad_select(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
-        let Some(fs_idx) = self.fullscreen_idx else {
+        if !self.gamepad_targets_viewer() {
             self.open_gamepad_location_picker(ctx);
+            return None;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
             return None;
         };
         if self.current_fullscreen_is_video(fs_idx) {
@@ -4936,18 +5092,19 @@ impl App {
     }
 
     fn handle_gamepad_y_tap(&mut self, ctx: &egui::Context) {
-        let Some(fs_idx) = self.fullscreen_idx else {
-            // 非フルスクリーン: Y でツリーをトグル。閉じる時はカーソルが別フォルダへ
-            // 動いていれば Enter 相当でそこへ移動して閉じる
-            // (`toggle_folder_tree_pane_from_key`)。
+        if !self.gamepad_targets_viewer() {
+            // グリッド面: Y でツリーをトグル。detached viewer が同時表示中でも
+            // foreground / last-touched がメインならこちらを操作する。
             if self.folder_pane_disabled() && !self.settings.folder_tree_pane_visible {
-                // 非表示→表示しようとした: スナップショット中は移動不可なので拒否。
                 self.show_feedback_toast(
                     "スナップショット中は他のフォルダに移動できません".to_string(),
                 );
                 return;
             }
             self.toggle_folder_tree_pane_from_key();
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
         if self.current_fullscreen_is_video(fs_idx) {
@@ -4956,13 +5113,15 @@ impl App {
     }
 
     fn handle_gamepad_direction(&mut self, ctx: &egui::Context, dir: PadDir, repeat: bool) {
+        let targets_viewer = self.gamepad_targets_viewer();
         if self.gamepad_state.button_down(PadButton::North) {
             self.gamepad_state.mark_y_modifier_used();
-            if let Some(fs_idx) = self.fullscreen_idx
+            if targets_viewer
+                && let Some(fs_idx) = self.fullscreen_idx
                 && !self.current_fullscreen_is_video(fs_idx)
             {
                 self.handle_gamepad_still_y_direction(ctx, fs_idx, dir);
-            } else if let Some(fs_idx) = self.fullscreen_idx {
+            } else if targets_viewer && let Some(fs_idx) = self.fullscreen_idx {
                 self.handle_gamepad_video_y_direction(ctx, fs_idx, dir, repeat);
             } else {
                 self.handle_gamepad_direction_for_grid(dir);
@@ -4970,7 +5129,7 @@ impl App {
             return;
         }
 
-        if let Some(fs_idx) = self.fullscreen_idx {
+        if targets_viewer && let Some(fs_idx) = self.fullscreen_idx {
             if self.current_fullscreen_is_video(fs_idx) {
                 self.handle_gamepad_video_direction(ctx, fs_idx, dir, repeat);
             } else {
@@ -5340,7 +5499,9 @@ impl App {
     }
 
     fn handle_gamepad_folder_nav(&mut self, ctx: &egui::Context, forward: bool) {
-        if let Some(fs_idx) = self.fullscreen_idx {
+        if self.gamepad_targets_viewer()
+            && let Some(fs_idx) = self.fullscreen_idx
+        {
             let native_toast = self.current_fullscreen_is_video(fs_idx);
             self.bump_input_seq(
                 "gamepad_fs_folder_nav",
@@ -6316,13 +6477,15 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        POST_FILTER_GROUPS, PadDir, continuous_reading_stick_axis, cycle_rating,
-        cycle_video_playback_speed, gamepad_grid_nav_target_pos, mouse_flick_direction,
-        picker_rows_for_context, post_filter_group_index, post_filter_item_index_in_group,
-        rating_label, ring_direction_from_dpad_buttons, ring_direction_from_stick,
-        ring_direction_from_stick_with_hysteresis,
+        MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir, continuous_reading_stick_axis,
+        cycle_rating, cycle_video_playback_speed, gamepad_grid_nav_target_pos,
+        mouse_flick_direction, picker_rows_for_context, post_filter_group_index,
+        post_filter_item_index_in_group, rating_label, ring_direction_from_dpad_buttons,
+        ring_direction_from_stick, ring_direction_from_stick_with_hysteresis,
+        ring_shortcut_context_for_surface_state, update_mouse_middle_click_state,
     };
     use crate::adjustment::PostFilter;
+    use crate::app::ActionSurface;
     use crate::gamepad::{GamepadInputState, PadButton};
     use crate::ring_shortcut::RingShortcutContext;
     use crate::ring_shortcut::{
@@ -6331,6 +6494,74 @@ mod tests {
     };
     use crate::settings::{ReadingDirection, ReadingFlow};
     use eframe::egui;
+
+    #[test]
+    fn detached_ring_context_follows_drawing_surface() {
+        assert_eq!(
+            ring_shortcut_context_for_surface_state(
+                ActionSurface::MainWindow,
+                true,
+                Some(RingShortcutContext::ImageFullscreen),
+            ),
+            RingShortcutContext::Grid
+        );
+        assert_eq!(
+            ring_shortcut_context_for_surface_state(
+                ActionSurface::Viewer,
+                true,
+                Some(RingShortcutContext::ImageFullscreen),
+            ),
+            RingShortcutContext::ImageFullscreen
+        );
+    }
+
+    #[test]
+    fn other_surface_idle_pass_does_not_cancel_middle_click() {
+        let now = std::time::Instant::now();
+        let pos = egui::pos2(20.0, 30.0);
+        let mut state = None;
+        assert!(!update_mouse_middle_click_state(
+            &mut state,
+            MouseMiddleInputSample {
+                is_down: true,
+                is_pressed: true,
+                is_released: false,
+                current_pos: Some(pos),
+            },
+            ActionSurface::MainWindow,
+            true,
+            now,
+        ));
+        assert!(state.is_some());
+
+        assert!(!update_mouse_middle_click_state(
+            &mut state,
+            MouseMiddleInputSample {
+                is_down: false,
+                is_pressed: false,
+                is_released: false,
+                current_pos: None,
+            },
+            ActionSurface::Viewer,
+            true,
+            now + std::time::Duration::from_millis(16),
+        ));
+        assert!(state.is_some());
+
+        assert!(update_mouse_middle_click_state(
+            &mut state,
+            MouseMiddleInputSample {
+                is_down: false,
+                is_pressed: false,
+                is_released: true,
+                current_pos: Some(pos),
+            },
+            ActionSurface::MainWindow,
+            true,
+            now + std::time::Duration::from_millis(100),
+        ));
+        assert!(state.is_none());
+    }
 
     #[test]
     fn details_grid_gamepad_up_down_move_one_row() {

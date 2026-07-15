@@ -387,7 +387,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     旧 F11 window mode 経路は `FsToggleWindowMode` へ昇格済みで、native 動画 presenter も
     global shortcut snapshot 経由で同じ effective chord を使う。
 13. **ゲームパッドは固定**: `src/app/gamepad_input.rs` は閲覧専用の物理ボタン/軸入力として扱い、
-    keymap.ini の対象にしない。docs/keymap-spec.md のゲームパッド節と同じ方針。
+    keymap.ini の対象にしない。docs/keymap-spec.md のゲームパッド節と同じ方針。detached viewer と
+    メイングリッドが並行表示される場合の発火面解決も固定入力レイヤーで行い、OS 前面 HWND、
+    判定不能時は最後に操作した面、面が明示されるマウスイベントはその呼び出し元を使う。
 
 ---
 
@@ -509,7 +511,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
 - BrowserBack/Forward、マウス戻る/進むは
   `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で
-  コンテキスト別に個別割り当て、通常ホイール、Ctrl+ホイール、クリックは固定。
+  コンテキスト別に個別割り当て、通常ホイール、Ctrl+ホイール、クリックは固定。detached viewer
+  表示中はマウスイベントの受信面をコンテキスト解決へ明示的に渡し、`fullscreen_idx` だけから
+  発火面を推定しない。
 
 ### FsImage (Ph2) ★
 - FsToggleMetadata `I`,`Tab` (P) ★: 画像フルスクリーン / native 動画 / egui 音楽ビューの
