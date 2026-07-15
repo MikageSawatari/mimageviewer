@@ -22,10 +22,32 @@ pub enum RarDirectReadDecision {
     Encrypted,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RarVolumeKind {
+    Single,
+    First,
+    Subsequent,
+}
+
+impl From<unrar::VolumeInfo> for RarVolumeKind {
+    fn from(value: unrar::VolumeInfo) -> Self {
+        match value {
+            unrar::VolumeInfo::None => Self::Single,
+            unrar::VolumeInfo::First => Self::First,
+            unrar::VolumeInfo::Subsequent => Self::Subsequent,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct RarInspection {
     pub decision: RarDirectReadDecision,
     pub summary: ArchiveImageSummary,
+    /// Header truth for the path that the caller originally supplied.
+    pub volume_kind: RarVolumeKind,
+    /// The path that must actually be listed/read. For a subsequent volume this is the
+    /// first volume; otherwise it is the original path.
+    pub resolved_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,18 +111,56 @@ pub(crate) fn classify_direct_read(
     }
 }
 
+fn open_listing_from_volume(
+    path: &Path,
+) -> io::Result<(
+    unrar::OpenArchive<unrar::List, unrar::CursorBeforeHeader>,
+    RarVolumeKind,
+    PathBuf,
+)> {
+    let archive = unrar::Archive::new(path);
+    let first_part = archive.first_part();
+    let opened = archive.open_for_listing().map_err(unrar_io)?;
+    let volume_kind = RarVolumeKind::from(opened.volume_info());
+    if volume_kind != RarVolumeKind::Subsequent {
+        return Ok((opened, volume_kind, path.to_path_buf()));
+    }
+    drop(opened);
+    let opened = unrar::Archive::new(&first_part)
+        .open_for_listing()
+        .map_err(unrar_io)?;
+    Ok((opened, volume_kind, first_part))
+}
+
+fn resolved_volume_path(path: &Path) -> io::Result<(PathBuf, RarVolumeKind)> {
+    let archive = unrar::Archive::new(path);
+    let first_part = archive.first_part();
+    let opened = archive.open_for_listing().map_err(unrar_io)?;
+    let volume_kind = RarVolumeKind::from(opened.volume_info());
+    drop(opened);
+    let resolved = if volume_kind == RarVolumeKind::Subsequent {
+        first_part
+    } else {
+        path.to_path_buf()
+    };
+    Ok((resolved, volume_kind))
+}
+
+/// Header-backed decision for worker-side folder navigation. A malformed or unreadable RAR is
+/// reported as an error so callers can conservatively keep it visible.
+pub fn is_subsequent_volume(path: &Path) -> io::Result<bool> {
+    resolved_volume_path(path).map(|(_, kind)| kind == RarVolumeKind::Subsequent)
+}
+
 /// Inspect a RAR once per `(path, mtime, size)` identity.
 pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
     let key = cache_key(path)?;
     if let Ok(cache) = DECISION_CACHE.lock()
         && let Some((_, inspection)) = cache.iter().find(|(cached, _)| cached == &key)
     {
-        return Ok(*inspection);
+        return Ok(inspection.clone());
     }
-    let mut archive = unrar::Archive::new(path)
-        .as_first_part()
-        .open_for_listing()
-        .map_err(unrar_io)?;
+    let (mut archive, volume_kind, resolved_path) = open_listing_from_volume(path)?;
     let is_solid = archive.is_solid();
     let mut has_encrypted = archive.has_encrypted_headers();
     let mut image_count = 0u32;
@@ -131,23 +191,22 @@ pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
             total_uncompressed_bytes,
             nested_archive_count,
         },
+        volume_kind,
+        resolved_path,
     };
     if let Ok(mut cache) = DECISION_CACHE.lock() {
         cache.retain(|(cached, _)| cached.path != key.path);
         if cache.len() >= DECISION_CACHE_CAPACITY {
             cache.remove(0);
         }
-        cache.push((key, inspection));
+        cache.push((key, inspection.clone()));
     }
     Ok(inspection)
 }
 
 pub fn enumerate_image_entries_detailed(path: &Path) -> io::Result<ZipEnumeration> {
-    let mut archive = unrar::Archive::new(path)
-        .as_first_part()
-        .open_for_listing()
-        .map_err(unrar_io)?;
-    let mtime = std::fs::metadata(path)
+    let (mut archive, _, resolved_path) = open_listing_from_volume(path)?;
+    let mtime = std::fs::metadata(&resolved_path)
         .ok()
         .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
     let mut entries = Vec::new();
@@ -175,10 +234,7 @@ pub fn enumerate_image_entries_detailed(path: &Path) -> io::Result<ZipEnumeratio
 }
 
 pub fn first_image_entry(path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {
-    let mut archive = unrar::Archive::new(path)
-        .as_first_part()
-        .open_for_listing()
-        .ok()?;
+    let (mut archive, _, _) = open_listing_from_volume(path).ok()?;
     for entry in archive.by_ref() {
         if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
             return None;
@@ -193,8 +249,8 @@ pub fn first_image_entry(path: &Path, cancel: Option<&AtomicBool>) -> Option<Str
 }
 
 pub fn read_first_image_bytes(path: &Path) -> Option<(String, Vec<u8>)> {
-    let mut archive = unrar::Archive::new(path)
-        .as_first_part()
+    let (resolved_path, _) = resolved_volume_path(path).ok()?;
+    let mut archive = unrar::Archive::new(&resolved_path)
         .open_for_processing()
         .ok()?;
     loop {
@@ -215,8 +271,8 @@ pub fn read_first_image_bytes(path: &Path) -> Option<(String, Vec<u8>)> {
 
 pub fn read_entry_bytes(path: &Path, wanted: &str) -> io::Result<Vec<u8>> {
     let wanted = wanted.replace('\\', "/");
-    let mut archive = unrar::Archive::new(path)
-        .as_first_part()
+    let (resolved_path, _) = resolved_volume_path(path)?;
+    let mut archive = unrar::Archive::new(&resolved_path)
         .open_for_processing()
         .map_err(unrar_io)?;
     let mut seen_names = HashSet::new();
@@ -249,6 +305,11 @@ pub fn read_entry_bytes(path: &Path, wanted: &str) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn multipart_filename_fixture_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression")
+    }
 
     #[test]
     fn direct_read_classifier_accepts_only_flat_non_solid_unencrypted_rar() {
@@ -298,5 +359,60 @@ mod tests {
         assert_eq!(first.len(), 165);
         assert_eq!(second.len(), 188);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ambiguous_numeric_names_are_single_archives_by_header() {
+        let root = multipart_filename_fixture_root();
+        for name in [
+            "○×△□ Vol.1.rar",
+            "○×△□ Vol.2.rar",
+            "○×△□ Vol.2a.rar",
+            "○×△□ Vol.10.rar",
+            "○×△□ Vol.10a.rar",
+            "○×△□ Vol.123.rar",
+            "○×△□ Vol.１.rar",
+        ] {
+            let path = root.join(name);
+            let inspection = inspect_for_direct_read(&path)
+                .unwrap_or_else(|error| panic!("failed to inspect {}: {error}", path.display()));
+            assert_eq!(inspection.volume_kind, RarVolumeKind::Single, "{name}");
+            assert_eq!(inspection.resolved_path, path, "{name}");
+            let entries = enumerate_image_entries_detailed(&path).unwrap();
+            assert_eq!(entries.entries.len(), 1, "{name}");
+            let bytes = read_entry_bytes(&path, &entries.entries[0].entry_name).unwrap();
+            assert!(!bytes.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn real_subsequent_volume_resolves_to_first_part_by_header() {
+        let root = multipart_filename_fixture_root().join("real-split-control");
+        let first = root.join("real-split-control.part1.rar");
+        let second = root.join("real-split-control.part2.rar");
+
+        let first_inspection = inspect_for_direct_read(&first).unwrap();
+        assert_eq!(first_inspection.volume_kind, RarVolumeKind::First);
+        assert_eq!(first_inspection.resolved_path, first);
+
+        let second_inspection = inspect_for_direct_read(&second).unwrap();
+        assert_eq!(second_inspection.volume_kind, RarVolumeKind::Subsequent);
+        assert_eq!(second_inspection.resolved_path, first);
+        assert!(is_subsequent_volume(&second).unwrap());
+
+        let from_first = enumerate_image_entries_detailed(&first).unwrap();
+        let from_second = enumerate_image_entries_detailed(&second).unwrap();
+        let first_entries: Vec<_> = from_first
+            .entries
+            .iter()
+            .map(|entry| (&entry.entry_name, entry.uncompressed_size))
+            .collect();
+        let second_entries: Vec<_> = from_second
+            .entries
+            .iter()
+            .map(|entry| (&entry.entry_name, entry.uncompressed_size))
+            .collect();
+        assert_eq!(second_entries, first_entries);
+        assert!(!from_first.entries.is_empty());
     }
 }

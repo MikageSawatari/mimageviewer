@@ -189,37 +189,6 @@
 - 規模 / 優先度: **Large** (複数選択 = 中 + 整列/配置 = 小 + スマートガイド = 大)。P2 candidate。
   段階実装推奨 (① 複数選択 → ② 整列/配置ボタン → ③ スマートガイド)。
 
-### 1.19 通常 RAR が分割 RAR の後続パートと誤判定され、一覧から消える
-
-- 出典: 5ch 不具合報告 (2026-07-15、調査 2026-07-16)。ピリオドを複数含む独立した
-  単体 RAR で、`Vol.1.rar` / `Vol.2a.rar` / `Vol.10a.rar` は表示される一方、
-  `Vol.2.rar` / `Vol.10.rar` / `Vol.123.rar` / `Vol.１.rar` が表示されない。
-  同名 ZIP では発生しない。
-- 再現データ: `testdata/archives/rar-multipart-filename-regression/` に、上記 7 ファイルを
-  それぞれ独立した正常な RAR5 として作成済み。`real-split-control/` には、本当に分割された
-  `real-split-control.part1.rar` / `.part2.rar` の対照データも置いている。
-- 期待する不変条件: 通常の単体 RAR は、分割 RAR に似た曖昧なファイル名だけを理由に
-  一覧・フォルダナビから除外したり、別ファイルへ読み替えたりしない。実際の分割 RAR の
-  後続ボリュームだけを非表示にし、先頭ボリュームから開く。
-- 原因 (確認済み): `unrar 0.5.8` の `is_multipart()` / `first_part()` / `as_first_part()` は
-  ファイルやヘッダを読まず、広めのファイル名規則だけで分割形式を推測する。mIV は
-  `archive_converter::is_non_first_rar_part()` でこの推測を確定判定として一覧除外に使い、
-  `rar_loader` / `archive_converter` の読込経路でも `as_first_part()` を無条件に使っている。
-  そのため `.2.rar` 等が後続パート扱いになり、一覧から消えるだけでなく、直接開いた場合も
-  推測された `.1.rar` へ誤転送される可能性がある。
-- 根本修正方針:
-  1. ファイル名判定は、ヘッダ確認が必要な候補を絞る用途にだけ使う。
-  2. worker で指定された RAR 自体を開き、RAR ヘッダの `volume_info()`
-     (`None` / `First` / `Subsequent`) を真実源にする。フォルダ走査の UI スレッドへ
-     同期 archive I/O を追加しない。
-  3. `Subsequent` と確認できた場合だけ先頭ボリュームを解決する。一覧フィルタだけでなく、
-     inspection / enumerate / read / convert に残る無条件 `as_first_part()` も同じ境界へ揃える。
-- 回帰テスト: 曖昧名の独立 RAR がすべて列挙・読込可能、本物の `.part2.rar` だけが後続扱い、
-  先頭 `.part1.rar` から全ボリュームを読めることをヘッダ付き fixture で確認する。現在の
-  `rar_non_first_part_detection` のファイル名だけのテストを直すだけでは不十分。
-- 着手条件 / 優先度: DetachedWindowManager 抽出と実機確認が完了したため着手可。P2
-  (対象ファイルが見えず、直接読込先も誤る correctness bug)。
-
 ### 1.20 見開き最終ページで「最後の項目です」が 1 回遅れて表示される
 
 - 出典: 5ch 不具合報告 (2026-07-15、調査 2026-07-16)。前方から読み進めて最後の 2 枚を

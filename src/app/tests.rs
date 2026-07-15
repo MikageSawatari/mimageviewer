@@ -111,6 +111,22 @@ fn scan_folder_names(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+fn scan_convertible_archive_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = scan_directory(dir)
+        .folders
+        .into_iter()
+        .filter_map(|(item, _)| match item {
+            GridItem::ConvertibleArchive { path, .. } => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn comic_export_composition_applies_multiply_marker() {
     let base = egui::ColorImage::new([8, 8], vec![egui::Color32::WHITE; 64]);
@@ -193,6 +209,40 @@ fn scan_directory_can_ignore_convertible_archives() {
             .iter()
             .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
         "convertible archives should be hidden from the folder list"
+    );
+}
+
+#[test]
+fn rar_folder_scan_keeps_all_volumes_visible_without_header_io() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/archives/rar-multipart-filename-regression");
+    let standalone_names = [
+        "○×△□ Vol.1.rar",
+        "○×△□ Vol.2.rar",
+        "○×△□ Vol.2a.rar",
+        "○×△□ Vol.10.rar",
+        "○×△□ Vol.10a.rar",
+        "○×△□ Vol.123.rar",
+        "○×△□ Vol.１.rar",
+    ];
+    for name in standalone_names {
+        crate::rar_loader::inspect_for_direct_read(&root.join(name)).unwrap();
+    }
+    let mut expected: Vec<String> = standalone_names.into_iter().map(str::to_owned).collect();
+    expected.sort();
+    assert_eq!(scan_convertible_archive_names(&root), expected);
+
+    let split_root = root.join("real-split-control");
+    let first = split_root.join("real-split-control.part1.rar");
+    let second = split_root.join("real-split-control.part2.rar");
+    crate::rar_loader::inspect_for_direct_read(&first).unwrap();
+    crate::rar_loader::inspect_for_direct_read(&second).unwrap();
+    assert_eq!(
+        scan_convertible_archive_names(&split_root),
+        vec![
+            "real-split-control.part1.rar".to_string(),
+            "real-split-control.part2.rar".to_string(),
+        ]
     );
 }
 

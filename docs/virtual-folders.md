@@ -165,7 +165,17 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
   `folder_should_stop` と `sorted_subdirs` は RAR/CBR/7z/CB7/LZH/LHA も ZIP/PDF と同じ
   コンテナ候補として扱い、`App::load_folder_nav_target` から
   `load_folder_or_convert_archive` へ渡す。`Ignore` では一覧スキャンと同じく候補から外す。
-  分割 RAR は先頭パートのみを候補にし、後続パートはフォルダナビで重複停止しない。
+  通常フォルダ一覧には分割 RAR の後続パートも実ファイルとして表示するが、フォルダ横断では
+  同じ本へ何度も停止しないよう後続パートを候補から外す。この判定は DFS worker で指定された
+  ファイルの RAR header `volume_info()` を確認する。`unrar` の `is_multipart()` /
+  `first_part()` は `Vol.2.rar` のような通常ファイル名にも一致するため、名前判定は header を
+  確認する候補の絞り込みにだけ使う。
+- **分割 RAR の表示とオープン**: 通常フォルダ一覧の UI 側 scan は RAR header I/O を行わず、
+  `.rar` / `.cbr` をすべて表示する。後続パートを選んだ場合は open worker が
+  `volume_info() == Subsequent` を確認した後だけ先頭パートへ正規化し、先頭を選んだ場合と
+  同じ本を開く。inspection / enumerate / read / convert、サムネイル用の直接読込／変換cache
+  参照も同じ正規化境界を使う。`None` の単体 RAR は、外側の名前が `Vol.2.rar` 等でも
+  選択されたファイル自身を開く。一覧の遅延フィルタや判定完了後の再読込は行わない。
 - **フルスクリーン Ctrl+↑↓ 中の未変換アーカイブ**: 変換キャッシュが無くても
   `archive_file_handling == Convert` により確認なしで変換できる場合は、直前ページの
   holdover と nav lock を維持し、変換完了後にキャッシュ ZIP を開いてフルスクリーンへ

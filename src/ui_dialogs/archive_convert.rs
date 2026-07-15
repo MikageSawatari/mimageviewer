@@ -33,7 +33,7 @@ use crate::archive_converter::{
 
 /// スキャン完了 / 変換完了通知用メッセージ。
 pub(crate) enum ArchiveConvertMsg {
-    ScanDone(Result<(ArchiveImageSummary, bool), ConvertError>),
+    ScanDone(Result<(ArchiveImageSummary, bool, PathBuf), ConvertError>),
     /// 変換完了。Ok なら (summary, cached_zip_path, cached_zip_size)
     ConvertDone(Result<(ArchiveImageSummary, PathBuf, i64), ConvertError>),
     SiblingConvertDone(Result<(ArchiveImageSummary, PathBuf, i64), ConvertError>),
@@ -142,15 +142,17 @@ fn spawn_archive_scan(
                 Ok(inspection) => Ok((
                     inspection.summary,
                     inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct,
+                    inspection.resolved_path,
                 )),
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    scan_summary_with_password(&src, format, None).map(|summary| (summary, false))
+                    scan_summary_with_password(&src, format, None)
+                        .map(|summary| (summary, false, src.clone()))
                 }
                 Err(error) => Err(ConvertError::Archive(error.to_string())),
             }
         } else {
             scan_summary_with_password(&src, format, password.as_deref())
-                .map(|summary| (summary, false))
+                .map(|summary| (summary, false, src.clone()))
         };
         let _ = tx.send(ArchiveConvertMsg::ScanDone(result));
     });
@@ -892,7 +894,13 @@ impl App {
         let mut clear_deferred_fullscreen = false;
         while let Ok(msg) = state.rx.try_recv() {
             match msg {
-                ArchiveConvertMsg::ScanDone(Ok((summary, direct_read))) => {
+                ArchiveConvertMsg::ScanDone(Ok((summary, direct_read, resolved_src))) => {
+                    if !crate::folder_tree::path_eq(&state.src_path, &resolved_src) {
+                        state.src_path = resolved_src;
+                        // A cache lookup made for a requested subsequent volume does not identify
+                        // the first volume that header inspection resolved.
+                        state.fallback_cached_zip = None;
+                    }
                     if direct_read {
                         state.pending_direct_nav = Some(state.src_path.clone());
                         continue;

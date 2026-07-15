@@ -113,11 +113,12 @@ impl ArchiveFormat {
     }
 }
 
-/// `path` が分割 RAR の先頭パート以外を指しているかを、ファイル名規則だけで判定する。
+/// `path` が分割 RAR の先頭パート以外に見えるかを、ファイル名規則だけで判定する。
 ///
-/// 後続パート (`.part02.rar` 等) は単独で開く対象ではないため、フォルダ一覧では
-/// 先頭パートだけを `ConvertibleArchive` として表示する。`.cbr` は単体 RAR として扱う。
-pub fn is_non_first_rar_part(path: &Path) -> bool {
+/// `unrar` の命名規則は通常の `Vol.2.rar` などにも一致するため、この結果を一覧除外や
+/// 読込先変更の確定判定に使ってはならない。worker で RAR header の `volume_info()` を
+/// 確認すべき候補を絞る用途にだけ使う。`.cbr` は単体 RAR として扱う。
+pub fn looks_like_non_first_rar_part(path: &Path) -> bool {
     if !path
         .extension()
         .and_then(|e| e.to_str())
@@ -311,14 +312,52 @@ fn rar_archive<'a>(
     }
 }
 
+fn open_rar_listing(
+    path: &Path,
+    password: Option<&str>,
+) -> Result<unrar::OpenArchive<unrar::List, unrar::CursorBeforeHeader>, ConvertError> {
+    let archive = rar_archive(path, password)?;
+    let first_part = archive.first_part();
+    let opened = archive.open_for_listing().map_err(rar_error)?;
+    if opened.volume_info() != unrar::VolumeInfo::Subsequent {
+        return Ok(opened);
+    }
+    drop(opened);
+    rar_archive(&first_part, password)?
+        .open_for_listing()
+        .map_err(rar_error)
+}
+
+fn resolve_rar_source_path(
+    path: &Path,
+    password: Option<&str>,
+) -> Result<std::path::PathBuf, ConvertError> {
+    let archive = rar_archive(path, password)?;
+    let first_part = archive.first_part();
+    let opened = archive.open_for_listing().map_err(rar_error)?;
+    let resolved = if opened.volume_info() == unrar::VolumeInfo::Subsequent {
+        first_part
+    } else {
+        path.to_path_buf()
+    };
+    Ok(resolved)
+}
+
+fn open_rar_processing(
+    path: &Path,
+    password: Option<&str>,
+) -> Result<unrar::OpenArchive<unrar::Process, unrar::CursorBeforeHeader>, ConvertError> {
+    let resolved = resolve_rar_source_path(path, password)?;
+    rar_archive(&resolved, password)?
+        .open_for_processing()
+        .map_err(rar_error)
+}
+
 fn scan_summary_rar(
     path: &Path,
     password: Option<&str>,
 ) -> Result<ArchiveImageSummary, ConvertError> {
-    let mut archive = rar_archive(path, password)?
-        .as_first_part()
-        .open_for_listing()
-        .map_err(rar_error)?;
+    let mut archive = open_rar_listing(path, password)?;
     let mut count = 0u32;
     let mut bytes = 0u64;
     let mut nested = 0u32;
@@ -993,10 +1032,7 @@ fn expand_rar(
 ) -> Result<(), ConvertError> {
     // 進捗分母: listing は伸長しないので安価。
     {
-        let mut listing = rar_archive(src, password)?
-            .as_first_part()
-            .open_for_listing()
-            .map_err(rar_error)?;
+        let mut listing = open_rar_listing(src, password)?;
         let mut expected = 0u32;
         for entry in listing.by_ref() {
             let entry = entry.map_err(rar_error)?;
@@ -1008,10 +1044,7 @@ fn expand_rar(
         ctx.add_expected(expected);
     }
 
-    let mut archive = rar_archive(src, password)?
-        .as_first_part()
-        .open_for_processing()
-        .map_err(rar_error)?;
+    let mut archive = open_rar_processing(src, password)?;
     loop {
         ctx.check_cancel()?;
         let Some(header) = archive.read_header().map_err(rar_error)? else {
@@ -1849,13 +1882,39 @@ mod tests {
     }
 
     #[test]
-    fn rar_non_first_part_detection() {
-        assert!(!is_non_first_rar_part(Path::new(r"C:\books\a.rar")));
-        assert!(!is_non_first_rar_part(Path::new(r"C:\books\a.cbr")));
-        assert!(!is_non_first_rar_part(Path::new(r"C:\books\a.part01.rar")));
-        assert!(is_non_first_rar_part(Path::new(r"C:\books\a.part02.rar")));
-        assert!(!is_non_first_rar_part(Path::new(r"C:\books\a.r00")));
-        assert!(!is_non_first_rar_part(Path::new(r"C:\books\a.r01")));
+    fn rar_non_first_part_name_candidate_detection() {
+        assert!(!looks_like_non_first_rar_part(Path::new(r"C:\books\a.rar")));
+        assert!(!looks_like_non_first_rar_part(Path::new(r"C:\books\a.cbr")));
+        assert!(!looks_like_non_first_rar_part(Path::new(
+            r"C:\books\a.part01.rar"
+        )));
+        assert!(looks_like_non_first_rar_part(Path::new(
+            r"C:\books\a.part02.rar"
+        )));
+        assert!(!looks_like_non_first_rar_part(Path::new(r"C:\books\a.r00")));
+        assert!(!looks_like_non_first_rar_part(Path::new(r"C:\books\a.r01")));
+    }
+
+    #[test]
+    fn rar_converter_resolves_only_header_confirmed_subsequent_volume() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression");
+        let ambiguous_single = root.join("○×△□ Vol.2.rar");
+        assert_eq!(
+            resolve_rar_source_path(&ambiguous_single, None).unwrap(),
+            ambiguous_single
+        );
+
+        let split_root = root.join("real-split-control");
+        let first = split_root.join("real-split-control.part1.rar");
+        let second = split_root.join("real-split-control.part2.rar");
+        assert_eq!(resolve_rar_source_path(&second, None).unwrap(), first);
+
+        let summary = scan_summary(&second, ArchiveFormat::Rar).unwrap();
+        assert!(summary.image_count > 0);
+        let (converted, names) = convert_sample(&second, ArchiveFormat::Rar);
+        assert_eq!(converted.image_count, summary.image_count);
+        assert!(!names.is_empty());
     }
 
     #[test]

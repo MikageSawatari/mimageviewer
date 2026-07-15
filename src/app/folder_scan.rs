@@ -95,7 +95,7 @@ pub(crate) fn scan_directory_with_convertible_archives(
             let mtime = meta
                 .as_ref()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-            let file_size = meta.map_or(0, |m| m.len() as i64);
+            let file_size = meta.as_ref().map_or(0, |m| m.len() as i64);
             if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
                 all_media.push((p, ScanMediaKind::Image, mtime, file_size));
             } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
@@ -110,11 +110,6 @@ pub(crate) fn scan_directory_with_convertible_archives(
                 && let Some(fmt) =
                     crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
             {
-                if fmt == crate::archive_converter::ArchiveFormat::Rar
-                    && crate::archive_converter::is_non_first_rar_part(&p)
-                {
-                    continue;
-                }
                 folders.push((
                     GridItem::ConvertibleArchive {
                         path: p,

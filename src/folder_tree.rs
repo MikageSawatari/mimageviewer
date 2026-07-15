@@ -174,7 +174,15 @@ fn is_folder_nav_file_candidate(path: &Path, opts: FolderTreeOptions) -> bool {
     is_virtual_folder(path)
         || (opts.include_convertible_archives
             && is_convertible_archive_path(path)
-            && !crate::archive_converter::is_non_first_rar_part(path))
+            && !is_confirmed_subsequent_rar_volume(path))
+}
+
+/// Folder navigation runs on its DFS worker, so it may confirm ambiguous RAR names by opening
+/// the supplied file's header. Name matching only narrows the candidates; unreadable files stay
+/// visible instead of being hidden on a guess.
+fn is_confirmed_subsequent_rar_volume(path: &Path) -> bool {
+    crate::archive_converter::looks_like_non_first_rar_part(path)
+        && crate::rar_loader::is_subsequent_volume(path).unwrap_or(false)
 }
 
 // -----------------------------------------------------------------------
@@ -241,8 +249,7 @@ fn folder_qualifies(
 
     if path.is_file() {
         if is_convertible_archive_path(path) {
-            return opts.include_convertible_archives
-                && !crate::archive_converter::is_non_first_rar_part(path);
+            return opts.include_convertible_archives && !is_confirmed_subsequent_rar_volume(path);
         }
         if !is_virtual_folder(path) {
             return false;
@@ -939,7 +946,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir(root.join("folder")).unwrap();
-        for name in ["a.zip", "b.pdf", "c.rar", "d.7z", "e.lzh", "c.part02.rar"] {
+        for name in ["a.zip", "b.pdf", "c.rar", "d.7z", "e.lzh"] {
             std::fs::write(root.join(name), b"").unwrap();
         }
 
@@ -954,10 +961,40 @@ mod tests {
                 "missing {expected}: {names:?}"
             );
         }
-        assert!(
-            !names.iter().any(|n| n == "c.part02.rar"),
-            "non-first split RAR parts must not become separate Ctrl+↑↓ targets: {names:?}"
-        );
+    }
+
+    #[test]
+    fn sorted_subdirs_uses_rar_header_truth_for_volume_filtering() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression");
+        let standalone = sorted_subdirs(&fixture, FolderTreeOptions::default());
+        let standalone_names: Vec<_> = standalone
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        for name in [
+            "○×△□ Vol.1.rar",
+            "○×△□ Vol.2.rar",
+            "○×△□ Vol.2a.rar",
+            "○×△□ Vol.10.rar",
+            "○×△□ Vol.10a.rar",
+            "○×△□ Vol.123.rar",
+            "○×△□ Vol.１.rar",
+        ] {
+            assert!(standalone_names.contains(&name), "missing {name}");
+        }
+
+        let split = fixture.join("real-split-control");
+        let split_names: Vec<_> = sorted_subdirs(&split, FolderTreeOptions::default())
+            .into_iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(split_names.contains(&"real-split-control.part1.rar".to_string()));
+        assert!(!split_names.contains(&"real-split-control.part2.rar".to_string()));
     }
 
     #[test]

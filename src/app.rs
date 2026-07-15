@@ -18408,21 +18408,39 @@ impl App {
                         return;
                     }
                     peeked += 1;
-                    if crate::rar_loader::is_rar_path(&path)
-                        && crate::rar_loader::inspect_for_direct_read(&path).is_ok_and(
-                            |inspection| {
-                                inspection.decision
-                                    == crate::rar_loader::RarDirectReadDecision::Direct
-                            },
-                        )
-                    {
-                        hits += 1;
-                        paths.insert(crate::path_key::normalize_keep_drive(&path), path.clone());
-                        continue;
+                    let mut cache_src = path.clone();
+                    let mut cache_mtime = mtime;
+                    let mut cache_file_size = file_size;
+                    if crate::rar_loader::is_rar_path(&path) {
+                        match crate::rar_loader::inspect_for_direct_read(&path) {
+                            Ok(inspection)
+                                if inspection.decision
+                                    == crate::rar_loader::RarDirectReadDecision::Direct =>
+                            {
+                                hits += 1;
+                                paths.insert(
+                                    crate::path_key::normalize_keep_drive(&path),
+                                    inspection.resolved_path,
+                                );
+                                continue;
+                            }
+                            Ok(inspection) => {
+                                // A visible subsequent volume represents the same logical book as
+                                // its first volume. Cache lookup and thumbnail loading therefore use
+                                // the header-resolved first path while the grid cell keeps the exact
+                                // file the user can manage via shell operations.
+                                cache_src = inspection.resolved_path;
+                                if let Ok(metadata) = std::fs::metadata(&cache_src) {
+                                    cache_mtime = crate::ui_helpers::mtime_secs(&metadata);
+                                    cache_file_size = metadata.len() as i64;
+                                }
+                            }
+                            Err(_) => {}
+                        }
                     }
                     // peek = 読み取り専用 lookup。フォルダを表示しただけで全アーカイブに
                     // last_access UPDATE (書き込みトランザクション) を発行しない。
-                    if let Some(cached_zip) = db.peek(&path, mtime, file_size) {
+                    if let Some(cached_zip) = db.peek(&cache_src, cache_mtime, cache_file_size) {
                         if worker_cancel.load(Ordering::Relaxed) {
                             return;
                         }
