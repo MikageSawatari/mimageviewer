@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>表示モードを選ぶ（1 画面 / 別ウィンドウ） — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>表示モードを選ぶ（1 画面 / 別ウィンドウ）</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">表示モードを選ぶ（1 画面 / 別ウィンドウ）</h1>
+    <p class="page-desc">
+      画像を一覧と同じウィンドウで見るか、別ウィンドウで何枚も開くかを、使い方に合わせて選べます。
+      まず「フル機能ウィンドウ」と「複数ウィンドウ」のどちらかを選び、必要ならフル機能側で
+      動画・音声だけを独立したウィンドウへ分けます。
+    </p>
+
+    <h2>3 つの実用的な構成</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>構成</th><th>画像</th><th>動画・音声</th><th>編集機能</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>フル機能ウィンドウ</strong></td>
+            <td>メインウィンドウで表示。<kbd>F12</kbd> で 1 つの連動する別ウィンドウへ切り替え</td>
+            <td>メインウィンドウで再生。<kbd>F12</kbd> で別ウィンドウへ切り替え</td>
+            <td>使用できます</td>
+          </tr>
+          <tr>
+            <td><strong>フル機能＋動画・音声は別ウィンドウ</strong></td>
+            <td>フル機能ウィンドウと同じ</td>
+            <td>1 つの独立したメディアウィンドウで再生</td>
+            <td>画像で使用できます</td>
+          </tr>
+          <tr>
+            <td><strong>複数ウィンドウ</strong></td>
+            <td>開くたびに新しい別ウィンドウで表示</td>
+            <td>1 つのメディアウィンドウを再利用</td>
+            <td>画像編集は使用できません。表示用の補正は使えます</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        迷ったら、既定の<strong>フル機能ウィンドウ</strong>から始めるのがおすすめです。
+        一覧と閲覧を 1 画面にまとめられ、必要なときだけ <kbd>F12</kbd> で別ウィンドウへ出せます。
+      </div>
+    </div>
+
+    <h2>初回起動で選ぶ</h2>
+    <p>
+      初回設定ダイアログの「ビューワモード」で、次のどちらかを選びます。
+    </p>
+    <ul>
+      <li><strong>フル機能ウィンドウ（編集機能あり）：</strong>一覧・閲覧・編集をメインウィンドウ中心で使います。本をページ一覧で開くか、ページを直接表示するかも選べます。</li>
+      <li><strong>複数ウィンドウ（編集機能なし）：</strong>画像を開くたびに別ウィンドウを増やします。ZIP / PDF / 対応アーカイブはページを直接表示します。</li>
+    </ul>
+    <p>
+      後から変える場合は、メニュー「設定」→「環境設定…」→「全体設定」の
+      <strong>ビューワモード</strong>を使います。フル機能ウィンドウでは、同じ場所にある
+      <strong>「動画・音声は別ウィンドウで再生」</strong>を ON にすると、再生を続けたままメインウィンドウで画像を閲覧できます。
+      ビューワモードを切り替えると、開いていた別ウィンドウは自動的に閉じます。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 環境設定 → 全体設定のビューワモードと「動画・音声は別ウィンドウで再生」</div>
+      <figcaption>フル機能ウィンドウか複数ウィンドウを選び、必要なら動画・音声だけを別ウィンドウへ分けます。</figcaption>
+    </figure>
+
+    <h2>F12 で連動する別ウィンドウへ切り替える</h2>
+    <p>
+      フル機能ウィンドウでは、<kbd>F12</kbd> を押すと表示中の画像や動画を 1 つの別ウィンドウへ切り替えられます。
+      この別ウィンドウは一覧と連動し、一覧のカーソル位置を動かすと別ウィンドウの表示も変わります。
+      反対に、別ウィンドウで前後のページへ進むと一覧のカーソル位置も追従します。
+    </p>
+    <ul>
+      <li>別ウィンドウを閉じてもビューワモード自体は変わりません。画像をダブルクリックするか <kbd>Enter</kbd> で再び開けます</li>
+      <li>「動画・音声は別ウィンドウで再生」が ON のときは、メディアウィンドウは独立して再生を続けます。<kbd>F12</kbd> で現在のメディアをメインウィンドウ側と切り替えられます</li>
+      <li>複数ウィンドウでは、画像は最初から個別の別ウィンドウで開きます。動画・音声では <kbd>F12</kbd> で現在のメディアを一時的にメインウィンドウ側へ移せます</li>
+    </ul>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        どちらのビューワモードでも <kbd>F11</kbd> で全画面表示を切り替えられます。
+        表示モードの全項目は<a href="settings.html#ui-theme">設定リファレンス</a>、
+        別ウィンドウと一覧の連動は<a href="fullscreen.html">フルスクリーン表示</a>を参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

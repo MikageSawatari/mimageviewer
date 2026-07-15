@@ -87,7 +87,7 @@
       <a class="toc-card" href="tut-first-run.html">
         <div class="toc-icon">🚀</div>
         <div class="toc-title">はじめての 10 分</div>
-        <div class="toc-desc">起動してフォルダを開き、選択・表示・移動・戻るまでをひと通り体験する導入シナリオ。</div>
+        <div class="toc-desc">起動してフォルダを開き、カーソル位置・チェック・表示・移動・戻るまでをひと通り体験する導入シナリオ。</div>
       </a>
       <a class="toc-card" href="tut-navigation.html">
         <div class="toc-icon">🧭</div>
@@ -101,13 +101,23 @@
       </a>
       <a class="toc-card" href="tut-archive.html">
         <div class="toc-icon">🗜️</div>
-        <div class="toc-title">ZIP / RAR / 7z / LZH を直接開く<span class="toc-chip setup">要設定</span></div>
-        <div class="toc-desc">ZIP はそのまま、RAR は多くが直接、それ以外は「変換」して読む。変換キャッシュの管理と再読み込みの流れ。</div>
+        <div class="toc-title">アーカイブを開く（必要に応じて ZIP へ変換）<span class="toc-chip setup">要設定</span></div>
+        <div class="toc-desc">ZIP / CBZ はそのまま、条件を満たす RAR / CBR は直接、それ以外は ZIP へ変換して読む。変換キャッシュの管理も解説。</div>
       </a>
       <a class="toc-card" href="tut-favorites.html">
         <div class="toc-icon">⭐</div>
         <div class="toc-title">お気に入りで素早くアクセス</div>
-        <div class="toc-desc">よく見るフォルダをお気に入り登録し、横断検索（<kbd>Ctrl</kbd>+<kbd>G</kbd>）の対象にする。追加・並べ替え・編集の基本。</div>
+        <div class="toc-desc">よく見るフォルダをお気に入り登録し、横断検索（<kbd>Ctrl</kbd>+<kbd>G</kbd>）の対象にする。音声はファイル名だけで検索。追加・並べ替え・編集の基本。</div>
+      </a>
+      <a class="toc-card" href="tut-file-ops.html">
+        <div class="toc-icon">🗃️</div>
+        <div class="toc-title">ファイルを整理する（コピー・移動・削除）</div>
+        <div class="toc-desc">右クリックメニュー、ドラッグ＆ドロップ、名前を指定したフォルダ作成、A / B クイックフォルダで整理する。</div>
+      </a>
+      <a class="toc-card" href="tut-display-modes.html">
+        <div class="toc-icon">🖥️</div>
+        <div class="toc-title">表示モードを選ぶ（1 画面 / 別ウィンドウ）<span class="toc-chip setup">要設定</span></div>
+        <div class="toc-desc">フル機能ウィンドウと複数ウィンドウの違い、動画・音声だけを別ウィンドウで開く設定、F12 の使い方。</div>
       </a>
       <a class="toc-card" href="tut-settings-basics.html">
         <div class="toc-icon">⚙️</div>
@@ -128,12 +138,12 @@
       <a class="toc-card" href="tut-reading.html">
         <div class="toc-icon">📚</div>
         <div class="toc-title">快適に読み続ける</div>
-        <div class="toc-desc">縦 / 横連結、フィット、余白トリム、読書位置の復元、読書履歴。長い作品を読み進めるための設定。</div>
+        <div class="toc-desc">縦 / 横連結、フィット、表示トリム、読書位置の復元、読書履歴。長い作品を読み進めるための設定。</div>
       </a>
       <a class="toc-card" href="tut-upscale-view.html">
         <div class="toc-icon">🪄</div>
         <div class="toc-title">AI アップスケールで拡大して見る<span class="toc-chip setup">要設定</span></div>
-        <div class="toc-desc">低解像度の画像や古い CG を、AI で高精細化して鑑賞する。モデル選びとメモリの目安。</div>
+        <div class="toc-desc">低解像度の画像や古い CG を、AI で高精細化して鑑賞する。モデル選びと適用範囲。</div>
       </a>
       <a class="toc-card" href="tut-stack.html">
         <div class="toc-icon">🗂️</div>
@@ -145,15 +155,10 @@
         <div class="toc-title">2 枚を並べて比較する<span class="toc-chip hidden">見つけづらい</span></div>
         <div class="toc-desc"><kbd>X</kbd> でピン留め →<kbd>C</kbd> 切り替え・<kbd>Shift</kbd>+<kbd>C</kbd> ワイプ・<kbd>Alt</kbd>+<kbd>C</kbd> 差分。加工前後の見比べに。</div>
       </a>
-      <a class="toc-card" href="tut-analysis.html">
-        <div class="toc-icon">🔬</div>
-        <div class="toc-title">画像分析モードで色・ピクセルを調べる<span class="toc-chip hidden">見つけづらい</span></div>
-        <div class="toc-desc"><kbd>Shift</kbd>+<kbd>Z</kbd> で起動。カラーピッカー・ヒストグラム・等倍拡大。<kbd>Z</kbd>（ズーム）との違いも整理。</div>
-      </a>
       <a class="toc-card" href="tut-search.html">
         <div class="toc-icon">🔎</div>
         <div class="toc-title">検索で目的のファイルを探す<span class="toc-chip tricky">戸惑いやすい</span></div>
-        <div class="toc-desc"><kbd>Ctrl</kbd>+<kbd>F</kbd>（現在地の絞り込み）/<kbd>Ctrl</kbd>+<kbd>S</kbd>（フォルダ・ZIP・PDF を名前で）/<kbd>Ctrl</kbd>+<kbd>G</kbd>（画像・動画・音声をメタ情報で）の使い分けと AND / OR / NOT。</div>
+        <div class="toc-desc"><kbd>Ctrl</kbd>+<kbd>F</kbd>（現在地の絞り込み）/<kbd>Ctrl</kbd>+<kbd>S</kbd>（フォルダ・ZIP・PDF を名前で）/<kbd>Ctrl</kbd>+<kbd>G</kbd>（画像・動画はメタ情報も、音声はファイル名のみ）の使い分け。</div>
       </a>
     </div>
 
@@ -253,6 +258,11 @@
         <div class="toc-icon">🧰</div>
         <div class="toc-title">一覧を掘り下げる（並べ替え・絞り込み）</div>
         <div class="toc-desc">並べ替え・詳細表示・スマートフィルタ・サブフォルダ展開・代表サムネイル固定で、グリッドを使い倒す。</div>
+      </a>
+      <a class="toc-card" href="tut-analysis.html">
+        <div class="toc-icon">🔬</div>
+        <div class="toc-title">画像分析モードで色・ピクセルを調べる<span class="toc-chip hidden">見つけづらい</span></div>
+        <div class="toc-desc">ホバーバーの 🔬（<kbd>Shift</kbd>+<kbd>Z</kbd>）で起動。カラーピッカー・ヒストグラム・等倍拡大。<kbd>Z</kbd>（ズーム）との違いも整理。</div>
       </a>
       <a class="toc-card" href="tut-cache.html">
         <div class="toc-icon">⚡</div>

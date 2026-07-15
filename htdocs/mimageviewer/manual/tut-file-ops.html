@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ファイルを整理する（コピー・移動・削除） — チュートリアル — mImageViewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>ファイルを整理する（コピー・移動・削除）</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">ファイルを整理する（コピー・移動・削除）</h1>
+    <p class="page-desc">
+      グリッドの右クリックメニュー、ドラッグ＆ドロップ、A / B クイックフォルダを使うと、
+      一覧を見ながら実ファイルをコピー・移動・整理できます。ZIP 内画像や PDF ページなど、
+      実体が通常のファイルではない項目には制約があるため、先に操作対象の決まり方を押さえておきましょう。
+    </p>
+
+    <h2>操作対象はカーソル位置とチェックで決まる</h2>
+    <p>
+      チェックした項目が 1 つでもあれば、その全項目が操作対象になります。チェックがなければ、
+      青いハイライトがあるカーソル位置の 1 件だけが対象です。複数をまとめて整理するときは、
+      <kbd>Space</kbd> や <kbd>Shift</kbd>+矢印で先にチェックします。
+    </p>
+
+    <h2>右クリックメニューでコピー・移動する</h2>
+    <p>
+      実ファイルまたは実フォルダを右クリックすると、mImageViewer の項目と Windows 標準の項目を使って
+      ファイル操作を行えます。コピー・切り取り・貼り付けなどを表示するには、環境設定で Windows 標準の
+      右クリックメニューを有効にしておきます。チェック済みの項目があれば、右クリックした 1 件ではなくチェック済み全体が対象です。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>やりたいこと</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>コピー</td><td>右クリックメニューの「コピー」。<kbd>Ctrl</kbd>+<kbd>C</kbd> でも実行できます</td></tr>
+          <tr><td>移動</td><td>右クリックメニューの「切り取り」で切り取り、移動先で「貼り付け」。<kbd>Ctrl</kbd>+<kbd>X</kbd> → <kbd>Ctrl</kbd>+<kbd>V</kbd> でも実行できます</td></tr>
+          <tr><td>名前変更</td><td>「mImageViewer: 名前の変更...」で新しい名前を指定します</td></tr>
+          <tr><td>削除</td><td>右クリックメニューの「削除」。<kbd>Delete</kbd> キーでもごみ箱へ移動できます</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        コピー・切り取りの対象に ZIP 内画像、PDF ページ、ドライブ一覧などの仮想項目が含まれると、
+        操作は中止されて通知が表示されます。実ファイルと仮想項目をいっしょにチェックした場合も同じです。
+        コピー・移動は実ファイルと実フォルダだけを対象にしてください。
+      </div>
+    </div>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 実ファイルを右クリックして、mImageViewer 項目とコピー・切り取り・削除が並んだメニュー</div>
+      <figcaption>チェック済みがあればチェックした全項目、なければカーソル位置の 1 件に対して右クリックメニューを使います。</figcaption>
+    </figure>
+
+    <h2>名前を指定してフォルダを作る</h2>
+    <p>
+      実フォルダの空いている場所を右クリックし、<strong>「mImageViewer: 新しいフォルダ...」</strong>を選ぶと、
+      ダイアログで名前を指定してからフォルダを作れます。作成後は一覧が更新され、新しいフォルダへカーソルが移ります。
+      名前を確定してから作れるため、OS 標準の新規フォルダー作成より、一覧を見ながら整理する流れが途切れません。
+    </p>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: 「mImageViewer: 新しいフォルダ...」から開いたフォルダ名の入力ダイアログ</div>
+      <figcaption>作成する名前をダイアログで指定し、確定すると現在の一覧へ新しいフォルダが追加されます。</figcaption>
+    </figure>
+
+    <h2>ドラッグ＆ドロップでやり取りする</h2>
+    <h3>mImageViewer から外へドラッグ</h3>
+    <p>
+      実ファイルや実フォルダは、グリッドからエクスプローラなどの外部へドラッグできます。
+      チェック済みがあればまとめて渡され、操作はコピーとして扱われます。画像・動画・ZIP・PDF などの実ファイルと
+      実フォルダが対象で、ZIP 内画像・PDF ページ・ドライブ一覧などの仮想項目は外へドラッグできません。
+    </p>
+
+    <h3>外から mImageViewer へドロップ</h3>
+    <p>
+      外部からのドロップでは、<strong>ファイルだけ</strong>を現在開いている実フォルダへコピーできます。
+      フォルダをドロップすると「フォルダのドロップは現在無効です」と通知され、コピーされません。
+      検索結果、ZIP / PDF の中、書き込み先になる実フォルダがない表示でも受け付けられません。
+    </p>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        フォルダごと移したい場合は、右クリックメニューの切り取りと貼り付けを使います。
+        外からフォルダをドロップする操作は現在利用できません。
+      </div>
+    </div>
+
+    <h2>A / B クイックフォルダでコピー元とコピー先を往復する</h2>
+    <p>
+      フォルダバーの <strong>A</strong> / <strong>B</strong> ボタンで、2 組の場所と履歴を切り替えられます。
+      A をコピー元、B をコピー先として開いておけば、ボタンを押すだけで往復できます。
+    </p>
+    <ul>
+      <li>A / B は、それぞれ最後に見た場所を別々に保持します</li>
+      <li>ドライブごとの最後の位置も A / B で別々に保持します</li>
+      <li>戻る / 進むの履歴も A / B ごとに独立しています</li>
+      <li>ZIP / PDF の中を見ていた場合は、その内部ページではなく入れ物の場所を記憶します</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <div class="tut-shot-ph">スクリーンショット: フォルダバーの A / B ボタンと、それぞれに別のフォルダを開いた状態</div>
+      <figcaption>フォルダバーの A / B ボタンを先に使い分けておくと、コピー元とコピー先を素早く行き来できます。</figcaption>
+    </figure>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        右クリックメニューの条件、ドラッグ＆ドロップ、A / B クイックフォルダの詳しい仕様は
+        <a href="grid.html">グリッド表示</a>リファレンスの「ファイル操作」と「A/B クイックフォルダ」を参照してください。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
