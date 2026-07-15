@@ -147,7 +147,79 @@
   (externalize + 翻訳 + QA 工程)。QA ツールは日本語バグにも効くため単独で投資回収がある。
 - 優先度: P2 candidate (QA ツール)。英語対応は QA ツール整備後に再判断 (現時点は保留)。
 
-## 2. フォルダツリーペイン
+### 1.18 注釈オブジェクトの整列・配置 (align / distribute) + スマートガイド
+
+- 出典: ユーザー要望 (2026-07-15)。テキスト注釈ツール (Ctrl+T、comic) で複数オブジェクトを
+  PowerPoint 的に整列・等間隔配置し、ドラッグ中のスナップ/ガイドで「綺麗に配置」しやすくする。
+  他ツール調査: 整列 6 種は PowerPoint/Illustrator/Figma 共通。distribute は PowerPoint/Figma が
+  「隙間均等 (両端固定)」既定、Illustrator は「中心/軸均等」と「隙間均等」を分離。整列基準は
+  PowerPoint の「選択物基準 / スライド基準」トグルが定番。
+- 正本ドキュメント: 着手時に本エントリを `docs/annotation-align-distribute-plan.md` へ起こして
+  詳細設計する。注釈サブシステムの契約は [comic-integration-plan.md](comic-integration-plan.md) /
+  [annotation-shapes-plan.md](annotation-shapes-plan.md)。
+
+- **前提機能 = 複数選択 (本機能の土台、追加コストの主)**: 現状は単一選択のみ
+  (`text_selected: Option<u64>`, src/app.rs)。以下を追加する:
+  - キャンバス: Ctrl+クリック=トグル / Shift+クリック=追加 / 空き領域ドラッグ=矩形囲み選択
+    (既存の pan/zoom ジェスチャとの共存整理が要)。
+  - 一覧 (`object_list_rows_ui` src/ui_text.rs): Ctrl+クリック=トグル / Shift+クリック=範囲。
+  - 選択状態を順序付き集合 (`Vec<u64>`) へ拡張。複数選択中は各オブジェクトに選択枠を描画。
+  - 複数まとめてドラッグ移動 (`translate_object` src/ui_text.rs:823 をループ。MessageWindow は
+    移動後 `position=Free` にする既存注意点を踏襲)。
+  - 2 個以上選択時は右パネルに整列バーを表示 (単一選択は従来の個別編集のまま)。
+
+- **整列 6 種 (2 個以上で有効)** — pivot 平行移動のみ (サイズ/回転は不変)、移動は片軸だけ:
+  - 左端 / 左右中央 / 右端、上端 / 上下中央 / 下端。
+  - **基準は「選択物」「画像」をトグルで切替 (既定 = 選択物)**。画像基準は PowerPoint の
+    スライド基準相当で、キャプション/透かしを画像端・画像中央へ絶対配置するのに使う。
+    選択物基準は選択グループの bounding box に対して揃える (両者は選択中心≠画像中心のとき差が出る)。
+  - **揃える箱は「本体のみ (しっぽ除外)」**。しっぽ付き吹き出しは本体 (輪郭) の箱で揃える
+    (`object_bounds` はしっぽ先端を含むので、本体だけの箱を別途算出する)。効果 (袋文字/影/発光)・
+    飾りは箱に含めない (現状の選択枠と同基準で一貫。テキストはレイアウト箱基準なので v2.4.0 の
+    ink 中央補正と整合し、上寄り偏りは再発しない)。
+
+- **配置 2 種 (3 個以上で有効)** — 両端固定、移動は片軸のみ:
+  - 横方向に等間隔 / 縦方向に等間隔。
+  - **「中心を等間隔」と「隙間 (edge-to-edge) を等間隔」の 2 モードを用意**
+    (同サイズなら同結果、サイズ混在時に差が出る。中心 = ユーザー既定イメージ、隙間 = 見た目が整う)。
+
+- **スマートガイド / スナップ (ドラッグ中、規模大)**:
+  - ドラッグ中に他オブジェクトの端/中心と一致したらガイド線表示 + 吸着 (スナップ閾値)、
+    等間隔になる位置でヒント表示 (Figma/PowerPoint 相当)。
+  - 毎フレームの候補計算・スナップ閾値・ガイド描画・既存 pan/zoom/変形ハンドルとの優先順位を
+    設計で確定する。実機調整が多い部分。
+
+- **座標系・Undo**: canonical ソース画素空間で演算。整列/配置/複数ドラッグは既存の coalesce
+  経路 (`mark_comic_dirty` → `commit_comic_undo_on_settle`) に乗せて 1 操作 = 1 undo。
+
+- **UI 文言/グリフ**: 整列バーのアイコンは絵文字を使わず painter 自作 or 安全字形
+  (CLAUDE.md グリフ tofu ポリシー)。キー操作は v1 ではボタンのみ (keymap 化・矢印キー nudge は将来)。
+
+- **再利用できる既存部品**: `object_bounds` (回転込み AABB, src/ui_text.rs:576) /
+  `translate_object` (src/ui_text.rs:823) / 安定 id (`AnnotationObject.id: u64`) /
+  Undo coalesce (`comic_commit_pending` / `commit_comic_undo_on_settle`) / `comic_docs`。
+
+- **ドキュメント更新 (実装時)**: `htdocs/mimageviewer/manual/annotation.html`,
+  `htdocs/mimageviewer/index.html`, `docs/spec.md`。
+
+- 規模 / 優先度: **Large** (複数選択 = 中 + 整列/配置 = 小 + スマートガイド = 大)。P2 candidate。
+  段階実装推奨 (① 複数選択 → ② 整列/配置ボタン → ③ スマートガイド)。
+
+### 1.19 内部パス / UI 文字列の露出 (マニュアルスクショ QA 由来)
+
+- 出典: チュートリアル全体レビュー (2026-07-15、Codex Sol)。公開マニュアルのスクショ撮影中に
+  露出した、ユーザーには不要な内部表現。実害は軽微だが、見た目・国際公開/ストア審査の観点で
+  次回以降に整えたい。
+- 対象:
+  1. **Windows タイトルバーに内部仮想パスが出る**: サブフォルダ展開ビュー表示中に
+     `data\__subfolder_expansion__`、読書履歴ビュー表示中に `data\__reading_history__` が
+     タイトルバーへ出る。これらは実フォルダではない内部ビューの sentinel パス。タイトルバーには
+     ビュー名 (例:「サブフォルダ展開」「読書履歴」) を出すか、パスを省くのが望ましい。
+  2. **隠蔽加工パネルのヘルプ文言に `DB` 表記**: 左パネル下部のキー説明に「終了時はDB保存」。
+     内部語 `DB` を避け「終了時に保存」等へ (CLAUDE.md「UI 文字列」方針)。
+- 非対象 (誤検出と確認済み): お気に入りダイアログの「I/O 並列度」「バックグラウンドインデクサ」
+  「起動時の整合性チェック」は通常の索引ステータス表示で、隠す必要はない。
+- 優先度: P3 (表示上の体裁のみ)。
 
 ### 2.1 folder pane scan worker の thread 構成判断
 
@@ -281,4 +353,5 @@
 | 表示 / AI / 補正 | `docs/display-pipeline.md`, `docs/preset-and-adjustment.md` |
 | 詳細表示 / スマートフィルタ | `docs/details-view-and-filter-plan.md`, `CLAUDE.md` の UI / スクロール節 |
 | タグ / フルスクリーン右パネル / 動画 overlay | `docs/tag-catalog-redesign-plan.md`, `docs/display-pipeline.md`, `docs/video-architecture.md`, `docs/detached-viewer-implementation-plan.md` |
+| 注釈の整列・配置 / 複数選択 / スマートガイド | `docs/comic-integration-plan.md`, `docs/annotation-shapes-plan.md`, `docs/keymap-spec.md` |
 | リリース / 依存更新 | `CLAUDE.md` のリリース手順、各 native 依存管理節 |
