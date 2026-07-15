@@ -6079,7 +6079,11 @@ fn edit_object_ui(
     if !is_multiply_bubble {
         let mut deg = o.rotation_rad.to_degrees();
         if ui
-            .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("回転°"))
+            .add(
+                egui::Slider::new(&mut deg, -180.0..=180.0)
+                    .text("回転°")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed()
         {
             o.rotation_rad = deg.to_radians();
@@ -6791,7 +6795,11 @@ fn text_block_ui(
         }
     });
     if ui
-        .add(egui::Slider::new(&mut t.size_px, 8.0..=400.0).text("サイズ"))
+        .add(
+            egui::Slider::new(&mut t.size_px, 8.0..=400.0)
+                .text("サイズ")
+                .clamping(egui::SliderClamping::Edits),
+        )
         .changed()
     {
         *changed = true;
@@ -7135,13 +7143,25 @@ fn marker_bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut 
     } = &mut b.shape
     {
         *changed |= ui
-            .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+            .add(
+                egui::Slider::new(half_w, 20.0..=800.0)
+                    .text("半幅")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed();
         *changed |= ui
-            .add(egui::Slider::new(half_h, 1.0..=800.0).text("半高"))
+            .add(
+                egui::Slider::new(half_h, 1.0..=800.0)
+                    .text("半高")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed();
         *changed |= ui
-            .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+            .add(
+                egui::Slider::new(corner_px, 0.0..=200.0)
+                    .text("角丸")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed();
     }
     if let Some(fill) = &mut b.fill {
@@ -7175,7 +7195,11 @@ fn annotation_arrow_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &m
     {
         let mut full_length = *half_w * 2.0;
         if ui
-            .add(egui::Slider::new(&mut full_length, 20.0..=2000.0).text("全長"))
+            .add(
+                egui::Slider::new(&mut full_length, 20.0..=2000.0)
+                    .text("全長")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed()
         {
             *half_w = full_length * 0.5;
@@ -7184,7 +7208,11 @@ fn annotation_arrow_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &m
 
         let mut shaft_width = shaft_half_px.unwrap_or(*half_h * 0.45) * 2.0;
         if ui
-            .add(egui::Slider::new(&mut shaft_width, 1.0..=60.0).text("線太さ"))
+            .add(
+                egui::Slider::new(&mut shaft_width, 1.0..=60.0)
+                    .text("線太さ")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed()
         {
             *shaft_half_px = Some(shaft_width * 0.5);
@@ -7193,7 +7221,11 @@ fn annotation_arrow_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &m
 
         let mut head_length = head_len_px.unwrap_or(*half_w * 0.9);
         if ui
-            .add(egui::Slider::new(&mut head_length, 1.0..=2000.0).text("先端の長さ"))
+            .add(
+                egui::Slider::new(&mut head_length, 1.0..=2000.0)
+                    .text("先端の長さ")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed()
         {
             *head_len_px = Some(head_length);
@@ -7202,7 +7234,11 @@ fn annotation_arrow_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &m
 
         let mut head_width = *half_h * 2.0;
         if ui
-            .add(egui::Slider::new(&mut head_width, 2.0..=1000.0).text("先端の幅"))
+            .add(
+                egui::Slider::new(&mut head_width, 2.0..=1000.0)
+                    .text("先端の幅")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed()
         {
             *half_h = head_width * 0.5;
@@ -7259,7 +7295,11 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
                 if *circle {
                     let mut radius = *rx;
                     if ui
-                        .add(egui::Slider::new(&mut radius, 20.0..=800.0).text("半径"))
+                        .add(
+                            egui::Slider::new(&mut radius, 20.0..=800.0)
+                                .text("半径")
+                                .clamping(egui::SliderClamping::Edits),
+                        )
                         .changed()
                     {
                         *rx = radius;
@@ -7268,10 +7308,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
                     }
                 } else {
                     *changed |= ui
-                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .add(
+                            egui::Slider::new(rx, 20.0..=800.0)
+                                .text("rx")
+                                .clamping(egui::SliderClamping::Edits),
+                        )
                         .changed();
                     *changed |= ui
-                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .add(
+                            egui::Slider::new(ry, 20.0..=800.0)
+                                .text("ry")
+                                .clamping(egui::SliderClamping::Edits),
+                        )
                         .changed();
                 }
             }
@@ -7283,10 +7331,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .add(
+                        egui::Slider::new(half_w, 20.0..=800.0)
+                            .text("半幅")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .add(
+                        egui::Slider::new(half_h, 20.0..=800.0)
+                            .text("半高")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7302,10 +7358,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .add(
+                        egui::Slider::new(rx, 20.0..=800.0)
+                            .text("rx")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .add(
+                        egui::Slider::new(ry, 20.0..=800.0)
+                            .text("ry")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7325,10 +7389,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .add(
+                        egui::Slider::new(rx, 20.0..=800.0)
+                            .text("rx")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .add(
+                        egui::Slider::new(ry, 20.0..=800.0)
+                            .text("ry")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7342,10 +7414,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         BubbleShape::Polygon { rx, ry, sides } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .add(
+                        egui::Slider::new(rx, 20.0..=800.0)
+                            .text("rx")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .add(
+                        egui::Slider::new(ry, 20.0..=800.0)
+                            .text("ry")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7355,20 +7435,36 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         BubbleShape::Diamond { half_w, half_h } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .add(
+                        egui::Slider::new(half_w, 20.0..=800.0)
+                            .text("半幅")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .add(
+                        egui::Slider::new(half_h, 20.0..=800.0)
+                            .text("半高")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
         }
         BubbleShape::Heart { rx, ry } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .add(
+                        egui::Slider::new(rx, 20.0..=800.0)
+                            .text("rx")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .add(
+                        egui::Slider::new(ry, 20.0..=800.0)
+                            .text("ry")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
         }
@@ -7380,10 +7476,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("長さ半分"))
+                    .add(
+                        egui::Slider::new(half_w, 20.0..=800.0)
+                            .text("長さ半分")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("幅半分"))
+                    .add(
+                        egui::Slider::new(half_h, 20.0..=800.0)
+                            .text("幅半分")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             let mut deg = dir_rad.to_degrees();
@@ -7403,10 +7507,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .add(
+                        egui::Slider::new(half_w, 20.0..=800.0)
+                            .text("半幅")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .add(
+                        egui::Slider::new(half_h, 20.0..=800.0)
+                            .text("半高")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7422,10 +7534,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(rx, 40.0..=1000.0).text("外半径rx"))
+                    .add(
+                        egui::Slider::new(rx, 40.0..=1000.0)
+                            .text("外半径rx")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(ry, 40.0..=1000.0).text("外半径ry"))
+                    .add(
+                        egui::Slider::new(ry, 40.0..=1000.0)
+                            .text("外半径ry")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7442,10 +7562,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 40.0..=1000.0).text("半幅"))
+                    .add(
+                        egui::Slider::new(half_w, 40.0..=1000.0)
+                            .text("半幅")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 40.0..=1000.0).text("半高"))
+                    .add(
+                        egui::Slider::new(half_h, 40.0..=1000.0)
+                            .text("半高")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7464,10 +7592,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         BubbleShape::TextOnly { half_w, half_h } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .add(
+                        egui::Slider::new(half_w, 20.0..=800.0)
+                            .text("半幅")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .add(
+                        egui::Slider::new(half_h, 20.0..=800.0)
+                            .text("半高")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             ui.label(
@@ -7479,10 +7615,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         BubbleShape::Concentration { rx, ry, shape_seed } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .add(
+                        egui::Slider::new(rx, 20.0..=800.0)
+                            .text("rx")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .add(
+                        egui::Slider::new(ry, 20.0..=800.0)
+                            .text("ry")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             shape_seed_row(ui, shape_seed, changed);
@@ -7495,10 +7639,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .add(
+                        egui::Slider::new(half_w, 20.0..=800.0)
+                            .text("半幅")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .add(
+                        egui::Slider::new(half_h, 20.0..=800.0)
+                            .text("半高")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7514,10 +7666,18 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         } => {
             if !auto {
                 *changed |= ui
-                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .add(
+                        egui::Slider::new(half_w, 20.0..=800.0)
+                            .text("半幅")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
                 *changed |= ui
-                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .add(
+                        egui::Slider::new(half_h, 20.0..=800.0)
+                            .text("半高")
+                            .clamping(egui::SliderClamping::Edits),
+                    )
                     .changed();
             }
             *changed |= ui
@@ -7631,7 +7791,11 @@ fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         .changed();
     if !t.base_auto {
         *changed |= ui
-            .add(egui::Slider::new(&mut t.base_t, 0.0..=1.0).text("付け根位置"))
+            .add(
+                egui::Slider::new(&mut t.base_t, 0.0..=1.0)
+                    .text("付け根位置")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed();
     }
     let w_label = if matches!(t.kind, TailKind::Thought) {
@@ -7730,15 +7894,27 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
     match w.size_mode {
         SizeMode::Inset => {
             *changed |= ui
-                .add(egui::Slider::new(&mut w.half_w, 40.0..=1200.0).text("半幅"))
+                .add(
+                    egui::Slider::new(&mut w.half_w, 40.0..=1200.0)
+                        .text("半幅")
+                        .clamping(egui::SliderClamping::Edits),
+                )
                 .changed();
             *changed |= ui
-                .add(egui::Slider::new(&mut w.half_h, 24.0..=800.0).text("半高"))
+                .add(
+                    egui::Slider::new(&mut w.half_h, 24.0..=800.0)
+                        .text("半高")
+                        .clamping(egui::SliderClamping::Edits),
+                )
                 .changed();
         }
         SizeMode::FullWidth => {
             *changed |= ui
-                .add(egui::Slider::new(&mut w.half_h, 24.0..=800.0).text("半高"))
+                .add(
+                    egui::Slider::new(&mut w.half_h, 24.0..=800.0)
+                        .text("半高")
+                        .clamping(egui::SliderClamping::Edits),
+                )
                 .changed();
             *changed |= ui
                 .add(egui::Slider::new(&mut w.margin_px, 0.0..=300.0).text("左右余白"))
@@ -8232,7 +8408,11 @@ fn stamp_ui(
         ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
         ui.label("大きさ");
         if ui
-            .add(egui::Slider::new(&mut long, 16.0..=1600.0).suffix("px"))
+            .add(
+                egui::Slider::new(&mut long, 16.0..=1600.0)
+                    .suffix("px")
+                    .clamping(egui::SliderClamping::Edits),
+            )
             .changed()
         {
             let half_long = (long * 0.5).max(8.0);
@@ -9062,6 +9242,117 @@ mod tests {
                 "bubble body width {width} exceeded PANEL_W {PANEL_W} (fill={fill:?})"
             );
         }
+    }
+
+    #[test]
+    fn bubble_body_panel_frame_preserves_out_of_range_round_rect_half_width() {
+        use egui_kittest::Harness;
+
+        let bubble = BubbleObject {
+            shape: BubbleShape::RoundRect {
+                half_w: 950.0,
+                half_h: 70.0,
+                corner_px: 12.0,
+            },
+            auto_size: false,
+            ..BubbleObject::default()
+        };
+        let harness = Harness::builder()
+            .with_size(egui::vec2(PANEL_W, 720.0))
+            .build_ui_state(
+                |ui, state: &mut (BubbleObject, bool)| {
+                    let (bubble, rendered) = state;
+                    if *rendered {
+                        return;
+                    }
+                    let mut changed = false;
+                    bubble_body_ui(ui, bubble, &mut changed);
+                    *rendered = true;
+                },
+                (bubble, false),
+            );
+
+        let (bubble, rendered) = harness.state();
+        assert!(*rendered);
+        let BubbleShape::RoundRect { half_w, .. } = &bubble.shape else {
+            panic!("not a round rect");
+        };
+        assert_eq!(*half_w, 950.0);
+    }
+
+    #[test]
+    fn marker_body_panel_frame_preserves_out_of_range_half_width() {
+        use egui_kittest::Harness;
+
+        let marker = BubbleObject {
+            shape: BubbleShape::RoundRect {
+                half_w: 950.0,
+                half_h: 24.0,
+                corner_px: 12.0,
+            },
+            blend: FillBlend::Multiply,
+            auto_size: false,
+            ..BubbleObject::default()
+        };
+        let harness = Harness::builder()
+            .with_size(egui::vec2(PANEL_W, 360.0))
+            .build_ui_state(
+                |ui, state: &mut (BubbleObject, bool)| {
+                    let (marker, rendered) = state;
+                    if *rendered {
+                        return;
+                    }
+                    let mut changed = false;
+                    marker_bubble_body_ui(ui, marker, &mut changed);
+                    *rendered = true;
+                },
+                (marker, false),
+            );
+
+        let (marker, rendered) = harness.state();
+        assert!(*rendered);
+        let BubbleShape::RoundRect { half_w, .. } = &marker.shape else {
+            panic!("not a round rect marker");
+        };
+        assert_eq!(*half_w, 950.0);
+    }
+
+    #[test]
+    fn annotation_arrow_panel_frame_preserves_out_of_range_half_width() {
+        use egui_kittest::Harness;
+
+        let arrow = BubbleObject {
+            shape: BubbleShape::Arrow {
+                half_w: 1200.0,
+                half_h: 30.0,
+                dir_rad: 0.0,
+                head_len_px: Some(120.0),
+                shaft_half_px: Some(3.0),
+            },
+            auto_size: false,
+            ..BubbleObject::default()
+        };
+        let harness = Harness::builder()
+            .with_size(egui::vec2(PANEL_W, 420.0))
+            .build_ui_state(
+                |ui, state: &mut (BubbleObject, bool)| {
+                    let (arrow, rendered) = state;
+                    if *rendered {
+                        return;
+                    }
+                    let mut changed = false;
+                    annotation_arrow_body_ui(ui, arrow, &mut changed);
+                    *rendered = true;
+                },
+                (arrow, false),
+            );
+
+        let (arrow, rendered) = harness.state();
+        assert!(*rendered);
+        let BubbleShape::Arrow { half_w, .. } = &arrow.shape else {
+            panic!("not an annotation arrow");
+        };
+        assert_eq!(*half_w, 1200.0);
     }
 
     #[test]
