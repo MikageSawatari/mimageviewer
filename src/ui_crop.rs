@@ -133,7 +133,7 @@ impl App {
         let action = crate::ui_fullscreen::FsKeyAction {
             close: false,
             close_to_page_list: false,
-            nav_delta: 0,
+            page_nav: crate::ui_fullscreen::FsPageNav::None,
             ctrl_nav: None,
             sibling_nav: None,
             mouse_nav: None,

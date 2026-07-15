@@ -296,7 +296,7 @@ impl App {
     /// 音楽ビューの下 HUD の前/次ファイルボタンの実体。動画 HUD の ↑↓ ボタン
     /// (`VideoPrevFile` / `VideoNextFile`) およびキーボードの ↑↓ と同一挙動で、表示順
     /// (`current_grid_order`) の隣接する移動可能アイテム (画像 / 動画 / 音声) へ移動する。
-    /// キーボード経路 (ui_fullscreen.rs の `nav_delta` → `adjacent_navigable_idx` →
+    /// キーボード経路 (ui_fullscreen.rs の `FsPageNav` → `adjacent_navigable_idx` →
     /// `open_fullscreen_from_fs_navigation`) をそのまま踏襲する。境界では中央にヒントを出す。
     /// `delta`: -1 = 前, +1 = 次。
     pub(crate) fn music_navigate_file(&mut self, ctx: &egui::Context, fs_idx: usize, delta: i32) {

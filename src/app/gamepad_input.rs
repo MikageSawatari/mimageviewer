@@ -2107,7 +2107,17 @@ impl App {
                 self.dispatch_native_video_key(ctx, fs_idx, 0x1B, false, false, false);
             } else {
                 self.bump_input_seq("gamepad_fs_close", None);
-                self.handle_fs_navigation(ctx, true, false, None, None, None, 0, None, fs_idx);
+                self.handle_fs_navigation(
+                    ctx,
+                    true,
+                    false,
+                    None,
+                    None,
+                    None,
+                    crate::ui_fullscreen::FsPageNav::None,
+                    None,
+                    fs_idx,
+                );
             }
             return None;
         }
@@ -4906,7 +4916,7 @@ impl App {
         };
         let mut action = crate::ui_fullscreen::FsKeyAction::default();
         self.queue_spread_shift_action(fs_idx, dir, &mut action);
-        if action.nav_delta != 0 || action.jump_to.is_some() {
+        if !action.page_nav.is_none() || action.jump_to.is_some() {
             self.bump_input_seq(source, Some(&format!("spread_shift_dir={dir}")));
             self.handle_fs_navigation(
                 ctx,
@@ -4915,7 +4925,7 @@ impl App {
                 None,
                 None,
                 None,
-                action.nav_delta,
+                action.page_nav,
                 action.jump_to,
                 fs_idx,
             );
@@ -5254,9 +5264,9 @@ impl App {
     }
 
     fn navigate_gamepad_still(&mut self, ctx: &egui::Context, fs_idx: usize, base_delta: i32) {
-        let nav_delta = self.spread_nav_delta(base_delta);
-        self.bump_input_seq("gamepad_fs_nav", Some(&format!("delta={nav_delta}")));
-        self.handle_fs_navigation(ctx, false, false, None, None, None, nav_delta, None, fs_idx);
+        let page_nav = self.spread_page_nav(base_delta);
+        self.bump_input_seq("gamepad_fs_nav", Some(&format!("page_nav={page_nav:?}")));
+        self.handle_fs_navigation(ctx, false, false, None, None, None, page_nav, None, fs_idx);
     }
 
     fn handle_gamepad_spread_nudge(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
@@ -5273,7 +5283,7 @@ impl App {
         };
         let mut action = crate::ui_fullscreen::FsKeyAction::default();
         self.queue_spread_shift_action(fs_idx, nudge_dir, &mut action);
-        if action.nav_delta != 0 || action.jump_to.is_some() {
+        if !action.page_nav.is_none() || action.jump_to.is_some() {
             self.bump_input_seq(
                 "gamepad_fs_nudge",
                 Some(&format!("spread_shift_dir={nudge_dir}")),
@@ -5285,7 +5295,7 @@ impl App {
                 None,
                 None,
                 None,
-                action.nav_delta,
+                action.page_nav,
                 action.jump_to,
                 fs_idx,
             );

@@ -7959,9 +7959,10 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn bug766_spread_nav_delta_uses_display_units_around_landscape() {
+    fn bug766_spread_page_nav_targets_display_units_around_landscape() {
         use crate::grid_item::{GridItem, ThumbnailState};
         use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::FsPageNav;
 
         fn loaded_thumb(
             ctx: &egui::Context,
@@ -7997,17 +7998,103 @@ mod favorite_adjustment_defaults_tests {
 
         app.fullscreen_idx = Some(4);
         assert_eq!(
-            app.spread_nav_delta(-1),
-            -1,
+            app.spread_page_nav(-1),
+            FsPageNav::Target(3),
             "横長単独ページの直後の見開きから戻ると横長ページへ戻る"
         );
 
         app.fullscreen_idx = Some(3);
-        assert_eq!(app.spread_nav_delta(1), 1);
-        assert_eq!(app.spread_nav_delta(-1), -2);
+        assert_eq!(app.spread_page_nav(1), FsPageNav::Target(4));
+        assert_eq!(app.spread_page_nav(-1), FsPageNav::Target(1));
 
         app.fullscreen_idx = Some(1);
-        assert_eq!(app.spread_nav_delta(1), 2);
+        assert_eq!(app.spread_page_nav(1), FsPageNav::Target(3));
+    }
+
+    #[test]
+    fn spread_boundary_is_reported_on_first_input_without_moving_internal_page() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::{FsBoundaryHint, FsPageNav};
+
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            for k in 0..4 {
+                app.items
+                    .push(GridItem::Image(std::path::PathBuf::from(format!(
+                        "c:/spread-boundary/{k}.jpg"
+                    ))));
+                app.thumbnails.push(ThumbnailState::Pending);
+            }
+            app.visible_indices = (0..4).collect();
+            app.cached_nav_indices = None;
+            app.spread_mode = mode;
+
+            app.fullscreen_idx = Some(2);
+            let end_nav = app.spread_page_nav(1);
+            assert_eq!(end_nav, FsPageNav::Boundary { at_end: true });
+            app.handle_fs_navigation(&ctx, false, false, None, None, None, end_nav, None, 2);
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert!(matches!(
+                app.fs_boundary_hint,
+                Some(FsBoundaryHint::Edge { at_end: true, .. })
+            ));
+
+            app.fs_boundary_hint = None;
+            app.fullscreen_idx = Some(0);
+            let start_nav = app.spread_page_nav(-1);
+            assert_eq!(start_nav, FsPageNav::Boundary { at_end: false });
+            app.handle_fs_navigation(&ctx, false, false, None, None, None, start_nav, None, 0);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(matches!(
+                app.fs_boundary_hint,
+                Some(FsBoundaryHint::Edge { at_end: false, .. })
+            ));
+
+            app.fs_boundary_hint = None;
+            let next_nav = app.spread_page_nav(1);
+            assert_eq!(next_nav, FsPageNav::Target(2));
+            app.handle_fs_navigation(&ctx, false, false, None, None, None, next_nav, None, 0);
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert!(app.fs_boundary_hint.is_none());
+        }
+    }
+
+    #[test]
+    fn spread_boundary_handles_cover_odd_tail_and_shift_anchor_units() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::FsPageNav;
+
+        for (mode, anchor, final_unit_start) in [
+            (SpreadMode::LtrCover, None, 3),
+            (SpreadMode::RtlCover, None, 3),
+            (SpreadMode::Ltr, None, 4),
+            (SpreadMode::Rtl, None, 4),
+            (SpreadMode::Ltr, Some(1), 3),
+            (SpreadMode::Rtl, Some(1), 3),
+        ] {
+            let mut app = setup_app();
+            for k in 0..5 {
+                app.items
+                    .push(GridItem::Image(std::path::PathBuf::from(format!(
+                        "c:/spread-shapes/{k}.jpg"
+                    ))));
+                app.thumbnails.push(ThumbnailState::Pending);
+            }
+            app.visible_indices = (0..5).collect();
+            app.cached_nav_indices = None;
+            app.spread_mode = mode;
+            app.spread_shift_anchor_idx = anchor;
+            app.fullscreen_idx = Some(final_unit_start);
+
+            assert_eq!(
+                app.spread_page_nav(1),
+                FsPageNav::Boundary { at_end: true },
+                "mode={mode:?}, anchor={anchor:?}"
+            );
+        }
     }
 
     #[test]
@@ -8124,9 +8211,11 @@ mod favorite_adjustment_defaults_tests {
             "1 ページずらして [4,5]"
         );
 
-        let prev_delta = app.spread_nav_delta(-1);
-        assert_eq!(prev_delta, -2);
-        let prev_idx = (new_idx as i32 + prev_delta) as usize;
+        let prev_idx = match app.spread_page_nav(-1) {
+            crate::ui_fullscreen::FsPageNav::Target(idx) => idx,
+            other => panic!("expected previous display unit, got {other:?}"),
+        };
+        assert_eq!(prev_idx, 2);
         app.fullscreen_idx = Some(prev_idx);
         assert_eq!(
             app.resolve_spread_pair(prev_idx),
@@ -8134,9 +8223,11 @@ mod favorite_adjustment_defaults_tests {
             "[4,5] から戻ると単独 [3] ではなく [2,3]"
         );
 
-        let prev_delta = app.spread_nav_delta(-1);
-        assert_eq!(prev_delta, -2);
-        let prev_idx = (prev_idx as i32 + prev_delta) as usize;
+        let prev_idx = match app.spread_page_nav(-1) {
+            crate::ui_fullscreen::FsPageNav::Target(idx) => idx,
+            other => panic!("expected previous display unit, got {other:?}"),
+        };
+        assert_eq!(prev_idx, 0);
         app.fullscreen_idx = Some(prev_idx);
         assert_eq!(
             app.resolve_spread_pair(prev_idx),
@@ -8299,7 +8390,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             None,
             None,
-            0,
+            crate::ui_fullscreen::FsPageNav::None,
             None,
             0,
         );
@@ -24811,7 +24902,17 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
 
-        app.handle_fs_navigation(&ctx, true, false, None, None, None, 0, None, idx);
+        app.handle_fs_navigation(
+            &ctx,
+            true,
+            false,
+            None,
+            None,
+            None,
+            crate::ui_fullscreen::FsPageNav::None,
+            None,
+            idx,
+        );
 
         assert_eq!(app.fullscreen_idx, None);
         assert!(app.settings.detached_viewer_enabled);

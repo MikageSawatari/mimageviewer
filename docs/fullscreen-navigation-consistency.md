@@ -152,6 +152,9 @@ Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を
 | Ctrl+S / Ctrl+G の結果一覧で Ctrl+↑↓ | 「検索結果を開いてから Ctrl+↑↓ で移動できます」などの no-op 案内 |
 | 切り離した detached / always-new 窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | 「切り離した別ウィンドウではフォルダ移動しません」などの no-op 案内 |
 
+見開きでは 2 ページを 1 つの表示単位として扱う。最後の見開きから次へ、または最初の見開きから
+前へ進む入力は、内部ページ index を同じ見開き内で動かさず、その 1 回目で境界ヒントを表示する。
+
 画像系の no-op 案内は中央の `FsBoundaryHint::NavNoOp` で表示する。native 動画の境界 /
 no-op 案内は段階を分ける:
 

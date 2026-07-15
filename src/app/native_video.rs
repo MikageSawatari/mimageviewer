@@ -7941,8 +7941,25 @@ impl App {
         if !self.video_tile_mode_active {
             self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
         }
-        let nav_delta = self.spread_nav_delta(base_delta);
         let display_order = self.current_grid_order().to_vec();
+        let page_nav = self.spread_page_nav(base_delta);
+        let nav_delta = match page_nav {
+            crate::ui_fullscreen::FsPageNav::None => return,
+            crate::ui_fullscreen::FsPageNav::Delta(delta) => delta,
+            crate::ui_fullscreen::FsPageNav::Target(target) => {
+                crate::ui_fullscreen::navigable_delta_between(
+                    &self.items,
+                    &display_order,
+                    fs_idx,
+                    target,
+                )
+                .unwrap_or(base_delta)
+            }
+            crate::ui_fullscreen::FsPageNav::Boundary { at_end } => {
+                self.show_native_video_boundary_toast(ctx, at_end);
+                return;
+            }
+        };
         self.start_manual_media_navigation(
             ctx,
             &display_order,

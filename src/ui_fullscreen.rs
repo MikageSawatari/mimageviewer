@@ -3257,6 +3257,19 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
         .collect()
 }
 
+pub(crate) fn navigable_delta_between(
+    items: &[GridItem],
+    display_order: &[usize],
+    current: usize,
+    target: usize,
+) -> Option<i32> {
+    let nav = build_nav_indices(items, display_order);
+    let current_pos = nav.iter().position(|&idx| idx == current)?;
+    let target_pos = nav.iter().position(|&idx| idx == target)?;
+    let delta = target_pos as i32 - current_pos as i32;
+    (delta != 0).then_some(delta)
+}
+
 fn build_image_reading_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
     visible_indices
         .iter()
@@ -3483,10 +3496,6 @@ impl SpreadDisplayUnit {
         self.pages[0]
     }
 
-    fn nav_end_exclusive(&self) -> usize {
-        self.nav_start + self.pages.len()
-    }
-
     fn contains_idx(&self, idx: usize) -> bool {
         self.pages.contains(&idx)
     }
@@ -3690,6 +3699,25 @@ struct FsFrameState {
     pdf_content_type: Option<PdfPageContentType>,
 }
 
+/// フルスクリーンのページ移動結果。
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FsPageNav {
+    #[default]
+    None,
+    /// 単ページ表示など、従来のページ差分ナビゲーション。
+    Delta(i32),
+    /// 見開き表示で解決済みの次の表示単位先頭。
+    Target(usize),
+    /// 見開き表示の先頭 / 末尾に、その入力 1 回で到達した。
+    Boundary { at_end: bool },
+}
+
+impl FsPageNav {
+    pub(crate) fn is_none(self) -> bool {
+        self == Self::None
+    }
+}
+
 /// フルスクリーンのキー入力結果。
 #[derive(Default)]
 pub(crate) struct FsKeyAction {
@@ -3699,7 +3727,7 @@ pub(crate) struct FsKeyAction {
     /// BS = 階層を 1 段だけ戻す。コンテナページなら `close_fullscreen` を直接呼んで
     /// L2 ページ一覧へ (設定で分岐しない)。
     pub(crate) close_to_page_list: bool,
-    pub(crate) nav_delta: i32,
+    pub(crate) page_nav: FsPageNav,
     pub(crate) ctrl_nav: Option<i32>,
     pub(crate) sibling_nav: Option<i32>,
     pub(crate) mouse_nav: Option<crate::ui_main::AddressBarNav>,
@@ -6981,7 +7009,7 @@ impl App {
 
         let mut close_fs = false;
         let mut close_to_page_list = false;
-        let mut nav_delta: i32 = 0;
+        let mut page_nav = FsPageNav::None;
         let mut ctrl_nav: Option<i32> = None;
         let mut sibling_nav: Option<i32> = None;
         let mut mouse_nav: Option<crate::ui_main::AddressBarNav> = None;
@@ -7534,14 +7562,14 @@ impl App {
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                         if key_action.close { close_fs = true; }
                         if key_action.close_to_page_list { close_to_page_list = true; }
-                        nav_delta = key_action.nav_delta;
+                        page_nav = key_action.page_nav;
                         ctrl_nav = key_action.ctrl_nav;
                         sibling_nav = key_action.sibling_nav;
                         mouse_nav = key_action.mouse_nav;
                         jump_to = key_action.jump_to;
                         // perf: キー起因のナビはここで input_seq を進める
-                        if nav_delta != 0 {
-                            self.bump_input_seq("fs_key", Some(&format!("delta={nav_delta}")));
+                        if !page_nav.is_none() {
+                            self.bump_input_seq("fs_key", Some(&format!("page_nav={page_nav:?}")));
                         } else if ctrl_nav.is_some() {
                             self.bump_input_seq("fs_ctrl_nav", None);
                         } else if sibling_nav.is_some() {
@@ -7563,17 +7591,17 @@ impl App {
                             is_spread_double,
                             prev_foreground_hwnd,
                         );
-                        if wheel_nav != 0 { nav_delta = wheel_nav; }
+                        if !wheel_nav.is_none() { page_nav = wheel_nav; }
                         if click_close { close_fs = true; }
                         // perf: ホイール/クリック起因のナビ
-                        if wheel_nav != 0 {
-                            self.bump_input_seq("fs_wheel", Some(&format!("delta={wheel_nav}")));
+                        if !wheel_nav.is_none() {
+                            self.bump_input_seq("fs_wheel", Some(&format!("page_nav={wheel_nav:?}")));
                         } else if click_close {
                             self.bump_input_seq("fs_close_click", None);
                         }
-                        // ホイール/キーで nav_delta が確定済みなら、
+                        // ホイール/キーでページ移動が確定済みなら、
                         // ホバーバーのボタンホバーで上書きされないよう保護
-                        let nav_locked = nav_delta != 0;
+                        let nav_locked = !page_nav.is_none();
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
                         #[cfg(windows)]
@@ -8352,7 +8380,7 @@ impl App {
                             && self.capture_region_selection.is_none()
                             && !is_music_view
                         {
-                            let saved_nav = nav_delta;
+                            let saved_nav = page_nav;
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
                             // Phase 6: 動画モードかどうかを上ホバーバーに通知する。
                             // 動画なら video_meta (duration, bitrate) と画像 dims (= 動画解像度) を
@@ -8433,7 +8461,7 @@ impl App {
                                 &state.location_display,
                                 display_dims, state.image_file_size,
                                 state.image_downscaled,
-                                &mut close_fs, &mut nav_delta,
+                                &mut close_fs, &mut page_nav,
                                 self.settings.fullscreen_side_panel_mode,
                                 &mut side_panel_mode_pressed,
                                 side_panel_visible,
@@ -8554,8 +8582,8 @@ impl App {
                             if vst3_pressed {
                                 self.show_vst3_manager = !self.show_vst3_manager;
                             }
-                            // ホイール/キーで確定した nav_delta を保護
-                            if nav_locked { nav_delta = saved_nav; }
+                            // ホイール/キーで確定したページ移動を保護
+                            if nav_locked { page_nav = saved_nav; }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
                         if bar_rotate_cw { self.rotate_image_cw(fs_idx); }
@@ -8919,7 +8947,7 @@ impl App {
             ctrl_nav,
             sibling_nav,
             mouse_nav,
-            nav_delta,
+            page_nav,
             jump_to,
             fs_idx,
         );
@@ -9675,43 +9703,55 @@ impl App {
         self.resolve_spread_pair(idx)
     }
 
-    /// 見開きモードでの nav_delta を計算する。
-    /// 見開き表示中は 2 ページ送り、Single 表示 (横長等) や非見開きは 1 ページ送り。
+    /// 現在の表示単位から前後へ移動した結果を解決する。
+    /// 見開き表示中は次の表示単位の先頭、または境界を明示して返す。
+    /// 非見開きは従来のページ差分を返す。
     /// 「1 ページずらし」は Ctrl+←/→ ([`Self::compute_spread_offset_nudge`]) が担当する
     /// ので、ここでは扱わない。
-    pub(crate) fn spread_nav_delta(&mut self, base_delta: i32) -> i32 {
+    pub(crate) fn spread_page_nav(&mut self, base_delta: i32) -> FsPageNav {
+        let dir = base_delta.signum();
+        if dir == 0 {
+            return FsPageNav::None;
+        }
         if !self.spread_mode.is_spread() {
-            return base_delta;
+            return FsPageNav::Delta(base_delta);
         }
         let fs_idx = match self.fullscreen_idx {
             Some(i) => i,
-            None => return base_delta,
+            None => return FsPageNav::Delta(base_delta),
         };
         let nav = self.get_nav_indices();
-        let Some(pos) = nav.iter().position(|&i| i == fs_idx) else {
-            return base_delta;
-        };
+        self.spread_page_nav_for_indices(&nav, fs_idx, base_delta)
+    }
+
+    fn spread_page_nav_for_indices(
+        &self,
+        nav: &[usize],
+        fs_idx: usize,
+        base_delta: i32,
+    ) -> FsPageNav {
+        let dir = base_delta.signum();
+        if dir == 0 {
+            return FsPageNav::None;
+        }
+        if !self.spread_mode.is_spread() {
+            return FsPageNav::Delta(base_delta);
+        }
         let units = build_spread_display_units(
-            &nav,
+            nav,
             self.spread_mode,
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
         );
-        let Some((unit_pos, unit)) = find_spread_display_unit(&units, fs_idx) else {
-            return base_delta;
+        let Some((unit_pos, _)) = find_spread_display_unit(&units, fs_idx) else {
+            return FsPageNav::Delta(base_delta);
         };
-        let dir = base_delta.signum();
-        if dir == 0 {
-            return 0;
-        }
         let target_unit_pos = unit_pos as i32 + dir;
         if (0..units.len() as i32).contains(&target_unit_pos) {
-            units[target_unit_pos as usize].nav_start as i32 - pos as i32
-        } else if dir > 0 {
-            unit.nav_end_exclusive() as i32 - pos as i32
+            FsPageNav::Target(units[target_unit_pos as usize].anchor_idx())
         } else {
-            unit.nav_start as i32 - 1 - pos as i32
+            FsPageNav::Boundary { at_end: dir > 0 }
         }
     }
 
@@ -9758,7 +9798,7 @@ impl App {
             }
         } else {
             // Single モード: 1 ページ移動にフォールバック (ユーザー要望)
-            action.nav_delta = dir;
+            action.page_nav = FsPageNav::Delta(dir);
         }
     }
 
@@ -9877,10 +9917,10 @@ impl App {
         let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
 
-        if key_action.nav_delta != 0 {
+        if !key_action.page_nav.is_none() {
             self.bump_input_seq(
                 "fs_root_key",
-                Some(&format!("delta={}", key_action.nav_delta)),
+                Some(&format!("page_nav={:?}", key_action.page_nav)),
             );
         } else if key_action.ctrl_nav.is_some() {
             self.bump_input_seq("fs_root_ctrl_nav", None);
@@ -9901,7 +9941,7 @@ impl App {
             key_action.ctrl_nav,
             key_action.sibling_nav,
             key_action.mouse_nav,
-            key_action.nav_delta,
+            key_action.page_nav,
             key_action.jump_to,
             fs_idx,
         );
@@ -10032,7 +10072,7 @@ impl App {
         let mut action = FsKeyAction {
             close: false,
             close_to_page_list: false,
-            nav_delta: 0,
+            page_nav: FsPageNav::None,
             ctrl_nav: None,
             sibling_nav: None,
             mouse_nav: None,
@@ -11652,10 +11692,10 @@ impl App {
         // 一部スキップしつつスライドショーを継続できる。フォルダをまたぐ Ctrl+↑↓ や
         // S / Space / Esc は従来どおり停止する。
         if nav_next && !ctrl_d {
-            action.nav_delta = self.spread_nav_delta(1);
+            action.page_nav = self.spread_page_nav(1);
         }
         if nav_prev && !ctrl_u {
-            action.nav_delta = self.spread_nav_delta(-1);
+            action.page_nav = self.spread_page_nav(-1);
         }
         // ファイル名スタック: Shift+↓↑ で次/前のスタックの先頭画像へ絶対ジャンプ
         // (フラット読書ビューのときのみ。端では no-op で消費)。Shift キーは上で
@@ -11710,10 +11750,10 @@ impl App {
             action.sibling_nav = Some(-1);
         }
         if page_next {
-            action.nav_delta = self.spread_nav_delta(1);
+            action.page_nav = self.spread_page_nav(1);
         }
         if page_prev {
-            action.nav_delta = self.spread_nav_delta(-1);
+            action.page_nav = self.spread_page_nav(-1);
         }
         if fixed_jump_next || fixed_jump_prev {
             let forward = if fixed_jump_next { !rtl } else { rtl };
@@ -11800,7 +11840,7 @@ impl App {
         false
     }
 
-    /// ホイールとクリックを処理し、(nav_delta, close) を返す。
+    /// ホイールとクリックを処理し、(page_nav, close) を返す。
     fn handle_fs_wheel_and_click(
         &mut self,
         ui: &mut egui::Ui,
@@ -11809,8 +11849,8 @@ impl App {
         state: &FsFrameState,
         is_spread_double: bool,
         prev_foreground_hwnd: usize,
-    ) -> (i32, bool) {
-        let mut nav_delta = 0i32;
+    ) -> (FsPageNav, bool) {
+        let mut page_nav = FsPageNav::None;
         let mut close = false;
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、連続読み中の
@@ -11824,7 +11864,7 @@ impl App {
             .map(|idx| self.fullscreen_media_rect(full_rect, idx, state.is_video))
             .unwrap_or(full_rect);
         if self.capture_region_selection.is_some() {
-            return (0, false);
+            return (FsPageNav::None, false);
         }
         let seek_panel_rect = fullscreen_seek_panel_rect(full_rect);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
@@ -11915,7 +11955,7 @@ impl App {
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_suppress_primary_until_release = true;
-                return (0, false);
+                return (FsPageNav::None, false);
             }
         }
 
@@ -12130,7 +12170,7 @@ impl App {
             })
             .unwrap_or(compare_base_rect);
         if !cursor_in_panel && self.handle_compare_wipe_drag(ctx, compare_drag_rect) {
-            return (0, false);
+            return (FsPageNav::None, false);
         }
 
         // ── 中ボタン (ホイール押し込み) ドラッグでズーム ──
@@ -12278,7 +12318,7 @@ impl App {
             } else if self.fs_zoom_active {
                 // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
                 let base = if wheel_y < 0.0 { 1 } else { -1 };
-                nav_delta = self.spread_nav_delta(base);
+                page_nav = self.spread_page_nav(base);
             } else if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
@@ -12320,7 +12360,7 @@ impl App {
                     }
                 } else {
                     let base = if wheel_y < 0.0 { 1 } else { -1 };
-                    nav_delta = self.spread_nav_delta(base);
+                    page_nav = self.spread_page_nav(base);
                 }
             }
         }
@@ -12513,7 +12553,7 @@ impl App {
                                         full_rect.center().x,
                                         self.spread_mode.is_rtl(),
                                     );
-                                    nav_delta = self.spread_nav_delta(base);
+                                    page_nav = self.spread_page_nav(base);
                                 }
                             }
                         }
@@ -12681,7 +12721,7 @@ impl App {
             match right_drag_mode {
                 crate::ring_shortcut::RightDragMode::RingShortcut => {
                     let Some(ring_context) = right_drag_context.ring_context() else {
-                        return (nav_delta, close);
+                        return (page_nav, close);
                     };
                     if secondary_in_seek_panel {
                         self.cancel_mouse_ring_flick();
@@ -12731,7 +12771,7 @@ impl App {
                 crate::ring_shortcut::RightDragMode::Disabled
                 | crate::ring_shortcut::RightDragMode::Unknown(_) => {
                     if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
-                        return (nav_delta, close);
+                        return (page_nav, close);
                     }
                     if secondary_in_seek_panel {
                         self.fs_secondary_press_start = None;
@@ -12773,7 +12813,7 @@ impl App {
             }
         }
 
-        (nav_delta, close)
+        (page_nav, close)
     }
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
@@ -12782,11 +12822,21 @@ impl App {
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
-        let slide_delta = self.spread_nav_delta(1);
         let display_order = self.current_grid_order().to_vec();
-        if let Some(idx) =
-            crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, slide_delta)
-        {
+        let slide_nav = if self.spread_mode.is_spread() {
+            let image_indices = build_image_reading_indices(&self.items, &display_order);
+            self.spread_page_nav_for_indices(&image_indices, cur, 1)
+        } else {
+            FsPageNav::Delta(1)
+        };
+        let next_idx = match slide_nav {
+            FsPageNav::Target(idx) => Some(idx),
+            FsPageNav::Delta(delta) => {
+                crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, delta)
+            }
+            FsPageNav::None | FsPageNav::Boundary { .. } => None,
+        };
+        if let Some(idx) = next_idx {
             // フォルダ内の次の静止画系アイテムへ前進。
             self.slideshow_anchor_idx = None;
             self.open_fullscreen_from_slideshow_navigation(ctx, idx);
@@ -13122,7 +13172,17 @@ impl App {
     ) {
         if let Some(target) = self.fullscreen_boundary_jump_target(fs_idx, at_end) {
             self.bump_input_seq(source, Some(if at_end { "end" } else { "home" }));
-            self.handle_fs_navigation(ctx, false, false, None, None, None, 0, Some(target), fs_idx);
+            self.handle_fs_navigation(
+                ctx,
+                false,
+                false,
+                None,
+                None,
+                None,
+                FsPageNav::None,
+                Some(target),
+                fs_idx,
+            );
         }
     }
 
@@ -13348,7 +13408,7 @@ impl App {
         ctrl_nav: Option<i32>,
         sibling_nav: Option<i32>,
         mouse_nav: Option<crate::ui_main::AddressBarNav>,
-        nav_delta: i32,
+        page_nav: FsPageNav,
         jump_to: Option<usize>,
         fs_idx: usize,
     ) {
@@ -13396,10 +13456,44 @@ impl App {
             self.mouse_ring_nav = Some(nav);
         } else if !close_fs && !close_to_page_list {
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
-            // wheel 由来 nav_delta 等で別項目を開き直さないようガードする。
+            // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 self.open_fullscreen_from_fs_navigation(ctx, new_idx);
-            } else if nav_delta != 0 {
+            } else if let FsPageNav::Target(new_idx) = page_nav {
+                let display_order = self.current_grid_order().to_vec();
+                let current_is_media = matches!(
+                    self.items.get(fs_idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                );
+                if current_is_media {
+                    if let Some(delta) =
+                        navigable_delta_between(&self.items, &display_order, fs_idx, new_idx)
+                    {
+                        self.start_manual_media_navigation(
+                            ctx,
+                            &display_order,
+                            fs_idx,
+                            delta,
+                            "media_window_manual",
+                            crate::app::ManualMediaNavigationLanding::Fullscreen,
+                        );
+                    }
+                } else {
+                    self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+                }
+            } else if let FsPageNav::Boundary { at_end } = page_nav {
+                self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    at_end,
+                    at: std::time::Instant::now(),
+                });
+                crate::logger::log(format!(
+                    "[NAV] display unit boundary: fs_idx={fs_idx}, at_end={at_end}, items={}, visible={}",
+                    self.items.len(),
+                    self.current_grid_order().len()
+                ));
+            } else if let FsPageNav::Delta(nav_delta) = page_nav
+                && nav_delta != 0
+            {
                 let display_order = self.current_grid_order().to_vec();
                 let current_is_media = matches!(
                     self.items.get(fs_idx),
@@ -17441,7 +17535,7 @@ impl App {
         // 原寸が GPU 上限超で表示が縮小版のとき true。dims のあとに⚠マーカーを出す。
         image_downscaled: bool,
         close_fs: &mut bool,
-        nav_delta: &mut i32,
+        page_nav: &mut FsPageNav,
         side_panel_mode: crate::settings::FsSidePanelMode,
         side_panel_mode_pressed: &mut bool,
         side_panel_visible: bool,
@@ -17589,7 +17683,7 @@ impl App {
             }
         }
         if close_resp.hovered() {
-            *nav_delta = 0;
+            *page_nav = FsPageNav::None;
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
@@ -17622,7 +17716,7 @@ impl App {
                 *window_mode_pressed = true;
             }
             if wm_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -17653,7 +17747,7 @@ impl App {
                 }
             }
             if camera_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -17681,7 +17775,7 @@ impl App {
                 *vst3_pressed = true;
             }
             if vst_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -17715,7 +17809,7 @@ impl App {
                 *tile_pressed = true;
             }
             if tile_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
         } else {
             let play_btn_x = next_x;
@@ -17763,7 +17857,7 @@ impl App {
                 }
             }
             if play_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
 
             if *slideshow_popup_open {
@@ -17940,7 +18034,7 @@ impl App {
                 *rotate_cw = true;
             }
             if rcw_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
@@ -17959,7 +18053,7 @@ impl App {
                 *rotate_ccw = true;
             }
             if rccw_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -17994,7 +18088,7 @@ impl App {
                 *side_panel_mode_pressed = true;
             }
             if info_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -18018,7 +18112,7 @@ impl App {
                 *analysis_pressed = true;
             }
             if analysis_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -18068,7 +18162,7 @@ impl App {
                 *panorama_pressed = true;
             }
             if pano_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -18117,7 +18211,7 @@ impl App {
                 *slideshow_popup_open = false;
             }
             if spread_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
         } else if *spread_popup_open {
             // 動画モードに切り替わったときは popup を閉じる (表示モードは画像のみ)
@@ -18384,7 +18478,7 @@ impl App {
                 *slideshow_popup_open = false;
             }
             if mf_resp.hovered() {
-                *nav_delta = 0;
+                *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         } else if *fit_popup_open {
