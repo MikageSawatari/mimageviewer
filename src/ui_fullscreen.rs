@@ -3614,6 +3614,21 @@ fn find_spread_display_unit(
         .find(|(_, unit)| unit.contains_idx(idx))
 }
 
+fn spread_seek_unit_fraction(unit_index: usize, unit_count: usize) -> f32 {
+    if unit_count <= 1 {
+        0.0
+    } else {
+        unit_index.min(unit_count - 1) as f32 / (unit_count - 1) as f32
+    }
+}
+
+fn spread_seek_unit_from_fraction(fraction: f32, unit_count: usize) -> usize {
+    if unit_count <= 1 {
+        return 0;
+    }
+    ((fraction.clamp(0.0, 1.0) * (unit_count - 1) as f32).round() as usize).min(unit_count - 1)
+}
+
 fn spread_offset_nudge_from_units(
     nav: &[usize],
     units: &[SpreadDisplayUnit],
@@ -6295,6 +6310,23 @@ impl App {
         let total = info.image_indices.len();
         let is_rtl = self.reading_direction == ReadingDirection::Rtl;
         let continuous_label_mode = self.continuous_reading_active_for_idx(fs_idx);
+        // 連結読みでない見開き中は、毎フレーム組み直した表示ユニット単位でシークする。
+        let spread_seek = if self.spread_mode.is_spread() && !continuous_label_mode {
+            let nav = self.get_nav_indices();
+            let units = build_spread_display_units(
+                &nav,
+                self.spread_mode,
+                self.spread_shift_anchor_idx,
+                &self.fs_cache,
+                &self.thumbnails,
+            );
+            match find_spread_display_unit(&units, fs_idx) {
+                Some((unit_index, _)) => Some((units, unit_index)),
+                None => None,
+            }
+        } else {
+            None
+        };
         let inner = content_rect.shrink2(egui::vec2(12.0, 7.0));
         let font = egui::FontId::monospace(13.0);
         let sample_positions =
@@ -6341,7 +6373,11 @@ impl App {
             return None;
         }
 
-        let mut display_pos = info.current_pos.min(total - 1);
+        let mut display_pos = spread_seek
+            .as_ref()
+            .map_or(info.current_pos.min(total - 1), |(_, unit_index)| {
+                *unit_index
+            });
         let mut target = None;
         let hit_rect = track_rect.expand2(egui::vec2(0.0, 14.0));
         let response = ui.interact(
@@ -6369,19 +6405,29 @@ impl App {
             } else {
                 raw_fraction
             };
-            let pos = if total <= 1 {
-                0
+            let pos = if let Some((units, _)) = spread_seek.as_ref() {
+                spread_seek_unit_from_fraction(fraction, units.len())
             } else {
-                (fraction * (total - 1) as f32).round() as usize
-            }
-            .min(total - 1);
-            display_pos = pos;
-            let target_idx = info.image_indices[pos];
-            if target_idx != fs_idx || self.continuous_reading_active_for_idx(fs_idx) {
-                if self.continuous_reading_active_for_idx(fs_idx) {
-                    self.seek_to_continuous_page(ctx, target_idx);
+                if total <= 1 {
+                    0
                 } else {
-                    target = Some(target_idx);
+                    (fraction * (total - 1) as f32).round() as usize
+                }
+                .min(total - 1)
+            };
+            display_pos = pos;
+            if let Some((units, current_unit_index)) = spread_seek.as_ref() {
+                if pos != *current_unit_index {
+                    target = Some(units[pos].anchor_idx());
+                }
+            } else {
+                let target_idx = info.image_indices[pos];
+                if target_idx != fs_idx || continuous_label_mode {
+                    if continuous_label_mode {
+                        self.seek_to_continuous_page(ctx, target_idx);
+                    } else {
+                        target = Some(target_idx);
+                    }
                 }
             }
         }
@@ -6391,7 +6437,9 @@ impl App {
             4.0,
             egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
         );
-        let fraction = if total <= 1 {
+        let fraction = if let Some((units, _)) = spread_seek.as_ref() {
+            spread_seek_unit_fraction(display_pos, units.len())
+        } else if total <= 1 {
             0.0
         } else {
             display_pos as f32 / (total - 1) as f32
@@ -6425,7 +6473,10 @@ impl App {
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(10, 16, 26, 180)),
         );
 
-        let label_idx = info.image_indices[display_pos];
+        let label_idx = spread_seek.as_ref().map_or_else(
+            || info.image_indices[display_pos],
+            |(units, _)| units[display_pos].anchor_idx(),
+        );
         let label = self
             .fullscreen_page_number_label_for_info(label_idx, &info, continuous_label_mode)
             .unwrap_or_else(|| format!("{} / {}", display_pos + 1, total));
@@ -23810,11 +23861,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spread_seek_maps_two_units_to_discrete_endpoints() {
+        assert_eq!(spread_seek_unit_fraction(0, 2), 0.0);
+        assert_eq!(spread_seek_unit_fraction(1, 2), 1.0);
+        assert_eq!(spread_seek_unit_from_fraction(0.0, 2), 0);
+        assert_eq!(spread_seek_unit_from_fraction(1.0, 2), 1);
+        assert_eq!(spread_seek_unit_from_fraction(0.49, 2), 0);
+        assert_eq!(spread_seek_unit_from_fraction(0.51, 2), 1);
+        assert_eq!(spread_seek_unit_from_fraction(-1.0, 2), 0);
+        assert_eq!(spread_seek_unit_from_fraction(2.0, 2), 1);
+    }
+
+    #[test]
+    fn spread_seek_handles_empty_and_single_unit() {
+        assert_eq!(spread_seek_unit_fraction(0, 0), 0.0);
+        assert_eq!(spread_seek_unit_from_fraction(0.0, 0), 0);
+        assert_eq!(spread_seek_unit_fraction(0, 1), 0.0);
+        assert_eq!(spread_seek_unit_from_fraction(0.0, 1), 0);
+    }
+
+    #[test]
+    fn spread_seek_units_without_cover_anchor_each_portrait_pair() {
+        let nav = [0, 1, 2, 3];
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Ltr, None, |_| false);
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(
+            units
+                .iter()
+                .map(SpreadDisplayUnit::anchor_idx)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn spread_seek_shift_anchor_preserves_discrete_unit_coverage() {
+        let nav = [0, 1, 2, 3, 4, 5];
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Ltr, Some(3), |_| false);
+        let actual = spread_unit_summary(&units);
+
+        assert_eq!(
+            actual,
+            vec![(0, vec![0, 1]), (2, vec![2]), (3, vec![3, 4]), (5, vec![5])]
+        );
+        assert_eq!(
+            units
+                .iter()
+                .flat_map(|unit| unit.pages.iter().copied())
+                .collect::<Vec<_>>(),
+            nav.to_vec()
+        );
+        assert_eq!(units.first().map(SpreadDisplayUnit::anchor_idx), Some(0));
+        assert_eq!(units.last().map(SpreadDisplayUnit::anchor_idx), Some(5));
+        assert!(
+            nav.iter()
+                .all(|idx| find_spread_display_unit(&units, *idx).is_some())
+        );
+        assert_eq!(spread_seek_unit_fraction(0, units.len()), 0.0);
+        assert_eq!(spread_seek_unit_fraction(units.len() - 1, units.len()), 1.0);
+    }
+
+    #[test]
+    fn spread_seek_landscape_middle_page_preserves_units_and_endpoints() {
+        let middle_nav = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let middle_units =
+            build_spread_display_units_with_landscape(&middle_nav, SpreadMode::Ltr, None, |idx| {
+                idx == 4
+            });
+        let middle_actual = spread_unit_summary(&middle_units);
+
+        assert_eq!(
+            middle_actual,
+            vec![
+                (0, vec![0, 1]),
+                (2, vec![2, 3]),
+                (4, vec![4]),
+                (5, vec![5, 6]),
+                (7, vec![7, 8]),
+                (9, vec![9])
+            ]
+        );
+        assert_spread_seek_units_cover_nav_and_endpoints(&middle_nav, &middle_units);
+    }
+
+    #[test]
+    fn spread_seek_landscape_second_pair_page_singles_previous_portrait() {
+        let nav = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Ltr, None, |idx| idx == 3);
+
+        assert_eq!(
+            spread_unit_summary(&units),
+            vec![
+                (0, vec![0, 1]),
+                (2, vec![2]),
+                (3, vec![3]),
+                (4, vec![4, 5]),
+                (6, vec![6, 7]),
+                (8, vec![8])
+            ]
+        );
+        assert_spread_seek_units_cover_nav_and_endpoints(&nav, &units);
+    }
+
+    #[test]
+    fn spread_seek_landscape_with_shift_anchor_preserves_units_and_endpoints() {
+        let nav = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Ltr, Some(6), |idx| {
+                idx == 4
+            });
+
+        assert_eq!(
+            spread_unit_summary(&units),
+            vec![
+                (0, vec![0, 1]),
+                (2, vec![2, 3]),
+                (4, vec![4]),
+                (5, vec![5]),
+                (6, vec![6, 7]),
+                (8, vec![8, 9]),
+                (10, vec![10])
+            ]
+        );
+        assert_spread_seek_units_cover_nav_and_endpoints(&nav, &units);
+    }
+
     fn spread_unit_summary(units: &[SpreadDisplayUnit]) -> Vec<(usize, Vec<usize>)> {
         units
             .iter()
             .map(|unit| (unit.nav_start, unit.pages.clone()))
             .collect()
+    }
+
+    fn assert_spread_seek_units_cover_nav_and_endpoints(
+        nav: &[usize],
+        units: &[SpreadDisplayUnit],
+    ) {
+        assert!(!units.is_empty());
+        assert_eq!(
+            units
+                .iter()
+                .flat_map(|unit| unit.pages.iter().copied())
+                .collect::<Vec<_>>(),
+            nav.to_vec()
+        );
+        assert_eq!(
+            units.first().map(SpreadDisplayUnit::anchor_idx),
+            nav.first().copied()
+        );
+        assert_eq!(
+            units.last().map(SpreadDisplayUnit::anchor_idx),
+            nav.last().copied()
+        );
+        assert!(
+            nav.iter()
+                .all(|idx| find_spread_display_unit(units, *idx).is_some())
+        );
+        assert_eq!(spread_seek_unit_fraction(0, units.len()), 0.0);
+        assert_eq!(spread_seek_unit_fraction(units.len() - 1, units.len()), 1.0);
     }
 
     fn spread_landscape_flags(
