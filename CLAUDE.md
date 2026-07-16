@@ -740,8 +740,8 @@ Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される�
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
 `scripts/build-release.{sh,ps1}` が 2 段階に分けて呼ぶ:
-1. `cargo build --release --bin mimageviewer-core` → 本体生成
-2. `cargo build --release --bin mimageviewer` → ランチャー生成 (本体を include_bytes!)
+1. `cargo build --release --bin mimageviewer-core` → 本体生成 (package `mimageviewer` 内の bin なので `-p` 不要)
+2. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (本体を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
 
 ラッパーは両方の cargo 呼び出しで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
 release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
@@ -1284,6 +1284,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 ## リリース手順チェックリスト
 
 リリース時は以下を漏れなく更新・作成すること。
+
+**過去リリースで踏んだ落とし穴・判断基準・復旧手順は
+[docs/release-operations.md](docs/release-operations.md) に集約している。**
+本チェックリストが手順の正本で、release-operations.md はその補助 (stale core cache /
+署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 /
+配布チャネル別の注意など)。リリースを別セッションや Codex に引き継ぐ前に一読する。
 
 ### Phase 0: 変更履歴の準備とユーザーレビュー (必ず最初)
 

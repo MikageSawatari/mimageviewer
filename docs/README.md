@@ -94,6 +94,7 @@
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
 | [screenshot-howto.md](screenshot-howto.md) | 製品ページ用スクリーンショット手順 |
 | [e2e-smoke-test.md](e2e-smoke-test.md) | E2E スモークテストのチェックリスト |
+| [release-operations.md](release-operations.md) | **リリース運用メモ**。CLAUDE.md「リリース手順チェックリスト」の補助。過去リリースで踏んだ落とし穴・判断基準・復旧手順 (stale core cache / 署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 / 配布チャネル別の注意) を集約。別セッション / Codex への引き継ぎ用 |
 | [test-video-generation.md](test-video-generation.md) | `testimage/movie/test_*fps_*p_sync.mp4` (FFmpeg testsrc2 + sine ビープ) の再生成手順 |
 | [ui-snapshot-policy.md](ui-snapshot-policy.md) | egui_kittest によるスナップショットテストの運用方針 |
 | [keymap-spec.md](keymap-spec.md) | キー / マウス操作仕様。フルスクリーン横断の詳細は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) も参照 |
