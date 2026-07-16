@@ -2,8 +2,8 @@
 # FFmpeg LGPL shared build のダウンロード・セットアップスクリプト。
 #
 # 使い方:
-#   bash scripts/setup-ffmpeg.sh           # 最新の LGPL shared ビルドをダウンロード
-#   bash scripts/setup-ffmpeg.sh check     # 新しいバージョンがあるか確認のみ
+#   bash scripts/setup-ffmpeg.sh           # 最新の版付き LGPL shared ビルドをダウンロード
+#   bash scripts/setup-ffmpeg.sh check     # 新しい版付きビルドがあるか確認のみ
 #
 # 前提:
 #   - gh (GitHub CLI), unzip, curl が使えること (Git Bash / MSYS2 等)
@@ -30,32 +30,56 @@ set -euo pipefail
 REPO="BtbN/FFmpeg-Builds"
 # n7.1 系の最新 LGPL shared build を狙う。新版を使いたければ ASSET_GLOB を変える。
 ASSET_GLOB="ffmpeg-n7.1*-win64-lgpl-shared-7.1.zip"
+RELEASE_TAG_GLOB="autobuild-*"
 VENDOR_DIR="vendor/ffmpeg"
 VERSION_FILE="$VENDOR_DIR/VERSION"
 
 cd "$(dirname "$0")/.."
 
-# ── 最新リリースのアセット一覧から ASSET_GLOB に合致するものを探す ──
-echo "Querying $REPO for asset matching $ASSET_GLOB ..."
-asset_name=$(gh release list --repo "$REPO" --limit 5 --json tagName \
-    | grep -Eo '"tagName":"[^"]+"' \
-    | head -1 \
-    | sed 's/"tagName":"//; s/"$//')
-if [ -z "$asset_name" ]; then
-    echo "Failed to query latest tag." >&2
+# ── 最新 autobuild の版付きアセットから ASSET_GLOB に合致するものを探す ──
+# BtbN の tag `latest` はファイル名に `-latest-` を含むローリング資産で、同じ URL の
+# 中身が更新される。VERSION と LGPL 対応ソースを一意にするため、日付付きの
+# `autobuild-*` release にあるコミット hash 込みの版付き資産だけを採用する。
+echo "Querying $REPO for versioned asset matching $ASSET_GLOB ..."
+release_tags=$(gh release list --repo "$REPO" --limit 20 --json tagName --jq '.[].tagName')
+latest_tag=""
+while IFS= read -r candidate; do
+    case "$candidate" in
+        $RELEASE_TAG_GLOB)
+            latest_tag="$candidate"
+            break
+            ;;
+    esac
+done <<< "$release_tags"
+
+if [ -z "$latest_tag" ]; then
+    echo "Failed to find a versioned BtbN release matching $RELEASE_TAG_GLOB." >&2
     exit 1
 fi
-latest_tag="$asset_name"
-echo "Latest tag: $latest_tag"
+echo "Latest versioned tag: $latest_tag"
 
-# 該当アセット名を解決 (latest tag 内の glob にマッチするもの)
-matched=$(gh release view "$latest_tag" --repo "$REPO" --json assets \
-    --jq ".assets[].name" 2>/dev/null \
-    | grep -E "^${ASSET_GLOB//\*/.*}$" \
-    | head -1 || true)
+# 該当アセット名を shell glob で解決し、rolling `-latest-` は明示的に拒否する。
+assets=$(gh release view "$latest_tag" --repo "$REPO" --json assets --jq '.assets[].name')
+matched=""
+while IFS= read -r candidate; do
+    case "$candidate" in
+        $ASSET_GLOB)
+            if [[ "$candidate" == *-latest-* ]]; then
+                continue
+            fi
+            matched="$candidate"
+            break
+            ;;
+    esac
+done <<< "$assets"
+
 if [ -z "$matched" ]; then
-    echo "No asset matching $ASSET_GLOB in $latest_tag." >&2
+    echo "No versioned asset matching $ASSET_GLOB in $latest_tag." >&2
     echo "Try a different ASSET_GLOB (e.g. ffmpeg-n7.0*-win64-lgpl-shared*.zip)." >&2
+    exit 1
+fi
+if [[ "$matched" == *-latest-* ]]; then
+    echo "Refusing rolling BtbN asset: $matched" >&2
     exit 1
 fi
 echo "Matched asset: $matched"

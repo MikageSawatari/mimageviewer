@@ -760,12 +760,14 @@ release link 時に未解決になることがあるため、配布ビルドは�
 ### セットアップ (メインビルド前に必須)
 
 ```bash
-bash scripts/setup-ffmpeg.sh           # BtbN の n7.1 系 LGPL shared build を取得
-bash scripts/setup-ffmpeg.sh check     # 新版があるか確認のみ
+bash scripts/setup-ffmpeg.sh           # BtbN の n7.1 系・最新の版付き LGPL shared build を取得
+bash scripts/setup-ffmpeg.sh check     # 新しい版付きビルドがあるか確認のみ
 ```
 
 - 取得元: [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)
   の `ffmpeg-n7.1*-win64-lgpl-shared-7.1.zip`
+  - ローリング `latest` release の `...-latest-...zip` は使わない。日付付き `autobuild-*`
+    release にある commit hash 込みの版付き資産だけを選び、`vendor/ffmpeg/VERSION` に記録する
 - 出力先:
   - `vendor/ffmpeg/bin/{avcodec,avformat,avutil,avfilter,swscale,swresample}-*.dll`
     — launcher の `include_bytes!` で `mimageviewer.exe` に埋め込み
@@ -1377,9 +1379,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
 8. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
 9. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
-10. FFmpeg LGPL shared build の更新確認（`bash scripts/setup-ffmpeg.sh check`、
-    バージョンを上げる場合は `vendor/ffmpeg/VERSION` と `src/video/ffmpeg_loader.rs` の
-    DLL 名が一致するか確認）。LGPL 通知の更新も忘れずに (本ファイル「FFmpeg LGPL DLL 管理」節)
+10. FFmpeg LGPL shared build の更新確認（`bash scripts/setup-ffmpeg.sh check` はローリング資産を除外し、
+    最新の版付き `autobuild-*` 資産と比較する）。バージョンを上げる場合は
+    `vendor/ffmpeg/VERSION`・実 DLL の `ProductVersion`・対応ソースを同じ commit に揃え、
+    `src/video/ffmpeg_loader.rs` の DLL 名も一致するか確認。LGPL 通知の更新も忘れずに
+    (本ファイル「FFmpeg LGPL DLL 管理」節)
 11. VST3 host bridge の確認 (v0.9.0+):
     - `vendor/vst3sdk/` が配置済み (`bash scripts/setup-vst3-sdk.sh`)
     - `vendor/vst3-host/mimageviewer-vst3-host.exe` が最新の C++ ソースでビルド済み
@@ -1415,14 +1419,15 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで clean → core → launcher → ISCC → portable)。
     - build-dist.ps1 は最初に `cargo clean --release -p mimageviewer -p mimageviewer-launcher` (+ `target-portable` の
       `-p mimageviewer`) してから実コンパイルするので、cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
-      ([docs は feedback_release_stale_core_cache の方針] 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
+      ([docs/release-operations.md](docs/release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
     - VST3 bridge の C++ を変えていなければ `.\scripts\build-dist.ps1 -SkipVst3Bridge` (cmake 再ビルドを省く)。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
       core / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
       **`include_bytes!` で埋め込む物は「埋め込み前」に署名する** (内側 vendor PE → core → launcher → setup.exe の順)。
-      でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知 ([[project_portable_av_false_positive]]) が
+      でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
+      ([docs/release-operations.md](docs/release-operations.md) §7) が
       再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
       **前提: 署名前に SimplySign Desktop を起動しログインしておく** (未ログインなら clean 前に `Assert-MivSignReady`
       で即停止)。署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
@@ -1498,7 +1503,7 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
 17. **Vector 申請**: `mImageViewer_installer_v<VERSION>.zip` (`mImageViewer_setup.exe` +
     `installer/readme.txt`) を申請。readme の版表記更新を忘れずに (本書「Distribution」節参照)。
 18. **窓の杜** (任意): これまで見送り実績が多い。掲載する場合はインストーラ zip を申請
-    (本書「窓の杜」まわり / メモリ [[reference_madonomori_coverage]] 参照)。
+    (過去の申請知見は [docs/release-operations.md](docs/release-operations.md) §8 参照)。
 19. **Microsoft Store 更新申請** (区切りの良い版で。毎リリース必須ではない):
     - **前提**: EXE/MSI 掲載は **Store が既存ユーザーを自動更新しない** (自動更新は MSIX のみ)。
       **既存ユーザーは mIV 自身の更新通知で自己更新**するので、Store 更新は「新規 Store インストール
@@ -1524,7 +1529,7 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
       Installation successful=**0** / プライバシーURL=`https://mikage.to/mimageviewer/privacy.html`。
       Microsoft Store ID=**`XP8JLWDWV5LS01`**、公開ページ=`https://apps.microsoft.com/detail/xp8jlwdwv5ls01`。
       コード署名は build-dist.ps1 が実施済み (本書 Phase 3 / 「code signing」)。詳細な経緯・ハマりどころは
-      メモリ [[project_msstore_publishing]] 参照。
+      [docs/release-operations.md](docs/release-operations.md) §8 参照。
 
 ## Codex CLI レビュー
 
@@ -1773,8 +1778,8 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
 - **配布ではないので `build-dist.ps1` ではなく `build-release.ps1` を使う** (速い・incremental)。
   配布物 (リリース) を作るときだけ clean-first の `build-dist.ps1`。
 - **⚠️ エージェントのツールから呼ぶときは `*>&1` を付けない**。PowerShell の `-ErrorAction Stop`
-  下で cargo の stderr が terminating error 化して即失敗する (詳細はメモリ
-  `feedback_release_build_stderr_trap`)。PowerShell ツールは stderr を自前で拾うので、素の
+  下で cargo の stderr が terminating error 化して即失敗する
+  ([docs/release-operations.md](docs/release-operations.md) §2.2)。PowerShell ツールは stderr を自前で拾うので、素の
   `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → launcher の 2 段 cargo build を
   直接叩く。
 - **依頼のしかた**: ビルド完了後に「`target\release\mimageviewer.exe` を起動して <具体的な手順>

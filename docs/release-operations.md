@@ -37,12 +37,16 @@
   (cargo はキャッシュ品をコピーするだけのときも出力 mtime を「今」に更新する)。
 - **確定対策**: **`build-dist.ps1` を使う** (冒頭で clean するので stale 不可能)。
   portable core は専用 `target-portable` dir に分離済みで、非 portable core を上書きしない。
-- **手動フォールバック** (素の `build-release.ps1` で配布物を作る場合のみ):
+- **診断用の手動復旧** (`build-release.ps1` が stale に見える原因を切り分ける場合のみ):
   - 「Compiling 行なしの数秒完了」を見たら疑う。**正常な full recompile は core で 3〜4 分**。
-  - `cargo clean --release -p mimageviewer -p mimageviewer-launcher` してから 2 段ビルド。
+  - `cargo clean --release -p mimageviewer -p mimageviewer-launcher` してから 2 段ビルドし、
+    現行ソースから再コンパイルできることを確認する。
   - **文字列 grep で stale 判定しない** (消えたはずの UI 文字列が別箇所に正規に残っていて
     誤判定する。過去に実際に踏んだ)。
-  - 出荷前に **launcher の mtime > core の mtime** を確認 (新 core を再埋め込みした証拠)。
+  - launcher の mtime > core の mtime はビルド順の参考にしかならず、core が現行ソース由来で
+    あることの証明には使わない。
+  - **この診断ビルドは出荷しない**。原因解消後、最終成果物は必ず `build-dist.ps1` を先頭から
+    実行して clean → core → launcher → installer → portable を作り直す。
 
 ### 2.2 stderr trap — ビルドスクリプトに `*>&1` を付けない
 
@@ -118,10 +122,12 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
   Get-ChildItem vendor\ffmpeg\bin\*.dll | % { $_.VersionInfo.ProductVersion }
   ```
 
-- **`vendor/ffmpeg/VERSION` と `scripts/setup-ffmpeg.sh check` を信用しない**。
-  `setup-ffmpeg.sh` の ASSET_GLOB は BtbN の **ローリング資産** (`...-latest-...`) と
-  **versioned 資産** の両方にマッチし、ローリング名を掴むと VERSION にその名が焼き付いて
-  ① `check` が「新版あり」と永久に誤検知、② 配布バイナリと LGPL 対応ソースがズレる。
+- **`vendor/ffmpeg/VERSION`、`scripts/setup-ffmpeg.sh check`、実 DLL の `ProductVersion` を
+  三者照合する**。`setup-ffmpeg.sh` は BtbN のローリング `latest` release を使わず、最新の
+  `autobuild-*` release からコミット hash 込みの版付き資産だけを選ぶ。資産名に `-latest-` が
+  入る場合はエラーで停止するため、`check` は版付き資産名どうしを比較する。
+- `check` が新版を報告しても、リリース直前に無条件更新しない。更新するか次版へ見送るかを決め、
+  更新した場合は VERSION の版・実 DLL の版・対応ソースを同じ commit に揃える。
 - **やること**: サイトの `htdocs/mimageviewer/ffmpeg-<VER>-source.tar.xz` と index.html の
   LGPL 節を **実 DLL のバージョン**に合わせる。BtbN ビルドはタグの N コミット後
   (`-1-g<hash>`) のことがあるので、release tarball に加えて**該当コミット**も明記し、
@@ -138,10 +144,17 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
 
 - **更新履歴は公開前に必ずユーザー承認を得る** (Phase 0)。機能名・説明の誤り、次期版扱いの
   項目混入はユーザーでないと判断できない。公開後修正はタグ打ち直しの手間を生む。
-- **タグを打ち直すときは force-push 一択**。`git push origin :refs/tags/vX.Y.Z` で削除すると
-  Release が **Draft に転落**し URL が `untagged-...` 化、同名再 push でも自動再付与されない。
-  - 正: `git tag -d vX.Y.Z && git tag -a vX.Y.Z -m ... && git push --force origin vX.Y.Z`
-  - 落ちてしまったら復旧: `gh release edit vX.Y.Z --draft=false --latest`
+- **公開済みタグの打ち直しは例外操作**。ユーザー承認を得たうえで、まず
+  `gh release view vX.Y.Z --json isDraft,isImmutable,tagName,url,assets` で状態と添付を記録する。
+  `isImmutable=true` ならタグの変更・削除はできないので停止し、公開済み Release を触らない。
+  - remote tag を先に削除すると Release が Draft に転落し URL が `untagged-...` 化し得るため、
+    **remote delete はしない**。本プロジェクトの通常タグと同じ lightweight tag を正しい commit へ
+    `git tag -f vX.Y.Z <correct-commit>` で移し、`git push --force origin refs/tags/vX.Y.Z` で同じ ref を更新する。
+  - push 後は `git ls-remote --tags origin refs/tags/vX.Y.Z` と `gh release view vX.Y.Z` で commit、
+    draft、tagName、添付4点が維持されたことを確認する。
+  - すでに `untagged-...` / Draft へ落ちた場合は `gh release list --limit 100 --json tagName,isDraft`
+    で **現在の tagName** を特定し、immutable でないことを確認してから
+    `gh release edit <current-tagName> --tag vX.Y.Z --draft=false --latest` で再関連付けし、再度全項目を照合する。
 - **アプリ内更新通知は body 先頭 8KB (UTF-8 バイト) で切られる** (`update_check.rs` の `BODY_CAP`)。
   README の該当セクションが 8KB を超える版は、**`docs/release-body-<version>.md` に 8KB 以内の
   短縮版を別途作り、それを Release body に使う** (目玉→主な改善→主なバグ修正の順で前方に重要
@@ -161,8 +174,10 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
   でランサムウェア亜種に誤検知**される。単体exe版 / インストーラ版は依存を `include_bytes!` で
   内包し raw PE が露出しないので誤検知しない → **問題は portable (loose) 固有**。
 - **恒久対策 = コード署名** (§4)。署名済みなら発行元実績で Google/Microsoft の判定が好転する。
-  VST3 ブリッジは**コード署名しない限り portable へ再同梱しない** (ハッシュが変わると誤検知
-  申請が無効化し再発するため)。単体exe / インストーラ版は埋め込みなので VST3 は従来通り動く。
+  ただし VST3 ブリッジは**署名対応後も当面 portable へ非同梱**とする。再同梱は別タスクの
+  ユーザー承認が必要な機能変更であり、`build-portable.ps1` / portable 文書の同時更新、署名検証、
+  Chrome での実ダウンロード確認を通してから行う。単体exe / インストーラ版は埋め込みなので
+  VST3 は従来通り動く。
 - **検証**: ビルド後、**Chrome で実際に zip をダウンロード**してブロックされないことを確認する
   (VirusTotal のスコアはキャッシュラグがあるので最終確認は実 DL)。
 - **運用知見** (AV ベンダーへの誤検知申請が必要になった場合):
