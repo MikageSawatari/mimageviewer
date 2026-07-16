@@ -18108,9 +18108,9 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(media);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(media_window_id);
-        bundle.detached_viewer_independent_active = true;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(media_window_id);
+        bundle.viewer_session.independent_active = true;
         app.detached_image_windows
             .push(parked_bundle_snapshot(ctx, media_window_id, bundle));
         app.transition_detached_window_state(
@@ -20333,9 +20333,9 @@ mod still_window_mode_key_tests {
         bundle.thumbnails = vec![ThumbnailState::Pending];
         bundle.visible_indices = vec![0];
         bundle.fullscreen_idx = Some(0);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_window_id = Some(11);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(11);
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         app.pending_folder_nav_steps = -2;
         app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
@@ -20458,7 +20458,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::MainWindow;
         let mut bundle = ViewerContextBundle::empty();
         bundle.fullscreen_idx = Some(0);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         assert!(
             !app.main_window_should_draw_export_dialogs(),
@@ -20534,8 +20534,11 @@ mod still_window_mode_key_tests {
             .as_ref()
             .expect("detached video should be preserved in an active detached context");
         assert_eq!(active.bundle.fullscreen_idx, Some(first));
-        assert_eq!(active.bundle.detached_viewer_window_id, Some(window_id));
-        assert!(active.bundle.detached_viewer_independent_active);
+        assert_eq!(
+            active.bundle.viewer_session.detached_window_id,
+            Some(window_id)
+        );
+        assert!(active.bundle.viewer_session.independent_active);
         assert!(matches!(
             active.bundle.items.get(first),
             Some(GridItem::Video(path)) if path.ends_with("a.mp4")
@@ -20591,9 +20594,12 @@ mod still_window_mode_key_tests {
             .as_ref()
             .expect("linked detached video should be cut loose before main context closes");
         assert_eq!(active.bundle.fullscreen_idx, Some(first));
-        assert_eq!(active.bundle.detached_viewer_window_id, Some(window_id));
+        assert_eq!(
+            active.bundle.viewer_session.detached_window_id,
+            Some(window_id)
+        );
         assert!(
-            active.bundle.detached_viewer_independent_active,
+            active.bundle.viewer_session.independent_active,
             "after the main context changes, the preserved video must stop following main selection"
         );
         let session = app
@@ -20615,9 +20621,9 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_window_id = Some(91);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(91);
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
 
         assert!(app.active_detached_viewer_context_contains_video());
@@ -20635,9 +20641,9 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(image);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_window_id = Some(92);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(92);
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
 
         assert!(!app.active_detached_viewer_context_contains_video());
@@ -20912,8 +20918,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(90);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(90);
         bundle.vst3_deferred_media_open = Some(video);
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
 
@@ -21168,9 +21174,9 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_window_id = Some(61);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(61);
         let media_tex = ctx.load_texture(
             "parked_live_ghost_media",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -21389,9 +21395,9 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_window_id = Some(61);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(61);
         let media_tex = ctx.load_texture(
             "removed_path_media",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -22065,9 +22071,9 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(window_id);
-        bundle.detached_viewer_independent_active = true;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        bundle.viewer_session.independent_active = true;
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         app.begin_active_detached_session(window_id, DetachedSource::Video);
         // main 側の stale コピー (実機の再現条件)。
@@ -22103,8 +22109,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(95);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(95);
         let tex = ctx.load_texture(
             "parked_live_music_clear_guard",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -22165,8 +22171,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(96);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(96);
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         let path = std::path::PathBuf::from(r"C:\music\bgm.flac");
         app.music_analysis_path = Some(path.clone());
@@ -22408,7 +22414,7 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
         bundle.fs_cache.insert(
             video,
             FsCacheEntry::Video {
@@ -22457,8 +22463,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(97);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(97);
         app.detached_image_windows
             .push(parked_bundle_snapshot(&ctx, 97, bundle));
         app.transition_detached_window_state(97, DetachedWindowState::ParkedLive, "test_setup");
@@ -22500,8 +22506,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(93);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(93);
         let tex = ctx.load_texture(
             "parked_live_poll_owner",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -22549,8 +22555,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(image);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(94);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(94);
         let tex = ctx.load_texture(
             "parked_live_still_poll_owner",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -23199,7 +23205,8 @@ mod still_window_mode_key_tests {
             .as_ref()
             .unwrap()
             .bundle
-            .detached_viewer_window_id
+            .viewer_session
+            .detached_window_id
             .expect("first detached book context should have a window id");
         let first_placement = app
             .detached_window_runtime_placement(first_window_id)
@@ -23212,7 +23219,8 @@ mod still_window_mode_key_tests {
             .as_ref()
             .unwrap()
             .bundle
-            .detached_viewer_window_id
+            .viewer_session
+            .detached_window_id
             .expect("second detached book context should have a window id");
 
         assert_ne!(
@@ -23279,10 +23287,10 @@ mod still_window_mode_key_tests {
         let active = app.active_detached_viewer_context.as_ref().unwrap();
         assert_eq!(active.bundle.fullscreen_idx, Some(0));
         assert_eq!(
-            active.bundle.viewer_presentation,
+            active.bundle.viewer_session.presentation,
             ViewerPresentation::DetachedWindow
         );
-        assert!(active.bundle.detached_viewer_independent_active);
+        assert!(active.bundle.viewer_session.independent_active);
     }
 
     #[test]
@@ -23624,7 +23632,7 @@ mod still_window_mode_key_tests {
             "the previously active window should be paused, not closed"
         );
         let active = app.active_detached_viewer_context.as_ref().unwrap();
-        assert_eq!(active.bundle.detached_viewer_window_id, Some(10));
+        assert_eq!(active.bundle.viewer_session.detached_window_id, Some(10));
         assert!(app.fs_viewport_shown);
         assert_eq!(
             app.fs_viewport_presentation,
@@ -23686,10 +23694,10 @@ mod still_window_mode_key_tests {
         paused_bundle.visible_indices = vec![0];
         paused_bundle.selected = Some(0);
         paused_bundle.fullscreen_idx = Some(0);
-        paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        paused_bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
         paused_bundle.native_video_in_window_active = false;
-        paused_bundle.detached_viewer_window_id = Some(1);
-        paused_bundle.detached_viewer_independent_active = true;
+        paused_bundle.viewer_session.detached_window_id = Some(1);
+        paused_bundle.viewer_session.independent_active = true;
         paused_bundle.current_folder = Some(PathBuf::from(r"C:\books\pinned.pdf"));
         paused_bundle.address = r"C:\books\pinned.pdf".to_string();
 
@@ -23837,9 +23845,9 @@ mod still_window_mode_key_tests {
         bundle.visible_indices = vec![0];
         bundle.selected = Some(0);
         bundle.fullscreen_idx = Some(0);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(window_id);
-        bundle.detached_viewer_independent_active = true;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        bundle.viewer_session.independent_active = true;
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         app.begin_active_detached_session(window_id, DetachedSource::Book);
 
@@ -24446,7 +24454,7 @@ mod still_window_mode_key_tests {
             .paused_bundle
             .as_ref()
             .expect("pause should keep the viewer bundle");
-        assert!(paused.detached_viewer_independent_active);
+        assert!(paused.viewer_session.independent_active);
         assert!(
             app.active_detached_session.is_none(),
             "active->passive handoff must end the active keep-alive session so cleanup does not hide the passive viewport"
@@ -26084,8 +26092,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(62);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(62);
 
         let texture = ctx.load_texture(
             "parked_live_audio",
@@ -26227,9 +26235,9 @@ mod still_window_mode_key_tests {
         let mut live_bundle = ViewerContextBundle::empty();
         live_bundle.items = app.items.clone();
         live_bundle.fullscreen_idx = Some(live_audio);
-        live_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        live_bundle.detached_viewer_window_id = Some(103);
-        live_bundle.detached_viewer_independent_active = true;
+        live_bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        live_bundle.viewer_session.detached_window_id = Some(103);
+        live_bundle.viewer_session.independent_active = true;
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 103,
@@ -26362,7 +26370,7 @@ mod still_window_mode_key_tests {
         assert_eq!(bundle.current_folder, Some(PathBuf::from(r"C:\clips")));
         assert_eq!(bundle.items.len(), 2);
         assert!(
-            bundle.detached_viewer_independent_active,
+            bundle.viewer_session.independent_active,
             "legacy linked live-park must promote the video window to its own bundle"
         );
 
@@ -26463,9 +26471,9 @@ mod still_window_mode_key_tests {
         bundle.items = app.items.clone();
         bundle.address = "parked-live://sentinel".to_owned();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_window_id = Some(61);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(61);
         let tex = ctx.load_texture(
             "parked_live_resume",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -26520,7 +26528,7 @@ mod still_window_mode_key_tests {
             .as_ref()
             .expect("parked live bundle should become the active context");
         assert_eq!(active.bundle.address, "parked-live://sentinel");
-        assert_eq!(active.bundle.detached_viewer_window_id, Some(61));
+        assert_eq!(active.bundle.viewer_session.detached_window_id, Some(61));
         assert_eq!(active.bundle.fullscreen_idx, Some(video));
         let wheel = Ev::Window(WinEv::MouseWheel(NativeVideoMouseWheelEvent {
             delta: -120,
@@ -26566,9 +26574,9 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(72);
-        bundle.detached_viewer_independent_active = true;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(72);
+        bundle.viewer_session.independent_active = true;
         let texture = ctx.load_texture(
             "parked_live_closes_linked",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -27113,8 +27121,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(72);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(72);
         app.detached_image_windows
             .push(parked_bundle_snapshot(&ctx, 72, bundle));
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
@@ -27244,8 +27252,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(74);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(74);
         app.detached_image_windows
             .push(parked_bundle_snapshot(&ctx, 74, bundle));
         app.transition_detached_window_state(74, DetachedWindowState::ParkedLive, "test_setup");
@@ -27271,8 +27279,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(73);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(73);
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         app.native_video_front_recover_after_external_foreground = false;
         app.native_video_front_last_raise = Some(std::time::Instant::now());
@@ -27294,8 +27302,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(old_video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(71);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(71);
         let tex = ctx.load_texture(
             "parked_live_close",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -27348,8 +27356,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(81);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(81);
         app.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
         let tex = ctx.load_texture(
             "parked_live_continuous",
@@ -27675,8 +27683,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items.push(GridItem::Video(path.clone()));
         bundle.fullscreen_idx = Some(0);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(108);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(108);
         app.detached_image_windows
             .push(parked_bundle_snapshot(&ctx, 108, bundle));
         app.transition_detached_window_state(108, DetachedWindowState::ParkedLive, "test_setup");
@@ -28248,8 +28256,8 @@ mod still_window_mode_key_tests {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(video);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_window_id = Some(82);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(82);
         let tex = ctx.load_texture(
             "parked_live_delayed_activation",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),

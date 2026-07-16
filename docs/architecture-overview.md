@@ -142,7 +142,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | モジュール / 概念 | 役割 |
 | --- | --- |
 | `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / ピン / Book) と parked live 窓は bundle swap で mount/unmount する。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む) |
-| `DetachedWindowRuntime` (app.rs) | 窓ごとの HWND / placement / 状態遷移 (Active/Passive/Parked/ParkedLive/Resuming/Closing) を一元管理する runtime (リワーク R2) |
+| `ViewerSession` (`app/viewer_session.rs`) | 退避中 bundle の表示先・同期 stamp・独立 detached 状態・window ID を一括所有する。現在表示中の session は当面 `App` の既存フィールドへマウントし、`swap_with_mounted` で5項目を同時交換する |
+| `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (Active/Passive/Parked/ParkedLive/Resuming/Closing) と activation watcher を一元管理する。`ViewerSession` の意味状態とは分離する |
 | `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
 | `app/native_video.rs` | F12 host migration / source-swap / 動画→音声モード enter/exit など、native 動画 presenter と detached 窓の接続層 |
 

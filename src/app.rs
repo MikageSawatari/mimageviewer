@@ -44,6 +44,8 @@ mod runtime_ops;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
+#[cfg(windows)]
+mod viewer_session;
 #[cfg(test)]
 pub(crate) use startup_ops::{
     startup_file_should_open_fullscreen, startup_openable_should_auto_fullscreen,
@@ -85,6 +87,8 @@ pub(crate) use prefetch_policy::{
     AllowReason, PREFETCH_BACKSTOP, PREFETCH_IDLE_THRESHOLD, PrefetchDecision,
     decide_prefetch_allowed, interleaved_prefetch_targets,
 };
+#[cfg(windows)]
+use viewer_session::ViewerSession;
 
 const MAX_FOLDER_NAV_STACK: usize = 100;
 const MAX_RECENT_FOLDERS: usize = 20;
@@ -1740,8 +1744,7 @@ struct ViewerContextBundle {
     /// VST3 startup load 完了まで start_fs_load を保留している、この context の media idx。
     vst3_deferred_media_open: Option<usize>,
     fullscreen_idx: Option<usize>,
-    viewer_presentation: ViewerPresentation,
-    last_viewer_sync_stamp: Option<ViewerSyncStamp>,
+    viewer_session: ViewerSession,
     native_video_in_window_active: bool,
     video_audio_mode: Option<usize>,
     video_audio_vst: Option<VideoAudioVstState>,
@@ -1751,9 +1754,6 @@ struct ViewerContextBundle {
         u64,
     )>,
     video_audio_exit_pending: Option<VideoAudioExitPending>,
-    detached_viewer_independent_active: bool,
-    detached_viewer_open_next_still_detached_once: bool,
-    detached_viewer_window_id: Option<u64>,
     panorama_state: Option<crate::panorama::PanoramaState>,
     pano_toast_shown_for_current_fs: bool,
     analysis_mode: bool,
@@ -1967,16 +1967,12 @@ impl ViewerContextBundle {
             current_folder_rating_cache: None,
             vst3_deferred_media_open: None,
             fullscreen_idx: None,
-            viewer_presentation: ViewerPresentation::Fullscreen,
-            last_viewer_sync_stamp: None,
+            viewer_session: ViewerSession::default(),
             native_video_in_window_active: false,
             video_audio_mode: None,
             video_audio_vst: None,
             video_audio_mode_entry_target: None,
             video_audio_exit_pending: None,
-            detached_viewer_independent_active: false,
-            detached_viewer_open_next_still_detached_once: false,
-            detached_viewer_window_id: None,
             panorama_state: None,
             pano_toast_shown_for_current_fs: false,
             analysis_mode: false,
@@ -5598,7 +5594,8 @@ fn viewer_context_bundle_displays_media_path(
     player_matches
         || item_matches
         || bundle
-            .last_viewer_sync_stamp
+            .viewer_session
+            .last_sync_stamp
             .as_ref()
             .is_some_and(|stamp| stamp.item_key == normalized_target)
 }
@@ -11059,16 +11056,12 @@ impl App {
             current_folder_rating_cache,
             vst3_deferred_media_open,
             fullscreen_idx,
-            viewer_presentation,
-            last_viewer_sync_stamp,
+            viewer_session,
             native_video_in_window_active,
             video_audio_mode,
             video_audio_vst,
             video_audio_mode_entry_target,
             video_audio_exit_pending,
-            detached_viewer_independent_active,
-            detached_viewer_open_next_still_detached_once,
-            detached_viewer_window_id,
             panorama_state,
             pano_toast_shown_for_current_fs,
             analysis_mode,
@@ -11240,16 +11233,18 @@ impl App {
         // (review-v2.3.0 追補 BA-7: vst3 deferred)
         swap_field!(vst3_deferred_media_open);
         swap_field!(fullscreen_idx);
-        swap_field!(viewer_presentation);
-        swap_field!(last_viewer_sync_stamp);
+        viewer_session.swap_with_mounted(
+            &mut self.viewer_presentation,
+            &mut self.last_viewer_sync_stamp,
+            &mut self.detached_viewer_independent_active,
+            &mut self.detached_viewer_open_next_still_detached_once,
+            &mut self.detached_viewer_window_id,
+        );
         swap_field!(native_video_in_window_active);
         swap_field!(video_audio_mode);
         swap_field!(video_audio_vst);
         swap_field!(video_audio_mode_entry_target);
         swap_field!(video_audio_exit_pending);
-        swap_field!(detached_viewer_independent_active);
-        swap_field!(detached_viewer_open_next_still_detached_once);
-        swap_field!(detached_viewer_window_id);
         swap_field!(panorama_state);
         swap_field!(pano_toast_shown_for_current_fs);
         swap_field!(analysis_mode);
@@ -27811,9 +27806,9 @@ impl App {
             "pause_active_context_begin bundle_window_id={:?} bundle_fs_idx={:?} \
              bundle_independent={} bundle_pending={} bundle_cache={} \
              bundle_passive_windows={}",
-            active.bundle.detached_viewer_window_id,
+            active.bundle.viewer_session.detached_window_id,
             active.bundle.fullscreen_idx,
-            active.bundle.detached_viewer_independent_active,
+            active.bundle.viewer_session.independent_active,
             active.bundle.fs_pending.len(),
             active.bundle.fs_cache.len(),
             self.detached_image_windows.len()
@@ -28069,7 +28064,7 @@ impl App {
         let active_context_window_id = self
             .active_detached_viewer_context
             .as_ref()
-            .and_then(|active| active.bundle.detached_viewer_window_id);
+            .and_then(|active| active.bundle.viewer_session.detached_window_id);
         if let Some(window_id) = active_context_window_id {
             ctx.send_viewport_cmd_to(
                 Self::detached_image_window_viewport_id(window_id),
@@ -29330,10 +29325,9 @@ impl App {
             return false;
         }
 
-        paused_bundle.detached_viewer_window_id = Some(id);
-        paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        paused_bundle.detached_viewer_independent_active = true;
-        paused_bundle.detached_viewer_open_next_still_detached_once = false;
+        paused_bundle
+            .viewer_session
+            .activate_independent_detached(id);
         paused_bundle.fs_open_intent_from_grid = false;
         paused_bundle.pending_auto_fs_open = false;
         paused_bundle.pending_return_to_parent = false;
@@ -29869,9 +29863,9 @@ impl App {
                  bundle_fs_idx={:?} bundle_independent={} \
                  bundle_pending={} bundle_cache={} snapshot_title={:?}",
                 snapshot.id,
-                paused_bundle.detached_viewer_window_id,
+                paused_bundle.viewer_session.detached_window_id,
                 paused_bundle.fullscreen_idx,
-                paused_bundle.detached_viewer_independent_active,
+                paused_bundle.viewer_session.independent_active,
                 paused_bundle.fs_pending.len(),
                 paused_bundle.fs_cache.len(),
                 snapshot.title
@@ -29891,10 +29885,9 @@ impl App {
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            paused_bundle.detached_viewer_window_id = Some(snapshot.id);
-            paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            paused_bundle.detached_viewer_independent_active = true;
-            paused_bundle.detached_viewer_open_next_still_detached_once = false;
+            paused_bundle
+                .viewer_session
+                .activate_independent_detached(snapshot.id);
             paused_bundle.fs_open_intent_from_grid = false;
             paused_bundle.pdf_prefetch_grace_until = None;
             self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
@@ -30548,10 +30541,9 @@ impl App {
             }
             return false;
         }
-        parked_bundle.detached_viewer_window_id = Some(snapshot_id);
-        parked_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        parked_bundle.detached_viewer_independent_active = true;
-        parked_bundle.detached_viewer_open_next_still_detached_once = false;
+        parked_bundle
+            .viewer_session
+            .activate_independent_detached(snapshot_id);
         snapshot.paused_bundle = Some(parked_bundle);
         self.detached_image_windows.push(snapshot);
         // mounted/active owner の pending を ParkedLive window へ焼き直す。別 parked window の
@@ -30650,16 +30642,12 @@ impl App {
             current_folder_rating_cache,
             vst3_deferred_media_open,
             fullscreen_idx,
-            viewer_presentation,
-            last_viewer_sync_stamp,
+            viewer_session,
             native_video_in_window_active,
             video_audio_mode,
             video_audio_vst,
             video_audio_mode_entry_target,
             video_audio_exit_pending,
-            detached_viewer_independent_active,
-            detached_viewer_open_next_still_detached_once,
-            detached_viewer_window_id,
             panorama_state,
             pano_toast_shown_for_current_fs,
             analysis_mode,
@@ -30815,16 +30803,11 @@ impl App {
         move_to_parked!(
             vst3_deferred_media_open,
             fullscreen_idx,
-            viewer_presentation,
-            last_viewer_sync_stamp,
             native_video_in_window_active,
             video_audio_mode,
             video_audio_vst,
             video_audio_mode_entry_target,
             video_audio_exit_pending,
-            detached_viewer_independent_active,
-            detached_viewer_open_next_still_detached_once,
-            detached_viewer_window_id,
             panorama_state,
             pano_toast_shown_for_current_fs,
             analysis_mode,
@@ -30875,6 +30858,14 @@ impl App {
             music_bookmarks,
             music_bookmarks_loaded_for,
             last_loop_pos,
+        );
+
+        viewer_session.swap_with_mounted(
+            &mut self.viewer_presentation,
+            &mut self.last_viewer_sync_stamp,
+            &mut self.detached_viewer_independent_active,
+            &mut self.detached_viewer_open_next_still_detached_once,
+            &mut self.detached_viewer_window_id,
         );
 
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
@@ -30974,7 +30965,7 @@ impl App {
             self.active_detached_viewer_context = Some(active);
             return false;
         }
-        let parked_window_id = active.bundle.detached_viewer_window_id;
+        let parked_window_id = active.bundle.viewer_session.detached_window_id;
         self.swap_viewer_context_bundle(&mut active.bundle);
         let parked = self.park_current_viewer_context_as_live_media_inner(ctx, reason, false);
         self.swap_viewer_context_bundle(&mut active.bundle);
@@ -31153,12 +31144,11 @@ impl App {
         let mut bundle = self.take_current_viewer_context_bundle();
         bundle.selected = Some(idx);
         bundle.fullscreen_idx = Some(idx);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         bundle.native_video_in_window_active = false;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_open_next_still_detached_once = false;
-        bundle.detached_viewer_window_id = Some(window_id);
-        bundle.last_viewer_sync_stamp = None;
+        bundle
+            .viewer_session
+            .activate_independent_detached(window_id);
+        bundle.viewer_session.last_sync_stamp = None;
         bundle.fs_open_intent_from_grid = false;
         bundle.pending_auto_fs_open = false;
         bundle.pending_return_to_parent = false;
@@ -32310,7 +32300,7 @@ impl App {
         let Some(idx) = active.bundle.fullscreen_idx else {
             return false;
         };
-        let window_id = active.bundle.detached_viewer_window_id.or_else(|| {
+        let window_id = active.bundle.viewer_session.detached_window_id.or_else(|| {
             self.active_detached_session
                 .map(|session| session.window_id)
         });

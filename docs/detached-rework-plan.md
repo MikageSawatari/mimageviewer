@@ -233,6 +233,33 @@ placement 永続化、メディア presenter、ログなど複数領域をまた
 - `ViewerContextBundle` の swap 廃止、`ViewerSession` / `MediaWindowSession` 導入、native presenter
   再設計はこの段階の対象外。Manager 抽出後も既存の表示・park / resume 意味論は維持する。
 
+### 9.2 ViewerSession 準備分離 (2026-07-16、実機確認待ち)
+
+退避中の `ViewerContextBundle` が個別フィールドとして持っていた次の session 意味状態を
+`src/app/viewer_session.rs` の `ViewerSession` に集約した。
+
+- `ViewerPresentation`
+- 最後に同期した `ViewerSyncStamp`
+- independent detached の active 状態
+- 次の静止画を detached で開く one-shot 状態
+- session が使う detached window ID
+
+現在表示中の session は、互換性を保つため引き続き `App` の既存フィールドへマウントする。
+bundle との交換は `ViewerSession::swap_with_mounted` に集約し、5項目の追加・交換漏れを純粋な
+round-trip test で固定した。退避 bundle を independent detached として再開するときも、4項目の
+identity tuple を `activate_independent_detached` で同時設定する。
+
+この段階では挙動変更を行わず、次は対象外とする。
+
+- `ViewerContextBundle` 全体の swap 廃止、または表示中 `App` 状態の全面的な session 化
+- `pending_detached_video_host_switch`、`video_audio_*`、`music_*` など media 固有状態
+- HWND / placement / activation watcher (`DetachedWindowManager` 所有)
+- native presenter / `MediaWindowSession` の再設計
+
+自動テスト完了後も、active / passive 切替、ParkedLive 復帰、複数 detached 窓の切替・close は
+Windows 実機 smoke 待ちとする。そこまで確認してから、表示中 `App` の session 化か
+`MediaWindowSession` のどちらへ進むかを判断する。
+
 ## 10. ゲート C 後の候補ステージ (別機能、リワーク出荷スコープ外)
 
 - **音声ファイルの detached 対応** (stage-audio): Phase S 検収合格後、Phase I で実装。
