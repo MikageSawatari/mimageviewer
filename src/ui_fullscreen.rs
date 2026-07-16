@@ -1798,6 +1798,7 @@ pub(crate) struct MusicChromeViewState {
     pub(crate) bookmark_secs: Vec<f64>,
     pub(crate) bookmarks_loaded: bool,
     pub(crate) show_row_stepper: bool,
+    pub(crate) show_side_panel_mode: bool,
     pub(crate) show_back_to_video: bool,
     pub(crate) show_vst: bool,
     pub(crate) show_window_toggle: bool,
@@ -4672,6 +4673,7 @@ impl App {
             bookmark_secs,
             bookmarks_loaded: self.music_bookmarks_loaded_for.is_some(),
             show_row_stepper,
+            show_side_panel_mode: true,
             show_back_to_video: video_audio_mode,
             show_vst,
             show_window_toggle: true,
@@ -4701,6 +4703,9 @@ impl App {
             // ParkedLive does not expose timeline input, but the chrome keeps the same visible
             // row control slot as active music. It is dimmed and inert.
             show_row_stepper: true,
+            // Keep the active chrome's side-panel mode slot so parking does not shift every
+            // control to its right. The shared renderer makes it dimmed and inert.
+            show_side_panel_mode: true,
             show_back_to_video: info.video_audio_mode,
             show_vst: false,
             show_window_toggle: true,
@@ -4869,9 +4874,9 @@ impl App {
             response.window_clicked = interactive && resp.clicked();
         }
 
-        // 左右パネル表示モード。ParkedLive の非操作 chrome には出さず、通常の音楽ビューだけ
-        // 静止画 / native 動画と同じ i / i+マウスカーソルを表示する。
-        if interactive {
+        // 左右パネル表示モード。ParkedLive でも同じ slot を描画してボタン位置を維持する。
+        // 非操作 chrome では他のボタンと同様に減光し、クリック結果だけを無効化する。
+        if chrome.show_side_panel_mode {
             let rect = egui::Rect::from_center_size(
                 egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
                 egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
@@ -4895,7 +4900,7 @@ impl App {
                     self.keymap
                         .chord_list_bracket_label(&tip, KeyAction::FsToggleMetadata),
                 );
-            let button_bg = if click_to_show && !resp.hovered() {
+            let button_bg = if click_to_show && !(interactive && resp.hovered()) {
                 egui::Color32::from_rgba_unmultiplied(45, 100, 170, 180)
             } else {
                 top_btn_bg(resp.hovered())
@@ -4906,7 +4911,8 @@ impl App {
             } else {
                 draw_info_icon(&painter, rect.center(), rect.width() * 0.29);
             }
-            response.side_panel_mode_clicked = resp.clicked();
+            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
+            response.side_panel_mode_clicked = interactive && resp.clicked();
         }
 
         if chrome.show_back_to_video {
@@ -23238,6 +23244,10 @@ mod tests {
 
         assert_eq!(chrome.title, "Song Title");
         assert!(chrome.show_row_stepper);
+        assert!(
+            chrome.show_side_panel_mode,
+            "ParkedLive must reserve the active music chrome's side-panel mode slot"
+        );
         assert!(chrome.show_back_to_video);
         assert!(
             !chrome.show_vst,
