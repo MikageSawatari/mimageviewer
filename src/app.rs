@@ -5877,6 +5877,12 @@ pub struct App {
     /// 次の描画フレームで該当 viewport へ明示 close を送るためのキュー。
     #[cfg(windows)]
     pub(crate) detached_image_window_close_pending: Vec<u64>,
+    /// Active な静止画 / 本の viewport を同じ OS window のまま passive renderer へ
+    /// 引き渡した際、次の描画で `CursorVisible(true)` を 1 回だけ送るためのキュー。
+    /// active 側のカーソル自動非表示が window 単位で残り、passive 窓上でもカーソルが
+    /// 消えたままになることを防ぐ。
+    #[cfg(windows)]
+    pub(crate) detached_image_window_cursor_show_pending: Vec<u64>,
     /// ParkedLive bundle を一時 mount している poll 中に判明した致命的 open failure。
     /// bundle を snapshot へ戻した後で共通 teardown seam を通して窓を閉じる。
     #[cfg(windows)]
@@ -9084,6 +9090,8 @@ impl App {
             detached_viewer_main_history_suppression_depth: 0,
             #[cfg(windows)]
             detached_image_window_close_pending: Vec::new(),
+            #[cfg(windows)]
+            detached_image_window_cursor_show_pending: Vec::new(),
             #[cfg(windows)]
             parked_live_media_close_after_poll: Vec::new(),
             #[cfg(windows)]
@@ -27897,6 +27905,29 @@ impl App {
         let presentation_before = self.fs_viewport_presentation;
         let host_before = self.detached_viewer_host_debug_state();
 
+        // 静止画 fullscreen の auto-hide は winit の window 単位の HIDDEN flag として
+        // `CursorVisible(false)` を保持する。Active -> Passive は同じ ViewportId / HWND を
+        // 閉じずに描画所有者だけ切り替えるため、ここで表示復帰を予約しないと、hidden 中に
+        // handoff された旧画像窓へ後からマウスを戻したときもカーソルが消えたままになる。
+        // native presenter が独自管理する Video / Audio には送らず、egui がカーソルを所有する
+        // Image / Book だけを対象にする。
+        if let Some(session) = session_before.filter(|session| {
+            matches!(session.source, DetachedSource::Image | DetachedSource::Book)
+        }) {
+            if !self
+                .detached_image_window_cursor_show_pending
+                .contains(&session.window_id)
+            {
+                self.detached_image_window_cursor_show_pending
+                    .push(session.window_id);
+            }
+            // cursor auto-hide state は active viewer の状態なので、passive への所有権移管後に
+            // main / 次の viewer へ持ち越さない。新規 viewer は open_fullscreen で timer を
+            // 初期化するため、ここでは close_fullscreen と同じ空の baseline に戻す。
+            self.cursor_last_activity = None;
+            self.cursor_hidden = false;
+        }
+
         // Active -> Passive の切替では OS viewport 自体は閉じない。active session と
         // runtime bookkeeping だけを手放し、次フレームから同じ ViewportId を passive
         // renderer が描く。ここを通常 close と同じ cleanup に流すと Visible(false) が送られ、
@@ -27911,8 +27942,9 @@ impl App {
         self.log_detached_image_window_debug(format!(
             "active_viewport_handoff_to_passive reason={reason} session_before={session_before:?} \
              shown_before={shown_before} presentation_before={presentation_before:?} \
-             host_before={host_before} passive_windows={}",
-            self.detached_image_windows.len()
+             host_before={host_before} passive_windows={} cursor_show_pending={:?}",
+            self.detached_image_windows.len(),
+            self.detached_image_window_cursor_show_pending
         ));
     }
 

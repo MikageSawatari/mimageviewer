@@ -233,7 +233,7 @@ placement 永続化、メディア presenter、ログなど複数領域をまた
 - `ViewerContextBundle` の swap 廃止、`ViewerSession` / `MediaWindowSession` 導入、native presenter
   再設計はこの段階の対象外。Manager 抽出後も既存の表示・park / resume 意味論は維持する。
 
-### 9.2 ViewerSession 準備分離 (2026-07-16、実機確認待ち)
+### 9.2 ViewerSession 準備分離 (2026-07-16、実機確認済み)
 
 退避中の `ViewerContextBundle` が個別フィールドとして持っていた次の session 意味状態を
 `src/app/viewer_session.rs` の `ViewerSession` に集約した。
@@ -256,9 +256,9 @@ identity tuple を `activate_independent_detached` で同時設定する。
 - HWND / placement / activation watcher (`DetachedWindowManager` 所有)
 - native presenter / `MediaWindowSession` の再設計
 
-自動テスト完了後も、active / passive 切替、ParkedLive 復帰、複数 detached 窓の切替・close は
-Windows 実機 smoke 待ちとする。そこまで確認してから、表示中 `App` の session 化か
-`MediaWindowSession` のどちらへ進むかを判断する。
+自動テストに加え、active / passive 切替、ParkedLive 復帰、複数 detached 窓の切替・close を
+Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaWindowSession` のどちらへ
+進むかを判断する。
 
 ## 10. ゲート C 後の候補ステージ (別機能、リワーク出荷スコープ外)
 

@@ -4150,6 +4150,15 @@ impl NativeEguiOverlay {
         }
     }
 
+    fn restore_active_hud_hover_after_undim(
+        pointer_pos: &mut Option<egui::Pos2>,
+        raw_hover_pos: &mut Option<egui::Pos2>,
+    ) -> Option<egui::Pos2> {
+        let restored = raw_hover_pos.take()?;
+        *pointer_pos = Some(restored);
+        Some(restored)
+    }
+
     fn visibility_hover_pos(&self) -> Option<egui::Pos2> {
         if self.hud_dimmed {
             self.raw_hover_pos
@@ -4790,7 +4799,18 @@ impl NativeEguiOverlay {
         }
         self.hud_dimmed = dimmed;
         if !dimmed {
-            self.raw_hover_pos = None;
+            // ParkedLive 中は操作を防ぐため egui の pointer_pos を消し、可視性専用の
+            // raw_hover_pos だけを追跡する。active 復帰時はその実座標を通常 hover へ移管し、
+            // activation click 後に次の MouseMove が来るまで HUD が消える隙間を作らない。
+            // PointerButton は再送せず PointerMoved だけを渡すので、復帰クリックが HUD
+            // ボタンの操作として二重発火することもない。
+            if let Some(restored) = Self::restore_active_hud_hover_after_undim(
+                &mut self.pointer_pos,
+                &mut self.raw_hover_pos,
+            ) {
+                self.pending_events
+                    .push(egui::Event::PointerMoved(restored));
+            }
         }
         if dimmed {
             self.clear_overlay_pointer_for_dimmed_hud();
@@ -8815,6 +8835,27 @@ mod tests {
                 &NativeVideoWindowEvent::MouseLeave
             )
         );
+    }
+
+    #[test]
+    fn undimming_hud_hands_raw_hover_back_to_the_active_overlay() {
+        let bottom_hover = egui::pos2(120.0, 650.0);
+        let mut pointer_pos = None;
+        let mut raw_hover_pos = Some(bottom_hover);
+
+        let moved = NativeEguiOverlay::restore_active_hud_hover_after_undim(
+            &mut pointer_pos,
+            &mut raw_hover_pos,
+        );
+
+        assert_eq!(moved, Some(bottom_hover));
+        assert_eq!(pointer_pos, Some(bottom_hover));
+        assert_eq!(raw_hover_pos, None);
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            pointer_pos,
+            720.0,
+            false
+        ));
     }
 
     #[test]

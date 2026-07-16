@@ -5530,6 +5530,28 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn flush_detached_image_window_cursor_show_pending(&mut self, ctx: &egui::Context) {
+        let mut pending = std::mem::take(&mut self.detached_image_window_cursor_show_pending);
+        pending.sort_unstable();
+        pending.dedup();
+        for id in pending {
+            // close が handoff と同フレームに確定した場合、存在しない viewport へ command を
+            // 残さない。通常経路では snapshot が先に登録され、同じ ViewportId の passive
+            // renderer がこの直後に引き継ぐ。
+            if self
+                .detached_image_windows
+                .iter()
+                .any(|window| window.id == id)
+            {
+                ctx.send_viewport_cmd_to(
+                    Self::detached_image_window_viewport_id(id),
+                    egui::ViewportCommand::CursorVisible(true),
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
         let pending_close_ids: Vec<u64> =
             self.detached_image_window_close_pending.drain(..).collect();
@@ -5545,6 +5567,11 @@ impl App {
             let viewport_id = Self::detached_image_window_viewport_id(id);
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
         }
+
+        // Active -> Passive handoff は OS window を閉じず同じ ViewportId を引き継ぐ。
+        // active 静止画が auto-hide 中だった場合の window 単位 cursor flag を、passive
+        // renderer を登録する前に 1 回だけ表示へ戻す。
+        self.flush_detached_image_window_cursor_show_pending(ctx);
 
         if self.detached_image_windows.is_empty() {
             self.prune_deferred_detached_image_window_views();

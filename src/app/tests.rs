@@ -18503,6 +18503,8 @@ mod still_window_mode_key_tests {
         app.transition_detached_window_state(42, DetachedWindowState::Active, "test_handoff");
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.cursor_last_activity = Some(std::time::Instant::now());
+        app.cursor_hidden = true;
 
         app.handoff_active_detached_viewport_to_passive("test_handoff");
 
@@ -18522,6 +18524,16 @@ mod still_window_mode_key_tests {
         assert!(
             another_unknown_already_claimed,
             "confirmed windows must not consume the per-frame unknown-window slot"
+        );
+        assert_eq!(
+            app.detached_image_window_cursor_show_pending,
+            vec![42],
+            "handoff must schedule one cursor-visible command for the same passive viewport"
+        );
+        assert_eq!(app.cursor_last_activity, None);
+        assert!(
+            !app.cursor_hidden,
+            "active viewer auto-hide state must not leak into the passive or next viewer"
         );
     }
 
@@ -22870,8 +22882,22 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(7, DetachedSource::Image);
+        app.cursor_last_activity = Some(std::time::Instant::now());
+        app.cursor_hidden = true;
 
         assert!(app.preserve_active_detached_image_window_for_main_context_change());
+        let viewport_id = App::detached_image_window_viewport_id(7);
+        ctx.set_embed_viewports(false);
+        ctx.begin_pass(egui::RawInput::default());
+        app.flush_detached_image_window_cursor_show_pending(&ctx);
+        // Production render registers the passive viewport later in the same root pass.
+        // Mirror that ordering so the queued command is included in FullOutput.
+        ctx.show_viewport_deferred(
+            viewport_id,
+            egui::ViewportBuilder::default(),
+            |_ctx, _class| {},
+        );
+        let output = ctx.end_pass();
 
         assert!(
             app.active_detached_session.is_none(),
@@ -22882,6 +22908,17 @@ mod still_window_mode_key_tests {
             "cleanup must not send Visible(false) to a viewport handed off to a passive window"
         );
         assert_eq!(app.fs_viewport_presentation, None);
+        let viewport_output = output
+            .viewport_output
+            .get(&viewport_id)
+            .expect("cursor restore must target the handed-off viewport");
+        assert!(
+            viewport_output
+                .commands
+                .contains(&egui::ViewportCommand::CursorVisible(true)),
+            "the first passive frame must explicitly restore the OS cursor"
+        );
+        assert!(app.detached_image_window_cursor_show_pending.is_empty());
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].id, 7);
         assert!(app.detached_image_windows[0].can_activate());
