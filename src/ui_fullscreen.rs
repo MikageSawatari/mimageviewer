@@ -18937,6 +18937,10 @@ impl App {
         ctx: &egui::Context,
         drawing_surface: crate::app::ActionSurface,
     ) {
+        // 消しゴム補完は一時トーストより長く続くことがあるため、同じ描画チョークポイントで
+        // ジョブ寿命に連動した専用ステータスも描く。トーストが無いフレームでも必要。
+        self.draw_erase_inpaint_progress(ui, full_rect, ctx, drawing_surface);
+
         let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
         };

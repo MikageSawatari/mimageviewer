@@ -316,6 +316,9 @@ AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1
 `erase_mask_generation` を保持し、完了時は `fs_cache` ではなく
 `erase_result_cache[EraseResultKey]` に書き戻す。入力やマスクが変わったときは該当
 commit pending を cancel し、古い結果が表示レイヤへ昇格しないようにする。
+worker は結果チャネルとは別の進捗チャネルで、モデル準備 / パス・タイル番号 / 合成 /
+diffusion fallback を UI へ通知する。UI は pending が存在する間だけ持続ステータスを描き、
+保存済みマスクの自動再生成を含めて、短時間トーストが消えた後も処理中であることを示す。
 
 ### 3.4 サムネイルワーカーの STALE 取消と重複エンキュー抑制
 

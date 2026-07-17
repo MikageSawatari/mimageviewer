@@ -45,6 +45,87 @@ pub(crate) struct EraseInpaintPendingKey {
     pub(crate) kind: EraseInpaintKind,
 }
 
+/// worker から UI へ通知する消しゴム補完の進行段階。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EraseInpaintProgress {
+    /// モデルの確認・ロード、段階数の計算中。
+    Preparing,
+    /// MI-GAN 推論中。`tile_index` は完了済みタイル数なので、開始時は 0。
+    Running {
+        pass_index: usize,
+        pass_count: usize,
+        tile_index: usize,
+        tile_count: usize,
+    },
+    /// 現在パスのタイル出力を画像へ合成中。
+    Compositing {
+        pass_index: usize,
+        pass_count: usize,
+    },
+    /// MI-GAN を利用できない場合の拡散フォールバック中。
+    DiffusionFallback,
+}
+
+fn report_inpaint_progress(
+    progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
+    progress: EraseInpaintProgress,
+) {
+    if let Some(tx) = progress_tx {
+        // UI 側がジョブをキャンセルして receiver を破棄した場合は通知不要。
+        let _ = tx.send(progress);
+    }
+}
+
+fn erase_inpaint_progress_label(
+    kind: EraseInpaintKind,
+    progress: EraseInpaintProgress,
+    job_count: usize,
+) -> String {
+    let preview = kind == EraseInpaintKind::Preview;
+    let mut label = match progress {
+        EraseInpaintProgress::Preparing if preview => "AI補完プレビューを準備中".to_string(),
+        EraseInpaintProgress::Preparing => "AI補完を準備中".to_string(),
+        EraseInpaintProgress::Running {
+            pass_index,
+            pass_count,
+            tile_index,
+            tile_count,
+        } => {
+            let operation = if preview {
+                "AI補完プレビュー中"
+            } else {
+                "AI補完中"
+            };
+            format!(
+                "{operation} {}/{}（タイル {}/{}）",
+                pass_index.max(1),
+                pass_count.max(1),
+                tile_index.min(tile_count),
+                tile_count.max(1)
+            )
+        }
+        EraseInpaintProgress::Compositing {
+            pass_index,
+            pass_count,
+        } => {
+            let operation = if preview {
+                "AI補完プレビューを合成中"
+            } else {
+                "AI補完を合成中"
+            };
+            format!("{operation} {}/{}", pass_index.max(1), pass_count.max(1))
+        }
+        EraseInpaintProgress::DiffusionFallback if preview => {
+            "補完プレビューの代替処理中".to_string()
+        }
+        EraseInpaintProgress::DiffusionFallback => "補完の代替処理中".to_string(),
+    };
+    if job_count > 1 {
+        label.push_str(&format!(" / 全{job_count}件"));
+    }
+    label
+}
+
 /// `apply_inpaint_only` の戻り値。
 ///
 /// 旧版は bool で「何かしら処理した = true」を返していたが、入力ピクセル取得不能 /
@@ -65,7 +146,8 @@ pub(crate) enum ApplyInpaintOutcome {
 
 /// 進行中の MI-GAN inpaint 推論。`App.erase_inpaint_pending` で保持され、
 /// 推論完了 (もしくは新規投入で前ジョブをキャンセル) するまで生存する。
-/// 推論本体は worker thread で走り、結果は `rx` 経由で UI スレッドへ届ける。
+/// 推論本体は worker thread で走り、結果は `rx`、途中経過は `progress_rx` 経由で
+/// UI スレッドへ届ける。
 pub(crate) struct EraseInpaintPending {
     /// 結果を反映する fs_cache のキー (= フルスクリーン idx)。
     pub idx: usize,
@@ -77,6 +159,10 @@ pub(crate) struct EraseInpaintPending {
     pub path_key: Option<String>,
     /// worker からの結果受信。`Ok(image)` で完了、`Err(_)` でキャンセル/失敗。
     pub rx: mpsc::Receiver<egui::ColorImage>,
+    /// worker から届くパス / タイル進捗。UI 側で全件 drain し、`progress` に最新値を保持する。
+    pub progress_rx: mpsc::Receiver<EraseInpaintProgress>,
+    /// 最後に受信した進捗。worker の最初の通知より前も準備中表示を出せるよう初期値を持つ。
+    pub progress: EraseInpaintProgress,
     /// 投入時にセット、worker は毎タイル前に load してキャンセル監視。
     /// 新規ジョブ投入で前ジョブを `store(true)` にして worker に終了を促す。
     pub cancel: Arc<AtomicBool>,
@@ -2851,6 +2937,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel::<egui::ColorImage>();
+        let (progress_tx, progress_rx) = mpsc::channel::<EraseInpaintProgress>();
         let ctx_clone = ctx.clone();
 
         let spawn_result = std::thread::Builder::new()
@@ -2865,6 +2952,7 @@ impl App {
                     h,
                     &cancel_for_thread,
                     log_prefix,
+                    Some(&progress_tx),
                 )
                 .image;
                 if cancel_for_thread.load(Ordering::Relaxed) {
@@ -2894,6 +2982,8 @@ impl App {
                 items_generation,
                 path_key,
                 rx,
+                progress_rx,
+                progress: EraseInpaintProgress::Preparing,
                 cancel,
                 started_at: std::time::Instant::now(),
                 input_generation,
@@ -2910,11 +3000,20 @@ impl App {
     /// 複数ページが同時並走するため)。texture アップロードの I/O 集中を避けるため
     /// 1 フレーム最大 1 件、残りは次フレームで処理する。
     pub(crate) fn poll_erase_inpaint(&mut self, ctx: &egui::Context) {
+        // 結果とは別チャネルで届く軽量な進捗を全件取り込み、各 pending に最新値だけ残す。
+        // UI thread は推論状態を共有ロックせず参照できる。
+        for pending in self.erase_inpaint_pending.values_mut() {
+            while let Ok(progress) = pending.progress_rx.try_recv() {
+                pending.progress = progress;
+            }
+        }
+
         // 各 pending を try_recv で peek。Ok ならその idx と結果を持って break、
         // Disconnected なら worker が死んでいるので削除して次へ進む。Empty は次へ。
         // (try_recv は &Receiver で借用するだけだが値を返すと所有権が移るので、
         //  Some を返した時点でループを抜けて map から remove する。)
         let mut completed: Option<(EraseInpaintPendingKey, egui::ColorImage)> = None;
+        let mut worker_failed = false;
         let keys: Vec<EraseInpaintPendingKey> =
             self.erase_inpaint_pending.keys().copied().collect();
         for key in keys {
@@ -2928,10 +3027,15 @@ impl App {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // ワーカーが panic 等で終了 — pending は破棄。
+                    let cancelled = pending.cancel.load(Ordering::Relaxed);
                     self.erase_inpaint_pending.remove(&key);
+                    worker_failed |= !cancelled;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+        if worker_failed {
+            self.show_feedback_toast("[補完失敗]".to_string());
         }
         let Some((target_key, result)) = completed else {
             return;
@@ -2998,6 +3102,7 @@ impl App {
                 elapsed.as_millis(),
                 pending.log_prefix
             ));
+            self.show_feedback_toast("[補完プレビュー完了]".to_string());
         } else {
             // **Commit 経路**: fs_cache には戻さず、消しゴム確定結果専用 cache に
             // 格納する。これで AI OFF / 補正変更時に raw fs_cache へ戻れる。
@@ -3021,7 +3126,107 @@ impl App {
                 elapsed.as_millis(),
                 pending.log_prefix
             ));
+            self.show_feedback_toast("[補完完了]".to_string());
         }
+    }
+
+    /// 消しゴム補完 worker が生存している間だけ表示する持続型ステータス。
+    ///
+    /// 一時トーストとは寿命を分け、保存済みマスクの自動再生成 (`ensure-result`) も含めて
+    /// 「処理中なのに表示が消えた」状態を作らない。推論時間のばらつきが大きいため ETA は
+    /// 出さず、パス / タイル番号と動くインジケーターで生存を伝える。
+    pub(crate) fn draw_erase_inpaint_progress(
+        &mut self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+        drawing_surface: crate::app::ActionSurface,
+    ) {
+        let target_surface = if self.fullscreen_idx.is_some() {
+            crate::app::ActionSurface::Viewer
+        } else {
+            crate::app::ActionSurface::MainWindow
+        };
+        if drawing_surface != target_surface || self.erase_inpaint_pending.is_empty() {
+            return;
+        }
+
+        let job_count = self.erase_inpaint_pending.len();
+        let current_idx = self.fullscreen_idx;
+        let selected = self
+            .erase_inpaint_pending
+            .iter()
+            .filter(|(key, _)| current_idx.is_none_or(|idx| key.idx == idx))
+            .max_by_key(|(_, pending)| pending.started_at)
+            .or_else(|| {
+                self.erase_inpaint_pending
+                    .iter()
+                    .max_by_key(|(_, pending)| pending.started_at)
+            })
+            .map(|(key, pending)| (key.kind, pending.progress, pending.started_at));
+        let Some((kind, progress, started_at)) = selected else {
+            return;
+        };
+
+        // 高速に終わる処理では一瞬だけ点滅させない。表示待ちの間も次フレームを予約する。
+        let elapsed = started_at.elapsed();
+        if elapsed < std::time::Duration::from_millis(150) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return;
+        }
+
+        let text = erase_inpaint_progress_label(kind, progress, job_count);
+        let font = egui::FontId::proportional(17.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
+        let padding = egui::vec2(14.0, 9.0);
+        let indicator_h = 3.0;
+        let box_size = egui::vec2(
+            galley.size().x + padding.x * 2.0,
+            galley.size().y + padding.y * 2.0 + indicator_h + 4.0,
+        );
+        let min_x = (full_rect.max.x - box_size.x - 20.0).max(full_rect.min.x + 8.0);
+        let min_y = (full_rect.min.y + 110.0)
+            .min((full_rect.max.y - box_size.y - 8.0).max(full_rect.min.y + 8.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(min_x, min_y), box_size);
+        ui.painter().rect_filled(
+            rect,
+            8.0,
+            egui::Color32::from_rgba_unmultiplied(30, 30, 30, 225),
+        );
+        ui.painter().text(
+            egui::pos2(rect.center().x, rect.center().y - 3.0),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font,
+            egui::Color32::WHITE,
+        );
+
+        // 1 タイルの所要時間も環境依存なので、数値更新の間も動いて見える indeterminate bar。
+        let track = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + padding.x, rect.max.y - padding.y),
+            egui::pos2(rect.max.x - padding.x, rect.max.y - padding.y + indicator_h),
+        );
+        ui.painter().rect_filled(
+            track,
+            indicator_h * 0.5,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45),
+        );
+        let segment_w = (track.width() * 0.28).max(20.0).min(track.width());
+        let travel = (track.width() - segment_w).max(0.0);
+        let phase = (elapsed.as_secs_f32() * 0.8) % 1.0;
+        let segment = egui::Rect::from_min_size(
+            egui::pos2(track.min.x + travel * phase, track.min.y),
+            egui::vec2(segment_w, indicator_h),
+        );
+        ui.painter().rect_filled(
+            segment,
+            indicator_h * 0.5,
+            egui::Color32::from_rgb(90, 170, 255),
+        );
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 }
 
@@ -3064,7 +3269,7 @@ pub(crate) fn erase_from_saved_mask(
     let flattened = black_flatten_if_transparent(base);
     let input = flattened.as_ref().unwrap_or(base);
     Ok(run_inpaint_pure(
-        runtime, manager, input, &composite, w, h, cancel, log_prefix,
+        runtime, manager, input, &composite, w, h, cancel, log_prefix, None,
     ))
 }
 
@@ -3077,7 +3282,9 @@ fn run_inpaint_pure(
     h: usize,
     cancel: &Arc<AtomicBool>,
     log_prefix: &str,
+    progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
 ) -> InpaintOutcome {
+    report_inpaint_progress(progress_tx, EraseInpaintProgress::Preparing);
     if let Some(rt) = runtime {
         let kind = crate::ai::ModelKind::InpaintMiGan;
         match manager.model_path(kind) {
@@ -3087,13 +3294,17 @@ fn run_inpaint_pure(
                         crate::logger::log(format!(
                             "[erase] {log_prefix} MI-GAN load failed: {e}, falling back to diffusion"
                         ));
+                        report_inpaint_progress(
+                            progress_tx,
+                            EraseInpaintProgress::DiffusionFallback,
+                        );
                         return InpaintOutcome {
                             image: inpaint_diffuse(original, composite, w, h),
                             used_diffusion_fallback: true,
                         };
                     }
                 }
-                match inpaint_migan(rt, original, composite, w, h, cancel) {
+                match inpaint_migan(rt, original, composite, w, h, cancel, progress_tx) {
                     Ok(image) => {
                         return InpaintOutcome {
                             image,
@@ -3118,6 +3329,7 @@ fn run_inpaint_pure(
             "[erase] {log_prefix} AI runtime not available, falling back to diffusion"
         ));
     }
+    report_inpaint_progress(progress_tx, EraseInpaintProgress::DiffusionFallback);
     InpaintOutcome {
         image: inpaint_diffuse(original, composite, w, h),
         used_diffusion_fallback: true,
@@ -3147,6 +3359,7 @@ fn inpaint_migan(
     w: usize,
     h: usize,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
+    progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
 ) -> Result<egui::ColorImage, crate::ai::AiError> {
     use std::sync::atomic::Ordering;
 
@@ -3197,6 +3410,7 @@ fn inpaint_migan(
             cancel,
             pass_index + 1,
             pass_count,
+            progress_tx,
         )?;
         remaining
             .iter_mut()
@@ -3220,6 +3434,7 @@ fn inpaint_migan(
             cancel,
             finite_passes + 1,
             finite_passes + 1,
+            progress_tx,
         )?;
     }
     Ok(working)
@@ -3238,6 +3453,7 @@ fn inpaint_migan_single_pass(
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     pass_index: usize,
     pass_count: usize,
+    progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
 ) -> Result<egui::ColorImage, crate::ai::AiError> {
     use std::sync::atomic::Ordering;
 
@@ -3273,6 +3489,15 @@ fn inpaint_migan_single_pass(
         "[erase] MI-GAN pass {pass_index}/{pass_count}: region ({region_x0},{region_y0})-({region_x1},{region_y1}) = {region_w}x{region_h}, {} tiles",
         tiles.len()
     ));
+    report_inpaint_progress(
+        progress_tx,
+        EraseInpaintProgress::Running {
+            pass_index,
+            pass_count,
+            tile_index: 0,
+            tile_count: tiles.len(),
+        },
+    );
 
     // 累積バッファ（region 座標系、RGB float + 重み）
     let rpixels = region_w * region_h;
@@ -3295,6 +3520,15 @@ fn inpaint_migan_single_pass(
             })
         });
         if !has_mask {
+            report_inpaint_progress(
+                progress_tx,
+                EraseInpaintProgress::Running {
+                    pass_index,
+                    pass_count,
+                    tile_index: ti + 1,
+                    tile_count: tiles.len(),
+                },
+            );
             continue;
         }
 
@@ -3393,11 +3627,27 @@ fn inpaint_migan_single_pass(
             ti + 1,
             tiles.len()
         ));
+        report_inpaint_progress(
+            progress_tx,
+            EraseInpaintProgress::Running {
+                pass_index,
+                pass_count,
+                tile_index: ti + 1,
+                tile_count: tiles.len(),
+            },
+        );
     }
 
     crate::logger::log(format!(
         "[erase] MI-GAN pass {pass_index}/{pass_count} done, compositing..."
     ));
+    report_inpaint_progress(
+        progress_tx,
+        EraseInpaintProgress::Compositing {
+            pass_index,
+            pass_count,
+        },
+    );
 
     // 元画像にマスク部分のみ累積結果を合成
     let mut pixels = original.pixels.clone();
@@ -3851,6 +4101,52 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 #[cfg(test)]
 mod book_erase_tests {
     use super::*;
+
+    #[test]
+    fn inpaint_progress_label_reports_pass_tile_and_parallel_job_count() {
+        let label = erase_inpaint_progress_label(
+            EraseInpaintKind::Commit,
+            EraseInpaintProgress::Running {
+                pass_index: 3,
+                pass_count: 12,
+                tile_index: 2,
+                tile_count: 4,
+            },
+            2,
+        );
+        assert_eq!(label, "AI補完中 3/12（タイル 2/4） / 全2件");
+    }
+
+    #[test]
+    fn inpaint_progress_label_distinguishes_preview_and_fallback() {
+        assert_eq!(
+            erase_inpaint_progress_label(
+                EraseInpaintKind::Preview,
+                EraseInpaintProgress::Preparing,
+                1,
+            ),
+            "AI補完プレビューを準備中"
+        );
+        assert_eq!(
+            erase_inpaint_progress_label(
+                EraseInpaintKind::Commit,
+                EraseInpaintProgress::DiffusionFallback,
+                1,
+            ),
+            "補完の代替処理中"
+        );
+    }
+
+    #[test]
+    fn inpaint_progress_is_delivered_over_worker_channel() {
+        let (tx, rx) = mpsc::channel();
+        let progress = EraseInpaintProgress::Compositing {
+            pass_index: 2,
+            pass_count: 3,
+        };
+        report_inpaint_progress(Some(&tx), progress);
+        assert_eq!(rx.try_recv().unwrap(), progress);
+    }
 
     #[test]
     fn inpaint_region_expands_top_and_right_edge_masks_to_native_512_square() {

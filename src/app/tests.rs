@@ -11736,7 +11736,9 @@ mod favorite_adjustment_defaults_tests {
 
     #[test]
     fn reset_erase_mode_keeps_commit_pending_when_no_post_filter_restore_needed() {
-        use crate::ui_erase::{EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey};
+        use crate::ui_erase::{
+            EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey, EraseInpaintProgress,
+        };
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11748,6 +11750,7 @@ mod favorite_adjustment_defaults_tests {
         app.input_generation.insert(idx, 7);
 
         let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let key = EraseInpaintPendingKey {
             idx,
@@ -11762,6 +11765,8 @@ mod favorite_adjustment_defaults_tests {
                 items_generation,
                 path_key,
                 rx,
+                progress_rx,
+                progress: EraseInpaintProgress::Preparing,
                 cancel: Arc::clone(&cancel),
                 started_at: std::time::Instant::now(),
                 input_generation: 7,
@@ -11785,7 +11790,9 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn reset_erase_mode_keeps_commit_pending_with_post_filter() {
         use crate::adjustment::PostFilter;
-        use crate::ui_erase::{EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey};
+        use crate::ui_erase::{
+            EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey, EraseInpaintProgress,
+        };
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11798,6 +11805,7 @@ mod favorite_adjustment_defaults_tests {
         app.input_generation.insert(idx, 11);
 
         let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let key = EraseInpaintPendingKey {
             idx,
@@ -11812,6 +11820,8 @@ mod favorite_adjustment_defaults_tests {
                 items_generation,
                 path_key,
                 rx,
+                progress_rx,
+                progress: EraseInpaintProgress::Preparing,
                 cancel: Arc::clone(&cancel),
                 started_at: std::time::Instant::now(),
                 input_generation: 11,
@@ -13208,18 +13218,23 @@ mod favorite_adjustment_defaults_tests {
     /// 同じ idx への再投入だけは旧版どおり cancel する。
     #[test]
     fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
-        use crate::ui_erase::{EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey};
+        use crate::ui_erase::{
+            EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey, EraseInpaintProgress,
+        };
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut app = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {
             let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+            let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
             EraseInpaintPending {
                 idx,
                 items_generation: 0,
                 path_key: None,
                 rx,
+                progress_rx,
+                progress: EraseInpaintProgress::Preparing,
                 cancel: Arc::new(AtomicBool::new(false)),
                 started_at: std::time::Instant::now(),
                 input_generation: 0,
