@@ -23730,7 +23730,14 @@ impl App {
 
     /// `keep_set` から外れた通常サムネイルだけを退去させる。
     ///
-    /// 同一 items 世代では Loaded は直前の keep_set 内にしか存在しないため、差分だけで
+    /// 差分退去が正しいための不変条件:
+    /// 1. `poll_thumbnails` は非動画を Loaded にする時点の `keep_set` 所属を必須にする。
+    /// 2. 同じフレームでは `poll_thumbnails` の後、グリッド描画より前に
+    ///    `update_keep_range_and_requests` が新しい `keep_set` を作ってここを呼ぶ。
+    /// 3. この reconcile を通らず `keep_set` を clear する経路は items 世代を進めるか、
+    ///    details hover のように対象を `evict_grid_thumbnail` で明示退去させる。
+    ///
+    /// したがって同一 items 世代の Loaded は直前の keep_set 内にしか存在せず、差分だけで
     /// 十分。items 差し替え時は Loaded 状態が content key で別 idx へ移される経路があるので、
     /// 世代ごとの初回だけ全 idx を照合する。
     fn reconcile_grid_thumbnail_evictions(

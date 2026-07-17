@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 const MAX_SUBFOLDER_EXPANSION_DEPTH: u32 = 40;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const PREPARE_CONFIRM_ITEM_THRESHOLD: usize = 100_000;
+/// `sort_unstable_by` の比較関数を途中で変えずにキャンセルへ応答するためのソート単位。
+const SUBFOLDER_SORT_CHUNK_SIZE: usize = 16_384;
+/// キー生成 / マージ中に cancel と進捗を確認する間隔。
+const SUBFOLDER_SORT_PROGRESS_INTERVAL: usize = 16_384;
 
 #[derive(Clone)]
 pub(crate) struct SubfolderExpansionOptions {
@@ -540,6 +544,114 @@ fn filter_image_ext_duplicates(
     });
 }
 
+struct SubfolderEntrySortKey {
+    name: crate::filename_sort::SortNameKey,
+    parent: crate::filename_sort::SortNameKey,
+    row: usize,
+}
+
+fn compare_subfolder_entry_indices(
+    ai: usize,
+    bi: usize,
+    entries: &[SubfolderExpansionEntry],
+    keys: &[SubfolderEntrySortKey],
+    sort: crate::settings::SortOrder,
+    order: crate::settings::SubfolderExpansionOrder,
+) -> std::cmp::Ordering {
+    use crate::settings::SubfolderExpansionOrder;
+
+    let a = &entries[ai];
+    let b = &entries[bi];
+    let ak = &keys[ai];
+    let bk = &keys[bi];
+    let within_folder = || {
+        ak.row
+            .cmp(&bk.row)
+            .then_with(|| sort.compare_name_keys(&ak.name, a.mtime, &bk.name, b.mtime))
+            .then_with(|| a.path.cmp(&b.path))
+    };
+    match order {
+        SubfolderExpansionOrder::Flat => within_folder()
+            .then_with(|| ak.parent.compare_file_name(&bk.parent))
+            .then_with(|| a.path.cmp(&b.path)),
+        SubfolderExpansionOrder::FolderGrouped => ak
+            .parent
+            .compare_file_name(&bk.parent)
+            .then_with(within_folder)
+            .then_with(|| a.path.cmp(&b.path)),
+    }
+}
+
+fn scaled_subfolder_sort_progress(
+    stage_start: usize,
+    stage_span: usize,
+    completed: usize,
+    work_total: usize,
+) -> usize {
+    if work_total == 0 {
+        return stage_start.saturating_add(stage_span);
+    }
+    let scaled = (completed.min(work_total) as u128 * stage_span as u128) / work_total as u128;
+    stage_start.saturating_add(scaled as usize)
+}
+
+fn report_subfolder_sort_progress(progress: &mut Option<&mut dyn FnMut(usize)>, completed: usize) {
+    if let Some(report) = progress.as_deref_mut() {
+        report(completed);
+    }
+}
+
+/// `source` 内の `run_width` ごとのソート済み run を 2 本ずつ `target` へマージする。
+/// cancel は比較関数の外でだけ確認し、ソートの全順序契約を維持する。
+fn merge_subfolder_sort_runs(
+    source: &[usize],
+    target: &mut [usize],
+    run_width: usize,
+    compare: &impl Fn(usize, usize) -> std::cmp::Ordering,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut impl FnMut(usize),
+) -> bool {
+    let len = source.len();
+    let pair_width = run_width.saturating_mul(2).max(1);
+    let mut written = 0usize;
+    for start in (0..len).step_by(pair_width) {
+        if cancel.is_some_and(cancelled) {
+            return false;
+        }
+        let mid = start.saturating_add(run_width).min(len);
+        let end = start.saturating_add(pair_width).min(len);
+        let (mut left, mut right, mut out) = (start, mid, start);
+        while left < mid || right < end {
+            let take_left = right >= end
+                || (left < mid
+                    && compare(source[left], source[right]) != std::cmp::Ordering::Greater);
+            target[out] = if take_left {
+                let value = source[left];
+                left += 1;
+                value
+            } else {
+                let value = source[right];
+                right += 1;
+                value
+            };
+            out += 1;
+            written += 1;
+            if written.is_multiple_of(SUBFOLDER_SORT_PROGRESS_INTERVAL) {
+                if cancel.is_some_and(cancelled) {
+                    return false;
+                }
+                on_progress(written);
+                if cancel.is_some_and(cancelled) {
+                    return false;
+                }
+            }
+        }
+    }
+    on_progress(written);
+    !cancel.is_some_and(cancelled)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sorted_entry_indices_for_view(
     entries: &[SubfolderExpansionEntry],
     sort: crate::settings::SortOrder,
@@ -547,68 +659,142 @@ fn sorted_entry_indices_for_view(
     display_order: &crate::settings::GridDisplayOrder,
     root: &Path,
     cancel: Option<&AtomicBool>,
+    mut progress: Option<&mut dyn FnMut(usize)>,
+    chunk_size: usize,
 ) -> Option<Vec<usize>> {
-    use crate::settings::{GridItemDisplayKind, SubfolderExpansionOrder};
+    use crate::settings::GridItemDisplayKind;
 
-    let mut keyed = Vec::with_capacity(entries.len());
+    let total = entries.len();
+    if total == 0 {
+        report_subfolder_sort_progress(&mut progress, 0);
+        return Some(Vec::new());
+    }
+    let key_stage_end = total / 3;
+    let chunk_stage_end = total.saturating_mul(2) / 3;
+
+    let mut keys = Vec::with_capacity(total);
     for (idx, entry) in entries.iter().enumerate() {
-        if idx % 16_384 == 0 && cancel.is_some_and(cancelled) {
-            return None;
+        if idx.is_multiple_of(SUBFOLDER_SORT_PROGRESS_INTERVAL) {
+            if cancel.is_some_and(cancelled) {
+                return None;
+            }
+            report_subfolder_sort_progress(
+                &mut progress,
+                scaled_subfolder_sort_progress(0, key_stage_end, idx, total),
+            );
         }
         let name = entry
             .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let name_key = sort.name_key(name);
         let parent = entry
             .path
             .parent()
             .and_then(|parent| parent.strip_prefix(root).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let parent_key = crate::filename_sort::SortNameKey::file_name(&parent);
         let kind = if entry.is_video {
             GridItemDisplayKind::VideoAudio
         } else {
             GridItemDisplayKind::Image
         };
-        let row = display_order.row_for(kind);
-        keyed.push((idx, name_key, parent_key, row));
+        keys.push(SubfolderEntrySortKey {
+            name: sort.name_key(name),
+            parent: crate::filename_sort::SortNameKey::file_name(&parent),
+            row: display_order.row_for(kind),
+        });
     }
-    let mut comparisons = 0usize;
-    let mut stop_sort = false;
-    keyed.sort_unstable_by(|(ai, ak, ap, ar), (bi, bk, bp, br)| {
-        if !stop_sort {
-            comparisons = comparisons.wrapping_add(1);
-            if comparisons % 16_384 == 0 && cancel.is_some_and(cancelled) {
-                stop_sort = true;
-            }
-        }
-        if stop_sort {
-            return std::cmp::Ordering::Equal;
-        }
-        let a = &entries[*ai];
-        let b = &entries[*bi];
-        let within_folder = || {
-            ar.cmp(br)
-                .then_with(|| sort.compare_name_keys(ak, a.mtime, bk, b.mtime))
-                .then_with(|| a.path.cmp(&b.path))
-        };
-        match order {
-            SubfolderExpansionOrder::Flat => within_folder()
-                .then_with(|| ap.compare_file_name(bp))
-                .then_with(|| a.path.cmp(&b.path)),
-            SubfolderExpansionOrder::FolderGrouped => ap
-                .compare_file_name(bp)
-                .then_with(within_folder)
-                .then_with(|| a.path.cmp(&b.path)),
-        }
-    });
-    if stop_sort || cancel.is_some_and(cancelled) {
+    report_subfolder_sort_progress(&mut progress, key_stage_end);
+    if cancel.is_some_and(cancelled) {
         return None;
     }
-    Some(keyed.into_iter().map(|(idx, _, _, _)| idx).collect())
+
+    let chunk_size = chunk_size.max(1);
+    let chunk_count = total.div_ceil(chunk_size);
+    let mut indices: Vec<usize> = (0..total).collect();
+    let compare = |ai, bi| compare_subfolder_entry_indices(ai, bi, entries, &keys, sort, order);
+    for (chunk_index, chunk) in indices.chunks_mut(chunk_size).enumerate() {
+        if cancel.is_some_and(cancelled) {
+            return None;
+        }
+        chunk.sort_unstable_by(|ai, bi| compare(*ai, *bi));
+        let processed = ((chunk_index + 1) * chunk_size).min(total);
+        let completed = if chunk_count == 1 {
+            total
+        } else {
+            scaled_subfolder_sort_progress(
+                key_stage_end,
+                chunk_stage_end.saturating_sub(key_stage_end),
+                processed,
+                total,
+            )
+        };
+        report_subfolder_sort_progress(&mut progress, completed);
+        if cancel.is_some_and(cancelled) {
+            return None;
+        }
+    }
+    if chunk_count == 1 {
+        return Some(indices);
+    }
+
+    let mut merge_levels = 0usize;
+    let mut level_width = chunk_size;
+    while level_width < total {
+        merge_levels += 1;
+        level_width = level_width.saturating_mul(2);
+    }
+    let merge_work_total = total.saturating_mul(merge_levels);
+    let merge_stage_span = total.saturating_sub(chunk_stage_end);
+    let mut merge_work_done = 0usize;
+    let mut scratch = vec![0usize; total];
+    let mut source_in_indices = true;
+    let mut run_width = chunk_size;
+    while run_width < total {
+        let work_before_pass = merge_work_done;
+        let mut report_merge = |pass_written: usize| {
+            report_subfolder_sort_progress(
+                &mut progress,
+                scaled_subfolder_sort_progress(
+                    chunk_stage_end,
+                    merge_stage_span,
+                    work_before_pass.saturating_add(pass_written),
+                    merge_work_total,
+                ),
+            );
+        };
+        let completed = if source_in_indices {
+            merge_subfolder_sort_runs(
+                &indices,
+                &mut scratch,
+                run_width,
+                &compare,
+                cancel,
+                &mut report_merge,
+            )
+        } else {
+            merge_subfolder_sort_runs(
+                &scratch,
+                &mut indices,
+                run_width,
+                &compare,
+                cancel,
+                &mut report_merge,
+            )
+        };
+        if !completed {
+            return None;
+        }
+        merge_work_done = merge_work_done.saturating_add(total);
+        source_in_indices = !source_in_indices;
+        run_width = run_width.saturating_mul(2);
+    }
+    report_subfolder_sort_progress(&mut progress, total);
+    if cancel.is_some_and(cancelled) {
+        return None;
+    }
+    Some(if source_in_indices { indices } else { scratch })
 }
 
 #[cfg(test)]
@@ -624,6 +810,8 @@ pub(crate) fn sort_entries_for_view(
         &crate::settings::GridDisplayOrder::default(),
         root,
         None,
+        None,
+        SUBFOLDER_SORT_CHUNK_SIZE,
     )
     .expect("test sort is not cancelled");
     indices
@@ -676,6 +864,14 @@ fn prepare_subfolder_expansion(
     let reused_metadata = options.reused_metadata.as_ref();
     let total = snapshot.entries.len();
     prepare_progress(tx, SubfolderExpansionPreparePhase::Sorting, 0, total);
+    let mut report_sort_progress = |completed| {
+        prepare_progress(
+            tx,
+            SubfolderExpansionPreparePhase::Sorting,
+            completed,
+            total,
+        );
+    };
     let Some(indices) = sorted_entry_indices_for_view(
         snapshot.entries.as_slice(),
         options.sort,
@@ -683,6 +879,8 @@ fn prepare_subfolder_expansion(
         &options.display_order,
         &snapshot.root,
         Some(cancel),
+        Some(&mut report_sort_progress),
+        SUBFOLDER_SORT_CHUNK_SIZE,
     ) else {
         return Ok(None);
     };
@@ -1975,6 +2173,8 @@ mod tests {
             &crate::settings::GridDisplayOrder::default(),
             &root,
             None,
+            None,
+            SUBFOLDER_SORT_CHUNK_SIZE,
         )
         .unwrap();
         let relative = indices
@@ -2021,6 +2221,8 @@ mod tests {
             &crate::settings::GridDisplayOrder::default(),
             &root,
             None,
+            None,
+            SUBFOLDER_SORT_CHUNK_SIZE,
         )
         .unwrap();
         let relative = indices
@@ -2191,9 +2393,160 @@ mod tests {
                 &crate::settings::GridDisplayOrder::default(),
                 &root,
                 Some(&cancel),
+                None,
+                SUBFOLDER_SORT_CHUNK_SIZE,
             )
             .is_none()
         );
+    }
+
+    fn chunked_sort_test_entries(root: &Path, count: usize) -> Vec<SubfolderExpansionEntry> {
+        (0..count)
+            .rev()
+            .map(|i| SubfolderExpansionEntry {
+                path: root
+                    .join(format!("folder_{:02}", i % 11))
+                    .join(format!("image_{:04}.png", (i * 37) % count)),
+                is_video: i % 5 == 0,
+                mtime: (i % 13) as i64,
+                file_size: i as i64,
+            })
+            .collect()
+    }
+
+    fn sort_keys_for_test(
+        entries: &[SubfolderExpansionEntry],
+        sort: crate::settings::SortOrder,
+        display_order: &crate::settings::GridDisplayOrder,
+        root: &Path,
+    ) -> Vec<SubfolderEntrySortKey> {
+        use crate::settings::GridItemDisplayKind;
+
+        entries
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let parent = entry
+                    .path
+                    .parent()
+                    .and_then(|parent| parent.strip_prefix(root).ok())
+                    .map(|parent| parent.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let kind = if entry.is_video {
+                    GridItemDisplayKind::VideoAudio
+                } else {
+                    GridItemDisplayKind::Image
+                };
+                SubfolderEntrySortKey {
+                    name: sort.name_key(name),
+                    parent: crate::filename_sort::SortNameKey::file_name(&parent),
+                    row: display_order.row_for(kind),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunked_sort_matches_single_total_order_sort_and_reports_monotonic_progress() {
+        let root = PathBuf::from(r"C:\root");
+        let entries = chunked_sort_test_entries(&root, 257);
+        let display_order = crate::settings::GridDisplayOrder::default();
+        for (sort, order) in [
+            (
+                crate::settings::SortOrder::FileName,
+                crate::settings::SubfolderExpansionOrder::Flat,
+            ),
+            (
+                crate::settings::SortOrder::DateDesc,
+                crate::settings::SubfolderExpansionOrder::FolderGrouped,
+            ),
+        ] {
+            let mut progress = Vec::new();
+            let mut report = |completed| progress.push(completed);
+            let actual = sorted_entry_indices_for_view(
+                &entries,
+                sort,
+                order,
+                &display_order,
+                &root,
+                None,
+                Some(&mut report),
+                17,
+            )
+            .unwrap();
+
+            let keys = sort_keys_for_test(&entries, sort, &display_order, &root);
+            let mut expected: Vec<usize> = (0..entries.len()).collect();
+            expected.sort_unstable_by(|ai, bi| {
+                compare_subfolder_entry_indices(*ai, *bi, &entries, &keys, sort, order)
+            });
+            assert_eq!(actual, expected);
+            assert_eq!(progress.last(), Some(&entries.len()));
+            assert!(progress.windows(2).all(|window| window[0] <= window[1]));
+        }
+    }
+
+    #[test]
+    fn chunked_sort_cancels_between_chunks_without_changing_comparator() {
+        let root = PathBuf::from(r"C:\root");
+        let entries = chunked_sort_test_entries(&root, 96);
+        let cancel = AtomicBool::new(false);
+        let key_stage_end = entries.len() / 3;
+        let mut progress = Vec::new();
+        let mut report = |completed| {
+            progress.push(completed);
+            if completed > key_stage_end {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let result = sorted_entry_indices_for_view(
+            &entries,
+            crate::settings::SortOrder::FileName,
+            crate::settings::SubfolderExpansionOrder::FolderGrouped,
+            &crate::settings::GridDisplayOrder::default(),
+            &root,
+            Some(&cancel),
+            Some(&mut report),
+            8,
+        );
+        assert!(result.is_none());
+        assert!(progress.iter().any(|completed| *completed > key_stage_end));
+    }
+
+    #[test]
+    fn chunked_sort_cancels_during_merge_without_panicking() {
+        let root = PathBuf::from(r"C:\root");
+        let entries = chunked_sort_test_entries(&root, 96);
+        let cancel = AtomicBool::new(false);
+        let chunk_stage_end = entries.len() * 2 / 3;
+        let mut progress = Vec::new();
+        let mut report = |completed| {
+            progress.push(completed);
+            if completed > chunk_stage_end {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let result = sorted_entry_indices_for_view(
+            &entries,
+            crate::settings::SortOrder::FileName,
+            crate::settings::SubfolderExpansionOrder::FolderGrouped,
+            &crate::settings::GridDisplayOrder::default(),
+            &root,
+            Some(&cancel),
+            Some(&mut report),
+            8,
+        );
+        assert!(result.is_none());
+        assert!(
+            progress
+                .iter()
+                .any(|completed| *completed > chunk_stage_end)
+        );
+        assert!(progress.windows(2).all(|window| window[0] <= window[1]));
     }
 
     #[test]
