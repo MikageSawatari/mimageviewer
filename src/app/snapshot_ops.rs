@@ -185,7 +185,7 @@ impl App {
                     .filter_map(|&i| self.thumbnails.get(i)),
             )
             .filter_map(|(item, thumb)| {
-                // snapshot 対象外 (ZipSeparator / SearchContainer) は entry が None になるので
+                // snapshot 対象外 (SearchContainer / 仮想コンテナ) は entry が None になるので
                 // entry と同じ filter で thumbnails 側も削る
                 if snapshot_key_from_grid_item(item).is_some() {
                     Some(thumb.clone())
@@ -238,7 +238,7 @@ impl App {
         // 元の selected idx (= items 内のグローバル位置) を snapshot 内の対応 idx に
         // 変換 (= ユーザー要望: ボタンを押したときのカーソル位置を保持)。
         // 元 items[old_idx] の SnapshotKey → membership で snapshot 内 idx を引く。
-        // snapshot 対象外 item (ZipSeparator 等) や、そもそも未選択なら None。
+        // snapshot 対象外 item や、そもそも未選択なら None。
         let new_selected = self.selected.and_then(|old_idx| {
             self.items
                 .get(old_idx)
@@ -854,8 +854,8 @@ impl App {
         if !(was_fs || resume_slideshow || target.is_some()) {
             return;
         }
-        // ZIP/PDF は非同期列挙なので、この時点では items が ZipSeparator のみ等で揃って
-        // いない。その場合は target を deferred reopen に載せ、`poll_zip_enumerate` /
+        // ZIP/PDF は非同期列挙なので、この時点では items がまだ揃っていない。その場合は
+        // target を deferred reopen に載せ、`poll_zip_enumerate` /
         // `poll_pdf_enumerate` 完了時に解決して開く (Codex P2 fix: 旧版は同期 lookup のみで
         // first playable / 先頭に着地し、ロックリストから未展開 ZIP/PDF 内ページへの
         // ジャンプ・スライドショー復帰が対象ページに到達しなかった)。
@@ -1317,16 +1317,19 @@ mod tests {
 
     #[test]
     fn activate_skips_unrelated_grid_items() {
-        // ZipSeparator は snapshot 対象外なので、items に混ざっていても snapshot からは除外される
+        // SearchContainer は snapshot 対象外なので、混ざっていても snapshot からは除外される。
         let mut app = test_app_with_items(vec![
             GridItem::Image(PathBuf::from(r"E:\a.png")),
-            GridItem::ZipSeparator {
-                dir_display: "Title".into(),
+            GridItem::SearchContainer {
+                path: PathBuf::from(r"E:\hits"),
+                kind: crate::grid_item::SearchContainerKind::Folder,
+                hit_count: 2,
+                representative: None,
             },
             GridItem::Image(PathBuf::from(r"E:\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
-        // ZipSeparator は除外されて 2 件
+        // SearchContainer は除外されて 2 件。
         assert_eq!(app.snapshot_count(), Some(2));
     }
 
@@ -1361,12 +1364,15 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_selected_with_remapped_index() {
-        // 元 items: [Sep, Folder, Image] (idx 0/1/2)、selected=2 (= Image)
-        // Sep は snapshot 対象外なので snapshot subset は [Folder, Image] (idx 0/1)
+        // 元 items: [SearchContainer, Folder, Image]、selected=2 (= Image)。
+        // SearchContainer は対象外なので snapshot subset は [Folder, Image]。
         // 元 selected=2 (Image) → snapshot 内 idx=1 (Image) に remap される
         let mut app = test_app_with_items(vec![
-            GridItem::ZipSeparator {
-                dir_display: "title".into(),
+            GridItem::SearchContainer {
+                path: PathBuf::from(r"E:\hits"),
+                kind: crate::grid_item::SearchContainerKind::Folder,
+                hit_count: 1,
+                representative: None,
             },
             GridItem::Folder(PathBuf::from(r"E:\folder")),
             GridItem::Image(PathBuf::from(r"E:\img.png")),
@@ -1379,14 +1385,17 @@ mod tests {
 
     #[test]
     fn snapshot_clears_selected_when_selected_not_in_snapshot() {
-        // 元 selected が ZipSeparator (snapshot 対象外) → 新 selected は None
+        // 元 selected が SearchContainer (snapshot 対象外) → 新 selected は None。
         let mut app = test_app_with_items(vec![
             GridItem::Folder(PathBuf::from(r"E:\folder")),
-            GridItem::ZipSeparator {
-                dir_display: "title".into(),
+            GridItem::SearchContainer {
+                path: PathBuf::from(r"E:\hits"),
+                kind: crate::grid_item::SearchContainerKind::Folder,
+                hit_count: 1,
+                representative: None,
             },
         ]);
-        app.selected = Some(1); // ZipSeparator
+        app.selected = Some(1); // SearchContainer
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         assert_eq!(app.selected, None);
         // scroll_to_selected は new_selected が None なので立たない

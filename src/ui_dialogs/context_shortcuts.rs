@@ -373,12 +373,7 @@ impl App {
         if let Some(fs_idx) = self.fullscreen_idx
             && matches!(
                 self.items.get(fs_idx),
-                Some(
-                    GridItem::Image(_)
-                        | GridItem::ZipImage { .. }
-                        | GridItem::PdfPage { .. }
-                        | GridItem::ZipSeparator { .. }
-                )
+                Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
             )
             && !self.is_overlay_edit_mode_active()
         {

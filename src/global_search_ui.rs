@@ -1091,10 +1091,10 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
         GridItem::PdfPage {
             pdf_path, page_num, ..
         } => Some(ThumbReuseKey::PdfPage(pdf_path.clone(), *page_num)),
-        // ZipSeparator / ZipDir / Stack は Ctrl+G 検索結果には出ない (通常フォルダ閲覧専用)。
+        // ZipDir / Stack は Ctrl+G 検索結果には出ない (通常フォルダ閲覧専用)。
         // 検索 rebuild の reuse 対象外 (スタックの drill/back は install_new_items 経由で
         // この関数を通らない)。
-        GridItem::ZipSeparator { .. } | GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
+        GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
     }
 }
 
@@ -3380,13 +3380,6 @@ mod tests {
         assert_eq!(thumb_reuse_key(&img1), thumb_reuse_key(&img1_dup));
         assert_ne!(thumb_reuse_key(&img1), thumb_reuse_key(&img2));
         assert_ne!(thumb_reuse_key(&img1), thumb_reuse_key(&folder1));
-        // ZipSeparator はサムネがないので key を返さない (None)
-        assert!(
-            thumb_reuse_key(&GridItem::ZipSeparator {
-                dir_display: "x".into(),
-            })
-            .is_none()
-        );
     }
 
     /// `SearchContainer` は representative が変わったら別キー扱い (代表サムネが

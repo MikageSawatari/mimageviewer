@@ -5599,7 +5599,6 @@ impl App {
             }
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
-            | Some(GridItem::ZipSeparator { .. })
             | Some(GridItem::PdfPage { .. })
             | Some(GridItem::Video(_))
             | Some(GridItem::Audio(_)) => {

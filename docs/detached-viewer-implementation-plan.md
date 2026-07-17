@@ -384,7 +384,7 @@ enum NativeVideoPlacement {
 - `ZipImage`
 - `PdfPage`
 
-`Folder` / `ZipFile` / `PdfFile` / `ConvertibleArchive` / `ZipSeparator` は自動追従対象にしない。
+`Folder` / `ZipFile` / `PdfFile` / `ConvertibleArchive` は自動追従対象にしない。
 `set_viewer_current_idx` は `selected` と `last_viewer_sync_stamp` を同じタイミングで更新し、viewer → main 同期直後の main → viewer pass が no-op になるようにする。
 
 `items` rebuild 後は bare idx が衝突しやすい。

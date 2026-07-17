@@ -124,7 +124,7 @@ impl FolderPinSource {
 ///
 /// 返り値:
 /// - `Some(source)`: ピン留め可能な item
-/// - `None`: ピン留め不可 (`ConvertibleArchive` / `SearchContainer` / `ZipSeparator`
+/// - `None`: ピン留め不可 (`ConvertibleArchive` / `SearchContainer`
 ///   や relative path が取れないケース)
 pub fn source_from_grid_item(
     container: &Path,
@@ -200,7 +200,6 @@ pub fn source_from_grid_item(
         // 代表サムネ pin source にはできない。
         GridItem::Audio(_)
         | GridItem::SearchContainer { .. }
-        | GridItem::ZipSeparator { .. }
         | GridItem::ZipDir { .. }
         | GridItem::Stack { .. } => None,
     }

@@ -52,7 +52,7 @@ ZIP / PDF / 動画は Ctrl+S と Ctrl+G の両方に出る。フォルダは Ctr
 
 - **Ctrl+F**: 現グリッドの可視フィルタ (`search_filter: Option<HashSet<usize>>`)。
   別ビューは作らず `visible_indices` を絞るだけ。構造アイテム (Folder / ZipFile /
-  PdfFile / SearchContainer / ZipSeparator) は **常にマッチ扱い** で絞り込まれない
+  PdfFile / SearchContainer) は **常にマッチ扱い** で絞り込まれない
   (`run_metadata_search` Pass 1)。
 - **Ctrl+S**: `start_loading_items` で検索結果 (GridItem::Folder / ZipFile / PdfFile /
   Video) のフラットな単一リストにグリッドを置換。display_name 昇順。
@@ -163,9 +163,9 @@ ZIP で保管するユーザー向けの機能として、独立した後続プ�
 | Video | ファイル名 / 動画コンテナメタ / タグ — lazy 読み |
 | ZipImage (PNG エントリ) | ファイル名 + PNG tEXt + XMP (ZIP を 1 回開く) |
 | ZipImage (非 PNG エントリ) | ファイル名 (エントリ basename) のみ |
-| ZipSeparator / SearchContainer | なし — 常に表示 |
+| SearchContainer | なし — 常に表示 |
 
-不整合: (a) 構造アイテム (Folder / ZipFile / PdfFile / separator) が一切絞られない、
+不整合: (a) 構造アイテム (Folder / ZipFile / PdfFile) が一切絞られない、
 (b) PdfFile の PDF document info が使われない、(c) ZipImage が PNG なら全メタ・非 PNG
 ならファイル名のみ、と非対称。いずれも下記の変更で解消する ((c) は §4.1.2 — ZIP 内
 メタ検索を廃止し ZipImage を一律ファイル名照合に統一)。
@@ -189,9 +189,7 @@ ZIP で保管するユーザー向けの機能として、独立した後続プ�
 - 検索対象 = EXIF / タグ等 (構造アイテムが持たない次元) → 構造アイテムは全て消える。
   これは「タグで絞ったらタグを持つアイテムだけになる」= 正しい挙動。
 - 照合は既存の `search_query::matches_with_mode(tokens, basename, mode)` を流用する。
-- `ZipSeparator` は付随する ZIP グループに可視アイテムが残るときだけ表示する
-  (グループが空になったら separator も隠す)。`SearchContainer` は Ctrl+F と Ctrl+G が
-  排他なので通常出現しないが、防御的に現状の挙動を残す。
+- `SearchContainer` は Ctrl+F と Ctrl+G が排他なので通常出現しないが、防御的に現状の挙動を残す。
 
 **トレードオフ**: フィルタ中に子フォルダへ直接潜れなくなる。ただし Esc で即解除できる
 ため実害は小さく、予測可能性のメリットが上回る (本再設計の「分かりやすさ優先」方針)。
@@ -444,7 +442,7 @@ aggregate_auto == false のとき:
 | 3 | `GlobalHit` に mtime 追加 (既存 STORED mtime の取り出し経路のみ) | 2 の日付ソートを完成させる。schema 変更・INDEX_VERSION bump なし |
 | 4 | 動画をコンテナ索引 (Ctrl+S) から除外 | `name_bulk_indexer` / `name_index_supervisor` |
 | 5 | Ctrl+S 種別フィルタ追加 + UI 文言の調整 | `FavSearchState` / `SearchIndexDb::search()` / バー UI |
-| 6 | Ctrl+F 修正 (構造アイテム絞り込み / PDF document info / PDF 表示中は無効化 / ZIP はファイル名のみ) | `run_metadata_search` Pass 1、Pass 3 削除、`ZipSeparator` は可視 ZipImage が残るグループだけ表示、Ctrl+F の入口ガード |
+| 6 | Ctrl+F 修正 (構造アイテム絞り込み / PDF document info / PDF 表示中は無効化 / ZIP はファイル名のみ) | `run_metadata_search` の構造アイテム特例削除、Ctrl+F の入口ガード |
 | 7 | 索引呼称の統一 (コンテナ索引 / アイテム索引) | お気に入り画面・hover・説明文 |
 | 8 | マニュアル・設計ドキュメント更新 | §9 参照 |
 

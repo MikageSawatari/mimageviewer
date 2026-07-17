@@ -299,50 +299,19 @@ fn folder_rating_tooltip(keymap: &Keymap) -> String {
     }
 }
 
-fn counts_as_thumbnail_item(item: &GridItem) -> bool {
-    !matches!(item, GridItem::ZipSeparator { .. })
+fn thumbnail_item_counts(items: &[GridItem], visible_indices: &[usize]) -> (usize, usize) {
+    // 全 GridItem が一覧上の 1 項目に対応するため、数百万件でも長さを読むだけでよい。
+    (items.len(), visible_indices.len())
 }
 
-fn thumbnail_item_counts(
-    items: &[GridItem],
-    visible_indices: &[usize],
-    may_contain_zip_separators: bool,
-) -> (usize, usize) {
-    if !may_contain_zip_separators {
-        // ZipSeparator が無い通常フォルダ/PDF/検索/サブ展開では、items と
-        // visible_indices の長さがそのまま表示件数。数百万件を毎フレーム数え直さない。
-        return (items.len(), visible_indices.len());
-    }
-    let total = items
-        .iter()
-        .filter(|item| counts_as_thumbnail_item(item))
-        .count();
-    let visible = visible_indices
-        .iter()
-        .filter_map(|&idx| items.get(idx))
-        .filter(|item| counts_as_thumbnail_item(item))
-        .count();
-    (total, visible)
-}
-
-fn thumbnail_count_label(
-    items: &[GridItem],
-    visible_indices: &[usize],
-    may_contain_zip_separators: bool,
-) -> String {
-    let (total, visible) =
-        thumbnail_item_counts(items, visible_indices, may_contain_zip_separators);
+fn thumbnail_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
+    let (total, visible) = thumbnail_item_counts(items, visible_indices);
     let width = total.max(1).to_string().len();
     format!("({:>width$}/{})", visible, total, width = width)
 }
 
-fn filtered_count_label(
-    items: &[GridItem],
-    visible_indices: &[usize],
-    may_contain_zip_separators: bool,
-) -> String {
-    let (total, visible) =
-        thumbnail_item_counts(items, visible_indices, may_contain_zip_separators);
+fn filtered_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
+    let (total, visible) = thumbnail_item_counts(items, visible_indices);
     format!("{visible} / {total} 件")
 }
 
@@ -2056,7 +2025,6 @@ fn details_kind_label(item: &GridItem) -> String {
         GridItem::PdfFile(path) => details_ext_kind(path, "PDF"),
         GridItem::ConvertibleArchive { format, .. } => format.label().to_string(),
         GridItem::ZipImage { .. } => "ZIP 内画像".to_string(),
-        GridItem::ZipSeparator { .. } => "見出し".to_string(),
         GridItem::PdfPage { .. } => "PDF ページ".to_string(),
         GridItem::ZipDir {
             is_archive,
@@ -2153,7 +2121,6 @@ fn selection_info_parent_location_label(item: &GridItem) -> Option<String> {
         GridItem::Stack { representative, .. } => {
             short_path_name(representative.parent()?).map(|name| format!("親フォルダ名 {name}"))
         }
-        GridItem::ZipSeparator { .. } => None,
     }
 }
 
@@ -6483,11 +6450,7 @@ impl App {
                 }
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(filtered_count_label(
-                        &self.items,
-                        &self.visible_indices,
-                        self.zip_nav.is_some(),
-                    ))
+                    egui::RichText::new(filtered_count_label(&self.items, &self.visible_indices))
                     .small(),
                 );
             });
@@ -7953,7 +7916,7 @@ impl App {
             && !self.items_are_tag_view
             && self.search_filter.is_none()
             && self.search_pending.is_none())
-        .then(|| thumbnail_count_label(&self.items, &self.visible_indices, self.zip_nav.is_some()));
+        .then(|| thumbnail_count_label(&self.items, &self.visible_indices));
         // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
@@ -8810,25 +8773,9 @@ impl App {
                     }
                 } else if let Some(ref filter) = self.search_filter {
                     ui.separator();
-                    // 構造アイテム (Folder/ZIP/PDF) も一貫して絞れるようになったので
-                    // (§4.1)、可視マッチ全体を「X/Y 件」で数える。グループ見出しの
-                    // separator は件数に含めない。
-                    let countable = |it: &crate::grid_item::GridItem| {
-                        !matches!(it, crate::grid_item::GridItem::ZipSeparator { .. })
-                    };
-                    let (total, matched) = if self.zip_nav.is_none() {
-                        // 通常ビューには ZipSeparator が存在しない。件数表示のためだけに
-                        // 数百万 item / match を毎フレーム走査しない。
-                        (self.items.len(), filter.len())
-                    } else {
-                        (
-                            self.items.iter().filter(|it| countable(it)).count(),
-                            filter
-                                .iter()
-                                .filter(|&&i| self.items.get(i).is_some_and(|it| countable(it)))
-                                .count(),
-                        )
-                    };
+                    // 構造アイテム (Folder/ZIP/PDF) も含む可視マッチ全体を数える。
+                    // Vec の長さだけを使い、数百万件を毎フレーム走査しない。
+                    let (total, matched) = (self.items.len(), filter.len());
                     ui.label(
                         egui::RichText::new(format!("{matched}/{total} 件"))
                             .size(11.0)
@@ -9437,7 +9384,6 @@ impl App {
                 Some(GridItem::Image(_))
                 | Some(GridItem::Audio(_))
                 | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::ZipSeparator { .. })
                 | Some(GridItem::PdfPage { .. })
                 | Some(GridItem::Video(_)) => {
                     // 動画も画像と同じくフルスクリーン化 → VideoPlayer がインライン再生する。
@@ -10654,9 +10600,9 @@ impl App {
         display_only: bool,
         show_tooltip: bool,
     ) -> Option<egui::Rect> {
-        let Some(item) = self.items.get(idx).cloned() else {
+        if self.items.get(idx).is_none() {
             return None;
-        };
+        }
         let column_rects = details_column_rects_for_columns(rect, &self.settings, column_set);
         let columns = column_rects
             .iter()
@@ -10723,20 +10669,19 @@ impl App {
         for (col, col_rect) in column_rects {
             match col {
                 DetailsColumn::Preview => {
-                    let enabled = !matches!(item, GridItem::ZipSeparator { .. });
                     let response = ui.interact(
                         col_rect,
                         ui.id().with(("details_preview_icon", idx)),
                         egui::Sense::hover(),
                     );
-                    if enabled && response.hovered() {
+                    if response.hovered() {
                         hovered_preview_rect = Some(col_rect);
                     }
                     draw_details_preview_icon(
                         ui.painter(),
                         col_rect.shrink2(egui::vec2(6.0, 5.0)),
                         text_color,
-                        !enabled,
+                        false,
                     );
                 }
                 DetailsColumn::Name => draw_details_text(
@@ -11307,16 +11252,7 @@ impl App {
     /// ツールチップと下部情報バーが共有する、選択情報の整形結果を構築する。
     /// 参照するのは一覧・サムネイル・遅延メタデータの既存キャッシュだけで、I/O は行わない。
     fn selection_info_content(&self) -> Option<SelectionInfoContent> {
-        let mut checked_indices = self
-            .checked
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                self.items
-                    .get(idx)
-                    .is_some_and(|item| !matches!(item, GridItem::ZipSeparator { .. }))
-            })
-            .collect::<Vec<_>>();
+        let mut checked_indices = self.checked.iter().copied().collect::<Vec<_>>();
         checked_indices.sort_unstable();
         if checked_indices.len() > 1 {
             let mut lines = vec![format!("{} 個選択", checked_indices.len())];
@@ -11340,9 +11276,6 @@ impl App {
 
         let idx = self.selected?;
         let item = self.items.get(idx)?;
-        if matches!(item, GridItem::ZipSeparator { .. }) {
-            return None;
-        }
         let mut lines = Vec::new();
         if self.settings.thumb_tooltip_show_filename {
             let name = item.name().into_owned();
@@ -11487,11 +11420,7 @@ impl App {
             return;
         }
 
-        let selected_idx = self.selected.filter(|&idx| {
-            self.items
-                .get(idx)
-                .is_some_and(|item| !matches!(item, GridItem::ZipSeparator { .. }))
-        });
+        let selected_idx = self.selected.filter(|&idx| self.items.get(idx).is_some());
         let available_before = ctx.available_rect();
         let panel = egui::TopBottomPanel::bottom("selection_info_bottom_bar")
             .exact_height(SELECTION_INFO_BAR_HEIGHT)
@@ -11936,10 +11865,7 @@ mod rating_filter_op_tests {
             .collect();
         let visible_indices: Vec<usize> = (0..20).collect();
 
-        assert_eq!(
-            thumbnail_count_label(&items, &visible_indices, false),
-            "( 20/100)"
-        );
+        assert_eq!(thumbnail_count_label(&items, &visible_indices), "( 20/100)");
     }
 
     #[test]
@@ -11950,25 +11876,8 @@ mod rating_filter_op_tests {
         let visible_indices: Vec<usize> = (0..123).collect();
 
         assert_eq!(
-            filtered_count_label(&items, &visible_indices, false),
+            filtered_count_label(&items, &visible_indices),
             "123 / 300 件"
-        );
-    }
-
-    #[test]
-    fn filtered_count_label_ignores_zip_separators() {
-        let items = vec![
-            GridItem::Image(PathBuf::from("a.jpg")),
-            GridItem::ZipSeparator {
-                dir_display: "dir".into(),
-            },
-            GridItem::Image(PathBuf::from("b.jpg")),
-        ];
-        let visible_indices = vec![0, 1];
-
-        assert_eq!(
-            filtered_count_label(&items, &visible_indices, true),
-            "1 / 2 件"
         );
     }
 
@@ -11993,23 +11902,6 @@ mod rating_filter_op_tests {
         assert_eq!(
             normalize_folder_bar_input_path(Path::new(r"D:books")),
             PathBuf::from(r"D:books")
-        );
-    }
-
-    #[test]
-    fn thumbnail_count_label_ignores_zip_separators() {
-        let items = vec![
-            GridItem::Image(PathBuf::from("a.jpg")),
-            GridItem::ZipSeparator {
-                dir_display: "chapter".to_string(),
-            },
-            GridItem::Image(PathBuf::from("b.jpg")),
-        ];
-        let visible_indices = vec![0, 1];
-
-        assert_eq!(
-            thumbnail_count_label(&items, &visible_indices, true),
-            "(1/2)"
         );
     }
 

@@ -615,10 +615,7 @@ fn lower_left_container_badge_no_for_image_like_items() {
         content_type: None,
     };
     let video = GridItem::Video(PathBuf::from("c:/x.mp4"));
-    let sep = GridItem::ZipSeparator {
-        dir_display: "ch01".to_string(),
-    };
-    for item in [&image, &zip_image, &pdf_page, &video, &sep] {
+    for item in [&image, &zip_image, &pdf_page, &video] {
         assert!(!cell_has_lower_left_container_badge(
             item,
             &ThumbnailState::Pending
@@ -738,16 +735,13 @@ fn next_video_search_uses_display_order_and_skips_non_video_items() {
         },
         GridItem::Video(PathBuf::from("c:/b.mp4")),
         GridItem::Folder(PathBuf::from("c:/sub")),
-        GridItem::ZipSeparator {
-            dir_display: "chapter".to_string(),
-        },
     ];
-    let visible_indices = vec![0, 1, 2, 3, 4, 5, 6];
+    let visible_indices = vec![0, 1, 2, 3, 4, 5];
 
     assert_eq!(
         App::find_next_video_in_display_order_from(&items, &visible_indices, 0, false),
         Some(4),
-        "画像 / ZIP 内画像 / PDF ページ / フォルダ / セパレータを飛ばして次の動画を選ぶ"
+        "画像 / ZIP 内画像 / PDF ページ / フォルダを飛ばして次の動画を選ぶ"
     );
     assert_eq!(
         App::find_next_video_in_display_order_from(&items, &visible_indices, 4, false),
@@ -987,15 +981,6 @@ fn rating_filter_applies_to_video_when_unrated_off() {
     rf[3] = true;
     assert!(!passes_rating_filter(&vid, 0, &rf));
     assert!(passes_rating_filter(&vid, 3, &rf));
-}
-
-#[test]
-fn separator_is_not_rating_target() {
-    // ZipSeparator はレーティング対象外なのでフィルタ素通り (常に可視)。
-    let sep = GridItem::ZipSeparator {
-        dir_display: "x".into(),
-    };
-    assert!(passes_rating_filter(&sep, 0, &[false; 6]));
 }
 
 #[test]
@@ -6080,7 +6065,7 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
-    fn fullscreen_page_number_label_ignores_video_and_zip_separators() {
+    fn fullscreen_page_number_label_ignores_video() {
         use crate::grid_item::{GridItem, ThumbnailState};
         let zip = std::path::PathBuf::from(r"C:\book\vol.zip");
         let pdf = std::path::PathBuf::from(r"C:\book\scan.pdf");
@@ -6088,9 +6073,6 @@ mod phase_c_drill_nav_tests {
         app.items = vec![
             GridItem::Image("c:/book/p001.jpg".into()),
             GridItem::Video("c:/book/bonus.mp4".into()),
-            GridItem::ZipSeparator {
-                dir_display: "chapter".to_string(),
-            },
             GridItem::ZipImage {
                 zip_path: zip,
                 entry_name: "p002.jpg".to_string(),
@@ -6107,11 +6089,10 @@ mod phase_c_drill_nav_tests {
         app.rebuild_visible_indices();
 
         assert_eq!(
-            app.fullscreen_page_number_label(3).as_deref(),
+            app.fullscreen_page_number_label(2).as_deref(),
             Some("2 / 3")
         );
         assert_eq!(app.fullscreen_page_number_label(1), None);
-        assert_eq!(app.fullscreen_page_number_label(2), None);
     }
 
     #[test]
@@ -7899,10 +7880,6 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg"))); // idx 0: 対応画像
         app.items
             .push(GridItem::Video(std::path::PathBuf::from("c:/p/v.mp4"))); // idx 1: 動画
-        app.items.push(GridItem::ZipSeparator {
-            dir_display: "chapter".to_owned(),
-        }); // idx 2: ZIP 区切り
-        app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
 
@@ -7918,13 +7895,9 @@ mod favorite_adjustment_defaults_tests {
 
         // 動画は対応外 → 非アクティブ (連結方式トグル / scroll の誤適用を防ぐ)
         assert!(!app.continuous_reading_active_for_idx(1));
-        // ZIP 区切りは連結読みの仮想ページとして扱う
-        assert!(app.continuous_reading_active_for_idx(2));
-
         // 解析モード中はレンダラが単ページへフォールバックするので非アクティブ
         app.analysis_mode = true;
         assert!(!app.continuous_reading_active_for_idx(0));
-        assert!(!app.continuous_reading_active_for_idx(2));
         app.analysis_mode = false;
 
         // 比較モード中も非アクティブ
@@ -13019,8 +12992,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.grid_is_pdf_pages());
         assert!(!app.grid_is_zip_entries());
 
-        app.items = vec![GridItem::ZipSeparator {
-            dir_display: "chapter".into(),
+        app.items = vec![GridItem::ZipImage {
+            zip_path: PathBuf::from("c:/book.zip"),
+            entry_name: "chapter/page.jpg".into(),
         }];
         assert!(!app.grid_is_pdf_pages());
         assert!(app.grid_is_zip_entries());
@@ -19092,15 +19066,6 @@ mod still_window_mode_key_tests {
             }
             _ => panic!("expected frozen page to preserve white transparent background"),
         }
-    }
-
-    fn push_zip_separator(app: &mut App, label: &str) -> usize {
-        app.items.push(GridItem::ZipSeparator {
-            dir_display: label.to_owned(),
-        });
-        app.thumbnails.push(ThumbnailState::Pending);
-        app.rebuild_visible_indices();
-        app.items.len() - 1
     }
 
     fn test_zip_nav_for(zip_path: PathBuf, names: &[&str]) -> crate::zip_tree::ZipNavState {
@@ -30814,63 +30779,6 @@ mod still_window_mode_key_tests {
             "converted archive child ratings must use the source archive root"
         );
     }
-
-    #[test]
-    fn zip_separator_root_num6_cycles_reading_flow() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let idx = push_zip_separator(&mut app, "chapter-01");
-        app.fullscreen_idx = Some(idx);
-        app.reading_flow = crate::settings::ReadingFlow::Paged;
-
-        begin_root_key_pass(&ctx, egui::Key::Num6, false);
-        let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
-
-        assert!(handled);
-        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
-    }
-
-    #[test]
-    fn zip_separator_root_num7_changes_reading_direction_and_spread() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let idx = push_zip_separator(&mut app, "chapter-01");
-        app.fullscreen_idx = Some(idx);
-        app.spread_mode = crate::settings::SpreadMode::LtrCover;
-        app.reading_direction = crate::settings::ReadingDirection::Ltr;
-
-        begin_root_key_pass(&ctx, egui::Key::Num7, false);
-        let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
-
-        assert!(handled);
-        assert_eq!(
-            app.reading_direction,
-            crate::settings::ReadingDirection::Rtl
-        );
-        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
-    }
-
-    #[test]
-    fn zip_separator_root_num0_cycles_fit_mode_in_continuous_reading() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let idx = push_zip_separator(&mut app, "chapter-01");
-        app.fullscreen_idx = Some(idx);
-        app.reading_flow = crate::settings::ReadingFlow::Vertical;
-        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
-
-        begin_root_key_pass(&ctx, egui::Key::Num0, false);
-        let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
-
-        assert!(handled);
-        assert_ne!(
-            app.settings.fullscreen_fit_mode,
-            crate::settings::FullscreenFitMode::Width
-        );
-    }
 }
 
 #[cfg(test)]
@@ -31353,12 +31261,6 @@ mod always_visible_selection_cursor_tests {
     #[test]
     fn rebuild_visible_indices_selects_first_visible_item_when_none_selected() {
         let mut app = setup_app();
-        push_item(
-            &mut app,
-            GridItem::ZipSeparator {
-                dir_display: "(root)".into(),
-            },
-        );
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")));
 
         app.selected = None;
@@ -31366,23 +31268,6 @@ mod always_visible_selection_cursor_tests {
 
         assert_eq!(app.selected, Some(image));
         assert!(app.scroll_to_selected);
-    }
-
-    #[test]
-    fn rebuild_visible_indices_does_not_select_zip_separator_only() {
-        let mut app = setup_app();
-        push_item(
-            &mut app,
-            GridItem::ZipSeparator {
-                dir_display: "(root)".into(),
-            },
-        );
-
-        app.selected = None;
-        app.rebuild_visible_indices();
-
-        assert_eq!(app.visible_indices, vec![0]);
-        assert_eq!(app.selected, None);
     }
 
     #[test]
@@ -31495,13 +31380,9 @@ mod ctrl_f_structural_filter_tests {
 
     #[test]
     fn progress_counts_countable_items_across_passes() {
-        // separator は最終件数表示と同じく分母から除外し、Pass 1 (ZIP) と
-        // Pass 2 (Image) の両方が item 単位で進捗を進める。
+        // Pass 1 (ZIP) と Pass 2 (Image) の両方が item 単位で進捗を進める。
         let zip = PathBuf::from(r"C:\g\book.zip");
         let items = vec![
-            GridItem::ZipSeparator {
-                dir_display: "(root)".into(),
-            },
             GridItem::ZipImage {
                 zip_path: zip,
                 entry_name: "sunset01.png".into(),
@@ -31513,7 +31394,7 @@ mod ctrl_f_structural_filter_tests {
             crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
         let (m, progress) = run_ctrl_f_with_progress("sunset", &items, target);
 
-        assert_eq!(m, std::collections::HashSet::from([0, 1, 2]));
+        assert_eq!(m, std::collections::HashSet::from([0, 1]));
         assert_eq!(
             progress,
             SearchProgressSnapshot {
@@ -31601,38 +31482,6 @@ mod ctrl_f_structural_filter_tests {
             crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Sidecar]),
         );
         assert!(m_key.is_empty(), "キー名ではヒットしない: {m_key:?}");
-    }
-
-    #[test]
-    fn zip_separator_visible_only_when_group_has_match() {
-        // §4.1: separator は付随グループに可視 ZipImage が残るときだけ表示する。
-        let zip = PathBuf::from(r"C:\g\book.zip");
-        let items = vec![
-            GridItem::ZipSeparator {
-                dir_display: "(root)".into(),
-            },
-            GridItem::ZipImage {
-                zip_path: zip.clone(),
-                entry_name: "sunset01.png".into(),
-            },
-            GridItem::ZipImage {
-                zip_path: zip.clone(),
-                entry_name: "cat.jpg".into(),
-            },
-            GridItem::ZipSeparator {
-                dir_display: "chapter2".into(),
-            },
-            GridItem::ZipImage {
-                zip_path: zip.clone(),
-                entry_name: "dog.jpg".into(),
-            },
-        ];
-        let m = run_ctrl_f("sunset", &items, crate::fts_index::SearchTarget::All);
-        assert!(m.contains(&1), "ヒットした ZipImage は表示");
-        assert!(m.contains(&0), "ヒットを含むグループの separator は表示");
-        assert!(!m.contains(&2), "不一致 ZipImage は非表示");
-        assert!(!m.contains(&3), "可視アイテムが残らない separator は非表示");
-        assert!(!m.contains(&4), "不一致 ZipImage は非表示");
     }
 
     #[test]

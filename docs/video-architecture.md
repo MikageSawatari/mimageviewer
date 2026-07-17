@@ -1695,7 +1695,7 @@ child を追従させる**ことで防ぐ:
 
 ### 静止画の embedded 描画
 
-in-window モードのとき、静止画 (Image / ZipImage / PdfPage / ZipSeparator) は
+in-window モードのとき、静止画 (Image / ZipImage / PdfPage) は
 **専用 viewport を作らず main ウィンドウの egui ctx に直接** CentralPanel を描く。
 
 - 判定: `App::fullscreen_embedded_still_active()`

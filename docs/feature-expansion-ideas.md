@@ -545,7 +545,7 @@ Codex 第 1 ラウンドレビュー指摘「Alt+C 差分は WGSL custom shader 
   - `fullscreen-navigation-consistency.md` の Ctrl+↑↓ コンテキスト解決と **別経路**
     (Ctrl+↑↓ はフォルダ横断、本機能は同一リスト内)
   - `find_next_video_in_visible_indices(current_idx, wrap)` を App 側 helper として新設
-  - `ZipSeparator` / 画像 / フォルダ / ZIP / PDF / `ZipImage` / `PdfPage` はスキップし、
+  - 画像 / フォルダ / ZIP / PDF / `ZipImage` / `PdfPage` はスキップし、
     `GridItem::Video` のみ候補にする
 - 動画切替は手動の動画→動画移動と同じ `open_native_video_fullscreen_from_navigation` /
   `SwitchSource` 経路を使う。native presenter HWND を破棄せず、既存 fast-swap の安全策

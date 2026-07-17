@@ -484,7 +484,6 @@ UI (render_search_bar)
          (target が PDF メタを含むとき。get_document_info の IPC、
           保存済みパスワードは pdf_passwords から、PDF 境界でのみ cancel)
        - ZipImage … ファイル名のみ (ZIP を開いてメタを読む経路は持たない)
-       - ZipSeparator … 付随グループに可視 ZipImage が残るときだけ表示
     Pass 2 (Image / Video、on-demand メタ):
        - target に応じて必要なメタだけ読む (PNG tEXt / JPEG EXIF UserComment AI メタ / EXIF / XMP /
          動画コンテナメタ / dc:subject)
@@ -500,10 +499,9 @@ UI (render_search_bar)
   バーも閉じる。
 - **ZIP 表示中は検索対象をファイル名に固定** (`grid_is_zip_entries`): ZIP 内
   画像のメタ検索は行わない (§4.6)。
-- 検索中表示は処理済み item 数 / 総 item 数を出す。分母・最終件数とも
-  `ZipSeparator` は除外する。1 item 内のメタ読み取り中は、その item が完了するまで
+- 検索中表示は処理済み item 数 / 総 item 数を出す。1 item 内のメタ読み取り中は、その item が完了するまで
   数字は進まない。
-- 件数バッジは可視マッチ全体を「X/Y 件」で数える (separator は除く)。
+- 件数バッジは可視マッチ全体を「X/Y 件」で数える。
 - フィルタが効いている元フォルダでは BS / Alt+↑ / アドレスバーの ⬆ による
   親移動を no-op / disabled にする。検索結果から子フォルダへ入った後は既存どおり
   `search_filter` が解除されるため、BS で元フォルダへ戻れる。

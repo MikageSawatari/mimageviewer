@@ -770,7 +770,7 @@ pub(super) fn compute_location_display(
             }
         }
         _ => {
-            // 通常画像・動画・ZipSeparator 等: folder + basename を連結。
+            // 通常画像・動画等: folder + basename を連結。
             if base_folder.is_empty() {
                 filename.to_string()
             } else if filename.is_empty() {

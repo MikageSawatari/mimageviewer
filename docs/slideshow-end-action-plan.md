@@ -26,7 +26,7 @@
 
 ### 動画スキップ (固定)
 
-- スライドショーの送り探索から `GridItem::Video` を除外する。ただし `GridItem::ZipSeparator` は仕様どおり同じ間隔で表示する ([docs/spec.md:154](spec.md))。
+- スライドショーの送り探索から `GridItem::Video` を除外する。
 - 手動で動画に来た場合 (ホイール等) も、スライドショー実行中なら次の間隔で動画を飛ばして進む (= 動画で停止しない)。
 
 ### フォルダ内ナビ継続
@@ -334,8 +334,7 @@ match next {
 スライドショー専用に **Video を除外する** 隣接探索を `src/ui_helpers.rs` に追加:
 
 ```rust
-/// スライドショー送り用。adjacent_navigable_idx と同じだが GridItem::Video を除外する
-/// (ZipSeparator は仕様どおり残す)。
+/// スライドショー送り用。adjacent_navigable_idx と同じだが GridItem::Video を除外する。
 pub fn adjacent_slideshow_idx(
     items: &[GridItem], visible_indices: &[usize], current: usize, delta: i32,
 ) -> Option<usize> {
@@ -343,16 +342,11 @@ pub fn adjacent_slideshow_idx(
 }
 ```
 
-**ZipSeparator の扱い (Codex P3)**: 役割で分ける。
-- **前進送り** (`adjacent_slideshow_idx`): `ZipSeparator` を **含める** (= 章タイトルが同じ間隔で
-  表示される。仕様 [spec.md:154](spec.md))。除外するのは `Video` だけ。
-- **LoopFolder の折り返し target**: 既存実装 ([ui_fullscreen.rs:4599-4608](../src/ui_fullscreen.rs)) は
-  先頭の `Image | ZipImage | PdfPage` を選び **ZipSeparator を含めない**。これを踏襲する
-  (先頭が章タイトル画面に戻るのは不自然なので、最初の実画像へ折り返す)。Video 除外は元々
-  入っていないが、loop target は画像系のみなので Video も自然に除外される。
+**LoopFolder の折り返し target**: 既存実装は先頭の `Image | ZipImage | PdfPage` を選ぶ。
+loop target は画像系のみなので Video も自然に除外される。
 
 スライドショーの自動送り ([ui_fullscreen.rs:4589-4595](../src/ui_fullscreen.rs)) は
-`adjacent_slideshow_idx` (ZipSeparator 込み・Video 除外) を使う。
+`adjacent_slideshow_idx` (Video 除外) を使う。
 **手動ナビ (矢印/ホイール/クリック) は従来どおり `adjacent_navigable_idx`** (動画にも止まれる)。
 
 #### 4.3 動画停止コードの撤去
@@ -407,12 +401,11 @@ ui.label(RichText::new("スライドショー中、動画は自動でスキッ�
 | NextFolder 中に検索 (Ctrl+F/G/Fav) がアクティブ | 「次フォルダ」概念が無いので **LoopFolder にフォールバック** (折り返し、§4.1) |
 | NextFolder の in-flight 中にスライドショータイマー再発火 | 発火時に `slideshow_playing=false` にしてタイマー/sync が早期 return + `fs_nav_is_locked` で再発火しない (§4.1) |
 | NextFolder 着地フォルダの先頭が動画 | §3.5 で **静止画のみ target を開く** (動画は開かない)。静止画 target が無ければ停止 |
-| ZipSeparator | 仕様どおり同じ間隔で表示 (スキップしない) |
 | 設定ファイルに `slideshow_end_action` が無い旧設定 | serde default で LoopFolder (移行不要) |
 
 ## テスト計画
 
-- **ユニット (`src/ui_helpers.rs`)**: `adjacent_slideshow_idx` が Video を飛ばし ZipSeparator は残すこと。境界で None。`adjacent_navigable_idx` の既存テスト ([ui_helpers.rs:1185](../src/ui_helpers.rs)) と並べる。
+- **ユニット (`src/ui_helpers.rs`)**: `adjacent_slideshow_idx` が Video を飛ばし、境界で None になること。`adjacent_navigable_idx` の既存テストと並べる。
 - **ユニット (`src/folder_tree.rs`)**: `folder_has_still_image` が 画像あり=true / 動画のみ=false / 空=false / ZIP画像あり=true / PDF=true ([folder_tree.rs:632](../src/folder_tree.rs) 付近の既存テストに追加)。`navigate_folder_with_skip` の述語注入版が既存テストを壊さないこと。
 - **ユニット (`src/settings.rs`)**: `slideshow_end_action` が serde default で LoopFolder になること。
 - **実機 (`docs/e2e-smoke-test.md` 追記)**:

@@ -692,9 +692,6 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
-                        GridItem::ZipSeparator { .. } => {
-                            close = true;
-                        }
                         GridItem::ZipDir {
                             zip_path,
                             dir_prefix,
@@ -885,7 +882,6 @@ impl crate::app::App {
             } => format!("{}:Page {}", native_path_text(&pdf_path), page_num + 1),
             // ファイル名スタック: 代表画像の実パスをコピー。
             GridItem::Stack { representative, .. } => native_path_text(&representative),
-            GridItem::ZipSeparator { .. } => return false,
         };
         ctx.copy_text(text);
         true
@@ -946,7 +942,6 @@ impl crate::app::App {
             GridItem::PdfPage { pdf_path, .. } => pdf_path,
             // ファイル名スタック: 代表画像を含むフォルダを開く。
             GridItem::Stack { representative, .. } => representative,
-            GridItem::ZipSeparator { .. } => return false,
         };
         open_folder_in_explorer(&path);
         true
@@ -1552,10 +1547,7 @@ impl crate::app::App {
                     }
                     // ZipDir / Stack はフルスクリーン対象外 (仮想ナビコンテナ) なので FS では
                     // 最小限 (そもそも FS の items にはメンバーの実 Image しか入らない)。
-                    GridItem::Folder(_)
-                    | GridItem::ZipSeparator { .. }
-                    | GridItem::ZipDir { .. }
-                    | GridItem::Stack { .. } => {
+                    GridItem::Folder(_) | GridItem::ZipDir { .. } | GridItem::Stack { .. } => {
                         close = true;
                     }
                     GridItem::ConvertibleArchive { path, .. } => {

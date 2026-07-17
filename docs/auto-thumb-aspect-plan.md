@@ -70,7 +70,6 @@ ColorImage サイズが取れる Loaded サムネは全部集計に入れる」�
 | ZipImage / PdfPage | ✓ | 開いている階層のアイテム自身 |
 | Video | ✓ | Shell サムネの HBITMAP 寸法 (元動画フレーム比とは限らない、詳細: §4.1.1) |
 | ZipFile / PdfFile / Folder | ✓ | 代表サムネ (1 ページ目 / 最初の画像) の `source_dims` |
-| ZipSeparator | ✗ | サムネ無し |
 
 `source_dims` の解決は次の優先順:
 

@@ -1139,7 +1139,6 @@ pub fn adjacent_navigable_idx(
                     | Some(GridItem::Video(_))
                     | Some(GridItem::Audio(_))
                     | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::ZipSeparator { .. })
                     | Some(GridItem::PdfPage { .. })
             )
         })
@@ -1253,7 +1252,6 @@ pub fn large_jump_page_idx(
 
 /// スライドショー送り用の隣接探索。`adjacent_navigable_idx` と同じだが
 /// **`GridItem::Video` を除外**する (スライドショー中は動画をスキップして継続するため)。
-/// `GridItem::ZipSeparator` は仕様どおり残す (章タイトルも同じ間隔で表示する)。
 /// 境界では None を返す (ラップアラウンドなし)。
 pub fn adjacent_slideshow_idx(
     items: &[GridItem],
@@ -1269,7 +1267,6 @@ pub fn adjacent_slideshow_idx(
                 items.get(i),
                 Some(GridItem::Image(_))
                     | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::ZipSeparator { .. })
                     | Some(GridItem::PdfPage { .. })
             )
         })
@@ -1294,9 +1291,7 @@ pub fn adjacent_slideshow_idx(
 }
 
 /// スライドショーの折り返し / 先頭着地用に、`display_order` の中で先頭の
-/// 静止画系アイテム (Image / ZipImage / PdfPage、Video と ZipSeparator は除外) を返す。
-/// LoopFolder の折り返し先は章タイトル (ZipSeparator) ではなく実画像にするため、
-/// `adjacent_slideshow_idx` のフィルタとは別に separator も除外する。
+/// 静止画系アイテム (Image / ZipImage / PdfPage、Video は除外) を返す。
 pub fn first_slideshow_still_idx(items: &[GridItem], display_order: &[usize]) -> Option<usize> {
     display_order.iter().copied().find(|&i| {
         matches!(
@@ -1322,7 +1317,6 @@ pub fn boundary_navigable_idx(
             Some(GridItem::Image(_))
                 | Some(GridItem::Video(_))
                 | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::ZipSeparator { .. })
                 | Some(GridItem::PdfPage { .. })
         )
     });
@@ -1879,9 +1873,6 @@ mod tests {
             GridItem::Folder(std::path::PathBuf::from("/a/folder")),
             GridItem::Image(std::path::PathBuf::from("/a/one.jpg")),
             GridItem::Video(std::path::PathBuf::from("/a/two.mp4")),
-            GridItem::ZipSeparator {
-                dir_display: "chapter".into(),
-            },
             GridItem::Image(std::path::PathBuf::from("/a/three.jpg")),
             GridItem::PdfPage {
                 pdf_path: std::path::PathBuf::from("/a/book.pdf"),
@@ -1889,9 +1880,9 @@ mod tests {
                 content_type: None,
             },
         ];
-        let order = vec![5, 0, 2, 3, 1, 4];
-        assert_eq!(fixed_jump_page_idx(&items, &order, 5, 2, true), Some(4));
-        assert_eq!(fixed_jump_page_idx(&items, &order, 4, 3, false), Some(5));
+        let order = vec![4, 0, 2, 1, 3];
+        assert_eq!(fixed_jump_page_idx(&items, &order, 4, 2, true), Some(3));
+        assert_eq!(fixed_jump_page_idx(&items, &order, 3, 3, false), Some(4));
     }
 
     #[test]
@@ -2019,21 +2010,6 @@ mod tests {
         assert_eq!(adjacent_slideshow_idx(&items, &order, 0, -1), Some(3));
     }
 
-    /// スライドショー送りは ZipSeparator は残す (章タイトルを同間隔で表示)。
-    #[test]
-    fn adjacent_slideshow_idx_keeps_separator() {
-        let items = vec![
-            GridItem::Image(std::path::PathBuf::from("/a/0.jpg")),
-            GridItem::ZipSeparator {
-                dir_display: "chapter".to_string(),
-            },
-            GridItem::Image(std::path::PathBuf::from("/a/2.jpg")),
-        ];
-        let vi = vec![0, 1, 2];
-        assert_eq!(adjacent_slideshow_idx(&items, &vi, 0, 1), Some(1));
-        assert_eq!(adjacent_slideshow_idx(&items, &vi, 1, 1), Some(2));
-    }
-
     /// 末尾が動画でも境界は None (折り返しは呼び出し側で行う)。
     #[test]
     fn adjacent_slideshow_idx_boundary_none_when_only_video_after() {
@@ -2045,18 +2021,15 @@ mod tests {
         assert_eq!(adjacent_slideshow_idx(&items, &vi, 0, 1), None);
     }
 
-    /// 折り返し target は separator を飛ばして先頭の実画像。
+    /// 折り返し target は動画を飛ばして先頭の実画像。
     #[test]
-    fn first_slideshow_still_idx_skips_separator_and_video() {
+    fn first_slideshow_still_idx_skips_video() {
         let items = vec![
-            GridItem::ZipSeparator {
-                dir_display: "chapter".to_string(),
-            },
-            GridItem::Video(std::path::PathBuf::from("/a/1.mp4")),
-            GridItem::Image(std::path::PathBuf::from("/a/2.jpg")),
+            GridItem::Video(std::path::PathBuf::from("/a/0.mp4")),
+            GridItem::Image(std::path::PathBuf::from("/a/1.jpg")),
         ];
-        let vi = vec![0, 1, 2];
-        assert_eq!(first_slideshow_still_idx(&items, &vi), Some(2));
+        let vi = vec![0, 1];
+        assert_eq!(first_slideshow_still_idx(&items, &vi), Some(1));
     }
 
     #[test]

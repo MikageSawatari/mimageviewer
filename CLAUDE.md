@@ -145,7 +145,7 @@ mimageviewer/
 │   ├── catalog.rs           # SQLite サムネイルカタログ
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー
 │   ├── folder_thumb_pins.rs # 親コンテナ（Folder/ZipFile/PdfFile）の代表サムネ手動ピン DB（v0.9.x、`#pin:` cache key suffix で identity を表現）
-│   ├── grid_item.rs         # GridItem（Folder/Image/Video/ZipFile/PdfFile/ZipImage/PdfPage/ZipSeparator/Stack）/ ThumbnailState 定義
+│   ├── grid_item.rs         # GridItem（Folder/Image/Video/Audio/ZipFile/PdfFile/ZipImage/ZipDir/PdfPage/Stack）/ ThumbnailState 定義
 │   ├── filename_stack.rs    # ファイル名 prefix スタック（v2.0.0）の純ロジック（StackGroup/StackView/group_media/materialize_*）
 │   ├── filename_stack_ui.rs # 上記の App グルー（トグル・集約⇔フラット切替・Shift+↓↑ ジャンプ）
 │   ├── thumb_loader.rs      # サムネイル並列ロード

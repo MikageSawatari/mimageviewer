@@ -131,27 +131,25 @@
   (externalize + 翻訳 + QA 工程)。QA ツールは日本語バグにも効くため単独で投資回収がある。
 - 優先度: P2 candidate (QA ツール)。英語対応は QA ツール整備後に再判断 (現時点は保留)。
 
-### 1.20 レガシー `GridItem::ZipSeparator` の完全撤去
+### 1.20 ✅ レガシー `GridItem::ZipSeparator` の完全撤去 (v2.5.0)
 
+- 状態: 完了 (2026-07-17)。
 - 出典: v2.4.1 前レビュー (2026-07-16)。`ZipSeparator` は旧 ZIP フラット展開で章見出しを
   1 セルとして挿入するための疑似アイテムだったが、v1.3.0 のネスト ZIP ツリーナビ移行後は
   `ZipTree` / `ZipDir` で現在階層だけを表示するため、本番経路では生成されない。
 - 互換性判断: `GridItem` は永続化形式ではなく、snapshot / viewer context 内の保持も同一プロセス中の
   一時状態だけである。旧設定・DB・セッションから `ZipSeparator` を復元する経路はなく、variant を
   残す後方互換上の必要はない。
-- 対応範囲:
+- 実施内容:
   1. `GridItem::ZipSeparator` variant と専用描画、ナビ、検索、メタデータ、スナップショット、
-     コンテキストメニュー等の match arm を削除する。
-  2. `ZipSeparator` を人工的に生成するテストと、「スライドショーで章カードを表示する」など現在は
-     到達不能な契約を削除または現行 `ZipDir` 仕様へ更新する。専用 enum 値・helper が他用途を
-     持たない場合は併せて撤去する。
-  3. `docs/spec.md` / `docs/virtual-folders.md` など現行仕様から特殊扱いとチェック項目を削除する。
-     過去の設計経緯を記録する文書は、撤去済みであることが誤解なく分かる形に更新する。
-- 不変条件: `ZipTree` / `ZipDir` の階層移動、`ZipImage` の表示順、見開き・連結読み、検索・
-  フィルタ、通常画像 / PDF の挙動は変更しない。削除後にソースの `ZipSeparator` 参照をゼロにし、
-  ZIP 関連テスト、全テスト、`cargo fmt --check` を通す。
-- 規模 / 優先度: Small〜Medium / P3 cleanup。ユーザー影響のある不具合ではないため、v2.4.1
-  リリース後の独立コミットで実施する。
+     コンテキストメニュー等の分岐を撤去した。
+  2. 人工的に旧 variant を生成するテストと、到達不能だったスライドショー / 連続読みの章カード契約、
+     専用 enum 値・helper を撤去した。
+  3. `docs/spec.md` / `docs/virtual-folders.md` などの現行仕様を更新し、過去の設計文書には撤去済みと
+     明記した。
+- 維持した不変条件: `ZipTree` / `ZipDir` の階層移動、`ZipImage` の表示順、見開き・連結読み、
+  検索・フィルタ、通常画像 / PDF の挙動は変更しない。ソースの `ZipSeparator` 参照はゼロとし、
+  旧 facet 設定値は `Unknown` として安全に読み込む。
 
 ### 2.1 folder pane scan worker の thread 構成判断
 

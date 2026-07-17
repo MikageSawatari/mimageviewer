@@ -7,20 +7,21 @@ ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは�
 
 ## 1. GridItem バリアント
 
-`grid_item.rs` の `GridItem` 列挙型は以下の 11 バリアント:
+`grid_item.rs` の `GridItem` 列挙型は以下の 12 バリアント:
 
 | バリアント | 発生元 | 中身 |
 | --- | --- | --- |
 | `Folder(PathBuf)` | 通常フォルダ | 実ファイルシステムのディレクトリ |
 | `Image(PathBuf)` | 通常フォルダ内 | 画像ファイル |
 | `Video(PathBuf)` | 通常フォルダ内 | 動画ファイル |
+| `Audio(PathBuf)` | 通常フォルダ内 | 音声ファイル |
 | `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開)。`.zip` と別名 `.cbz` を含む (`folder_tree::is_zip_extension` で判定) |
 | `PdfFile(PathBuf)` | 通常フォルダ内 | PDF ドキュメント (未展開) |
 | `ConvertibleArchive { path, format }` | 通常フォルダ内 | RAR/7z/LZH 等。RAR は worker 判定で直接閲覧または ZIP 変換キャッシュ、7z/LZH は ZIP 変換キャッシュ経由で開く |
 | `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ。`entry_name` はネストでも `"outer/ch01.zip/p.jpg"` のフルパス |
 | `ZipDir { zip_path, dir_prefix, is_archive, representative }` | ネスト ZIP を開いた中 (v1.3.0) | 「入れる」子ディレクトリ / 内側アーカイブ。Enter で降りる。仮想コンテナで実パスなし |
-| `ZipSeparator { dir_display }` | **(レガシー、現在は未生成)** | 旧フラット展開時の区切り疑似アイテム。v1.3.0 のツリーナビ化で `finalize_zip_enumerate` は生成しなくなった。variant 自体と各 match arm は後方互換で残置 |
 | `PdfPage { pdf_path, page_num, content_type }` | PDF を開いた中 | PDF のページ (0-indexed) |
+| `Stack { key, representative, count }` | ファイル名スタック | 複数画像を畳んだ集約セル。クリックでメンバーへドリルインする |
 | `SearchContainer { path, kind, hit_count, representative }` | Ctrl+G 検索集約ビュー | ヒットを含む親フォルダ/ZIP を 1 セルで表現 (v0.8.0) |
 
 `Folder/Image/Video/ZipFile/PdfFile/ConvertibleArchive` は「外側」= 通常フォルダのリスト。
@@ -59,7 +60,7 @@ RAR / CBR / 変換キャッシュ ZIP のページと ZIP 内階層は、常に�
 
 ### ネスト ZIP のツリーナビ (v1.3.0)
 
-ネスト ZIP (ZIP 内に内側 ZIP/サブフォルダ) は、**フラット展開 + `ZipSeparator` をやめ**、
+ネスト ZIP (ZIP 内に内側 ZIP/サブフォルダ) は、**フラット展開 + 章区切りセルをやめ**、
 `entry_name` の `/` 区切りでメモリ上にツリー (`src/zip_tree.rs` の `ZipTree`) を組み、
 現在階層だけを `materialize_level` で表示する。子コンテナは `ZipDir` セルになり、
 Enter/ダブルクリック/ゲームパッド/Ctrl+↑↓(本またぎ)/Backspace でツリー内を移動する
@@ -214,8 +215,8 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 
 2. **(v1.3.0〜) `entry_name` の `/` 区切りでツリー (`zip_tree::ZipTree`) を構築**
    - `.zip`/`.cbz` 境界も構造上はただのディレクトリ階層 (`entry_name` 中で既に `/` 区切り)。
-   - 旧実装の「サブディレクトリで BTreeMap グループ化 + 2 つ以上で ZipSeparator 挿入 +
-     全エントリをフラットに ZipImage」は廃止 (ZipSeparator は生成しない)。
+   - 旧実装の「サブディレクトリで BTreeMap グループ化 + 章区切りセル挿入 +
+     全エントリをフラットに ZipImage」は廃止。区切り用の疑似バリアントも v2.5.0 で撤去した。
 
 3. ルート階層だけを `materialize_level` で items 化:
    - 冗長ラッパー (画像 0・子 1) は `collapse_redundant` で自動降下
@@ -518,21 +519,11 @@ Folder 自動代表の cache key には自動選定アルゴリズム版・`fold
 
 ---
 
-## 4. ZipSeparator の扱い
+## 4. 旧区切り疑似アイテムの撤去
 
-ZipSeparator は **UI 上の区切り線**なので、以下のように特殊扱い:
-
-- クリック不可 / 選択不可
-- サムネイルロード対象外 (LoadRequest を作らない)
-- キーボードナビゲーションでスキップされる
-- ソート時に境界として機能 (隣のグループに渡らない)
-- フルスクリーンの表示モード操作 (`0`〜`7`) は例外的に有効。連結読みでは
-  区切りページ自体が画面中央に来るため、そこでページ構成・連結方式・横方向・
-  フィットを切り替えられるようにする。
-
-新しいキーボード操作や一括処理を追加する時、ZipSeparator をスキップするのを忘れないこと。
-ただし表示設定のように区切りページ上でも操作できるべきものは、描画側の
-`continuous_reading_supported_idx` と判定を揃える。
+旧フラット ZIP 表示で使っていた `GridItem::ZipSeparator` は、v1.3.0 以降の本番経路では
+生成されなくなり、v2.5.0 で型・描画・ナビ・検索・テストを含めて完全撤去した。
+現在の ZIP 一覧は `ZipDir` と `ZipImage` だけで階層とページを表現する。
 
 ---
 
@@ -543,7 +534,6 @@ ZipSeparator は **UI 上の区切り線**なので、以下のように特殊�
 - [ ] **GridItem::ZipImage で動くか** (バイト経由で処理できるか)
 - [ ] **GridItem::PdfPage で動くか** (PDF ワーカー描画後の ColorImage で処理できるか)
 - [ ] **DB のキーは正規化されているか** (path だけだと ZIP 内エントリを区別できない)
-- [ ] **パスが存在しない項目** (ZipSeparator) を誤ってリストから引いていないか
 - [ ] **パスワード付き PDF** で落ちないか (enumerate 段階で止まる可能性)
 - [ ] **キャッシュキー** が他と衝突しないプレフィクスになっているか
 - [ ] **サムネイル経路とフルスクリーン経路** の両方で対応しているか ([display-pipeline.md](display-pipeline.md))

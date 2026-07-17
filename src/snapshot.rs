@@ -289,7 +289,7 @@ pub fn pdf_page_inner_key(page_num: u32) -> String {
 ///
 /// 戻り値:
 /// - `Some(key)` = snapshot 化可能なアイテム
-/// - `None` = snapshot 対象外 (= `ZipSeparator`, `SearchContainer`)
+/// - `None` = snapshot 対象外 (= `SearchContainer` / 仮想コンテナ)
 pub fn snapshot_key_from_grid_item(item: &GridItem) -> Option<SnapshotKey> {
     match item {
         GridItem::Folder(p)
@@ -312,8 +312,6 @@ pub fn snapshot_key_from_grid_item(item: &GridItem) -> Option<SnapshotKey> {
             container: normalize_fs(pdf_path),
             inner: pdf_page_inner_key(*page_num),
         }),
-        // snapshot 対象外
-        GridItem::ZipSeparator { .. } => None,
         // MVP では SearchContainer は §4.5 で disable 扱い (= 取り込まない)
         GridItem::SearchContainer { .. } => None,
         // ZipDir はネスト ZIP ツリーの仮想ナビコンテナ。snapshot は leaf 画像 (ZipImage)
@@ -337,10 +335,7 @@ pub fn snapshot_entry_kind(item: &GridItem) -> Option<SnapshotEntryKind> {
         GridItem::ConvertibleArchive { .. } => Some(SnapshotEntryKind::ConvertibleArchive),
         GridItem::ZipImage { .. } => Some(SnapshotEntryKind::ZipImage),
         GridItem::PdfPage { .. } => Some(SnapshotEntryKind::PdfPage),
-        GridItem::ZipSeparator { .. }
-        | GridItem::SearchContainer { .. }
-        | GridItem::ZipDir { .. }
-        | GridItem::Stack { .. } => None,
+        GridItem::SearchContainer { .. } | GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
     }
 }
 
@@ -385,10 +380,7 @@ pub fn snapshot_target_from_grid_item(item: &GridItem) -> Option<SnapshotTarget>
             pdf_path: pdf_path.clone(),
             page_num: *page_num,
         }),
-        GridItem::ZipSeparator { .. }
-        | GridItem::SearchContainer { .. }
-        | GridItem::ZipDir { .. }
-        | GridItem::Stack { .. } => None,
+        GridItem::SearchContainer { .. } | GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
     }
 }
 
@@ -724,14 +716,6 @@ mod tests {
                 inner: "p:7".into(),
             }
         );
-    }
-
-    #[test]
-    fn snapshot_key_from_grid_item_returns_none_for_separator() {
-        let item = GridItem::ZipSeparator {
-            dir_display: "Some Title".into(),
-        };
-        assert!(snapshot_key_from_grid_item(&item).is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! グリッド要素のデータモデル。
 //!
 //! `GridItem` は一覧に表示される各セルの種別 (フォルダ・画像・動画・ZIP/PDF ファイル・
-//! ZIP 内画像・ZIP 内サブディレクトリ境界・PDF ページ) を表す。
+//! ZIP 内画像・ZIP 内サブディレクトリ・PDF ページ) を表す。
 //! `ThumbnailState` は各セルのサムネイル読み込み状態。
 //!
 //! どちらも純粋なデータ型で、UI 状態や I/O は持たない。
@@ -53,12 +53,6 @@ pub enum GridItem {
     ZipImage {
         zip_path: PathBuf,
         entry_name: String,
-    },
-    /// タスク 3: ZIP 内のサブディレクトリ境界を示す擬似アイテム
-    /// (1 セル分を占め、作品名など大きな文字で表示される)
-    ZipSeparator {
-        /// 表示されるディレクトリ名 (ルート直下の場合は "(root)")
-        dir_display: String,
     },
     /// ネスト ZIP ツリーナビ (v1.3.0、`docs/nested-zip-tree-plan.md` Strategy A) で、
     /// 開いている外側 ZIP の現在階層にある「入れる子ディレクトリ / 内側アーカイブ」を表す
@@ -222,7 +216,6 @@ impl GridItem {
     /// 表示用の名前を返す。
     /// - 通常: ファイル名
     /// - ZipImage: ZIP 内エントリのベース名
-    /// - ZipSeparator: ディレクトリ表示名
     /// - PdfPage: "Page N" (1-indexed)
     pub fn name(&self) -> Cow<'_, str> {
         match self {
@@ -236,7 +229,6 @@ impl GridItem {
             GridItem::ZipImage { entry_name, .. } => {
                 Cow::Borrowed(crate::zip_loader::entry_basename(entry_name))
             }
-            GridItem::ZipSeparator { dir_display } => Cow::Borrowed(dir_display),
             GridItem::ZipDir { dir_prefix, .. } => Cow::Borrowed(zipdir_display_name(dir_prefix)),
             GridItem::PdfPage { page_num, .. } => Cow::Owned(format!("Page {}", page_num + 1)),
             GridItem::SearchContainer { path, .. } => path_display_name(path),
@@ -248,7 +240,6 @@ impl GridItem {
     /// - 通常ファイル / フォルダ / コンテナ: パスそのまま
     /// - ZipImage: "<zip>:<entry>"
     /// - PdfPage: "<pdf>:Page N" (1-indexed)
-    /// - ZipSeparator: ディレクトリ表示名
     pub fn display_path(&self) -> String {
         match self {
             GridItem::Folder(p)
@@ -267,7 +258,6 @@ impl GridItem {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => format!("{}:Page {}", pdf_path.display(), page_num + 1),
-            GridItem::ZipSeparator { dir_display } => dir_display.clone(),
             GridItem::ZipDir {
                 zip_path,
                 dir_prefix,
@@ -301,7 +291,6 @@ impl GridItem {
     /// [`Self::file_operation_path`] と同じく、実パスを持つフォルダ / ファイルだけを
     /// 対象にする。対象外:
     /// - `ZipImage` / `PdfPage` — 仮想フォルダ内でディスク上に実体がない
-    /// - `ZipSeparator` — 擬似アイテム
     /// - `SearchContainer` — 検索集約 UI のコンテナ。`path` は実フォルダ / ZIP を
     ///   指すが、初版スコープ外 (`docs/file-drag-drop-design.md` §2)。将来含める
     ///   場合はここに 1 分岐足す。
@@ -344,9 +333,6 @@ impl GridItem {
                 entry_name,
             } => {
                 format!("zip::{}#{}", zip_path.display(), entry_name)
-            }
-            GridItem::ZipSeparator { dir_display } => {
-                format!("zipsep::{dir_display}")
             }
             GridItem::ZipDir {
                 zip_path,
@@ -528,7 +514,7 @@ fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemDisplayKind>
         | GridItem::PdfPage { .. }
         | GridItem::Stack { .. } => Some(GridItemDisplayKind::Image),
         GridItem::Video(_) | GridItem::Audio(_) => Some(GridItemDisplayKind::VideoAudio),
-        GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. } => None,
+        GridItem::SearchContainer { .. } => None,
     }
 }
 
@@ -590,14 +576,6 @@ mod tests {
             entry_name: "chapter1/page01.jpg".to_string(),
         };
         assert_eq!(item.name(), "page01.jpg");
-    }
-
-    #[test]
-    fn zip_separator_name() {
-        let item = GridItem::ZipSeparator {
-            dir_display: "Chapter 1".to_string(),
-        };
-        assert_eq!(item.name(), "Chapter 1");
     }
 
     fn zipdir(prefix: &str, is_archive: bool) -> GridItem {
@@ -712,12 +690,6 @@ mod tests {
             .is_checkable()
         );
         assert!(
-            !GridItem::ZipSeparator {
-                dir_display: "chapter".to_owned(),
-            }
-            .is_checkable()
-        );
-        assert!(
             !GridItem::SearchContainer {
                 path: PathBuf::from(r"C:\books"),
                 kind: SearchContainerKind::Folder,
@@ -824,13 +796,6 @@ mod tests {
                 pdf_path: PathBuf::from(r"C:\books\a.pdf"),
                 page_num: 0,
                 content_type: None,
-            }
-            .drag_source_path()
-            .is_none()
-        );
-        assert!(
-            GridItem::ZipSeparator {
-                dir_display: "chapter".to_owned(),
             }
             .drag_source_path()
             .is_none()

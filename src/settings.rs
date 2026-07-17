@@ -604,7 +604,6 @@ pub enum FacetItemKind {
     Archive,
     ZipImage,
     PdfPage,
-    Separator,
     SearchContainer,
     /// 将来バージョンが書いた未知の variant の受け皿 (ダウングレード耐性、
     /// `ToolbarFacetFilterItem::Unknown` と同じ方針)。実アイテムがこの kind に
@@ -630,7 +629,6 @@ impl FacetItemKind {
             Self::Archive => "変換アーカイブ",
             Self::ZipImage => "ZIP内画像",
             Self::PdfPage => "PDFページ",
-            Self::Separator => "見出し",
             Self::SearchContainer => "検索コンテナ",
             Self::Unknown => "不明",
         }
@@ -5893,6 +5891,14 @@ mod tests {
             ToolbarFacetFilterItem::visible_order(&[]).is_empty(),
             "空 Vec は「全部隠す」として保持する"
         );
+    }
+
+    #[test]
+    fn removed_separator_facet_kind_deserializes_as_unknown() {
+        // v2.5.0 で FacetItemKind::Separator を撤去した後も、旧 settings に残った
+        // 文字列は設定全体を破損扱いにせず、未知の種類として安全に読み込む。
+        let kind: FacetItemKind = serde_json::from_str(r#""Separator""#).unwrap();
+        assert_eq!(kind, FacetItemKind::Unknown);
     }
 
     /// 種類フィルタの Audio は保存時に kinds から `kind_audio_stash` へ退避され、

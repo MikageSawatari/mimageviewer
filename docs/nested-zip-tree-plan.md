@@ -22,7 +22,8 @@
 見開きペアリングは 2 経路とも **平坦な並び順の偶奇 (`pos % 2`) だけ** でページを組む:
 - ページ送り: [`resolve_spread_pair`](../src/ui_fullscreen.rs) (`get_nav_indices` ベース)
 - 連続読み: [`continuous_reading_units_and_pos`](../src/ui_fullscreen.rs)
-  (`build_image_reading_indices` は ZipSeparator を捨てる)
+  (当時の `build_image_reading_indices` は旧 `ZipSeparator` を除外していた。旧 variant は
+  v2.5.0 で撤去済み)
 
 このため複数の本 (内側 ZIP / サブフォルダ) を 1 つの ZIP に入れると:
 1. 本 A のページ数が奇数だと、本 B の 1 ページ目が本 A の最終ページと対向ページになる
@@ -42,7 +43,7 @@
 - `d1a6e99f`: ネスト ZIP 約 1100 ファイルの列挙が **UI スレッドを 2.3 秒ブロック** →
   非同期列挙に移行。**ツリー構築も非同期 (UI スレッド外) で行う制約は維持する。**
 - `d136e055` (CBZ 境界) / `531527f8` (separator/fullscreen): 文字列パス境界と
-  ZipSeparator 特別扱いに由来する修正が続いている。
+  旧 `ZipSeparator` 特別扱いに由来する修正が続いていた。旧 variant は v2.5.0 で撤去済み。
 
 ---
 
@@ -254,7 +255,7 @@ view 変換としてのみ適用 (結果を保存し直さない)」だったが
 | ID | 判断 | 推奨デフォルト | 代替 |
 | --- | --- | --- | --- |
 | D1 | サブフォルダも一様にツリー化するか | **する** + 冗長ラッパー自動降下 | 内側 ZIP 境界のみツリー化 |
-| D2 | 新 `GridItem::ZipDir` 追加 vs `ZipSeparator` 役割拡張 | **新バリアント** | セパレータ二役 |
+| D2 | 新 `GridItem::ZipDir` 追加 vs 旧 `ZipSeparator` 役割拡張 | **新バリアント** | セパレータ二役 |
 | D3 | 本またぎ連続読み | 現階層完結 + Ctrl+↑↓ で次本 (実機 3 巡目で **DFS 前順ナビ** に確定、§6) | 全本を 1 ストリーム維持 |
 | D4 | 読書再開/見開きモードの粒度 | **当面 ZIP 単位** (per-book は将来) | per-(zip+prefix) 拡張 |
 

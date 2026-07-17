@@ -57,7 +57,7 @@ tag-feature.md から **置き換える部分**: §1/§3.1/§5 (XMP・動画 `.x
 | `ZipFile` / `PdfFile` / `ConvertibleArchive` | ○ | 実ファイル (コンテナ自身) |
 | `Folder` | ○ | フォルダ (v1 で付与可。UX レビュー) |
 | `ZipImage` / `PdfPage` / `ZipDir` | ✗ | アーカイブ内の仮想エントリ/ページ/サブコンテナ |
-| `ZipSeparator` (撤去予定 §9) / `SearchContainer` | ✗ | 疑似アイテム |
+| `SearchContainer` | ✗ | 疑似アイテム |
 
 判定述語は **2 つに分ける** (UX レビューでフォルダを付与可にしたため):
 - **`item_supports_tags`** (付与/タグビュー/バッジ対象): Image / Video / ZipFile / PdfFile /
@@ -544,8 +544,8 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 
 ## 9. 関連クリーンアップ
 
-- **`GridItem::ZipSeparator` 撤去** (別バックログタスク `task_7f616358`)。v1.3.0 のネスト ZIP ツリー化で
-  生成されなくなったレガシー variant。本設計の付与対象表からも除外済み。
+- **`GridItem::ZipSeparator` 撤去**: v1.3.0 のネスト ZIP ツリー化で生成されなくなったレガシー
+  variant を v2.5.0 で撤去済み。本設計の付与対象表からも除外した。
 
 ---
 

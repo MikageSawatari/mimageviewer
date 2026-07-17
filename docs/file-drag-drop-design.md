@@ -331,7 +331,6 @@ D&D でも同じ実体パスだけを送出するため、別アクセサ `drag_
 /// file_operation_path() と同じく実パスを持つアイテムだけを返す。
 /// 対象外:
 ///   - ZipImage / PdfPage  — 仮想フォルダ内 (ディスク上に実体がない)
-///   - ZipSeparator        — 擬似アイテム
 ///   - SearchContainer     — 検索集約 UI のコンテナ。path は実フォルダ/ZIP を指すが
 ///                           初版スコープ外 (§2)。将来含めるならここに 1 分岐足す。
 pub fn drag_source_path(&self) -> Option<&Path> {
@@ -345,7 +344,7 @@ pub fn drag_source_path(&self) -> Option<&Path> {
 ```
 
 `#[cfg(test)]` でユニットテストを追加 — Folder/Image/Video/ZipFile/PdfFile/
-ConvertibleArchive が `Some`、ZipImage/PdfPage/ZipSeparator/**SearchContainer** が
+ConvertibleArchive が `Some`、ZipImage/PdfPage/**SearchContainer** が
 `None` になる不変条件を検証する。`SearchContainer` を初版でスコープ外にする判断
 (§2) をテストで固定し、将来含める変更時にこのテストが「意図的な仕様変更」の
 明示ポイントになる。
@@ -687,7 +686,7 @@ OS モーダル操作のため `egui_kittest` スナップショットテスト�
 ### ユニットテスト (自動)
 
 - `GridItem::drag_source_path()`: Folder/Image/Video/ZipFile/PdfFile/ConvertibleArchive が
-  `Some`、ZipImage/PdfPage/ZipSeparator/SearchContainer が `None`。
+  `Some`、ZipImage/PdfPage/SearchContainer が `None`。
 - `decide_drag_payload()` (§5.4.3): 単体実パス / 単体仮想 / 複数実パス /
   混在選択 (実 + 仮想) / 全仮想 / 未チェック item の各分岐で、`DragDecision` の種別・
   ドラッグ対象パス・`post_drag_toast` 文言が仕様通りか。payload が **index 昇順**で

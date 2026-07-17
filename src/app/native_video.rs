@@ -1555,7 +1555,6 @@ impl App {
             GridItem::PdfFile(_) => "pdf-file",
             GridItem::ConvertibleArchive { .. } => "convertible-archive",
             GridItem::ZipImage { .. } => "zip-image",
-            GridItem::ZipSeparator { .. } => "zip-separator",
             GridItem::ZipDir { .. } => "zip-dir",
             GridItem::PdfPage { .. } => "pdf-page",
             GridItem::Stack { .. } => "stack",

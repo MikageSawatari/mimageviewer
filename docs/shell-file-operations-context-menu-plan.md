@@ -87,7 +87,6 @@ Useful existing facts:
 | `ZipImage` | Native mIV custom menu | No | May offer copy rendered image and virtual path only. |
 | `PdfPage` | Native mIV custom menu | No | May add rendered page image copy as a future command. |
 | `ZipDir` | Native mIV custom menu | No | Virtual nested book/container. |
-| `ZipSeparator` | No menu | No | Legacy pseudo item, currently not generated. |
 
 ## 4. mIV command inventory
 

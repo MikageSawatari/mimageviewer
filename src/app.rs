@@ -4490,7 +4490,7 @@ pub(crate) fn location_root_for_path(path: &Path) -> Option<PathBuf> {
 /// サムネイル色調補正の対象アイテムかどうか。
 ///
 /// 補正は「ページ単位の色調を持つ画像系」だけに掛ける ([docs/display-pipeline.md §1.5](docs/display-pipeline.md))。
-/// フォルダ・ZipFile・PdfFile・ConvertibleArchive・Video・ZipSeparator の代表
+/// フォルダ・ZipFile・PdfFile・ConvertibleArchive・Video の代表
 /// サムネは対象外で、`global_preset` を意図せず適用するとフォルダ表紙が変色する等の
 /// バグになる。「ページ単位データを持てるか」と概念的に一致するので
 /// [`GridItem::has_page_data`] を流用する。
@@ -10351,14 +10351,10 @@ impl App {
     /// 動画が抜けて動画オンリーフォルダで判定が走らない問題があった、ユーザー報告 +
     /// Codex P2 #2 2026-05)。
     ///
-    /// `ZipSeparator` は比率取得対象でないので除外、それ以外 (Image / Video /
-    /// ZipImage / PdfPage / Folder / ZipFile / PdfFile) は代表サムネ経由で
+    /// Image / Video / ZipImage / PdfPage / Folder / ZipFile / PdfFile は代表サムネ経由で
     /// `source_dims` がいずれ来る可能性があるので分母に入れる。
     pub(crate) fn auto_aspect_eligible_total(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|it| !matches!(it, GridItem::ZipSeparator { .. }))
-            .count()
+        self.items.len()
     }
 
     /// `auto_aspect` を新フォルダ用にリセットし、catalog の既存比率を一括投入する。
@@ -10383,7 +10379,7 @@ impl App {
             return;
         }
 
-        // 集計対象母数は items ベース (動画含む、ZipSeparator 除外)。
+        // 集計対象母数は items ベース (動画含む)。
         let eligible_total: usize = self.auto_aspect_eligible_total();
         if eligible_total == 0 {
             return;
@@ -10519,7 +10515,7 @@ impl App {
             return;
         }
 
-        // 集計対象母数は items ベース (動画含む、ZipSeparator 除外)。seed と同じ helper。
+        // 集計対象母数は items ベース (動画含む)。seed と同じ helper。
         let eligible_total: usize = self.auto_aspect_eligible_total();
         if eligible_total == 0 {
             return;
@@ -16181,7 +16177,7 @@ impl App {
         ));
 
         // ネスト ZIP ツリーナビ (v1.3.0、docs/nested-zip-tree-plan.md Strategy A)。
-        // フラット展開 + ZipSeparator をやめ、entry_name の '/' 区切りでツリーを構築し、
+        // フラット展開 + 章区切りセルをやめ、entry_name の '/' 区切りでツリーを構築し、
         // ルート階層 (冗長ラッパーは自動降下) だけを materialize して表示する。これで
         // 内側 ZIP / サブフォルダが「入れるコンテナ」になり、見開きペアリングが本ごとに
         // リセットされる (= 平坦な並びの偶奇で複数本を 1 冊に連結してしまう問題の根治)。
@@ -17347,7 +17343,7 @@ impl App {
             .map(|s| s.to_ascii_lowercase());
         let (parent_prefix, target_key, target_idx, is_pdf) = match ext.as_deref() {
             Some("pdf") => {
-                // 最初の PdfPage の idx (通常 0、ZipSeparator 等が入らない PDF では 0 確定)。
+                // 最初の PdfPage の idx (通常 0)。
                 let Some(target_idx) = self
                     .items
                     .iter()
@@ -19482,8 +19478,8 @@ impl App {
     /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
     /// - Ctrl+T タグビュー (`items_are_tag_view`)
     /// - RAR/7z/LZH 変換キャッシュ ZIP の drill-down だが `zip_nav` が無い中途半端な状態
-    /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer /
-    ///   ZipSeparator、または container を指す `rel=""` ケース)
+    /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer、
+    ///   または container を指す `rel=""` ケース)
     ///
     /// **Video pin の set ガード**: pin 対象が動画でかつ `video_pins` DB に有効な WebP
     /// (= フルスクリーン HUD でユーザーがピン留めしたフレーム) が無い場合、トースト
@@ -19838,10 +19834,7 @@ impl App {
             return false;
         }
         // pin 不能 variant: 描画スキップ
-        if matches!(
-            item,
-            GridItem::SearchContainer { .. } | GridItem::ZipSeparator { .. }
-        ) {
+        if matches!(item, GridItem::SearchContainer { .. }) {
             return false;
         }
         // ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
@@ -25425,7 +25418,6 @@ impl App {
                         }
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::ZipSeparator { .. })
                         | Some(GridItem::PdfPage { .. })
                         | Some(GridItem::Video(_))
                         | Some(GridItem::Audio(_)) => {
@@ -28835,7 +28827,6 @@ impl App {
             Some(GridItem::ZipDir { .. }) => "zip-dir",
             Some(GridItem::Stack { .. }) => "stack",
             Some(GridItem::SearchContainer { .. }) => "search-container",
-            Some(GridItem::ZipSeparator { .. }) => "zip-separator",
             Some(GridItem::ConvertibleArchive { .. }) => "convertible-archive",
             None => "missing",
         }
@@ -33452,12 +33443,6 @@ impl App {
                     self.start_fs_load(idx);
                 }
             }
-            Some(GridItem::ZipSeparator { dir_display }) => {
-                // セパレータはテキスト表示のみ (デコード不要)
-                crate::logger::log(format!(
-                    "  zip separator idx={idx} → title mode: {dir_display}"
-                ));
-            }
             _ => {}
         }
 
@@ -34904,7 +34889,6 @@ impl App {
                 zip_path.parent().map(Path::to_path_buf)
             }
             GridItem::PdfPage { pdf_path, .. } => pdf_path.parent().map(Path::to_path_buf),
-            GridItem::ZipSeparator { .. } => None,
         }
     }
 
@@ -35784,7 +35768,6 @@ impl App {
             GridItem::ConvertibleArchive { format, .. } => format!("5-{}", format.label()),
             GridItem::ZipImage { .. } => "6-zip-image".to_string(),
             GridItem::PdfPage { .. } => "7-pdf-page".to_string(),
-            GridItem::ZipSeparator { .. } => "8-separator".to_string(),
             // ネスト ZIP 子コンテナ: ZIP 内には実フォルダが無いので、コンテナ慣習に従い
             // 先頭グループ (ZipImage より前) に並べる。
             GridItem::ZipDir { .. } => "0-zipdir".to_string(),
@@ -35890,17 +35873,13 @@ impl App {
     }
 
     /// 選択カーソルを常に可視アイテム上に置く。フィルタやフォルダ切替で未選択に
-    /// なった場合は、章見出し (`ZipSeparator`) 以外の先頭可視アイテムを選ぶ。
+    /// なった場合は、先頭可視アイテムを選ぶ。
     pub(crate) fn ensure_selected_visible_or_first(&mut self) {
         self.redirect_selected_to_visible();
         if self.selected.is_some() {
             return;
         }
-        let first_selectable = self
-            .visible_indices
-            .iter()
-            .copied()
-            .find(|&idx| !matches!(self.items.get(idx), Some(GridItem::ZipSeparator { .. })));
+        let first_selectable = self.visible_indices.first().copied();
         if let Some(idx) = first_selectable {
             self.selected = Some(idx);
             self.scroll_to_selected = true;
@@ -36034,7 +36013,6 @@ impl App {
                 matches!(
                     it,
                     crate::grid_item::GridItem::ZipImage { .. }
-                        | crate::grid_item::GridItem::ZipSeparator { .. }
                         | crate::grid_item::GridItem::ZipDir { .. }
                 )
             })

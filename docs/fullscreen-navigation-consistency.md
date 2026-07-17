@@ -17,7 +17,7 @@
 | 境界ヒント | 先頭 / 末尾に達したとき、次に使える操作を中央または native overlay に出す案内 |
 
 `adjacent_navigable_idx` は現在、`Image` / `Video` / `Audio` / `ZipImage` /
-`ZipSeparator` / `PdfPage` を同一フォルダ内の前後移動対象に含める。
+`PdfPage` を同一フォルダ内の前後移動対象に含める。
 `Audio` は「映像なし動画」として動画と同じ前/次項目ナビの対象で、フルスクリーン
 (音楽ビュー) では plain ↓↑ = `VideoNextFile`/`VideoPrevFile` で移動する
 (2026-07-03、操作は動画フルスクリーンと共通スコープ)。
@@ -134,8 +134,6 @@ Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を
   先頭着地を採用する。
 - ZIP / PDF / 変換アーカイブファイルだけが置かれたフォルダでは、対象を仮想フォルダとして開き、
   enumerate 完了後に先頭 image-like を開く。
-- `ZipSeparator` は同一一覧の見出しとしては前後移動対象に残してよいが、
-  フォルダ横断の着地点にはしない。
 
 ### 3.3 境界ヒント
 

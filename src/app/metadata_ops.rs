@@ -145,7 +145,6 @@ pub(super) fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItem
         GridItem::ConvertibleArchive { .. } => FacetItemKind::Archive,
         GridItem::ZipImage { .. } => FacetItemKind::ZipImage,
         GridItem::PdfPage { .. } => FacetItemKind::PdfPage,
-        GridItem::ZipSeparator { .. } => FacetItemKind::Separator,
         GridItem::SearchContainer { .. } => FacetItemKind::SearchContainer,
         // ZipDir はネスト ZIP ツリーの仮想サブコンテナ。ZIP 内には実フォルダが無いので、
         // facet 上は Folder バケツに入れる (= 「フォルダ」絞り込みで子コンテナだけが出る)。
@@ -157,9 +156,7 @@ pub(super) fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItem
 
 pub(super) fn facet_ext_for_item(item: &GridItem) -> String {
     match item {
-        GridItem::Folder(_) | GridItem::ZipSeparator { .. } | GridItem::ZipDir { .. } => {
-            String::new()
-        }
+        GridItem::Folder(_) | GridItem::ZipDir { .. } => String::new(),
         GridItem::Image(p)
         | GridItem::Video(p)
         | GridItem::Audio(p)
@@ -765,10 +762,7 @@ pub(super) fn details_created_time_path(item: &GridItem) -> Option<&Path> {
         }
         // ファイル名スタック: 代表画像の作成日時を使う (実ファイル)。
         GridItem::Stack { representative, .. } => Some(representative.as_path()),
-        GridItem::ZipImage { .. }
-        | GridItem::ZipSeparator { .. }
-        | GridItem::ZipDir { .. }
-        | GridItem::PdfPage { .. } => None,
+        GridItem::ZipImage { .. } | GridItem::ZipDir { .. } | GridItem::PdfPage { .. } => None,
     }
 }
 
@@ -839,15 +833,8 @@ pub(super) fn probe_audio_details(path: &Path, cancel: &AtomicBool) -> Option<De
     })
 }
 
-pub(super) fn ctrl_f_progress_countable(item: &GridItem) -> bool {
-    !matches!(item, GridItem::ZipSeparator { .. })
-}
-
 pub(super) fn ctrl_f_progress_total(items: &[GridItem]) -> usize {
-    items
-        .iter()
-        .filter(|it| ctrl_f_progress_countable(it))
-        .count()
+    items.len()
 }
 
 pub(super) fn mark_ctrl_f_progress(progress: Option<&SearchProgressShared>, matched: bool) {
@@ -901,7 +888,6 @@ pub(super) fn run_metadata_search(
     // 構造アイテムも一貫して絞り込む (§4.1): 名前がマッチしないものは非表示にする。
     // 検索対象がファイル名次元を含まない (EXIF / タグ単独指定) なら構造アイテムは
     // 全件非表示になる ("タグで絞ったらタグを持つアイテムだけ残る" = 正しい挙動)。
-    let mut zip_separators: Vec<usize> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -981,11 +967,6 @@ pub(super) fn run_metadata_search(
                 }
                 true
             }
-            GridItem::ZipSeparator { .. } => {
-                // 付随グループに可視アイテムが残るかを Pass 1 完了後に判定する。
-                zip_separators.push(idx);
-                false
-            }
             GridItem::PdfPage { .. } => {
                 // PDF ページ表示中は Ctrl+F 自体を無効化する (§4.1.1) ため通常は
                 // ここに来ない。防御的に "Page N" のファイル名照合だけ残す。
@@ -1002,19 +983,6 @@ pub(super) fn run_metadata_search(
         };
         if processed_in_pass1 {
             mark_ctrl_f_progress(progress, matches.contains(&idx));
-        }
-    }
-
-    // ZipSeparator: 付随する ZIP グループ (separator の次〜次の separator 手前) に
-    // 可視 ZipImage が残るときだけ表示する (§4.1)。ZIP 表示中のグリッドは
-    // separator と ZipImage だけで構成されるため、Pass 1 完了時点でグループの
-    // 可視判定は確定している。
-    for &sep_idx in &zip_separators {
-        let group_has_visible = ((sep_idx + 1)..items.len())
-            .take_while(|&probe| !matches!(items[probe], GridItem::ZipSeparator { .. }))
-            .any(|probe| matches.contains(&probe));
-        if group_has_visible {
-            matches.insert(sep_idx);
         }
     }
 
