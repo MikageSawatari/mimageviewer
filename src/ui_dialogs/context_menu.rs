@@ -799,6 +799,27 @@ impl crate::app::App {
                         }
                     }
 
+                    if matches!(
+                        item,
+                        GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+                    ) {
+                        ui.separator();
+                        if ui.button("編集内容をコピー").clicked() {
+                            self.copy_page_edit_bundle(idx);
+                            close = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.has_page_edit_bundle_clipboard(),
+                                egui::Button::new("編集内容を貼り付け"),
+                            )
+                            .clicked()
+                        {
+                            self.request_paste_page_edit_bundle(idx);
+                            close = true;
+                        }
+                    }
+
                     // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
                     // 空フォルダの右クリックで合成された `GridItem::Folder(current_folder)`
                     // は rel="" で pin できないので呼ばない (Codex Phase D P3 指摘: 単独の
@@ -1129,6 +1150,21 @@ impl crate::app::App {
                 label: "画像をクリップボードにコピー".to_string(),
             });
         }
+        if matches!(
+            target.item,
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+        ) {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::CopyEditBundle,
+                label: "編集内容をコピー".to_string(),
+            });
+            if self.has_page_edit_bundle_clipboard() {
+                items.push(NativeMivMenuItem {
+                    command: NativeMivCommand::PasteEditBundle,
+                    label: "編集内容を貼り付け".to_string(),
+                });
+            }
+        }
         if !target.is_folder_context
             && !target.has_checked
             && matches!(
@@ -1267,6 +1303,18 @@ impl crate::app::App {
                         .map(|idx| self.get_rotation(idx))
                         .unwrap_or(crate::rotation_db::Rotation::None);
                     copy_image_to_clipboard(path, rotation);
+                }
+                None
+            }
+            NativeMivCommand::CopyEditBundle => {
+                if let Some(idx) = target.item_index {
+                    self.copy_page_edit_bundle(idx);
+                }
+                None
+            }
+            NativeMivCommand::PasteEditBundle => {
+                if let Some(idx) = target.item_index {
+                    self.request_paste_page_edit_bundle(idx);
                 }
                 None
             }
@@ -1530,6 +1578,27 @@ impl crate::app::App {
                             open_folder_in_explorer(path);
                             close = true;
                         }
+                    }
+                }
+
+                if matches!(
+                    item,
+                    GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+                ) {
+                    ui.separator();
+                    if ui.button("編集内容をコピー").clicked() {
+                        self.copy_page_edit_bundle(idx);
+                        close = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.has_page_edit_bundle_clipboard(),
+                            egui::Button::new("編集内容を貼り付け"),
+                        )
+                        .clicked()
+                    {
+                        self.request_paste_page_edit_bundle(idx);
+                        close = true;
                     }
                 }
 

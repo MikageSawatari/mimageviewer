@@ -30,6 +30,8 @@ pub enum NativeMivCommand {
     CopyPath,
     CopyFileName,
     CopyImageToClipboard,
+    CopyEditBundle,
+    PasteEditBundle,
     JumpToFolder,
     OpenContainerAsPage,
     OpenContainerAsList,

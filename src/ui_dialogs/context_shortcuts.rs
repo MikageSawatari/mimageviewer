@@ -194,11 +194,15 @@ const TEXT_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
     FixedShortcutRow {
         keys: "Delete / Backspace",
-        description: "選択中の注釈を削除する。本文の編集中はテキスト入力を優先する",
+        description: "選択中の注釈をまとめて削除する。本文の編集中はテキスト入力を優先する",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl / Shift+クリック",
+        description: "注釈を複数選択する。一覧の Shift+クリックは範囲選択する",
     },
     FixedShortcutRow {
         keys: "ドラッグ",
-        description: "画像上で注釈を選択、移動、またはハンドル編集する",
+        description: "選択注釈をまとめて移動する。空き領域では矩形選択、単一選択ではハンドル編集する",
     },
     FixedShortcutRow {
         keys: "マウスホイール / Ctrl+ホイール",

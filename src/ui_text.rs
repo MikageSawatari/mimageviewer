@@ -26,7 +26,7 @@
 //! 変形ハンドル (四隅スケール / 回転ノブ / しっぽ) と Undo/Redo は Inc 6、スタンプ
 //! ピッカー (絵文字アセット) は Inc 4c、プリセット / 追加ダイアログは Inc 5。
 
-use crate::app::{App, TextDrag, TextDragKind};
+use crate::app::{App, TextDrag, TextDragKind, TextMarquee, TextSmartGuides};
 use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset};
 use crate::keymap::{KeyAction, ModKind, modifier_held_via_os};
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
@@ -37,7 +37,7 @@ use comic_core::{
     SizeMode, StampObject, StrokeStyle, Tail, TailKind, TextAlign, TextBackgroundStyle, TextBlock,
     TextEchoStyle, TextGlowStyle, TextShadowStyle, VAnchor, WindowPosition,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
 const PANEL_W: f32 = 268.0;
@@ -51,6 +51,36 @@ const HANDLE_R: f32 = 7.0;
 /// エディタ専用 Undo/Redo (Inc 6) の最大スタック深さ。ラボ (`UNDO_CAP`) と同値。
 /// 超過時は最古エントリから捨てる。
 const COMIC_UNDO_CAP: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextAlignReference {
+    #[default]
+    Selection,
+    Image,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextDistributeMode {
+    #[default]
+    Centers,
+    Gaps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextAlignOp {
+    Left,
+    HCenter,
+    Right,
+    Top,
+    VCenter,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDistributeAxis {
+    Horizontal,
+    Vertical,
+}
 
 const ANNOTATION_DEFAULT_COLOR: Rgba = Rgba::new(242, 60, 60, 255);
 pub(crate) const ANNOTATION_MARKER_DEFAULT_COLOR: Rgba = Rgba::new(255, 235, 59, 255);
@@ -574,6 +604,20 @@ fn rotate_about(p: (f32, f32), pivot: (f32, f32), theta: f32) -> (f32, f32) {
 /// ラボ `object_bounds` と同じ計算 (= 当たり判定が見た目と一致)。`fonts` が無ければ
 /// pivot 周りの控えめな箱でフォールバックする。
 fn object_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
+    object_bounds_impl(o, fonts, true, true)
+}
+
+/// 整列・均等配置用の本体境界。しっぽ、線幅、影などの効果・装飾を含めない。
+fn object_alignment_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
+    object_bounds_impl(o, fonts, false, false)
+}
+
+fn object_bounds_impl(
+    o: &AnnotationObject,
+    fonts: Option<&FontSet>,
+    include_tail: bool,
+    include_effects: bool,
+) -> egui::Rect {
     use comic_core::{bubble_geometry, effective_bubble_shape, effective_window_half_extents};
     let pivot = o.pivot;
     let rot = o.rotation_rad;
@@ -589,9 +633,9 @@ fn object_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
         AnnotationKind::Bubble(b) => {
             if let Some(fonts) = fonts {
                 let eff = effective_bubble_shape(b, fonts);
-                let tail = b
-                    .tail
-                    .as_ref()
+                let tail = include_tail
+                    .then_some(b.tail.as_ref())
+                    .flatten()
                     .filter(|_| comic_core::shape_renders_tail(&eff));
                 let geo = bubble_geometry(&eff, pivot, tail);
                 for &(x, y) in &geo.outline {
@@ -610,7 +654,11 @@ fn object_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
                     let (px, py) = rotate_about(drawn_tip, pivot, rot);
                     acc(px, py);
                 }
-                let m = b.outline.width_px.max(0.0) * 0.5 + 2.0;
+                let m = if include_effects {
+                    b.outline.width_px.max(0.0) * 0.5 + 2.0
+                } else {
+                    0.0
+                };
                 if min.0 <= max.0 {
                     return egui::Rect::from_min_max(
                         egui::pos2(min.0 - m, min.1 - m),
@@ -650,7 +698,11 @@ fn object_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
                 let (px, py) = rotate_about((pivot.0 + lx, pivot.1 + ly), pivot, rot);
                 acc(px, py);
             }
-            let m = w.outline.width_px.max(0.0) * 0.5 + 2.0;
+            let m = if include_effects {
+                w.outline.width_px.max(0.0) * 0.5 + 2.0
+            } else {
+                0.0
+            };
             egui::Rect::from_min_max(
                 egui::pos2(min.0 - m, min.1 - m),
                 egui::pos2(max.0 + m, max.1 + m),
@@ -662,7 +714,11 @@ fn object_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
                 let (px, py) = rotate_about((pivot.0 + lx, pivot.1 + ly), pivot, rot);
                 acc(px, py);
             }
-            let m = s.outline.map(|o| o.width_px).unwrap_or(0.0).max(0.0) + 2.0;
+            let m = if include_effects {
+                s.outline.map(|o| o.width_px).unwrap_or(0.0).max(0.0) + 2.0
+            } else {
+                0.0
+            };
             egui::Rect::from_min_max(
                 egui::pos2(min.0 - m, min.1 - m),
                 egui::pos2(max.0 + m, max.1 + m),
@@ -690,6 +746,27 @@ fn point_in_polygon(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
         j = i;
     }
     inside
+}
+
+fn point_in_or_on_polygon(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
+    if point_in_polygon(p, poly) {
+        return true;
+    }
+    poly.iter()
+        .zip(poly.iter().cycle().skip(1))
+        .take(poly.len())
+        .any(|(&(ax, ay), &(bx, by))| {
+            let ab = (bx - ax, by - ay);
+            let ap = (p.0 - ax, p.1 - ay);
+            let len_sq = ab.0 * ab.0 + ab.1 * ab.1;
+            if len_sq <= f32::EPSILON {
+                return ap.0 * ap.0 + ap.1 * ap.1 <= 1e-6;
+            }
+            let t = ((ap.0 * ab.0 + ap.1 * ab.1) / len_sq).clamp(0.0, 1.0);
+            let dx = p.0 - (ax + ab.0 * t);
+            let dy = p.1 - (ay + ab.1 * t);
+            dx * dx + dy * dy <= 1e-4
+        })
 }
 
 /// 点 `p`(canonical img px) がオブジェクト `o` の **実体**(実際に描画される不透明部分) 上にあるか。
@@ -829,6 +906,337 @@ fn translate_object(o: &mut AnnotationObject, dx: f32, dy: f32) {
             t.tip.1 += dy;
         }
     }
+}
+
+fn set_window_position_free(o: &mut AnnotationObject) {
+    if let AnnotationKind::MessageWindow(w) = &mut o.kind {
+        w.position = WindowPosition::Free;
+    }
+}
+
+fn normalize_text_selection(
+    objects: &[AnnotationObject],
+    selected_ids: &mut Vec<u64>,
+    primary: &mut Option<u64>,
+) {
+    let existing: HashSet<u64> = objects.iter().map(|o| o.id).collect();
+    let mut seen = HashSet::new();
+    selected_ids.retain(|id| existing.contains(id) && seen.insert(*id));
+    match *primary {
+        Some(id) if existing.contains(&id) => {
+            // 追加ダイアログ等の従来経路が主選択だけを更新した場合は単一選択へ同期する。
+            if !selected_ids.contains(&id) {
+                selected_ids.clear();
+                selected_ids.push(id);
+            }
+        }
+        _ => *primary = selected_ids.last().copied(),
+    }
+}
+
+fn replace_text_selection(selected_ids: &mut Vec<u64>, primary: &mut Option<u64>, id: Option<u64>) {
+    selected_ids.clear();
+    if let Some(id) = id {
+        selected_ids.push(id);
+    }
+    *primary = id;
+}
+
+fn add_text_selection(selected_ids: &mut Vec<u64>, primary: &mut Option<u64>, id: u64) {
+    if let Some(pos) = selected_ids.iter().position(|candidate| *candidate == id) {
+        selected_ids.remove(pos);
+    }
+    selected_ids.push(id);
+    *primary = Some(id);
+}
+
+fn toggle_text_selection(selected_ids: &mut Vec<u64>, primary: &mut Option<u64>, id: u64) {
+    if let Some(pos) = selected_ids.iter().position(|candidate| *candidate == id) {
+        selected_ids.remove(pos);
+        *primary = selected_ids.last().copied();
+    } else {
+        selected_ids.push(id);
+        *primary = Some(id);
+    }
+}
+
+fn selected_alignment_bounds(
+    objects: &[AnnotationObject],
+    selected_ids: &[u64],
+    fonts: Option<&FontSet>,
+) -> Option<egui::Rect> {
+    let selected: HashSet<u64> = selected_ids.iter().copied().collect();
+    objects
+        .iter()
+        .filter(|o| selected.contains(&o.id))
+        .map(|o| object_alignment_bounds(o, fonts))
+        .reduce(|a, b| a.union(b))
+}
+
+fn align_text_objects(
+    objects: &mut [AnnotationObject],
+    selected_ids: &[u64],
+    fonts: Option<&FontSet>,
+    canvas_size: (f32, f32),
+    reference: TextAlignReference,
+    op: TextAlignOp,
+) -> bool {
+    if selected_ids.len() < 2 {
+        return false;
+    }
+    let Some(group) = selected_alignment_bounds(objects, selected_ids, fonts) else {
+        return false;
+    };
+    let target = match (reference, op) {
+        (TextAlignReference::Selection, TextAlignOp::Left) => group.min.x,
+        (TextAlignReference::Selection, TextAlignOp::HCenter) => group.center().x,
+        (TextAlignReference::Selection, TextAlignOp::Right) => group.max.x,
+        (TextAlignReference::Selection, TextAlignOp::Top) => group.min.y,
+        (TextAlignReference::Selection, TextAlignOp::VCenter) => group.center().y,
+        (TextAlignReference::Selection, TextAlignOp::Bottom) => group.max.y,
+        (TextAlignReference::Image, TextAlignOp::Left | TextAlignOp::Top) => 0.0,
+        (TextAlignReference::Image, TextAlignOp::HCenter) => canvas_size.0 * 0.5,
+        (TextAlignReference::Image, TextAlignOp::Right) => canvas_size.0,
+        (TextAlignReference::Image, TextAlignOp::VCenter) => canvas_size.1 * 0.5,
+        (TextAlignReference::Image, TextAlignOp::Bottom) => canvas_size.1,
+    };
+    let selected: HashSet<u64> = selected_ids.iter().copied().collect();
+    let mut changed = false;
+    for o in objects.iter_mut().filter(|o| selected.contains(&o.id)) {
+        let bounds = object_alignment_bounds(o, fonts);
+        let (dx, dy) = match op {
+            TextAlignOp::Left => (target - bounds.min.x, 0.0),
+            TextAlignOp::HCenter => (target - bounds.center().x, 0.0),
+            TextAlignOp::Right => (target - bounds.max.x, 0.0),
+            TextAlignOp::Top => (0.0, target - bounds.min.y),
+            TextAlignOp::VCenter => (0.0, target - bounds.center().y),
+            TextAlignOp::Bottom => (0.0, target - bounds.max.y),
+        };
+        if dx.abs() > f32::EPSILON || dy.abs() > f32::EPSILON {
+            translate_object(o, dx, dy);
+            set_window_position_free(o);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn distribute_text_objects(
+    objects: &mut [AnnotationObject],
+    selected_ids: &[u64],
+    fonts: Option<&FontSet>,
+    axis: TextDistributeAxis,
+    mode: TextDistributeMode,
+) -> bool {
+    if selected_ids.len() < 3 {
+        return false;
+    }
+    let selected: HashSet<u64> = selected_ids.iter().copied().collect();
+    let mut entries: Vec<(u64, egui::Rect)> = objects
+        .iter()
+        .filter(|o| selected.contains(&o.id))
+        .map(|o| (o.id, object_alignment_bounds(o, fonts)))
+        .collect();
+    entries.sort_by(|a, b| {
+        let av = match axis {
+            TextDistributeAxis::Horizontal => a.1.center().x,
+            TextDistributeAxis::Vertical => a.1.center().y,
+        };
+        let bv = match axis {
+            TextDistributeAxis::Horizontal => b.1.center().x,
+            TextDistributeAxis::Vertical => b.1.center().y,
+        };
+        av.total_cmp(&bv).then_with(|| a.0.cmp(&b.0))
+    });
+    let mut offsets = HashMap::new();
+    match mode {
+        TextDistributeMode::Centers => {
+            let first = match axis {
+                TextDistributeAxis::Horizontal => entries.first().unwrap().1.center().x,
+                TextDistributeAxis::Vertical => entries.first().unwrap().1.center().y,
+            };
+            let last = match axis {
+                TextDistributeAxis::Horizontal => entries.last().unwrap().1.center().x,
+                TextDistributeAxis::Vertical => entries.last().unwrap().1.center().y,
+            };
+            let step = (last - first) / (entries.len() - 1) as f32;
+            for (position, (id, bounds)) in
+                entries.iter().enumerate().skip(1).take(entries.len() - 2)
+            {
+                let current = match axis {
+                    TextDistributeAxis::Horizontal => bounds.center().x,
+                    TextDistributeAxis::Vertical => bounds.center().y,
+                };
+                offsets.insert(*id, first + step * position as f32 - current);
+            }
+        }
+        TextDistributeMode::Gaps => {
+            let span_start = match axis {
+                TextDistributeAxis::Horizontal => entries.first().unwrap().1.min.x,
+                TextDistributeAxis::Vertical => entries.first().unwrap().1.min.y,
+            };
+            let span_end = match axis {
+                TextDistributeAxis::Horizontal => entries.last().unwrap().1.max.x,
+                TextDistributeAxis::Vertical => entries.last().unwrap().1.max.y,
+            };
+            let total_size: f32 = entries
+                .iter()
+                .map(|(_, bounds)| match axis {
+                    TextDistributeAxis::Horizontal => bounds.width(),
+                    TextDistributeAxis::Vertical => bounds.height(),
+                })
+                .sum();
+            let gap = (span_end - span_start - total_size) / (entries.len() - 1) as f32;
+            let mut cursor = span_start;
+            for (position, (id, bounds)) in entries.iter().enumerate() {
+                let size = match axis {
+                    TextDistributeAxis::Horizontal => bounds.width(),
+                    TextDistributeAxis::Vertical => bounds.height(),
+                };
+                if position > 0 && position + 1 < entries.len() {
+                    let current = match axis {
+                        TextDistributeAxis::Horizontal => bounds.min.x,
+                        TextDistributeAxis::Vertical => bounds.min.y,
+                    };
+                    offsets.insert(*id, cursor - current);
+                }
+                cursor += size + gap;
+            }
+        }
+    }
+    let mut changed = false;
+    for o in objects {
+        let Some(offset) = offsets.get(&o.id).copied() else {
+            continue;
+        };
+        if offset.abs() <= f32::EPSILON {
+            continue;
+        }
+        let (dx, dy) = match axis {
+            TextDistributeAxis::Horizontal => (offset, 0.0),
+            TextDistributeAxis::Vertical => (0.0, offset),
+        };
+        translate_object(o, dx, dy);
+        set_window_position_free(o);
+        changed = true;
+    }
+    changed
+}
+
+fn move_text_selection_with_guides(
+    objects: &mut [AnnotationObject],
+    selected_ids: &[u64],
+    dx: f32,
+    dy: f32,
+    fonts: Option<&FontSet>,
+    threshold: f32,
+) -> (bool, TextSmartGuides) {
+    let selected: HashSet<u64> = selected_ids.iter().copied().collect();
+    if selected.is_empty() || (dx == 0.0 && dy == 0.0) {
+        return (false, TextSmartGuides::default());
+    }
+    for o in objects.iter_mut().filter(|o| selected.contains(&o.id)) {
+        translate_object(o, dx, dy);
+        set_window_position_free(o);
+    }
+    let Some(group) = selected_alignment_bounds(objects, selected_ids, fonts) else {
+        return (true, TextSmartGuides::default());
+    };
+    let others: Vec<egui::Rect> = objects
+        .iter()
+        .filter(|o| !selected.contains(&o.id) && o.enabled)
+        .map(|o| object_alignment_bounds(o, fonts))
+        .collect();
+    let mut guides = TextSmartGuides::default();
+    let group_x = [group.min.x, group.center().x, group.max.x];
+    let group_y = [group.min.y, group.center().y, group.max.y];
+    let mut best_x: Option<(f32, f32)> = None;
+    let mut best_y: Option<(f32, f32)> = None;
+    for bounds in &others {
+        for target in [bounds.min.x, bounds.center().x, bounds.max.x] {
+            for source in group_x {
+                let correction = target - source;
+                if correction.abs() <= threshold
+                    && best_x.is_none_or(|(best, _)| correction.abs() < best.abs())
+                {
+                    best_x = Some((correction, target));
+                }
+            }
+        }
+        for target in [bounds.min.y, bounds.center().y, bounds.max.y] {
+            for source in group_y {
+                let correction = target - source;
+                if correction.abs() <= threshold
+                    && best_y.is_none_or(|(best, _)| correction.abs() < best.abs())
+                {
+                    best_y = Some((correction, target));
+                }
+            }
+        }
+    }
+
+    // 両側にオブジェクトがあるときは、左右 / 上下の隙間が等しくなる位置も候補にする。
+    let left = others
+        .iter()
+        .filter(|b| b.max.x <= group.min.x)
+        .max_by(|a, b| a.max.x.total_cmp(&b.max.x));
+    let right = others
+        .iter()
+        .filter(|b| b.min.x >= group.max.x)
+        .min_by(|a, b| a.min.x.total_cmp(&b.min.x));
+    if let (Some(left), Some(right)) = (left, right) {
+        let target_min = (left.max.x + right.min.x - group.width()) * 0.5;
+        let correction = target_min - group.min.x;
+        if correction.abs() <= threshold
+            && best_x.is_none_or(|(best, _)| correction.abs() <= best.abs())
+        {
+            best_x = Some((correction, target_min));
+            guides.equal_horizontal = Some((
+                left.max.x,
+                group.min.x + correction,
+                group.max.x + correction,
+                right.min.x,
+            ));
+        }
+    }
+    let above = others
+        .iter()
+        .filter(|b| b.max.y <= group.min.y)
+        .max_by(|a, b| a.max.y.total_cmp(&b.max.y));
+    let below = others
+        .iter()
+        .filter(|b| b.min.y >= group.max.y)
+        .min_by(|a, b| a.min.y.total_cmp(&b.min.y));
+    if let (Some(above), Some(below)) = (above, below) {
+        let target_min = (above.max.y + below.min.y - group.height()) * 0.5;
+        let correction = target_min - group.min.y;
+        if correction.abs() <= threshold
+            && best_y.is_none_or(|(best, _)| correction.abs() <= best.abs())
+        {
+            best_y = Some((correction, target_min));
+            guides.equal_vertical = Some((
+                above.max.y,
+                group.min.y + correction,
+                group.max.y + correction,
+                below.min.y,
+            ));
+        }
+    }
+
+    let correction_x = best_x.map_or(0.0, |(correction, target)| {
+        guides.vertical = Some(target);
+        correction
+    });
+    let correction_y = best_y.map_or(0.0, |(correction, target)| {
+        guides.horizontal = Some(target);
+        correction
+    });
+    if correction_x != 0.0 || correction_y != 0.0 {
+        for o in objects.iter_mut().filter(|o| selected.contains(&o.id)) {
+            translate_object(o, correction_x, correction_y);
+        }
+    }
+    (true, guides)
 }
 
 // ── 変形ハンドル (回転 / サイズ / しっぽ) ─ ラボ `*_handle_points` 等を移植 ─────
@@ -1574,8 +1982,12 @@ impl App {
 
         self.text_mode = true;
         self.text_selected = None;
+        self.text_selected_ids.clear();
+        self.text_list_selection_anchor = None;
         self.text_prop_tab_selection = None;
         self.text_drag = None;
+        self.text_marquee = None;
+        self.text_smart_guides = TextSmartGuides::default();
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
         self.text_add_annotation_dialog = false;
@@ -1618,8 +2030,12 @@ impl App {
 
         self.text_mode = false;
         self.text_selected = None;
+        self.text_selected_ids.clear();
+        self.text_list_selection_anchor = None;
         self.text_prop_tab_selection = None;
         self.text_drag = None;
+        self.text_marquee = None;
+        self.text_smart_guides = TextSmartGuides::default();
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
         self.text_add_annotation_dialog = false;
@@ -1765,8 +2181,16 @@ impl App {
                 self.text_selected = None;
             }
         }
+        if let Some(objs) = self.comic_docs.get(key) {
+            normalize_text_selection(objs, &mut self.text_selected_ids, &mut self.text_selected);
+        } else {
+            self.text_selected_ids.clear();
+            self.text_selected = None;
+        }
         // 復元の途中で握っていたドラッグ状態は無効化する (古い id / 座標基準が残る事故防止)。
         self.text_drag = None;
+        self.text_marquee = None;
+        self.text_smart_guides = TextSmartGuides::default();
         // undo/redo で消えたオブジェクトのしっぽ stash を prune (stash の desync 防止、
         // ラボ `after_history_change` 相当)。
         if let Some(objs) = self.comic_docs.get(key) {
@@ -1852,8 +2276,10 @@ impl App {
             ctx.input_mut(|i| {
                 let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
             });
-            if self.text_selected.is_some() {
+            if !self.text_selected_ids.is_empty() || self.text_selected.is_some() {
                 self.text_selected = None;
+                self.text_selected_ids.clear();
+                self.text_list_selection_anchor = None;
                 return action;
             }
             self.reset_text_mode();
@@ -1865,9 +2291,14 @@ impl App {
 
     /// 選択中オブジェクトを削除して z を正規化、comic を再ベイク + 保存。
     fn delete_selected_text_object(&mut self) {
-        let Some(id) = self.text_selected else {
+        if self.text_selected_ids.is_empty() {
+            if let Some(id) = self.text_selected {
+                self.text_selected_ids.push(id);
+            }
+        }
+        if self.text_selected_ids.is_empty() {
             return;
-        };
+        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
@@ -1878,15 +2309,19 @@ impl App {
             return;
         };
         let before = objs.len();
-        objs.retain(|o| o.id != id);
+        let removed_ids: HashSet<u64> = self.text_selected_ids.iter().copied().collect();
+        objs.retain(|o| !removed_ids.contains(&o.id));
         if objs.len() == before {
             return;
         }
         normalize_z(objs);
         let snapshot = objs.clone();
         self.text_selected = None;
+        self.text_selected_ids.clear();
+        self.text_list_selection_anchor = None;
         // 削除したオブジェクトのしっぽ stash も破棄 (orphan 防止)。
-        self.comic_tail_stash.remove(&id);
+        self.comic_tail_stash
+            .retain(|id, _| !removed_ids.contains(id));
         self.save_comic_objects(fs_idx, &key, &snapshot);
         self.text_dirty_at = None;
         self.mark_comic_dirty();
@@ -1987,48 +2422,95 @@ impl App {
             comic_core::StampImages::new()
         };
 
+        if let Some(objects) = self.comic_docs.get(&key) {
+            normalize_text_selection(
+                objects,
+                &mut self.text_selected_ids,
+                &mut self.text_selected,
+            );
+        }
+
         if pressed {
+            self.text_smart_guides = TextSmartGuides::default();
             if let Some(pos) = pos {
                 if pointer_over_panel {
-                    return; // パネル上のクリックはキャンバス操作にしない
+                    return;
                 }
                 let img = view.screen_to_image(pos);
-                // 優先: 選択中オブジェクトのハンドル (しっぽ/回転/四隅) → 本体 hit-test。
-                let handle = self.text_selected.and_then(|sel| {
-                    self.comic_docs
+                let ctrl = modifier_held_via_os(ModKind::Ctrl);
+                let shift = modifier_held_via_os(ModKind::Shift);
+                // 変形ハンドルは単一選択時だけ有効。複数選択時はグループ移動を優先する。
+                let handle = (self.text_selected_ids.len() == 1)
+                    .then_some(self.text_selected)
+                    .flatten()
+                    .and_then(|sel| {
+                        self.comic_docs
+                            .get(&key)
+                            .and_then(|objs| objs.iter().find(|o| o.id == sel))
+                            .and_then(|o| pick_handle(o, pos, &view, fonts.as_deref()))
+                    });
+                let (drag_id, kind) = if let Some(kind) = handle {
+                    (self.text_selected, Some(kind))
+                } else {
+                    let hit = self
+                        .comic_docs
                         .get(&key)
-                        .and_then(|objs| objs.iter().find(|o| o.id == sel))
-                        .and_then(|o| pick_handle(o, pos, &view, fonts.as_deref()))
-                });
-                let (drag_id, kind) = match handle {
-                    Some(k) => (self.text_selected, Some(k)),
-                    None => {
-                        // 本体クリックでの **ドラッグ対象** を決める (選択そのものは release 時に
-                        // 透過考慮で確定する。後述)。選択中オブジェクトの青枠 (AABB) 内を押した時は、
-                        // 手前に別オブジェクトが重なっていても・透明な穴でも、選択中をそのまま Move
-                        // できるようにする。これが無いと、巨大／透過の手前オブジェクトに掴みを奪われ、
-                        // 裏側の選択中オブジェクトをドラッグできなくなる (実機 FB / ユーザー要件)。
-                        // 選択中の枠外を押した時だけ、実体 (透過考慮) で掴む対象を選び直す。
-                        let on_selected = self.text_selected.filter(|&sel| {
-                            self.comic_docs.get(&key).is_some_and(|objs| {
-                                objs.iter().any(|o| {
-                                    o.id == sel
-                                        && object_bounds(o, fonts.as_deref())
-                                            .contains(egui::pos2(img.0, img.1))
-                                })
+                        .and_then(|objs| hit_test_visible(objs, img, fonts.as_deref(), &stamps));
+                    // 選択済みオブジェクトの枠内なら、透明部でもそのグループを掴める。
+                    let on_selected = self.comic_docs.get(&key).and_then(|objs| {
+                        objs.iter()
+                            .filter(|o| self.text_selected_ids.contains(&o.id))
+                            .filter(|o| {
+                                object_bounds(o, fonts.as_deref())
+                                    .contains(egui::pos2(img.0, img.1))
                             })
-                        });
-                        if let Some(sel) = on_selected {
-                            (Some(sel), Some(TextDragKind::Move))
-                        } else {
-                            // 非選択をつかむ時は「実体」(透過考慮) で最前面を選ぶ。透明な隙間は
-                            // 素通りして奥に当たる。ドラッグ対象として即選択する (枠が追従)。
-                            let hit = self.comic_docs.get(&key).and_then(|objs| {
-                                hit_test_visible(objs, img, fonts.as_deref(), &stamps)
-                            });
-                            self.text_selected = hit;
-                            (hit, hit.map(|_| TextDragKind::Move))
+                            .max_by_key(|o| o.z)
+                            .map(|o| o.id)
+                    });
+                    if let Some(hit) = hit {
+                        if ctrl {
+                            toggle_text_selection(
+                                &mut self.text_selected_ids,
+                                &mut self.text_selected,
+                                hit,
+                            );
+                        } else if shift {
+                            add_text_selection(
+                                &mut self.text_selected_ids,
+                                &mut self.text_selected,
+                                hit,
+                            );
+                        } else if !self.text_selected_ids.contains(&hit) && on_selected.is_none() {
+                            replace_text_selection(
+                                &mut self.text_selected_ids,
+                                &mut self.text_selected,
+                                Some(hit),
+                            );
                         }
+                        let target = if self.text_selected_ids.contains(&hit) {
+                            Some(hit)
+                        } else if !ctrl && !shift {
+                            on_selected
+                        } else {
+                            None
+                        };
+                        (target, target.map(|_| TextDragKind::Move))
+                    } else if let Some(selected) = on_selected.filter(|_| !ctrl && !shift) {
+                        (Some(selected), Some(TextDragKind::Move))
+                    } else {
+                        if !ctrl && !shift {
+                            replace_text_selection(
+                                &mut self.text_selected_ids,
+                                &mut self.text_selected,
+                                None,
+                            );
+                        }
+                        self.text_marquee = Some(TextMarquee {
+                            start_screen: pos,
+                            current_screen: pos,
+                            additive: ctrl || shift,
+                        });
+                        (None, None)
                     }
                 };
                 self.text_drag = match (drag_id, kind) {
@@ -2053,30 +2535,45 @@ impl App {
             }
         } else if down {
             if let (Some(pos), Some(mut drag)) = (pos, self.text_drag) {
-                // 閾値を超えるまで変形を適用しない (単なるクリックでハンドルが微小に
-                // 動く / 不要保存が出るのを防ぐ。ラボの resp.dragged() 相当)。
                 const DRAG_ARM_PX: f32 = 4.0;
                 if drag.armed || (pos - drag.start).length() >= DRAG_ARM_PX {
                     drag.armed = true;
                     let img = view.screen_to_image(pos);
-                    // FS キャンバスでは egui modifiers が stale になり得るため、Ctrl / Shift は
-                    // ドラッグ中の各フレームで OS から直接読む。
                     let symmetric_corner_resize = modifier_held_via_os(ModKind::Ctrl);
                     let preserve_aspect_corner_resize = modifier_held_via_os(ModKind::Shift);
-                    let changed = self
-                        .comic_docs
-                        .get_mut(&key)
-                        .map(|objs| {
-                            apply_text_drag(
-                                objs,
-                                &drag,
-                                img,
-                                fonts.as_deref(),
-                                symmetric_corner_resize,
-                                preserve_aspect_corner_resize,
-                            )
-                        })
-                        .unwrap_or(false);
+                    let changed = if matches!(drag.kind, TextDragKind::Move) {
+                        let (changed, guides) = self
+                            .comic_docs
+                            .get_mut(&key)
+                            .map(|objs| {
+                                move_text_selection_with_guides(
+                                    objs,
+                                    &self.text_selected_ids,
+                                    img.0 - drag.last_img.0,
+                                    img.1 - drag.last_img.1,
+                                    fonts.as_deref(),
+                                    6.0 / view.scale.max(1e-3),
+                                )
+                            })
+                            .unwrap_or_default();
+                        self.text_smart_guides = guides;
+                        changed
+                    } else {
+                        self.text_smart_guides = TextSmartGuides::default();
+                        self.comic_docs
+                            .get_mut(&key)
+                            .map(|objs| {
+                                apply_text_drag(
+                                    objs,
+                                    &drag,
+                                    img,
+                                    fonts.as_deref(),
+                                    symmetric_corner_resize,
+                                    preserve_aspect_corner_resize,
+                                )
+                            })
+                            .unwrap_or(false)
+                    };
                     if changed {
                         drag.moved = true;
                         self.mark_comic_dirty();
@@ -2084,24 +2581,77 @@ impl App {
                     drag.last_img = img;
                 }
                 self.text_drag = Some(drag);
+            } else if let (Some(pos), Some(mut marquee)) = (pos, self.text_marquee) {
+                marquee.current_screen = pos;
+                self.text_marquee = Some(marquee);
             }
         }
 
         if released {
+            self.text_smart_guides = TextSmartGuides::default();
             if let Some(drag) = self.text_drag.take() {
                 if drag.moved {
-                    // 移動確定で comic.db + サイドカーへ保存 (退場時保存に加えて即時永続化)。
                     let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
                     self.save_comic_objects(fs_idx, &key, &objs);
                     self.text_dirty_at = None;
-                } else if matches!(drag.kind, TextDragKind::Move) {
-                    // 動かさずに離した本体クリック (= ハンドル操作でない) は、クリック点の「実体」
-                    // (透過考慮) で選択し直す。選択中の透明な穴をクリックすれば奥のオブジェクトへ、
-                    // 実体が無ければ選択解除。ドラッグは選択中を青枠内どこでも掴める挙動のまま。
+                } else if matches!(drag.kind, TextDragKind::Move)
+                    && !modifier_held_via_os(ModKind::Ctrl)
+                    && !modifier_held_via_os(ModKind::Shift)
+                {
                     let hit = self.comic_docs.get(&key).and_then(|objs| {
                         hit_test_visible(objs, drag.last_img, fonts.as_deref(), &stamps)
                     });
-                    self.text_selected = hit;
+                    replace_text_selection(
+                        &mut self.text_selected_ids,
+                        &mut self.text_selected,
+                        hit,
+                    );
+                }
+            }
+            if let Some(marquee) = self.text_marquee.take() {
+                let moved = pos.is_some_and(|p| (p - marquee.start_screen).length() >= 4.0);
+                if moved {
+                    let screen_rect =
+                        egui::Rect::from_two_pos(marquee.start_screen, marquee.current_screen);
+                    let selection_polygon: Vec<(f32, f32)> = [
+                        screen_rect.left_top(),
+                        screen_rect.right_top(),
+                        screen_rect.right_bottom(),
+                        screen_rect.left_bottom(),
+                    ]
+                    .into_iter()
+                    .map(|point| view.screen_to_image(point))
+                    .collect();
+                    let enclosed: Vec<u64> = self
+                        .comic_docs
+                        .get(&key)
+                        .into_iter()
+                        .flatten()
+                        .filter(|o| o.enabled)
+                        .filter(|o| {
+                            let bounds = object_alignment_bounds(o, fonts.as_deref());
+                            [
+                                (bounds.min.x, bounds.min.y),
+                                (bounds.max.x, bounds.min.y),
+                                (bounds.max.x, bounds.max.y),
+                                (bounds.min.x, bounds.max.y),
+                            ]
+                            .into_iter()
+                            .all(|corner| point_in_or_on_polygon(corner, &selection_polygon))
+                        })
+                        .map(|o| o.id)
+                        .collect();
+                    if !marquee.additive {
+                        self.text_selected_ids.clear();
+                    }
+                    for id in enclosed {
+                        add_text_selection(
+                            &mut self.text_selected_ids,
+                            &mut self.text_selected,
+                            id,
+                        );
+                    }
+                    self.text_selected = self.text_selected_ids.last().copied();
                 }
             }
         }
@@ -2191,9 +2741,6 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        let Some(id) = self.text_selected else {
-            return;
-        };
         let Some(key) = self.page_path_key(fs_idx) else {
             return;
         };
@@ -2201,6 +2748,131 @@ impl App {
             return;
         };
         let fonts = self.ensure_comic_fonts();
+        let painter = ui.painter().with_clip_rect(image_rect);
+        let guide_color = egui::Color32::from_rgb(255, 80, 210);
+        if let Some(x) = self.text_smart_guides.vertical {
+            painter.line_segment(
+                [
+                    view.image_to_screen(x, 0.0),
+                    view.image_to_screen(x, view.sh),
+                ],
+                egui::Stroke::new(1.2, guide_color),
+            );
+        }
+        if let Some(y) = self.text_smart_guides.horizontal {
+            painter.line_segment(
+                [
+                    view.image_to_screen(0.0, y),
+                    view.image_to_screen(view.sw, y),
+                ],
+                egui::Stroke::new(1.2, guide_color),
+            );
+        }
+        if let Some(marquee) = self.text_marquee {
+            let rect = egui::Rect::from_two_pos(marquee.start_screen, marquee.current_screen);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.2, sel_color()),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        let mut selected_ids = self.text_selected_ids.clone();
+        if selected_ids.is_empty() {
+            if let Some(id) = self.text_selected {
+                selected_ids.push(id);
+            }
+        }
+        if let Some(group) = self
+            .comic_docs
+            .get(&key)
+            .and_then(|objects| selected_alignment_bounds(objects, &selected_ids, fonts.as_deref()))
+        {
+            if let Some((left, group_left, group_right, right)) =
+                self.text_smart_guides.equal_horizontal
+            {
+                let y = group.center().y;
+                painter.line_segment(
+                    [
+                        view.image_to_screen(left, y),
+                        view.image_to_screen(group_left, y),
+                    ],
+                    egui::Stroke::new(2.0, guide_color),
+                );
+                painter.line_segment(
+                    [
+                        view.image_to_screen(group_right, y),
+                        view.image_to_screen(right, y),
+                    ],
+                    egui::Stroke::new(2.0, guide_color),
+                );
+            }
+            if let Some((top, group_top, group_bottom, bottom)) =
+                self.text_smart_guides.equal_vertical
+            {
+                let x = group.center().x;
+                painter.line_segment(
+                    [
+                        view.image_to_screen(x, top),
+                        view.image_to_screen(x, group_top),
+                    ],
+                    egui::Stroke::new(2.0, guide_color),
+                );
+                painter.line_segment(
+                    [
+                        view.image_to_screen(x, group_bottom),
+                        view.image_to_screen(x, bottom),
+                    ],
+                    egui::Stroke::new(2.0, guide_color),
+                );
+            }
+        }
+        if selected_ids.len() > 1 {
+            let selected: HashSet<u64> = selected_ids.iter().copied().collect();
+            let objects: Vec<AnnotationObject> = self
+                .comic_docs
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .filter(|o| selected.contains(&o.id))
+                .cloned()
+                .collect();
+            let draw_rect = |rect: egui::Rect, stroke: egui::Stroke| {
+                let corners = [
+                    (rect.min.x, rect.min.y),
+                    (rect.max.x, rect.min.y),
+                    (rect.max.x, rect.max.y),
+                    (rect.min.x, rect.max.y),
+                ];
+                let points: Vec<egui::Pos2> = corners
+                    .iter()
+                    .map(|&(x, y)| view.image_to_screen(x, y))
+                    .collect();
+                for i in 0..4 {
+                    painter.line_segment([points[i], points[(i + 1) % 4]], stroke);
+                }
+            };
+            for object in &objects {
+                draw_rect(
+                    object_alignment_bounds(object, fonts.as_deref()),
+                    egui::Stroke::new(1.2, sel_color()),
+                );
+            }
+            if let Some(group) =
+                selected_alignment_bounds(&objects, &selected_ids, fonts.as_deref())
+            {
+                draw_rect(
+                    group,
+                    egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 205, 70)),
+                );
+            }
+            return;
+        }
+
+        let Some(id) = selected_ids.last().copied() else {
+            return;
+        };
         let Some(o) = self
             .comic_docs
             .get(&key)
@@ -2212,7 +2884,6 @@ impl App {
         let Some((corners, roth)) = handle_points(&o, fonts.as_deref(), view.scale) else {
             return;
         };
-        let painter = ui.painter().with_clip_rect(image_rect);
         let blue = sel_color();
         let cs: Vec<egui::Pos2> = corners
             .iter()
@@ -2290,6 +2961,14 @@ impl App {
         // 借用衝突を避けるため作業セットを一旦取り出し、ローカルだけを編集する。
         let mut objects = self.comic_docs.remove(&key).unwrap_or_default();
         let mut selected = self.text_selected;
+        let mut selected_ids = self.text_selected_ids.clone();
+        normalize_text_selection(&objects, &mut selected_ids, &mut selected);
+        let mut selection_anchor = self.text_list_selection_anchor;
+        if selection_anchor.is_none_or(|anchor| !selected_ids.contains(&anchor)) {
+            selection_anchor = selected;
+        }
+        let mut align_reference = self.text_align_reference;
+        let mut distribute_mode = self.text_distribute_mode;
         let mut prop_tab = self.text_prop_tab;
         let mut changed = false;
         let mut close = false;
@@ -2423,7 +3102,7 @@ impl App {
                             let mut o = AnnotationObject::new_text(id, (sw * 0.3, sh * 0.3), tb);
                             o.z = z;
                             objects.push(o);
-                            selected = Some(id);
+                            replace_text_selection(&mut selected_ids, &mut selected, Some(id));
                             changed = true;
                         }
                         ui.add_space(2.0);
@@ -2468,10 +3147,23 @@ impl App {
                             .max_height(list_max)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                object_list_rows_ui(ui, &mut objects, &mut selected, &mut changed);
+                                object_list_rows_ui(
+                                    ui,
+                                    &mut objects,
+                                    &mut selected,
+                                    &mut selected_ids,
+                                    &mut selection_anchor,
+                                    &mut changed,
+                                );
                             });
                         ui.separator();
-                        object_list_actions_ui(ui, &mut objects, &mut selected, &mut changed);
+                        object_list_actions_ui(
+                            ui,
+                            &mut objects,
+                            &mut selected,
+                            &mut selected_ids,
+                            &mut changed,
+                        );
                     });
             });
 
@@ -2550,7 +3242,19 @@ impl App {
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
-                                        if let Some(o) = selected
+                                        if selected_ids.len() >= 2 {
+                                            let fonts = self.ensure_comic_fonts_for(&objects);
+                                            alignment_controls_ui(
+                                                ui,
+                                                &mut objects,
+                                                &selected_ids,
+                                                fonts.as_deref(),
+                                                (sw, sh),
+                                                &mut align_reference,
+                                                &mut distribute_mode,
+                                                &mut changed,
+                                            );
+                                        } else if let Some(o) = selected
                                             .and_then(|id| objects.iter_mut().find(|o| o.id == id))
                                         {
                                             let mut pctx = PresetCtx {
@@ -2670,6 +3374,10 @@ impl App {
         // 書き戻し。編集中は毎フレーム DB へ書かず (Codex P2)、メモリ更新 + 再ベイクに留め、
         // 編集が止まってから (デバウンス) / 退場時に 1 度だけ comic.db + サイドカーへ保存する。
         self.text_selected = selected;
+        self.text_selected_ids = selected_ids;
+        self.text_list_selection_anchor = selection_anchor;
+        self.text_align_reference = align_reference;
+        self.text_distribute_mode = distribute_mode;
         self.text_prop_tab = prop_tab;
         const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(700);
         let save_now = if changed {
@@ -5845,6 +6553,8 @@ fn object_list_rows_ui(
     ui: &mut egui::Ui,
     objects: &mut Vec<AnnotationObject>,
     selected: &mut Option<u64>,
+    selected_ids: &mut Vec<u64>,
+    selection_anchor: &mut Option<u64>,
     changed: &mut bool,
 ) {
     ui.label(
@@ -5862,13 +6572,13 @@ fn object_list_rows_ui(
     }
 
     let row_w = PANEL_W - 12.0;
-    let mut clicked: Option<u64> = None;
+    let mut clicked: Option<(u64, egui::Modifiers)> = None;
     let mut toggle_enabled: Option<(usize, bool)> = None;
     // 配列の末尾ほど前面 (z 大)。前面のものを上に見せると直感的なので逆順で描く。
     for i in (0..objects.len()).rev() {
         let o = &objects[i];
         let id = o.id;
-        let is_sel = *selected == Some(id);
+        let is_sel = selected_ids.contains(&id);
         let label = object_list_label(o);
         let text_color = if o.enabled {
             egui::Color32::WHITE
@@ -5927,15 +6637,42 @@ fn object_list_rows_ui(
                 row_clicked
             });
         if frame.inner {
-            clicked = Some(id);
+            clicked = Some((id, ui.input(|input| input.modifiers)));
         }
     }
     if let Some((i, en)) = toggle_enabled {
         objects[i].enabled = en;
         *changed = true;
     }
-    if let Some(id) = clicked {
-        *selected = Some(id);
+    if let Some((id, modifiers)) = clicked {
+        if modifiers.shift {
+            let visual_order: Vec<u64> = objects.iter().rev().map(|o| o.id).collect();
+            if let Some(anchor) = selection_anchor.and_then(|anchor| {
+                visual_order
+                    .iter()
+                    .position(|candidate| *candidate == anchor)
+            }) {
+                if let Some(clicked) = visual_order.iter().position(|candidate| *candidate == id) {
+                    let (start, end) = if anchor <= clicked {
+                        (anchor, clicked)
+                    } else {
+                        (clicked, anchor)
+                    };
+                    for range_id in &visual_order[start..=end] {
+                        add_text_selection(selected_ids, selected, *range_id);
+                    }
+                }
+            } else {
+                add_text_selection(selected_ids, selected, id);
+                *selection_anchor = Some(id);
+            }
+        } else if modifiers.ctrl {
+            toggle_text_selection(selected_ids, selected, id);
+            *selection_anchor = Some(id);
+        } else {
+            replace_text_selection(selected_ids, selected, Some(id));
+            *selection_anchor = Some(id);
+        }
     }
 }
 
@@ -5946,6 +6683,7 @@ fn object_list_actions_ui(
     ui: &mut egui::Ui,
     objects: &mut Vec<AnnotationObject>,
     selected: &mut Option<u64>,
+    selected_ids: &mut Vec<u64>,
     changed: &mut bool,
 ) {
     let row_w = PANEL_W - 12.0;
@@ -5955,7 +6693,7 @@ fn object_list_actions_ui(
     let mut move_up: Option<usize> = None;
     let mut move_down: Option<usize> = None;
     let mut duplicate: Option<usize> = None;
-    let mut delete: Option<usize> = None;
+    let mut delete = false;
     ui.horizontal(|ui| {
         let gap = 4.0;
         ui.spacing_mut().item_spacing.x = gap;
@@ -5994,7 +6732,7 @@ fn object_list_actions_ui(
             )
             .clicked()
         {
-            delete = sel_idx;
+            delete = true;
         }
     });
 
@@ -6025,21 +6763,111 @@ fn object_list_actions_ui(
                 }
             }
             *selected = Some(dup.id);
+            selected_ids.clear();
+            selected_ids.push(dup.id);
             objects.push(dup);
             normalize_z(objects);
             *changed = true;
         }
     }
-    if let Some(i) = delete {
-        if i < objects.len() {
-            let removed = objects.remove(i);
-            if *selected == Some(removed.id) {
-                *selected = None;
-            }
+    if delete {
+        let removed: HashSet<u64> = selected_ids.iter().copied().collect();
+        let before = objects.len();
+        objects.retain(|o| !removed.contains(&o.id));
+        if objects.len() != before {
+            selected_ids.clear();
+            *selected = None;
             normalize_z(objects);
             *changed = true;
         }
     }
+}
+
+fn alignment_controls_ui(
+    ui: &mut egui::Ui,
+    objects: &mut [AnnotationObject],
+    selected_ids: &[u64],
+    fonts: Option<&FontSet>,
+    canvas_size: (f32, f32),
+    reference: &mut TextAlignReference,
+    distribute_mode: &mut TextDistributeMode,
+    changed: &mut bool,
+) {
+    ui.strong(format!("{} 個を選択", selected_ids.len()));
+    ui.label(
+        egui::RichText::new("ドラッグでまとめて移動できます")
+            .small()
+            .color(egui::Color32::from_gray(175)),
+    );
+    ui.separator();
+    ui.label("整列基準");
+    ui.horizontal(|ui| {
+        ui.selectable_value(reference, TextAlignReference::Selection, "選択範囲");
+        ui.selectable_value(reference, TextAlignReference::Image, "画像");
+    });
+    ui.add_space(4.0);
+    let mut run_align = None;
+    ui.horizontal(|ui| {
+        for (label, op, help) in [
+            ("左", TextAlignOp::Left, "左端を揃える"),
+            ("左右中央", TextAlignOp::HCenter, "左右中央を揃える"),
+            ("右", TextAlignOp::Right, "右端を揃える"),
+        ] {
+            if ui.button(label).on_hover_text(help).clicked() {
+                run_align = Some(op);
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        for (label, op, help) in [
+            ("上", TextAlignOp::Top, "上端を揃える"),
+            ("上下中央", TextAlignOp::VCenter, "上下中央を揃える"),
+            ("下", TextAlignOp::Bottom, "下端を揃える"),
+        ] {
+            if ui.button(label).on_hover_text(help).clicked() {
+                run_align = Some(op);
+            }
+        }
+    });
+    if let Some(op) = run_align {
+        *changed |= align_text_objects(objects, selected_ids, fonts, canvas_size, *reference, op);
+    }
+
+    ui.separator();
+    ui.add_enabled_ui(selected_ids.len() >= 3, |ui| {
+        ui.label("均等配置");
+        ui.horizontal(|ui| {
+            ui.selectable_value(distribute_mode, TextDistributeMode::Centers, "中心間隔");
+            ui.selectable_value(distribute_mode, TextDistributeMode::Gaps, "端の隙間");
+        });
+        ui.horizontal(|ui| {
+            if ui.button("横方向").clicked() {
+                *changed |= distribute_text_objects(
+                    objects,
+                    selected_ids,
+                    fonts,
+                    TextDistributeAxis::Horizontal,
+                    *distribute_mode,
+                );
+            }
+            if ui.button("縦方向").clicked() {
+                *changed |= distribute_text_objects(
+                    objects,
+                    selected_ids,
+                    fonts,
+                    TextDistributeAxis::Vertical,
+                    *distribute_mode,
+                );
+            }
+        });
+        if selected_ids.len() < 3 {
+            ui.label(
+                egui::RichText::new("3 個以上を選択してください")
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+            );
+        }
+    });
 }
 
 /// 選択中オブジェクトの種別別インライン編集。
@@ -8702,6 +9530,148 @@ mod tests {
         let mut bubble = BubbleObject::default();
         bubble.text.text = text.to_string();
         AnnotationObject::new_bubble(id, (100.0, 100.0), bubble)
+    }
+
+    fn stamp_object(id: u64, pivot: (f32, f32), half_w: f32, half_h: f32) -> AnnotationObject {
+        AnnotationObject::new_stamp(
+            id,
+            pivot,
+            StampObject {
+                half_w,
+                half_h,
+                ..StampObject::default()
+            },
+        )
+    }
+
+    #[test]
+    fn align_selection_uses_body_bounds_and_only_moves_requested_axis() {
+        let mut objects = vec![
+            stamp_object(1, (20.0, 30.0), 10.0, 8.0),
+            stamp_object(2, (70.0, 80.0), 20.0, 12.0),
+        ];
+        assert!(align_text_objects(
+            &mut objects,
+            &[1, 2],
+            None,
+            (200.0, 200.0),
+            TextAlignReference::Selection,
+            TextAlignOp::Left,
+        ));
+        assert_eq!(objects[0].pivot, (20.0, 30.0));
+        assert_eq!(objects[1].pivot, (30.0, 80.0));
+    }
+
+    #[test]
+    fn align_to_image_right_uses_canvas_edge() {
+        let mut objects = vec![
+            stamp_object(1, (20.0, 30.0), 10.0, 8.0),
+            stamp_object(2, (70.0, 80.0), 20.0, 12.0),
+        ];
+        assert!(align_text_objects(
+            &mut objects,
+            &[1, 2],
+            None,
+            (200.0, 160.0),
+            TextAlignReference::Image,
+            TextAlignOp::Right,
+        ));
+        assert_eq!(objects[0].pivot.0, 190.0);
+        assert_eq!(objects[1].pivot.0, 180.0);
+    }
+
+    #[test]
+    fn distribute_centers_keeps_endpoints_fixed() {
+        let mut objects = vec![
+            stamp_object(1, (10.0, 20.0), 10.0, 5.0),
+            stamp_object(2, (35.0, 20.0), 5.0, 5.0),
+            stamp_object(3, (110.0, 20.0), 20.0, 5.0),
+        ];
+        assert!(distribute_text_objects(
+            &mut objects,
+            &[1, 2, 3],
+            None,
+            TextDistributeAxis::Horizontal,
+            TextDistributeMode::Centers,
+        ));
+        assert_eq!(objects[0].pivot.0, 10.0);
+        assert_eq!(objects[1].pivot.0, 60.0);
+        assert_eq!(objects[2].pivot.0, 110.0);
+    }
+
+    #[test]
+    fn distribute_gaps_accounts_for_different_object_sizes() {
+        let mut objects = vec![
+            stamp_object(1, (10.0, 20.0), 10.0, 5.0),
+            stamp_object(2, (40.0, 20.0), 5.0, 5.0),
+            stamp_object(3, (100.0, 20.0), 20.0, 5.0),
+        ];
+        assert!(distribute_text_objects(
+            &mut objects,
+            &[1, 2, 3],
+            None,
+            TextDistributeAxis::Horizontal,
+            TextDistributeMode::Gaps,
+        ));
+        assert_eq!(objects[0].pivot.0, 10.0);
+        assert_eq!(objects[1].pivot.0, 50.0);
+        assert_eq!(objects[2].pivot.0, 100.0);
+    }
+
+    #[test]
+    fn group_move_snaps_selected_edge_to_neighbor() {
+        let mut objects = vec![
+            stamp_object(1, (10.0, 20.0), 5.0, 5.0),
+            stamp_object(2, (50.0, 20.0), 5.0, 5.0),
+        ];
+        let (changed, guides) =
+            move_text_selection_with_guides(&mut objects, &[1], 29.0, 0.0, None, 2.0);
+        assert!(changed);
+        assert_eq!(objects[0].pivot.0, 40.0);
+        assert_eq!(guides.vertical, Some(45.0));
+    }
+
+    #[test]
+    fn group_move_releases_message_window_position_preset() {
+        let window = MessageWindowObject {
+            position: WindowPosition::Top,
+            half_w: 20.0,
+            half_h: 10.0,
+            ..MessageWindowObject::default()
+        };
+        let mut objects = vec![AnnotationObject::new_message_window(
+            1,
+            (50.0, 20.0),
+            window,
+        )];
+        let (changed, _) = move_text_selection_with_guides(&mut objects, &[1], 5.0, 7.0, None, 0.0);
+        assert!(changed);
+        assert_eq!(objects[0].pivot, (55.0, 27.0));
+        let AnnotationKind::MessageWindow(window) = &objects[0].kind else {
+            panic!("not a message window");
+        };
+        assert_eq!(window.position, WindowPosition::Free);
+    }
+
+    #[test]
+    fn marquee_polygon_accepts_points_on_boundary() {
+        let polygon = vec![(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)];
+        assert!(point_in_or_on_polygon((0.0, 5.0), &polygon));
+        assert!(point_in_or_on_polygon((10.0, 5.0), &polygon));
+        assert!(!point_in_or_on_polygon((21.0, 5.0), &polygon));
+    }
+
+    #[test]
+    fn normalize_selection_prunes_missing_ids_and_preserves_order() {
+        let objects = vec![
+            stamp_object(1, (0.0, 0.0), 5.0, 5.0),
+            stamp_object(3, (0.0, 0.0), 5.0, 5.0),
+        ];
+        let mut selected_ids = vec![3, 2, 3, 1];
+        let mut primary = Some(3);
+        normalize_text_selection(&objects, &mut selected_ids, &mut primary);
+        assert_eq!(selected_ids, vec![3, 1]);
+        assert_eq!(primary, Some(3));
     }
 
     #[test]

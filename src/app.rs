@@ -3707,6 +3707,26 @@ pub(crate) struct TextDrag {
     pub moved: bool,
 }
 
+/// テキスト注釈の空き領域ドラッグによる矩形選択。表示枠は screen 座標で保持し、
+/// 確定時に四隅を canonical source px へ逆写像して判定する。
+#[derive(Clone, Copy)]
+pub(crate) struct TextMarquee {
+    pub start_screen: egui::Pos2,
+    pub current_screen: egui::Pos2,
+    pub additive: bool,
+}
+
+/// 注釈移動中に表示するスナップガイド。値は canonical source px。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TextSmartGuides {
+    pub vertical: Option<f32>,
+    pub horizontal: Option<f32>,
+    /// 左隣の右端、選択範囲の左右端、右隣の左端。
+    pub equal_horizontal: Option<(f32, f32, f32, f32)>,
+    /// 上隣の下端、選択範囲の上下端、下隣の上端。
+    pub equal_vertical: Option<(f32, f32, f32, f32)>,
+}
+
 /// 消しゴムプレビュー (= preview ボタン押下時の MI-GAN 結果) を保持する一時キャッシュ。
 ///
 /// `fs_cache` を書き換えない隔離設計 (Codex P1 R4 #1)。プレビュー中だけ表示
@@ -6275,6 +6295,14 @@ pub struct App {
 
     // ── 削除確認ダイアログ ───────────────────────────────────────
     pub(crate) show_delete_confirm: bool,
+    /// アプリ内の画像編集 bundle clipboard。OS の file/image clipboard とは独立。
+    pub(crate) edit_bundle_clipboard: Option<crate::edit_bundle::EditBundleClipboard>,
+    /// 編集 bundle の DB 読み込み worker。
+    pub(crate) edit_bundle_copy_pending: Option<crate::edit_bundle::EditBundleCopyPending>,
+    /// 既存編集を全置換する貼り付けの確認待ち。None が通常状態。
+    pub(crate) edit_bundle_paste_pending: Option<crate::edit_bundle::EditBundlePasteRequest>,
+    /// 異サイズ変換 + 6 DB transaction の worker。
+    pub(crate) edit_bundle_apply_pending: Option<crate::edit_bundle::EditBundleApplyPending>,
     /// 削除対象のファイル / フォルダパスリスト
     pub(crate) delete_targets: Vec<(usize, PathBuf)>,
     /// 削除確認ダイアログの文言。ドライブ種別 / ゴミ箱設定 / 容量判定を毎フレーム
@@ -8227,6 +8255,10 @@ pub struct App {
     /// 選択中の注釈オブジェクトの **id** (`comic_docs[key]` 内の `AnnotationObject::id`)。
     /// index ではなく id で持つので、削除 / z 並べ替えで選択がずれない (Inc 3b)。
     pub(crate) text_selected: Option<u64>,
+    /// 複数選択の順序付き id。末尾が詳細パネルの主選択 (`text_selected`)。
+    pub(crate) text_selected_ids: Vec<u64>,
+    /// 一覧の Shift 範囲選択の起点。
+    pub(crate) text_list_selection_anchor: Option<u64>,
     /// 右詳細パネルのカテゴリタブ選択 (セリフ/本体/しっぽ/枠)。アプリ単位で 1 つ保持し、
     /// 補正レイヤーの section-accent と同じカラー分類を右パネルに与える (Inc 4b)。
     pub(crate) text_prop_tab: crate::ui_text::TextPropTab,
@@ -8236,6 +8268,14 @@ pub struct App {
     /// キャンバス上のドラッグ移動の進行状態 (Inc 3c)。`last_img` は直近のポインタ画像
     /// 座標で、毎フレームの差分でオブジェクトを動かす。
     pub(crate) text_drag: Option<TextDrag>,
+    /// 空き領域からの矩形選択。
+    pub(crate) text_marquee: Option<TextMarquee>,
+    /// ドラッグ中のエッジ・中央・等間隔スナップガイド。
+    pub(crate) text_smart_guides: TextSmartGuides,
+    /// 整列基準（選択範囲 / 画像）。
+    pub(crate) text_align_reference: crate::ui_text::TextAlignReference,
+    /// 均等配置方式（中心間隔 / 端の隙間）。
+    pub(crate) text_distribute_mode: crate::ui_text::TextDistributeMode,
     /// パネル編集の未保存タイムスタンプ (Codex P2: 毎フレーム DB 書き込みを避ける
     /// デバウンス用)。`Some(t)` の間は未保存で、編集が `DEBOUNCE` 止まったら comic.db +
     /// サイドカーへ 1 度だけ保存する (退場時 `reset_text_mode` でも最終保存)。
@@ -9284,6 +9324,10 @@ impl App {
             fs_context_menu_idx: None,
             fs_context_menu_pos: egui::Pos2::ZERO,
             show_delete_confirm: false,
+            edit_bundle_clipboard: None,
+            edit_bundle_copy_pending: None,
+            edit_bundle_paste_pending: None,
+            edit_bundle_apply_pending: None,
             delete_targets: Vec::new(),
             delete_confirm_label: None,
             pending_reload: false,
@@ -9942,9 +9986,15 @@ impl App {
             comic_docs: std::collections::HashMap::new(),
             text_mode: false,
             text_selected: None,
+            text_selected_ids: Vec::new(),
+            text_list_selection_anchor: None,
             text_prop_tab: crate::ui_text::TextPropTab::Serifu,
             text_prop_tab_selection: None,
             text_drag: None,
+            text_marquee: None,
+            text_smart_guides: TextSmartGuides::default(),
+            text_align_reference: crate::ui_text::TextAlignReference::default(),
+            text_distribute_mode: crate::ui_text::TextDistributeMode::default(),
             text_dirty_at: None,
             text_add_bubble_dialog: false,
             text_add_annotation_dialog: false,
@@ -10927,6 +10977,8 @@ impl App {
             || self.show_metadata_cleanup
             || self.metadata_cleanup_pending.is_some()
             || self.show_delete_confirm
+            || self.edit_bundle_paste_pending.is_some()
+            || self.edit_bundle_apply_pending.is_some()
             || self.show_rotation_reset_confirm
             || self.show_pdf_password_dialog
             || self.show_about_dialog
@@ -10975,6 +11027,8 @@ impl App {
             || self.show_metadata_cleanup
             || self.metadata_cleanup_pending.is_some()
             || self.show_delete_confirm
+            || self.edit_bundle_paste_pending.is_some()
+            || self.edit_bundle_apply_pending.is_some()
             || self.show_rotation_reset_confirm
             || self.show_pdf_password_dialog
             || self.show_about_dialog
@@ -40851,7 +40905,7 @@ impl App {
         Some(key)
     }
 
-    fn invalidate_edit_preview_cache_for_key(&self, item_key: &str) {
+    pub(crate) fn invalidate_edit_preview_cache_for_key(&self, item_key: &str) {
         if let Some(service) = &self.edit_preview_cache {
             service.delete(item_key.to_string());
         }
@@ -41113,7 +41167,7 @@ impl App {
     }
 
     /// (sidecar_folder, sidecar_relative_key) のペアを取得する。
-    fn sidecar_coords(&self, idx: usize) -> Option<(std::path::PathBuf, String)> {
+    pub(crate) fn sidecar_coords(&self, idx: usize) -> Option<(std::path::PathBuf, String)> {
         Some((self.sidecar_folder(idx)?, self.sidecar_relative_key(idx)?))
     }
 
@@ -41172,6 +41226,22 @@ impl App {
             if let Some(sc) = self.sidecar_mut(&folder) {
                 op(sc, &rel);
             }
+        }
+    }
+
+    /// 一覧 idx が変化した後でも、操作開始時に固定した sidecar 座標へ mirror する。
+    pub(crate) fn with_sidecar_coords_mut<F>(
+        &mut self,
+        coords: Option<&(std::path::PathBuf, String)>,
+        op: F,
+    ) where
+        F: FnOnce(&mut crate::sidecar::SidecarFile, &str),
+    {
+        let Some((folder, rel_key)) = coords else {
+            return;
+        };
+        if let Some(sidecar) = self.sidecar_mut(folder) {
+            op(sidecar, rel_key);
         }
     }
 
@@ -51970,6 +52040,7 @@ impl eframe::App for App {
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
+        self.show_edit_bundle_paste_confirm_dialog(ctx);
         self.show_delete_progress_dialog(ctx);
         self.show_batch_convert_progress_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);

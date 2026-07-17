@@ -32,7 +32,7 @@ CC-BY 帰属 + bootstrap 配線。Inc 4c オノマトペ + フォント基盤: �
 `228786ca` (左追加UI+一覧抜粋+題名) で解消 (詳細は §7.0 補遺)。
 Inc 8 (仕上げ・回帰) 完了 (2026-06-07): マニュアル (`annotation.html` 新設 + 全ページ横断整合 +
 補正パネルのアイコン列訂正) / 製品ページ (機能カード + ユースケース + 概要) / 技術仕様書
-(§8.8 拡充 + Phase 6) を同期。実機目視は良好。UI スナップショットは対象外と判断 (理由は §8 Inc 8 の注)。
+(§8.9 拡充 + Phase 6) を同期。実機目視は良好。UI スナップショットは対象外と判断 (理由は §8 Inc 8 の注)。
 対象ブランチ: `master`（lab を初回 `6ac779b2`、追加分を `ff0efc98` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
@@ -550,7 +550,7 @@ Inc 6（変形ハンドル + Undo/Redo）→ Inc 4d（ウィンドウ詳細編�
   - 残りの perf 詰め、非破壊回転 DB の総合整合確認、マニュアル/製品ページ更新、スナップショット総点検。
   - 受け入れ: docs 同期、回帰緑。→ **達成**: マニュアル (`annotation.html` 新設 +
     処理順/エクスポート/右Ctrl/アイコン列の横断整合) `7ebb408e`/`4da1843b`/`2fcd08e1`、
-    製品ページ `e5e7a9c9`、技術仕様書 §8.8 + Phase 6 `167a2751`。bin 2104 passed / comic-core 103 passed。
+    製品ページ `e5e7a9c9`、技術仕様書 §8.9 + Phase 6 `167a2751`。bin 2104 passed / comic-core 103 passed。
   - 注: UI 応答性/IME/回転/律速は **Inc 1/3/4 で都度** 担保済（Inc 8 に溜めない）。
   - **UI スナップショットは対象外と判断**: `tests/ui_snapshot.rs` (egui_kittest) は
     [docs/ui-snapshot-policy.md](ui-snapshot-policy.md) 設計方針 §1 のとおり「`fn foo(ui, args)` に

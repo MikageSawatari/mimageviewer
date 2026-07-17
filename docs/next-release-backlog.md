@@ -131,64 +131,6 @@
   (externalize + 翻訳 + QA 工程)。QA ツールは日本語バグにも効くため単独で投資回収がある。
 - 優先度: P2 candidate (QA ツール)。英語対応は QA ツール整備後に再判断 (現時点は保留)。
 
-### 1.18 注釈オブジェクトの整列・配置 (align / distribute) + スマートガイド
-
-- 出典: ユーザー要望 (2026-07-15)。テキスト注釈ツール (Ctrl+T、comic) で複数オブジェクトを
-  PowerPoint 的に整列・等間隔配置し、ドラッグ中のスナップ/ガイドで「綺麗に配置」しやすくする。
-  他ツール調査: 整列 6 種は PowerPoint/Illustrator/Figma 共通。distribute は PowerPoint/Figma が
-  「隙間均等 (両端固定)」既定、Illustrator は「中心/軸均等」と「隙間均等」を分離。整列基準は
-  PowerPoint の「選択物基準 / スライド基準」トグルが定番。
-- 正本ドキュメント: 着手時に本エントリを `docs/annotation-align-distribute-plan.md` へ起こして
-  詳細設計する。注釈サブシステムの契約は [comic-integration-plan.md](comic-integration-plan.md) /
-  [annotation-shapes-plan.md](annotation-shapes-plan.md)。
-
-- **前提機能 = 複数選択 (本機能の土台、追加コストの主)**: 現状は単一選択のみ
-  (`text_selected: Option<u64>`, src/app.rs)。以下を追加する:
-  - キャンバス: Ctrl+クリック=トグル / Shift+クリック=追加 / 空き領域ドラッグ=矩形囲み選択
-    (既存の pan/zoom ジェスチャとの共存整理が要)。
-  - 一覧 (`object_list_rows_ui` src/ui_text.rs): Ctrl+クリック=トグル / Shift+クリック=範囲。
-  - 選択状態を順序付き集合 (`Vec<u64>`) へ拡張。複数選択中は各オブジェクトに選択枠を描画。
-  - 複数まとめてドラッグ移動 (`translate_object` src/ui_text.rs:823 をループ。MessageWindow は
-    移動後 `position=Free` にする既存注意点を踏襲)。
-  - 2 個以上選択時は右パネルに整列バーを表示 (単一選択は従来の個別編集のまま)。
-
-- **整列 6 種 (2 個以上で有効)** — pivot 平行移動のみ (サイズ/回転は不変)、移動は片軸だけ:
-  - 左端 / 左右中央 / 右端、上端 / 上下中央 / 下端。
-  - **基準は「選択物」「画像」をトグルで切替 (既定 = 選択物)**。画像基準は PowerPoint の
-    スライド基準相当で、キャプション/透かしを画像端・画像中央へ絶対配置するのに使う。
-    選択物基準は選択グループの bounding box に対して揃える (両者は選択中心≠画像中心のとき差が出る)。
-  - **揃える箱は「本体のみ (しっぽ除外)」**。しっぽ付き吹き出しは本体 (輪郭) の箱で揃える
-    (`object_bounds` はしっぽ先端を含むので、本体だけの箱を別途算出する)。効果 (袋文字/影/発光)・
-    飾りは箱に含めない (現状の選択枠と同基準で一貫。テキストはレイアウト箱基準なので v2.4.0 の
-    ink 中央補正と整合し、上寄り偏りは再発しない)。
-
-- **配置 2 種 (3 個以上で有効)** — 両端固定、移動は片軸のみ:
-  - 横方向に等間隔 / 縦方向に等間隔。
-  - **「中心を等間隔」と「隙間 (edge-to-edge) を等間隔」の 2 モードを用意**
-    (同サイズなら同結果、サイズ混在時に差が出る。中心 = ユーザー既定イメージ、隙間 = 見た目が整う)。
-
-- **スマートガイド / スナップ (ドラッグ中、規模大)**:
-  - ドラッグ中に他オブジェクトの端/中心と一致したらガイド線表示 + 吸着 (スナップ閾値)、
-    等間隔になる位置でヒント表示 (Figma/PowerPoint 相当)。
-  - 毎フレームの候補計算・スナップ閾値・ガイド描画・既存 pan/zoom/変形ハンドルとの優先順位を
-    設計で確定する。実機調整が多い部分。
-
-- **座標系・Undo**: canonical ソース画素空間で演算。整列/配置/複数ドラッグは既存の coalesce
-  経路 (`mark_comic_dirty` → `commit_comic_undo_on_settle`) に乗せて 1 操作 = 1 undo。
-
-- **UI 文言/グリフ**: 整列バーのアイコンは絵文字を使わず painter 自作 or 安全字形
-  (CLAUDE.md グリフ tofu ポリシー)。キー操作は v1 ではボタンのみ (keymap 化・矢印キー nudge は将来)。
-
-- **再利用できる既存部品**: `object_bounds` (回転込み AABB, src/ui_text.rs:576) /
-  `translate_object` (src/ui_text.rs:823) / 安定 id (`AnnotationObject.id: u64`) /
-  Undo coalesce (`comic_commit_pending` / `commit_comic_undo_on_settle`) / `comic_docs`。
-
-- **ドキュメント更新 (実装時)**: `htdocs/mimageviewer/manual/annotation.html`,
-  `htdocs/mimageviewer/index.html`, `docs/spec.md`。
-
-- 規模 / 優先度: **Large** (複数選択 = 中 + 整列/配置 = 小 + スマートガイド = 大)。P2 candidate。
-  段階実装推奨 (① 複数選択 → ② 整列/配置ボタン → ③ スマートガイド)。
-
 ### 1.20 レガシー `GridItem::ZipSeparator` の完全撤去
 
 - 出典: v2.4.1 前レビュー (2026-07-16)。`ZipSeparator` は旧 ZIP フラット展開で章見出しを
@@ -243,39 +185,6 @@
 - 方針: 具体的な再現手順が出るまではコード修正しない。再報告時は、変更したパラメータが色調補正 /
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
-
-### 3.3 画像単位の編集内容をコピー / 貼り付け
-
-- 出典: ユーザー要望 (2026-07-15)。ある画像で作った編集内容一式をコピーし、別の画像へ
-  貼り付けて再利用したい。対象は通常画像 / ZIP 内画像 / PDF ページのうち、既存の画像編集を
-  利用できる単一ページとする。
-- 基本 UX:
-  1. コピー元を 1 件選び、「編集内容をコピー」でその時点の編集内容をアプリ内に snapshot する。
-  2. コピー先を 1 件選び、「編集内容を貼り付け」で snapshot 全体を適用する。
-  3. コピー先に対象の編集内容が 1 種類でもあれば、「現在の編集内容をすべて消して上書きする」
-     ことを明記した確認ダイアログを出す。既定はキャンセルとし、明示確認後だけ置換する。
-  4. コピー先に編集内容が無ければ確認なしで適用してよい。複数選択 / チェック済み項目への
-     一括貼り付け、複数ファイル間のバッチ処理は初期スコープ外。
-- **コピー単位は部分マージではなく、ページ単位の編集 bundle 全置換**とする。初期定義は既存
-  `SidecarEntry` と同じ 6 系統: ページ個別補正 (`adjust`)、消しゴム (`mask`)、隠蔽加工
-  (`conceal`)、補正レイヤー (`local_adjust_layers`)、切り取り (`export_crop`)、テキスト注釈
-  (`comic`)。コピー元に存在しない系統はコピー先でも削除し、「元の隠蔽だけ残る」等の混在を
-  起こさない。★ / タグ / 読書位置 / 表示トリム / グローバル設定・プリセット / 非破壊回転は
-  編集 bundle に含めない。
-- コピー後にコピー元を編集しても snapshot は変化しない。OS のファイルコピー用 Ctrl+C / V と
-  衝突させず、まずは「編集内容をコピー / 貼り付け」と明示した UI 導線を設ける。
-- 実装上の不変条件:
-  - 6 系統を論理的に一括置換し、途中失敗で新旧の編集内容が混在しないこと。中央 DB の更新、
-    `mimageviewer.dat` への dual-write (設定のバックアップ ON 時)、メモリ上の page-key presence、
-    edit / final / comic cache の無効化を同じ成功境界で扱う。
-  - 製本ページ転送用の `copy_book_page_edit_key` / 各 DB の `copy_entry_key` は再利用候補だが、
-    現状は同一画素のページ複製を前提にした raw key copy で、★ / タグも含むため、そのまま公開
-    操作には使わない。
-  - コピー元と先で画像サイズ / 縦横比が違う場合は、pixel 座標のマスク・図形・注釈・crop を
-    raw row のまま複製しない。座標と太さの正規化変換、ラスターマスクの再サンプル、はみ出しの
-    clip 規則を詳細設計で確定し、同サイズ / 異サイズの双方に回帰テストを置く。
-- 規模 / リスク: Medium / 中 (複数 DB の全置換、サイドカー同期、異サイズ座標変換、
-  キャッシュ無効化)。優先度: P2 candidate。
 
 ### 3.4 トーン漫画の縮小モアレ対策 (手動 post_filter 縮小 → 将来 LOD)
 
@@ -374,8 +283,6 @@
 | 入力カスタマイズ / マウス / ゲームパッド | `docs/keymap-spec.md`, `docs/key-customization-impl-plan.md`, `docs/ring-shortcut-plan.md`, `docs/operation-customize-share-plan.md` |
 | フルスクリーン / F12 別ウィンドウ / 連結読み | `docs/display-pipeline.md`, `docs/detached-viewer-implementation-plan.md`, `docs/fullscreen-navigation-consistency.md` |
 | 表示 / AI / 補正 | `docs/display-pipeline.md`, `docs/preset-and-adjustment.md` |
-| 編集内容のコピー / 貼り付け | `docs/display-pipeline.md`, `docs/preset-and-adjustment.md`, `docs/local-adjustment-layer-v1.1.0-plan.md`, `docs/comic-integration-plan.md`, `src/sidecar.rs` |
 | 詳細表示 / スマートフィルタ | `docs/details-view-and-filter-plan.md`, `CLAUDE.md` の UI / スクロール節 |
 | タグ / フルスクリーン右パネル / 動画 overlay | `docs/tag-catalog-redesign-plan.md`, `docs/display-pipeline.md`, `docs/video-architecture.md`, `docs/detached-viewer-implementation-plan.md` |
-| 注釈の整列・配置 / 複数選択 / スマートガイド | `docs/comic-integration-plan.md`, `docs/annotation-shapes-plan.md`, `docs/keymap-spec.md` |
 | リリース / 依存更新 | `CLAUDE.md` のリリース手順、各 native 依存管理節 |

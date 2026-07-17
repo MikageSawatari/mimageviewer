@@ -226,6 +226,18 @@ impl SidecarFile {
         self.last_change
     }
 
+    /// 画像編集の 6 系統だけを page bundle として全置換する。タグは編集 bundle の
+    /// 対象外なので、同じ entry に保存済みの値を必ず引き継ぐ。
+    pub fn replace_edit_bundle(&mut self, rel_key: &str, mut replacement: SidecarEntry) {
+        replacement.tags = self.items.get(rel_key).and_then(|entry| entry.tags.clone());
+        if replacement.is_empty() {
+            self.items.remove(rel_key);
+        } else {
+            self.items.insert(rel_key.to_string(), replacement);
+        }
+        self.mark_dirty();
+    }
+
     // ── 変更 ──────────────────────────────────────────────────────
 
     pub fn set_adjust(&mut self, rel_key: &str, params: AdjustParams) {
@@ -842,6 +854,44 @@ mod tests {
         assert_eq!(s.items().len(), 1);
         s.remove_adjust("img.jpg");
         assert!(s.items().is_empty());
+    }
+
+    #[test]
+    fn replace_edit_bundle_preserves_tags_and_replaces_all_edit_fields() {
+        let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
+        s.set_adjust("img.jpg", sample_params());
+        s.set_mask(
+            "img.jpg",
+            SidecarMask {
+                w: 2,
+                h: 2,
+                data: "old".to_string(),
+                vectors: Vec::new(),
+            },
+        );
+        s.set_tags("img.jpg", ["keep"]);
+
+        s.replace_edit_bundle(
+            "img.jpg",
+            SidecarEntry {
+                conceal: Some(SidecarMask {
+                    w: 4,
+                    h: 4,
+                    data: "new".to_string(),
+                    vectors: Vec::new(),
+                }),
+                ..SidecarEntry::default()
+            },
+        );
+
+        let entry = s.items().get("img.jpg").unwrap();
+        assert!(entry.adjust.is_none());
+        assert!(entry.mask.is_none());
+        assert_eq!(entry.conceal.as_ref().unwrap().data, "new");
+        assert_eq!(
+            entry.tags.as_deref(),
+            Some(["#keep".to_string()].as_slice())
+        );
     }
 
     #[test]

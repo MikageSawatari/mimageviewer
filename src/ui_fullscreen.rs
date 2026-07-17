@@ -8851,6 +8851,9 @@ impl App {
                 // メイン update 側は fullscreen 中スキップするので二重描画にはならない。
                 self.show_editing_addon_dialog(ctx);
 
+                // 編集内容貼り付けの全置換確認は、操作した fullscreen viewport 上に出す。
+                self.show_edit_bundle_paste_confirm_dialog(ctx);
+
                 // `?` ヘルプは押された viewport 上に出す。専用フルスクリーン viewport では
                 // メイン側に描くと背面へ隠れるため、フルスクリーン中はこちらで描く。
                 self.show_context_shortcuts_dialog(ctx);

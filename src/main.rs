@@ -43,6 +43,8 @@ pub mod dwm_transitions;
 pub mod dwm_transitions {
     pub fn disable_transitions_for_thread_windows() {}
 }
+pub mod edit_bundle;
+mod edit_bundle_app;
 pub mod edit_preview_cache;
 pub mod editing_addon;
 pub mod editing_addon_download;
