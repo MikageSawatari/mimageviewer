@@ -20,7 +20,9 @@ use sha2::{Digest, Sha256};
 pub const PREVIEW_LONG_SIDE: u32 = 2048;
 pub const PREVIEW_WEBP_QUALITY: f32 = 90.0;
 pub const DEFAULT_MAX_BYTES: u64 = 1_000_000_000;
-const CACHE_FORMAT_VERSION: i64 = 2;
+// v3: MI-GAN の原寸正方形入力 + 段階補完より前に生成された erase 焼き込みを
+// 再利用しない。DB 形式自体は同じだが、派生画像の生成規約も version に含める。
+const CACHE_FORMAT_VERSION: i64 = 3;
 
 /// edit-result の上にだけ注釈を焼くための worker payload。
 ///
@@ -141,8 +143,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<bool> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let reset = version != CACHE_FORMAT_VERSION;
     if reset {
-        // v1 は comic 合成済み 1 枚だけを保存していたため、表示時の色調補正が注釈にも
-        // 掛かってしまう。下地と注釈を復元不能なので、派生キャッシュとして安全に作り直す。
+        // v1 は comic 合成済み 1 枚だけを保存していた。v3 では MI-GAN の生成規約も
+        // 更新した。いずれも派生キャッシュとして安全に全件作り直す。
         conn.execute_batch("DROP TABLE IF EXISTS edit_previews;")?;
     }
     conn.execute_batch(

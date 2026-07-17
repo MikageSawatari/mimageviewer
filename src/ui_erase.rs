@@ -15,6 +15,7 @@
 //! - 新ツール: Rect / Ellipse (Phase 0b、`Shape::Rect` / `Shape::Ellipse` を作成)
 
 use eframe::egui;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -3129,9 +3130,16 @@ fn run_inpaint_pure(
 
 /// タイルオーバーラップ幅（ピクセル）。
 const TILE_OVERLAP: usize = 64;
+/// 大きい穴を既知画素側から内側へ埋める 1 段あたりの深さ。
+const INPAINT_STAGE_DEPTH: u32 = 48;
+/// マスク周囲から MI-GAN 入力へ含める既知画素の目安。
+const INPAINT_CONTEXT_PAD: usize = MIGAN_SIZE / 4;
 
-/// MI-GAN によるタイル分割 inpainting。
-/// マスク領域を 512×512 タイルでカバーし、オーバーラップ線形ブレンドで結合する。
+/// MI-GAN による段階的タイル inpainting。
+///
+/// 実在する既知画素に近い領域から 48px ずつ内側へ確定する。各段では
+/// 「まだ埋めていない全領域」をモデル入力上の hole として隠し、「現在の帯」だけを
+/// 出力へ採用する。前段の生成結果は、次段で初めて既知画素として利用される。
 fn inpaint_migan(
     runtime: &crate::ai::runtime::AiRuntime,
     original: &egui::ColorImage,
@@ -3142,11 +3150,102 @@ fn inpaint_migan(
 ) -> Result<egui::ColorImage, crate::ai::AiError> {
     use std::sync::atomic::Ordering;
 
+    if w == 0 || h == 0 || mask.len() < w.saturating_mul(h) {
+        return Err(crate::ai::AiError::ImageProcessing(
+            "Invalid MI-GAN image or mask dimensions".to_string(),
+        ));
+    }
+    if !mask.iter().any(|masked| *masked) {
+        return Err(crate::ai::AiError::ImageProcessing(
+            "No masked pixels".to_string(),
+        ));
+    }
+
+    let (distance, max_distance) = inpaint_distance_from_known(mask, w, h);
+    let finite_passes = if max_distance == 0 {
+        0
+    } else {
+        max_distance.div_ceil(INPAINT_STAGE_DEPTH) as usize
+    };
+    let pass_count = finite_passes.max(1);
+    crate::logger::log(format!(
+        "[erase] MI-GAN staged: max-known-depth={max_distance}px, passes={pass_count}, band={INPAINT_STAGE_DEPTH}px"
+    ));
+
+    let mut working = original.clone();
+    let mut remaining = mask.to_vec();
+    for pass_index in 0..finite_passes {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(crate::ai::AiError::Cancelled);
+        }
+        let upper = ((pass_index as u32 + 1) * INPAINT_STAGE_DEPTH).min(max_distance);
+        let commit: Vec<bool> = remaining
+            .iter()
+            .zip(distance.iter())
+            .map(|(&pending, &depth)| pending && depth != u32::MAX && depth <= upper)
+            .collect();
+        if !commit.iter().any(|selected| *selected) {
+            continue;
+        }
+        working = inpaint_migan_single_pass(
+            runtime,
+            &working,
+            &remaining,
+            &commit,
+            w,
+            h,
+            cancel,
+            pass_index + 1,
+            pass_count,
+        )?;
+        remaining
+            .iter_mut()
+            .zip(commit.iter())
+            .for_each(|(pending, selected)| {
+                if *selected {
+                    *pending = false;
+                }
+            });
+    }
+
+    if remaining.iter().any(|pending| *pending) {
+        // 全面マスク等、実在する既知画素へ到達できない成分は従来相当の 1 pass に倒す。
+        working = inpaint_migan_single_pass(
+            runtime,
+            &working,
+            &remaining,
+            &remaining,
+            w,
+            h,
+            cancel,
+            finite_passes + 1,
+            finite_passes + 1,
+        )?;
+    }
+    Ok(working)
+}
+
+/// MI-GAN の 1 段を実行する。
+/// `input_mask` は未修復領域全体、`commit_mask` は今回確定する帯だけを表す。
+#[allow(clippy::too_many_arguments)]
+fn inpaint_migan_single_pass(
+    runtime: &crate::ai::runtime::AiRuntime,
+    original: &egui::ColorImage,
+    input_mask: &[bool],
+    commit_mask: &[bool],
+    w: usize,
+    h: usize,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    pass_index: usize,
+    pass_count: usize,
+) -> Result<egui::ColorImage, crate::ai::AiError> {
+    use std::sync::atomic::Ordering;
+
     // マスクのバウンディングボックス
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0usize, 0usize);
     for py in 0..h {
         for px in 0..w {
-            if mask[py * w + px] {
+            if commit_mask[py * w + px] {
                 min_x = min_x.min(px);
                 min_y = min_y.min(py);
                 max_x = max_x.max(px + 1);
@@ -3160,12 +3259,10 @@ fn inpaint_migan(
         ));
     }
 
-    // マスク周囲にコンテキストパディングを追加（タイルが周辺情報を得るため）
-    let ctx_pad = MIGAN_SIZE / 4; // 128px
-    let region_x0 = min_x.saturating_sub(ctx_pad);
-    let region_y0 = min_y.saturating_sub(ctx_pad);
-    let region_x1 = (max_x + ctx_pad).min(w);
-    let region_y1 = (max_y + ctx_pad).min(h);
+    // 512px より小さい切り出しを縦横別倍率で引き伸ばすと形状とコンテキストが
+    // 歪む。画像が 512px 以上なら必ず原寸 512px 以上の領域へ広げる。
+    let (region_x0, region_x1) = fit_inpaint_region_axis(min_x, max_x, w);
+    let (region_y0, region_y1) = fit_inpaint_region_axis(min_y, max_y, h);
     let region_w = region_x1 - region_x0;
     let region_h = region_y1 - region_y0;
 
@@ -3173,7 +3270,7 @@ fn inpaint_migan(
     let tiles = compute_inpaint_tiles(region_w, region_h, MIGAN_SIZE, TILE_OVERLAP);
 
     crate::logger::log(format!(
-        "[erase] MI-GAN tiled: region ({region_x0},{region_y0})-({region_x1},{region_y1}) = {region_w}x{region_h}, {} tiles",
+        "[erase] MI-GAN pass {pass_index}/{pass_count}: region ({region_x0},{region_y0})-({region_x1},{region_y1}) = {region_w}x{region_h}, {} tiles",
         tiles.len()
     ));
 
@@ -3183,21 +3280,6 @@ fn inpaint_migan(
     let mut accum_g = vec![0.0f32; rpixels];
     let mut accum_b = vec![0.0f32; rpixels];
     let mut accum_w = vec![0.0f32; rpixels];
-
-    // マスクされていない領域は元画像の値を初期化
-    for ry in 0..region_h {
-        for rx in 0..region_w {
-            let src_idx = (region_y0 + ry) * w + (region_x0 + rx);
-            if !mask[src_idx] {
-                let c = original.pixels[src_idx];
-                let ri = ry * region_w + rx;
-                accum_r[ri] = c.r() as f32;
-                accum_g[ri] = c.g() as f32;
-                accum_b[ri] = c.b() as f32;
-                accum_w[ri] = 1.0;
-            }
-        }
-    }
 
     for (ti, tile) in tiles.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -3209,42 +3291,17 @@ fn inpaint_migan(
             (tile.x..tile.x + tile.w).any(|tx| {
                 let gx = region_x0 + tx;
                 let gy = region_y0 + ty;
-                gx < w && gy < h && mask[gy * w + gx]
+                gx < w && gy < h && commit_mask[gy * w + gx]
             })
         });
         if !has_mask {
             continue;
         }
 
-        // タイル領域を切り出して 512×512 入力テンソルを構築
+        // 原寸 1:1 で 512×512 tensor へ配置する。512px 未満の画像だけは中央へ
+        // letterbox し、余白を hole として扱う。マスク RGB は必ず 0 になる。
         let s = MIGAN_SIZE;
-        let mut input_nchw = ndarray::Array4::<f32>::zeros((1, 4, s, s));
-
-        for iy in 0..s {
-            for ix in 0..s {
-                // タイル座標 → region 座標 → 画像座標 (浮動小数点で精密マッピング)
-                let rx = tile.x + (ix as f32 * tile.w as f32 / s as f32) as usize;
-                let ry = tile.y + (iy as f32 * tile.h as f32 / s as f32) as usize;
-                let gx = region_x0 + rx;
-                let gy = region_y0 + ry;
-
-                if gx < w && gy < h {
-                    let src_idx = gy * w + gx;
-                    let is_masked = mask[src_idx];
-                    let m = if is_masked { 0.0f32 } else { 1.0f32 };
-                    let c = original.pixels[src_idx];
-                    let r = c.r() as f32 / 255.0 * 2.0 - 1.0;
-                    let g = c.g() as f32 / 255.0 * 2.0 - 1.0;
-                    let b = c.b() as f32 / 255.0 * 2.0 - 1.0;
-                    input_nchw[[0, 0, iy, ix]] = m - 0.5;
-                    input_nchw[[0, 1, iy, ix]] = r * m;
-                    input_nchw[[0, 2, iy, ix]] = g * m;
-                    input_nchw[[0, 3, iy, ix]] = b * m;
-                } else {
-                    input_nchw[[0, 0, iy, ix]] = -0.5; // masked
-                }
-            }
-        }
+        let input_nchw = build_migan_input(original, input_mask, w, h, region_x0, region_y0, *tile);
 
         let input_tensor = ort::value::Tensor::from_array(input_nchw)
             .map_err(|e| crate::ai::AiError::Ort(format!("Input tensor: {e}")))?;
@@ -3284,11 +3341,10 @@ fn inpaint_migan(
         let is_last_y = tile.y + tile.h >= region_h;
         let ramp = TILE_OVERLAP as f32;
 
-        for iy in 0..s {
-            for ix in 0..s {
-                // 512 座標 → タイル内座標 → region 座標 (浮動小数点で精密マッピング)
-                let tx = (ix as f32 * tile.w as f32 / s as f32) as usize;
-                let ty = (iy as f32 * tile.h as f32 / s as f32) as usize;
+        let canvas_x = (s - tile.w) / 2;
+        let canvas_y = (s - tile.h) / 2;
+        for ty in 0..tile.h {
+            for tx in 0..tile.w {
                 let rx = tile.x + tx;
                 let ry = tile.y + ty;
                 if rx >= region_w || ry >= region_h {
@@ -3302,7 +3358,7 @@ fn inpaint_migan(
                 }
 
                 // マスクされたピクセルのみ inpaint 結果を使用
-                if !mask[gy * w + gx] {
+                if !commit_mask[gy * w + gx] {
                     continue;
                 }
 
@@ -3324,7 +3380,7 @@ fn inpaint_migan(
                 let weight = wx * wy;
 
                 let ri = ry * region_w + rx;
-                let si = (iy * s + ix) * 3;
+                let si = ((canvas_y + ty) * s + canvas_x + tx) * 3;
                 accum_r[ri] += tile_rgb[si] * weight;
                 accum_g[ri] += tile_rgb[si + 1] * weight;
                 accum_b[ri] += tile_rgb[si + 2] * weight;
@@ -3332,10 +3388,16 @@ fn inpaint_migan(
             }
         }
 
-        crate::logger::log(format!("[erase] MI-GAN tile {}/{}", ti + 1, tiles.len()));
+        crate::logger::log(format!(
+            "[erase] MI-GAN pass {pass_index}/{pass_count} tile {}/{}",
+            ti + 1,
+            tiles.len()
+        ));
     }
 
-    crate::logger::log("[erase] MI-GAN tiled inference done, compositing...".to_string());
+    crate::logger::log(format!(
+        "[erase] MI-GAN pass {pass_index}/{pass_count} done, compositing..."
+    ));
 
     // 元画像にマスク部分のみ累積結果を合成
     let mut pixels = original.pixels.clone();
@@ -3347,12 +3409,15 @@ fn inpaint_migan(
                 continue;
             }
             let src_idx = gy * w + gx;
-            if !mask[src_idx] {
+            if !commit_mask[src_idx] {
                 continue;
             }
 
             let ri = ry * region_w + rx;
-            let wt = accum_w[ri].max(1e-6);
+            let wt = accum_w[ri];
+            if wt <= f32::EPSILON {
+                continue;
+            }
             let r = (accum_r[ri] / wt).clamp(0.0, 255.0) as u8;
             let g = (accum_g[ri] / wt).clamp(0.0, 255.0) as u8;
             let b = (accum_b[ri] / wt).clamp(0.0, 255.0) as u8;
@@ -3365,6 +3430,132 @@ fn inpaint_migan(
     }
 
     Ok(egui::ColorImage::new([w, h], pixels))
+}
+
+/// mask bbox + context を画像内へ収め、可能なら少なくとも 512px の原寸領域にする。
+fn fit_inpaint_region_axis(min: usize, max: usize, image_len: usize) -> (usize, usize) {
+    if image_len == 0 {
+        return (0, 0);
+    }
+    let mut start = min.saturating_sub(INPAINT_CONTEXT_PAD);
+    let mut end = max.saturating_add(INPAINT_CONTEXT_PAD).min(image_len);
+    let target = MIGAN_SIZE.min(image_len);
+    if end.saturating_sub(start) < target {
+        let mut missing = target - (end - start);
+        let before = (missing / 2).min(start);
+        start -= before;
+        missing -= before;
+        let after = missing.min(image_len - end);
+        end += after;
+        missing -= after;
+        let before = missing.min(start);
+        start -= before;
+    }
+    (start, end)
+}
+
+/// 実在する非マスク画素からの 4-neighbor 距離。
+///
+/// 画像外周は既知画素ではない。上端/右端等に接したマスクを外周から埋め始めると、
+/// コンテキストが存在しない側の生成を先に確定してしまうためである。
+fn inpaint_distance_from_known(mask: &[bool], w: usize, h: usize) -> (Vec<u32>, u32) {
+    let len = w.saturating_mul(h);
+    let mut distance = vec![u32::MAX; len];
+    let mut queue = VecDeque::new();
+    for y in 0..h {
+        for x in 0..w {
+            let index = y * w + x;
+            if !mask.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let adjacent_known = inpaint_neighbors(x, y, w, h)
+                .any(|neighbor| !mask.get(neighbor).copied().unwrap_or(false));
+            if adjacent_known {
+                distance[index] = 1;
+                queue.push_back(index);
+            }
+        }
+    }
+    let mut max_distance = 0;
+    while let Some(index) = queue.pop_front() {
+        let current = distance[index];
+        max_distance = max_distance.max(current);
+        let x = index % w;
+        let y = index / w;
+        for neighbor in inpaint_neighbors(x, y, w, h) {
+            if mask[neighbor] && distance[neighbor] == u32::MAX {
+                distance[neighbor] = current.saturating_add(1);
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    (distance, max_distance)
+}
+
+fn inpaint_neighbors(x: usize, y: usize, w: usize, h: usize) -> impl Iterator<Item = usize> {
+    let mut neighbors = [usize::MAX; 4];
+    let mut count = 0;
+    if x > 0 {
+        neighbors[count] = y * w + x - 1;
+        count += 1;
+    }
+    if x + 1 < w {
+        neighbors[count] = y * w + x + 1;
+        count += 1;
+    }
+    if y > 0 {
+        neighbors[count] = (y - 1) * w + x;
+        count += 1;
+    }
+    if y + 1 < h {
+        neighbors[count] = (y + 1) * w + x;
+        count += 1;
+    }
+    neighbors.into_iter().take(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_migan_input(
+    original: &egui::ColorImage,
+    input_mask: &[bool],
+    w: usize,
+    h: usize,
+    region_x0: usize,
+    region_y0: usize,
+    tile: TileRect,
+) -> ndarray::Array4<f32> {
+    let s = MIGAN_SIZE;
+    let mut input = ndarray::Array4::<f32>::zeros((1, 4, s, s));
+    for iy in 0..s {
+        for ix in 0..s {
+            input[[0, 0, iy, ix]] = -0.5;
+        }
+    }
+    let canvas_x = (s - tile.w) / 2;
+    let canvas_y = (s - tile.h) / 2;
+    for ty in 0..tile.h {
+        for tx in 0..tile.w {
+            let gx = region_x0 + tile.x + tx;
+            let gy = region_y0 + tile.y + ty;
+            if gx >= w || gy >= h {
+                continue;
+            }
+            let source = gy * w + gx;
+            let m = if input_mask.get(source).copied().unwrap_or(true) {
+                0.0
+            } else {
+                1.0
+            };
+            let color = original.pixels[source];
+            let iy = canvas_y + ty;
+            let ix = canvas_x + tx;
+            input[[0, 0, iy, ix]] = m - 0.5;
+            input[[0, 1, iy, ix]] = (color.r() as f32 / 255.0 * 2.0 - 1.0) * m;
+            input[[0, 2, iy, ix]] = (color.g() as f32 / 255.0 * 2.0 - 1.0) * m;
+            input[[0, 3, iy, ix]] = (color.b() as f32 / 255.0 * 2.0 - 1.0) * m;
+        }
+    }
+    input
 }
 
 /// マスク領域をカバーするタイル分割を計算する。
@@ -3420,6 +3611,7 @@ fn compute_inpaint_tiles(
     tiles
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TileRect {
     x: usize,
     y: usize,
@@ -3659,6 +3851,96 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 #[cfg(test)]
 mod book_erase_tests {
     use super::*;
+
+    #[test]
+    fn inpaint_region_expands_top_and_right_edge_masks_to_native_512_square() {
+        // 時計例: bbox x=33..282, y=0..188。旧実装は 410x316 を 512x512 へ歪めた。
+        assert_eq!(fit_inpaint_region_axis(33, 282, 896), (0, 512));
+        assert_eq!(fit_inpaint_region_axis(0, 188, 1152), (0, 512));
+
+        // 右下例: bbox x=693..896。右へ広げられない分を左へ寄せて原寸を保つ。
+        assert_eq!(fit_inpaint_region_axis(693, 896, 896), (384, 896));
+        assert_eq!(fit_inpaint_region_axis(794, 1060, 1152), (640, 1152));
+    }
+
+    #[test]
+    fn inpaint_distance_does_not_treat_image_edge_as_known_context() {
+        let (w, h) = (7, 6);
+        let mut mask = vec![false; w * h];
+        // 上端に接する 5x5 hole。上端中央は左右/下の実在背景まで 3px。
+        for y in 0..5 {
+            for x in 1..6 {
+                mask[y * w + x] = true;
+            }
+        }
+        let (distance, max_distance) = inpaint_distance_from_known(&mask, w, h);
+        assert_eq!(distance[3], 3);
+        assert_eq!(max_distance, 3);
+    }
+
+    #[test]
+    fn inpaint_distance_splits_deep_hole_into_multiple_48px_stages() {
+        let (w, h) = (132, 132);
+        let mut mask = vec![false; w * h];
+        for y in 1..131 {
+            for x in 1..131 {
+                mask[y * w + x] = true;
+            }
+        }
+        let (distance, max_distance) = inpaint_distance_from_known(&mask, w, h);
+        assert_eq!(max_distance, 65);
+        assert_eq!(max_distance.div_ceil(INPAINT_STAGE_DEPTH), 2);
+
+        let first = mask
+            .iter()
+            .zip(distance.iter())
+            .filter(|(masked, depth)| **masked && **depth <= INPAINT_STAGE_DEPTH)
+            .count();
+        let second = mask
+            .iter()
+            .zip(distance.iter())
+            .filter(|(masked, depth)| **masked && **depth > INPAINT_STAGE_DEPTH)
+            .count();
+        assert!(first > 0);
+        assert!(second > 0);
+        assert_eq!(
+            first + second,
+            mask.iter().filter(|masked| **masked).count()
+        );
+    }
+
+    #[test]
+    fn migan_input_zeroes_masked_rgb_and_letterboxes_without_rescaling() {
+        let image = egui::ColorImage::new([2, 1], vec![egui::Color32::RED, egui::Color32::GREEN]);
+        let input = build_migan_input(
+            &image,
+            &[true, false],
+            2,
+            1,
+            0,
+            0,
+            TileRect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+        );
+        let x0 = (MIGAN_SIZE - 2) / 2;
+        let y0 = (MIGAN_SIZE - 1) / 2;
+        assert_eq!(input[[0, 0, y0, x0]], -0.5);
+        assert_eq!(input[[0, 1, y0, x0]], 0.0);
+        assert_eq!(input[[0, 2, y0, x0]], 0.0);
+        assert_eq!(input[[0, 3, y0, x0]], 0.0);
+
+        assert_eq!(input[[0, 0, y0, x0 + 1]], 0.5);
+        assert_eq!(input[[0, 1, y0, x0 + 1]], -1.0);
+        assert_eq!(input[[0, 2, y0, x0 + 1]], 1.0);
+        assert_eq!(input[[0, 3, y0, x0 + 1]], -1.0);
+        // letterbox の余白は hole 扱いで、画像を引き伸ばして埋めない。
+        assert_eq!(input[[0, 0, 0, 0]], -0.5);
+        assert_eq!(input[[0, 1, 0, 0]], 0.0);
+    }
 
     #[test]
     fn saved_mask_without_runtime_uses_deterministic_diffusion_fallback() {
