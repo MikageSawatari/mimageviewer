@@ -13,6 +13,10 @@ use crate::zip_loader::{ZipEnumeration, ZipImageEntry};
 
 const MAX_DIRECT_ENTRY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DECISION_CACHE_CAPACITY: usize = 32;
+// Volume resolution entries contain only two paths and a small enum. Keep more of them than the
+// full inspection cache so folder navigation and thumbnail workers can reuse probes across a
+// moderately large archive folder without retaining archive contents or handles.
+const VOLUME_RESOLUTION_CACHE_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RarDirectReadDecision {
@@ -57,7 +61,19 @@ struct DecisionCacheKey {
     mtime: Option<std::time::SystemTime>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RarVolumeResolution {
+    resolved_path: PathBuf,
+    volume_kind: RarVolumeKind,
+}
+
 static DECISION_CACHE: LazyLock<Mutex<Vec<(DecisionCacheKey, RarInspection)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static VOLUME_RESOLUTION_CACHE: LazyLock<Mutex<Vec<(DecisionCacheKey, RarVolumeResolution)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+static VOLUME_RESOLUTION_PROBE_COUNTS: LazyLock<Mutex<Vec<(PathBuf, usize)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub fn is_rar_path(path: &Path) -> bool {
@@ -73,6 +89,39 @@ fn cache_key(path: &Path) -> io::Result<DecisionCacheKey> {
         len: meta.len(),
         mtime: meta.modified().ok(),
     })
+}
+
+fn cached_volume_resolution(key: &DecisionCacheKey) -> Option<RarVolumeResolution> {
+    let cache = VOLUME_RESOLUTION_CACHE.lock().ok()?;
+    cache
+        .iter()
+        .rev()
+        .find(|(cached, _)| cached == key)
+        .map(|(_, resolution)| resolution.clone())
+}
+
+fn remember_volume_resolution(key: &DecisionCacheKey, resolution: RarVolumeResolution) {
+    let Ok(mut cache) = VOLUME_RESOLUTION_CACHE.lock() else {
+        return;
+    };
+    // A changed `(len, mtime)` for the same path supersedes the previous identity.
+    cache.retain(|(cached, _)| cached.path != key.path);
+    if cache.len() >= VOLUME_RESOLUTION_CACHE_CAPACITY {
+        cache.remove(0);
+    }
+    cache.push((key.clone(), resolution));
+}
+
+#[cfg(test)]
+fn record_volume_resolution_probe(path: &Path) {
+    let Ok(mut counts) = VOLUME_RESOLUTION_PROBE_COUNTS.lock() else {
+        return;
+    };
+    if let Some((_, count)) = counts.iter_mut().find(|(cached, _)| cached == path) {
+        *count += 1;
+    } else {
+        counts.push((path.to_path_buf(), 1));
+    }
 }
 
 fn normalized_entry_name(path: &Path) -> String {
@@ -111,6 +160,51 @@ pub(crate) fn classify_direct_read(
     }
 }
 
+fn open_listing_from_volume_with_key(
+    path: &Path,
+    key: Option<&DecisionCacheKey>,
+) -> io::Result<(
+    unrar::OpenArchive<unrar::List, unrar::CursorBeforeHeader>,
+    RarVolumeKind,
+    PathBuf,
+)> {
+    if let Some(resolution) = key.and_then(cached_volume_resolution) {
+        let opened = unrar::Archive::new(&resolution.resolved_path)
+            .open_for_listing()
+            .map_err(unrar_io)?;
+        return Ok((opened, resolution.volume_kind, resolution.resolved_path));
+    }
+
+    #[cfg(test)]
+    record_volume_resolution_probe(path);
+    let archive = unrar::Archive::new(path);
+    let first_part = archive.first_part();
+    let opened = archive.open_for_listing().map_err(unrar_io)?;
+    let volume_kind = RarVolumeKind::from(opened.volume_info());
+    let resolved_path = if volume_kind == RarVolumeKind::Subsequent {
+        first_part
+    } else {
+        path.to_path_buf()
+    };
+    if let Some(key) = key {
+        remember_volume_resolution(
+            key,
+            RarVolumeResolution {
+                resolved_path: resolved_path.clone(),
+                volume_kind,
+            },
+        );
+    }
+    if volume_kind != RarVolumeKind::Subsequent {
+        return Ok((opened, volume_kind, resolved_path));
+    }
+    drop(opened);
+    let opened = unrar::Archive::new(&resolved_path)
+        .open_for_listing()
+        .map_err(unrar_io)?;
+    Ok((opened, volume_kind, resolved_path))
+}
+
 fn open_listing_from_volume(
     path: &Path,
 ) -> io::Result<(
@@ -118,21 +212,18 @@ fn open_listing_from_volume(
     RarVolumeKind,
     PathBuf,
 )> {
-    let archive = unrar::Archive::new(path);
-    let first_part = archive.first_part();
-    let opened = archive.open_for_listing().map_err(unrar_io)?;
-    let volume_kind = RarVolumeKind::from(opened.volume_info());
-    if volume_kind != RarVolumeKind::Subsequent {
-        return Ok((opened, volume_kind, path.to_path_buf()));
-    }
-    drop(opened);
-    let opened = unrar::Archive::new(&first_part)
-        .open_for_listing()
-        .map_err(unrar_io)?;
-    Ok((opened, volume_kind, first_part))
+    let key = cache_key(path).ok();
+    open_listing_from_volume_with_key(path, key.as_ref())
 }
 
 fn resolved_volume_path(path: &Path) -> io::Result<(PathBuf, RarVolumeKind)> {
+    let key = cache_key(path).ok();
+    if let Some(resolution) = key.as_ref().and_then(cached_volume_resolution) {
+        return Ok((resolution.resolved_path, resolution.volume_kind));
+    }
+
+    #[cfg(test)]
+    record_volume_resolution_probe(path);
     let archive = unrar::Archive::new(path);
     let first_part = archive.first_part();
     let opened = archive.open_for_listing().map_err(unrar_io)?;
@@ -143,6 +234,15 @@ fn resolved_volume_path(path: &Path) -> io::Result<(PathBuf, RarVolumeKind)> {
     } else {
         path.to_path_buf()
     };
+    if let Some(key) = key.as_ref() {
+        remember_volume_resolution(
+            key,
+            RarVolumeResolution {
+                resolved_path: resolved.clone(),
+                volume_kind,
+            },
+        );
+    }
     Ok((resolved, volume_kind))
 }
 
@@ -160,7 +260,8 @@ pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
     {
         return Ok(inspection.clone());
     }
-    let (mut archive, volume_kind, resolved_path) = open_listing_from_volume(path)?;
+    let (mut archive, volume_kind, resolved_path) =
+        open_listing_from_volume_with_key(path, Some(&key))?;
     let is_solid = archive.is_solid();
     let mut has_encrypted = archive.has_encrypted_headers();
     let mut image_count = 0u32;
@@ -383,6 +484,37 @@ mod tests {
             let bytes = read_entry_bytes(&path, &entries.entries[0].entry_name).unwrap();
             assert!(!bytes.is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn volume_resolution_probe_is_reused_by_listing_read_and_dfs_checks() {
+        // Use a unique path so this assertion is independent of the process-wide caches and of
+        // other RAR tests running in parallel. The filename deliberately looks like a later
+        // volume while the header says this is a standalone archive.
+        let source = multipart_filename_fixture_root().join("○×△□ Vol.2.rar");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-cache Vol.2.rar");
+        std::fs::copy(source, &path).unwrap();
+
+        let inspection = inspect_for_direct_read(&path).unwrap();
+        assert_eq!(inspection.volume_kind, RarVolumeKind::Single);
+
+        let entries = enumerate_image_entries_detailed(&path).unwrap();
+        assert_eq!(entries.entries.len(), 1);
+        let bytes = read_entry_bytes(&path, &entries.entries[0].entry_name).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(!is_subsequent_volume(&path).unwrap());
+
+        let probe_count = VOLUME_RESOLUTION_PROBE_COUNTS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(probed, _)| probed == &path)
+            .map_or(0, |(_, count)| *count);
+        assert_eq!(
+            probe_count, 1,
+            "inspection, entry reads, and DFS checks must share one volume-header probe"
+        );
     }
 
     #[test]
