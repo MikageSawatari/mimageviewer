@@ -79,7 +79,8 @@ resync (`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`) と同じ「surface 復帰まで
 ```
 1. 編集済みページでは `edit_preview_cache.db` の対応表を先に確認
    ├─ ヒット (skip_cache=false): 最大辺 2048px の edit-result 下地 WebP (q=90) と
-   │   注釈レイヤー WebP (lossless) → 下地＋注釈の ColorImage と表示時補正用の分離 payload
+   │   注釈レイヤー WebP (lossless) を同一寸法で display_px へ縮小 →
+   │   下地＋注釈の ColorImage と表示時補正用の分離 payload
    └─ ミス: 通常の catalog へ続行
 2. キャッシュ DB (catalog.db) に該当エントリがあるか確認
    ├─ ヒット (skip_cache=false): WebP バイト → ColorImage
@@ -103,6 +104,9 @@ crop を実切り出しする。最大辺 2048px の下地は WebP q=90、透明
 lossless WebP として分離保存する。保存先は `<data_dir>/edit_preview_cache/`、対応表と LRU は
 `<data_dir>/edit_preview_cache.db` に保持し、crop 後の縦横寸法を一覧のアスペクト比として使う。
 元画像と各編集 DB は変更しない。
+読み込み worker は保存サイズを品質原本として残したまま、現在の `display_px` へ下地と
+全注釈レイヤーを Lanczos3 で同一寸法へ縮小してから合成する。UI / GPU には表示寸法の
+画像だけを渡し、ページ数ベースの eviction と VRAM 上限見積もりを実際のテクスチャ寸法と一致させる。
 
 注釈済みの `final_composite_cache` は流用しない。そこには色調補正・final AI・スマートシャープ・
 ポストフィルタまで含まれるため、scene / font / stamp cache を worker へ snapshot し、

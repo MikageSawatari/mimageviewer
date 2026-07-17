@@ -224,13 +224,15 @@ impl EditPreviewCacheDb {
         })
     }
 
-    /// mtime + size が一致する WebP を返す。不一致・欠損・破損行はその場で掃除する。
-    /// サムネイル worker からだけ呼ばれるため、ファイル読み込みで UI はブロックしない。
+    /// mtime + size が一致する WebP を `display_px` へ縮小して返す。
+    /// 不一致・欠損・破損行はその場で掃除する。サムネイル worker からだけ
+    /// 呼ばれるため、ファイル読み込みと Lanczos3 縮小で UI はブロックしない。
     pub fn load(
         &self,
         item_key: &str,
         source_mtime: i64,
         source_size: i64,
+        display_px: u32,
     ) -> Option<EditPreviewData> {
         let row: Option<(i64, i64, i64, i64, String, String, i64)> = {
             let conn = self.conn.lock().ok()?;
@@ -331,13 +333,16 @@ impl EditPreviewCacheDb {
             );
             None
         })?;
+        let cached_preview_size = adjustment_base.size;
+        let display_dims = fit_output_dims(cached_preview_size, display_px)?;
+        let adjustment_base = resize_color_image_to_dims(adjustment_base, display_dims)?;
         let mut annotation_layers = Vec::with_capacity(records.len());
         for record in &records {
             let layer = std::fs::read(&record.path)
                 .ok()
                 .filter(|bytes| !bytes.is_empty())
                 .and_then(|bytes| crate::catalog::decode_thumb_to_color_image(&bytes));
-            let Some(image) = layer.filter(|image| image.size == adjustment_base.size) else {
+            let Some(image) = layer.filter(|image| image.size == cached_preview_size) else {
                 self.delete_if_row_matches(
                     item_key,
                     stored_mtime,
@@ -348,6 +353,7 @@ impl EditPreviewCacheDb {
                 );
                 return None;
             };
+            let image = resize_color_image_to_dims(image, display_dims)?;
             annotation_layers.push(CachedAnnotationLayer {
                 blend: record.blend,
                 image,
@@ -766,21 +772,25 @@ fn prepare_preview_components(
     Some((prepared, layers))
 }
 
-fn preview_output_dims([width, height]: [usize; 2]) -> Option<(u32, u32)> {
+fn fit_output_dims([width, height]: [usize; 2], max_side: u32) -> Option<(u32, u32)> {
     if width == 0 || height == 0 {
         return None;
     }
     let width = width as u32;
     let height = height as u32;
-    if width <= PREVIEW_LONG_SIDE && height <= PREVIEW_LONG_SIDE {
+    let max_side = max_side.max(1);
+    if width <= max_side && height <= max_side {
         return Some((width, height));
     }
-    let scale =
-        (PREVIEW_LONG_SIDE as f64 / width as f64).min(PREVIEW_LONG_SIDE as f64 / height as f64);
+    let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
     Some((
         ((width as f64 * scale).round() as u32).max(1),
         ((height as f64 * scale).round() as u32).max(1),
     ))
+}
+
+fn preview_output_dims(size: [usize; 2]) -> Option<(u32, u32)> {
+    fit_output_dims(size, PREVIEW_LONG_SIDE)
 }
 
 fn color_image_to_rgba(pixels: &egui::ColorImage) -> Option<image::RgbaImage> {
@@ -793,6 +803,26 @@ fn color_image_to_rgba(pixels: &egui::ColorImage) -> Option<image::RgbaImage> {
         rgba.extend_from_slice(&pixel.to_srgba_unmultiplied());
     }
     image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+}
+
+fn resize_color_image_to_dims(
+    pixels: egui::ColorImage,
+    output_dims: (u32, u32),
+) -> Option<egui::ColorImage> {
+    if pixels.size == [output_dims.0 as usize, output_dims.1 as usize] {
+        return Some(pixels);
+    }
+    let rgba = color_image_to_rgba(&pixels)?;
+    let resized = crate::fast_resize::resize_rgba8_exact(
+        &rgba,
+        output_dims.0,
+        output_dims.1,
+        crate::fast_resize::Quality::Lanczos3,
+    );
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [resized.width() as usize, resized.height() as usize],
+        resized.as_raw(),
+    ))
 }
 
 fn encode_preview_exact(
@@ -1009,10 +1039,10 @@ mod tests {
         db.save_encoded("page-a", 10, 20, (8, 4), &webp, &[])
             .unwrap();
 
-        let hit = db.load("page-a", 10, 20).unwrap();
+        let hit = db.load("page-a", 10, 20, 2048).unwrap();
         assert_eq!(hit.source_dims, (8, 4));
         assert_eq!(hit.image.size, [8, 4]);
-        assert!(db.load("page-a", 11, 20).is_none());
+        assert!(db.load("page-a", 11, 20, 2048).is_none());
         assert_eq!(db.total_bytes(), 0);
     }
 
@@ -1031,13 +1061,36 @@ mod tests {
         db.save_encoded("page-layers", 10, 20, (8, 4), &base_webp, &layers)
             .unwrap();
 
-        let hit = db.load("page-layers", 10, 20).unwrap();
+        let hit = db.load("page-layers", 10, 20, 2048).unwrap();
         assert_eq!(hit.adjustment_base.size, [8, 4]);
         assert_eq!(hit.annotation_layers.len(), 1);
         assert_eq!(
             hit.annotation_layers[0].blend,
             CachedAnnotationBlend::Normal
         );
+        assert_ne!(hit.image.pixels[0], hit.adjustment_base.pixels[0]);
+    }
+
+    #[test]
+    fn preview_load_downscales_base_and_layers_to_display_size() {
+        let (_temp, db) = test_db();
+        let base = egui::ColorImage::filled([80, 40], egui::Color32::from_rgb(20, 80, 140));
+        let annotation = CachedAnnotationLayer {
+            blend: CachedAnnotationBlend::Normal,
+            image: egui::ColorImage::filled(
+                [80, 40],
+                egui::Color32::from_rgba_unmultiplied(240, 120, 160, 128),
+            ),
+        };
+        let (base_webp, layers) = encode_preview_components(&base, &[annotation]).unwrap();
+        db.save_encoded("page-display", 10, 20, (80, 40), &base_webp, &layers)
+            .unwrap();
+
+        let hit = db.load("page-display", 10, 20, 24).unwrap();
+        assert_eq!(hit.source_dims, (80, 40));
+        assert_eq!(hit.adjustment_base.size, [24, 12]);
+        assert_eq!(hit.annotation_layers[0].image.size, [24, 12]);
+        assert_eq!(hit.image.size, [24, 12]);
         assert_ne!(hit.image.pixels[0], hit.adjustment_base.pixels[0]);
     }
 
@@ -1112,7 +1165,7 @@ mod tests {
             .unwrap();
         }
 
-        assert!(db.load("tampered", 1, 1).is_none());
+        assert!(db.load("tampered", 1, 1, 2048).is_none());
         assert!(external.exists());
         assert_eq!(db.total_bytes(), 0);
     }

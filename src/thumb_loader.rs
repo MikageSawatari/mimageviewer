@@ -908,11 +908,12 @@ pub fn process_load_request(
     let filename: &str = key_cow.as_ref();
 
     // 編集済みページは通常 catalog より先に、source 解像度 edit-result 由来の
-    // 永続プレビューを試す。これは最大辺 2048px / q=90 の完成済み派生画像なので、
-    // 後段の idle quality-upgrade で元画像に差し替えてはいけない。
+    // 永続プレビューを試す。ディスク上は最大辺 2048px / q=90 を保持し、ここで
+    // display_px へ縮小した完成済み派生画像を受け取る。後段の idle quality-upgrade で
+    // 元画像に差し替えてはいけない。
     if !req.skip_cache
         && let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db)
-        && let Some(preview) = db.load(item_key, req.mtime, req.file_size)
+        && let Some(preview) = db.load(item_key, req.mtime, req.file_size, display_px)
     {
         let _ = tx.send(ThumbMsg {
             idx: req.idx,
