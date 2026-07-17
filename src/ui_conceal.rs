@@ -1625,9 +1625,12 @@ impl App {
     /// 従来は `draw_conceal_overlay` の末尾でだけ preview 状態を更新していたため、短い
     /// クリックではパイプラインが設定変更後の世代を解決する前にボタンが離され得た。
     /// 前フレームの安定したボタン矩形を使って先に状態を確定し、描画順依存をなくす。
-    pub(crate) fn sync_conceal_preview_before_pipeline(&mut self, ctx: &egui::Context) {
-        let (pointer_pos, primary_down) =
-            ctx.input(|input| (input.pointer.interact_pos(), input.pointer.primary_down()));
+    pub(crate) fn sync_conceal_preview_before_pipeline(
+        &mut self,
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+    ) {
+        let (pointer_pos, primary_down) = conceal_preview_pointer_state(ctx, viewport_id);
         self.conceal_preview_active = conceal_preview_pointer_active(
             self.conceal_mode,
             self.conceal_preview_button_rect,
@@ -2719,9 +2722,18 @@ fn conceal_preview_pointer_active(
             .is_some_and(|(rect, pos)| rect.contains(pos))
 }
 
+fn conceal_preview_pointer_state(
+    ctx: &egui::Context,
+    viewport_id: egui::ViewportId,
+) -> (Option<egui::Pos2>, bool) {
+    ctx.input_for(viewport_id, |input| {
+        (input.pointer.interact_pos(), input.pointer.primary_down())
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::conceal_preview_pointer_active;
+    use super::{conceal_preview_pointer_active, conceal_preview_pointer_state};
 
     #[test]
     fn conceal_preview_pointer_state_is_available_before_panel_draw() {
@@ -2751,5 +2763,45 @@ mod tests {
             Some(egui::pos2(60.0, 35.0)),
             true,
         ));
+    }
+
+    #[test]
+    fn conceal_preview_reads_pointer_from_requested_viewport() {
+        let ctx = egui::Context::default();
+        let fullscreen_id = egui::ViewportId::from_hash_of("conceal-preview-fullscreen");
+        let pointer_pos = egui::pos2(25.0, 35.0);
+        let viewports = [
+            (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+            (fullscreen_id, egui::ViewportInfo::default()),
+        ]
+        .into_iter()
+        .collect();
+
+        ctx.begin_pass(egui::RawInput {
+            viewport_id: fullscreen_id,
+            viewports,
+            events: vec![
+                egui::Event::PointerMoved(pointer_pos),
+                egui::Event::PointerButton {
+                    pos: pointer_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        });
+        let _ = ctx.end_pass();
+
+        assert_eq!(
+            conceal_preview_pointer_state(&ctx, fullscreen_id),
+            (Some(pointer_pos), true),
+            "専用 fullscreen viewport の押下状態を読む"
+        );
+        assert_eq!(
+            conceal_preview_pointer_state(&ctx, egui::ViewportId::ROOT),
+            (None, false),
+            "メイン viewport の入力と混同しない"
+        );
     }
 }

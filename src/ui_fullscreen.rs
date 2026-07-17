@@ -6990,10 +6990,25 @@ impl App {
                 self.start_fs_load(partner);
             }
         }
+        // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
+        // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
+        // 済みなので、ここに来る fs_idx は常に非動画。
+        #[cfg(windows)]
+        let embedded = self.fullscreen_embedded_still_active();
+        #[cfg(not(windows))]
+        let embedded = false;
+
         // 隠蔽パネルは画像の後に描かれるため、パネル内で preview 状態を更新するだけでは
         // 当該フレームの processed texture 解決に間に合わない。前フレームで確定した
         // 目アイコン矩形と現在 pointer 状態から、必ずパイプライン解決前に同期する。
-        self.sync_conceal_preview_before_pipeline(ctx);
+        // `show_viewport_immediate` の子 viewport は独立した入力キューを持つため、
+        // 専用 fullscreen / detached では ROOT ではなく描画先の ViewportId を読む。
+        let preview_viewport_id = if embedded {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
         let state = self.prepare_fullscreen_state(ctx, fs_idx);
 
         let mut close_fs = false;
@@ -7011,13 +7026,6 @@ impl App {
         let prev_foreground_hwnd = self.fs_prev_foreground_hwnd;
 
         // ── ビューポート構築 ──
-        // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
-        // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
-        // 済みなので、ここに来る fs_idx は常に非動画。
-        #[cfg(windows)]
-        let embedded = self.fullscreen_embedded_still_active();
-        #[cfg(not(windows))]
-        let embedded = false;
         #[cfg(windows)]
         let detached = self.viewer_session_is_detached_or_switching();
         #[cfg(not(windows))]
