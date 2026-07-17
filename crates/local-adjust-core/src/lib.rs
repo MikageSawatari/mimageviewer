@@ -106,6 +106,12 @@ impl<'a> RgbaImageRef<'a> {
     }
 }
 
+/// A non-destructive local adjustment layer.
+///
+/// Serialization contract: fields that represent lengths in source-image pixels must end in
+/// `_px`, including fields in nested mask/effect parameter structs. Cross-canvas edit-bundle
+/// paste discovers and scales those fields by name; normalized coordinates and ratios must not
+/// use this suffix.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalAdjustmentLayer {
     pub name: String,

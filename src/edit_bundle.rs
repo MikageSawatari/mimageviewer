@@ -9,7 +9,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use comic_core::{AnnotationKind, AnnotationObject};
-use local_adjust_core::LocalAdjustmentLayer;
+use local_adjust_core::{LocalAdjustmentLayer, LocalEffect, LocalMask};
 use rusqlite::{Connection, params};
 
 use crate::adjustment::AdjustParams;
@@ -256,15 +256,139 @@ fn transform_local_adjust_layers(
     for layer in layers {
         // LocalEffect には多数の px 単位パラメータがある。永続 JSON の `_px` 命名を
         // schema contract として一括変換し、新しい effect 追加時の取りこぼしを防ぐ。
+        // ラスターマスクや LUT を Value の要素ツリーへ展開するとメモリを大量に
+        // 消費するため、`*_px` を持たない大規模 payload だけを一時退避する。
+        let mut layer = layer.clone();
+        let payloads = DetachedLocalAdjustPayloads::take_from(&mut layer);
         let mut value = serde_json::to_value(layer)
             .map_err(|e| format!("補正レイヤーのサイズ変換に失敗しました: {e}"))?;
         scale_pixel_fields(&mut value, length_scale, None);
         let mut layer: LocalAdjustmentLayer = serde_json::from_value(value)
             .map_err(|e| format!("補正レイヤーのサイズ変換に失敗しました: {e}"))?;
+        payloads.restore_into(&mut layer)?;
         layer.resize_masks_to(target_size[0], target_size[1]);
         transformed.push(layer);
     }
     Ok(transformed)
+}
+
+enum DetachedMaskPayload {
+    None,
+    Raster(Vec<f32>),
+    RasterVector(Vec<f32>),
+    Subject {
+        alpha: Vec<f32>,
+        source_alpha: Option<Vec<f32>>,
+    },
+    Segmentation(Vec<u32>),
+}
+
+struct DetachedLocalAdjustPayloads {
+    mask: DetachedMaskPayload,
+    manual_add_alpha: Option<Vec<f32>>,
+    manual_subtract_alpha: Option<Vec<f32>>,
+    cube_lut_table: Option<Vec<[f32; 3]>>,
+}
+
+impl DetachedLocalAdjustPayloads {
+    fn take_from(layer: &mut LocalAdjustmentLayer) -> Self {
+        let mask = match &mut layer.mask {
+            LocalMask::Raster(mask) => DetachedMaskPayload::Raster(std::mem::take(&mut mask.alpha)),
+            LocalMask::RasterVector(mask) => {
+                DetachedMaskPayload::RasterVector(std::mem::take(&mut mask.alpha))
+            }
+            LocalMask::Subject(mask) => DetachedMaskPayload::Subject {
+                alpha: std::mem::take(&mut mask.alpha),
+                source_alpha: std::mem::take(&mut mask.source_alpha),
+            },
+            LocalMask::Segmentation(mask) => {
+                DetachedMaskPayload::Segmentation(std::mem::take(&mut mask.labels))
+            }
+            LocalMask::Full
+            | LocalMask::LinearGradient(_)
+            | LocalMask::RadialGradient(_)
+            | LocalMask::LumaRange(_)
+            | LocalMask::ColorRange(_) => DetachedMaskPayload::None,
+        };
+        let manual_add_alpha = layer
+            .manual_override
+            .add
+            .as_mut()
+            .map(|mask| std::mem::take(&mut mask.alpha));
+        let manual_subtract_alpha = layer
+            .manual_override
+            .subtract
+            .as_mut()
+            .map(|mask| std::mem::take(&mut mask.alpha));
+        let cube_lut_table = match &mut layer.effect {
+            LocalEffect::CubeLut(params) => Some(std::mem::take(&mut params.table)),
+            _ => None,
+        };
+        Self {
+            mask,
+            manual_add_alpha,
+            manual_subtract_alpha,
+            cube_lut_table,
+        }
+    }
+
+    fn restore_into(self, layer: &mut LocalAdjustmentLayer) -> Result<(), String> {
+        let payload_mismatch =
+            || "補正レイヤーのサイズ変換中にデータ形式が変化しました".to_string();
+        match (self.mask, &mut layer.mask) {
+            (DetachedMaskPayload::None, _) => {}
+            (DetachedMaskPayload::Raster(alpha), LocalMask::Raster(mask)) => {
+                mask.alpha = alpha;
+            }
+            (DetachedMaskPayload::RasterVector(alpha), LocalMask::RasterVector(mask)) => {
+                mask.alpha = alpha;
+            }
+            (
+                DetachedMaskPayload::Subject {
+                    alpha,
+                    source_alpha,
+                },
+                LocalMask::Subject(mask),
+            ) => {
+                mask.alpha = alpha;
+                mask.source_alpha = source_alpha;
+            }
+            (DetachedMaskPayload::Segmentation(labels), LocalMask::Segmentation(mask)) => {
+                mask.labels = labels;
+            }
+            _ => return Err(payload_mismatch()),
+        }
+
+        restore_manual_mask_alpha(
+            &mut layer.manual_override.add,
+            self.manual_add_alpha,
+            &payload_mismatch,
+        )?;
+        restore_manual_mask_alpha(
+            &mut layer.manual_override.subtract,
+            self.manual_subtract_alpha,
+            &payload_mismatch,
+        )?;
+        match (self.cube_lut_table, &mut layer.effect) {
+            (Some(table), LocalEffect::CubeLut(params)) => params.table = table,
+            (None, _) => {}
+            _ => return Err(payload_mismatch()),
+        }
+        Ok(())
+    }
+}
+
+fn restore_manual_mask_alpha(
+    mask: &mut Option<local_adjust_core::RasterVectorMask>,
+    alpha: Option<Vec<f32>>,
+    payload_mismatch: &impl Fn() -> String,
+) -> Result<(), String> {
+    match (mask.as_mut(), alpha) {
+        (Some(mask), Some(alpha)) => mask.alpha = alpha,
+        (None, None) => {}
+        _ => return Err(payload_mismatch()),
+    }
+    Ok(())
 }
 
 fn scale_pixel_fields(value: &mut serde_json::Value, scale: f32, field_name: Option<&str>) {
@@ -616,6 +740,132 @@ mod tests {
         assert_eq!(value["offset_px"], -6);
         assert_eq!(value["radius_px"], 9);
         assert_eq!(value["opacity"], 0.5);
+    }
+
+    #[test]
+    fn transformed_local_adjust_restores_large_payloads_and_scales_metadata() {
+        let lut_table = vec![[0.1, 0.2, 0.3]; 8];
+        let subject = local_adjust_core::SubjectMask {
+            width: 2,
+            height: 2,
+            alpha: vec![0.0, 0.25, 0.75, 1.0],
+            source_alpha: Some(vec![1.0, 0.75, 0.25, 0.0]),
+            refinement: local_adjust_core::SubjectMaskRefinement {
+                enabled: true,
+                threshold: 0.5,
+                expand_px: 2,
+                feather_px: 3,
+            },
+        };
+        let mut layer = LocalAdjustmentLayer::new(
+            "subject + lut",
+            LocalMask::Subject(subject),
+            LocalEffect::CubeLut(local_adjust_core::CubeLutParams {
+                name: "test".to_string(),
+                size: 2,
+                domain_min: [0.0; 3],
+                domain_max: [1.0; 3],
+                table: lut_table.clone(),
+                strength: 1.0,
+            }),
+        );
+        layer.mask_expand_px = -2.0;
+        layer.mask_feather_px = 4.0;
+        layer.manual_override.add = Some(local_adjust_core::RasterVectorMask {
+            width: 2,
+            height: 2,
+            alpha: vec![0.0, 1.0, 0.0, 1.0],
+            shapes: vec![local_adjust_core::MaskShape::Line {
+                op: local_adjust_core::ShapeOp::Add,
+                kind: local_adjust_core::LineKind::Diagonal,
+                p0: [1.0, 1.0],
+                p1: [2.0, 2.0],
+                thickness: 2.0,
+            }],
+        });
+
+        let transformed = transform_local_adjust_layers(&[layer], [4, 6], 2.5).unwrap();
+        let layer = &transformed[0];
+        assert_eq!(layer.mask_expand_px, -5.0);
+        assert_eq!(layer.mask_feather_px, 10.0);
+        let LocalMask::Subject(mask) = &layer.mask else {
+            panic!("expected subject mask");
+        };
+        assert_eq!((mask.width, mask.height), (4, 6));
+        assert_eq!(mask.alpha.len(), 24);
+        assert_eq!(mask.source_alpha.as_ref().unwrap().len(), 24);
+        assert_eq!(mask.refinement.expand_px, 5);
+        assert_eq!(mask.refinement.feather_px, 8);
+
+        let manual = layer.manual_override.add.as_ref().unwrap();
+        assert_eq!((manual.width, manual.height), (4, 6));
+        assert_eq!(manual.alpha.len(), 24);
+        let local_adjust_core::MaskShape::Line {
+            p0, p1, thickness, ..
+        } = manual.shapes[0]
+        else {
+            panic!("expected line mask shape");
+        };
+        assert_eq!(p0, [2.0, 3.0]);
+        assert_eq!(p1, [4.0, 6.0]);
+        assert_eq!(thickness, 5.0);
+
+        let LocalEffect::CubeLut(params) = &layer.effect else {
+            panic!("expected cube LUT");
+        };
+        assert_eq!(params.table, lut_table);
+    }
+
+    #[test]
+    fn transformed_local_adjust_restores_all_raster_payload_variants() {
+        let layers = vec![
+            LocalAdjustmentLayer::new(
+                "raster",
+                LocalMask::Raster(local_adjust_core::RasterMask {
+                    width: 2,
+                    height: 2,
+                    alpha: vec![0.0, 0.25, 0.75, 1.0],
+                }),
+                LocalEffect::None,
+            ),
+            LocalAdjustmentLayer::new(
+                "raster vector",
+                LocalMask::RasterVector(local_adjust_core::RasterVectorMask {
+                    width: 2,
+                    height: 2,
+                    alpha: vec![0.0, 1.0, 1.0, 0.0],
+                    shapes: Vec::new(),
+                }),
+                LocalEffect::None,
+            ),
+            LocalAdjustmentLayer::new(
+                "segmentation",
+                LocalMask::Segmentation(local_adjust_core::RegionMask {
+                    width: 2,
+                    height: 2,
+                    labels: vec![0, 1, 1, 0],
+                    selected: vec![false, true],
+                }),
+                LocalEffect::None,
+            ),
+        ];
+
+        let transformed = transform_local_adjust_layers(&layers, [4, 4], 2.0).unwrap();
+        match &transformed[0].mask {
+            LocalMask::Raster(mask) => assert_eq!(mask.alpha.len(), 16),
+            _ => panic!("expected raster mask"),
+        }
+        match &transformed[1].mask {
+            LocalMask::RasterVector(mask) => assert_eq!(mask.alpha.len(), 16),
+            _ => panic!("expected raster-vector mask"),
+        }
+        match &transformed[2].mask {
+            LocalMask::Segmentation(mask) => {
+                assert_eq!(mask.labels.len(), 16);
+                assert_eq!(mask.selected, vec![false, true]);
+            }
+            _ => panic!("expected segmentation mask"),
+        }
     }
 
     #[test]

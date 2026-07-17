@@ -1037,6 +1037,11 @@ fn distribute_text_objects(
         .filter(|o| selected.contains(&o.id))
         .map(|o| (o.id, object_alignment_bounds(o, fonts)))
         .collect();
+    // UI は事前に selection を正規化するが、この関数単体でも欠番 ID や
+    // 重複 ID による unwrap / usize underflow を起こさないよう不変条件を閉じる。
+    if entries.len() < 3 {
+        return false;
+    }
     entries.sort_by(|a, b| {
         let av = match axis {
             TextDistributeAxis::Horizontal => a.1.center().x,
@@ -9616,6 +9621,25 @@ mod tests {
         assert_eq!(objects[0].pivot.0, 10.0);
         assert_eq!(objects[1].pivot.0, 50.0);
         assert_eq!(objects[2].pivot.0, 100.0);
+    }
+
+    #[test]
+    fn distribute_rejects_missing_or_duplicate_selection_ids() {
+        let original = vec![
+            stamp_object(1, (10.0, 20.0), 10.0, 5.0),
+            stamp_object(2, (40.0, 20.0), 5.0, 5.0),
+        ];
+        for selected_ids in [[99, 98, 97], [1, 1, 1], [1, 2, 99]] {
+            let mut objects = original.clone();
+            assert!(!distribute_text_objects(
+                &mut objects,
+                &selected_ids,
+                None,
+                TextDistributeAxis::Horizontal,
+                TextDistributeMode::Centers,
+            ));
+            assert_eq!(objects, original);
+        }
     }
 
     #[test]
