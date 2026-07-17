@@ -3515,7 +3515,8 @@ mod phase_c_folder_nav_history_tests {
                 is_video: false,
                 mtime: 1,
                 file_size: 10,
-            }],
+            }]
+            .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
         });
@@ -3530,6 +3531,7 @@ mod phase_c_folder_nav_history_tests {
             app.dispatch_synthetic_folder_history_target(&target),
             super::SyntheticFolderHistoryDispatch::Restored
         );
+        app.finish_subfolder_expansion_prepare_for_test();
         assert!(app.items_are_subfolder_expansion_view);
         assert_eq!(
             app.current_folder.as_ref(),
@@ -3645,7 +3647,8 @@ mod phase_c_folder_nav_history_tests {
                 is_video: false,
                 mtime: 1,
                 file_size: 10,
-            }],
+            }]
+            .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
         });
@@ -3664,6 +3667,7 @@ mod phase_c_folder_nav_history_tests {
         );
 
         app.close_favsearch();
+        app.finish_subfolder_expansion_prepare_for_test();
 
         assert!(!app.favsearch.active);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -5216,7 +5220,8 @@ mod phase_c_drill_nav_tests {
                 is_video: false,
                 mtime: 1,
                 file_size: 10,
-            }],
+            }]
+            .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
         });
@@ -5264,12 +5269,14 @@ mod phase_c_drill_nav_tests {
                 is_video: false,
                 mtime: 1,
                 file_size: 10,
-            }],
+            }]
+            .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
         });
 
         app.reload_current_folder_preserving_override();
+        app.finish_subfolder_expansion_prepare_for_test();
 
         assert!(app.items_are_subfolder_expansion_view);
         assert_eq!(
@@ -5310,12 +5317,14 @@ mod phase_c_drill_nav_tests {
                 is_video: false,
                 mtime: 1,
                 file_size: 10,
-            }],
+            }]
+            .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
         });
 
         app.close_global_search();
+        app.finish_subfolder_expansion_prepare_for_test();
 
         assert!(!app.global_search.active);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -5354,7 +5363,8 @@ mod phase_c_drill_nav_tests {
                 is_video: false,
                 mtime: 1,
                 file_size: 10,
-            }],
+            }]
+            .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
         });
@@ -5381,6 +5391,7 @@ mod phase_c_drill_nav_tests {
         );
 
         app.close_tag_view();
+        app.finish_subfolder_expansion_prepare_for_test();
 
         assert!(!app.tag_view.active);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -5450,7 +5461,8 @@ mod phase_c_drill_nav_tests {
                 is_video: false,
                 mtime: 1,
                 file_size: 10,
-            }],
+            }]
+            .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
         });
@@ -5474,6 +5486,7 @@ mod phase_c_drill_nav_tests {
         );
 
         app.close_rating_view();
+        app.finish_subfolder_expansion_prepare_for_test();
 
         assert!(!app.items_are_rating_view);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -31987,6 +32000,40 @@ fn settings_restore_blocks_background_dialog_input() {
     assert!(!app.any_dialog_open());
     app.show_settings_restore = true;
     assert!(app.any_dialog_open());
+}
+
+#[test]
+fn subfolder_display_prepare_blocks_background_input() {
+    let mut app = phase_c_support::setup_app();
+    let root = PathBuf::from(r"C:\photos");
+    app.subfolder_expansion_confirm_pending =
+        Some(subfolder_expansion::SubfolderExpansionConfirmPending {
+            snapshot: subfolder_expansion::SubfolderExpansionSnapshot {
+                root: root.clone(),
+                roots: vec![root],
+                entries: std::sync::Arc::new(Vec::new()),
+                video_thumb_overrides: std::collections::HashMap::new(),
+                diag: subfolder_expansion::SubfolderExpansionDiag::default(),
+            },
+            show_toast: false,
+        });
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+
+    app.subfolder_expansion_confirm_pending = None;
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.subfolder_expansion_install_pending =
+        Some(subfolder_expansion::SubfolderExpansionInstallPending {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+            progress: subfolder_expansion::SubfolderExpansionPrepareProgress {
+                phase: subfolder_expansion::SubfolderExpansionPreparePhase::Sorting,
+                completed: 0,
+                total: 1,
+            },
+        });
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
 }
 
 #[test]

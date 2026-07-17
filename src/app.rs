@@ -7366,11 +7366,17 @@ pub struct App {
     /// ボタン押下時点の走査結果。ソート変更ではこれを再利用し、ファイルシステムを再走査しない。
     pub(crate) subfolder_expansion_snapshot:
         Option<subfolder_expansion::SubfolderExpansionSnapshot>,
+    /// snapshot を prepare worker と共有中に削除された実パス。巨大 Arc を UI
+    /// スレッドで copy-on-write せず、以後の再構築で除外する tombstone。
+    pub(crate) subfolder_expansion_removed_paths: std::collections::HashSet<String>,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
-    /// サブ展開 worker 完了後、巨大な snapshot を UI に反映する直前の 1 フレーム待ち状態。
+    /// サブ展開 worker 完了後、ソート・一覧構築・メタ DB 読み込みを行う非同期準備。
     pub(crate) subfolder_expansion_install_pending:
         Option<subfolder_expansion::SubfolderExpansionInstallPending>,
+    /// 10 万件以上の走査結果を一覧準備へ進める前の確認。
+    pub(crate) subfolder_expansion_confirm_pending:
+        Option<subfolder_expansion::SubfolderExpansionConfirmPending>,
     /// フォルダバーに出す軽量進捗。
     pub(crate) subfolder_expansion_progress:
         Option<subfolder_expansion::SubfolderExpansionProgress>,
@@ -9710,8 +9716,10 @@ impl App {
             subfolder_expansion_roots: Vec::new(),
             subfolder_expansion_saved_folder: None,
             subfolder_expansion_snapshot: None,
+            subfolder_expansion_removed_paths: std::collections::HashSet::new(),
             subfolder_expansion_pending: None,
             subfolder_expansion_install_pending: None,
+            subfolder_expansion_confirm_pending: None,
             subfolder_expansion_progress: None,
             subfolder_expansion_diag: None,
             fs_nav_after_pdf_enumerate: None,
@@ -10993,6 +11001,8 @@ impl App {
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
             || self.batch_convert.is_some()
+            || self.subfolder_expansion_confirm_pending.is_some()
+            || self.subfolder_expansion_install_pending.is_some()
             || self.editing_addon_install_state.is_some()
             || self.text_subdialog_open()
     }
@@ -11042,6 +11052,8 @@ impl App {
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
             || self.batch_convert.is_some()
+            || self.subfolder_expansion_confirm_pending.is_some()
+            || self.subfolder_expansion_install_pending.is_some()
             // 編集用追加パック DL ダイアログ (フルスクリーンビューポートで描画)。表示中は
             // フルスクリーンのキー (Enter で閉じる / Esc で選択解除・テキストモード退出 /
             // 矢印ナビ) を止め、ダイアログ操作に集中させる (Codex 監査)。
@@ -17565,6 +17577,46 @@ impl App {
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<u64>,
     ) {
+        self.start_loading_items_inner(
+            source_path,
+            items,
+            image_metas,
+            catalog_existing_keys,
+            video_items,
+            folder_signature,
+            None,
+        );
+    }
+
+    pub(crate) fn start_loading_subfolder_items(
+        &mut self,
+        source_path: PathBuf,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+        metadata: subfolder_expansion::PreparedSubfolderMetadata,
+    ) {
+        self.start_loading_items_inner(
+            source_path,
+            items,
+            image_metas,
+            std::collections::HashSet::new(),
+            video_items,
+            None,
+            Some(metadata),
+        );
+    }
+
+    fn start_loading_items_inner(
+        &mut self,
+        source_path: PathBuf,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        catalog_existing_keys: std::collections::HashSet<String>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+        folder_signature: Option<u64>,
+        mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
+    ) {
         self.cancel_media_navigation_pending_for_current_context("start_loading_items");
         self.clear_color_filter_for_new_items();
         self.color_filter_scope_refresh_pending = false;
@@ -17791,6 +17843,11 @@ impl App {
         self.scroll_hint.store(0, Ordering::Relaxed);
 
         self.install_new_items(items, image_metas);
+        // 準備 worker が sparse metadata を完成させているため、未登録キーの同期 DB
+        // fallback を止めるフラグを prewarm / visible rebuild より先に立てる。
+        if prepared_subfolder.is_some() {
+            self.items_are_subfolder_expansion_view = true;
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -17850,7 +17907,11 @@ impl App {
         // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
         let prewarm_rating_t0 = std::time::Instant::now();
-        self.prewarm_rating_cache();
+        if let Some(prepared) = prepared_subfolder.as_mut() {
+            self.rating_cache = std::mem::take(&mut prepared.rating_cache);
+        } else {
+            self.prewarm_rating_cache();
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -17867,7 +17928,27 @@ impl App {
         // rating と合算すると tags.db 側の退行が見えないので区間を分けて計測する
         // (cold tags.db + 大フォルダで UI スレッド同期クエリが伸びる潜在箇所)。
         let prewarm_tags_t0 = std::time::Instant::now();
-        self.prewarm_grid_tags();
+        if let Some(prepared) = prepared_subfolder.as_mut() {
+            if let Some(pending) = self.tag_prewarm_pending.take() {
+                pending.cancel();
+            }
+            self.tag_prewarm_queued.clear();
+            if let Some(pending) = self.tag_legacy_seed_pending.take() {
+                pending.cancel();
+            }
+            self.tags_cache = std::mem::take(&mut prepared.tags_cache);
+            if self.settings.write_rating_to_xmp {
+                self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+            }
+            if self.tags_db.is_some() {
+                self.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
+                    crate::data_dir::get(),
+                    std::mem::take(&mut prepared.legacy_paths),
+                ));
+            }
+        } else {
+            self.prewarm_grid_tags();
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -18055,7 +18136,13 @@ impl App {
         // 読まず、現在 items の page key に対応する行の存在だけを復元する。
         // レイヤー配列はフルスクリーン表示 / 補正レイヤーパネルで遅延ロードする。
         let local_adjust_t0 = std::time::Instant::now();
-        self.hydrate_local_adjust_layer_keys_for_current_items();
+        if let Some(prepared) = prepared_subfolder.as_mut() {
+            self.local_adjust_page_layers.clear();
+            self.local_adjust_pages = std::mem::take(&mut prepared.local_adjust_pages);
+            self.local_adjust_selected_layers.clear();
+        } else {
+            self.hydrate_local_adjust_layer_keys_for_current_items();
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -18300,7 +18387,9 @@ impl App {
             // Phase 8.B': ピン留めフレームを path → WebP の map で snapshot し
             // worker thread に渡す (= grid サムネ最優先で使用される)。
             let pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>> =
-                if let Some(db) = self.video_pin_db.as_ref() {
+                if let Some(prepared) = prepared_subfolder.as_mut() {
+                    std::mem::take(&mut prepared.video_pin_blobs)
+                } else if let Some(db) = self.video_pin_db.as_ref() {
                     video_items
                         .iter()
                         .filter_map(|(_, p, _)| {
@@ -18499,6 +18588,13 @@ impl App {
             pending.cancel();
         }
         self.converted_archive_cache_paths.clear();
+        // サブ展開は Image / Video だけ。数百万件を ConvertibleArchive 判定のために
+        // UI スレッドで全走査しても必ず空なので、synthetic path で即終了する。
+        if self.current_folder.as_ref().is_some_and(|folder| {
+            crate::folder_tree::path_eq(folder, &subfolder_expansion_synthetic_path())
+        }) {
+            return;
+        }
         let Some(db) = self.archive_cache_db.clone() else {
             return;
         };
@@ -19049,6 +19145,13 @@ impl App {
     /// 強調 / tooltip が「未ピン」固定になってしまう。
     fn refresh_folder_pin_map(&mut self) {
         self.folder_pin_map.clear();
+        // サブ展開は親コンテナセルを含まない。`with_capacity(items.len())` だけでも
+        // 数百万件では大きな UI-thread allocation になるため、DB lookup 前に除外する。
+        if self.current_folder.as_ref().is_some_and(|folder| {
+            crate::folder_tree::path_eq(folder, &subfolder_expansion_synthetic_path())
+        }) {
+            return;
+        }
         let Some(db) = self.folder_thumb_pin_db.as_ref() else {
             return;
         };
@@ -36202,6 +36305,11 @@ impl App {
         if let Some(&v) = self.rating_cache.get(&idx) {
             return v;
         }
+        // サブ展開は準備 worker が DB の全対象キーを一括確認し、非ゼロだけを sparse
+        // cache に載せる。miss は未評価と確定しているので UI スレッドから点 query しない。
+        if self.items_are_subfolder_expansion_view {
+            return 0;
+        }
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
             return 0;
@@ -37381,7 +37489,7 @@ impl App {
             _ => return true,
         };
         let key = crate::tags_db::item_key_for_path(p);
-        self.tags_cache.contains_key(&key)
+        self.tags_cache.contains_key(&key) || self.items_are_subfolder_expansion_view
     }
 
     /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。

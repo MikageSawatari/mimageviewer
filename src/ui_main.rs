@@ -2934,6 +2934,23 @@ impl App {
                                                 }
                                             }
                                         }
+                                        if self.items_are_subfolder_expansion_view {
+                                            ui.separator();
+                                            ui.label("サブ展開の並び単位");
+                                            for &mode in crate::settings::SubfolderExpansionOrder::all() {
+                                                let checked =
+                                                    self.settings.subfolder_expansion_order == mode;
+                                                let prefix = if checked { "✓ " } else { "  " };
+                                                let resp = ui
+                                                    .button(format!("{prefix}{}", mode.label()))
+                                                    .on_hover_text(mode.description());
+                                                if resp.clicked() && !checked {
+                                                    self.settings.subfolder_expansion_order = mode;
+                                                    sort_changed = true;
+                                                    ui.close();
+                                                }
+                                            }
+                                        }
                                     });
                                 }
                                 ui.menu_button("スケーリング", |ui| {
@@ -5197,6 +5214,31 @@ impl App {
                                     egui::ComboBox::is_open(ctx, combo_id);
                             });
                         }
+                    }
+                    if self.items_are_subfolder_expansion_view {
+                        let current_mode = self.settings.subfolder_expansion_order;
+                        let combo = egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
+                            .width(132.0)
+                            .height(TOOLBAR_SORT_COMBO_HEIGHT)
+                            .selected_text(current_mode.label())
+                            .show_ui(ui, |ui| {
+                                apply_toolbar_style(ui);
+                                for &mode in crate::settings::SubfolderExpansionOrder::all() {
+                                    let selected = current_mode == mode;
+                                    if ui
+                                        .selectable_label(selected, mode.label())
+                                        .on_hover_text(mode.description())
+                                        .clicked()
+                                        && !selected
+                                    {
+                                        self.settings.subfolder_expansion_order = mode;
+                                        self.settings.save();
+                                        toolbar_sort_changed = true;
+                                    }
+                                }
+                            });
+                        toolbar_combo_popup_open |=
+                            egui::ComboBox::is_open(ctx, combo.response.id);
                     }
                     // ソート候補を全部外したときの右クリック誘導 (Codex P3)。
                     if tb_sorts.is_empty() {

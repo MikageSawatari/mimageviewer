@@ -37,7 +37,19 @@ impl LocalAdjustDb {
         Ok(Self { conn })
     }
 
-    fn db_path() -> PathBuf {
+    /// 起動時に schema 初期化済みの DB を一覧準備 worker から読み取り専用で開く。
+    pub fn open_readonly(path: &Path) -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self { conn })
+    }
+
+    pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("local_adjust.db")
     }
 

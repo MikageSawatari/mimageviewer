@@ -1182,6 +1182,42 @@ impl SortOrder {
 }
 
 // -----------------------------------------------------------------------
+// SubfolderExpansionOrder
+// -----------------------------------------------------------------------
+
+/// サブフォルダ展開ビュー内の並び単位。
+///
+/// `Flat` は従来どおり全フォルダの同名ファイルを横断して並べる。
+/// `FolderGrouped` は相対フォルダ順を優先し、各フォルダの中だけ `SortOrder` を適用する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubfolderExpansionOrder {
+    #[default]
+    Flat,
+    FolderGrouped,
+}
+
+impl SubfolderExpansionOrder {
+    pub fn all() -> &'static [Self] {
+        &[Self::Flat, Self::FolderGrouped]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "全体で並べる",
+            Self::FolderGrouped => "フォルダごとに並べる",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Flat => "すべてのサブフォルダを横断して並べます",
+            Self::FolderGrouped => "フォルダ順を優先し、各フォルダ内を現在の並び順で並べます",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // GridDisplayOrder
 // -----------------------------------------------------------------------
 
@@ -2150,6 +2186,9 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// サブフォルダ展開ビューでフォルダ境界を優先するか。
+    #[serde(default)]
+    pub subfolder_expansion_order: SubfolderExpansionOrder,
     /// 実フォルダ / アーカイブ類 / 画像 / 動画・音声を 4 行へ割り当てる表示順。
     /// 同じ行は `sort_order` で混在ソートし、空行は表示時に読み飛ばす。
     #[serde(default)]
@@ -3805,6 +3844,7 @@ impl Default for Settings {
             folder_skip_limit: default_folder_skip_limit(),
             show_hidden_files: false,
             sort_order: SortOrder::default(),
+            subfolder_expansion_order: SubfolderExpansionOrder::default(),
             grid_display_order: GridDisplayOrder::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
@@ -5274,6 +5314,7 @@ impl Settings {
         self.facet_filter = src.facet_filter.clone();
         self.thumb_aspect = src.thumb_aspect;
         self.sort_order = src.sort_order;
+        self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.rating_filter = src.rating_filter;
         self.folder_tree_pane_visible = src.folder_tree_pane_visible;
         self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
@@ -6098,6 +6139,7 @@ mod tests {
         assert_eq!(s.folder_skip_limit, 5);
         assert!(!s.show_hidden_files);
         assert_eq!(s.sort_order, SortOrder::FileName);
+        assert_eq!(s.subfolder_expansion_order, SubfolderExpansionOrder::Flat);
         assert_eq!(s.thumb_px, 512);
         assert_eq!(s.thumb_quality, 75);
         assert_eq!(s.cache_policy, CachePolicy::Auto);
