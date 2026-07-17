@@ -20,9 +20,9 @@ use sha2::{Digest, Sha256};
 pub const PREVIEW_LONG_SIDE: u32 = 2048;
 pub const PREVIEW_WEBP_QUALITY: f32 = 90.0;
 pub const DEFAULT_MAX_BYTES: u64 = 1_000_000_000;
-// v3: MI-GAN の原寸正方形入力 + 段階補完より前に生成された erase 焼き込みを
+// v4: 透過境界を straight-alpha のまま縮小して暗い縁を焼き込んだ旧 preview を
 // 再利用しない。DB 形式自体は同じだが、派生画像の生成規約も version に含める。
-const CACHE_FORMAT_VERSION: i64 = 3;
+const CACHE_FORMAT_VERSION: i64 = 4;
 
 /// edit-result の上にだけ注釈を焼くための worker payload。
 ///
@@ -793,16 +793,29 @@ fn preview_output_dims(size: [usize; 2]) -> Option<(u32, u32)> {
     fit_output_dims(size, PREVIEW_LONG_SIDE)
 }
 
-fn color_image_to_rgba(pixels: &egui::ColorImage) -> Option<image::RgbaImage> {
+fn color_image_to_premultiplied_rgba(pixels: &egui::ColorImage) -> Option<image::RgbaImage> {
     let [width, height] = pixels.size;
     if width == 0 || height == 0 || pixels.pixels.len() != width.saturating_mul(height) {
         return None;
     }
     let mut rgba = Vec::with_capacity(pixels.pixels.len().saturating_mul(4));
     for pixel in &pixels.pixels {
-        rgba.extend_from_slice(&pixel.to_srgba_unmultiplied());
+        // Color32 は gamma-space premultiplied alpha。透明画素の黒 RGB を
+        // 隣接色へ混ぜないよう、縮小中もその表現を保つ。
+        rgba.extend_from_slice(&pixel.to_array());
     }
     image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+}
+
+fn premultiplied_rgba_to_unmultiplied_bytes(pixels: &image::RgbaImage) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(pixels.len());
+    for pixel in pixels.pixels() {
+        let [r, g, b, a] = pixel.0;
+        rgba.extend_from_slice(
+            &egui::Color32::from_rgba_premultiplied(r, g, b, a).to_srgba_unmultiplied(),
+        );
+    }
+    rgba
 }
 
 fn resize_color_image_to_dims(
@@ -812,14 +825,14 @@ fn resize_color_image_to_dims(
     if pixels.size == [output_dims.0 as usize, output_dims.1 as usize] {
         return Some(pixels);
     }
-    let rgba = color_image_to_rgba(&pixels)?;
+    let rgba = color_image_to_premultiplied_rgba(&pixels)?;
     let resized = crate::fast_resize::resize_rgba8_exact(
         &rgba,
         output_dims.0,
         output_dims.1,
         crate::fast_resize::Quality::Lanczos3,
     );
-    Some(egui::ColorImage::from_rgba_unmultiplied(
+    Some(egui::ColorImage::from_rgba_premultiplied(
         [resized.width() as usize, resized.height() as usize],
         resized.as_raw(),
     ))
@@ -830,14 +843,17 @@ fn encode_preview_exact(
     output_dims: (u32, u32),
     lossless: bool,
 ) -> Option<Vec<u8>> {
-    let rgba = color_image_to_rgba(pixels)?;
+    let rgba = color_image_to_premultiplied_rgba(pixels)?;
     let resized = crate::fast_resize::resize_rgba8_exact(
         &rgba,
         output_dims.0,
         output_dims.1,
         crate::fast_resize::Quality::Lanczos3,
     );
-    let encoder = webp::Encoder::from_rgba(resized.as_raw(), resized.width(), resized.height());
+    // WebP encoder の入力は straight alpha なので、フィルタ後にだけ
+    // premultiplied から戻す。先に戻すと透過画素の黒が縮小で混入する。
+    let unmultiplied = premultiplied_rgba_to_unmultiplied_bytes(&resized);
+    let encoder = webp::Encoder::from_rgba(&unmultiplied, resized.width(), resized.height());
     Some(if lossless {
         encoder.encode_lossless().to_vec()
     } else {
@@ -1026,6 +1042,38 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db = EditPreviewCacheDb::open_at(&temp.path().join("preview.db")).unwrap();
         (temp, db)
+    }
+
+    fn red_transparent_edge() -> egui::ColorImage {
+        egui::ColorImage::new([2, 1], vec![egui::Color32::RED, egui::Color32::TRANSPARENT])
+    }
+
+    fn assert_half_transparent_red(pixel: egui::Color32) {
+        let [r, g, b, a] = pixel.to_srgba_unmultiplied();
+        assert!(
+            (120..=136).contains(&a),
+            "opaque + transparent average should retain half alpha: {a}"
+        );
+        assert!(
+            r >= 250,
+            "transparent black must not darken the straight red channel: {r}"
+        );
+        assert_eq!([g, b], [0, 0]);
+    }
+
+    #[test]
+    fn display_resize_filters_transparent_edges_as_premultiplied_alpha() {
+        let resized = resize_color_image_to_dims(red_transparent_edge(), (1, 1)).unwrap();
+        assert_eq!(resized.size, [1, 1]);
+        assert_half_transparent_red(resized.pixels[0]);
+    }
+
+    #[test]
+    fn lossless_preview_encode_unmultiplies_only_after_resize() {
+        let webp = encode_preview_exact(&red_transparent_edge(), (1, 1), true).unwrap();
+        let decoded = crate::catalog::decode_thumb_to_color_image(&webp).unwrap();
+        assert_eq!(decoded.size, [1, 1]);
+        assert_half_transparent_red(decoded.pixels[0]);
     }
 
     #[test]

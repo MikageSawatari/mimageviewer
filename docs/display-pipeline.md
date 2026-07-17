@@ -107,6 +107,8 @@ lossless WebP として分離保存する。保存先は `<data_dir>/edit_previe
 読み込み worker は保存サイズを品質原本として残したまま、現在の `display_px` へ下地と
 全注釈レイヤーを Lanczos3 で同一寸法へ縮小してから合成する。UI / GPU には表示寸法の
 画像だけを渡し、ページ数ベースの eviction と VRAM 上限見積もりを実際のテクスチャ寸法と一致させる。
+透過境界は `Color32` の premultiplied alpha を保ったまま縮小し、WebP 保存の直前だけ
+straight alpha へ戻す。これにより Normal 注釈や透過画像の縁に透明黒が混じることを防ぐ。
 
 注釈済みの `final_composite_cache` は流用しない。そこには色調補正・final AI・スマートシャープ・
 ポストフィルタまで含まれるため、scene / font / stamp cache を worker へ snapshot し、
