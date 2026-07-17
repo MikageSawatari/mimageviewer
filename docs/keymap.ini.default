@@ -303,6 +303,7 @@
 # FsLoupeLockToggle = M ; ルーペの固定表示を切り替える
 # FsLoupeHold = Shift ; 押している間だけルーペを表示する
 # FsEraseMode = E ; 消しゴムモードを開始または確定する
+# FsLocalAdjustMode = Ctrl+G ; 補正レイヤーモードを開始する
 # FsConcealMode = Ctrl+M ; 隠蔽加工モードを開始または終了する
 # FsTextMode = Ctrl+T ; テキスト注釈モードを開始または終了する
 # FsBgCycle = B ; 透過背景色を切り替える

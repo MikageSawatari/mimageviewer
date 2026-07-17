@@ -17,16 +17,19 @@ fn lab_combo_box<R>(
     selected_text: impl Into<egui::WidgetText>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    ComboBox::from_id_salt(id_salt)
-        .selected_text(selected_text)
-        .height(420.0)
-        .show_ui(ui, |ui| {
-            apply_local_adjust_dark_ui(ui);
-            add_contents(ui)
-        })
+    let ctx = ui.ctx().clone();
+    with_local_adjust_dark_context_style(&ctx, || {
+        ComboBox::from_id_salt(id_salt)
+            .selected_text(selected_text)
+            .height(420.0)
+            .show_ui(ui, |ui| {
+                apply_local_adjust_dark_ui(ui);
+                add_contents(ui)
+            })
+    })
 }
 
-fn local_adjust_dark_visuals() -> egui::Visuals {
+pub(crate) fn local_adjust_dark_visuals() -> egui::Visuals {
     let mut visuals = egui::Visuals::dark();
     visuals.override_text_color = Some(egui::Color32::WHITE);
     visuals.window_fill = egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245);
@@ -36,14 +39,51 @@ fn local_adjust_dark_visuals() -> egui::Visuals {
 }
 
 fn apply_local_adjust_dark_ui(ui: &mut egui::Ui) {
-    ui.ctx().set_theme(egui::ThemePreference::Dark);
-    let mut style = (*ui.ctx().style()).clone();
-    style.visuals = local_adjust_dark_visuals();
-    ui.ctx().set_style(style);
+    *ui.visuals_mut() = local_adjust_dark_visuals();
+}
+
+struct LocalAdjustContextStyleGuard {
+    ctx: egui::Context,
+    previous_style: egui::Style,
+    previous_theme: egui::ThemePreference,
+}
+
+impl LocalAdjustContextStyleGuard {
+    fn install(ctx: &egui::Context) -> Self {
+        let previous_style = (*ctx.style()).clone();
+        let previous_theme = ctx.options(|options| options.theme_preference);
+        let mut dark_style = previous_style.clone();
+        dark_style.visuals = local_adjust_dark_visuals();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        ctx.set_style(dark_style);
+        Self {
+            ctx: ctx.clone(),
+            previous_style,
+            previous_theme,
+        }
+    }
+}
+
+impl Drop for LocalAdjustContextStyleGuard {
+    fn drop(&mut self) {
+        self.ctx.set_theme(self.previous_theme);
+        self.ctx.set_style(self.previous_style.clone());
+    }
+}
+
+/// ComboBox の popup や Window の frame は子 `Ui` を作る前に Context の style で
+/// 描かれる。補正 UI の構築中だけ Context も暗色へ切り替え、呼び出しを抜けると元へ戻す。
+pub(crate) fn with_local_adjust_dark_context_style<R>(
+    ctx: &egui::Context,
+    add_contents: impl FnOnce() -> R,
+) -> R {
+    let _guard = LocalAdjustContextStyleGuard::install(ctx);
+    add_contents()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RgbPickTarget {
+    RepairColor,
     ColorFillStart,
     ColorFillMiddle,
     ColorFillEnd,
@@ -82,6 +122,7 @@ pub(crate) enum RgbPickTarget {
 impl RgbPickTarget {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::RepairColor => "修復／塗りの基準色",
             Self::ColorFillStart => "塗りつぶしの開始色",
             Self::ColorFillMiddle => "塗りつぶしの中間色",
             Self::ColorFillEnd => "塗りつぶしの終了色",
@@ -116,6 +157,53 @@ impl RgbPickTarget {
             Self::ToonShadeShadowTint => "トゥーン影色",
             Self::ToonShadeLightTint => "トゥーン光色",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepairPointPickTarget {
+    Source,
+    Destination,
+}
+
+impl RepairPointPickTarget {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Source => "コピー元",
+            Self::Destination => "塗り先の基準点",
+        }
+    }
+}
+
+fn repair_mode_label(mode: RepairMode) -> &'static str {
+    match mode {
+        RepairMode::Solid => "単色で塗る",
+        RepairMode::PreserveLuminance => "輝度を残して塗る",
+        RepairMode::Surrounding => "周囲から修復",
+        RepairMode::Clone => "クローン（固定オフセット）",
+    }
+}
+
+fn repair_color_source_label(source: RepairColorSource) -> &'static str {
+    match source {
+        RepairColorSource::Surrounding => "周囲の色に合わせる",
+        RepairColorSource::Sampled => "スポイト色に合わせる",
+    }
+}
+
+fn repair_quality_label(quality: RepairQuality) -> &'static str {
+    match quality {
+        RepairQuality::Fast => "高速",
+        RepairQuality::Standard => "標準",
+        RepairQuality::High => "高品質",
+    }
+}
+
+fn repair_patch_size_label(size: RepairPatchSize) -> &'static str {
+    match size {
+        RepairPatchSize::Auto => "自動 (10〜14 px)",
+        RepairPatchSize::Standard => "標準 (24 px)",
+        RepairPatchSize::Large => "大きめ (48 px)",
     }
 }
 
@@ -420,6 +508,10 @@ pub(crate) fn set_rgb_pick_target(
     rgb: [u8; 3],
 ) -> bool {
     match (effect, target) {
+        (LocalEffect::Repair(params), RgbPickTarget::RepairColor) => {
+            params.sampled_rgb = rgb;
+            true
+        }
         (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillStart) => {
             params.start_rgb = rgb;
             true
@@ -736,6 +828,8 @@ pub(crate) struct EffectParamResponse {
     pub(crate) cancel_selective_color_pick: bool,
     pub(crate) start_rgb_pick: Option<RgbPickTarget>,
     pub(crate) cancel_rgb_pick: bool,
+    pub(crate) start_repair_point_pick: Option<RepairPointPickTarget>,
+    pub(crate) cancel_repair_point_pick: bool,
     pub(crate) set_effect_position_handles_visible: Option<bool>,
     pub(crate) copy_effect: bool,
     pub(crate) paste_effect: bool,
@@ -3999,6 +4093,7 @@ pub(crate) fn draw_effect_params(
     image_dims: (usize, usize),
     selective_color_pick_active: bool,
     rgb_pick_active: Option<RgbPickTarget>,
+    repair_point_pick_active: Option<RepairPointPickTarget>,
     effect_clipboard_available: bool,
     effect_position_handles_visible: bool,
 ) -> EffectParamResponse {
@@ -4008,8 +4103,11 @@ pub(crate) fn draw_effect_params(
     let mut cancel_selective_color_pick = false;
     let mut start_rgb_pick = None;
     let mut cancel_rgb_pick = false;
+    let mut start_repair_point_pick = None;
+    let mut cancel_repair_point_pick = false;
     let mut set_effect_position_handles_visible = None;
     let has_effect = !matches!(&layer.effect, LocalEffect::None);
+    let base_mask_is_full = matches!(&layer.mask, LocalMask::Full);
     let mut copy_effect = false;
     let mut paste_effect = false;
     let mut reset_effect = false;
@@ -6295,6 +6393,241 @@ pub(crate) fn draw_effect_params(
             changed |= contrast_response.changed();
             contrast_response
                 .lab_hover_tip("色を割り当てる前に、明るさの差を締めたり広げたりします。");
+        }
+        LocalEffect::Repair(params) => {
+            let before_mode = params.mode;
+            lab_combo_box(ui, "repair_mode", repair_mode_label(params.mode), |ui| {
+                for mode in [
+                    RepairMode::Solid,
+                    RepairMode::PreserveLuminance,
+                    RepairMode::Surrounding,
+                    RepairMode::Clone,
+                ] {
+                    ui.selectable_value(&mut params.mode, mode, repair_mode_label(mode));
+                }
+            });
+            if params.mode != before_mode {
+                changed = true;
+                if params.mode != RepairMode::Clone {
+                    cancel_repair_point_pick = true;
+                }
+            }
+            let description = match params.mode {
+                RepairMode::Solid => {
+                    "マスク範囲をスポイト色で塗ります。元画像は変更せず、レイヤーのマスクと不透明度で後から調整できます。"
+                }
+                RepairMode::PreserveLuminance => {
+                    "スポイト色の色相・彩度と元画像の明るさを組み合わせ、周囲の陰影を残して塗ります。"
+                }
+                RepairMode::Surrounding => {
+                    "マスク外の周囲から小さなテクスチャを探して埋め、色とコントラストを境界に自動でなじませます。"
+                }
+                RepairMode::Clone => {
+                    "コピー元と塗り先の基準点で固定オフセットを決め、マスク全体へ同じずらし量で複写します。"
+                }
+            };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(description)
+                        .size(10.0)
+                        .color(Color32::from_gray(170)),
+                )
+                .wrap(),
+            );
+            if params.mode == RepairMode::Surrounding && base_mask_is_full {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "周囲から修復にはマスク外の参照領域が必要です。手動マスクなどで修復範囲だけを選んでください。",
+                        )
+                        .size(10.0)
+                        .color(Color32::from_rgb(255, 205, 105)),
+                    )
+                    .wrap(),
+                );
+            }
+
+            if matches!(params.mode, RepairMode::Surrounding | RepairMode::Clone) {
+                let before_source = params.color_source;
+                lab_combo_box(
+                    ui,
+                    "repair_color_source",
+                    repair_color_source_label(params.color_source),
+                    |ui| {
+                        for source in [RepairColorSource::Surrounding, RepairColorSource::Sampled] {
+                            ui.selectable_value(
+                                &mut params.color_source,
+                                source,
+                                repair_color_source_label(source),
+                            );
+                        }
+                    },
+                );
+                changed |= params.color_source != before_source;
+            }
+            if matches!(
+                params.mode,
+                RepairMode::Solid | RepairMode::PreserveLuminance
+            ) || params.color_source == RepairColorSource::Sampled
+            {
+                merge_rgb_color_response(
+                    draw_rgb_color_control(
+                        ui,
+                        "基準色",
+                        &mut params.sampled_rgb,
+                        RgbPickTarget::RepairColor,
+                        rgb_pick_active,
+                    ),
+                    &mut changed,
+                    &mut start_rgb_pick,
+                    &mut cancel_rgb_pick,
+                );
+                let sample_radius = ui.add(
+                    egui::Slider::new(&mut params.sample_radius_px, 0.0..=32.0)
+                        .text("スポイト半径")
+                        .suffix(" px"),
+                );
+                changed |= sample_radius.changed();
+                sample_radius.lab_hover_tip(
+                    "0pxは1画素、1px以上は周囲の不透明画素を平均し、点ノイズの影響を抑えます。",
+                );
+            }
+
+            match params.mode {
+                RepairMode::Surrounding => {
+                    let search_radius = ui.add(
+                        egui::Slider::new(&mut params.search_radius_px, 8.0..=512.0)
+                            .text("探索半径")
+                            .suffix(" px")
+                            .logarithmic(true),
+                    );
+                    changed |= search_radius.changed();
+                    search_radius.lab_hover_tip(
+                        "最寄りの参照領域を基準に、修復へ使う別のテクスチャ候補を探す広さです。",
+                    );
+                    let before_patch_size = params.patch_size;
+                    ui.horizontal(|ui| {
+                        lab_combo_box(
+                            ui,
+                            "repair_patch_size",
+                            repair_patch_size_label(params.patch_size),
+                            |ui| {
+                                for patch_size in [
+                                    RepairPatchSize::Auto,
+                                    RepairPatchSize::Standard,
+                                    RepairPatchSize::Large,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut params.patch_size,
+                                        patch_size,
+                                        repair_patch_size_label(patch_size),
+                                    );
+                                }
+                            },
+                        )
+                        .response
+                        .lab_hover_tip(
+                            "自動は従来値を維持し、高品質 10 px・標準品質 12 px・高速 14 px を使います。広い模様や色面では標準・大きめを試せます。",
+                        );
+                        ui.label("パッチサイズ");
+                    });
+                    changed |= params.patch_size != before_patch_size;
+                    let before_quality = params.quality;
+                    ui.horizontal(|ui| {
+                        lab_combo_box(
+                            ui,
+                            "repair_quality",
+                            repair_quality_label(params.quality),
+                            |ui| {
+                                for quality in [
+                                    RepairQuality::Fast,
+                                    RepairQuality::Standard,
+                                    RepairQuality::High,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut params.quality,
+                                        quality,
+                                        repair_quality_label(quality),
+                                    );
+                                }
+                            },
+                        );
+                        ui.label("処理品質");
+                    });
+                    changed |= params.quality != before_quality;
+                    let another = ui.button("別の修復候補");
+                    if another.clicked() {
+                        params.seed = params.seed.wrapping_add(1);
+                        changed = true;
+                    }
+                    another
+                        .lab_hover_tip("同じマスクのまま、別の周囲パッチの組み合わせを試します。");
+                }
+                RepairMode::Clone => {
+                    ui.horizontal_wrapped(|ui| {
+                        for target in [
+                            RepairPointPickTarget::Source,
+                            RepairPointPickTarget::Destination,
+                        ] {
+                            let active = repair_point_pick_active == Some(target);
+                            let text = if active {
+                                format!("{}指定を解除", target.label())
+                            } else {
+                                format!("{}を指定", target.label())
+                            };
+                            if ui.selectable_label(active, text).clicked() {
+                                if active {
+                                    cancel_repair_point_pick = true;
+                                } else {
+                                    start_repair_point_pick = Some(target);
+                                }
+                            }
+                        }
+                    });
+                    let point_label = |point: Option<[f32; 2]>| match point {
+                        Some(point) => format!(
+                            "X {:.1}% / Y {:.1}%",
+                            point[0].clamp(0.0, 1.0) * 100.0,
+                            point[1].clamp(0.0, 1.0) * 100.0
+                        ),
+                        None => "未指定".to_string(),
+                    };
+                    ui.label(format!("コピー元: {}", point_label(params.clone_source_uv)));
+                    ui.label(format!(
+                        "塗り先基準点: {}",
+                        point_label(params.clone_destination_uv)
+                    ));
+                    let clear = ui.add_enabled(
+                        params.clone_source_uv.is_some() || params.clone_destination_uv.is_some(),
+                        egui::Button::new("基準点をクリア"),
+                    );
+                    if clear.clicked() {
+                        params.clone_source_uv = None;
+                        params.clone_destination_uv = None;
+                        cancel_repair_point_pick = true;
+                        changed = true;
+                    }
+                }
+                RepairMode::Solid | RepairMode::PreserveLuminance => {}
+            }
+            if matches!(params.mode, RepairMode::Surrounding | RepairMode::Clone) {
+                let texture = ui.add(
+                    egui::Slider::new(&mut params.texture_strength, 0.0..=1.0)
+                        .text("テクスチャ保持"),
+                );
+                changed |= texture.changed();
+                texture.lab_hover_tip(
+                    "低いほど滑らかになじませ、高いほどコピー元の細かい質感を残します。",
+                );
+                let color_match = ui.add(
+                    egui::Slider::new(&mut params.color_match_strength, 0.0..=1.0)
+                        .text("色のなじみ"),
+                );
+                changed |= color_match.changed();
+                color_match.lab_hover_tip(
+                    "修復結果の平均色とコントラストを、周囲またはスポイト色へ寄せる強さです。",
+                );
+            }
         }
         LocalEffect::ColorFill(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -10650,9 +10983,88 @@ pub(crate) fn draw_effect_params(
         cancel_selective_color_pick,
         start_rgb_pick,
         cancel_rgb_pick,
+        start_repair_point_pick,
+        cancel_repair_point_pick,
         set_effect_position_handles_visible,
         copy_effect,
         paste_effect,
         reset_effect,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_adjust_dark_context_style_is_scoped() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Light);
+        assert!(!ctx.style().visuals.dark_mode);
+
+        with_local_adjust_dark_context_style(&ctx, || {
+            assert_eq!(
+                ctx.options(|options| options.theme_preference),
+                egui::ThemePreference::Dark
+            );
+            assert!(ctx.style().visuals.dark_mode);
+        });
+
+        assert_eq!(
+            ctx.options(|options| options.theme_preference),
+            egui::ThemePreference::Light
+        );
+        assert!(!ctx.style().visuals.dark_mode);
+    }
+
+    #[test]
+    fn local_adjust_combo_popup_is_dark_inside_a_light_app() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut fonts_ready = false;
+        let mut quality = RepairQuality::Standard;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(250.0, 220.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    apply_local_adjust_dark_ui(ui);
+                    ui.set_max_width(150.0);
+                    lab_combo_box(
+                        ui,
+                        "repair_quality_theme_regression",
+                        repair_quality_label(quality),
+                        |ui| {
+                            for candidate in [
+                                RepairQuality::Fast,
+                                RepairQuality::Standard,
+                                RepairQuality::High,
+                            ] {
+                                ui.selectable_value(
+                                    &mut quality,
+                                    candidate,
+                                    repair_quality_label(candidate),
+                                );
+                            }
+                        },
+                    );
+                });
+            });
+
+        harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+        harness.run();
+        assert!(harness.query_by_label("高品質").is_some());
+        harness.snapshot("local_adjust_combo_popup_dark_on_light_app");
+        assert_eq!(
+            harness.ctx.options(|options| options.theme_preference),
+            egui::ThemePreference::Light
+        );
+        assert!(!harness.ctx.style().visuals.dark_mode);
     }
 }

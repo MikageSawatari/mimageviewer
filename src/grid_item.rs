@@ -428,6 +428,9 @@ pub enum ThumbnailState {
     Loaded {
         tex: egui::TextureHandle,
         from_cache: bool,
+        /// 非破壊編集プレビュー由来。通常の低品質 catalog cache と異なり、
+        /// 元画像で上書きする idle quality-upgrade の対象にしない。
+        from_edit_preview: bool,
         rendered_at_px: u32,
         source_dims: Option<(u32, u32)>,
     },

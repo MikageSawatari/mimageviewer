@@ -788,6 +788,7 @@ fn load_palette_for_request(
         keep_start,
         keep_end,
         pin_db,
+        None,
     );
 
     let mut image = None;

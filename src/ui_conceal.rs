@@ -126,6 +126,7 @@ impl App {
 
         self.conceal_mode = true;
         self.conceal_preview_active = false;
+        self.conceal_preview_button_rect = None;
         self.clear_meta_undo();
         if !self.post_filter_bypassed {
             self.post_filter_bypassed = true;
@@ -222,6 +223,7 @@ impl App {
 
         self.conceal_mode = false;
         self.conceal_preview_active = false;
+        self.conceal_preview_button_rect = None;
 
         if was_conceal_mode {
             self.clear_meta_undo();
@@ -1618,6 +1620,22 @@ impl App {
 
     // ── 描画 ──────────────────────────────────────────────────────
 
+    /// パネルより先に解決される画像パイプラインへ、現在フレームの目アイコン押下を反映する。
+    ///
+    /// 従来は `draw_conceal_overlay` の末尾でだけ preview 状態を更新していたため、短い
+    /// クリックではパイプラインが設定変更後の世代を解決する前にボタンが離され得た。
+    /// 前フレームの安定したボタン矩形を使って先に状態を確定し、描画順依存をなくす。
+    pub(crate) fn sync_conceal_preview_before_pipeline(&mut self, ctx: &egui::Context) {
+        let (pointer_pos, primary_down) =
+            ctx.input(|input| (input.pointer.interact_pos(), input.pointer.primary_down()));
+        self.conceal_preview_active = conceal_preview_pointer_active(
+            self.conceal_mode,
+            self.conceal_preview_button_rect,
+            pointer_pos,
+            primary_down,
+        );
+    }
+
     /// マスクオーバーレイ + ハンドル + ツールプレビュー + パネルを描画する。
     pub(crate) fn draw_conceal_overlay(
         &mut self,
@@ -1982,6 +2000,7 @@ impl App {
                                         egui::vec2(26.0, 22.0),
                                         egui::Sense::click_and_drag(),
                                     );
+                                    self.conceal_preview_button_rect = Some(eye_rect);
                                     let eye_bg = if eye_resp.is_pointer_button_down_on() {
                                         // 押下中 = アクセント青
                                         egui::Color32::from_rgb(60, 120, 200)
@@ -2685,4 +2704,52 @@ fn point_in_polygon_local(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
         j = i;
     }
     inside
+}
+
+fn conceal_preview_pointer_active(
+    conceal_mode: bool,
+    button_rect: Option<egui::Rect>,
+    pointer_pos: Option<egui::Pos2>,
+    primary_down: bool,
+) -> bool {
+    conceal_mode
+        && primary_down
+        && button_rect
+            .zip(pointer_pos)
+            .is_some_and(|(rect, pos)| rect.contains(pos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::conceal_preview_pointer_active;
+
+    #[test]
+    fn conceal_preview_pointer_state_is_available_before_panel_draw() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(40.0, 50.0));
+
+        assert!(conceal_preview_pointer_active(
+            true,
+            Some(rect),
+            Some(egui::pos2(25.0, 35.0)),
+            true,
+        ));
+        assert!(!conceal_preview_pointer_active(
+            true,
+            Some(rect),
+            Some(egui::pos2(25.0, 35.0)),
+            false,
+        ));
+        assert!(!conceal_preview_pointer_active(
+            false,
+            Some(rect),
+            Some(egui::pos2(25.0, 35.0)),
+            true,
+        ));
+        assert!(!conceal_preview_pointer_active(
+            true,
+            Some(rect),
+            Some(egui::pos2(60.0, 35.0)),
+            true,
+        ));
+    }
 }

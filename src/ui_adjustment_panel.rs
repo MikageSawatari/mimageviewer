@@ -27,7 +27,7 @@ use crate::keymap::KeyAction;
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
 };
-use crate::local_adjust_effect_ui::draw_effect_params;
+use crate::local_adjust_effect_ui::{draw_effect_params, with_local_adjust_dark_context_style};
 use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 64.0;
@@ -83,27 +83,6 @@ enum LocalAdjustBitmapMaskOp {
     Shrink,
 }
 
-fn with_local_adjust_dark_window_style<R>(
-    ctx: &egui::Context,
-    add_contents: impl FnOnce() -> R,
-) -> R {
-    let previous_style = (*ctx.style()).clone();
-    let previous_theme = ctx.options(|opt| opt.theme_preference);
-    let mut dark_style = previous_style.clone();
-    dark_style.visuals = egui::Visuals::dark();
-    dark_style.visuals.override_text_color = Some(egui::Color32::WHITE);
-    dark_style.visuals.window_fill = egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245);
-    dark_style.visuals.widgets.noninteractive.fg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::WHITE);
-    dark_style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    ctx.set_theme(egui::ThemePreference::Dark);
-    ctx.set_style(dark_style);
-    let result = add_contents();
-    ctx.set_theme(previous_theme);
-    ctx.set_style(previous_style);
-    result
-}
-
 #[derive(Default)]
 struct LocalEffectPanelRequests {
     load_cube_lut: Option<usize>,
@@ -114,6 +93,8 @@ struct LocalEffectPanelRequests {
     cancel_selective_color_pick: bool,
     start_rgb_pick: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
     cancel_rgb_pick: bool,
+    start_repair_point_pick: Option<crate::local_adjust_effect_ui::RepairPointPickTarget>,
+    cancel_repair_point_pick: bool,
     set_effect_position_handles_visible: Option<bool>,
     generate_subject_mask: Option<usize>,
     generate_region_mask: Option<(usize, LocalAdjustRegionSegmentationScope)>,
@@ -1389,6 +1370,80 @@ mod local_adjust_segmentation_tests {
             false,
         );
     }
+
+    fn snapshot_repair_effect_panel(
+        name: &str,
+        params: local_adjust_core::RepairParams,
+        mask: local_adjust_core::LocalMask,
+    ) {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut layer = snapshot_layer(
+            "修復／塗り",
+            mask,
+            local_adjust_core::LocalEffect::Repair(params),
+            true,
+        );
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(320.0, 590.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_min_width(300.0);
+                    ui.set_max_width(300.0);
+                    crate::local_adjust_effect_ui::draw_effect_params(
+                        ui,
+                        &mut layer,
+                        (1920, 1080),
+                        false,
+                        None,
+                        None,
+                        false,
+                        true,
+                    );
+                });
+            });
+
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    /// v2.5.0: 周囲修復の探索品質、テクスチャ / 色なじみ調整と
+    /// 全体マスクの警告が右パネルに収まることを固定する。
+    #[test]
+    fn local_adjust_panel_snapshot_repair_effect() {
+        snapshot_repair_effect_panel(
+            "local_adjust_panel_repair_effect",
+            local_adjust_core::RepairParams::default(),
+            local_adjust_core::LocalMask::Full,
+        );
+    }
+
+    /// v2.5.0: 固定オフセットクローンの2点指定と座標表示を固定する。
+    #[test]
+    fn local_adjust_panel_snapshot_repair_clone_effect() {
+        snapshot_repair_effect_panel(
+            "local_adjust_panel_repair_clone_effect",
+            local_adjust_core::RepairParams {
+                mode: local_adjust_core::RepairMode::Clone,
+                clone_source_uv: Some([0.25, 0.35]),
+                clone_destination_uv: Some([0.65, 0.55]),
+                ..Default::default()
+            },
+            local_adjust_core::LocalMask::Raster(local_adjust_core::RasterMask {
+                width: 1,
+                height: 1,
+                alpha: vec![1.0],
+            }),
+        );
+    }
 }
 
 fn effective_local_mask_edit_target(
@@ -2422,6 +2477,7 @@ fn draw_selected_local_adjust_layer_editor(
     effect_clipboard_available: bool,
     selective_color_pick_active: bool,
     rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
+    repair_point_pick_active: Option<crate::local_adjust_effect_ui::RepairPointPickTarget>,
     effect_position_handles_visible: bool,
     segmentation_pending: bool,
     subject_model_available: bool,
@@ -2554,31 +2610,50 @@ fn draw_selected_local_adjust_layer_editor(
         changed |= ui
             .add(egui::Slider::new(&mut edited.opacity, 0.0..=1.0).text("不透明度"))
             .changed();
-        ui.horizontal(|ui| {
-            ui.label("マスク適用");
-            let before_response =
-                draw_local_mask_application_button(ui, "前", edited.mask_before_effect);
-            let before_clicked = before_response.clicked();
-            before_response.on_hover_text("ONで、マスク範囲だけを効果の入力素材にします。");
-            if before_clicked {
-                edited.mask_before_effect = !edited.mask_before_effect;
-                changed = true;
-            }
-            let after_response =
-                draw_local_mask_application_button(ui, "後", edited.mask_after_effect);
-            let after_clicked = after_response.clicked();
-            after_response.on_hover_text("ONで、効果後の結果をマスク範囲で切り取ります。");
-            if after_clicked {
-                edited.mask_after_effect = !edited.mask_after_effect;
-                changed = true;
-            }
-        });
+        if matches!(&edited.effect, local_adjust_core::LocalEffect::Repair(_)) {
+            ui.label(
+                egui::RichText::new("修復／塗りは常にマスク範囲だけへ適用します。")
+                    .size(10.0)
+                    .color(egui::Color32::from_gray(175)),
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("マスク適用");
+                let before_response =
+                    draw_local_mask_application_button(ui, "前", edited.mask_before_effect);
+                let before_clicked = before_response.clicked();
+                before_response.on_hover_text("ONで、マスク範囲だけを効果の入力素材にします。");
+                if before_clicked {
+                    edited.mask_before_effect = !edited.mask_before_effect;
+                    changed = true;
+                }
+                let after_response =
+                    draw_local_mask_application_button(ui, "後", edited.mask_after_effect);
+                let after_clicked = after_response.clicked();
+                after_response.on_hover_text("ONで、効果後の結果をマスク範囲で切り取ります。");
+                if after_clicked {
+                    edited.mask_after_effect = !edited.mask_after_effect;
+                    changed = true;
+                }
+            });
+        }
         changed |= ui
             .add(egui::Slider::new(&mut edited.mask_expand_px, -32.0..=32.0).text("拡張/縮小"))
             .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut edited.mask_feather_px, 0.0..=64.0).text("ぼかし境界"))
-            .changed();
+        let is_repair = matches!(&edited.effect, local_adjust_core::LocalEffect::Repair(_));
+        let feather = ui.add(
+            egui::Slider::new(&mut edited.mask_feather_px, 0.0..=64.0).text(if is_repair {
+                "境界なじませ"
+            } else {
+                "ぼかし境界"
+            }),
+        );
+        changed |= feather.changed();
+        if is_repair {
+            feather.on_hover_text(
+                "修復元の探索や生成テクスチャは変えず、最後の合成境界だけを内側へ滑らかになじませます。必要なら先に「拡張/縮小」で修復範囲を広げてください。",
+            );
+        }
         ui.separator();
         changed |= draw_local_mask_editor(
             ui,
@@ -2609,6 +2684,7 @@ fn draw_selected_local_adjust_layer_editor(
             image_dims,
             selective_color_pick_active,
             rgb_pick_active,
+            repair_point_pick_active,
             effect_clipboard_available,
             effect_position_handles_visible,
         );
@@ -2635,6 +2711,10 @@ fn draw_selected_local_adjust_layer_editor(
             effect_requests.start_rgb_pick = response.start_rgb_pick;
         }
         effect_requests.cancel_rgb_pick |= response.cancel_rgb_pick;
+        if response.start_repair_point_pick.is_some() {
+            effect_requests.start_repair_point_pick = response.start_repair_point_pick;
+        }
+        effect_requests.cancel_repair_point_pick |= response.cancel_repair_point_pick;
         if response.set_effect_position_handles_visible.is_some() {
             effect_requests.set_effect_position_handles_visible =
                 response.set_effect_position_handles_visible;
@@ -2783,6 +2863,15 @@ fn draw_local_adjust_ellipse_stroke(
 }
 
 fn sample_local_adjust_rgb(app: &App, fs_idx: usize, norm: [f32; 2]) -> Option<[u8; 3]> {
+    sample_local_adjust_rgb_with_radius(app, fs_idx, norm, 0.0)
+}
+
+fn sample_local_adjust_rgb_with_radius(
+    app: &App,
+    fs_idx: usize,
+    norm: [f32; 2],
+    radius_px: f32,
+) -> Option<[u8; 3]> {
     let pixels = app.current_local_adjust_source_pixels(fs_idx)?;
     let [w, h] = pixels.size;
     if w == 0 || h == 0 {
@@ -2790,8 +2879,39 @@ fn sample_local_adjust_rgb(app: &App, fs_idx: usize, norm: [f32; 2]) -> Option<[
     }
     let x = (norm[0].clamp(0.0, 1.0) * (w.saturating_sub(1)) as f32).round() as usize;
     let y = (norm[1].clamp(0.0, 1.0) * (h.saturating_sub(1)) as f32).round() as usize;
-    let color = pixels.pixels[y.min(h - 1) * w + x.min(w - 1)];
-    Some([color.r(), color.g(), color.b()])
+    let radius = radius_px.round().clamp(0.0, 64.0) as isize;
+    if radius == 0 {
+        let color = pixels.pixels[y.min(h - 1) * w + x.min(w - 1)];
+        return Some([color.r(), color.g(), color.b()]);
+    }
+    let mut sum = [0.0_f64; 3];
+    let mut weight_sum = 0.0_f64;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let sx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+            let sy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+            let color = pixels.pixels[sy * w + sx];
+            let weight = color.a() as f64 / 255.0;
+            if weight <= f64::EPSILON {
+                continue;
+            }
+            sum[0] += color.r() as f64 * weight;
+            sum[1] += color.g() as f64 * weight;
+            sum[2] += color.b() as f64 * weight;
+            weight_sum += weight;
+        }
+    }
+    if weight_sum <= f64::EPSILON {
+        return None;
+    }
+    Some([
+        (sum[0] / weight_sum).round().clamp(0.0, 255.0) as u8,
+        (sum[1] / weight_sum).round().clamp(0.0, 255.0) as u8,
+        (sum[2] / weight_sum).round().clamp(0.0, 255.0) as u8,
+    ])
 }
 
 fn local_adjust_subject_mask_has_content(mask: &local_adjust_core::SubjectMask) -> bool {
@@ -5277,6 +5397,41 @@ fn draw_local_adjust_effect_position_overlay(
 ) {
     let source_px_scale = local_adjust_screen_px_per_source_px(rect, image_dims);
     match effect {
+        local_adjust_core::LocalEffect::Repair(params)
+            if params.mode == local_adjust_core::RepairMode::Clone =>
+        {
+            let source = params
+                .clone_source_uv
+                .map(|point| local_adjust_drawn_norm_to_screen(rect, point));
+            let destination = params
+                .clone_destination_uv
+                .map(|point| local_adjust_drawn_norm_to_screen(rect, point));
+            if let (Some(source), Some(destination)) = (source, destination) {
+                painter.line_segment(
+                    [source, destination],
+                    egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgba_unmultiplied(255, 225, 110, 190),
+                    ),
+                );
+            }
+            if let Some(source) = source {
+                draw_local_adjust_effect_center_marker(
+                    painter,
+                    source,
+                    "コピー元",
+                    egui::Color32::from_rgb(90, 220, 255),
+                );
+            }
+            if let Some(destination) = destination {
+                draw_local_adjust_effect_center_marker(
+                    painter,
+                    destination,
+                    "塗り先",
+                    egui::Color32::from_rgb(255, 205, 90),
+                );
+            }
+        }
         local_adjust_core::LocalEffect::ColorFill(_)
         | local_adjust_core::LocalEffect::ColorOverlay(_) => {
             draw_local_adjust_effect_gradient_overlay(painter, rect, effect);
@@ -7820,6 +7975,18 @@ fn draw_sliders(
 }
 
 impl App {
+    /// 補正レイヤーモードへ入る共通の状態遷移。
+    ///
+    /// 左パネルのボタンと画像フルスクリーンのショートカットは、表示初期状態を
+    /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
+    /// マスク表示は ON から始める。
+    pub(crate) fn enter_local_adjust_mode(&mut self) {
+        self.adjustment_mode = false;
+        self.local_adjust_mode = true;
+        self.local_adjust_show_source = false;
+        self.local_adjust_show_mask = true;
+    }
+
     pub(crate) fn set_local_adjust_mask_tool_from_shortcut(&mut self, tool: LocalAdjustMaskTool) {
         if self.local_adjust_mask_tool != tool {
             self.local_adjust_mask_lasso_points.clear();
@@ -9025,6 +9192,7 @@ impl App {
                 if primary_pressed
                     && !self.local_adjust_selective_color_pick_active
                     && self.local_adjust_rgb_pick_active.is_none()
+                    && self.local_adjust_repair_point_pick_active.is_none()
                 {
                     let drag_norm = if kind
                         == crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius
@@ -9106,6 +9274,26 @@ impl App {
         }
 
         if primary_pressed {
+            if let Some(target) = self.local_adjust_repair_point_pick_active {
+                if self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, true, |layer| {
+                    let local_adjust_core::LocalEffect::Repair(params) = &mut layer.effect else {
+                        return false;
+                    };
+                    match target {
+                        crate::local_adjust_effect_ui::RepairPointPickTarget::Source => {
+                            params.clone_source_uv = Some(norm);
+                        }
+                        crate::local_adjust_effect_ui::RepairPointPickTarget::Destination => {
+                            params.clone_destination_uv = Some(norm);
+                        }
+                    }
+                    true
+                }) {
+                    self.show_feedback_toast(format!("{}を指定しました", target.label()));
+                }
+                self.local_adjust_repair_point_pick_active = None;
+                return;
+            }
             if self.local_adjust_selective_color_pick_active {
                 if let Some(rgb) = sample_local_adjust_rgb(self, fs_idx, norm) {
                     let hue = crate::local_adjust_effect_ui::hue_degrees_from_rgb(rgb);
@@ -9132,7 +9320,24 @@ impl App {
             }
 
             if let Some(target) = self.local_adjust_rgb_pick_active {
-                if let Some(rgb) = sample_local_adjust_rgb(self, fs_idx, norm) {
+                let sample_radius =
+                    if target == crate::local_adjust_effect_ui::RgbPickTarget::RepairColor {
+                        self.local_adjust_page_layers
+                            .get(&fs_idx)
+                            .and_then(|layers| layers.get(layer_idx))
+                            .and_then(|layer| match &layer.effect {
+                                local_adjust_core::LocalEffect::Repair(params) => {
+                                    Some(params.sample_radius_px)
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                if let Some(rgb) =
+                    sample_local_adjust_rgb_with_radius(self, fs_idx, norm, sample_radius)
+                {
                     if self.mutate_local_adjust_layer_from_canvas(
                         fs_idx,
                         layer_idx,
@@ -9552,6 +9757,7 @@ impl App {
                 .is_some_and(local_adjust_gradient_create_pending)
             || self.local_adjust_selective_color_pick_active
             || self.local_adjust_rgb_pick_active.is_some()
+            || self.local_adjust_repair_point_pick_active.is_some()
         {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         } else if self.local_adjust_effect_position_handles_visible
@@ -9920,7 +10126,12 @@ impl App {
                 );
             }
         }
-        if self.local_adjust_effect_position_handles_visible
+        if (self.local_adjust_effect_position_handles_visible
+            || matches!(
+                &layer.effect,
+                local_adjust_core::LocalEffect::Repair(params)
+                    if params.mode == local_adjust_core::RepairMode::Clone
+            ))
             && let Some((_, drawn_rect)) =
                 local_adjust_image_layout(image_rect, image_dims, zoom_pan)
         {
@@ -10100,6 +10311,7 @@ impl App {
             undo_summary.get_or_insert_with(|| "補正レイヤー効果選択".to_string());
             self.local_adjust_selective_color_pick_active = false;
             self.local_adjust_rgb_pick_active = None;
+            self.local_adjust_repair_point_pick_active = None;
             self.show_feedback_toast(format!("加工内容を変更: {}", kind.label()));
         }
         if let Some((layer_idx, mask_kind, keep_manual_override)) = change_layer_mask
@@ -10183,6 +10395,7 @@ impl App {
                     undo_summary.get_or_insert_with(|| "補正レイヤー効果ペースト".to_string());
                     self.local_adjust_selective_color_pick_active = false;
                     self.local_adjust_rgb_pick_active = None;
+                    self.local_adjust_repair_point_pick_active = None;
                     self.show_feedback_toast(format!("加工パラメータをペースト: {}", kind.label()));
                 }
             } else {
@@ -10199,6 +10412,7 @@ impl App {
                 undo_summary.get_or_insert_with(|| "補正レイヤー効果リセット".to_string());
                 self.local_adjust_selective_color_pick_active = false;
                 self.local_adjust_rgb_pick_active = None;
+                self.local_adjust_repair_point_pick_active = None;
                 self.show_feedback_toast(format!("加工パラメータをリセット: {}", kind.label()));
             }
         }
@@ -10256,6 +10470,7 @@ impl App {
         if effect_requests.start_selective_color_pick {
             self.local_adjust_selective_color_pick_active = true;
             self.local_adjust_rgb_pick_active = None;
+            self.local_adjust_repair_point_pick_active = None;
             self.show_feedback_toast("画像上の色をクリックして対象色を選択します".to_string());
         }
         if effect_requests.cancel_rgb_pick {
@@ -10264,7 +10479,20 @@ impl App {
         if let Some(target) = effect_requests.start_rgb_pick {
             self.local_adjust_rgb_pick_active = Some(target);
             self.local_adjust_selective_color_pick_active = false;
+            self.local_adjust_repair_point_pick_active = None;
             self.show_feedback_toast(format!("スポイト対象: {}", target.label()));
+        }
+        if effect_requests.cancel_repair_point_pick {
+            self.local_adjust_repair_point_pick_active = None;
+        }
+        if let Some(target) = effect_requests.start_repair_point_pick {
+            self.local_adjust_repair_point_pick_active = Some(target);
+            self.local_adjust_selective_color_pick_active = false;
+            self.local_adjust_rgb_pick_active = None;
+            self.show_feedback_toast(format!(
+                "画像上をクリックして{}を指定します",
+                target.label()
+            ));
         }
         if let Some(layer_idx) = effect_requests.load_cube_lut {
             self.choose_local_adjust_cube_lut_for_layer(fs_idx, layer_idx);
@@ -10722,7 +10950,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        with_local_adjust_dark_window_style(ctx, || {
+        with_local_adjust_dark_context_style(ctx, || {
             egui::Window::new("補正レイヤーを追加")
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
@@ -10822,7 +11050,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        with_local_adjust_dark_window_style(ctx, || {
+        with_local_adjust_dark_context_style(ctx, || {
             egui::Window::new("マスク種類変更")
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
@@ -10916,7 +11144,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        with_local_adjust_dark_window_style(ctx, || {
+        with_local_adjust_dark_context_style(ctx, || {
             egui::Window::new("加工内容を選択")
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
@@ -11051,6 +11279,7 @@ impl App {
         let effect_clipboard_available = self.local_adjust_effect_clipboard.is_some();
         let selective_color_pick_active = self.local_adjust_selective_color_pick_active;
         let rgb_pick_active = self.local_adjust_rgb_pick_active;
+        let repair_point_pick_active = self.local_adjust_repair_point_pick_active;
         let effect_position_handles_visible = self.local_adjust_effect_position_handles_visible;
         let segmentation_pending = self.local_adjust_segmentation_pending.is_some();
         let active_local_adjust_layers = self.has_active_local_adjust_layers(fs_idx);
@@ -11330,6 +11559,7 @@ impl App {
                                         effect_clipboard_available,
                                         selective_color_pick_active,
                                         rgb_pick_active,
+                                        repair_point_pick_active,
                                         effect_position_handles_visible,
                                         segmentation_pending,
                                         subject_model_available,
@@ -11379,7 +11609,9 @@ impl App {
         );
 
         if close_clicked {
+            self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
+            self.local_adjust_repair_point_pick_active = None;
             self.local_adjust_add_layer_dialog_open = false;
             self.local_adjust_change_mask_dialog_open = false;
             self.local_adjust_effect_picker_dialog_open = false;
@@ -11635,13 +11867,17 @@ impl App {
                 activate_erase = true;
             }
 
+            let local_adjust_tooltip = self.keymap.first_chord_action_label(
+                "補正レイヤー",
+                crate::keymap::KeyAction::FsLocalAdjustMode,
+            );
             let local_adjust_resp = draw_header_icon_button(
                 &mut child,
                 local_adjust_rect,
                 "adjust_panel_local_adjust_btn",
                 can_start_edit_tool,
                 false,
-                "補正レイヤー",
+                &local_adjust_tooltip,
                 edit_tool_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_local_adjust_icon,
             );
@@ -11710,10 +11946,7 @@ impl App {
             // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
             // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
             if activate_local_adjust {
-                self.adjustment_mode = false;
-                self.local_adjust_mode = true;
-                self.local_adjust_show_source = false;
-                self.local_adjust_show_mask = true;
+                self.enter_local_adjust_mode();
                 return;
             }
             if activate_erase {

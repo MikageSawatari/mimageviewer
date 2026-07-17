@@ -1842,6 +1842,10 @@ struct ViewerContextBundle {
     virtual_folder_writeback: Option<VirtualFolderWriteback>,
     pdf_prefetch_grace_until: Option<std::time::Instant>,
     thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    thumb_edit_preview_layers: std::collections::HashMap<
+        usize,
+        std::sync::Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
+    >,
     thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
@@ -2048,6 +2052,7 @@ impl ViewerContextBundle {
             virtual_folder_writeback: None,
             pdf_prefetch_grace_until: None,
             thumb_pixels: std::collections::HashMap::new(),
+            thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
             adjustment_page_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
@@ -3753,6 +3758,20 @@ pub(crate) struct EditResultEntry {
     /// UI スレッドで前倒ししない)。holdover 表示 (`current_edit_result_texture`) は
     /// `None` のとき単にこのソースを使わない (best-effort)。
     pub(crate) texture: Option<egui::TextureHandle>,
+}
+
+enum EditPreviewCloseUpdate {
+    Save {
+        item_key: String,
+        source_mtime: i64,
+        source_size: i64,
+        pixels: Arc<egui::ColorImage>,
+        annotations: Option<crate::edit_preview_cache::EditPreviewAnnotations>,
+        crop: Option<crate::export_crop::CropRect>,
+    },
+    Delete {
+        item_key: String,
+    },
 }
 
 /// 編集結果ピクセルを表示用テクスチャへアップロードする (`EditResultKey` 由来の安定名)。
@@ -6357,6 +6376,12 @@ pub struct App {
     // ── 変換済みアーカイブキャッシュ (v0.7.0) ───────────────────
     /// RAR / 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
     pub(crate) archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
+    /// 非破壊編集結果のグリッド用 WebP キャッシュ。encode / I/O / prune は専用 worker。
+    pub(crate) edit_preview_cache: Option<crate::edit_preview_cache::EditPreviewCacheService>,
+    /// cache worker 完了時に UI を起こすため、直近 update の Context を保持する。
+    pub(crate) edit_preview_repaint_ctx: Option<egui::Context>,
+    /// 保存完了後、同じページの通常サムネを編集プレビューへ差し替えるまで追跡する。
+    pub(crate) edit_preview_refresh_pending: std::collections::HashMap<String, std::time::Instant>,
     /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
     pub(crate) archive_convert: Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
     pub(crate) video_upscale: Option<crate::ui_dialogs::video_upscale::VideoUpscaleState>,
@@ -7501,6 +7526,9 @@ pub struct App {
     pub(crate) local_adjust_effect_clipboard: Option<local_adjust_core::LocalEffect>,
     /// 効果色スポイトの対象。キャンバスクリックで対象色を拾う。
     pub(crate) local_adjust_rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
+    /// 修復クローンのコピー元 / 塗り先基準点を指定する状態。
+    pub(crate) local_adjust_repair_point_pick_active:
+        Option<crate::local_adjust_effect_ui::RepairPointPickTarget>,
     /// 選択色スポイトの状態。キャンバスクリックで対象色を拾う。
     pub(crate) local_adjust_selective_color_pick_active: bool,
     /// 画像上の効果位置ハンドル表示フラグ。
@@ -7646,6 +7674,11 @@ pub struct App {
     /// 同期的に `apply_adjustments_fast` を掛け直すための元ソース。
     /// 範囲外に evict されたら drop する。post_filter は適用しない (色調のみ)。
     pub(crate) thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    /// 編集プレビューの注釈ラスターレイヤー。`thumb_pixels` の下地へ色調補正を掛けた後に合成。
+    pub(crate) thumb_edit_preview_layers: std::collections::HashMap<
+        usize,
+        std::sync::Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
+    >,
     /// サムネイル補正済みテクスチャ: idx → TextureHandle。
     /// `effective_params(idx)` が色調 identity でないときのみ格納。
     /// サムネ描画時は `thumbnails[idx].tex` より優先される。
@@ -8083,6 +8116,11 @@ pub struct App {
     /// 隠蔽編集モード中の「プレビューボタン押下」状態。
     /// 押している間 true で、`ensure_conceal_texture` が conceal_mode でも合成を実行する。
     pub(crate) conceal_preview_active: bool,
+    /// 前フレームで確定した隠蔽プレビュー目アイコンの矩形。
+    ///
+    /// 画像テクスチャの解決はパネル描画より先に行われるため、当該フレームの pointer
+    /// 状態をこの矩形で先読みし、`conceal_preview_active` をパイプライン解決前に更新する。
+    pub(crate) conceal_preview_button_rect: Option<egui::Rect>,
     /// 消しゴム編集中に `erase_base_cache` から作る表示テクスチャのキャッシュ。
     /// `Arc<ColorImage>` をテクスチャ化したものを per-idx で保持し、毎フレーム
     /// `ctx.load_texture` を呼ぶオーバーヘッド (4K で 30ms) を避ける。
@@ -8789,6 +8827,19 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_archive_cache", 0, t);
 
         let t = std::time::Instant::now();
+        let edit_preview_cache = crate::edit_preview_cache::EditPreviewCacheService::open()
+            .map_err(|e| crate::logger::log(format!("edit_preview_cache open failed: {e}")))
+            .ok();
+        if let Some(service) = &edit_preview_cache {
+            if settings.edit_preview_cache_enabled {
+                service.prune(settings.edit_preview_cache_max_bytes.max(1_000_000));
+            } else {
+                service.clear();
+            }
+        }
+        crate::perf::emit_ms("startup", "db_open_edit_preview_cache", 0, t);
+
+        let t = std::time::Instant::now();
         let search_index_db = crate::search_index_db::SearchIndexDb::open()
             .map_err(|e| crate::logger::log(format!("search_index_db open failed: {e}")))
             .ok()
@@ -9281,6 +9332,9 @@ impl App {
             cache_maint_pending: None,
             archive_cache_maint_pending: None,
             archive_cache_db,
+            edit_preview_cache,
+            edit_preview_repaint_ctx: None,
+            edit_preview_refresh_pending: std::collections::HashMap::new(),
             archive_convert: None,
             video_upscale: None,
             show_video_upscale_tasks: false,
@@ -9671,6 +9725,7 @@ impl App {
             local_adjust_mask_preview_texture: None,
             local_adjust_effect_clipboard: None,
             local_adjust_rgb_pick_active: None,
+            local_adjust_repair_point_pick_active: None,
             local_adjust_selective_color_pick_active: false,
             local_adjust_effect_position_handles_visible: true,
             local_adjust_canvas_drag: None,
@@ -9729,6 +9784,7 @@ impl App {
             adjustment_generation: std::collections::HashMap::new(),
             ai_upscale_generation: std::collections::HashMap::new(),
             thumb_pixels: std::collections::HashMap::new(),
+            thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
             thumb_adjust_was_dragging: false,
             thumb_adjust_drag_color_dirty: false,
@@ -9923,6 +9979,7 @@ impl App {
             comic_tail_stash: std::collections::HashMap::new(),
             erase_preview_active: false,
             conceal_preview_active: false,
+            conceal_preview_button_rect: None,
             erase_base_tex_cache: std::collections::HashMap::new(),
             fs_nav_locked_gen: None,
             fs_holdover_tex: None,
@@ -11145,6 +11202,7 @@ impl App {
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
             thumb_pixels,
+            thumb_edit_preview_layers,
             thumb_adjust_tex,
             adjustment_page_params,
             local_adjust_page_layers,
@@ -11328,6 +11386,7 @@ impl App {
         swap_field!(virtual_folder_writeback);
         swap_field!(pdf_prefetch_grace_until);
         swap_field!(thumb_pixels);
+        swap_field!(thumb_edit_preview_layers);
         swap_field!(thumb_adjust_tex);
         swap_field!(adjustment_page_params);
         swap_field!(local_adjust_page_layers);
@@ -13036,6 +13095,7 @@ impl App {
         self.reset_folder_rating_counts();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.fs_cache.clear();
         self.fs_upload_backlog.clear();
@@ -16300,6 +16360,20 @@ impl App {
                     .and_then(|pixels| zip_level_thumb_reuse_key(it).map(|k| (k, pixels)))
             })
             .collect();
+        let preserved_thumb_layers: std::collections::HashMap<
+            String,
+            Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
+        > = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                self.thumb_edit_preview_layers
+                    .get(&i)
+                    .cloned()
+                    .and_then(|layers| zip_level_thumb_reuse_key(it).map(|key| (key, layers)))
+            })
+            .collect();
         // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
         // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
@@ -16326,6 +16400,9 @@ impl App {
                     if is_thumb_adjust_target(Some(&self.items[i])) {
                         if let Some(pixels) = preserved_thumb_pixels.get(&key) {
                             self.thumb_pixels.insert(i, Arc::clone(pixels));
+                        }
+                        if let Some(layers) = preserved_thumb_layers.get(&key) {
+                            self.thumb_edit_preview_layers.insert(i, Arc::clone(layers));
                         }
                     }
                 }
@@ -17796,12 +17873,14 @@ impl App {
         // 画像補正: ページ個別パラメータを DB から復元
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.thumb_adjust_was_dragging = false;
         self.thumb_adjust_drag_color_dirty = false;
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
+        self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.export_crop_mode = false;
         self.export_crop_drag = None;
@@ -17822,6 +17901,7 @@ impl App {
         self.local_adjust_preview_to_selected_layer = false;
         self.local_adjust_effect_clipboard = None;
         self.local_adjust_rgb_pick_active = None;
+        self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_selective_color_pick_active = false;
         self.local_adjust_effect_position_handles_visible = true;
         self.local_adjust_canvas_drag = None;
@@ -19711,6 +19791,7 @@ impl App {
         self.rating_cache.clear();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
@@ -20117,6 +20198,16 @@ impl App {
                     .map(|ni| (ni, v))
             })
             .collect();
+        let shifted_thumb_layers = std::mem::take(&mut self.thumb_edit_preview_layers)
+            .into_iter()
+            .filter_map(|(i, layers)| {
+                shift(i)
+                    .filter(|&ni| {
+                        ni < self.items.len() && is_thumb_adjust_target(self.items.get(ni))
+                    })
+                    .map(|ni| (ni, layers))
+            })
+            .collect();
 
         // selected の詰め動作: `sel - count(removed idx < sel)` は残存 / 削除どちらの
         // ケースでも「old idx の位置に収まる新 idx」(= 繰り上がった次 item) を返す。
@@ -20357,6 +20448,7 @@ impl App {
         // Loaded のサムネイル本体は Vec::remove で残るため、補正用 source も同じ
         // idx shift で残す。補正済み TextureHandle は invalidate 後に再生成させる。
         self.thumb_pixels = shifted_thumb_pixels;
+        self.thumb_edit_preview_layers = shifted_thumb_layers;
 
         let n = self.items.len();
         if n == 0 {
@@ -22180,7 +22272,14 @@ impl App {
             Ok(crate::books::BookOpResult::Append(summary)) => {
                 self.apply_book_page_edit_copies(&summary.edit_copies);
                 self.apply_book_page_semantic_copies(&summary.semantic_copies);
-                self.book_list_cache = None;
+                if let Some(rows) = self.book_list_cache.as_mut() {
+                    crate::books::apply_append_to_cached_list(
+                        rows,
+                        &summary.book_name,
+                        &summary.folder,
+                        summary.added,
+                    );
+                }
                 if self
                     .current_folder
                     .as_ref()
@@ -22599,6 +22698,7 @@ impl App {
         let keep_start_shared = Arc::clone(&self.keep_start_shared);
         let keep_end_shared = Arc::clone(&self.keep_end_shared);
         let visible_end_shared = Arc::clone(&self.visible_end_shared);
+        let edit_preview_db = self.edit_preview_cache.as_ref().map(|service| service.db());
 
         crate::logger::log(format!(
             "  spawning {} regular + {} I/O workers",
@@ -22623,6 +22723,7 @@ impl App {
             // 内部 Mutex<Connection> で並列読みは serialize されるが、cascade lookup
             // 件数は典型的に数件程度なので contention は無視できる。
             let pin_db_w = pin_db.clone();
+            let edit_preview_db_w = edit_preview_db.clone();
             let tag = format!("{prefix}{worker_idx}");
 
             std::thread::spawn(move || {
@@ -22688,6 +22789,8 @@ impl App {
                             idx: req.idx,
                             image: None,
                             from_cache: false,
+                            from_edit_preview: false,
+                            edit_preview_adjustment: None,
                             source_dims: None,
                             canceled: true,
                             finalized: false,
@@ -22738,6 +22841,7 @@ impl App {
                         &ks_w,
                         &ke_w,
                         pin_db_w.as_deref(),
+                        edit_preview_db_w.as_ref(),
                     );
                 }
                 crate::logger::log(format!("  {tag} stopped"));
@@ -23019,6 +23123,8 @@ impl App {
                     idx,
                     image: ci,
                     from_cache: false,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
                     source_dims: None,
                     canceled: false,
                     finalized: false,
@@ -23079,6 +23185,8 @@ impl App {
                 idx: i,
                 image: color_image_opt,
                 from_cache,
+                from_edit_preview,
+                edit_preview_adjustment,
                 source_dims,
                 canceled,
                 finalized,
@@ -23199,13 +23307,24 @@ impl App {
                         // (display-pipeline.md §1.5)。動画 / フォルダ / ZIP・PDF
                         // 代表サムネに global_preset が漏れないようゲートする。
                         let retain_pixels_for_adjust = is_thumb_adjust_target(self.items.get(i));
-                        let (arc_pixels_opt, image_to_upload) = if retain_pixels_for_adjust {
-                            let arc = std::sync::Arc::new(color_image);
-                            let img = (*arc).clone();
-                            (Some(arc), img)
+                        let (arc_pixels_opt, edit_layers_opt, image_to_upload) =
+                            if retain_pixels_for_adjust {
+                                let (base, layers) = match edit_preview_adjustment {
+                                    Some(adjustment) => (
+                                        adjustment.base,
+                                        Some(std::sync::Arc::new(adjustment.annotation_layers)),
+                                    ),
+                                    None => (color_image.clone(), None),
+                                };
+                                (Some(std::sync::Arc::new(base)), layers, color_image)
+                            } else {
+                                (None, None, color_image)
+                            };
+                        if let Some(layers) = edit_layers_opt {
+                            self.thumb_edit_preview_layers.insert(i, layers);
                         } else {
-                            (None, color_image)
-                        };
+                            self.thumb_edit_preview_layers.remove(&i);
+                        }
                         let handle = ctx.load_texture(
                             format!("thumb_{i}"),
                             image_to_upload,
@@ -23221,6 +23340,7 @@ impl App {
                         self.thumbnails[i] = ThumbnailState::Loaded {
                             tex: handle,
                             from_cache,
+                            from_edit_preview,
                             rendered_at_px,
                             source_dims,
                         };
@@ -23302,6 +23422,8 @@ impl App {
                             idx: i,
                             image: Some(color_image),
                             from_cache,
+                            from_edit_preview,
+                            edit_preview_adjustment,
                             source_dims,
                             canceled: false,
                             finalized: false,
@@ -23322,6 +23444,7 @@ impl App {
                         self.requested.remove(&i);
                         self.pending_finalize.remove(&i);
                         self.thumb_pixels.remove(&i);
+                        self.thumb_edit_preview_layers.remove(&i);
                         self.thumb_adjust_tex.remove(&i);
                         self.thumbnails[i] = ThumbnailState::Evicted;
                     }
@@ -23438,6 +23561,7 @@ impl App {
             *thumb = ThumbnailState::Evicted;
         }
         self.thumb_pixels.remove(&idx);
+        self.thumb_edit_preview_layers.remove(&idx);
         self.thumb_adjust_tex.remove(&idx);
     }
 
@@ -23492,6 +23616,7 @@ impl App {
         let Some(mut req) = req_opt else {
             return;
         };
+        self.attach_edit_preview_to_request(&mut req);
         if !self.items_are_drive_list
             && let Some(item) = self.items.get(idx)
             && self.should_force_cache_for_drive_list_pin(item)
@@ -23545,6 +23670,7 @@ impl App {
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
             self.thumb_pixels.clear();
+            self.thumb_edit_preview_layers.clear();
             self.thumb_adjust_tex.clear();
             for (item, thumb) in self.items.iter().zip(self.thumbnails.iter_mut()) {
                 // Video thumbnails are produced by the dedicated Shell/sidecar worker at
@@ -23701,6 +23827,7 @@ impl App {
             // サムネ補正用ピクセル/テクスチャも keep_set 外では破棄する。
             // 動画は上で skip 済みなのでここには来ない。
             self.thumb_pixels.remove(&i);
+            self.thumb_edit_preview_layers.remove(&i);
             self.thumb_adjust_tex.remove(&i);
         }
         let t2 = frame_t0.elapsed();
@@ -23869,6 +23996,7 @@ impl App {
                 }
                 continue;
             };
+            self.attach_edit_preview_to_request(&mut req);
             if !self.items_are_drive_list
                 && let Some(item) = self.items.get(i)
                 && self.should_force_cache_for_drive_list_pin(item)
@@ -24368,6 +24496,7 @@ impl App {
             let needs_upgrade = match self.thumbnails.get(i) {
                 Some(ThumbnailState::Loaded {
                     from_cache,
+                    from_edit_preview,
                     rendered_at_px,
                     source_dims,
                     ..
@@ -24386,7 +24515,8 @@ impl App {
                     let target_px = source_long_edge
                         .map(|src| src.min(current_display_px))
                         .unwrap_or(current_display_px);
-                    *from_cache || (*rendered_at_px as u64) * 5 < (target_px as u64) * 4
+                    !*from_edit_preview
+                        && (*from_cache || (*rendered_at_px as u64) * 5 < (target_px as u64) * 4)
                 }
                 _ => false,
             };
@@ -27976,7 +28106,9 @@ impl App {
 
         self.finish_adjustment_drag_for_detached_pause();
         self.adjustment_mode = false;
+        self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
+        self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
@@ -30755,6 +30887,7 @@ impl App {
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
             thumb_pixels,
+            thumb_edit_preview_layers,
             thumb_adjust_tex,
             adjustment_page_params,
             local_adjust_page_layers,
@@ -30950,6 +31083,7 @@ impl App {
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
             thumb_pixels,
+            thumb_edit_preview_layers,
             thumb_adjust_tex,
             adjustment_page_params,
             local_adjust_page_layers,
@@ -32825,6 +32959,11 @@ impl App {
     /// 見開き正規化のような内部起動は bump しないので、fs load は現在の
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
+        // viewer 内ページ送りでも、idx を差し替える前に前ページの完成済み編集結果を
+        // 派生キャッシュへ渡す。grid からの新規入場では fullscreen_idx=None なので no-op。
+        if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {
+            self.cache_current_edit_preview_if_ready();
+        }
         // ClickToShow の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
         // ファイル移動が集約されるこの境界で、前ファイルの開状態を引き継がない。
         self.reset_fs_side_panel_runtime_for_file_change();
@@ -34604,6 +34743,23 @@ impl App {
             comic: self.comic_pages.contains(&idx)
                 || self.item_has_one_level_edit_key(idx, &self.comic_page_keys),
             rotation: self.item_has_one_level_rotation(idx),
+        }
+    }
+
+    fn attach_edit_preview_to_request(&self, req: &mut LoadRequest) {
+        if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
+            return;
+        }
+        let badges = self.grid_edit_badges(req.idx);
+        // 色調補正は既存の thumb_adjust_tex が安価に再現する。永続プレビューには
+        // source 解像度の edit-result + 注釈 + 最後段 crop だけを含める。
+        if badges.local_adjust
+            || badges.mask
+            || badges.conceal
+            || badges.comic
+            || self.export_crop_pages.contains(&req.idx)
+        {
+            req.edit_preview_key = self.page_path_key(req.idx);
         }
     }
 
@@ -39291,6 +39447,12 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // teardown で fullscreen_idx / edit_result_cache を落とす前に、現在見えている
+        // 最新の edit-result を snapshot。実際の encode / 保存は reset 系の DB 更新
+        // command より後へ enqueue し、旧 preview の invalidate が後着しない順序にする。
+        let edit_preview_close_update = self
+            .fullscreen_idx
+            .and_then(|idx| self.snapshot_edit_preview_close_update(idx));
         self.cancel_media_navigation_pending_for_current_context("close_fullscreen");
         // 表示モード / フィットのポップアップを開いたまま抜けると、次回フルスクリーンで
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
@@ -39620,6 +39782,7 @@ impl App {
         self.view_trim_page_apply_root_idx = None;
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         self.local_adjust_mode = false;
+        self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
@@ -39636,6 +39799,7 @@ impl App {
         self.local_adjust_mask_brush_before_layers = None;
         self.local_adjust_brush_deferred_render = None;
         self.local_adjust_segmentation_pending = None;
+        self.enqueue_edit_preview_close_update(edit_preview_close_update);
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
@@ -40687,6 +40851,232 @@ impl App {
         Some(key)
     }
 
+    fn invalidate_edit_preview_cache_for_key(&self, item_key: &str) {
+        if let Some(service) = &self.edit_preview_cache {
+            service.delete(item_key.to_string());
+        }
+    }
+
+    fn snapshot_edit_preview_close_update(&mut self, idx: usize) -> Option<EditPreviewCloseUpdate> {
+        if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
+            return None;
+        }
+        let item_key = self.page_path_key(idx)?;
+        let (source_mtime, source_size) = self.image_metas.get(idx).copied().flatten()?;
+        let has_source_edits = self.local_adjust_pages.contains(&idx)
+            || self.mask_pages.contains(&idx)
+            || self.conceal_pages.contains(&idx);
+        let has_crop = self.export_crop_pages.contains(&idx);
+        // fullscreen で読み込み済みの in-memory scene を使う。DB の debounce 確定前でも
+        // 編集中の最新テキスト / スタンプを snapshot できる。
+        let annotation_objects = self
+            .comic_docs
+            .get(&item_key)
+            .filter(|objects| !objects.is_empty())
+            .cloned();
+        let has_annotations = annotation_objects.is_some();
+        if !has_source_edits && !has_annotations && !has_crop {
+            return Some(EditPreviewCloseUpdate::Delete { item_key });
+        }
+
+        let edit_key = self.current_edit_result_key(idx);
+        let Some(entry) = self.edit_result_cache.get(&edit_key) else {
+            // 最新世代がまだ完成していない場合、古いプレビューを表示する方が危険。
+            // 今回は削除し、次に完成結果を表示して閉じた時に再生成する。
+            return Some(EditPreviewCloseUpdate::Delete { item_key });
+        };
+        let pixels = Arc::clone(&entry.pixels);
+        let crop = self.export_crop_rect_for_pixels(idx, pixels.size);
+        let annotations = if let Some(objects) = annotation_objects {
+            // fullscreen の comic 表示時に解決済みの FontSet を Arc clone する。close / page
+            // navigation 境界で新しいフォント列挙やファイル読み込みを同期実行しない。
+            let Some(fonts) = self.comic_fonts.clone() else {
+                // 注釈を欠いたプレビューで旧結果を上書きしない。
+                return Some(EditPreviewCloseUpdate::Delete { item_key });
+            };
+            let (source_w, source_h) = self
+                .source_dims_for_idx(idx)
+                .unwrap_or((pixels.size[0] as f32, pixels.size[1] as f32));
+            Some(crate::edit_preview_cache::EditPreviewAnnotations {
+                objects,
+                fonts,
+                stamp_cache: self.comic_stamp_cache.clone(),
+                source_dims: [
+                    source_w.round().max(1.0) as usize,
+                    source_h.round().max(1.0) as usize,
+                ],
+            })
+        } else {
+            None
+        };
+        Some(EditPreviewCloseUpdate::Save {
+            item_key,
+            source_mtime,
+            source_size,
+            pixels,
+            annotations,
+            crop,
+        })
+    }
+
+    fn enqueue_edit_preview_close_update(&self, update: Option<EditPreviewCloseUpdate>) {
+        let (Some(service), Some(update)) = (&self.edit_preview_cache, update) else {
+            return;
+        };
+        match update {
+            EditPreviewCloseUpdate::Save {
+                item_key,
+                source_mtime,
+                source_size,
+                pixels,
+                annotations,
+                crop,
+            } => service.save(
+                item_key,
+                source_mtime,
+                source_size,
+                pixels,
+                annotations,
+                crop,
+                self.settings.edit_preview_cache_max_bytes.max(1_000_000),
+                self.edit_preview_repaint_ctx.clone(),
+            ),
+            EditPreviewCloseUpdate::Delete { item_key } => service.delete(item_key),
+        }
+    }
+
+    /// 補正レイヤーモード退出・別編集モードへの切替・ページ移動の境界で、現在ページの
+    /// 完成済み edit-result を保存する。未完成なら旧 preview を削除するだけに留める。
+    pub(crate) fn cache_current_edit_preview_if_ready(&mut self) {
+        let update = self
+            .fullscreen_idx
+            .and_then(|idx| self.snapshot_edit_preview_close_update(idx));
+        self.enqueue_edit_preview_close_update(update);
+    }
+
+    fn evict_thumbnail_for_edit_preview_refresh(&mut self, idx: usize) {
+        for queue in [&self.reload_queue, &self.heavy_io_queue]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(mut pending) = queue.0.lock() {
+                pending.retain(|req| req.idx != idx);
+            }
+        }
+        self.requested.remove(&idx);
+        self.pending_finalize.remove(&idx);
+        self.texture_backlog.retain(|msg| msg.idx != idx);
+        self.thumb_pixels.remove(&idx);
+        self.thumb_edit_preview_layers.remove(&idx);
+        self.thumb_adjust_tex.remove(&idx);
+        if let Some(state) = self.thumbnails.get_mut(idx) {
+            *state = ThumbnailState::Evicted;
+        }
+    }
+
+    fn poll_edit_preview_cache(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(service) = &self.edit_preview_cache {
+            while let Ok(event) = service.try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            match event {
+                crate::edit_preview_cache::EditPreviewEvent::Saved { item_key } => {
+                    let matching: Vec<usize> = (0..self.items.len())
+                        .filter(|&idx| {
+                            self.page_path_key(idx).as_deref() == Some(item_key.as_str())
+                        })
+                        .collect();
+                    for idx in matching {
+                        self.evict_thumbnail_for_edit_preview_refresh(idx);
+                    }
+                    self.edit_preview_refresh_pending.insert(
+                        item_key,
+                        std::time::Instant::now() + std::time::Duration::from_secs(10),
+                    );
+                }
+                crate::edit_preview_cache::EditPreviewEvent::Invalidated { item_key } => {
+                    let matching: Vec<usize> = (0..self.items.len())
+                        .filter(|&idx| {
+                            self.page_path_key(idx).as_deref() == Some(item_key.as_str())
+                        })
+                        .collect();
+                    for idx in matching {
+                        self.evict_thumbnail_for_edit_preview_refresh(idx);
+                    }
+                    self.edit_preview_refresh_pending.remove(&item_key);
+                }
+                crate::edit_preview_cache::EditPreviewEvent::Cleared => {
+                    let loaded_previews: Vec<usize> = self
+                        .thumbnails
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, state)| {
+                            matches!(
+                                state,
+                                ThumbnailState::Loaded {
+                                    from_edit_preview: true,
+                                    ..
+                                }
+                            )
+                            .then_some(idx)
+                        })
+                        .collect();
+                    for idx in loaded_previews {
+                        self.evict_thumbnail_for_edit_preview_refresh(idx);
+                    }
+                    self.edit_preview_refresh_pending.clear();
+                }
+            }
+        }
+        if !self.edit_preview_refresh_pending.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn reconcile_edit_preview_refreshes(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let pending: Vec<(String, std::time::Instant)> = self
+            .edit_preview_refresh_pending
+            .iter()
+            .map(|(key, deadline)| (key.clone(), *deadline))
+            .collect();
+        for (item_key, deadline) in pending {
+            let idx = (0..self.items.len())
+                .find(|&idx| self.page_path_key(idx).as_deref() == Some(item_key.as_str()));
+            let Some(idx) = idx else {
+                if now >= deadline {
+                    self.edit_preview_refresh_pending.remove(&item_key);
+                }
+                continue;
+            };
+            let preview_loaded = matches!(
+                self.thumbnails.get(idx),
+                Some(ThumbnailState::Loaded {
+                    from_edit_preview: true,
+                    ..
+                })
+            );
+            if preview_loaded || now >= deadline {
+                self.edit_preview_refresh_pending.remove(&item_key);
+                continue;
+            }
+            // 保存通知より前に開始済みだった raw decode が後着した場合も、次の
+            // フレームで再度 Evicted にして preview cache を必ず読み直す。
+            if matches!(
+                self.thumbnails.get(idx),
+                Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
+            ) {
+                self.evict_thumbnail_for_edit_preview_refresh(idx);
+            }
+        }
+        if !self.edit_preview_refresh_pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// ページのサイドカー置き場 (= 対応する `mimageviewer.dat` が置かれるフォルダ) を返す。
     /// `page_path_key` と対になるヘルパー。3 バリアント対応漏れを避けるため同じ構造で書いている。
     pub(crate) fn sidecar_folder(&self, idx: usize) -> Option<std::path::PathBuf> {
@@ -40924,6 +41314,7 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        self.invalidate_edit_preview_cache_for_key(&key);
         if let Some(db) = &self.mask_db {
             let _ = db.set_raw(&key, compressed, shapes_json, w, h);
         }
@@ -40941,6 +41332,7 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        self.invalidate_edit_preview_cache_for_key(&key);
         if let Some(db) = &self.mask_db {
             let _ = db.delete(&key);
         }
@@ -40997,6 +41389,7 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        self.invalidate_edit_preview_cache_for_key(&key);
         if let Some(db) = &self.conceal_db {
             let _ = db.set_raw(&key, compressed, shapes_json, w, h);
         }
@@ -41015,6 +41408,7 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        self.invalidate_edit_preview_cache_for_key(&key);
         if let Some(db) = &self.conceal_db {
             let _ = db.delete(&key);
         }
@@ -41037,6 +41431,7 @@ impl App {
             Some(key) => key,
             None => return,
         };
+        self.invalidate_edit_preview_cache_for_key(&key);
         if let Some(db) = &self.local_adjust_db {
             if let Err(err) = db.set_layers(&key, &layers) {
                 crate::logger::log(format!(
@@ -41165,6 +41560,9 @@ impl App {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
         }
+        // crop は edit-result / final AI を作り直さないが、永続編集プレビューの最終段には
+        // 含まれる。確定した矩形が変わった時点で旧 WebP だけを失効させる。
+        self.invalidate_edit_preview_cache_for_key(&key);
         // crop は表示パイプライン (edit_result / final composite) に含まれない (暗転
         // overlay のみ。実切り出しは save 時)。よって edit_result / final AI キャッシュは
         // 無効化しない。無効化すると crop ドラッグのたびに AI アップスケールを無駄に
@@ -42237,6 +42635,28 @@ impl App {
     /// UI ヒッチを避けるための設計 (Codex P2、`docs/conceal-feature-plan.md §9.1`)。
     pub(crate) fn bump_conceal_generation(&mut self) {
         self.conceal_generation = self.conceal_generation.wrapping_add(1);
+        // 非表示ページは generation 不一致で lazy eviction のままにする。一方、編集中の
+        // 現在ページはパラメータ変更直後にも旧 GPU texture を描画経路が保持し得るため、
+        // entry 自体を即時に外す。次のプレビュー lookup は必ず現在設定で compose し直す。
+        if let Some(idx) = self.fullscreen_idx {
+            self.conceal_cache.remove(&idx);
+        }
+        // 隠蔽タイプ・強度等は全ページ共通なので、マスク単位の invalidate では
+        // 他ページの永続 preview が古いままになる。専用 worker 側の clear は
+        // 既に空なら SELECT だけで抜けるため、slider drag 中も UI / disk write を塞がない。
+        if let Some(service) = &self.edit_preview_cache {
+            service.clear();
+        }
+        // retained final AI の key はページの安定キー / 入力サイズ / 色調設定を使い、
+        // edit_result の一時世代は含めない。これは同じ画像を閉じて開き直したときに
+        // AI 結果を再利用するためだが、隠蔽パラメータ変更後も同じサイズの旧結果が
+        // hit すると、再合成したモザイク境界が古い AI 出力で上書きされる。
+        //
+        // 隠蔽パラメータは全ページ共通で、現在の retained cache から「隠蔽ありの
+        // entry」だけを識別する情報は得られないため、この ownership boundary で
+        // retained final AI を全失効する。epoch も進むので、変更前に開始された orphan
+        // job が完了して旧結果を再挿入することもない。
+        self.clear_retained_final_ai_cache("conceal_generation_change");
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches();
     }
@@ -44170,6 +44590,9 @@ impl App {
             self.comic_pages.insert(idx);
         }
         Self::set_page_key_presence(&mut self.comic_page_keys, key, !objects.is_empty());
+        // 永続編集プレビューは edit-result の上に注釈を焼くため、注釈内容が変わった時点で
+        // 旧 WebP を失効させる。最新 scene は編集境界で worker へ snapshot する。
+        self.invalidate_edit_preview_cache_for_key(key);
         // 比較 (Wipe/Diff) 準備済みキャッシュは comic を焼き込むため、注釈の保存で旧ピクセルが
         // stale になる。該当 idx の準備済みペア / 準備中ジョブを落とす (mark_comic_dirty が拾えない
         // 非現在ページ保存もカバー)。
@@ -44370,7 +44793,8 @@ impl App {
 
     /// 注釈編集を確定したときに呼ぶ。`comic_generation` を進めて comic_cache の各 entry を
     /// 失効させ、次の `ensure_comic_composite_texture` で最新 `comic_docs` から再ベイク
-    /// させる (§5.5 のキャッシュ無効化規約)。サムネは非反映 (D3) なので触らない。
+    /// させる (§5.5 のキャッシュ無効化規約)。永続サムネイル preview の失効は
+    /// `save_comic_objects` が page key 単位で担当する。
     pub(crate) fn mark_comic_dirty(&mut self) {
         self.comic_generation = self.comic_generation.wrapping_add(1);
         // 注釈内容が変わると、比較 (Wipe/Diff) 用に prepare_capture_pixel_job が焼いた準備済み
@@ -45134,6 +45558,17 @@ impl App {
                 || stats.imported_comic > 0
             {
                 self.refresh_edit_rollup_keys_from_dbs();
+            }
+            if stats.imported_mask > 0
+                || stats.imported_conceal > 0
+                || stats.imported_local_adjust > 0
+            {
+                // 外部更新された sidecar はページごとの旧 preview より新しい可能性がある。
+                // import 対象キーの全列挙を UI スレッドで行わず、派生キャッシュを worker で
+                // 一括失効して次の編集終了時に再生成する。
+                if let Some(service) = &self.edit_preview_cache {
+                    service.clear();
+                }
             }
         }
         self.sidecars.insert(sidecar_folder.to_path_buf(), sidecar);
@@ -46533,13 +46968,19 @@ impl App {
         let Some(pixels) = self.thumb_pixels.get(&idx).cloned() else {
             return;
         };
-        let adjusted = {
+        let mut adjusted = {
             let params = self.effective_params(idx);
             if params.is_color_identity() {
                 return;
             }
             crate::adjustment::apply_adjustments_fast(&pixels, params)
         };
+        if let Some(layers) = self.thumb_edit_preview_layers.get(&idx) {
+            // fullscreen と同じ `edit -> color -> comic`。注釈を先に焼くと gamma 等が
+            // テキスト／スタンプにも掛かるため、色調補正後の下地へだけ戻す。
+            adjusted =
+                crate::edit_preview_cache::composite_cached_annotation_layers(&adjusted, layers);
+        }
         let handle = ctx.load_texture(
             format!("thumb_adj_{idx}"),
             adjusted,
@@ -47934,7 +48375,9 @@ impl App {
         self.slideshow_scroll_anim = None;
         self.slideshow_scroll_range_cache = None;
         self.adjustment_mode = false;
+        self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
+        self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
@@ -50299,6 +50742,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
+        self.edit_preview_repaint_ctx = Some(ctx.clone());
         // prefetch suppression gate: 同フレーム内の scroll 入力を即時に拾う。
         // `scroll_offset_y` への反映 (= process_scroll / handle_keyboard) を待たないので、
         // `update_keep_range_and_requests` の gate 判定時点で last_prefetch_scroll_at が
@@ -50840,7 +51284,9 @@ impl eframe::App for App {
         // install_new_items / remove_items_batch 側に追加する。
         let items_gen_pre_late = self.items_generation;
 
+        self.poll_edit_preview_cache(ctx);
         self.poll_thumbnails(ctx);
+        self.reconcile_edit_preview_refreshes(ctx);
         // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
         // 立った同フレームで holdover を捨てて新画面に切り替える)。
         self.poll_fs_nav_lock();
@@ -53712,6 +54158,7 @@ fn apply_folder_thumb_pin(
             // 値で catalog 行を書いているので、worker の cache_hit 比較が成立する。
             mtime: resolved.mtime,
             file_size: resolved.file_size,
+            edit_preview_key: None,
             resolve_override: None,
             folder_thumb_sort: base_req.folder_thumb_sort,
             folder_thumb_depth: base_req.folder_thumb_depth,
@@ -53758,6 +54205,7 @@ fn apply_folder_thumb_pin(
         cache_key_override: Some(pinned_key),
         mtime: resolved.mtime,
         file_size: resolved.file_size,
+        edit_preview_key: None,
         resolve_override,
         // フォルダ自動選定パラメータ (sort/depth) は Folder strategy のときだけ意味がある。
         // base_req から継承するので Folder → Folder の pin で sort/depth が消えない。

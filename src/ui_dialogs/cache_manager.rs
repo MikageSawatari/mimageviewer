@@ -206,6 +206,7 @@ impl App {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label("すべてのサムネイルキャッシュを削除します。");
+                    ui.label("(編集結果のプレビューキャッシュも一緒に削除されます)");
                     ui.label("(動画タイル モードのサムネ キャッシュも一緒に削除されます)");
                     ui.label("(比率自動判定キャッシュも一緒に削除されます)");
                     ui.label("この操作は元に戻せません。");
@@ -217,6 +218,9 @@ impl App {
                         let del_btn = egui::Button::new("  削除する  ");
                         if ui.add_enabled(!busy, del_btn).clicked() {
                             let cache_dir = crate::catalog::default_cache_dir();
+                            if let Some(service) = &self.edit_preview_cache {
+                                service.clear();
+                            }
                             // 削除前に Connection を畳む (Codex P3): 同上。
                             self.evict_all_catalog_cache();
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(

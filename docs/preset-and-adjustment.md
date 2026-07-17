@@ -537,8 +537,10 @@ epoch が進んでいた結果は store 時に捨てる。保持 LRU の `store`
 ### 3.3 サムネイル補正
 
 サムネイルは `thumb_pixels` から色調補正のみを同期適用し、`thumb_adjust_tex` に保持する。
-edit 系 (erase / local_adjust / conceal) や crop は反映しない。post_filter と AI もサムネでは
-実行しない。スライダー drag 中は補正サムネ生成を止め、release 後に visible 優先で再生成する。
+環境設定の編集プレビューキャッシュが有効なら、erase / local_adjust / conceal / crop 済みの下地と、
+crop 済み comic 注釈ラスターレイヤーを分離して読み込む。色調補正は下地だけへ表示時に適用し、
+その後で注釈を合成する。post_filter と final AI はサムネでは実行しない。スライダー drag 中は
+補正サムネ生成を止め、release 後に visible 優先で再生成する。
 
 ### 3.4 補正レイヤーの適用タイミング
 
@@ -573,10 +575,38 @@ idle まで遅延する。release 時は遅延をキャンセルして 1 回だ�
 - `LinearGradient` / `RadialGradient`: 画像上ドラッグで開始/終了点または中心/半径を更新する。
 - `ColorRange`: 画像クリックで対象 RGB を拾う。
 - `SelectiveColor` と各種 RGB パラメータ: 効果 UI のスポイトボタンから画像クリックで色を拾う。
+- `Repair`: 基準色は指定半径の不透明画素を平均してスポイトで拾う。`Clone` では
+  コピー元 / 塗り先基準点をそれぞれ画像上のクリックで指定し、固定オフセットを作る。
 - 位置を持つ効果 (`TiltShift` / `RadialBlur` / `LensFlare` / `Spotlight` など): 位置ハンドル表示中に画像上のハンドルをドラッグする。
 - 手描きマスク: `RasterVector` はベースマスクを直接編集し、その他のマスクでは追加/削除マスクを明示的に開いたときだけブラシ入力が有効になる。ドラッグ中は in-memory 更新、release 時に DB 保存する。
 
-サムネイル側は画像を変えず、補正レイヤー設定があるページに `局` バッジだけを表示する。
+#### 修復／塗り効果 (v2.5.0)
+
+`LocalEffect::Repair` は必ず解決済みマスクとレイヤ不透明度の範囲内だけへ適用する。
+汎用効果の「マスク適用 前 / 後」切替によって修復結果がマスク外へ逃げない。
+修復レイヤーではマスクの `ぼかし境界` を `境界なじませ` と表示し、修復元の探索 / パッチ配置には
+ぼかす前のマスク、最終合成にはぼかしたマスクを使う。これにより境界をなじませても生成テクスチャや
+参照元は変化しない。なじませ幅を外側へ確保したい場合は、先に `拡張/縮小` で修復範囲を広げる。
+
+- `Solid`: スポイト色の RGB へ置き換える。
+- `PreserveLuminance`: スポイト色の色相 / 彩度と入力画素の HSL 輝度を組み合わせる。
+- `Surrounding`: マスク外の小パッチを境界から内側へ選択 / 複写し、重なり領域を連続ウェイトで
+  合成してパッチ境界の段差を抑えた後、周囲の平均色とコントラストへ寄せる。処理品質は候補数、
+  `RepairPatchSize` はパッチ寸法を独立して切り替える。`Auto` (既定) は従来どおり品質に応じた
+  10〜14px、`Standard` は 24px、`Large` は 48px。`seed` で別候補を再現可能にする。
+- `Clone`: 正規化座標で保存したコピー元 / 塗り先基準点の差をマスク全体へ適用し、入力画像を
+  bilinear sample する。
+
+周囲修復とクローンの重い処理は既存の `local-adjust-render` worker 内で行う。品質で候補数を上限付きにし、
+一定タイルごとに cancel flag と進捗を確認する。専用の AI session や別のピクセルキャッシュは持たず、既存の
+`local_adjust_generation` / `local_adjust_cache` の無効化境界に従う。
+
+補正レイヤー設定があるページには `局` バッジを表示する。環境設定の「編集結果をサムネイル一覧に
+保持する」が有効なら、フルスクリーン編集を閉じた時点または別ページへ移動する直前の
+`edit_result_cache` とテキスト／スタンプの注釈ラスターレイヤーへ同じ crop を適用し、下地 WebP と
+lossless 注釈 WebP に分けて編集プレビューキャッシュへ非同期保存する。表示時は下地へだけ色調補正を
+掛けた後で注釈を合成し、fullscreen と同じ処理順にする。final AI / スマートシャープ /
+post-filter は含めない。
 
 Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページでは `local_adjust_cache` が揃ってから
 実行する。表示中の暫定フォールバック画像をそのまま保存しない。
@@ -602,9 +632,9 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | フォルダ切替 | 全クリア | 全クリア | **全クリア** + `thumb_pixels` も全クリア | pending をキャンセル |
 | keep_range からの eviction | 該当 idx の edit/final を evict | 該当 idx の final を evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | **クリアしない** | — |
-| 消しゴムマスク変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない (`thumb_pixels` は元サムネソース、マスクで変わらない) | erase/local/conceal/final pending をキャンセル |
-| 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない (サムネ画像には反映しない) | local/final pending をキャンセル |
-| 隠蔽加工変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない | final pending をキャンセル |
+| 消しゴムマスク変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | erase/local/conceal/final pending をキャンセル |
+| 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | local/final pending をキャンセル |
+| 隠蔽加工変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | final pending をキャンセル |
 | crop 変更 | **クリアしない** (表示は overlay のみ) | **クリアしない** | 触らない | **触らない** (AI を無駄にキャンセルしない) |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
@@ -708,11 +738,16 @@ local_adjust_cache ─▶ conceal_cache ─▶ edit_result_cache
                          色調補正 ─▶ final AI ─▶ post_filter ─▶ final_composite_cache ─▶ 画面
                                                                        │
                                                                        ▼
-                                     (Ctrl+S / Ctrl+E のみ) crop で切り出し ─▶ 保存
+                                     (Ctrl+S / Ctrl+E) crop で切り出し ─▶ 保存
+                                           │
+                                           └─ (編集 preview) 下地／注釈へ crop
+                                                                  ├─▶ 下地 WebP
+                                                                  └─▶ 注釈 lossless WebP
 ```
 
-crop は通常表示には反映されず (crop 外を暗くする overlay のみ)、保存 / 書き出し時に
-final composite を crop 矩形で切り出す最終段としてだけ働く。
+crop はフルスクリーン通常表示には反映されず (crop 外を暗くする overlay のみ)、保存 / 書き出し時に
+final composite を切り出す最終段として働く。編集プレビューでは edit-result と各注釈レイヤーを同じ
+矩形で切り出すため、一覧のサムネイルとアスペクト比には反映される。
 
 `fs_cache` は raw decode 専用で、消しゴム確定結果を書き戻さない。マスクが存在する画像は
 表示時に `ensure_erase_result_texture` が source 解像度の raw 入力

@@ -1381,6 +1381,7 @@ pub enum KeyAction {
     FsLoupeLockToggle,
     FsLoupeHold,
     FsEraseMode,
+    FsLocalAdjustMode,
     FsConcealMode,
     FsTextMode,
     FsBgCycle,
@@ -1778,6 +1779,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsLoupeLockToggle,
     KeyAction::FsLoupeHold,
     KeyAction::FsEraseMode,
+    KeyAction::FsLocalAdjustMode,
     KeyAction::FsConcealMode,
     KeyAction::FsTextMode,
     KeyAction::FsBgCycle,
@@ -3179,6 +3181,7 @@ impl KeyAction {
             FsLoupeLockToggle => "FsLoupeLockToggle",
             FsLoupeHold => "FsLoupeHold",
             FsEraseMode => "FsEraseMode",
+            FsLocalAdjustMode => "FsLocalAdjustMode",
             FsConcealMode => "FsConcealMode",
             FsTextMode => "FsTextMode",
             FsBgCycle => "FsBgCycle",
@@ -3694,6 +3697,7 @@ impl KeyAction {
             FsLoupeLockToggle => "ルーペの固定表示を切り替える",
             FsLoupeHold => "押している間だけルーペを表示する",
             FsEraseMode => "消しゴムモードを開始または確定する",
+            FsLocalAdjustMode => "補正レイヤーモードを開始する",
             FsConcealMode => "隠蔽加工モードを開始または終了する",
             FsTextMode => "テキスト注釈モードを開始または終了する",
             FsBgCycle => "透過背景色を切り替える",
@@ -4078,6 +4082,7 @@ impl KeyAction {
             | FsLoupeLockToggle
             | FsLoupeHold
             | FsEraseMode
+            | FsLocalAdjustMode
             | FsConcealMode
             | FsTextMode
             | FsBgCycle
@@ -4448,6 +4453,7 @@ impl KeyAction {
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsEraseMode
+            | FsLocalAdjustMode
             | FsConcealMode
             | FsTextMode
             | FsBgCycle
@@ -4842,6 +4848,7 @@ impl KeyAction {
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
             FsLoupeHold => ChordList::one(Chord::modifier(ModKind::Shift)),
             FsEraseMode => ChordList::one(Chord::key(E)),
+            FsLocalAdjustMode => ChordList::one(Chord::ctrl(G)),
             FsConcealMode => ChordList::one(Chord::ctrl(M)),
             FsTextMode => ChordList::one(Chord::ctrl(T)),
             FsBgCycle => ChordList::one(Chord::key(B)),
@@ -8273,6 +8280,17 @@ mod tests {
             KeyAction::FsImageAnalysis.default_chords().iter().next(),
             Some(Chord::shift(KeyName::Z))
         );
+    }
+
+    #[test]
+    fn local_adjust_start_is_configurable_in_image_fullscreen_with_ctrl_g_default() {
+        assert_eq!(KeyAction::FsLocalAdjustMode.context(), KeyContext::FsImage);
+        assert_eq!(KeyAction::FsLocalAdjustMode.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            KeyAction::FsLocalAdjustMode.default_chords().iter().next(),
+            Some(Chord::ctrl(KeyName::G))
+        );
+        assert!(KeyAction::FsLocalAdjustMode.is_user_facing());
     }
 
     #[test]

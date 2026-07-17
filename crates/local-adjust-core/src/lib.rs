@@ -872,6 +872,7 @@ pub enum LocalEffect {
     Duotone(DuotoneParams),
     Equalize(EqualizeParams),
     GradientMap(GradientMapParams),
+    Repair(RepairParams),
     ColorFill(ColorFillParams),
     Frame(FrameParams),
     OutlineStroke(OutlineStrokeParams),
@@ -988,6 +989,7 @@ impl LocalEffect {
             Self::Duotone(_) => "デュオトーン",
             Self::Equalize(_) => "ヒストグラム均等化",
             Self::GradientMap(_) => "グラデーションマップ",
+            Self::Repair(_) => "修復／塗り",
             Self::ColorFill(_) => "塗りつぶし",
             Self::Frame(_) => "フレーム",
             Self::OutlineStroke(_) => "縁取り",
@@ -2762,6 +2764,108 @@ impl Default for GradientMapParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairMode {
+    Solid,
+    PreserveLuminance,
+    #[default]
+    Surrounding,
+    Clone,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairColorSource {
+    #[default]
+    Surrounding,
+    Sampled,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairQuality {
+    Fast,
+    #[default]
+    Standard,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairPatchSize {
+    /// 品質設定に応じた従来値 (10〜14px)。既存レイヤーとの互換もこの値に寄せる。
+    #[default]
+    Auto,
+    /// 広めのテクスチャ単位を扱う 24px パッチ。
+    Standard,
+    /// 大きな色面や模様を扱う 48px パッチ。
+    Large,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RepairParams {
+    #[serde(default)]
+    pub mode: RepairMode,
+    #[serde(default)]
+    pub color_source: RepairColorSource,
+    #[serde(default = "default_repair_sampled_rgb")]
+    pub sampled_rgb: [u8; 3],
+    #[serde(default = "default_repair_sample_radius_px")]
+    pub sample_radius_px: f32,
+    #[serde(default = "default_repair_search_radius_px")]
+    pub search_radius_px: f32,
+    #[serde(default = "default_repair_texture_strength")]
+    pub texture_strength: f32,
+    #[serde(default = "default_repair_color_match_strength")]
+    pub color_match_strength: f32,
+    #[serde(default)]
+    pub quality: RepairQuality,
+    #[serde(default)]
+    pub patch_size: RepairPatchSize,
+    #[serde(default)]
+    pub seed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_source_uv: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_destination_uv: Option<[f32; 2]>,
+}
+
+impl Default for RepairParams {
+    fn default() -> Self {
+        Self {
+            mode: RepairMode::Surrounding,
+            color_source: RepairColorSource::Surrounding,
+            sampled_rgb: default_repair_sampled_rgb(),
+            sample_radius_px: default_repair_sample_radius_px(),
+            search_radius_px: default_repair_search_radius_px(),
+            texture_strength: default_repair_texture_strength(),
+            color_match_strength: default_repair_color_match_strength(),
+            quality: RepairQuality::Standard,
+            patch_size: RepairPatchSize::Auto,
+            seed: 0,
+            clone_source_uv: None,
+            clone_destination_uv: None,
+        }
+    }
+}
+
+fn default_repair_sampled_rgb() -> [u8; 3] {
+    [128, 128, 128]
+}
+
+fn default_repair_sample_radius_px() -> f32 {
+    3.0
+}
+
+fn default_repair_search_radius_px() -> f32 {
+    96.0
+}
+
+fn default_repair_texture_strength() -> f32 {
+    0.85
+}
+
+fn default_repair_color_match_strength() -> f32 {
+    0.75
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ColorFillParams {
     #[serde(default = "default_color_fill_shape")]
@@ -4437,6 +4541,20 @@ fn evaluate_layer_mask_without_opacity(
     layer: &LocalAdjustmentLayer,
 ) -> Result<Vec<f32>> {
     let image = image.validate()?;
+    let alpha = evaluate_layer_mask_before_feather(image, layer)?;
+    Ok(apply_layer_mask_feather(
+        alpha,
+        image.width,
+        image.height,
+        layer.mask_feather_px,
+    ))
+}
+
+fn evaluate_layer_mask_before_feather(
+    image: RgbaImageRef<'_>,
+    layer: &LocalAdjustmentLayer,
+) -> Result<Vec<f32>> {
+    let image = image.validate()?;
     let mut alpha = evaluate_raw_mask(image, &layer.mask)?;
     apply_manual_override(
         &mut alpha,
@@ -4457,15 +4575,20 @@ fn evaluate_layer_mask_without_opacity(
             layer.mask_expand_px.round() as i32,
         );
     }
-    if layer.mask_feather_px >= 0.5 {
-        alpha = box_blur_alpha(
-            &alpha,
-            image.width,
-            image.height,
-            layer.mask_feather_px.round() as usize,
-        );
-    }
     Ok(alpha)
+}
+
+fn apply_layer_mask_feather(
+    alpha: Vec<f32>,
+    width: usize,
+    height: usize,
+    feather_px: f32,
+) -> Vec<f32> {
+    if feather_px >= 0.5 {
+        box_blur_alpha(&alpha, width, height, feather_px.round() as usize)
+    } else {
+        alpha
+    }
 }
 
 fn apply_mask_opacity(alpha: &mut [f32], opacity: f32) {
@@ -4537,7 +4660,18 @@ where
         return Ok(());
     }
     check_cancel(cancel)?;
-    let base_mask = evaluate_layer_mask_without_opacity(image.as_ref(), layer)?;
+    let mask_before_feather = evaluate_layer_mask_before_feather(image.as_ref(), layer)?;
+    // Repair の生成範囲 / 周囲パッチ探索には hard mask を使う。汎用の feathered mask を
+    // 渡すと、わずかな alpha の halo まで欠損扱いになり、参照元とタイル配置が変わって
+    // テクスチャそのものがぼけたり粗くなったりする。feather は最後の合成だけに使う。
+    let repair_mask =
+        matches!(&layer.effect, LocalEffect::Repair(_)).then(|| mask_before_feather.clone());
+    let base_mask = apply_layer_mask_feather(
+        mask_before_feather,
+        image.width,
+        image.height,
+        layer.mask_feather_px,
+    );
     let opacity = layer.opacity.clamp(0.0, 1.0);
     let output_mask = if layer.mask_after_effect {
         let mut output_mask = base_mask.clone();
@@ -4557,6 +4691,31 @@ where
             &output_mask,
             *params,
         );
+        return Ok(());
+    }
+    if let LocalEffect::Repair(params) = &layer.effect {
+        let repair_mask = repair_mask
+            .as_deref()
+            .expect("Repair layers always retain their pre-feather mask");
+        let effected = apply_repair(
+            &image.pixels,
+            image.width,
+            image.height,
+            repair_mask,
+            *params,
+            cancel,
+            |percent| {
+                progress(LocalAdjustProgress {
+                    layer_index,
+                    layer_count,
+                    effect_name: layer.effect.progress_label(),
+                    percent,
+                });
+            },
+        )?;
+        let mut repair_mask = base_mask;
+        apply_mask_opacity(&mut repair_mask, opacity);
+        blend_rgb_with_mask(&mut image.pixels, &effected, &repair_mask);
         return Ok(());
     }
 
@@ -4749,6 +4908,7 @@ where
             LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
             LocalEffect::Equalize(params) => apply_equalize(&image.pixels, *params),
             LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
+            LocalEffect::Repair(_) => unreachable!("Repair is handled with its resolved mask"),
             LocalEffect::ColorFill(params) => {
                 apply_color_fill(&image.pixels, image.width, image.height, *params)
             }
@@ -10585,6 +10745,696 @@ fn apply_color_overlay(
         }
     }
     out
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RepairTile {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    anchor: usize,
+    distance: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RepairRgbStats {
+    mean: [f32; 3],
+    std_dev: [f32; 3],
+}
+
+struct RepairBlendState {
+    x0: usize,
+    y0: usize,
+    width: usize,
+    weights: Vec<f32>,
+}
+
+impl RepairBlendState {
+    fn new(image_width: usize, image_height: usize, hole: &[bool]) -> Self {
+        let mut x0 = image_width;
+        let mut y0 = image_height;
+        let mut x1 = 0;
+        let mut y1 = 0;
+        for (index, inside) in hole.iter().copied().enumerate() {
+            if !inside {
+                continue;
+            }
+            let x = index % image_width;
+            let y = index / image_width;
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+        let width = x1.saturating_sub(x0);
+        let height = y1.saturating_sub(y0);
+        Self {
+            x0,
+            y0,
+            width,
+            weights: vec![0.0; width.saturating_mul(height)],
+        }
+    }
+
+    fn local_index(&self, x: usize, y: usize) -> usize {
+        (y - self.y0) * self.width + (x - self.x0)
+    }
+
+    fn has_sample(&self, x: usize, y: usize) -> bool {
+        self.weights[self.local_index(x, y)] > f32::EPSILON
+    }
+
+    fn blend_rgb(
+        &mut self,
+        out: &mut [u8],
+        target: usize,
+        source_rgb: &[u8],
+        x: usize,
+        y: usize,
+        weight: f32,
+    ) {
+        let local = self.local_index(x, y);
+        let previous_weight = self.weights[local];
+        let total_weight = previous_weight + weight;
+        let pixel = target * 4;
+        if previous_weight <= f32::EPSILON {
+            out[pixel..pixel + 3].copy_from_slice(source_rgb);
+        } else {
+            for channel in 0..3 {
+                let value = (out[pixel + channel] as f32 * previous_weight
+                    + source_rgb[channel] as f32 * weight)
+                    / total_weight;
+                out[pixel + channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        self.weights[local] = total_weight;
+    }
+}
+
+fn apply_repair<F>(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    mask: &[f32],
+    params: RepairParams,
+    cancel: Option<&AtomicBool>,
+    mut progress: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(f32),
+{
+    if width == 0 || height == 0 {
+        return Ok(src.to_vec());
+    }
+    let hole: Vec<bool> = mask.iter().map(|value| *value > 0.001).collect();
+    if !hole.iter().any(|value| *value) {
+        return Ok(src.to_vec());
+    }
+    check_cancel(cancel)?;
+    progress(0.05);
+
+    match params.mode {
+        RepairMode::Solid | RepairMode::PreserveLuminance => {
+            let overlay = rgb_u8_to_f32(params.sampled_rgb);
+            let mut out = src.to_vec();
+            out.par_chunks_exact_mut(4)
+                .zip(src.par_chunks_exact(4))
+                .zip(hole.par_iter())
+                .for_each(|((dst, base), inside)| {
+                    if !inside {
+                        return;
+                    }
+                    let replacement = if params.mode == RepairMode::PreserveLuminance {
+                        color_overlay_blend_rgb(
+                            [
+                                base[0] as f32 / 255.0,
+                                base[1] as f32 / 255.0,
+                                base[2] as f32 / 255.0,
+                            ],
+                            overlay,
+                            ColorOverlayBlendMode::Color,
+                        )
+                    } else {
+                        overlay
+                    };
+                    for channel in 0..3 {
+                        dst[channel] = to_u8(replacement[channel]);
+                    }
+                });
+            progress(0.95);
+            Ok(out)
+        }
+        RepairMode::Clone => {
+            let (Some(source_uv), Some(destination_uv)) =
+                (params.clone_source_uv, params.clone_destination_uv)
+            else {
+                return Ok(src.to_vec());
+            };
+            let source = repair_uv_to_pixel(source_uv, width, height);
+            let destination = repair_uv_to_pixel(destination_uv, width, height);
+            let offset = [source[0] - destination[0], source[1] - destination[1]];
+            let mut out = src.to_vec();
+            let mut cloned = vec![false; hole.len()];
+            for y in 0..height {
+                if y % 64 == 0 {
+                    check_cancel(cancel)?;
+                    progress(0.1 + 0.62 * y as f32 / height.max(1) as f32);
+                }
+                for x in 0..width {
+                    let index = y * width + x;
+                    if !hole[index] {
+                        continue;
+                    }
+                    let source_x = x as f32 + offset[0];
+                    let source_y = y as f32 + offset[1];
+                    if source_x < 0.0
+                        || source_y < 0.0
+                        || source_x > width.saturating_sub(1) as f32
+                        || source_y > height.saturating_sub(1) as f32
+                    {
+                        continue;
+                    }
+                    let (sampled, sampled_alpha) =
+                        sample_rgb_bilinear_alpha_aware(src, width, height, source_x, source_y);
+                    if sampled_alpha <= f32::EPSILON {
+                        continue;
+                    }
+                    let pixel = index * 4;
+                    for channel in 0..3 {
+                        out[pixel + channel] = to_u8(sampled[channel]);
+                    }
+                    cloned[index] = true;
+                }
+            }
+            harmonize_repair(src, &mut out, width, height, &cloned, params);
+            progress(0.95);
+            Ok(out)
+        }
+        RepairMode::Surrounding => {
+            apply_surrounding_repair(src, width, height, &hole, params, cancel, progress)
+        }
+    }
+}
+
+fn repair_uv_to_pixel(uv: [f32; 2], width: usize, height: usize) -> [f32; 2] {
+    [
+        uv[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32,
+        uv[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32,
+    ]
+}
+
+fn apply_surrounding_repair<F>(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    hole: &[bool],
+    params: RepairParams,
+    cancel: Option<&AtomicBool>,
+    mut progress: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(f32),
+{
+    let source_available: Vec<bool> = hole
+        .iter()
+        .copied()
+        .zip(src.chunks_exact(4))
+        .map(|(inside, pixel)| !inside && pixel[3] > 0)
+        .collect();
+    let (distance, nearest_source) =
+        repair_distance_map(width, height, hole, &source_available, cancel)?;
+    if nearest_source.iter().all(|source| *source == usize::MAX) {
+        return Ok(src.to_vec());
+    }
+    check_cancel(cancel)?;
+    progress(0.12);
+
+    let (patch_size, patch_step, context, candidate_count) =
+        repair_patch_geometry(params.quality, params.patch_size);
+    let mut tiles = repair_tiles(width, height, hole, &distance, patch_size, patch_step);
+    tiles.sort_unstable_by_key(|tile| tile.distance);
+    let mut out = src.to_vec();
+    let mut blend_state = RepairBlendState::new(width, height, hole);
+    let radius = params.search_radius_px.round().clamp(8.0, 512.0) as i32;
+    let target_hint = if params.color_source == RepairColorSource::Sampled {
+        rgb_u8_to_f32(params.sampled_rgb)
+    } else {
+        repair_surrounding_stats(src, width, height, hole)
+            .map(|stats| stats.mean)
+            .unwrap_or_else(|| rgb_u8_to_f32(params.sampled_rgb))
+    };
+
+    for (tile_index, tile) in tiles.iter().copied().enumerate() {
+        if tile_index % 16 == 0 {
+            check_cancel(cancel)?;
+            progress(0.12 + 0.68 * tile_index as f32 / tiles.len().max(1) as f32);
+        }
+        let anchor_x = tile.anchor % width;
+        let anchor_y = tile.anchor / width;
+        let mut offsets = Vec::with_capacity(candidate_count + 1);
+        let nearest = nearest_source[tile.anchor];
+        let nearest_offset = if nearest != usize::MAX {
+            Some([
+                nearest as i32 % width as i32 - anchor_x as i32,
+                nearest as i32 / width as i32 - anchor_y as i32,
+            ])
+        } else {
+            None
+        };
+        if let Some(nearest_offset) = nearest_offset {
+            offsets.push(nearest_offset);
+        }
+        let max_attempts = candidate_count * 16;
+        for attempt in 0..max_attempts {
+            if offsets.len() >= candidate_count {
+                break;
+            }
+            let base_seed = params.seed
+                ^ (tile_index as u32).wrapping_mul(0x9E37_79B1)
+                ^ (attempt as u32).wrapping_mul(0x85EB_CA77);
+            let jitter_x = repair_hash_offset(base_seed, radius);
+            let jitter_y = repair_hash_offset(base_seed ^ 0xA511_E9B3, radius);
+            if jitter_x * jitter_x + jitter_y * jitter_y > radius * radius {
+                continue;
+            }
+            let base = nearest_offset.unwrap_or([0, 0]);
+            let offset = [base[0] + jitter_x, base[1] + jitter_y];
+            if !offsets.contains(&offset)
+                && repair_tile_source_is_valid(tile, offset, width, height, hole, &source_available)
+            {
+                offsets.push(offset);
+            }
+        }
+
+        let mut best_offset = None;
+        let mut best_score = f32::INFINITY;
+        for offset in offsets {
+            if !repair_tile_source_is_valid(tile, offset, width, height, hole, &source_available) {
+                continue;
+            }
+            let score = repair_patch_score(
+                src,
+                &out,
+                width,
+                height,
+                &source_available,
+                hole,
+                &blend_state,
+                tile,
+                offset,
+                context,
+                target_hint,
+            );
+            if score < best_score {
+                best_score = score;
+                best_offset = Some(offset);
+            }
+        }
+
+        for y in tile.y0..tile.y1 {
+            for x in tile.x0..tile.x1 {
+                let target = y * width + x;
+                if !hole[target] {
+                    continue;
+                }
+                let source = best_offset
+                    .and_then(|offset| repair_offset_index(x, y, offset, width, height))
+                    .filter(|source| source_available[*source])
+                    .or_else(|| {
+                        (nearest_source[target] != usize::MAX).then_some(nearest_source[target])
+                    });
+                let Some(source) = source else {
+                    continue;
+                };
+                let source_pixel = source * 4;
+                blend_state.blend_rgb(
+                    &mut out,
+                    target,
+                    &src[source_pixel..source_pixel + 3],
+                    x,
+                    y,
+                    repair_tile_blend_weight(tile, x, y),
+                );
+            }
+        }
+    }
+    check_cancel(cancel)?;
+    progress(0.84);
+    harmonize_repair(src, &mut out, width, height, hole, params);
+    progress(0.95);
+    Ok(out)
+}
+
+fn repair_patch_geometry(
+    quality: RepairQuality,
+    patch_size: RepairPatchSize,
+) -> (usize, usize, usize, usize) {
+    let (auto_patch_size, auto_patch_step, auto_context, candidate_count) = match quality {
+        RepairQuality::Fast => (14, 10, 2, 10),
+        RepairQuality::Standard => (12, 6, 3, 18),
+        RepairQuality::High => (10, 5, 4, 32),
+    };
+    let (patch_size, patch_step, context) = match patch_size {
+        RepairPatchSize::Auto => (auto_patch_size, auto_patch_step, auto_context),
+        RepairPatchSize::Standard => (24, 12, 6),
+        RepairPatchSize::Large => (48, 24, 10),
+    };
+    (patch_size, patch_step, context, candidate_count)
+}
+
+fn repair_hash_offset(seed: u32, radius: i32) -> i32 {
+    let unit = hash_u32(seed) as f32 / u32::MAX as f32;
+    ((unit * 2.0 - 1.0) * radius as f32).round() as i32
+}
+
+fn repair_distance_map(
+    width: usize,
+    height: usize,
+    hole: &[bool],
+    source_available: &[bool],
+    cancel: Option<&AtomicBool>,
+) -> Result<(Vec<u32>, Vec<usize>)> {
+    let len = width.saturating_mul(height);
+    let mut distance = vec![u32::MAX; len];
+    let mut nearest_source = vec![usize::MAX; len];
+    let mut queue = VecDeque::new();
+    for y in 0..height {
+        if y % 128 == 0 {
+            check_cancel(cancel)?;
+        }
+        for x in 0..width {
+            let index = y * width + x;
+            if !hole[index] {
+                continue;
+            }
+            for neighbor in repair_neighbors(x, y, width, height) {
+                if source_available[neighbor] {
+                    distance[index] = 1;
+                    nearest_source[index] = neighbor;
+                    queue.push_back(index);
+                    break;
+                }
+            }
+        }
+    }
+    let mut visited = 0_usize;
+    while let Some(index) = queue.pop_front() {
+        visited += 1;
+        if visited.is_multiple_of(65_536) {
+            check_cancel(cancel)?;
+        }
+        let x = index % width;
+        let y = index / width;
+        for neighbor in repair_neighbors(x, y, width, height) {
+            if hole[neighbor] && distance[neighbor] == u32::MAX {
+                distance[neighbor] = distance[index].saturating_add(1);
+                nearest_source[neighbor] = nearest_source[index];
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    Ok((distance, nearest_source))
+}
+
+fn repair_neighbors(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> impl Iterator<Item = usize> {
+    let mut neighbors = [usize::MAX; 4];
+    let mut count = 0;
+    if x > 0 {
+        neighbors[count] = y * width + x - 1;
+        count += 1;
+    }
+    if x + 1 < width {
+        neighbors[count] = y * width + x + 1;
+        count += 1;
+    }
+    if y > 0 {
+        neighbors[count] = (y - 1) * width + x;
+        count += 1;
+    }
+    if y + 1 < height {
+        neighbors[count] = (y + 1) * width + x;
+        count += 1;
+    }
+    neighbors.into_iter().take(count)
+}
+
+fn repair_tiles(
+    width: usize,
+    height: usize,
+    hole: &[bool],
+    distance: &[u32],
+    patch_size: usize,
+    patch_step: usize,
+) -> Vec<RepairTile> {
+    let mut tiles = Vec::new();
+    for y0 in (0..height).step_by(patch_step.max(1)) {
+        for x0 in (0..width).step_by(patch_step.max(1)) {
+            let y1 = (y0 + patch_size).min(height);
+            let x1 = (x0 + patch_size).min(width);
+            let mut anchor = usize::MAX;
+            let mut min_distance = u32::MAX;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let index = y * width + x;
+                    if hole[index] && distance[index] < min_distance {
+                        anchor = index;
+                        min_distance = distance[index];
+                    }
+                }
+            }
+            if anchor != usize::MAX {
+                tiles.push(RepairTile {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    anchor,
+                    distance: min_distance,
+                });
+            }
+        }
+    }
+    tiles
+}
+
+fn repair_tile_blend_weight(tile: RepairTile, x: usize, y: usize) -> f32 {
+    let width = tile.x1.saturating_sub(tile.x0).max(1) as f32;
+    let height = tile.y1.saturating_sub(tile.y0).max(1) as f32;
+    let x_norm = (x.saturating_sub(tile.x0) as f32 + 0.5) / width;
+    let y_norm = (y.saturating_sub(tile.y0) as f32 + 0.5) / height;
+    let x_weight = (1.0 - (x_norm * 2.0 - 1.0).abs()).clamp(0.08, 1.0);
+    let y_weight = (1.0 - (y_norm * 2.0 - 1.0).abs()).clamp(0.08, 1.0);
+    x_weight * y_weight
+}
+
+fn repair_tile_source_is_valid(
+    tile: RepairTile,
+    offset: [i32; 2],
+    width: usize,
+    height: usize,
+    hole: &[bool],
+    source_available: &[bool],
+) -> bool {
+    for y in tile.y0..tile.y1 {
+        for x in tile.x0..tile.x1 {
+            let target = y * width + x;
+            if !hole[target] {
+                continue;
+            }
+            let Some(source) = repair_offset_index(x, y, offset, width, height) else {
+                return false;
+            };
+            if !source_available[source] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn repair_offset_index(
+    x: usize,
+    y: usize,
+    offset: [i32; 2],
+    width: usize,
+    height: usize,
+) -> Option<usize> {
+    let source_x = x as i32 + offset[0];
+    let source_y = y as i32 + offset[1];
+    if source_x < 0 || source_y < 0 || source_x >= width as i32 || source_y >= height as i32 {
+        None
+    } else {
+        Some(source_y as usize * width + source_x as usize)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repair_patch_score(
+    src: &[u8],
+    out: &[u8],
+    width: usize,
+    height: usize,
+    source_available: &[bool],
+    hole: &[bool],
+    blend_state: &RepairBlendState,
+    tile: RepairTile,
+    offset: [i32; 2],
+    context: usize,
+    target_hint: [f32; 3],
+) -> f32 {
+    let min_x = tile.x0.saturating_sub(context);
+    let min_y = tile.y0.saturating_sub(context);
+    let max_x = (tile.x1 + context).min(width);
+    let max_y = (tile.y1 + context).min(height);
+    let mut error = 0.0_f32;
+    let mut samples = 0_u32;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let target = y * width + x;
+            if hole[target] && !blend_state.has_sample(x, y) {
+                continue;
+            }
+            let Some(source) = repair_offset_index(x, y, offset, width, height) else {
+                continue;
+            };
+            if !source_available[source] {
+                continue;
+            }
+            let target_pixel = target * 4;
+            let source_pixel = source * 4;
+            for channel in 0..3 {
+                let delta = out[target_pixel + channel] as f32 - src[source_pixel + channel] as f32;
+                error += delta * delta;
+            }
+            samples += 1;
+        }
+    }
+    let anchor_x = tile.anchor % width;
+    let anchor_y = tile.anchor / width;
+    if let Some(source) = repair_offset_index(anchor_x, anchor_y, offset, width, height) {
+        let source_pixel = source * 4;
+        for channel in 0..3 {
+            let delta = src[source_pixel + channel] as f32 / 255.0 - target_hint[channel];
+            error += delta * delta * 255.0 * 255.0 * 0.15;
+        }
+    }
+    error / samples.max(1) as f32
+}
+
+fn harmonize_repair(
+    src: &[u8],
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    hole: &[bool],
+    params: RepairParams,
+) {
+    let texture_strength = params.texture_strength.clamp(0.0, 1.0);
+    if texture_strength < 0.999 {
+        let softened = box_blur_rgba(out, width, height, 2);
+        for (index, inside) in hole.iter().copied().enumerate() {
+            if !inside {
+                continue;
+            }
+            let pixel = index * 4;
+            for channel in 0..3 {
+                out[pixel + channel] = lerp_u8(
+                    softened[pixel + channel],
+                    out[pixel + channel],
+                    texture_strength,
+                );
+            }
+        }
+    }
+    let match_strength = params.color_match_strength.clamp(0.0, 1.0);
+    if match_strength <= f32::EPSILON {
+        return;
+    }
+    let Some(mut target) = repair_surrounding_stats(src, width, height, hole) else {
+        return;
+    };
+    if params.color_source == RepairColorSource::Sampled {
+        target.mean = rgb_u8_to_f32(params.sampled_rgb);
+    }
+    let Some(current) = repair_masked_stats(out, hole) else {
+        return;
+    };
+    for (index, inside) in hole.iter().copied().enumerate() {
+        if !inside {
+            continue;
+        }
+        let pixel = index * 4;
+        for channel in 0..3 {
+            let value = out[pixel + channel] as f32 / 255.0;
+            let scale = if current.std_dev[channel] > 0.003 {
+                (target.std_dev[channel] / current.std_dev[channel]).clamp(0.35, 2.8)
+            } else {
+                1.0
+            };
+            let matched =
+                ((value - current.mean[channel]) * scale + target.mean[channel]).clamp(0.0, 1.0);
+            out[pixel + channel] = to_u8(lerp_f32(value, matched, match_strength));
+        }
+    }
+}
+
+fn repair_surrounding_stats(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    hole: &[bool],
+) -> Option<RepairRgbStats> {
+    let mut boundary = vec![false; hole.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if hole[index] {
+                continue;
+            }
+            boundary[index] = repair_neighbors(x, y, width, height).any(|neighbor| hole[neighbor]);
+        }
+    }
+    repair_stats(src, boundary)
+}
+
+fn repair_masked_stats(src: &[u8], hole: &[bool]) -> Option<RepairRgbStats> {
+    repair_stats(src, hole.iter().copied())
+}
+
+fn repair_stats(src: &[u8], selected: impl IntoIterator<Item = bool>) -> Option<RepairRgbStats> {
+    let mut sum = [0.0_f64; 3];
+    let mut sum_squared = [0.0_f64; 3];
+    let mut count = 0_u64;
+    for (pixel, selected) in src.chunks_exact(4).zip(selected) {
+        if !selected || pixel[3] == 0 {
+            continue;
+        }
+        for channel in 0..3 {
+            let value = pixel[channel] as f64 / 255.0;
+            sum[channel] += value;
+            sum_squared[channel] += value * value;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let mut mean = [0.0_f32; 3];
+    let mut std_dev = [0.0_f32; 3];
+    for channel in 0..3 {
+        let channel_mean = sum[channel] / count as f64;
+        mean[channel] = channel_mean as f32;
+        std_dev[channel] = (sum_squared[channel] / count as f64 - channel_mean * channel_mean)
+            .max(0.0)
+            .sqrt() as f32;
+    }
+    Some(RepairRgbStats { mean, std_dev })
 }
 
 fn apply_color_fill(src: &[u8], width: usize, height: usize, params: ColorFillParams) -> Vec<u8> {
@@ -18437,6 +19287,18 @@ mod tests {
                     radius_px: 96.0,
                 }),
             ),
+            masked(
+                "surrounding repair high quality",
+                LocalEffect::Repair(RepairParams {
+                    mode: RepairMode::Surrounding,
+                    search_radius_px: 512.0,
+                    texture_strength: 1.0,
+                    color_match_strength: 1.0,
+                    quality: RepairQuality::High,
+                    seed: 31,
+                    ..Default::default()
+                }),
+            ),
             full(
                 "high pass max radius",
                 LocalEffect::HighPass(HighPassParams {
@@ -23071,6 +23933,298 @@ LUT_3D_SIZE 2
                 threshold: 20.0,
                 strength: 1.0,
             }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn repair_solid_replaces_only_masked_rgb_even_if_mask_flags_are_disabled() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![10, 20, 30, 255, 40, 50, 60, 211, 70, 80, 90, 255],
+        )
+        .unwrap();
+        let mut layer = LocalAdjustmentLayer::new(
+            "repair",
+            LocalMask::Raster(RasterMask {
+                width: 3,
+                height: 1,
+                alpha: vec![0.0, 1.0, 0.0],
+            }),
+            LocalEffect::Repair(RepairParams {
+                mode: RepairMode::Solid,
+                sampled_rgb: [200, 100, 50],
+                ..Default::default()
+            }),
+        );
+        layer.mask_before_effect = false;
+        layer.mask_after_effect = false;
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert_eq!(&out.pixels[0..4], &src.pixels[0..4]);
+        assert_eq!(&out.pixels[4..8], &[200, 100, 50, 211]);
+        assert_eq!(&out.pixels[8..12], &src.pixels[8..12]);
+    }
+
+    #[test]
+    fn repair_preserve_luminance_keeps_hsl_lightness() {
+        let src = RgbaImageBuf::new(1, 1, vec![35, 115, 205, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "repair color",
+            LocalMask::Full,
+            LocalEffect::Repair(RepairParams {
+                mode: RepairMode::PreserveLuminance,
+                sampled_rgb: [225, 45, 60],
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let source_lightness =
+            (35.0_f32.max(115.0).max(205.0) + 35.0_f32.min(115.0).min(205.0)) * 0.5;
+        let output_lightness = (*out.pixels[0..3].iter().max().unwrap() as f32
+            + *out.pixels[0..3].iter().min().unwrap() as f32)
+            * 0.5;
+
+        assert!((source_lightness - output_lightness).abs() <= 1.0);
+        assert!(out.pixels[0] > out.pixels[2]);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn repair_clone_uses_fixed_source_destination_offset() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                220, 20, 20, 255, 20, 220, 20, 255, 20, 20, 220, 255, 240, 220, 20, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "clone",
+            LocalMask::Raster(RasterMask {
+                width: 4,
+                height: 1,
+                alpha: vec![0.0, 0.0, 0.0, 1.0],
+            }),
+            LocalEffect::Repair(RepairParams {
+                mode: RepairMode::Clone,
+                clone_source_uv: Some([0.0, 0.0]),
+                clone_destination_uv: Some([1.0, 0.0]),
+                texture_strength: 1.0,
+                color_match_strength: 0.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert_eq!(&out.pixels[0..12], &src.pixels[0..12]);
+        assert_eq!(&out.pixels[12..16], &[220, 20, 20, 255]);
+    }
+
+    #[test]
+    fn surrounding_repair_copies_texture_without_touching_mask_exterior() {
+        let (width, height) = (12, 8);
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        let mut alpha = vec![0.0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let value = if (x + y) % 2 == 0 { 55 } else { 185 };
+                let inside = (4..8).contains(&x) && (2..6).contains(&y);
+                if inside {
+                    pixels.extend_from_slice(&[255, 0, 255, 255]);
+                    alpha[y * width + x] = 1.0;
+                } else {
+                    pixels.extend_from_slice(&[value, value + 10, value + 20, 255]);
+                }
+            }
+        }
+        let src = RgbaImageBuf::new(width, height, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "surrounding repair",
+            LocalMask::Raster(RasterMask {
+                width,
+                height,
+                alpha: alpha.clone(),
+            }),
+            LocalEffect::Repair(RepairParams {
+                mode: RepairMode::Surrounding,
+                search_radius_px: 16.0,
+                texture_strength: 1.0,
+                color_match_strength: 0.0,
+                quality: RepairQuality::High,
+                seed: 7,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer.clone()]).unwrap();
+        let repeated = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let mut repaired_values = std::collections::BTreeSet::new();
+        for (index, amount) in alpha.iter().copied().enumerate() {
+            let pixel = index * 4;
+            if amount == 0.0 {
+                assert_eq!(&out.pixels[pixel..pixel + 4], &src.pixels[pixel..pixel + 4]);
+            } else {
+                assert_ne!(&out.pixels[pixel..pixel + 3], &[255, 0, 255]);
+                repaired_values.insert(out.pixels[pixel]);
+            }
+        }
+        assert!(repaired_values.len() >= 2);
+        assert_eq!(out.pixels, repeated.pixels);
+    }
+
+    #[test]
+    fn repair_patch_size_defaults_to_auto() {
+        assert_eq!(RepairPatchSize::default(), RepairPatchSize::Auto);
+        assert_eq!(RepairParams::default().patch_size, RepairPatchSize::Auto);
+    }
+
+    #[test]
+    fn manual_repair_patch_sizes_select_larger_geometry() {
+        assert_eq!(
+            repair_patch_geometry(RepairQuality::High, RepairPatchSize::Auto),
+            (10, 5, 4, 32)
+        );
+        assert_eq!(
+            repair_patch_geometry(RepairQuality::High, RepairPatchSize::Standard),
+            (24, 12, 6, 32)
+        );
+        assert_eq!(
+            repair_patch_geometry(RepairQuality::High, RepairPatchSize::Large),
+            (48, 24, 10, 32)
+        );
+    }
+
+    #[test]
+    fn surrounding_repair_does_not_add_coarse_tile_seams_to_smooth_texture() {
+        let (width, height) = (64, 48);
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        let mut alpha = vec![0.0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let inside = (20..44).contains(&x) && (14..34).contains(&y);
+                if inside {
+                    pixels.extend_from_slice(&[255, 0, 255, 255]);
+                    alpha[y * width + x] = 1.0;
+                } else {
+                    let value = (50 + x * 2 + y).min(245) as u8;
+                    pixels.extend_from_slice(&[value, value, value, 255]);
+                }
+            }
+        }
+        let src = RgbaImageBuf::new(width, height, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "smooth surrounding repair",
+            LocalMask::Raster(RasterMask {
+                width,
+                height,
+                alpha: alpha.clone(),
+            }),
+            LocalEffect::Repair(RepairParams {
+                mode: RepairMode::Surrounding,
+                search_radius_px: 24.0,
+                texture_strength: 1.0,
+                color_match_strength: 0.0,
+                quality: RepairQuality::Standard,
+                seed: 11,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let mut max_inside_jump = 0_u8;
+        for y in 14..34 {
+            for x in 20..44 {
+                let index = y * width + x;
+                if x + 1 < 44 {
+                    let right = index + 1;
+                    max_inside_jump =
+                        max_inside_jump.max(out.pixels[index * 4].abs_diff(out.pixels[right * 4]));
+                }
+                if y + 1 < 34 {
+                    let below = index + width;
+                    max_inside_jump =
+                        max_inside_jump.max(out.pixels[index * 4].abs_diff(out.pixels[below * 4]));
+                }
+            }
+        }
+
+        assert!(
+            max_inside_jump <= 12,
+            "smooth repair introduced a coarse tile seam: {max_inside_jump}"
+        );
+    }
+
+    #[test]
+    fn surrounding_repair_feather_only_blends_the_generated_boundary() {
+        let (width, height) = (40, 32);
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        let mut alpha = vec![0.0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let inside = (12..28).contains(&x) && (8..24).contains(&y);
+                if inside {
+                    pixels.extend_from_slice(&[255, 0, 255, 255]);
+                    alpha[y * width + x] = 1.0;
+                } else {
+                    let value = ((x * 17 + y * 29 + (x * y) % 31) % 180 + 35) as u8;
+                    pixels.extend_from_slice(&[
+                        value,
+                        value.saturating_add(13),
+                        value.saturating_add(27),
+                        255,
+                    ]);
+                }
+            }
+        }
+        let src = RgbaImageBuf::new(width, height, pixels).unwrap();
+        let mut layer = LocalAdjustmentLayer::new(
+            "feathered surrounding repair",
+            LocalMask::Raster(RasterMask {
+                width,
+                height,
+                alpha,
+            }),
+            LocalEffect::Repair(RepairParams {
+                mode: RepairMode::Surrounding,
+                search_radius_px: 24.0,
+                texture_strength: 1.0,
+                color_match_strength: 0.0,
+                quality: RepairQuality::Standard,
+                seed: 19,
+                ..Default::default()
+            }),
+        );
+        let hard = apply_layers(src.as_ref(), &[layer.clone()]).unwrap();
+        layer.mask_feather_px = 4.0;
+        let feathered = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        // ぼかし半径より内側では、探索元と生成テクスチャが同一である。
+        for y in 12..20 {
+            for x in 16..24 {
+                let pixel = (y * width + x) * 4;
+                assert_eq!(
+                    &feathered.pixels[pixel..pixel + 4],
+                    &hard.pixels[pixel..pixel + 4]
+                );
+            }
+        }
+        // 境界では同じ生成結果を元画像へ alpha 合成してなじませる。
+        let boundary = (16 * width + 12) * 4;
+        assert_ne!(
+            &feathered.pixels[boundary..boundary + 3],
+            &hard.pixels[boundary..boundary + 3]
+        );
+    }
+
+    #[test]
+    fn surrounding_repair_with_no_external_source_is_identity() {
+        let src = solid(3, 3, [80, 100, 120, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "full repair",
+            LocalMask::Full,
+            LocalEffect::Repair(RepairParams::default()),
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, src.pixels);

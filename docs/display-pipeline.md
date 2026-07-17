@@ -36,7 +36,7 @@ Failed は単発の終端ステート。デコードエラー時のみ。
    - 1 件以上キューへ投入したフレームは `update_keep_range_and_requests` 自身も repaint を要求する。
      通常は `App::update` 末尾の `requested_nonempty` と同じ役割だが、フルスクリーン cleanup や
      font atlas resync で末尾まで到達しないフレームでも worker 結果を入力待ちにしないため。
-4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` の Loaded に対して `skip_cache: true` で再要求 → 高品質デコード
+4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` かつ `from_edit_preview: false` の Loaded に対して `skip_cache: true` で再要求 → 高品質デコード。編集プレビューは完成済みの派生画像なので元画像で上書きしない
    - 一覧ロード直後は `start_loading_items` が履歴スクロール復元後の位置で idle 判定をリセットし、
      親一覧へ戻った瞬間に古い idle 時刻で高品質再生成が走らないようにする。
    - **フレーム内境界レース対策 (2026-06-19)**: アップグレードの起動条件 (input/scroll が
@@ -76,7 +76,11 @@ resync (`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`) と同じ「surface 復帰まで
 `thumb_loader.rs::process_load_request`:
 
 ```
-1. キャッシュ DB (catalog.db) に該当エントリがあるか確認
+1. 編集済みページでは `edit_preview_cache.db` の対応表を先に確認
+   ├─ ヒット (skip_cache=false): 最大辺 2048px の edit-result 下地 WebP (q=90) と
+   │   注釈レイヤー WebP (lossless) → 下地＋注釈の ColorImage と表示時補正用の分離 payload
+   └─ ミス: 通常の catalog へ続行
+2. キャッシュ DB (catalog.db) に該当エントリがあるか確認
    ├─ ヒット (skip_cache=false): WebP バイト → ColorImage
    └─ ミス or skip_cache=true:
         ├─ ソースデコード (JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
@@ -85,15 +89,42 @@ resync (`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`) と同じ「surface 復帰まで
         ├─ Lanczos3 で display_px までリサイズ
         ├─ CacheDecision::should_cache でキャッシュ可否判定
         └─ 必要なら WebP エンコードして catalog.db に保存
-2. mpsc で (idx, ColorImage, from_cache, source_dims) を送信
+3. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
+   edit_preview_adjustment, source_dims) を送信
 ```
+
+### 1.3.1 非破壊編集プレビューキャッシュ
+
+フルスクリーン編集を閉じる直前または別ページへ移動する直前に、source 解像度の
+`edit_result_cache`（消しゴム／補正レイヤー／隠蔽加工まで）を snapshot する。専用 worker 上で
+テキスト／スタンプを z 順の注釈ラスターレイヤーへベイクし、下地と各注釈レイヤーへ同じ保存済み
+crop を実切り出しする。最大辺 2048px の下地は WebP q=90、透明縁と Multiply 係数を持つ注釈は
+lossless WebP として分離保存する。保存先は `<data_dir>/edit_preview_cache/`、対応表と LRU は
+`<data_dir>/edit_preview_cache.db` に保持し、crop 後の縦横寸法を一覧のアスペクト比として使う。
+元画像と各編集 DB は変更しない。
+
+注釈済みの `final_composite_cache` は流用しない。そこには色調補正・final AI・スマートシャープ・
+ポストフィルタまで含まれるため、scene / font / stamp cache を worker へ snapshot し、
+`edit_result_cache` から下地と注釈だけを作る。グリッドでは下地へだけ色調補正を 1 回適用した後、
+Normal / Multiply の注釈レイヤーを z 順に合成する。これにより fullscreen と同じ
+`edit -> color -> comic` を保ち、文字・スタンプの色がページ補正で変化しない。
+
+色調補正をキャッシュに含めないため、グリッドの既存 `thumb_adjust_tex` を一度だけ適用でき、ページ
+補正を後から変えても重い編集プレビューを再生成せず追従する。編集データを更新した時点で旧 preview
+を非同期削除し、終了時に最新の完成済み結果だけを保存する。source の mtime / size が変わった場合も
+load 時に失効する。削除／全消去通知を受けた UI も、メモリ上の古い編集 preview を即時破棄する。
+保存完了通知を受けた UI は該当セルを `Evicted` に戻して読み直し、同時進行して
+いた raw decode が後着しても `from_edit_preview` が立つまで再試行する。
+
+既定は有効・上限 1GB。上限超過時は最終アクセスが古い WebP から削除する。encode、ファイル I/O、
+SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッドをブロックしない。
 
 `display_px` の算出には main egui Context の実効 `pixels_per_point` (= OS DPI × UI 表示倍率) を
 使う。そのため「設定 → スケーリング」を上げるとサムネイル / 表示用デコード解像度も上がり、
 高倍率ではメモリ使用量が増える。要求サイズは 256〜2048px に clamp されるため、UI 表示倍率を
 200% にしても 2048px を超えて増え続けることはない。
 
-### 1.3.1 親コンテナの代表サムネ — 優先順位
+### 1.3.2 親コンテナの代表サムネ — 優先順位
 
 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネは次の順で決まる:
 
@@ -144,6 +175,7 @@ seed する。worker は通常の cache_hit で取り出すので、Shell API �
 | --- | --- | --- |
 | 回転 (DB) | 描画時の GPU 行列 | `get_rotation(idx)` で毎フレーム参照、結果は `rotation_cache` にキャッシュ |
 | EXIF Orientation | **デコード時**に適用 | 通常画像はファイル path、ZIP 内画像はエントリ bytes から読む。PDF は対象外 |
+| 非破壊編集結果 | **編集プレビューキャッシュ** | 消しゴム・補正レイヤー・隠蔽加工・テキスト／スタンプ・切り取り。編集終了時に非同期生成し、次回一覧から利用 |
 | プリセット補正 (色調のみ) | **UI スレッド同期適用** | `thumb_adjust_tex[idx]` に保持、§1.5 参照 |
 | ポストフィルタ | **適用されない** | コスト/実装維持のためサムネは色調のみ |
 | AI アップスケール | **適用されない** | 1 枚 10 秒級のためサムネでは非現実的 |
@@ -949,6 +981,10 @@ denoise は意図的に飛ばすため、grid / fullscreen / stack のどこか�
   Ctrl+E / キャプチャ保存では、補正レイヤーが有効なページは `local_adjust_cache` 完了後だけ
   出力対象にする。
   ブラシ stroke 中は 150ms の idle まで重い再合成を遅延し、release 時に確定世代を進める。
+  `Repair` の周囲パッチ探索 / クローン / 色とテクスチャのなじみ処理もこの worker で行い、
+  決定した結果ピクセルは専用レイヤーに保持せず、パラメータとマスクから再生成する。Repair の
+  マスク境界なじませは、ぼかす前のマスクで修復元探索 / テクスチャ生成を行い、ぼかしたマスクは
+  最終合成 alpha にだけ使うため、なじませ幅を変えても参照パッチ自体は変化しない。
 - **AI アップスケール/デノイズ**: final pipeline の別スレッドで推論。完了時に
   `final_ai_cache` に pixels と `used_upscale` を格納し、未完了の
   `final_composite_cache` を捨てて再合成する。
@@ -997,7 +1033,9 @@ denoise は意図的に飛ばすため、grid / fullscreen / stack のどこか�
     (`edit_result_cache` は保持)。post_filter / シャープ化**のみ**の変更は
     `final_composite_cache` だけクリアして final AI を保持する
     (preset-and-adjustment.md §4)
-  - 消しゴム / 補正レイヤー / 隠蔽加工 / crop 変更 → source 解像度の edit cache と final cache をクリア
+  - 消しゴム / 補正レイヤー / 隠蔽加工 / crop 変更 → source 解像度の edit cache と final cache をクリア。
+    特に全ページ共通の隠蔽パラメータ変更は、edit 世代を安定キーに含めない
+    `retained_final_ai_cache` も全失効し、変更前の AI 結果の復元を防ぐ
   - 消しゴム/隠蔽加工/分析モード入出 → 該当 idx の final cache のみクリア (bypass 切替のため)
   - フォルダ切替 → edit / final / thumb 系 cache をグローバルクリア
   - 回転変更 → **キャッシュはクリアしない** (GPU 行列で回すため)

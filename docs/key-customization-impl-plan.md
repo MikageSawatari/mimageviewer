@@ -536,7 +536,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
 - FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)
 - FsLoupeLockToggle `M` (P) ★ / FsLoupeHold `Shift` (MH, Ph6。修飾↔修飾のみ)
-- FsEraseMode `E` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
+- FsEraseMode `E` ★ / FsLocalAdjustMode `Ctrl+G` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
 - FsExport `Ctrl+E` ★ / FsCapture `Ctrl+S` ★
 - FsCompareToggle `X` ★ / FsCompareCycle `C` ★ / FsCompareWipe `Shift+C` ★ / FsCompareDiff `Alt+C` ★
 - FsSpreadSingle/L/LCover/R/RCover `1`..`5` (P) ★

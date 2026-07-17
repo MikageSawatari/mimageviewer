@@ -286,6 +286,35 @@ pub fn list_books(root: &Path) -> Result<Vec<BookInfo>, String> {
     Ok(rows)
 }
 
+/// 追加完了結果を UI が保持する本棚一覧へ反映する。
+///
+/// 一覧を `None` にして再走査すると、その間だけ固定本棚ボタンが全て消えてツールバーが
+/// 縮み、再取得時に元へ戻るちらつきになる。Append は追加先と件数が確定しているため、
+/// キャッシュを保ったまま件数だけ更新できる。
+pub fn apply_append_to_cached_list(
+    rows: &mut Vec<BookInfo>,
+    book_name: &str,
+    folder: &Path,
+    added: usize,
+) {
+    if let Some(row) = rows.iter_mut().find(|row| row.name == book_name) {
+        row.path = folder.to_path_buf();
+        row.page_count = row.page_count.saturating_add(added);
+        return;
+    }
+    rows.push(BookInfo {
+        name: book_name.to_string(),
+        path: folder.to_path_buf(),
+        page_count: added,
+    });
+    rows.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 pub fn create_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
     let name = normalize_book_name(name);
     let path = book_folder(root, &name);
@@ -1652,6 +1681,45 @@ mod tests {
             format: crate::capture::CaptureFormat::Png,
             jpeg_matte: crate::capture::JpegMatte::Black,
         }
+    }
+
+    #[test]
+    fn append_updates_cached_book_count_without_dropping_other_rows() {
+        let mut rows = vec![
+            BookInfo {
+                name: "A".to_string(),
+                path: PathBuf::from("books/A"),
+                page_count: 3,
+            },
+            BookInfo {
+                name: "B".to_string(),
+                path: PathBuf::from("books/B"),
+                page_count: 7,
+            },
+        ];
+
+        apply_append_to_cached_list(&mut rows, "B", Path::new("books/B"), 2);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].page_count, 3);
+        assert_eq!(rows[1].page_count, 9);
+    }
+
+    #[test]
+    fn append_inserts_missing_cached_book_in_list_order() {
+        let mut rows = vec![BookInfo {
+            name: "B".to_string(),
+            path: PathBuf::from("books/B"),
+            page_count: 1,
+        }];
+
+        apply_append_to_cached_list(&mut rows, "A", Path::new("books/A"), 2);
+
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert_eq!(rows[0].page_count, 2);
     }
 
     #[test]

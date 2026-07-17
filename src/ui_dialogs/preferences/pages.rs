@@ -5219,6 +5219,54 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(6.0);
 
+    ui.label(egui::RichText::new("編集結果のプレビューキャッシュ").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut s.edit_preview_cache_enabled,
+        "編集結果をサムネイル一覧に保持する",
+    );
+    ui.label(
+        egui::RichText::new(
+            "編集を閉じたときや別ページへ移動したとき、消しゴム・補正レイヤー・隠蔽加工・テキスト／スタンプ・切り取りの結果を派生 WebP として保存します。\n\
+             色調補正は一覧表示時に適用し、最終AI・ポストフィルタは含めません。元画像と非破壊編集データは変更しません。画質は高品質（最大辺 2048 px）固定です。",
+        )
+        .small()
+        .weak(),
+    );
+    const EDIT_PREVIEW_BYTES_PER_MB: u64 = 1_000_000;
+    let mut edit_preview_limit_mb = s
+        .edit_preview_cache_max_bytes
+        .saturating_add(EDIT_PREVIEW_BYTES_PER_MB - 1)
+        / EDIT_PREVIEW_BYTES_PER_MB;
+    edit_preview_limit_mb = edit_preview_limit_mb.max(1);
+    ui.add_enabled_ui(s.edit_preview_cache_enabled, |ui| {
+        if ui
+            .horizontal(|ui| {
+                ui.label("容量上限:");
+                ui.add(
+                    egui::DragValue::new(&mut edit_preview_limit_mb)
+                        .range(100..=100_000u64)
+                        .speed(100.0)
+                        .suffix(" MB"),
+                )
+            })
+            .inner
+            .changed()
+        {
+            s.edit_preview_cache_max_bytes =
+                edit_preview_limit_mb.saturating_mul(EDIT_PREVIEW_BYTES_PER_MB);
+        }
+    });
+    ui.label(
+        egui::RichText::new("OFF にして OK を押すと、この派生キャッシュは削除されます。")
+            .small()
+            .weak(),
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
     ui.label(egui::RichText::new("変換済みアーカイブキャッシュ").strong());
     ui.add_space(4.0);
     ui.label(

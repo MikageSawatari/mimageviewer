@@ -2198,6 +2198,13 @@ pub struct Settings {
     /// Auto モード: ZIP 内画像を無条件でキャッシュ対象にする（解凍+デコードの二重コスト）
     #[serde(default = "default_true")]
     pub cache_zip_always: bool,
+    /// 非破壊編集結果をグリッド用プレビューとして永続キャッシュする。
+    /// 元画像・編集 DB は変更せず、派生 WebP だけを保持する。
+    #[serde(default = "default_true")]
+    pub edit_preview_cache_enabled: bool,
+    /// 編集プレビューキャッシュの容量上限 (bytes)。有効時は LRU で古い順に削除する。
+    #[serde(default = "default_edit_preview_cache_max_bytes")]
+    pub edit_preview_cache_max_bytes: u64,
     /// 変換済みアーカイブキャッシュ (RAR / 7z / LZH → ZIP) の容量上限。
     /// 0 は無制限 (= 既存挙動)。
     #[serde(default)]
@@ -3536,6 +3543,9 @@ fn default_cache_threshold_ms() -> u32 {
 fn default_cache_size_threshold_bytes() -> u64 {
     2_000_000
 }
+fn default_edit_preview_cache_max_bytes() -> u64 {
+    crate::edit_preview_cache::DEFAULT_MAX_BYTES
+}
 fn default_true() -> bool {
     true
 }
@@ -3806,6 +3816,8 @@ impl Default for Settings {
             cache_webp_always: true,
             cache_pdf_always: true,
             cache_zip_always: true,
+            edit_preview_cache_enabled: true,
+            edit_preview_cache_max_bytes: default_edit_preview_cache_max_bytes(),
             archive_cache_max_bytes: 0,
             archive_file_handling: ArchiveFileHandling::Ask,
             archive_convert_without_dialog: false,
@@ -6042,6 +6054,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_edit_preview_cache_settings_default_to_enabled_one_gb() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(loaded.edit_preview_cache_enabled);
+        assert_eq!(
+            loaded.edit_preview_cache_max_bytes,
+            crate::edit_preview_cache::DEFAULT_MAX_BYTES
+        );
+    }
+
+    #[test]
     fn settings_default_values() {
         let s = Settings::default();
         assert_eq!(s.grid_cols, 4);
@@ -6083,6 +6105,11 @@ mod tests {
         assert_eq!(s.cache_size_threshold_bytes, 2_000_000);
         assert!(s.cache_videos_always);
         assert!(s.cache_webp_always);
+        assert!(s.edit_preview_cache_enabled);
+        assert_eq!(
+            s.edit_preview_cache_max_bytes,
+            crate::edit_preview_cache::DEFAULT_MAX_BYTES
+        );
         assert_eq!(s.archive_cache_max_bytes, 0);
         assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ask);
         assert!(!s.archive_convert_without_dialog);

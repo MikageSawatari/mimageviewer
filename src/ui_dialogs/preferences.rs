@@ -1029,6 +1029,10 @@ impl App {
                     self.settings.retained_final_ai_cache_max_entries,
                     self.settings.retained_final_ai_cache_max_mib,
                 );
+                let old_edit_preview_cache = (
+                    self.settings.edit_preview_cache_enabled,
+                    self.settings.edit_preview_cache_max_bytes,
+                );
 
                 // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
                 let old_vst3_enabled = self.settings.vst3_enabled;
@@ -1112,6 +1116,21 @@ impl App {
                     }
                 }
                 self.settings.save();
+
+                if let Some(service) = &self.edit_preview_cache {
+                    if !self.settings.edit_preview_cache_enabled {
+                        if old_edit_preview_cache.0 {
+                            service.clear();
+                        }
+                    } else if old_edit_preview_cache
+                        != (
+                            self.settings.edit_preview_cache_enabled,
+                            self.settings.edit_preview_cache_max_bytes,
+                        )
+                    {
+                        service.prune(self.settings.edit_preview_cache_max_bytes.max(1_000_000));
+                    }
+                }
 
                 // 動画ループモードが変わったらフルスクリーン中の player に反映する
                 #[cfg(windows)]

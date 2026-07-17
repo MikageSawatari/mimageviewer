@@ -577,6 +577,8 @@ fn run_bench(
                             // ベンチでは folder_thumb_pin DB を使わない (pin-aware
                             // auto-pick 無し = 純粋 auto-pick で計測)
                             None,
+                            // 編集プレビューキャッシュはベンチ対象外。
+                            None,
                         );
                     }
                     None => {

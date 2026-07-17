@@ -843,9 +843,23 @@ struct ConcealCacheEntry {
 
 表示パイプライン入口で `entry.generation == self.current_conceal_generation()` を
 判定し、一致しないエントリは「miss 扱い (再合成キューに積む)」+ lazy に drop
-(keep_range eviction で順次解放)。これで visible idx だけが即時再合成され、
+(keep_range eviction で順次解放)。隠蔽編集中の現在 idx だけは、パラメータ変更時に旧
+GPU texture を即時 evict して、次のプレビュー lookup で必ず再合成する。これで visible idx だけが即時再合成され、
 キャッシュにいる他ページは「次に表示されるとき」または「keep_range 外に出たとき」
 に解放される。
+
+目アイコンの長押し状態はパネル描画後に確定するが、加工済み画像の解決はパネルより先に走る。
+前フレームで確定した目アイコン矩形と現在フレームの pointer 状態を使い、
+`prepare_fullscreen_state` より前に `conceal_preview_active` を同期する。これにより短い押下でも
+設定変更後の `conceal_generation` を同じフレームから参照し、パネルを閉じるまで旧境界処理が
+残る描画順依存を防ぐ。
+
+`bump_conceal_generation()` は live の `edit_result` / final pipeline だけでなく、
+ページ移動・再オープン用の `retained_final_ai_cache` も全失効する。retained final AI の安定キーは
+同じ画像の再利用を優先して edit の一時世代を含めないため、ここを残すと同じ入力サイズ・色調設定の
+AI アップスケール結果が境界処理変更後にも hit し、再合成済みのモザイクを旧結果で上書きする。
+全ページ共通パラメータの変更なので全 retained entry を対象とし、同時に epoch を進めて変更前の
+orphan AI job が完了後に旧結果を再挿入することも防ぐ。
 
 ### 9.2 idx-keyed cache lifecycle checklist (Codex P1)
 

@@ -1965,7 +1965,9 @@ impl App {
             // 補正パネルと排他
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
+            self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
+            self.local_adjust_repair_point_pick_active = None;
             self.local_adjust_add_layer_dialog_open = false;
             self.local_adjust_change_mask_dialog_open = false;
             self.local_adjust_effect_picker_dialog_open = false;
@@ -7038,6 +7040,10 @@ impl App {
                 self.start_fs_load(partner);
             }
         }
+        // 隠蔽パネルは画像の後に描かれるため、パネル内で preview 状態を更新するだけでは
+        // 当該フレームの processed texture 解決に間に合わない。前フレームで確定した
+        // 目アイコン矩形と現在 pointer 状態から、必ずパイプライン解決前に同期する。
+        self.sync_conceal_preview_before_pipeline(ctx);
         let state = self.prepare_fullscreen_state(ctx, fs_idx);
 
         let mut close_fs = false;
@@ -10375,7 +10381,9 @@ impl App {
                     self.show_feedback_toast("編集中の図形操作を解除しました".to_string());
                     ctx.request_repaint();
                 } else {
+                    self.cache_current_edit_preview_if_ready();
                     self.local_adjust_mode = false;
+                    self.local_adjust_repair_point_pick_active = None;
                     self.local_adjust_add_layer_dialog_open = false;
                     self.local_adjust_change_mask_dialog_open = false;
                     self.local_adjust_effect_picker_dialog_open = false;
@@ -11554,6 +11562,30 @@ impl App {
             } else {
                 // 1回目のE: マスクモード開始
                 self.enter_erase_mode(fs_idx);
+            }
+        }
+
+        // Ctrl+G: 補正レイヤーモード入場（分析・補正・他の編集モード・動画中は無効）。
+        // モード中の Esc は本関数冒頭の早期 return で処理する。開始と終了を別 Action に
+        // することで、補正レイヤー内の編集キー設定と画像表示時の開始キーを分離する。
+        let key_ctrl_g = !fs_music_view_active
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsLocalAdjustMode);
+        if key_ctrl_g
+            && !self.analysis_mode
+            && !self.adjustment_mode
+            && !self.erase_mode
+            && !self.conceal_mode
+            && !self.text_mode
+            && self.reading_flow.is_paged()
+            && !is_video_fs
+            && !self.fs_entry_is_animated(fs_idx)
+        {
+            if image_edit_unavailable {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
+            } else {
+                self.enter_local_adjust_mode();
             }
         }
 
@@ -14404,7 +14436,9 @@ impl App {
             self.export_crop_spread_ctx = None;
             self.reset_export_crop_mode();
         }
+        self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
+        self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;

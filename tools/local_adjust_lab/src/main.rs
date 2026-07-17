@@ -39,16 +39,17 @@ use local_adjust_core::{
     PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams,
     PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
     RadialBlurParams, RadialFlashParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
-    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
+    RasterVectorMask, RegionMask, RepairColorSource, RepairMode, RepairParams, RepairPatchSize,
+    RepairQuality, RetroPaletteMode, RetroPaletteParams, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
+    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams, WaterCausticsParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1089,6 +1090,7 @@ enum EffectKind {
     Duotone,
     Equalize,
     GradientMap,
+    Repair,
     ColorFill,
     Frame,
     OutlineStroke,
@@ -1278,6 +1280,7 @@ impl EffectKind {
             LocalEffect::Duotone(_) => Self::Duotone,
             LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
+            LocalEffect::Repair(_) => Self::Repair,
             LocalEffect::ColorFill(_) => Self::ColorFill,
             LocalEffect::Frame(_) => Self::Frame,
             LocalEffect::OutlineStroke(_) => Self::OutlineStroke,
@@ -1390,6 +1393,7 @@ impl EffectKind {
             Self::Duotone => "ダブルトーン",
             Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
+            Self::Repair => "修復／塗り",
             Self::ColorFill => "塗りつぶし",
             Self::Frame => "フレーム/黒帯",
             Self::OutlineStroke => "縁取り",
@@ -1590,6 +1594,9 @@ impl EffectKind {
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
             }
+            Self::Repair => {
+                "マスク範囲を単色で置換するか、周囲のテクスチャ／指定したクローン元から非破壊で修復します。"
+            }
             Self::ColorFill => {
                 "マスク範囲を単色、線形グラデーション、円形グラデーションで塗りつぶします。"
             }
@@ -1737,6 +1744,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         title: "基本",
         kinds: &[
             EffectKind::None,
+            EffectKind::Repair,
             EffectKind::ColorFill,
             EffectKind::Frame,
             EffectKind::OutlineStroke,
@@ -9330,6 +9338,20 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 gradient_map_preset_label(params.preset)
             )
         }
+        LocalEffect::Repair(params) => {
+            let mode = match params.mode {
+                RepairMode::Solid => "単色",
+                RepairMode::PreserveLuminance => "輝度保持",
+                RepairMode::Surrounding => "周囲",
+                RepairMode::Clone => "クローン",
+            };
+            let patch = match params.patch_size {
+                RepairPatchSize::Auto => "自動 (10〜14px)",
+                RepairPatchSize::Standard => "24px",
+                RepairPatchSize::Large => "48px",
+            };
+            format!("修復 {mode} パッチ{patch}")
+        }
         LocalEffect::ColorFill(params) => {
             if params.shape == ColorOverlayShape::Unselected {
                 "塗りつぶし 選択してください".to_string()
@@ -9503,6 +9525,152 @@ fn effect_summary(effect: &LocalEffect) -> String {
         }
         LocalEffect::Median(params) => format!("メディアン {:.0}px", params.radius_px),
     }
+}
+
+fn draw_repair_effect_params(ui: &mut egui::Ui, params: &mut RepairParams) -> bool {
+    let mut changed = false;
+    let before_mode = params.mode;
+    lab_combo_box(
+        ui,
+        "repair_mode",
+        match params.mode {
+            RepairMode::Solid => "単色で塗る",
+            RepairMode::PreserveLuminance => "色をなじませる",
+            RepairMode::Surrounding => "周囲から修復",
+            RepairMode::Clone => "クローン",
+        },
+        |ui| {
+            for (mode, label) in [
+                (RepairMode::Solid, "単色で塗る"),
+                (RepairMode::PreserveLuminance, "色をなじませる"),
+                (RepairMode::Surrounding, "周囲から修復"),
+                (RepairMode::Clone, "クローン"),
+            ] {
+                ui.selectable_value(&mut params.mode, mode, label);
+            }
+        },
+    );
+    changed |= params.mode != before_mode;
+
+    if matches!(
+        params.mode,
+        RepairMode::Solid | RepairMode::PreserveLuminance
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("塗り色").color(Color32::from_gray(190)));
+            changed |= ui.color_edit_button_srgb(&mut params.sampled_rgb).changed();
+        });
+    }
+
+    if matches!(params.mode, RepairMode::Surrounding | RepairMode::Clone) {
+        let before_source = params.color_source;
+        lab_combo_box(
+            ui,
+            "repair_color_source",
+            match params.color_source {
+                RepairColorSource::Surrounding => "周囲の色に合わせる",
+                RepairColorSource::Sampled => "指定色に合わせる",
+            },
+            |ui| {
+                ui.selectable_value(
+                    &mut params.color_source,
+                    RepairColorSource::Surrounding,
+                    "周囲の色に合わせる",
+                );
+                ui.selectable_value(
+                    &mut params.color_source,
+                    RepairColorSource::Sampled,
+                    "指定色に合わせる",
+                );
+            },
+        );
+        changed |= params.color_source != before_source;
+        if params.color_source == RepairColorSource::Sampled {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("基準色").color(Color32::from_gray(190)));
+                changed |= ui.color_edit_button_srgb(&mut params.sampled_rgb).changed();
+            });
+        }
+
+        changed |= ui
+            .add(egui::Slider::new(&mut params.color_match_strength, 0.0..=1.0).text("色なじませ"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut params.texture_strength, 0.0..=1.0).text("テクスチャ"))
+            .changed();
+    }
+
+    if params.mode == RepairMode::Surrounding {
+        changed |= ui
+            .add(egui::Slider::new(&mut params.search_radius_px, 8.0..=512.0).text("探索範囲 px"))
+            .changed();
+        let before_patch = params.patch_size;
+        lab_combo_box(
+            ui,
+            "repair_patch_size",
+            match params.patch_size {
+                RepairPatchSize::Auto => "自動 (10〜14 px)",
+                RepairPatchSize::Standard => "標準 (24 px)",
+                RepairPatchSize::Large => "大きめ (48 px)",
+            },
+            |ui| {
+                ui.selectable_value(
+                    &mut params.patch_size,
+                    RepairPatchSize::Auto,
+                    "自動 (10〜14 px)",
+                );
+                ui.selectable_value(
+                    &mut params.patch_size,
+                    RepairPatchSize::Standard,
+                    "標準 (24 px)",
+                );
+                ui.selectable_value(
+                    &mut params.patch_size,
+                    RepairPatchSize::Large,
+                    "大きめ (48 px)",
+                );
+            },
+        );
+        changed |= params.patch_size != before_patch;
+
+        let before_quality = params.quality;
+        lab_combo_box(
+            ui,
+            "repair_quality",
+            match params.quality {
+                RepairQuality::Fast => "高速",
+                RepairQuality::Standard => "標準",
+                RepairQuality::High => "高品質",
+            },
+            |ui| {
+                ui.selectable_value(&mut params.quality, RepairQuality::Fast, "高速");
+                ui.selectable_value(&mut params.quality, RepairQuality::Standard, "標準");
+                ui.selectable_value(&mut params.quality, RepairQuality::High, "高品質");
+            },
+        );
+        changed |= params.quality != before_quality;
+    }
+
+    if params.mode == RepairMode::Clone {
+        let source = params.clone_source_uv.get_or_insert([0.25, 0.5]);
+        let destination = params.clone_destination_uv.get_or_insert([0.75, 0.5]);
+        ui.label(
+            egui::RichText::new("クローン位置 (画像内 0.0–1.0)").color(Color32::from_gray(190)),
+        );
+        changed |= ui
+            .add(egui::Slider::new(&mut source[0], 0.0..=1.0).text("元 X"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut source[1], 0.0..=1.0).text("元 Y"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut destination[0], 0.0..=1.0).text("先 X"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut destination[1], 0.0..=1.0).text("先 Y"))
+            .changed();
+    }
+    changed
 }
 
 fn effect_has_position_handles(effect: &LocalEffect) -> bool {
@@ -15722,6 +15890,9 @@ fn draw_effect_params(
             contrast_response
                 .lab_hover_tip("色を割り当てる前に、明るさの差を締めたり広げたりします。");
         }
+        LocalEffect::Repair(params) => {
+            changed |= draw_repair_effect_params(ui, params);
+        }
         LocalEffect::ColorFill(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -21535,6 +21706,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
         EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
+        EffectKind::Repair => LocalEffect::Repair(RepairParams::default()),
         EffectKind::ColorFill => LocalEffect::ColorFill(ColorFillParams::default()),
         EffectKind::Frame => LocalEffect::Frame(FrameParams::default()),
         EffectKind::OutlineStroke => LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
@@ -24025,6 +24197,7 @@ mod tests {
             .collect();
         let expected = vec![
             EffectKind::None,
+            EffectKind::Repair,
             EffectKind::ColorFill,
             EffectKind::Frame,
             EffectKind::OutlineStroke,

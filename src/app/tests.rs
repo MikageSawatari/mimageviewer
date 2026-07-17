@@ -554,6 +554,7 @@ fn lower_left_container_badge_yes_for_folder_when_loaded() {
     let loaded = ThumbnailState::Loaded {
         tex: dummy_tex,
         from_cache: false,
+        from_edit_preview: false,
         rendered_at_px: 128,
         source_dims: None,
     };
@@ -4975,6 +4976,7 @@ mod phase_c_drill_nav_tests {
                 ThumbnailState::Loaded {
                     tex,
                     from_cache: false,
+                    from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
                 },
@@ -7569,6 +7571,8 @@ mod favorite_adjustment_defaults_tests {
                     idx: 0,
                     image: Some(color.clone()),
                     from_cache: true,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
                     source_dims: Some((2, 2)),
                     canceled: false,
                     finalized: false,
@@ -7670,6 +7674,49 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             app.thumb_idle_upgrade_recheck_delay().is_none(),
             "while work is in flight the requested_nonempty tail drives repaints"
+        );
+    }
+
+    #[test]
+    fn edited_preview_thumbnail_is_not_replaced_by_idle_source_upgrade() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "edited_preview",
+            egui::ColorImage::filled([64, 64], egui::Color32::LIGHT_BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.items.push(GridItem::Image(PathBuf::from("c:/p/a.jpg")));
+        app.image_metas.push(Some((10, 20)));
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex,
+            from_cache: true,
+            from_edit_preview: true,
+            rendered_at_px: 64,
+            source_dims: Some((4000, 3000)),
+        });
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.keep_start_shared.store(0, Ordering::Relaxed);
+        app.keep_end_shared.store(1, Ordering::Relaxed);
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.settings.thumb_idle_upgrade = true;
+        app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.display_px_shared.store(1024, Ordering::Relaxed);
+
+        app.enqueue_idle_upgrades();
+
+        assert!(app.requested.is_empty());
+        assert!(
+            app.reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -7921,6 +7968,7 @@ mod favorite_adjustment_defaults_tests {
                     egui::TextureOptions::LINEAR,
                 ),
                 from_cache: false,
+                from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
             }
@@ -7976,6 +8024,7 @@ mod favorite_adjustment_defaults_tests {
                     egui::TextureOptions::LINEAR,
                 ),
                 from_cache: false,
+                from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
             }
@@ -12456,6 +12505,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: old_tex.clone(),
             from_cache: false,
+            from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
         });
@@ -12502,6 +12552,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails = vec![ThumbnailState::Loaded {
             tex: new_tex,
             from_cache: false,
+            from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
         }];
@@ -12844,6 +12895,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: image_tex,
             from_cache: false,
+            from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
         });
@@ -12852,6 +12904,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: video_tex,
             from_cache: false,
+            from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
         });
@@ -12926,6 +12979,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: dummy_tex.clone(),
             from_cache: false,
+            from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
         });
@@ -13443,6 +13497,7 @@ mod favorite_adjustment_defaults_tests {
                 ThumbnailState::Loaded {
                     tex,
                     from_cache: false,
+                    from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
                 },
@@ -14613,10 +14668,24 @@ mod pipeline_cache_refactor_tests {
         let idx_b = push_image(&mut app, "C:/pics/conceal-gen-b.jpg");
         let (edit_a, final_a) = insert_edit_and_final_cache(&mut app, &ctx, idx_a, "conceal_a");
         let (edit_b, final_b) = insert_edit_and_final_cache(&mut app, &ctx, idx_b, "conceal_b");
+        assert!(app.insert_retained_final_ai(
+            idx_a,
+            FinalAiKey {
+                edit_key: edit_a,
+                color_ai_hash: 0x22,
+                bg: 0,
+            },
+            [1, 1],
+            Arc::new(egui::ColorImage::filled(
+                [1, 1],
+                egui::Color32::from_rgb(12, 13, 14),
+            )),
+        ));
 
         assert_eq!(app.edit_result_cache.len(), 2);
         assert_eq!(app.final_composite_cache.len(), 2);
         assert_eq!(app.final_ai_cache.len(), 2);
+        assert_eq!(app.retained_final_ai_cache.len(), 1);
         let conceal_gen_before = app.conceal_generation;
 
         app.bump_conceal_generation();
@@ -14643,6 +14712,138 @@ mod pipeline_cache_refactor_tests {
         );
         assert!(app.final_composite_cache.is_empty());
         assert!(app.final_ai_cache.is_empty());
+        assert!(
+            app.retained_final_ai_cache.is_empty(),
+            "隠蔽設定変更前の retained AI 出力も全ページ分失効する"
+        );
+    }
+
+    /// retained final AI の安定キーは edit 世代を持たないため、隠蔽設定を何度往復しても
+    /// 毎回明示 invalidation されなければならない。最初の変更だけ反映され、その後は
+    /// 同サイズの古い AI 出力が復元される実機退行を固定する。
+    #[test]
+    fn repeated_conceal_generation_changes_never_restore_previous_retained_ai() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/conceal-retained-ai.jpg");
+
+        for cycle in 0..3 {
+            let edit_key = dummy_edit_key(&app, idx);
+            let ai_key = FinalAiKey {
+                edit_key,
+                color_ai_hash: 0x55,
+                bg: 0,
+            };
+            assert!(app.insert_retained_final_ai(
+                idx,
+                ai_key,
+                [2, 2],
+                Arc::new(egui::ColorImage::filled(
+                    [2, 2],
+                    egui::Color32::from_rgb(20 + cycle, 30, 40),
+                )),
+            ));
+            assert!(app.has_retained_final_ai(idx, ai_key, [2, 2]));
+
+            app.bump_conceal_generation();
+
+            let next_ai_key = FinalAiKey {
+                edit_key: dummy_edit_key(&app, idx),
+                ..ai_key
+            };
+            assert!(
+                !app.has_retained_final_ai(idx, next_ai_key, [2, 2]),
+                "cycle {cycle}: 前の境界処理で生成した retained AI を再利用しない"
+            );
+        }
+    }
+
+    #[test]
+    fn conceal_generation_evicts_current_gpu_preview_but_keeps_other_pages_lazy() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let current = push_image(&mut app, "C:/pics/conceal-current.jpg");
+        let other = push_image(&mut app, "C:/pics/conceal-other.jpg");
+        app.fullscreen_idx = Some(current);
+        let generation = app.conceal_generation;
+        for (idx, label) in [(current, "conceal_current"), (other, "conceal_other")] {
+            let pixels = Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::BLACK));
+            let texture = ctx.load_texture(label, (*pixels).clone(), Default::default());
+            app.conceal_cache.insert(
+                idx,
+                ConcealCacheEntry {
+                    pixels,
+                    texture,
+                    generation,
+                },
+            );
+        }
+
+        app.bump_conceal_generation();
+
+        assert!(
+            !app.conceal_cache.contains_key(&current),
+            "編集中ページは次のプレビューで現在設定を必ず再合成する"
+        );
+        assert!(
+            app.conceal_cache.contains_key(&other),
+            "非表示ページは generation 不一致による遅延解放を維持する"
+        );
+    }
+
+    #[test]
+    fn conceal_boundary_change_recomposes_current_preview_pixels() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/conceal-boundary-preview.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.conceal_mode = true;
+        app.conceal_preview_active = true;
+        app.conceal_mask_size = [2, 2];
+        app.conceal_mask = Some(vec![true, false, false, false]);
+        app.settings.conceal_type = crate::conceal::ConcealType::Mosaic;
+        app.settings.conceal_mosaic_tile_mode = crate::conceal::TileSizeMode::FixedPx(2);
+        app.settings.conceal_mosaic_boundary = crate::conceal::MosaicBoundary::Opaque;
+
+        let raw = egui::ColorImage::new(
+            [2, 2],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+                egui::Color32::WHITE,
+            ],
+        );
+        let raw_pixels = Arc::new(raw.clone());
+        let raw_texture = ctx.load_texture("conceal_boundary_raw", raw, Default::default());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw_texture,
+                pixels: raw_pixels,
+                source_dims: Some([2, 2]),
+                load_seq: 0,
+            },
+        );
+
+        let _ = app
+            .ensure_conceal_texture(&ctx, idx)
+            .expect("opaque preview should compose");
+        let opaque = app.conceal_cache[&idx].pixels.clone();
+
+        app.settings.conceal_mosaic_boundary = crate::conceal::MosaicBoundary::MaskShape;
+        app.bump_conceal_generation();
+        let _ = app
+            .ensure_conceal_texture(&ctx, idx)
+            .expect("mask-shape preview should recompose");
+        let mask_shape = &app.conceal_cache[&idx];
+
+        assert_ne!(opaque.pixels, mask_shape.pixels.pixels);
+        assert_eq!(
+            mask_shape.pixels.pixels[1],
+            egui::Color32::GREEN,
+            "マスク外は新しい MaskShape 境界で元画素を維持する"
+        );
+        assert_eq!(mask_shape.generation, app.conceal_generation);
     }
 
     /// P5-6: `bump_adjustment_generation` は `final_ai_cache` を巻き込まず、
@@ -20733,6 +20934,8 @@ mod still_window_mode_key_tests {
             idx: video,
             image: None,
             from_cache: false,
+            from_edit_preview: false,
+            edit_preview_adjustment: None,
             source_dims: None,
             canceled: false,
             finalized: false,
@@ -21174,6 +21377,7 @@ mod still_window_mode_key_tests {
         app.thumbnails[image] = ThumbnailState::Loaded {
             tex: img_tex,
             from_cache: false,
+            from_edit_preview: false,
             rendered_at_px: 128,
             source_dims: Some((1, 1)),
         };
@@ -24262,6 +24466,7 @@ mod still_window_mode_key_tests {
                 ThumbnailState::Loaded {
                     tex: tex.clone(),
                     from_cache: false,
+                    from_edit_preview: false,
                     rendered_at_px: 20,
                     source_dims: Some((20, 20)),
                 },

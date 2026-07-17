@@ -86,6 +86,7 @@ effect_kind_catalog! {
     Duotone => Duotone(DuotoneParams),
     Equalize => Equalize(EqualizeParams),
     GradientMap => GradientMap(GradientMapParams),
+    Repair => Repair(RepairParams),
     ColorFill => ColorFill(ColorFillParams),
     Frame => Frame(FrameParams),
     OutlineStroke => OutlineStroke(OutlineStrokeParams),
@@ -195,6 +196,9 @@ impl EffectKind {
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::CrtDisplay => "スキャンラインやRGBマスクでブラウン管表示風にします。",
             Self::Anaglyph3d => "RGBチャンネルをずらして立体視風や色ズレ表現を作ります。",
+            Self::Repair => {
+                "マスク範囲をスポイト色、周囲のテクスチャ、または指定したコピー元で非破壊に修復します。"
+            }
             _ => self.label(),
         }
     }
@@ -210,6 +214,7 @@ pub(crate) const EFFECT_GROUPS: &[EffectGroup] = &[
         title: "基本",
         kinds: &[
             EffectKind::None,
+            EffectKind::Repair,
             EffectKind::ColorFill,
             EffectKind::Frame,
             EffectKind::OutlineStroke,
@@ -385,4 +390,26 @@ pub(crate) fn effect_picker_matches_query(kind: EffectKind, query: &str) -> bool
     query
         .split_whitespace()
         .all(|token| fields.iter().any(|field| field.contains(token)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repair_is_listed_once_in_the_basic_group() {
+        let basic = EFFECT_GROUPS
+            .iter()
+            .find(|group| group.title == "基本")
+            .expect("basic effect group");
+        assert!(basic.kinds.contains(&EffectKind::Repair));
+        assert_eq!(
+            EFFECT_GROUPS
+                .iter()
+                .flat_map(|group| group.kinds.iter())
+                .filter(|kind| **kind == EffectKind::Repair)
+                .count(),
+            1
+        );
+    }
 }

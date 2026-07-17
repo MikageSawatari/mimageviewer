@@ -1171,6 +1171,20 @@ impl App {
                     .and_then(|pixels| thumb_reuse_key(it).map(|k| (k, pixels)))
             })
             .collect();
+        let preserved_thumb_layers: HashMap<
+            ThumbReuseKey,
+            Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
+        > = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                self.thumb_edit_preview_layers
+                    .get(&i)
+                    .cloned()
+                    .and_then(|layers| thumb_reuse_key(it).map(|key| (key, layers)))
+            })
+            .collect();
         // 選択中アイテム + チェック済みアイテムの「内容キー」をスナップショット。
         // ストリーミング rebuild で items 並びが変わってもカーソル位置とチェック状態を
         // 同じ内容のセルに追従させる (idx ベースだと別アイテムを指す事故になる)。
@@ -1215,6 +1229,9 @@ impl App {
                     if is_thumb_adjust_target(Some(item)) {
                         if let Some(pixels) = preserved_thumb_pixels.get(&key) {
                             self.thumb_pixels.insert(i, Arc::clone(pixels));
+                        }
+                        if let Some(layers) = preserved_thumb_layers.get(&key) {
+                            self.thumb_edit_preview_layers.insert(i, Arc::clone(layers));
                         }
                     }
                 }
@@ -3430,6 +3447,7 @@ mod tests {
         ThumbnailState::Loaded {
             tex,
             from_cache: false,
+            from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
         }

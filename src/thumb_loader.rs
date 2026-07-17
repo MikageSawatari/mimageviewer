@@ -147,6 +147,12 @@ pub fn folder_thumb_auto_cache_key(
 // 共通型
 // -----------------------------------------------------------------------
 
+/// 編集プレビュー由来サムネイルの、色調補正用に分離した下地と注釈。
+pub struct ThumbEditPreviewAdjustment {
+    pub base: egui::ColorImage,
+    pub annotation_layers: Vec<crate::edit_preview_cache::CachedAnnotationLayer>,
+}
+
 /// サムネイル読み込み結果メッセージ。
 ///
 /// ワーカースレッドが UI スレッドに送る。フィールドを位置に頼らず名前で判別できる
@@ -158,6 +164,10 @@ pub struct ThumbMsg {
     /// true: WebP キャッシュから復元 (段階 E アップグレード対象)。
     /// false: 元画像から直接デコード (高画質) または動画 Shell API。
     pub from_cache: bool,
+    /// true: 非破壊編集結果のプレビューキャッシュから復元。
+    pub from_edit_preview: bool,
+    /// `from_edit_preview` のとき、色調補正を下地だけへ掛けてから注釈を戻すためのデータ。
+    pub edit_preview_adjustment: Option<ThumbEditPreviewAdjustment>,
     /// 元画像のピクセル寸法 (幅, 高さ)。取得できなかった場合は None。
     pub source_dims: Option<(u32, u32)>,
     /// ワーカーがロードを中断した場合 true (STALE: keep_range 外になった等)。
@@ -192,6 +202,8 @@ pub struct LoadRequest {
     pub path: std::path::PathBuf,
     pub mtime: i64,
     pub file_size: i64,
+    /// 非破壊編集プレビューのページキー。編集済み画像系アイテムだけに設定する。
+    pub edit_preview_key: Option<String>,
     /// 段階 E: true の場合はキャッシュを無視して元画像から再デコードする
     pub skip_cache: bool,
     /// true = 画面上に見えている可視範囲のアイテム。ワーカーは priority 要求を
@@ -789,6 +801,8 @@ fn send_thumb_failed(req: &LoadRequest, tx: &mpsc::Sender<ThumbMsg>, gen_done: &
         idx: req.idx,
         image: None,
         from_cache: false,
+        from_edit_preview: false,
+        edit_preview_adjustment: None,
         source_dims: None,
         canceled: false,
         finalized: false,
@@ -833,6 +847,8 @@ fn send_pinned_only_cached(
         idx: req.idx,
         image: ci,
         from_cache: true,
+        from_edit_preview: false,
+        edit_preview_adjustment: None,
         source_dims,
         canceled: false,
         finalized: false,
@@ -875,6 +891,7 @@ pub fn process_load_request(
     // recursive auto-pick の各段でサブフォルダの pin を引いて leaf 画像へ
     // cascade 解決する。`None` のとき従来の純粋 auto-pick になる。
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    edit_preview_db: Option<&Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
 ) {
     if let Some(pin) = req.pinned_only.as_ref() {
         if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done) {
@@ -889,6 +906,36 @@ pub fn process_load_request(
     // None ケース (path に file_name が無い等の異常) は既存挙動に合わせて空文字 fallback。
     let key_cow = cache_key_for_request(req).unwrap_or(std::borrow::Cow::Borrowed(""));
     let filename: &str = key_cow.as_ref();
+
+    // 編集済みページは通常 catalog より先に、source 解像度 edit-result 由来の
+    // 永続プレビューを試す。これは最大辺 2048px / q=90 の完成済み派生画像なので、
+    // 後段の idle quality-upgrade で元画像に差し替えてはいけない。
+    if !req.skip_cache
+        && let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db)
+        && let Some(preview) = db.load(item_key, req.mtime, req.file_size)
+    {
+        let _ = tx.send(ThumbMsg {
+            idx: req.idx,
+            image: Some(preview.image),
+            from_cache: true,
+            from_edit_preview: true,
+            edit_preview_adjustment: Some(ThumbEditPreviewAdjustment {
+                base: preview.adjustment_base,
+                annotation_layers: preview.annotation_layers,
+            }),
+            source_dims: Some(preview.source_dims),
+            canceled: false,
+            finalized: false,
+            input_seq: req.input_seq,
+            items_gen: req.items_gen,
+        });
+        gen_done.fetch_add(1, Ordering::Relaxed);
+        crate::logger::log(format!(
+            "    idx={:>4} edit_preview_cache_hit  {filename}",
+            req.idx,
+        ));
+        return;
+    }
 
     let req_t0 = std::time::Instant::now();
     if crate::perf::is_enabled() {
@@ -929,6 +976,8 @@ pub fn process_load_request(
                 idx: req.idx,
                 image: ci,
                 from_cache: true,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
                 source_dims,
                 canceled: false,
                 finalized: false,
@@ -1024,6 +1073,8 @@ pub fn process_load_request(
                 idx: req.idx,
                 image: None,
                 from_cache: false,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
                 source_dims: None,
                 canceled: false,
                 finalized: false,
@@ -1100,6 +1151,8 @@ pub fn process_load_request(
                     idx: req.idx,
                     image: None,
                     from_cache: false,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
                     source_dims: None,
                     canceled: false,
                     finalized: false,
@@ -1133,6 +1186,8 @@ pub fn process_load_request(
                     idx: req.idx,
                     image: None,
                     from_cache: false,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
                     source_dims: None,
                     canceled: false,
                     finalized: false,
@@ -1178,6 +1233,8 @@ pub fn process_load_request(
                 idx: req.idx,
                 image: None,
                 from_cache: false,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
                 source_dims: None,
                 canceled: true,
                 finalized: false,
@@ -1218,6 +1275,8 @@ pub fn process_load_request(
                 idx: req.idx,
                 image: None,
                 from_cache: false,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
                 source_dims: None,
                 canceled: true,
                 finalized: false,
@@ -2323,6 +2382,8 @@ pub fn load_one_cached(
                     idx,
                     image: None,
                     from_cache: false,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
                     source_dims: None,
                     canceled: true,
                     finalized: false,
@@ -2337,6 +2398,8 @@ pub fn load_one_cached(
                 idx,
                 image: None,
                 from_cache: false,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
                 source_dims: None,
                 canceled: false,
                 finalized: false,
@@ -2410,6 +2473,8 @@ pub fn load_one_cached(
         idx,
         image: Some(display_ci),
         from_cache: false,
+        from_edit_preview: false,
+        edit_preview_adjustment: None,
         source_dims,
         canceled: false,
         finalized: false,
@@ -2512,6 +2577,8 @@ pub fn load_one_cached(
         idx,
         image: None,
         from_cache: false,
+        from_edit_preview: false,
+        edit_preview_adjustment: None,
         source_dims: None,
         canceled: false,
         finalized: true,
