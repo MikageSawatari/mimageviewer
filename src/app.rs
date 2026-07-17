@@ -1697,6 +1697,7 @@ struct ViewerContextBundle {
     requested: std::collections::HashMap<usize, bool>,
     keep_range: (usize, usize),
     keep_set: std::collections::HashSet<usize>,
+    thumbnail_eviction_generation: Option<u64>,
     details_thumb_suppression_applied: bool,
     details_hover_thumb_idx: Option<usize>,
     details_hover_thumb_viewport_open: bool,
@@ -1937,6 +1938,7 @@ impl ViewerContextBundle {
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            thumbnail_eviction_generation: None,
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
             details_hover_thumb_viewport_open: false,
@@ -5781,6 +5783,12 @@ pub struct App {
     /// ★フィルタや Ctrl+F で疎になった `visible_indices` でも、非可視 idx が
     /// 先読みキューに流入しないよう、raw range ではなく set 判定に統一する。
     pub(crate) keep_set: std::collections::HashSet<usize>,
+    /// 範囲外サムネイルを全件照合済みの `items_generation`。
+    ///
+    /// 同一世代の通常フレームでは、前回 keep_set から外れた少数の idx だけを退去させる。
+    /// items 差し替え直後だけ全件照合し、並べ替え等で別 idx へ再利用された Loaded を
+    /// keep_set 外に残さない。
+    pub(crate) thumbnail_eviction_generation: Option<u64>,
     /// 詳細表示中にサムネ要求抑制 / 既存テクスチャ破棄を適用済みか。
     /// 詳細モードは `update_keep_range_and_requests` が毎フレーム呼ばれるので、
     /// O(n) の eviction とキュー drain を初回だけに抑える。
@@ -9141,6 +9149,7 @@ impl App {
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            thumbnail_eviction_generation: None,
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
             details_hover_thumb_viewport_open: false,
@@ -11001,6 +11010,7 @@ impl App {
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
             || self.batch_convert.is_some()
+            || self.subfolder_expansion_pending.is_some()
             || self.subfolder_expansion_confirm_pending.is_some()
             || self.subfolder_expansion_install_pending.is_some()
             || self.editing_addon_install_state.is_some()
@@ -11052,6 +11062,7 @@ impl App {
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
             || self.batch_convert.is_some()
+            || self.subfolder_expansion_pending.is_some()
             || self.subfolder_expansion_confirm_pending.is_some()
             || self.subfolder_expansion_install_pending.is_some()
             // 編集用追加パック DL ダイアログ (フルスクリーンビューポートで描画)。表示中は
@@ -11153,6 +11164,7 @@ impl App {
             requested,
             keep_range,
             keep_set,
+            thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
@@ -11326,6 +11338,7 @@ impl App {
         swap_field!(requested);
         swap_field!(keep_range);
         swap_field!(keep_set);
+        swap_field!(thumbnail_eviction_generation);
         swap_field!(details_thumb_suppression_applied);
         swap_field!(details_hover_thumb_idx);
         swap_field!(details_hover_thumb_viewport_open);
@@ -23653,7 +23666,7 @@ impl App {
         if self.details_hover_thumb_idx != idx {
             if let Some(prev_idx) = self.details_hover_thumb_idx {
                 self.remove_details_hover_thumbnail_request(prev_idx);
-                self.evict_details_hover_thumbnail(prev_idx);
+                self.evict_grid_thumbnail(prev_idx);
             }
             self.details_hover_thumb_idx = idx;
         }
@@ -23683,7 +23696,7 @@ impl App {
     fn clear_details_hover_keep(&mut self) {
         if let Some(idx) = self.details_hover_thumb_idx.take() {
             self.remove_details_hover_thumbnail_request(idx);
-            self.evict_details_hover_thumbnail(idx);
+            self.evict_grid_thumbnail(idx);
         }
         self.keep_range = (0, 0);
         self.keep_set.clear();
@@ -23706,7 +23719,7 @@ impl App {
         self.pending_finalize.remove(&idx);
     }
 
-    fn evict_details_hover_thumbnail(&mut self, idx: usize) {
+    fn evict_grid_thumbnail(&mut self, idx: usize) {
         if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
             return;
         }
@@ -23720,6 +23733,36 @@ impl App {
         self.thumb_pixels.remove(&idx);
         self.thumb_edit_preview_layers.remove(&idx);
         self.thumb_adjust_tex.remove(&idx);
+    }
+
+    /// `keep_set` から外れた通常サムネイルだけを退去させる。
+    ///
+    /// 同一 items 世代では Loaded は直前の keep_set 内にしか存在しないため、差分だけで
+    /// 十分。items 差し替え時は Loaded 状態が content key で別 idx へ移される経路があるので、
+    /// 世代ごとの初回だけ全 idx を照合する。
+    fn reconcile_grid_thumbnail_evictions(
+        &mut self,
+        previous_keep_set: &std::collections::HashSet<usize>,
+        force_full_reconcile: bool,
+    ) {
+        if force_full_reconcile {
+            for idx in 0..self.items.len() {
+                if !self.keep_set.contains(&idx) {
+                    self.evict_grid_thumbnail(idx);
+                }
+            }
+            return;
+        }
+
+        // keep_set は通常数ページ分だけなので、この一時 Vec も数百件程度に留まる。
+        // 差分 iterator が self.keep_set を借りたままでは self を変更できないため collect する。
+        let leaving: Vec<usize> = previous_keep_set
+            .difference(&self.keep_set)
+            .copied()
+            .collect();
+        for idx in leaving {
+            self.evict_grid_thumbnail(idx);
+        }
     }
 
     fn enqueue_details_hover_thumbnail(&mut self, idx: usize) {
@@ -23819,27 +23862,22 @@ impl App {
             return;
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
-            if self.details_thumb_suppression_applied {
+            if self.details_thumb_suppression_applied
+                && self.thumbnail_eviction_generation == Some(self.items_generation)
+            {
                 return;
             }
+            let previous_keep_set = std::mem::take(&mut self.keep_set);
             self.keep_range = (0, 0);
-            self.keep_set.clear();
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
             self.thumb_pixels.clear();
             self.thumb_edit_preview_layers.clear();
             self.thumb_adjust_tex.clear();
-            for (item, thumb) in self.items.iter().zip(self.thumbnails.iter_mut()) {
-                // Video thumbnails are produced by the dedicated Shell/sidecar worker at
-                // folder-load time, not by make_load_request. If we evict them here,
-                // returning from details view cannot request them again.
-                if matches!(item, GridItem::Video(_)) {
-                    continue;
-                }
-                if matches!(thumb, ThumbnailState::Loaded { .. }) {
-                    *thumb = ThumbnailState::Evicted;
-                }
-            }
+            let force_full_reconcile =
+                self.thumbnail_eviction_generation != Some(self.items_generation);
+            self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
+            self.thumbnail_eviction_generation = Some(self.items_generation);
             if let Some(queue_arc) = self.reload_queue.clone() {
                 let (ref mtx, _) = *queue_arc;
                 let mut q = mtx.lock().unwrap();
@@ -23867,6 +23905,7 @@ impl App {
             self.keep_set.clear();
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
+            self.thumbnail_eviction_generation = Some(self.items_generation);
             return;
         }
 
@@ -23943,7 +23982,7 @@ impl App {
             .visible_indices
             .get(vis_keep_start_capped..vis_keep_end)
             .unwrap_or(&[]);
-        self.keep_set.clear();
+        let previous_keep_set = std::mem::take(&mut self.keep_set);
         self.keep_set.extend(keep_slice.iter().copied());
 
         // keep_range: keep_set の bounding box。worker atomic キャンセル判定で使われる。
@@ -23971,22 +24010,10 @@ impl App {
         //         poll_thumbnails が remove
         //       - 正常完了: poll_thumbnails が remove
         let t1 = frame_t0.elapsed();
-        for i in 0..total {
-            if self.keep_set.contains(&i) {
-                continue;
-            }
-            if matches!(self.items.get(i), Some(GridItem::Video(_))) {
-                continue;
-            }
-            if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
-                self.thumbnails[i] = ThumbnailState::Evicted;
-            }
-            // サムネ補正用ピクセル/テクスチャも keep_set 外では破棄する。
-            // 動画は上で skip 済みなのでここには来ない。
-            self.thumb_pixels.remove(&i);
-            self.thumb_edit_preview_layers.remove(&i);
-            self.thumb_adjust_tex.remove(&i);
-        }
+        let force_full_reconcile =
+            self.thumbnail_eviction_generation != Some(self.items_generation);
+        self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
+        self.thumbnail_eviction_generation = Some(self.items_generation);
         let t2 = frame_t0.elapsed();
 
         // (2) reload_queue 内の keep_range 外リクエストを除去し、
@@ -30929,6 +30956,7 @@ impl App {
             requested,
             keep_range,
             keep_set,
+            thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
@@ -31103,6 +31131,7 @@ impl App {
             scroll_to_selected,
             keep_range,
             keep_set,
+            thumbnail_eviction_generation,
             visible_indices,
             details_order,
             search_filter,
@@ -35988,8 +36017,8 @@ impl App {
     /// Ctrl+F を無効化する (docs/search-container-item-redesign.md §4.1.1)。
     pub(crate) fn grid_is_pdf_pages(&self) -> bool {
         self.items
-            .iter()
-            .any(|it| matches!(it, crate::grid_item::GridItem::PdfPage { .. }))
+            .first()
+            .is_some_and(|it| matches!(it, crate::grid_item::GridItem::PdfPage { .. }))
     }
 
     /// グリッドが ZIP 内エントリで構成されているか (= ZIP を開いている)。
@@ -36001,7 +36030,7 @@ impl App {
     /// ZipDir の名前照合 (filename 次元) が無効化されてコンテナが全消えする (Codex P2)。
     pub(crate) fn grid_is_zip_entries(&self) -> bool {
         self.zip_nav.is_some()
-            || self.items.iter().any(|it| {
+            || self.items.first().is_some_and(|it| {
                 matches!(
                     it,
                     crate::grid_item::GridItem::ZipImage { .. }

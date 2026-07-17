@@ -28,7 +28,8 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 1. **keep_range の再計算** (`update_keep_range_and_requests` in `app.rs`)
    - 可視範囲 + `thumb_prev_pages` + `thumb_next_pages` を含む範囲を算出
    - `keep_start_shared` / `keep_end_shared` (`Arc<AtomicUsize>`) に書き込み → ワーカーが参照
-2. **エビクション**: keep_range 外の Loaded を `Evicted` に遷移 (GPU テクスチャを drop)
+2. **エビクション**: 同一 items 世代では前回 keep_set から外れた Loaded だけを
+   `Evicted` に遷移 (GPU テクスチャを drop)。items 差し替え後の初回だけ全件照合する
 3. **要求投入**: keep_range 内の Pending / Evicted に対して `LoadRequest` を作り
    - 通常キュー: `reload_queue` (Image/ZipImage/PdfPage)
    - 重 I/O キュー: `heavy_io_queue` (Folder/ZipFile/ConvertibleArchive/ZipDir — 全体走査、

@@ -303,7 +303,16 @@ fn counts_as_thumbnail_item(item: &GridItem) -> bool {
     !matches!(item, GridItem::ZipSeparator { .. })
 }
 
-fn thumbnail_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
+fn thumbnail_item_counts(
+    items: &[GridItem],
+    visible_indices: &[usize],
+    may_contain_zip_separators: bool,
+) -> (usize, usize) {
+    if !may_contain_zip_separators {
+        // ZipSeparator が無い通常フォルダ/PDF/検索/サブ展開では、items と
+        // visible_indices の長さがそのまま表示件数。数百万件を毎フレーム数え直さない。
+        return (items.len(), visible_indices.len());
+    }
     let total = items
         .iter()
         .filter(|item| counts_as_thumbnail_item(item))
@@ -313,20 +322,27 @@ fn thumbnail_count_label(items: &[GridItem], visible_indices: &[usize]) -> Strin
         .filter_map(|&idx| items.get(idx))
         .filter(|item| counts_as_thumbnail_item(item))
         .count();
+    (total, visible)
+}
+
+fn thumbnail_count_label(
+    items: &[GridItem],
+    visible_indices: &[usize],
+    may_contain_zip_separators: bool,
+) -> String {
+    let (total, visible) =
+        thumbnail_item_counts(items, visible_indices, may_contain_zip_separators);
     let width = total.max(1).to_string().len();
     format!("({:>width$}/{})", visible, total, width = width)
 }
 
-fn filtered_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
-    let total = items
-        .iter()
-        .filter(|item| counts_as_thumbnail_item(item))
-        .count();
-    let visible = visible_indices
-        .iter()
-        .filter_map(|&idx| items.get(idx))
-        .filter(|item| counts_as_thumbnail_item(item))
-        .count();
+fn filtered_count_label(
+    items: &[GridItem],
+    visible_indices: &[usize],
+    may_contain_zip_separators: bool,
+) -> String {
+    let (total, visible) =
+        thumbnail_item_counts(items, visible_indices, may_contain_zip_separators);
     format!("{visible} / {total} 件")
 }
 
@@ -6467,8 +6483,12 @@ impl App {
                 }
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(filtered_count_label(&self.items, &self.visible_indices))
-                        .small(),
+                    egui::RichText::new(filtered_count_label(
+                        &self.items,
+                        &self.visible_indices,
+                        self.zip_nav.is_some(),
+                    ))
+                    .small(),
                 );
             });
             ui.add_space(1.0);
@@ -7933,7 +7953,7 @@ impl App {
             && !self.items_are_tag_view
             && self.search_filter.is_none()
             && self.search_pending.is_none())
-        .then(|| thumbnail_count_label(&self.items, &self.visible_indices));
+        .then(|| thumbnail_count_label(&self.items, &self.visible_indices, self.zip_nav.is_some()));
         // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
@@ -7944,10 +7964,10 @@ impl App {
         let stack_available = (self.settings.show_address_bar_stack_toggle || stack_on)
             && self.stack_mode_available();
         let subfolder_expansion_on = self.subfolder_expansion_on();
-        let subfolder_expansion_pending_label = self.subfolder_expansion_pending_label();
+        let subfolder_expansion_pending = self.subfolder_expansion_busy();
         let subfolder_expansion_pending_tooltip = self.subfolder_expansion_pending_tooltip();
         let subfolder_expansion_available = subfolder_expansion_on
-            || subfolder_expansion_pending_label.is_some()
+            || subfolder_expansion_pending
             || self.subfolder_expansion_available();
         egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<AddressBarNav> {
@@ -8388,27 +8408,7 @@ impl App {
                             ui.add_space(4.0);
                         }
                         if subfolder_expansion_available {
-                            let pending = subfolder_expansion_pending_label.is_some();
-                            if pending {
-                                let tooltip = subfolder_expansion_pending_tooltip
-                                    .clone()
-                                    .unwrap_or_else(|| "サブフォルダを走査中".to_string());
-                                let cancel_resp = ui
-                                    .small_button("中止")
-                                    .hover_tip(format!("{tooltip}\nクリック: 走査をキャンセル"));
-                                if cancel_resp.clicked() {
-                                    subfolder_expansion_toggle = true;
-                                }
-                                ui.add_space(2.0);
-                            }
-                            let label = if let Some(progress) =
-                                subfolder_expansion_pending_label.as_ref()
-                            {
-                                progress.as_str()
-                            } else {
-                                "サブ展開"
-                            };
-                            let tooltip = if pending {
+                            let tooltip = if subfolder_expansion_pending {
                                 subfolder_expansion_pending_tooltip
                                     .clone()
                                     .unwrap_or_else(|| "サブフォルダを走査中".to_string())
@@ -8418,7 +8418,13 @@ impl App {
                                 self.subfolder_expansion_action_tooltip()
                             };
                             let resp = ui
-                                .selectable_label(subfolder_expansion_on || pending, label)
+                                .add_enabled(
+                                    !subfolder_expansion_pending,
+                                    egui::Button::selectable(
+                                        subfolder_expansion_on || subfolder_expansion_pending,
+                                        "サブ展開",
+                                    ),
+                                )
                                 .hover_tip(tooltip);
                             if resp.clicked() {
                                 subfolder_expansion_toggle = true;
@@ -8810,11 +8816,19 @@ impl App {
                     let countable = |it: &crate::grid_item::GridItem| {
                         !matches!(it, crate::grid_item::GridItem::ZipSeparator { .. })
                     };
-                    let total = self.items.iter().filter(|it| countable(it)).count();
-                    let matched = filter
-                        .iter()
-                        .filter(|&&i| self.items.get(i).is_some_and(|it| countable(it)))
-                        .count();
+                    let (total, matched) = if self.zip_nav.is_none() {
+                        // 通常ビューには ZipSeparator が存在しない。件数表示のためだけに
+                        // 数百万 item / match を毎フレーム走査しない。
+                        (self.items.len(), filter.len())
+                    } else {
+                        (
+                            self.items.iter().filter(|it| countable(it)).count(),
+                            filter
+                                .iter()
+                                .filter(|&&i| self.items.get(i).is_some_and(|it| countable(it)))
+                                .count(),
+                        )
+                    };
                     ui.label(
                         egui::RichText::new(format!("{matched}/{total} 件"))
                             .size(11.0)
@@ -11922,7 +11936,10 @@ mod rating_filter_op_tests {
             .collect();
         let visible_indices: Vec<usize> = (0..20).collect();
 
-        assert_eq!(thumbnail_count_label(&items, &visible_indices), "( 20/100)");
+        assert_eq!(
+            thumbnail_count_label(&items, &visible_indices, false),
+            "( 20/100)"
+        );
     }
 
     #[test]
@@ -11933,7 +11950,7 @@ mod rating_filter_op_tests {
         let visible_indices: Vec<usize> = (0..123).collect();
 
         assert_eq!(
-            filtered_count_label(&items, &visible_indices),
+            filtered_count_label(&items, &visible_indices, false),
             "123 / 300 件"
         );
     }
@@ -11949,7 +11966,10 @@ mod rating_filter_op_tests {
         ];
         let visible_indices = vec![0, 1];
 
-        assert_eq!(filtered_count_label(&items, &visible_indices), "1 / 2 件");
+        assert_eq!(
+            filtered_count_label(&items, &visible_indices, true),
+            "1 / 2 件"
+        );
     }
 
     #[test]
@@ -11987,7 +12007,10 @@ mod rating_filter_op_tests {
         ];
         let visible_indices = vec![0, 1];
 
-        assert_eq!(thumbnail_count_label(&items, &visible_indices), "(1/2)");
+        assert_eq!(
+            thumbnail_count_label(&items, &visible_indices, true),
+            "(1/2)"
+        );
     }
 
     #[test]

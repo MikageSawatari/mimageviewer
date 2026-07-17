@@ -960,40 +960,10 @@ impl App {
         self.items_are_subfolder_expansion_view
     }
 
-    pub(crate) fn subfolder_expansion_pending_label(&self) -> Option<String> {
-        if let Some(pending) = self.subfolder_expansion_install_pending.as_ref() {
-            return Some(format!(
-                "サブ展開準備中 {} / {}件",
-                pending.progress.completed, pending.progress.total
-            ));
-        }
-        if let Some(pending) = self.subfolder_expansion_confirm_pending.as_ref() {
-            return Some(format!(
-                "サブ展開確認待ち {}件",
-                pending.snapshot.entries.len()
-            ));
-        }
-        let pending = self.subfolder_expansion_pending.as_ref()?;
-        let progress = self.subfolder_expansion_progress.as_ref();
-        Some(match progress {
-            Some(progress) => {
-                format!(
-                    "サブ展開中 {}件 / {}フォルダ",
-                    progress.media_found, progress.dirs_scanned
-                )
-            }
-            None => {
-                if pending.roots.len() > 1 {
-                    format!(
-                        "サブ展開中: {} ({}フォルダ)",
-                        pending.root.display(),
-                        pending.roots.len()
-                    )
-                } else {
-                    format!("サブ展開中: {}", pending.root.display())
-                }
-            }
-        })
+    pub(crate) fn subfolder_expansion_busy(&self) -> bool {
+        self.subfolder_expansion_pending.is_some()
+            || self.subfolder_expansion_install_pending.is_some()
+            || self.subfolder_expansion_confirm_pending.is_some()
     }
 
     pub(crate) fn subfolder_expansion_pending_tooltip(&self) -> Option<String> {
@@ -1672,6 +1642,56 @@ impl App {
     }
 
     pub(crate) fn render_subfolder_expansion_install_overlay(&mut self, ctx: &egui::Context) {
+        if self.subfolder_expansion_pending.is_some() {
+            let progress = self
+                .subfolder_expansion_progress
+                .clone()
+                .unwrap_or_default();
+            let current_dir = progress
+                .current_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::new("subfolder_expansion_scan_modal")).show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.heading("サブフォルダを走査中...");
+                });
+                ui.add_space(6.0);
+                ui.label(format!("画像・動画: {} 件", progress.media_found));
+                ui.label(format!("確認済みフォルダ: {} 件", progress.dirs_scanned));
+                if let Some(current_dir) = current_dir.as_deref() {
+                    ui.label("現在のフォルダ:").on_hover_text(current_dir);
+                    ui.add(
+                        egui::Label::new(
+                            std::path::Path::new(current_dir)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(current_dir),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(current_dir);
+                }
+                ui.add_space(8.0);
+                if ui.button("中止").clicked() {
+                    cancel = true;
+                }
+            });
+            if cancel {
+                self.cancel_subfolder_expansion_pending();
+                if let Some(current) = self.current_folder.clone() {
+                    self.address = self
+                        .book_address_label_for_path(&current)
+                        .unwrap_or_else(|| current.to_string_lossy().to_string());
+                }
+                self.show_feedback_toast("サブ展開をキャンセルしました".into());
+            }
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+
         if let Some(confirm) = self.subfolder_expansion_confirm_pending.as_ref() {
             let item_count = confirm.snapshot.entries.len();
             let mut proceed = false;

@@ -2317,21 +2317,25 @@ impl App {
     /// fullscreen / VST owner と誤認しない
     /// (Codex P1)。`request_id` で遅延イベントの誤適用を防ぐ (Codex P2)。
     #[cfg(windows)]
+    pub(super) fn native_video_presentation_switch_source(&self) -> Option<usize> {
+        let idx = self.fullscreen_idx?;
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return None;
+        }
+        // S タイルは動画表示の overlay state であり、presenter placement の切替可否とは
+        // 独立している。ここへ video_tile_mode_active の gate を追加しないこと。
+        Some(idx)
+    }
+
+    #[cfg(windows)]
     pub(crate) fn switch_native_video_viewer_presentation(
         &mut self,
         target_presentation: ViewerPresentation,
         activate_on_show: bool,
     ) {
-        let Some(idx) = self.fullscreen_idx else {
+        let Some(idx) = self.native_video_presentation_switch_source() else {
             return;
         };
-        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
-            return;
-        }
-        // タイルモード中はトグル不可 (HUD ボタンも非表示)。防御的に弾く。
-        if self.video_tile_mode_active {
-            return;
-        }
         if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
             self.pending_detached_video_host_switch = None;
         }
@@ -2550,12 +2554,11 @@ impl App {
             return;
         }
         if self.viewer_session_is_detached() {
-            if self.video_tile_mode_active {
-                return;
-            }
             if self.show_vst3_manager {
                 self.toggle_native_video_vst3_gui();
             }
+            // タイル overlay は presenter child 側の表示状態であり、host の装飾・サイズ変更と
+            // 独立している。仮想フルスクリーン settle 後の child rect 同期でも維持する。
             self.toggle_detached_viewer_borderless_fullscreen(ctx);
             return;
         }

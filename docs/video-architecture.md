@@ -1325,6 +1325,11 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   `video_tile_state` は worker / サムネ snapshot を持つ実体 state で、source-swap 中や
   metadata 未到着では一時的に `None` になりうる。mode と state を混同すると、動画切替中の
   path mismatch で `video_tile_state` を捨てた瞬間に、タイルモード自体まで無音で解除される。
+- S タイル表示中も `FsToggleWindowMode` (既定 F11) は有効。MainWindow / Fullscreen 間は
+  `SwitchPlacement` で presenter の表示先だけを切り替え、App が保持する
+  `video_tile_mode_active` / `video_tile_state` は維持して次フレームに新 presenter へ overlay を
+  再同期する。DetachedWindow では presenter を移さず、host の borderless と client rect を
+  切り替える。タイル状態を presentation switch の許可条件にしてはならない。
 - `video_tile_reopen_pending` は「タイル表示中に動画を切り替えたが、次動画の info がまだ無い」
   場合の短期 retry 予約。通常のホイールナビゲーション (`NavigateItem`、旧 `WheelNavigate` /
   `try_start_native_video_fast_swap` / `NativeVideoSourceSwapPending` の `reason=navigation`)

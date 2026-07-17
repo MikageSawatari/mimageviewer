@@ -12936,6 +12936,101 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn incremental_thumbnail_eviction_only_releases_indices_leaving_keep_set() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items = (0..3)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/p/{idx}.jpg"))))
+            .collect();
+        app.thumbnails = (0..3)
+            .map(|idx| ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    format!("incremental-evict-{idx}"),
+                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+                from_cache: false,
+                from_edit_preview: false,
+                rendered_at_px: 1,
+                source_dims: None,
+            })
+            .collect();
+
+        let previous_keep_set = std::collections::HashSet::from([0, 1]);
+        app.keep_set = std::collections::HashSet::from([1]);
+        app.reconcile_grid_thumbnail_evictions(&previous_keep_set, false);
+
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+        assert!(
+            matches!(app.thumbnails[2], ThumbnailState::Loaded { .. }),
+            "same-generation incremental eviction must not scan unrelated indices"
+        );
+    }
+
+    #[test]
+    fn new_items_generation_fully_reconciles_reused_loaded_thumbnails() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items = (0..3)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/p/{idx}.jpg"))))
+            .collect();
+        app.thumbnails = (0..3)
+            .map(|idx| ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    format!("generation-evict-{idx}"),
+                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+                from_cache: false,
+                from_edit_preview: false,
+                rendered_at_px: 1,
+                source_dims: None,
+            })
+            .collect();
+        app.keep_set = std::collections::HashSet::from([1]);
+
+        app.reconcile_grid_thumbnail_evictions(&std::collections::HashSet::new(), true);
+
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+        assert!(matches!(app.thumbnails[2], ThumbnailState::Evicted));
+    }
+
+    #[test]
+    fn grid_container_kind_checks_use_homogeneous_leading_item() {
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("c:/book.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("c:/book.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+        ];
+        assert!(app.grid_is_pdf_pages());
+        assert!(!app.grid_is_zip_entries());
+
+        app.items = vec![GridItem::ZipSeparator {
+            dir_display: "chapter".into(),
+        }];
+        assert!(!app.grid_is_pdf_pages());
+        assert!(app.grid_is_zip_entries());
+
+        app.items = vec![GridItem::Image(PathBuf::from("c:/p/a.jpg"))];
+        assert!(!app.grid_is_pdf_pages());
+        assert!(!app.grid_is_zip_entries());
+    }
+
+    #[test]
     fn folder_nav_mode_same_kind_distinguishes_favsearch_scope() {
         let root_a = PathBuf::from("c:/fav-a");
         let root_b = PathBuf::from("c:/fav-b");
@@ -20139,6 +20234,60 @@ mod still_window_mode_key_tests {
                 .map(|t| t.target_borderless),
             Some(false),
             "second F11 should request borderless exit without changing presentation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_tile_mode_remains_a_valid_native_presentation_switch_source() {
+        let mut app = setup_app();
+        let path = PathBuf::from(r"C:\clips\tile-window-toggle.mp4");
+        let video = push_video(&mut app, path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        app.video_tile_mode_active = true;
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(path, 12.0)),
+                load_seq: 0,
+            },
+        );
+
+        assert_eq!(
+            app.native_video_presentation_switch_source(),
+            Some(video),
+            "S tile overlay must not block the native presenter F11 switch path"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_video_tile_f11_toggles_borderless_and_preserves_tile_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\tile-detached.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.begin_active_detached_session(12, DetachedSource::Video);
+        app.video_tile_mode_active = true;
+
+        app.toggle_video_window_mode_for_input(&ctx);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(
+            app.video_tile_mode_active,
+            "F11 must keep the S tile mode open"
+        );
+        assert_eq!(
+            app.detached_viewer_borderless_transition
+                .as_ref()
+                .map(|transition| transition.target_borderless),
+            Some(true),
+            "F11 must start the detached host borderless transition while tiles are visible"
+        );
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "detached F11 resizes the host and must not migrate the presenter"
         );
     }
 
@@ -32006,6 +32155,17 @@ fn settings_restore_blocks_background_dialog_input() {
 fn subfolder_display_prepare_blocks_background_input() {
     let mut app = phase_c_support::setup_app();
     let root = PathBuf::from(r"C:\photos");
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.subfolder_expansion_pending = Some(subfolder_expansion::SubfolderExpansionPending {
+        root: root.clone(),
+        roots: vec![root.clone()],
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+    });
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+
+    app.subfolder_expansion_pending = None;
     app.subfolder_expansion_confirm_pending =
         Some(subfolder_expansion::SubfolderExpansionConfirmPending {
             snapshot: subfolder_expansion::SubfolderExpansionSnapshot {

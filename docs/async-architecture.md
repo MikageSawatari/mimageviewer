@@ -448,10 +448,16 @@ mImageViewer は 2 つのリストを使い分ける:
   `visible_indices[vis_keep_start..vis_keep_end]` から毎フレーム構築する。
   enqueue / eviction / retain / idle upgrade / tag prewarm / 補正テクスチャの
   バックグラウンド処理はすべてこの `keep_set.contains(&i)` で判定する。
+- **eviction は前回 keep_set との差分だけを処理する** — 同一 `items_generation` では
+  `previous_keep_set - current_keep_set` の idx だけを `Evicted` にする。`items` 全件を
+  毎フレーム走査すると、数百万件の一覧では可視セル描画が仮想化されていても UI thread が
+  停止する。並べ替え等で Loaded を別 idx へ再利用する可能性があるため、items 世代ごとの
+  初回だけ `thumbnail_eviction_generation` を使って全件照合する。
 
 新しく「可視範囲の画像に対する背景処理」を追加する場合:
 
-1. 反復対象は `self.keep_set.iter()` (必要なら `sorted` に clone してから)。
+1. 反復対象は `self.keep_set.iter()` (必要なら `sorted` に clone してから)。退去処理は
+   前回 keep_set との差分を使う。
 2. `keep_start..keep_end` の range ループは絶対に書かない。
 3. `rebuild_visible_indices()` は `keep_set` を直接触らない。次フレームの
    `update_keep_range_and_requests` が再計算する (フィルタ変更で疎になっても

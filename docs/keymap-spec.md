@@ -210,7 +210,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | マウス左クリック | (画像) ページめくり。LTR では右半分クリックで次 / 左半分クリックで前、RTL では左半分クリックで次 / 右半分クリックで前 / (動画) 再生・一時停止トグル |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>F6</kbd> | 表示中アイテムへレーティング 1〜5 / 解除 |
 | <kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>Shift</kbd>+<kbd>F6</kbd> | 現在のコンテナへレーティング 1〜5 / 解除 |
-| <kbd>F11</kbd> | ウィンドウ内表示 ⇔ 全画面表示 を切り替え (右上 × の左のトグルボタンと同等)。Action: `FsToggleWindowMode`。静止画は egui 経路 (`toggle_still_window_mode` = 設定 flip のみ)、動画は native presenter 経路 (`toggle_video_window_mode` = presenter rebuild)。Windows native 動画ウィンドウにフォーカスがある場合も現在の keymap 割り当てで App 側へ転送する。別ウィンドウ表示中は、真の fullscreen API ではなく装飾なしでモニター全体を覆う仮想フルスクリーンをトグルする。消しゴムモード中は無効化 |
+| <kbd>F11</kbd> | ウィンドウ内表示 ⇔ 全画面表示 を切り替え (右上 × の左のトグルボタンと同等)。Action: `FsToggleWindowMode`。静止画は egui 経路 (`toggle_still_window_mode` = 設定 flip のみ)、動画は native presenter 経路 (`toggle_video_window_mode` = presenter rebuild)。Windows native 動画ウィンドウにフォーカスがある場合も現在の keymap 割り当てで App 側へ転送し、S キーの動画タイル表示中もタイル状態を維持したまま切り替える。別ウィンドウ表示中は、真の fullscreen API ではなく装飾なしでモニター全体を覆う仮想フルスクリーンをトグルする。消しゴムモード中は無効化 |
 | <kbd>F12</kbd> | 画像・動画・音声ビューアの別ウィンドウモード ON/OFF を切り替える。Global action として keymap 対象。native 動画ウィンドウにフォーカスがある場合も App 側へ転送する。静止画のフルスクリーン編集モード中、IME 変換中、ダイアログ操作中は発火させない。設定「画像/動画を別ウィンドウで開く」が ON の間は、静止画 / ZIP画像 / PDFページでの F12 切替は無効化し、動画 / 音声表示中だけ現在のメディアをメイン / detached へ一時 migration する。F11 のウィンドウ内表示 / 全画面表示の選択は F12 とは独立して保持し、F12 OFF 時は直前の F11 状態へ戻る |
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> | (画像) 現在ページを追加先の本へ追加 / (動画) 現在の再生フレームを画像として追加先の本へ追加 |
 
