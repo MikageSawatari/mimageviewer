@@ -151,6 +151,41 @@
   検索・フィルタ、通常画像 / PDF の挙動は変更しない。ソースの `ZipSeparator` 参照はゼロとし、
   旧 facet 設定値は `Unknown` として安全に読み込む。
 
+### 1.21 親コンテナの代表サムネイルに編集プレビューを反映
+
+- 出典: v2.5.0 リリース前実機確認 (2026-07-17)。ZIP 内画像を編集しても、
+  親階層の ZIP セルの自動代表サムネイルには編集結果が反映されない。
+  編集済みページを <kbd>P</kbd> で代表サムネに固定した場合も、同じページの
+  未編集画像が表示される。
+- 調査結果:
+  - ZIP 内の通常 `ZipImage` サムネイルは `edit_preview_key` を持ち、編集プレビューを
+    通常 catalog より優先して読み込む。
+  - `folder_thumb_pins.db` は対象の参照 (entry / page / path) だけを保存し、
+    `apply_folder_thumb_pin` が作る親セル用 `LoadRequest` は `edit_preview_key = None`
+    のため、元画像から代表サムネイルを作る。
+  - 編集プレビューの Saved / Invalidated イベントは、現在の `items` と
+    `page_path_key` が直接一致するページセルだけを無効化する。親 Folder / ZipFile /
+    PdfFile セルまでは更新が伝播しない。
+  - 共通の親代表経路のため、直接画像を固定した Folder、PdfPage を固定した
+    PdfFile、変換アーカイブ、ネスト ZIP も対象候補に含める。
+- 方針 (二段階):
+  1. **先行候補: 手動ピンの反映**。cascade 解決後の leaf から canonical page key を
+     導出し、代表サムネイル要求へ渡す。編集プレビューの保存・無効化時に、
+     そのページを固定している親セルも evict / reload する。
+  2. **後続候補: 自動代表選定の反映**。worker 内で leaf を選定した後に page key を
+     組み立て、対応する編集プレビューがあれば raw decode / catalog より優先する。
+     自動選定結果と親キャッシュの無効化条件も同時に設計する。
+- 不変条件 / 確認:
+  - サムネイルへ反映するのは現行の編集プレビュー内容 (erase / local_adjust /
+    conceal / crop / comic 注釈) とし、親代表の色調補正は現行仕様を勝手に変えない。
+  - ZipEntry / PdfPage / 直接 Image、ネスト ZipDir、変換アーカイブ、編集更新・
+    編集解除・キャッシュヒットを回帰テストする。
+  - UI スレッドで ZIP/PDF 列挙や SQLite 単件照会を追加しない。
+- v2.5.0 裁定: 編集データ・書き出し・ピン対象の参照は正常で、表示上のみの
+  既知の制限。実機検証でその他の問題がなければ 2026-07-18 付けの v2.5.0 を
+  ブロックしない。
+- 規模 / 優先度: 手動ピン = Medium / P2 candidate、自動代表 = Medium〜Large / P3。
+
 ### 2.1 folder pane scan worker の thread 構成判断
 
 - 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。
