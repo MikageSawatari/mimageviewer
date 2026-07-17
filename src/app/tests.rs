@@ -23256,6 +23256,32 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn cursor_show_pending_for_window_closed_during_handoff_is_dropped() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 91;
+        let viewport_id = App::detached_image_window_viewport_id(window_id);
+        app.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Closing,
+            "test_same_frame_close",
+        );
+        app.detached_image_window_cursor_show_pending
+            .push(window_id);
+
+        ctx.set_embed_viewports(false);
+        ctx.begin_pass(egui::RawInput::default());
+        app.flush_detached_image_window_cursor_show_pending(&ctx);
+        let output = ctx.end_pass();
+
+        assert!(app.detached_image_window_cursor_show_pending.is_empty());
+        assert!(
+            !output.viewport_output.contains_key(&viewport_id),
+            "a closed viewport must not receive a stale CursorVisible command"
+        );
+    }
+
+    #[test]
     fn explicit_pdf_deferred_reopen_keeps_grid_open_intent_for_detached_viewer() {
         let mut app = setup_app();
         app.settings.detached_viewer_open_images_in_window = true;

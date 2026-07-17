@@ -5488,6 +5488,17 @@ impl App {
                     Self::detached_image_window_viewport_id(id),
                     egui::ViewportCommand::CursorVisible(true),
                 );
+            } else {
+                // Closing / runtime removal 済みなら同フレーム close の正常競合。Parked 等の
+                // runtime が残っていれば snapshot 登録より先に handoff した契約違反を疑える。
+                // 通常ログには出さず、detached 診断時だけ将来の順序退行を観測可能にする。
+                self.log_detached_image_window_debug(format!(
+                    "cursor_show_pending_dropped id={id} reason=snapshot_missing \
+                     runtime_state={:?} hwnd=0x{:x} passive_windows={}",
+                    self.detached_window_state(id),
+                    self.detached_window_hwnd_raw_for_window_id(id),
+                    self.detached_image_windows.len()
+                ));
             }
         }
     }
