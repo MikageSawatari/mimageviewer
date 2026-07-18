@@ -8597,8 +8597,7 @@ impl App {
                     return;
                 }
                 if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::ShortTap) {
-                    self.handle_fullscreen_close_request();
-                    ctx.request_repaint();
+                    self.handle_native_video_short_right_click(ctx, fs_idx, pos);
                     return;
                 }
             }
@@ -8618,8 +8617,7 @@ impl App {
                     return;
                 }
                 if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::ShortTap) {
-                    self.handle_fullscreen_close_request();
-                    ctx.request_repaint();
+                    self.handle_native_video_short_right_click(ctx, fs_idx, pos);
                     return;
                 }
             }
@@ -8628,15 +8626,14 @@ impl App {
                     if start_time.elapsed() >= std::time::Duration::from_millis(400) {
                         self.fs_context_menu_idx = Some(fs_idx);
                         self.fs_context_menu_pos = pos;
+                        ctx.request_repaint();
                     } else {
-                        self.handle_fullscreen_close_request();
+                        self.handle_native_video_short_right_click(ctx, fs_idx, pos);
                     }
-                    ctx.request_repaint();
                 }
                 return;
             }
-            self.handle_fullscreen_close_request();
-            ctx.request_repaint();
+            self.handle_native_video_short_right_click(ctx, fs_idx, pos);
             return;
         }
         if !event.double_click && event.down {
@@ -8736,6 +8733,23 @@ impl App {
             return;
         }
         self.handle_native_video_toggle_play_command(ctx, fs_idx);
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_short_right_click(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        pos: egui::Pos2,
+    ) {
+        if self.apply_viewer_short_right_click_action(
+            crate::ring_shortcut::RightDragContext::VideoFullscreen,
+            Some(fs_idx),
+            pos,
+        ) {
+            self.handle_fullscreen_close_request();
+        }
+        ctx.request_repaint();
     }
 
     #[cfg(windows)]

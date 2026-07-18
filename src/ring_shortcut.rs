@@ -166,6 +166,85 @@ impl<'de> Deserialize<'de> for RightDragMode {
         Ok(Self::from_str(&value).unwrap_or(Self::Unknown(value)))
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewerShortRightClickAction {
+    CloseFullscreen,
+    None,
+    ContextMenu,
+    Unknown(String),
+}
+
+impl ViewerShortRightClickAction {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::CloseFullscreen => "close_fullscreen",
+            Self::None => "none",
+            Self::ContextMenu => "context_menu",
+            Self::Unknown(s) => s.as_str(),
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "close_fullscreen" | "close" | "" => Self::CloseFullscreen,
+            "none" => Self::None,
+            "context_menu" | "menu" => Self::ContextMenu,
+            _ => return None,
+        })
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CloseFullscreen => "フルスクリーンを閉じる",
+            Self::None => "何もしない (右ドラッグ専用)",
+            Self::ContextMenu => "右クリックメニューを表示",
+            Self::Unknown(_) => "不明な設定",
+        }
+    }
+
+    pub fn guide_hint(&self) -> &'static str {
+        match self {
+            Self::CloseFullscreen | Self::Unknown(_) => "短押しは閉じる",
+            Self::None => "短押しは何もしない",
+            Self::ContextMenu => "短押しは右クリックメニュー",
+        }
+    }
+
+    pub fn effective(&self) -> Self {
+        match self {
+            Self::CloseFullscreen => Self::CloseFullscreen,
+            Self::None => Self::None,
+            Self::ContextMenu => Self::ContextMenu,
+            Self::Unknown(_) => Self::CloseFullscreen,
+        }
+    }
+}
+
+impl Default for ViewerShortRightClickAction {
+    fn default() -> Self {
+        Self::CloseFullscreen
+    }
+}
+
+impl Serialize for ViewerShortRightClickAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewerShortRightClickAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_str(&value).unwrap_or(Self::Unknown(value)))
+    }
+}
 pub const MOUSE_GESTURE_MAX_STROKES: usize = 4;
 pub const MOUSE_GESTURE_STEP_THRESHOLD_PX: f32 = 36.0;
 
@@ -1765,6 +1844,10 @@ pub struct RingShortcutSettings {
     pub right_drag_video: Option<RightDragMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_drag_edit: Option<RightDragMode>,
+    #[serde(default)]
+    pub short_right_click_image: ViewerShortRightClickAction,
+    #[serde(default)]
+    pub short_right_click_video: ViewerShortRightClickAction,
     /// Select the grid item under the pointer as soon as an enabled right-drag
     /// operation starts. Defaults to false to preserve the pre-v2.6 behavior.
     #[serde(default)]
@@ -1836,6 +1919,33 @@ impl RingShortcutSettings {
             RightDragContext::EditMode => &mut self.right_drag_edit,
         };
         *target = Some(mode.effective());
+    }
+
+    pub fn viewer_short_right_click_action(
+        &self,
+        context: RightDragContext,
+    ) -> Option<ViewerShortRightClickAction> {
+        match context {
+            RightDragContext::ImageFullscreen => Some(self.short_right_click_image.effective()),
+            RightDragContext::VideoFullscreen => Some(self.short_right_click_video.effective()),
+            RightDragContext::Grid | RightDragContext::EditMode => None,
+        }
+    }
+
+    pub fn set_viewer_short_right_click_action(
+        &mut self,
+        context: RightDragContext,
+        action: ViewerShortRightClickAction,
+    ) {
+        match context {
+            RightDragContext::ImageFullscreen => {
+                self.short_right_click_image = action.effective();
+            }
+            RightDragContext::VideoFullscreen => {
+                self.short_right_click_video = action.effective();
+            }
+            RightDragContext::Grid | RightDragContext::EditMode => {}
+        }
     }
 
     pub fn mouse_gesture_profile(&self, context: RightDragContext) -> &MouseGestureProfile {
@@ -1936,6 +2046,8 @@ impl RingShortcutSettings {
         Self::sanitize_right_drag_mode(&mut self.right_drag_image);
         Self::sanitize_right_drag_mode(&mut self.right_drag_video);
         Self::sanitize_right_drag_mode(&mut self.right_drag_edit);
+        self.short_right_click_image = self.short_right_click_image.effective();
+        self.short_right_click_video = self.short_right_click_video.effective();
         self.mouse_gestures_grid.sanitize(RightDragContext::Grid);
         self.mouse_gestures_image
             .sanitize(RightDragContext::ImageFullscreen);
@@ -1980,6 +2092,8 @@ impl Default for RingShortcutSettings {
             right_drag_image: None,
             right_drag_video: None,
             right_drag_edit: None,
+            short_right_click_image: ViewerShortRightClickAction::CloseFullscreen,
+            short_right_click_video: ViewerShortRightClickAction::CloseFullscreen,
             select_grid_item_on_right_drag_start: false,
             mouse_gestures_grid: default_grid_gesture_profile(),
             mouse_gestures_image: default_image_gesture_profile(),
@@ -2575,6 +2689,69 @@ mod tests {
         let mut sanitized = loaded;
         sanitized.sanitize();
         assert!(sanitized.select_grid_item_on_right_drag_start);
+    }
+
+    #[test]
+    fn viewer_short_right_click_actions_default_and_round_trip_separately() {
+        let legacy: RingShortcutSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            legacy.viewer_short_right_click_action(RightDragContext::ImageFullscreen),
+            Some(ViewerShortRightClickAction::CloseFullscreen)
+        );
+        assert_eq!(
+            legacy.viewer_short_right_click_action(RightDragContext::VideoFullscreen),
+            Some(ViewerShortRightClickAction::CloseFullscreen)
+        );
+        assert_eq!(
+            legacy.viewer_short_right_click_action(RightDragContext::Grid),
+            None
+        );
+        assert_eq!(
+            legacy.viewer_short_right_click_action(RightDragContext::EditMode),
+            None
+        );
+
+        let mut settings = RingShortcutSettings::default();
+        settings.set_viewer_short_right_click_action(
+            RightDragContext::ImageFullscreen,
+            ViewerShortRightClickAction::None,
+        );
+        settings.set_viewer_short_right_click_action(
+            RightDragContext::VideoFullscreen,
+            ViewerShortRightClickAction::ContextMenu,
+        );
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: RingShortcutSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.viewer_short_right_click_action(RightDragContext::ImageFullscreen),
+            Some(ViewerShortRightClickAction::None)
+        );
+        assert_eq!(
+            loaded.viewer_short_right_click_action(RightDragContext::VideoFullscreen),
+            Some(ViewerShortRightClickAction::ContextMenu)
+        );
+    }
+
+    #[test]
+    fn viewer_short_right_click_unknown_value_sanitizes_to_legacy_close() {
+        let mut settings: RingShortcutSettings = serde_json::from_str(
+            r#"{"short_right_click_image":"future_action","short_right_click_video":"none"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.short_right_click_image,
+            ViewerShortRightClickAction::Unknown("future_action".to_string())
+        );
+        settings.sanitize();
+        assert_eq!(
+            settings.short_right_click_image,
+            ViewerShortRightClickAction::CloseFullscreen
+        );
+        assert_eq!(
+            settings.short_right_click_video,
+            ViewerShortRightClickAction::None
+        );
     }
     #[test]
     fn toggle_maximize_action_round_trips_and_is_grid_only() {

@@ -12752,7 +12752,11 @@ impl App {
                         secondary_released,
                     ) {
                         crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                            close = true;
+                            close |= self.apply_viewer_short_right_click_action(
+                                right_drag_context,
+                                self.fullscreen_idx,
+                                secondary_pos,
+                            );
                         }
                         crate::ring_shortcut::MouseFlickOutcome::Fired
                         | crate::ring_shortcut::MouseFlickOutcome::Cancelled
@@ -12773,11 +12777,11 @@ impl App {
                         secondary_released,
                     ) {
                         crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                            if right_drag_context
-                                != crate::ring_shortcut::RightDragContext::EditMode
-                            {
-                                close = true;
-                            }
+                            close |= self.apply_viewer_short_right_click_action(
+                                right_drag_context,
+                                self.fullscreen_idx,
+                                secondary_pos,
+                            );
                         }
                         crate::ring_shortcut::MouseFlickOutcome::Fired
                         | crate::ring_shortcut::MouseFlickOutcome::Cancelled
@@ -12816,7 +12820,11 @@ impl App {
                                     self.fs_context_menu_idx = self.fullscreen_idx;
                                     self.fs_context_menu_pos = current_pos;
                                 } else {
-                                    close = true;
+                                    close |= self.apply_viewer_short_right_click_action(
+                                        right_drag_context,
+                                        self.fullscreen_idx,
+                                        current_pos,
+                                    );
                                 }
                             }
                             self.fs_secondary_press_start = None;
@@ -12830,6 +12838,42 @@ impl App {
         }
 
         (page_nav, close)
+    }
+
+    /// Apply the configurable short right-click action only after the caller's
+    /// drag/hold state machine has classified the input as a short tap.
+    ///
+    /// Returning `true` asks the caller to run its normal fullscreen close path.
+    /// Context-menu state is shared by egui and the native video presenter so
+    /// both routes reuse the existing menu construction and owner/focus logic.
+    pub(crate) fn apply_viewer_short_right_click_action(
+        &mut self,
+        context: crate::ring_shortcut::RightDragContext,
+        fs_idx: Option<usize>,
+        pos: egui::Pos2,
+    ) -> bool {
+        use crate::ring_shortcut::ViewerShortRightClickAction;
+
+        match self
+            .settings
+            .ring_shortcuts
+            .viewer_short_right_click_action(context)
+        {
+            Some(ViewerShortRightClickAction::CloseFullscreen) => true,
+            Some(ViewerShortRightClickAction::None) | None => false,
+            Some(ViewerShortRightClickAction::ContextMenu) => {
+                self.fs_context_menu_idx = fs_idx;
+                self.fs_context_menu_pos = pos;
+                false
+            }
+            Some(ViewerShortRightClickAction::Unknown(_)) => {
+                debug_assert!(
+                    false,
+                    "effective short right-click action must not be unknown"
+                );
+                true
+            }
+        }
     }
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
@@ -22754,7 +22798,56 @@ impl App {
 mod tests {
     use super::*;
     use crate::grid_item::GridItem;
+    use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[test]
+    fn viewer_short_right_click_action_applies_close_none_and_shared_menu_state() {
+        let mut app = App::default();
+        let pos = egui::pos2(123.0, 456.0);
+
+        assert!(app.apply_viewer_short_right_click_action(
+            RightDragContext::ImageFullscreen,
+            Some(7),
+            pos,
+        ));
+        assert_eq!(app.fs_context_menu_idx, None);
+
+        app.settings
+            .ring_shortcuts
+            .set_viewer_short_right_click_action(
+                RightDragContext::ImageFullscreen,
+                ViewerShortRightClickAction::None,
+            );
+        assert!(!app.apply_viewer_short_right_click_action(
+            RightDragContext::ImageFullscreen,
+            Some(7),
+            pos,
+        ));
+        assert_eq!(app.fs_context_menu_idx, None);
+
+        app.settings
+            .ring_shortcuts
+            .set_viewer_short_right_click_action(
+                RightDragContext::VideoFullscreen,
+                ViewerShortRightClickAction::ContextMenu,
+            );
+        assert!(!app.apply_viewer_short_right_click_action(
+            RightDragContext::VideoFullscreen,
+            Some(7),
+            pos,
+        ));
+        assert_eq!(app.fs_context_menu_idx, Some(7));
+        assert_eq!(app.fs_context_menu_pos, pos);
+
+        app.fs_context_menu_idx = None;
+        assert!(!app.apply_viewer_short_right_click_action(
+            RightDragContext::EditMode,
+            Some(7),
+            pos,
+        ));
+        assert_eq!(app.fs_context_menu_idx, None);
+    }
 
     #[test]
     fn loupe_is_suppressed_in_text_annotation_mode() {

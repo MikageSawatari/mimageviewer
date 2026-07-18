@@ -597,7 +597,14 @@ impl App {
         painter.text(
             egui::pos2(rect.min.x + 14.0, rect.max.y - 20.0),
             egui::Align2::LEFT_CENTER,
-            "右ドラッグで軌跡を入力、離すと実行 / 短押しは従来操作",
+            format!(
+                "右ドラッグで軌跡を入力、離すと実行 / {}",
+                self.settings
+                    .ring_shortcuts
+                    .viewer_short_right_click_action(surface_context)
+                    .map(|action| action.guide_hint())
+                    .unwrap_or("短押しは従来操作")
+            ),
             egui::FontId::proportional(12.0),
             egui::Color32::from_gray(190),
         );
@@ -3378,11 +3385,17 @@ impl App {
         } else {
             format_mouse_gesture_pattern(&gesture.pattern)
         };
+        let short_tap_hint = self
+            .settings
+            .ring_shortcuts
+            .viewer_short_right_click_action(RightDragContext::VideoFullscreen)
+            .map(|action| action.guide_hint())
+            .unwrap_or("短押しは閉じる");
         Some(crate::video::native_presenter::NativeOverlayRingPicker {
             title: format!("マウスジェスチャ / 入力中: {current}"),
             rows,
             selected_row,
-            footer: "右ドラッグで軌跡を入力、離すと実行 / 短押しは閉じる".to_string(),
+            footer: format!("右ドラッグで軌跡を入力、離すと実行 / {short_tap_hint}"),
             drill: None,
         })
     }

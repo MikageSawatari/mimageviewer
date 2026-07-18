@@ -965,7 +965,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | 右半分クリック | 次の画像へ |
 | 左半分クリック | 前の画像へ |
 | 右ドラッグ / 長押し（設定時） | 右ドラッグ mode に従う。リングショートカットでは右ボタンを押した位置を中心に 8 方向リングを表示し、離した方向の一発アクションを実行する。マウスジェスチャでは上下左右の軌跡 (最大 4 stroke、同方向連続は圧縮) を登録済みパターンと照合して実行し、長押しまたは入力中は登録済み操作の一覧を表示する。右ドラッグ mode はグリッド / 画像フルスクリーン / 動画フルスクリーン / 編集モードごとに未使用・リング・ジェスチャから選ぶ。編集モードは初期版では未使用 / ジェスチャのみ。既定はすべて未使用。短い右クリック、中ボタンズームとは別の状態として扱う |
-| 右クリック短押し（移動なし / 400ms 未満） | 現在表示中の項目にカーソルを戻してフルスクリーンを閉じる。動画 native presenter 経路でも同じ |
+| 右クリック短押し（移動なし / 400ms 未満） | `Settings.ring_shortcuts.short_right_click_image` / `short_right_click_video` に従い、画像と動画を別々に「フルスクリーンを閉じる」（既定）/「何もしない (右ドラッグ専用)」/「右クリックメニューを表示」から選ぶ。右ドラッグ mode がリング / ジェスチャでも、方向操作が発火せず短押しに確定した場合だけ適用する。静止画・音楽の egui viewer と動画 native presenter で共通。グリッドと編集モードは対象外 |
 | 右クリック長押し（設定 OFF 時） | コンテキストメニュー。実ファイルではグリッドと同じ Windows Shell 標準メニュー + mIV 独自項目を優先し、ZIP/PDF 内ページなど仮想項目や Shell メニュー取得失敗時は mIV 独自メニュー（パスコピー・フォルダを開く・アプリケーションで開く等）を表示する |
 | Escape | 現在表示中の項目にカーソルを戻してフルスクリーンを閉じる。動画のサムネイル一覧中は一覧を閉じて動画再生へ戻る |
 | Q / Ctrl+Backspace | 現在ページの個別補正設定を解除（標準値に戻す）。Q は片手操作用 |
@@ -1196,7 +1196,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
-| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、`select_grid_item_on_right_drag_start` はグリッドの有効な右ドラッグ開始セルを押下時点で選択するかを保持する（既定 false）。旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
+| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、`short_right_click_image` / `short_right_click_video` は画像 / 動画ビューアの短い右クリックを閉じる / 何もしない / メニュー表示から個別に選ぶ（既定は閉じる）。`select_grid_item_on_right_drag_start` はグリッドの有効な右ドラッグ開始セルを押下時点で選択するかを保持する（既定 false）。旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ビューワモード) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ui_scale_factor` | f32 | 1.0 | アプリ内 UI 表示倍率。設定メニュー「スケーリング」から 0.5〜2.0 を 0.1 刻みで選ぶ。main egui Context の `zoom_factor` が正本で、メイン UI・静止画フルスクリーン・native 動画 overlay に反映する。物理 window geometry は倍率に依存しない。active viewer は倍率変更時に閉じ、再 open で新倍率を適用する。VST plugin GUI の別 HWND は対象外 |
@@ -1684,7 +1684,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - [x] 右クリックコンテキストメニュー（mIV 独自項目: パスコピー・画像コピー・フォルダを開く・回転・削除・新規フォルダ作成 / 実ファイル操作: Windows 標準メニューのコピー・カット・ペースト等）
 - [x] ファイル D&D 送出（グリッドのセルを左ドラッグでエクスプローラ等へコピー。複数選択対応、フォルダ・ZIP/PDF 本体も対象、仮想フォルダ内画像は対象外）
 - [x] ファイル D&D 受け取り（エクスプローラ等から mIV へドロップ → 現在表示中のフォルダへコピー。ZIP/PDF など仮想フォルダ表示中は拒否）
-- [x] フルスクリーン右クリック（短押しは閉じる。右フリック OFF 時の長押しでコンテキストメニュー。実ファイルは Windows Shell 標準メニュー + mIV 独自項目、仮想項目は mIV 独自メニュー）
+- [x] フルスクリーン右クリック（画像 / 動画別に短押しを「閉じる（既定）/ 何もしない / コンテキストメニュー」から選択。右ドラッグ OFF 時の長押しメニューは維持。実ファイルは Windows Shell 標準メニュー + mIV 独自項目、仮想項目は mIV 独自メニュー）
 - [x] 複数選択（Space キー / Ctrl+クリック、チェックマークオーバーレイ）
 - [x] 同名ファイル処理設定（ZIP+フォルダ重複、同名 ZIP 優先、動画+画像重複、拡張子優先度）
 - [x] スクロールバードラッグ対応 + Home/End/PageUp/PageDown キー

@@ -7,8 +7,8 @@ use crate::keymap::{
 };
 use crate::ring_shortcut::{
     MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
-    RingShortcutContext, RingShortcutSettings, format_mouse_gesture_pattern,
-    mouse_gesture_direction_from_delta,
+    RingShortcutContext, RingShortcutSettings, ViewerShortRightClickAction,
+    format_mouse_gesture_pattern, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
@@ -637,13 +637,31 @@ pub(super) fn page_right_drag_modes(ui: &mut egui::Ui, state: &mut PreferencesSt
     let settings = &mut state.settings.ring_shortcuts;
 
     ui.label(egui::RichText::new("マウス右ドラッグ").strong());
-    ui.small("右ドラッグの用途を文脈ごとに選びます。未使用の文脈では、右クリックや既存の短押し動作を優先します。");
+    ui.small("右ドラッグの用途を文脈ごとに選びます。画像と動画では、移動しない短い右クリックの動作も個別に選べます。");
     egui::Grid::new("right_drag_mode_grid")
-        .num_columns(2)
+        .num_columns(3)
         .spacing([10.0, 6.0])
+        .striped(true)
         .show(ui, |ui| {
+            ui.label(egui::RichText::new("対象").strong());
+            ui.label(egui::RichText::new("右ドラッグ").strong());
+            ui.label(egui::RichText::new("右クリック短押し").strong());
+            ui.end_row();
             for &context in RightDragContext::all() {
+                ui.label(context.label());
                 right_drag_mode_combo(ui, settings, context);
+                match context {
+                    RightDragContext::ImageFullscreen | RightDragContext::VideoFullscreen => {
+                        viewer_short_right_click_combo(ui, settings, context);
+                    }
+                    RightDragContext::Grid => {
+                        ui.label("右クリックメニュー (固定)");
+                    }
+                    RightDragContext::EditMode => {
+                        ui.label("編集操作を優先 (固定)");
+                    }
+                }
+                ui.end_row();
             }
         });
     ui.add_space(8.0);
@@ -658,6 +676,7 @@ pub(super) fn page_right_drag_modes(ui: &mut egui::Ui, state: &mut PreferencesSt
         );
     });
     ui.small("グリッドの空き位置から右ドラッグを始めた場合は、現在の選択を維持します。");
+    ui.small("画像または動画で「何もしない」と右ドラッグの「未使用」を組み合わせると、短い右クリックには反応しません。長押しメニューは維持されます。");
 }
 
 pub(super) fn page_ring_shortcut_assignments(
@@ -3418,7 +3437,6 @@ fn right_drag_mode_combo(
     settings: &mut RingShortcutSettings,
     context: RightDragContext,
 ) {
-    ui.label(context.label());
     let mut mode = settings.right_drag_mode(context);
     if context.ring_context().is_none() && mode == RightDragMode::RingShortcut {
         mode = RightDragMode::Disabled;
@@ -3451,7 +3469,30 @@ fn right_drag_mode_combo(
             );
         });
     settings.set_right_drag_mode(context, mode);
-    ui.end_row();
+}
+
+fn viewer_short_right_click_combo(
+    ui: &mut egui::Ui,
+    settings: &mut RingShortcutSettings,
+    context: RightDragContext,
+) {
+    let Some(mut action) = settings.viewer_short_right_click_action(context) else {
+        return;
+    };
+    egui::ComboBox::from_id_salt(("viewer_short_right_click", context))
+        .width(230.0)
+        .selected_text(action.label())
+        .show_ui(ui, |ui| {
+            for candidate in [
+                ViewerShortRightClickAction::CloseFullscreen,
+                ViewerShortRightClickAction::None,
+                ViewerShortRightClickAction::ContextMenu,
+            ] {
+                let label = candidate.label();
+                ui.selectable_value(&mut action, candidate, label);
+            }
+        });
+    settings.set_viewer_short_right_click_action(context, action);
 }
 fn mouse_button_context_editor(
     ui: &mut egui::Ui,
