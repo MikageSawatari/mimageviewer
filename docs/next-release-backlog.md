@@ -14,6 +14,15 @@
 
 ## 1. 優先候補
 
+### 1.1 v2.6.0 スマートフォルダ — 対応中
+
+- 任意の複数実フォルダを source とし、本として扱うフォルダ / ZIP / PDF / 対応アーカイブを
+  background scan で収集する保存済み snapshot view。
+- お気に入りとは別概念。索引 / watcher は MVP に含めず、開く / 更新時に再走査する。
+- 元階層は source-relative path として保持し、表示は横断フラット。全体 sort とフォルダごと sort を持つ。
+- 独立したメニューを常設し、ツールバーセクションは定義が 1 件以上あるときだけ表示する。
+- 正本: `docs/plan-v2.6.0.md`。完了したら本節を削除する。
+
 ### 1.7 detached 中の発火面解決の残り (? / トースト / スタック) — BA 報告
 
 - 残り (P3、発火面の window_id 粒度が必要):
@@ -130,26 +139,6 @@
 - 規模 / リスク: QA 計装 = Medium (描画経路への hook + 幅バジェット定義)。英語化 = Large
   (externalize + 翻訳 + QA 工程)。QA ツールは日本語バグにも効くため単独で投資回収がある。
 - 優先度: P2 candidate (QA ツール)。英語対応は QA ツール整備後に再判断 (現時点は保留)。
-
-### 1.20 ✅ レガシー `GridItem::ZipSeparator` の完全撤去 (v2.5.0)
-
-- 状態: 完了 (2026-07-17)。
-- 出典: v2.4.1 前レビュー (2026-07-16)。`ZipSeparator` は旧 ZIP フラット展開で章見出しを
-  1 セルとして挿入するための疑似アイテムだったが、v1.3.0 のネスト ZIP ツリーナビ移行後は
-  `ZipTree` / `ZipDir` で現在階層だけを表示するため、本番経路では生成されない。
-- 互換性判断: `GridItem` は永続化形式ではなく、snapshot / viewer context 内の保持も同一プロセス中の
-  一時状態だけである。旧設定・DB・セッションから `ZipSeparator` を復元する経路はなく、variant を
-  残す後方互換上の必要はない。
-- 実施内容:
-  1. `GridItem::ZipSeparator` variant と専用描画、ナビ、検索、メタデータ、スナップショット、
-     コンテキストメニュー等の分岐を撤去した。
-  2. 人工的に旧 variant を生成するテストと、到達不能だったスライドショー / 連続読みの章カード契約、
-     専用 enum 値・helper を撤去した。
-  3. `docs/spec.md` / `docs/virtual-folders.md` などの現行仕様を更新し、過去の設計文書には撤去済みと
-     明記した。
-- 維持した不変条件: `ZipTree` / `ZipDir` の階層移動、`ZipImage` の表示順、見開き・連結読み、
-  検索・フィルタ、通常画像 / PDF の挙動は変更しない。ソースの `ZipSeparator` 参照はゼロとし、
-  旧 facet 設定値は `Unknown` として安全に読み込む。
 
 ### 1.21 親コンテナの代表サムネイルに編集プレビューを反映
 
@@ -427,8 +416,8 @@
 
 | 対象 | 現状 / 次の確認 | 注意点 |
 | --- | --- | --- |
-| PDFium | **新版 `chromium/7906` あり (2026-06-23 確認)**。v2.1.0 は v2.0.0 と同じ `151.0.7891.0` 維持で出荷 (PDF 再テスト回避のため見送り)。次回リリースで `setup-pdfium.sh` 更新 → PDF 表示手動確認 | PDF 開封、ページ列挙、サムネ、フルスクリーン、パスワード PDF |
-| FFmpeg LGPL shared | 動画再生の手動確認と LGPL ソース tarball 配置更新 | DLL 名が変わる更新では `setup-ffmpeg.sh` / loader / `build.rs` を揃える |
+| PDFium | v2.5.0 は `chromium/7934`。**新版 `chromium/7947` あり (2026-07-18 確認)**。v2.6.0 開発初期に `setup-pdfium.sh` 更新 → PDF 表示手動確認 | PDF 開封、ページ列挙、サムネ、フルスクリーン、パスワード PDF |
+| FFmpeg LGPL shared | v2.5.0 は `ffmpeg-n7.1.5-1-g7d0e842004`。**新版 `ffmpeg-n7.1.5-2-g998de74adf` あり (2026-07-18 確認)**。v2.6.0 開発初期に更新し、対応ソース / LGPL 表記も同期 | DLL 名が変わる更新では `setup-ffmpeg.sh` / loader / `build.rs` を揃える |
 | ONNX Runtime | `ort-sys` 要求 DLL と setup script の VERSION を確認 | C API バージョン一致、`+crt-static` + `load-dynamic` 維持 |
 | VST3 SDK / bridge | C++ ソース変更がなければ再ビルド不要 | 更新時は商用プラグインで実機確認 |
 
