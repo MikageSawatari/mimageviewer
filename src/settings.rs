@@ -565,6 +565,7 @@ pub enum DetailsSortKey {
     Rating,
     Tags,
     Kind,
+    PageCount,
     Size,
     Modified,
     Created,
@@ -583,6 +584,7 @@ impl DetailsSortKey {
             Self::Rating => "★",
             Self::Tags => "タグ",
             Self::Kind => "種類",
+            Self::PageCount => "ページ数",
             Self::Size => "サイズ",
             Self::Modified => "更新日時",
             Self::Created => "作成日時",
@@ -670,6 +672,7 @@ pub enum DetailsColumnId {
     Rating,
     Tags,
     Kind,
+    PageCount,
     Size,
     Modified,
     Created,
@@ -688,6 +691,7 @@ impl DetailsColumnId {
             Self::Rating,
             Self::Tags,
             Self::Kind,
+            Self::PageCount,
             Self::Size,
             Self::Modified,
             Self::Created,
@@ -2227,6 +2231,8 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub details_show_kind: bool,
     #[serde(default = "default_true")]
+    pub details_show_page_count: bool,
+    #[serde(default = "default_true")]
     pub details_show_size: bool,
     #[serde(default = "default_true")]
     pub details_show_modified: bool,
@@ -2429,6 +2435,9 @@ pub struct Settings {
     /// 選択情報に種類を表示する。
     #[serde(default)]
     pub thumb_tooltip_show_kind: bool,
+    /// 選択情報に本コンテナのページ数を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_tooltip_show_page_count: bool,
     /// 選択情報にファイルサイズを表示する。
     #[serde(default)]
     pub thumb_tooltip_show_file_size: bool,
@@ -3946,6 +3955,7 @@ impl Default for Settings {
             details_show_rating: true,
             details_show_tags: true,
             details_show_kind: true,
+            details_show_page_count: true,
             details_show_size: true,
             details_show_modified: true,
             details_show_created: false,
@@ -4004,6 +4014,7 @@ impl Default for Settings {
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
             thumb_tooltip_show_kind: false,
+            thumb_tooltip_show_page_count: true,
             thumb_tooltip_show_file_size: false,
             thumb_tooltip_show_modified: false,
             thumb_tooltip_show_created: false,
@@ -5493,6 +5504,7 @@ impl Settings {
         self.details_show_rating = src.details_show_rating;
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
+        self.details_show_page_count = src.details_show_page_count;
         self.details_show_size = src.details_show_size;
         self.details_show_modified = src.details_show_modified;
         self.details_show_created = src.details_show_created;
@@ -8559,6 +8571,7 @@ mod tests {
             s.details_show_rating = false;
             s.details_show_tags = false;
             s.details_show_kind = false;
+            s.details_show_page_count = false;
             s.details_show_size = false;
             s.details_show_modified = false;
             s.details_show_created = true;
@@ -8594,6 +8607,7 @@ mod tests {
             s.thumb_tooltip_show_image_dimensions = false;
             s.thumb_tooltip_show_video_duration = false;
             s.thumb_tooltip_show_kind = true;
+            s.thumb_tooltip_show_page_count = false;
             s.thumb_tooltip_show_file_size = true;
             s.thumb_tooltip_show_modified = true;
             s.thumb_tooltip_show_created = true;
@@ -8728,6 +8742,10 @@ mod tests {
             assert!(
                 !loaded.details_show_kind,
                 "details_show_kind should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_page_count,
+                "details_show_page_count should survive roundtrip"
             );
             assert!(
                 !loaded.details_show_size,
@@ -8996,6 +9014,10 @@ mod tests {
             assert!(
                 loaded.thumb_tooltip_show_kind,
                 "thumb tooltip kind flag should survive roundtrip"
+            );
+            assert!(
+                !loaded.thumb_tooltip_show_page_count,
+                "thumb tooltip page count flag should survive roundtrip"
             );
             assert!(
                 loaded.thumb_tooltip_show_file_size,

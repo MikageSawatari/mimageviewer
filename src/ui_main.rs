@@ -870,6 +870,7 @@ pub(crate) enum DetailsColumn {
     Rating,
     Tags,
     Kind,
+    PageCount,
     Size,
     Modified,
     Created,
@@ -900,6 +901,7 @@ impl DetailsColumn {
             Self::Rating,
             Self::Tags,
             Self::Kind,
+            Self::PageCount,
             Self::Size,
             Self::Modified,
             Self::Created,
@@ -918,6 +920,7 @@ impl DetailsColumn {
             Self::Rating => "★",
             Self::Tags => "タグ",
             Self::Kind => "種類",
+            Self::PageCount => "ページ数",
             Self::Size => "サイズ",
             Self::Modified => "更新日時",
             Self::Created => "作成日時",
@@ -936,6 +939,7 @@ impl DetailsColumn {
             Self::Rating => DetailsColumnId::Rating,
             Self::Tags => DetailsColumnId::Tags,
             Self::Kind => DetailsColumnId::Kind,
+            Self::PageCount => DetailsColumnId::PageCount,
             Self::Size => DetailsColumnId::Size,
             Self::Modified => DetailsColumnId::Modified,
             Self::Created => DetailsColumnId::Created,
@@ -954,6 +958,7 @@ impl DetailsColumn {
             DetailsColumnId::Rating => Self::Rating,
             DetailsColumnId::Tags => Self::Tags,
             DetailsColumnId::Kind => Self::Kind,
+            DetailsColumnId::PageCount => Self::PageCount,
             DetailsColumnId::Size => Self::Size,
             DetailsColumnId::Modified => Self::Modified,
             DetailsColumnId::Created => Self::Created,
@@ -972,6 +977,7 @@ impl DetailsColumn {
             Self::Rating => Some(DetailsSortKey::Rating),
             Self::Tags => Some(DetailsSortKey::Tags),
             Self::Kind => Some(DetailsSortKey::Kind),
+            Self::PageCount => Some(DetailsSortKey::PageCount),
             Self::Size => Some(DetailsSortKey::Size),
             Self::Modified => Some(DetailsSortKey::Modified),
             Self::Created => Some(DetailsSortKey::Created),
@@ -987,6 +993,7 @@ impl DetailsColumn {
         matches!(
             self,
             Self::Created
+                | Self::PageCount
                 | Self::ImageDimensions
                 | Self::VideoDuration
                 | Self::VideoDimensions
@@ -1001,6 +1008,7 @@ impl DetailsColumn {
             Self::Rating => settings.details_show_rating,
             Self::Tags => settings.details_show_tags,
             Self::Kind => settings.details_show_kind,
+            Self::PageCount => settings.details_show_page_count,
             Self::Size => settings.details_show_size,
             Self::Modified => settings.details_show_modified,
             Self::Created => settings.details_show_created,
@@ -1019,6 +1027,7 @@ impl DetailsColumn {
             Self::Rating => 58.0,
             Self::Tags => 160.0,
             Self::Kind => 96.0,
+            Self::PageCount => 80.0,
             Self::Size => 92.0,
             Self::Modified | Self::Created => 138.0,
             Self::State => 92.0,
@@ -10670,6 +10679,7 @@ impl App {
         }
 
         let old_lazy = (
+            self.settings.details_show_page_count,
             self.settings.details_show_created,
             self.settings.details_show_image_dimensions,
             self.settings.details_show_video_duration,
@@ -10688,6 +10698,10 @@ impl App {
             .changed();
         changed |= ui
             .checkbox(&mut self.settings.details_show_kind, "種類")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_page_count, "ページ数")
+            .on_hover_text("ZIP / PDF / 画像のみフォルダのページ数をバックグラウンドで読み込みます")
             .changed();
         changed |= ui
             .checkbox(&mut self.settings.details_show_size, "サイズ")
@@ -10765,6 +10779,7 @@ impl App {
 
         if changed {
             let new_lazy = (
+                self.settings.details_show_page_count,
                 self.settings.details_show_created,
                 self.settings.details_show_image_dimensions,
                 self.settings.details_show_video_duration,
@@ -10772,7 +10787,8 @@ impl App {
                 self.settings.details_show_video_codec,
             );
             if old_lazy != new_lazy {
-                let has_lazy = self.settings.details_show_created
+                let has_lazy = self.settings.details_show_page_count
+                    || self.settings.details_show_created
                     || self.settings.details_show_image_dimensions
                     || self.settings.details_show_video_duration
                     || self.settings.details_show_video_dimensions
@@ -10810,6 +10826,7 @@ impl App {
             }
             DetailsColumn::Tags => self.cell_tag_list(idx).join(" "),
             DetailsColumn::Kind => details_kind_label(item),
+            DetailsColumn::PageCount => self.details_page_count_text(idx),
             DetailsColumn::Size => meta
                 .and_then(|(_, size)| (size > 0).then_some(size))
                 .map(|size| {
@@ -10984,6 +11001,14 @@ impl App {
                     col_rect,
                     &kind_text,
                     egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::PageCount => draw_details_text(
+                    ui,
+                    col_rect,
+                    row_data.text(DetailsColumn::PageCount),
+                    egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
                 ),
@@ -11578,6 +11603,16 @@ impl App {
         if self.settings.thumb_tooltip_show_kind {
             fields.push(format!("種類 {}", details_kind_label(item)));
         }
+        if self.settings.thumb_tooltip_show_page_count && self.details_item_supports_page_count(idx)
+        {
+            let page_count = self.details_page_count_text(idx);
+            let display = if page_count.is_empty() {
+                "..."
+            } else {
+                page_count.as_str()
+            };
+            fields.push(format!("ページ数 {display}"));
+        }
         if self.settings.thumb_tooltip_show_file_size {
             let size = self
                 .image_metas
@@ -12021,19 +12056,47 @@ mod selection_info_tests {
             Some((1_700_000_000, 4096)),
         );
         zip.settings.thumb_tooltip_show_file_size = true;
+        zip.details_lazy_meta.insert(
+            crate::adjustment_db::normalize_path(Path::new(r"C:\books\book.zip")),
+            DetailsLazyMeta {
+                source_mtime: 1_700_000_000,
+                source_size: 4096,
+                page_count: Some(42),
+                page_count_checked: true,
+                ..Default::default()
+            },
+        );
         let zip_text = zip.selection_info_content().unwrap().single_line_text();
         assert!(zip_text.contains("book.zip"));
         assert!(zip_text.contains("種類 ZIP"));
+        assert!(zip_text.contains("ページ数 42"));
         assert!(zip_text.contains("サイズ 4.0 KB"));
+        assert_eq!(
+            zip.details_row_data(0, &[DetailsColumn::PageCount])
+                .unwrap()
+                .text(DetailsColumn::PageCount),
+            "42"
+        );
 
         let mut pdf = app_with_item(
             GridItem::PdfFile(PathBuf::from(r"C:\books\book.pdf")),
             Some((1_700_000_000, 8192)),
         );
         pdf.settings.thumb_tooltip_show_file_size = true;
+        pdf.details_lazy_meta.insert(
+            crate::adjustment_db::normalize_path(Path::new(r"C:\books\book.pdf")),
+            DetailsLazyMeta {
+                source_mtime: 1_700_000_000,
+                source_size: 8192,
+                page_count: Some(88),
+                page_count_checked: true,
+                ..Default::default()
+            },
+        );
         let pdf_text = pdf.selection_info_content().unwrap().single_line_text();
         assert!(pdf_text.contains("book.pdf"));
         assert!(pdf_text.contains("種類 PDF"));
+        assert!(pdf_text.contains("ページ数 88"));
         assert!(pdf_text.contains("サイズ 8.0 KB"));
     }
 

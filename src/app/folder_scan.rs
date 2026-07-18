@@ -27,6 +27,86 @@ pub(crate) struct ScannedDir {
     pub all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ImageFolderPageCountOptions {
+    pub(crate) include_convertible_archives: bool,
+    pub(crate) show_hidden_files: bool,
+    pub(crate) skip_duplicate_images: bool,
+    pub(crate) image_ext_priority: Vec<String>,
+    pub(crate) fingerprint: i64,
+}
+
+pub(crate) fn image_folder_page_count_options(
+    settings: &crate::settings::Settings,
+) -> Option<ImageFolderPageCountOptions> {
+    if !settings.auto_fullscreen_image_folders_enabled() {
+        return None;
+    }
+    // 永続 cache 用の決定的 FNV-1a。判定規則を変えたときは version bytes を上げる。
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut mix = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(b"image-folder-page-count-v1\0");
+    mix(&[u8::from(settings.show_hidden_files)]);
+    mix(&[u8::from(settings.skip_duplicate_images)]);
+    mix(&[u8::from(
+        !settings.archive_file_handling_ignores_convertible(),
+    )]);
+    mix(&[u8::from(settings.susie_enabled)]);
+    for extension in &settings.image_ext_priority {
+        mix(extension.as_bytes());
+        mix(&[0]);
+    }
+    if let Some(pool) = crate::susie_loader::try_get_pool() {
+        for extension in pool.extensions() {
+            mix(extension.as_bytes());
+            mix(&[0]);
+        }
+    }
+    Some(ImageFolderPageCountOptions {
+        include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+        show_hidden_files: settings.show_hidden_files,
+        skip_duplicate_images: settings.skip_duplicate_images,
+        image_ext_priority: settings.image_ext_priority.clone(),
+        fingerprint: i64::from_ne_bytes(hash.to_ne_bytes()),
+    })
+}
+
+/// 通常フォルダを実際の一覧走査と同じ規則で分類し、本扱いなら表示ページ数を返す。
+/// `Ok(None)` は走査成功だが画像だけの本ではない、`Err` は走査自体の失敗。
+pub(crate) fn image_folder_page_count(
+    path: &std::path::Path,
+    options: &ImageFolderPageCountOptions,
+) -> std::io::Result<Option<u32>> {
+    // `scan_directory_with_convertible_archives` は従来互換で read_dir error を空一覧へ
+    // 畳み込むため、失敗を「空フォルダ」として永続 cache しないよう先に確認する。
+    drop(std::fs::read_dir(path)?);
+    let mut scan = scan_directory_with_convertible_archives(
+        path,
+        options.include_convertible_archives,
+        options.show_hidden_files,
+    );
+    if !scan.folders.is_empty()
+        || scan.all_media.is_empty()
+        || !scan
+            .all_media
+            .iter()
+            .all(|(_, kind, _, _)| *kind == ScanMediaKind::Image)
+    {
+        return Ok(None);
+    }
+    if options.skip_duplicate_images {
+        filter_image_ext_duplicates(&mut scan.all_media, &options.image_ext_priority);
+    }
+    u32::try_from(scan.all_media.len())
+        .map(Some)
+        .map_err(|_| std::io::Error::other("画像のみフォルダのページ数が上限を超えています"))
+}
+
 /// ディレクトリ走査: `read_dir` + 各エントリの `file_type()` / `metadata()` 呼び出し。
 ///
 /// **Windows パフォーマンス上の注意**: `entry.file_type()` と `entry.metadata()` は
@@ -166,6 +246,62 @@ pub(super) fn filter_upscaled_video_pairs_fast(
     });
 }
 
+/// 同名ステムの画像を拡張子優先順で 1 件へ絞る。一覧と画像フォルダのページ数で共有する。
+pub(super) fn filter_image_ext_duplicates(
+    all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    priority: &[String],
+) {
+    let mut best: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for (index, (path, kind, _, _)) in all_media.iter().enumerate() {
+        if *kind != ScanMediaKind::Image {
+            continue;
+        }
+        let stem = super::stem_lower(path);
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let rank = priority
+            .iter()
+            .position(|candidate| candidate == &extension)
+            .unwrap_or(usize::MAX);
+        match best.get(&stem) {
+            Some(&(existing_rank, _)) if rank >= existing_rank => {}
+            _ => {
+                best.insert(stem, (rank, index));
+            }
+        }
+    }
+
+    let mut stem_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (path, kind, _, _) in all_media.iter() {
+        if *kind == ScanMediaKind::Image {
+            *stem_counts.entry(super::stem_lower(path)).or_insert(0) += 1;
+        }
+    }
+    let keep_indices: std::collections::HashSet<usize> = best
+        .iter()
+        .filter(|(stem, _)| stem_counts.get(stem.as_str()).copied().unwrap_or(0) > 1)
+        .map(|(_, &(_, index))| index)
+        .collect();
+    if keep_indices.is_empty() {
+        return;
+    }
+    let mut index = 0usize;
+    all_media.retain(|(path, kind, _, _)| {
+        let current = index;
+        index += 1;
+        if *kind != ScanMediaKind::Image {
+            return true;
+        }
+        let stem = super::stem_lower(path);
+        stem_counts.get(&stem).copied().unwrap_or(0) <= 1 || keep_indices.contains(&current)
+    });
+}
+
 pub(super) fn is_miv_upscaled_derivative(path: &std::path::Path) -> bool {
     // Fast UI-path check: a `.miv.mkv` name marks an upscaled derivative visually.
     // Pairing/hiding stays stricter and also requires the sibling `.miv.json`.
@@ -235,4 +371,81 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
         e.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+#[cfg(test)]
+mod page_count_tests {
+    use super::*;
+
+    fn options(skip_duplicate_images: bool) -> ImageFolderPageCountOptions {
+        ImageFolderPageCountOptions {
+            include_convertible_archives: true,
+            show_hidden_files: true,
+            skip_duplicate_images,
+            image_ext_priority: vec!["png".to_owned(), "jpg".to_owned()],
+            fingerprint: 1,
+        }
+    }
+
+    #[test]
+    fn image_folder_page_count_accepts_images_and_ignores_unrelated_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("001.jpg"), b"not decoded during scan").unwrap();
+        std::fs::write(temp.path().join("002.png"), b"not decoded during scan").unwrap();
+        std::fs::write(temp.path().join("notes.txt"), b"metadata").unwrap();
+
+        assert_eq!(
+            image_folder_page_count(temp.path(), &options(false)).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn image_folder_page_count_rejects_empty_mixed_and_nested_folders() {
+        let empty = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            image_folder_page_count(empty.path(), &options(false)).unwrap(),
+            None
+        );
+
+        let mixed = tempfile::TempDir::new().unwrap();
+        std::fs::write(mixed.path().join("001.jpg"), b"image").unwrap();
+        std::fs::write(mixed.path().join("clip.mp4"), b"video").unwrap();
+        assert_eq!(
+            image_folder_page_count(mixed.path(), &options(false)).unwrap(),
+            None
+        );
+
+        let nested = tempfile::TempDir::new().unwrap();
+        std::fs::write(nested.path().join("001.jpg"), b"image").unwrap();
+        std::fs::create_dir(nested.path().join("chapter-2")).unwrap();
+        assert_eq!(
+            image_folder_page_count(nested.path(), &options(false)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn image_folder_page_count_uses_the_same_duplicate_rule_as_the_grid() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("001.jpg"), b"jpg").unwrap();
+        std::fs::write(temp.path().join("001.png"), b"png").unwrap();
+        std::fs::write(temp.path().join("002.jpg"), b"jpg").unwrap();
+
+        assert_eq!(
+            image_folder_page_count(temp.path(), &options(false)).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            image_folder_page_count(temp.path(), &options(true)).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn image_folder_page_count_propagates_scan_errors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(image_folder_page_count(&missing, &options(false)).is_err());
+    }
 }

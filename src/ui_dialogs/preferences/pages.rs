@@ -450,6 +450,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.thumb_tooltip_show_image_dimensions, "画像解像度");
     ui.checkbox(&mut s.thumb_tooltip_show_video_duration, "長さ");
     ui.checkbox(&mut s.thumb_tooltip_show_kind, "種類");
+    ui.checkbox(&mut s.thumb_tooltip_show_page_count, "ページ数");
     ui.checkbox(&mut s.thumb_tooltip_show_file_size, "サイズ");
     ui.checkbox(&mut s.thumb_tooltip_show_modified, "更新日時");
     ui.checkbox(&mut s.thumb_tooltip_show_created, "作成日時");

@@ -3171,6 +3171,9 @@ pub(crate) struct DetailsLazyMeta {
     pub(crate) ai_metadata_checked: bool,
     pub(crate) ai_models: Vec<String>,
     pub(crate) ai_tool: Option<String>,
+    pub(crate) page_count: Option<u32>,
+    pub(crate) page_count_checked: bool,
+    pub(crate) page_count_failed: bool,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) image_dims_failed: bool,
     pub(crate) video_duration_secs: Option<f64>,
@@ -3219,6 +3222,9 @@ struct DetailsMetaTarget {
     catalog_folder: Option<PathBuf>,
     catalog_key: Option<String>,
     warm_image_dims: Option<(u32, u32)>,
+    image_folder_page_count_options: Option<crate::app::folder_scan::ImageFolderPageCountOptions>,
+    pdf_password: Option<String>,
+    load_page_count: bool,
     load_created_at: bool,
     load_ai_metadata: bool,
     load_image_dims: bool,
@@ -33610,6 +33616,18 @@ impl App {
         Some(key)
     }
 
+    fn details_lazy_cache_key(&self, idx: usize) -> Option<String> {
+        if let Some(key) = self.metadata_cache_key(idx) {
+            return Some(key);
+        }
+        match self.items.get(idx)? {
+            GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
+                Some(crate::adjustment_db::normalize_path(path))
+            }
+            _ => None,
+        }
+    }
+
     /// 指定 idx の AI/EXIF/XMP メタデータ読み込みをバックグラウンドで開始する。
     /// 全キャッシュが既にヒットしていれば spawn しない (no-op)。
     /// 既存 pending があれば cancel して置き換える (連打時は最新だけ処理)。
@@ -33803,7 +33821,8 @@ impl App {
                         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                             && matches!(
                                 self.settings.details_sort_key,
-                                crate::settings::DetailsSortKey::ImageDimensions
+                                crate::settings::DetailsSortKey::PageCount
+                                    | crate::settings::DetailsSortKey::ImageDimensions
                                     | crate::settings::DetailsSortKey::Created
                                     | crate::settings::DetailsSortKey::VideoDuration
                                     | crate::settings::DetailsSortKey::VideoDimensions
@@ -33868,7 +33887,8 @@ impl App {
     }
 
     fn details_any_lazy_columns_enabled(&self) -> bool {
-        self.settings.details_show_created
+        self.settings.details_show_page_count
+            || self.settings.details_show_created
             || self.settings.details_show_image_dimensions
             || self.settings.details_show_video_duration
             || self.settings.details_show_video_dimensions
@@ -33892,7 +33912,7 @@ impl App {
 
     fn selection_info_lazy_target_key(&self) -> Option<String> {
         let idx = self.selection_info_lazy_target_idx()?;
-        self.metadata_cache_key(idx)
+        self.details_lazy_cache_key(idx)
     }
 
     fn selection_info_needs_lazy_meta_request(&self) -> bool {
@@ -33918,6 +33938,12 @@ impl App {
         ((self.settings.thumb_tooltip_show_created
             || selection_info_bottom_bar_shows_column(&self.settings, DetailsColumn::Created))
             && self.details_item_supports_created_at(idx))
+            || ((self.settings.thumb_tooltip_show_page_count
+                || selection_info_bottom_bar_shows_column(
+                    &self.settings,
+                    DetailsColumn::PageCount,
+                ))
+                && self.details_item_supports_page_count(idx))
             || ((self.settings.thumb_tooltip_show_image_dimensions
                 || selection_info_bottom_bar_shows_column(
                     &self.settings,
@@ -33975,6 +34001,25 @@ impl App {
             }
         };
         requested && self.details_item_supports_created_at(idx)
+    }
+
+    fn lazy_load_page_count_for_idx(&self, idx: usize) -> bool {
+        let requested = match self.settings.grid_view_mode {
+            crate::settings::GridViewMode::Details => {
+                self.settings.details_show_page_count
+                    || (self.selection_info_only_lazy_load()
+                        && self.selection_info_lazy_target_idx() == Some(idx)
+                        && self.settings.thumb_tooltip_show_page_count)
+            }
+            crate::settings::GridViewMode::Thumbnail => {
+                self.settings.thumb_tooltip_show_page_count
+                    || crate::ui_main::selection_info_bottom_bar_shows_column(
+                        &self.settings,
+                        crate::ui_main::DetailsColumn::PageCount,
+                    )
+            }
+        };
+        requested && self.details_item_supports_page_count(idx)
     }
 
     fn lazy_load_image_dims_for_idx(&self, idx: usize) -> bool {
@@ -34089,6 +34134,37 @@ impl App {
             | LazyColumnState::Loading { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
+    }
+
+    pub(crate) fn details_page_count_text(&self, idx: usize) -> String {
+        if !self.details_item_supports_page_count(idx) {
+            return "-".to_string();
+        }
+        if let Some(meta) = self.details_lazy_meta_for_idx(idx)
+            && meta.page_count_checked
+        {
+            return meta
+                .page_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "-".to_string());
+        }
+        match self.details_image_dims_state {
+            LazyColumnState::Disabled => String::new(),
+            LazyColumnState::Ready { .. } => "-".to_string(),
+            LazyColumnState::NotRequested
+            | LazyColumnState::Loading { .. }
+            | LazyColumnState::Cancelled => "...".to_string(),
+        }
+    }
+
+    pub(crate) fn details_page_count_sort_value(&self, idx: usize) -> Option<u64> {
+        if !self.details_lazy_sort_ready() {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .filter(|meta| meta.page_count_checked)
+            .and_then(|meta| meta.page_count)
+            .map(u64::from)
     }
 
     pub(crate) fn details_created_sort_value(&self, idx: usize) -> Option<i64> {
@@ -34260,7 +34336,10 @@ impl App {
                 if self.details_lazy_meta_satisfies_idx(idx, meta) {
                     cached_done += 1;
                     cached_failed += usize::from(
-                        meta.image_dims_failed || meta.video_meta_failed || meta.created_at_failed,
+                        meta.page_count_failed
+                            || meta.image_dims_failed
+                            || meta.video_meta_failed
+                            || meta.created_at_failed,
                     );
                     continue;
                 }
@@ -34287,6 +34366,10 @@ impl App {
             .iter()
             .filter(|target| target.load_created_at)
             .count();
+        let page_count_targets = targets
+            .iter()
+            .filter(|target| target.load_page_count)
+            .count();
         let image_dim_targets = targets
             .iter()
             .filter(|target| target.load_image_dims)
@@ -34303,7 +34386,8 @@ impl App {
             if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                 && matches!(
                     self.settings.details_sort_key,
-                    crate::settings::DetailsSortKey::ImageDimensions
+                    crate::settings::DetailsSortKey::PageCount
+                        | crate::settings::DetailsSortKey::ImageDimensions
                         | crate::settings::DetailsSortKey::Created
                         | crate::settings::DetailsSortKey::VideoDuration
                         | crate::settings::DetailsSortKey::VideoDimensions
@@ -34357,6 +34441,10 @@ impl App {
                     ("ai_targets", serde_json::Value::from(ai_targets)),
                     ("created_targets", serde_json::Value::from(created_targets)),
                     (
+                        "page_count_targets",
+                        serde_json::Value::from(page_count_targets),
+                    ),
+                    (
                         "image_dim_targets",
                         serde_json::Value::from(image_dim_targets),
                     ),
@@ -34403,7 +34491,7 @@ impl App {
     }
 
     fn details_lazy_meta_for_idx(&self, idx: usize) -> Option<&DetailsLazyMeta> {
-        let key = self.metadata_cache_key(idx)?;
+        let key = self.details_lazy_cache_key(idx)?;
         let source = self.image_metas.get(idx).copied().flatten();
         self.details_lazy_meta
             .get(&key)
@@ -34415,7 +34503,7 @@ impl App {
             return;
         }
         let current_keys: std::collections::HashSet<String> = (0..self.items.len())
-            .filter_map(|idx| self.metadata_cache_key(idx))
+            .filter_map(|idx| self.details_lazy_cache_key(idx))
             .collect();
         if current_keys.is_empty() {
             self.details_lazy_meta.clear();
@@ -34426,6 +34514,9 @@ impl App {
     }
 
     fn details_lazy_meta_satisfies_idx(&self, idx: usize, meta: &DetailsLazyMeta) -> bool {
+        if self.lazy_load_page_count_for_idx(idx) && !meta.page_count_checked {
+            return false;
+        }
         if self.lazy_load_created_for_idx(idx)
             && meta.created_at.is_none()
             && !meta.created_at_failed
@@ -34459,6 +34550,16 @@ impl App {
             .is_some()
     }
 
+    pub(crate) fn details_item_supports_page_count(&self, idx: usize) -> bool {
+        match self.items.get(idx) {
+            Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_)) => true,
+            Some(GridItem::Folder(_)) => {
+                crate::app::folder_scan::image_folder_page_count_options(&self.settings).is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn details_item_supports_image_dims(&self, idx: usize) -> bool {
         matches!(
             self.items.get(idx),
@@ -34479,7 +34580,8 @@ impl App {
     }
 
     fn details_item_requires_lazy_meta(&self, idx: usize) -> bool {
-        self.lazy_load_created_for_idx(idx)
+        self.lazy_load_page_count_for_idx(idx)
+            || self.lazy_load_created_for_idx(idx)
             || self.lazy_load_ai_metadata_for_idx(idx)
             || self.lazy_load_image_dims_for_idx(idx)
             || self.lazy_load_video_meta_for_idx(idx)
@@ -34491,7 +34593,7 @@ impl App {
         visible_near: &std::collections::HashSet<usize>,
     ) -> Option<DetailsMetaTarget> {
         let item = self.items.get(idx)?.clone();
-        let key = self.metadata_cache_key(idx)?;
+        let key = self.details_lazy_cache_key(idx)?;
         let (source_mtime, source_size) = self
             .image_metas
             .get(idx)
@@ -34506,8 +34608,23 @@ impl App {
         };
         let load_image_dims = self.lazy_load_image_dims_for_idx(idx);
         let load_video_meta = self.lazy_load_video_meta_for_idx(idx);
+        let load_page_count = self.lazy_load_page_count_for_idx(idx);
         let load_created_at = self.lazy_load_created_for_idx(idx);
         let load_ai_metadata = self.lazy_load_ai_metadata_for_idx(idx);
+        let image_folder_page_count_options =
+            if load_page_count && matches!(&item, GridItem::Folder(_)) {
+                crate::app::folder_scan::image_folder_page_count_options(&self.settings)
+            } else {
+                None
+            };
+        let pdf_password = if load_page_count {
+            match &item {
+                GridItem::PdfFile(path) => self.pdf_passwords.get(path),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Some(DetailsMetaTarget {
             key,
             item,
@@ -34516,6 +34633,9 @@ impl App {
             catalog_folder,
             catalog_key,
             warm_image_dims: self.details_warm_image_dims(idx),
+            image_folder_page_count_options,
+            pdf_password,
+            load_page_count,
             load_created_at,
             load_ai_metadata,
             load_image_dims,
@@ -34553,6 +34673,12 @@ impl App {
             } => (
                 Some(pdf_path.clone()),
                 Some(crate::grid_item::pdf_page_cache_key(*page_num)),
+            ),
+            GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path) => (
+                path.parent().map(Path::to_path_buf),
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string),
             ),
             _ => (None, None),
         }
@@ -34594,7 +34720,10 @@ impl App {
             self.filter_video_image_duplicates(all_media);
         }
         if self.settings.skip_duplicate_images {
-            Self::filter_image_ext_duplicates(all_media, &self.settings.image_ext_priority);
+            crate::app::folder_scan::filter_image_ext_duplicates(
+                all_media,
+                &self.settings.image_ext_priority,
+            );
         }
     }
 
@@ -34705,71 +34834,6 @@ impl App {
         all_media.retain(|(p, kind, _, _)| {
             *kind != ScanMediaKind::Image || !video_stems.contains(&stem_lower(p))
         });
-    }
-
-    /// 同名画像の拡張子重複: 優先度リストに基づいてフィルタ。
-    fn filter_image_ext_duplicates(
-        all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
-        priority: &[String],
-    ) {
-        use crate::app::folder_scan::ScanMediaKind;
-        // ステム → (最優先の拡張子の優先度, インデックス)
-        let mut best: std::collections::HashMap<String, (usize, usize)> =
-            std::collections::HashMap::new();
-
-        for (i, (p, kind, _, _)) in all_media.iter().enumerate() {
-            if *kind != ScanMediaKind::Image {
-                continue;
-            }
-            let stem = stem_lower(p);
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let prio = priority
-                .iter()
-                .position(|e| e == &ext)
-                .unwrap_or(usize::MAX);
-            match best.get(&stem) {
-                Some(&(existing_prio, _)) if prio >= existing_prio => {}
-                _ => {
-                    best.insert(stem, (prio, i));
-                }
-            }
-        }
-
-        // 同名ステムの画像が複数あるか判定
-        let mut stem_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for (p, kind, _, _) in all_media.iter() {
-            if *kind != ScanMediaKind::Image {
-                continue;
-            }
-            *stem_counts.entry(stem_lower(p)).or_insert(0) += 1;
-        }
-
-        let keep_indices: std::collections::HashSet<usize> = best
-            .iter()
-            .filter(|(stem, _)| stem_counts.get(stem.as_str()).copied().unwrap_or(0) > 1)
-            .map(|(_, &(_, idx))| idx)
-            .collect();
-
-        if !keep_indices.is_empty() {
-            let mut i = 0;
-            all_media.retain(|(p, kind, _, _)| {
-                let current_i = i;
-                i += 1;
-                if *kind != ScanMediaKind::Image {
-                    return true;
-                }
-                let stem = stem_lower(p);
-                if stem_counts.get(&stem).copied().unwrap_or(0) <= 1 {
-                    return true;
-                }
-                keep_indices.contains(&current_i)
-            });
-        }
     }
 
     /// `search_filter` とレーティングフィルタに基づいて `visible_indices` を再計算する。
@@ -35681,6 +35745,7 @@ impl App {
             DetailsSortKey::Rating => self.settings.details_show_rating,
             DetailsSortKey::Tags => self.settings.details_show_tags,
             DetailsSortKey::Kind => self.settings.details_show_kind,
+            DetailsSortKey::PageCount => self.settings.details_show_page_count,
             DetailsSortKey::Size => self.settings.details_show_size,
             DetailsSortKey::Modified => self.settings.details_show_modified,
             DetailsSortKey::Created => self.settings.details_show_created,
@@ -35698,7 +35763,8 @@ impl App {
         }
         let lazy_key = matches!(
             key,
-            crate::settings::DetailsSortKey::Created
+            crate::settings::DetailsSortKey::PageCount
+                | crate::settings::DetailsSortKey::Created
                 | crate::settings::DetailsSortKey::ImageDimensions
                 | crate::settings::DetailsSortKey::VideoDuration
                 | crate::settings::DetailsSortKey::VideoDimensions
@@ -35767,6 +35833,9 @@ impl App {
             DetailsSortKey::Rating => DetailsSortPrimary::U8(self.get_rating(idx)),
             DetailsSortKey::Tags => DetailsSortPrimary::Text(self.cell_tag_list(idx).join(" ")),
             DetailsSortKey::Kind => DetailsSortPrimary::Text(self.details_kind_sort_key(idx)),
+            DetailsSortKey::PageCount => {
+                DetailsSortPrimary::U64(self.details_page_count_sort_value(idx))
+            }
             DetailsSortKey::Size => {
                 DetailsSortPrimary::I64(self.details_meta_value(idx).map(|(_, size)| size))
             }
@@ -35818,7 +35887,8 @@ impl App {
                 };
                 cmp_option_last(*av, *bv, ascending)
             }
-            DetailsSortKey::ImageDimensions
+            DetailsSortKey::PageCount
+            | DetailsSortKey::ImageDimensions
             | DetailsSortKey::VideoDuration
             | DetailsSortKey::VideoDimensions => {
                 let DetailsSortPrimary::U64(av) = &a.primary else {
@@ -35836,6 +35906,7 @@ impl App {
             DetailsSortKey::Size
             | DetailsSortKey::Modified
             | DetailsSortKey::Created
+            | DetailsSortKey::PageCount
             | DetailsSortKey::ImageDimensions
             | DetailsSortKey::VideoDuration
             | DetailsSortKey::VideoDimensions => primary,

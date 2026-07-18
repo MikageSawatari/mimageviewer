@@ -98,7 +98,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `filename_stack.rs` | ファイル名 prefix スタック (v2.0.0) の純ロジック。`StackMember`/`StackGroup`/`StackView` + `group_media` (末尾区切り文字の前でグループ化、動画は単独固定) / `materialize_aggregated` (集約グリッド) / `materialize_flat` (フラット読書フルスクリーン) / flat-index 写像 / `stack_jump_target` (Shift+↓↑)。I/O 無しで unit test 容易 |
 | `filename_stack_ui.rs` | 上記の App グルー (bin-only)。トグル / 集約⇔フラットのビュー切替 (`swap_stack_view_items`) / `stack_try_open_from_grid` (集約セル → フラットフルスクリーン) / `stack_reconcile_after_fullscreen_close` (閉じたら集約へ戻す)。集約構築は `load_folder_with_scan` hook 経由。詳細は [filename-stack-plan.md](filename-stack-plan.md) |
 | `thumb_loader.rs` | サムネイル並列ロード (WebP キャッシュ生成含む) |
-| `catalog.rs` | SQLite サムネイルキャッシュ (`%APPDATA%/mimageviewer/catalog.db`) |
+| `catalog.rs` | フォルダ単位の SQLite catalog。サムネイル WebP、PDF メタデータ、ZIP / 画像のみフォルダのページ数を保持する。ページ数 cache は種別・mtime・file size・判定設定 fingerprint の完全一致時だけ再利用する |
 | `folder_thumb_pins.rs` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン DB (`%APPDATA%/mimageviewer/folder_thumb_pins.db`)。`apply_folder_thumb_pin` が cache key に `#pin:{source_id}` suffix を載せて pin の identity を表現、Video ピンは `seed_folder_video_pin_thumbs` で `video_pins` から WebP を catalog に seed する。RAR/7z/LZH 変換キャッシュ閲覧中は元アーカイブパスを root key にする |
 
 ### 仮想フォルダ (ZIP/PDF) / フォーマット
@@ -271,7 +271,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `settings.db` (SQLite, 2026-05 移行) | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`)・VST3 chain 設定 (大型 BLOB)。**SQLite トランザクション + `VACUUM INTO` で `settings.db.bak1..bak10` に世代スナップショット**。Corrupted 検出時は `.corrupted-<ts>-<seq>` 3 セット (main + WAL + SHM) で quarantine、bak1→bak10 を新→古で試行し復旧。バージョン跨ぎは初回 load で `settings.db.preupgrade-v<old>` を `VACUUM INTO` でスナップショット。**Transient I/O / 全復旧失敗時は `MAIN_UNREADABLE_THIS_SESSION` + `settings_db::SAVE_SUPPRESSED` で `Settings::save()` 完全 no-op 化** (= 残骸保護)。旧 `settings.json` は初回起動時に migration して `*.migrated-<ts>` にリネーム済み | `settings.rs` + `settings_db.rs` |
 | `Pictures\mimageviewer\books\...` (既定、設定可) | 製本した本の実体。DB ではなく通常フォルダ + `0001_元名.ext` 画像ファイルのみ。`Settings.book_root` で変更でき、Ctrl+S/Ctrl+G の自動索引対象外 | `books.rs` + `ui_main.rs` + `ui_fullscreen.rs` |
 | `Settings.keymap` / `keymap.ini.default` | キーボード割り当て設定。GUI 編集の正本は `settings.db` 内の `Settings.keymap`。旧 `keymap.ini` が残っている環境では初回起動時に読み込み、同じ内容を `Settings.keymap` へ移してから `keymap.ini.imported*.bak` へリネームする。以後 `keymap.ini` は通常読み込み対象外。`keymap.ini.default` は現在バージョンの Action 名と既定キーを確認する参照ファイルとして更新される。競合は拒否せず warning として扱う | `keymap.rs` + `settings.rs` |
-| `catalog.db` | サムネイル WebP キャッシュ (BLOB) + メタデータ | `catalog.rs` |
+| `catalog.db` | フォルダ単位のサムネイル WebP キャッシュ (BLOB) + PDF メタデータ + ZIP / 画像のみフォルダのページ数 cache。ページ数取得は詳細遅延 worker が `GlobalIoSemaphore` 配下で行い、cache 障害時は表示自体を失敗させず元コンテナから再取得する | `catalog.rs` + `app/metadata_ops.rs` |
 | `auto_aspect_cache.db` | Auto サムネイル比率のフォルダ別前回確定値。フォルダ再訪時はこの値を初期 `auto_aspect.current` にして、後続の実統計で必要なら既存ゲート (streak/cooldown 等) に従って補正する。サムネイルキャッシュ管理の削除操作と連動してリセットされる | `auto_aspect_cache.rs` + `app.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
 | `audio_normalize.db` | 動画ファイル単位のノーマライズ測定値 (integrated LUFS / true peak / 算出ゲイン)。主キー `(path_lower, file_size, mtime_ms, target_lufs_milli)`。環境設定 → 動画・音声 → 動画から全件クリア可能 | `audio_normalize_db.rs` |

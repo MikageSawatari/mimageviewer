@@ -387,6 +387,10 @@ pub(super) fn run_details_meta_load(
         PathBuf,
         Option<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     > = std::collections::HashMap::new();
+    let mut container_catalogs: std::collections::HashMap<
+        PathBuf,
+        Option<crate::catalog::CatalogDb>,
+    > = std::collections::HashMap::new();
 
     for target in targets {
         if cancel.load(Ordering::Relaxed) {
@@ -397,6 +401,9 @@ pub(super) fn run_details_meta_load(
         let mut ai_metadata_checked = false;
         let mut ai_models = Vec::new();
         let mut ai_tool = None;
+        let mut page_count = None;
+        let mut page_count_checked = false;
+        let mut page_count_failed = false;
         let mut zip_entry_bytes: Option<Vec<u8>> = None;
         let mut dims = if target.load_image_dims {
             target.warm_image_dims
@@ -404,6 +411,25 @@ pub(super) fn run_details_meta_load(
             None
         };
         let mut video_probe: Option<DetailsVideoProbe> = None;
+        if target.load_page_count {
+            match load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut container_catalogs,
+                &io_sem,
+                &cancel,
+            ) {
+                Ok(count) => {
+                    page_count = count;
+                    page_count_checked = true;
+                }
+                Err(()) if cancel.load(Ordering::Relaxed) => return,
+                Err(()) => {
+                    page_count_checked = true;
+                    page_count_failed = true;
+                }
+            }
+        }
         if target.load_created_at
             && let Some(path) = details_created_time_path(&target.item)
         {
@@ -622,7 +648,9 @@ pub(super) fn run_details_meta_load(
             && matches!(target.item, GridItem::Video(_) | GridItem::Audio(_))
             && video_probe.is_none();
         let created_at_failed = target.load_created_at && created_at.is_none();
-        failed += usize::from(image_dims_failed || video_meta_failed || created_at_failed);
+        failed += usize::from(
+            page_count_failed || image_dims_failed || video_meta_failed || created_at_failed,
+        );
         let (video_duration_secs, video_dims, video_codec) = video_probe
             .map(|probe| (probe.duration_secs, probe.dims, probe.codec))
             .unwrap_or((None, None, None));
@@ -634,6 +662,9 @@ pub(super) fn run_details_meta_load(
             ai_metadata_checked,
             ai_models,
             ai_tool,
+            page_count,
+            page_count_checked,
+            page_count_failed,
             image_dims: dims,
             image_dims_failed,
             video_duration_secs,
@@ -721,6 +752,162 @@ pub(super) fn run_details_meta_load(
         );
     }
     let _ = tx.send(DetailsMetaEvent::Finished { generation, failed });
+}
+
+fn load_details_page_count(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut std::collections::HashMap<PathBuf, Option<crate::catalog::CatalogDb>>,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Option<u32>, ()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(());
+    }
+    let folder = target.catalog_folder.as_ref().ok_or(())?;
+    let key = target.catalog_key.as_deref().ok_or(())?;
+    // Metadata acquisition can fail during directory enumeration.  In that case
+    // a zero identity is not safe for persistent reuse, so compute the value but
+    // deliberately skip both lookup and writeback.
+    let identity_is_cacheable = target.source_mtime > 0
+        && match &target.item {
+            GridItem::ZipFile(_) | GridItem::PdfFile(_) => target.source_size > 0,
+            GridItem::Folder(_) => true,
+            _ => false,
+        };
+    if identity_is_cacheable && !catalogs.contains_key(folder) {
+        let opened = {
+            let _permit = io_sem.acquire(target.priority);
+            crate::catalog::CatalogDb::open(cache_dir, folder).ok()
+        };
+        catalogs.insert(folder.clone(), opened);
+    }
+    // The catalog is only an optimization.  A corrupt/unwritable cache must not
+    // make an otherwise readable container lose its page count.
+    let catalog = identity_is_cacheable
+        .then(|| catalogs.get(folder).and_then(Option::as_ref))
+        .flatten();
+
+    match &target.item {
+        GridItem::ZipFile(path) => {
+            if let Some(catalog) = catalog {
+                let cached = {
+                    let _permit = io_sem.acquire(target.priority);
+                    catalog.get_container_page_meta(
+                        key,
+                        crate::catalog::ContainerPageKind::Zip,
+                        target.source_mtime,
+                        target.source_size,
+                        0,
+                    )
+                };
+                if let Ok(Some(meta)) = cached {
+                    return Ok(meta.page_count);
+                }
+            }
+            let entries = {
+                let _permit = io_sem.acquire(target.priority);
+                crate::zip_loader::enumerate_image_entries(path).map_err(|_| ())?
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(());
+            }
+            let count = u32::try_from(entries.len()).map_err(|_| ())?;
+            if let Some(catalog) = catalog {
+                let _permit = io_sem.acquire(target.priority);
+                let _ = catalog.set_container_page_meta(
+                    key,
+                    crate::catalog::ContainerPageKind::Zip,
+                    target.source_mtime,
+                    target.source_size,
+                    0,
+                    Some(count),
+                );
+            }
+            Ok(Some(count))
+        }
+        GridItem::Folder(path) => {
+            let options = target.image_folder_page_count_options.as_ref().ok_or(())?;
+            if let Some(catalog) = catalog {
+                let cached = {
+                    let _permit = io_sem.acquire(target.priority);
+                    catalog.get_container_page_meta(
+                        key,
+                        crate::catalog::ContainerPageKind::Folder,
+                        target.source_mtime,
+                        target.source_size,
+                        options.fingerprint,
+                    )
+                };
+                if let Ok(Some(meta)) = cached {
+                    return Ok(meta.page_count);
+                }
+            }
+            let count = {
+                let _permit = io_sem.acquire(target.priority);
+                crate::app::folder_scan::image_folder_page_count(path, options).map_err(|_| ())?
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(());
+            }
+            if let Some(catalog) = catalog {
+                let _permit = io_sem.acquire(target.priority);
+                let _ = catalog.set_container_page_meta(
+                    key,
+                    crate::catalog::ContainerPageKind::Folder,
+                    target.source_mtime,
+                    target.source_size,
+                    options.fingerprint,
+                    count,
+                );
+            }
+            Ok(count)
+        }
+        GridItem::PdfFile(path) => {
+            if let Some(catalog) = catalog {
+                let cached = {
+                    let _permit = io_sem.acquire(target.priority);
+                    catalog.get_pdf_meta(key, target.source_mtime, target.source_size)
+                };
+                if let Ok(Some((count, password_required))) = cached {
+                    if password_required && target.pdf_password.is_none() {
+                        return Ok(None);
+                    }
+                    if count > 0 {
+                        return Ok(Some(count));
+                    }
+                }
+            }
+            let pages = {
+                let _permit = io_sem.acquire(target.priority);
+                crate::pdf_loader::enumerate_pages_with_cancel(
+                    path,
+                    target.pdf_password.as_deref(),
+                    Some(Arc::clone(cancel)),
+                )
+                .map_err(|_| ())?
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(());
+            }
+            let count = u32::try_from(pages.len()).map_err(|_| ())?;
+            if count == 0 {
+                return Ok(None);
+            }
+            if let Some(catalog) = catalog {
+                let _permit = io_sem.acquire(target.priority);
+                let _ = catalog.set_pdf_meta(
+                    key,
+                    target.source_mtime,
+                    target.source_size,
+                    count,
+                    target.pdf_password.is_some(),
+                );
+            }
+            Ok(Some(count))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn probe_image_dims_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -1163,6 +1350,68 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_zip_with_nested_images(path: &Path) {
+        use std::io::Write as _;
+
+        let inner_cursor = std::io::Cursor::new(Vec::new());
+        let mut inner = zip::ZipWriter::new(inner_cursor);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        inner.start_file("chapter/page02.png", options).unwrap();
+        inner.write_all(b"inner image").unwrap();
+        let inner_bytes = inner.finish().unwrap().into_inner();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut outer = zip::ZipWriter::new(file);
+        outer.start_file("page01.jpg", options).unwrap();
+        outer.write_all(b"outer image").unwrap();
+        outer.start_file("chapter.zip", options).unwrap();
+        outer.write_all(&inner_bytes).unwrap();
+        outer.finish().unwrap();
+    }
+
+    #[test]
+    fn details_page_count_uses_exact_nested_zip_enumeration_and_cache() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("book.zip");
+        write_zip_with_nested_images(&path);
+        let source_size = std::fs::metadata(&path).unwrap().len() as i64;
+        let target = DetailsMetaTarget {
+            key: crate::adjustment_db::normalize_path(&path),
+            item: GridItem::ZipFile(path.clone()),
+            source_mtime: 123,
+            source_size,
+            catalog_folder: Some(temp.path().to_path_buf()),
+            catalog_key: Some("book.zip".to_owned()),
+            warm_image_dims: None,
+            image_folder_page_count_options: None,
+            pdf_password: None,
+            load_page_count: true,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        };
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut catalogs = std::collections::HashMap::new();
+
+        assert_eq!(
+            load_details_page_count(&target, &cache_dir, &mut catalogs, &io_sem, &cancel),
+            Ok(Some(2)),
+            "外側画像と実 nested ZIP 内画像を同じ閲覧ページ列として数える"
+        );
+
+        // 元 ZIP を壊しても同じ identity なら永続 catalog hit から値を返す。
+        std::fs::write(&path, b"broken after cache").unwrap();
+        assert_eq!(
+            load_details_page_count(&target, &cache_dir, &mut catalogs, &io_sem, &cancel),
+            Ok(Some(2))
+        );
+    }
 
     #[test]
     fn probe_image_dims_from_bytes_reads_png_dimensions() {

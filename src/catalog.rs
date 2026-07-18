@@ -44,6 +44,19 @@ pub struct CacheEntry {
     pub source_dims: Option<(u32, u32)>,
 }
 
+/// ZIP / 画像のみフォルダのページ数キャッシュ種別。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerPageKind {
+    Folder = 1,
+    Zip = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContainerPageMeta {
+    /// `None` は走査に成功したが、本として扱う対象ではなかったことを表す。
+    pub page_count: Option<u32>,
+}
+
 /// 保存済みサムネのバイト列からヘッダのみで `(w, h)` を取り出す。
 /// フォーマットは auto-detect (`with_guessed_format`)。これは旧バージョンが JPEG で
 /// 保存していたエントリ ([`decode_thumb_to_color_image`] が "WebP or old JPEG" の
@@ -420,6 +433,64 @@ impl CatalogDb {
         )?;
         Ok(())
     }
+
+    /// ZIP / 画像のみフォルダのページ数を、内容 identity と判定設定 fingerprint が
+    /// 完全一致するときだけ返す。失敗結果は保存せず、`page_count=NULL` はフォルダを
+    /// 正常に走査した結果「本として扱う対象外」だったことを表す。
+    pub fn get_container_page_meta(
+        &self,
+        filename: &str,
+        kind: ContainerPageKind,
+        mtime: i64,
+        file_size: i64,
+        fingerprint: i64,
+    ) -> rusqlite::Result<Option<ContainerPageMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT page_count FROM container_page_meta \
+             WHERE filename = ?1 AND kind = ?2 AND mtime = ?3 \
+               AND file_size = ?4 AND fingerprint = ?5",
+        )?;
+        stmt.query_row(
+            params![filename, kind as i64, mtime, file_size, fingerprint],
+            |row| {
+                let count: Option<i64> = row.get(0)?;
+                Ok(ContainerPageMeta {
+                    page_count: count.map(|value| value.max(0) as u32),
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn set_container_page_meta(
+        &self,
+        filename: &str,
+        kind: ContainerPageKind,
+        mtime: i64,
+        file_size: i64,
+        fingerprint: i64,
+        page_count: Option<u32>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO container_page_meta \
+             (filename, kind, mtime, file_size, fingerprint, page_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(filename, kind) DO UPDATE SET \
+               mtime = excluded.mtime, file_size = excluded.file_size, \
+               fingerprint = excluded.fingerprint, page_count = excluded.page_count",
+            params![
+                filename,
+                kind as i64,
+                mtime,
+                file_size,
+                fingerprint,
+                page_count.map(i64::from),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -444,6 +515,15 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              file_size         INTEGER NOT NULL,
              page_count        INTEGER NOT NULL,
              password_required INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS container_page_meta (
+             filename       TEXT    NOT NULL,
+             kind           INTEGER NOT NULL,
+             mtime          INTEGER NOT NULL,
+             file_size      INTEGER NOT NULL,
+             fingerprint    INTEGER NOT NULL,
+             page_count     INTEGER,
+             PRIMARY KEY(filename, kind)
          );",
     )?;
     // 非破壊マイグレーション。open ごとの ALTER 失敗ログを避け、並行 open が同時に
@@ -896,6 +976,59 @@ mod tests {
             .query_row("SELECT count(*) FROM thumbnails", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn container_page_meta_roundtrip_and_identity_invalidation() {
+        let db = open_in_memory();
+        db.set_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2_048, 0, Some(123))
+            .unwrap();
+
+        assert_eq!(
+            db.get_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2_048, 0)
+                .unwrap(),
+            Some(ContainerPageMeta {
+                page_count: Some(123)
+            })
+        );
+        assert_eq!(
+            db.get_container_page_meta("book.zip", ContainerPageKind::Zip, 101, 2_048, 0)
+                .unwrap(),
+            None,
+            "mtime が変われば再走査する"
+        );
+        assert_eq!(
+            db.get_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 4_096, 0)
+                .unwrap(),
+            None,
+            "サイズが変われば再走査する"
+        );
+        assert_eq!(
+            db.get_container_page_meta("book.zip", ContainerPageKind::Folder, 100, 2_048, 0)
+                .unwrap(),
+            None,
+            "同名でもコンテナ種別を混同しない"
+        );
+    }
+
+    #[test]
+    fn container_page_meta_preserves_non_book_and_fingerprint() {
+        let db = open_in_memory();
+        db.set_container_page_meta("pictures", ContainerPageKind::Folder, 200, 0, 77, None)
+            .unwrap();
+
+        assert_eq!(
+            db.get_container_page_meta("pictures", ContainerPageKind::Folder, 200, 0, 77)
+                .unwrap(),
+            Some(ContainerPageMeta { page_count: None }),
+            "走査済みの対象外フォルダは NULL として区別する"
+        );
+        assert_eq!(
+            db.get_container_page_meta("pictures", ContainerPageKind::Folder, 200, 0, 78)
+                .unwrap(),
+            None,
+            "判定設定が変われば再走査する"
+        );
     }
 
     // -- WebP encode/decode --
