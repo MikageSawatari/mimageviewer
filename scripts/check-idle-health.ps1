@@ -12,12 +12,39 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
+if (-not ("MivIdleHealthNative" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MivIdleHealthNative {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}
+'@
+}
+
 function Get-FileLength {
     param([string]$Path)
     if (Test-Path -LiteralPath $Path) {
         return (Get-Item -LiteralPath $Path).Length
     }
     return 0
+}
+
+function Get-ForegroundProcessId {
+    $window = [MivIdleHealthNative]::GetForegroundWindow()
+    if ($window -eq [IntPtr]::Zero) {
+        return 0
+    }
+    [uint32]$foregroundProcessId = 0
+    [void][MivIdleHealthNative]::GetWindowThreadProcessId(
+        $window,
+        [ref]$foregroundProcessId
+    )
+    return [int]$foregroundProcessId
 }
 
 function Format-Invariant {
@@ -122,6 +149,7 @@ $StartProcessElapsed = ($StartWall - $Process.StartTime).TotalSeconds
 $StartCpu = $Process.TotalProcessorTime.TotalSeconds
 $StartAppLogBytes = Get-FileLength -Path $AppLog
 $StartPerfLogBytes = Get-FileLength -Path $PerfLog
+$StartForegroundProcessId = Get-ForegroundProcessId
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host "Measuring: $MeasureSeconds seconds (do not interact)"
@@ -134,10 +162,11 @@ $EndProcessElapsed = ($EndWall - $Process.StartTime).TotalSeconds
 $EndCpu = $Process.TotalProcessorTime.TotalSeconds
 $EndAppLogBytes = Get-FileLength -Path $AppLog
 $EndPerfLogBytes = Get-FileLength -Path $PerfLog
+$EndForegroundProcessId = Get-ForegroundProcessId
 
 $ElapsedSeconds = [Math]::Max($Stopwatch.Elapsed.TotalSeconds, 0.001)
 $CpuDeltaSeconds = [Math]::Max($EndCpu - $StartCpu, 0.0)
-# 1.0 = one logical core fully occupied. Machine-wide core countで割らない。
+# 1.0 means one logical core is fully occupied; do not divide by machine core count.
 $CpuCoreRatio = $CpuDeltaSeconds / $ElapsedSeconds
 $AppLogGrowth = [Math]::Max($EndAppLogBytes - $StartAppLogBytes, 0)
 $PerfLogGrowth = [Math]::Max($EndPerfLogBytes - $StartPerfLogBytes, 0)
@@ -169,6 +198,28 @@ $AnalyzerExitCode = $LASTEXITCODE
 
 $Failures = New-Object System.Collections.Generic.List[string]
 $Warnings = New-Object System.Collections.Generic.List[string]
+$ScenarioLower = $Scenario.ToLowerInvariant()
+$TargetForegroundAtStart = $StartForegroundProcessId -eq $Process.Id
+$TargetForegroundAtEnd = $EndForegroundProcessId -eq $Process.Id
+if ($StartForegroundProcessId -eq 0 -or $EndForegroundProcessId -eq 0) {
+    $Failures.Add("foreground process could not be observed at both measurement boundaries")
+}
+elseif ($ScenarioLower.Contains("background")) {
+    if ($TargetForegroundAtStart -or $TargetForegroundAtEnd) {
+        $Failures.Add(
+            "background scenario had mImageViewer in foreground " +
+            "(start=$TargetForegroundAtStart end=$TargetForegroundAtEnd)"
+        )
+    }
+}
+elseif ($ScenarioLower.Contains("foreground")) {
+    if (-not $TargetForegroundAtStart -or -not $TargetForegroundAtEnd) {
+        $Failures.Add(
+            "foreground scenario did not keep mImageViewer in foreground " +
+            "(start=$TargetForegroundAtStart end=$TargetForegroundAtEnd)"
+        )
+    }
+}
 if ($CpuCoreRatio -gt [double]$Thresholds.max_cpu_core_ratio) {
     $Failures.Add(
         "CPU one-core ratio $([Math]::Round($CpuCoreRatio, 4)) exceeds $($Thresholds.max_cpu_core_ratio)"
@@ -216,6 +267,10 @@ $ProcessReport = [ordered]@{
         cpu_one_core_ratio = $CpuCoreRatio
         app_log_growth_bytes = $AppLogGrowth
         perf_log_growth_bytes = $PerfLogGrowth
+        foreground_process_id_start = $StartForegroundProcessId
+        foreground_process_id_end = $EndForegroundProcessId
+        target_foreground_start = $TargetForegroundAtStart
+        target_foreground_end = $TargetForegroundAtEnd
     }
     thresholds = $Thresholds
     perf_report = $PerfReportPath
@@ -229,6 +284,7 @@ Write-Host ""
 Write-Host "CPU one-core ratio : $([Math]::Round($CpuCoreRatio, 4))"
 Write-Host "App log growth     : $AppLogGrowth bytes"
 Write-Host "Perf log growth    : $PerfLogGrowth bytes"
+Write-Host "Target foreground  : start=$TargetForegroundAtStart end=$TargetForegroundAtEnd"
 foreach ($Warning in $Warnings) {
     Write-Warning $Warning
 }

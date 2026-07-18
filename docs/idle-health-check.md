@@ -26,7 +26,8 @@ PowerShell 側で測る。
 Enter を押すと、5 秒 warmup 後に 15 秒測定する。測定中はマウス・キーボードへ触れない。
 前面シナリオは Enter 後の warmup 中に mImageViewer へフォーカスを戻す。背面シナリオは
 コンソール等を前面のままにする。warmup 中の入力は測定対象外で、測定開始表示後の入力だけが
-idle 測定を無効にする。
+idle 測定を無効にする。シナリオ名に `foreground` / `background` が含まれる場合は、測定開始・
+終了時の foreground process ID も検査し、実際の状態と名前が一致しなければ FAIL にする。
 
 ```powershell
 .\scripts\check-idle-health.ps1 -Scenario static-foreground

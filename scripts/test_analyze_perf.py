@@ -31,6 +31,14 @@ def tail(t: float, n: int, reasons: list[str] | None = None) -> dict:
 
 
 class IdleHealthTests(unittest.TestCase):
+    def test_powershell_harness_is_ascii_for_windows_powershell_51(self) -> None:
+        # Windows PowerShell 5.1 treats UTF-8 without BOM as an ANSI code page. A multibyte
+        # comment can swallow the following newline after mojibake, so keep this script ASCII.
+        harness = Path(__file__).with_name("check-idle-health.ps1")
+        source = harness.read_bytes().decode("ascii")
+        self.assertIn("$CpuCoreRatio =", source)
+        self.assertIn("GetForegroundWindow", source)
+
     def test_sleeping_window_with_no_events_passes(self) -> None:
         events = [frame(1.0, 1), tail(1.0, 1)]
 
