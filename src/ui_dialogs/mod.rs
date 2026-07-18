@@ -27,6 +27,7 @@ pub(crate) mod preferences;
 pub(crate) mod rename_item;
 mod rotation_reset;
 pub(crate) mod settings_restore;
+mod smart_folder_editor;
 mod stats_dialog;
 mod tag_apply;
 mod tag_editor;

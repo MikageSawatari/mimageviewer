@@ -1995,6 +1995,7 @@ pub fn command_catalog() -> impl Iterator<Item = CommandSpec> {
 pub enum TopMenuId {
     File,
     Favorites,
+    SmartFolders,
     Books,
     Convert,
     Video,
@@ -2007,6 +2008,7 @@ impl TopMenuId {
     pub const ALL: &'static [Self] = &[
         Self::File,
         Self::Favorites,
+        Self::SmartFolders,
         Self::Books,
         Self::Convert,
         Self::Video,
@@ -2019,6 +2021,7 @@ impl TopMenuId {
         match self {
             TopMenuId::File => "ファイル",
             TopMenuId::Favorites => "お気に入り",
+            TopMenuId::SmartFolders => "スマートフォルダ",
             TopMenuId::Books => "製本",
             TopMenuId::Convert => "変換",
             TopMenuId::Video => "動画",
@@ -2032,6 +2035,7 @@ impl TopMenuId {
         match self {
             TopMenuId::File => "File",
             TopMenuId::Favorites => "Favorites",
+            TopMenuId::SmartFolders => "SmartFolders",
             TopMenuId::Books => "Books",
             TopMenuId::Convert => "Convert",
             TopMenuId::Video => "Video",
@@ -2045,6 +2049,7 @@ impl TopMenuId {
         match name {
             "File" => Some(TopMenuId::File),
             "Favorites" => Some(TopMenuId::Favorites),
+            "SmartFolders" => Some(TopMenuId::SmartFolders),
             "Books" => Some(TopMenuId::Books),
             "Convert" => Some(TopMenuId::Convert),
             "Video" => Some(TopMenuId::Video),
@@ -2068,6 +2073,8 @@ pub enum MenuCommandId {
     FavoritesEdit,
     FavoritesFavSearch,
     FavoritesMetadataSearch,
+    SmartFoldersNew,
+    SmartFoldersManage,
     BooksAddSelectionToActiveBook,
     BooksAddClipboardImage,
     BooksOpenRoot,
@@ -2106,6 +2113,8 @@ impl MenuCommandId {
         Self::FavoritesEdit,
         Self::FavoritesFavSearch,
         Self::FavoritesMetadataSearch,
+        Self::SmartFoldersNew,
+        Self::SmartFoldersManage,
         Self::BooksAddSelectionToActiveBook,
         Self::BooksAddClipboardImage,
         Self::BooksOpenRoot,
@@ -2144,6 +2153,8 @@ impl MenuCommandId {
             MenuCommandId::FavoritesEdit => "FavoritesEdit",
             MenuCommandId::FavoritesFavSearch => "FavoritesFavSearch",
             MenuCommandId::FavoritesMetadataSearch => "FavoritesMetadataSearch",
+            MenuCommandId::SmartFoldersNew => "SmartFoldersNew",
+            MenuCommandId::SmartFoldersManage => "SmartFoldersManage",
             MenuCommandId::BooksAddSelectionToActiveBook => "BooksAddSelectionToActiveBook",
             MenuCommandId::BooksAddClipboardImage => "BooksAddClipboardImage",
             MenuCommandId::BooksOpenRoot => "BooksOpenRoot",
@@ -2255,6 +2266,18 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::Favorites,
         label: "アイテム検索",
         action: Some(KeyAction::GlobalMetadataSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SmartFoldersNew,
+        parent: TopMenuId::SmartFolders,
+        label: "新しいスマートフォルダ…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SmartFoldersManage,
+        parent: TopMenuId::SmartFolders,
+        label: "スマートフォルダを管理…",
+        action: None,
     },
     MenuCommandSpec {
         id: MenuCommandId::BooksAddSelectionToActiveBook,

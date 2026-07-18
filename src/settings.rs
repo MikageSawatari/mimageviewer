@@ -125,6 +125,125 @@ pub struct FavoriteEntry {
     pub auto_index_thumbs: bool,
 }
 
+// -----------------------------------------------------------------------
+// SmartFolderDefinition (v2.6.0)
+// -----------------------------------------------------------------------
+
+/// スマートフォルダが一覧へ取り込むコンテナ種別。
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartFolderContainerKind {
+    ImageFolder,
+    Zip,
+    Pdf,
+    Archive,
+    /// 将来版が追加した値を旧版で読んだ場合の受け皿。sanitize で除外する。
+    #[serde(other)]
+    Unknown,
+}
+
+impl SmartFolderContainerKind {
+    pub fn all() -> &'static [Self] {
+        &[Self::ImageFolder, Self::Zip, Self::Pdf, Self::Archive]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ImageFolder => "画像のみフォルダ",
+            Self::Zip => "ZIP / CBZ",
+            Self::Pdf => "PDF",
+            Self::Archive => "その他の対応アーカイブ",
+            Self::Unknown => "不明",
+        }
+    }
+}
+
+/// スマートフォルダ共通条件。空の集合 / 空文字は「制限なし」。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SmartFolderFilter {
+    #[serde(default)]
+    pub name_contains: String,
+    #[serde(default)]
+    pub kinds: std::collections::BTreeSet<SmartFolderContainerKind>,
+    /// 先頭の `.` を除いた小文字拡張子。空なら全拡張子。
+    #[serde(default)]
+    pub extensions: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub date_preset: Option<FacetDatePreset>,
+    #[serde(default)]
+    pub size_preset: Option<FacetSizePreset>,
+    /// 0=未評価、1..=5=星。全 false は sanitize で「全て」に補正する。
+    #[serde(default = "default_smart_folder_ratings")]
+    pub ratings: [bool; 6],
+    #[serde(default)]
+    pub tags: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub include_untagged: bool,
+}
+
+fn default_smart_folder_ratings() -> [bool; 6] {
+    [true; 6]
+}
+
+impl Default for SmartFolderFilter {
+    fn default() -> Self {
+        Self {
+            name_contains: String::new(),
+            kinds: std::collections::BTreeSet::new(),
+            extensions: std::collections::BTreeSet::new(),
+            date_preset: None,
+            size_preset: None,
+            ratings: default_smart_folder_ratings(),
+            tags: std::collections::BTreeSet::new(),
+            include_untagged: false,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SmartFolderSource {
+    #[serde(default = "Uuid::nil")]
+    pub id: Uuid,
+    #[serde(default)]
+    pub path: PathBuf,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SmartFolderDefinition {
+    #[serde(default = "Uuid::nil")]
+    pub id: Uuid,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub sources: Vec<SmartFolderSource>,
+    #[serde(default)]
+    pub filter: SmartFolderFilter,
+    #[serde(default)]
+    pub sort: SortOrder,
+    #[serde(default)]
+    pub grouping: SubfolderExpansionOrder,
+    #[serde(default)]
+    pub view_mode: GridViewMode,
+}
+
+impl SmartFolderDefinition {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            sources: Vec::new(),
+            filter: SmartFolderFilter::default(),
+            sort: SortOrder::default(),
+            grouping: SubfolderExpansionOrder::default(),
+            view_mode: GridViewMode::default(),
+        }
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for FavoriteEntry {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -944,6 +1063,7 @@ pub enum ToolbarSectionId {
     Sort,
     Rating,
     Favorites,
+    SmartFolders,
     Tags,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
@@ -964,6 +1084,7 @@ impl ToolbarSectionId {
             Self::Sort,
             Self::Rating,
             Self::Favorites,
+            Self::SmartFolders,
             Self::Tags,
         ]
     }
@@ -2141,6 +2262,9 @@ pub struct Settings {
     pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
+    /// 任意の複数実フォルダを横断して本コンテナを表示する保存済みビュー。
+    #[serde(default)]
+    pub smart_folders: Vec<SmartFolderDefinition>,
     #[serde(default)]
     pub last_folder: Option<PathBuf>,
     #[serde(default)]
@@ -2342,6 +2466,9 @@ pub struct Settings {
     /// ツールバーに「お気に入り」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_favorites: bool,
+    /// スマートフォルダセクションのユーザー表示設定。定義 0 件時は実効非表示。
+    #[serde(default = "default_true")]
+    pub show_toolbar_smart_folders: bool,
     /// ツールバーに「タグ」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_tags: bool,
@@ -2696,12 +2823,16 @@ pub struct Settings {
     #[serde(default)]
     pub toolbar_favorites_display: ToolbarSectionDisplay,
     #[serde(default)]
+    pub toolbar_smart_folders_display: ToolbarSectionDisplay,
+    #[serde(default)]
     pub toolbar_tags_display: ToolbarSectionDisplay,
     #[serde(default)]
     pub toolbar_bookshelf_display: ToolbarSectionDisplay,
     /// 折りたたみモード時の畳み状態 (true = 畳んで隠す)。v2.0.0。
     #[serde(default)]
     pub toolbar_favorites_collapsed: bool,
+    #[serde(default)]
+    pub toolbar_smart_folders_collapsed: bool,
     #[serde(default)]
     pub toolbar_tags_collapsed: bool,
     #[serde(default)]
@@ -3827,6 +3958,7 @@ impl Default for Settings {
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
+            smart_folders: Vec::new(),
             last_folder: None,
             startup_folder_mode: StartupFolderMode::default(),
             startup_folder_path: None,
@@ -3928,6 +4060,7 @@ impl Default for Settings {
             ai_feature_mode: AiFeatureMode::default(),
             tags: Vec::new(),
             show_toolbar_favorites: true,
+            show_toolbar_smart_folders: true,
             show_toolbar_tags: true,
             folder_tree_pane_visible: false,
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
@@ -3971,9 +4104,11 @@ impl Default for Settings {
             toolbar_aspect_display: ToolbarSectionDisplay::Dropdown,
             toolbar_sort_display: ToolbarSectionDisplay::Dropdown,
             toolbar_favorites_display: ToolbarSectionDisplay::default(),
+            toolbar_smart_folders_display: ToolbarSectionDisplay::default(),
             toolbar_tags_display: ToolbarSectionDisplay::default(),
             toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
             toolbar_favorites_collapsed: false,
+            toolbar_smart_folders_collapsed: false,
             toolbar_tags_collapsed: false,
             toolbar_bookshelf_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
@@ -5202,6 +5337,63 @@ impl Settings {
                 fav.id = Uuid::new_v4();
             }
         }
+        let mut definition_ids = std::collections::HashSet::new();
+        for (index, definition) in self.smart_folders.iter_mut().enumerate() {
+            if definition.id.is_nil() || !definition_ids.insert(definition.id) {
+                definition.id = Uuid::new_v4();
+                definition_ids.insert(definition.id);
+            }
+            definition.name = definition.name.trim().to_string();
+            if definition.name.is_empty() {
+                definition.name = format!("スマートフォルダ {}", index + 1);
+            }
+
+            let mut source_ids = std::collections::HashSet::new();
+            let mut source_paths = std::collections::HashSet::new();
+            definition.sources.retain_mut(|source| {
+                if source.path.as_os_str().is_empty() {
+                    return false;
+                }
+                let path_key = crate::path_key::normalize_keep_drive(&source.path);
+                if path_key.is_empty() || !source_paths.insert(path_key) {
+                    return false;
+                }
+                if source.id.is_nil() || !source_ids.insert(source.id) {
+                    source.id = Uuid::new_v4();
+                    source_ids.insert(source.id);
+                }
+                true
+            });
+
+            definition
+                .filter
+                .kinds
+                .remove(&SmartFolderContainerKind::Unknown);
+            definition.filter.name_contains = definition.filter.name_contains.trim().to_string();
+            definition.filter.extensions = definition
+                .filter
+                .extensions
+                .iter()
+                .filter_map(|extension| {
+                    let normalized = extension
+                        .trim()
+                        .trim_start_matches('.')
+                        .to_ascii_lowercase();
+                    (!normalized.is_empty()).then_some(normalized)
+                })
+                .collect();
+            definition.filter.tags = definition
+                .filter
+                .tags
+                .iter()
+                .map(|tag| tag.trim())
+                .filter(|tag| !tag.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !definition.filter.ratings.iter().any(|enabled| *enabled) {
+                definition.filter.ratings = default_smart_folder_ratings();
+            }
+        }
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
         self.toolbar_facet_filter_items =
@@ -5327,6 +5519,7 @@ impl Settings {
         self.show_toolbar_aspect = src.show_toolbar_aspect;
         self.show_toolbar_sort = src.show_toolbar_sort;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
+        self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
         self.show_toolbar_folder_tree_button = src.show_toolbar_folder_tree_button;
         self.show_toolbar_bookshelf = src.show_toolbar_bookshelf;
@@ -5336,9 +5529,11 @@ impl Settings {
         self.toolbar_aspect_display = src.toolbar_aspect_display;
         self.toolbar_sort_display = src.toolbar_sort_display;
         self.toolbar_favorites_display = src.toolbar_favorites_display;
+        self.toolbar_smart_folders_display = src.toolbar_smart_folders_display;
         self.toolbar_tags_display = src.toolbar_tags_display;
         self.toolbar_bookshelf_display = src.toolbar_bookshelf_display;
         self.toolbar_favorites_collapsed = src.toolbar_favorites_collapsed;
+        self.toolbar_smart_folders_collapsed = src.toolbar_smart_folders_collapsed;
         self.toolbar_tags_collapsed = src.toolbar_tags_collapsed;
         self.toolbar_bookshelf_collapsed = src.toolbar_bookshelf_collapsed;
         self.toolbar_cols_items = std::mem::take(&mut src.toolbar_cols_items);
@@ -5396,8 +5591,9 @@ impl Settings {
         self.window_size = src.window_size;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
-        // ── お気に入り / タグ (専用ダイアログで編集) ──
+        // ── お気に入り / スマートフォルダ / タグ (専用ダイアログで編集) ──
         self.favorites = std::mem::take(&mut src.favorites);
+        self.smart_folders = std::mem::take(&mut src.smart_folders);
         self.tags = std::mem::take(&mut src.tags);
         // ── 検索インデックス関連 ──
         self.search_index_checks = std::mem::take(&mut src.search_index_checks);
@@ -5708,7 +5904,7 @@ mod tests {
         let got = ToolbarSectionId::ordered_with_fallback(&saved);
         assert_eq!(got[0], ToolbarSectionId::Tags);
         assert_eq!(got[1], ToolbarSectionId::Cols);
-        // 全 8 セクションが過不足なく 1 回ずつ含まれる。
+        // 全セクションが過不足なく 1 回ずつ含まれる。
         assert_eq!(got.len(), ToolbarSectionId::default_order().len());
         for &id in ToolbarSectionId::default_order() {
             assert_eq!(
@@ -7376,6 +7572,102 @@ mod tests {
             !s.favorites[0].id.is_nil(),
             "sanitize で UUID が発行されるはず"
         );
+    }
+
+    #[test]
+    fn smart_folder_fields_are_backward_compatible_when_missing() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.smart_folders.is_empty());
+        assert!(settings.show_toolbar_smart_folders);
+        assert_eq!(
+            settings.toolbar_smart_folders_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert!(!settings.toolbar_smart_folders_collapsed);
+        assert!(ToolbarSectionId::default_order().contains(&ToolbarSectionId::SmartFolders));
+    }
+
+    #[test]
+    fn smart_folder_definition_roundtrips() {
+        let mut definition = SmartFolderDefinition::new("未整理の本");
+        definition.sources.push(SmartFolderSource {
+            id: Uuid::new_v4(),
+            path: PathBuf::from(r"C:\Books"),
+            enabled: false,
+        });
+        definition.filter.name_contains = "sample".into();
+        definition
+            .filter
+            .kinds
+            .insert(SmartFolderContainerKind::Zip);
+        definition.filter.extensions.insert("cbz".into());
+        definition.filter.ratings = [true, false, true, false, true, false];
+        definition.filter.tags.insert("あとで読む".into());
+        definition.filter.include_untagged = true;
+        definition.sort = SortOrder::DateDesc;
+        definition.grouping = SubfolderExpansionOrder::FolderGrouped;
+        definition.view_mode = GridViewMode::Details;
+
+        let json = serde_json::to_string(&definition).unwrap();
+        let loaded: SmartFolderDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, definition);
+    }
+
+    #[test]
+    fn sanitize_repairs_smart_folder_ids_paths_and_filters() {
+        let mut settings = Settings::default();
+        let mut first = SmartFolderDefinition::new("  ");
+        first.id = Uuid::nil();
+        first.sources = vec![
+            SmartFolderSource {
+                id: Uuid::nil(),
+                path: PathBuf::from(r"C:\Books"),
+                enabled: true,
+            },
+            SmartFolderSource {
+                id: Uuid::nil(),
+                path: PathBuf::from(r"C:\Books"),
+                enabled: true,
+            },
+            SmartFolderSource {
+                id: Uuid::nil(),
+                path: PathBuf::new(),
+                enabled: true,
+            },
+        ];
+        first.filter.kinds.insert(SmartFolderContainerKind::Unknown);
+        first.filter.extensions.insert(" .CBZ ".into());
+        first.filter.extensions.insert(" . ".into());
+        first.filter.tags.insert(" あとで読む ".into());
+        first.filter.tags.insert(" ".into());
+        first.filter.ratings = [false; 6];
+        let mut second = SmartFolderDefinition::new("two");
+        second.id = Uuid::nil();
+        settings.smart_folders = vec![first, second];
+
+        settings.sanitize();
+
+        let first = &settings.smart_folders[0];
+        assert!(!first.id.is_nil());
+        assert_ne!(first.id, settings.smart_folders[1].id);
+        assert_eq!(first.name, "スマートフォルダ 1");
+        assert_eq!(first.sources.len(), 1);
+        assert!(!first.sources[0].id.is_nil());
+        assert!(
+            !first
+                .filter
+                .kinds
+                .contains(&SmartFolderContainerKind::Unknown)
+        );
+        assert_eq!(
+            first.filter.extensions.iter().cloned().collect::<Vec<_>>(),
+            ["cbz"]
+        );
+        assert_eq!(
+            first.filter.tags.iter().cloned().collect::<Vec<_>>(),
+            ["あとで読む"]
+        );
+        assert_eq!(first.filter.ratings, [true; 6]);
     }
 
     // -- ThumbAspect --

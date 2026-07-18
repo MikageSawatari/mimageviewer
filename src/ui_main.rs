@@ -1468,9 +1468,14 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
         TS::Sort => "ソート",
         TS::Rating => "レーティング (★)",
         TS::Favorites => "お気に入り",
+        TS::SmartFolders => "スマートフォルダ",
         TS::Tags => "タグ",
         TS::Unknown => "",
     }
+}
+
+fn smart_folder_toolbar_visible(show_setting: bool, definition_count: usize) -> bool {
+    show_setting && definition_count > 0
 }
 
 /// ツールバーのドラッグ並べ替え中の状態 (ctx の temp data に保存)。
@@ -1600,6 +1605,7 @@ fn set_toolbar_section_visible(
         TS::Sort => settings.show_toolbar_sort = visible,
         TS::Rating => settings.show_toolbar_rating = visible,
         TS::Favorites => settings.show_toolbar_favorites = visible,
+        TS::SmartFolders => settings.show_toolbar_smart_folders = visible,
         TS::Tags => settings.show_toolbar_tags = visible,
         TS::Unknown => {}
     }
@@ -2306,6 +2312,7 @@ impl App {
     /// メニューバーを描画し、ナビゲーション先とソート変更の有無を返す。
     pub(crate) fn render_menubar(&mut self, ctx: &egui::Context) -> (Option<PathBuf>, bool) {
         let mut fav_nav: Option<PathBuf> = None;
+        let mut smart_folder_open: Option<uuid::Uuid> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
         let book_sort_locked = self.page_order_locked_for_current_view();
@@ -2357,6 +2364,12 @@ impl App {
         let metadata_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FavoritesMetadataSearch);
+        let smart_folder_new_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SmartFoldersNew);
+        let smart_folder_manage_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SmartFoldersManage);
         let book_add_selection_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::BooksAddSelectionToActiveBook);
@@ -2420,7 +2433,7 @@ impl App {
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                let mut top_menu_responses = Vec::with_capacity(8);
+                let mut top_menu_responses = Vec::with_capacity(9);
 
                 for resolved_top_menu in &resolved_menu_layout.menus {
                     match resolved_top_menu.id {
@@ -2578,6 +2591,53 @@ impl App {
                                     for fav in &favorites {
                                         if ui.button(&fav.name).clicked() {
                                             fav_nav = Some(fav.path.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            });
+                            top_menu_responses.push(response.response);
+                        }
+                        TopMenuId::SmartFolders => {
+                            let smart_folder_commands = &resolved_top_menu.commands;
+                            let response = ui.menu_button(TopMenuId::SmartFolders.label(), |ui| {
+                                for &command in smart_folder_commands {
+                                    match command {
+                                        MenuCommandId::SmartFoldersNew => {
+                                            if ui.button(&smart_folder_new_menu_label).clicked() {
+                                                self.begin_new_smart_folder();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SmartFoldersManage => {
+                                            if ui
+                                                .add_enabled(
+                                                    !self.settings.smart_folders.is_empty(),
+                                                    egui::Button::new(&smart_folder_manage_menu_label),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.open_smart_folder_manager(None);
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                ui.separator();
+                                if self.settings.smart_folders.is_empty() {
+                                    ui.label(egui::RichText::new("（未登録）").weak());
+                                } else {
+                                    for definition in &self.settings.smart_folders {
+                                        let selected = self.items_are_smart_folder_view
+                                            && self.current_smart_folder_id
+                                                == Some(definition.id);
+                                        if ui
+                                            .selectable_label(selected, &definition.name)
+                                            .clicked()
+                                        {
+                                            smart_folder_open = Some(definition.id);
                                             ui.close();
                                         }
                                     }
@@ -3298,6 +3358,11 @@ impl App {
             self.settings.save();
             // ネスト ZIP は階層維持で再ソート、Ctrl+G は検索結果再ソート、通常は再ロード。
             self.apply_sort_change_reload();
+        }
+        if let Some(id) = smart_folder_open {
+            let refresh =
+                self.items_are_smart_folder_view && self.current_smart_folder_id == Some(id);
+            self.open_smart_folder(id, refresh);
         }
 
         (fav_nav, sort_changed)
@@ -4626,6 +4691,10 @@ impl App {
         let show_aspect = self.settings.show_toolbar_aspect && !details_mode;
         let show_sort = self.settings.show_toolbar_sort;
         let show_favs = self.settings.show_toolbar_favorites;
+        let show_smart_folders = smart_folder_toolbar_visible(
+            self.settings.show_toolbar_smart_folders,
+            self.settings.smart_folders.len(),
+        );
         let show_rating = self.settings.show_toolbar_rating;
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
@@ -4637,6 +4706,7 @@ impl App {
         let active_book_name = self.active_book_name();
         let toolbar_book_rows = self.book_list_cache.clone();
         let toolbar_pinned_books = self.settings.pinned_books.clone();
+        let toolbar_smart_folder_definitions = self.settings.smart_folders.clone();
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
         let has_rating_selection = has_book_add_target;
         let toolbar_section_order = crate::settings::ToolbarSectionId::ordered_with_fallback(
@@ -4652,6 +4722,7 @@ impl App {
             || show_aspect
             || show_sort
             || show_favs
+            || show_smart_folders
             || show_rating
             || show_tags;
 
@@ -4660,6 +4731,7 @@ impl App {
         }
 
         let mut toolbar_fav_nav: Option<PathBuf> = None;
+        let mut toolbar_smart_folder_open: Option<uuid::Uuid> = None;
         let mut toolbar_sort_changed = false;
         let mut toolbar_rating_changed = false;
         let mut toolbar_rating_assign_selection: Option<u8> = None;
@@ -4816,6 +4888,7 @@ impl App {
                         TS::Sort => show_sort,
                         TS::Rating => show_rating,
                         TS::Favorites => show_favs,
+                        TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
                         TS::Unknown => false,
                     };
@@ -5503,6 +5576,82 @@ impl App {
                         }
                     }
                 }
+                TS::SmartFolders => {
+                    let lead = toolbar_label(ui, "スマート:", 60.0, drag_enabled)
+                        .hover_tip(lead_hint);
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::SmartFolders,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
+                    let mode = self.settings.toolbar_smart_folders_display;
+                    let (show_inline, new_collapsed) = toolbar_section_fold_toggle(
+                        ui,
+                        mode,
+                        self.settings.toolbar_smart_folders_collapsed,
+                    );
+                    if let Some(collapsed) = new_collapsed {
+                        self.settings.toolbar_smart_folders_collapsed = collapsed;
+                        self.settings.save();
+                    }
+                    let current_id = self
+                        .items_are_smart_folder_view
+                        .then_some(self.current_smart_folder_id)
+                        .flatten();
+                    if mode == crate::settings::ToolbarSectionDisplay::Dropdown {
+                        let selected_text = current_id
+                            .and_then(|id| {
+                                toolbar_smart_folder_definitions
+                                    .iter()
+                                    .find(|definition| definition.id == id)
+                            })
+                            .map(|definition| definition.name.clone())
+                            .unwrap_or_else(|| "選択".to_string());
+                        let combo = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(180.0, ui.spacing().interact_size.y),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    egui::ComboBox::from_id_salt("toolbar_smart_folder_combo")
+                                        .width(172.0)
+                                        .selected_text(selected_text)
+                                        .show_ui(ui, |ui| {
+                                            apply_toolbar_style(ui);
+                                            for definition in &toolbar_smart_folder_definitions {
+                                                if ui
+                                                    .selectable_label(
+                                                        current_id == Some(definition.id),
+                                                        &definition.name,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    toolbar_smart_folder_open =
+                                                        Some(definition.id);
+                                                    ui.close();
+                                                }
+                                            }
+                                        })
+                                },
+                            )
+                            .inner;
+                        toolbar_combo_popup_open |=
+                            egui::ComboBox::is_open(ctx, combo.response.id);
+                    } else if show_inline {
+                        for definition in &toolbar_smart_folder_definitions {
+                            if ui
+                                .selectable_label(
+                                    current_id == Some(definition.id),
+                                    &definition.name,
+                                )
+                                .clicked()
+                            {
+                                toolbar_smart_folder_open = Some(definition.id);
+                            }
+                        }
+                    }
+                }
                 // タグセクション (docs/tag-feature.md §4.3)
                 TS::Tags => {
                     let lead = toolbar_label(ui, "タグ:", 42.0, drag_enabled).hover_tip(lead_hint);
@@ -5742,6 +5891,11 @@ impl App {
         if toolbar_tag_view_open {
             self.open_tag_view();
         }
+        if let Some(id) = toolbar_smart_folder_open {
+            let refresh =
+                self.items_are_smart_folder_view && self.current_smart_folder_id == Some(id);
+            self.open_smart_folder(id, refresh);
+        }
 
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
 
@@ -5786,6 +5940,10 @@ impl App {
             .changed();
         changed |= ui
             .checkbox(&mut s.show_toolbar_favorites, "お気に入り")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_smart_folders, "スマートフォルダ")
+            .on_hover_text("登録が1件以上あるときだけツールバーに表示されます")
             .changed();
         changed |= ui.checkbox(&mut s.show_toolbar_tags, "タグ").changed();
         ui.separator();
@@ -5892,6 +6050,7 @@ impl App {
         s.show_toolbar_sort = true;
         s.show_toolbar_rating = true;
         s.show_toolbar_favorites = true;
+        s.show_toolbar_smart_folders = true;
         s.show_toolbar_tags = true;
         s.show_toolbar_facet_filter = true;
         // フォルダバー (アドレス行) もセクション扱いなので一緒に既定へ戻す (Codex P3)。
@@ -5923,9 +6082,11 @@ impl App {
         s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
         s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
         s.toolbar_favorites_display = ToolbarSectionDisplay::default();
+        s.toolbar_smart_folders_display = ToolbarSectionDisplay::default();
         s.toolbar_tags_display = ToolbarSectionDisplay::default();
         s.toolbar_bookshelf_display = ToolbarSectionDisplay::default();
         s.toolbar_favorites_collapsed = false;
+        s.toolbar_smart_folders_collapsed = false;
         s.toolbar_tags_collapsed = false;
         s.toolbar_bookshelf_collapsed = false;
         // 出す項目
@@ -6076,6 +6237,19 @@ impl App {
                 ui.separator();
                 if ui.button("お気に入りを編集…").clicked() {
                     self.show_favorites_editor = true;
+                    ui.close();
+                }
+            }
+            TS::SmartFolders => {
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_smart_folders_display,
+                    TD::all_with_collapsible(),
+                    &mut changed,
+                );
+                ui.separator();
+                if ui.button("スマートフォルダを管理…").clicked() {
+                    self.open_smart_folder_manager(None);
                     ui.close();
                 }
             }
@@ -12823,6 +12997,13 @@ mod toolbar_reorder_tests {
 
     fn rect(x: f32, y: f32, w: f32) -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, 20.0))
+    }
+
+    #[test]
+    fn smart_folder_toolbar_requires_visibility_setting_and_a_definition() {
+        assert!(!smart_folder_toolbar_visible(true, 0));
+        assert!(!smart_folder_toolbar_visible(false, 1));
+        assert!(smart_folder_toolbar_visible(true, 1));
     }
 
     #[test]

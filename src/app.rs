@@ -40,7 +40,9 @@ mod metadata_ops;
 mod native_video;
 pub(crate) mod normalize;
 mod prefetch_policy;
+mod recursive_snapshot_scan;
 mod runtime_ops;
+mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
@@ -1787,6 +1789,7 @@ struct ViewerContextBundle {
     items_are_reading_history_view: bool,
     items_are_rating_view: bool,
     items_are_subfolder_expansion_view: bool,
+    items_are_smart_folder_view: bool,
     items_are_drive_list: bool,
     reading_history_return_from: Option<PathBuf>,
     fs_open_intent_from_grid: bool,
@@ -2010,6 +2013,7 @@ impl ViewerContextBundle {
             items_are_reading_history_view: false,
             items_are_rating_view: false,
             items_are_subfolder_expansion_view: false,
+            items_are_smart_folder_view: false,
             items_are_drive_list: false,
             reading_history_return_from: None,
             fs_open_intent_from_grid: false,
@@ -4399,12 +4403,15 @@ fn main_window_title(
     effective_folder: Option<&Path>,
     reading_history_view: bool,
     subfolder_expansion_view: bool,
+    smart_folder_name: Option<&str>,
     indexing_active: bool,
 ) -> String {
     let base = if reading_history_view {
         "読書履歴 - mimageviewer".to_string()
     } else if subfolder_expansion_view {
         "サブフォルダ展開 - mimageviewer".to_string()
+    } else if let Some(name) = smart_folder_name {
+        format!("スマートフォルダ: {name} - mimageviewer")
     } else if let Some(path) = effective_folder {
         format!("{} - mimageviewer", path.display())
     } else {
@@ -4426,6 +4433,7 @@ pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
         || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
         || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
         || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
+        || smart_folder::is_smart_folder_synthetic_path(path)
         || crate::folder_tree::path_eq(path, &drive_list_synthetic_path())
 }
 
@@ -6050,6 +6058,8 @@ pub struct App {
     pub(crate) items_are_rating_view: bool,
     /// 現在の `items` がサブフォルダ展開のスナップショット仮想ビューかを示す。
     pub(crate) items_are_subfolder_expansion_view: bool,
+    /// 現在の `items` が保存済みスマートフォルダのスナップショット仮想ビューか。
+    pub(crate) items_are_smart_folder_view: bool,
     /// 現在の `items` がドライブ一覧の仮想ビューかを示す。
     /// `current_folder` は履歴用の synthetic marker を持つが、通常フォルダの D&D / rating /
     /// 代表サムネ探索はこのフラグで明示的に止める。
@@ -6084,6 +6094,11 @@ pub struct App {
     /// 内側の `Option<String>` が `None` のときは「ETA 算出不可 (= サンプル不足
     /// または進行中なし)」。close 時に None に戻す。
     pub(crate) favorites_total_eta_cache: Option<(std::time::Instant, Option<String>)>,
+
+    // ── スマートフォルダ管理ダイアログ ─────────────────────────────
+    pub(crate) show_smart_folder_editor: bool,
+    pub(crate) smart_folder_editor_selected: Option<uuid::Uuid>,
+    pub(crate) smart_folder_delete_confirm: Option<uuid::Uuid>,
 
     // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
     pub(crate) show_tag_editor: bool,
@@ -7401,6 +7416,17 @@ pub struct App {
         Option<subfolder_expansion::SubfolderExpansionProgress>,
     /// 直近完了時の診断統計。実機レビュー時のログ/確認用。
     pub(crate) subfolder_expansion_diag: Option<subfolder_expansion::SubfolderExpansionDiag>,
+
+    // ── スマートフォルダ snapshot view ───────────────────────────
+    pub(crate) current_smart_folder_id: Option<uuid::Uuid>,
+    pub(crate) smart_folder_saved_folder: Option<PathBuf>,
+    pub(crate) smart_folder_snapshots:
+        std::collections::HashMap<uuid::Uuid, smart_folder::SmartFolderSnapshot>,
+    pub(crate) smart_folder_generation: u64,
+    pub(crate) smart_folder_pending: Option<smart_folder::SmartFolderPending>,
+    pub(crate) smart_folder_prepare_pending: Option<smart_folder::SmartFolderPreparePending>,
+    pub(crate) smart_folder_confirm_pending: Option<smart_folder::SmartFolderConfirmPending>,
+    pub(crate) smart_folder_progress: Option<smart_folder::SmartFolderProgress>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -9249,6 +9275,7 @@ impl App {
             items_are_reading_history_view: false,
             items_are_rating_view: false,
             items_are_subfolder_expansion_view: false,
+            items_are_smart_folder_view: false,
             items_are_drive_list: false,
             show_favorites_editor: false,
             favorite_delete_confirm: None,
@@ -9256,6 +9283,9 @@ impl App {
             favorites_index_count_cache: None,
             favorites_index_refresh_rx: None,
             favorites_total_eta_cache: None,
+            show_smart_folder_editor: false,
+            smart_folder_editor_selected: None,
+            smart_folder_delete_confirm: None,
             show_tag_editor: false,
             tag_editor_draft: Vec::new(),
             show_tag_apply: false,
@@ -9743,6 +9773,14 @@ impl App {
             subfolder_expansion_confirm_pending: None,
             subfolder_expansion_progress: None,
             subfolder_expansion_diag: None,
+            current_smart_folder_id: None,
+            smart_folder_saved_folder: None,
+            smart_folder_snapshots: std::collections::HashMap::new(),
+            smart_folder_generation: 0,
+            smart_folder_pending: None,
+            smart_folder_prepare_pending: None,
+            smart_folder_confirm_pending: None,
+            smart_folder_progress: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -10978,6 +11016,7 @@ impl App {
     pub(crate) fn any_dialog_open(&self) -> bool {
         self.show_stats_dialog
             || self.show_favorites_editor
+            || self.show_smart_folder_editor
             || self.show_tag_editor
             || self.show_tag_apply
             || self.fullscreen_tag_picker_open
@@ -11020,6 +11059,9 @@ impl App {
             || self.batch_convert.is_some()
             || self.subfolder_expansion_pending.is_some()
             || self.subfolder_expansion_confirm_pending.is_some()
+            || self.smart_folder_pending.is_some()
+            || self.smart_folder_prepare_pending.is_some()
+            || self.smart_folder_confirm_pending.is_some()
             || self.subfolder_expansion_install_pending.is_some()
             || self.editing_addon_install_state.is_some()
             || self.text_subdialog_open()
@@ -11032,6 +11074,7 @@ impl App {
     pub(crate) fn any_modal_dialog_open_for_fullscreen_keys(&self) -> bool {
         self.show_stats_dialog
             || self.show_favorites_editor
+            || self.show_smart_folder_editor
             || self.show_tag_editor
             || self.show_tag_apply
             || self.fullscreen_tag_picker_open
@@ -11073,6 +11116,9 @@ impl App {
             || self.subfolder_expansion_pending.is_some()
             || self.subfolder_expansion_confirm_pending.is_some()
             || self.subfolder_expansion_install_pending.is_some()
+            || self.smart_folder_pending.is_some()
+            || self.smart_folder_prepare_pending.is_some()
+            || self.smart_folder_confirm_pending.is_some()
             // 編集用追加パック DL ダイアログ (フルスクリーンビューポートで描画)。表示中は
             // フルスクリーンのキー (Enter で閉じる / Esc で選択解除・テキストモード退出 /
             // 矢印ナビ) を止め、ダイアログ操作に集中させる (Codex 監査)。
@@ -11243,6 +11289,7 @@ impl App {
             items_are_reading_history_view,
             items_are_rating_view,
             items_are_subfolder_expansion_view,
+            items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
             fs_open_intent_from_grid,
@@ -11429,6 +11476,7 @@ impl App {
         swap_field!(items_are_reading_history_view);
         swap_field!(items_are_rating_view);
         swap_field!(items_are_subfolder_expansion_view);
+        swap_field!(items_are_smart_folder_view);
         swap_field!(items_are_drive_list);
         swap_field!(reading_history_return_from);
         swap_field!(fs_open_intent_from_grid);
@@ -11738,6 +11786,9 @@ impl App {
         if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
         }
+        if let Some(nav) = self.smart_folder_back_nav() {
+            return Some(nav);
+        }
         let cur = self.effective_folder()?;
         if let Some(parent) = cur.parent() {
             Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()))
@@ -11754,6 +11805,9 @@ impl App {
             return Some(crate::ui_main::AddressBarNav::RatingViewBack);
         }
         if let Some(nav) = self.subfolder_expansion_back_nav() {
+            return Some(nav);
+        }
+        if let Some(nav) = self.smart_folder_back_nav() {
             return Some(nav);
         }
         let cur = self.effective_folder()?;
@@ -11811,6 +11865,9 @@ impl App {
             return Some(crate::ui_main::AddressBarNav::RatingViewBack);
         }
         if let Some(nav) = self.subfolder_expansion_back_nav() {
+            return Some(nav);
+        }
+        if let Some(nav) = self.smart_folder_back_nav() {
             return Some(nav);
         }
         let cur = self.effective_folder()?;
@@ -12463,6 +12520,12 @@ impl App {
             } else {
                 SyntheticFolderHistoryDispatch::Unavailable
             }
+        } else if smart_folder::is_smart_folder_synthetic_path(target) {
+            if self.restore_smart_folder_for_synthetic_path(target) {
+                SyntheticFolderHistoryDispatch::Restored
+            } else {
+                SyntheticFolderHistoryDispatch::Unavailable
+            }
         } else {
             SyntheticFolderHistoryDispatch::NotSynthetic
         };
@@ -12771,6 +12834,9 @@ impl App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
+        if self.restore_smart_folder_for_synthetic_path(&folder) {
+            return;
+        }
         if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
             return;
         }
@@ -12811,6 +12877,9 @@ impl App {
                     crate::rating_view::RatingViewSort::Normal(self.settings.sort_order);
             }
             self.install_rating_view_rows();
+            return;
+        }
+        if self.update_current_smart_folder_sort() {
             return;
         }
         if let Some(root) = self
@@ -13141,6 +13210,8 @@ impl App {
         }
         self.cancel_subfolder_expansion_pending();
         self.clear_subfolder_expansion_view_state();
+        self.cancel_smart_folder_pending();
+        self.clear_smart_folder_view_state();
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
@@ -13373,6 +13444,10 @@ impl App {
         // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
         // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
         self.cancel_folder_pane_open();
+        if self.restore_smart_folder_for_synthetic_path(&path) {
+            self.suppress_nav_record_for_search_restore = false;
+            return;
+        }
         if self.restore_subfolder_expansion_for_synthetic_path(&path) {
             self.suppress_nav_record_for_search_restore = false;
             return;
@@ -17676,6 +17751,12 @@ impl App {
             self.cancel_subfolder_expansion_pending();
             self.clear_subfolder_expansion_view_state();
         }
+        if !smart_folder::is_smart_folder_synthetic_path(&source_path) {
+            self.cancel_smart_folder_pending();
+            if self.items_are_smart_folder_view {
+                self.clear_smart_folder_view_state();
+            }
+        }
         self.gamepad_location_picker = None;
         if !crate::folder_tree::path_eq(&source_path, &rating_view_synthetic_path()) {
             if let Some(pending) = self.rating_view_pending.take() {
@@ -18593,6 +18674,7 @@ impl App {
         self.items_are_reading_history_view = false;
         self.items_are_rating_view = false;
         self.items_are_subfolder_expansion_view = false;
+        self.items_are_smart_folder_view = false;
         self.items_are_drive_list = false;
         self.reading_history_rows.clear();
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
@@ -19686,6 +19768,14 @@ impl App {
                     self.subfolder_expansion_roots.clone()
                 };
                 self.start_subfolder_expansion_scan_roots(root, roots);
+            }
+        } else if self.items_are_smart_folder_view {
+            if let Some(snapshot) = self
+                .current_smart_folder_id
+                .and_then(|id| self.smart_folder_snapshots.get(&id))
+                .cloned()
+            {
+                self.start_smart_folder_prepare(snapshot, false);
             }
         } else if let Some(cur) = self.current_folder.clone()
             && !is_synthetic_view_path(&cur)
@@ -22000,6 +22090,7 @@ impl App {
             && !self.items_are_global_search_view
             && !self.items_are_tag_view
             && !self.items_are_subfolder_expansion_view
+            && !self.items_are_smart_folder_view
             && !self.items.is_empty()
             && self
                 .items
@@ -25656,7 +25747,7 @@ impl App {
                 self.favsearch_ctrl_nav(true);
             } else if in_tag_view {
                 self.cancel_pending_folder_nav();
-            } else if self.items_are_subfolder_expansion_view {
+            } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(true) {
                 // ネスト ZIP 内: ツリーを DFS 前順で次のノードへ (#4 改)。ツリーの端では
@@ -25682,7 +25773,7 @@ impl App {
                 self.favsearch_ctrl_nav(false);
             } else if in_tag_view {
                 self.cancel_pending_folder_nav();
-            } else if self.items_are_subfolder_expansion_view {
+            } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(false) {
                 // ネスト ZIP 内: ツリーを DFS 逆前順で前のノードへ (#4 改)。
@@ -25703,7 +25794,7 @@ impl App {
                 // 検索ビューは仮想階層なので、実ファイルシステムの兄弟移動は行わない。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
-            } else if self.items_are_subfolder_expansion_view {
+            } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::SiblingGrid);
@@ -25717,7 +25808,7 @@ impl App {
                 // 同上。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
-            } else if self.items_are_subfolder_expansion_view {
+            } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::SiblingGrid);
@@ -31043,6 +31134,7 @@ impl App {
             items_are_reading_history_view,
             items_are_rating_view,
             items_are_subfolder_expansion_view,
+            items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
             fs_open_intent_from_grid,
@@ -31164,6 +31256,7 @@ impl App {
             items_are_reading_history_view,
             items_are_rating_view,
             items_are_subfolder_expansion_view,
+            items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
         );
@@ -36342,7 +36435,7 @@ impl App {
         }
         // サブ展開は準備 worker が DB の全対象キーを一括確認し、非ゼロだけを sparse
         // cache に載せる。miss は未評価と確定しているので UI スレッドから点 query しない。
-        if self.items_are_subfolder_expansion_view {
+        if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
             return 0;
         }
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
@@ -37524,7 +37617,9 @@ impl App {
             _ => return true,
         };
         let key = crate::tags_db::item_key_for_path(p);
-        self.tags_cache.contains_key(&key) || self.items_are_subfolder_expansion_view
+        self.tags_cache.contains_key(&key)
+            || self.items_are_subfolder_expansion_view
+            || self.items_are_smart_folder_view
     }
 
     /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。
@@ -51551,6 +51646,7 @@ impl eframe::App for App {
         // スタックスクリプト (ワーカー) の結果を取り込み、完了したら集約ビューへ差し替える。
         self.poll_stack_script(ctx);
         self.poll_subfolder_expansion(ctx);
+        self.poll_smart_folder(ctx);
         self.poll_details_meta_load(ctx);
         // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
         // 1. NeedsUserConfirmation → SettleApproved 経路の追加 worker 結果取り込み
@@ -51710,10 +51806,20 @@ impl eframe::App for App {
         // 名前索引 / メタ索引の supervisor が `in_full_scan=true` を示している間は
         // 「(インデックス更新中)」をサフィックスに付け、検索結果が不完全である
         // 可能性をユーザーに示唆する (notify-rs の watcher 待ちだけなら付けない)。
+        let smart_folder_name = self.current_smart_folder_id.and_then(|id| {
+            self.settings
+                .smart_folders
+                .iter()
+                .find(|definition| definition.id == id)
+                .map(|definition| definition.name.as_str())
+        });
         let title = main_window_title(
             self.effective_folder().as_deref(),
             self.items_are_reading_history_view,
             self.items_are_subfolder_expansion_view,
+            self.items_are_smart_folder_view
+                .then_some(smart_folder_name)
+                .flatten(),
             self.any_indexer_in_full_scan(),
         );
         // タイトルが変わったときだけ送信する (2026-05-10 修正)。
@@ -52113,6 +52219,7 @@ impl eframe::App for App {
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
         self.render_progress_overlay(ctx);
         self.render_subfolder_expansion_install_overlay(ctx);
+        self.render_smart_folder_overlay(ctx);
 
         // ── PDF / ZIP コンテナ列挙待ちバッジ (左下、進捗バーの上に積む) ──
         // PDFium 開封 + 列挙の 100ms〜1.3 秒の間「親フォルダのまま動かない」状態に
@@ -52129,6 +52236,7 @@ impl eframe::App for App {
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
+        self.show_smart_folder_editor_dialog(ctx);
         self.show_tag_editor_dialog(ctx);
         self.show_tag_apply_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);

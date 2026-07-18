@@ -210,6 +210,8 @@ pub(crate) fn spawn_subfolder_expansion_worker(
     root: PathBuf,
     roots: Vec<PathBuf>,
     options: SubfolderExpansionOptions,
+    io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    activity_gate: Arc<crate::activity_gate::ActivityGate>,
 ) -> Result<SubfolderExpansionPending, String> {
     let roots = normalize_expansion_roots(&root, roots);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -225,6 +227,8 @@ pub(crate) fn spawn_subfolder_expansion_worker(
                 roots_w,
                 options,
                 Arc::clone(&cancel_w),
+                &io_sem,
+                &activity_gate,
                 &tx,
             ) {
                 Some(_result) if cancel_w.load(Ordering::Relaxed) => {
@@ -250,6 +254,8 @@ fn scan_subfolder_expansion(
     roots: Vec<PathBuf>,
     options: SubfolderExpansionOptions,
     cancel: Arc<AtomicBool>,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    activity_gate: &crate::activity_gate::ActivityGate,
     tx: &mpsc::Sender<SubfolderExpansionEvent>,
 ) -> Option<SubfolderExpansionResult> {
     let roots = normalize_expansion_roots(&root, roots);
@@ -260,46 +266,39 @@ fn scan_subfolder_expansion(
         video_thumb_overrides: HashMap::new(),
         diag: SubfolderExpansionDiag::default(),
     };
-    let mut visited = HashSet::new();
-    let mut stack: Vec<_> = roots
-        .iter()
-        .rev()
-        .cloned()
-        .map(|root| (root, 0_u32))
-        .collect();
-    let mut last_progress = Instant::now();
-
-    while let Some((dir, depth)) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-        if depth > MAX_SUBFOLDER_EXPANSION_DEPTH {
-            result.diag.depth_limit_hits += 1;
-            continue;
-        }
-        if !crate::fs_entry::mark_directory_visited(&dir, &mut visited) {
-            result.diag.visited_skips += 1;
-            continue;
-        }
-
-        let mut subdirs = Vec::new();
-        scan_one_directory(&dir, &options, &cancel, &mut result, &mut subdirs);
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        result.diag.dirs_scanned += 1;
-        if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            let _ = tx.send(SubfolderExpansionEvent::Progress(
-                SubfolderExpansionProgress::from_diag(&result.diag, Some(dir.clone())),
-            ));
-            last_progress = Instant::now();
-        }
-
-        subdirs.sort_by(|a, b| path_name_for_sort(a).cmp(&path_name_for_sort(b)));
-        for subdir in subdirs.into_iter().rev() {
-            stack.push((subdir, depth + 1));
-        }
+    let media_found = std::cell::Cell::new(0usize);
+    let last_progress = std::cell::Cell::new(Instant::now());
+    let walk_diag = super::recursive_snapshot_scan::walk_snapshot_roots(
+        &roots,
+        MAX_SUBFOLDER_EXPANSION_DEPTH,
+        &cancel,
+        Some(io_sem),
+        Some(activity_gate),
+        |_, _dir, entries, cancel| {
+            let mut subdirs = Vec::new();
+            scan_one_directory(entries, &options, cancel, &mut result, &mut subdirs);
+            media_found.set(result.diag.media_found);
+            subdirs
+        },
+        |diag, current_dir| {
+            if current_dir.is_none() || last_progress.get().elapsed() >= PROGRESS_INTERVAL {
+                let _ = tx.send(SubfolderExpansionEvent::Progress(
+                    SubfolderExpansionProgress {
+                        dirs_scanned: diag.dirs_scanned,
+                        media_found: media_found.get(),
+                        current_dir: current_dir.map(Path::to_path_buf),
+                    },
+                ));
+                last_progress.set(Instant::now());
+            }
+        },
+    );
+    result.diag.dirs_scanned = walk_diag.dirs_scanned;
+    result.diag.read_dir_errors = walk_diag.read_dir_errors;
+    result.diag.depth_limit_hits = walk_diag.depth_limit_hits;
+    result.diag.visited_skips = walk_diag.visited_skips;
+    if cancel.load(Ordering::Relaxed) {
+        return None;
     }
 
     let _ = tx.send(SubfolderExpansionEvent::Progress(
@@ -331,20 +330,12 @@ fn normalize_expansion_roots(root: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn scan_one_directory(
-    dir: &Path,
+    read_dir: std::fs::ReadDir,
     options: &SubfolderExpansionOptions,
     cancel: &AtomicBool,
     result: &mut SubfolderExpansionResult,
     subdirs: &mut Vec<PathBuf>,
 ) {
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => {
-            result.diag.read_dir_errors += 1;
-            return;
-        }
-    };
-
     let mut media: Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)> = Vec::new();
     let mut entry_file_names_ci = HashSet::new();
 
@@ -1093,13 +1084,6 @@ fn stem_lower_local(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn path_name_for_sort(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_lowercase)
-        .unwrap_or_else(|| path.to_string_lossy().to_lowercase())
-}
-
 impl App {
     pub(crate) fn grid_item_can_be_checked(&self, idx: usize) -> bool {
         let Some(item) = self.items.get(idx) else {
@@ -1286,10 +1270,22 @@ impl App {
         self.subfolder_expansion_diag = None;
         self.address = subfolder_expansion_view_label("サブ展開中", &root, &roots);
 
+        let io_sem = self
+            .indexer_manager
+            .as_ref()
+            .map(|manager| manager.io_sem())
+            .unwrap_or_else(|| {
+                Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
+                    self.settings.indexer_speed_profile.io_permits().max(1),
+                ))
+            });
+
         match spawn_subfolder_expansion_worker(
             root.clone(),
             roots,
             SubfolderExpansionOptions::from(&self.settings),
+            io_sem,
+            Arc::clone(&self.activity_gate),
         ) {
             Ok(pending) => {
                 self.subfolder_expansion_pending = Some(pending);
@@ -2066,6 +2062,8 @@ mod tests {
         std::fs::write(b.join("b.png"), b"b").unwrap();
         std::fs::write(c.join("c.jpg"), b"c").unwrap();
         let (tx, _rx) = mpsc::channel();
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let activity_gate = crate::activity_gate::ActivityGate::new(0);
 
         let result = scan_subfolder_expansion(
             root.clone(),
@@ -2077,6 +2075,8 @@ mod tests {
                 image_ext_priority: Vec::new(),
             },
             Arc::new(AtomicBool::new(false)),
+            &io_sem,
+            &activity_gate,
             &tx,
         )
         .expect("scan should finish");
