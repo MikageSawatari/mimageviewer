@@ -32199,6 +32199,52 @@ fn fullscreen_info_action_toggles_mode_for_button_key_and_gamepad_path() {
 }
 
 #[test]
+fn grid_close_and_quit_ring_actions_use_root_close_with_distinct_tray_intent() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+
+    ctx.begin_pass(egui::RawInput::default());
+    app.apply_ring_action(
+        &ctx,
+        crate::ring_shortcut::RingShortcutContext::Grid,
+        crate::ring_shortcut::RingActionId::CloseMainWindow,
+        "test",
+    );
+    let output = ctx.end_pass();
+    assert!(
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close))
+    );
+    assert!(
+        !app.shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "close-main must remain eligible for tray interception"
+    );
+
+    ctx.begin_pass(egui::RawInput::default());
+    app.apply_ring_action(
+        &ctx,
+        crate::ring_shortcut::RingShortcutContext::Grid,
+        crate::ring_shortcut::RingActionId::QuitApplication,
+        "test",
+    );
+    let output = ctx.end_pass();
+    assert!(
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close))
+    );
+    assert!(
+        app.shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "explicit quit must bypass tray interception"
+    );
+}
+
+#[test]
 fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     let mut app = phase_c_support::setup_app();
     app.adjustment_mode = true;

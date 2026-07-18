@@ -1009,6 +1009,12 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
             "全画面ズームモードを切り替えます。Zキー長押し時の照準表示はスキップし、現在のカーソル位置でズーム状態へ入ります"
         }
         RingActionId::MinimizeWindow => "現在操作中のウィンドウを最小化する",
+        RingActionId::CloseMainWindow => {
+            "メインウィンドウの［×］と同じ動作。タスクトレイ常駐が有効ならトレイへ格納します"
+        }
+        RingActionId::QuitApplication => {
+            "タスクトレイ常駐設定にかかわらず、保存処理を行ってアプリを終了します"
+        }
         _ => action.label_for_context(context),
     }
 }

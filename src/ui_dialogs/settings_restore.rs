@@ -394,9 +394,7 @@ impl App {
                     // その間に親ウィンドウが flicker するのを防ぐ。
                     self.show_settings_restore = false;
                     self.settings_restore_state = SettingsRestoreState::default();
-                    self.shutdown_requested
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_application_quit(ctx);
                 }
             }
         }

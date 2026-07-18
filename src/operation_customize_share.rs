@@ -454,6 +454,7 @@ fn is_leap_year(year: u32) -> bool {
 mod tests {
     use super::*;
     use crate::keymap::{KeyBindingOverride, MenuCommandId};
+    use crate::ring_shortcut::RingActionId;
 
     fn binding(action: &str, chords: &[&str]) -> KeyBindingOverride {
         KeyBindingOverride {
@@ -475,6 +476,8 @@ mod tests {
                 .stable_name()
                 .to_string(),
         ];
+        settings.ring_shortcuts.grid.slots[0] = RingActionId::CloseMainWindow;
+        settings.ring_shortcuts.mouse_buttons_grid.middle = RingActionId::QuitApplication;
         let original = OperationCustomizeBundle::from_settings(&settings).with_label("共有用");
         let mut json: serde_json::Value =
             serde_json::from_str(&to_json(&original).unwrap()).unwrap();
@@ -482,6 +485,14 @@ mod tests {
         let parsed = parse_json(&serde_json::to_string(&json).unwrap()).unwrap();
 
         assert_eq!(parsed.bundle, original);
+        assert_eq!(
+            parsed.bundle.ring_shortcuts.grid.slots[0],
+            RingActionId::CloseMainWindow
+        );
+        assert_eq!(
+            parsed.bundle.ring_shortcuts.mouse_buttons_grid.middle,
+            RingActionId::QuitApplication
+        );
         assert_eq!(parsed.ignored_items, 0);
     }
 

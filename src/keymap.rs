@@ -7085,6 +7085,8 @@ mod tests {
         let fixed_or_ring_only = std::collections::BTreeSet::from([
             // Favorite picker / snapshot lock / Explorer open-folder are input-layer features.
             "CycleFavorite".to_string(),
+            "CloseMainWindow".to_string(),
+            "QuitApplication".to_string(),
             "GridToggleSnapshotLock".to_string(),
             "ImageOpenFolder".to_string(),
             // These are intentionally fixed because they depend on OS/browser/clipboard routes

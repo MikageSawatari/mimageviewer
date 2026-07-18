@@ -4445,6 +4445,14 @@ impl App {
                 self.apply_ring_minimize_window(ctx, context);
                 None
             }
+            RingActionId::CloseMainWindow if context == RingShortcutContext::Grid => {
+                self.request_main_window_close(ctx);
+                None
+            }
+            RingActionId::QuitApplication if context == RingShortcutContext::Grid => {
+                self.request_application_quit(ctx);
+                None
+            }
             RingActionId::CloseFullscreen
                 if matches!(
                     context,

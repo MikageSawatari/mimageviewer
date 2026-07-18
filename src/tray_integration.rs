@@ -19,6 +19,20 @@ fn should_close_fullscreen_for_tray(
 }
 
 impl App {
+    /// Request the same root viewport close as the main window's [x] button.
+    /// The next update lets `maybe_intercept_close` apply tray residency rules.
+    pub(crate) fn request_main_window_close(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+    }
+
+    /// Explicitly quit the application, bypassing tray residency while still
+    /// using eframe's normal close/on-exit persistence path.
+    pub(crate) fn request_application_quit(&self, ctx: &egui::Context) {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.request_main_window_close(ctx);
+    }
+
     /// 設定状態に応じてタスクトレイコントローラの起動 / 停止を同期する。
     /// - 設定 ON + tray_controller=None + HWND 取得済み → 起動
     /// - 設定 OFF + tray_controller=Some → 停止 (アイコンが消える)

@@ -453,6 +453,8 @@ pub enum RingActionId {
     ToggleWindowMode,
     ToggleMaximize,
     MinimizeWindow,
+    CloseMainWindow,
+    QuitApplication,
     CloseFullscreen,
     CycleFavorite,
     OpenFavorite1,
@@ -837,6 +839,8 @@ impl RingActionId {
             Self::ToggleWindowMode => "toggle_window_mode",
             Self::ToggleMaximize => "toggle_maximize",
             Self::MinimizeWindow => "minimize_window",
+            Self::CloseMainWindow => "close_main_window",
+            Self::QuitApplication => "quit_application",
             Self::CloseFullscreen => "close_fullscreen",
             Self::CycleFavorite => "cycle_favorite",
             Self::OpenFavorite1
@@ -970,6 +974,8 @@ impl RingActionId {
             "toggle_window_mode" => Self::ToggleWindowMode,
             "toggle_maximize" => Self::ToggleMaximize,
             "minimize_window" => Self::MinimizeWindow,
+            "close_main_window" => Self::CloseMainWindow,
+            "quit_application" => Self::QuitApplication,
             "close_fullscreen" => Self::CloseFullscreen,
             "cycle_favorite" => Self::CycleFavorite,
             "open_location_drive_list" => Self::OpenLocationDriveList,
@@ -1068,6 +1074,8 @@ impl RingActionId {
             Self::ToggleWindowMode => "ウィンドウ/全画面切替",
             Self::ToggleMaximize => "ウィンドウ最大化/復元",
             Self::MinimizeWindow => "ウィンドウ最小化",
+            Self::CloseMainWindow => "メインウィンドウを閉じる",
+            Self::QuitApplication => "アプリを終了する",
             Self::CloseFullscreen => match context {
                 RingShortcutContext::ImageFullscreen => "画像フルスクリーンを閉じる",
                 RingShortcutContext::VideoFullscreen => "動画フルスクリーンを閉じる",
@@ -1193,6 +1201,8 @@ impl RingActionId {
                 Self::None
                     | Self::ToggleMaximize
                     | Self::MinimizeWindow
+                    | Self::CloseMainWindow
+                    | Self::QuitApplication
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::CycleFavorite
@@ -1295,6 +1305,8 @@ impl RingActionId {
                 Self::None,
                 Self::ToggleMaximize,
                 Self::MinimizeWindow,
+                Self::CloseMainWindow,
+                Self::QuitApplication,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
                 Self::CycleFavorite,
@@ -2848,6 +2860,49 @@ mod tests {
             action.label_for_context(RingShortcutContext::VideoFullscreen),
             "動画フルスクリーンを閉じる"
         );
+    }
+
+    #[test]
+    fn main_window_exit_actions_round_trip_and_are_grid_only() {
+        let samples = [
+            (
+                RingActionId::CloseMainWindow,
+                "close_main_window",
+                "メインウィンドウを閉じる",
+            ),
+            (
+                RingActionId::QuitApplication,
+                "quit_application",
+                "アプリを終了する",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            assert!(
+                RingActionId::available_for_mouse_button_context(RingShortcutContext::Grid)
+                    .contains(&action)
+            );
+            for context in [
+                RingShortcutContext::ImageFullscreen,
+                RingShortcutContext::VideoFullscreen,
+            ] {
+                assert!(!action.is_valid_for_context(context));
+                assert!(!RingActionId::available_for_context(context).contains(&action));
+                assert!(
+                    !RingActionId::available_for_mouse_button_context(context).contains(&action)
+                );
+            }
+        }
+
+        assert_ne!(RingActionId::CloseMainWindow, RingActionId::CloseFullscreen);
+        assert_ne!(RingActionId::QuitApplication, RingActionId::CloseFullscreen);
     }
 
     #[test]
