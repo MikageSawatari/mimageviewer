@@ -12661,6 +12661,7 @@ mod compute_cell_size_tests {
         settings.details_show_rating = false;
         settings.details_show_tags = false;
         settings.details_show_kind = false;
+        settings.details_show_page_count = false;
         settings.details_show_modified = false;
         settings.details_show_created = false;
         settings.details_show_state = false;
