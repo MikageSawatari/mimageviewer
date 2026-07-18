@@ -705,6 +705,9 @@ MIDI 半音スペクトラム (`SpectrumAnalyzer`) の 3 ワーカーを持つ�
     解除」**: 個別アイテムから設定
 - **永続化先**: `%APPDATA%/mimageviewer/folder_thumb_pins.db` (コンテナ単位 1 行)
 - **優先順位**: 手動ピン > 自動代表選定 > フォルダ/ZIP/PDF/アーカイブアイコン fallback
+- **入れ子の固定**: 固定先が代表 pin を持つサブフォルダ / ZIP / PDF / ZIP 内コンテナなら、
+  その最終ページまで連鎖して表示する。ZIP/PDF の固定ページに編集があれば親の代表にも
+  反映する。子側に代表 pin がなければ ZIP は先頭画像、PDF はページ 0 を使う
 - **無効化条件**: pin 先のファイルが存在しない / mtime/size 変化で identity が変わった
   場合、自動的に新キャッシュキーで再生成 (古い WebP は `delete_missing` で掃除される)
 - **対象外**: 検索アグリゲートビュー (Ctrl+G)、空フォルダ、`ConvertibleArchive`

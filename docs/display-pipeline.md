@@ -146,9 +146,12 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 1. **手動ピン (`folder_thumb_pins.db`)** — ユーザーがアドレスバー 📌 ボタンや
    右クリックメニュー「📌 代表サムネに固定」で指定した子アイテム。`make_load_request`
    の `apply_folder_thumb_pin` が `LoadRequest` を target アイテム用に書き換え、cache
-   key は `{base_key}#pin:{source_id}` に変わる (source_id = kind/rel/entry/page/
-   mtime/size の compact 表現)。pin の付け替えや target ファイルの変更で
-   source_id が自動的に変わるので古い WebP を catch しない。詳細:
+   key は `{base_key}#pin:{source_id}` に変わる。直接ページなら source_id は
+   kind/rel/entry/page/mtime/size の compact 表現、子のフォルダ / ZIP / PDF / ZipDir に
+   さらに代表 pin があれば、最終ページまでの経路 hash + leaf identity になる。pin の
+   付け替え、途中コンテナ、target ファイルの変更で source_id が自動的に変わるので
+   古い WebP を catch しない。固定 leaf が ZipEntry / PdfPage なら、そのページの編集
+   preview も親コンテナまで引き継ぐ。詳細:
    [virtual-folders.md §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)。
 2. **自動代表選定 (`resolve_folder_thumb_image`)** — Settings の `folder_thumb_sort`
    (Numeric / Modified / etc.) + `folder_thumb_depth` (再帰深さ) で先頭画像を選び、

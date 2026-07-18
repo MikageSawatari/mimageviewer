@@ -54563,8 +54563,8 @@ fn pin_source_compatible_with_container(
     }
 }
 
-/// cascade 解決: Folder→Folder の pin 連鎖を最終 leaf (非 Folder か pin 無し Folder)
-/// まで辿って `ResolvedPinTarget` を返す。
+/// cascade 解決: Folder / ZipFile / PdfFile / ZipDir の pin 連鎖を最終 leaf
+/// (固定ページ等、または pin 無しコンテナ) まで辿って `ResolvedPinTarget` を返す。
 ///
 /// 動機: A が B (Folder) を pin、B が C (Image) を pin している場合、ユーザーは A の
 /// 親 grid で A のタイルが C を表示することを期待する。cascade なしだと A の pin は
@@ -54573,7 +54573,7 @@ fn pin_source_compatible_with_container(
 /// 動作:
 /// - 1 段目: `pin_map` 由来の immediate_source を使う (UI スレッドで lookup 済み)
 /// - 2 段目以降: `pin_db` で直接 DB lookup (cheap single-row)
-/// - 終了条件: 非 Folder kind に到達 / pin 無し Folder に到達 / サイクル検出 /
+/// - 終了条件: 非コンテナ kind に到達 / pin 無しコンテナに到達 / サイクル検出 /
 ///   `max_depth` 超過
 /// - サイクル A↔B の場合は visited HashSet で 2 周目を検知して停止
 ///
@@ -54582,9 +54582,9 @@ fn pin_source_compatible_with_container(
 /// 同じ上限。0 のとき cascade は完全に無効化される (= 旧 Phase B 互換挙動)。
 ///
 /// 返値: 最終 leaf の `ResolvedPinTarget`。
-/// - 非 Folder leaf (Image / Video / ZipEntry / PdfPage / ZipFirstImage / PdfFirstPage):
+/// - 固定 leaf (Image / Video / ZipEntry / PdfPage):
 ///   そのまま target として使う
-/// - pin 無し Folder leaf: `FolderRepresentative` strategy で auto-pick する
+/// - pin 無しコンテナ leaf: Folder / ZIP / PDF / ZipDir ごとの strategy で auto-pick する
 fn resolve_pin_target_cascaded(
     container: &std::path::Path,
     immediate_source: &crate::folder_thumb_pins::FolderPinSource,
@@ -54609,11 +54609,12 @@ fn resolve_pin_target_cascaded(
 ///
 /// 動作:
 /// - `pin_map` から container のピン source を引く。無ければ `base_req` をそのまま返す。
-/// - **Folder→Folder→... の cascade を最終 leaf まで追跡** (`resolve_pin_target_cascaded`)。
-///   サブフォルダがさらに pin を持っていれば再帰的にそちらの target を採用する。
+/// - **Folder / ZipFile / PdfFile / ZipDir の cascade を最終 leaf まで追跡**
+///   (`resolve_pin_target_cascaded`)。子コンテナがさらに pin を持っていれば、その固定ページを
+///   再帰的に採用する。
 /// - target 種別に応じて `path` / `zip_entry` / `pdf_page` / `resolve_override` を上書き。
-/// - `cache_key_override` は `{base_key}#pin:{leaf_source_id}` にし、cascade の leaf 内容が
-///   変わると key も変わって古い WebP を catch しない。
+/// - `cache_key_override` は `{base_key}#pin:{source_id}` にする。cascade 時の source_id は
+///   経路 hash + leaf identity なので、途中または leaf が変わると古い WebP を catch しない。
 /// - `mtime` / `file_size` を leaf 自身のものに差し替える (= catalog の hit 判定が leaf
 ///   metadata に対して行われる)。
 ///
@@ -54653,9 +54654,9 @@ fn apply_folder_thumb_pin(
         ));
         return base_req;
     }
-    // cascade 解決: Folder→Folder の pin 連鎖を leaf まで辿る。max_depth は base_req の
-    // folder_thumb_depth (= Settings.folder_thumb_depth) に揃える。pin 無し時の
-    // `resolve_folder_thumb_image` のサブフォルダ探索上限と同じ仕様にして UX を統一する。
+    // cascade 解決: Folder / ZipFile / PdfFile / ZipDir の pin 連鎖を leaf まで辿る。
+    // max_depth は base_req の folder_thumb_depth (= Settings.folder_thumb_depth) に揃える。
+    // pin 無し時の `resolve_folder_thumb_image` のサブフォルダ探索上限と同じ仕様にする。
     let Some(resolved) = resolve_pin_target_cascaded(
         container,
         source,

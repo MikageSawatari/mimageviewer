@@ -10399,6 +10399,178 @@ mod favorite_adjustment_defaults_tests {
         assert!(req.edit_preview_validate_container);
     }
 
+    #[test]
+    fn folder_pin_to_zip_file_cascades_to_the_zips_pinned_page() {
+        let app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let zip_path = folder.join("book.zip");
+        std::fs::write(&zip_path, b"PK\x03\x04 test").unwrap();
+        let item = GridItem::Folder(folder.clone());
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.zip".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::ZipFile,
+            },
+        );
+        let zip_page = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "chapter/page02.jpg".to_string(),
+        };
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&zip_path, &zip_page)
+            .unwrap();
+
+        let req = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &std::collections::HashMap::new(),
+            None,
+            Some(&folder),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("folder pin should follow the selected ZIP file's own representative pin");
+
+        assert_eq!(req.path, zip_path);
+        assert_eq!(req.zip_entry.as_deref(), Some("chapter/page02.jpg"));
+        assert_eq!(req.resolve_override, None);
+        assert_eq!(
+            req.edit_preview_key.as_deref(),
+            Some(crate::adjustment_db::zip_entry_key(&req.path, "chapter/page02.jpg").as_str())
+        );
+        assert!(req.edit_preview_validate_container);
+        let pinned_key = req.cache_key_override.clone().unwrap();
+        assert!(pinned_key.contains("#pin:cascade:"), "{pinned_key}");
+        assert!(pinned_key.contains(":zipentry||chapter/page02.jpg|-|"));
+
+        let existing_keys = folder_thumb_existing_keys_for(
+            &item,
+            Some((1, 2)),
+            &pins,
+            app.folder_thumb_pin_db.as_deref(),
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            false,
+        );
+        assert!(existing_keys.contains(&pinned_key));
+
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &req.path,
+                &crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "chapter/page03.jpg".to_string(),
+                },
+            )
+            .unwrap();
+        let changed = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &std::collections::HashMap::new(),
+            None,
+            Some(&folder),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(changed.zip_entry.as_deref(), Some("chapter/page03.jpg"));
+        assert_ne!(changed.cache_key_override, req.cache_key_override);
+    }
+
+    #[test]
+    fn folder_pin_to_pdf_file_cascades_to_the_pdfs_pinned_page() {
+        let app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let pdf_path = folder.join("book.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4 test").unwrap();
+        let item = GridItem::Folder(folder.clone());
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.pdf".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::PdfFile,
+            },
+        );
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &pdf_path,
+                &crate::folder_thumb_pins::FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 7,
+                },
+            )
+            .unwrap();
+
+        let req = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &std::collections::HashMap::new(),
+            None,
+            Some(&folder),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("folder pin should follow the selected PDF file's own representative pin");
+
+        assert_eq!(req.path, pdf_path);
+        assert_eq!(req.pdf_page, Some(7));
+        assert_eq!(req.zip_entry, None);
+        assert_eq!(
+            req.edit_preview_key.as_deref(),
+            Some(crate::adjustment_db::zip_entry_key(&req.path, "page_7").as_str())
+        );
+        assert!(req.edit_preview_validate_container);
+        let pinned_key = req.cache_key_override.clone().unwrap();
+        assert!(pinned_key.contains("#pin:cascade:"), "{pinned_key}");
+        assert!(pinned_key.contains(":pdfpage||-|7|"));
+
+        let existing_keys = folder_thumb_existing_keys_for(
+            &item,
+            Some((1, 2)),
+            &pins,
+            app.folder_thumb_pin_db.as_deref(),
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            false,
+        );
+        assert!(existing_keys.contains(&pinned_key));
+    }
+
     /// 読書位置レジュームはネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない。
     /// idx は階層ローカルだが、再オープン時はルート階層 items に対して検証されるため、
     /// 同 idx の別アイテムへ誤って「続きから」着地し得る (レビュー P3)。
@@ -10678,12 +10850,14 @@ mod favorite_adjustment_defaults_tests {
             Some(crate::adjustment_db::zip_entry_key(&zip_path, "bookA/ch02/page01.jpg").as_str())
         );
         assert!(req.edit_preview_validate_container);
+        let pinned_key = req.cache_key_override.as_deref().unwrap();
         assert!(
-            req.cache_key_override
-                .as_deref()
-                .is_some_and(|key| key.contains("#pin:zipentry||bookA/ch02/page01.jpg|-|")),
-            "cache key should use cascaded leaf source id: {:?}",
-            req.cache_key_override
+            pinned_key.contains("#pin:cascade:"),
+            "cache key should identify the complete cascade route: {pinned_key}"
+        );
+        assert!(
+            pinned_key.contains(":zipentry||bookA/ch02/page01.jpg|-|"),
+            "cache key should retain the cascaded leaf source id: {pinned_key}"
         );
 
         let unresolved = make_load_request(

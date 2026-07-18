@@ -381,10 +381,12 @@ cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解�
   pin があれば `LoadRequest` を target アイテム用の形 (path/zip_entry/pdf_page/
   resolve_override) に書き換える。
 - **キャッシュキーの例外規則**: pin 適用後は `{base_key}#pin:{source_id}` の形に
-  なる。`source_id` は kind/rel/entry/page/mtime/size を `|` 連結した compact 表現で、
-  pin の付け替え / target ファイルの mtime/size 変化で自動的に変わる
-  (= 古い WebP を catch しない)。`existing_keys` には base + pinned 両形を入れて
-  `delete_missing` の巻き添え削除を防ぐ (`folder_thumb_existing_keys_for`)。
+  なる。直接 leaf の `source_id` は kind/rel/entry/page/mtime/size を `|` 連結した
+  compact 表現。cascade 時は途中コンテナも含む経路 identity を SHA-256 で固定長にして
+  `cascade:{route_hash}:{leaf_source_id}` とする。pin の付け替え、途中コンテナ、target
+  ファイルの mtime/size 変化で自動的に変わり、別 ZIP/PDF の同名ページでも古い WebP を
+  catch しない。`existing_keys` には base + pinned 両形を入れて `delete_missing` の
+  巻き添え削除を防ぐ (`folder_thumb_existing_keys_for`)。
 - **Video ピンの特殊経路**: pin source が動画の場合、`thumb_loader` 側で動画
   Shell API を直接使うとピン位置の WebP が出ないため、folder load 時に
   `seed_folder_video_pin_thumbs` が `video_pins` DB から WebP を読んで pinned key
@@ -399,20 +401,22 @@ cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解�
     Shell 遅延でフォルダ移動が固まるため。これにより seed は軽い DB→DB コピーのみに
     なり UI スレッドのヒッチが消える。動画を folder pin したいユーザーは先にフルスクリーン
     で `P` キー / HUD ピンボタンでフレームを保存する。
-- **Folder / ZipDir source の cascade 解決** (v0.9.x+ / ZipDir は v1.3.x+): pin source が
-  サブフォルダ (`FolderRepresentative`) または ZIP 内コンテナ (`ZipDirRepresentative`) の
-  場合、`resolve_pin_target_cascaded` が `folder_thumb_pins.db` を順に lookup して
-  **Folder→Folder / ZipDir→ZipDir の pin 連鎖を最終 leaf まで辿る**。例: A が B
-  (Folder) を pin、B が C (Image) を pin → A の親グリッドでの A のタイルは C を表示する。
-  ZIP 内でも、外側 root + ZipDir prefix を合成した仮想 container key で lookup し、子の
-  `ZipEntry` / `ZipDir` pin を通常フォルダと同じ規則で辿る。
+- **Folder / ZipFile / PdfFile / ZipDir source の cascade 解決** (v0.9.x+ / ZipDir は
+  v1.3.x+): pin source がサブフォルダ、ZIP、PDF、ZIP 内コンテナの場合、
+  `resolve_pin_target_cascaded` が `folder_thumb_pins.db` を順に lookup して、子コンテナが
+  持つ代表 pin の最終 leaf まで辿る。例: A が B (Folder) を pin、B が C (Image) を pin
+  → A の親グリッドでの A のタイルは C を表示する。同様に、親フォルダが book.zip /
+  book.pdf を pin し、その ZIP/PDF が page 2 を pin していれば、親も page 2 とその編集
+  preview を表示する。子側に pin がなければ従来どおり ZIP の先頭画像 / PDF のページ 0
+  へフォールバックする。ZIP 内でも、外側 root + ZipDir prefix を合成した仮想 container
+  key で lookup し、子の `ZipEntry` / `ZipDir` pin を同じ規則で辿る。
   cascade の段数上限は `Settings.folder_thumb_depth` (規定 3、範囲 0〜10) に揃える
   (= `resolve_folder_thumb_image` のサブフォルダ探索深度と同じ仕様)。
   - サイクル検出: `visited` HashSet で normalize_keep_drive 済みパスを記録。A↔B 循環は
     2 周目で検知して停止し、その時点の Folder を `FolderRepresentative` で auto-pick する。
   - 0 を指定すると cascade は無効化される (= 旧 Phase B 互換挙動)。
-  - `pinned_key` は **cascade leaf の source_id** を埋める。連鎖途中の pin が書き換わると
-    leaf の identity が変わって cache key も変わるので、stale cache を catch しない。
+  - `pinned_key` は **cascade 経路 hash + leaf source_id** を埋める。連鎖途中のコンテナや
+    pin が書き換わっても cache key が変わるので、stale cache を catch しない。
   - `folder_thumb_existing_keys_for` も同じ cascade を実行して existing_keys に leaf
     pinned_key を含める。これをしないと delete_missing が cascade 由来の cache 行を
     毎ロード掃除してしまう (Phase D 後のバグ修正 / 二重実装で識別)。

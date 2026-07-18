@@ -27,6 +27,7 @@
 //! 出ないようにする。
 
 use rusqlite::{Connection, Result as SqlResult, params};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -621,9 +622,11 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
 /// UI スレッドからは `pin_db.lookup(p)` を、worker スレッドからは `pin_db.lookup(p)` を
 /// (Arc 経由) ラップして渡す。
 ///
-/// 仕様: `Folder` kind の resolve 結果を受け取ったら `lookup` でその container 自身の
-/// pin を取り、見つかれば cascade 続行。非 Folder kind に到達 / lookup 失敗 / サイクル /
-/// `max_depth` 超過のいずれかで停止し、最後の `ResolvedPinTarget` を返す。
+/// 仕様: 解決結果が子コンテナ (`Folder` / `ZipFirstImage` /
+/// `PdfFirstPage` / `ZipDirRepresentative`) なら `lookup` でそのコンテナ自身の
+/// pin を取り、見つかれば cascade 続行。非コンテナ kind に到達 / lookup 失敗 /
+/// サイクル / `max_depth` 超過のいずれかで停止し、最後の
+/// `ResolvedPinTarget` を返す。
 ///
 /// `max_depth` は **追加 cascade 段数** (= immediate を 0 段目とする)。例えば `max_depth=3`
 /// で A→B→C→D の 3 段 cascade まで追跡可能。`Settings.folder_thumb_depth` と揃える。
@@ -641,19 +644,34 @@ where
     let mut current_container: PathBuf = container.to_path_buf();
     let mut current_source: FolderPinSource = immediate_source.clone();
     let mut cascades_remaining = max_depth;
+    let mut route_source_ids: Vec<String> = Vec::new();
+    let mut followed_child_pin = false;
     loop {
         let resolved = resolve_pin_target(&current_container, &current_source)?;
+        route_source_ids.push(resolved.source_id.clone());
         if !matches!(
             resolved.kind,
-            ResolvedKind::Folder | ResolvedKind::ZipDirRepresentative
+            ResolvedKind::Folder
+                | ResolvedKind::ZipFirstImage
+                | ResolvedKind::PdfFirstPage
+                | ResolvedKind::ZipDirRepresentative
         ) {
-            return Some(resolved);
+            return Some(finalize_cascaded_source_id(
+                resolved,
+                &route_source_ids,
+                followed_child_pin,
+            ));
         }
         if cascades_remaining == 0 {
-            return Some(resolved);
+            return Some(finalize_cascaded_source_id(
+                resolved,
+                &route_source_ids,
+                followed_child_pin,
+            ));
         }
         let next_container = match resolved.kind {
             ResolvedKind::Folder => resolved.abs_path.clone(),
+            ResolvedKind::ZipFirstImage | ResolvedKind::PdfFirstPage => resolved.abs_path.clone(),
             ResolvedKind::ZipDirRepresentative => {
                 zip_dir_container_key(&resolved.abs_path, resolved.zip_dir_prefix.as_deref()?)
             }
@@ -665,10 +683,18 @@ where
                 "folder_thumb_pin: cascade cycle at {} — stopping",
                 next_container.display(),
             ));
-            return Some(resolved);
+            return Some(finalize_cascaded_source_id(
+                resolved,
+                &route_source_ids,
+                followed_child_pin,
+            ));
         }
         let Some(next_source) = lookup(&next_container) else {
-            return Some(resolved);
+            return Some(finalize_cascaded_source_id(
+                resolved,
+                &route_source_ids,
+                followed_child_pin,
+            ));
         };
         // 次の container 種別ごとの compat 規則を inline で適用。
         let compatible = match (resolved.kind, &next_source) {
@@ -687,6 +713,19 @@ where
                 zip_rel.is_empty()
             }
             (ResolvedKind::ZipDirRepresentative, _) => false,
+            // ZIP ファイル自身の pin は、その ZIP 内のページ / 仮想サブコンテナだけ。
+            (ResolvedKind::ZipFirstImage, FolderPinSource::ZipEntry { zip_rel, .. }) => {
+                zip_rel.is_empty()
+            }
+            (ResolvedKind::ZipFirstImage, FolderPinSource::ZipDir { zip_rel, .. }) => {
+                zip_rel.is_empty()
+            }
+            (ResolvedKind::ZipFirstImage, _) => false,
+            // PDF ファイル自身の pin は、その PDF 内のページだけ。
+            (ResolvedKind::PdfFirstPage, FolderPinSource::PdfPage { pdf_rel, .. }) => {
+                pdf_rel.is_empty()
+            }
+            (ResolvedKind::PdfFirstPage, _) => false,
             _ => false,
         };
         if !compatible {
@@ -694,13 +733,40 @@ where
                 "folder_thumb_pin: cascade incompatible source at {} — stopping",
                 next_container.display(),
             ));
-            return Some(resolved);
+            return Some(finalize_cascaded_source_id(
+                resolved,
+                &route_source_ids,
+                followed_child_pin,
+            ));
         }
         visited.insert(next_key);
         current_container = next_container;
         current_source = next_source;
+        followed_child_pin = true;
         cascades_remaining -= 1;
     }
+}
+
+/// cascade 経路全体を pinned cache key の identity に含める。
+///
+/// leaf の `source_id` だけでは、別の ZIP/PDF/サブフォルダが同名ページと同一
+/// metadata を持つと、親の pin 付け替え後も同じ cache key になり得る。経路中の
+/// source identity 全てを SHA-256 で固定長にし、診断用に leaf identity も末尾へ残す。
+fn finalize_cascaded_source_id(
+    mut resolved: ResolvedPinTarget,
+    route_source_ids: &[String],
+    followed_child_pin: bool,
+) -> ResolvedPinTarget {
+    if followed_child_pin {
+        let mut hasher = Sha256::new();
+        for source_id in route_source_ids {
+            hasher.update((source_id.len() as u64).to_le_bytes());
+            hasher.update(source_id.as_bytes());
+        }
+        let route_hash = format!("{:x}", hasher.finalize());
+        resolved.source_id = format!("cascade:{route_hash}:{}", resolved.source_id);
+    }
+    resolved
 }
 
 /// DB 行から `FolderPinSource` を組み立てる。検査に通らない行は `None` を返し、
@@ -1536,6 +1602,100 @@ mod tests {
         assert_eq!(resolved.kind, ResolvedKind::ZipEntry);
         assert_eq!(resolved.abs_path, zip);
         assert_eq!(resolved.zip_entry.as_deref(), Some("bookA/page01.jpg"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cascade_zipfile_follows_its_own_page_pin_and_keeps_route_identity() {
+        use std::io::Write;
+        let tmp =
+            std::env::temp_dir().join(format!("miv_pin_cascade_zipfile_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let zip_a = tmp.join("book-a.zip");
+        let zip_b = tmp.join("book-b.zip");
+        for zip in [&zip_a, &zip_b] {
+            std::fs::File::create(zip)
+                .unwrap()
+                .write_all(b"PK\x03\x04 dummy")
+                .unwrap();
+        }
+        let inner = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "chapter/page02.jpg".to_string(),
+        };
+        let resolve = |rel: &str, max_depth| {
+            resolve_pin_target_cascaded_via(
+                &tmp,
+                &FolderPinSource::File {
+                    rel: rel.to_string(),
+                    kind: FileKind::ZipFile,
+                },
+                |_| Some(inner.clone()),
+                max_depth,
+            )
+            .unwrap()
+        };
+
+        let resolved_a = resolve("book-a.zip", 1);
+        assert_eq!(resolved_a.kind, ResolvedKind::ZipEntry);
+        assert_eq!(resolved_a.abs_path, zip_a);
+        assert_eq!(resolved_a.zip_entry.as_deref(), Some("chapter/page02.jpg"));
+        assert!(resolved_a.source_id.starts_with("cascade:"));
+        assert!(
+            resolved_a
+                .source_id
+                .contains(":zipentry||chapter/page02.jpg|-|")
+        );
+
+        let resolved_b = resolve("book-b.zip", 1);
+        assert_ne!(
+            resolved_a.source_id, resolved_b.source_id,
+            "同名 entry と同じ metadata でも、中間 ZIP が違えば cache identity を分ける"
+        );
+
+        let depth_zero = resolve("book-a.zip", 0);
+        assert_eq!(depth_zero.kind, ResolvedKind::ZipFirstImage);
+        assert_eq!(depth_zero.zip_entry, None);
+        assert!(depth_zero.source_id.starts_with("zipfile|book-a.zip|"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cascade_pdffile_follows_its_own_page_pin() {
+        use std::io::Write;
+        let tmp =
+            std::env::temp_dir().join(format!("miv_pin_cascade_pdffile_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pdf = tmp.join("book.pdf");
+        std::fs::File::create(&pdf)
+            .unwrap()
+            .write_all(b"%PDF-1.4 dummy")
+            .unwrap();
+        let immediate = FolderPinSource::File {
+            rel: "book.pdf".to_string(),
+            kind: FileKind::PdfFile,
+        };
+
+        let resolved = resolve_pin_target_cascaded_via(
+            &tmp,
+            &immediate,
+            |p| {
+                (p == pdf).then(|| FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 7,
+                })
+            },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.kind, ResolvedKind::PdfPage);
+        assert_eq!(resolved.abs_path, pdf);
+        assert_eq!(resolved.pdf_page, Some(7));
+        assert!(resolved.source_id.starts_with("cascade:"));
+        assert!(resolved.source_id.contains(":pdfpage||-|7|"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
