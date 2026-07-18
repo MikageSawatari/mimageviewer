@@ -1694,6 +1694,7 @@ struct ViewerContextBundle {
     selected: Option<usize>,
     scroll_offset_y: f32,
     scroll_to_selected: bool,
+    pending_grid_scroll: Option<GridScrollIntent>,
     requested: std::collections::HashMap<usize, bool>,
     keep_range: (usize, usize),
     keep_set: std::collections::HashSet<usize>,
@@ -1935,6 +1936,7 @@ impl ViewerContextBundle {
             selected: None,
             scroll_offset_y: 0.0,
             scroll_to_selected: false,
+            pending_grid_scroll: None,
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
@@ -5679,6 +5681,12 @@ fn detached_window_references_removed(
         .is_some_and(|bundle| viewer_bundle_references_removed(bundle, matches_key))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridScrollIntent {
+    Top,
+    Bottom,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -5732,6 +5740,9 @@ pub struct App {
     pub(crate) last_viewport_h: f32,
     /// true のとき選択セルが見えるようにオフセットを調整する
     pub(crate) scroll_to_selected: bool,
+    /// 選択を変えず、現在レイアウトで確定した先頭 / 末尾 offset へ移す要求。
+    /// `render_grid` が同フレームの viewport と行高から max offset を求めて消費する。
+    pub(crate) pending_grid_scroll: Option<GridScrollIntent>,
 
     /// ウィンドウ状態保存用：最後に確認した outer_rect（最小化・最大化時は更新しない）
     pub(crate) last_outer_rect: Option<egui::Rect>,
@@ -9136,6 +9147,7 @@ impl App {
             auto_aspect_cache_db,
             last_viewport_h: 600.0,
             scroll_to_selected: false,
+            pending_grid_scroll: None,
             last_outer_rect: None,
             last_inner_size: None,
             last_window_title: None,
@@ -11157,6 +11169,7 @@ impl App {
             selected,
             scroll_offset_y,
             scroll_to_selected,
+            pending_grid_scroll,
             requested,
             keep_range,
             keep_set,
@@ -11331,6 +11344,7 @@ impl App {
         swap_field!(selected);
         swap_field!(scroll_offset_y);
         swap_field!(scroll_to_selected);
+        swap_field!(pending_grid_scroll);
         swap_field!(requested);
         swap_field!(keep_range);
         swap_field!(keep_set);
@@ -13146,6 +13160,7 @@ impl App {
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
+        self.pending_grid_scroll = None;
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.search_filter = None;
         self.search_filter_origin_folder = None;
@@ -16026,6 +16041,7 @@ impl App {
         self.details_image_dims_state = LazyColumnState::Disabled;
         self.selected = None;
         self.scroll_offset_y = 0.0;
+        self.pending_grid_scroll = None;
         // 変換キャッシュの override は「current_folder == そのキャッシュ ZIP」の間だけ
         // 有効なペア。**別の ZIP へ遷移するならここで同期的に破棄する** (キャッシュ経由で
         // 開く経路は open_archive_via_cache / 変換完了 pending_nav が load 後に再設定する)。
@@ -16501,6 +16517,7 @@ impl App {
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
+        self.pending_grid_scroll = None;
         self.scroll_hint
             .store(0, std::sync::atomic::Ordering::Relaxed);
         // レーティングフィルタ有効時、rebuild_visible_indices が item ごとに get_rating で
@@ -17849,6 +17866,7 @@ impl App {
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
+        self.pending_grid_scroll = None;
         self.scroll_hint.store(0, Ordering::Relaxed);
 
         self.install_new_items(items, image_metas);
@@ -30951,6 +30969,7 @@ impl App {
             selected,
             scroll_offset_y,
             scroll_to_selected,
+            pending_grid_scroll,
             requested,
             keep_range,
             keep_set,
@@ -31127,6 +31146,7 @@ impl App {
             selected,
             scroll_offset_y,
             scroll_to_selected,
+            pending_grid_scroll,
             keep_range,
             keep_set,
             thumbnail_eviction_generation,
@@ -36052,6 +36072,7 @@ impl App {
                 self.rebuild_visible_indices();
                 self.selected = None;
                 self.scroll_offset_y = 0.0;
+                self.pending_grid_scroll = None;
                 self.search_pending = None;
                 self.refresh_color_filter_for_scope_change(ctx);
             }

@@ -159,6 +159,7 @@ consume する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させ�
 | <kbd>Delete</kbd> | チェック済み、または選択中の実ファイル / 実フォルダを削除 (通常はゴミ箱。ZIP/PDF 内ページなど仮想項目は対象外) |
 | <kbd>F11</kbd> | メインウィンドウを最大化 ⇔ 元のサイズに復元する (`toggle_main_window_maximized` → `ViewportCommand::Maximized`)。Action: `GridToggleMaximize`。フルスクリーン中は F11 が window/全画面切替 (フルスクリーン共通表参照) なので、この最大化トグルは通常 (グリッド) 表示時のみ |
 | 標準キーなし（リング / ジェスチャ / マウス / X リング専用） | `CloseMainWindow` はメインウィンドウの [×] と同じ close request を送り、タスクトレイ常駐設定が有効ならトレイへ格納する。`QuitApplication` は明示終了フラグを立て、常駐設定にかかわらず通常の保存・終了処理を通ってアプリを終了する。いずれもグリッド文脈だけの `RingActionId` で、画像 / 動画の `CloseFullscreen` とは別操作。通常キーへは割り当てず、操作カスタマイズのリング系候補として提供する |
+| 標準キーなし（リング / ジェスチャ / マウス / X リング専用） | `GridScrollTop` / `GridScrollBottom` は、選択・チェック・最後に選択した画像を変えず、現在の一覧だけを先頭 / 末尾へスクロールする。`GridMoveFirst` / `GridMoveLast`（既定 Home / End）の選択移動とは別操作。実行時は pending intent を立て、サムネイル / 詳細表示の同フレームの行高と viewport から最大 offset が確定した後に適用する |
 | <kbd>F12</kbd> | 画像・動画ビューアの別ウィンドウモード ON/OFF を切り替える。静止画 / ZIP画像 / PDFページは detached viewport、動画は同じ detached viewport の child native presenter で表示する |
 | マウス左ドラッグ | グリッドのセルを掴んでエクスプローラ等へファイル D&D 送出 (コピー)。複数チェック選択時はその実パス群をまとめてドラッグ。フォルダ / ZIP・PDF 本体 / 変換前アーカイブも対象。ZIP/PDF 内画像 (仮想フォルダ) とドライブ一覧は対象外 |
 | マウス戻る / 進む / ホイールクリック | `Settings.ring_shortcuts.mouse_buttons_grid` に従い、物理戻る / 進むボタンとホイールクリックを個別に割り当てる。新規環境と既定リセットは戻る / 進むがフォルダ履歴、ホイールクリックは未割り当て。既存環境は初回ダイアログで標準 / 従来どおりを選ぶまで、戻る / 進むのみ従来互換の Ctrl+↑ / Ctrl+↓ 相当 |

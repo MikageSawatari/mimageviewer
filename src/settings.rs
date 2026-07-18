@@ -8348,6 +8348,7 @@ mod tests {
             s.ring_shortcuts.mouse_buttons_grid.middle =
                 crate::ring_shortcut::RingActionId::QuitApplication;
             s.ring_shortcuts.grid.slots[0] = crate::ring_shortcut::RingActionId::CloseMainWindow;
+            s.ring_shortcuts.grid.slots[1] = crate::ring_shortcut::RingActionId::GridScrollTop;
             s.ring_shortcuts.mouse_buttons_image.forward =
                 crate::ring_shortcut::RingActionId::ImageSlideshow;
             s.ring_shortcuts.mouse_buttons_image.middle =
@@ -8648,6 +8649,11 @@ mod tests {
                 loaded.ring_shortcuts.grid.slots[0],
                 crate::ring_shortcut::RingActionId::CloseMainWindow,
                 "grid close-main ring action should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.grid.slots[1],
+                crate::ring_shortcut::RingActionId::GridScrollTop,
+                "grid scroll-top ring action should survive roundtrip"
             );
             assert_eq!(
                 loaded.ring_shortcuts.mouse_buttons_image.forward,

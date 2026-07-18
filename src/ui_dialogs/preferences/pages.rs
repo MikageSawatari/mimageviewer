@@ -1015,6 +1015,10 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
         RingActionId::QuitApplication => {
             "タスクトレイ常駐設定にかかわらず、保存処理を行ってアプリを終了します"
         }
+        RingActionId::GridScrollTop => "選択とチェックを変えず、一覧だけを先頭までスクロールします",
+        RingActionId::GridScrollBottom => {
+            "選択とチェックを変えず、一覧だけを末尾までスクロールします"
+        }
         _ => action.label_for_context(context),
     }
 }

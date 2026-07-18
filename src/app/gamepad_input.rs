@@ -4,7 +4,7 @@ use eframe::egui;
 
 #[cfg(windows)]
 use super::ViewerPresentation;
-use super::{App, FolderNavMode, GridContainerOpenMode};
+use super::{App, FolderNavMode, GridContainerOpenMode, GridScrollIntent};
 use crate::adjustment::PostFilter;
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
@@ -4508,6 +4508,14 @@ impl App {
                     GridContainerOpenMode::PageList,
                     source,
                 ),
+            RingActionId::GridScrollTop if context == RingShortcutContext::Grid => {
+                self.request_grid_scroll(ctx, GridScrollIntent::Top, source);
+                None
+            }
+            RingActionId::GridScrollBottom if context == RingShortcutContext::Grid => {
+                self.request_grid_scroll(ctx, GridScrollIntent::Bottom, source);
+                None
+            }
             RingActionId::GridColumnCount1 if context == RingShortcutContext::Grid => {
                 self.apply_ring_grid_column_count(1);
                 None
@@ -4848,6 +4856,23 @@ impl App {
             }
             RingShortcutContext::Grid => {}
         }
+    }
+
+    fn request_grid_scroll(
+        &mut self,
+        ctx: &egui::Context,
+        intent: GridScrollIntent,
+        source: &'static str,
+    ) {
+        self.pending_grid_scroll = Some(intent);
+        self.bump_input_seq(
+            source,
+            Some(match intent {
+                GridScrollIntent::Top => "grid_scroll_top",
+                GridScrollIntent::Bottom => "grid_scroll_bottom",
+            }),
+        );
+        request_ring_overlay_repaint(ctx);
     }
 
     fn apply_ring_minimize_window(&mut self, ctx: &egui::Context, context: RingShortcutContext) {

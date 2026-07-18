@@ -337,29 +337,6 @@
 - v2.5.0 裁定: native 動画を含む実機 matrix が必要なため次バージョンへ送る。
 - 規模 / リスク: Medium / P2 candidate。正しい変更境界は各入力経路の `ShortTap` 適用部。
 
-### 4.5 選択を変えず一覧の先頭 / 末尾へスクロールするコマンド
-
-- 出典: mImageViewer 専用スレ 73 (2026-07-18)。「一番上へスクロール」「一番下へ
-  スクロール」コマンドの要望。既存 Home/End (`GridMoveFirst` / `GridMoveLast`) は
-  先頭/末尾項目を選択するため、別操作とする。
-- 仕様:
-  - `GridScrollTop` / `GridScrollBottom` (仮名) をグリッド文脈の操作候補へ追加する。
-    表示名は「一覧の先頭へスクロール」「一覧の末尾へスクロール」。
-  - `selected`、`checked`、Shift 選択 anchor、`last_selected_image` を一切変更しない。
-    `scroll_to_selected` も立てない。スクロール後に選択項目が画面外でもそのまま保持する。
-  - サムネイル / 詳細ビュー、フィルタ、詳細ソート、読書履歴など、現在の実表示順と
-    viewport の最大 offset に対して先頭 `0` / 末尾 `max_offset` へ移動する。
-  - action 実行時には top/bottom の pending request だけを立て、セル高・列数・viewport 高と
-    `max_offset` が確定する `render_grid` 内で適用する。古いレイアウト値や `f32::MAX` を
-    直接 `scroll_offset_y` へ書く実装は避ける。
-  - リング、グリッド用マウスジェスチャ、マウスボタン、ゲームパッド X リングの候補へ追加し、
-    既存 Home/End のキー操作と意味を変えない。
-- 回帰確認: サムネイル/詳細、通常/フィルタ/詳細ソート、空一覧、既に先頭/末尾、
-  列数・UI倍率変更直後で正しい offset になり、選択・チェックが不変であることを確認する。
-- v2.5.0 裁定: 新コマンドとして次バージョンへ送る。
-- 規模 / リスク: Low〜Medium / P2 candidate。新しい pending scroll intent と両描画経路への
-  適用が主な変更。
-
 ## 5. リリース前確認 / 依存更新
 
 ### 5.1 ネイティブ依存

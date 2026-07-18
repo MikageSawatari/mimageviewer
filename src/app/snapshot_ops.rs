@@ -519,6 +519,7 @@ impl App {
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
+        self.pending_grid_scroll = None;
         self.selected = None;
         // items_generation bump + invalidate (= Codex P1-1)
         self.items_generation = self.items_generation.wrapping_add(1);

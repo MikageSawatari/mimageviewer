@@ -477,6 +477,7 @@ mod tests {
                 .to_string(),
         ];
         settings.ring_shortcuts.grid.slots[0] = RingActionId::CloseMainWindow;
+        settings.ring_shortcuts.grid.slots[1] = RingActionId::GridScrollBottom;
         settings.ring_shortcuts.mouse_buttons_grid.middle = RingActionId::QuitApplication;
         let original = OperationCustomizeBundle::from_settings(&settings).with_label("共有用");
         let mut json: serde_json::Value =
@@ -488,6 +489,10 @@ mod tests {
         assert_eq!(
             parsed.bundle.ring_shortcuts.grid.slots[0],
             RingActionId::CloseMainWindow
+        );
+        assert_eq!(
+            parsed.bundle.ring_shortcuts.grid.slots[1],
+            RingActionId::GridScrollBottom
         );
         assert_eq!(
             parsed.bundle.ring_shortcuts.mouse_buttons_grid.middle,

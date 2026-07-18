@@ -32245,6 +32245,58 @@ fn grid_close_and_quit_ring_actions_use_root_close_with_distinct_tray_intent() {
 }
 
 #[test]
+fn grid_scroll_ring_actions_queue_layout_intent_without_changing_selection() {
+    let mut app = phase_c_support::setup_app();
+    app.items = vec![
+        GridItem::Image(PathBuf::from("C:/photos/a.jpg")),
+        GridItem::Image(PathBuf::from("C:/photos/b.jpg")),
+        GridItem::Image(PathBuf::from("C:/photos/c.jpg")),
+    ];
+    app.visible_indices = vec![0, 1, 2];
+    app.selected = Some(1);
+    app.checked = [0usize, 2].into_iter().collect();
+    app.scroll_offset_y = 240.0;
+    app.scroll_to_selected = false;
+    app.update_last_selected_image();
+
+    let selected_before = app.selected;
+    let checked_before = app.checked.clone();
+    let sample_before = app
+        .last_selected_thumb_sample
+        .as_ref()
+        .map(|sample| sample.display_name());
+    let ctx = egui::Context::default();
+
+    app.apply_ring_action(
+        &ctx,
+        crate::ring_shortcut::RingShortcutContext::Grid,
+        crate::ring_shortcut::RingActionId::GridScrollTop,
+        "test",
+    );
+    assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Top));
+    assert_eq!(app.scroll_offset_y, 240.0);
+    assert!(!app.scroll_to_selected);
+    assert_eq!(app.selected, selected_before);
+    assert_eq!(app.checked, checked_before);
+    assert_eq!(
+        app.last_selected_thumb_sample
+            .as_ref()
+            .map(|sample| sample.display_name()),
+        sample_before
+    );
+
+    app.apply_ring_action(
+        &ctx,
+        crate::ring_shortcut::RingShortcutContext::Grid,
+        crate::ring_shortcut::RingActionId::GridScrollBottom,
+        "test",
+    );
+    assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
+    assert_eq!(app.selected, selected_before);
+    assert_eq!(app.checked, checked_before);
+}
+
+#[test]
 fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     let mut app = phase_c_support::setup_app();
     app.adjustment_mode = true;

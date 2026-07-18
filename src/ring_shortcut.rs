@@ -518,6 +518,8 @@ pub enum RingActionId {
     GridSelectAll,
     GridOpenSelectedAsPage,
     GridOpenSelectedAsList,
+    GridScrollTop,
+    GridScrollBottom,
     GridColumnCount1,
     GridColumnCount2,
     GridColumnCount3,
@@ -904,6 +906,8 @@ impl RingActionId {
             Self::GridSelectAll => "grid_select_all",
             Self::GridOpenSelectedAsPage => "grid_open_selected_as_page",
             Self::GridOpenSelectedAsList => "grid_open_selected_as_list",
+            Self::GridScrollTop => "grid_scroll_top",
+            Self::GridScrollBottom => "grid_scroll_bottom",
             Self::GridColumnCount1 => "grid_column_count_1",
             Self::GridColumnCount2 => "grid_column_count_2",
             Self::GridColumnCount3 => "grid_column_count_3",
@@ -995,6 +999,8 @@ impl RingActionId {
             "grid_select_all" => Self::GridSelectAll,
             "grid_open_selected_as_page" => Self::GridOpenSelectedAsPage,
             "grid_open_selected_as_list" => Self::GridOpenSelectedAsList,
+            "grid_scroll_top" => Self::GridScrollTop,
+            "grid_scroll_bottom" => Self::GridScrollBottom,
             "grid_column_count_1" => Self::GridColumnCount1,
             "grid_column_count_2" => Self::GridColumnCount2,
             "grid_column_count_3" => Self::GridColumnCount3,
@@ -1143,6 +1149,8 @@ impl RingActionId {
             Self::GridSelectAll => "表示中を全チェック",
             Self::GridOpenSelectedAsPage => "ページを開く",
             Self::GridOpenSelectedAsList => "一覧を開く",
+            Self::GridScrollTop => "一覧の先頭へスクロール",
+            Self::GridScrollBottom => "一覧の末尾へスクロール",
             Self::GridColumnCount1 => "サムネイル 1列",
             Self::GridColumnCount2 => "サムネイル 2列",
             Self::GridColumnCount3 => "サムネイル 3列",
@@ -1212,6 +1220,8 @@ impl RingActionId {
                     | Self::GridSelectAll
                     | Self::GridOpenSelectedAsPage
                     | Self::GridOpenSelectedAsList
+                    | Self::GridScrollTop
+                    | Self::GridScrollBottom
                     | Self::GridColumnCount1
                     | Self::GridColumnCount2
                     | Self::GridColumnCount3
@@ -1316,6 +1326,8 @@ impl RingActionId {
                 Self::GridSelectAll,
                 Self::GridOpenSelectedAsPage,
                 Self::GridOpenSelectedAsList,
+                Self::GridScrollTop,
+                Self::GridScrollBottom,
                 Self::GridColumnCount1,
                 Self::GridColumnCount2,
                 Self::GridColumnCount3,
@@ -2641,6 +2653,43 @@ mod tests {
             );
             assert!(!action.is_valid_for_context(RingShortcutContext::ImageFullscreen));
             assert!(!action.is_valid_for_context(RingShortcutContext::VideoFullscreen));
+        }
+    }
+
+    #[test]
+    fn grid_scroll_actions_round_trip_and_are_grid_only() {
+        let samples = [
+            (
+                RingActionId::GridScrollTop,
+                "grid_scroll_top",
+                "一覧の先頭へスクロール",
+            ),
+            (
+                RingActionId::GridScrollBottom,
+                "grid_scroll_bottom",
+                "一覧の末尾へスクロール",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            assert!(
+                RingActionId::available_for_mouse_button_context(RingShortcutContext::Grid)
+                    .contains(&action)
+            );
+            for context in [
+                RingShortcutContext::ImageFullscreen,
+                RingShortcutContext::VideoFullscreen,
+            ] {
+                assert!(!action.is_valid_for_context(context));
+                assert!(!RingActionId::available_for_context(context).contains(&action));
+            }
         }
     }
 

@@ -9,7 +9,9 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui;
 
-use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget};
+use crate::app::{
+    App, FacetField, GridScrollIntent, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget,
+};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
 use crate::settings::{
@@ -191,6 +193,19 @@ fn snapped_scroll_extent(natural_h: f32, viewport_h: f32, row_h: f32) -> (f32, f
     let raw_max = natural_h - viewport_h;
     let max_offset = (raw_max / row_h).ceil() * row_h;
     (max_offset + viewport_h, max_offset)
+}
+
+fn resolve_grid_scroll_offset(
+    current: f32,
+    max_offset: f32,
+    intent: Option<GridScrollIntent>,
+) -> f32 {
+    let max_offset = max_offset.max(0.0);
+    match intent {
+        Some(GridScrollIntent::Top) => 0.0,
+        Some(GridScrollIntent::Bottom) => max_offset,
+        None => current.clamp(0.0, max_offset),
+    }
 }
 
 fn is_rating_solo(rf: &[bool; 6], idx: usize) -> bool {
@@ -9762,6 +9777,7 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         scroll_to: bool,
+        pending_scroll: Option<GridScrollIntent>,
         spread_pair_cursor_idx: Option<usize>,
     ) -> Option<PathBuf> {
         let avail_w = ui.available_width().max(1.0);
@@ -9837,7 +9853,8 @@ impl App {
                 }
                 let (total_h, max_offset) =
                     snapped_scroll_extent(natural_h, viewport_h, Self::DETAILS_ROW_H);
-                self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
+                self.scroll_offset_y =
+                    resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
 
                 let old_scroll_style = ui.spacing().scroll;
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
@@ -10914,6 +10931,9 @@ impl App {
     pub(crate) fn render_grid(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         let scroll_to = self.scroll_to_selected;
         self.scroll_to_selected = false;
+        // セル寸法がまだ確定しない一時的なフレームでは要求を残し、
+        // 現在レイアウトの最大 offset を求められた時点でだけ消費する。
+        let pending_scroll = self.pending_grid_scroll;
         if self.settings.grid_view_mode != GridViewMode::Details
             && self.details_hover_thumb_viewport_open
         {
@@ -10928,6 +10948,7 @@ impl App {
                 let global_searching =
                     self.items_are_global_search_view && self.global_search.is_searching();
                 if self.items.is_empty() {
+                    self.pending_grid_scroll = None;
                     // ZIP / PDF 非同期列挙中は「読み込み中…」にして待ち状態を明示する。
                     // BS や Ctrl+↑↓ はこの間でも受理され、load_folder 側で pending が
                     // Drop されて worker が cancel する。
@@ -10994,6 +11015,7 @@ impl App {
                 }
 
                 if self.visible_indices.is_empty() {
+                    self.pending_grid_scroll = None;
                     ui.centered_and_justified(|ui| {
                         ui.label(if global_searching {
                             "検索中"
@@ -11053,7 +11075,15 @@ impl App {
                 let spread_pair_cursor_idx = self.main_grid_spread_pair_cursor_idx();
 
                 if self.settings.grid_view_mode == GridViewMode::Details {
-                    return self.render_details_list(ui, ctx, scroll_to, spread_pair_cursor_idx);
+                    let nav = self.render_details_list(
+                        ui,
+                        ctx,
+                        scroll_to,
+                        pending_scroll,
+                        spread_pair_cursor_idx,
+                    );
+                    self.pending_grid_scroll = None;
+                    return nav;
                 }
 
                 let cols = self.settings.grid_cols.max(1);
@@ -11086,7 +11116,9 @@ impl App {
                 // total_h を拡張する。これにより egui と自前の行スナップが一致し振動を防ぐ。
                 // 拡張量は最大 cell_h 未満（端数の補正のみ）。
                 let (total_h, max_offset) = snapped_scroll_extent(natural_h, viewport_h, cell_h);
-                self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
+                self.scroll_offset_y =
+                    resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
+                self.pending_grid_scroll = None;
 
                 let mut nav: Option<PathBuf> = None;
 
@@ -12764,6 +12796,23 @@ mod compute_cell_size_tests {
 
         assert_eq!(total_h, 280.0);
         assert_eq!(max_offset, 0.0);
+    }
+
+    #[test]
+    fn pending_grid_scroll_resolves_against_current_layout_extent() {
+        assert_eq!(
+            resolve_grid_scroll_offset(240.0, 800.0, Some(GridScrollIntent::Top)),
+            0.0
+        );
+        assert_eq!(
+            resolve_grid_scroll_offset(240.0, 800.0, Some(GridScrollIntent::Bottom)),
+            800.0
+        );
+        assert_eq!(resolve_grid_scroll_offset(900.0, 800.0, None), 800.0);
+        assert_eq!(
+            resolve_grid_scroll_offset(240.0, 0.0, Some(GridScrollIntent::Bottom)),
+            0.0
+        );
     }
 }
 
