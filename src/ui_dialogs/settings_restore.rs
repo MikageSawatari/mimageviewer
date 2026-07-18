@@ -562,6 +562,7 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
     let now = SystemTime::now();
     egui::ScrollArea::vertical()
         .max_height(360.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("settings_restore_grid")
                 .num_columns(7)
@@ -989,6 +990,7 @@ fn draw_operation_customize_body(app: &mut App, ui: &mut egui::Ui) {
     let now = SystemTime::now();
     egui::ScrollArea::vertical()
         .max_height(340.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("operation_customize_share_grid")
                 .num_columns(5)

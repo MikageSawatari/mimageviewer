@@ -21159,6 +21159,7 @@ impl App {
                     );
                     egui::ScrollArea::vertical()
                         .max_height(120.0)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for err in &pending.errors {
                                 ui.small(format!("{}: {}", err.label, err.message));

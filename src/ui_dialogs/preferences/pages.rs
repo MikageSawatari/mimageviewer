@@ -1342,6 +1342,7 @@ pub(super) fn draw_operation_assignment_editor_dialog(
                 egui::ScrollArea::vertical()
                     .id_salt("operation_assignment_editor_body")
                     .max_height(available_h)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
                     });
@@ -6408,6 +6409,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
             egui::ScrollArea::vertical()
                 .max_height(200.0)
                 .id_salt("dup_ext_scroll")
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for i in 0..len {
                         ui.horizontal(|ui| {

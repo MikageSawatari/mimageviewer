@@ -373,6 +373,20 @@ impl App {
             .is_some()
     }
 
+    /// 背面入力を止める実ダイアログが現在表示されるか。
+    ///
+    /// 確認なし変換の走査中は state 自体は存在するが Window は描画しないため、
+    /// `archive_convert.is_some()` だけで判定すると変換中の一覧操作まで塞いでしまう。
+    pub(crate) fn archive_convert_dialog_visible(&self) -> bool {
+        self.archive_convert.as_ref().is_some_and(|state| {
+            !archive_convert_window_suppressed(
+                &state.phase,
+                state.suppress_confirm,
+                state.allow_direct_read,
+            )
+        })
+    }
+
     pub(crate) fn attach_archive_convert_deferred_fullscreen(
         &mut self,
         restore_video_tile: bool,

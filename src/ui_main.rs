@@ -3525,6 +3525,7 @@ impl App {
                             .retain(|name, _| row_names.contains(name));
                         egui::ScrollArea::vertical()
                             .max_height(360.0)
+                            .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 for row in rows {
                                     let active = row.name == active_name;

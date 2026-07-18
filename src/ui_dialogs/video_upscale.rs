@@ -325,19 +325,21 @@ impl App {
                     return;
                 }
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for task in &tasks {
-                        render_task_row(
-                            ui,
-                            task,
-                            running_task_id,
-                            running_status,
-                            queue_paused,
-                            &mut action,
-                        );
-                        ui.separator();
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for task in &tasks {
+                            render_task_row(
+                                ui,
+                                task,
+                                running_task_id,
+                                running_status,
+                                queue_paused,
+                                &mut action,
+                            );
+                            ui.separator();
+                        }
+                    });
             });
 
         self.show_video_upscale_tasks = open;

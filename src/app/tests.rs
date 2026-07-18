@@ -1246,6 +1246,8 @@ mod phase_c_support {
     }
 
     /// TempDir を data_dir として差し替え、空の settings で App を構築した結果を保持する。
+    /// 入力ハンドラの大半は通常起動状態を対象にするため、初回セットアップだけは完了済みにする。
+    /// 初回セットアップ固有のテストでは `first_setup_completed = false` を明示する。
     ///
     /// **フィールドの宣言順がそのまま drop 順** (Rust spec: struct fields are dropped in
     /// declaration order)。`App` を最先頭に置いて supervisor join まで完了させたあとで
@@ -1293,7 +1295,8 @@ mod phase_c_support {
             data_dir: tmp.path().to_path_buf(),
             settings: None,
         };
-        let app = App::new_for_test(config);
+        let mut app = App::new_for_test(config);
+        app.settings.first_setup_completed = true;
         AppTestEnv {
             app,
             _guard: guard,
@@ -32550,6 +32553,102 @@ fn settings_restore_blocks_background_dialog_input() {
     assert!(!app.any_dialog_open());
     app.show_settings_restore = true;
     assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+}
+
+#[test]
+fn common_dialog_registry_covers_cache_and_setup_dialogs() {
+    let mut app = phase_c_support::setup_app();
+    assert!(!app.any_dialog_open());
+    assert!(!app.any_modal_dialog_open_for_fullscreen_keys());
+
+    app.show_archive_cache_manager = true;
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+    app.show_archive_cache_manager = false;
+
+    app.cc.show = true;
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+    app.cc.show = false;
+
+    app.tq.show = true;
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+    app.tq.show = false;
+
+    app.show_tray_enabled_notice = true;
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+    app.show_tray_enabled_notice = false;
+
+    app.settings.first_setup_completed = false;
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+}
+
+#[test]
+fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
+    let mut app = phase_c_support::setup_app();
+    app.last_cell_h = 28.0;
+    app.scroll_offset_y = 56.0;
+    assert!(!app.any_dialog_open());
+
+    let ctx = egui::Context::default();
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        )),
+        ..Default::default()
+    };
+    input
+        .events
+        .push(egui::Event::PointerMoved(egui::pos2(80.0, 80.0)));
+    input.events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, -1.0),
+        modifiers: egui::Modifiers::NONE,
+    });
+
+    let _ = ctx.run(input, |ctx| {
+        egui::Window::new("future_dialog_not_in_registry")
+            .fixed_pos(egui::pos2(40.0, 40.0))
+            .fixed_size(egui::vec2(240.0, 160.0))
+            .show(ctx, |ui| {
+                ui.label("dialog body");
+            });
+        assert!(App::floating_ui_blocks_background_scroll(ctx));
+        app.process_scroll(ctx);
+    });
+
+    assert_eq!(app.scroll_offset_y, 56.0);
+}
+
+#[test]
+fn tooltip_layer_does_not_disable_normal_grid_wheel() {
+    let ctx = egui::Context::default();
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        )),
+        ..Default::default()
+    };
+    input
+        .events
+        .push(egui::Event::PointerMoved(egui::pos2(80.0, 80.0)));
+
+    let _ = ctx.run(input, |ctx| {
+        egui::Area::new(egui::Id::new("grid_hover_tooltip"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::pos2(40.0, 40.0))
+            .show(ctx, |ui| {
+                ui.set_min_size(egui::vec2(160.0, 100.0));
+                ui.label("tooltip body");
+            });
+        assert!(!App::floating_ui_blocks_background_scroll(ctx));
+    });
 }
 
 #[test]

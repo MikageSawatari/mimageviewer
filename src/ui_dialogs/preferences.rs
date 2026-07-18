@@ -926,6 +926,7 @@ impl App {
                 egui::ScrollArea::vertical()
                     .id_salt("pref_tree")
                     .max_height(main_height)
+                    .auto_shrink([false, false])
                     .show(&mut left_ui, |ui| {
                         ui.set_min_width(tree_width - 12.0);
                         draw_tree(ui, state);

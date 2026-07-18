@@ -11045,7 +11045,11 @@ impl App {
             || self.text_font_dialog
     }
 
-    pub(crate) fn any_dialog_open(&self) -> bool {
+    /// 背面のメイン UI とフルスクリーン入力を止める共通ダイアログ状態。
+    ///
+    /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
+    /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
+    fn common_modal_dialog_open(&self) -> bool {
         self.show_stats_dialog
             || self.show_favorites_editor
             || self.show_smart_folder_editor
@@ -11070,8 +11074,15 @@ impl App {
             || self.show_context_shortcuts_help
             || self.show_toolbar_reset_confirm
             || self.show_cache_manager
+            || self.show_archive_cache_manager
             || self.show_metadata_cleanup
             || self.metadata_cleanup_pending.is_some()
+            || self.cc.show
+            || self.archive_convert_dialog_visible()
+            || self.video_upscale.is_some()
+            || self.tq.show
+            || !self.settings.first_setup_completed
+            || self.trt_install_state.is_some()
             || self.show_delete_confirm
             || self.edit_bundle_paste_pending.is_some()
             || self.edit_bundle_apply_pending.is_some()
@@ -11079,7 +11090,7 @@ impl App {
             || self.show_pdf_password_dialog
             || self.show_about_dialog
             || self.show_update_dialog
-            || self.show_vst3_manager
+            || self.show_tray_enabled_notice
             || self.slot_save_dialog.is_some()
             || self.export_dialog.is_some()
             || self.export_pending.is_some()
@@ -11099,64 +11110,19 @@ impl App {
             || self.text_subdialog_open()
     }
 
+    pub(crate) fn any_dialog_open(&self) -> bool {
+        self.common_modal_dialog_open()
+            // VST3 manager は main window では背面グリッド入力を止めるが、fullscreen
+            // viewport 内では操作パネルとして使うため共通述語には含めない。
+            || self.show_vst3_manager
+    }
+
     /// フルスクリーンのキー入力を止める必要があるモーダルダイアログ。
     ///
     /// VST3 manager は fullscreen viewport 内の操作パネルなので、開いたままでも
     /// W / Enter / 矢印などの動画ショートカットは使えるようにする。
     pub(crate) fn any_modal_dialog_open_for_fullscreen_keys(&self) -> bool {
-        self.show_stats_dialog
-            || self.show_favorites_editor
-            || self.show_smart_folder_editor
-            || self.show_tag_editor
-            || self.show_tag_apply
-            || self.fullscreen_tag_picker_open
-            || self.show_fav_add_dialog
-            || self.show_open_folder_dialog
-            || self.show_new_folder_dialog
-            || self.new_folder_pending.is_some()
-            || self.show_rename_dialog
-            || self.rename_pending.is_some()
-            || self.show_book_manager
-            || self.book_reorder.is_some()
-            || self.show_preferences
-            || self.show_preferences_discard_confirm
-            || self.show_operation_customize
-            || self.show_operation_customize_discard_confirm
-            || self.show_mouse_nav_migration_prompt
-            || self.show_whats_new
-            || self.show_context_shortcuts_help
-            || self.show_toolbar_reset_confirm
-            || self.show_cache_manager
-            || self.show_metadata_cleanup
-            || self.metadata_cleanup_pending.is_some()
-            || self.show_delete_confirm
-            || self.edit_bundle_paste_pending.is_some()
-            || self.edit_bundle_apply_pending.is_some()
-            || self.show_rotation_reset_confirm
-            || self.show_pdf_password_dialog
-            || self.show_about_dialog
-            || self.show_update_dialog
-            || self.slot_save_dialog.is_some()
-            || self.export_dialog.is_some()
-            || self.export_pending.is_some()
-            || self.local_adjust_add_layer_dialog_open
-            || self.local_adjust_change_mask_dialog_open
-            || self.local_adjust_effect_picker_dialog_open
-            || self.context_menu_idx.is_some()
-            || self.delete_pending.is_some()
-            || self.batch_convert.is_some()
-            || self.subfolder_expansion_pending.is_some()
-            || self.subfolder_expansion_confirm_pending.is_some()
-            || self.subfolder_expansion_install_pending.is_some()
-            || self.smart_folder_pending.is_some()
-            || self.smart_folder_prepare_pending.is_some()
-            || self.smart_folder_confirm_pending.is_some()
-            // 編集用追加パック DL ダイアログ (フルスクリーンビューポートで描画)。表示中は
-            // フルスクリーンのキー (Enter で閉じる / Esc で選択解除・テキストモード退出 /
-            // 矢印ナビ) を止め、ダイアログ操作に集中させる (Codex 監査)。
-            || self.editing_addon_install_state.is_some()
-            // テキスト注釈の子ダイアログ表示中も同様にフルスクリーンキーを止める (Codex P2)。
-            || self.text_subdialog_open()
+        self.common_modal_dialog_open()
     }
 
     pub(crate) fn clear_fullscreen_tag_picker_state(&mut self) {
@@ -26926,6 +26892,15 @@ impl App {
     /// 呼び出し位置に注意: メニュー/ツールバー/アドレスバー/ファセットバー等を描いた後、
     /// グリッド描画の直前で呼ぶ。これより早いと popup 内 ScrollArea の wheel が背面の
     /// サムネイル一覧にも通り抜ける。
+    fn floating_ui_blocks_background_scroll(ctx: &egui::Context) -> bool {
+        let Some(pointer_pos) = ctx.pointer_latest_pos() else {
+            return false;
+        };
+        ctx.layer_id_at(pointer_pos).is_some_and(|layer| {
+            matches!(layer.order, egui::Order::Middle | egui::Order::Foreground)
+        })
+    }
+
     fn process_scroll(&mut self, ctx: &egui::Context) {
         // ダイアログ / popup / フルスクリーン表示中はスクロールを消費しない
         // (ダイアログや ComboBox popup 内の ScrollArea が正しく動くようにする)。
@@ -26937,6 +26912,10 @@ impl App {
             || self.fs_nav_deferred_reopen_wait_active()
             || self.any_dialog_open()
             || ctx.is_popup_open()
+            // 新しい egui::Window / Modal を共通状態述語へ追加し忘れても、ポインタ直下が
+            // floating layer なら背面グリッドへ wheel を渡さない最終安全網。Tooltip は
+            // hover 中の通常グリッドスクロールを妨げるため対象外にする。
+            || Self::floating_ui_blocks_background_scroll(ctx)
         {
             return;
         }

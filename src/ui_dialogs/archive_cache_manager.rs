@@ -236,55 +236,61 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
 fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
     let rows = app.archive_cache_rows.clone().unwrap_or_default();
 
+    archive_cache_entry_scroll_area().show(ui, |ui| {
+        egui::Grid::new("archive_cache_grid")
+            .num_columns(5)
+            .striped(true)
+            .spacing(egui::vec2(8.0, 3.0))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("").strong());
+                ui.label(egui::RichText::new("元ファイル").strong());
+                ui.label(egui::RichText::new("形式").strong());
+                ui.label(egui::RichText::new("キャッシュサイズ").strong());
+                ui.label(egui::RichText::new("画像数").strong());
+                ui.end_row();
+
+                for (idx, entry) in rows.iter().enumerate() {
+                    let mut selected = app.archive_cache_selection.contains(&idx);
+                    if ui.checkbox(&mut selected, "").changed() {
+                        if selected {
+                            app.archive_cache_selection.insert(idx);
+                        } else {
+                            app.archive_cache_selection.remove(&idx);
+                        }
+                    }
+                    let name = entry
+                        .src_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let path_text = entry.src_path.to_string_lossy().to_string();
+                    let label = if entry.src_exists {
+                        egui::RichText::new(truncate_name(&name, 42))
+                    } else {
+                        egui::RichText::new(format!("✗ {}", truncate_name(&name, 40)))
+                            .color(egui::Color32::from_rgb(180, 60, 60))
+                    };
+                    ui.label(label).on_hover_text(path_text);
+                    let format_resp = ui.label(format_display_text(entry));
+                    if let Some(hover) = format_hover_text(entry) {
+                        format_resp.on_hover_text(hover);
+                    }
+                    ui.label(format_bytes(entry.cached_zip_size.max(0) as u64));
+                    ui.label(format!("{}", entry.image_count));
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+fn archive_cache_entry_scroll_area() -> egui::ScrollArea {
     egui::ScrollArea::vertical()
         .max_height(360.0)
         .id_salt("archive_cache_entries")
-        .show(ui, |ui| {
-            egui::Grid::new("archive_cache_grid")
-                .num_columns(5)
-                .striped(true)
-                .spacing(egui::vec2(8.0, 3.0))
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("").strong());
-                    ui.label(egui::RichText::new("元ファイル").strong());
-                    ui.label(egui::RichText::new("形式").strong());
-                    ui.label(egui::RichText::new("キャッシュサイズ").strong());
-                    ui.label(egui::RichText::new("画像数").strong());
-                    ui.end_row();
-
-                    for (idx, entry) in rows.iter().enumerate() {
-                        let mut selected = app.archive_cache_selection.contains(&idx);
-                        if ui.checkbox(&mut selected, "").changed() {
-                            if selected {
-                                app.archive_cache_selection.insert(idx);
-                            } else {
-                                app.archive_cache_selection.remove(&idx);
-                            }
-                        }
-                        let name = entry
-                            .src_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let path_text = entry.src_path.to_string_lossy().to_string();
-                        let label = if entry.src_exists {
-                            egui::RichText::new(truncate_name(&name, 42))
-                        } else {
-                            egui::RichText::new(format!("✗ {}", truncate_name(&name, 40)))
-                                .color(egui::Color32::from_rgb(180, 60, 60))
-                        };
-                        ui.label(label).on_hover_text(path_text);
-                        let format_resp = ui.label(format_display_text(entry));
-                        if let Some(hover) = format_hover_text(entry) {
-                            format_resp.on_hover_text(hover);
-                        }
-                        ui.label(format_bytes(entry.cached_zip_size.max(0) as u64));
-                        ui.label(format!("{}", entry.image_count));
-                        ui.end_row();
-                    }
-                });
-        });
+        // 横方向を内容幅へ縮めない。ダイアログの利用可能幅を使い切ることで、縦
+        // スクロールバーを表の途中ではなくダイアログ右端へ固定する。
+        .auto_shrink([false, true])
 }
 
 fn format_display_text(entry: &ArchiveCacheEntry) -> String {
@@ -340,4 +346,39 @@ fn spawn_delete_selected(app: &mut App, db: std::sync::Arc<crate::archive_cache:
         crate::cache_maintenance::ArchiveMaintTask::DeleteSelected { src_paths },
         db,
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_cache_scroll_area_uses_the_full_dialog_width() {
+        let ctx = egui::Context::default();
+        let mut inner_width = 0.0;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(600.0);
+                let output = archive_cache_entry_scroll_area().show(ui, |ui| {
+                    ui.set_min_width(120.0);
+                    for _ in 0..40 {
+                        ui.label("row");
+                    }
+                });
+                inner_width = output.inner_rect.width();
+            });
+        });
+
+        assert!(
+            inner_width > 550.0,
+            "scroll body should span the 600px dialog body, got {inner_width}"
+        );
+    }
 }

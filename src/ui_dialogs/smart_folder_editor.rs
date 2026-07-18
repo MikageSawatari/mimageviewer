@@ -155,6 +155,7 @@ impl App {
                         ui.separator();
                         egui::ScrollArea::vertical()
                             .id_salt("smart_folder_definition_list")
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 if self.settings.smart_folders.is_empty() {
                                     ui.label(egui::RichText::new("(未登録)").weak());
@@ -219,6 +220,7 @@ impl App {
                             egui::ScrollArea::vertical()
                                 .id_salt("smart_folder_source_list")
                                 .max_height(150.0)
+                                .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     let source_count = definition.sources.len();
                                     for (index, source) in definition.sources.iter_mut().enumerate()

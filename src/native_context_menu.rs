@@ -39,6 +39,7 @@ pub enum NativeMivCommand {
     RotateRight,
     ToggleRepresentativeThumb,
     SetCurrentVideoFrameThumbnail,
+    OpenFolderInExplorer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

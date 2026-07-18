@@ -130,6 +130,7 @@ struct NativeGridContextMenuTarget {
     is_folder_context: bool,
     has_checked: bool,
     surface: ContextMenuSurface,
+    explorer_folder: Option<PathBuf>,
 }
 
 impl NativeGridContextMenuTarget {
@@ -422,6 +423,12 @@ impl crate::app::App {
         } else {
             self.current_favorite_target()
         };
+        let explorer_folder = context_explorer_folder(
+            &item,
+            is_folder_context,
+            has_checked,
+            folder_command_target.as_deref(),
+        );
         let mut close = false;
 
         // 記録済みの座標に固定表示
@@ -496,9 +503,6 @@ impl crate::app::App {
                         .collect::<Vec<_>>();
                     self.draw_legacy_xmp_context_entries(ui, legacy_xmp_paths, &mut close);
 
-                    // フォルダを開く (disabled)
-                    ui.add_enabled(false, egui::Button::new("フォルダを開く"));
-
                     ui.separator();
 
                     // 削除 (ゴミ箱)
@@ -541,10 +545,6 @@ impl crate::app::App {
                                     close = true;
                                 }
                             }
-                            if ui.button("フォルダを開く").clicked() {
-                                open_folder_in_explorer(p);
-                                close = true;
-                            }
                             if in_search && ui.button("フォルダに移動").clicked() {
                                 nav =
                                     parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
@@ -583,17 +583,6 @@ impl crate::app::App {
                             }
                             // フォルダのコピー / カット (クリップボード経由) は v1.1.0 で一旦
                             // 無効化 (データ破壊リスクのため将来へ延期)。ここには出さない。
-                            let open_label = if is_folder_context {
-                                "このフォルダを開く"
-                            } else {
-                                "エクスプローラで開く"
-                            };
-                            if ui.button(open_label).clicked() {
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(native_path_text(p))
-                                    .spawn();
-                                close = true;
-                            }
                             if in_search
                                 && !is_folder_context
                                 && ui.button("フォルダに移動").clicked()
@@ -661,11 +650,6 @@ impl crate::app::App {
                                     idx,
                                     mode: crate::app::GridContainerOpenMode::PageList,
                                 });
-                                close = true;
-                            }
-                            ui.separator();
-                            if ui.button("フォルダを開く").clicked() {
-                                open_folder_in_explorer(p);
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
@@ -788,11 +772,6 @@ impl crate::app::App {
                                 });
                                 close = true;
                             }
-                            ui.separator();
-                            if ui.button("フォルダを開く").clicked() {
-                                open_folder_in_explorer(path);
-                                close = true;
-                            }
                             if in_search && ui.button("フォルダに移動").clicked() {
                                 nav = parent_folder_for_nav(path)
                                     .map(ContextMenuAction::JumpFromSearch);
@@ -855,6 +834,14 @@ impl crate::app::App {
                             self.remove_reading_history_entry_for_idx(idx);
                             close = true;
                         }
+                    }
+                }
+
+                if let Some(folder) = explorer_folder.as_ref() {
+                    ui.separator();
+                    if ui.button("このフォルダをエクスプローラで開く").clicked() {
+                        open_directory_in_explorer(folder);
+                        close = true;
                     }
                 }
 
@@ -987,6 +974,12 @@ impl crate::app::App {
             return NativeGridContextMenuOutcome::Fallback;
         };
         let prepare_t0 = std::time::Instant::now();
+        let explorer_folder = context_explorer_folder(
+            &item,
+            is_folder_context,
+            has_checked,
+            folder_command_target.as_deref(),
+        );
         let Some(target) = self.native_grid_context_menu_target(
             idx,
             item,
@@ -994,6 +987,7 @@ impl crate::app::App {
             has_checked,
             folder_command_target,
             surface,
+            explorer_folder,
         ) else {
             return NativeGridContextMenuOutcome::Fallback;
         };
@@ -1077,6 +1071,7 @@ impl crate::app::App {
         has_checked: bool,
         folder_command_target: Option<PathBuf>,
         surface: ContextMenuSurface,
+        explorer_folder: Option<PathBuf>,
     ) -> Option<NativeGridContextMenuTarget> {
         let paths = if is_folder_context {
             vec![folder_command_target?]
@@ -1103,6 +1098,7 @@ impl crate::app::App {
             is_folder_context,
             has_checked,
             surface,
+            explorer_folder,
         })
     }
 
@@ -1126,6 +1122,12 @@ impl crate::app::App {
                 command: NativeMivCommand::RotateRight,
                 label: "右に回転 (R)".to_string(),
             });
+            if target.explorer_folder.is_some() {
+                items.push(NativeMivMenuItem {
+                    command: NativeMivCommand::OpenFolderInExplorer,
+                    label: "このフォルダをエクスプローラで開く".to_string(),
+                });
+            }
             return items;
         }
 
@@ -1239,6 +1241,12 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::ToggleRepresentativeThumb,
                 label,
+            });
+        }
+        if target.explorer_folder.is_some() {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::OpenFolderInExplorer,
+                label: "このフォルダをエクスプローラで開く".to_string(),
             });
         }
         items
@@ -1417,6 +1425,12 @@ impl crate::app::App {
                 }
                 None
             }
+            NativeMivCommand::OpenFolderInExplorer => {
+                if let Some(folder) = target.explorer_folder.as_deref() {
+                    open_directory_in_explorer(folder);
+                }
+                None
+            }
         }
     }
 
@@ -1487,6 +1501,7 @@ impl crate::app::App {
         let mut close = false;
         let mut close_fullscreen = false;
         let pos = self.fs_context_menu_pos;
+        let explorer_folder = context_explorer_folder(&item, false, false, None);
 
         match self.try_show_native_grid_context_menu(
             ctx,
@@ -1542,10 +1557,6 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
-                        if ui.button("フォルダを開く").clicked() {
-                            open_folder_in_explorer(p);
-                            close = true;
-                        }
                         // ── アプリケーションで開く ──
                         ui.separator();
                         close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
@@ -1554,10 +1565,6 @@ impl crate::app::App {
                     GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                         if ui.button("パスをコピー").clicked() {
                             copy_path_text(ctx, p);
-                            close = true;
-                        }
-                        if ui.button("フォルダを開く").clicked() {
-                            open_folder_in_explorer(p);
                             close = true;
                         }
                         // ── アプリケーションで開く ──
@@ -1608,19 +1615,11 @@ impl crate::app::App {
                             copy_path_text(ctx, path);
                             close = true;
                         }
-                        if ui.button("フォルダを開く").clicked() {
-                            open_folder_in_explorer(path);
-                            close = true;
-                        }
                     }
                     GridItem::SearchContainer { path, .. } => {
                         // Ctrl+G 結果ビューのコンテナ (v0.8.0): コピー系のみ最低限
                         if ui.button("パスをコピー").clicked() {
                             copy_path_text(ctx, path);
-                            close = true;
-                        }
-                        if ui.button("フォルダを開く").clicked() {
-                            open_folder_in_explorer(path);
                             close = true;
                         }
                     }
@@ -1659,6 +1658,14 @@ impl crate::app::App {
                     // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
                     // 条件分岐とそれに伴う separator 描画は helper 側に集約。
                     if self.render_folder_pin_menu_entry(ui, &item) {
+                        close = true;
+                    }
+                }
+
+                if let Some(folder) = explorer_folder.as_ref() {
+                    ui.separator();
+                    if ui.button("このフォルダをエクスプローラで開く").clicked() {
+                        open_directory_in_explorer(folder);
                         close = true;
                     }
                 }
@@ -2458,6 +2465,54 @@ fn parent_folder_for_nav(path: &std::path::Path) -> Option<PathBuf> {
     Some(native_nav_path(path.parent()?))
 }
 
+/// 右クリック対象に対して「このフォルダ」が指す実ディレクトリを返す。
+/// 単一フォルダはそのフォルダ自身、ファイルや仮想ページは元コンテナの親、複数選択と
+/// 背景メニューは現在表示中の実フォルダを使う。検索結果の複数選択のように単一の
+/// 実フォルダを決められない場合は項目を出さない。
+fn context_explorer_folder(
+    item: &GridItem,
+    is_folder_context: bool,
+    has_checked: bool,
+    current_real_folder: Option<&Path>,
+) -> Option<PathBuf> {
+    if is_folder_context || has_checked {
+        return current_real_folder.map(Path::to_path_buf);
+    }
+    match item {
+        GridItem::Folder(path) => Some(path.clone()),
+        GridItem::SearchContainer {
+            path,
+            kind: crate::grid_item::SearchContainerKind::Folder,
+            ..
+        } => Some(path.clone()),
+        GridItem::Image(path)
+        | GridItem::Video(path)
+        | GridItem::Audio(path)
+        | GridItem::ZipFile(path)
+        | GridItem::PdfFile(path)
+        | GridItem::ConvertibleArchive { path, .. }
+        | GridItem::SearchContainer { path, .. } => path.parent().map(Path::to_path_buf),
+        GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
+            zip_path.parent().map(Path::to_path_buf)
+        }
+        GridItem::PdfPage { pdf_path, .. } => pdf_path.parent().map(Path::to_path_buf),
+        GridItem::Stack { representative, .. } => representative.parent().map(Path::to_path_buf),
+    }
+}
+
+fn open_directory_in_explorer(path: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(native_path_text(path))
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+}
+
 fn open_folder_in_explorer(path: &std::path::Path) {
     #[cfg(windows)]
     {
@@ -2496,6 +2551,7 @@ mod delete_confirm_tests {
             is_folder_context: false,
             has_checked: false,
             surface,
+            explorer_folder: Some(PathBuf::from(r"C:\media")),
         };
         app.native_grid_context_menu_items(&target, false)
             .into_iter()
@@ -2527,6 +2583,11 @@ mod delete_confirm_tests {
         ] {
             assert!(!commands.contains(&invalid), "unexpected {invalid:?}");
         }
+        assert_eq!(
+            commands.last(),
+            Some(&NativeMivCommand::OpenFolderInExplorer),
+            "Explorer action must remain the last mIV item"
+        );
     }
 
     #[test]
@@ -2549,6 +2610,55 @@ mod delete_confirm_tests {
         assert!(fullscreen_image.contains(&NativeMivCommand::RotateLeft));
         assert!(fullscreen_image.contains(&NativeMivCommand::RotateRight));
         assert!(!fullscreen_image.contains(&NativeMivCommand::SetCurrentVideoFrameThumbnail));
+        assert_eq!(
+            fullscreen_image.last(),
+            Some(&NativeMivCommand::OpenFolderInExplorer)
+        );
+    }
+
+    #[test]
+    fn context_explorer_folder_resolves_real_and_virtual_targets_without_ambiguity() {
+        let current = Path::new(r"C:\library");
+        assert_eq!(
+            context_explorer_folder(
+                &GridItem::Image(PathBuf::from(r"C:\library\page.jpg")),
+                false,
+                false,
+                Some(current),
+            ),
+            Some(current.to_path_buf())
+        );
+        assert_eq!(
+            context_explorer_folder(
+                &GridItem::Folder(PathBuf::from(r"C:\library\book")),
+                false,
+                false,
+                Some(current),
+            ),
+            Some(PathBuf::from(r"C:\library\book"))
+        );
+        assert_eq!(
+            context_explorer_folder(
+                &GridItem::ZipImage {
+                    zip_path: PathBuf::from(r"C:\library\book.cbz"),
+                    entry_name: "001.jpg".to_owned(),
+                },
+                false,
+                false,
+                None,
+            ),
+            Some(current.to_path_buf())
+        );
+        assert_eq!(
+            context_explorer_folder(
+                &GridItem::Image(PathBuf::from(r"C:\one\page.jpg")),
+                false,
+                true,
+                None,
+            ),
+            None,
+            "cross-folder checked results have no single Explorer folder"
+        );
     }
 
     #[test]

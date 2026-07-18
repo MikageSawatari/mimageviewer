@@ -319,6 +319,15 @@ C:\home\mimageviewer_vendor_backup\
   必ず `default_pos()` を使う。定番の初期位置は `ctx.content_rect().min + egui::vec2(60.0, 40.0)`。
 - **閉じるボタン**: `.open(&mut open)` でタイトルバーに × ボタンが付く。
   `open` が `false` になったら `show_*` フラグを落とす。
+- **背面への wheel / key 伝播防止**: モーダル相当の表示状態は `App::common_modal_dialog_open`
+  へ追加し、main / fullscreen で別々の一覧を持たない。`App::process_scroll` は描画済みの
+  `Order::Middle` / `Foreground` layer がポインタ直下にある場合も背面グリッドの wheel を
+  止めるため、モデルレス Window と将来の登録漏れにも安全側で動く。state が存在しても
+  Window を描かない phase がある処理は、state の有無ではなく「現在表示されるか」を返す
+  helper を登録すること。
+- **ScrollArea の横幅**: ダイアログ右端に縦スクロールバーを置く一覧は
+  `.auto_shrink([false, ...])` を指定し、利用可能幅を使い切る。既定の横 shrink のままだと
+  内容幅まで縮み、スクロールバーがダイアログの途中に出る。
 - **パターン**: `ui_dialogs/` に 1 ファイル 1 メソッドで追加。
   `mod.rs` に `mod xxx;` を追加し、`app.rs` の `update()` 内で `self.show_xxx(ctx)` を呼ぶ。
   `App` 構造体に `show_xxx: bool` フィールドを追加し、`Default` impl で `false` 初期化。
