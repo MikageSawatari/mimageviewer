@@ -37,7 +37,7 @@ Failed は単発の終端ステート。デコードエラー時のみ。
    - 1 件以上キューへ投入したフレームは `update_keep_range_and_requests` 自身も repaint を要求する。
      通常は `App::update` 末尾の `requested_nonempty` と同じ役割だが、フルスクリーン cleanup や
      font atlas resync で末尾まで到達しないフレームでも worker 結果を入力待ちにしないため。
-4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` かつ `from_edit_preview: false` の Loaded に対して `skip_cache: true` で再要求 → 高品質デコード。ただし、`make_load_request` が親コンテナや手動ピンを最終 target へ解決した後も `req.skip_cache == true` を保つ要求だけを upgrade queue へ入れる。編集プレビューと、動画ピンから seed された完成済み WebP キャッシュは元画像から改善できない派生画像なので対象外。特に動画ピン要求は `apply_folder_thumb_pin` が意図的に `skip_cache = false` へ変換し、アイドル高画質化へ投入しないことでフォルダ自動代表画像による上書きと無限再投入を防ぐ
+4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` かつ `from_edit_preview: false` の Loaded に対して `skip_cache: true` で再要求 → 高品質デコード。ただし、`make_load_request` が親コンテナや手動ピンを最終 target へ解決した後も `req.skip_cache == true` を保つ要求だけを upgrade queue へ入れる。編集プレビューと、動画ピンから seed された完成済み WebP キャッシュは元画像から改善できない派生画像なので対象外。特に動画ピン要求は `apply_folder_thumb_pin` が意図的に `skip_cache = false` へ変換し、アイドル高画質化へ投入しないことでフォルダ自動代表画像による上書きと無限再投入を防ぐ。対象外と確定した idx は現在の Loaded サムネイル / viewer context に紐づけて記憶し、repaint ごとの pin 解決も行わない。この記憶は新しい items 世代、サムネイルの退去・再ロード、編集プレビュー更新で破棄する
    - 一覧ロード直後は `start_loading_items` が履歴スクロール復元後の位置で idle 判定をリセットし、
      親一覧へ戻った瞬間に古い idle 時刻で高品質再生成が走らないようにする。
    - **フレーム内境界レース対策 (2026-06-19)**: アップグレードの起動条件 (input/scroll が

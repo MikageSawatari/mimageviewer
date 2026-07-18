@@ -1698,6 +1698,7 @@ struct ViewerContextBundle {
     scroll_to_selected: bool,
     pending_grid_scroll: Option<GridScrollIntent>,
     requested: std::collections::HashMap<usize, bool>,
+    idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
     keep_range: (usize, usize),
     keep_set: std::collections::HashSet<usize>,
     thumbnail_eviction_generation: Option<u64>,
@@ -1942,6 +1943,7 @@ impl ViewerContextBundle {
             scroll_to_selected: false,
             pending_grid_scroll: None,
             requested: std::collections::HashMap::new(),
+            idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
             thumbnail_eviction_generation: None,
@@ -5801,6 +5803,11 @@ pub struct App {
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
     pub(crate) requested: std::collections::HashMap<usize, bool>,
+    /// 現在の Loaded サムネイルについて、最終的な `LoadRequest` がキャッシュを迂回
+    /// できないと確認済みの idx。動画ピン WebP など完成済み派生物を、repaint ごとに
+    /// `make_load_request` で再解決しないための per-context memo。
+    /// 新しい items 世代、または該当サムネイルの退去 / 再ロードで無効化する。
+    pub(crate) idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
     /// 現在の keep range を `[min, max+1)` でくくった bounding box。
     /// worker 側の atomic キャンセル判定 (`keep_start_shared`/`keep_end_shared`) 用。
     /// enqueue / eviction / retain / idle upgrade は `keep_set` の方を使うこと
@@ -9197,6 +9204,7 @@ impl App {
             reload_queue: None,
             heavy_io_queue: None,
             requested: std::collections::HashMap::new(),
+            idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
             thumbnail_eviction_generation: None,
@@ -11230,6 +11238,7 @@ impl App {
             scroll_to_selected,
             pending_grid_scroll,
             requested,
+            idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
             thumbnail_eviction_generation,
@@ -11407,6 +11416,7 @@ impl App {
         swap_field!(scroll_to_selected);
         swap_field!(pending_grid_scroll);
         swap_field!(requested);
+        swap_field!(idle_upgrade_cache_bypass_ineligible);
         swap_field!(keep_range);
         swap_field!(keep_set);
         swap_field!(thumbnail_eviction_generation);
@@ -18652,6 +18662,7 @@ impl App {
         self.items = items;
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
+        self.idle_upgrade_cache_bypass_ineligible.clear();
         self.thumbnails = self
             .items
             .iter()
@@ -23630,6 +23641,9 @@ impl App {
                         // 新しいピクセルに差し替わったので、古い補正済みテクスチャは捨てる。
                         // 次フレームで `maybe_apply_thumb_adjustment` により再生成される。
                         self.thumb_adjust_tex.remove(&i);
+                        // Loaded の実体が差し替わるため、以前の完成済みキャッシュ判定は
+                        // 失効させる。新しい状態が必要なら次の idle 判定で再評価する。
+                        self.idle_upgrade_cache_bypass_ineligible.remove(&i);
                         self.thumbnails[i] = ThumbnailState::Loaded {
                             tex: handle,
                             from_cache,
@@ -23853,6 +23867,7 @@ impl App {
         {
             *thumb = ThumbnailState::Evicted;
         }
+        self.idle_upgrade_cache_bypass_ineligible.remove(&idx);
         self.thumb_pixels.remove(&idx);
         self.thumb_edit_preview_layers.remove(&idx);
         self.thumb_adjust_tex.remove(&idx);
@@ -24807,6 +24822,9 @@ impl App {
         //    keep_set 外なら自動破棄される)。
         let mut upgrade_reqs: Vec<LoadRequest> = Vec::new();
         for i in self.keep_set_sorted() {
+            if self.idle_upgrade_cache_bypass_ineligible.contains(&i) {
+                continue;
+            }
             let needs_upgrade = match self.thumbnails.get(i) {
                 Some(ThumbnailState::Loaded {
                     from_cache,
@@ -24863,13 +24881,12 @@ impl App {
             }) else {
                 continue;
             };
-            // `make_load_request` may resolve a cached derivative that cannot be improved by
-            // bypassing the catalog.  In particular, a folder tile pinned to a video forces
-            // `skip_cache = false` so the seeded video-frame WebP is not overwritten by the
-            // folder's automatic representative.  Such a request is already a finished cache
-            // artifact, not an idle quality upgrade.  Only enqueue requests that still preserve
-            // the upgrade invariant after all container/pin rewriting has completed.
+            // `make_load_request` は、catalog を迂回しても改善できない完成済み派生物へ
+            // 解決することがある。特に動画ピンは seed 済み WebP をフォルダ自動代表画像で
+            // 上書きしないよう `skip_cache = false` を強制する。この最終判定を現在の
+            // Loaded サムネイルに memo し、次フレーム以降は pin 解決自体を繰り返さない。
             if !req.skip_cache {
+                self.idle_upgrade_cache_bypass_ineligible.insert(i);
                 continue;
             }
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
@@ -31092,6 +31109,7 @@ impl App {
             scroll_to_selected,
             pending_grid_scroll,
             requested,
+            idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
             thumbnail_eviction_generation,
@@ -31365,6 +31383,7 @@ impl App {
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
             requested,
+            idle_upgrade_cache_bypass_ineligible,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
@@ -41379,6 +41398,7 @@ impl App {
         self.thumb_pixels.remove(&idx);
         self.thumb_edit_preview_layers.remove(&idx);
         self.thumb_adjust_tex.remove(&idx);
+        self.idle_upgrade_cache_bypass_ineligible.remove(&idx);
         if let Some(state) = self.thumbnails.get_mut(idx) {
             *state = ThumbnailState::Evicted;
         }

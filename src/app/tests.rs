@@ -7710,6 +7710,7 @@ mod favorite_adjustment_defaults_tests {
         app.enqueue_idle_upgrades();
 
         assert!(app.requested.is_empty());
+        assert!(app.idle_upgrade_cache_bypass_ineligible.is_empty());
         assert!(
             app.reload_queue
                 .as_ref()
@@ -7803,6 +7804,7 @@ mod favorite_adjustment_defaults_tests {
         app.enqueue_idle_upgrades();
 
         assert!(app.requested.is_empty());
+        assert!(app.idle_upgrade_cache_bypass_ineligible.contains(&0));
         assert!(
             app.reload_queue
                 .as_ref()
@@ -7821,6 +7823,26 @@ mod favorite_adjustment_defaults_tests {
                 .unwrap()
                 .is_empty()
         );
+
+        // 判定済みの同じ Loaded サムネイルは、次フレームで pin 解決を繰り返さない。
+        // WebP を消して再評価されれば通常の skip_cache=true 要求へフォールバックして
+        // enqueue されるため、キューが空のままであることが memo の回帰テストになる。
+        app.video_pin_db.as_ref().unwrap().remove(&video).unwrap();
+        app.enqueue_idle_upgrades();
+        assert!(app.requested.is_empty());
+        assert!(
+            app.heavy_io_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        // サムネイルの退去 / 再ロード境界では、次の Loaded 状態を再評価できる。
+        app.evict_grid_thumbnail(0);
+        assert!(!app.idle_upgrade_cache_bypass_ineligible.contains(&0));
     }
 
     #[test]
@@ -7857,6 +7879,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.enqueue_idle_upgrades();
 
+        assert!(app.idle_upgrade_cache_bypass_ineligible.is_empty());
         assert_eq!(app.requested.get(&0), Some(&true));
         let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
         assert_eq!(queue.len(), 1);
@@ -12263,6 +12286,25 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(
             app.auto_aspect.samples.get(&3).copied(),
             Some(ThumbAspect::Portrait3x4.height_ratio())
+        );
+    }
+
+    #[test]
+    fn viewer_context_bundle_preserves_idle_upgrade_ineligible_memo() {
+        let mut app = setup_app();
+        app.idle_upgrade_cache_bypass_ineligible.insert(7);
+
+        let mut bundle = app.take_current_viewer_context_bundle();
+        app.idle_upgrade_cache_bypass_ineligible.insert(99);
+        app.swap_viewer_context_bundle(&mut bundle);
+
+        assert_eq!(
+            app.idle_upgrade_cache_bypass_ineligible,
+            std::collections::HashSet::from([7])
+        );
+        assert_eq!(
+            bundle.idle_upgrade_cache_bypass_ineligible,
+            std::collections::HashSet::from([99])
         );
     }
 
