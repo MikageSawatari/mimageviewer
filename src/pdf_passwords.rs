@@ -30,6 +30,12 @@ use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 pub struct PdfPasswordStore {
     /// path_hash → base64-encoded DPAPI-encrypted password
     entries: HashMap<String, String>,
+    /// path_hash → process-local credential revision.
+    ///
+    /// This is deliberately not persisted and contains no password-derived data.  It lets
+    /// in-memory consumers discard an authentication result after this process saves or removes
+    /// a credential for the same PDF.
+    credential_revisions: HashMap<String, u64>,
 }
 
 impl PdfPasswordStore {
@@ -43,7 +49,10 @@ impl PdfPasswordStore {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Self { entries }
+        Self {
+            entries,
+            credential_revisions: HashMap::new(),
+        }
     }
 
     /// delete worker 用。保存済みパスワードが 1 件でもある場合だけ、削除前の PDF
@@ -96,7 +105,8 @@ impl PdfPasswordStore {
             let hash = Self::path_hash(pdf_path);
             match encrypt_data(password.as_bytes(), Scope::User, None) {
                 Ok(encrypted) => {
-                    self.entries.insert(hash, BASE64.encode(&encrypted));
+                    self.entries.insert(hash.clone(), BASE64.encode(&encrypted));
+                    self.bump_credential_revision(&hash);
                 }
                 Err(e) => {
                     eprintln!("pdf_passwords DPAPI encrypt failed: {e}");
@@ -112,7 +122,22 @@ impl PdfPasswordStore {
     /// 保存済みパスワードを削除する。
     pub fn remove(&mut self, pdf_path: &Path) {
         let hash = Self::path_hash(pdf_path);
-        self.entries.remove(&hash);
+        if self.entries.remove(&hash).is_some() {
+            self.bump_credential_revision(&hash);
+        }
+    }
+
+    /// 指定 PDF の保存済み認証情報に対する、現プロセス内の更新世代。
+    ///
+    /// 世代の変化は「メモリ上の認証結果が stale」という意味だけを持つ。
+    /// 認証情報の有無は表さず、パスワードの fingerprint も含まない。
+    // lib / core の両 target で同モジュールを構築するが、世代参照は App を持つ core だけで使う。
+    #[allow(dead_code)]
+    pub(crate) fn credential_revision(&self, pdf_path: &Path) -> u64 {
+        self.credential_revisions
+            .get(&Self::path_hash(pdf_path))
+            .copied()
+            .unwrap_or(0)
     }
 
     // ── 内部 ────────────────────────────────────────────────
@@ -126,6 +151,14 @@ impl PdfPasswordStore {
         let mut hasher = Sha256::new();
         hasher.update(normalized.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    fn bump_credential_revision(&mut self, path_hash: &str) {
+        let revision = self
+            .credential_revisions
+            .entry(path_hash.to_owned())
+            .or_default();
+        *revision = revision.wrapping_add(1);
     }
 
     /// delete worker 用。削除前に列挙した PDF path のハッシュ行だけを hard purge する。
@@ -157,6 +190,11 @@ impl PdfPasswordStore {
     pub fn empty_for_test() -> Self {
         Self {
             entries: HashMap::new(),
+            credential_revisions: HashMap::new(),
         }
+    }
+
+    pub(crate) fn bump_credential_revision_for_test(&mut self, pdf_path: &Path) {
+        self.bump_credential_revision(&Self::path_hash(pdf_path));
     }
 }

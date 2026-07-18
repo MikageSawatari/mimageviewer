@@ -32904,3 +32904,91 @@ fn video_audio_transition_resets_music_left_session_but_keeps_same_file_right_st
     assert!(!app.music_left_click_open);
     assert!(app.fs_click_info_open);
 }
+
+#[test]
+fn pdf_page_count_auth_result_becomes_stale_after_saved_credential_changes() {
+    let mut app = phase_c_support::setup_app();
+    let pdf_path = PathBuf::from(r"C:\Books\protected.pdf");
+    app.install_new_items(
+        vec![GridItem::PdfFile(pdf_path.clone())],
+        vec![Some((1_700_000_000, 4096))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+
+    let failed_without_saved_password = DetailsLazyMeta {
+        source_mtime: 1_700_000_000,
+        source_size: 4096,
+        page_count_checked: true,
+        page_count_failed: true,
+        page_count_pdf_password_revision: Some(0),
+        ..Default::default()
+    };
+    assert!(app.details_lazy_meta_satisfies_idx(0, &failed_without_saved_password));
+
+    app.pdf_passwords
+        .bump_credential_revision_for_test(&pdf_path);
+
+    assert!(
+        !app.details_lazy_meta_satisfies_idx(0, &failed_without_saved_password),
+        "保存済み認証情報が変わったら、同じ起動中の取得失敗を終端結果として再利用しない"
+    );
+
+    let target = app
+        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]))
+        .expect("PDF page-count target");
+    assert_eq!(target.pdf_password_revision, Some(1));
+}
+
+#[test]
+fn pdf_page_count_does_not_use_session_only_password() {
+    let mut app = phase_c_support::setup_app();
+    let pdf_path = PathBuf::from(r"C:\Books\protected.pdf");
+    app.install_new_items(
+        vec![GridItem::PdfFile(pdf_path)],
+        vec![Some((1_700_000_000, 4096))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.pdf_current_password = Some("session-only-password".to_owned());
+
+    let target = app
+        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]))
+        .expect("PDF page-count target");
+
+    assert!(
+        target.pdf_password.is_none(),
+        "保存しないセッションパスワードで親一覧のページ数を露出しない"
+    );
+    assert_eq!(target.pdf_password_revision, Some(0));
+}
+
+#[test]
+fn saving_pdf_password_invalidates_cached_page_count_result() {
+    let mut app = phase_c_support::setup_app();
+    let pdf_path = PathBuf::from(r"C:\Books\protected.pdf");
+    app.install_new_items(
+        vec![GridItem::PdfFile(pdf_path.clone())],
+        vec![Some((1_700_000_000, 4096))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 1 };
+    let key = crate::adjustment_db::normalize_path(&pdf_path);
+    app.details_lazy_meta.insert(
+        key.clone(),
+        DetailsLazyMeta {
+            source_mtime: 1_700_000_000,
+            source_size: 4096,
+            page_count_checked: true,
+            page_count_failed: true,
+            page_count_pdf_password_revision: Some(0),
+            ..Default::default()
+        },
+    );
+
+    app.invalidate_details_pdf_page_count(&pdf_path);
+
+    assert!(!app.details_lazy_meta.contains_key(&key));
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}

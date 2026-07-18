@@ -3178,6 +3178,9 @@ pub(crate) struct DetailsLazyMeta {
     pub(crate) page_count: Option<u32>,
     pub(crate) page_count_checked: bool,
     pub(crate) page_count_failed: bool,
+    /// PDF のページ数を取得した時点の、保存済みパスワードのプロセス内更新世代。
+    /// パスワード自体やそのハッシュは保持しない。
+    pub(crate) page_count_pdf_password_revision: Option<u64>,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) image_dims_failed: bool,
     pub(crate) video_duration_secs: Option<f64>,
@@ -3228,6 +3231,7 @@ struct DetailsMetaTarget {
     warm_image_dims: Option<(u32, u32)>,
     image_folder_page_count_options: Option<crate::app::folder_scan::ImageFolderPageCountOptions>,
     pdf_password: Option<String>,
+    pdf_password_revision: Option<u64>,
     load_page_count: bool,
     load_created_at: bool,
     load_ai_metadata: bool,
@@ -17242,6 +17246,7 @@ impl App {
                     if save_path == pdf_path {
                         self.pdf_passwords.set(&save_path, &pw);
                         self.pdf_passwords.save();
+                        self.invalidate_details_pdf_page_count(&save_path);
                     }
                 }
 
@@ -34564,6 +34569,24 @@ impl App {
             .filter(|meta| meta.matches_source(source))
     }
 
+    /// 保存済み PDF パスワードの変更後に、同じ起動中の古いページ数結果を破棄する。
+    ///
+    /// 一覧のメタデータ取得が並行中の場合は、変更前の認証状態で完了した結果が
+    /// 再挿入されないようジョブ全体をキャンセルし、必要な列だけ次フレームで再開する。
+    fn invalidate_details_pdf_page_count(&mut self, pdf_path: &Path) {
+        self.details_lazy_meta
+            .remove(&crate::adjustment_db::normalize_path(pdf_path));
+        if let Some(pending) = self.details_meta_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+        self.details_image_dims_state = if self.details_lazy_columns_visible() {
+            LazyColumnState::NotRequested
+        } else {
+            LazyColumnState::Disabled
+        };
+    }
+
     fn prune_details_lazy_meta_cache(&mut self) {
         if self.details_lazy_meta.len() <= DETAILS_LAZY_META_STALE_CAP {
             return;
@@ -34580,8 +34603,16 @@ impl App {
     }
 
     fn details_lazy_meta_satisfies_idx(&self, idx: usize, meta: &DetailsLazyMeta) -> bool {
-        if self.lazy_load_page_count_for_idx(idx) && !meta.page_count_checked {
-            return false;
+        if self.lazy_load_page_count_for_idx(idx) {
+            if !meta.page_count_checked {
+                return false;
+            }
+            if let Some(GridItem::PdfFile(path)) = self.items.get(idx)
+                && meta.page_count_pdf_password_revision
+                    != Some(self.pdf_passwords.credential_revision(path))
+            {
+                return false;
+            }
         }
         if self.lazy_load_created_for_idx(idx)
             && meta.created_at.is_none()
@@ -34683,13 +34714,16 @@ impl App {
             } else {
                 None
             };
-        let pdf_password = if load_page_count {
+        let (pdf_password, pdf_password_revision) = if load_page_count {
             match &item {
-                GridItem::PdfFile(path) => self.pdf_passwords.get(path),
-                _ => None,
+                GridItem::PdfFile(path) => (
+                    self.pdf_passwords.get(path),
+                    Some(self.pdf_passwords.credential_revision(path)),
+                ),
+                _ => (None, None),
             }
         } else {
-            None
+            (None, None)
         };
         Some(DetailsMetaTarget {
             key,
@@ -34701,6 +34735,7 @@ impl App {
             warm_image_dims: self.details_warm_image_dims(idx),
             image_folder_page_count_options,
             pdf_password,
+            pdf_password_revision,
             load_page_count,
             load_created_at,
             load_ai_metadata,

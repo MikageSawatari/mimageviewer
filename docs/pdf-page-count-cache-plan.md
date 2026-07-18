@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS pdf_meta (
 
 `try_apply_pdf_meta_cache` は **`pdf_passwords.get(this_pdf).is_some()`** (= ファイル固有保存 pw) でだけ password-protected キャッシュを trust する。session-level `pdf_current_password` は当てにしない (round 1 P1)。
 
+### 親一覧のページ数遅延取得
+
+パスワード付き PDF の親一覧では、保存済みのファイル固有パスワードがある場合だけ
+ページ数を取得・表示する。`pdf_current_password` だけの未保存パスワードは使用せず、
+ページ数は `-` のままとする。これは placeholder と同じ非露出境界である。
+
+遅延取得結果には、パスワードやそのハッシュではなく、保存済み認証情報の
+プロセス内更新世代を紐付ける。パスワードの保存または削除後は旧世代の「確認済み」
+結果を再利用せず、同じ起動中で対象 PDF を再取得する。これにより、保存前の認証失敗が
+再起動まで `-` として残ることを防ぐ。
+
 ---
 
 ## 以下は round 0 の素案 (アーカイブ目的で残す)
