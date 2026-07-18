@@ -91,6 +91,10 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
   transient なキャンセルテスト等)。いずれも単体では通る。高負荷時に別々のテストが順に
   落ちたら、個別に潰す前に **`cargo test --no-fail-fast -- --test-threads=1` で確定検証**する。
 - stale テストは「設計が変わった (期待が古い)」のか「実バグ」かを切り分けてから直す。
+- 単体テストと hitch 検査だけでは、短い work を高速で再投入する「速い無限ループ」を
+  検出できない。毎リリース `scripts/check-idle-health.ps1` で前面 / 背面 / 動画ピンの静止
+  シナリオを測り、`target/idle-health/` の統合 report が全て PASS であることを確認する。
+  手順と閾値は [idle-health-check.md](idle-health-check.md) を正とする。
 
 ---
 

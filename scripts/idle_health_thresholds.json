@@ -1,0 +1,13 @@
+{
+  "warmup_seconds": 5,
+  "measure_seconds": 15,
+  "target_cpu_core_ratio": 0.05,
+  "max_cpu_core_ratio": 0.1,
+  "target_update_rate_per_sec": 2.0,
+  "max_update_rate_per_sec": 10.0,
+  "max_reason_streak_seconds": 2.0,
+  "max_same_work": 3,
+  "max_input_events": 0,
+  "max_app_log_growth_bytes": 16384,
+  "max_perf_log_growth_bytes": 262144
+}

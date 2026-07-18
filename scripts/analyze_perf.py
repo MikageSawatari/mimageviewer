@@ -20,6 +20,8 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
                         start_loading_items / close_fullscreen) を集計
     hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
                         表示 (デフォルト 33ms = 30fps 閾値)
+    idle-health         静止区間の update 頻度、repaint 理由の継続、同一 work の
+                        反復を検査し、閾値超過時に終了コード 1 を返す
     startup             起動時間のフェーズ別 breakdown (data_dir / models /
                         susie_worker / settings / icon / fonts / theme / app_default /
                         creator_enter/exit / first_frame) を表示
@@ -525,6 +527,271 @@ def cmd_startup(events: list[dict]) -> None:
     if final and final.get("total_ms") is not None:
         print()
         print(f"=> 起動から初回フレームまで: {float(final['total_ms']):.0f} ms")
+
+
+# -----------------------------------------------------------------------
+# idle-health — 静止状態での高速 repaint / work 再投入ループ検出
+# -----------------------------------------------------------------------
+
+IDLE_HEALTH_WORK_KINDS = {
+    "enqueue",
+    "idle_upgrade_enqueue",
+    "idle_upgrade_ineligible",
+}
+
+
+def analyze_idle_health(
+    events: list[dict],
+    start_t: float,
+    end_t: float,
+    *,
+    target_update_rate: float = 2.0,
+    max_update_rate: float = 10.0,
+    max_reason_streak_secs: float = 2.0,
+    max_same_work: int = 3,
+    max_input_events: int = 0,
+) -> dict:
+    """静止測定区間を解析し、JSON 化可能な report を返す。
+
+    App が正しく sleep すると区間内イベントが 0 件になるため、イベントの最終時刻ではなく
+    呼び出し側が指定した wall-clock 相当の ``start_t`` / ``end_t`` を分母に使う。
+    """
+    duration = end_t - start_t
+    if duration <= 0.0:
+        raise ValueError("end_t は start_t より大きくしてください")
+
+    selected = [
+        e
+        for e in events
+        if start_t <= float(e.get("t", 0.0)) <= end_t
+    ]
+    selected.sort(key=lambda e: float(e.get("t", 0.0)))
+
+    frame_events = [
+        e
+        for e in selected
+        if e.get("cat") == "frame" and e.get("kind") == "begin"
+    ]
+    tail_events = [
+        e
+        for e in selected
+        if e.get("cat") == "ui" and e.get("kind") == "tail_repaint"
+    ]
+    input_events = [e for e in selected if e.get("cat") == "input"]
+
+    action_counts: dict[str, int] = defaultdict(int)
+    reason_counts: dict[str, int] = defaultdict(int)
+    cause_counts: dict[str, int] = defaultdict(int)
+    for event in tail_events:
+        action_counts[str(event.get("action", "?"))] += 1
+        for reason in event.get("reasons", []) or []:
+            reason_counts[str(reason)] += 1
+        for cause in event.get("prev_frame_causes", []) or []:
+            cause_counts[str(cause)] += 1
+
+    # 同じ理由が短い frame gap で連続する時間を測る。500ms を超えて次の frame が来た
+    # 場合は、継続 repaint ではなく sleep 後の別 run とみなす。
+    active_reasons: dict[str, tuple[float, float]] = {}
+    max_reason_streaks: dict[str, float] = defaultdict(float)
+    for event in tail_events:
+        t = float(event.get("t", 0.0))
+        present = {str(reason) for reason in (event.get("reasons", []) or [])}
+        for reason in list(active_reasons):
+            run_start, last_t = active_reasons[reason]
+            if reason not in present or t - last_t > 0.5:
+                max_reason_streaks[reason] = max(
+                    max_reason_streaks[reason],
+                    last_t - run_start,
+                )
+                del active_reasons[reason]
+        for reason in present:
+            if reason in active_reasons:
+                run_start, _ = active_reasons[reason]
+                active_reasons[reason] = (run_start, t)
+            else:
+                active_reasons[reason] = (t, t)
+    for reason, (run_start, last_t) in active_reasons.items():
+        max_reason_streaks[reason] = max(
+            max_reason_streaks[reason],
+            last_t - run_start,
+        )
+
+    work_counts: dict[tuple[str, str, str, str], int] = defaultdict(int)
+    for event in selected:
+        if event.get("cat") != "thumb" or event.get("kind") not in IDLE_HEALTH_WORK_KINDS:
+            continue
+        kind = str(event.get("kind"))
+        idx = str(event.get("idx", "-"))
+        key = str(event.get("key") or f"idx:{idx}")
+        generation = str(event.get("items_gen", event.get("seq", 0)))
+        work_counts[(kind, key, idx, generation)] += 1
+
+    repeated_work = [
+        {
+            "kind": identity[0],
+            "key": identity[1],
+            "idx": identity[2],
+            "generation": identity[3],
+            "count": count,
+        }
+        for identity, count in sorted(
+            work_counts.items(),
+            key=lambda pair: (-pair[1], pair[0]),
+        )
+        if count > 1
+    ]
+    max_work_count = max(work_counts.values(), default=0)
+    update_rate = len(frame_events) / duration
+
+    failures: list[str] = []
+    warnings: list[str] = []
+    if not any(e.get("cat") == "frame" and e.get("kind") == "begin" for e in events):
+        failures.append("perf log に frame.begin が無く、測定が有効か確認できません")
+    if not any(e.get("cat") == "ui" and e.get("kind") == "tail_repaint" for e in events):
+        failures.append("perf log に ui.tail_repaint が無く、対応ビルドか確認できません")
+    if len(input_events) > max_input_events:
+        failures.append(
+            f"測定区間に input event が {len(input_events)} 件あります "
+            f"(上限 {max_input_events})"
+        )
+    if update_rate > max_update_rate:
+        failures.append(
+            f"静止中の update rate が {update_rate:.2f}/s です "
+            f"(上限 {max_update_rate:.2f}/s)"
+        )
+    elif update_rate > target_update_rate:
+        warnings.append(
+            f"静止中の update rate が目標 {target_update_rate:.2f}/s を超えています: "
+            f"{update_rate:.2f}/s"
+        )
+    for reason, streak in sorted(max_reason_streaks.items()):
+        if streak > max_reason_streak_secs:
+            failures.append(
+                f"repaint reason `{reason}` が {streak:.2f}s 継続しました "
+                f"(上限 {max_reason_streak_secs:.2f}s)"
+            )
+    if max_work_count > max_same_work:
+        failures.append(
+            f"同一 thumbnail work が最大 {max_work_count} 回発生しました "
+            f"(上限 {max_same_work} 回)"
+        )
+
+    top_causes = [
+        {"cause": cause, "count": count}
+        for cause, count in sorted(
+            cause_counts.items(),
+            key=lambda pair: (-pair[1], pair[0]),
+        )[:10]
+    ]
+    return {
+        "status": "fail" if failures else "pass",
+        "window": {
+            "start_t": start_t,
+            "end_t": end_t,
+            "duration_secs": duration,
+        },
+        "metrics": {
+            "events": len(selected),
+            "frames": len(frame_events),
+            "update_rate_per_sec": update_rate,
+            "tail_repaint_events": len(tail_events),
+            "input_events": len(input_events),
+            "max_same_work": max_work_count,
+        },
+        "thresholds": {
+            "target_update_rate_per_sec": target_update_rate,
+            "max_update_rate_per_sec": max_update_rate,
+            "max_reason_streak_secs": max_reason_streak_secs,
+            "max_same_work": max_same_work,
+            "max_input_events": max_input_events,
+        },
+        "action_counts": dict(sorted(action_counts.items())),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "max_reason_streaks_secs": dict(sorted(max_reason_streaks.items())),
+        "repeated_work": repeated_work[:20],
+        "top_repaint_causes": top_causes,
+        "warnings": warnings,
+        "failures": failures,
+    }
+
+
+def cmd_idle_health(
+    events: list[dict],
+    start_t: float | None,
+    end_t: float | None,
+    window_secs: float,
+    target_update_rate: float,
+    max_update_rate: float,
+    max_reason_streak_secs: float,
+    max_same_work: int,
+    max_input_events: int,
+    json_out: Path | None,
+) -> int:
+    if not events:
+        print("ERROR: perf event が 0 件です", file=sys.stderr)
+        return 2
+    if end_t is None:
+        end_t = max(float(e.get("t", 0.0)) for e in events)
+    if start_t is None:
+        start_t = max(0.0, end_t - window_secs)
+    try:
+        report = analyze_idle_health(
+            events,
+            start_t,
+            end_t,
+            target_update_rate=target_update_rate,
+            max_update_rate=max_update_rate,
+            max_reason_streak_secs=max_reason_streak_secs,
+            max_same_work=max_same_work,
+            max_input_events=max_input_events,
+        )
+    except ValueError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+
+    metrics = report["metrics"]
+    window = report["window"]
+    print("=== idle health ===")
+    print(
+        f"測定区間: t={window['start_t']:.3f}..{window['end_t']:.3f} "
+        f"({window['duration_secs']:.2f}s)"
+    )
+    print(
+        f"events={metrics['events']} frames={metrics['frames']} "
+        f"update_rate={metrics['update_rate_per_sec']:.2f}/s "
+        f"tail_repaint={metrics['tail_repaint_events']} "
+        f"input={metrics['input_events']} max_same_work={metrics['max_same_work']}"
+    )
+    if report["action_counts"]:
+        print("tail actions:")
+        for action, count in report["action_counts"].items():
+            print(f"  {action}: {count}")
+    if report["reason_counts"]:
+        print("repaint reasons (count / max streak):")
+        for reason, count in report["reason_counts"].items():
+            streak = report["max_reason_streaks_secs"].get(reason, 0.0)
+            print(f"  {reason}: {count} / {streak:.2f}s")
+    if report["repeated_work"]:
+        print("repeated thumbnail work (top 20):")
+        for work in report["repeated_work"]:
+            print(
+                f"  {work['kind']} count={work['count']} idx={work['idx']} "
+                f"gen={work['generation']} key={fmt_key(work['key'])}"
+            )
+    for warning in report["warnings"]:
+        print(f"WARNING: {warning}")
+    for failure in report["failures"]:
+        print(f"FAIL: {failure}")
+    print(f"判定: {str(report['status']).upper()}")
+
+    if json_out is not None:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"JSON report: {json_out}")
+    return 1 if report["failures"] else 0
 
 
 # -----------------------------------------------------------------------
@@ -1213,6 +1480,21 @@ def main() -> None:
     subs.add_parser("startup")
     p_hit = subs.add_parser("hitches")
     p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
+    p_idle = subs.add_parser("idle-health")
+    p_idle.add_argument("--start-t", type=float, default=None, help="測定開始 t (秒)")
+    p_idle.add_argument("--end-t", type=float, default=None, help="測定終了 t (秒)")
+    p_idle.add_argument(
+        "--window-secs",
+        type=float,
+        default=15.0,
+        help="start-t 省略時に end-t から遡る秒数 (既定 15)",
+    )
+    p_idle.add_argument("--target-update-rate", type=float, default=2.0)
+    p_idle.add_argument("--max-update-rate", type=float, default=10.0)
+    p_idle.add_argument("--max-reason-streak-secs", type=float, default=2.0)
+    p_idle.add_argument("--max-same-work", type=int, default=3)
+    p_idle.add_argument("--max-input-events", type=int, default=0)
+    p_idle.add_argument("--json-out", type=Path, default=None)
     p_avd = subs.add_parser("av_drift")
     p_avd.add_argument(
         "--plot",
@@ -1254,6 +1536,21 @@ def main() -> None:
         cmd_startup(events)
     elif args.cmd == "hitches":
         cmd_hitches(events, args.ms)
+    elif args.cmd == "idle-health":
+        sys.exit(
+            cmd_idle_health(
+                events,
+                args.start_t,
+                args.end_t,
+                args.window_secs,
+                args.target_update_rate,
+                args.max_update_rate,
+                args.max_reason_streak_secs,
+                args.max_same_work,
+                args.max_input_events,
+                args.json_out,
+            )
+        )
     elif args.cmd == "av_drift":
         cmd_av_drift(events, args.plot)
     elif args.cmd == "spike-context":

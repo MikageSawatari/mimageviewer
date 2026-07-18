@@ -849,7 +849,7 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 - `input`  — ユーザー入力 (seq が振られる唯一のカテゴリ)
 - `frame`  — 毎フレーム begin。`n` はフレーム番号
 - `fs`     — フルスクリーン画像: `load_begin` / `decode_begin` / `decode_end` / `ready` / `paint`
-- `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`
+- `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`。アイドル高画質化の最終判定は `idle_upgrade_enqueue` / `idle_upgrade_ineligible` に `key` / `idx` / `items_gen` を載せ、同一状態の反復を検出できるようにする
 - `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `inproc_*` / `enumerate_send`
 - `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`
 - `folder_pane` — 左フォルダツリーペイン: `scan_subfolders` (子ディレクトリ列挙の ms / 件数 / cancel)
@@ -865,9 +865,18 @@ python scripts/analyze_perf.py <path>/perf_events.jsonl priority  # 優先度違
 python scripts/analyze_perf.py <path>/perf_events.jsonl thumbs    # decode 時間分布
 python scripts/analyze_perf.py <path>/perf_events.jsonl dump 42   # 特定 seq の全イベント
 python scripts/analyze_perf.py <path>/perf_events.jsonl timeline  # ガントチャート (matplotlib)
+python scripts/analyze_perf.py <path>/perf_events.jsonl idle-health --start-t 10 --end-t 25
 ```
 
-### 7.5 新ワーカー追加時のテンプレ
+### 7.5 アイドル健全性
+
+`idle-health` は静止区間の `frame.begin` 件数、`ui.tail_repaint` reason の継続時間、同一
+thumbnail work の反復を検査し、閾値超過で exit 1 を返す。アプリが正常に sleep すると
+区間内 event が 0 件になるため、wall time はプロセス外から `--start-t` / `--end-t` で渡す。
+CPU time とログ増加量も含むリリース前手順は
+[idle-health-check.md](idle-health-check.md) を参照する。
+
+### 7.6 新ワーカー追加時のテンプレ
 
 1. ワーカーに渡すタスク構造体に `input_seq: u64` フィールドを追加
 2. UI スレッドの enqueue 箇所で `req.input_seq = self.input_seq` を設定

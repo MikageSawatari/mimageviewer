@@ -1416,6 +1416,21 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - 「ヒッチ: 0 件」または既知の長時間 nav (PDF cold open ~700ms 等) のみなら OK。
      nav イベント無しのヒッチは UI スレッド同期 I/O 退行の疑い (docs/ui-responsiveness.md §4)。
 
+9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
+   ```powershell
+   .\scripts\check-idle-health.ps1 -Scenario static-foreground
+   .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
+   .\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background
+   ```
+   - 最初のコマンドが `mimageviewer-core.exe --perf-log` を起動する。各シナリオを準備して
+     Enter を押す。前面シナリオは warmup 5 秒中にアプリへフォーカスを戻し、測定 15 秒の
+     開始表示後は入力しない。背面シナリオは別ウィンドウを前面に保つ。
+   - CPU one-core ratio、update rate、repaint reason streak、同一 thumbnail work、通常 / perf
+     ログ増加量のどれかが上限を超えたら exit 1。失敗を閾値緩和だけで通さず、
+     `target/idle-health/*-perf.json` の原因と反復 key を確認する。
+   - ZIP / PDF / スマートフォルダ、AI、動画・音楽の非同期経路を変更した場合は、その処理が
+     完了した静止状態も追加測定する。詳細は `docs/idle-health-check.md`。
+
 ### Phase 3: ビルド・配布成果物
 
 10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで clean → core → launcher → ISCC → portable)。

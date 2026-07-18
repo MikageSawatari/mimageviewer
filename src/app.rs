@@ -24881,6 +24881,27 @@ impl App {
             }) else {
                 continue;
             };
+            // `--perf-log` の idle-health 検査は、同じ Loaded 状態を入力や世代変更なしに
+            // 何度も評価 / 再投入するループを work key 単位で検出する。通常ログだけでは
+            // 件数集計が不安定になるため、最終 skip_cache 判定を構造化イベントで残す。
+            if crate::perf::is_enabled() {
+                let perf_key = self.perf_item_key(i);
+                crate::perf::event(
+                    "thumb",
+                    if req.skip_cache {
+                        "idle_upgrade_enqueue"
+                    } else {
+                        "idle_upgrade_ineligible"
+                    },
+                    perf_key.as_deref(),
+                    self.input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(i)),
+                        ("items_gen", serde_json::Value::from(self.items_generation)),
+                        ("skip_cache", serde_json::Value::from(req.skip_cache)),
+                    ],
+                );
+            }
             // `make_load_request` は、catalog を迂回しても改善できない完成済み派生物へ
             // 解決することがある。特に動画ピンは seed 済み WebP をフォルダ自動代表画像で
             // 上書きしないよう `skip_cache = false` を強制する。この最終判定を現在の

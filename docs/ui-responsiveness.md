@@ -302,6 +302,23 @@ python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベン
 
 悪化した場合は `hitches` の直前 nav イベントで原因区間を特定し、§4 チェックリストを通す。
 
+### 7.2 静止中・背面表示中の健全性
+
+`hitches` は遅いフレームを探すため、短い処理を高速で再投入して CPU 1 コアとログを消費する
+ループは別検査にする。release verification binary を `--perf-log` 付きで起動し、PowerShell
+側から CPU time / wall time とログ増加を測りながら `analyze_perf.py idle-health` を実行する。
+
+```powershell
+.\scripts\check-idle-health.ps1 -Scenario static-foreground
+.\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
+.\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background
+```
+
+測定中の入力、update rate、repaint reason streak、同一 work 反復、CPU、ログ増加のいずれかが
+上限を超えると exit 1。詳細手順・閾値・シナリオは
+[idle-health-check.md](idle-health-check.md) を参照する。新しい polling / retry / idle work を
+追加するときは、同じ安定状態を複数回評価して最終的に work 0 へ収束する単体テストも追加する。
+
 ---
 
 ## 7a. 既知の同期 I/O 残課題 (v0.8.2 以降で worker 化)
