@@ -8337,6 +8337,7 @@ mod tests {
             s.show_location_drive_roots = false;
             s.toolbar_section_new_row = vec![ToolbarSectionId::Tags, ToolbarSectionId::Favorites];
             s.ring_shortcuts.mouse_flick_enabled = true;
+            s.ring_shortcuts.select_grid_item_on_right_drag_start = true;
             s.ring_shortcuts.gamepad_ring_enabled = false;
             s.ring_shortcuts.shift_wheel_pair =
                 crate::ring_shortcut::WheelPairActionId::VideoVolumeUpDown;
@@ -8606,6 +8607,10 @@ mod tests {
             assert!(
                 loaded.ring_shortcuts.mouse_flick_enabled,
                 "ring shortcut mouse toggle should survive roundtrip"
+            );
+            assert!(
+                loaded.ring_shortcuts.select_grid_item_on_right_drag_start,
+                "grid right-drag start selection should survive roundtrip"
             );
             assert!(
                 loaded.ring_shortcuts.gamepad_ring_enabled,

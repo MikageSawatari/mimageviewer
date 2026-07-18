@@ -531,7 +531,7 @@ set・列数 set 等は既存 `KeyAction` を流用できる。
   より旧 DB を新コードで開いても安全に既定が入る。
 - `RingShortcutSettings` が保持する**保存対象 (全列挙、Codex 第6回 P2)**:
   - context 別 × 8 スロットの `RingActionId` (または空き)
-  - 右ドラッグ mode 4 文脈 (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) と、4 文脈ごとの `mouse_gestures_*` (最大 4 stroke の方向列 + `RingActionId`)。旧 `mouse_flick_enabled` は互換用
+  - 右ドラッグ mode 4 文脈 (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) と、グリッド開始セルを押下時に選択する opt-in `select_grid_item_on_right_drag_start`、4 文脈ごとの `mouse_gestures_*` (最大 4 stroke の方向列 + `RingActionId`)。旧 `mouse_flick_enabled` は互換用
   - `shift_wheel_pair` / `alt_wheel_pair` (`WheelPairActionId`) — 互換読み込み用。§5.2 のとおり現行 UI /
     入力経路からは参照しない
   - `mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video`

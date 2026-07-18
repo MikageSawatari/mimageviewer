@@ -645,6 +645,18 @@ pub(super) fn page_right_drag_modes(ui: &mut egui::Ui, state: &mut PreferencesSt
                 right_drag_mode_combo(ui, settings, context);
             }
         });
+    ui.add_space(8.0);
+    let grid_right_drag_enabled = matches!(
+        settings.right_drag_mode(RightDragContext::Grid),
+        RightDragMode::RingShortcut | RightDragMode::MouseGesture
+    );
+    ui.add_enabled_ui(grid_right_drag_enabled, |ui| {
+        ui.checkbox(
+            &mut settings.select_grid_item_on_right_drag_start,
+            "ファイル上で右ドラッグを始めたとき、そのファイルを選択",
+        );
+    });
+    ui.small("グリッドの空き位置から右ドラッグを始めた場合は、現在の選択を維持します。");
 }
 
 pub(super) fn page_ring_shortcut_assignments(

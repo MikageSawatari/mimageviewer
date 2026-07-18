@@ -1741,6 +1741,10 @@ pub struct RingShortcutSettings {
     pub right_drag_video: Option<RightDragMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_drag_edit: Option<RightDragMode>,
+    /// Select the grid item under the pointer as soon as an enabled right-drag
+    /// operation starts. Defaults to false to preserve the pre-v2.6 behavior.
+    #[serde(default)]
+    pub select_grid_item_on_right_drag_start: bool,
     #[serde(default = "default_grid_gesture_profile")]
     pub mouse_gestures_grid: MouseGestureProfile,
     #[serde(default = "default_image_gesture_profile")]
@@ -1952,6 +1956,7 @@ impl Default for RingShortcutSettings {
             right_drag_image: None,
             right_drag_video: None,
             right_drag_edit: None,
+            select_grid_item_on_right_drag_start: false,
             mouse_gestures_grid: default_grid_gesture_profile(),
             mouse_gestures_image: default_image_gesture_profile(),
             mouse_gestures_video: default_video_gesture_profile(),
@@ -2354,6 +2359,7 @@ mod tests {
     fn default_profiles_match_design_slots() {
         let defaults = RingShortcutSettings::default();
         assert_eq!(defaults.mouse_flick_enabled, false);
+        assert!(!defaults.select_grid_item_on_right_drag_start);
         for &context in RightDragContext::all() {
             assert_eq!(defaults.right_drag_mode(context), RightDragMode::Disabled);
         }
@@ -2529,6 +2535,22 @@ mod tests {
             settings.right_drag_mode(RightDragContext::VideoFullscreen),
             RightDragMode::RingShortcut
         );
+    }
+
+    #[test]
+    fn grid_right_drag_start_selection_setting_defaults_and_round_trips() {
+        let legacy: RingShortcutSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.select_grid_item_on_right_drag_start);
+
+        let mut settings = RingShortcutSettings::default();
+        settings.select_grid_item_on_right_drag_start = true;
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: RingShortcutSettings = serde_json::from_str(&json).unwrap();
+        assert!(loaded.select_grid_item_on_right_drag_start);
+
+        let mut sanitized = loaded;
+        sanitized.sanitize();
+        assert!(sanitized.select_grid_item_on_right_drag_start);
     }
     #[test]
     fn toggle_maximize_action_round_trips_and_is_grid_only() {

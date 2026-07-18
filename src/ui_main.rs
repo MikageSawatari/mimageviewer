@@ -2211,6 +2211,80 @@ fn reading_history_progress_text(
     }
 }
 
+/// Applies the optional grid-selection change at the right-button press
+/// boundary. Keeping this separate from the ring/gesture state machines makes
+/// the selection policy explicit and leaves checked multi-selection untouched.
+fn apply_grid_right_drag_start_selection(
+    selected: &mut Option<usize>,
+    enabled: bool,
+    mode: &crate::ring_shortcut::RightDragMode,
+    target_idx: Option<usize>,
+) -> bool {
+    if !enabled
+        || !matches!(
+            mode,
+            crate::ring_shortcut::RightDragMode::RingShortcut
+                | crate::ring_shortcut::RightDragMode::MouseGesture
+        )
+    {
+        return false;
+    }
+    let Some(idx) = target_idx else {
+        return false;
+    };
+    *selected = Some(idx);
+    true
+}
+
+#[cfg(test)]
+mod grid_right_drag_start_selection_tests {
+    use super::*;
+    use crate::ring_shortcut::RightDragMode;
+
+    #[test]
+    fn active_modes_select_the_start_cell_only_when_opted_in() {
+        for mode in [RightDragMode::RingShortcut, RightDragMode::MouseGesture] {
+            let mut selected = Some(1);
+            assert!(apply_grid_right_drag_start_selection(
+                &mut selected,
+                true,
+                &mode,
+                Some(4)
+            ));
+            assert_eq!(selected, Some(4));
+
+            selected = Some(1);
+            assert!(!apply_grid_right_drag_start_selection(
+                &mut selected,
+                false,
+                &mode,
+                Some(4)
+            ));
+            assert_eq!(selected, Some(1));
+        }
+    }
+
+    #[test]
+    fn disabled_mode_and_background_start_preserve_selection() {
+        let mut selected = Some(2);
+        assert!(!apply_grid_right_drag_start_selection(
+            &mut selected,
+            true,
+            &RightDragMode::Disabled,
+            Some(5)
+        ));
+        assert_eq!(selected, Some(2));
+
+        assert!(!apply_grid_right_drag_start_selection(
+            &mut selected,
+            true,
+            &RightDragMode::MouseGesture,
+            None
+        ));
+        assert_eq!(selected, Some(2));
+    }
+}
+
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -9231,11 +9305,21 @@ impl App {
             })
             && cell_rect.contains(pos)
         {
-            match self
+            let mode = self
                 .settings
                 .ring_shortcuts
-                .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid)
-            {
+                .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid);
+            if apply_grid_right_drag_start_selection(
+                &mut self.selected,
+                self.settings
+                    .ring_shortcuts
+                    .select_grid_item_on_right_drag_start,
+                &mode,
+                Some(idx),
+            ) {
+                self.update_last_selected_image();
+            }
+            match mode {
                 crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
                     ctx,
                     crate::ring_shortcut::RingShortcutContext::Grid,
