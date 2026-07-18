@@ -249,15 +249,11 @@
 
 | 対象 | 現状 / 次の確認 | 注意点 |
 | --- | --- | --- |
-| PDFium | v2.5.0 は `chromium/7934`。**新版 `chromium/7947` あり (2026-07-18 確認)**。v2.6.0 開発初期に `setup-pdfium.sh` 更新 → PDF 表示手動確認 | PDF 開封、ページ列挙、サムネ、フルスクリーン、パスワード PDF |
-| FFmpeg LGPL shared | v2.5.0 は `ffmpeg-n7.1.5-1-g7d0e842004`。**新版 `ffmpeg-n7.1.5-2-g998de74adf` あり (2026-07-18 確認)**。v2.6.0 開発初期に更新し、対応ソース / LGPL 表記も同期 | DLL 名が変わる更新では `setup-ffmpeg.sh` / loader / `build.rs` を揃える |
-| ONNX Runtime | `ort-sys` 要求 DLL と setup script の VERSION を確認 | C API バージョン一致、`+crt-static` + `load-dynamic` 維持 |
 | VST3 SDK / bridge | C++ ソース変更がなければ再ビルド不要 | 更新時は商用プラグインで実機確認 |
 
 ### 5.2 Rust クレート
 
-- 通常の `cargo update` は互換範囲でまとめて実施する。
-- メジャー / rc 脱出は個別判断:
+- 互換範囲の一括更新とは分け、次のメジャー更新 / rc 脱出は個別判断する:
   - `ort`
   - `pdfium-render`
   - `ffmpeg-the-third`

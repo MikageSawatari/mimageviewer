@@ -180,7 +180,19 @@ MVP の定義には保存しない。
 - 親代表サムネイルの自動選定への編集プレビュー反映（手動固定を先行）
 - detached viewer の資源予算、メディア昇格、表示 LOD、英語 UI
 
-## 5. 関連ドキュメント
+## 5. 依存更新ベースライン（2026-07-18）
+
+- PDFium を `chromium/7934` から `chromium/7947` へ更新した。PDF 開封、ページ列挙、
+  サムネイル、フルスクリーン、パスワード付き PDF は実機回帰対象とする。
+- FFmpeg LGPL shared build を `n7.1.5-1-g7d0e842004` から
+  `n7.1.5-2-g998de74adf` へ更新した。DLL メジャー名は不変。実 DLL の ProductVersion、
+  LGPLv3-or-later、`--enable-version3`、x264/x265 無効を監査し、製品ページの対応ソース表記を同期した。
+- ONNX Runtime は `ort` / `ort-sys 2.0.0-rc.12` の配布表が要求する `1.24.2` と、
+  setup script / vendor DLL の `1.24.2` が一致するため据え置いた。
+- `cargo update` で Rust 1.88 互換範囲の lockfile を更新した。メジャー更新と rc 脱出は
+  通常更新へ混ぜず、バックログの個別判断対象として残す。
+
+## 6. 関連ドキュメント
 
 - [architecture-overview.md](architecture-overview.md)
 - [async-architecture.md](async-architecture.md)

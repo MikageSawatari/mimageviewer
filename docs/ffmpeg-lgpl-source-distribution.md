@@ -1,6 +1,6 @@
 # FFmpeg LGPL Source Distribution Notes
 
-Last updated: 2026-05-01
+Last updated: 2026-07-18
 
 mImageViewer bundles BtbN FFmpeg LGPL shared DLLs under `vendor/ffmpeg/`.
 The current build is LGPLv3-or-later because the bundled DLLs contain
