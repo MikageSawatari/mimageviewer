@@ -123,6 +123,14 @@ load 時に失効する。削除／全消去通知を受けた UI も、メモ�
 保存完了通知を受けた UI は該当セルを `Evicted` に戻して読み直し、同時進行して
 いた raw decode が後着しても `from_edit_preview` が立つまで再試行する。
 
+親コンテナの代表サムネイルを手動 pin した場合も、cascade 解決後の leaf が固定の
+Image / ZipEntry / PdfPage なら同じ preview を通常 catalog より優先する。直接ページは
+page mtime + size、ZIP/PDF の親代表は保存 worker が記録した container size と thumbnail
+worker が読んだ現在の container mtime + size で stale 判定する。変換アーカイブでは元
+アーカイブではなく、実際にページを読んだ cache ZIP の key / identity を使う。編集 preview
+通知は直接ページだけでなく、その leaf を固定している親セルにも伝播する。自動選定代表への
+反映は別 backlog とする。
+
 既定は有効・上限 1GB。上限超過時は最終アクセスが古い WebP から削除する。encode、ファイル I/O、
 SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッドをブロックしない。
 

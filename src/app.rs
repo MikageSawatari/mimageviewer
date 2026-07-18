@@ -1851,6 +1851,7 @@ struct ViewerContextBundle {
         usize,
         std::sync::Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
     >,
+    thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
     thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
@@ -2061,6 +2062,7 @@ impl ViewerContextBundle {
             pdf_prefetch_grace_until: None,
             thumb_pixels: std::collections::HashMap::new(),
             thumb_edit_preview_layers: std::collections::HashMap::new(),
+            thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
             adjustment_page_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
@@ -3799,6 +3801,7 @@ enum EditPreviewCloseUpdate {
         item_key: String,
         source_mtime: i64,
         source_size: i64,
+        source_container_path: Option<PathBuf>,
         pixels: Arc<egui::ColorImage>,
         annotations: Option<crate::edit_preview_cache::EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
@@ -7764,6 +7767,9 @@ pub struct App {
         usize,
         std::sync::Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
     >,
+    /// 現在の cell request が参照する edit-preview page key。手動 pin の親 cell も含む。
+    /// Saved/Invalidated 通知を直接ページと親代表の両方へ伝播するための per-context map。
+    pub(crate) thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
     /// サムネイル補正済みテクスチャ: idx → TextureHandle。
     /// `effective_params(idx)` が色調 identity でないときのみ格納。
     /// サムネ描画時は `thumbnails[idx].tex` より優先される。
@@ -9902,6 +9908,7 @@ impl App {
             ai_upscale_generation: std::collections::HashMap::new(),
             thumb_pixels: std::collections::HashMap::new(),
             thumb_edit_preview_layers: std::collections::HashMap::new(),
+            thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
             thumb_adjust_was_dragging: false,
             thumb_adjust_drag_color_dirty: false,
@@ -11343,6 +11350,7 @@ impl App {
             pdf_prefetch_grace_until,
             thumb_pixels,
             thumb_edit_preview_layers,
+            thumb_edit_preview_keys,
             thumb_adjust_tex,
             adjustment_page_params,
             local_adjust_page_layers,
@@ -11530,6 +11538,7 @@ impl App {
         swap_field!(pdf_prefetch_grace_until);
         swap_field!(thumb_pixels);
         swap_field!(thumb_edit_preview_layers);
+        swap_field!(thumb_edit_preview_keys);
         swap_field!(thumb_adjust_tex);
         swap_field!(adjustment_page_params);
         swap_field!(local_adjust_page_layers);
@@ -18642,6 +18651,7 @@ impl App {
         self.persist_pending_view_trim_state();
         self.items = items;
         self.image_metas = image_metas;
+        self.thumb_edit_preview_keys.clear();
         self.thumbnails = self
             .items
             .iter()
@@ -20485,6 +20495,10 @@ impl App {
                     .map(|ni| (ni, layers))
             })
             .collect();
+        let shifted_thumb_preview_keys = std::mem::take(&mut self.thumb_edit_preview_keys)
+            .into_iter()
+            .filter_map(|(i, key)| shift(i).map(|ni| (ni, key)))
+            .collect();
 
         // selected の詰め動作: `sel - count(removed idx < sel)` は残存 / 削除どちらの
         // ケースでも「old idx の位置に収まる新 idx」(= 繰り上がった次 item) を返す。
@@ -20726,6 +20740,7 @@ impl App {
         // idx shift で残す。補正済み TextureHandle は invalidate 後に再生成させる。
         self.thumb_pixels = shifted_thumb_pixels;
         self.thumb_edit_preview_layers = shifted_thumb_layers;
+        self.thumb_edit_preview_keys = shifted_thumb_preview_keys;
 
         let n = self.items.len();
         if n == 0 {
@@ -31188,6 +31203,7 @@ impl App {
             pdf_prefetch_grace_until,
             thumb_pixels,
             thumb_edit_preview_layers,
+            thumb_edit_preview_keys,
             thumb_adjust_tex,
             adjustment_page_params,
             local_adjust_page_layers,
@@ -31387,6 +31403,7 @@ impl App {
             pdf_prefetch_grace_until,
             thumb_pixels,
             thumb_edit_preview_layers,
+            thumb_edit_preview_keys,
             thumb_adjust_tex,
             adjustment_page_params,
             local_adjust_page_layers,
@@ -35100,20 +35117,30 @@ impl App {
         }
     }
 
-    fn attach_edit_preview_to_request(&self, req: &mut LoadRequest) {
+    fn attach_edit_preview_to_request(&mut self, req: &mut LoadRequest) {
         if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
+            req.edit_preview_key = None;
+            req.edit_preview_validate_container = false;
+            self.thumb_edit_preview_keys.remove(&req.idx);
             return;
         }
-        let badges = self.grid_edit_badges(req.idx);
-        // 色調補正は既存の thumb_adjust_tex が安価に再現する。永続プレビューには
-        // source 解像度の edit-result + 注釈 + 最後段 crop だけを含める。
-        if badges.local_adjust
-            || badges.mask
-            || badges.conceal
-            || badges.comic
-            || self.export_crop_pages.contains(&req.idx)
-        {
-            req.edit_preview_key = self.page_path_key(req.idx);
+        if req.edit_preview_key.is_none() {
+            let badges = self.grid_edit_badges(req.idx);
+            // 色調補正は既存の thumb_adjust_tex が安価に再現する。永続プレビューには
+            // source 解像度の edit-result + 注釈 + 最後段 crop だけを含める。
+            if badges.local_adjust
+                || badges.mask
+                || badges.conceal
+                || badges.comic
+                || self.export_crop_pages.contains(&req.idx)
+            {
+                req.edit_preview_key = self.page_path_key(req.idx);
+            }
+        }
+        if let Some(key) = req.edit_preview_key.as_ref() {
+            self.thumb_edit_preview_keys.insert(req.idx, key.clone());
+        } else {
+            self.thumb_edit_preview_keys.remove(&req.idx);
         }
     }
 
@@ -41226,6 +41253,14 @@ impl App {
         }
         let item_key = self.page_path_key(idx)?;
         let (source_mtime, source_size) = self.image_metas.get(idx).copied().flatten()?;
+        // ZIP/PDF の container stat は encode と同じ専用 worker で行う。親コンテナの
+        // 手動代表サムネイルは entry size を持たないため、保存時の container identity
+        // を別に記録して照合する。
+        let source_container_path = match self.items.get(idx)? {
+            GridItem::ZipImage { zip_path, .. } => Some(zip_path.clone()),
+            GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
+            _ => None,
+        };
         let has_source_edits = self.local_adjust_pages.contains(&idx)
             || self.mask_pages.contains(&idx)
             || self.conceal_pages.contains(&idx);
@@ -41276,6 +41311,7 @@ impl App {
             item_key,
             source_mtime,
             source_size,
+            source_container_path,
             pixels,
             annotations,
             crop,
@@ -41291,6 +41327,7 @@ impl App {
                 item_key,
                 source_mtime,
                 source_size,
+                source_container_path,
                 pixels,
                 annotations,
                 crop,
@@ -41298,6 +41335,7 @@ impl App {
                 item_key,
                 source_mtime,
                 source_size,
+                source_container_path,
                 pixels,
                 annotations,
                 crop,
@@ -41337,6 +41375,18 @@ impl App {
         }
     }
 
+    fn thumbnail_indices_for_edit_preview_key(&self, item_key: &str) -> Vec<usize> {
+        (0..self.items.len())
+            .filter(|&idx| {
+                self.page_path_key(idx).as_deref() == Some(item_key)
+                    || self
+                        .thumb_edit_preview_keys
+                        .get(&idx)
+                        .is_some_and(|key| key == item_key)
+            })
+            .collect()
+    }
+
     fn poll_edit_preview_cache(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         if let Some(service) = &self.edit_preview_cache {
@@ -41347,11 +41397,7 @@ impl App {
         for event in events {
             match event {
                 crate::edit_preview_cache::EditPreviewEvent::Saved { item_key } => {
-                    let matching: Vec<usize> = (0..self.items.len())
-                        .filter(|&idx| {
-                            self.page_path_key(idx).as_deref() == Some(item_key.as_str())
-                        })
-                        .collect();
+                    let matching = self.thumbnail_indices_for_edit_preview_key(&item_key);
                     for idx in matching {
                         self.evict_thumbnail_for_edit_preview_refresh(idx);
                     }
@@ -41361,11 +41407,7 @@ impl App {
                     );
                 }
                 crate::edit_preview_cache::EditPreviewEvent::Invalidated { item_key } => {
-                    let matching: Vec<usize> = (0..self.items.len())
-                        .filter(|&idx| {
-                            self.page_path_key(idx).as_deref() == Some(item_key.as_str())
-                        })
-                        .collect();
+                    let matching = self.thumbnail_indices_for_edit_preview_key(&item_key);
                     for idx in matching {
                         self.evict_thumbnail_for_edit_preview_refresh(idx);
                     }
@@ -41407,32 +41449,35 @@ impl App {
             .map(|(key, deadline)| (key.clone(), *deadline))
             .collect();
         for (item_key, deadline) in pending {
-            let idx = (0..self.items.len())
-                .find(|&idx| self.page_path_key(idx).as_deref() == Some(item_key.as_str()));
-            let Some(idx) = idx else {
+            let matching = self.thumbnail_indices_for_edit_preview_key(&item_key);
+            if matching.is_empty() {
                 if now >= deadline {
                     self.edit_preview_refresh_pending.remove(&item_key);
                 }
                 continue;
-            };
-            let preview_loaded = matches!(
-                self.thumbnails.get(idx),
-                Some(ThumbnailState::Loaded {
-                    from_edit_preview: true,
-                    ..
-                })
-            );
-            if preview_loaded || now >= deadline {
+            }
+            let all_previews_loaded = matching.iter().all(|&idx| {
+                matches!(
+                    self.thumbnails.get(idx),
+                    Some(ThumbnailState::Loaded {
+                        from_edit_preview: true,
+                        ..
+                    })
+                )
+            });
+            if all_previews_loaded || now >= deadline {
                 self.edit_preview_refresh_pending.remove(&item_key);
                 continue;
             }
             // 保存通知より前に開始済みだった raw decode が後着した場合も、次の
             // フレームで再度 Evicted にして preview cache を必ず読み直す。
-            if matches!(
-                self.thumbnails.get(idx),
-                Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
-            ) {
-                self.evict_thumbnail_for_edit_preview_refresh(idx);
+            for idx in matching {
+                if matches!(
+                    self.thumbnails.get(idx),
+                    Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
+                ) {
+                    self.evict_thumbnail_for_edit_preview_refresh(idx);
+                }
             }
         }
         if !self.edit_preview_refresh_pending.is_empty() {
@@ -53889,6 +53934,40 @@ fn zip_level_thumb_reuse_key(item: &GridItem) -> Option<String> {
     }
 }
 
+/// 手動代表 pin が特定の編集可能ページへ解決されたとき、そのページの永続
+/// edit-preview key と検証方式を返す。
+///
+/// ZIP/PDF は parent request が page size を持たないため container identity で検証する。
+/// Folder/ZipDir/ZipFirstImage は worker が後から代表を選ぶため、固定 page key を付けない。
+fn pinned_edit_preview_target(
+    kind: crate::folder_thumb_pins::ResolvedKind,
+    request_path: &std::path::Path,
+    zip_entry: Option<&str>,
+    pdf_page: Option<u32>,
+) -> (Option<String>, bool) {
+    use crate::folder_thumb_pins::ResolvedKind;
+    match kind {
+        ResolvedKind::Image => (
+            Some(crate::adjustment_db::normalize_path(request_path)),
+            false,
+        ),
+        ResolvedKind::ZipEntry => (
+            zip_entry.map(|entry| crate::adjustment_db::zip_entry_key(request_path, entry)),
+            true,
+        ),
+        ResolvedKind::PdfFirstPage | ResolvedKind::PdfPage => (
+            pdf_page.map(|page| {
+                crate::adjustment_db::zip_entry_key(request_path, &format!("page_{page}"))
+            }),
+            true,
+        ),
+        ResolvedKind::Video
+        | ResolvedKind::Folder
+        | ResolvedKind::ZipFirstImage
+        | ResolvedKind::ZipDirRepresentative => (None, false),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_load_request(
     item: &GridItem,
@@ -53981,6 +54060,11 @@ fn make_load_request(
                         return Some(LoadRequest {
                             path: load_zip_path.clone(),
                             zip_entry: Some(entry.clone()),
+                            edit_preview_key: Some(crate::adjustment_db::zip_entry_key(
+                                load_zip_path,
+                                entry,
+                            )),
+                            edit_preview_validate_container: true,
                             cache_key_override: Some(format!(
                                 "{}{}{}",
                                 crate::grid_item::zipdir_cache_key(dir_prefix),
@@ -54007,9 +54091,18 @@ fn make_load_request(
                             );
                             match resolved.kind {
                                 crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
+                                    let (edit_preview_key, edit_preview_validate_container) =
+                                        pinned_edit_preview_target(
+                                            resolved.kind,
+                                            load_zip_path,
+                                            resolved.zip_entry.as_deref(),
+                                            resolved.pdf_page,
+                                        );
                                     return Some(LoadRequest {
                                         path: load_zip_path.clone(),
                                         zip_entry: resolved.zip_entry,
+                                        edit_preview_key,
+                                        edit_preview_validate_container,
                                         cache_key_override: Some(cache_key),
                                         mtime: resolved.mtime,
                                         file_size: resolved.file_size,
@@ -54067,6 +54160,8 @@ fn make_load_request(
                 return Some(LoadRequest {
                     path: cached_zip.clone(),
                     zip_entry: Some(entry.clone()),
+                    edit_preview_key: Some(crate::adjustment_db::zip_entry_key(cached_zip, entry)),
+                    edit_preview_validate_container: true,
                     cache_key_override: Some(convertible_archive_pinned_cache_key(
                         &base_key, source, mtime, file_size,
                     )),
@@ -54087,9 +54182,18 @@ fn make_load_request(
                 );
                 match resolved.kind {
                     crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
+                        let (edit_preview_key, edit_preview_validate_container) =
+                            pinned_edit_preview_target(
+                                resolved.kind,
+                                cached_zip,
+                                resolved.zip_entry.as_deref(),
+                                resolved.pdf_page,
+                            );
                         return Some(LoadRequest {
                             path: cached_zip.clone(),
                             zip_entry: resolved.zip_entry,
+                            edit_preview_key,
+                            edit_preview_validate_container,
                             cache_key_override: Some(cache_key),
                             mtime: resolved.mtime,
                             file_size: resolved.file_size,
@@ -54552,6 +54656,7 @@ fn apply_folder_thumb_pin(
             mtime: resolved.mtime,
             file_size: resolved.file_size,
             edit_preview_key: None,
+            edit_preview_validate_container: false,
             resolve_override: None,
             folder_thumb_sort: base_req.folder_thumb_sort,
             folder_thumb_depth: base_req.folder_thumb_depth,
@@ -54565,6 +54670,13 @@ fn apply_folder_thumb_pin(
             force_cache: false,
         };
     }
+
+    let (edit_preview_key, edit_preview_validate_container) = pinned_edit_preview_target(
+        resolved.kind,
+        &resolved.abs_path,
+        resolved.zip_entry.as_deref(),
+        resolved.pdf_page,
+    );
 
     // dispatch field を target 種別ごとに組み立てる。
     let (resolve_override, zip_entry, zip_dir_prefix, pdf_page) = match resolved.kind {
@@ -54598,7 +54710,8 @@ fn apply_folder_thumb_pin(
         cache_key_override: Some(pinned_key),
         mtime: resolved.mtime,
         file_size: resolved.file_size,
-        edit_preview_key: None,
+        edit_preview_key,
+        edit_preview_validate_container,
         resolve_override,
         // フォルダ自動選定パラメータ (sort/depth) は Folder strategy のときだけ意味がある。
         // base_req から継承するので Folder → Folder の pin で sort/depth が消えない。

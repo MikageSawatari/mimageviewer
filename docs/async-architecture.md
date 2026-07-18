@@ -782,6 +782,14 @@ single-row I/O に収めてあるため `cargo run --perf-log` でも hitches �
 連動)。fullscreen 中は load_folder が close_fullscreen を呼ぶため、抜けるまで dirty を
 保留する (Codex Phase D P2 指摘の対応)。
 
+手動 pin が固定の Image / ZipEntry / PdfPage leaf へ解決された場合、親用
+`LoadRequest` に leaf の canonical `edit_preview_key` も載せる。ZIP/PDF の親要求は
+page size を持たないため、編集 preview 保存 worker が container size を別記録し、
+thumbnail worker が `LoadRequest.path` を stat して container mtime + size で検証する。
+UI thread に archive 列挙・追加 stat・edit preview DB lookup は置かない。Saved /
+Invalidated 通知は per-context の `thumb_edit_preview_keys` を使い、直接ページと同じ leaf を
+固定している親セルをまとめて evict / reload する。
+
 **Codex Phase D P2 (drill-down dead pin) 対応**: `archive_source_override.is_some()`
 (= RAR/7z/LZH の変換キャッシュ ZIP を drill-down 中) では UI 経路の `compute_folder_pin_
 button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエントリ自体を

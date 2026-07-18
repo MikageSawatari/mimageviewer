@@ -204,6 +204,10 @@ pub struct LoadRequest {
     pub file_size: i64,
     /// 非破壊編集プレビューのページキー。編集済み画像系アイテムだけに設定する。
     pub edit_preview_key: Option<String>,
+    /// ZIP/PDF 内ページを親コンテナの手動代表として読む要求。
+    /// true のときは page の size ではなく、worker 上で `path` の mtime + size を読み、
+    /// 保存済み container identity と照合する。UI thread へ archive stat を追加しない。
+    pub edit_preview_validate_container: bool,
     /// 段階 E: true の場合はキャッシュを無視して元画像から再デコードする
     pub skip_cache: bool,
     /// true = 画面上に見えている可視範囲のアイテム。ワーカーは priority 要求を
@@ -911,10 +915,25 @@ pub fn process_load_request(
     // 永続プレビューを試す。ディスク上は最大辺 2048px / q=90 を保持し、ここで
     // display_px へ縮小した完成済み派生画像を受け取る。後段の idle quality-upgrade で
     // 元画像に差し替えてはいけない。
-    if !req.skip_cache
-        && let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db)
-        && let Some(preview) = db.load(item_key, req.mtime, req.file_size, display_px)
-    {
+    let edit_preview = if req.skip_cache {
+        None
+    } else if let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db) {
+        if req.edit_preview_validate_container {
+            std::fs::metadata(&req.path).ok().and_then(|meta| {
+                db.load_for_container(
+                    item_key,
+                    crate::ui_helpers::mtime_secs(&meta),
+                    meta.len() as i64,
+                    display_px,
+                )
+            })
+        } else {
+            db.load(item_key, req.mtime, req.file_size, display_px)
+        }
+    } else {
+        None
+    };
+    if let Some(preview) = edit_preview {
         let _ = tx.send(ThumbMsg {
             idx: req.idx,
             image: Some(preview.image),

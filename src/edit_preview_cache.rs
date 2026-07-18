@@ -20,9 +20,9 @@ use sha2::{Digest, Sha256};
 pub const PREVIEW_LONG_SIDE: u32 = 2048;
 pub const PREVIEW_WEBP_QUALITY: f32 = 90.0;
 pub const DEFAULT_MAX_BYTES: u64 = 1_000_000_000;
-// v4: 透過境界を straight-alpha のまま縮小して暗い縁を焼き込んだ旧 preview を
-// 再利用しない。DB 形式自体は同じだが、派生画像の生成規約も version に含める。
-const CACHE_FORMAT_VERSION: i64 = 4;
+// v5: ZIP/PDF 内ページを親コンテナの手動代表サムネイルとして使うときも、
+// container の mtime + size で stale 判定できるよう source_container_size を保持する。
+const CACHE_FORMAT_VERSION: i64 = 5;
 
 /// edit-result の上にだけ注釈を焼くための worker payload。
 ///
@@ -152,6 +152,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<bool> {
              item_key       TEXT PRIMARY KEY,
              source_mtime   INTEGER NOT NULL,
              source_size    INTEGER NOT NULL,
+             source_container_size INTEGER,
              source_width   INTEGER NOT NULL,
              source_height  INTEGER NOT NULL,
              cached_path    TEXT NOT NULL,
@@ -190,6 +191,12 @@ struct EncodedAnnotationLayer {
     webp: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+enum PreviewSourceValidation {
+    Page { mtime: i64, size: i64 },
+    Container { mtime: i64, size: i64 },
+}
+
 /// SQLite は対応表と LRU だけを保持し、WebP 本体は個別ファイルに置く。
 ///
 /// BLOB を SQLite に入れないのは、上限 prune 後に DB ファイルの予約領域が縮まず、
@@ -224,7 +231,7 @@ impl EditPreviewCacheDb {
         })
     }
 
-    /// mtime + size が一致する WebP を `display_px` へ縮小して返す。
+    /// page source の mtime + size が一致する WebP を `display_px` へ縮小して返す。
     /// 不一致・欠損・破損行はその場で掃除する。サムネイル worker からだけ
     /// 呼ばれるため、ファイル読み込みと Lanczos3 縮小で UI はブロックしない。
     pub fn load(
@@ -234,10 +241,49 @@ impl EditPreviewCacheDb {
         source_size: i64,
         display_px: u32,
     ) -> Option<EditPreviewData> {
-        let row: Option<(i64, i64, i64, i64, String, String, i64)> = {
+        self.load_validated(
+            item_key,
+            PreviewSourceValidation::Page {
+                mtime: source_mtime,
+                size: source_size,
+            },
+            display_px,
+        )
+    }
+
+    /// ZIP/PDF 内ページを親コンテナの代表として読む場合の検証経路。
+    ///
+    /// 親 `LoadRequest` は ZIP entry の非圧縮サイズを持たないため、通常の page identity
+    /// では照合できない。保存 worker が記録した container size と、thumbnail worker が
+    /// 読んだ現在の container mtime + size を照合する。どちらの I/O も UI thread 外。
+    pub fn load_for_container(
+        &self,
+        item_key: &str,
+        container_mtime: i64,
+        container_size: i64,
+        display_px: u32,
+    ) -> Option<EditPreviewData> {
+        self.load_validated(
+            item_key,
+            PreviewSourceValidation::Container {
+                mtime: container_mtime,
+                size: container_size,
+            },
+            display_px,
+        )
+    }
+
+    fn load_validated(
+        &self,
+        item_key: &str,
+        validation: PreviewSourceValidation,
+        display_px: u32,
+    ) -> Option<EditPreviewData> {
+        let row: Option<(i64, i64, Option<i64>, i64, i64, String, String, i64)> = {
             let conn = self.conn.lock().ok()?;
             conn.query_row(
-                "SELECT source_mtime, source_size, source_width, source_height, cached_path,
+                "SELECT source_mtime, source_size, source_container_size,
+                        source_width, source_height, cached_path,
                         annotation_layers_json, updated_at
                  FROM edit_previews WHERE item_key = ?1",
                 params![item_key],
@@ -250,6 +296,7 @@ impl EditPreviewCacheDb {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
@@ -259,13 +306,22 @@ impl EditPreviewCacheDb {
         let (
             stored_mtime,
             stored_size,
+            stored_container_size,
             width,
             height,
             cached_path,
             annotation_layers_json,
             updated_at,
         ) = row?;
-        if stored_mtime != source_mtime || stored_size != source_size || width <= 0 || height <= 0 {
+        let source_matches = match validation {
+            PreviewSourceValidation::Page { mtime, size } => {
+                stored_mtime == mtime && stored_size == size
+            }
+            PreviewSourceValidation::Container { mtime, size } => {
+                stored_mtime == mtime && stored_container_size == Some(size)
+            }
+        };
+        if !source_matches || width <= 0 || height <= 0 {
             self.delete_if_row_matches(
                 item_key,
                 stored_mtime,
@@ -381,6 +437,7 @@ impl EditPreviewCacheDb {
         item_key: &str,
         source_mtime: i64,
         source_size: i64,
+        source_container_size: Option<i64>,
         source_dims: (u32, u32),
         base_webp: &[u8],
         annotation_layers: &[EncodedAnnotationLayer],
@@ -443,12 +500,14 @@ impl EditPreviewCacheDb {
             let conn = self.conn.lock().map_err(|e| e.to_string())?;
             conn.execute(
                 "INSERT INTO edit_previews
-                 (item_key, source_mtime, source_size, source_width, source_height,
+                 (item_key, source_mtime, source_size, source_container_size,
+                  source_width, source_height,
                   cached_path, annotation_layers_json, cached_bytes, updated_at, last_access_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
                  ON CONFLICT(item_key) DO UPDATE SET
                     source_mtime=excluded.source_mtime,
                     source_size=excluded.source_size,
+                    source_container_size=excluded.source_container_size,
                     source_width=excluded.source_width,
                     source_height=excluded.source_height,
                     cached_path=excluded.cached_path,
@@ -460,6 +519,7 @@ impl EditPreviewCacheDb {
                     item_key,
                     source_mtime,
                     source_size,
+                    source_container_size,
                     source_dims.0 as i64,
                     source_dims.1 as i64,
                     &final_path_string,
@@ -897,6 +957,7 @@ enum EditPreviewCommand {
         item_key: String,
         source_mtime: i64,
         source_size: i64,
+        source_container_path: Option<PathBuf>,
         pixels: Arc<egui::ColorImage>,
         annotations: Option<EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
@@ -933,6 +994,7 @@ impl EditPreviewCacheService {
                             item_key,
                             source_mtime,
                             source_size,
+                            source_container_path,
                             pixels,
                             annotations,
                             crop,
@@ -952,11 +1014,16 @@ impl EditPreviewCacheService {
                                             "edit preview WebP encode failed".to_string()
                                         })
                                 });
+                            let source_container_size = source_container_path
+                                .as_deref()
+                                .and_then(|path| std::fs::metadata(path).ok())
+                                .map(|meta| meta.len() as i64);
                             match result.and_then(|(source_dims, base_webp, encoded_layers)| {
                                 worker_db.save_encoded(
                                     &item_key,
                                     source_mtime,
                                     source_size,
+                                    source_container_size,
                                     source_dims,
                                     &base_webp,
                                     &encoded_layers,
@@ -999,6 +1066,7 @@ impl EditPreviewCacheService {
         item_key: String,
         source_mtime: i64,
         source_size: i64,
+        source_container_path: Option<PathBuf>,
         pixels: Arc<egui::ColorImage>,
         annotations: Option<EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
@@ -1009,6 +1077,7 @@ impl EditPreviewCacheService {
             item_key,
             source_mtime,
             source_size,
+            source_container_path,
             pixels,
             annotations,
             crop,
@@ -1084,13 +1153,37 @@ mod tests {
             egui::Color32::from_rgb(20, 80, 140),
         ))
         .unwrap();
-        db.save_encoded("page-a", 10, 20, (8, 4), &webp, &[])
+        db.save_encoded("page-a", 10, 20, None, (8, 4), &webp, &[])
             .unwrap();
 
         let hit = db.load("page-a", 10, 20, 2048).unwrap();
         assert_eq!(hit.source_dims, (8, 4));
         assert_eq!(hit.image.size, [8, 4]);
         assert!(db.load("page-a", 11, 20, 2048).is_none());
+        assert_eq!(db.total_bytes(), 0);
+    }
+
+    #[test]
+    fn virtual_page_preview_can_validate_against_container_identity() {
+        let (_temp, db) = test_db();
+        let webp = encode_preview(&egui::ColorImage::filled(
+            [8, 4],
+            egui::Color32::from_rgb(20, 80, 140),
+        ))
+        .unwrap();
+        db.save_encoded("archive::page.jpg", 10, 20, Some(200), (8, 4), &webp, &[])
+            .unwrap();
+
+        assert!(
+            db.load_for_container("archive::page.jpg", 10, 200, 2048)
+                .is_some(),
+            "parent thumbnails validate the archive, not the entry's uncompressed size"
+        );
+        assert!(
+            db.load_for_container("archive::page.jpg", 10, 201, 2048)
+                .is_none(),
+            "a replaced archive must invalidate its edited representative preview"
+        );
         assert_eq!(db.total_bytes(), 0);
     }
 
@@ -1106,7 +1199,7 @@ mod tests {
             ),
         };
         let (base_webp, layers) = encode_preview_components(&base, &[annotation]).unwrap();
-        db.save_encoded("page-layers", 10, 20, (8, 4), &base_webp, &layers)
+        db.save_encoded("page-layers", 10, 20, None, (8, 4), &base_webp, &layers)
             .unwrap();
 
         let hit = db.load("page-layers", 10, 20, 2048).unwrap();
@@ -1131,7 +1224,7 @@ mod tests {
             ),
         };
         let (base_webp, layers) = encode_preview_components(&base, &[annotation]).unwrap();
-        db.save_encoded("page-display", 10, 20, (80, 40), &base_webp, &layers)
+        db.save_encoded("page-display", 10, 20, None, (80, 40), &base_webp, &layers)
             .unwrap();
 
         let hit = db.load("page-display", 10, 20, 24).unwrap();
@@ -1149,8 +1242,10 @@ mod tests {
             encode_preview(&egui::ColorImage::filled([16, 16], egui::Color32::RED)).unwrap();
         let webp_b =
             encode_preview(&egui::ColorImage::filled([16, 16], egui::Color32::BLUE)).unwrap();
-        db.save_encoded("a", 1, 1, (16, 16), &webp_a, &[]).unwrap();
-        db.save_encoded("b", 1, 1, (16, 16), &webp_b, &[]).unwrap();
+        db.save_encoded("a", 1, 1, None, (16, 16), &webp_a, &[])
+            .unwrap();
+        db.save_encoded("b", 1, 1, None, (16, 16), &webp_b, &[])
+            .unwrap();
         db.prune(webp_b.len() as u64);
         assert!(db.total_bytes() <= webp_b.len() as u64);
     }

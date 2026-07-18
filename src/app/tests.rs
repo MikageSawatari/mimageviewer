@@ -10169,9 +10169,57 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(req.zip_entry.as_deref(), Some("inner/p01.png"));
         assert_eq!(req.resolve_override, None);
         assert_eq!(
+            req.edit_preview_key.as_deref(),
+            Some(crate::adjustment_db::zip_entry_key(&cache, "inner/p01.png").as_str())
+        );
+        assert!(req.edit_preview_validate_container);
+        assert_eq!(
             req.cache_key_override.as_deref(),
             Some(expected_key.as_str())
         );
+    }
+
+    #[test]
+    fn folder_pin_to_zip_entry_carries_edited_page_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let zip_path = folder.join("book.zip");
+        std::fs::write(&zip_path, b"PK\x03\x04 test").unwrap();
+        let item = GridItem::Folder(folder.clone());
+        let source = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: "book.zip".to_string(),
+            entry: "chapter/page01.jpg".to_string(),
+        };
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(crate::path_key::normalize_keep_drive(&folder), source);
+
+        let req = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &std::collections::HashMap::new(),
+            None,
+            Some(&folder),
+            None,
+            None,
+            false,
+        )
+        .expect("folder pin should resolve to the selected ZIP page");
+
+        assert_eq!(req.path, zip_path);
+        assert_eq!(req.zip_entry.as_deref(), Some("chapter/page01.jpg"));
+        assert_eq!(
+            req.edit_preview_key.as_deref(),
+            Some(crate::adjustment_db::zip_entry_key(&req.path, "chapter/page01.jpg").as_str())
+        );
+        assert!(req.edit_preview_validate_container);
     }
 
     /// 読書位置レジュームはネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない。
@@ -10448,6 +10496,11 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(req.zip_entry.as_deref(), Some("bookA/ch02/page01.jpg"));
         assert_eq!(req.zip_dir_prefix, None);
         assert_eq!(req.resolve_override, None);
+        assert_eq!(
+            req.edit_preview_key.as_deref(),
+            Some(crate::adjustment_db::zip_entry_key(&zip_path, "bookA/ch02/page01.jpg").as_str())
+        );
+        assert!(req.edit_preview_validate_container);
         assert!(
             req.cache_key_override
                 .as_deref()
@@ -10484,6 +10537,29 @@ mod favorite_adjustment_defaults_tests {
             Some(ResolveStrategy::ZipDirRepresentative)
         );
         assert_eq!(unresolved.zip_dir_prefix.as_deref(), Some("bookA/ch02/"));
+        assert_eq!(unresolved.edit_preview_key, None);
+        assert!(!unresolved.edit_preview_validate_container);
+    }
+
+    #[test]
+    fn edit_preview_refresh_matches_direct_page_and_pinned_parent() {
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\books\book.zip");
+        let page_key = crate::adjustment_db::zip_entry_key(&zip_path, "chapter/page01.jpg");
+        app.items = vec![
+            GridItem::ZipFile(zip_path.clone()),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name: "chapter/page01.jpg".to_string(),
+            },
+        ];
+        app.thumb_edit_preview_keys.insert(0, page_key.clone());
+
+        assert_eq!(
+            app.thumbnail_indices_for_edit_preview_key(&page_key),
+            vec![0, 1],
+            "cache notifications must evict both the pinned parent and the direct page"
+        );
     }
 
     /// ネスト ZIP の本 (ZipDir) はコンテナレーティング対象で、キーは zip_path +
