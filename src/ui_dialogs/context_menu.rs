@@ -10,6 +10,13 @@ use crate::native_context_menu::{
     NativeContextMenuRequest, NativeContextMenuResult, NativeMivCommand, NativeMivMenuItem,
 };
 
+#[cfg(windows)]
+fn primary_mouse_button_physically_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+
+    unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
+}
+
 /// `show_context_menu` の戻り値。単なる `Option<PathBuf>` ではなくアクション種別を
 /// 表現することで、検索終了などの副作用を呼び出し側 (= 優先度判定後) で発火できる。
 /// これにより別 nav 源 (キーボード等) が同じフレームで勝った場合に context_nav の副作用
@@ -109,6 +116,12 @@ enum NativeGridContextMenuOutcome {
     Fallback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMenuSurface {
+    Grid,
+    Fullscreen,
+}
+
 #[derive(Clone)]
 struct NativeGridContextMenuTarget {
     paths: Vec<PathBuf>,
@@ -116,6 +129,13 @@ struct NativeGridContextMenuTarget {
     item_index: Option<usize>,
     is_folder_context: bool,
     has_checked: bool,
+    surface: ContextMenuSurface,
+}
+
+impl NativeGridContextMenuTarget {
+    fn is_fullscreen_video(&self) -> bool {
+        self.surface == ContextMenuSurface::Fullscreen && matches!(self.item, GridItem::Video(_))
+    }
 }
 
 fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) -> &'static str {
@@ -416,6 +436,7 @@ impl crate::app::App {
                 has_checked,
                 in_search,
                 folder_command_target.clone(),
+                ContextMenuSurface::Grid,
             ) {
                 NativeGridContextMenuOutcome::Consumed(nav) => {
                     self.context_menu_idx = None;
@@ -957,6 +978,7 @@ impl crate::app::App {
         has_checked: bool,
         in_search: bool,
         folder_command_target: Option<PathBuf>,
+        surface: ContextMenuSurface,
     ) -> NativeGridContextMenuOutcome {
         if !self.settings.use_native_shell_context_menu {
             return NativeGridContextMenuOutcome::Fallback;
@@ -971,6 +993,7 @@ impl crate::app::App {
             is_folder_context,
             has_checked,
             folder_command_target,
+            surface,
         ) else {
             return NativeGridContextMenuOutcome::Fallback;
         };
@@ -1019,6 +1042,16 @@ impl crate::app::App {
         };
         let native_result = crate::native_context_menu::show_native_context_menu(request);
         Self::resync_egui_modifiers_from_os(ctx);
+        #[cfg(windows)]
+        if matches!(&native_result, NativeContextMenuResult::Canceled)
+            && target.is_fullscreen_video()
+            && primary_mouse_button_physically_down()
+        {
+            // TrackPopupMenuEx を動画 HWND 上の左クリックで閉じると、その同じ click
+            // sequence が presenter に遅れて届く。menu dismissal の down 時刻を所有し、
+            // native video input 側で対応する down/up だけを消費する。
+            self.begin_native_video_context_menu_dismiss_click();
+        }
         match native_result {
             NativeContextMenuResult::Canceled | NativeContextMenuResult::ShellCommandInvoked => {
                 NativeGridContextMenuOutcome::Consumed(None)
@@ -1043,6 +1076,7 @@ impl crate::app::App {
         is_folder_context: bool,
         has_checked: bool,
         folder_command_target: Option<PathBuf>,
+        surface: ContextMenuSurface,
     ) -> Option<NativeGridContextMenuTarget> {
         let paths = if is_folder_context {
             vec![folder_command_target?]
@@ -1068,6 +1102,7 @@ impl crate::app::App {
             item_index: (!is_folder_context).then_some(idx),
             is_folder_context,
             has_checked,
+            surface,
         })
     }
 
@@ -1077,6 +1112,7 @@ impl crate::app::App {
         in_search: bool,
     ) -> Vec<NativeMivMenuItem> {
         let mut items = Vec::new();
+        let fullscreen_video = target.is_fullscreen_video();
         if target.has_checked {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::CopyPath,
@@ -1182,7 +1218,9 @@ impl crate::app::App {
                 label: "フォルダに移動".to_string(),
             });
         }
-        if matches!(target.item, GridItem::Image(_) | GridItem::Video(_)) {
+        if matches!(target.item, GridItem::Image(_))
+            || matches!(target.item, GridItem::Video(_)) && !fullscreen_video
+        {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateLeft,
                 label: "左に回転 (L)".to_string(),
@@ -1192,7 +1230,12 @@ impl crate::app::App {
                 label: "右に回転 (R)".to_string(),
             });
         }
-        if let Some(label) = self.native_folder_pin_context_label(target) {
+        if fullscreen_video {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::SetCurrentVideoFrameThumbnail,
+                label: "📌 現在のフレームを動画サムネに設定".to_string(),
+            });
+        } else if let Some(label) = self.native_folder_pin_context_label(target) {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::ToggleRepresentativeThumb,
                 label,
@@ -1365,6 +1408,15 @@ impl crate::app::App {
                 }
                 None
             }
+            NativeMivCommand::SetCurrentVideoFrameThumbnail => {
+                #[cfg(windows)]
+                if target.is_fullscreen_video()
+                    && let Some(idx) = target.item_index
+                {
+                    self.pin_current_native_video_frame_for_input(ctx, idx);
+                }
+                None
+            }
         }
     }
 
@@ -1445,6 +1497,7 @@ impl crate::app::App {
             false,
             false,
             None,
+            ContextMenuSurface::Fullscreen,
         ) {
             NativeGridContextMenuOutcome::Consumed(_) => {
                 self.fs_context_menu_idx = None;
@@ -1594,10 +1647,20 @@ impl crate::app::App {
                     }
                 }
 
-                // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
-                // 条件分岐とそれに伴う separator 描画は helper 側に集約。
-                if self.render_folder_pin_menu_entry(ui, &item) {
-                    close = true;
+                if matches!(item, GridItem::Video(_)) {
+                    ui.separator();
+                    if ui.button("📌 現在のフレームを動画サムネに設定").clicked()
+                    {
+                        #[cfg(windows)]
+                        self.pin_current_native_video_frame_for_input(ctx, idx);
+                        close = true;
+                    }
+                } else {
+                    // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
+                    // 条件分岐とそれに伴う separator 描画は helper 側に集約。
+                    if self.render_folder_pin_menu_entry(ui, &item) {
+                        close = true;
+                    }
                 }
 
                 // メニュー外クリックで閉じる
@@ -2416,6 +2479,77 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 #[cfg(test)]
 mod delete_confirm_tests {
     use super::*;
+
+    fn menu_commands(
+        app: &crate::app::App,
+        item: GridItem,
+        surface: ContextMenuSurface,
+    ) -> Vec<NativeMivCommand> {
+        let path = item
+            .drag_source_path()
+            .expect("test item should expose a file-operation path")
+            .to_path_buf();
+        let target = NativeGridContextMenuTarget {
+            paths: vec![path],
+            item,
+            item_index: Some(0),
+            is_folder_context: false,
+            has_checked: false,
+            surface,
+        };
+        app.native_grid_context_menu_items(&target, false)
+            .into_iter()
+            .map(|item| item.command)
+            .collect()
+    }
+
+    #[test]
+    fn fullscreen_video_menu_uses_frame_thumbnail_action_without_image_only_actions() {
+        let app = crate::app::App::default();
+        let commands = menu_commands(
+            &app,
+            GridItem::Video(PathBuf::from("movie.mp4")),
+            ContextMenuSurface::Fullscreen,
+        );
+
+        for required in [
+            NativeMivCommand::Rename,
+            NativeMivCommand::CopyPath,
+            NativeMivCommand::CopyFileName,
+            NativeMivCommand::SetCurrentVideoFrameThumbnail,
+        ] {
+            assert!(commands.contains(&required), "missing {required:?}");
+        }
+        for invalid in [
+            NativeMivCommand::RotateLeft,
+            NativeMivCommand::RotateRight,
+            NativeMivCommand::ToggleRepresentativeThumb,
+        ] {
+            assert!(!commands.contains(&invalid), "unexpected {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn context_menu_surface_keeps_grid_video_and_fullscreen_image_rotation_actions() {
+        let app = crate::app::App::default();
+        let grid_video = menu_commands(
+            &app,
+            GridItem::Video(PathBuf::from("movie.mp4")),
+            ContextMenuSurface::Grid,
+        );
+        assert!(grid_video.contains(&NativeMivCommand::RotateLeft));
+        assert!(grid_video.contains(&NativeMivCommand::RotateRight));
+        assert!(!grid_video.contains(&NativeMivCommand::SetCurrentVideoFrameThumbnail));
+
+        let fullscreen_image = menu_commands(
+            &app,
+            GridItem::Image(PathBuf::from("image.png")),
+            ContextMenuSurface::Fullscreen,
+        );
+        assert!(fullscreen_image.contains(&NativeMivCommand::RotateLeft));
+        assert!(fullscreen_image.contains(&NativeMivCommand::RotateRight));
+        assert!(!fullscreen_image.contains(&NativeMivCommand::SetCurrentVideoFrameThumbnail));
+    }
 
     #[test]
     fn delete_confirm_label_keeps_recycle_bin_wording_for_normal_targets() {

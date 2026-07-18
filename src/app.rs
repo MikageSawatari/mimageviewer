@@ -8669,6 +8669,11 @@ pub struct App {
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
     #[cfg(windows)]
+    /// Win32 context menu を動画上の左クリックで閉じたとき、その click sequence が
+    /// presenter の再生トグルへ遅延配送されるのを弾く。時刻は menu close 時に記録し、
+    /// 対応する left up または短い stale 上限で破棄する。
+    native_video_context_menu_dismiss_click_started_at: Option<std::time::Instant>,
+    #[cfg(windows)]
     /// Native fullscreen presenter 上の右クリック候補。egui 側の pointer 状態とは
     /// 別に release 時の押下時間と移動量で close / 長押しメニューを判定する。
     native_video_secondary_press_start: Option<(std::time::Instant, egui::Pos2)>,
@@ -10197,6 +10202,8 @@ impl App {
             pending_main_foreground_reclaim_force_at: None,
             #[cfg(windows)]
             native_video_pointer_down: None,
+            #[cfg(windows)]
+            native_video_context_menu_dismiss_click_started_at: None,
             #[cfg(windows)]
             native_video_secondary_press_start: None,
             #[cfg(windows)]
@@ -39812,6 +39819,7 @@ impl App {
         self.native_video_front_last_raise = None;
         self.native_video_front_recover_after_external_foreground = false;
         self.native_video_pointer_down = None;
+        self.native_video_context_menu_dismiss_click_started_at = None;
         self.native_video_secondary_press_start = None;
         self.native_video_middle_press_start = None;
         self.schedule_native_video_main_chrome_restore();

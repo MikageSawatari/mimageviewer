@@ -3440,6 +3440,7 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
+                self.native_video_context_menu_dismiss_click_started_at = None;
                 self.native_video_secondary_press_start = None;
                 self.native_video_middle_press_start = None;
                 let gesture_was_active = self.mouse_gesture.is_some();
@@ -5826,6 +5827,32 @@ impl App {
         true
     }
 
+    /// P キー、リング、フルスクリーンメニューに共通する「画面上で選んでいる動画
+    /// フレームをサムネイルに設定」の所有境界。タイル表示中だけは選択中タイルを使い、
+    /// 通常再生中は現在の再生位置を使う。
+    #[cfg(windows)]
+    pub(crate) fn pin_current_native_video_frame_for_input(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> bool {
+        if self.video_tile_mode_active {
+            self.handle_native_video_set_tile_pin_command(ctx, fs_idx)
+        } else {
+            let target_secs = self
+                .fs_video_player(fs_idx)
+                .map(|player| player.position())
+                .unwrap_or(0.0);
+            self.handle_native_video_set_pin_command(ctx, fs_idx, target_secs);
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn begin_native_video_context_menu_dismiss_click(&mut self) {
+        self.native_video_context_menu_dismiss_click_started_at = Some(std::time::Instant::now());
+    }
+
     #[cfg(windows)]
     pub(super) fn handle_native_video_delete_bookmark_command(
         &mut self,
@@ -6712,28 +6739,17 @@ impl App {
             {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
             }
-            // P: pin the selected tile while tile mode is open; otherwise pin
-            // the current frame (= HUD 📌 button).
-            _ if !key.repeat
-                && self.video_tile_mode_active
-                && self.keymap.matches_vk_action(KeyAction::VideoPin, &key) =>
-            {
-                // If tile metadata is not ready or contains no timestamps, tile-mode P is an
-                // intentional no-op; falling back to current playback position would pin a
-                // different frame than the highlighted tile UI suggests.
-                if !self.handle_native_video_set_tile_pin_command(ctx, fs_idx) {
-                    hud_activity = false;
-                }
-            }
-            // P: pin current frame (= HUD 📌 ボタンと同等)。グリッドの P と統一した
+            // P: pin the selected tile while tile mode is open; otherwise pin the current
+            // frame (= HUD 📌 button). グリッドの P と統一した
             // 「P = Pin」の mnemonic。v0.9.x で perf overlay の P から再割り当て、
             // perf overlay は F に移動した。
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoPin, &key) => {
-                let target = self
-                    .fs_video_player(fs_idx)
-                    .map(|p| p.position())
-                    .unwrap_or(0.0);
-                self.handle_native_video_set_pin_command(ctx, fs_idx, target);
+                if !self.pin_current_native_video_frame_for_input(ctx, fs_idx) {
+                    // If tile metadata is not ready or contains no timestamps, tile-mode P is
+                    // an intentional no-op; falling back to playback position would pin a
+                    // different frame than the highlighted tile UI suggests.
+                    hud_activity = false;
+                }
             }
             // F: perf / framerate overlay toggle (旧 P)。Frames / FPS mnemonic。
             _ if !key.repeat
@@ -8701,6 +8717,32 @@ impl App {
         }
         if event.button != NativeVideoMouseButton::Left {
             return;
+        }
+
+        if self.fs_context_menu_idx.is_some() {
+            // egui fallback menu の外側を動画上でクリックした場合。その click は menu を
+            // 閉じるためだけの入力であり、背面 presenter の再生トグルへ渡さない。
+            self.native_video_pointer_down = None;
+            self.native_video_context_menu_dismiss_click_started_at = None;
+            if event.down {
+                self.fs_context_menu_idx = None;
+                self.cached_handlers = None;
+                ctx.request_repaint();
+            }
+            return;
+        }
+
+        if let Some(started_at) = self.native_video_context_menu_dismiss_click_started_at {
+            // Win32 TrackPopupMenuEx を閉じたクリックは presenter の queue に遅れて届く。
+            // 500ms は click sequence の相関上限で、時間経過による挙動変更ではない。
+            if started_at.elapsed() <= std::time::Duration::from_millis(500) {
+                self.native_video_pointer_down = None;
+                if !event.down {
+                    self.native_video_context_menu_dismiss_click_started_at = None;
+                }
+                return;
+            }
+            self.native_video_context_menu_dismiss_click_started_at = None;
         }
 
         if event.double_click {

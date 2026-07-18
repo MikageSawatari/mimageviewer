@@ -21991,19 +21991,7 @@ impl App {
             // ピン留め (= HUD の 📌 ボタンと同等)。
             #[cfg(windows)]
             {
-                if self.video_tile_mode_active {
-                    self.handle_native_video_set_tile_pin_command(ctx, fs_idx);
-                } else {
-                    // 現在 PTS を `set_native_video_pin` に渡す (内部で seek thumbnail を
-                    // request + nearest 取得 + WebP encode + video_pins DB に書き込み)。
-                    // 既に同位置のピンがあれば SQL の ON CONFLICT で pin_pts/thumb_webp を
-                    // 上書きするだけなので idempotent。
-                    let target = self
-                        .fs_video_player(fs_idx)
-                        .map(|p| p.position())
-                        .unwrap_or(0.0);
-                    self.handle_native_video_set_pin_command(ctx, fs_idx, target);
-                }
+                let _ = self.pin_current_native_video_frame_for_input(ctx, fs_idx);
             }
             #[cfg(not(windows))]
             let _ = (ctx, fs_idx);

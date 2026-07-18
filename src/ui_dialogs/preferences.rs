@@ -202,7 +202,7 @@ impl OperationSettingsTab {
     fn label(self) -> &'static str {
         match self {
             Self::Behavior => "動作",
-            Self::RightDrag => "右ドラッグ",
+            Self::RightDrag => "右ドラッグ・右クリック",
             Self::MouseButtons => "マウスボタン",
         }
     }

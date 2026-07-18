@@ -27809,6 +27809,64 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn native_video_context_menu_dismiss_click_is_not_reused_as_play_pause_click() {
+        use crate::video::native_window::{NativeVideoMouseButton, NativeVideoMouseButtonEvent};
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\menu.mp4");
+        app.fullscreen_idx = Some(video);
+        let left_down = NativeVideoMouseButtonEvent {
+            button: NativeVideoMouseButton::Left,
+            down: true,
+            double_click: false,
+            x: 12,
+            y: 34,
+            shift: false,
+            ctrl: false,
+        };
+        let left_up = NativeVideoMouseButtonEvent {
+            down: false,
+            ..left_down
+        };
+
+        // egui fallback menu: the presenter sees the click while the menu state is open.
+        app.fs_context_menu_idx = Some(video);
+        app.handle_native_video_mouse_button(&ctx, video, left_down);
+        assert_eq!(app.fs_context_menu_idx, None);
+        assert!(app.native_video_pointer_down.is_none());
+        app.handle_native_video_mouse_button(&ctx, video, left_up);
+        assert!(app.native_video_pointer_down.is_none());
+
+        // Win32 menu: TrackPopupMenuEx has already returned, then the queued presenter
+        // down/up sequence arrives. Both halves must be consumed.
+        app.native_video_context_menu_dismiss_click_started_at = Some(std::time::Instant::now());
+        app.handle_native_video_mouse_button(&ctx, video, left_down);
+        assert!(app.native_video_pointer_down.is_none());
+        assert!(
+            app.native_video_context_menu_dismiss_click_started_at
+                .is_some()
+        );
+        app.handle_native_video_mouse_button(&ctx, video, left_up);
+        assert!(app.native_video_pointer_down.is_none());
+        assert!(
+            app.native_video_context_menu_dismiss_click_started_at
+                .is_none()
+        );
+
+        // A stale correlation marker must not suppress a later ordinary click.
+        app.native_video_context_menu_dismiss_click_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        app.handle_native_video_mouse_button(&ctx, video, left_down);
+        assert!(app.native_video_pointer_down.is_some());
+        assert!(
+            app.native_video_context_menu_dismiss_click_started_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn fullfeature_linked_still_is_preserved_before_different_media_open() {
         // review-v2.3.0 追補5: §1.7 linked still × media open (a)。
         let mut app = setup_app();

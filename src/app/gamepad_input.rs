@@ -5128,15 +5128,7 @@ impl App {
     fn pin_ring_video_frame(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
-            if self.video_tile_mode_active {
-                let _ = self.handle_native_video_set_tile_pin_command(ctx, fs_idx);
-            } else {
-                let target = self
-                    .fs_video_player(fs_idx)
-                    .map(|p| p.position())
-                    .unwrap_or(0.0);
-                self.handle_native_video_set_pin_command(ctx, fs_idx, target);
-            }
+            let _ = self.pin_current_native_video_frame_for_input(ctx, fs_idx);
         }
         #[cfg(not(windows))]
         let _ = ctx;
