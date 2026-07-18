@@ -7721,6 +7721,160 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    #[test]
+    fn video_pinned_folder_cache_is_not_enqueued_as_idle_upgrade() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("clips");
+        std::fs::create_dir_all(&folder).unwrap();
+        let video = folder.join("clip.mp4");
+        std::fs::write(&video, b"video").unwrap();
+
+        let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([48, 96, 160, 255]));
+        let mut webp_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        app.video_pin_db
+            .as_ref()
+            .expect("test app should open video_pins.db")
+            .set_pin(&video, 1.25, &webp_bytes)
+            .unwrap();
+
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "clip.mp4".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::Video,
+            },
+        );
+        app.items.push(GridItem::Folder(folder));
+        app.image_metas.push(Some((10, 20)));
+
+        let req = make_load_request(
+            &app.items[0],
+            0,
+            10,
+            20,
+            true,
+            None,
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.converted_archive_cache_paths,
+            None,
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("a valid video pin WebP should produce a folder thumbnail request");
+        assert!(
+            !req.skip_cache,
+            "video pins must keep using the seeded WebP instead of overwriting it with auto-pick"
+        );
+
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "video_pinned_folder",
+            egui::ColorImage::filled([64, 64], egui::Color32::LIGHT_BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex,
+            from_cache: true,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((1920, 1080)),
+        });
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.keep_start_shared.store(0, Ordering::Relaxed);
+        app.keep_end_shared.store(1, Ordering::Relaxed);
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.settings.thumb_idle_upgrade = true;
+        app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.display_px_shared.store(1024, Ordering::Relaxed);
+
+        app.enqueue_idle_upgrades();
+
+        assert!(app.requested.is_empty());
+        assert!(
+            app.reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app.heavy_io_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cached_image_still_enqueues_cache_bypassing_idle_upgrade() {
+        let mut app = setup_app();
+        let image = app.tmp.path().join("photo.jpg");
+        std::fs::write(&image, b"image").unwrap();
+        app.items.push(GridItem::Image(image));
+        app.image_metas.push(Some((10, 20)));
+
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "cached_image",
+            egui::ColorImage::filled([64, 64], egui::Color32::LIGHT_BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex,
+            from_cache: true,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((4000, 3000)),
+        });
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.keep_start_shared.store(0, Ordering::Relaxed);
+        app.keep_end_shared.store(1, Ordering::Relaxed);
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.settings.thumb_idle_upgrade = true;
+        app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.display_px_shared.store(1024, Ordering::Relaxed);
+
+        app.enqueue_idle_upgrades();
+
+        assert_eq!(app.requested.get(&0), Some(&true));
+        let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(
+            queue[0].skip_cache,
+            "ordinary cached images must still bypass the cache during idle upgrade"
+        );
+        assert!(
+            app.heavy_io_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// Codex P3 (2026-04): ヒントの指す名前が items に無い場合 (削除等) は false を
     /// 返し、`start_loading_items` 側の履歴フォールバック分岐に委ねる。
     #[test]

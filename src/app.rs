@@ -24863,6 +24863,15 @@ impl App {
             }) else {
                 continue;
             };
+            // `make_load_request` may resolve a cached derivative that cannot be improved by
+            // bypassing the catalog.  In particular, a folder tile pinned to a video forces
+            // `skip_cache = false` so the seeded video-frame WebP is not overwritten by the
+            // folder's automatic representative.  Such a request is already a finished cache
+            // artifact, not an idle quality upgrade.  Only enqueue requests that still preserve
+            // the upgrade invariant after all container/pin rewriting has completed.
+            if !req.skip_cache {
+                continue;
+            }
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
             req.items_gen = self.items_generation;
             // PDF render pool の context epoch を UI スレッドで焼き付ける (TOCTOU 防止)。
