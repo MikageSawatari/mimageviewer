@@ -7061,6 +7061,8 @@ mod tests {
             "GridSelectAll".to_string(),
             "GridOpenSelectedAsPage".to_string(),
             "GridOpenSelectedAsList".to_string(),
+            "GridMoveFirst".to_string(),
+            "GridMoveLast".to_string(),
             "GridParentFolder".to_string(),
             "TreeFolderPrev".to_string(),
             "TreeFolderNext".to_string(),

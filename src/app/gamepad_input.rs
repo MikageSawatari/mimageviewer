@@ -41,6 +41,12 @@ const GAMEPAD_LIST_VISIBLE_ROWS: usize = 12;
 const RING_STICK_COMMIT_THRESHOLD: f32 = 0.50;
 const RING_STICK_HYSTERESIS_DEGREES: f32 = 8.0;
 
+#[derive(Clone, Copy)]
+enum GridSelectionEdge {
+    First,
+    Last,
+}
+
 fn request_ring_overlay_repaint(ctx: &egui::Context) {
     ctx.request_repaint();
     if ctx.viewport_id() != egui::ViewportId::ROOT {
@@ -4529,6 +4535,14 @@ impl App {
                 self.request_grid_scroll(ctx, GridScrollIntent::Bottom, source);
                 None
             }
+            RingActionId::GridMoveFirst if context == RingShortcutContext::Grid => {
+                self.move_grid_selection_to_edge(ctx, GridSelectionEdge::First, source);
+                None
+            }
+            RingActionId::GridMoveLast if context == RingShortcutContext::Grid => {
+                self.move_grid_selection_to_edge(ctx, GridSelectionEdge::Last, source);
+                None
+            }
             RingActionId::GridColumnCount1 if context == RingShortcutContext::Grid => {
                 self.apply_ring_grid_column_count(1);
                 None
@@ -4883,6 +4897,34 @@ impl App {
             Some(match intent {
                 GridScrollIntent::Top => "grid_scroll_top",
                 GridScrollIntent::Bottom => "grid_scroll_bottom",
+            }),
+        );
+        request_ring_overlay_repaint(ctx);
+    }
+
+    fn move_grid_selection_to_edge(
+        &mut self,
+        ctx: &egui::Context,
+        edge: GridSelectionEdge,
+        source: &'static str,
+    ) {
+        let target = match edge {
+            GridSelectionEdge::First => self.current_grid_order().first(),
+            GridSelectionEdge::Last => self.current_grid_order().last(),
+        }
+        .copied();
+        let Some(target) = target else {
+            return;
+        };
+
+        self.selected = Some(target);
+        self.scroll_to_selected = true;
+        self.update_last_selected_image();
+        self.bump_input_seq(
+            source,
+            Some(match edge {
+                GridSelectionEdge::First => "grid_move_first",
+                GridSelectionEdge::Last => "grid_move_last",
             }),
         );
         request_ring_overlay_repaint(ctx);

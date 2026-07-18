@@ -1039,6 +1039,8 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
         RingActionId::GridScrollBottom => {
             "選択とチェックを変えず、一覧だけを末尾までスクロールします"
         }
+        RingActionId::GridMoveFirst => "Homeキーと同じく、選択を一覧の先頭項目へ移動して表示します",
+        RingActionId::GridMoveLast => "Endキーと同じく、選択を一覧の末尾項目へ移動して表示します",
         _ => action.label_for_context(context),
     }
 }

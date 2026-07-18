@@ -598,6 +598,8 @@ pub enum RingActionId {
     GridOpenSelectedAsList,
     GridScrollTop,
     GridScrollBottom,
+    GridMoveFirst,
+    GridMoveLast,
     GridColumnCount1,
     GridColumnCount2,
     GridColumnCount3,
@@ -986,6 +988,8 @@ impl RingActionId {
             Self::GridOpenSelectedAsList => "grid_open_selected_as_list",
             Self::GridScrollTop => "grid_scroll_top",
             Self::GridScrollBottom => "grid_scroll_bottom",
+            Self::GridMoveFirst => "grid_move_first",
+            Self::GridMoveLast => "grid_move_last",
             Self::GridColumnCount1 => "grid_column_count_1",
             Self::GridColumnCount2 => "grid_column_count_2",
             Self::GridColumnCount3 => "grid_column_count_3",
@@ -1079,6 +1083,8 @@ impl RingActionId {
             "grid_open_selected_as_list" => Self::GridOpenSelectedAsList,
             "grid_scroll_top" => Self::GridScrollTop,
             "grid_scroll_bottom" => Self::GridScrollBottom,
+            "grid_move_first" => Self::GridMoveFirst,
+            "grid_move_last" => Self::GridMoveLast,
             "grid_column_count_1" => Self::GridColumnCount1,
             "grid_column_count_2" => Self::GridColumnCount2,
             "grid_column_count_3" => Self::GridColumnCount3,
@@ -1229,6 +1235,8 @@ impl RingActionId {
             Self::GridOpenSelectedAsList => "一覧を開く",
             Self::GridScrollTop => "一覧の先頭へスクロール",
             Self::GridScrollBottom => "一覧の末尾へスクロール",
+            Self::GridMoveFirst => "先頭の項目へ移動 (Home)",
+            Self::GridMoveLast => "末尾の項目へ移動 (End)",
             Self::GridColumnCount1 => "サムネイル 1列",
             Self::GridColumnCount2 => "サムネイル 2列",
             Self::GridColumnCount3 => "サムネイル 3列",
@@ -1300,6 +1308,8 @@ impl RingActionId {
                     | Self::GridOpenSelectedAsList
                     | Self::GridScrollTop
                     | Self::GridScrollBottom
+                    | Self::GridMoveFirst
+                    | Self::GridMoveLast
                     | Self::GridColumnCount1
                     | Self::GridColumnCount2
                     | Self::GridColumnCount3
@@ -1414,6 +1424,8 @@ impl RingActionId {
                 Self::GridOpenSelectedAsList,
                 Self::GridScrollTop,
                 Self::GridScrollBottom,
+                Self::GridMoveFirst,
+                Self::GridMoveLast,
                 Self::GridColumnCount1,
                 Self::GridColumnCount2,
                 Self::GridColumnCount3,
@@ -2861,6 +2873,43 @@ mod tests {
                 RingActionId::GridScrollBottom,
                 "grid_scroll_bottom",
                 "一覧の末尾へスクロール",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            assert!(
+                RingActionId::available_for_mouse_button_context(RingShortcutContext::Grid)
+                    .contains(&action)
+            );
+            for context in [
+                RingShortcutContext::ImageFullscreen,
+                RingShortcutContext::VideoFullscreen,
+            ] {
+                assert!(!action.is_valid_for_context(context));
+                assert!(!RingActionId::available_for_context(context).contains(&action));
+            }
+        }
+    }
+
+    #[test]
+    fn grid_edge_move_actions_round_trip_and_are_grid_only() {
+        let samples = [
+            (
+                RingActionId::GridMoveFirst,
+                "grid_move_first",
+                "先頭の項目へ移動 (Home)",
+            ),
+            (
+                RingActionId::GridMoveLast,
+                "grid_move_last",
+                "末尾の項目へ移動 (End)",
             ),
         ];
 

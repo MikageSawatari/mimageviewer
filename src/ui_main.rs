@@ -208,6 +208,15 @@ fn resolve_grid_scroll_offset(
     }
 }
 
+/// Claims only the request that existed when the current layout extent became known.
+/// A ring / gesture action may enqueue another request later in the same frame; callers
+/// must not clear the field after drawing or that new request would be lost.
+fn take_grid_scroll_for_current_layout(
+    pending: &mut Option<GridScrollIntent>,
+) -> Option<GridScrollIntent> {
+    pending.take()
+}
+
 fn is_rating_solo(rf: &[bool; 6], idx: usize) -> bool {
     (0..6).all(|i| rf[i] == (i == idx))
 }
@@ -9960,7 +9969,6 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         scroll_to: bool,
-        pending_scroll: Option<GridScrollIntent>,
         spread_pair_cursor_idx: Option<usize>,
     ) -> Option<PathBuf> {
         let avail_w = ui.available_width().max(1.0);
@@ -10036,6 +10044,10 @@ impl App {
                 }
                 let (total_h, max_offset) =
                     snapped_scroll_extent(natural_h, viewport_h, Self::DETAILS_ROW_H);
+                // このフレームで解決する要求だけを描画前に所有する。下でリング / ジェスチャが
+                // 新しく積んだ要求は次フレームまで残し、同フレーム末尾で消さない。
+                let pending_scroll =
+                    take_grid_scroll_for_current_layout(&mut self.pending_grid_scroll);
                 self.scroll_offset_y =
                     resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
 
@@ -11130,9 +11142,6 @@ impl App {
     pub(crate) fn render_grid(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         let scroll_to = self.scroll_to_selected;
         self.scroll_to_selected = false;
-        // セル寸法がまだ確定しない一時的なフレームでは要求を残し、
-        // 現在レイアウトの最大 offset を求められた時点でだけ消費する。
-        let pending_scroll = self.pending_grid_scroll;
         if self.settings.grid_view_mode != GridViewMode::Details
             && self.details_hover_thumb_viewport_open
         {
@@ -11274,14 +11283,7 @@ impl App {
                 let spread_pair_cursor_idx = self.main_grid_spread_pair_cursor_idx();
 
                 if self.settings.grid_view_mode == GridViewMode::Details {
-                    let nav = self.render_details_list(
-                        ui,
-                        ctx,
-                        scroll_to,
-                        pending_scroll,
-                        spread_pair_cursor_idx,
-                    );
-                    self.pending_grid_scroll = None;
+                    let nav = self.render_details_list(ui, ctx, scroll_to, spread_pair_cursor_idx);
                     return nav;
                 }
 
@@ -11315,9 +11317,12 @@ impl App {
                 // total_h を拡張する。これにより egui と自前の行スナップが一致し振動を防ぐ。
                 // 拡張量は最大 cell_h 未満（端数の補正のみ）。
                 let (total_h, max_offset) = snapped_scroll_extent(natural_h, viewport_h, cell_h);
+                // セル寸法と最大 offset が確定した時点でだけ要求を所有する。これより後に
+                // リング / ジェスチャが積んだ要求は次フレームで処理する。
+                let pending_scroll =
+                    take_grid_scroll_for_current_layout(&mut self.pending_grid_scroll);
                 self.scroll_offset_y =
                     resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
-                self.pending_grid_scroll = None;
 
                 let mut nav: Option<PathBuf> = None;
 
@@ -13051,6 +13056,17 @@ mod compute_cell_size_tests {
             resolve_grid_scroll_offset(240.0, 0.0, Some(GridScrollIntent::Bottom)),
             0.0
         );
+    }
+
+    #[test]
+    fn grid_scroll_claim_does_not_clear_request_enqueued_later_in_same_frame() {
+        let mut pending = Some(GridScrollIntent::Top);
+
+        let claimed = take_grid_scroll_for_current_layout(&mut pending);
+        pending = Some(GridScrollIntent::Bottom);
+
+        assert_eq!(claimed, Some(GridScrollIntent::Top));
+        assert_eq!(pending, Some(GridScrollIntent::Bottom));
     }
 }
 

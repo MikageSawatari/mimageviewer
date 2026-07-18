@@ -32589,6 +32589,52 @@ fn grid_scroll_ring_actions_queue_layout_intent_without_changing_selection() {
 }
 
 #[test]
+fn grid_edge_move_ring_actions_follow_visible_order_and_keep_checks() {
+    for (mode, order) in [
+        (crate::settings::GridViewMode::Thumbnail, vec![0usize, 1, 2]),
+        (crate::settings::GridViewMode::Details, vec![2usize, 0, 1]),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("C:/photos/a.jpg")),
+            GridItem::Image(PathBuf::from("C:/photos/b.jpg")),
+            GridItem::Image(PathBuf::from("C:/photos/c.jpg")),
+        ];
+        app.visible_indices = vec![0, 1, 2];
+        app.settings.grid_view_mode = mode;
+        if mode == crate::settings::GridViewMode::Details {
+            app.details_order = order.clone();
+        }
+        app.selected = Some(0);
+        app.checked = [0usize, 2].into_iter().collect();
+        app.scroll_to_selected = false;
+        let checked_before = app.checked.clone();
+        let ctx = egui::Context::default();
+
+        app.apply_ring_action(
+            &ctx,
+            crate::ring_shortcut::RingShortcutContext::Grid,
+            crate::ring_shortcut::RingActionId::GridMoveFirst,
+            "test",
+        );
+        assert_eq!(app.selected, order.first().copied());
+        assert!(app.scroll_to_selected);
+        assert_eq!(app.checked, checked_before);
+
+        app.scroll_to_selected = false;
+        app.apply_ring_action(
+            &ctx,
+            crate::ring_shortcut::RingShortcutContext::Grid,
+            crate::ring_shortcut::RingActionId::GridMoveLast,
+            "test",
+        );
+        assert_eq!(app.selected, order.last().copied());
+        assert!(app.scroll_to_selected);
+        assert_eq!(app.checked, checked_before);
+    }
+}
+
+#[test]
 fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     let mut app = phase_c_support::setup_app();
     app.adjustment_mode = true;
