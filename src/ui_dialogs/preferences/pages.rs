@@ -3685,8 +3685,7 @@ fn mouse_gesture_context_editor(
     }
 
     if open_recorder {
-        let action_context = context.gesture_action_context();
-        let action = RingActionId::available_for_context(action_context)
+        let action = RingActionId::available_for_right_drag_context(context)
             .into_iter()
             .find(|action| *action != RingActionId::None)
             .unwrap_or(RingActionId::None);
@@ -3744,7 +3743,7 @@ fn mouse_gesture_assignment_editor(
             .width(300.0)
             .selected_text(action.label_for_context(action_context))
             .show_ui(ui, |ui| {
-                for candidate in RingActionId::available_for_context(action_context) {
+                for candidate in RingActionId::available_for_right_drag_context(context) {
                     ui.selectable_value(
                         &mut action,
                         candidate.clone(),

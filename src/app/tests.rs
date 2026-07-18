@@ -32478,7 +32478,7 @@ fn fullscreen_info_action_toggles_mode_for_button_key_and_gamepad_path() {
 }
 
 #[test]
-fn grid_close_and_quit_ring_actions_use_root_close_with_distinct_tray_intent() {
+fn main_window_close_ring_action_remains_grid_scoped() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
 
@@ -32501,26 +32501,39 @@ fn grid_close_and_quit_ring_actions_use_root_close_with_distinct_tray_intent() {
             .load(std::sync::atomic::Ordering::SeqCst),
         "close-main must remain eligible for tray interception"
     );
+}
 
-    ctx.begin_pass(egui::RawInput::default());
-    app.apply_ring_action(
-        &ctx,
+#[test]
+fn quit_ring_action_uses_root_close_in_every_context() {
+    for context in [
         crate::ring_shortcut::RingShortcutContext::Grid,
-        crate::ring_shortcut::RingActionId::QuitApplication,
-        "test",
-    );
-    let output = ctx.end_pass();
-    assert!(
-        output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close))
-    );
-    assert!(
-        app.shutdown_requested
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "explicit quit must bypass tray interception"
-    );
+        crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+        crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+
+        ctx.begin_pass(egui::RawInput::default());
+        app.apply_ring_action(
+            &ctx,
+            context,
+            crate::ring_shortcut::RingActionId::QuitApplication,
+            "test",
+        );
+        let output = ctx.end_pass();
+        assert!(
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close)),
+            "explicit quit must target the root viewport from {context:?}"
+        );
+        assert!(
+            app.shutdown_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "explicit quit must bypass tray interception from {context:?}"
+        );
+    }
 }
 
 #[test]

@@ -958,7 +958,7 @@ impl App {
             .mouse_gesture_profile(context)
             .action_for_pattern(pattern);
         let pattern_label = format_mouse_gesture_pattern(pattern);
-        if !action.is_valid_for_context(action_context) {
+        if !action.is_valid_for_right_drag_context(context) {
             crate::logger::log(format!(
                 "mouse gesture ignored invalid action={} context={context:?}",
                 action.as_str()
@@ -4462,7 +4462,7 @@ impl App {
                 self.request_main_window_close(ctx);
                 None
             }
-            RingActionId::QuitApplication if context == RingShortcutContext::Grid => {
+            RingActionId::QuitApplication => {
                 self.request_application_quit(ctx);
                 None
             }

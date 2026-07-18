@@ -432,14 +432,13 @@ pub struct MouseGestureProfile {
 
 impl MouseGestureProfile {
     pub fn sanitize(&mut self, context: RightDragContext) {
-        let action_context = context.gesture_action_context();
         let mut sanitized = Vec::new();
         for mut binding in self.bindings.drain(..) {
             let Some(pattern) = normalize_mouse_gesture_pattern(binding.pattern) else {
                 continue;
             };
             binding.pattern = pattern;
-            if !binding.action.is_valid_for_context(action_context) {
+            if !binding.action.is_valid_for_right_drag_context(context) {
                 binding.action = RingActionId::None;
             }
             sanitized.push(binding);
@@ -1327,6 +1326,7 @@ impl RingActionId {
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
                     | Self::MinimizeWindow
+                    | Self::QuitApplication
                     | Self::CloseFullscreen
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
@@ -1363,6 +1363,7 @@ impl RingActionId {
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
                     | Self::MinimizeWindow
+                    | Self::QuitApplication
                     | Self::CloseFullscreen
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
@@ -1386,6 +1387,12 @@ impl RingActionId {
     pub fn is_valid_for_mouse_button_context(&self, context: RingShortcutContext) -> bool {
         self.is_valid_for_context(context)
             && (context == RingShortcutContext::Grid || !self.is_location_navigation_action())
+    }
+
+    pub fn is_valid_for_right_drag_context(&self, context: RightDragContext) -> bool {
+        self.is_valid_for_context(context.gesture_action_context())
+            && !(context == RightDragContext::EditMode
+                && matches!(self, Self::CloseMainWindow | Self::QuitApplication))
     }
 
     pub fn available_for_context(context: RingShortcutContext) -> Vec<Self> {
@@ -1432,6 +1439,7 @@ impl RingActionId {
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
                 Self::MinimizeWindow,
+                Self::QuitApplication,
                 Self::CloseFullscreen,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
@@ -1467,6 +1475,7 @@ impl RingActionId {
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
                 Self::MinimizeWindow,
+                Self::QuitApplication,
                 Self::CloseFullscreen,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
@@ -1493,6 +1502,13 @@ impl RingActionId {
         Self::available_for_context(context)
             .into_iter()
             .filter(|action| action.is_valid_for_mouse_button_context(context))
+            .collect()
+    }
+
+    pub fn available_for_right_drag_context(context: RightDragContext) -> Vec<Self> {
+        Self::available_for_context(context.gesture_action_context())
+            .into_iter()
+            .filter(|action| action.is_valid_for_right_drag_context(context))
             .collect()
     }
 }
@@ -3089,46 +3105,67 @@ mod tests {
     }
 
     #[test]
-    fn main_window_exit_actions_round_trip_and_are_grid_only() {
-        let samples = [
-            (
-                RingActionId::CloseMainWindow,
-                "close_main_window",
-                "メインウィンドウを閉じる",
-            ),
-            (
-                RingActionId::QuitApplication,
-                "quit_application",
-                "アプリを終了する",
-            ),
-        ];
+    fn main_window_close_is_grid_only_and_application_quit_is_available_everywhere() {
+        let close = RingActionId::CloseMainWindow;
+        assert_eq!(close.as_str(), "close_main_window");
+        assert_eq!(
+            RingActionId::from_str("close_main_window"),
+            Some(close.clone())
+        );
+        assert_eq!(
+            close.label_for_context(RingShortcutContext::Grid),
+            "メインウィンドウを閉じる"
+        );
+        assert!(close.is_valid_for_context(RingShortcutContext::Grid));
+        assert!(RingActionId::available_for_context(RingShortcutContext::Grid).contains(&close));
+        assert!(
+            RingActionId::available_for_mouse_button_context(RingShortcutContext::Grid)
+                .contains(&close)
+        );
+        for context in [
+            RingShortcutContext::ImageFullscreen,
+            RingShortcutContext::VideoFullscreen,
+        ] {
+            assert!(!close.is_valid_for_context(context));
+            assert!(!RingActionId::available_for_context(context).contains(&close));
+            assert!(!RingActionId::available_for_mouse_button_context(context).contains(&close));
+        }
 
-        for (action, id, label) in samples {
-            assert_eq!(action.as_str(), id);
-            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
-            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
-            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
-            assert!(
-                RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
-            );
-            assert!(
-                RingActionId::available_for_mouse_button_context(RingShortcutContext::Grid)
-                    .contains(&action)
-            );
-            for context in [
-                RingShortcutContext::ImageFullscreen,
-                RingShortcutContext::VideoFullscreen,
-            ] {
-                assert!(!action.is_valid_for_context(context));
-                assert!(!RingActionId::available_for_context(context).contains(&action));
-                assert!(
-                    !RingActionId::available_for_mouse_button_context(context).contains(&action)
-                );
-            }
+        let quit = RingActionId::QuitApplication;
+        assert_eq!(quit.as_str(), "quit_application");
+        assert_eq!(
+            RingActionId::from_str("quit_application"),
+            Some(quit.clone())
+        );
+        for context in [
+            RingShortcutContext::Grid,
+            RingShortcutContext::ImageFullscreen,
+            RingShortcutContext::VideoFullscreen,
+        ] {
+            assert_eq!(quit.label_for_context(context), "アプリを終了する");
+            assert!(quit.is_valid_for_context(context));
+            assert!(RingActionId::available_for_context(context).contains(&quit));
+            assert!(RingActionId::available_for_mouse_button_context(context).contains(&quit));
         }
 
         assert_ne!(RingActionId::CloseMainWindow, RingActionId::CloseFullscreen);
         assert_ne!(RingActionId::QuitApplication, RingActionId::CloseFullscreen);
+    }
+
+    #[test]
+    fn application_quit_is_not_available_in_edit_mode_gestures() {
+        assert!(
+            !RingActionId::available_for_right_drag_context(RightDragContext::EditMode)
+                .contains(&RingActionId::QuitApplication)
+        );
+        let mut profile = MouseGestureProfile {
+            bindings: vec![gesture_binding(
+                &[MouseGestureDirection::Down],
+                RingActionId::QuitApplication,
+            )],
+        };
+        profile.sanitize(RightDragContext::EditMode);
+        assert_eq!(profile.bindings[0].action, RingActionId::None);
     }
 
     #[test]
