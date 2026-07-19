@@ -738,6 +738,18 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 8. Pan (fs_pan)
 ```
 
+静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
+`FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
+両方固定なら上下を同時に除外した同一矩形を、単ページ・見開き・連結読み・入力座標へ渡す。
+上部情報バーの見開き2ページ情報は表示済み `fs_cache` / `ThumbnailState` / `image_metas` だけから
+構築し、HUD 描画のために同期ファイル I/O やアーカイブ読み込みを追加しない。AI 処理名と
+処理後解像度も current page の一時状態ではなくページ別の実効補正値・cache から解決し、
+単ページと見開き左右の各行へ同じ規則で表示する。
+
+ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
+決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して
+クリック先が逆になるような独立判定を置かない。
+
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
 **描画は `draw_fs_image` を再利用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
 keymap カスタマイズ可) のホールドで動き、

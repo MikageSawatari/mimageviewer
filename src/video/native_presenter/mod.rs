@@ -129,6 +129,8 @@ pub struct NativePresenterConfig {
     pub cursor_hide_delay_secs: f32,
     /// OS DPI に追加で掛けるアプリ内 UI 表示倍率。
     pub ui_scale: f32,
+    /// main UI と同じ標準 / 強めの文字コントラスト。
+    pub text_contrast: crate::settings::TextContrast,
     /// HUD overlay HWND の wndproc が拾った mouse / DPI / raise 要求を流す sender。
     /// `Some` のとき、presenter は HUD overlay HWND を作って egui overlay を
     /// その DComp tree にぶら下げる (CP4 反映)。`None` または HUD HWND 作成失敗時は
@@ -1494,7 +1496,12 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
     crate::ui_fonts::configure_fonts(ctx);
 }
 
-fn configure_overlay_style(ctx: &egui::Context) {
+fn configure_overlay_style(ctx: &egui::Context, text_contrast: crate::settings::TextContrast) {
+    crate::os_theme::apply_resolved_with_contrast(
+        ctx,
+        crate::os_theme::ResolvedTheme::Dark,
+        text_contrast,
+    );
     ctx.style_mut(|style| {
         // native HUD は HUD_BOTTOM_HEIGHT (= 64pt、2 段) の小さな操作面なので、ヘルプ
         // text は hover 直後に出す。egui default の 0.5s delay だと「初回だけ待つ /
@@ -1712,6 +1719,7 @@ impl NativeVideoPresenter {
                         config.height,
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
+                        config.text_contrast,
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -1765,6 +1773,7 @@ impl NativeVideoPresenter {
                         config.height,
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
+                        config.text_contrast,
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -3241,6 +3250,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_text_contrast(&mut self, contrast: crate::settings::TextContrast) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_text_contrast(contrast);
+        }
+    }
+
     pub fn set_overlay_audio_only(&mut self, audio_only: bool) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_audio_only(audio_only);
@@ -3884,6 +3899,7 @@ impl NativeEguiOverlay {
         height: u32,
         cursor_hide_delay_secs: f32,
         ui_scale: f32,
+        text_contrast: crate::settings::TextContrast,
         cursor_was_hidden_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -3932,7 +3948,7 @@ impl NativeEguiOverlay {
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         configure_overlay_fonts(&egui_ctx);
-        configure_overlay_style(&egui_ctx);
+        configure_overlay_style(&egui_ctx, text_contrast);
         let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
         let pixels_per_point =
             effective_overlay_pixels_per_point(pixels_per_point_for_hwnd(dcomp_hwnd), ui_scale);
@@ -4586,6 +4602,14 @@ impl NativeEguiOverlay {
         self.perf_visible = visible;
         self.dirty = true;
         true
+    }
+
+    fn set_text_contrast(&mut self, contrast: crate::settings::TextContrast) {
+        if crate::os_theme::current_text_contrast(&self.egui_ctx) == contrast {
+            return;
+        }
+        configure_overlay_style(&self.egui_ctx, contrast);
+        self.dirty = true;
     }
 
     fn push_perf_sample(
@@ -8623,9 +8647,9 @@ mod tests {
     use super::{
         NativeEguiOverlay, NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting,
         NativePixelSample, NativeRightPanelVisibilityInputs, compare_pixel_probe,
-        compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
-        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
-        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        compute_video_visual_transform, configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra,
+        cursor_move_is_activity, effective_overlay_pixels_per_point, egui_key_from_virtual_key,
+        metadata_clean_text, native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
         native_right_panel_visible_from_inputs, native_video_fullscreen_shortcut_key,
         sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
@@ -8676,6 +8700,33 @@ mod tests {
             shift: false,
             ctrl: false,
         })
+    }
+
+    #[test]
+    fn native_overlay_uses_shared_strong_dark_text_style() {
+        let ctx = egui::Context::default();
+        configure_overlay_style(&ctx, crate::settings::TextContrast::Strong);
+
+        assert!(ctx.style().visuals.dark_mode);
+        assert_eq!(
+            crate::os_theme::current_text_contrast(&ctx),
+            crate::settings::TextContrast::Strong
+        );
+        assert_eq!(ctx.style().interaction.tooltip_delay, 0.0);
+        assert_eq!(
+            ctx.style().visuals.text_color(),
+            crate::os_theme::dark_visuals(crate::settings::TextContrast::Strong).text_color()
+        );
+
+        configure_overlay_style(&ctx, crate::settings::TextContrast::Standard);
+        assert_eq!(
+            crate::os_theme::current_text_contrast(&ctx),
+            crate::settings::TextContrast::Standard
+        );
+        assert_eq!(
+            ctx.style().visuals.text_color(),
+            crate::os_theme::dark_visuals(crate::settings::TextContrast::Standard).text_color()
+        );
     }
 
     #[test]

@@ -1958,8 +1958,7 @@ impl App {
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
                         // ⚠ 重要: テーマに依存せず常に DARK visuals を使う (R3 FB)。
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        crate::os_theme::apply_dark_ui(ui);
 
                         // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
                         // R5: ヘッダは **ScrollArea の外** に出す。旧版はスクロールバー

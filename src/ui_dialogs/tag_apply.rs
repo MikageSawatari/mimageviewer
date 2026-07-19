@@ -176,13 +176,13 @@ impl App {
                     ui.label(
                         egui::RichText::new("タグ名は 64 文字以内にしてください。")
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(200, 80, 60)),
+                            .color(ui.visuals().error_fg_color),
                     );
                 } else if input_has_whitespace {
                     ui.label(
                         egui::RichText::new("タグ名に空白は使えません。")
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(200, 80, 60)),
+                            .color(ui.visuals().error_fg_color),
                     );
                 }
 

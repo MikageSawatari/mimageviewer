@@ -410,6 +410,9 @@ pub(crate) struct PreferencesState {
     pub settings: Settings,
     /// 現在選択中のページ
     pub selected: PreferencesPage,
+    /// 右ペインのスクロール状態をページ切替ごとに新しくする世代。
+    /// 同じページの再描画では維持し、別ページへ移ったときだけ増やす。
+    pub right_panel_scroll_generation: u64,
     /// 展開中のカテゴリラベル
     pub expanded: HashSet<&'static str>,
 
@@ -624,6 +627,7 @@ impl PreferencesState {
         Self {
             settings: s.clone(),
             selected: PreferencesPage::General,
+            right_panel_scroll_generation: 0,
             expanded,
             manual_threads,
             capture_output_dir_input: s
@@ -718,6 +722,16 @@ impl PreferencesState {
             vst3_auto_bypassed: Vec::new(),
             diag_export_result: None,
         }
+    }
+}
+
+fn advance_preferences_scroll_generation(
+    previous: PreferencesPage,
+    current: PreferencesPage,
+    generation: &mut u64,
+) {
+    if previous != current {
+        *generation = generation.wrapping_add(1);
     }
 }
 
@@ -923,6 +937,7 @@ impl App {
                         .max_rect(left_rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
+                let selected_before_tree = state.selected;
                 egui::ScrollArea::vertical()
                     .id_salt("pref_tree")
                     .max_height(main_height)
@@ -931,6 +946,11 @@ impl App {
                         ui.set_min_width(tree_width - 12.0);
                         draw_tree(ui, state);
                     });
+                advance_preferences_scroll_generation(
+                    selected_before_tree,
+                    state.selected,
+                    &mut state.right_panel_scroll_generation,
+                );
 
                 // 区切り線
                 let sep_x = outer_rect.min.x + tree_width + 3.0;
@@ -950,7 +970,7 @@ impl App {
                 right_ui.spacing_mut().scroll = pref_panel_scroll_style();
                 let mut command_capture_waiting = false;
                 egui::ScrollArea::vertical()
-                    .id_salt("pref_panel")
+                    .id_salt(("pref_panel", state.right_panel_scroll_generation))
                     .scroll_bar_visibility(
                         egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
                     )
@@ -1939,3 +1959,26 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 }
 
 // 個別ページ実装は `preferences/pages.rs` に分離。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferences_scroll_generation_changes_only_on_page_switch() {
+        let mut generation = 7;
+        advance_preferences_scroll_generation(
+            PreferencesPage::General,
+            PreferencesPage::General,
+            &mut generation,
+        );
+        assert_eq!(generation, 7);
+
+        advance_preferences_scroll_generation(
+            PreferencesPage::General,
+            PreferencesPage::SpreadMode,
+            &mut generation,
+        );
+        assert_eq!(generation, 8);
+    }
+}

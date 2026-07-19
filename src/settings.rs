@@ -1690,6 +1690,30 @@ impl UiTheme {
     }
 }
 
+/// UI 全体の文字コントラスト。
+///
+/// 任意色の指定ではなく、ライト / ダーク / フルスクリーンそれぞれに用意した
+/// セマンティック配色を 2 段階で切り替える。`Strong` でも通常文字と補助文字の
+/// 階層は維持し、補助文字を通常文字と同色にはしない。
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TextContrast {
+    #[default]
+    Standard,
+    Strong,
+}
+
+impl TextContrast {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "標準",
+            Self::Strong => "強め",
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // AiFeatureMode (AI 利用範囲)
 // -----------------------------------------------------------------------
@@ -2035,6 +2059,43 @@ impl ReadingDirection {
             Self::Ltr => Self::Rtl,
             Self::Rtl => Self::Ltr,
         }
+    }
+}
+
+/// 静止画フルスクリーンのページシークバーで、左端から右端へページ番号をどう並べるか。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenSeekDirection {
+    /// 横の読み方向が右→左なら、シークバーも右端を先頭ページにする。
+    #[default]
+    FollowReading,
+    /// 読み方向にかかわらず、左端を先頭ページにする。
+    LeftToRight,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenSeekDirection {
+    pub fn all() -> &'static [Self] {
+        &[Self::FollowReading, Self::LeftToRight]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::FollowReading => "読み方向に合わせる",
+            Self::LeftToRight => "常に左→右",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::FollowReading,
+            value => value,
+        }
+    }
+
+    pub fn is_rtl(self, reading_direction: ReadingDirection) -> bool {
+        self.normalized() == Self::FollowReading && reading_direction == ReadingDirection::Rtl
     }
 }
 
@@ -2739,6 +2800,12 @@ pub struct Settings {
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
+    /// 静止画フルスクリーン上部 HUD を常時表示し、画像領域から除外する。
+    #[serde(default)]
+    pub fullscreen_top_bar_locked: bool,
+    /// 静止画フルスクリーン下部のページシークバーの左右方向。
+    #[serde(default)]
+    pub fullscreen_seek_direction: FullscreenSeekDirection,
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
@@ -2791,6 +2858,10 @@ pub struct Settings {
     /// 背景色テーマ (System / Light / Dark)。デフォルト `System` で Windows のアプリ用色に追従。
     #[serde(default)]
     pub ui_theme: UiTheme,
+
+    /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
+    #[serde(default)]
+    pub text_contrast: TextContrast,
 
     /// OS DPI とは独立したアプリ内 UI 表示倍率 (50%..=200%、10% 刻み)。
     #[serde(default = "default_ui_scale_factor")]
@@ -4051,6 +4122,8 @@ impl Default for Settings {
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_seek_bar_locked: false,
+            fullscreen_top_bar_locked: false,
+            fullscreen_seek_direction: FullscreenSeekDirection::default(),
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
             fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
@@ -4066,6 +4139,7 @@ impl Default for Settings {
             auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
+            text_contrast: TextContrast::default(),
             ui_scale_factor: default_ui_scale_factor(),
             first_setup_completed: false,
             ai_feature_mode: AiFeatureMode::default(),
@@ -6381,6 +6455,11 @@ mod tests {
         assert_eq!(s.slideshow_continuous_scroll_percent, 50);
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert!(!s.fullscreen_seek_bar_locked);
+        assert!(!s.fullscreen_top_bar_locked);
+        assert_eq!(
+            s.fullscreen_seek_direction,
+            FullscreenSeekDirection::FollowReading
+        );
         assert!(s.fullscreen_page_number_overlay);
         assert!(!s.fullscreen_keep_on_app_switch);
         assert_eq!(
@@ -6432,6 +6511,16 @@ mod tests {
         assert!(s.use_native_shell_context_menu);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
+        assert_eq!(s.text_contrast, TextContrast::Standard);
+    }
+
+    #[test]
+    fn fullscreen_seek_direction_default_follows_reading_direction() {
+        let follow = FullscreenSeekDirection::default();
+        assert!(!follow.is_rtl(ReadingDirection::Ltr));
+        assert!(follow.is_rtl(ReadingDirection::Rtl));
+        assert!(!FullscreenSeekDirection::LeftToRight.is_rtl(ReadingDirection::Rtl));
+        assert!(FullscreenSeekDirection::Unknown.is_rtl(ReadingDirection::Rtl));
     }
 
     #[test]
@@ -6791,6 +6880,7 @@ mod tests {
     #[test]
     fn settings_missing_fields_use_defaults() {
         let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.text_contrast, TextContrast::Standard);
         assert_eq!(loaded.grid_cols, 4);
         assert_eq!(loaded.thumb_px, 512);
         assert_eq!(loaded.thumb_quality, 75);

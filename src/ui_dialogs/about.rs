@@ -101,7 +101,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("各ライセンス全文は追加パック内に同梱されています。")
                             .size(10.0)
-                            .color(egui::Color32::from_gray(150)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 }
 

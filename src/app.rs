@@ -7329,8 +7329,9 @@ pub struct App {
     /// 直近に ctx に適用した「解決後」のテーマ (Light / Dark)。
     /// `settings.ui_theme` が `System` のとき、設定値は変わらなくても
     /// Windows 側の Light/Dark 切替で解決後の値が変わるため、毎フレーム
-    /// `os_theme::resolve` の結果と比較して再適用する。
+    /// `os_theme::resolve` の結果と文字コントラストを比較して再適用する。
     pub(crate) applied_ui_theme: Option<crate::os_theme::ResolvedTheme>,
+    pub(crate) applied_text_contrast: Option<crate::settings::TextContrast>,
 
     /// eframe の wgpu::Device / Queue / Adapter / target_format。動画 GPU レンダリング
     /// で `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared
@@ -9767,6 +9768,7 @@ impl App {
             startup_open_path: None,
             startup_open_path_resolve_pending: None,
             applied_ui_theme: None,
+            applied_text_contrast: None,
             #[cfg(windows)]
             wgpu_render_state: None,
             #[cfg(windows)]
@@ -36395,6 +36397,19 @@ impl App {
         self.apply_rotation(idx, new_rot);
     }
 
+    /// 指定 idx の画像を選択された絶対角度へ設定する。
+    pub(crate) fn set_image_rotation(
+        &mut self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+    ) {
+        if self.idx_is_compiled_book_page(idx) {
+            self.show_feedback_toast("本のページは回転できません".to_string());
+            return;
+        }
+        self.apply_rotation(idx, rotation);
+    }
+
     fn apply_rotation(&mut self, idx: usize, rot: crate::rotation_db::Rotation) {
         let Some(key) = self.rotation_key_for_idx(idx) else {
             return;
@@ -38783,6 +38798,7 @@ impl App {
                             self.settings.vst3_enabled,
                             self.checked.contains(&idx),
                             self.settings.ui_scale_factor,
+                            self.settings.text_contrast,
                             self.settings.fullscreen_cursor_hide_delay_secs,
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                             Some(self.dsp_bridge.editor_hwnds_snapshot()),
@@ -50818,6 +50834,8 @@ impl App {
         #[cfg(windows)]
         let native_hud_dimmed = self.native_video_hud_dimmed_for_current_poll();
         #[cfg(windows)]
+        let native_text_contrast = self.settings.text_contrast;
+        #[cfg(windows)]
         let native_vst3_controls_available = self.native_video_vst3_controls_available();
         // 音声 VST シェル (Inc 6 ②-3): フレーム開始時点のシェル対象 fs_idx。close race
         // (soft close イベントで exit 済み ↔ hard close の native_closed_idx) を安全に判定する
@@ -50899,6 +50917,8 @@ impl App {
                 player.set_native_checked(self.checked.contains(idx));
                 #[cfg(windows)]
                 player.set_native_hud_dimmed(native_hud_dimmed);
+                #[cfg(windows)]
+                player.set_native_text_contrast(native_text_contrast);
                 if let Some(d) = player.tick(ctx) {
                     let d = if player.is_playing() {
                         d.min(std::time::Duration::from_millis(16))
@@ -51700,9 +51720,13 @@ impl eframe::App for App {
         // `UiTheme::System` 選択時は設定値が変わらなくても Windows の Light/Dark
         // 切替に追従する必要があるので、毎フレーム resolve して解決後の値で比較する。
         let resolved_theme = crate::os_theme::resolve(self.settings.ui_theme);
-        if self.applied_ui_theme != Some(resolved_theme) {
-            crate::os_theme::apply_resolved(ctx, resolved_theme);
+        let text_contrast = self.settings.text_contrast;
+        if self.applied_ui_theme != Some(resolved_theme)
+            || self.applied_text_contrast != Some(text_contrast)
+        {
+            crate::os_theme::apply_resolved_with_contrast(ctx, resolved_theme, text_contrast);
             self.applied_ui_theme = Some(resolved_theme);
+            self.applied_text_contrast = Some(text_contrast);
             #[cfg(windows)]
             if !self.native_video_main_chrome_black
                 && let Some(hwnd_raw) = self.main_hwnd
@@ -55273,6 +55297,7 @@ fn native_video_presenter_config(
     vst3_available: bool,
     checked: bool,
     ui_scale: f32,
+    text_contrast: crate::settings::TextContrast,
     cursor_hide_delay_secs: f32,
     editor_hwnds_snapshot: Option<
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
@@ -55300,6 +55325,7 @@ fn native_video_presenter_config(
         vst3_available: vst3_available && placement.is_fullscreen_borderless(),
         checked,
         ui_scale: crate::settings::normalize_ui_scale_factor(ui_scale),
+        text_contrast,
         cursor_hide_delay_secs: crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
             cursor_hide_delay_secs,
         ),

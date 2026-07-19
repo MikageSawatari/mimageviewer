@@ -320,6 +320,8 @@ pub struct NativeVideoOutputConfig {
     pub cursor_hide_delay_secs: f32,
     /// main egui Context の zoom_factor を native overlay にミラーする倍率。
     pub ui_scale: f32,
+    /// main egui Context と native HUD で共有する文字コントラスト。
+    pub text_contrast: crate::settings::TextContrast,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -580,6 +582,9 @@ enum NativeVideoOutputCommand {
     SetHudDimmed {
         dimmed: bool,
     },
+    SetTextContrast {
+        contrast: crate::settings::TextContrast,
+    },
     SetChecked {
         checked: bool,
     },
@@ -769,6 +774,7 @@ pub(crate) struct NativeVideoOutput {
     committed_generation: AtomicU64,
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
+    last_text_contrast_strong: AtomicBool,
     command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
     event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(u64, NativeVideoOutputEvent)>>,
     /// Presenter thread 内で起きた fatal init error (`CoInitializeEx` /
@@ -797,6 +803,7 @@ impl NativeVideoOutput {
             committed_generation: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
+            last_text_contrast_strong: AtomicBool::new(false),
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error: Arc::new(Mutex::new(None)),
@@ -831,6 +838,8 @@ impl NativeVideoOutput {
         let source_epoch = Arc::new(AtomicU64::new(0));
         let initial_vst3_available = config.vst3_available;
         let initial_checked = config.checked;
+        let initial_text_contrast_strong =
+            matches!(config.text_contrast, crate::settings::TextContrast::Strong);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let init_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -906,6 +915,7 @@ impl NativeVideoOutput {
             committed_generation: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
+            last_text_contrast_strong: AtomicBool::new(initial_text_contrast_strong),
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error,
@@ -1062,6 +1072,21 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetHudDimmed { dimmed });
+    }
+
+    fn set_text_contrast(&self, contrast: crate::settings::TextContrast) {
+        let strong = matches!(contrast, crate::settings::TextContrast::Strong);
+        if self
+            .last_text_contrast_strong
+            .swap(strong, Ordering::AcqRel)
+            == strong
+        {
+            return;
+        }
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetTextContrast { contrast });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
     fn set_checked(&self, checked: bool) {
@@ -1950,6 +1975,7 @@ fn run_native_video_output(
             egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
             ui_scale: config.ui_scale,
+            text_contrast: config.text_contrast,
             hud_event_tx,
         },
     ) {
@@ -1994,15 +2020,17 @@ fn run_native_video_output(
     // Plan B: viewer presentation 切替 (`SwitchPlacement`) で presenter を作り直す
     // とき、新 presenter に再適用するための現行状態。`config.*` は初期値しか持たない
     // ため、command で更新されうる値はここで追跡する。
-    //   - `cur_checked` / `cur_vst3_available`: HUD ボタン状態 (`SetChecked` /
-    //     `SetVst3Available` は `NativeVideoOutput` 側で dedup されるため、再構築後の
-    //     新 presenter には command が来ない可能性がある → ここから直接再適用する)。
+    //   - `cur_checked` / `cur_vst3_available` / `cur_text_contrast`: HUD 状態
+    //     (`SetChecked` / `SetVst3Available` / `SetTextContrast` は `NativeVideoOutput` 側で
+    //     dedup されるため、再構築後の新 presenter には command が来ない可能性がある
+    //     → ここから直接再適用する)。
     //   - `cur_sar`: anamorphic 補正の SAR。`SetVideoSar` は info 到着時に 1 度だけ
     //     送られるので、再構築後は新 presenter へ手動で再適用する必要がある。
     let mut cur_placement = config.placement;
     let mut cur_owner_hwnd = config.owner_hwnd;
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
+    let mut cur_text_contrast = config.text_contrast;
     let cur_ui_scale = crate::settings::normalize_ui_scale_factor(config.ui_scale);
     let mut cur_hud_dimmed = false;
     let mut cur_sar: Option<(u32, u32)> = None;
@@ -2469,6 +2497,10 @@ fn run_native_video_output(
                     cur_hud_dimmed = dimmed;
                     presenter.set_overlay_hud_dimmed(dimmed);
                 }
+                NativeVideoOutputCommand::SetTextContrast { contrast } => {
+                    cur_text_contrast = contrast;
+                    presenter.set_overlay_text_contrast(contrast);
+                }
                 NativeVideoOutputCommand::SetChecked { checked } => {
                     cur_checked = checked;
                     presenter.set_overlay_checked(checked);
@@ -2882,6 +2914,7 @@ fn run_native_video_output(
                                             ),
                                             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
                                             ui_scale: cur_ui_scale,
+                                            text_contrast: cur_text_contrast,
                                             hud_event_tx: new_hud_event_tx,
                                         },
                                     );
@@ -6039,6 +6072,13 @@ impl VideoPlayer {
     pub fn set_native_hud_dimmed(&self, dimmed: bool) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_hud_dimmed(dimmed);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_text_contrast(&self, contrast: crate::settings::TextContrast) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_text_contrast(contrast);
         }
     }
 

@@ -12,8 +12,8 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
-    GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
-    StartupFolderMode, UiTheme,
+    FullscreenSeekDirection, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
+    SortOrder, SpreadMode, StartupFolderMode, TextContrast, UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -40,6 +40,26 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         &mut state.settings.ui_theme,
         UiTheme::Dark,
         "ダーク (全体暗色 / フルスクリーン黒)",
+    );
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("文字のコントラスト").strong());
+    ui.horizontal(|ui| {
+        ui.radio_value(
+            &mut state.settings.text_contrast,
+            TextContrast::Standard,
+            TextContrast::Standard.label(),
+        );
+        ui.radio_value(
+            &mut state.settings.text_contrast,
+            TextContrast::Strong,
+            TextContrast::Strong.label(),
+        );
+    });
+    ui.label(
+        egui::RichText::new(
+            "メイン画面、メニュー、ダイアログ、フルスクリーンの文字をまとめて切り替えます。",
+        )
+        .weak(),
     );
     ui.add_space(12.0);
     ui.label(
@@ -614,7 +634,7 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         egui::RichText::new(format!("実際の保存先: {}", effective.display()))
             .size(11.0)
-            .color(egui::Color32::from_gray(140)),
+            .color(ui.visuals().weak_text_color()),
     );
 }
 
@@ -2466,7 +2486,7 @@ fn command_conflict_summary(
         ui.label(
             egui::RichText::new(format!("競合している割り当て: {} 件", conflicts.len()))
                 .strong()
-                .color(egui::Color32::from_rgb(220, 150, 80)),
+                .color(ui.visuals().warn_fg_color),
         );
         ui.small("上から処理される側が優先される場合があります。必要に応じて片方を別キーに変更するか、割り当てを解除してください。");
 
@@ -2781,7 +2801,7 @@ fn command_editor_for_action(
         ui.label(
             egui::RichText::new("このコマンドの競合")
                 .strong()
-                .color(egui::Color32::from_rgb(220, 150, 80)),
+                .color(ui.visuals().warn_fg_color),
         );
         for conflict in related {
             ui.horizontal(|ui| {
@@ -4535,14 +4555,14 @@ pub(super) fn page_book(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         egui::RichText::new(format!("本棚: {}", effective.display()))
             .size(11.0)
-            .color(egui::Color32::from_gray(140)),
+            .color(ui.visuals().weak_text_color()),
     );
     ui.label(
         egui::RichText::new(
             "保存先を変更しても既存の本は移動しません。元の場所に通常のフォルダとして残ります。",
         )
         .size(11.0)
-        .color(egui::Color32::from_gray(140)),
+        .color(ui.visuals().weak_text_color()),
     );
 }
 
@@ -4829,7 +4849,7 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
              (このモデルでは DirectML が最速のため)。",
         )
         .size(12.0)
-        .color(egui::Color32::from_rgb(170, 170, 170)),
+        .color(ui.visuals().weak_text_color()),
     );
     ui.add_space(8.0);
 
@@ -5573,7 +5593,7 @@ pub(super) fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState)
              問い合わせ内容はバージョン情報のみで、ユーザーデータは送信しません。",
         )
         .size(11.0)
-        .color(egui::Color32::from_gray(150)),
+        .color(ui.visuals().weak_text_color()),
     );
 
     ui.add_space(12.0);
@@ -6109,7 +6129,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.label(
             egui::RichText::new(format!("スキャンに失敗しました: {err}"))
                 .small()
-                .color(egui::Color32::from_rgb(220, 80, 80)),
+                .color(ui.visuals().error_fg_color),
         );
     }
     ui.label(
@@ -6239,7 +6259,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         egui::RichText::new("システムファイル ($Recycle.Bin 等) は常に非表示です")
             .size(11.0)
-            .color(egui::Color32::from_gray(150)),
+            .color(ui.visuals().weak_text_color()),
     );
 
     ui.add_space(12.0);
@@ -6311,7 +6331,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
              OFF 中は該当バックアップの書き込みも既存ファイルの読み込みも行いません (既存の mimageviewer.dat は削除されず残ります)。",
         )
         .size(11.0)
-        .color(egui::Color32::from_gray(150)),
+        .color(ui.visuals().weak_text_color()),
     );
 
     ui.add_space(14.0);
@@ -6367,7 +6387,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
              テンプレートはヘルプの「スタック表示」ページを参照してください。",
         )
         .size(11.0)
-        .color(egui::Color32::from_gray(150)),
+        .color(ui.visuals().weak_text_color()),
     );
 }
 
@@ -6399,7 +6419,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
             ui.label(
                 egui::RichText::new("拡張子の優先度（上が最優先）:")
                     .size(12.0)
-                    .color(egui::Color32::from_gray(160)),
+                    .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(2.0);
 
@@ -6416,7 +6436,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                             ui.label(
                                 egui::RichText::new(format!("{}.", i + 1))
                                     .size(11.0)
-                                    .color(egui::Color32::from_gray(140)),
+                                    .color(ui.visuals().weak_text_color()),
                             );
                             ui.label(&state.settings.image_ext_priority[i]);
                             ui.with_layout(
@@ -6492,7 +6512,7 @@ pub(super) fn page_exif_display(
             "MakerNote 系などリストに無いタグはここから追加できます (内部名で入力)。",
         )
         .small()
-        .color(egui::Color32::from_gray(140)),
+        .color(ui.visuals().weak_text_color()),
     );
 
     ui.add_space(4.0);
@@ -6618,7 +6638,7 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(format!("▼ カスタム  ({} 件)", custom.len()))
-            .color(egui::Color32::from_gray(180))
+            .color(ui.visuals().text_color())
             .size(13.0),
     );
 
@@ -6716,6 +6736,20 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         "下部ページシークバーを固定表示",
     );
     ui.small("ON のときはフルスクリーン下端にシークバー領域を確保し、画像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    egui::ComboBox::from_label("ページシークバーの方向")
+        .selected_text(s.fullscreen_seek_direction.label())
+        .show_ui(ui, |ui| {
+            for &direction in FullscreenSeekDirection::all() {
+                ui.selectable_value(
+                    &mut s.fullscreen_seek_direction,
+                    direction,
+                    direction.label(),
+                );
+            }
+        });
+    ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグに適用されます。左右キーと画面端クリックは本の読み方向に従います。");
+    ui.checkbox(&mut s.fullscreen_top_bar_locked, "上部情報バーを固定表示");
+    ui.small("ON のときはフルスクリーン上端に情報バー領域を確保し、画像と重ならないようにフィットします。上部バーの鍵アイコンからも切り替えできます。");
     ui.checkbox(
         &mut s.fullscreen_page_number_overlay,
         "ページ番号を常時表示",
@@ -6908,7 +6942,7 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
              例えば「移動は続き・開いたら先頭」のように、セルごとに自由に組み合わせられます。",
         )
         .size(11.0)
-        .color(egui::Color32::from_gray(150)),
+        .color(ui.visuals().weak_text_color()),
     );
 
     // ── 保存済み位置の管理 (記憶件数の確認 + クリア) ──
@@ -6944,7 +6978,7 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
         ui.label(
             egui::RichText::new(msg)
                 .size(11.0)
-                .color(egui::Color32::from_gray(150)),
+                .color(ui.visuals().weak_text_color()),
         );
     }
 
@@ -6978,7 +7012,7 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
         ui.label(
             egui::RichText::new(msg)
                 .size(11.0)
-                .color(egui::Color32::from_gray(150)),
+                .color(ui.visuals().weak_text_color()),
         );
     }
 }

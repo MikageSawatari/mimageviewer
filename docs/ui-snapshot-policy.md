@@ -57,13 +57,18 @@ UI コードをスナップショットしたい場合は、まずロジック�
 
 ### 2. ハーネスは `tests/ui_snapshot.rs` 内のヘルパーを使う
 
-- `snapshot_with_theme(name, theme, build_ui)`: 任意 UI + テーマ指定
+- `snapshot_with_theme(name, theme, build_ui)`: 任意 UI + テーマ指定（文字コントラストは標準）
+- `snapshot_with_theme_and_contrast(name, theme, contrast, build_ui)`: 任意 UI + テーマ + 文字コントラスト指定
 - `snapshot_diagnostic(name, status, plugins)`: Susie 診断専用
 
 これらはすべて `install_app_fonts()` を呼んで、本体と同じ `ui_fonts::configure_fonts()`
 のフォント fallback (YuGothM / meiryo / msgothic + 記号・絵文字補完) を登録する。
 豆腐化したスナップショットは「描画が崩れている」のか「フォントが無いだけ」のか
 区別できないため常に登録する。
+
+通常文字・薄い文字・ボタン状態の配色を変える場合は、Light / Dark の標準 snapshot に加えて
+`TextContrast::Strong` の Light / Dark snapshot も更新し、背景色まで意図せず変わっていないことを
+目視確認する。
 
 ### 3. サイズは固定
 

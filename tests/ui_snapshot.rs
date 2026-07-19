@@ -38,13 +38,27 @@ fn install_app_fonts(ctx: &egui::Context) {
 fn snapshot_with_theme(
     name: &str,
     resolved: mimageviewer::os_theme::ResolvedTheme,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_and_contrast(
+        name,
+        resolved,
+        mimageviewer::settings::TextContrast::Standard,
+        build_ui,
+    );
+}
+
+fn snapshot_with_theme_and_contrast(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
     mut build_ui: impl FnMut(&mut egui::Ui),
 ) {
     let mut fonts_ready = false;
     let mut harness = Harness::builder()
         .with_size(egui::vec2(480.0, 360.0))
         .build(move |ctx| {
-            mimageviewer::os_theme::apply_resolved(ctx, resolved);
+            mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
             if !fonts_ready {
                 install_app_fonts(ctx);
                 fonts_ready = true;
@@ -63,6 +77,39 @@ fn snapshot_with_theme(
 
     harness.run();
     harness.snapshot(name);
+}
+
+fn contrast_fixture(ui: &mut egui::Ui) {
+    ui.set_min_width(440.0);
+    ui.heading("文字コントラスト");
+    ui.label("通常文字：ツールバーやメニューと共通の色です。");
+    ui.label(egui::RichText::new("薄い文字：補足情報や件数表示です。").weak());
+    ui.horizontal(|ui| {
+        let _ = ui.button("通常ボタン");
+        ui.add_enabled(false, egui::Button::new("無効ボタン"));
+    });
+    ui.label(egui::RichText::new("注意表示").color(ui.visuals().warn_fg_color));
+    ui.label(egui::RichText::new("エラー表示").color(ui.visuals().error_fg_color));
+}
+
+#[test]
+fn text_contrast_strong_light() {
+    snapshot_with_theme_and_contrast(
+        "text_contrast_strong_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::Strong,
+        contrast_fixture,
+    );
+}
+
+#[test]
+fn text_contrast_strong_dark() {
+    snapshot_with_theme_and_contrast(
+        "text_contrast_strong_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Strong,
+        contrast_fixture,
+    );
 }
 
 /// シンプルなラベル+ボタンを Light テーマで描画して、基盤が動くことを確認する

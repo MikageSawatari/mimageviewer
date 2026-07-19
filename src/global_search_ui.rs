@@ -2213,7 +2213,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("📁 {}", d.current_path.display()))
                             .size(11.0)
-                            .color(egui::Color32::from_gray(150)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 });
             }
@@ -2442,7 +2442,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("タグ候補:")
                             .size(11.0)
-                            .color(egui::Color32::from_gray(150)),
+                            .color(ui.visuals().weak_text_color()),
                     )
                     .on_hover_text(
                         "mIV タグは Ctrl+G の全文検索には混ぜません。\n\

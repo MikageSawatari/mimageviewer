@@ -7030,6 +7030,7 @@ impl App {
             true,  // vst3_available
             self.checked.contains(&fs_idx), // checked: グリッドのチェック状態 (動画 HUD と同じ)
             self.settings.ui_scale_factor,
+            self.settings.text_contrast,
             self.settings.fullscreen_cursor_hide_delay_secs,
             Some(self.dsp_bridge.editor_hwnds_snapshot()),
             self.main_hwnd.unwrap_or(0) as u64,
@@ -7532,6 +7533,7 @@ impl App {
                 self.settings.vst3_enabled,
                 self.checked.contains(&fs_idx),
                 self.settings.ui_scale_factor,
+                self.settings.text_contrast,
                 self.settings.fullscreen_cursor_hide_delay_secs,
                 Some(self.dsp_bridge.editor_hwnds_snapshot()),
                 self.main_hwnd.unwrap_or(0) as u64,

@@ -116,7 +116,7 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     let Some(db) = app.archive_cache_db.clone() else {
         ui.label(
             egui::RichText::new("キャッシュ DB が初期化できていません。")
-                .color(egui::Color32::from_rgb(180, 60, 60)),
+                .color(ui.visuals().error_fg_color),
         );
         return;
     };
@@ -154,7 +154,7 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
             if missing_count > 0 {
                 ui.label(
                     egui::RichText::new(format!("(元ファイル消失: {})", missing_count))
-                        .color(egui::Color32::from_rgb(180, 60, 60)),
+                        .color(ui.visuals().error_fg_color),
                 );
             }
         }
@@ -218,7 +218,7 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new("変換済みのアーカイブはありません。")
                 .italics()
-                .color(egui::Color32::from_gray(140)),
+                .color(ui.visuals().weak_text_color()),
         );
     } else {
         draw_entry_list(app, ui);
@@ -269,7 +269,7 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
                         egui::RichText::new(truncate_name(&name, 42))
                     } else {
                         egui::RichText::new(format!("✗ {}", truncate_name(&name, 40)))
-                            .color(egui::Color32::from_rgb(180, 60, 60))
+                            .color(ui.visuals().error_fg_color)
                     };
                     ui.label(label).on_hover_text(path_text);
                     let format_resp = ui.label(format_display_text(entry));

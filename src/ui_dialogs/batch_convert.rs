@@ -393,7 +393,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(current)
                         .size(12.0)
-                        .color(egui::Color32::from_gray(160)),
+                        .color(ui.visuals().weak_text_color()),
                 );
             }
             let ratio = if total > 0 {

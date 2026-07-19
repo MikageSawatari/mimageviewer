@@ -623,7 +623,7 @@ pub(crate) fn draw_native_jump_panel_body(
             if entries.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
-                    ui.colored_label(egui::Color32::from_gray(170), opts.empty_text);
+                    ui.label(egui::RichText::new(opts.empty_text).weak());
                 });
                 return;
             }
@@ -706,7 +706,7 @@ pub(super) fn draw_native_jump_row(
     // (+12pt) から始めて行高も詰める。
     let row_h_min: f32 = if show_thumbnail { 76.0 } else { 52.0 };
     let row_w = (ui.available_width() - 12.0).max(260.0);
-    let title_color = egui::Color32::from_rgb(205, 205, 205);
+    let title_color = ui.visuals().text_color();
     let title_font = egui::FontId::proportional(12.0);
     let title_y_offset = 38.0; // BM ラベル (y +14) の下、サムネ下端 (y +72) より少し上から
     let title_bottom_pad = 6.0;
@@ -946,7 +946,7 @@ pub(crate) fn draw_native_bookmark_title_editor(
             // 動画 native overlay は egui 既定 (= ダーク) の ctx なので no-op = バイト等価。
             // 音楽ビューはメイン ctx でアプリテーマが Light だと既定 Light になり、暗い
             // ダイアログ枠に白ボタン/白 TextEdit が乗る不具合になるため明示する (Inc 5c-A FB)。
-            *ui.visuals_mut() = egui::Visuals::dark();
+            crate::os_theme::apply_dark_ui(ui);
             egui::Frame::new()
                 .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 24, 244))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(112)))
@@ -1094,7 +1094,7 @@ pub(super) fn draw_native_shortcut_help_dialog(
                     ui.label(
                         egui::RichText::new("現在のコンテキスト: 動画フルスクリーン")
                             .size(12.0)
-                            .color(egui::Color32::from_gray(205)),
+                            .color(ui.visuals().text_color()),
                     );
                     ui.add_space(6.0);
 
@@ -1228,7 +1228,7 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
             // ボタン / TextEdit / checkbox など ambient テーマ依存ウィジェットをダーク配色で
             // 描く。動画は egui 既定 (ダーク) ctx なので no-op = バイト等価。音楽ビューは
             // メイン ctx で Light テーマだと白ウィジェットになるため明示する (Inc 5c-A FB)。
-            *ui.visuals_mut() = egui::Visuals::dark();
+            crate::os_theme::apply_dark_ui(ui);
             egui::Frame::new()
                 .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 24, 244))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(112)))
@@ -1276,7 +1276,7 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
                              既存のブックマークと時刻が ±1 秒以内の行は重複として skip します。",
                         )
                         .size(11.5)
-                        .color(egui::Color32::from_gray(190)),
+                        .weak(),
                     );
                     ui.add_space(8.0);
 
@@ -1373,7 +1373,7 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
                     ui.label(
                         egui::RichText::new("現在のブックマーク一覧をエクスポート")
                             .size(12.0)
-                            .color(egui::Color32::from_gray(200)),
+                            .color(ui.visuals().text_color()),
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -1400,7 +1400,7 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
                     ui.label(
                         egui::RichText::new("誤登録対策")
                             .size(12.0)
-                            .color(egui::Color32::from_gray(200)),
+                            .color(ui.visuals().text_color()),
                     );
                     ui.add_space(4.0);
                     if !state.confirm_clear_all {
@@ -2184,7 +2184,7 @@ pub(super) fn draw_native_center_status(
                     egui::Label::new(
                         egui::RichText::new(body)
                             .size(14.0)
-                            .color(egui::Color32::from_gray(230)),
+                            .color(ui.visuals().text_color()),
                     )
                     .wrap(),
                 );
@@ -3654,11 +3654,7 @@ fn draw_native_tag_panel(
     } else {
         ui.horizontal(|ui| {
             ui.add_space(14.0);
-            ui.label(
-                egui::RichText::new("（タグなし）")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(150)),
-            );
+            ui.label(egui::RichText::new("（タグなし）").size(11.0).weak());
         });
     }
 }
@@ -3932,11 +3928,7 @@ fn draw_native_tag_picker(
     if choices.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(14.0);
-            ui.label(
-                egui::RichText::new("候補なし")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(150)),
-            );
+            ui.label(egui::RichText::new("候補なし").size(11.0).weak());
         });
         return;
     }
@@ -4369,10 +4361,7 @@ pub(super) fn draw_native_metadata_panel(
                             ui.add_sized(
                                 egui::vec2(88.0, 18.0),
                                 egui::Label::new(
-                                    egui::RichText::new(label)
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(egui::Color32::from_gray(150)),
+                                    egui::RichText::new(label).monospace().size(11.0).weak(),
                                 ),
                             );
                             ui.vertical(|ui| {
@@ -5520,7 +5509,7 @@ pub(crate) fn draw_overlay_speed_control(
                 // 音楽ビューのフルスクリーンコンテキストは os_theme で light になり得るため、
                 // 選択ボタンの `interact_selectable` 色が崩れる (実機 FB 2026-07-02)。dark 固定に
                 // することで動画 (既定 dark) と音楽で見た目を揃える。
-                *ui.visuals_mut() = egui::Visuals::dark();
+                crate::os_theme::apply_dark_ui(ui);
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(110)))

@@ -315,6 +315,14 @@ C:\home\mimageviewer_vendor_backup\
   `suppress_menu_button_wheel_passthrough` とツールバー ComboBox の open guard。
 
 ### ダイアログ (egui::Window)
+- **テーマと文字色の所有境界**: 通常 UI の配色は `os_theme::apply_resolved_with_contrast`
+  が Light / Dark 両 Style をまとめて所有する。通常文字・補足文字・警告・エラーは
+  `ui.visuals().text_color()` / `weak_text_color()` / `warn_fg_color` / `error_fg_color` を使い、
+  画面ごとの固定 gray を追加しない。フルスクリーン等の暗色固定子 UI は
+  `os_theme::apply_dark_ui`、ComboBox / popup は `dark_popup_style` / `dark_menu_popup`、
+  タイトルバーを含む暗色 `egui::Window` は `with_dark_context_style` を使う。
+  popup / Window のために `ctx.set_theme` / `ctx.set_visuals` を直接呼ばない。限定スコープが
+  Light / Dark 両 Style と theme preference を復元することが、メインテーマへ漏らさない不変条件。
 - **ドラッグ移動**: `anchor()` を使うとウィンドウが固定されドラッグできなくなる。
   必ず `default_pos()` を使う。定番の初期位置は `ctx.content_rect().min + egui::vec2(60.0, 40.0)`。
 - **閉じるボタン**: `.open(&mut open)` でタイトルバーに × ボタンが付く。

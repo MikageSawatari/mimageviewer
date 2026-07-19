@@ -2051,7 +2051,73 @@ fn draw_details_preview_icon(
     painter.add(egui::Shape::line(mountain, stroke));
 }
 
-fn details_kind_label(item: &GridItem) -> String {
+fn archive_container_format_label(
+    zip_path: &std::path::Path,
+    archive_source_override: Option<&std::path::Path>,
+    current_folder: Option<&std::path::Path>,
+) -> &'static str {
+    let display_path = if archive_source_override.is_some()
+        && current_folder.is_some_and(|folder| crate::folder_tree::path_eq(folder, zip_path))
+    {
+        archive_source_override.unwrap_or(zip_path)
+    } else {
+        zip_path
+    };
+    display_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(crate::archive_converter::ArchiveFormat::nested_from_extension)
+        .map(crate::archive_converter::ArchiveFormat::label)
+        .unwrap_or("ZIP")
+}
+
+fn archive_inner_image_kind_label(
+    zip_path: &std::path::Path,
+    archive_source_override: Option<&std::path::Path>,
+    current_folder: Option<&std::path::Path>,
+) -> String {
+    format!(
+        "{} 内画像",
+        archive_container_format_label(zip_path, archive_source_override, current_folder)
+    )
+}
+
+fn details_row_text_color(visuals: &egui::Visuals, selected: bool) -> egui::Color32 {
+    if selected {
+        visuals.selection.stroke.color
+    } else {
+        // 通常行は共通テーマの primary text。文字コントラスト設定は os_theme 側で
+        // ラベル、ツールバー、メニューとまとめて反映する。
+        visuals.text_color()
+    }
+}
+
+fn selection_info_popup_y(cell_rect: egui::Rect, viewport: egui::Rect, popup_height: f32) -> f32 {
+    const VIEWPORT_MARGIN: f32 = 8.0;
+    const CELL_GAP: f32 = 6.0;
+
+    let below = cell_rect.bottom() + CELL_GAP;
+    let below_max = viewport.bottom() - VIEWPORT_MARGIN - popup_height;
+    if below <= below_max {
+        return below;
+    }
+
+    let above = cell_rect.top() - CELL_GAP - popup_height;
+    let viewport_top = viewport.top() + VIEWPORT_MARGIN;
+    if above >= viewport_top {
+        above
+    } else {
+        // 極端に低い viewport では完全非重複にできないが、通常サイズでは上側領域の
+        // 上限を越えて下へ clamp しない。これが選択行への再侵入を防ぐ境界になる。
+        viewport_top.min(above)
+    }
+}
+
+fn details_kind_label(
+    item: &GridItem,
+    archive_source_override: Option<&std::path::Path>,
+    current_folder: Option<&std::path::Path>,
+) -> String {
     match item {
         GridItem::Folder(path) if crate::path_key::is_drive_or_share_root(path) => {
             "ドライブ".to_string()
@@ -2063,9 +2129,12 @@ fn details_kind_label(item: &GridItem) -> String {
         GridItem::ZipFile(path) => details_ext_kind(path, "ZIP"),
         GridItem::PdfFile(path) => details_ext_kind(path, "PDF"),
         GridItem::ConvertibleArchive { format, .. } => format.label().to_string(),
-        GridItem::ZipImage { .. } => "ZIP 内画像".to_string(),
+        GridItem::ZipImage { zip_path, .. } => {
+            archive_inner_image_kind_label(zip_path, archive_source_override, current_folder)
+        }
         GridItem::PdfPage { .. } => "PDF ページ".to_string(),
         GridItem::ZipDir {
+            zip_path,
             is_archive,
             dir_prefix,
             ..
@@ -2079,7 +2148,14 @@ fn details_kind_label(item: &GridItem) -> String {
                     .unwrap_or("ZIP");
                 format!("内側 {label}")
             } else {
-                "ZIP 内フォルダ".to_string()
+                format!(
+                    "{} 内フォルダ",
+                    archive_container_format_label(
+                        zip_path,
+                        archive_source_override,
+                        current_folder,
+                    )
+                )
             }
         }
         GridItem::SearchContainer { kind, .. } => match kind {
@@ -8630,7 +8706,7 @@ impl App {
                                 egui::RichText::new(count.as_str())
                                     .size(11.0)
                                     .monospace()
-                                    .color(egui::Color32::from_gray(140)),
+                                    .color(ui.visuals().weak_text_color()),
                             )
                             .hover_tip("表示中のサムネイル数 / 全サムネイル数");
                             ui.add_space(4.0);
@@ -9041,7 +9117,7 @@ impl App {
                     let response = ui.label(
                         egui::RichText::new(text)
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(180, 180, 80)),
+                            .color(ui.visuals().warn_fg_color),
                     );
                     if progress.total > 0 {
                         response.on_hover_text(format!(
@@ -9057,7 +9133,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("{matched}/{total} 件"))
                             .size(11.0)
-                            .color(egui::Color32::from_gray(140)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 }
             });
@@ -9070,7 +9146,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("タグ候補:")
                             .size(11.0)
-                            .color(egui::Color32::from_gray(150)),
+                            .color(ui.visuals().weak_text_color()),
                     )
                     .on_hover_text(
                         "mIV タグは Ctrl+F の絞り込み対象には混ぜません。\n\
@@ -9227,14 +9303,14 @@ impl App {
                     ui.label(
                         egui::RichText::new("検索中...")
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(180, 180, 80)),
+                            .color(ui.visuals().warn_fg_color),
                     );
                 } else if self.favsearch.on_results_grid() {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(format!("{} 件", self.favsearch.results_paths.len()))
                             .size(11.0)
-                            .color(egui::Color32::from_gray(140)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 }
             });
@@ -9436,14 +9512,14 @@ impl App {
                     ui.label(
                         egui::RichText::new("検索中...")
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(180, 180, 80)),
+                            .color(ui.visuals().warn_fg_color),
                     );
                 } else if let Some(msg) = self.tag_view.reject_message.as_ref() {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(msg)
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(190, 80, 80)),
+                            .color(ui.visuals().error_fg_color),
                     );
                 } else if !self.tag_view.last_executed.trim().is_empty() {
                     ui.separator();
@@ -9455,7 +9531,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("{}{}", self.tag_view.result_count, suffix))
                             .size(11.0)
-                            .color(egui::Color32::from_gray(140)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 }
             });
@@ -10838,7 +10914,11 @@ impl App {
                 "★".repeat(rating as usize)
             }
             DetailsColumn::Tags => self.cell_tag_list(idx).join(" "),
-            DetailsColumn::Kind => details_kind_label(item),
+            DetailsColumn::Kind => details_kind_label(
+                item,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            ),
             DetailsColumn::PageCount => self.details_page_count_text(idx),
             DetailsColumn::Size => meta
                 .and_then(|(_, size)| (size > 0).then_some(size))
@@ -10928,11 +11008,7 @@ impl App {
             checked,
             visual_state.hovered,
         );
-        let text_color = if selected {
-            visuals.selection.stroke.color
-        } else {
-            visuals.text_color()
-        };
+        let text_color = details_row_text_color(visuals, selected);
 
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, bg);
@@ -11607,7 +11683,14 @@ impl App {
         let mut fields = Vec::new();
         let mut full_location_line = None;
         if self.settings.thumb_tooltip_show_kind {
-            fields.push(format!("種類 {}", details_kind_label(item)));
+            fields.push(format!(
+                "種類 {}",
+                details_kind_label(
+                    item,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
+                )
+            ));
         }
         if self.settings.thumb_tooltip_show_page_count && self.details_item_supports_page_count(idx)
         {
@@ -11833,6 +11916,37 @@ impl App {
         };
         let text = content.tooltip_text();
 
+        let style = ctx.style();
+        let dark = style.visuals.dark_mode;
+        let (fill, text_color, stroke, shadow) = if dark {
+            (
+                egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230),
+                egui::Color32::WHITE,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
+                ),
+                egui::Shadow {
+                    offset: [0, 2],
+                    blur: 10,
+                    spread: 0,
+                    color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+                },
+            )
+        } else {
+            (
+                egui::Color32::from_rgba_unmultiplied(232, 235, 240, 248),
+                egui::Color32::from_gray(25),
+                egui::Stroke::new(1.0, egui::Color32::from_gray(172)),
+                egui::Shadow {
+                    offset: [0, 2],
+                    blur: 12,
+                    spread: 0,
+                    color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 52),
+                },
+            )
+        };
+
         let viewport = ctx.content_rect();
         let popup_w = (cell_rect.width() * 2.5)
             .clamp(180.0, 520.0)
@@ -11849,72 +11963,39 @@ impl App {
             min_x
         };
 
-        let row_count = text.lines().count().clamp(1, 3) as f32;
-        let estimated_h = 18.0 * row_count + 18.0;
-        let mut y = cell_rect.bottom() + 4.0;
-        if y + estimated_h > viewport.bottom() - 8.0 {
-            y = (cell_rect.top() - estimated_h - 4.0).max(viewport.top() + 8.0);
-        }
+        let popup_frame = egui::Frame::popup(&style)
+            .fill(fill)
+            .stroke(stroke)
+            .shadow(shadow);
+        let inner_width = (popup_w - popup_frame.total_margin().sum().x).max(40.0);
+        // 配置前に実際の折り返し条件で galley を作る。改行数からの高さ推定では、
+        // 空白のない長いファイル名が 3 行へ折り返されたときに選択行へ重なっていた。
+        let mut job = egui::text::LayoutJob::single_section(
+            text,
+            egui::TextFormat {
+                font_id: egui::TextStyle::Monospace.resolve(&style),
+                color: text_color,
+                ..Default::default()
+            },
+        );
+        job.wrap.max_width = inner_width;
+        job.wrap.max_rows = 3;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        let measured_h = galley.size().y + popup_frame.total_margin().sum().y;
+        let y = selection_info_popup_y(cell_rect, viewport, measured_h);
         let area_pos = egui::pos2(x, y);
 
         egui::Area::new("selection_info".into())
             .order(egui::Order::Middle)
             .fixed_pos(area_pos)
             .show(ctx, |ui| {
-                let dark = ui.visuals().dark_mode;
-                let (fill, text_color, stroke, shadow) = if dark {
-                    (
-                        egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230),
-                        egui::Color32::WHITE,
-                        egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
-                        ),
-                        egui::Shadow {
-                            offset: [0, 2],
-                            blur: 10,
-                            spread: 0,
-                            color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90),
-                        },
-                    )
-                } else {
-                    (
-                        egui::Color32::from_rgba_unmultiplied(232, 235, 240, 248),
-                        egui::Color32::from_gray(25),
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(172)),
-                        egui::Shadow {
-                            offset: [0, 2],
-                            blur: 12,
-                            spread: 0,
-                            color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 52),
-                        },
-                    )
-                };
-                egui::Frame::popup(ui.style())
-                    .fill(fill)
-                    .stroke(stroke)
-                    .shadow(shadow)
-                    .show(ui, |ui| {
-                        let inner_width = (popup_w - 12.0).max(40.0);
-                        ui.set_min_width(inner_width);
-                        ui.set_max_width(inner_width);
-                        // ファイル名や仮想コンテナ名は空白なしで長くなりやすい。
-                        // 幅を広げた上で最大 3 行に収め、超過分は末尾省略にする。
-                        let mut job = egui::text::LayoutJob::single_section(
-                            text,
-                            egui::TextFormat {
-                                font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                                color: text_color,
-                                ..Default::default()
-                            },
-                        );
-                        job.wrap.max_width = inner_width;
-                        job.wrap.max_rows = 3;
-                        job.wrap.break_anywhere = true;
-                        job.wrap.overflow_character = Some('…');
-                        let galley = ui.painter().layout_job(job);
-                        ui.add(egui::Label::new(galley));
-                    });
+                popup_frame.show(ui, |ui| {
+                    ui.set_min_width(inner_width);
+                    ui.set_max_width(inner_width);
+                    ui.add(egui::Label::new(galley));
+                });
             });
     }
 }
@@ -12034,6 +12115,81 @@ mod selection_info_tests {
         assert!(text.contains("page01.png"));
         assert!(text.contains("種類 ZIP 内画像"));
         assert!(text.contains("画像 800 × 1200"));
+    }
+
+    #[test]
+    fn converted_archive_page_uses_original_container_kind() {
+        let cached_zip = PathBuf::from(r"C:\cache\converted.zip");
+        let mut app = app_with_item(
+            GridItem::ZipImage {
+                zip_path: cached_zip.clone(),
+                entry_name: "page01.jpg".to_string(),
+            },
+            None,
+        );
+        app.current_folder = Some(cached_zip);
+        app.archive_source_override = Some(PathBuf::from(r"C:\books\source.rar"));
+
+        let text = app.selection_info_content().unwrap().single_line_text();
+        assert!(text.contains("種類 RAR 内画像"));
+        let data = app.details_row_data(0, &[DetailsColumn::Kind]).unwrap();
+        assert_eq!(data.text(DetailsColumn::Kind), "RAR 内画像");
+    }
+
+    #[test]
+    fn archive_page_kind_covers_all_supported_original_formats() {
+        let cache = PathBuf::from(r"C:\cache\converted.zip");
+        for (source, expected) in [
+            (r"C:\books\source.rar", "RAR 内画像"),
+            (r"C:\books\source.7z", "7z 内画像"),
+            (r"C:\books\source.lzh", "LZH 内画像"),
+        ] {
+            assert_eq!(
+                archive_inner_image_kind_label(
+                    &cache,
+                    Some(std::path::Path::new(source)),
+                    Some(cache.as_path()),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn converted_archive_folder_uses_original_container_kind() {
+        let cache = PathBuf::from(r"C:\cache\converted.zip");
+        for (source, expected) in [
+            (r"C:\books\source.rar", "RAR 内フォルダ"),
+            (r"C:\books\source.7z", "7z 内フォルダ"),
+            (r"C:\books\source.lzh", "LZH 内フォルダ"),
+        ] {
+            let item = GridItem::ZipDir {
+                zip_path: cache.clone(),
+                dir_prefix: "chapter/".to_string(),
+                is_archive: false,
+                representative: None,
+            };
+            assert_eq!(
+                details_kind_label(
+                    &item,
+                    Some(std::path::Path::new(source)),
+                    Some(cache.as_path()),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn selection_info_popup_above_keeps_measured_height_clear_of_selected_row() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let selected = egui::Rect::from_min_size(egui::pos2(100.0, 520.0), egui::vec2(160.0, 54.0));
+        let popup_height = 72.0;
+
+        let y = selection_info_popup_y(selected, viewport, popup_height);
+
+        assert!(y + popup_height <= selected.top() - 6.0);
+        assert!(y >= viewport.top() + 8.0);
     }
 
     #[test]
@@ -12687,6 +12843,19 @@ mod compute_cell_size_tests {
                 "stroke should be one physical pixel at {pixels_per_point}x"
             );
         }
+    }
+
+    #[test]
+    fn normal_details_text_uses_shared_primary_theme_color() {
+        let visuals = egui::Visuals::light();
+        assert_eq!(
+            details_row_text_color(&visuals, false),
+            visuals.text_color()
+        );
+        assert_eq!(
+            details_row_text_color(&visuals, true),
+            visuals.selection.stroke.color
+        );
     }
 
     #[test]

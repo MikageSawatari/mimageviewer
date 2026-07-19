@@ -166,7 +166,8 @@ impl App {
         );
         let frame = egui::Frame::window(&ctx.style()).fill(bg).stroke(stroke);
 
-        let window_response = egui::Window::new("VST3")
+        let window_response = crate::os_theme::with_dark_context_style(ctx, || {
+            egui::Window::new("VST3")
             .id(egui::Id::new("vst3-playback-panel"))
             .frame(frame)
             .open(&mut open)
@@ -178,8 +179,8 @@ impl App {
             .show(ctx, |ui| {
                 // ── 内側 widget の visuals を dark に ──
                 // (タイトルバーの色は frame() で固定済。ここは widget 群の bg/fg)
+                crate::os_theme::apply_dark_ui(ui);
                 let style = ui.style_mut();
-                style.visuals = egui::Visuals::dark();
                 style.visuals.window_fill = bg;
                 style.visuals.panel_fill = bg;
                 style.visuals.window_stroke = stroke;
@@ -207,7 +208,7 @@ impl App {
             if matches!(state, DspState::Error(_)) {
                 if let DspState::Error(e) = state {
                     ui.colored_label(
-                        egui::Color32::from_rgb(240, 130, 130),
+                        ui.visuals().error_fg_color,
                         format!("エラー: {e}"),
                     );
                 }
@@ -216,25 +217,25 @@ impl App {
             if matches!(state, DspState::Disabled) {
                 if let Some(reason) = bridge.session_disabled_reason() {
                     ui.colored_label(
-                        egui::Color32::from_rgb(230, 180, 80),
+                        ui.visuals().warn_fg_color,
                         "VST3 はこのセッションでは一時停止しています。",
                     );
                     ui.label(
                         egui::RichText::new(reason)
                             .small()
-                            .color(egui::Color32::from_rgb(210, 210, 210)),
+                            .color(ui.visuals().text_color()),
                     );
                     ui.label(
                         egui::RichText::new(
                             "応答しないプラグインからアプリを保護するため、VST3 bridge を停止しました。\n問題のプラグインをチェーンから外して再起動してください。",
                         )
                         .small()
-                        .color(egui::Color32::from_rgb(170, 170, 170)),
+                        .color(ui.visuals().weak_text_color()),
                     );
                     return;
                 }
                 ui.colored_label(
-                    egui::Color32::from_rgb(230, 180, 80),
+                    ui.visuals().warn_fg_color,
                     "VST3 機能は環境設定→VST3 プラグイン タブから\n有効にしてください。",
                 );
                 return;
@@ -271,14 +272,14 @@ impl App {
             if display_count == 0 {
                 ui.label(
                     egui::RichText::new("プラグイン未設定")
-                        .color(egui::Color32::from_rgb(190, 190, 190)),
+                        .color(ui.visuals().text_color()),
                 );
                 ui.label(
                     egui::RichText::new(
                         "環境設定→動画 タブで\nプラグインをチェーンに追加してください。",
                     )
                     .small()
-                    .color(egui::Color32::from_rgb(170, 170, 170)),
+                    .color(ui.visuals().weak_text_color()),
                 );
             } else {
                 let sample_rate = self.dsp_bridge.sample_rate();
@@ -339,7 +340,7 @@ impl App {
                                     ui.label(
                                         egui::RichText::new(ms_text)
                                             .small()
-                                            .color(egui::Color32::from_rgb(255, 200, 100)),
+                                            .color(ui.visuals().warn_fg_color),
                                     )
                                     .on_hover_text(format!(
                                         "プラグインが報告したレイテンシ\n\
@@ -408,7 +409,7 @@ impl App {
                 egui::RichText::new("チェーンスロット")
                     .small()
                     .strong()
-                    .color(egui::Color32::from_rgb(210, 210, 210)),
+                    .color(ui.visuals().text_color()),
             );
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("読込").small());
@@ -459,8 +460,9 @@ impl App {
                     "プラグインの追加・並べ替えは 環境設定→VST3 プラグイン から行います。",
                 )
                 .small()
-                .color(egui::Color32::from_rgb(160, 160, 160)),
+                .color(ui.visuals().weak_text_color()),
             );
+            })
         });
 
         if let Some(inner) = window_response {

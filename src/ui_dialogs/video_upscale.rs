@@ -175,7 +175,7 @@ impl App {
                                 egui::RichText::new(
                                     "低ビットレート・ノイズが多い動画では効果が限定的です。",
                                 )
-                                .color(egui::Color32::from_rgb(210, 150, 60)),
+                                .color(ui.visuals().warn_fg_color),
                             );
                             ui.label("音声は最終出力時に元動画からコピーします。");
                             ui.label(format!(
@@ -192,7 +192,7 @@ impl App {
                                     egui::RichText::new(
                                         "出力解像度が8K UHD上限を超えるため登録できません。",
                                     )
-                                    .color(egui::Color32::from_rgb(210, 80, 80)),
+                                    .color(ui.visuals().error_fg_color),
                                 );
                             }
                             if preflight.output_path.exists() && !overwrite {
@@ -201,7 +201,7 @@ impl App {
                                     egui::RichText::new(
                                         "出力ファイルがすでに存在します。上書きを有効にしてください。",
                                     )
-                                    .color(egui::Color32::from_rgb(210, 150, 60)),
+                                    .color(ui.visuals().warn_fg_color),
                                 );
                             }
                             if self.video_upscale_queue_lock.is_none() {
@@ -210,7 +210,7 @@ impl App {
                                     egui::RichText::new(
                                         "別の mIV がアップスケールキューを使用中のため登録できません。",
                                     )
-                                    .color(egui::Color32::from_rgb(210, 80, 80)),
+                                    .color(ui.visuals().error_fg_color),
                                 );
                             }
                             ui.add_space(10.0);
@@ -233,7 +233,7 @@ impl App {
                     VideoUpscalePhase::Error { message } => {
                         ui.label(
                             egui::RichText::new(message.as_str())
-                                .color(egui::Color32::from_rgb(210, 80, 80)),
+                                .color(ui.visuals().error_fg_color),
                         );
                         ui.add_space(8.0);
                         if ui.button("閉じる").clicked() {
@@ -307,14 +307,13 @@ impl App {
                     if running_pause_pending {
                         ui.spinner();
                         ui.label(
-                            egui::RichText::new("一時停止中")
-                                .color(egui::Color32::from_rgb(210, 150, 60)),
+                            egui::RichText::new("一時停止中").color(ui.visuals().warn_fg_color),
                         );
                     }
                     if self.video_upscale_queue_lock.is_none() {
                         ui.label(
                             egui::RichText::new("別の mIV がキューを使用中です")
-                                .color(egui::Color32::from_rgb(210, 80, 80)),
+                                .color(ui.visuals().error_fg_color),
                         );
                     }
                 });

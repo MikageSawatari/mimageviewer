@@ -667,7 +667,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(src_name.as_str())
                                 .size(12.0)
-                                .color(egui::Color32::from_gray(120)),
+                                .color(ui.visuals().weak_text_color()),
                         );
                         ui.add_space(4.0);
                         let resp = ui.add(
@@ -746,7 +746,7 @@ impl App {
                                 egui::RichText::new(
                                     "この変換キャッシュはパスワードなしの ZIP として保存されます。",
                                 )
-                                .color(egui::Color32::from_rgb(170, 120, 40)),
+                                .color(ui.visuals().warn_fg_color),
                             );
                         }
                         ui.add_space(10.0);
@@ -755,7 +755,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!("ファイル: {src_name}"))
                                 .size(12.0)
-                                .color(egui::Color32::from_gray(160)),
+                                .color(ui.visuals().weak_text_color()),
                         );
                         let mut info = format!(
                             "画像ファイル数: {} / 変換後 ZIP の目安: 約 {}",
@@ -771,7 +771,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(info)
                                 .size(12.0)
-                                .color(egui::Color32::from_gray(160)),
+                                .color(ui.visuals().weak_text_color()),
                         );
                         ui.add_space(10.0);
                         if !is_sibling_zip {
@@ -807,7 +807,7 @@ impl App {
                                 egui::RichText::new(
                                     "このアーカイブには画像ファイルが含まれていません。",
                                 )
-                                .color(egui::Color32::from_rgb(180, 60, 60)),
+                                .color(ui.visuals().error_fg_color),
                             );
                         }
                     }
@@ -837,7 +837,7 @@ impl App {
                         ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(message.as_str())
-                                .color(egui::Color32::from_rgb(180, 60, 60)),
+                                .color(ui.visuals().error_fg_color),
                         );
                         ui.add_space(6.0);
                         if ui.button("閉じる").clicked() {

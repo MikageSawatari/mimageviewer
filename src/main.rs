@@ -1052,7 +1052,7 @@ fn main() -> eframe::Result {
             // ダーク表示になる)。
             let t = Instant::now();
             let resolved = os_theme::resolve(saved.ui_theme);
-            os_theme::apply_resolved(&cc.egui_ctx, resolved);
+            os_theme::apply_resolved_with_contrast(&cc.egui_ctx, resolved, saved.text_contrast);
             emit_startup("apply_theme", Some(t));
             // UI 表示倍率も初回フレーム前に復元する。キーボードズームは settings と
             // presenter の倍率同期を迂回するため、初回リリースでは無効化する。

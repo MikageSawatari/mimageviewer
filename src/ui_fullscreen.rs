@@ -369,21 +369,29 @@ fn still_side_panel_chrome_enabled(input: StillSidePanelChromeInputs) -> bool {
 
 #[derive(Clone, Copy)]
 struct StillTopBarVisibilityInputs {
+    locked: bool,
     hover_in_top: bool,
     side_panel_visible: bool,
     spread_popup_open: bool,
     fit_popup_open: bool,
     slideshow_popup_open: bool,
+    rotation_popup_open: bool,
     view_trim_mode: bool,
 }
 
 fn still_top_bar_visible_from_inputs(input: StillTopBarVisibilityInputs) -> bool {
-    input.hover_in_top
+    input.locked
+        || input.hover_in_top
         || input.side_panel_visible
         || input.spread_popup_open
         || input.fit_popup_open
         || input.slideshow_popup_open
+        || input.rotation_popup_open
         || input.view_trim_mode
+}
+
+fn fs_rotation_popup_open(ctx: &egui::Context) -> bool {
+    egui::Popup::is_id_open(ctx, egui::Id::new("fs_rotation_btn").with("popup"))
 }
 
 fn fullscreen_side_panel_contains_pointer(
@@ -3162,13 +3170,38 @@ fn fullscreen_seek_panel_rect(full_rect: egui::Rect) -> egui::Rect {
     .intersect(full_rect)
 }
 
-fn fullscreen_rect_excluding_seek_panel(full_rect: egui::Rect) -> egui::Rect {
+fn fullscreen_seek_fraction_from_x(track_rect: egui::Rect, pointer_x: f32, rtl: bool) -> f32 {
+    let raw = ((pointer_x - track_rect.left()) / track_rect.width().max(1.0)).clamp(0.0, 1.0);
+    if rtl { 1.0 - raw } else { raw }
+}
+
+fn fullscreen_seek_knob_x(track_rect: egui::Rect, fraction: f32, rtl: bool) -> f32 {
+    let fraction = fraction.clamp(0.0, 1.0);
+    if rtl {
+        track_rect.right() - track_rect.width() * fraction
+    } else {
+        track_rect.left() + track_rect.width() * fraction
+    }
+}
+
+fn fullscreen_rect_excluding_fixed_bars(
+    full_rect: egui::Rect,
+    top_locked: bool,
+    seek_locked: bool,
+) -> egui::Rect {
+    let top = if top_locked {
+        (full_rect.top() + TOP_BAR_HEIGHT).min(full_rect.bottom() - 1.0)
+    } else {
+        full_rect.top()
+    };
+    let bottom = if seek_locked {
+        (full_rect.bottom() - FS_SEEK_BAR_HEIGHT).max(top + 1.0)
+    } else {
+        full_rect.bottom()
+    };
     egui::Rect::from_min_max(
-        full_rect.min,
-        egui::pos2(
-            full_rect.max.x,
-            (full_rect.max.y - FS_SEEK_BAR_HEIGHT).max(full_rect.min.y + 1.0),
-        ),
+        egui::pos2(full_rect.left(), top),
+        egui::pos2(full_rect.right(), bottom),
     )
 }
 
@@ -3639,6 +3672,52 @@ struct FsFrameState {
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
+}
+
+#[derive(Clone)]
+struct FsTopBarPageInfo {
+    location_display: String,
+    image_dims: Option<(u32, u32)>,
+    image_file_size: Option<u64>,
+    image_downscaled: bool,
+    pdf_content_type: Option<PdfPageContentType>,
+    /// このページ自身へ適用される AI 処理名と処理後サイズ。
+    ai_upscale_info: Option<(String, u32, u32)>,
+}
+
+fn top_bar_info_text(
+    page: &FsTopBarPageInfo,
+    is_video: bool,
+    video_meta: Option<(f64, i64)>,
+) -> String {
+    if is_video {
+        build_info_text_video(page.image_dims, page.image_file_size, video_meta)
+    } else {
+        let ai_info = page
+            .ai_upscale_info
+            .as_ref()
+            .map(|(label, width, height)| (label.as_str(), *width, *height));
+        build_info_text(
+            page.image_dims,
+            page.image_file_size,
+            page.image_downscaled,
+            ai_info,
+            page.pdf_content_type,
+        )
+    }
+}
+
+impl FsFrameState {
+    fn top_bar_page_info(&self) -> FsTopBarPageInfo {
+        FsTopBarPageInfo {
+            location_display: self.location_display.clone(),
+            image_dims: self.image_dims,
+            image_file_size: self.image_file_size,
+            image_downscaled: self.image_downscaled,
+            pdf_content_type: self.pdf_content_type,
+            ai_upscale_info: None,
+        }
+    }
 }
 
 /// フルスクリーンのページ移動結果。
@@ -6041,11 +6120,12 @@ impl App {
         fs_idx: usize,
         is_video: bool,
     ) -> egui::Rect {
-        if self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video) {
-            fullscreen_rect_excluding_seek_panel(full_rect)
-        } else {
-            full_rect
-        }
+        let still_page = !is_video && self.items.get(fs_idx).is_some_and(GridItem::has_page_data);
+        fullscreen_rect_excluding_fixed_bars(
+            full_rect,
+            still_page && self.settings.fullscreen_top_bar_locked,
+            self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
+        )
     }
 
     fn fullscreen_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
@@ -6319,7 +6399,11 @@ impl App {
         }
 
         let total = info.image_indices.len();
-        let is_rtl = self.reading_direction == ReadingDirection::Rtl;
+        // レイアウト、pointer→page、fill、knob の全経路で同じ実効方向を共有する。
+        let is_rtl = self
+            .settings
+            .fullscreen_seek_direction
+            .is_rtl(self.reading_direction);
         let continuous_label_mode = self.continuous_reading_active_for_idx(fs_idx);
         // 連結読みでない見開き中は、毎フレーム組み直した表示ユニット単位でシークする。
         let spread_seek = if self.spread_mode.is_spread() && !continuous_label_mode {
@@ -6409,13 +6493,7 @@ impl App {
             self.fs_seek_drag_active = true;
         }
         if let Some(pointer_pos) = seek_pointer {
-            let raw_fraction =
-                ((pointer_pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
-            let fraction = if is_rtl {
-                1.0 - raw_fraction
-            } else {
-                raw_fraction
-            };
+            let fraction = fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);
             let pos = if let Some((units, _)) = spread_seek.as_ref() {
                 spread_seek_unit_from_fraction(fraction, units.len())
             } else {
@@ -6455,11 +6533,7 @@ impl App {
         } else {
             display_pos as f32 / (total - 1) as f32
         };
-        let knob_x = if is_rtl {
-            track_rect.right() - track_rect.width() * fraction
-        } else {
-            track_rect.left() + track_rect.width() * fraction
-        };
+        let knob_x = fullscreen_seek_knob_x(track_rect, fraction, is_rtl);
         let filled_rect = if is_rtl {
             egui::Rect::from_min_max(
                 egui::pos2(knob_x, track_rect.top()),
@@ -8329,45 +8403,11 @@ impl App {
 
                         // ── ホバーバー ──
                         let hover_bar_t0 = std::time::Instant::now();
-                        let mut bar_rotate_cw = false;
-                        let mut bar_rotate_ccw = false;
+                        let current_rotation = self.get_rotation(fs_idx);
+                        let mut rotation_choice = None;
                         let spread_before = self.spread_mode;
                         let reading_flow_before = self.reading_flow;
                         let reading_direction_before = self.reading_direction;
-                        // AI 処理情報を計算（ホバーバーのファイル情報に表示）
-                        let ai_info_model_name: String;
-                        let ai_upscale_info = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-                            ai_info_model_name = self.ai_model_label(fs_idx, false);
-                            // 処理後のサイズ
-                            if let Some(tex) = self.current_final_composite_texture(fs_idx) {
-                                let s = tex.size_vec2();
-                                Some((ai_info_model_name.as_str(), s.x as u32, s.y as u32))
-                            } else if self.ai_upscale_enabled {
-                                if let Some((w, h)) = state.image_dims {
-                                    if crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit()) {
-                                        // 4x 推定。8192px 超は worker 側で縮小される
-                                        // (`clamp_color_image_for_gpu`) ので推定値も合わせる。
-                                        let (mut ew, mut eh) = (w * 4, h * 4);
-                                        let max_dim = crate::app::MAX_TEXTURE_DIM as u32;
-                                        if ew.max(eh) > max_dim {
-                                            let scale = max_dim as f64 / ew.max(eh) as f64;
-                                            ew = ((ew as f64 * scale).round() as u32).max(1);
-                                            eh = ((eh as f64 * scale).round() as u32).max(1);
-                                        }
-                                        Some((ai_info_model_name.as_str(), ew, eh))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
                         // 消しゴム / 隠蔽加工モード中は上部バーを抑制 (自前パネルと競合させない)。
                         // 音楽ビューも画像用の上部ホバーバーは出さない (music view が自前で
                         // 上情報バー + 下シークバーを描くため、Inc 3 パネル漏れ修正)。
@@ -8381,7 +8421,6 @@ impl App {
                             // 動画なら video_meta (duration, bitrate) と画像 dims (= 動画解像度) を
                             // 動画用 info text 構築のために流す。
                             let is_video_mode = state.is_video;
-                            let mut video_dims: Option<(u32, u32)> = None;
                             let mut video_meta: Option<(f64, i64)> = None;
                             #[cfg(windows)]
                             if is_video_mode {
@@ -8390,17 +8429,11 @@ impl App {
                                 }) = self.fs_cache.get(&fs_idx)
                                 {
                                     if let Some(info) = player.info() {
-                                        video_dims = Some((info.width, info.height));
                                         video_meta =
                                             Some((info.duration_secs, info.bit_rate_bps));
                                     }
                                 }
                             }
-                            let display_dims = if is_video_mode {
-                                video_dims
-                            } else {
-                                state.image_dims
-                            };
                             #[cfg(windows)]
                             let tile_active = self.video_tile_mode_active;
                             #[cfg(not(windows))]
@@ -8451,11 +8484,31 @@ impl App {
                             let mut fit_no_downscale_choice: Option<bool> = None;
                             let mut bar_analysis_pressed = false;
                             let mut side_panel_mode_pressed = false;
+                            let mut top_bar_lock_pressed = false;
+                            let top_bar_page_infos = match spread_pair {
+                                SpreadPair::Single => {
+                                    let mut info = state.top_bar_page_info();
+                                    info.ai_upscale_info =
+                                        self.top_bar_ai_upscale_info(fs_idx, info.image_dims);
+                                    vec![info]
+                                }
+                                SpreadPair::Double { left, right } => [left, right]
+                                    .into_iter()
+                                    .map(|idx| {
+                                        if idx == fs_idx {
+                                            let mut info = state.top_bar_page_info();
+                                            info.ai_upscale_info = self
+                                                .top_bar_ai_upscale_info(idx, info.image_dims);
+                                            info
+                                        } else {
+                                            self.cached_top_bar_page_info(idx)
+                                        }
+                                    })
+                                    .collect(),
+                            };
                             Self::draw_fs_hover_bar(
                                 ui, ctx, &self.keymap, full_rect,
-                                &state.location_display,
-                                display_dims, state.image_file_size,
-                                state.image_downscaled,
+                                &top_bar_page_infos,
                                 &mut close_fs, &mut page_nav,
                                 self.settings.fullscreen_side_panel_mode,
                                 &mut side_panel_mode_pressed,
@@ -8463,7 +8516,7 @@ impl App {
                                 &mut self.slideshow_playing,
                                 &mut self.settings.slideshow_interval_secs,
                                 &mut self.settings.slideshow_end_action,
-                                &mut bar_rotate_cw, &mut bar_rotate_ccw,
+                                current_rotation, &mut rotation_choice,
                                 self.analysis_mode,
                                 &mut bar_analysis_pressed,
                                 panorama_trigger,
@@ -8475,7 +8528,6 @@ impl App {
                                 &mut self.reading_direction,
                                 &mut self.spread_popup_open,
                                 is_spread_double,
-                                ai_upscale_info,
                                 &mut self.local_adjust_mode,
                                 has_page_override,
                                 fit_mode,
@@ -8491,7 +8543,6 @@ impl App {
                                 &mut fit_no_downscale_choice,
                                 &mut self.view_trim_mode,
                                 view_trim_active,
-                                state.pdf_content_type,
                                 is_video_mode,
                                 video_meta,
                                 tile_active,
@@ -8504,8 +8555,16 @@ impl App {
                                 show_window_toggle,
                                 embedded,
                                 &mut window_mode_pressed,
+                                self.settings.fullscreen_top_bar_locked,
+                                &mut top_bar_lock_pressed,
                                 self.cursor_hidden,
                             );
+                            if top_bar_lock_pressed {
+                                self.settings.fullscreen_top_bar_locked =
+                                    !self.settings.fullscreen_top_bar_locked;
+                                self.settings.save();
+                                ctx.request_repaint();
+                            }
                             if side_panel_mode_pressed {
                                 self.cycle_fs_side_panel_mode();
                             }
@@ -8581,8 +8640,9 @@ impl App {
                             if nav_locked { page_nav = saved_nav; }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
-                        if bar_rotate_cw { self.rotate_image_cw(fs_idx); }
-                        if bar_rotate_ccw { self.rotate_image_ccw(fs_idx); }
+                        if let Some(rotation) = rotation_choice {
+                            self.set_image_rotation(fs_idx, rotation);
+                        }
 
                         // ── フルスクリーン用コンテキストメニュー ──
                         #[cfg(windows)]
@@ -9139,6 +9199,147 @@ impl App {
             fs_load_failed,
             pdf_content_type,
         }
+    }
+
+    /// 見開き上部 HUD の相方ページ情報を、表示済みキャッシュだけから組み立てる。
+    /// 描画中にファイル metadata やアーカイブを同期参照しない。
+    fn cached_top_bar_page_info(&self, idx: usize) -> FsTopBarPageInfo {
+        let (image_dims, image_downscaled) = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static {
+                tex, source_dims, ..
+            }) => {
+                let tex_size = tex.size_vec2();
+                match source_dims {
+                    Some([w, h]) => (
+                        Some((*w as u32, *h as u32)),
+                        (*w, *h) != (tex_size.x as usize, tex_size.y as usize),
+                    ),
+                    None => (Some((tex_size.x as u32, tex_size.y as u32)), false),
+                }
+            }
+            Some(FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            }) => (
+                frames.get(*current_frame).map(|(texture, _)| {
+                    let size = texture.size_vec2();
+                    (size.x as u32, size.y as u32)
+                }),
+                false,
+            ),
+            _ => {
+                if let Some([w, h]) = self.fs_early_dims.get(&idx).copied() {
+                    (
+                        Some((w as u32, h as u32)),
+                        w > crate::app::MAX_TEXTURE_DIM || h > crate::app::MAX_TEXTURE_DIM,
+                    )
+                } else {
+                    let dims = match self.thumbnails.get(idx) {
+                        Some(ThumbnailState::Loaded {
+                            source_dims: Some((w, h)),
+                            ..
+                        }) => Some((*w, *h)),
+                        Some(ThumbnailState::Loaded { tex, .. }) => {
+                            let size = tex.size_vec2();
+                            Some((size.x as u32, size.y as u32))
+                        }
+                        _ => None,
+                    };
+                    (dims, false)
+                }
+            }
+        };
+        let mut info = FsTopBarPageInfo {
+            location_display: self.location_display_for(idx),
+            image_dims,
+            image_file_size: self
+                .image_metas
+                .get(idx)
+                .and_then(|meta| meta.map(|(_, size)| size.max(0) as u64)),
+            image_downscaled,
+            pdf_content_type: match self.items.get(idx) {
+                Some(GridItem::PdfPage { content_type, .. }) => *content_type,
+                _ => None,
+            },
+            ai_upscale_info: None,
+        };
+        info.ai_upscale_info = self.top_bar_ai_upscale_info(idx, info.image_dims);
+        info
+    }
+
+    /// 上部 HUD に出す AI 名称と処理後サイズをページ単位で解決する。
+    /// `ai_upscale_enabled` 等の current-page runtime 値には依存せず、有効 preset と
+    /// idx 別 cache を使うことで見開きの左右を同じ規則で扱う。
+    fn top_bar_ai_upscale_info(
+        &self,
+        idx: usize,
+        image_dims: Option<(u32, u32)>,
+    ) -> Option<(String, u32, u32)> {
+        let params = self.effective_params(idx);
+        let upscale_request = if matches!(
+            self.settings.ai_feature_mode,
+            crate::settings::AiFeatureMode::Disabled
+        ) {
+            None
+        } else {
+            match params.upscale_model_kind() {
+                Some(Some(kind)) if self.settings.ai_feature_mode.allows_upscale_model(kind) => {
+                    Some(Some(kind))
+                }
+                Some(None) => Some(None),
+                _ => None,
+            }
+        };
+        let denoise = self
+            .settings
+            .ai_feature_mode
+            .allows_denoise()
+            .then(|| params.denoise_model_kind())
+            .flatten();
+        if upscale_request.is_none() && denoise.is_none() {
+            return None;
+        }
+
+        let mut labels = Vec::new();
+        if let Some(kind) = denoise {
+            labels.push(kind.display_label().to_string());
+        }
+        if let Some(request) = upscale_request {
+            labels.push(match request {
+                Some(kind) => kind.display_label().to_string(),
+                None => self
+                    .ai_classify_cache
+                    .get(&idx)
+                    .map(|category| category.display_label().to_string())
+                    .unwrap_or_else(|| "自動".to_string()),
+            });
+        }
+
+        let (width, height) = if let Some(texture) = self.current_final_composite_texture(idx) {
+            let size = texture.size_vec2();
+            (size.x as u32, size.y as u32)
+        } else if upscale_request.is_some() {
+            let (width, height) = image_dims?;
+            if !crate::ai::upscale::should_process_rect(
+                width,
+                height,
+                self.settings.ai_upscale_limit(),
+            ) {
+                return None;
+            }
+            let (mut width, mut height) = (width.saturating_mul(4), height.saturating_mul(4));
+            let max_dim = crate::app::MAX_TEXTURE_DIM as u32;
+            if width.max(height) > max_dim {
+                let scale = max_dim as f64 / width.max(height) as f64;
+                width = ((width as f64 * scale).round() as u32).max(1);
+                height = ((height as f64 * scale).round() as u32).max(1);
+            }
+            (width, height)
+        } else {
+            return None;
+        };
+        Some((labels.join(" + "), width, height))
     }
 
     /// フルスクリーンビューポートの ViewportBuilder を構築する。
@@ -12246,7 +12447,10 @@ impl App {
             in_video_tile,
             ctrl_held,
             modal_for_keys,
-            self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open,
+            self.spread_popup_open
+                || self.fit_popup_open
+                || self.slideshow_popup_open
+                || fs_rotation_popup_open(ctx),
         );
         #[cfg(windows)]
         if self.viewer_session_is_detached_or_switching()
@@ -12543,7 +12747,8 @@ impl App {
                         // ポップアップ表示中はクリックでのページ送りを抑制
                         let any_popup = self.spread_popup_open
                             || self.fit_popup_open
-                            || self.slideshow_popup_open;
+                            || self.slideshow_popup_open
+                            || fs_rotation_popup_open(ctx);
                         if !any_popup {
                             if let Some(pos) = fs_response.interact_pointer_pos() {
                                 let has_right_panel = self.metadata_panel_click_shown()
@@ -12733,6 +12938,7 @@ impl App {
             && !self.spread_popup_open
             && !self.fit_popup_open
             && !self.slideshow_popup_open
+            && !fs_rotation_popup_open(ctx)
         {
             match right_drag_mode {
                 crate::ring_shortcut::RightDragMode::RingShortcut => {
@@ -17415,19 +17621,15 @@ impl App {
 
     /// フルスクリーンのホバー時トップバーを描画する。
     #[allow(clippy::too_many_arguments)]
-    /// 上部ホバーバーを描画する。`location_display` は左側に表示するパス文字列
-    /// (`FsFrameState::location_display`)。通常は `<folder>\<filename>`、ZIP/PDF
-    /// 内は `<archive-path> > <entry>`。
+    /// 上部ホバーバーを描画する。`page_infos` は単ページなら1件、見開きなら
+    /// 画面上の左・右順で2件。通常は `<folder>\<filename>`、ZIP/PDF 内は
+    /// `<archive-path> > <entry>` を表示する。
     fn draw_fs_hover_bar(
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         keymap: &Keymap,
         full_rect: egui::Rect,
-        location_display: &str,
-        image_dims: Option<(u32, u32)>,
-        image_file_size: Option<u64>,
-        // 原寸が GPU 上限超で表示が縮小版のとき true。dims のあとに⚠マーカーを出す。
-        image_downscaled: bool,
+        page_infos: &[FsTopBarPageInfo],
         close_fs: &mut bool,
         page_nav: &mut FsPageNav,
         side_panel_mode: crate::settings::FsSidePanelMode,
@@ -17436,8 +17638,8 @@ impl App {
         slideshow_playing: &mut bool,
         slideshow_interval: &mut f32,
         slideshow_end_action: &mut SlideshowEndAction,
-        rotate_cw: &mut bool,
-        rotate_ccw: &mut bool,
+        current_rotation: crate::rotation_db::Rotation,
+        rotation_choice: &mut Option<crate::rotation_db::Rotation>,
         // 分析ボタン: 表示状態 (active) は値で受け、押下は out フラグで返す。`analysis_mode` を
         // 直接反転すると Z キー経路の副作用 (ズーム/パン引き継ぎ・bypass enter/exit・補正排他) を
         // 飛ばすため、呼び出し側で `toggle_analysis_mode()` に合流させる (Codex P1)。
@@ -17458,8 +17660,6 @@ impl App {
         reading_direction: &mut ReadingDirection,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
-        // AI アップスケール後のサイズとモデル名（表示用）。動画モードでは無視される。
-        ai_upscale_info: Option<(&str, u32, u32)>,
         _local_adjust_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         _has_page_override: bool,
@@ -17479,8 +17679,6 @@ impl App {
         fit_no_downscale_choice: &mut Option<bool>,
         view_trim_mode: &mut bool,
         _view_trim_active: bool,
-        // PDF ページのコンテンツ種別 (非 PDF なら None)
-        pdf_content_type: Option<PdfPageContentType>,
         // Phase 6: 動画モードか。true なら画像専用ボタンを隠し、▦ タイルボタンに
         // 切替、右側情報も動画情報に差し替える。
         is_video: bool,
@@ -17502,6 +17700,8 @@ impl App {
         show_window_toggle: bool,
         in_window_mode: bool,
         window_mode_pressed: &mut bool,
+        top_bar_locked: bool,
+        top_bar_lock_pressed: &mut bool,
         cursor_hidden: bool,
     ) {
         let hover_in_top = ctx.input(|i| {
@@ -17512,16 +17712,19 @@ impl App {
                     .unwrap_or(false)
         });
         if !still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
+            locked: top_bar_locked,
             hover_in_top,
             side_panel_visible,
             spread_popup_open: *spread_popup_open,
             fit_popup_open: *fit_popup_open,
             slideshow_popup_open: *slideshow_popup_open,
+            rotation_popup_open: fs_rotation_popup_open(ctx),
             view_trim_mode: *view_trim_mode,
         }) {
             return;
         }
 
+        crate::os_theme::apply_dark_ui(ui);
         let bar_rect =
             egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), TOP_BAR_HEIGHT));
         ui.painter().rect_filled(
@@ -17580,6 +17783,31 @@ impl App {
             *page_nav = FsPageNav::None;
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // 上部情報バー固定。× の直左に置き、下部シークバーと同じ鍵表現を使う。
+        if !is_video {
+            let lock_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_top_bar_lock_btn",
+                |hovered| bar_button_bg(hovered, top_bar_locked),
+                top_bar_locked,
+                |p, c, r| draw_seek_lock_icon(p, c, r, top_bar_locked),
+            );
+            let lock_resp = lock_resp.hover_tip_dark(if top_bar_locked {
+                "上部情報バー固定を解除"
+            } else {
+                "上部情報バーを固定表示"
+            });
+            if lock_resp.clicked() {
+                *top_bar_lock_pressed = true;
+            }
+            if lock_resp.hovered() {
+                *page_nav = FsPageNav::None;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
 
         // ⊞ ウィンドウ / 全画面 切り替えボタン (× の左)。
         // native 動画 HUD のトグルボタンと同じ役割を、静止画フルスクリーンの
@@ -17910,45 +18138,46 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // ↷ 右回転 / ↶ 左回転ボタン (画像のみ — 動画では意味を持たないため非表示)
+        // 回転角度メニュー (画像のみ — 動画では意味を持たないため非表示)。
+        // 左右回転の2ボタンを1個にまとめ、現在角度を含む絶対角度を選べるようにする。
         // 360 モード中は非表示 (360 ビューは独自の yaw を持つため rotation_db は適用しない)。
         if !is_video && !panorama_mode_active {
-            let rcw_resp = draw_bar_button(
+            let rotate_resp = draw_bar_button(
                 ui,
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
-                "fs_rcw_btn",
-                |hovered| bar_button_bg(hovered, false),
-                false,
+                "fs_rotation_btn",
+                |hovered| bar_button_bg(hovered, !current_rotation.is_none()),
+                !current_rotation.is_none(),
                 |p, c, r| draw_rotate_icon(p, c, r, true),
             );
-            let rcw_resp = rcw_resp
-                .hover_tip_dark(keymap.first_chord_bracket_label("右回転", KeyAction::FsRotateCw));
-            if rcw_resp.clicked() {
-                *rotate_cw = true;
-            }
-            if rcw_resp.hovered() {
+            let rotate_resp = rotate_resp.hover_tip_dark(format!(
+                "回転角度: {}°\n{} / {}",
+                current_rotation.degrees(),
+                keymap.first_chord_bracket_label("右回転", KeyAction::FsRotateCw),
+                keymap.first_chord_bracket_label("左回転", KeyAction::FsRotateCcw)
+            ));
+            if rotate_resp.hovered() {
                 *page_nav = FsPageNav::None;
             }
-            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
-
-            let rccw_resp = draw_bar_button(
-                ui,
-                next_x,
-                bar_rect.min.y + BAR_BUTTON_MARGIN,
-                "fs_rccw_btn",
-                |hovered| bar_button_bg(hovered, false),
-                false,
-                |p, c, r| draw_rotate_icon(p, c, r, false),
-            );
-            let rccw_resp = rccw_resp
-                .hover_tip_dark(keymap.first_chord_bracket_label("左回転", KeyAction::FsRotateCcw));
-            if rccw_resp.clicked() {
-                *rotate_ccw = true;
-            }
-            if rccw_resp.hovered() {
-                *page_nav = FsPageNav::None;
-            }
+            let _ = crate::os_theme::dark_menu_popup(&rotate_resp).show(|ui| {
+                crate::os_theme::apply_dark_ui(ui);
+                ui.set_min_width(132.0);
+                for (rotation, label) in [
+                    (crate::rotation_db::Rotation::None, "0°"),
+                    (crate::rotation_db::Rotation::Cw90, "90°"),
+                    (crate::rotation_db::Rotation::Cw180, "180°"),
+                    (crate::rotation_db::Rotation::Cw270, "270°"),
+                ] {
+                    if ui
+                        .selectable_label(current_rotation == rotation, label)
+                        .clicked()
+                    {
+                        *rotation_choice = Some(rotation);
+                        ui.close();
+                    }
+                }
+            });
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
@@ -18540,79 +18769,111 @@ impl App {
         // 右側のボタン / 情報テキストと衝突しないように幅制限して右端を切る。
         // Phase 6: 動画モードでは AI アップスケール / PDF 情報を渡さず、
         // 動画専用の info text に切り替える。
-        let info_text = if is_video {
-            build_info_text_video(image_dims, image_file_size, video_meta)
+        let page_infos = if page_infos.len() > 2 {
+            &page_infos[..2]
         } else {
-            build_info_text(
-                image_dims,
-                image_file_size,
-                image_downscaled,
-                ai_upscale_info,
-                pdf_content_type,
-            )
+            page_infos
         };
-        if !location_display.is_empty() {
+        let two_rows = !is_video && page_infos.len() == 2;
+        for (row, page) in page_infos.iter().enumerate() {
+            let row_ai_info = page
+                .ai_upscale_info
+                .as_ref()
+                .map(|(label, width, height)| (label.as_str(), *width, *height));
+            let info_text = top_bar_info_text(page, is_video, video_meta);
+            let (path_font_size, info_font_size, row_y) = if two_rows {
+                (
+                    11.5,
+                    12.0,
+                    if row == 0 {
+                        bar_rect.top() + 11.5
+                    } else {
+                        bar_rect.bottom() - 11.5
+                    },
+                )
+            } else {
+                (13.0, 15.0, bar_rect.center().y)
+            };
             let info_w = if info_text.is_empty() {
                 0.0
             } else {
                 ui.painter()
                     .layout_no_wrap(
                         info_text.clone(),
-                        egui::FontId::proportional(15.0),
+                        egui::FontId::proportional(info_font_size),
                         egui::Color32::WHITE,
                     )
                     .size()
                     .x
             };
-            let max_x = next_x - 12.0 - info_w;
-            let avail_width = (max_x - (bar_rect.min.x + 12.0)).max(40.0);
-            // パス文字列は 1 行に切り詰める (溢れは末尾を省略)。折り返すと上バー
-            // (TOP_BAR_HEIGHT=44px) を超えて下の補正パネルに食い込むため
-            // (狭い in-window 表示で顕著)。
-            let mut job = egui::text::LayoutJob::single_section(
-                location_display.to_string(),
-                egui::TextFormat {
-                    font_id: egui::FontId::proportional(13.0),
-                    color: egui::Color32::from_gray(200),
+            let path_left = bar_rect.left() + 12.0;
+            let info_right = next_x - 12.0;
+            let path_right = (info_right - info_w - 12.0).max(path_left + 40.0);
+            let path_width = (path_right - path_left).max(40.0);
+            if !page.location_display.is_empty() {
+                let mut job = egui::text::LayoutJob::single_section(
+                    page.location_display.clone(),
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(path_font_size),
+                        color: ui.visuals().weak_text_color(),
+                        ..Default::default()
+                    },
+                );
+                job.wrap = egui::text::TextWrapping {
+                    max_width: path_width,
+                    max_rows: 1,
+                    overflow_character: Some('…'),
                     ..Default::default()
-                },
-            );
-            job.wrap = egui::text::TextWrapping {
-                max_width: avail_width,
-                max_rows: 1,
-                ..Default::default()
-            };
-            let galley = ui.painter().layout_job(job);
-            let text_y = bar_rect.center().y - galley.size().y * 0.5;
-            ui.painter().galley(
-                egui::pos2(bar_rect.min.x + 12.0, text_y),
-                galley,
-                egui::Color32::from_gray(200),
-            );
-        }
-
-        // ── 右側: 画像サイズ / 動画情報 / ファイルサイズ ──
-        if is_video {
-            if !info_text.is_empty() {
-                ui.painter().text(
-                    egui::pos2(next_x - 12.0, bar_rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    info_text,
-                    egui::FontId::proportional(15.0),
-                    egui::Color32::WHITE,
+                };
+                let galley = ui.painter().layout_job(job);
+                ui.painter().galley(
+                    egui::pos2(path_left, row_y - galley.size().y * 0.5),
+                    galley,
+                    ui.visuals().weak_text_color(),
                 );
             }
-        } else {
-            draw_fs_bar_info_text(
-                ui,
-                bar_rect,
-                egui::pos2(next_x - 12.0, bar_rect.center().y),
-                image_dims,
-                image_file_size,
-                image_downscaled,
-                ai_upscale_info,
-                pdf_content_type,
-            );
+            if !info_text.is_empty() {
+                if !two_rows && !is_video {
+                    draw_fs_bar_info_text(
+                        ui,
+                        bar_rect,
+                        egui::pos2(info_right, row_y),
+                        page.image_dims,
+                        page.image_file_size,
+                        page.image_downscaled,
+                        row_ai_info,
+                        page.pdf_content_type,
+                    );
+                } else {
+                    ui.painter().text(
+                        egui::pos2(info_right, row_y),
+                        egui::Align2::RIGHT_CENTER,
+                        info_text.clone(),
+                        egui::FontId::proportional(info_font_size),
+                        ui.visuals().text_color(),
+                    );
+                }
+            }
+            if two_rows {
+                let row_rect = egui::Rect::from_min_max(
+                    egui::pos2(path_left, row_y - 10.0),
+                    egui::pos2(info_right, row_y + 10.0),
+                );
+                let response = ui.interact(
+                    row_rect,
+                    ui.id().with(("fs_top_bar_page_info", row)),
+                    egui::Sense::hover(),
+                );
+                let full_text = if info_text.is_empty() {
+                    page.location_display.clone()
+                } else {
+                    format!("{}\n{}", page.location_display, info_text)
+                };
+                if response.hovered() {
+                    *page_nav = FsPageNav::None;
+                }
+                let _ = response.hover_tip_dark(full_text);
+            }
         }
     }
 }
@@ -22524,7 +22785,7 @@ impl App {
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
             child.set_clip_rect(timeline_rect);
-            *child.visuals_mut() = egui::Visuals::dark();
+            crate::os_theme::apply_dark_ui(&mut child);
             let row_secs = self.music_timeline_row_secs;
             let analysis_version = self.music_analysis_version;
             let analysis = self.music_analysis.as_ref().unwrap();
@@ -23327,11 +23588,13 @@ mod tests {
     #[test]
     fn still_side_panel_forces_top_bar_visible() {
         let hidden = StillTopBarVisibilityInputs {
+            locked: false,
             hover_in_top: false,
             side_panel_visible: false,
             spread_popup_open: false,
             fit_popup_open: false,
             slideshow_popup_open: false,
+            rotation_popup_open: false,
             view_trim_mode: false,
         };
         assert!(!still_top_bar_visible_from_inputs(hidden));
@@ -23344,6 +23607,12 @@ mod tests {
         assert!(still_top_bar_visible_from_inputs(
             StillTopBarVisibilityInputs {
                 hover_in_top: true,
+                ..hidden
+            }
+        ));
+        assert!(still_top_bar_visible_from_inputs(
+            StillTopBarVisibilityInputs {
+                locked: true,
                 ..hidden
             }
         ));
@@ -24433,13 +24702,37 @@ mod tests {
     fn locked_seek_bar_reserves_bottom_media_rect() {
         let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
         let panel = fullscreen_seek_panel_rect(full);
-        let media = fullscreen_rect_excluding_seek_panel(full);
+        let media = fullscreen_rect_excluding_fixed_bars(full, false, true);
 
         assert_eq!(panel.top(), 800.0 - FS_SEEK_BAR_HEIGHT);
         assert_eq!(panel.bottom(), 800.0);
         assert_eq!(media.top(), 0.0);
         assert_eq!(media.bottom(), panel.top());
         assert_eq!(media.width(), full.width());
+    }
+
+    #[test]
+    fn locked_top_and_seek_bars_reserve_both_edges_of_media_rect() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let media = fullscreen_rect_excluding_fixed_bars(full, true, true);
+
+        assert_eq!(media.top(), TOP_BAR_HEIGHT);
+        assert_eq!(media.bottom(), 800.0 - FS_SEEK_BAR_HEIGHT);
+        assert_eq!(media.width(), full.width());
+    }
+
+    #[test]
+    fn seek_pointer_and_knob_share_the_same_effective_direction() {
+        let track = egui::Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(500.0, 8.0));
+        for rtl in [false, true] {
+            for pointer_x in [100.0, 220.0, 500.0] {
+                let fraction = fullscreen_seek_fraction_from_x(track, pointer_x, rtl);
+                let knob_x = fullscreen_seek_knob_x(track, fraction, rtl);
+                assert!((knob_x - pointer_x).abs() < 0.001);
+            }
+        }
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 100.0, false), 0.0);
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 100.0, true), 1.0);
     }
 
     #[test]
@@ -25252,5 +25545,34 @@ mod tests {
             !s.contains("ダウンスケール"),
             "no marker without dims: {s:?}"
         );
+    }
+
+    #[test]
+    fn spread_top_bar_keeps_ai_model_for_both_page_rows() {
+        let pages = [
+            FsTopBarPageInfo {
+                location_display: "left.png".to_string(),
+                image_dims: Some((640, 480)),
+                image_file_size: Some(100),
+                image_downscaled: false,
+                pdf_content_type: None,
+                ai_upscale_info: Some(("高速汎用".to_string(), 2560, 1920)),
+            },
+            FsTopBarPageInfo {
+                location_display: "right.png".to_string(),
+                image_dims: Some((800, 600)),
+                image_file_size: Some(200),
+                image_downscaled: false,
+                pdf_content_type: None,
+                ai_upscale_info: Some(("漫画".to_string(), 3200, 2400)),
+            },
+        ];
+
+        let rows = pages
+            .iter()
+            .map(|page| top_bar_info_text(page, false, None))
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("高速汎用 2560×1920"), "{}", rows[0]);
+        assert!(rows[1].contains("漫画 3200×2400"), "{}", rows[1]);
     }
 }

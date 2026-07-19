@@ -33,7 +33,7 @@ impl crate::app::App {
                     ui.label(
                         egui::RichText::new(name)
                             .size(12.0)
-                            .color(egui::Color32::from_gray(120)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 }
                 ui.add_space(4.0);

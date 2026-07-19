@@ -141,22 +141,6 @@ const TOOLTIP_GAP: f32 = 6.0;
 #[allow(dead_code)]
 const CURSOR_FALLBACK_EXTENT: f32 = 34.0;
 
-/// フルスクリーン（黒背景）用のツールチップ枠。動画 HUD（egui 既定の dark
-/// テーマ）と同じ見た目になるよう `Visuals::dark()` から一度だけ生成して使い回す。
-#[allow(dead_code)]
-fn dark_tooltip_frame() -> egui::Frame {
-    static FRAME: std::sync::OnceLock<egui::Frame> = std::sync::OnceLock::new();
-    FRAME
-        .get_or_init(|| {
-            let style = egui::Style {
-                visuals: egui::Visuals::dark(),
-                ..egui::Style::default()
-            };
-            egui::Frame::popup(&style)
-        })
-        .clone()
-}
-
 /// 現在のマウスカーソル画像がホットスポットから上下それぞれへ何ピクセル
 /// 張り出しているかを物理ピクセルで `(上, 下)` の順に返す。
 ///
@@ -256,6 +240,7 @@ fn anchor_for(resp: &egui::Response) -> Option<egui::Rect> {
 /// tooltip をカーソル画像の外側へずらして表示する共通処理。
 #[allow(dead_code)]
 fn show_offset_tooltip(
+    ctx: &egui::Context,
     tip: egui::Tooltip<'_>,
     dark: bool,
     anchor: Option<egui::Rect>,
@@ -267,13 +252,16 @@ fn show_offset_tooltip(
         None => tip = tip.at_pointer(),
     }
     if dark {
-        tip.popup = tip.popup.frame(dark_tooltip_frame());
+        tip.popup = tip
+            .popup
+            .style(crate::os_theme::dark_popup_style(ctx))
+            .frame(crate::os_theme::dark_popup_frame(ctx));
     }
     tip.show(|ui| {
         // 動的な内容で Area が縮まないよう最大幅を固定する（egui issue #5167）。
         ui.set_max_width(ui.spacing().tooltip_width);
         if dark {
-            *ui.visuals_mut() = egui::Visuals::dark();
+            crate::os_theme::apply_dark_ui(ui);
         }
         ui.add(egui::Label::new(text));
     });
@@ -297,19 +285,37 @@ pub(crate) trait HoverTipExt {
 impl HoverTipExt for egui::Response {
     fn hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
         let anchor = anchor_for(&self);
-        show_offset_tooltip(egui::Tooltip::for_enabled(&self), false, anchor, text);
+        show_offset_tooltip(
+            &self.ctx,
+            egui::Tooltip::for_enabled(&self),
+            false,
+            anchor,
+            text,
+        );
         self
     }
 
     fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
         let anchor = anchor_for(&self);
-        show_offset_tooltip(egui::Tooltip::for_enabled(&self), true, anchor, text);
+        show_offset_tooltip(
+            &self.ctx,
+            egui::Tooltip::for_enabled(&self),
+            true,
+            anchor,
+            text,
+        );
         self
     }
 
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self {
         let anchor = anchor_for(&self);
-        show_offset_tooltip(egui::Tooltip::for_disabled(&self), false, anchor, text);
+        show_offset_tooltip(
+            &self.ctx,
+            egui::Tooltip::for_disabled(&self),
+            false,
+            anchor,
+            text,
+        );
         self
     }
 }

@@ -112,7 +112,7 @@ impl App {
                                     ui.label(
                                         egui::RichText::new(preview)
                                             .monospace()
-                                            .color(egui::Color32::from_rgb(100, 170, 100)),
+                                            .color(ui.visuals().hyperlink_color),
                                     );
 
                                     ui.checkbox(
@@ -152,7 +152,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("タグ名に空白は使えません。")
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(200, 80, 60)),
+                            .color(ui.visuals().error_fg_color),
                     );
                 }
 

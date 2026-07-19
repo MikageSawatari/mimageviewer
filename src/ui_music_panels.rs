@@ -568,7 +568,7 @@ impl App {
         let inner = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
         child.set_clip_rect(content_rect);
-        *child.visuals_mut() = egui::Visuals::dark();
+        crate::os_theme::apply_dark_ui(&mut child);
 
         let probe = self.music_probe.clone();
         // probe がまだ届いていない理由が「解析ワーカーが動作中」か「終了したが probe 失敗」かで
@@ -727,7 +727,7 @@ impl App {
                     // ScrollArea スクロールバー等の ambient テーマ依存要素を、動画 overlay
                     // (既定ダーク ctx) と揃えてダーク描画する。メイン ctx が Light テーマでも
                     // 暗いパネル上に明色スクロールバーが出ないようにする。
-                    *ui.visuals_mut() = egui::Visuals::dark();
+                    crate::os_theme::apply_dark_ui(ui);
                     draw_native_jump_panel_body(
                         ui,
                         panel_rect,

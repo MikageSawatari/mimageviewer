@@ -1058,8 +1058,7 @@ impl App {
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
                         ui.set_max_height(panel_h);
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        crate::os_theme::apply_dark_ui(ui);
 
                         ui.horizontal(|ui| {
                             ui.heading("表示トリム");

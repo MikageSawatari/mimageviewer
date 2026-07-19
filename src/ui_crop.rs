@@ -194,8 +194,7 @@ impl App {
                         ui.set_max_height(panel_h);
                         // ⚠ テーマに依存せず常に DARK visuals を使う (隠蔽加工パネルと同じ。
                         // これが無いとライトテーマで widget 背景色が崩れる)。
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        crate::os_theme::apply_dark_ui(ui);
 
                         ui.horizontal(|ui| {
                             ui.heading("切り取り");

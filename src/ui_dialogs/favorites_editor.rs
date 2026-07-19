@@ -258,7 +258,7 @@ impl App {
                         egui::RichText::new(
                             "📋 インデックス整合性チェック中… (起動時 reconciliation)",
                         )
-                        .color(egui::Color32::from_rgb(200, 170, 60))
+                        .color(ui.visuals().warn_fg_color)
                         .size(11.0),
                     );
                     ui.add_space(2.0);
@@ -284,7 +284,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!("I/O 並列度: {}", diag.io_permits))
                                     .size(11.0)
-                                    .color(egui::Color32::from_gray(150)),
+                                    .color(ui.visuals().weak_text_color()),
                             )
                             .on_hover_text(
                                 "環境設定「インデクサの速度プロファイル」で変更可。\n\
@@ -299,7 +299,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new("💾 インデックスサイズ:")
                                     .size(11.0)
-                                    .color(egui::Color32::from_gray(150)),
+                                    .color(ui.visuals().weak_text_color()),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -308,7 +308,7 @@ impl App {
                                     format_count(name_total)
                                 ))
                                 .size(11.0)
-                                .color(egui::Color32::from_gray(150)),
+                                .color(ui.visuals().weak_text_color()),
                             )
                             .on_hover_text(
                                 "コンテナ索引のディスク使用量 (WAL/SHM 込み) と総件数。\n\
@@ -323,7 +323,7 @@ impl App {
                                     format_count(meta_total)
                                 ))
                                 .size(11.0)
-                                .color(egui::Color32::from_gray(150)),
+                                .color(ui.visuals().weak_text_color()),
                             )
                             .on_hover_text(
                                 "アイテム索引のディスク使用量 (WAL/SHM 込み)。\n\
@@ -348,7 +348,7 @@ impl App {
                              起動がスムーズになります。",
                         )
                         .size(11.0)
-                        .color(egui::Color32::from_gray(180)),
+                        .color(ui.visuals().weak_text_color()),
                     );
                     let tray_before = self.settings.minimize_to_tray_on_close;
                     if ui
@@ -669,13 +669,13 @@ impl App {
                         ui.label(
                             egui::RichText::new("🔄 バックグラウンドインデクサ")
                                 .size(11.0)
-                                .color(egui::Color32::from_rgb(200, 170, 60)),
+                                .color(ui.visuals().warn_fg_color),
                         );
                         if let Some(t) = total_eta_text {
                             ui.label(
                                 egui::RichText::new(format!("  {t}"))
                                     .size(11.0)
-                                    .color(egui::Color32::from_rgb(200, 170, 60)),
+                                    .color(ui.visuals().warn_fg_color),
                             )
                             .on_hover_text(
                                 "進行中インデクサ全体の残り時間と処理速度。\n\
@@ -698,7 +698,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new("  (アイドル)")
                                         .size(11.0)
-                                        .color(egui::Color32::from_gray(110)),
+                                        .color(ui.visuals().weak_text_color()),
                                 );
                             } else {
                                 for (name, msg) in &active {
@@ -710,7 +710,7 @@ impl App {
                                         ))
                                         .size(11.0)
                                         .monospace()
-                                        .color(egui::Color32::from_gray(150)),
+                                        .color(ui.visuals().weak_text_color()),
                                     )
                                     .on_hover_text(format!("{name}: {msg}"));
                                 }
@@ -905,7 +905,7 @@ fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, f
         ui.label(
             egui::RichText::new("—")
                 .size(11.0)
-                .color(egui::Color32::from_gray(120)),
+                .color(ui.visuals().weak_text_color()),
         );
         return;
     }

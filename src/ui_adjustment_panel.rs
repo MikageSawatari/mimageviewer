@@ -27,14 +27,12 @@ use crate::keymap::KeyAction;
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
 };
-use crate::local_adjust_effect_ui::{draw_effect_params, with_local_adjust_dark_context_style};
+use crate::local_adjust_effect_ui::draw_effect_params;
 use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 64.0;
 const TAB_ROW_H: f32 = 24.0;
 const SECTION_FONT: f32 = 12.0;
-/// ラベルの色（暗い背景で読みやすい白系）
-const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
 
 /// 左パネルの幅
 // ヘッダーには 画像補正 / 表示トリム のタブと、画像補正タブ用のツール入口アイコン
@@ -1727,7 +1725,7 @@ fn draw_local_adjust_display_controls(
     mask_color_preset: &mut LocalAdjustMaskColorPreset,
 ) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("表示:").color(egui::Color32::from_gray(200)));
+        ui.label(egui::RichText::new("表示:").color(ui.visuals().text_color()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             for preset in LocalAdjustMaskColorPreset::ALL.into_iter().rev() {
                 let selected = *mask_color_preset == preset;
@@ -1814,14 +1812,14 @@ fn draw_local_adjust_layer_list(
                 layers.len()
             ))
             .size(10.0)
-            .color(egui::Color32::from_gray(170)),
+            .weak(),
         );
     }
     if layers.is_empty() {
         ui.label(
             egui::RichText::new("補正レイヤーを追加してください。")
                 .size(11.0)
-                .color(egui::Color32::from_gray(180)),
+                .weak(),
         );
         return;
     }
@@ -1935,12 +1933,8 @@ fn draw_local_adjust_layer_list(
                         if !layer.enabled
                             && ui
                                 .add(
-                                    egui::Label::new(
-                                        egui::RichText::new("OFF")
-                                            .size(10.0)
-                                            .color(egui::Color32::from_gray(150)),
-                                    )
-                                    .sense(egui::Sense::click()),
+                                    egui::Label::new(egui::RichText::new("OFF").size(10.0).weak())
+                                        .sense(egui::Sense::click()),
                                 )
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked()
@@ -2016,7 +2010,7 @@ fn draw_local_adjust_effect_selector(
     selected_layer: usize,
     effect_picker_dialog_open: &mut bool,
 ) {
-    ui.label(egui::RichText::new("加工内容:").color(egui::Color32::from_gray(200)));
+    ui.label(egui::RichText::new("加工内容:").color(ui.visuals().text_color()));
     let label = layers
         .get(selected_layer)
         .map(|layer| layer.effect.display_label().to_string())
@@ -2027,7 +2021,7 @@ fn draw_local_adjust_effect_selector(
             egui::Label::new(
                 egui::RichText::new(label)
                     .size(12.0)
-                    .color(egui::Color32::from_gray(230)),
+                    .color(ui.visuals().text_color()),
             ),
         );
         if ui
@@ -2063,7 +2057,7 @@ fn draw_local_adjust_manual_tool_selector(
         } else {
             "追加/削除マスク:"
         })
-        .color(egui::Color32::from_gray(200)),
+        .color(ui.visuals().text_color()),
     );
     match mask_kind {
         MaskKind::Raster => {
@@ -2178,7 +2172,7 @@ fn draw_local_adjust_manual_tool_selector(
                 ui.label(
                     egui::RichText::new("追加は1.0、削除は0.0でベースマスクを上書きします。")
                         .size(10.0)
-                        .color(egui::Color32::from_gray(170)),
+                        .weak(),
                 );
                 draw_local_manual_mask_tool_panel(
                     ui,
@@ -2228,11 +2222,7 @@ fn draw_local_adjust_manual_tool_selector(
             } else {
                 "必要なときだけ追加マスク/削除マスクを開いて手描きします。"
             };
-            ui.label(
-                egui::RichText::new(help)
-                    .size(10.0)
-                    .color(egui::Color32::from_gray(170)),
-            );
+            ui.label(egui::RichText::new(help).size(10.0).weak());
         });
     }
 }
@@ -2244,7 +2234,7 @@ fn draw_local_manual_mask_tool_panel(
     mask_tool: &mut LocalAdjustMaskTool,
     bitmap_mask_op: &mut Option<LocalAdjustBitmapMaskOp>,
 ) {
-    ui.label(egui::RichText::new("描画 / 消去:").color(egui::Color32::from_gray(200)));
+    ui.label(egui::RichText::new("描画 / 消去:").color(ui.visuals().text_color()));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         if local_adjust_panel_toggle_button(ui, "描画 [D]", *mask_paint_add, Some(btn_size), true)
@@ -2259,7 +2249,7 @@ fn draw_local_manual_mask_tool_panel(
         }
     });
     ui.separator();
-    ui.label(egui::RichText::new("ビットマップ:").color(egui::Color32::from_gray(200)));
+    ui.label(egui::RichText::new("ビットマップ:").color(ui.visuals().text_color()));
     for row in [
         &[
             (LocalAdjustMaskTool::Brush, "筆 [B]"),
@@ -2303,7 +2293,7 @@ fn draw_local_manual_mask_tool_panel(
             *bitmap_mask_op = Some(LocalAdjustBitmapMaskOp::Shrink);
         }
     });
-    ui.label(egui::RichText::new("オブジェクト:").color(egui::Color32::from_gray(200)));
+    ui.label(egui::RichText::new("オブジェクト:").color(ui.visuals().text_color()));
     for row in [
         [
             (LocalAdjustMaskTool::Select, "選択 [S]"),
@@ -2373,7 +2363,7 @@ fn draw_local_tool_settings(
     ui.label(
         egui::RichText::new(local_mask_tool_label(mask_tool))
             .size(11.0)
-            .color(egui::Color32::from_gray(180)),
+            .weak(),
     );
     ui.separator();
 
@@ -2400,7 +2390,7 @@ fn draw_local_tool_settings(
                 ui.label(
                     egui::RichText::new("選択中の直線にも反映します。")
                         .size(10.0)
-                        .color(egui::Color32::from_gray(170)),
+                        .weak(),
                 );
             }
         }
@@ -2419,7 +2409,7 @@ fn draw_local_tool_settings(
                     "開始点から連結している近い色だけを、境界で止めて塗ります。Ctrl中は境界を表示しながら通常筆です。",
                 )
                 .size(10.0)
-                .color(egui::Color32::from_gray(170)),
+                .weak(),
             );
         }
         LocalAdjustMaskTool::GapFillBrush => {
@@ -2427,7 +2417,7 @@ fn draw_local_tool_settings(
             ui.label(
                 egui::RichText::new("左右または上下のマスクに挟まれた細い未塗り部分を補完します。")
                     .size(10.0)
-                    .color(egui::Color32::from_gray(170)),
+                    .weak(),
             );
         }
         LocalAdjustMaskTool::Polygon => {
@@ -2440,14 +2430,14 @@ fn draw_local_tool_settings(
                     "Ctrl中は候補点が近くの境界へ吸着します。右クリックまたは始点クリックで確定します。",
                 )
                     .size(10.0)
-                    .color(egui::Color32::from_gray(170)),
+                    .weak(),
             );
         }
         LocalAdjustMaskTool::Brush => {
             ui.label(
                 egui::RichText::new("ドラッグした範囲をマスクに描画します。")
                     .size(10.0)
-                    .color(egui::Color32::from_gray(170)),
+                    .weak(),
             );
         }
         _ => {}
@@ -2463,7 +2453,7 @@ fn draw_local_tool_settings(
             local_mask_edit_target_label(active_target)
         ))
         .size(10.0)
-        .color(egui::Color32::from_gray(170)),
+        .weak(),
     );
 }
 
@@ -2554,7 +2544,7 @@ fn draw_selected_local_adjust_layer_editor(
                     "追加マスク/削除マスクを開くと、手描きツール設定を表示します。",
                 )
                 .size(11.0)
-                .color(egui::Color32::from_gray(180)),
+                .weak(),
             );
         }
         if selected_mask_kind != Some(MaskKind::Raster) && manual_edit_controls_visible {
@@ -2578,11 +2568,7 @@ fn draw_selected_local_adjust_layer_editor(
                 None | Some(MaskKind::Raster) => "",
             };
             if !help.is_empty() {
-                ui.label(
-                    egui::RichText::new(help)
-                        .size(11.0)
-                        .color(egui::Color32::from_gray(180)),
-                );
+                ui.label(egui::RichText::new(help).size(11.0).weak());
             }
         }
     });
@@ -2614,7 +2600,7 @@ fn draw_selected_local_adjust_layer_editor(
             ui.label(
                 egui::RichText::new("修復／塗りは常にマスク範囲だけへ適用します。")
                     .size(10.0)
-                    .color(egui::Color32::from_gray(175)),
+                    .weak(),
             );
         } else {
             ui.horizontal(|ui| {
@@ -6811,7 +6797,7 @@ fn draw_local_mask_editor(
             ui.label(
                 egui::RichText::new("画像全体に効果を適用します。")
                     .size(11.0)
-                    .color(egui::Color32::from_gray(170)),
+                    .weak(),
             );
         }
         local_adjust_core::LocalMask::Raster(mask) => {
@@ -6878,11 +6864,7 @@ fn draw_local_mask_editor(
             }
         }
         local_adjust_core::LocalMask::LumaRange(mask) => {
-            ui.label(
-                egui::RichText::new("輝度範囲")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(170)),
-            );
+            ui.label(egui::RichText::new("輝度範囲").size(11.0).weak());
             changed |= draw_range_mask_sliders(ui, mask);
         }
         local_adjust_core::LocalMask::ColorRange(mask) => {
@@ -6965,7 +6947,7 @@ fn draw_local_mask_editor(
                 egui::RichText::new("マスク補正")
                     .size(11.0)
                     .strong()
-                    .color(egui::Color32::from_gray(190)),
+                    .color(ui.visuals().text_color()),
             );
             let mut refinement_enabled = mask.refinement.enabled;
             let enable_response = ui.checkbox(&mut refinement_enabled, "マスクを整形");
@@ -7059,15 +7041,11 @@ fn draw_local_mask_editor(
                     stats.foreground_percent, stats.soft_percent
                 ))
                 .size(10.0)
-                .color(egui::Color32::from_gray(170)),
+                .weak(),
             );
         }
         local_adjust_core::LocalMask::Segmentation(mask) => {
-            ui.label(
-                egui::RichText::new("領域分割")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(170)),
-            );
+            ui.label(egui::RichText::new("領域分割").size(11.0).weak());
             let response =
                 ui.add(egui::Slider::new(region_color_tolerance, 4.0..=120.0).text("色差許容"));
             response.on_hover_text("大きいほど近い色が同じ領域にまとまります。");
@@ -7113,7 +7091,7 @@ fn draw_local_mask_editor(
                 ui.label(
                     egui::RichText::new("被写体マスクがあると、被写体内や背景だけを分割できます。")
                         .size(10.0)
-                        .color(egui::Color32::from_gray(170)),
+                        .weak(),
                 );
             }
             ui.horizontal_wrapped(|ui| {
@@ -7153,7 +7131,7 @@ fn draw_local_mask_editor(
             ui.label(
                 egui::RichText::new("画像上の領域をクリックして追加/解除します。")
                     .size(10.0)
-                    .color(egui::Color32::from_gray(170)),
+                    .weak(),
             );
         }
     }
@@ -7267,7 +7245,7 @@ macro_rules! slider_with_reset {
             ui.label(
                 egui::RichText::new($label)
                     .size(SECTION_FONT)
-                    .color(LABEL_COLOR),
+                    .color(ui.visuals().text_color()),
             );
             if *$val != $default && !$disabled {
                 let reset_resp = ui.small_button("↩");
@@ -7299,7 +7277,7 @@ macro_rules! slider_log_with_reset {
             ui.label(
                 egui::RichText::new($label)
                     .size(SECTION_FONT)
-                    .color(LABEL_COLOR),
+                    .color(ui.visuals().text_color()),
             );
             if (*$val - $default).abs() > 0.001 && !$disabled {
                 let reset_resp = ui.small_button("↩");
@@ -7344,7 +7322,7 @@ fn draw_sliders(
     ui.label(
         egui::RichText::new("補正モード")
             .size(SECTION_FONT)
-            .color(LABEL_COLOR),
+            .color(ui.visuals().text_color()),
     );
     ui.add_space(2.0);
     {
@@ -7352,7 +7330,7 @@ fn draw_sliders(
         if ui
             .radio(
                 params.auto_mode.is_none(),
-                egui::RichText::new("手動").color(LABEL_COLOR),
+                egui::RichText::new("手動").color(ui.visuals().text_color()),
             )
             .clicked()
         {
@@ -7362,7 +7340,7 @@ fn draw_sliders(
         if ui
             .radio(
                 params.auto_mode == Some(AutoMode::Auto),
-                egui::RichText::new("自動補正").color(LABEL_COLOR),
+                egui::RichText::new("自動補正").color(ui.visuals().text_color()),
             )
             .clicked()
         {
@@ -7372,7 +7350,7 @@ fn draw_sliders(
         if ui
             .radio(
                 params.auto_mode == Some(AutoMode::MangaCleanup),
-                egui::RichText::new("モノクロ漫画補正").color(LABEL_COLOR),
+                egui::RichText::new("モノクロ漫画補正").color(ui.visuals().text_color()),
             )
             .clicked()
         {
@@ -7444,7 +7422,7 @@ fn draw_sliders(
     ui.label(
         egui::RichText::new("レベル補正")
             .size(SECTION_FONT)
-            .color(LABEL_COLOR),
+            .color(ui.visuals().text_color()),
     );
     {
         let mut bp = params.black_point as f32;
@@ -7452,7 +7430,7 @@ fn draw_sliders(
             ui.label(
                 egui::RichText::new("黒点")
                     .size(SECTION_FONT)
-                    .color(LABEL_COLOR),
+                    .color(ui.visuals().text_color()),
             );
             if bp != 0.0 && !is_auto {
                 if ui
@@ -7486,7 +7464,7 @@ fn draw_sliders(
             ui.label(
                 egui::RichText::new("白点")
                     .size(SECTION_FONT)
-                    .color(LABEL_COLOR),
+                    .color(ui.visuals().text_color()),
             );
             if wp != 255.0 && !is_auto {
                 if ui
@@ -7519,7 +7497,7 @@ fn draw_sliders(
             ui.label(
                 egui::RichText::new("中間点")
                     .size(SECTION_FONT)
-                    .color(LABEL_COLOR),
+                    .color(ui.visuals().text_color()),
             );
             if (params.midtone - 1.0).abs() > 0.001 && !is_auto {
                 if ui
@@ -7555,7 +7533,7 @@ fn draw_sliders(
     ui.label(
         egui::RichText::new("AI ノイズ除去 [N: ON/OFF]")
             .size(SECTION_FONT)
-            .color(LABEL_COLOR),
+            .color(ui.visuals().text_color()),
     );
     if let Some(limit) = ai_denoise_disabled_limit {
         ui.label(
@@ -7564,7 +7542,7 @@ fn draw_sliders(
                 limit.label()
             ))
             .size(SECTION_FONT - 1.0)
-            .color(egui::Color32::from_gray(150))
+            .weak()
             .italics(),
         );
     }
@@ -7582,7 +7560,7 @@ fn draw_sliders(
             ui.label(
                 egui::RichText::new(note)
                     .size(SECTION_FONT - 1.0)
-                    .color(egui::Color32::from_gray(150))
+                    .weak()
                     .italics(),
             );
         }
@@ -7594,7 +7572,7 @@ fn draw_sliders(
             ai_feature_mode.allows_denoise(),
             egui::Checkbox::new(
                 &mut toggled,
-                egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR),
+                egui::RichText::new("JPEG ノイズ除去を適用").color(ui.visuals().text_color()),
             ),
         )
         .changed()
@@ -7611,7 +7589,7 @@ fn draw_sliders(
     ui.label(
         egui::RichText::new("AI アップスケール [U: 次 / Shift+U: 前 / Alt+U: リセット]")
             .size(SECTION_FONT)
-            .color(LABEL_COLOR),
+            .color(ui.visuals().text_color()),
     );
     if let Some(limit) = ai_upscale_disabled_limit {
         ui.label(
@@ -7620,7 +7598,7 @@ fn draw_sliders(
                 limit.label()
             ))
             .size(SECTION_FONT - 1.0)
-            .color(egui::Color32::from_gray(150))
+            .weak()
             .italics(),
         );
     }
@@ -7638,7 +7616,7 @@ fn draw_sliders(
                 ai_feature_mode.label()
             ))
             .size(SECTION_FONT - 1.0)
-            .color(egui::Color32::from_gray(150))
+            .weak()
             .italics(),
         );
     }
@@ -7649,7 +7627,10 @@ fn draw_sliders(
             _ => false,
         };
         if ui
-            .radio(is_sel, egui::RichText::new(*label).color(LABEL_COLOR))
+            .radio(
+                is_sel,
+                egui::RichText::new(*label).color(ui.visuals().text_color()),
+            )
             .clicked()
         {
             params.upscale_model = val.map(|s| s.to_string());
@@ -7665,7 +7646,7 @@ fn draw_sliders(
             ui.label(
                 egui::RichText::new("シャープ化")
                     .size(SECTION_FONT)
-                    .color(LABEL_COLOR),
+                    .color(ui.visuals().text_color()),
             )
             .on_hover_text(
                 "最終表示に輪郭中心のシャープ化 (スマートシャープ) を適用します。\n\
@@ -7695,7 +7676,7 @@ fn draw_sliders(
             ui.label(
                 egui::RichText::new("（AI アップスケール実行時は適用されません）")
                     .size(SECTION_FONT - 1.0)
-                    .color(egui::Color32::from_gray(150))
+                    .weak()
                     .italics(),
             );
         }
@@ -7714,7 +7695,7 @@ fn draw_sliders(
     ui.label(
         egui::RichText::new("ポストフィルタ [T: 次 / Shift+T: 前 / Alt+T: リセット]")
             .size(SECTION_FONT)
-            .color(LABEL_COLOR),
+            .color(ui.visuals().text_color()),
     );
     let before_pf = params.post_filter;
     egui::ComboBox::from_id_salt("post_filter_combo")
@@ -7722,11 +7703,7 @@ fn draw_sliders(
         .width(ui.available_width() - 8.0)
         .show_ui(ui, |ui| {
             let group_heading = |ui: &mut egui::Ui, text: &str| {
-                ui.label(
-                    egui::RichText::new(text)
-                        .size(SECTION_FONT - 1.0)
-                        .color(egui::Color32::from_gray(150)),
-                );
+                ui.label(egui::RichText::new(text).size(SECTION_FONT - 1.0).weak());
             };
 
             group_heading(ui, "── 基本 ──");
@@ -10950,7 +10927,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        with_local_adjust_dark_context_style(ctx, || {
+        crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("補正レイヤーを追加")
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
@@ -10961,14 +10938,13 @@ impl App {
                 .default_height(390.0)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    *ui.visuals_mut() = egui::Visuals::dark();
-                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    crate::os_theme::apply_dark_ui(ui);
                     ui.label(
                     egui::RichText::new(
                         "使いたいマスク種類を選んでください。クリックするとレイヤーを追加します。",
                     )
                     .size(11.0)
-                    .color(egui::Color32::from_gray(180)),
+                    .weak(),
                 );
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -11011,7 +10987,7 @@ impl App {
                                     h.max(1)
                                 ))
                                 .size(10.0)
-                                .color(egui::Color32::from_gray(160)),
+                                .weak(),
                             );
                         });
                 });
@@ -11050,7 +11026,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        with_local_adjust_dark_context_style(ctx, || {
+        crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("マスク種類変更")
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
@@ -11061,15 +11037,14 @@ impl App {
                 .default_height(420.0)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    *ui.visuals_mut() = egui::Visuals::dark();
-                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    crate::os_theme::apply_dark_ui(ui);
                     ui.checkbox(&mut keep_manual_override, "追加/削除マスクを維持");
                     ui.label(
                         egui::RichText::new(
                             "加工内容は残したまま、選択中レイヤーのベースマスクだけを変更します。",
                         )
                         .size(11.0)
-                        .color(egui::Color32::from_gray(180)),
+                        .weak(),
                     );
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -11144,7 +11119,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        with_local_adjust_dark_context_style(ctx, || {
+        crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("加工内容を選択")
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
@@ -11155,8 +11130,7 @@ impl App {
                 .min_size(egui::vec2(560.0, 360.0))
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    *ui.visuals_mut() = egui::Visuals::dark();
-                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    crate::os_theme::apply_dark_ui(ui);
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             egui::vec2((ui.available_width() - 32.0).max(120.0), 24.0),
@@ -11224,7 +11198,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new("該当する効果がありません")
                                         .size(11.0)
-                                        .color(egui::Color32::from_gray(160)),
+                                        .weak(),
                                 );
                             }
                         });
@@ -11373,8 +11347,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_min_width(LOCAL_ADJUST_PANEL_W);
                         ui.set_max_width(LOCAL_ADJUST_PANEL_W);
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        crate::os_theme::apply_dark_ui(ui);
 
                         ui.horizontal(|ui| {
                             ui.label(
@@ -11414,7 +11387,7 @@ impl App {
                                 egui::Label::new(
                                     egui::RichText::new(&local_adjust_status)
                                         .size(11.0)
-                                        .color(egui::Color32::from_gray(190)),
+                                        .color(ui.visuals().text_color()),
                                 )
                                 .wrap(),
                             );
@@ -11481,7 +11454,7 @@ impl App {
                                                     }
                                                 ))
                                                 .size(11.0)
-                                                .color(egui::Color32::from_gray(170)),
+                                                .weak(),
                                             );
                                             ui.add_space(4.0);
                                         }
@@ -11536,8 +11509,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_min_width(LOCAL_ADJUST_TOOL_PANEL_W);
                         ui.set_max_width(LOCAL_ADJUST_TOOL_PANEL_W);
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        crate::os_theme::apply_dark_ui(ui);
                         let body_height =
                             (tool_panel_rect.height() - 14.0).max(LOCAL_ADJUST_PANEL_MIN_BODY_H);
                         ui.set_min_height(body_height);
@@ -11587,7 +11559,7 @@ impl App {
                                             "左側のレイヤーパネルからレイヤーを追加してください。",
                                         )
                                         .size(11.0)
-                                        .color(egui::Color32::from_gray(180)),
+                                        .weak(),
                                     );
                                 }
                             });
@@ -11723,8 +11695,7 @@ impl App {
         // の bg が near-white になり「白の上に白文字」で読めなくなる問題への対応
         // (= 消しゴム / 隠蔽パネルと同じ方針、CLAUDE.md「フルスクリーン内は黒背景
         // ベース統一」)。実機 FB R4 で配色統一の要望があった。
-        *child.visuals_mut() = egui::Visuals::dark();
-        child.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+        crate::os_theme::apply_dark_ui(&mut child);
 
         // ── ヘッダー ──
         // 左ホバーパネルは 画像補正 / 表示トリム のタブ式。
@@ -12246,7 +12217,7 @@ impl App {
                         ui.label(
                             egui::RichText::new("保存スロット")
                                 .size(11.0)
-                                .color(LABEL_COLOR),
+                                .color(ui.visuals().text_color()),
                         );
                         ui.add_space(2.0);
                         let slot_gap = 4.0;

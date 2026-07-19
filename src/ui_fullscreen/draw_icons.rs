@@ -108,55 +108,10 @@ pub(super) fn draw_seek_lock_icon(painter: &egui::Painter, c: egui::Pos2, r: f32
     );
     painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Outside);
 
-    let stem_bottom = body.top() + r * 0.12;
-    let stem_top = c.y - r * 0.48;
-    let half_w = r * 0.46;
-    if locked {
-        painter.line_segment(
-            [
-                egui::pos2(c.x - half_w, stem_bottom),
-                egui::pos2(c.x - half_w, stem_top),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(c.x + half_w, stem_bottom),
-                egui::pos2(c.x + half_w, stem_top),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(c.x - half_w, stem_top),
-                egui::pos2(c.x + half_w, stem_top),
-            ],
-            stroke,
-        );
-    } else {
-        let shift = r * 0.28;
-        painter.line_segment(
-            [
-                egui::pos2(c.x - half_w - shift, stem_bottom),
-                egui::pos2(c.x - half_w - shift, stem_top),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(c.x - half_w - shift, stem_top),
-                egui::pos2(c.x + half_w - shift, stem_top),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(c.x + half_w - shift, stem_top),
-                egui::pos2(c.x + half_w - shift, stem_top + r * 0.38),
-            ],
-            stroke,
-        );
-    }
+    painter.add(egui::Shape::line(
+        seek_lock_shackle_points(c, r, body.top(), locked),
+        stroke,
+    ));
 
     painter.circle_filled(egui::pos2(c.x, c.y + r * 0.18), r * 0.14, white);
     painter.line_segment(
@@ -166,6 +121,46 @@ pub(super) fn draw_seek_lock_icon(painter: &egui::Painter, c: egui::Pos2, r: f32
         ],
         egui::Stroke::new(1.4, white),
     );
+}
+
+/// 潰れた角形ではなく、上端に十分な高さを持つ半円状の錠前シャックルを作る。
+/// unlocked は半円全体を右へずらし、右端を本体外へ出して開状態を表す。
+fn seek_lock_shackle_points(c: egui::Pos2, r: f32, body_top: f32, locked: bool) -> Vec<egui::Pos2> {
+    const SEGMENTS: usize = 12;
+    let half_w = r * 0.48;
+    let arch_h = r * 0.72;
+    let center_x = c.x + if locked { 0.0 } else { r * 0.50 };
+    (0..=SEGMENTS)
+        .map(|i| {
+            let t = i as f32 / SEGMENTS as f32;
+            let angle = std::f32::consts::PI + std::f32::consts::PI * t;
+            egui::pos2(
+                center_x + half_w * angle.cos(),
+                body_top + arch_h * angle.sin(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod seek_lock_icon_tests {
+    use super::*;
+
+    #[test]
+    fn shackle_is_a_visible_semicircle_and_unlock_has_an_open_end() {
+        let c = egui::pos2(20.0, 20.0);
+        let r = 9.0;
+        let body_top = 18.0;
+        let locked = seek_lock_shackle_points(c, r, body_top, true);
+        assert!((locked.first().unwrap().y - body_top).abs() < 0.01);
+        assert!((locked.last().unwrap().y - body_top).abs() < 0.01);
+        assert!(body_top - locked[locked.len() / 2].y > r * 0.65);
+        assert!((locked.first().unwrap().x + locked.last().unwrap().x - 2.0 * c.x).abs() < 0.01);
+
+        let unlocked = seek_lock_shackle_points(c, r, body_top, false);
+        let body_right = c.x + r * 1.45 * 0.5;
+        assert!(unlocked.last().unwrap().x > body_right);
+    }
 }
 
 /// 目アイコン (= プレビューボタン)。横長楕円 + 中央の瞳孔。
@@ -839,7 +834,7 @@ pub(super) fn draw_fs_bar_info_text(
                 egui::Align2::RIGHT_CENTER,
                 main_text,
                 font,
-                egui::Color32::WHITE,
+                ui.visuals().text_color(),
             );
         } else {
             ui.painter().text(
@@ -847,7 +842,7 @@ pub(super) fn draw_fs_bar_info_text(
                 egui::Align2::RIGHT_CENTER,
                 text,
                 font,
-                egui::Color32::WHITE,
+                ui.visuals().text_color(),
             );
         }
     }

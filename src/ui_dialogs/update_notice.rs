@@ -34,12 +34,12 @@ impl App {
                 if let Some(ref e) = error {
                     ui.label(
                         egui::RichText::new(format!("⚠ 更新確認に失敗しました: {e}"))
-                            .color(egui::Color32::from_rgb(220, 120, 120)),
+                            .color(ui.visuals().error_fg_color),
                     );
                     ui.label(
                         egui::RichText::new("ネットワーク接続を確認してください。")
                             .size(11.0)
-                            .color(egui::Color32::from_gray(180)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                     ui.add_space(6.0);
                     ui.separator();

@@ -2713,20 +2713,17 @@ impl App {
         self.draw_text_selection(ui, image_rect, zoom_pan);
         self.draw_text_panel(ctx, image_rect);
         // 追加ダイアログ (パネルが comic_docs を書き戻した後に描く)。
-        // これらは暗フレーム (Frame::window().fill(dark)) を強制するが、egui::Window の
-        // タイトルバー文字と × ボタンはビューポート ctx の visuals で描かれる。フルスクリーン
-        // ビューポートは OS テーマ連動でライトになる場合があり、その時タイトル/× が暗色になって
-        // 暗フレーム上で読めない (実機 FB 2026-06-06)。ダイアログ描画の間だけ ctx visuals を
-        // ダークへ上書きし、描画後に元へ戻す (他の fullscreen UI に影響させない)。
-        let prev_visuals = ctx.style().visuals.clone();
-        ctx.set_visuals(egui::Visuals::dark());
-        self.draw_text_add_bubble_dialog(ctx);
-        self.draw_text_add_annotation_dialog(ctx);
-        self.draw_text_add_window_dialog(ctx);
-        self.draw_text_add_stamp_dialog(ctx);
-        self.draw_text_add_onomatopoeia_dialog(ctx);
-        self.draw_text_font_dialog(ctx);
-        ctx.set_visuals(prev_visuals);
+        // これらは暗フレームを使うため、タイトルバーを含めて共通の暗色 Window scope で描く。
+        // scope は Light / Dark 両 Style を復元し、編集ダイアログの表示がメインテーマへ漏れる
+        // 旧不具合を防ぐ。
+        crate::os_theme::with_dark_context_style(ctx, || {
+            self.draw_text_add_bubble_dialog(ctx);
+            self.draw_text_add_annotation_dialog(ctx);
+            self.draw_text_add_window_dialog(ctx);
+            self.draw_text_add_stamp_dialog(ctx);
+            self.draw_text_add_onomatopoeia_dialog(ctx);
+            self.draw_text_font_dialog(ctx);
+        });
         // フレーム末: 編集が settle (drag 終了 + フィールド非フォーカス) したら
         // coalesce した undo エントリを 1 つ commit する (Inc 6、ラボの frame-end
         // `commit_pending` 相当)。パネル / キャンバス / ダイアログの全編集が反映済みの
@@ -3011,8 +3008,7 @@ impl App {
                         // フルスクリーンビューポートの visuals は明るい場合があり、暗い
                         // パネル背景に暗い文字が乗って読めなくなる。隠蔽 (conceal) パネルと
                         // 同様に暗テーマ + 白文字を明示する。
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        crate::os_theme::apply_dark_ui(ui);
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
                         ui.horizontal(|ui| {
@@ -3232,8 +3228,7 @@ impl App {
                     ))
                     .corner_radius(6.0)
                     .show(ui, |ui| {
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        crate::os_theme::apply_dark_ui(ui);
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
                         ui.strong("詳細設定");
@@ -3453,8 +3448,7 @@ impl App {
             .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .open(&mut open)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                crate::os_theme::apply_dark_ui(ui);
                 ui.label(
                     egui::RichText::new("形を選んでください。クリックで追加します。")
                         .size(12.0)
@@ -3556,8 +3550,7 @@ impl App {
             .default_pos(avail.center() - default_size * 0.5)
             .open(&mut open)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                crate::os_theme::apply_dark_ui(ui);
                 let (add_clicked, cancel_clicked) = annotation_dialog_contents_ui(
                     ui,
                     &mut preset,
@@ -3654,8 +3647,7 @@ impl App {
             .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .open(&mut open)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                crate::os_theme::apply_dark_ui(ui);
                 ui.label(
                     egui::RichText::new("デザインを選んでください。クリックで追加します。")
                         .size(12.0)
@@ -3842,8 +3834,7 @@ impl App {
             .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .open(&mut open)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                crate::os_theme::apply_dark_ui(ui);
                 if !pack_installed {
                     ui.label(
                         egui::RichText::new(
@@ -4157,8 +4148,7 @@ impl App {
             .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .open(&mut open)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                crate::os_theme::apply_dark_ui(ui);
                 ui.horizontal(|ui| {
                     ui.label("見本");
                     if ui
@@ -4690,8 +4680,7 @@ impl App {
             .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .open(&mut open)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                crate::os_theme::apply_dark_ui(ui);
                 ui.horizontal(|ui| {
                     if ui.button("画像ファイルから追加…").clicked() {
                         pick_file = true;

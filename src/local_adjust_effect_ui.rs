@@ -17,68 +17,14 @@ fn lab_combo_box<R>(
     selected_text: impl Into<egui::WidgetText>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    let ctx = ui.ctx().clone();
-    with_local_adjust_dark_context_style(&ctx, || {
-        ComboBox::from_id_salt(id_salt)
-            .selected_text(selected_text)
-            .height(420.0)
-            .show_ui(ui, |ui| {
-                apply_local_adjust_dark_ui(ui);
-                add_contents(ui)
-            })
-    })
-}
-
-pub(crate) fn local_adjust_dark_visuals() -> egui::Visuals {
-    let mut visuals = egui::Visuals::dark();
-    visuals.override_text_color = Some(egui::Color32::WHITE);
-    visuals.window_fill = egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    visuals
-}
-
-fn apply_local_adjust_dark_ui(ui: &mut egui::Ui) {
-    *ui.visuals_mut() = local_adjust_dark_visuals();
-}
-
-struct LocalAdjustContextStyleGuard {
-    ctx: egui::Context,
-    previous_style: egui::Style,
-    previous_theme: egui::ThemePreference,
-}
-
-impl LocalAdjustContextStyleGuard {
-    fn install(ctx: &egui::Context) -> Self {
-        let previous_style = (*ctx.style()).clone();
-        let previous_theme = ctx.options(|options| options.theme_preference);
-        let mut dark_style = previous_style.clone();
-        dark_style.visuals = local_adjust_dark_visuals();
-        ctx.set_theme(egui::ThemePreference::Dark);
-        ctx.set_style(dark_style);
-        Self {
-            ctx: ctx.clone(),
-            previous_style,
-            previous_theme,
-        }
-    }
-}
-
-impl Drop for LocalAdjustContextStyleGuard {
-    fn drop(&mut self) {
-        self.ctx.set_theme(self.previous_theme);
-        self.ctx.set_style(self.previous_style.clone());
-    }
-}
-
-/// ComboBox の popup や Window の frame は子 `Ui` を作る前に Context の style で
-/// 描かれる。補正 UI の構築中だけ Context も暗色へ切り替え、呼び出しを抜けると元へ戻す。
-pub(crate) fn with_local_adjust_dark_context_style<R>(
-    ctx: &egui::Context,
-    add_contents: impl FnOnce() -> R,
-) -> R {
-    let _guard = LocalAdjustContextStyleGuard::install(ctx);
-    add_contents()
+    ComboBox::from_id_salt(id_salt)
+        .selected_text(selected_text)
+        .height(420.0)
+        .popup_style(crate::os_theme::dark_popup_style(ui.ctx()))
+        .show_ui(ui, |ui| {
+            crate::os_theme::apply_dark_ui(ui);
+            add_contents(ui)
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,11 +389,11 @@ fn draw_rgb_color_control(
     let mut cancel_pick = false;
     let pick_active = active_pick == Some(target);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(Color32::from_gray(190)));
+        ui.label(egui::RichText::new(label).weak());
         ui.label(
             egui::RichText::new(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]))
                 .monospace()
-                .color(Color32::from_gray(170)),
+                .weak(),
         );
         let response = ui.color_edit_button_srgb(rgb);
         response.lab_hover_tip(format!("{label}を選びます。"));
@@ -905,7 +851,7 @@ fn draw_tone_detail_effect_params(
 
     match effect {
         LocalEffect::Tone(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "明るく") {
                     *params = ToneParams {
@@ -998,7 +944,7 @@ fn draw_tone_detail_effect_params(
             );
         }
         LocalEffect::ToneCurve(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "S字") {
                     *params = ToneCurveParams {
@@ -1031,7 +977,7 @@ fn draw_tone_detail_effect_params(
                     "RGB共通の簡易カーブです。色チャンネルは RGBカーブ で調整します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             for (idx, label) in ["黒", "暗部", "中間", "明部", "白"].iter().enumerate() {
                 changed |= ui
@@ -1040,7 +986,7 @@ fn draw_tone_detail_effect_params(
             }
         }
         LocalEffect::RgbToneCurve(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "暖色") {
                     *params = RgbToneCurveParams {
@@ -1100,7 +1046,7 @@ fn draw_tone_detail_effect_params(
                     "白い線が全体、赤/緑/青の線が各チャンネルです。全体カーブ後に各チャンネルを適用します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.collapsing("全体", |ui| {
                 changed |= draw_curve_point_sliders(ui, &mut params.master);
@@ -1116,7 +1062,7 @@ fn draw_tone_detail_effect_params(
             });
         }
         LocalEffect::ColorBalance(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "影を青く") {
                     *params = ColorBalanceParams {
@@ -1207,7 +1153,7 @@ fn draw_tone_detail_effect_params(
                     "明るさの帯ごとに色を寄せます。RGBカーブより直感的に色かぶりや空気感を調整できます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.collapsing("シャドウ", |ui| {
                 changed |= draw_color_balance_range_sliders(ui, &mut params.shadows);
@@ -1225,7 +1171,7 @@ fn draw_tone_detail_effect_params(
             );
         }
         LocalEffect::PhotoFilter(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "Warm 85") {
                     *params = PhotoFilterParams {
@@ -1319,7 +1265,7 @@ fn draw_tone_detail_effect_params(
                     "色付きフィルターをかぶせる感覚で、暖色・寒色・セピアなどの色かぶりや雰囲気を足します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             if params.preset == PhotoFilterPreset::Custom {
                 merge_rgb_color_response(
@@ -1348,7 +1294,7 @@ fn draw_tone_detail_effect_params(
             strength.lab_hover_tip("元画像からフォトフィルター後の色へどれだけ近づけるかです。");
         }
         LocalEffect::ThreeWayColorGrading(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "シネマ") {
                     *params = ThreeWayColorGradingParams {
@@ -1473,7 +1419,7 @@ fn draw_tone_detail_effect_params(
                     "カラーバランスより演出的な仕上げ向けです。色相と彩度で足す色を選び、明るさで帯ごとの持ち上げ/締めを調整します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.collapsing("シャドウ", |ui| {
                 changed |= draw_color_grade_wheel_sliders(ui, &mut params.shadows);
@@ -1492,7 +1438,7 @@ fn draw_tone_detail_effect_params(
             );
         }
         LocalEffect::SelectiveColor(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "赤を桜色") {
                     *params = SelectiveColorParams {
@@ -1566,7 +1512,7 @@ fn draw_tone_detail_effect_params(
                     "対象色相に近い色だけを補正します。色が広く変わりすぎる場合は範囲やぼかしを小さくしてください。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let swatch = hsl_swatch_color(params.target_hue_degrees, 0.8, 0.55);
@@ -1659,7 +1605,7 @@ fn draw_tone_detail_effect_params(
             lightness.lab_hover_tip("対象色だけ明るさを増減します。");
         }
         LocalEffect::PartColor(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "赤だけ") {
                     *params = PartColorParams {
@@ -1722,7 +1668,7 @@ fn draw_tone_detail_effect_params(
                     "対象色に近い色だけを残し、それ以外を白黒へ寄せます。色が抜けすぎる場合は範囲やぼかしを広げてください。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let response = draw_rgb_color_control(
                 ui,
@@ -1741,7 +1687,7 @@ fn draw_tone_detail_effect_params(
             ui.label(
                 egui::RichText::new(format!("対象色相: {hue:.0}°"))
                     .size(10.0)
-                    .color(Color32::from_gray(160)),
+                    .weak(),
             );
             let range =
                 ui.add(egui::Slider::new(&mut params.range_degrees, 1.0..=120.0).text("残す範囲"));
@@ -1770,7 +1716,7 @@ fn draw_tone_detail_effect_params(
             lightness.lab_hover_tip("残した対象色だけ、明るさを少し整えます。");
         }
         LocalEffect::ChannelMixer(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "白黒標準") {
                     *params = ChannelMixerParams {
@@ -1828,7 +1774,7 @@ fn draw_tone_detail_effect_params(
                     "白黒化では元画像の赤/緑/青をどれだけ明度へ混ぜるかを調整します。カラー時は各出力チャンネルの混合率を直接編集します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let mono = ui.checkbox(&mut params.monochrome, "白黒化");
             changed |= mono.changed();
@@ -1850,7 +1796,7 @@ fn draw_tone_detail_effect_params(
             }
         }
         LocalEffect::MonochromeMixer(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "標準白黒") {
                     *params = MonochromeMixerParams {
@@ -1914,7 +1860,7 @@ fn draw_tone_detail_effect_params(
                     "色ごとの明度を調整して白黒化します。赤フィルターは肌や赤を明るく、青空を暗くするような使い方に向いています。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let mut activates_effect = false;
             let red = ui.add(egui::Slider::new(&mut params.red, -100.0..=100.0).text("赤の明るさ"));
@@ -1985,7 +1931,7 @@ fn draw_tone_detail_effect_params(
             strength.lab_hover_tip("元画像からモノクロミキサー結果へ切り替える強さです。");
         }
         LocalEffect::Clarity(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "くっきり") {
                     *params = ClarityParams {
@@ -2010,7 +1956,7 @@ fn draw_tone_detail_effect_params(
                 .changed();
         }
         LocalEffect::Texture(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "質感+") {
                     *params = TextureParams {
@@ -2042,7 +1988,7 @@ fn draw_tone_detail_effect_params(
             radius.lab_hover_tip("拾う質感の大きさです。大きい値ほど広めの凹凸を対象にします。");
         }
         LocalEffect::HighPass(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱く") {
                     *params = HighPassParams {
@@ -2101,7 +2047,7 @@ fn draw_tone_detail_effect_params(
             contrast.lab_hover_tip("抽出したディテールを中間グレーからどれだけ離すかです。");
         }
         LocalEffect::FrequencySeparation(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "塗り面なめらか") {
                     *params = FrequencySeparationParams {
@@ -2149,7 +2095,7 @@ fn draw_tone_detail_effect_params(
                     "低周波の色/明暗と高周波の質感を分けて再合成します。肌や塗り面のざらつき、スキャンの色むら補修に使います。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let radius = ui.add(
                 egui::Slider::new(&mut params.radius_px, 1.0..=80.0)
@@ -2181,7 +2127,7 @@ fn draw_tone_detail_effect_params(
             strength.lab_hover_tip("周波数分離で再合成した結果へ近づける強さです。");
         }
         LocalEffect::HighlightsShadows(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "シャドウを強調") {
                     *params = HighlightsShadowsParams {
@@ -2220,7 +2166,7 @@ fn draw_tone_detail_effect_params(
                 .changed();
         }
         LocalEffect::Dehaze(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱く") {
                     *params = DehazeParams {
@@ -2255,7 +2201,7 @@ fn draw_tone_detail_effect_params(
                     "写真向けの霧・白っぽさ低減です。AI絵では弱めから確認してください。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= ui
                 .add(egui::Slider::new(&mut params.amount, 0.0..=1.0).text("量"))
@@ -2321,7 +2267,7 @@ fn draw_focus_motion_effect_params(
 
     match effect {
         LocalEffect::Blur(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱く") {
                     params.radius_px = 6.0;
@@ -2341,7 +2287,7 @@ fn draw_focus_motion_effect_params(
                 .changed();
         }
         LocalEffect::MotionBlur(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "横") {
                     *params = MotionBlurParams {
@@ -2381,7 +2327,7 @@ fn draw_focus_motion_effect_params(
                     "指定方向へ画像を流すぼかしです。背景やエフェクトに部分適用すると動きの表現に使えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let distance =
                 ui.add(egui::Slider::new(&mut params.distance_px, 0.0..=160.0).text("距離"));
@@ -2400,7 +2346,7 @@ fn draw_focus_motion_effect_params(
             strength.lab_hover_tip("元画像から移動ぼかし結果へどれだけ近づけるかです。");
         }
         LocalEffect::Wind(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "右へ") {
                     *params = WindParams {
@@ -2460,7 +2406,7 @@ fn draw_focus_motion_effect_params(
                     "指定した起点を片方向へ引きずります。明部は光の尾、暗部は漫画的な暗線、輪郭は速度感の強い流線に向いています。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let right = params.direction == WindDirection::Right;
@@ -2530,7 +2476,7 @@ fn draw_focus_motion_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::SpeedLines(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "白集中") {
                     *params = SpeedLinesParams {
@@ -2606,7 +2552,7 @@ fn draw_focus_motion_effect_params(
                     "放射状の集中線、または指定方向へ流れる平行スピード線を自動生成します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let radial = params.mode == SpeedLinesMode::Radial;
@@ -2687,7 +2633,7 @@ fn draw_focus_motion_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::RadialFlash(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "白黒衝撃") {
                     *params = RadialFlashParams {
@@ -2755,7 +2701,7 @@ fn draw_focus_motion_effect_params(
                     "中心から白黒のくさび形フラッシュを放射します。漫画的な衝撃や強い視線誘導向けです。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= draw_effect_center_controls(
                 ui,
@@ -2814,7 +2760,7 @@ fn draw_focus_motion_effect_params(
             if !params.range_initialized && !params.mode_selected {
                 params.mode_selected = true;
             }
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "奥ぼかし") {
                     *params = TiltShiftParams {
@@ -2886,7 +2832,7 @@ fn draw_focus_motion_effect_params(
                     "焦点帯または焦点円を残し、外側だけをぼかします。背景だけに使う場合は線形の奥ぼかしから試してください。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let linear_create_active = !params.range_initialized
@@ -2964,7 +2910,7 @@ fn draw_focus_motion_effect_params(
                         "範囲未設定です。アクティブな作成ボタンの形で、画像上をドラッグして範囲を作成します。",
                     )
                     .size(10.0)
-                    .color(Color32::from_gray(190)),
+                    .weak(),
                 );
             }
             let max_radius =
@@ -2976,7 +2922,7 @@ fn draw_focus_motion_effect_params(
             strength.lab_hover_tip("元画像からチルトシフト結果へどれだけ近づけるかです。");
         }
         LocalEffect::LensBlur(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱") {
                     *params = LensBlurParams {
@@ -3028,7 +2974,7 @@ fn draw_focus_motion_effect_params(
                     "絞り形状で画像を集めるぼかしです。明るい点がある背景に使うと、通常のぼかしよりレンズらしい玉ボケになります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal(|ui| {
                 let circular = params.aperture == LensBlurAperture::Circular;
@@ -3077,7 +3023,7 @@ fn draw_focus_motion_effect_params(
             strength.lab_hover_tip("元画像からレンズぼかし結果へどれだけ近づけるかです。");
         }
         LocalEffect::BokehSprite(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "丸い光") {
                     *params = BokehSpriteParams {
@@ -3141,7 +3087,7 @@ fn draw_focus_motion_effect_params(
                     "明るい点から形状付きの玉ボケ粒子を作ります。レンズぼかしの上に重ねる装飾や、夜景・魔法光の仕上げに向いています。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal(|ui| {
                 for (shape, label) in [
@@ -3188,7 +3134,7 @@ fn draw_focus_motion_effect_params(
             strength.lab_hover_tip("元画像に対して玉ボケ粒子をどれだけ重ねるかです。");
         }
         LocalEffect::LensDirt(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "ほこり") {
                     *params = LensDirtParams {
@@ -3252,7 +3198,7 @@ fn draw_focus_motion_effect_params(
                     "レンズ表面のほこり、水滴、曇りを重ねます。光源や逆光のある絵で、レンズ越しの質感を足す用途に向いています。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal(|ui| {
                 for (mode, label) in [
@@ -3344,7 +3290,7 @@ fn draw_distort_effect_params(
 
     match effect {
         LocalEffect::RadialBlur(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "ズーム弱") {
                     *params = RadialBlurParams {
@@ -3396,7 +3342,7 @@ fn draw_distort_effect_params(
                     "中心から外へ伸びるズームぼかし、または中心周りに回るぼかしです。集中線的な速度感や渦巻き感に使えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal(|ui| {
                 let zoom = params.mode == RadialBlurMode::Zoom;
@@ -3445,7 +3391,7 @@ fn draw_distort_effect_params(
             strength.lab_hover_tip("元画像から放射/回転ぼかし結果へどれだけ近づけるかです。");
         }
         LocalEffect::WaveDistortion(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "水面横波") {
                     *params = WaveDistortionParams {
@@ -3497,7 +3443,7 @@ fn draw_distort_effect_params(
                     "画像を波の形にサンプルし直します。反射、水面、熱気、背景の揺らぎに使えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let horizontal = params.mode == WaveDistortionMode::Horizontal;
@@ -3556,7 +3502,7 @@ fn draw_distort_effect_params(
             strength.lab_hover_tip("元画像からゆがみ結果へどれだけ近づけるかです。");
         }
         LocalEffect::HeatHaze(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "炎のゆらぎ") {
                     *params = HeatHazeParams {
@@ -3612,7 +3558,7 @@ fn draw_distort_effect_params(
                     "上昇する空気のように横へ揺らし、必要に応じて下側の画素を少し引き上げます。マスクで炎や排熱の範囲を切ると使いやすい効果です。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let amplitude =
                 ui.add(egui::Slider::new(&mut params.amplitude_px, -80.0..=80.0).text("揺れ幅"));
@@ -3656,7 +3602,7 @@ fn draw_distort_effect_params(
             strength.lab_hover_tip("元画像から陽炎結果へどれだけ近づけるかです。");
         }
         LocalEffect::PinchSpherize(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "魚眼") {
                     *params = PinchSpherizeParams {
@@ -3700,7 +3646,7 @@ fn draw_distort_effect_params(
                     "中心からの距離を変えて、魚眼レンズのようなふくらみや、内側へつまむ変形を作ります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let amount = ui.add(egui::Slider::new(&mut params.amount, -1.0..=1.0).text("変形量"));
             changed |= amount.changed();
@@ -3721,7 +3667,7 @@ fn draw_distort_effect_params(
             strength.lab_hover_tip("元画像から変形結果へどれだけ近づけるかです。");
         }
         LocalEffect::Twirl(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "渦弱") {
                     *params = TwirlParams {
@@ -3765,7 +3711,7 @@ fn draw_distort_effect_params(
                     "中心に近いほど強く回転させ、外側へ自然に弱まる渦巻き変形を作ります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let angle = ui.add(
                 egui::Slider::new(&mut params.angle_degrees, -720.0..=720.0)
@@ -3790,7 +3736,7 @@ fn draw_distort_effect_params(
             strength.lab_hover_tip("元画像から渦巻き結果へどれだけ近づけるかです。");
         }
         LocalEffect::PolarCoordinates(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "Tiny planet") {
                     *params = PolarCoordinatesParams {
@@ -3835,7 +3781,7 @@ fn draw_distort_effect_params(
                     "横方向を角度、縦方向を半径として扱い、画像を円形に巻いたり横長へ展開したりします。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let rect_to_polar = params.mode == PolarCoordinatesMode::RectToPolar;
@@ -3882,7 +3828,7 @@ fn draw_distort_effect_params(
             strength.lab_hover_tip("元画像から極座標変換結果へどれだけ近づけるかです。");
         }
         LocalEffect::GlassDisplacement(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "すりガラス") {
                     *params = GlassDisplacementParams {
@@ -3938,7 +3884,7 @@ fn draw_distort_effect_params(
                     "ノイズや波形を変位マップとして使い、元画像のサンプル位置をずらします。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let frosted = params.mode == GlassDisplacementMode::Frosted;
@@ -3995,7 +3941,7 @@ fn draw_distort_effect_params(
             strength.lab_hover_tip("元画像からガラス変位結果へどれだけ近づけるかです。");
         }
         LocalEffect::LensCorrection(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "樽型補正") {
                     *params = LensCorrectionParams {
@@ -4043,7 +3989,7 @@ fn draw_distort_effect_params(
                     "中心から外側へ向かうレンズ歪みを補正します。ズームは補正後の端の伸びやにじみを切るために使います。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let distortion =
                 ui.add(egui::Slider::new(&mut params.distortion, -1.0..=1.0).text("歪み補正"));
@@ -4192,7 +4138,7 @@ pub(crate) fn draw_effect_params(
             }
         }
         LocalEffect::LineExtract(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "白地黒線") {
                     *params = LineExtractParams {
@@ -4240,7 +4186,7 @@ pub(crate) fn draw_effect_params(
                     "Sobel エッジから線を作ります。しきい値を下げるほど薄い差も線になり、柔らかさで境界をなじませます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let black_on_white = params.mode == LineExtractMode::BlackOnWhite;
@@ -4295,7 +4241,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から線画抽出結果へどれだけ近づけるかです。");
         }
         LocalEffect::ColorTrace(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "柔らかく") {
                     *params = ColorTraceParams {
@@ -4336,7 +4282,7 @@ pub(crate) fn draw_effect_params(
                     "暗い線画を拾い、線を除外してぼかした周辺色を暗めにして線色へ混ぜます。黒線を下地になじませる仕上げ向けです。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
@@ -4374,7 +4320,7 @@ pub(crate) fn draw_effect_params(
                 .lab_hover_tip("色トレス後の線色の彩度です。負で控えめ、正で鮮やかになります。");
         }
         LocalEffect::ArtisticMedia(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "水彩") {
                     *params = ArtisticMediaParams {
@@ -4430,7 +4376,7 @@ pub(crate) fn draw_effect_params(
                     "色をなじませ、輪郭と紙目を足して絵画調に寄せます。鉛筆画では色量を上げると淡い色付きになります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let watercolor = params.mode == ArtisticMediaMode::Watercolor;
@@ -4478,7 +4424,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::BrushStroke(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "ドライブラシ") {
                     *params = BrushStrokeParams {
@@ -4542,7 +4488,7 @@ pub(crate) fn draw_effect_params(
                     "方向のあるサンプルで色を引き、筆跡・厚塗り・ナイフ跡のテクスチャを重ねます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let dry = params.mode == BrushStrokeMode::DryBrush;
@@ -4601,7 +4547,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::Cutout(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "フラット") {
                     *params = CutoutParams {
@@ -4649,7 +4595,7 @@ pub(crate) fn draw_effect_params(
                     "色面をなじませて階調を減らし、切り絵やフラットなベクター調に寄せます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let mut levels = params.levels as i32;
             let levels_response = ui.add(egui::Slider::new(&mut levels, 2..=12).text("階調"));
@@ -4675,7 +4621,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から切り絵結果へどれだけ近づけるかです。");
         }
         LocalEffect::ToonShade(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "セル塗り") {
                     *params = ToonShadeParams {
@@ -4739,7 +4685,7 @@ pub(crate) fn draw_effect_params(
                     "明度だけを段階化して色相を保ち、セル画風の影面と光面を作ります。影色・光色を少し混ぜるとアニメ塗りらしくなります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let mut bands = params.bands as i32;
             let bands_response = ui.add(egui::Slider::new(&mut bands, 2..=8).text("階調数"));
@@ -4798,7 +4744,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からトゥーンシェード結果へどれだけ近づけるかです。");
         }
         LocalEffect::Emboss(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "浅い") {
                     *params = EmbossParams {
@@ -4846,7 +4792,7 @@ pub(crate) fn draw_effect_params(
                     "明るさの傾きから陰影を作り、紙や金属の浮き彫りのように見せます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let angle = ui.add(
                 egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
@@ -4870,7 +4816,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からエンボス結果へどれだけ近づけるかです。");
         }
         LocalEffect::PixelStylize(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "結晶化") {
                     *params = PixelStylizeParams {
@@ -4926,7 +4872,7 @@ pub(crate) fn draw_effect_params(
                     "セルや粒で色を再構成します。結晶化/Facet は面、点描/メゾチントは粒の表現に向いています。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let crystallize = params.mode == PixelStylizeMode::Crystallize;
@@ -4977,7 +4923,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::Solarize(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "標準") {
                     *params = SolarizeParams {
@@ -5029,7 +4975,7 @@ pub(crate) fn draw_effect_params(
                     "しきい値より明るいトーンを反転します。ネガより部分的で、境目の色ずれや暗室風の効果を作れます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold =
                 ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
@@ -5058,7 +5004,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からソラリゼーション結果へどれだけ近づけるかです。");
         }
         LocalEffect::GlowingEdges(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "シアン") {
                     *params = GlowingEdgesParams {
@@ -5126,7 +5072,7 @@ pub(crate) fn draw_effect_params(
                     "明るさの輪郭を抽出し、黒背景または元画像上にネオン色の線と光彩を重ねます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold =
                 ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
@@ -5189,7 +5135,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からエッジ光彩結果へどれだけ近づけるかです。");
         }
         LocalEffect::OilPaint(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "標準") {
                     *params = OilPaintParams {
@@ -5233,7 +5179,7 @@ pub(crate) fn draw_effect_params(
                     "4象限の輝度分散が小さい領域を選んで平均色に置き換える Kuwahara 系の油彩化です。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let radius = ui.add(
                 egui::Slider::new(&mut params.radius_px, 1.0..=12.0)
@@ -5255,7 +5201,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から油彩結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "淡く") {
                     *params = SoftFocusParams {
@@ -5280,7 +5226,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::Orton(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "自然") {
                     *params = OrtonParams {
@@ -5328,7 +5274,7 @@ pub(crate) fn draw_effect_params(
                     "ぼかして明るくしたコピーをスクリーン合成し、柔らかい光と少し濃い色を足します。Soft Focus よりルック寄りの仕上げです。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let radius = ui.add(
                 egui::Slider::new(&mut params.radius_px, 0.0..=160.0)
@@ -5357,7 +5303,7 @@ pub(crate) fn draw_effect_params(
             saturation.lab_hover_tip("ボケコピー側の鮮やかさです。");
         }
         LocalEffect::Mosaic(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "長辺0.5倍") {
                     params.tile_mode = MosaicTileMode::LongEdgeRatio(0.5);
@@ -5429,7 +5375,7 @@ pub(crate) fn draw_effect_params(
             ui.label(
                 egui::RichText::new(format!("実タイルサイズ: {actual_px}px"))
                     .size(11.0)
-                    .color(Color32::from_gray(170)),
+                    .weak(),
             );
 
             ui.separator();
@@ -5458,7 +5404,7 @@ pub(crate) fn draw_effect_params(
             ui.label(
                 egui::RichText::new(params.boundary.process_description())
                     .size(10.0)
-                    .color(Color32::from_gray(170)),
+                    .weak(),
             );
             if matches!(params.boundary, MosaicBoundary::Opaque) {
                 ui.label(
@@ -5466,12 +5412,12 @@ pub(crate) fn draw_effect_params(
                         "隠蔽加工と同じく、マスクに触れたタイル全体へ効果が広がります。",
                     )
                     .size(10.0)
-                    .color(Color32::from_gray(170)),
+                    .weak(),
                 );
             }
         }
         LocalEffect::Sharpen(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱く") {
                     *params = SharpenParams {
@@ -5523,7 +5469,7 @@ pub(crate) fn draw_effect_params(
             );
         }
         LocalEffect::SmartSharpen(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "自然") {
                     *params = SmartSharpenParams {
@@ -5584,7 +5530,7 @@ pub(crate) fn draw_effect_params(
             halo.lab_hover_tip("明るいフチや暗いフチが立ちすぎる方向の強調を抑えます。");
         }
         LocalEffect::Hsl(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "赤へ") {
                     *params = HslParams {
@@ -5629,7 +5575,7 @@ pub(crate) fn draw_effect_params(
             ui.label(
                 egui::RichText::new("カラー範囲マスクと組み合わせると、髪や服だけ色替えできます。")
                     .size(10.0)
-                    .color(Color32::from_gray(170)),
+                    .weak(),
             );
             changed |= ui
                 .add(egui::Slider::new(&mut params.hue_degrees, -180.0..=180.0).text("色相"))
@@ -5642,7 +5588,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::ColorMixer(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "空を濃く") {
                     *params = ColorMixerParams::default();
@@ -5693,7 +5639,7 @@ pub(crate) fn draw_effect_params(
                     "色相ごとに補正します。カラー範囲マスクなしでも、近い色だけをまとめて調整できます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let range_response =
                 ui.add(egui::Slider::new(&mut params.range_degrees, 8.0..=90.0).text("色帯の広さ"));
@@ -5717,7 +5663,7 @@ pub(crate) fn draw_effect_params(
             }
         }
         LocalEffect::Look(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "夕焼け") {
                     *params = LookParams {
@@ -5782,7 +5728,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::CubeLut(params) => {
-            ui.label(egui::RichText::new("LUTファイル").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("LUTファイル").weak());
             if params.is_loaded() {
                 ui.label(format!("読み込み済み: {} ({}^3)", params.name, params.size));
             } else {
@@ -5796,14 +5742,14 @@ pub(crate) fn draw_effect_params(
                     "3D LUT は RGB の組み合わせごとに色を変換する外部カラープリセットです。読み込んだ LUT データは設定ファイルにも保存されます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から LUT 変換後の色へどれだけ近づけるかです。");
         }
         LocalEffect::Posterize(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱 16段") {
                     *params = PosterizeParams {
@@ -5839,7 +5785,7 @@ pub(crate) fn draw_effect_params(
                     "RGB各チャンネルの階調を指定段数へ丸めます。色数を減らしたポスター調やレトロ調に使います。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let levels = ui.add(egui::Slider::new(&mut params.levels, 2..=256).text("階調数"));
             changed |= levels.changed();
@@ -5849,7 +5795,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から階調を減らした色へどれだけ近づけるかです。");
         }
         LocalEffect::RetroPalette(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "1bit") {
                     *params = RetroPaletteParams {
@@ -5921,7 +5867,7 @@ pub(crate) fn draw_effect_params(
                     "ポスタリゼーションと違い、実機風の固定パレットや画像に合わせた適応パレットへ色を寄せます。ディザを上げると階調は滑らかになりますが、網目感が増えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let before_mode = params.mode;
             lab_combo_box(
@@ -5959,7 +5905,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からレトロ減色後の色へどれだけ近づけるかです。");
         }
         LocalEffect::CrtDisplay(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "控えめ") {
                     *params = CrtDisplayParams::preset(CrtDisplayMode::Simple);
@@ -5993,7 +5939,7 @@ pub(crate) fn draw_effect_params(
                     "スキャンライン、RGBマスク、ビームにじみ、明部グローを同じ画像サイズのまま重ねます。レトロ減色と組み合わせると実機表示風に寄せられます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let before_mode = params.mode;
             lab_combo_box(
@@ -6068,7 +6014,7 @@ pub(crate) fn draw_effect_params(
             }
         }
         LocalEffect::Threshold(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "標準") {
                     *params = ThresholdParams {
@@ -6108,7 +6054,7 @@ pub(crate) fn draw_effect_params(
                     "輝度がしきい値以上なら白、それ未満なら黒にします。線画確認やモノクロ風の加工に使えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold =
                 ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
@@ -6124,7 +6070,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から黒白化した結果へどれだけ近づけるかです。");
         }
         LocalEffect::Invert(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "ネガ") {
                     *params = InvertParams { strength: 1.0 };
@@ -6140,14 +6086,14 @@ pub(crate) fn draw_effect_params(
                     "RGBの明暗を反転します。強度を下げると元画像とネガを混ぜた特殊な色味になります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から反転後の色へどれだけ近づけるかです。");
         }
         LocalEffect::Duotone(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "セピア") {
                     *params = DuotoneParams {
@@ -6234,7 +6180,7 @@ pub(crate) fn draw_effect_params(
                     "明るさを元に2色または3色のインク風カラーへ置き換えます。グラデーションマップより印刷・ポスター調に寄せた効果です。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
@@ -6246,7 +6192,7 @@ pub(crate) fn draw_effect_params(
             contrast.lab_hover_tip("色を割り当てる前に明暗差を締めたり広げたりします。");
         }
         LocalEffect::Equalize(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱") {
                     *params = EqualizeParams {
@@ -6282,7 +6228,7 @@ pub(crate) fn draw_effect_params(
                     "画像全体の明暗分布を広げます。色を保つと元の色味をなるべく残し、白黒にすると輝度だけで階調を整えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
@@ -6293,7 +6239,7 @@ pub(crate) fn draw_effect_params(
             preserve.lab_hover_tip("ONにすると、明るさだけを広げて元の色相をなるべく維持します。OFFにすると白黒の平坦化になります。");
         }
         LocalEffect::GradientMap(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "夕焼け") {
                     *params = GradientMapParams {
@@ -6381,7 +6327,7 @@ pub(crate) fn draw_effect_params(
                     "輝度をグラデーション色に置き換えます。マスクや強度を弱めると色味だけを乗せる用途にも使えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let strength_response =
                 ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
@@ -6426,14 +6372,7 @@ pub(crate) fn draw_effect_params(
                     "コピー元と塗り先の基準点で固定オフセットを決め、マスク全体へ同じずらし量で複写します。"
                 }
             };
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(description)
-                        .size(10.0)
-                        .color(Color32::from_gray(170)),
-                )
-                .wrap(),
-            );
+            ui.add(egui::Label::new(egui::RichText::new(description).size(10.0).weak()).wrap());
             if params.mode == RepairMode::Surrounding && base_mask_is_full {
                 ui.add(
                     egui::Label::new(
@@ -6630,7 +6569,7 @@ pub(crate) fn draw_effect_params(
             }
         }
         LocalEffect::ColorFill(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "白背景") {
                     *params = ColorFillParams {
@@ -6719,7 +6658,7 @@ pub(crate) fn draw_effect_params(
                     "マスク範囲の元画像RGBを、指定した色またはグラデーション色へ置き換えます。被写体切り抜きの背景作成や確認用に向きます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             if params.shape != ColorOverlayShape::Unselected {
                 let color_label = if params.shape == ColorOverlayShape::Solid {
@@ -6822,7 +6761,7 @@ pub(crate) fn draw_effect_params(
             }
         }
         LocalEffect::Frame(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "黒枠") {
                     *params = FrameParams {
@@ -6900,7 +6839,7 @@ pub(crate) fn draw_effect_params(
                     "画像サイズは変えず、画像の内側に枠や黒帯を描きます。外側キャンバスを広げる余白追加とは別の仕上げ効果です。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             merge_rgb_color_response(
                 draw_rgb_color_control(
@@ -7027,7 +6966,7 @@ pub(crate) fn draw_effect_params(
             }
         }
         LocalEffect::OutlineStroke(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "黒フチ") {
                     *params = OutlineStrokeParams {
@@ -7065,7 +7004,7 @@ pub(crate) fn draw_effect_params(
                     "マスク境界をもとに色枠を描きます。初期状態では前ON/後OFFなので、外側の縁取りがマスクの外へ出ます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let before_placement = params.placement;
             lab_combo_box(
@@ -7121,7 +7060,7 @@ pub(crate) fn draw_effect_params(
             opacity.lab_hover_tip("縁取り色を元画像へ重ねる強さです。");
         }
         LocalEffect::RimLight(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "右リム") {
                     *params = RimLightParams {
@@ -7173,7 +7112,7 @@ pub(crate) fn draw_effect_params(
                     "マスク境界の光方向に向いた側だけを照らします。初期状態では前ON/後OFFなので、輪郭光がマスク外へ広がります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             merge_rgb_color_response(
                 draw_rgb_color_control(
@@ -7212,7 +7151,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("輪郭光を元画像へ重ねる強さです。");
         }
         LocalEffect::ContactShadow(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "内側AO") {
                     *params = ContactShadowParams {
@@ -7264,7 +7203,7 @@ pub(crate) fn draw_effect_params(
                     "マスク境界の内側だけを暗くします。初期状態では前ON/後ONなので、簡易AOがマスク内に収まります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             merge_rgb_color_response(
                 draw_rgb_color_control(
@@ -7308,7 +7247,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("影色へ寄せる強さです。");
         }
         LocalEffect::ColorOverlay(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "夕焼け") {
                     *params = ColorOverlayParams {
@@ -7409,7 +7348,7 @@ pub(crate) fn draw_effect_params(
                     "画像の明るさではなく画面上の位置を基準に、単色またはグラデーションの色面を合成します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let color_label = if params.shape == ColorOverlayShape::Solid {
                 "塗り色"
@@ -7484,7 +7423,7 @@ pub(crate) fn draw_effect_params(
             }
         }
         LocalEffect::NeonGlow(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "シアン管") {
                     *params = NeonGlowParams {
@@ -7563,7 +7502,7 @@ pub(crate) fn draw_effect_params(
                     "輝度だけでなく高彩度の色も発光源として拾い、芯のにじみと広いハローを二段で重ねます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold =
                 ui.add(egui::Slider::new(&mut params.threshold, 0.05..=0.999).text("発光しきい値"));
@@ -7654,7 +7593,7 @@ pub(crate) fn draw_effect_params(
             screen_blend.lab_hover_tip("ONにすると、加算より白飛びを抑えながら発光感を出します。");
         }
         LocalEffect::DiffuseGlow(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "夢幻") {
                     *params = DiffuseGlowParams {
@@ -7695,7 +7634,7 @@ pub(crate) fn draw_effect_params(
                     "明るい部分を白く拡散し、粒状ノイズで光のにじみにムラを作ります。Bloom より柔らかい写真効果向けです。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold =
                 ui.add(egui::Slider::new(&mut params.threshold, 0.0..=0.98).text("明部しきい値"));
@@ -7726,7 +7665,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::Bloom(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "弱い光") {
                     *params = BloomParams {
@@ -7764,7 +7703,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::Halation(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "アニメ光") {
                     *params = HalationParams {
@@ -7820,7 +7759,7 @@ pub(crate) fn draw_effect_params(
                     "明るい部分を暖色の白へ寄せて柔らかくにじませます。エッジ寄せを上げると明暗境界の白浮きが強くなります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold =
                 ui.add(egui::Slider::new(&mut params.threshold, 0.05..=0.98).text("明部しきい値"));
@@ -7863,7 +7802,7 @@ pub(crate) fn draw_effect_params(
             screen_blend.lab_hover_tip("ONにすると、加算より白飛びを抑えながら発光感を出します。");
         }
         LocalEffect::ColorDodgeGlow(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "魔法光") {
                     *params = ColorDodgeGlowParams {
@@ -7915,7 +7854,7 @@ pub(crate) fn draw_effect_params(
                     "明るい部分を発光源にして、スクリーンと覆い焼きを混ぜた色付きの強い光を重ねます。初期状態では前ON/後OFFなので光がマスク外へ広がります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold =
                 ui.add(egui::Slider::new(&mut params.threshold, 0.0..=0.995).text("発光しきい値"));
@@ -7953,7 +7892,7 @@ pub(crate) fn draw_effect_params(
             color_strength.lab_hover_tip("元の明部色から、指定した光色へどれだけ寄せるかです。");
         }
         LocalEffect::GodRays(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "木漏れ日") {
                     *params = GodRaysParams {
@@ -7994,7 +7933,7 @@ pub(crate) fn draw_effect_params(
                     "明るい部分を拾い、光源中心から外側へ伸びる放射状の光芒を作ります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= draw_effect_center_controls(
                 ui,
@@ -8025,7 +7964,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::LensFlare(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "逆光") {
                     *params = LensFlareParams {
@@ -8072,7 +8011,7 @@ pub(crate) fn draw_effect_params(
                     "指定した光源から、にじみ、薄いリング、レンズ内反射のゴーストを作ります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= draw_effect_center_controls(
                 ui,
@@ -8105,7 +8044,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::AnamorphicFlare(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "シネマ青") {
                     *params = AnamorphicFlareParams {
@@ -8157,7 +8096,7 @@ pub(crate) fn draw_effect_params(
                     "明るい部分を拾い、横方向へ色付きのストリークを伸ばします。初期状態では前ON/後OFFなので光がマスク外へ広がります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let threshold = ui.add(
                 egui::Slider::new(&mut params.threshold, 0.0..=0.98)
@@ -8203,7 +8142,7 @@ pub(crate) fn draw_effect_params(
             color_strength.lab_hover_tip("元の明部色から指定したフレア色へどれだけ寄せるかです。");
         }
         LocalEffect::LightLeak(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "左上") {
                     *params = LightLeakParams {
@@ -8271,7 +8210,7 @@ pub(crate) fn draw_effect_params(
                     "指定位置からスクリーン合成の暖色光、薄いヘイズ、斜めの漏れ筋を重ねます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= draw_effect_center_controls(
                 ui,
@@ -8327,7 +8266,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::BacklightHaze(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "夕逆光") {
                     *params = BacklightHazeParams {
@@ -8395,7 +8334,7 @@ pub(crate) fn draw_effect_params(
                     "光源方向の薄い空気かぶり、グロー、影の持ち上げをまとめて足します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= draw_effect_center_controls(
                 ui,
@@ -8449,7 +8388,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から逆光ヘイズ結果へどれだけ近づけるかです。");
         }
         LocalEffect::CloudFog(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "薄霧") {
                     *params = CloudFogParams {
@@ -8513,7 +8452,7 @@ pub(crate) fn draw_effect_params(
                     "手続き型のノイズで霧や雲を重ねます。マスクと組み合わせて遠景や背景に大気感を足せます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 let fog = params.mode == CloudFogMode::Fog;
@@ -8568,7 +8507,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::WaterCaustics(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "水面") {
                     *params = WaterCausticsParams {
@@ -8628,7 +8567,7 @@ pub(crate) fn draw_effect_params(
                     "水面越しの揺らぐ光網を重ねます。背景や水中、プールの反射光に向きます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let scale = ui.add(
                 egui::Slider::new(&mut params.scale_px, 8.0..=240.0)
@@ -8664,7 +8603,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から水中コースティクス結果へどれだけ近づけるかです。");
         }
         LocalEffect::ParticleOverlay(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "雨") {
                     *params = ParticleOverlayParams {
@@ -8728,7 +8667,7 @@ pub(crate) fn draw_effect_params(
                     "雨、雪、花びらを手続き型の粒子として重ねます。seedで配置を変えられます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 changed |= ui
@@ -8791,7 +8730,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から粒子オーバーレイ結果へどれだけ近づけるかです。");
         }
         LocalEffect::Aurora(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "緑紫") {
                     *params = AuroraParams {
@@ -8863,7 +8802,7 @@ pub(crate) fn draw_effect_params(
                     "縦に揺れる発光カーテンをスクリーン合成します。夜空や幻想的な背景に向きます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let bands =
                 ui.add(egui::Slider::new(&mut params.band_count, 1.0..=12.0).text("カーテン数"));
@@ -8928,7 +8867,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からオーロラ合成結果へどれだけ近づけるかです。");
         }
         LocalEffect::Spotlight(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "主役ライト") {
                     *params = SpotlightParams {
@@ -8984,7 +8923,7 @@ pub(crate) fn draw_effect_params(
                     "指定中心を照らし、周辺を落として視線誘導や舞台照明のような局所光を作ります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= draw_effect_center_controls(
                 ui,
@@ -9026,7 +8965,7 @@ pub(crate) fn draw_effect_params(
             );
         }
         LocalEffect::Vignette(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "周辺を暗く") {
                     *params = VignetteParams {
@@ -9056,7 +8995,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::FilmGrain(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "微量") {
                     *params = FilmGrainParams {
@@ -9090,7 +9029,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::Noise(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "微量") {
                     *params = NoiseParams {
@@ -9151,7 +9090,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::ChromaticAberration(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "微量") {
                     params.offset_px = 1.2;
@@ -9167,7 +9106,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::Anaglyph3d(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "赤シアン") {
                     *params = AnaglyphParams {
@@ -9225,7 +9164,7 @@ pub(crate) fn draw_effect_params(
                     "左右にずらした画像を色チャンネルへ割り当てます。赤シアンは立体視風、RGB分離はグリッチ寄りの色ズレに向きます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let mut activates_effect = false;
             let previous_mode = params.mode;
@@ -9296,7 +9235,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からアナグリフ結果へ切り替える強さです。");
         }
         LocalEffect::Defringe(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "軽く") {
                     *params = DefringeParams {
@@ -9344,7 +9283,7 @@ pub(crate) fn draw_effect_params(
                     "周辺より彩度が高いエッジ上の色フチだけを検出し、局所的に彩度を落とします。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let radius = ui.add(
                 egui::Slider::new(&mut params.radius_px, 1.0..=8.0)
@@ -9372,7 +9311,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から色フチ除去結果へどれだけ近づけるかです。");
         }
         LocalEffect::ScanlineGlitch(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "ホログラム") {
                     *params = ScanlineGlitchParams {
@@ -9430,7 +9369,7 @@ pub(crate) fn draw_effect_params(
             ui.label(
                 egui::RichText::new("横走査線、行ごとのずれ、RGBずれを重ねるデジタル演出です。")
                     .size(10.0)
-                    .color(Color32::from_gray(170)),
+                    .weak(),
             );
             changed |= ui
                 .add(
@@ -9463,7 +9402,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::Vhs(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "VHS標準") {
                     *params = VhsParams {
@@ -9531,7 +9470,7 @@ pub(crate) fn draw_effect_params(
                     "輝度は残し、色成分だけを横ににじませるアナログビデオ風の演出です。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= ui
                 .add(
@@ -9577,7 +9516,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::DataMosh(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "軽い破綻") {
                     *params = DataMoshParams {
@@ -9649,7 +9588,7 @@ pub(crate) fn draw_effect_params(
                     "ブロック単位のずれ、フリーズ、RGB分離、ノイズを重ねるデジタル破損演出です。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let block_size = ui.add(
                 egui::Slider::new(&mut params.block_size_px, 2.0..=128.0)
@@ -9714,7 +9653,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像からデータモッシュ結果へどれだけ近づけるかです。");
         }
         LocalEffect::PixelSort(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "横流れ") {
                     *params = PixelSortParams {
@@ -9766,7 +9705,7 @@ pub(crate) fn draw_effect_params(
                     "指定した明るさ帯の連続画素だけを行または列方向に並べ替えます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
 
             let previous_direction = params.direction;
@@ -9827,7 +9766,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::OldFilm(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "古写真") {
                     *params = OldFilmParams {
@@ -9885,7 +9824,7 @@ pub(crate) fn draw_effect_params(
             ui.label(
                 egui::RichText::new("セピア調の退色、周辺落ち、粒子、ホコリ、縦傷を重ねます。")
                     .size(10.0)
-                    .color(Color32::from_gray(170)),
+                    .weak(),
             );
             changed |= ui
                 .add(egui::Slider::new(&mut params.sepia, 0.0..=1.0).text("セピア"))
@@ -9915,7 +9854,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::Halftone(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "細かい") {
                     *params = HalftoneParams {
@@ -9937,7 +9876,7 @@ pub(crate) fn draw_effect_params(
                     "印刷網点風の演出です。背景や効果線、漫画調の質感付け向けです。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let mut cell = params.cell_px as i32;
             changed |= ui
@@ -9949,7 +9888,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::ScreenTone(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "網点") {
                     *params = ScreenToneParams {
@@ -10005,7 +9944,7 @@ pub(crate) fn draw_effect_params(
                     "漫画用のトーンです。階調追従を下げると均一なトーン、上げると元画像の明暗に沿ったトーンになります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 changed |= ui
@@ -10038,7 +9977,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::ColorHalftone(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "ポップ") {
                     *params = ColorHalftoneParams {
@@ -10079,7 +10018,7 @@ pub(crate) fn draw_effect_params(
                     "CMYKの4版を角度違いのドットにします。ドット増減を上げるとインクが太り、印刷物らしい粗さが出ます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= ui
                 .add(egui::Slider::new(&mut params.cell_px, 3.0..=160.0).text("セル(px)"))
@@ -10104,7 +10043,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::CmykPlateShift(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "軽い版ズレ") {
                     *params = CmykPlateShiftParams {
@@ -10156,7 +10095,7 @@ pub(crate) fn draw_effect_params(
                     "CMYKの各色版を少し違う位置から重ね直します。カラーハーフトーンや紙目と組み合わせると印刷物らしいズレが出ます。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let offset = ui.add(
                 egui::Slider::new(&mut params.offset_px, 0.0..=32.0)
@@ -10192,7 +10131,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から版ズレ再合成結果へどれだけ近づけるかです。");
         }
         LocalEffect::Lithograph(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "ピンク×シアン") {
                     *params = LithographParams {
@@ -10264,7 +10203,7 @@ pub(crate) fn draw_effect_params(
                     "元画像を2色のスポットインクと紙色へ寄せ、少しの版ズレと粒状感を足します。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let ink_a = draw_rgb_color_control(
                 ui,
@@ -10341,7 +10280,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::Engraving(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "古典") {
                     *params = EngravingParams {
@@ -10417,7 +10356,7 @@ pub(crate) fn draw_effect_params(
                     "明暗を線の太さとクロスハッチに置き換え、紙色とインクで古典挿絵の線彫り感を作ります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let ink = draw_rgb_color_control(
                 ui,
@@ -10482,7 +10421,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::NewspaperPrint(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "新聞紙") {
                     *params = NewspaperPrintParams {
@@ -10546,7 +10485,7 @@ pub(crate) fn draw_effect_params(
                     "元画像の明るさを粗い網点に置き換え、黄ばんだ紙色と紙目、少しにじんだインクで新聞・古印刷物風にします。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             changed |= ui
                 .add(egui::Slider::new(&mut params.cell_px, 3.0..=96.0).text("網点セル(px)"))
@@ -10579,7 +10518,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::Textureizer(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "紙目") {
                     *params = TextureizerParams {
@@ -10635,7 +10574,7 @@ pub(crate) fn draw_effect_params(
                     "手続き型の紙目や織り目をソフトライトで重ねます。フィルム粒子より大きな面の質感向けです。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             ui.horizontal_wrapped(|ui| {
                 changed |= ui
@@ -10670,7 +10609,7 @@ pub(crate) fn draw_effect_params(
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::StarGlow(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "クロス弱") {
                     *params = StarGlowParams {
@@ -10726,7 +10665,7 @@ pub(crate) fn draw_effect_params(
             ui.label(
                 egui::RichText::new("明るい点を抽出し、レンズのクロス/スター光条風に伸ばします。")
                     .size(10.0)
-                    .color(Color32::from_gray(170)),
+                    .weak(),
             );
             let mut ray_count = params.ray_count as i32;
             changed |= ui
@@ -10758,7 +10697,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::DiffractionStarburst(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "6羽スター") {
                     *params = DiffractionStarburstParams {
@@ -10818,7 +10757,7 @@ pub(crate) fn draw_effect_params(
                     "明るい点から絞り羽根状の細い光条を伸ばします。奇数羽根では光条が倍になります。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let mut blade_count = params.blade_count as i32;
             changed |= ui
@@ -10853,7 +10792,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::EdgeSmooth(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "背景なじませ") {
                     *params = EdgeSmoothParams {
@@ -10885,7 +10824,7 @@ pub(crate) fn draw_effect_params(
                 .changed();
         }
         LocalEffect::Despeckle(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "点ゴミ") {
                     *params = DespeckleParams {
@@ -10917,7 +10856,7 @@ pub(crate) fn draw_effect_params(
                     "周囲から大きく外れた孤立点だけを中央値へ寄せます。通常のメディアンより線や面を残しやすい点ゴミ除去です。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let radius = ui.add(egui::Slider::new(&mut params.radius_px, 1.0..=4.0).text("半径"));
             changed |= radius.changed();
@@ -10935,7 +10874,7 @@ pub(crate) fn draw_effect_params(
             strength.lab_hover_tip("元画像から補修後の色へどれだけ近づけるかです。");
         }
         LocalEffect::Median(params) => {
-            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.label(egui::RichText::new("プリセット").weak());
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "点ノイズ") {
                     *params = MedianParams {
@@ -10964,7 +10903,7 @@ pub(crate) fn draw_effect_params(
                     "周囲の中央値に置き換えることで、孤立した白点・黒点や細かいゴミを落とします。線や細部も丸まりやすいので小さめの半径から試してください。",
                 )
                 .size(10.0)
-                .color(Color32::from_gray(170)),
+                .weak(),
             );
             let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=8.0).text("半径"));
             changed |= radius.changed();
@@ -10997,27 +10936,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_adjust_dark_context_style_is_scoped() {
-        let ctx = egui::Context::default();
-        ctx.set_theme(egui::ThemePreference::Light);
-        assert!(!ctx.style().visuals.dark_mode);
-
-        with_local_adjust_dark_context_style(&ctx, || {
-            assert_eq!(
-                ctx.options(|options| options.theme_preference),
-                egui::ThemePreference::Dark
-            );
-            assert!(ctx.style().visuals.dark_mode);
-        });
-
-        assert_eq!(
-            ctx.options(|options| options.theme_preference),
-            egui::ThemePreference::Light
-        );
-        assert!(!ctx.style().visuals.dark_mode);
-    }
-
-    #[test]
     fn local_adjust_combo_popup_is_dark_inside_a_light_app() {
         use egui_kittest::{Harness, kittest::Queryable};
 
@@ -11034,7 +10952,7 @@ mod tests {
                     return;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    apply_local_adjust_dark_ui(ui);
+                    crate::os_theme::apply_dark_ui(ui);
                     ui.set_max_width(150.0);
                     lab_combo_box(
                         ui,
