@@ -246,6 +246,109 @@ pub(super) fn filter_upscaled_video_pairs_fast(
     });
 }
 
+/// 同じ物理フォルダ内の動画と同名 stem の画像を一覧から除外する。
+///
+/// `media` は必ず 1 フォルダ分だけを渡す。フラットビュー全体を渡すと、別フォルダの
+/// 同名ファイルまで衝突する。`use_sidecar` が有効なら、除外画像を動画サムネイルへ
+/// 引き継ぐため `(video_path, image_path)` を返す。画像の除外自体は設定に関係なく行う。
+pub(super) fn filter_video_image_duplicates(
+    media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    use_sidecar: bool,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut videos_by_stem: std::collections::HashMap<String, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for (path, kind, _, _) in media.iter() {
+        if *kind == ScanMediaKind::Video {
+            videos_by_stem
+                .entry(super::stem_lower(path))
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    if videos_by_stem.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sidecars = Vec::new();
+    if use_sidecar {
+        for (path, kind, _, _) in media.iter() {
+            if *kind != ScanMediaKind::Image {
+                continue;
+            }
+            if let Some(videos) = videos_by_stem.get(&super::stem_lower(path)) {
+                sidecars.extend(videos.iter().cloned().map(|video| (video, path.clone())));
+            }
+        }
+    }
+
+    media.retain(|(path, kind, _, _)| {
+        *kind != ScanMediaKind::Image || !videos_by_stem.contains_key(&super::stem_lower(path))
+    });
+    sidecars
+}
+
+/// ZIP/PDF/対応アーカイブと同名の実フォルダがあれば、実フォルダを一覧の正本にする。
+pub(super) fn filter_virtual_folder_duplicates(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+) {
+    let real_folder_names: std::collections::HashSet<String> = folders
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::Folder(path) => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_lowercase),
+            _ => None,
+        })
+        .collect();
+    let keep: Vec<bool> = folders
+        .iter()
+        .map(|item| match item {
+            GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => {
+                !real_folder_names.contains(&super::stem_lower(path))
+            }
+            _ => true,
+        })
+        .collect();
+    let mut iter = keep.iter();
+    folders.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    folder_metas.retain(|_| *iter.next().unwrap());
+}
+
+/// 同名の ZIP/CBZ があれば、変換元になる RAR/7z/LZH 等を一覧から除外する。
+pub(super) fn filter_convertible_archive_duplicates(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+) {
+    let zip_stems: std::collections::HashSet<String> = folders
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::ZipFile(path) => Some(super::stem_lower(path)),
+            _ => None,
+        })
+        .collect();
+    if zip_stems.is_empty() {
+        return;
+    }
+    let keep: Vec<bool> = folders
+        .iter()
+        .map(|item| match item {
+            GridItem::ConvertibleArchive { path, .. } => {
+                !zip_stems.contains(&super::stem_lower(path))
+            }
+            _ => true,
+        })
+        .collect();
+    let mut iter = keep.iter();
+    folders.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    folder_metas.retain(|_| *iter.next().unwrap());
+}
+
 /// 同名ステムの画像を拡張子優先順で 1 件へ絞る。一覧と画像フォルダのページ数で共有する。
 pub(super) fn filter_image_ext_duplicates(
     all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,

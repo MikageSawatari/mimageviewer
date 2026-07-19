@@ -4179,7 +4179,7 @@ mod phase_c_drill_nav_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
-            .saturating_sub(FacetDatePreset::Last7Days.seconds() + 1);
+            .saturating_sub(8 * 86_400);
         app.image_metas = vec![Some((old_mtime, 0))];
 
         app.settings

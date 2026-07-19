@@ -129,44 +129,15 @@ pub struct FavoriteEntry {
 // SmartFolderDefinition (v2.6.0)
 // -----------------------------------------------------------------------
 
-/// スマートフォルダが一覧へ取り込むコンテナ種別。
-#[derive(
-    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum SmartFolderContainerKind {
-    ImageFolder,
-    Zip,
-    Pdf,
-    Archive,
-    /// 将来版が追加した値を旧版で読んだ場合の受け皿。sanitize で除外する。
-    #[serde(other)]
-    Unknown,
-}
-
-impl SmartFolderContainerKind {
-    pub fn all() -> &'static [Self] {
-        &[Self::ImageFolder, Self::Zip, Self::Pdf, Self::Archive]
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ImageFolder => "画像のみフォルダ",
-            Self::Zip => "ZIP / CBZ",
-            Self::Pdf => "PDF",
-            Self::Archive => "その他の対応アーカイブ",
-            Self::Unknown => "不明",
-        }
-    }
-}
-
-/// スマートフォルダ共通条件。空の集合 / 空文字は「制限なし」。
+/// スマートフォルダの 1 ルール内で使う条件。
+/// 空の集合 / 空文字は「制限なし」。AI モデル / 生成ツール / 画像色 / 場所は、
+/// ファイル内容の走査または現在 snapshot 固有の情報を必要とするため保存しない。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct SmartFolderFilter {
     #[serde(default)]
     pub name_contains: String,
     #[serde(default)]
-    pub kinds: std::collections::BTreeSet<SmartFolderContainerKind>,
+    pub kinds: std::collections::BTreeSet<FacetItemKind>,
     /// 先頭の `.` を除いた小文字拡張子。空なら全拡張子。
     #[serde(default)]
     pub extensions: std::collections::BTreeSet<String>,
@@ -180,7 +151,13 @@ pub struct SmartFolderFilter {
     #[serde(default)]
     pub tags: std::collections::BTreeSet<String>,
     #[serde(default)]
+    pub tag_mode: FacetTagMode,
+    #[serde(default)]
     pub include_untagged: bool,
+    #[serde(default)]
+    pub edits: std::collections::BTreeSet<FacetEditFlag>,
+    #[serde(default)]
+    pub edit_include_descendants: bool,
 }
 
 fn default_smart_folder_ratings() -> [bool; 6] {
@@ -197,19 +174,38 @@ impl Default for SmartFolderFilter {
             size_preset: None,
             ratings: default_smart_folder_ratings(),
             tags: std::collections::BTreeSet::new(),
+            tag_mode: FacetTagMode::default(),
             include_untagged: false,
+            edits: std::collections::BTreeSet::new(),
+            edit_include_descendants: false,
         }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct SmartFolderSource {
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SmartFolderRule {
     #[serde(default = "Uuid::nil")]
     pub id: Uuid,
     #[serde(default)]
-    pub path: PathBuf,
+    pub source: PathBuf,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub include_descendants: bool,
+    #[serde(default)]
+    pub filter: SmartFolderFilter,
+}
+
+impl SmartFolderRule {
+    pub fn new(source: PathBuf, include_descendants: bool, filter: SmartFolderFilter) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            source,
+            enabled: true,
+            include_descendants,
+            filter,
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -219,15 +215,9 @@ pub struct SmartFolderDefinition {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
-    pub sources: Vec<SmartFolderSource>,
-    #[serde(default)]
-    pub filter: SmartFolderFilter,
-    #[serde(default)]
-    pub sort: SortOrder,
+    pub rules: Vec<SmartFolderRule>,
     #[serde(default)]
     pub grouping: SubfolderExpansionOrder,
-    #[serde(default)]
-    pub view_mode: GridViewMode,
 }
 
 impl SmartFolderDefinition {
@@ -235,11 +225,8 @@ impl SmartFolderDefinition {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
-            sources: Vec::new(),
-            filter: SmartFolderFilter::default(),
-            sort: SortOrder::default(),
+            rules: Vec::new(),
             grouping: SubfolderExpansionOrder::default(),
-            view_mode: GridViewMode::default(),
         }
     }
 }
@@ -774,31 +761,214 @@ impl FacetTagMode {
     }
 }
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord,
+)]
+pub struct FacetCalendarDate {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+}
+
+impl FacetCalendarDate {
+    pub fn new(year: i32, month: u8, day: u8) -> Self {
+        let mut value = Self { year, month, day };
+        value.sanitize();
+        value
+    }
+
+    pub fn label(self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    pub fn sanitize(&mut self) {
+        self.year = self.year.clamp(1970, 9999);
+        self.month = self.month.clamp(1, 12);
+        self.day = self.day.clamp(1, days_in_month(self.year, self.month));
+    }
+
+    fn ordinal(self) -> i64 {
+        // Howard Hinnant の days_from_civil。日付同士の比較だけに使うため epoch は任意。
+        let mut year = self.year as i64;
+        let month = self.month as i64;
+        let day = self.day as i64;
+        year -= i64::from(month <= 2);
+        let era = if year >= 0 { year } else { year - 399 } / 400;
+        let yoe = year - era * 400;
+        let mp = month + if month > 2 { -3 } else { 9 };
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe
+    }
+
+    pub fn today_local() -> Self {
+        local_calendar_date_from_unix(unix_now_secs())
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn local_calendar_date_from_unix(secs: i64) -> FacetCalendarDate {
+    const WINDOWS_TICKS_PER_SEC: i128 = 10_000_000;
+    const UNIX_TO_WINDOWS_SECS: i128 = 11_644_473_600;
+    let ticks = (secs as i128 + UNIX_TO_WINDOWS_SECS) * WINDOWS_TICKS_PER_SEC;
+    if ticks <= 0 || ticks > u64::MAX as i128 {
+        return FacetCalendarDate::new(1970, 1, 1);
+    }
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
+    let ticks = ticks as u64;
+    let filetime = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut local_filetime = FILETIME::default();
+    let mut system_time = SYSTEMTIME::default();
+    if unsafe { FileTimeToLocalFileTime(&filetime, &mut local_filetime) }.is_ok()
+        && unsafe { FileTimeToSystemTime(&local_filetime, &mut system_time) }.is_ok()
+    {
+        FacetCalendarDate::new(
+            system_time.wYear as i32,
+            system_time.wMonth as u8,
+            system_time.wDay as u8,
+        )
+    } else {
+        FacetCalendarDate::new(1970, 1, 1)
+    }
+}
+
+#[cfg(not(windows))]
+fn local_calendar_date_from_unix(secs: i64) -> FacetCalendarDate {
+    // 非 Windows のテスト / 補助ビルドでは UTC 日付を使う。
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    FacetCalendarDate::new(year as i32, month as u8, day as u8)
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FacetDatePreset {
+    Today,
+    Last3Days,
     Last7Days,
+    Last14Days,
     Last30Days,
+    Last90Days,
     Last365Days,
+    CustomDays(u16),
+    Range {
+        start: Option<FacetCalendarDate>,
+        end: Option<FacetCalendarDate>,
+    },
 }
 
 impl FacetDatePreset {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::Last7Days => "7日以内",
-            Self::Last30Days => "30日以内",
-            Self::Last365Days => "1年以内",
+            Self::Today => "今日".to_string(),
+            Self::Last3Days => "3日以内".to_string(),
+            Self::Last7Days => "7日以内".to_string(),
+            Self::Last14Days => "14日以内".to_string(),
+            Self::Last30Days => "30日以内".to_string(),
+            Self::Last90Days => "90日以内".to_string(),
+            Self::Last365Days => "1年以内".to_string(),
+            Self::CustomDays(days) => format!("{}日以内", days.max(1)),
+            Self::Range { start, end } => match (start, end) {
+                (Some(start), Some(end)) => format!("{}〜{}", start.label(), end.label()),
+                (Some(start), None) => format!("{}以降", start.label()),
+                (None, Some(end)) => format!("{}以前", end.label()),
+                (None, None) => "期間指定".to_string(),
+            },
         }
     }
 
     pub fn all() -> &'static [Self] {
-        &[Self::Last7Days, Self::Last30Days, Self::Last365Days]
+        &[
+            Self::Today,
+            Self::Last3Days,
+            Self::Last7Days,
+            Self::Last14Days,
+            Self::Last30Days,
+            Self::Last90Days,
+            Self::Last365Days,
+        ]
     }
 
-    pub fn seconds(self) -> i64 {
+    pub fn sanitized(self) -> Self {
         match self {
-            Self::Last7Days => 7 * 24 * 60 * 60,
-            Self::Last30Days => 30 * 24 * 60 * 60,
-            Self::Last365Days => 365 * 24 * 60 * 60,
+            Self::CustomDays(days) => Self::CustomDays(days.clamp(1, 36_500)),
+            Self::Range { mut start, mut end } => {
+                if let Some(value) = start.as_mut() {
+                    value.sanitize();
+                }
+                if let Some(value) = end.as_mut() {
+                    value.sanitize();
+                }
+                if start.zip(end).is_some_and(|(start, end)| start > end) {
+                    std::mem::swap(&mut start, &mut end);
+                }
+                Self::Range { start, end }
+            }
+            preset => preset,
+        }
+    }
+
+    fn days(self) -> Option<i64> {
+        match self {
+            Self::Today => Some(1),
+            Self::Last3Days => Some(3),
+            Self::Last7Days => Some(7),
+            Self::Last14Days => Some(14),
+            Self::Last30Days => Some(30),
+            Self::Last90Days => Some(90),
+            Self::Last365Days => Some(365),
+            Self::CustomDays(days) => Some(days.max(1) as i64),
+            Self::Range { .. } => None,
+        }
+    }
+
+    pub fn matches_mtime(self, mtime: i64, now: i64) -> bool {
+        if mtime <= 0 {
+            return false;
+        }
+        let modified = local_calendar_date_from_unix(mtime).ordinal();
+        if let Some(days) = self.days() {
+            let today = local_calendar_date_from_unix(now).ordinal();
+            return modified >= today.saturating_sub(days.saturating_sub(1));
+        }
+        match self {
+            Self::Range { start, end } => {
+                start.is_none_or(|start| modified >= start.ordinal())
+                    && end.is_none_or(|end| modified <= end.ordinal())
+            }
+            _ => true,
         }
     }
 }
@@ -928,6 +1098,11 @@ pub struct FacetFilter {
     pub include_untagged: bool,
     #[serde(default)]
     pub date_preset: Option<FacetDatePreset>,
+    /// v2.5.0 が知らない日付候補の保存用キャリア。旧版が読む `date_preset` には
+    /// Last7Days / Last30Days / Last365Days だけを書き、追加候補は旧版が無視するこの
+    /// フィールドへ退避する。実行時の正は常に `date_preset`。
+    #[serde(default)]
+    pub date_extended_stash: Option<FacetDatePreset>,
     #[serde(default)]
     pub size_preset: Option<FacetSizePreset>,
     #[serde(default)]
@@ -959,6 +1134,28 @@ impl FacetFilter {
     pub fn restore_kind_audio_after_load(&mut self) {
         if std::mem::take(&mut self.kind_audio_stash) {
             self.kinds.insert(FacetItemKind::Audio);
+        }
+    }
+
+    /// v2.5.0 が deserialize できる既存候補以外を、未知フィールド側へ退避して保存する。
+    pub fn stash_extended_date_for_persist(&mut self) {
+        if self.date_preset.is_some_and(|preset| {
+            !matches!(
+                preset,
+                FacetDatePreset::Last7Days
+                    | FacetDatePreset::Last30Days
+                    | FacetDatePreset::Last365Days
+            )
+        }) {
+            self.date_extended_stash = self.date_preset.take();
+        } else {
+            self.date_extended_stash = None;
+        }
+    }
+
+    pub fn restore_extended_date_after_load(&mut self) {
+        if let Some(preset) = self.date_extended_stash.take() {
+            self.date_preset = Some(preset);
         }
     }
 
@@ -5433,51 +5630,49 @@ impl Settings {
                 definition.name = format!("スマートフォルダ {}", index + 1);
             }
 
-            let mut source_ids = std::collections::HashSet::new();
-            let mut source_paths = std::collections::HashSet::new();
-            definition.sources.retain_mut(|source| {
-                if source.path.as_os_str().is_empty() {
+            let mut rule_ids = std::collections::HashSet::new();
+            definition.rules.retain_mut(|rule| {
+                if rule.source.as_os_str().is_empty() {
                     return false;
                 }
-                let path_key = crate::path_key::normalize_keep_drive(&source.path);
-                if path_key.is_empty() || !source_paths.insert(path_key) {
+                let path_key = crate::path_key::normalize_keep_drive(&rule.source);
+                if path_key.is_empty() {
                     return false;
                 }
-                if source.id.is_nil() || !source_ids.insert(source.id) {
-                    source.id = Uuid::new_v4();
-                    source_ids.insert(source.id);
+                if rule.id.is_nil() || !rule_ids.insert(rule.id) {
+                    rule.id = Uuid::new_v4();
+                    rule_ids.insert(rule.id);
                 }
+                rule.filter.kinds.remove(&FacetItemKind::Unknown);
+                rule.filter.name_contains = rule.filter.name_contains.trim().to_string();
+                rule.filter.extensions = rule
+                    .filter
+                    .extensions
+                    .iter()
+                    .filter_map(|extension| {
+                        let normalized = extension
+                            .trim()
+                            .trim_start_matches('.')
+                            .to_ascii_lowercase();
+                        (!normalized.is_empty()).then_some(normalized)
+                    })
+                    .collect();
+                rule.filter.tags = rule
+                    .filter
+                    .tags
+                    .iter()
+                    .map(|tag| crate::tags_db::normalize_tag_key(tag))
+                    .filter(|tag| !tag.is_empty())
+                    .collect();
+                if !rule.filter.ratings.iter().any(|enabled| *enabled) {
+                    rule.filter.ratings = default_smart_folder_ratings();
+                }
+                if rule.filter.edits.remove(&FacetEditFlag::AiAdjustment) {
+                    rule.filter.edits.insert(FacetEditFlag::Adjustment);
+                }
+                rule.filter.date_preset = rule.filter.date_preset.map(FacetDatePreset::sanitized);
                 true
             });
-
-            definition
-                .filter
-                .kinds
-                .remove(&SmartFolderContainerKind::Unknown);
-            definition.filter.name_contains = definition.filter.name_contains.trim().to_string();
-            definition.filter.extensions = definition
-                .filter
-                .extensions
-                .iter()
-                .filter_map(|extension| {
-                    let normalized = extension
-                        .trim()
-                        .trim_start_matches('.')
-                        .to_ascii_lowercase();
-                    (!normalized.is_empty()).then_some(normalized)
-                })
-                .collect();
-            definition.filter.tags = definition
-                .filter
-                .tags
-                .iter()
-                .map(|tag| tag.trim())
-                .filter(|tag| !tag.is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-            if !definition.filter.ratings.iter().any(|enabled| *enabled) {
-                definition.filter.ratings = default_smart_folder_ratings();
-            }
         }
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
@@ -5497,6 +5692,11 @@ impl Settings {
         if self.facet_filter.edits.remove(&FacetEditFlag::AiAdjustment) {
             self.facet_filter.edits.insert(FacetEditFlag::Adjustment);
         }
+        self.facet_filter.restore_extended_date_after_load();
+        self.facet_filter.date_preset = self
+            .facet_filter
+            .date_preset
+            .map(FacetDatePreset::sanitized);
         // 保存時に退避した種類フィルタの Audio を kinds へ戻す (v2.2.0 ダウングレード互換、
         // `FacetFilter::kind_audio_stash` のコメント参照)。
         self.facet_filter.restore_kind_audio_after_load();
@@ -6241,6 +6441,51 @@ mod tests {
         roundtrip.stash_kind_audio_for_persist();
         roundtrip.restore_kind_audio_after_load();
         assert_eq!(roundtrip, ff);
+    }
+
+    #[test]
+    fn facet_extended_date_stash_keeps_persisted_form_v25_compatible() {
+        let today = FacetCalendarDate::today_local();
+        let mut ff = FacetFilter {
+            date_preset: Some(FacetDatePreset::Range {
+                start: Some(today),
+                end: Some(today),
+            }),
+            ..FacetFilter::default()
+        };
+        let original = ff.clone();
+        ff.stash_extended_date_for_persist();
+        let json = serde_json::to_value(&ff).unwrap();
+        assert!(json["date_preset"].is_null());
+        assert!(!json["date_extended_stash"].is_null());
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum V25DatePreset {
+            Last7Days,
+            Last30Days,
+            Last365Days,
+        }
+        #[derive(serde::Deserialize)]
+        struct V25FacetFilter {
+            #[serde(default)]
+            date_preset: Option<V25DatePreset>,
+        }
+        let v25: V25FacetFilter = serde_json::from_value(json.clone())
+            .expect("v2.5.0 shape must ignore the extended date carrier");
+        assert!(v25.date_preset.is_none());
+
+        let mut loaded: FacetFilter = serde_json::from_value(json).unwrap();
+        loaded.restore_extended_date_after_load();
+        assert_eq!(loaded, original);
+
+        let mut legacy = FacetFilter {
+            date_preset: Some(FacetDatePreset::Last30Days),
+            ..FacetFilter::default()
+        };
+        legacy.stash_extended_date_for_persist();
+        assert_eq!(legacy.date_preset, Some(FacetDatePreset::Last30Days));
+        assert!(legacy.date_extended_stash.is_none());
     }
 
     #[test]
@@ -7692,25 +7937,21 @@ mod tests {
     #[test]
     fn smart_folder_definition_roundtrips() {
         let mut definition = SmartFolderDefinition::new("未整理の本");
-        definition.sources.push(SmartFolderSource {
-            id: Uuid::new_v4(),
-            path: PathBuf::from(r"C:\Books"),
-            enabled: false,
-        });
-        definition.filter.name_contains = "sample".into();
-        definition
-            .filter
-            .kinds
-            .insert(SmartFolderContainerKind::Zip);
-        definition.filter.extensions.insert("cbz".into());
-        definition.filter.ratings = [true, false, true, false, true, false];
-        definition.filter.tags.insert("あとで読む".into());
-        definition.filter.include_untagged = true;
-        definition.sort = SortOrder::DateDesc;
+        let mut filter = SmartFolderFilter::default();
+        filter.name_contains = "sample".into();
+        filter.kinds.insert(FacetItemKind::Video);
+        filter.extensions.insert("mp4".into());
+        filter.ratings = [true, false, true, false, true, false];
+        filter.tags.insert("あとで見る".into());
+        filter.include_untagged = true;
+        let mut rule = SmartFolderRule::new(PathBuf::from(r"C:\Videos"), true, filter);
+        rule.enabled = false;
+        definition.rules.push(rule);
         definition.grouping = SubfolderExpansionOrder::FolderGrouped;
-        definition.view_mode = GridViewMode::Details;
 
         let json = serde_json::to_string(&definition).unwrap();
+        assert!(!json.contains("\"sort\""));
+        assert!(!json.contains("\"view_mode\""));
         let loaded: SmartFolderDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded, definition);
     }
@@ -7720,29 +7961,36 @@ mod tests {
         let mut settings = Settings::default();
         let mut first = SmartFolderDefinition::new("  ");
         first.id = Uuid::nil();
-        first.sources = vec![
-            SmartFolderSource {
+        first.rules = vec![
+            SmartFolderRule {
                 id: Uuid::nil(),
-                path: PathBuf::from(r"C:\Books"),
+                source: PathBuf::from(r"C:\Books"),
                 enabled: true,
+                include_descendants: true,
+                filter: SmartFolderFilter::default(),
             },
-            SmartFolderSource {
+            SmartFolderRule {
                 id: Uuid::nil(),
-                path: PathBuf::from(r"C:\Books"),
+                source: PathBuf::from(r"C:\Books"),
                 enabled: true,
+                include_descendants: false,
+                filter: SmartFolderFilter::default(),
             },
-            SmartFolderSource {
+            SmartFolderRule {
                 id: Uuid::nil(),
-                path: PathBuf::new(),
+                source: PathBuf::new(),
                 enabled: true,
+                include_descendants: false,
+                filter: SmartFolderFilter::default(),
             },
         ];
-        first.filter.kinds.insert(SmartFolderContainerKind::Unknown);
-        first.filter.extensions.insert(" .CBZ ".into());
-        first.filter.extensions.insert(" . ".into());
-        first.filter.tags.insert(" あとで読む ".into());
-        first.filter.tags.insert(" ".into());
-        first.filter.ratings = [false; 6];
+        first.rules[0].filter.kinds.insert(FacetItemKind::Unknown);
+        first.rules[0].filter.extensions.insert(" .MP4 ".into());
+        first.rules[0].filter.extensions.insert(" . ".into());
+        first.rules[0].filter.tags.insert(" あとで見る ".into());
+        first.rules[0].filter.tags.insert(" ".into());
+        first.rules[0].filter.ratings = [false; 6];
+        first.rules[0].filter.date_preset = Some(FacetDatePreset::CustomDays(0));
         let mut second = SmartFolderDefinition::new("two");
         second.id = Uuid::nil();
         settings.smart_folders = vec![first, second];
@@ -7753,23 +8001,86 @@ mod tests {
         assert!(!first.id.is_nil());
         assert_ne!(first.id, settings.smart_folders[1].id);
         assert_eq!(first.name, "スマートフォルダ 1");
-        assert_eq!(first.sources.len(), 1);
-        assert!(!first.sources[0].id.is_nil());
+        assert_eq!(first.rules.len(), 2);
+        assert!(!first.rules[0].id.is_nil());
+        assert_ne!(first.rules[0].id, first.rules[1].id);
         assert!(
-            !first
+            !first.rules[0]
                 .filter
                 .kinds
-                .contains(&SmartFolderContainerKind::Unknown)
+                .contains(&FacetItemKind::Unknown)
         );
         assert_eq!(
-            first.filter.extensions.iter().cloned().collect::<Vec<_>>(),
-            ["cbz"]
+            first.rules[0]
+                .filter
+                .extensions
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["mp4"]
         );
         assert_eq!(
-            first.filter.tags.iter().cloned().collect::<Vec<_>>(),
-            ["あとで読む"]
+            first.rules[0]
+                .filter
+                .tags
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["あとで見る"]
         );
-        assert_eq!(first.filter.ratings, [true; 6]);
+        assert_eq!(first.rules[0].filter.ratings, [true; 6]);
+        assert_eq!(
+            first.rules[0].filter.date_preset,
+            Some(FacetDatePreset::CustomDays(1))
+        );
+    }
+
+    #[test]
+    fn facet_date_custom_days_and_calendar_range_use_local_dates() {
+        let now = unix_now_secs();
+        assert!(FacetDatePreset::CustomDays(3).matches_mtime(now, now));
+        assert!(
+            !FacetDatePreset::CustomDays(3).matches_mtime(now.saturating_sub(10 * 86_400), now)
+        );
+
+        let today = local_calendar_date_from_unix(now);
+        assert!(
+            FacetDatePreset::Range {
+                start: Some(today),
+                end: Some(today),
+            }
+            .matches_mtime(now, now)
+        );
+        assert!(
+            !FacetDatePreset::Range {
+                start: None,
+                end: Some(FacetCalendarDate::new(1970, 1, 1)),
+            }
+            .matches_mtime(now, now)
+        );
+    }
+
+    #[test]
+    fn facet_date_sanitize_clamps_values_and_orders_range() {
+        assert_eq!(
+            FacetDatePreset::CustomDays(0).sanitized(),
+            FacetDatePreset::CustomDays(1)
+        );
+        assert_eq!(
+            FacetDatePreset::Range {
+                start: Some(FacetCalendarDate {
+                    year: 2026,
+                    month: 13,
+                    day: 99,
+                }),
+                end: Some(FacetCalendarDate::new(2025, 1, 1)),
+            }
+            .sanitized(),
+            FacetDatePreset::Range {
+                start: Some(FacetCalendarDate::new(2025, 1, 1)),
+                end: Some(FacetCalendarDate::new(2026, 12, 31)),
+            }
+        );
     }
 
     // -- ThumbAspect --

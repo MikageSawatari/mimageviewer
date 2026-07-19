@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-v2.6.0 は、複数の場所に分散した本を 1 つの保存済みビューから見渡せる
+v2.6.0 は、複数の場所に分散した本・画像・動画・音声を 1 つの保存済みビューから見渡せる
 **スマートフォルダ**を中心機能とする。あわせて、v2.5.0 で次版送りにした入力
 カスタマイズ、コンテナ情報、代表サムネイルの改善を、独立した小さい変更から
 順に実装する。
@@ -50,20 +50,29 @@ v2.6.0 は、複数の場所に分散した本を 1 つの保存済みビュー�
 
 - スマートフォルダとお気に入りは別概念とする。
 - お気に入りは単一の実フォルダへ素早く移動し、必要に応じて検索索引のルートにもする。
-- スマートフォルダは任意の複数実フォルダを直接登録し、条件に合う本を横断表示する。
-- スマートフォルダの source はお気に入り UUID ではなく実パスを正本として保存する。
+- スマートフォルダは現在の実フォルダと一覧の絞り込み条件を 1 ルールとして保存し、複数ルールを
+  OR 結合して条件に合う実アイテムを横断表示する。
+- 各ルールの source はお気に入り UUID ではなく実パスを正本として保存する。
   お気に入りの改名 / 削除でスマートフォルダを壊さない。
-- 編集 UI には「フォルダを追加」に加えて「お気に入りから追加」を便利な入力手段として置く。
+- 検索元を単独で編集する巨大な定義フォームは作らない。通常一覧で結果を絞り込んでから
+  「現在のアイテム表示条件を追加」で保存するため、既存 facet UI を条件指定の正本にする。
 
 ### 3.2 構築方式
 
 - **索引を使わないスナップショット方式**を MVP の正本とする。
-- スマートフォルダを開くたびに、登録 source を background worker で再帰走査する。
+- スマートフォルダを開くたびに、有効ルールの source を background worker で走査する。
+- 各ルールは「このフォルダ直下のみ / サブフォルダを含む」を個別に持つ。通常一覧から追加すると
+  直下のみ、サブ展開結果から追加するとサブフォルダを含む設定を初期値とし、確認画面で変更できる。
 - 表示中に外部で起きた変更は自動監視しない。明示的な「更新」で再走査できるようにする。
 - 走査完了後の snapshot は保持し、ソート / facet / 表示形式の変更では再走査しない。
 - UI スレッドでは `read_dir`、metadata 取得、再帰走査、大量 DB lookup を実行しない。
 - 既存 `subfolder_expansion` の複数 root、進捗、cancel、reparse point guard、chunk sort、
   `Arc<Vec<_>>` snapshot、prepare worker の規約を共有する。似た walker を別実装しない。
+- 各物理フォルダを列挙した直後、保存条件を適用する前に、通常一覧と同じ同名ファイル規則を
+  フォルダ単位で適用する。同名動画の sidecar 画像、同名実フォルダがある ZIP / PDF / 対応
+  アーカイブ、同名 ZIP がある変換元アーカイブ、優先度の低い同名画像は独立項目にしない。
+  別の物理フォルダにある同名ファイル同士は衝突させない。動画 sidecar を非表示にした場合も、
+  その実パスを動画サムネイル用 snapshot として表示準備へ引き継ぐ。
 - I/O は `GlobalIoSemaphore` の Normal priority を通し、可視サムネイルなどの High I/O を優先する。
 - 10 万件以上は既存サブ展開と同じ続行確認を使う。件数で黙って打ち切らない。
 
@@ -80,16 +89,18 @@ registry として設計し、canonical root の重複排除と参照数を一�
 
 ### 3.4 結果の単位
 
-MVP の主対象は「本として扱うコンテナ」とする。
+スマートフォルダは通常の実フォルダ一覧で扱う次の実アイテムを対象にする。「本のみ」には制限しない。
 
-- 実際に画像だけの本として開けるフォルダ
+- フォルダ
+- 通常画像
+- 動画
+- 音声
 - ZIP / CBZ
 - PDF
 - 直接閲覧または ZIP 変換対象になる RAR / CBR / 7z / LZH 等の対応アーカイブ
 
-画像だけのフォルダ判定は、通常の自動本判定と同じ列挙規則を共有する。名前や拡張子だけの
-別判定を作らない。コンテナの中身や PDF ページは走査時に展開せず、コンテナ 1 件として表示する。
-通常画像 / 動画 / 音声を横断して平坦化するモードは、MVP の実測と要望を見て後続判断する。
+コンテナの中身や PDF ページは走査時に展開せず、コンテナ 1 件として表示する。ZIP / PDF 内、
+検索結果、読書履歴など実検索元を一意に復元できない仮想ビューからルールは作成できない。
 
 ### 3.5 フラット表示と階層情報
 
@@ -112,50 +123,57 @@ MVP の主対象は「本として扱うコンテナ」とする。
 SmartFolderDefinition
   id: UUID
   name: String
-  sources: Vec<SmartFolderSource>
-  filter: SmartFolderFilter
-  sort: SortOrder
+  rules: Vec<SmartFolderRule>
   grouping: Global | ByFolder
-  view_mode: Thumbnail | Details
 
-SmartFolderSource
+SmartFolderRule
   id: UUID
-  path: PathBuf
+  source: PathBuf
   enabled: bool
-  filter_override: None   # 将来拡張用。MVP UI では共通 filter のみ
+  include_descendants: bool
+  filter: SmartFolderFilter
 ```
 
 - `Settings.smart_folders` として settings.db の世代バックアップ対象にする。
 - 旧設定では空 Vec を default とし、破壊的な設定 DB migration は行わない。
-- UUID 欠落、重複 source、空 path、将来 enum 値は `Settings::sanitize` で安全に補正する。
+- UUID 欠落、空 source、条件値の範囲外、将来 enum 値は `Settings::sanitize` で安全に補正する。
+- v2.6.0 開発中の旧スマートフォルダ定義は移行対象にしない。
 - source の移動を自動追跡しない。見つからない source は定義から削除せず、警告として表示する。
+- 通常一覧と共通のソート順およびサムネイル / 詳細表示は定義へ保存しない。スマートフォルダを
+  開いても現在の全体表示設定を上書きせず、スマートフォルダ固有には「全体で並べる / フォルダごとに
+  並べる」の単位だけを保存する。
 
 ### 3.7 保存する条件
 
-MVP は snapshot 構築後に既存データで正確に判定できる共通条件を保存する。
+通常一覧の facet から、snapshot 構築後に既存データで正確に判定できる条件をルール単位で保存する。
 
 - 名前
 - コンテナ種別 / 拡張子
-- 更新日時 / サイズ
+- 更新日時（既定期間、任意日数、開始日 / 終了日）/ サイズ
 - ★
-- タグ
-- source の有効 / 無効（検索元一覧で指定）
+- タグ（OR / AND、タグなし）
+- 編集状態
+- ルールの有効 / 無効、サブフォルダを含むか
 
 名前・種別・拡張子など安価な条件は worker の早い段階で適用してよい。★ / タグは
 既存 DB の batch 取得を使い、1 item ごとの同期 lookup を行わない。EXIF、AI プロンプト、
 PDF document info などファイル内容を大量に開く全文条件は MVP の保存条件に含めない。
-場所と編集状態は、表示された snapshot に対する既存 Ctrl+F の一時条件として利用できるが、
-MVP の定義には保存しない。
+場所、AI モデル、生成ツール、画像色は保存しない。現在表示で指定されていた場合は、ルール追加の
+確認画面に「保存されない条件」として明示する。
 
 ### 3.8 メニューとツールバー
 
 - メニューバーに独立した「スマートフォルダ」を常設する。0 件でも作成入口を失わない。
 - メニュー項目:
   - 新しいスマートフォルダ…
+  - 現在のアイテム表示条件を追加 → 登録済みスマートフォルダ一覧
   - スマートフォルダを管理…（0 件では disabled）
   - 区切り線
   - 登録済みスマートフォルダ一覧（選択で開く）
 - `MenuCommandId` / `TopMenuId` / menu layout sanitize と候補 parity test を更新する。
+- 「現在のアイテム表示条件を追加」は通常の実フォルダまたはサブ展開でだけ有効にする。ZIP / PDF 内、
+  検索結果、読書履歴等では disabled とし、理由を tooltip で表示する。
+- 「新しいスマートフォルダ…」は名前だけを入力して末尾へ追加する。条件は作成後に現在表示から追加する。
 - ツールバーには独立 `ToolbarSectionId::SmartFolders` を追加する。
 - effective visibility は `show_toolbar_smart_folders && !smart_folders.is_empty()` とする。
   0 件では描画せず、最後の 1 件を削除した後も表示設定・順序・表示形式は保持する。
@@ -168,7 +186,8 @@ MVP の定義には保存しない。
 ### 3.9 開く・更新・ナビゲーション
 
 - synthetic path は definition UUID から生成し、実 filesystem path と混同しない。
-- 開くと現在の一覧を残したまま scan modal を表示し、完成 snapshot を一括 install する。
+- 開くと現在の一覧を残したまま背景をグレーアウトした scan / prepare modal を表示し、
+  「中止」以外の背面操作を止める。完成 snapshot だけを一括 install する。
 - stale definition ID / scan generation / source set の結果は破棄する。
 - `中止`、別の場所を開く、definition 編集 / 削除、アプリ終了で pending scan を cancel する。
 - フォルダバーには `スマートフォルダ: <name>` と表示し、source path を synthetic breadcrumb にしない。
@@ -179,13 +198,15 @@ MVP の定義には保存しない。
 
 ### 3.10 テストと計測
 
-- definition / source の serde roundtrip、legacy default、sanitize、UUID 補完
+- definition / rule の serde roundtrip、legacy default、sanitize、UUID 補完
 - 複数 root、親子 root、重複 path、登録順、missing / access denied source
 - reparse point loop、depth limit、cancel、stale generation discard
-- 画像のみフォルダ、混在フォルダ、ZIP / PDF / 対応アーカイブの判定
+- フォルダ、画像、動画、音声、ZIP / PDF / 対応アーカイブの収集と種類条件
+- 直下のみ / 再帰、複数ルールの OR、現在 facet の取得、保存対象外条件の明示
 - 全体 sort / フォルダごと sort、filter、場所ラベル
-- toolbar 0 件非表示、最初の作成、最後の削除、明示非表示保持、表示形式 roundtrip
-- menu layout の旧設定補完、作成 / 管理 / 登録一覧
+- toolbar 0 件非表示、最初の作成、最後の削除、明示非表示保持、並び単位 roundtrip、
+  スマートフォルダ表示時に全体のソート順 / サムネイル・詳細表示を上書きしないこと
+- menu layout の旧設定補完、名前だけの作成 / 現在条件追加 / 管理 / 登録一覧 / 対象外 tooltip
 - synthetic view からの open / back / forward / refresh / file operation 後の clamp
 - perf event は scan / prepare / install / cancel を分け、10 万 / 50 万 / 200 万 entry で計測する。
 
@@ -194,7 +215,7 @@ MVP の定義には保存しない。
 - スマートフォルダ root の常時 watcher
 - スマートフォルダ専用 Tantivy / SQLite 検索索引
 - EXIF / AI プロンプト等の保存済み全文条件
-- source ごとの個別 filter UI
+- スマートフォルダ管理画面内に既存 facet と重複する巨大な条件編集 UI
 - 完全な仮想階層表示
 - ZIP / PDF の中の各ページを scan 結果へ展開する機能
 - 親代表サムネイルの自動選定への編集プレビュー反映（手動固定を先行）

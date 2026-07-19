@@ -15,8 +15,8 @@ use crate::app::{
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
 use crate::settings::{
-    DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSortKey, FacetDatePreset,
-    FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
+    DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSortKey, FacetCalendarDate,
+    FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -355,6 +355,39 @@ fn sticky_facet_menu_config() -> egui::containers::menu::MenuConfig {
 fn prepare_facet_menu_popup(ui: &mut egui::Ui) {
     ui.set_min_width(180.0);
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+}
+
+fn draw_facet_calendar_date_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    date: &mut Option<FacetCalendarDate>,
+) -> bool {
+    let before = *date;
+    let mut enabled = date.is_some();
+    let mut value = date.unwrap_or_else(FacetCalendarDate::today_local);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut enabled, label);
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.add(
+                egui::DragValue::new(&mut value.year)
+                    .range(1970..=9999)
+                    .suffix("年"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut value.month)
+                    .range(1..=12)
+                    .suffix("月"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut value.day)
+                    .range(1..=31)
+                    .suffix("日"),
+            );
+        });
+    });
+    value.sanitize();
+    *date = enabled.then_some(value);
+    *date != before
 }
 
 fn prepare_ai_facet_menu_popup(ui: &mut egui::Ui) {
@@ -2461,6 +2494,9 @@ impl App {
         let smart_folder_new_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SmartFoldersNew);
+        let smart_folder_add_current_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SmartFoldersAddCurrent);
         let smart_folder_manage_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SmartFoldersManage);
@@ -2702,6 +2738,42 @@ impl App {
                                                 self.begin_new_smart_folder();
                                                 ui.close();
                                             }
+                                        }
+                                        MenuCommandId::SmartFoldersAddCurrent => {
+                                            let targets = self
+                                                .settings
+                                                .smart_folders
+                                                .iter()
+                                                .map(|definition| {
+                                                    (definition.id, definition.name.clone())
+                                                })
+                                                .collect::<Vec<_>>();
+                                            let source_error =
+                                                self.smart_folder_current_rule_source().err();
+                                            let can_add = !targets.is_empty()
+                                                && source_error.is_none();
+                                            let disabled_reason = if targets.is_empty() {
+                                                "先にスマートフォルダを作成してください"
+                                            } else {
+                                                source_error.unwrap_or("")
+                                            };
+                                            let submenu = ui.add_enabled_ui(can_add, |ui| {
+                                                ui.menu_button(
+                                                    &smart_folder_add_current_menu_label,
+                                                    |ui| {
+                                                        for (id, name) in &targets {
+                                                            if ui.button(name).clicked() {
+                                                                self.begin_add_current_smart_folder_rule(*id);
+                                                                ui.close();
+                                                            }
+                                                        }
+                                                    },
+                                                )
+                                            });
+                                            submenu
+                                                .inner
+                                                .response
+                                                .hover_tip_disabled(disabled_reason);
                                         }
                                         MenuCommandId::SmartFoldersManage => {
                                             if ui
@@ -7412,27 +7484,87 @@ impl App {
     fn draw_facet_date_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let active = usize::from(self.settings.facet_filter.date_preset.is_some());
         let mut changed = false;
-        let menu = ui.menu_button(facet_menu_label("日付", active), |ui| {
-            prepare_facet_menu_popup(ui);
-            let current = self.settings.facet_filter.date_preset;
-            if ui.selectable_label(current.is_none(), "すべて").clicked() {
-                self.settings.facet_filter.date_preset = None;
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            for &preset in FacetDatePreset::all() {
-                if ui
-                    .selectable_label(current == Some(preset), preset.label())
-                    .clicked()
-                {
-                    self.settings.facet_filter.date_preset = Some(preset);
-                    changed = true;
-                    ui.close();
-                }
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+        let (menu_response, _) =
+            egui::containers::menu::MenuButton::new(facet_menu_label("日付", active))
+                .config(sticky_facet_menu_config())
+                .ui(ui, |ui| {
+                    prepare_facet_menu_popup(ui);
+                    let current = self.settings.facet_filter.date_preset;
+                    if ui.selectable_label(current.is_none(), "すべて").clicked() {
+                        self.settings.facet_filter.date_preset = None;
+                        changed = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    for &preset in FacetDatePreset::all() {
+                        if ui
+                            .selectable_label(current == Some(preset), preset.label())
+                            .clicked()
+                        {
+                            self.settings.facet_filter.date_preset = Some(preset);
+                            changed = true;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+
+                    let mut custom_days = match self.settings.facet_filter.date_preset {
+                        Some(FacetDatePreset::CustomDays(days)) => days,
+                        _ => 30,
+                    };
+                    ui.horizontal(|ui| {
+                        let selected = matches!(
+                            self.settings.facet_filter.date_preset,
+                            Some(FacetDatePreset::CustomDays(_))
+                        );
+                        if ui.selectable_label(selected, "日数を指定").clicked() {
+                            self.settings.facet_filter.date_preset =
+                                Some(FacetDatePreset::CustomDays(custom_days));
+                            changed = true;
+                        }
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut custom_days)
+                                    .range(1..=36_500)
+                                    .suffix(" 日以内"),
+                            )
+                            .changed()
+                        {
+                            self.settings.facet_filter.date_preset =
+                                Some(FacetDatePreset::CustomDays(custom_days));
+                            changed = true;
+                        }
+                    });
+
+                    let (mut start, mut end) = match self.settings.facet_filter.date_preset {
+                        Some(FacetDatePreset::Range { start, end }) => (start, end),
+                        _ => (None, None),
+                    };
+                    let range_selected = matches!(
+                        self.settings.facet_filter.date_preset,
+                        Some(FacetDatePreset::Range { .. })
+                    );
+                    if ui.selectable_label(range_selected, "期間を指定").clicked() {
+                        let today = FacetCalendarDate::today_local();
+                        start = Some(today);
+                        end = Some(today);
+                        self.settings.facet_filter.date_preset =
+                            Some(FacetDatePreset::Range { start, end });
+                        changed = true;
+                    }
+                    let mut range_changed = false;
+                    range_changed |= draw_facet_calendar_date_row(ui, "開始", &mut start);
+                    range_changed |= draw_facet_calendar_date_row(ui, "終了", &mut end);
+                    if range_changed {
+                        if start.zip(end).is_some_and(|(start, end)| start > end) {
+                            std::mem::swap(&mut start, &mut end);
+                        }
+                        self.settings.facet_filter.date_preset =
+                            Some(FacetDatePreset::Range { start, end });
+                        changed = true;
+                    }
+                });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 

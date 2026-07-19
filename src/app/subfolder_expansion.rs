@@ -424,115 +424,16 @@ fn apply_duplicate_filters_to_media(
     video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
     if options.skip_image_if_video_exists {
-        filter_video_image_duplicates_for_subfolder(
+        for (video, image) in super::folder_scan::filter_video_image_duplicates(
             media,
             options.video_thumb_use_sidecar_image,
-            video_thumb_overrides,
-        );
+        ) {
+            video_thumb_overrides.insert(crate::path_key::normalize_keep_drive(&video), image);
+        }
     }
     if options.skip_duplicate_images {
-        filter_image_ext_duplicates(media, &options.image_ext_priority);
+        super::folder_scan::filter_image_ext_duplicates(media, &options.image_ext_priority);
     }
-}
-
-fn filter_video_image_duplicates_for_subfolder(
-    media: &mut Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)>,
-    use_sidecar: bool,
-    video_thumb_overrides: &mut HashMap<String, PathBuf>,
-) {
-    use super::folder_scan::ScanMediaKind;
-    let mut videos_by_stem: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    for (path, kind, _, _) in media.iter() {
-        if *kind == ScanMediaKind::Video {
-            videos_by_stem
-                .entry(stem_lower_local(path))
-                .or_default()
-                .push(path.clone());
-        }
-    }
-    if videos_by_stem.is_empty() {
-        return;
-    }
-
-    // 動画とのサイドカー重複判定・除外は画像のみ対象 (音声は常に残す)。現状サブ展開の
-    // media は Image / Video のみだが、将来 Audio を含めても安全なよう `!= Image` で判定。
-    if use_sidecar {
-        for (path, kind, _, _) in media.iter() {
-            if *kind != ScanMediaKind::Image {
-                continue;
-            }
-            let stem = stem_lower_local(path);
-            let Some(videos) = videos_by_stem.get(&stem) else {
-                continue;
-            };
-            for video in videos {
-                video_thumb_overrides
-                    .insert(crate::path_key::normalize_keep_drive(video), path.clone());
-            }
-        }
-    }
-
-    media.retain(|(path, kind, _, _)| {
-        *kind != ScanMediaKind::Image || !videos_by_stem.contains_key(&stem_lower_local(path))
-    });
-}
-
-fn filter_image_ext_duplicates(
-    media: &mut Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)>,
-    priority: &[String],
-) {
-    use super::folder_scan::ScanMediaKind;
-    let mut best: HashMap<String, (usize, usize)> = HashMap::new();
-    for (i, (path, kind, _, _)) in media.iter().enumerate() {
-        if *kind != ScanMediaKind::Image {
-            continue;
-        }
-        let stem = stem_lower_local(path);
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let prio = priority
-            .iter()
-            .position(|candidate| candidate == &ext)
-            .unwrap_or(usize::MAX);
-        match best.get(&stem) {
-            Some(&(existing_prio, _)) if prio >= existing_prio => {}
-            _ => {
-                best.insert(stem, (prio, i));
-            }
-        }
-    }
-
-    let mut stem_counts: HashMap<String, usize> = HashMap::new();
-    for (path, kind, _, _) in media.iter() {
-        if *kind == ScanMediaKind::Image {
-            *stem_counts.entry(stem_lower_local(path)).or_insert(0) += 1;
-        }
-    }
-    let keep_indices: HashSet<usize> = best
-        .iter()
-        .filter(|(stem, _)| stem_counts.get(stem.as_str()).copied().unwrap_or(0) > 1)
-        .map(|(_, &(_, idx))| idx)
-        .collect();
-    if keep_indices.is_empty() {
-        return;
-    }
-
-    let mut i = 0;
-    media.retain(|(path, kind, _, _)| {
-        let current_i = i;
-        i += 1;
-        if *kind != ScanMediaKind::Image {
-            return true;
-        }
-        let stem = stem_lower_local(path);
-        if stem_counts.get(&stem).copied().unwrap_or(0) <= 1 {
-            return true;
-        }
-        keep_indices.contains(&current_i)
-    });
 }
 
 struct SubfolderEntrySortKey {
@@ -1075,13 +976,6 @@ fn spawn_subfolder_expansion_prepare(
             total,
         },
     })
-}
-
-fn stem_lower_local(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(str::to_lowercase)
-        .unwrap_or_default()
 }
 
 impl App {

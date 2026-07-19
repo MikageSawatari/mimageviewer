@@ -1,50 +1,173 @@
-//! スマートフォルダの作成・管理ダイアログ。
+//! スマートフォルダの作成・ルール追加・管理 UI。
 //!
-//! 定義は `Settings::smart_folders` を正本として即時保存する。ファイル走査はここでは
-//! 行わず、一覧を開いたときだけ `app::smart_folder` の background worker が実行する。
+//! 条件の正本は通常一覧の絞り込み UI。管理画面で同じ巨大フォームを再実装せず、
+//! 「現在の実フォルダ + 現在の絞り込み」を確認ダイアログから OR ルールとして追加する。
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eframe::egui;
 
 use crate::app::App;
 use crate::settings::{
-    FacetDatePreset, FacetSizePreset, GridViewMode, SmartFolderContainerKind,
-    SmartFolderDefinition, SmartFolderSource, SortOrder, SubfolderExpansionOrder,
+    FacetItemKind, SmartFolderDefinition, SmartFolderFilter, SmartFolderRule,
+    SubfolderExpansionOrder,
 };
 
-fn source_path_exists(sources: &[SmartFolderSource], path: &std::path::Path) -> bool {
-    let key = crate::path_key::normalize_keep_drive(path);
-    sources
-        .iter()
-        .any(|source| crate::path_key::normalize_keep_drive(&source.path) == key)
+const SAVABLE_KINDS: &[FacetItemKind] = &[
+    FacetItemKind::Folder,
+    FacetItemKind::Image,
+    FacetItemKind::Video,
+    FacetItemKind::Audio,
+    FacetItemKind::Zip,
+    FacetItemKind::Pdf,
+    FacetItemKind::Archive,
+];
+
+#[derive(Clone, Debug)]
+pub(crate) struct SmartFolderRuleDraft {
+    pub(crate) target_id: uuid::Uuid,
+    pub(crate) sources: Vec<PathBuf>,
+    pub(crate) include_descendants: bool,
+    pub(crate) filter: SmartFolderFilter,
+    pub(crate) ignored_conditions: Vec<String>,
 }
 
-fn push_source_if_new(definition: &mut SmartFolderDefinition, path: PathBuf) -> bool {
-    if path.as_os_str().is_empty() || source_path_exists(&definition.sources, &path) {
-        return false;
+fn filter_summary(filter: &SmartFolderFilter) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !filter.name_contains.is_empty() {
+        parts.push(format!("名前に「{}」を含む", filter.name_contains));
     }
-    definition.sources.push(SmartFolderSource {
-        id: uuid::Uuid::new_v4(),
-        path,
-        enabled: true,
-    });
-    true
+    if !filter.kinds.is_empty() {
+        parts.push(format!(
+            "種類: {}",
+            filter
+                .kinds
+                .iter()
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    if !filter.extensions.is_empty() {
+        parts.push(format!(
+            "拡張子: {}",
+            filter
+                .extensions
+                .iter()
+                .map(|extension| format!(".{extension}"))
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    if let Some(date) = filter.date_preset {
+        parts.push(format!("更新日: {}", date.label()));
+    }
+    if let Some(size) = filter.size_preset {
+        parts.push(format!("サイズ: {}", size.label()));
+    }
+    if filter.ratings != [true; 6] {
+        let ratings = (0..=5)
+            .filter(|rating| filter.ratings[*rating])
+            .map(|rating| {
+                if rating == 0 {
+                    "未評価".to_string()
+                } else {
+                    format!("★{rating}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        parts.push(format!("レーティング: {ratings}"));
+    }
+    if !filter.tags.is_empty() || filter.include_untagged {
+        let mut tags = filter
+            .tags
+            .iter()
+            .map(|tag| format!("#{tag}"))
+            .collect::<Vec<_>>();
+        if filter.include_untagged {
+            tags.push("タグなし".to_string());
+        }
+        parts.push(format!(
+            "タグ({}): {}",
+            filter.tag_mode.label(),
+            tags.join("、")
+        ));
+    }
+    if !filter.edits.is_empty() {
+        parts.push(format!(
+            "状態: {}{}",
+            filter
+                .edits
+                .iter()
+                .map(|flag| flag.menu_label())
+                .collect::<Vec<_>>()
+                .join("、"),
+            if filter.edit_include_descendants {
+                "（子フォルダも対象）"
+            } else {
+                ""
+            }
+        ));
+    }
+    if parts.is_empty() {
+        parts.push("追加の絞り込みなし".to_string());
+    }
+    parts
+}
+
+fn rule_summary(rule: &SmartFolderRule) -> String {
+    let mut parts = filter_summary(&rule.filter);
+    parts.insert(
+        0,
+        if rule.include_descendants {
+            "サブフォルダを含む".to_string()
+        } else {
+            "このフォルダ直下のみ".to_string()
+        },
+    );
+    parts.join(" / ")
+}
+
+fn capture_smart_folder_filter(
+    facet: &crate::settings::FacetFilter,
+    ratings: [bool; 6],
+) -> SmartFolderFilter {
+    let mut filter = SmartFolderFilter::default();
+    filter.kinds = facet
+        .kinds
+        .iter()
+        .filter(|kind| SAVABLE_KINDS.contains(kind))
+        .copied()
+        .collect();
+    filter.extensions = facet.exts.clone();
+    filter.date_preset = facet.date_preset;
+    filter.size_preset = facet.size_preset;
+    filter.ratings = ratings;
+    filter.tags = facet.tags.clone();
+    filter.tag_mode = facet.tag_mode;
+    filter.include_untagged = facet.include_untagged;
+    filter.edits = facet.edits.clone();
+    filter.edit_include_descendants = facet.edit_include_descendants;
+    filter
 }
 
 impl App {
     pub(crate) fn begin_new_smart_folder(&mut self) {
-        let number = self.settings.smart_folders.len() + 1;
-        let mut definition = SmartFolderDefinition::new(format!("スマートフォルダ {number}"));
-        if let Some(folder) = self.effective_folder().filter(|path| path.is_dir()) {
-            push_source_if_new(&mut definition, folder);
+        let mut number = self.settings.smart_folders.len() + 1;
+        loop {
+            let candidate = format!("スマートフォルダ {number}");
+            if !self
+                .settings
+                .smart_folders
+                .iter()
+                .any(|definition| definition.name.eq_ignore_ascii_case(&candidate))
+            {
+                self.smart_folder_create_name = Some(candidate);
+                break;
+            }
+            number += 1;
         }
-        let id = definition.id;
-        self.settings.smart_folders.push(definition);
-        self.settings.save();
-        self.smart_folder_editor_selected = Some(id);
-        self.show_smart_folder_editor = true;
     }
 
     pub(crate) fn open_smart_folder_manager(&mut self, selected: Option<uuid::Uuid>) {
@@ -57,7 +180,255 @@ impl App {
         self.show_smart_folder_editor = true;
     }
 
+    /// 現在表示を再現できる実検索元。I/O は行わず、既存の view state だけで判定する。
+    pub(crate) fn smart_folder_current_rule_source(
+        &self,
+    ) -> Result<(Vec<PathBuf>, bool), &'static str> {
+        if self.items_are_subfolder_expansion_view {
+            let roots = if self.subfolder_expansion_roots.is_empty() {
+                self.subfolder_expansion_root.iter().cloned().collect()
+            } else {
+                self.subfolder_expansion_roots.clone()
+            };
+            return if roots.is_empty() {
+                Err("サブ展開の検索元を特定できないため追加できません")
+            } else {
+                Ok((roots, true))
+            };
+        }
+        if self.subfolder_expansion_available()
+            && let Some(folder) = self.current_folder.clone()
+        {
+            return Ok((vec![folder], false));
+        }
+        Err(
+            "ZIP／PDF内、検索結果、読書履歴など、実フォルダを検索元として特定できない表示では追加できません",
+        )
+    }
+
+    pub(crate) fn begin_add_current_smart_folder_rule(&mut self, target_id: uuid::Uuid) {
+        if !self
+            .settings
+            .smart_folders
+            .iter()
+            .any(|definition| definition.id == target_id)
+        {
+            return;
+        }
+        let Ok((sources, include_descendants)) = self.smart_folder_current_rule_source() else {
+            return;
+        };
+        let facet = &self.settings.facet_filter;
+        let filter = capture_smart_folder_filter(facet, self.effective_rating_filter());
+
+        let mut ignored_conditions = Vec::new();
+        if !facet.ai_models.is_empty() {
+            ignored_conditions.push(format!(
+                "AIモデル: {}",
+                facet
+                    .ai_models
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
+        }
+        if !facet.ai_tools.is_empty() {
+            ignored_conditions.push(format!(
+                "生成ツール: {}",
+                facet
+                    .ai_tools
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
+        }
+        if self.color_filter.enabled {
+            ignored_conditions.push(format!(
+                "画像色: {}",
+                crate::color_search::hex_rgb(self.color_filter.query_rgb)
+            ));
+        }
+        if !facet.place_keys.is_empty() {
+            ignored_conditions.push("場所".to_string());
+        }
+        self.smart_folder_rule_draft = Some(SmartFolderRuleDraft {
+            target_id,
+            sources,
+            include_descendants,
+            filter,
+            ignored_conditions,
+        });
+    }
+
+    fn show_smart_folder_create_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.smart_folder_create_name.clone() else {
+            return;
+        };
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        let trimmed = name.trim().to_string();
+        let duplicate = self
+            .settings
+            .smart_folders
+            .iter()
+            .any(|definition| definition.name.eq_ignore_ascii_case(&trimmed));
+        egui::Window::new("新しいスマートフォルダ")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(ctx.content_rect().min + egui::vec2(90.0, 70.0))
+            .show(ctx, |ui| {
+                ui.label("名前:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut name)
+                        .desired_width(360.0)
+                        .hint_text("スマートフォルダ名"),
+                );
+                if duplicate && !trimmed.is_empty() {
+                    ui.colored_label(ui.visuals().error_fg_color, "同じ名前が既にあります");
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "作成後、一覧のスマートフォルダメニューから現在の表示条件を追加します",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    let can_confirm = !trimmed.is_empty() && !duplicate;
+                    if ui
+                        .add_enabled(can_confirm, egui::Button::new("作成"))
+                        .clicked()
+                        || (can_confirm && response.lost_focus() && enter_pressed)
+                    {
+                        confirm = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            let definition = SmartFolderDefinition::new(trimmed);
+            self.smart_folder_editor_selected = Some(definition.id);
+            self.settings.smart_folders.push(definition);
+            self.settings.save();
+            self.smart_folder_create_name = None;
+        } else if cancel || escape_pressed || !open {
+            self.smart_folder_create_name = None;
+        } else {
+            self.smart_folder_create_name = Some(name);
+        }
+    }
+
+    fn show_smart_folder_rule_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.smart_folder_rule_draft.clone() else {
+            return;
+        };
+        let Some(target_name) = self
+            .settings
+            .smart_folders
+            .iter()
+            .find(|definition| definition.id == draft.target_id)
+            .map(|definition| definition.name.clone())
+        else {
+            self.smart_folder_rule_draft = None;
+            return;
+        };
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("現在のアイテム表示条件を追加")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_pos(ctx.content_rect().min + egui::vec2(80.0, 55.0))
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.label(format!("追加先: {target_name}"));
+                ui.separator();
+                ui.label(egui::RichText::new("検索元").strong());
+                for source in &draft.sources {
+                    ui.label(source.to_string_lossy())
+                        .on_hover_text(source.to_string_lossy());
+                }
+                ui.checkbox(&mut draft.include_descendants, "サブフォルダを含む")
+                    .on_hover_text(
+                        "サブ展開中は既定でONです。通常一覧で追加する場合は既定でOFFです。",
+                    );
+                ui.label(
+                    egui::RichText::new(
+                        "先に一覧でサブ展開を使うと、サブフォルダを含めた結果を確認できます",
+                    )
+                    .weak(),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("名前に含む:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.filter.name_contains)
+                            .desired_width(320.0),
+                    );
+                    ui.label(egui::RichText::new("（任意）").weak());
+                });
+                ui.label(egui::RichText::new("保存する条件").strong());
+                for summary in filter_summary(&draft.filter) {
+                    ui.label(format!("・{summary}"));
+                }
+                if !draft.ignored_conditions.is_empty() {
+                    ui.separator();
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "次の条件はファイル内容の確認または現在表示固有のため保存されません:",
+                    );
+                    for ignored in &draft.ignored_conditions {
+                        ui.label(format!("・{ignored}"));
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("追加").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            if let Some(definition) = self
+                .settings
+                .smart_folders
+                .iter_mut()
+                .find(|definition| definition.id == draft.target_id)
+            {
+                draft.filter.name_contains = draft.filter.name_contains.trim().to_string();
+                for source in draft.sources {
+                    definition.rules.push(SmartFolderRule::new(
+                        source,
+                        draft.include_descendants,
+                        draft.filter.clone(),
+                    ));
+                }
+                self.settings.save();
+                self.invalidate_smart_folder_definition(draft.target_id);
+            }
+            self.smart_folder_rule_draft = None;
+        } else if cancel || escape_pressed || !open {
+            self.smart_folder_rule_draft = None;
+        } else {
+            self.smart_folder_rule_draft = Some(draft);
+        }
+    }
+
     pub(crate) fn show_smart_folder_editor_dialog(&mut self, ctx: &egui::Context) {
+        self.show_smart_folder_create_dialog(ctx);
+        self.show_smart_folder_rule_dialog(ctx);
         if !self.show_smart_folder_editor {
             return;
         }
@@ -77,18 +448,6 @@ impl App {
                 .position(|definition| definition.id == id)
         });
         let mut draft = selected_index.map(|index| self.settings.smart_folders[index].clone());
-        let favorite_sources: Vec<(String, PathBuf)> = self
-            .settings
-            .favorites
-            .iter()
-            .map(|favorite| (favorite.name.clone(), favorite.path.clone()))
-            .collect();
-        let known_tags: Vec<String> = self
-            .settings
-            .tags
-            .iter()
-            .map(|tag| tag.name.clone())
-            .collect();
 
         let mut open = true;
         let mut close_requested = false;
@@ -96,10 +455,8 @@ impl App {
         let mut select_requested = None;
         let mut definition_swap = None;
         let mut delete_requested = None;
-        let mut source_remove = None;
-        let mut source_swap = None;
-        let mut pick_source_folder = false;
-        let mut add_favorite_source = None;
+        let mut rule_remove = None;
+        let mut rule_swap = None;
         let mut open_definition = None;
         let mut invalidated_definition = None;
         let mut deleted_definition = None;
@@ -114,9 +471,16 @@ impl App {
             .default_size(egui::vec2(900.0, 650.0))
             .min_size(egui::vec2(720.0, 460.0))
             .show(ctx, |ui| {
+                // 一覧部分だけが可変高を所有する。ScrollArea に高さ上限を渡さないと、
+                // 内容高が Window の最小高になり、縦方向へ縮められなくなる。
+                let footer_height = 42.0;
+                let body_height = (ui.available_height() - footer_height).max(180.0);
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(220.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(220.0, body_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                        ui.set_max_size(egui::vec2(220.0, body_height));
                         ui.horizontal(|ui| {
                             if ui.button("新規").clicked() {
                                 create_requested = true;
@@ -134,10 +498,9 @@ impl App {
                             }
                             if ui
                                 .add_enabled(
-                                    can_move
-                                        && selected_index.is_some_and(|index| {
-                                            index + 1 < self.settings.smart_folders.len()
-                                        }),
+                                    selected_index.is_some_and(|index| {
+                                        index + 1 < self.settings.smart_folders.len()
+                                    }),
                                     egui::Button::new("↓"),
                                 )
                                 .clicked()
@@ -153,9 +516,11 @@ impl App {
                             }
                         });
                         ui.separator();
+                        let list_height = ui.available_height().max(0.0);
                         egui::ScrollArea::vertical()
                             .id_salt("smart_folder_definition_list")
                             .auto_shrink([false, false])
+                            .max_height(list_height)
                             .show(ui, |ui| {
                                 if self.settings.smart_folders.is_empty() {
                                     ui.label(egui::RichText::new("(未登録)").weak());
@@ -167,8 +532,8 @@ impl App {
                                             &definition.name,
                                         )
                                         .on_hover_text(format!(
-                                            "{} 件の検索元",
-                                            definition.sources.len()
+                                            "{} 件の表示条件",
+                                            definition.rules.len()
                                         ))
                                         .clicked()
                                     {
@@ -176,88 +541,38 @@ impl App {
                                     }
                                 }
                             });
-                    });
+                        },
+                    );
 
                     ui.separator();
-                    ui.vertical(|ui| {
+                    let right_size = egui::vec2(ui.available_width(), body_height);
+                    ui.allocate_ui_with_layout(
+                        right_size,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                        ui.set_max_size(right_size);
                         if let Some(definition) = draft.as_mut() {
                             ui.horizontal(|ui| {
                                 ui.label("名前:");
                                 ui.text_edit_singleline(&mut definition.name);
-                                if ui.button("開く").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        !definition.rules.is_empty(),
+                                        egui::Button::new("開く"),
+                                    )
+                                    .on_hover_text(if definition.rules.is_empty() {
+                                        "現在の一覧から表示条件を追加してください"
+                                    } else {
+                                        "スマートフォルダを開きます"
+                                    })
+                                    .clicked()
+                                {
                                     open_definition = Some(definition.id);
                                 }
                             });
                             ui.add_space(4.0);
-                            ui.label(egui::RichText::new("検索元フォルダ").strong());
-                            ui.horizontal(|ui| {
-                                if ui.button("フォルダを追加…").clicked() {
-                                    pick_source_folder = true;
-                                }
-                                ui.menu_button("お気に入りから追加", |ui| {
-                                    if favorite_sources.is_empty() {
-                                        ui.add_enabled(false, egui::Button::new("(未登録)"));
-                                    }
-                                    for (name, path) in &favorite_sources {
-                                        let already = source_path_exists(&definition.sources, path);
-                                        if ui
-                                            .add_enabled(!already, egui::Button::new(name))
-                                            .on_hover_text(path.to_string_lossy())
-                                            .clicked()
-                                        {
-                                            add_favorite_source = Some(path.clone());
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "開くたびに有効な検索元をバックグラウンド走査します",
-                                    )
-                                    .weak(),
-                                );
-                            });
-                            egui::ScrollArea::vertical()
-                                .id_salt("smart_folder_source_list")
-                                .max_height(150.0)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    let source_count = definition.sources.len();
-                                    for (index, source) in definition.sources.iter_mut().enumerate()
-                                    {
-                                        ui.horizontal(|ui| {
-                                            ui.checkbox(&mut source.enabled, "");
-                                            ui.label(source.path.to_string_lossy())
-                                                .on_hover_text(source.path.to_string_lossy());
-                                            if ui.small_button("↑").clicked() && index > 0 {
-                                                source_swap = Some((index, index - 1));
-                                            }
-                                            if ui.small_button("↓").clicked()
-                                                && index + 1 < source_count
-                                            {
-                                                source_swap = Some((index, index + 1));
-                                            }
-                                            if ui.small_button("削除").clicked() {
-                                                source_remove = Some(index);
-                                            }
-                                        });
-                                    }
-                                });
-
-                            ui.separator();
-                            ui.label(egui::RichText::new("表示").strong());
+                            ui.label(egui::RichText::new("並び方").strong());
                             ui.horizontal_wrapped(|ui| {
-                                egui::ComboBox::from_id_salt("smart_folder_sort")
-                                    .selected_text(definition.sort.label())
-                                    .show_ui(ui, |ui| {
-                                        for &sort in SortOrder::all() {
-                                            ui.selectable_value(
-                                                &mut definition.sort,
-                                                sort,
-                                                sort.label(),
-                                            );
-                                        }
-                                    });
                                 egui::ComboBox::from_id_salt("smart_folder_grouping")
                                     .selected_text(definition.grouping.label())
                                     .show_ui(ui, |ui| {
@@ -269,146 +584,87 @@ impl App {
                                             );
                                         }
                                     });
-                                egui::ComboBox::from_id_salt("smart_folder_view_mode")
-                                    .selected_text(definition.view_mode.label())
-                                    .show_ui(ui, |ui| {
-                                        for &view_mode in GridViewMode::all() {
-                                            ui.selectable_value(
-                                                &mut definition.view_mode,
-                                                view_mode,
-                                                view_mode.label(),
-                                            );
-                                        }
-                                    });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "表示形式とソート順は現在の一覧設定を使います",
+                                    )
+                                    .weak(),
+                                );
                             });
 
                             ui.separator();
-                            ui.label(egui::RichText::new("保存する条件").strong());
-                            ui.horizontal(|ui| {
-                                ui.label("名前に含む:");
-                                ui.text_edit_singleline(&mut definition.filter.name_contains);
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("種類:");
-                                for &kind in SmartFolderContainerKind::all() {
-                                    let mut enabled = definition.filter.kinds.contains(&kind);
-                                    if ui.checkbox(&mut enabled, kind.label()).changed() {
-                                        if enabled {
-                                            definition.filter.kinds.insert(kind);
-                                        } else {
-                                            definition.filter.kinds.remove(&kind);
-                                        }
+                            ui.label(egui::RichText::new("保存した表示条件").strong());
+                            ui.label(
+                                egui::RichText::new(
+                                    "条件はスマートフォルダメニューの「現在のアイテム表示条件を追加」から登録します。複数条件はORで結合されます。",
+                                )
+                                .weak(),
+                            );
+                            let rule_list_height = ui.available_height().max(0.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("smart_folder_rule_list")
+                                .auto_shrink([false, false])
+                                .max_height(rule_list_height)
+                                .show(ui, |ui| {
+                                    if definition.rules.is_empty() {
+                                        ui.add_space(20.0);
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label("まだ表示条件がありません");
+                                        });
                                     }
-                                }
-                                ui.label(egui::RichText::new("(未選択は全種類)").weak());
-                            });
-                            let mut extensions = definition
-                                .filter
-                                .extensions
-                                .iter()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            ui.horizontal(|ui| {
-                                ui.label("拡張子:");
-                                if ui.text_edit_singleline(&mut extensions).changed() {
-                                    definition.filter.extensions = extensions
-                                        .split([',', '、', ' '])
-                                        .map(|value| {
-                                            value
-                                                .trim()
-                                                .trim_start_matches('.')
-                                                .to_ascii_lowercase()
-                                        })
-                                        .filter(|value| !value.is_empty())
-                                        .collect::<BTreeSet<_>>();
-                                }
-                                ui.label(egui::RichText::new("(空欄は全て)").weak());
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("更新日:");
-                                egui::ComboBox::from_id_salt("smart_folder_date_filter")
-                                    .selected_text(
-                                        definition
-                                            .filter
-                                            .date_preset
-                                            .map(FacetDatePreset::label)
-                                            .unwrap_or("指定なし"),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut definition.filter.date_preset,
-                                            None,
-                                            "指定なし",
-                                        );
-                                        for &preset in FacetDatePreset::all() {
-                                            ui.selectable_value(
-                                                &mut definition.filter.date_preset,
-                                                Some(preset),
-                                                preset.label(),
+                                    let rule_count = definition.rules.len();
+                                    for (index, rule) in definition.rules.iter_mut().enumerate() {
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.checkbox(&mut rule.enabled, "有効");
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        rule.source.to_string_lossy(),
+                                                    )
+                                                    .strong(),
+                                                )
+                                                .on_hover_text(rule.source.to_string_lossy());
+                                                if ui.small_button("↑").clicked() && index > 0 {
+                                                    rule_swap = Some((index, index - 1));
+                                                }
+                                                if ui.small_button("↓").clicked()
+                                                    && index + 1 < rule_count
+                                                {
+                                                    rule_swap = Some((index, index + 1));
+                                                }
+                                                if ui.small_button("削除").clicked() {
+                                                    rule_remove = Some(index);
+                                                }
+                                            });
+                                            ui.checkbox(
+                                                &mut rule.include_descendants,
+                                                "サブフォルダを含む",
                                             );
-                                        }
-                                    });
-                                ui.label("サイズ:");
-                                egui::ComboBox::from_id_salt("smart_folder_size_filter")
-                                    .selected_text(
-                                        definition
-                                            .filter
-                                            .size_preset
-                                            .map(FacetSizePreset::label)
-                                            .unwrap_or("指定なし"),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut definition.filter.size_preset,
-                                            None,
-                                            "指定なし",
-                                        );
-                                        for &preset in FacetSizePreset::all() {
-                                            ui.selectable_value(
-                                                &mut definition.filter.size_preset,
-                                                Some(preset),
-                                                preset.label(),
+                                            ui.horizontal(|ui| {
+                                                ui.label("名前に含む:");
+                                                ui.add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut rule.filter.name_contains,
+                                                    )
+                                                    .desired_width(240.0),
+                                                );
+                                            });
+                                            ui.label(
+                                                egui::RichText::new(rule_summary(rule))
+                                                    .small()
+                                                    .weak(),
                                             );
-                                        }
-                                    });
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("レーティング:");
-                                for rating in 0..=5 {
-                                    let label = if rating == 0 {
-                                        "未評価".to_string()
-                                    } else {
-                                        format!("★{rating}")
-                                    };
-                                    ui.checkbox(&mut definition.filter.ratings[rating], label);
-                                }
-                            });
-                            if !known_tags.is_empty() {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label("タグ:");
-                                    for tag in &known_tags {
-                                        let mut enabled = definition.filter.tags.contains(tag);
-                                        if ui.checkbox(&mut enabled, tag).changed() {
-                                            if enabled {
-                                                definition.filter.tags.insert(tag.clone());
-                                            } else {
-                                                definition.filter.tags.remove(tag);
-                                            }
-                                        }
+                                        });
+                                        ui.add_space(4.0);
                                     }
-                                    ui.checkbox(
-                                        &mut definition.filter.include_untagged,
-                                        "タグなしも含む",
-                                    );
                                 });
-                            }
                         } else {
                             ui.centered_and_justified(|ui| {
                                 ui.label("左の一覧から選ぶか、「新規」を押してください");
                             });
                         }
-                    });
+                        },
+                    );
                 });
 
                 ui.separator();
@@ -417,47 +673,31 @@ impl App {
                         close_requested = true;
                     }
                     ui.label(
-                        egui::RichText::new("外部の変更は自動監視せず、開く／更新時に再走査します")
-                            .weak(),
+                        egui::RichText::new("開く／更新時に実フォルダを再走査します").weak(),
                     );
                 });
             });
 
         let mut dirty = false;
         if let (Some(index), Some(mut updated)) = (selected_index, draft) {
-            if let Some((a, b)) = source_swap {
-                updated.sources.swap(a, b);
+            if let Some((a, b)) = rule_swap {
+                updated.rules.swap(a, b);
             }
-            if let Some(index) = source_remove {
-                if index < updated.sources.len() {
-                    updated.sources.remove(index);
-                }
-            }
-            if let Some(path) = add_favorite_source {
-                push_source_if_new(&mut updated, path);
+            if let Some(index) = rule_remove
+                && index < updated.rules.len()
+            {
+                updated.rules.remove(index);
             }
             updated.name = updated.name.trim().to_string();
             if updated.name.is_empty() {
                 updated.name = "スマートフォルダ".to_string();
             }
+            for rule in &mut updated.rules {
+                rule.filter.name_contains = rule.filter.name_contains.trim().to_string();
+            }
             if self.settings.smart_folders.get(index) != Some(&updated) {
                 invalidated_definition = Some(updated.id);
                 self.settings.smart_folders[index] = updated;
-                dirty = true;
-            }
-        }
-
-        if pick_source_folder {
-            let start = self
-                .effective_folder()
-                .filter(|path| path.is_dir())
-                .unwrap_or_else(|| PathBuf::from("."));
-            if let Some(path) = rfd::FileDialog::new().set_directory(start).pick_folder()
-                && let Some(index) = selected_index
-                && let Some(definition) = self.settings.smart_folders.get_mut(index)
-                && push_source_if_new(definition, path)
-            {
-                invalidated_definition = Some(definition.id);
                 dirty = true;
             }
         }
@@ -553,16 +793,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn duplicate_source_paths_are_not_added_twice() {
-        let mut definition = SmartFolderDefinition::new("test");
-        assert!(push_source_if_new(
-            &mut definition,
-            PathBuf::from(r"C:\Books")
-        ));
-        assert!(!push_source_if_new(
-            &mut definition,
-            PathBuf::from(r"c:\books")
-        ));
-        assert_eq!(definition.sources.len(), 1);
+    fn rule_summary_distinguishes_recursive_video_rule() {
+        let mut filter = SmartFolderFilter::default();
+        filter.kinds.insert(FacetItemKind::Video);
+        filter.extensions.insert("mp4".into());
+        let rule = SmartFolderRule::new(PathBuf::from(r"C:\Videos"), true, filter);
+        let summary = rule_summary(&rule);
+        assert!(summary.contains("サブフォルダを含む"));
+        assert!(summary.contains("動画"));
+        assert!(summary.contains(".mp4"));
+    }
+
+    #[test]
+    fn captured_filter_keeps_only_explicit_kind_conditions() {
+        let unrestricted = capture_smart_folder_filter(&Default::default(), [true; 6]);
+        assert!(unrestricted.kinds.is_empty());
+
+        let mut facet = crate::settings::FacetFilter::default();
+        facet.kinds.insert(FacetItemKind::Video);
+        facet.exts.insert("mp4".into());
+        let videos = capture_smart_folder_filter(&facet, [true; 6]);
+        assert_eq!(videos.kinds, [FacetItemKind::Video].into_iter().collect());
+        assert_eq!(videos.extensions, ["mp4".to_string()].into_iter().collect());
     }
 }

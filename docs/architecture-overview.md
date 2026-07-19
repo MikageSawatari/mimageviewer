@@ -63,10 +63,11 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `main.rs` | エントリポイント。フォント設定、logger 初期化、eframe 起動、`--pdf-worker` サブコマンド分岐 |
 | `lib.rs` | モジュール宣言のみ (ベンチマーク・テスト用に公開) |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
+| `app/folder_scan.rs` | 通常実フォルダの列挙と、1 物理フォルダ内に限定した同名メディア / コンテナ正規化の所有者。動画 + sidecar 画像、実フォルダ + ZIP/PDF/対応アーカイブ、ZIP + 変換元アーカイブ、画像拡張子優先度の規則を通常一覧・サブ展開・スマートフォルダで共有する |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理 |
 | `app/recursive_snapshot_scan.rs` | 複数実フォルダを再帰列挙する snapshot view 共通 walker。cancel、深さ上限、reparse point 回避、重複 root 排除、`GlobalIoSemaphore` / `ActivityGate`、chunk sort をサブ展開とスマートフォルダで共有する |
 | `app/subfolder_expansion.rs` | 現在地以下の画像 / 動画を平坦化する一時 snapshot view。共通 walker で走査し、prepare worker で metadata と表示順を構築する |
-| `app/smart_folder.rs` | 保存済みスマートフォルダの複数 root 走査、画像本 / ZIP / PDF / 対応アーカイブ判定、条件適用、snapshot 履歴復元、進捗 / cancel / stale generation 破棄を担当する |
+| `app/smart_folder.rs` | 保存済みスマートフォルダの複数ルール / root 走査、フォルダ / 画像 / 動画 / 音声 / ZIP / PDF / 対応アーカイブ収集、物理フォルダ単位の同名正規化、ルール OR 条件適用、現在の全体ソート順と保存済みグループ化単位による prepare、snapshot 履歴復元、進捗 / cancel / stale generation 破棄を担当する。同名動画 sidecar は full-path key の snapshot として表示へ渡す。通常一覧のソート順・サムネイル / 詳細表示は定義へ保存も上書きもしない |
 | `app/tests.rs` | `App` 周辺の unit test / App-level 状態機械テスト |
 | `settings.rs` | 設定の永続化 API (`Settings::load` / `save`)。Phase 3 で SQLite 経路に切替 (= `settings_db::boot_settings_db` / `with_db_result` 経由)。旧 JSON 経路 (`try_load_with_recovery` / `rotate_backups` / `write_atomic` 等) は `#[allow(dead_code)]` で残置 (将来削除予定) |
 | `settings_db.rs` | 設定永続化 SQLite バックエンド (`%APPDATA%/mimageviewer/settings.db`)。spec §5 の起動決定木 (`boot_settings_db`)、世代バックアップ (`SettingsDb::rotate_backups` で `bak1..bak10`)、JSON migration (`migrate_from_settings_json`)、quarantine (`quarantine_db_files`)、save 抑止フラグ (`save_suppressed`) を提供。詳細は [docs/settings-sqlite-migration.md](settings-sqlite-migration.md) |
@@ -89,7 +90,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | モジュール | 役割 |
 | --- | --- |
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
-| `ui_dialogs/smart_folder_editor.rs` | スマートフォルダ定義、任意検索元、共通条件、並び順、表示形式の管理 UI。変更は即時保存し、対応する実行中 worker / snapshot を無効化する |
+| `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示し、変更時は対応する worker / snapshot を無効化する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定 |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は base pixels / mask / preset を snapshot し、隠蔽合成・画像エンコード・メタデータ転記は worker が担当 |

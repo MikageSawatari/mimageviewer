@@ -6119,6 +6119,11 @@ pub struct App {
     pub(crate) show_smart_folder_editor: bool,
     pub(crate) smart_folder_editor_selected: Option<uuid::Uuid>,
     pub(crate) smart_folder_delete_confirm: Option<uuid::Uuid>,
+    /// `Some` の間は名前だけを入力する新規作成ダイアログを表示する。
+    pub(crate) smart_folder_create_name: Option<String>,
+    /// 現在の実フォルダ + 絞り込み条件から生成した、追加確認中のルール。
+    pub(crate) smart_folder_rule_draft:
+        Option<crate::ui_dialogs::smart_folder_editor::SmartFolderRuleDraft>,
 
     // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
     pub(crate) show_tag_editor: bool,
@@ -9316,6 +9321,8 @@ impl App {
             show_smart_folder_editor: false,
             smart_folder_editor_selected: None,
             smart_folder_delete_confirm: None,
+            smart_folder_create_name: None,
+            smart_folder_rule_draft: None,
             show_tag_editor: false,
             tag_editor_draft: Vec::new(),
             show_tag_apply: false,
@@ -11055,6 +11062,8 @@ impl App {
         self.show_stats_dialog
             || self.show_favorites_editor
             || self.show_smart_folder_editor
+            || self.smart_folder_create_name.is_some()
+            || self.smart_folder_rule_draft.is_some()
             || self.show_tag_editor
             || self.show_tag_apply
             || self.fullscreen_tag_picker_open
@@ -12883,7 +12892,7 @@ impl App {
             self.install_rating_view_rows();
             return;
         }
-        if self.update_current_smart_folder_sort() {
+        if self.reprepare_current_smart_folder_for_sort() {
             return;
         }
         if let Some(root) = self
@@ -34826,35 +34835,7 @@ impl App {
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
     ) {
-        let real_folder_names: std::collections::HashSet<String> = folders
-            .iter()
-            .filter_map(|item| {
-                if let GridItem::Folder(p) = item {
-                    return p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.to_lowercase());
-                }
-                None
-            })
-            .collect();
-
-        let mut keep = vec![true; folders.len()];
-        for (i, item) in folders.iter().enumerate() {
-            let p = match item {
-                GridItem::ZipFile(p)
-                | GridItem::PdfFile(p)
-                | GridItem::ConvertibleArchive { path: p, .. } => p,
-                _ => continue,
-            };
-            if real_folder_names.contains(&stem_lower(p)) {
-                keep[i] = false;
-            }
-        }
-        let mut ki = keep.iter();
-        folders.retain(|_| *ki.next().unwrap());
-        let mut ki = keep.iter();
-        folder_metas.retain(|_| *ki.next().unwrap());
+        crate::app::folder_scan::filter_virtual_folder_duplicates(folders, folder_metas);
     }
 
     /// Prefer native ZIP/CBZ over a same-stem RAR/7z/LZH archive.
@@ -34862,27 +34843,7 @@ impl App {
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
     ) {
-        let zip_stems: std::collections::HashSet<String> = folders
-            .iter()
-            .filter_map(|item| match item {
-                GridItem::ZipFile(path) => Some(stem_lower(path)),
-                _ => None,
-            })
-            .collect();
-        if zip_stems.is_empty() {
-            return;
-        }
-        let keep: Vec<bool> = folders
-            .iter()
-            .map(|item| match item {
-                GridItem::ConvertibleArchive { path, .. } => !zip_stems.contains(&stem_lower(path)),
-                _ => true,
-            })
-            .collect();
-        let mut iter = keep.iter();
-        folders.retain(|_| *iter.next().unwrap());
-        let mut iter = keep.iter();
-        folder_metas.retain(|_| *iter.next().unwrap());
+        crate::app::folder_scan::filter_convertible_archive_duplicates(folders, folder_metas);
     }
 
     /// 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
@@ -34896,33 +34857,12 @@ impl App {
         &mut self,
         all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
     ) {
-        use crate::app::folder_scan::ScanMediaKind;
-        let video_stems: std::collections::HashSet<String> = all_media
-            .iter()
-            .filter(|(_, kind, _, _)| *kind == ScanMediaKind::Video)
-            .map(|(p, _, _, _)| stem_lower(p))
-            .collect();
-
-        if video_stems.is_empty() {
-            return;
-        }
-
-        // 動画とのサイドカー重複判定・除外は画像のみ対象。音声 (Audio) は動画と同名でも
-        // 別メディアなので常に残す (= ここでは Image だけを処理する)。
         let use_sidecar = self.settings.video_thumb_use_sidecar_image;
-        for (p, kind, _, _) in all_media.iter() {
-            if *kind != ScanMediaKind::Image {
-                continue;
-            }
-            let stem = stem_lower(p);
-            if video_stems.contains(&stem) && use_sidecar {
-                self.video_thumb_overrides.insert(stem, p.clone());
-            }
+        for (video, image) in
+            crate::app::folder_scan::filter_video_image_duplicates(all_media, use_sidecar)
+        {
+            self.video_thumb_overrides.insert(stem_lower(&video), image);
         }
-
-        all_media.retain(|(p, kind, _, _)| {
-            *kind != ScanMediaKind::Image || !video_stems.contains(&stem_lower(p))
-        });
     }
 
     /// `search_filter` とレーティングフィルタに基づいて `visible_indices` を再計算する。
@@ -35640,7 +35580,7 @@ impl App {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(i64::MAX);
-                if mtime < now.saturating_sub(preset.seconds()) {
+                if !preset.matches_mtime(mtime, now) {
                     return false;
                 }
             }

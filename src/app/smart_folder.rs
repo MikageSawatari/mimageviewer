@@ -1,4 +1,5 @@
-//! スマートフォルダ: 複数実フォルダから本コンテナを収集する flat snapshot view。
+//! スマートフォルダ: 現在の一覧条件から保存した複数ルールを OR 結合し、
+//! 実フォルダ / 画像 / 動画 / 音声 / アーカイブを収集する flat snapshot view。
 
 use super::*;
 
@@ -15,19 +16,25 @@ const METADATA_CHUNK_SIZE: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SmartFolderEntryKind {
-    ImageFolder,
+    Folder,
+    Image,
+    Video,
+    Audio,
     Zip,
     Pdf,
     Archive,
 }
 
 impl SmartFolderEntryKind {
-    fn setting_kind(self) -> crate::settings::SmartFolderContainerKind {
+    fn setting_kind(self) -> crate::settings::FacetItemKind {
         match self {
-            Self::ImageFolder => crate::settings::SmartFolderContainerKind::ImageFolder,
-            Self::Zip => crate::settings::SmartFolderContainerKind::Zip,
-            Self::Pdf => crate::settings::SmartFolderContainerKind::Pdf,
-            Self::Archive => crate::settings::SmartFolderContainerKind::Archive,
+            Self::Folder => crate::settings::FacetItemKind::Folder,
+            Self::Image => crate::settings::FacetItemKind::Image,
+            Self::Video => crate::settings::FacetItemKind::Video,
+            Self::Audio => crate::settings::FacetItemKind::Audio,
+            Self::Zip => crate::settings::FacetItemKind::Zip,
+            Self::Pdf => crate::settings::FacetItemKind::Pdf,
+            Self::Archive => crate::settings::FacetItemKind::Archive,
         }
     }
 }
@@ -45,6 +52,9 @@ pub(crate) struct SmartFolderEntry {
     pub(crate) kind: SmartFolderEntryKind,
     pub(crate) mtime: i64,
     pub(crate) file_size: i64,
+    /// 安価な条件を通過したルールの definition.rules 上の index。prepare の ★ / タグ /
+    /// 編集状態条件はこの集合を OR 評価する。
+    pub(crate) matching_rule_indices: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,6 +111,8 @@ impl SmartFolderPhase {
 pub(crate) struct SmartFolderSnapshot {
     pub(crate) definition: crate::settings::SmartFolderDefinition,
     pub(crate) entries: Arc<Vec<SmartFolderEntry>>,
+    /// 動画 path の正規化キー -> 同じ物理フォルダで一覧から除外した同名画像。
+    pub(crate) video_thumb_overrides: HashMap<String, PathBuf>,
     pub(crate) diag: SmartFolderDiag,
 }
 
@@ -138,6 +150,7 @@ struct PreparedSmartFolder {
     snapshot: SmartFolderSnapshot,
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
+    video_items: Vec<(usize, PathBuf, u64)>,
     metadata: super::subfolder_expansion::PreparedSubfolderMetadata,
     refresh: bool,
 }
@@ -163,10 +176,46 @@ impl SmartFolderPreparePending {
 }
 
 #[derive(Clone)]
-struct ActiveSource {
+struct ActiveRule {
     id: uuid::Uuid,
-    root: PathBuf,
-    registration_order: usize,
+    source: PathBuf,
+    definition_order: usize,
+    include_descendants: bool,
+    filter: crate::settings::SmartFolderFilter,
+}
+
+#[derive(Clone)]
+struct SmartFolderScanOptions {
+    show_hidden_files: bool,
+    include_convertible_archives: bool,
+    skip_zip_if_folder_exists: bool,
+    skip_archive_if_zip_exists: bool,
+    skip_image_if_video_exists: bool,
+    skip_duplicate_images: bool,
+    video_thumb_use_sidecar_image: bool,
+    image_ext_priority: Vec<String>,
+}
+
+impl From<&crate::settings::Settings> for SmartFolderScanOptions {
+    fn from(settings: &crate::settings::Settings) -> Self {
+        Self {
+            show_hidden_files: settings.show_hidden_files,
+            include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
+            skip_image_if_video_exists: settings.skip_image_if_video_exists,
+            skip_duplicate_images: settings.skip_duplicate_images,
+            video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            image_ext_priority: settings.image_ext_priority.clone(),
+        }
+    }
+}
+
+struct SmartFolderCandidate {
+    path: PathBuf,
+    kind: SmartFolderEntryKind,
+    mtime: i64,
+    file_size: i64,
 }
 
 fn smart_folder_root() -> PathBuf {
@@ -193,26 +242,28 @@ fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
-fn active_sources(definition: &crate::settings::SmartFolderDefinition) -> Vec<ActiveSource> {
-    let mut sources: Vec<_> = definition
-        .sources
+fn active_rules(definition: &crate::settings::SmartFolderDefinition) -> Vec<ActiveRule> {
+    definition
+        .rules
         .iter()
         .enumerate()
-        .filter(|(_, source)| source.enabled && !source.path.as_os_str().is_empty())
-        .map(|(registration_order, source)| ActiveSource {
-            id: source.id,
-            root: source.path.clone(),
-            registration_order,
+        .filter(|(_, rule)| rule.enabled && !rule.source.as_os_str().is_empty())
+        .map(|(definition_order, rule)| ActiveRule {
+            id: rule.id,
+            source: rule.source.clone(),
+            definition_order,
+            include_descendants: rule.include_descendants,
+            filter: rule.filter.clone(),
         })
-        .collect();
-    // 親子 root が重なるとき、具体的な root を先に訪問して共通 walker の visited set に
-    // 登録する。親 root から同じ subtree に再侵入しないため、所属も具体的 root で安定する。
-    sources.sort_by(|a, b| {
-        path_depth(&b.root)
-            .cmp(&path_depth(&a.root))
-            .then_with(|| a.registration_order.cmp(&b.registration_order))
-    });
-    sources
+        .collect()
+}
+
+fn unique_rule_roots(rules: &[ActiveRule]) -> Vec<PathBuf> {
+    let mut roots: Vec<_> = rules.iter().map(|rule| rule.source.clone()).collect();
+    roots.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| a.cmp(b)));
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(crate::path_key::normalize_keep_drive(root)));
+    roots
 }
 
 fn entry_relative_parent(path: &Path, source_root: &Path) -> PathBuf {
@@ -229,16 +280,18 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn passes_cheap_filter(
-    entry: &SmartFolderEntry,
+fn passes_cheap_filter_values(
+    kind: SmartFolderEntryKind,
+    path: &Path,
+    mtime: i64,
+    file_size: i64,
     filter: &crate::settings::SmartFolderFilter,
     now: i64,
 ) -> bool {
-    if !filter.kinds.is_empty() && !filter.kinds.contains(&entry.kind.setting_kind()) {
+    if !filter.kinds.is_empty() && !filter.kinds.contains(&kind.setting_kind()) {
         return false;
     }
-    let name = entry
-        .path
+    let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
@@ -250,26 +303,26 @@ fn passes_cheap_filter(
         return false;
     }
     if !filter.extensions.is_empty() {
-        let extension = entry
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        // 画像のみフォルダには拡張子が無いので、拡張子条件があれば対象外。
+        let extension = if kind == SmartFolderEntryKind::Folder {
+            String::new()
+        } else {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        };
         if extension.is_empty() || !filter.extensions.contains(&extension) {
             return false;
         }
     }
     if let Some(preset) = filter.date_preset {
-        let earliest = now.saturating_sub(preset.seconds());
-        if entry.mtime < earliest {
+        if !preset.matches_mtime(mtime, now) {
             return false;
         }
     }
     if let Some(preset) = filter.size_preset {
         let (min, max) = preset.range_bytes();
-        let size = entry.file_size.max(0) as u64;
+        let size = file_size.max(0) as u64;
         if size < min || max.is_some_and(|max| size >= max) {
             return false;
         }
@@ -277,22 +330,150 @@ fn passes_cheap_filter(
     true
 }
 
+fn classify_entry_kind(
+    extension: &str,
+    include_convertible_archives: bool,
+) -> Option<SmartFolderEntryKind> {
+    if crate::folder_tree::is_recognized_image_ext(extension) {
+        Some(SmartFolderEntryKind::Image)
+    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension) {
+        Some(SmartFolderEntryKind::Video)
+    } else if crate::folder_tree::is_audio_ext(extension) {
+        Some(SmartFolderEntryKind::Audio)
+    } else if crate::folder_tree::is_zip_extension(extension) {
+        Some(SmartFolderEntryKind::Zip)
+    } else if extension == "pdf" {
+        Some(SmartFolderEntryKind::Pdf)
+    } else if include_convertible_archives
+        && crate::archive_converter::ArchiveFormat::from_extension(extension).is_some()
+    {
+        Some(SmartFolderEntryKind::Archive)
+    } else {
+        None
+    }
+}
+
+fn rules_for_directory<'a>(rules: &'a [ActiveRule], dir: &Path) -> Vec<&'a ActiveRule> {
+    rules
+        .iter()
+        .filter(|rule| {
+            crate::folder_tree::path_eq(dir, &rule.source)
+                || (rule.include_descendants
+                    && crate::books::path_is_under_or_equal(dir, &rule.source))
+        })
+        .collect()
+}
+
+/// 通常一覧と同じ同名ファイル規則を、1 つの物理フォルダ分の候補へ適用する。
+/// 条件適用より先に呼ぶことで、たとえば「画像だけ」のルールでも同名動画の sidecar
+/// 画像を独立アイテムとして復活させない。フラット一覧全体では呼ばない。
+fn normalize_smart_folder_candidates(
+    candidates: &mut Vec<SmartFolderCandidate>,
+    entry_file_names_ci: &HashSet<String>,
+    options: &SmartFolderScanOptions,
+) -> HashMap<String, PathBuf> {
+    use super::folder_scan::ScanMediaKind;
+
+    let mut media = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let kind = match candidate.kind {
+                SmartFolderEntryKind::Image => ScanMediaKind::Image,
+                SmartFolderEntryKind::Video => ScanMediaKind::Video,
+                SmartFolderEntryKind::Audio => ScanMediaKind::Audio,
+                _ => return None,
+            };
+            Some((
+                candidate.path.clone(),
+                kind,
+                candidate.mtime,
+                candidate.file_size,
+            ))
+        })
+        .collect::<Vec<_>>();
+    super::folder_scan::filter_upscaled_video_pairs_fast(&mut media, entry_file_names_ci);
+    let mut video_thumb_overrides = HashMap::new();
+    if options.skip_image_if_video_exists {
+        for (video, image) in super::folder_scan::filter_video_image_duplicates(
+            &mut media,
+            options.video_thumb_use_sidecar_image,
+        ) {
+            video_thumb_overrides.insert(crate::path_key::normalize_keep_drive(&video), image);
+        }
+    }
+    if options.skip_duplicate_images {
+        super::folder_scan::filter_image_ext_duplicates(&mut media, &options.image_ext_priority);
+    }
+
+    let mut containers = Vec::new();
+    let mut container_metas = Vec::new();
+    for candidate in candidates.iter() {
+        let item = match candidate.kind {
+            SmartFolderEntryKind::Folder => Some(GridItem::Folder(candidate.path.clone())),
+            SmartFolderEntryKind::Zip => Some(GridItem::ZipFile(candidate.path.clone())),
+            SmartFolderEntryKind::Pdf => Some(GridItem::PdfFile(candidate.path.clone())),
+            SmartFolderEntryKind::Archive => candidate
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase)
+                .and_then(|extension| {
+                    crate::archive_converter::ArchiveFormat::from_extension(&extension)
+                })
+                .map(|format| GridItem::ConvertibleArchive {
+                    path: candidate.path.clone(),
+                    format,
+                }),
+            _ => None,
+        };
+        if let Some(item) = item {
+            containers.push(item);
+            container_metas.push(Some((candidate.mtime, candidate.file_size)));
+        }
+    }
+    if options.skip_zip_if_folder_exists {
+        super::folder_scan::filter_virtual_folder_duplicates(&mut containers, &mut container_metas);
+    }
+    if options.skip_archive_if_zip_exists {
+        super::folder_scan::filter_convertible_archive_duplicates(
+            &mut containers,
+            &mut container_metas,
+        );
+    }
+
+    let keep_paths = media
+        .iter()
+        .map(|(path, _, _, _)| crate::path_key::normalize_keep_drive(path))
+        .chain(containers.iter().filter_map(|item| {
+            item.container_path()
+                .map(crate::path_key::normalize_keep_drive)
+        }))
+        .collect::<HashSet<_>>();
+    candidates.retain(|candidate| {
+        keep_paths.contains(&crate::path_key::normalize_keep_drive(&candidate.path))
+    });
+    video_thumb_overrides
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_one_directory(
-    source: &ActiveSource,
+    rules: &[ActiveRule],
     dir: &Path,
     entries: std::fs::ReadDir,
-    show_hidden_files: bool,
-    include_convertible_archives: bool,
+    options: &SmartFolderScanOptions,
     cancel: &AtomicBool,
     result: &mut Vec<SmartFolderEntry>,
+    video_thumb_overrides: &mut HashMap<String, PathBuf>,
     diag: &mut SmartFolderDiag,
 ) -> Vec<PathBuf> {
+    let applicable_rules = rules_for_directory(rules, dir);
+    if applicable_rules.is_empty() {
+        return Vec::new();
+    }
     let mut subdirs = Vec::new();
-    let mut image_count = 0usize;
-    let mut only_images = true;
-    let mut image_total_size = 0i64;
-    let mut image_latest_mtime = 0i64;
+    let mut candidates = Vec::new();
+    let mut entry_file_names_ci = HashSet::new();
+    let now = now_unix_secs();
 
     for entry_result in entries {
         if cancel.load(Ordering::Relaxed) {
@@ -305,7 +486,8 @@ fn scan_one_directory(
                 continue;
             }
         };
-        if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
+        entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
+        if crate::fs_entry::should_hide_fs_entry(&entry, options.show_hidden_files) {
             continue;
         }
         let file_type = match entry.file_type() {
@@ -317,20 +499,31 @@ fn scan_one_directory(
         };
         let entry_kind = crate::fs_entry::classify_dir_entry(&entry, &file_type);
         let path = entry.path();
-        if entry_kind.is_directory() {
-            if !crate::video::upscale::paths::has_work_dir_suffix(&path) {
-                subdirs.push(path);
-                only_images = false;
+        let kind = if entry_kind.is_directory() {
+            if crate::video::upscale::paths::has_work_dir_suffix(&path) {
+                continue;
             }
-            continue;
-        }
-        if !entry_kind.is_file() || crate::folder_tree::is_apple_double(&path) {
-            continue;
-        }
-        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-            continue;
+            if rules.iter().any(|rule| {
+                rule.include_descendants
+                    && crate::books::path_is_under_or_equal(&path, &rule.source)
+            }) {
+                subdirs.push(path.clone());
+            }
+            SmartFolderEntryKind::Folder
+        } else {
+            if !entry_kind.is_file() || crate::folder_tree::is_apple_double(&path) {
+                continue;
+            }
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            let extension = extension.to_ascii_lowercase();
+            let Some(kind) = classify_entry_kind(&extension, options.include_convertible_archives)
+            else {
+                continue;
+            };
+            kind
         };
-        let extension = extension.to_ascii_lowercase();
         let metadata = entry.metadata().ok();
         let mtime = metadata
             .as_ref()
@@ -343,60 +536,61 @@ fn scan_one_directory(
         if metadata.is_none() {
             diag.metadata_errors += 1;
         }
-
-        if crate::folder_tree::is_recognized_image_ext(&extension) {
-            image_count += 1;
-            image_total_size = image_total_size.saturating_add(file_size);
-            image_latest_mtime = image_latest_mtime.max(mtime);
-            continue;
-        }
-        if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str())
-            || crate::folder_tree::is_audio_ext(&extension)
-        {
-            only_images = false;
-            continue;
-        }
-        let kind = if crate::folder_tree::is_zip_extension(&extension) {
-            Some(SmartFolderEntryKind::Zip)
-        } else if extension == "pdf" {
-            Some(SmartFolderEntryKind::Pdf)
-        } else if include_convertible_archives
-            && crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some()
-        {
-            Some(SmartFolderEntryKind::Archive)
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            only_images = false;
-            result.push(SmartFolderEntry {
-                source_id: source.id,
-                source_root: source.root.clone(),
-                source_order: source.registration_order,
-                relative_parent: entry_relative_parent(&path, &source.root),
-                path,
-                kind,
-                mtime,
-                file_size,
-            });
-        }
+        candidates.push(SmartFolderCandidate {
+            path,
+            kind,
+            mtime,
+            file_size,
+        });
     }
 
-    if only_images && image_count > 0 {
-        let dir_metadata = std::fs::metadata(dir).ok();
-        let dir_mtime = dir_metadata
-            .as_ref()
-            .map(crate::ui_helpers::mtime_secs)
-            .unwrap_or(image_latest_mtime);
+    let before_normalize = candidates.len();
+    let directory_video_overrides =
+        normalize_smart_folder_candidates(&mut candidates, &entry_file_names_ci, options);
+    diag.duplicates_removed += before_normalize.saturating_sub(candidates.len());
+
+    for candidate in candidates {
+        let SmartFolderCandidate {
+            path,
+            kind,
+            mtime,
+            file_size,
+        } = candidate;
+        let mut matching_rules = applicable_rules
+            .iter()
+            .copied()
+            .filter(|rule| {
+                passes_cheap_filter_values(kind, &path, mtime, file_size, &rule.filter, now)
+            })
+            .collect::<Vec<_>>();
+        if matching_rules.is_empty() {
+            continue;
+        }
+        matching_rules.sort_by(|a, b| {
+            path_depth(&b.source)
+                .cmp(&path_depth(&a.source))
+                .then_with(|| a.definition_order.cmp(&b.definition_order))
+        });
+        let primary = matching_rules[0];
+        if kind == SmartFolderEntryKind::Video {
+            let video_key = crate::path_key::normalize_keep_drive(&path);
+            if let Some(image) = directory_video_overrides.get(&video_key) {
+                video_thumb_overrides.insert(video_key, image.clone());
+            }
+        }
         result.push(SmartFolderEntry {
-            source_id: source.id,
-            source_root: source.root.clone(),
-            source_order: source.registration_order,
-            relative_parent: entry_relative_parent(dir, &source.root),
-            path: dir.to_path_buf(),
-            kind: SmartFolderEntryKind::ImageFolder,
-            mtime: dir_mtime,
-            file_size: image_total_size,
+            source_id: primary.id,
+            source_root: primary.source.clone(),
+            source_order: primary.definition_order,
+            relative_parent: entry_relative_parent(&path, &primary.source),
+            path,
+            kind,
+            mtime,
+            file_size,
+            matching_rule_indices: matching_rules
+                .iter()
+                .map(|rule| rule.definition_order)
+                .collect(),
         });
     }
     subdirs
@@ -404,18 +598,18 @@ fn scan_one_directory(
 
 fn scan_smart_folder(
     definition: crate::settings::SmartFolderDefinition,
-    show_hidden_files: bool,
-    include_convertible_archives: bool,
+    options: SmartFolderScanOptions,
     cancel: &AtomicBool,
     io_sem: &crate::io_semaphore::GlobalIoSemaphore,
     activity_gate: &crate::activity_gate::ActivityGate,
     tx: &mpsc::Sender<SmartFolderScanEvent>,
 ) -> Option<SmartFolderScanResult> {
-    let sources = active_sources(&definition);
-    let roots: Vec<_> = sources.iter().map(|source| source.root.clone()).collect();
+    let rules = active_rules(&definition);
+    let roots = unique_rule_roots(&rules);
     let mut entries = Vec::new();
+    let mut video_thumb_overrides = HashMap::new();
     let mut diag = SmartFolderDiag::default();
-    let root_scanned = std::cell::RefCell::new(vec![false; sources.len()]);
+    let root_scanned = std::cell::RefCell::new(vec![false; roots.len()]);
     let containers_found = std::cell::Cell::new(0usize);
     let last_progress = std::cell::Cell::new(Instant::now());
     let walk_diag = super::recursive_snapshot_scan::walk_snapshot_roots(
@@ -425,17 +619,17 @@ fn scan_smart_folder(
         Some(io_sem),
         Some(activity_gate),
         |root_index, dir, read_dir, cancel| {
-            if crate::folder_tree::path_eq(dir, &sources[root_index].root) {
+            if crate::folder_tree::path_eq(dir, &roots[root_index]) {
                 root_scanned.borrow_mut()[root_index] = true;
             }
             let subdirs = scan_one_directory(
-                &sources[root_index],
+                &rules,
                 dir,
                 read_dir,
-                show_hidden_files,
-                include_convertible_archives,
+                &options,
                 cancel,
                 &mut entries,
+                &mut video_thumb_overrides,
                 &mut diag,
             );
             containers_found.set(entries.len());
@@ -463,19 +657,30 @@ fn scan_smart_folder(
     diag.read_dir_errors = walk_diag.read_dir_errors;
     diag.depth_limit_hits = walk_diag.depth_limit_hits;
     diag.visited_skips = walk_diag.visited_skips;
-    diag.source_failures = root_scanned.borrow().iter().filter(|seen| !**seen).count();
+    let scanned_root_keys: HashSet<_> = root_scanned
+        .borrow()
+        .iter()
+        .enumerate()
+        .filter(|(_, scanned)| **scanned)
+        .map(|(index, _)| crate::path_key::normalize_keep_drive(&roots[index]))
+        .collect();
+    diag.source_failures = rules
+        .iter()
+        .filter(|rule| {
+            !scanned_root_keys.contains(&crate::path_key::normalize_keep_drive(&rule.source))
+        })
+        .count();
 
-    let now = now_unix_secs();
-    entries.retain(|entry| passes_cheap_filter(entry, &definition.filter, now));
     let before_dedupe = entries.len();
     let mut seen = HashSet::new();
     entries.retain(|entry| seen.insert(crate::path_key::normalize_keep_drive(&entry.path)));
-    diag.duplicates_removed = before_dedupe.saturating_sub(entries.len());
+    diag.duplicates_removed += before_dedupe.saturating_sub(entries.len());
     diag.containers_found = entries.len();
     Some(SmartFolderScanResult {
         snapshot: SmartFolderSnapshot {
             definition,
             entries: Arc::new(entries),
+            video_thumb_overrides,
             diag,
         },
     })
@@ -486,8 +691,7 @@ fn spawn_smart_folder_scan(
     definition: crate::settings::SmartFolderDefinition,
     generation: u64,
     refresh: bool,
-    show_hidden_files: bool,
-    include_convertible_archives: bool,
+    options: SmartFolderScanOptions,
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     activity_gate: Arc<crate::activity_gate::ActivityGate>,
 ) -> Result<SmartFolderPending, String> {
@@ -500,8 +704,7 @@ fn spawn_smart_folder_scan(
         .spawn(move || {
             let event = match scan_smart_folder(
                 definition,
-                show_hidden_files,
-                include_convertible_archives,
+                options,
                 &cancel_worker,
                 &io_sem,
                 &activity_gate,
@@ -526,22 +729,153 @@ fn spawn_smart_folder_scan(
 
 fn metadata_filter_passes(
     filter: &crate::settings::SmartFolderFilter,
+    entry: &SmartFolderEntry,
     key: &str,
     ratings: &HashMap<String, u8>,
     tags: &HashMap<String, Vec<String>>,
+    edits: &SmartEditKeySets,
 ) -> bool {
+    use crate::settings::{FacetEditFlag, FacetTagMode};
+
     let rating = ratings.get(key).copied().unwrap_or(0).min(5) as usize;
     if !filter.ratings[rating] {
         return false;
     }
     let item_tags = tags.get(key).map(Vec::as_slice).unwrap_or(&[]);
     if !filter.tags.is_empty() || filter.include_untagged {
-        let tag_match = filter.tags.iter().any(|tag| item_tags.contains(tag));
+        let normalized_tags = item_tags
+            .iter()
+            .map(|tag| crate::tags_db::normalize_tag_key(tag))
+            .collect::<HashSet<_>>();
+        let tag_match = match filter.tag_mode {
+            FacetTagMode::Any => filter.tags.iter().any(|tag| normalized_tags.contains(tag)),
+            FacetTagMode::All => filter.tags.iter().all(|tag| normalized_tags.contains(tag)),
+        };
         if !tag_match && !(filter.include_untagged && item_tags.is_empty()) {
             return false;
         }
     }
+    for flag in &filter.edits {
+        let matched = match flag {
+            FacetEditFlag::Adjustment | FacetEditFlag::AiAdjustment => edit_key_matches(
+                &edits.adjustment,
+                entry,
+                key,
+                filter.edit_include_descendants,
+            ),
+            FacetEditFlag::LocalAdjustment => edit_key_matches(
+                &edits.local_adjust,
+                entry,
+                key,
+                filter.edit_include_descendants,
+            ),
+            FacetEditFlag::Mask => {
+                edit_key_matches(&edits.mask, entry, key, filter.edit_include_descendants)
+            }
+            FacetEditFlag::Conceal => {
+                edit_key_matches(&edits.conceal, entry, key, filter.edit_include_descendants)
+            }
+            FacetEditFlag::Annotation => edit_key_matches(
+                &edits.annotation,
+                entry,
+                key,
+                filter.edit_include_descendants,
+            ),
+            FacetEditFlag::Rotation => {
+                edit_key_matches(&edits.rotation, entry, key, filter.edit_include_descendants)
+            }
+            FacetEditFlag::Tagged => !item_tags.is_empty(),
+            FacetEditFlag::Untagged => item_tags.is_empty(),
+            FacetEditFlag::Rated => rating > 0,
+            FacetEditFlag::Unrated => rating == 0,
+        };
+        if !matched {
+            return false;
+        }
+    }
     true
+}
+
+#[derive(Default)]
+struct SmartEditKeySets {
+    adjustment: std::collections::BTreeSet<String>,
+    local_adjust: std::collections::BTreeSet<String>,
+    mask: std::collections::BTreeSet<String>,
+    conceal: std::collections::BTreeSet<String>,
+    annotation: std::collections::BTreeSet<String>,
+    rotation: std::collections::BTreeSet<String>,
+}
+
+fn edit_key_matches(
+    keys: &std::collections::BTreeSet<String>,
+    entry: &SmartFolderEntry,
+    key: &str,
+    include_descendants: bool,
+) -> bool {
+    if keys.contains(key) {
+        return true;
+    }
+    let separator = match entry.kind {
+        SmartFolderEntryKind::Folder => "/",
+        SmartFolderEntryKind::Zip | SmartFolderEntryKind::Pdf | SmartFolderEntryKind::Archive => {
+            "::"
+        }
+        SmartFolderEntryKind::Image | SmartFolderEntryKind::Video | SmartFolderEntryKind::Audio => {
+            return false;
+        }
+    };
+    let prefix = format!("{}{}", key.trim_end_matches(['/', ':']), separator);
+    for candidate in keys.range(prefix.clone()..) {
+        if !candidate.starts_with(&prefix) {
+            break;
+        }
+        if include_descendants {
+            return true;
+        }
+        let rest = &candidate[prefix.len()..];
+        if !rest.is_empty() && !rest.contains('/') {
+            return true;
+        }
+    }
+    false
+}
+
+fn load_edit_key_sets(
+    wanted: &std::collections::BTreeSet<crate::settings::FacetEditFlag>,
+    local_adjust: std::collections::BTreeSet<String>,
+) -> Result<SmartEditKeySets, String> {
+    use crate::settings::FacetEditFlag;
+    let mut result = SmartEditKeySets {
+        local_adjust,
+        ..SmartEditKeySets::default()
+    };
+    if wanted.contains(&FacetEditFlag::Adjustment) || wanted.contains(&FacetEditFlag::AiAdjustment)
+    {
+        result.adjustment = crate::adjustment_db::AdjustmentDb::open()
+            .map_err(|error| format!("補正 DB を読み込めませんでした: {error}"))?
+            .load_page_param_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Mask) {
+        result.mask = crate::mask_db::MaskDb::open()
+            .map_err(|error| format!("消しゴム DB を読み込めませんでした: {error}"))?
+            .load_all_mask_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Conceal) {
+        result.conceal = crate::conceal_db::ConcealDb::open()
+            .map_err(|error| format!("隠蔽加工 DB を読み込めませんでした: {error}"))?
+            .load_all_conceal_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Annotation) {
+        result.annotation = crate::comic_db::ComicDb::open()
+            .map_err(|error| format!("注釈 DB を読み込めませんでした: {error}"))?
+            .load_all_comic_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Rotation) {
+        result.rotation = crate::rotation_db::RotationDb::open()
+            .map_err(|error| format!("回転 DB を読み込めませんでした: {error}"))?
+            .load_rotated_keys();
+    }
+    Ok(result)
 }
 
 struct SmartEntrySortKey {
@@ -551,6 +885,7 @@ struct SmartEntrySortKey {
 
 fn prepare_smart_folder(
     snapshot: SmartFolderSnapshot,
+    sort: crate::settings::SortOrder,
     refresh: bool,
     load_ratings: bool,
     load_tags: bool,
@@ -627,6 +962,14 @@ fn prepare_smart_folder(
         }
     }
 
+    let wanted_edit_flags = snapshot
+        .definition
+        .rules
+        .iter()
+        .flat_map(|rule| rule.filter.edits.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    let edit_keys = load_edit_key_sets(&wanted_edit_flags, local_adjust.iter().cloned().collect())?;
+
     report(SmartFolderPhase::Filtering, 0);
     let mut included = Vec::with_capacity(total);
     for (index, key) in keys.iter().enumerate() {
@@ -636,13 +979,21 @@ fn prepare_smart_folder(
             }
             report(SmartFolderPhase::Filtering, index);
         }
-        if metadata_filter_passes(&snapshot.definition.filter, key, &ratings, &tags) {
+        let entry = &snapshot.entries[index];
+        if entry.matching_rule_indices.iter().any(|rule_index| {
+            snapshot
+                .definition
+                .rules
+                .get(*rule_index)
+                .is_some_and(|rule| {
+                    metadata_filter_passes(&rule.filter, entry, key, &ratings, &tags, &edit_keys)
+                })
+        }) {
             included.push(index);
         }
     }
 
     report(SmartFolderPhase::Sorting, 0);
-    let sort = snapshot.definition.sort;
     let grouping = snapshot.definition.grouping;
     let sort_keys: Vec<_> = snapshot
         .entries
@@ -708,7 +1059,10 @@ fn prepare_smart_folder(
         let entry_index = included[included_position];
         let entry = &snapshot.entries[entry_index];
         let item = match entry.kind {
-            SmartFolderEntryKind::ImageFolder => GridItem::Folder(entry.path.clone()),
+            SmartFolderEntryKind::Folder => GridItem::Folder(entry.path.clone()),
+            SmartFolderEntryKind::Image => GridItem::Image(entry.path.clone()),
+            SmartFolderEntryKind::Video => GridItem::Video(entry.path.clone()),
+            SmartFolderEntryKind::Audio => GridItem::Audio(entry.path.clone()),
             SmartFolderEntryKind::Zip => GridItem::ZipFile(entry.path.clone()),
             SmartFolderEntryKind::Pdf => GridItem::PdfFile(entry.path.clone()),
             SmartFolderEntryKind::Archive => {
@@ -739,10 +1093,12 @@ fn prepare_smart_folder(
             local_adjust_pages.insert(display_index);
         }
     }
+    let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
     Ok(Some(PreparedSmartFolder {
         snapshot,
         items,
         image_metas,
+        video_items,
         metadata: super::subfolder_expansion::PreparedSubfolderMetadata {
             rating_cache,
             tags_cache,
@@ -756,6 +1112,7 @@ fn prepare_smart_folder(
 
 fn spawn_smart_folder_prepare(
     snapshot: SmartFolderSnapshot,
+    sort: crate::settings::SortOrder,
     generation: u64,
     refresh: bool,
     load_ratings: bool,
@@ -771,6 +1128,7 @@ fn spawn_smart_folder_prepare(
         .spawn(move || {
             let event = match prepare_smart_folder(
                 snapshot,
+                sort,
                 refresh,
                 load_ratings,
                 load_tags,
@@ -807,8 +1165,8 @@ impl App {
             self.show_feedback_toast("スマートフォルダが見つかりません".into());
             return;
         };
-        if active_sources(&definition).is_empty() {
-            self.show_feedback_toast("有効な検索元フォルダを追加してください".into());
+        if active_rules(&definition).is_empty() {
+            self.show_feedback_toast("表示条件を追加してください".into());
             self.open_smart_folder_manager(Some(definition_id));
             return;
         }
@@ -833,8 +1191,7 @@ impl App {
             definition.clone(),
             generation,
             refresh,
-            self.settings.show_hidden_files,
-            !self.settings.archive_file_handling_ignores_convertible(),
+            SmartFolderScanOptions::from(&self.settings),
             io_sem,
             Arc::clone(&self.activity_gate),
         ) {
@@ -861,6 +1218,7 @@ impl App {
         let generation = self.smart_folder_generation;
         match spawn_smart_folder_prepare(
             snapshot,
+            self.settings.sort_order,
             generation,
             refresh,
             self.rating_db.is_some(),
@@ -996,7 +1354,7 @@ impl App {
                         break;
                     }
                     if result.snapshot.diag.source_failures
-                        == active_sources(&result.snapshot.definition).len()
+                        == active_rules(&result.snapshot.definition).len()
                     {
                         self.smart_folder_progress = None;
                         self.show_feedback_toast(
@@ -1079,6 +1437,7 @@ impl App {
             snapshot,
             items,
             image_metas,
+            video_items,
             metadata,
             refresh,
         } = prepared;
@@ -1086,13 +1445,14 @@ impl App {
         let definition_name = snapshot.definition.name.clone();
         let diag = snapshot.diag.clone();
         let item_count = items.len();
-        self.settings.sort_order = snapshot.definition.sort;
-        self.settings.grid_view_mode = snapshot.definition.view_mode;
+        self.video_thumb_overrides.clear();
+        self.video_thumb_overrides
+            .extend(snapshot.video_thumb_overrides.clone());
         self.start_loading_subfolder_items(
             smart_folder_synthetic_path(definition_id),
             items,
             image_metas,
-            Vec::new(),
+            video_items,
             metadata,
         );
         self.items_are_subfolder_expansion_view = false;
@@ -1121,27 +1481,15 @@ impl App {
         }
     }
 
-    pub(crate) fn update_current_smart_folder_sort(&mut self) -> bool {
+    pub(crate) fn reprepare_current_smart_folder_for_sort(&mut self) -> bool {
         if !self.items_are_smart_folder_view {
             return false;
         }
         let Some(id) = self.current_smart_folder_id else {
             return true;
         };
-        if let Some(definition) = self
-            .settings
-            .smart_folders
-            .iter_mut()
-            .find(|definition| definition.id == id)
-        {
-            definition.sort = self.settings.sort_order;
-            definition.view_mode = self.settings.grid_view_mode;
-        }
-        self.settings.save();
-        if let Some(snapshot) = self.smart_folder_snapshots.get_mut(&id) {
-            snapshot.definition.sort = self.settings.sort_order;
-            snapshot.definition.view_mode = self.settings.grid_view_mode;
-        }
+        // 通常一覧と同じグローバルなソート順を使う。スマートフォルダ定義へは
+        // 書き戻さず、保存済み snapshot を現在の設定で prepare し直すだけにする。
         if let Some(snapshot) = self.smart_folder_snapshots.get(&id).cloned() {
             self.start_smart_folder_prepare(snapshot, false);
         }
@@ -1183,41 +1531,63 @@ impl App {
             return;
         };
         let mut cancel = false;
-        egui::Area::new(egui::Id::new("smart_folder_progress_overlay"))
-            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -42.0))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(360.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(progress.phase.label());
-                        if ui.small_button("中止").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    if progress.phase == SmartFolderPhase::Scanning {
-                        ui.label(format!(
-                            "{}フォルダ / {}件",
-                            progress.dirs_scanned, progress.containers_found
-                        ));
-                        if let Some(path) = progress.current_dir {
-                            ui.label(egui::RichText::new(path.to_string_lossy()).small().weak());
-                        }
-                    } else if progress.total > 0 {
-                        ui.add(
-                            egui::ProgressBar::new(
-                                progress.completed as f32 / progress.total as f32,
-                            )
-                            .show_percentage(),
-                        );
-                    }
+        egui::Modal::new(egui::Id::new("smart_folder_progress_modal")).show(ctx, |ui| {
+            // サブ展開と同じ幅・構成にして、走査中は背面の一覧を操作できないことを
+            // 見た目でも明示する。処理本体と cancel の所有境界は変更しない。
+            ui.set_min_width(460.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.heading(if progress.phase == SmartFolderPhase::Scanning {
+                    "スマートフォルダを走査中..."
+                } else {
+                    "スマートフォルダの表示を準備中..."
                 });
             });
+            ui.add_space(6.0);
+            if progress.phase == SmartFolderPhase::Scanning {
+                ui.label(format!("対象項目: {} 件", progress.containers_found));
+                ui.label(format!("確認済みフォルダ: {} 件", progress.dirs_scanned));
+                if let Some(current_dir) = progress.current_dir.as_ref() {
+                    let full_path = current_dir.to_string_lossy().into_owned();
+                    ui.label("現在のフォルダ:").on_hover_text(&full_path);
+                    ui.add(
+                        egui::Label::new(
+                            current_dir
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(&full_path),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(full_path);
+                }
+            } else {
+                ui.add(
+                    egui::Label::new(format!(
+                        "{}: {} / {} 件",
+                        progress.phase.label(),
+                        progress.completed,
+                        progress.total
+                    ))
+                    .wrap_mode(egui::TextWrapMode::Extend),
+                );
+                if progress.total > 0 {
+                    ui.add(
+                        egui::ProgressBar::new(progress.completed as f32 / progress.total as f32)
+                            .show_percentage(),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            if ui.button("中止").clicked() {
+                cancel = true;
+            }
+        });
         if cancel {
             self.cancel_smart_folder_pending();
             self.show_feedback_toast("スマートフォルダ処理を中止しました".into());
         }
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 
@@ -1225,11 +1595,19 @@ impl App {
 mod tests {
     use super::*;
 
-    fn source(id: uuid::Uuid, path: &str, enabled: bool) -> crate::settings::SmartFolderSource {
-        crate::settings::SmartFolderSource {
+    fn rule(
+        id: uuid::Uuid,
+        source: PathBuf,
+        enabled: bool,
+        include_descendants: bool,
+        filter: crate::settings::SmartFolderFilter,
+    ) -> crate::settings::SmartFolderRule {
+        crate::settings::SmartFolderRule {
             id,
-            path: PathBuf::from(path),
+            source,
             enabled,
+            include_descendants,
+            filter,
         }
     }
 
@@ -1243,81 +1621,127 @@ mod tests {
             kind: SmartFolderEntryKind::Zip,
             mtime: 0,
             file_size: 1,
+            matching_rule_indices: vec![0],
         }
     }
 
+    fn unfiltered_scan_options() -> SmartFolderScanOptions {
+        SmartFolderScanOptions {
+            show_hidden_files: false,
+            include_convertible_archives: true,
+            skip_zip_if_folder_exists: false,
+            skip_archive_if_zip_exists: false,
+            skip_image_if_video_exists: false,
+            skip_duplicate_images: false,
+            video_thumb_use_sidecar_image: true,
+            image_ext_priority: Vec::new(),
+        }
+    }
+
+    fn run_test_scan(
+        definition: crate::settings::SmartFolderDefinition,
+        options: SmartFolderScanOptions,
+    ) -> SmartFolderScanResult {
+        let cancel = AtomicBool::new(false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let activity_gate = crate::activity_gate::ActivityGate::new(0);
+        let (tx, _rx) = mpsc::channel();
+        scan_smart_folder(definition, options, &cancel, &io_sem, &activity_gate, &tx).unwrap()
+    }
+
     #[test]
-    fn active_sources_put_specific_roots_first_but_keep_registration_order() {
+    fn unique_rule_roots_put_specific_roots_first_and_ignore_disabled_rules() {
         let mut definition = crate::settings::SmartFolderDefinition::new("books");
-        definition.sources = vec![
-            source(uuid::Uuid::new_v4(), r"C:\Books", true),
-            source(uuid::Uuid::new_v4(), r"C:\Books\Done", true),
-            source(uuid::Uuid::new_v4(), r"D:\Download", false),
+        definition.rules = vec![
+            rule(
+                uuid::Uuid::new_v4(),
+                PathBuf::from(r"C:\Books"),
+                true,
+                true,
+                Default::default(),
+            ),
+            rule(
+                uuid::Uuid::new_v4(),
+                PathBuf::from(r"C:\Books\Done"),
+                true,
+                true,
+                Default::default(),
+            ),
+            rule(
+                uuid::Uuid::new_v4(),
+                PathBuf::from(r"D:\Download"),
+                false,
+                true,
+                Default::default(),
+            ),
         ];
-        let sources = active_sources(&definition);
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources[0].root, PathBuf::from(r"C:\Books\Done"));
-        assert_eq!(sources[0].registration_order, 1);
-        assert_eq!(sources[1].registration_order, 0);
+        let roots = unique_rule_roots(&active_rules(&definition));
+        assert_eq!(
+            roots,
+            [PathBuf::from(r"C:\Books\Done"), PathBuf::from(r"C:\Books")]
+        );
     }
 
     #[test]
     fn cheap_filter_matches_kind_name_extension_date_and_size() {
         let now = now_unix_secs();
-        let entry = SmartFolderEntry {
-            source_id: uuid::Uuid::new_v4(),
-            source_root: PathBuf::from(r"C:\Books"),
-            source_order: 0,
-            relative_parent: PathBuf::new(),
-            path: PathBuf::from(r"C:\Books\Sample.cbz"),
-            kind: SmartFolderEntryKind::Zip,
-            mtime: now,
-            file_size: 2 * 1024 * 1024,
-        };
+        let path = PathBuf::from(r"C:\Books\Sample.cbz");
         let mut filter = crate::settings::SmartFolderFilter::default();
         filter.name_contains = "sample".into();
-        filter
-            .kinds
-            .insert(crate::settings::SmartFolderContainerKind::Zip);
+        filter.kinds.insert(crate::settings::FacetItemKind::Zip);
         filter.extensions.insert("cbz".into());
         filter.date_preset = Some(crate::settings::FacetDatePreset::Last7Days);
         filter.size_preset = Some(crate::settings::FacetSizePreset::MiB1To10);
-        assert!(passes_cheap_filter(&entry, &filter, now));
+        assert!(passes_cheap_filter_values(
+            SmartFolderEntryKind::Zip,
+            &path,
+            now,
+            2 * 1024 * 1024,
+            &filter,
+            now,
+        ));
         filter.extensions.clear();
         filter.extensions.insert("pdf".into());
-        assert!(!passes_cheap_filter(&entry, &filter, now));
+        assert!(!passes_cheap_filter_values(
+            SmartFolderEntryKind::Zip,
+            &path,
+            now,
+            2 * 1024 * 1024,
+            &filter,
+            now,
+        ));
     }
 
     #[test]
-    fn scan_recognizes_image_only_folder_and_supported_containers() {
+    fn scan_collects_folders_images_videos_audio_and_supported_containers() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
-        let image_book = root.join("images");
-        let mixed = root.join("mixed");
-        std::fs::create_dir_all(&image_book).unwrap();
-        std::fs::create_dir_all(&mixed).unwrap();
-        std::fs::write(image_book.join("001.jpg"), b"image").unwrap();
-        std::fs::write(image_book.join("note.txt"), b"ignored").unwrap();
-        std::fs::write(mixed.join("001.jpg"), b"image").unwrap();
-        std::fs::write(mixed.join("movie.mp4"), b"video").unwrap();
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(root.join("cover.jpg"), b"image").unwrap();
+        std::fs::write(root.join("movie.mp4"), b"video").unwrap();
+        std::fs::write(root.join("track.mp3"), b"audio").unwrap();
         std::fs::write(root.join("book.zip"), b"zip").unwrap();
         std::fs::write(root.join("book.pdf"), b"pdf").unwrap();
         std::fs::write(root.join("book.7z"), b"archive").unwrap();
+        std::fs::write(root.join("note.txt"), b"ignored").unwrap();
+        std::fs::write(child.join("inside.webp"), b"image").unwrap();
 
         let mut definition = crate::settings::SmartFolderDefinition::new("books");
-        definition.sources.push(crate::settings::SmartFolderSource {
-            id: uuid::Uuid::new_v4(),
-            path: root,
-            enabled: true,
-        });
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            true,
+            Default::default(),
+        ));
         let cancel = AtomicBool::new(false);
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
         let activity_gate = crate::activity_gate::ActivityGate::new(0);
         let (tx, _rx) = mpsc::channel();
         let result = scan_smart_folder(
             definition,
-            false,
-            true,
+            unfiltered_scan_options(),
             &cancel,
             &io_sem,
             &activity_gate,
@@ -1330,11 +1754,230 @@ mod tests {
             .iter()
             .filter_map(|entry| entry.path.file_name()?.to_str().map(str::to_owned))
             .collect();
-        assert!(names.contains("images"));
-        assert!(!names.contains("mixed"));
+        assert!(names.contains("child"));
+        assert!(names.contains("cover.jpg"));
+        assert!(names.contains("movie.mp4"));
+        assert!(names.contains("track.mp3"));
         assert!(names.contains("book.zip"));
         assert!(names.contains("book.pdf"));
         assert!(names.contains("book.7z"));
+        assert!(names.contains("inside.webp"));
+        assert!(!names.contains("note.txt"));
+    }
+
+    #[test]
+    fn scan_hides_same_folder_video_sidecar_and_keeps_it_as_thumbnail_override() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let video = root.join("movie.mp4");
+        let sidecar = root.join("movie.jpg");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&sidecar, b"image").unwrap();
+
+        let mut definition = crate::settings::SmartFolderDefinition::new("videos");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            false,
+            Default::default(),
+        ));
+        let mut options = unfiltered_scan_options();
+        options.skip_image_if_video_exists = true;
+        let result = run_test_scan(definition, options);
+
+        assert!(
+            result
+                .snapshot
+                .entries
+                .iter()
+                .any(|entry| crate::folder_tree::path_eq(&entry.path, &video))
+        );
+        assert!(
+            !result
+                .snapshot
+                .entries
+                .iter()
+                .any(|entry| crate::folder_tree::path_eq(&entry.path, &sidecar))
+        );
+        assert_eq!(
+            result
+                .snapshot
+                .video_thumb_overrides
+                .get(&crate::path_key::normalize_keep_drive(&video)),
+            Some(&sidecar)
+        );
+    }
+
+    #[test]
+    fn scan_does_not_merge_same_stem_media_from_different_physical_folders() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let video_dir = root.join("videos");
+        let image_dir = root.join("images");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        std::fs::create_dir_all(&image_dir).unwrap();
+        let video = video_dir.join("same.mp4");
+        let image = image_dir.join("same.jpg");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&image, b"image").unwrap();
+
+        let mut definition = crate::settings::SmartFolderDefinition::new("media");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            true,
+            Default::default(),
+        ));
+        let mut options = unfiltered_scan_options();
+        options.skip_image_if_video_exists = true;
+        let result = run_test_scan(definition, options);
+
+        assert!(
+            result
+                .snapshot
+                .entries
+                .iter()
+                .any(|entry| crate::folder_tree::path_eq(&entry.path, &video))
+        );
+        assert!(
+            result
+                .snapshot
+                .entries
+                .iter()
+                .any(|entry| crate::folder_tree::path_eq(&entry.path, &image))
+        );
+        assert!(result.snapshot.video_thumb_overrides.is_empty());
+    }
+
+    #[test]
+    fn scan_applies_same_name_normalization_before_saved_kind_filter() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("movie.mp4"), b"video").unwrap();
+        std::fs::write(root.join("movie.jpg"), b"image").unwrap();
+
+        let mut filter = crate::settings::SmartFolderFilter::default();
+        filter.kinds.insert(crate::settings::FacetItemKind::Image);
+        let mut definition = crate::settings::SmartFolderDefinition::new("images");
+        definition
+            .rules
+            .push(rule(uuid::Uuid::new_v4(), root, true, false, filter));
+        let mut options = unfiltered_scan_options();
+        options.skip_image_if_video_exists = true;
+        let result = run_test_scan(definition, options);
+
+        assert!(result.snapshot.entries.is_empty());
+        assert!(result.snapshot.video_thumb_overrides.is_empty());
+    }
+
+    #[test]
+    fn scan_keeps_video_and_same_name_image_when_duplicate_setting_is_disabled() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("movie.mp4"), b"video").unwrap();
+        std::fs::write(root.join("movie.jpg"), b"image").unwrap();
+
+        let mut definition = crate::settings::SmartFolderDefinition::new("media");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            false,
+            Default::default(),
+        ));
+        let result = run_test_scan(definition, unfiltered_scan_options());
+
+        assert_eq!(result.snapshot.entries.len(), 2);
+        assert!(result.snapshot.video_thumb_overrides.is_empty());
+    }
+
+    #[test]
+    fn scan_applies_container_and_image_duplicate_settings_per_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("book.v1")).unwrap();
+        std::fs::write(root.join("book.v1.zip"), b"zip").unwrap();
+        std::fs::write(root.join("book.v1.pdf"), b"pdf").unwrap();
+        std::fs::write(root.join("book.v1.7z"), b"archive").unwrap();
+        std::fs::write(root.join("native.zip"), b"zip").unwrap();
+        std::fs::write(root.join("native.rar"), b"archive").unwrap();
+        std::fs::write(root.join("cover.jpg"), b"jpg").unwrap();
+        std::fs::write(root.join("cover.png"), b"png").unwrap();
+
+        let mut definition = crate::settings::SmartFolderDefinition::new("books");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            false,
+            Default::default(),
+        ));
+        let mut options = unfiltered_scan_options();
+        options.skip_zip_if_folder_exists = true;
+        options.skip_archive_if_zip_exists = true;
+        options.skip_duplicate_images = true;
+        options.image_ext_priority = vec!["jpg".into(), "png".into()];
+        let result = run_test_scan(definition, options);
+        let names = result
+            .snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| entry.path.file_name()?.to_str())
+            .collect::<HashSet<_>>();
+
+        assert!(names.contains("book.v1"));
+        assert!(!names.contains("book.v1.zip"));
+        assert!(!names.contains("book.v1.pdf"));
+        assert!(!names.contains("book.v1.7z"));
+        assert!(names.contains("native.zip"));
+        assert!(!names.contains("native.rar"));
+        assert!(names.contains("cover.jpg"));
+        assert!(!names.contains("cover.png"));
+    }
+
+    #[test]
+    fn non_recursive_rule_keeps_direct_items_but_does_not_scan_children() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(root.join("direct.mp4"), b"video").unwrap();
+        std::fs::write(child.join("nested.mp4"), b"video").unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("videos");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            false,
+            Default::default(),
+        ));
+        let cancel = AtomicBool::new(false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let activity_gate = crate::activity_gate::ActivityGate::new(0);
+        let (tx, _rx) = mpsc::channel();
+        let result = scan_smart_folder(
+            definition,
+            unfiltered_scan_options(),
+            &cancel,
+            &io_sem,
+            &activity_gate,
+            &tx,
+        )
+        .unwrap();
+        let names: HashSet<_> = result
+            .snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| entry.path.file_name()?.to_str())
+            .collect();
+        assert!(names.contains("child"));
+        assert!(names.contains("direct.mp4"));
+        assert!(!names.contains("nested.mp4"));
     }
 
     #[test]
@@ -1344,17 +1987,21 @@ mod tests {
         std::fs::create_dir_all(&readable).unwrap();
         std::fs::write(readable.join("book.zip"), b"zip").unwrap();
         let mut definition = crate::settings::SmartFolderDefinition::new("books");
-        definition.sources = vec![
-            crate::settings::SmartFolderSource {
-                id: uuid::Uuid::new_v4(),
-                path: temp.path().join("missing"),
-                enabled: true,
-            },
-            crate::settings::SmartFolderSource {
-                id: uuid::Uuid::new_v4(),
-                path: readable,
-                enabled: true,
-            },
+        definition.rules = vec![
+            rule(
+                uuid::Uuid::new_v4(),
+                temp.path().join("missing"),
+                true,
+                true,
+                Default::default(),
+            ),
+            rule(
+                uuid::Uuid::new_v4(),
+                readable,
+                true,
+                true,
+                Default::default(),
+            ),
         ];
         let cancel = AtomicBool::new(false);
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
@@ -1362,8 +2009,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let result = scan_smart_folder(
             definition,
-            false,
-            true,
+            unfiltered_scan_options(),
             &cancel,
             &io_sem,
             &activity_gate,
@@ -1383,17 +2029,15 @@ mod tests {
         let parent_id = uuid::Uuid::new_v4();
         let child_id = uuid::Uuid::new_v4();
         let mut definition = crate::settings::SmartFolderDefinition::new("books");
-        definition.sources = vec![
-            crate::settings::SmartFolderSource {
-                id: parent_id,
-                path: temp.path().to_path_buf(),
-                enabled: true,
-            },
-            crate::settings::SmartFolderSource {
-                id: child_id,
-                path: child.clone(),
-                enabled: true,
-            },
+        definition.rules = vec![
+            rule(
+                parent_id,
+                temp.path().to_path_buf(),
+                true,
+                true,
+                Default::default(),
+            ),
+            rule(child_id, child.clone(), true, true, Default::default()),
         ];
         let cancel = AtomicBool::new(false);
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
@@ -1401,17 +2045,30 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let result = scan_smart_folder(
             definition,
-            false,
-            true,
+            unfiltered_scan_options(),
             &cancel,
             &io_sem,
             &activity_gate,
             &tx,
         )
         .unwrap();
-        assert_eq!(result.snapshot.entries.len(), 1);
-        assert_eq!(result.snapshot.entries[0].path, child);
-        assert_eq!(result.snapshot.entries[0].source_id, child_id);
+        let image = result
+            .snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("001.jpg"))
+            .unwrap();
+        assert_eq!(image.source_id, child_id);
+        assert_eq!(image.matching_rule_indices, [1, 0]);
+        assert_eq!(
+            result
+                .snapshot
+                .entries
+                .iter()
+                .filter(|entry| entry.path.ends_with("001.jpg"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1423,16 +2080,28 @@ mod tests {
         filter.ratings = [false; 6];
         filter.ratings[4] = true;
         filter.tags.insert("あとで読む".into());
-        assert!(metadata_filter_passes(&filter, &key, &ratings, &tags,));
+        let entry = smart_entry(r"C:\Books\sample.cbz", 0, "");
+        let edits = SmartEditKeySets::default();
+        assert!(metadata_filter_passes(
+            &filter, &entry, &key, &ratings, &tags, &edits,
+        ));
         filter.tags.clear();
         filter.include_untagged = true;
-        assert!(!metadata_filter_passes(&filter, &key, &ratings, &tags,));
+        assert!(!metadata_filter_passes(
+            &filter, &entry, &key, &ratings, &tags, &edits,
+        ));
     }
 
     #[test]
-    fn folder_grouped_sort_prioritizes_source_and_relative_folder() {
+    fn folder_grouped_prepare_uses_active_sort_after_source_and_relative_folder() {
         let mut definition = crate::settings::SmartFolderDefinition::new("books");
-        definition.sort = crate::settings::SortOrder::FileName;
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            PathBuf::from(r"C:\Books"),
+            true,
+            true,
+            Default::default(),
+        ));
         definition.grouping = crate::settings::SubfolderExpansionOrder::FolderGrouped;
         let snapshot = SmartFolderSnapshot {
             definition,
@@ -1441,13 +2110,23 @@ mod tests {
                 smart_entry(r"C:\SourceA\B\z.zip", 0, "B"),
                 smart_entry(r"C:\SourceA\A\m.zip", 0, "A"),
             ]),
+            video_thumb_overrides: HashMap::new(),
             diag: SmartFolderDiag::default(),
         };
         let cancel = AtomicBool::new(false);
         let (tx, _rx) = mpsc::channel();
-        let prepared = prepare_smart_folder(snapshot, false, false, false, false, &cancel, &tx)
-            .unwrap()
-            .unwrap();
+        let prepared = prepare_smart_folder(
+            snapshot,
+            crate::settings::SortOrder::FileName,
+            false,
+            false,
+            false,
+            false,
+            &cancel,
+            &tx,
+        )
+        .unwrap()
+        .unwrap();
         let names: Vec<_> = prepared
             .items
             .iter()
