@@ -80,6 +80,17 @@ pub fn init_with_path(
                 .is_ok()
             {
                 ENABLED.store(true, Ordering::Release);
+                // A same-session witness lets external release gates reject a stale perf log
+                // or a different mimageviewer-core process while still allowing a correctly
+                // sleeping measurement window to contain no frame events.
+                event(
+                    "session",
+                    "start",
+                    None,
+                    0,
+                    &[("pid", Value::from(std::process::id()))],
+                );
+                flush();
                 crate::logger::log(format!("perf: JSONL log enabled at {}", log_path.display()));
             }
         }

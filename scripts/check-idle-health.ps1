@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Scenario = "static-folder",
+    [ValidateSet("static-foreground", "static-background", "video-pin-background")]
+    [string]$Scenario = "static-foreground",
     [string]$ExePath = "",
     [int]$ProcessId = 0,
     [switch]$NoLaunch,
@@ -92,13 +93,21 @@ if ($ProcessId -gt 0) {
     $Process = Get-LiveProcess -Id $ProcessId
 }
 elseif ($NoLaunch) {
-    $Process = Get-Process -Name "mimageviewer-core" -ErrorAction SilentlyContinue |
-        Sort-Object StartTime -Descending |
-        Select-Object -First 1
-    if ($null -eq $Process) {
-        throw "mimageviewer-core is not running; omit -NoLaunch to start it"
+    if (-not (Test-Path -LiteralPath $PerfLog)) {
+        throw "perf log was not found; omit -NoLaunch to start a measured process"
     }
-    $Process.Refresh()
+    $SessionRecord = Get-Content -LiteralPath $PerfLog -Encoding UTF8 -TotalCount 64 |
+        ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+        } |
+        Where-Object {
+            $null -ne $_ -and $_.cat -eq "session" -and $_.kind -eq "start"
+        } |
+        Select-Object -First 1
+    if ($null -eq $SessionRecord -or $null -eq $SessionRecord.pid) {
+        throw "perf log has no session PID; start the current verification binary with --perf-log"
+    }
+    $Process = Get-LiveProcess -Id ([int]$SessionRecord.pid)
 }
 else {
     if ([string]::IsNullOrWhiteSpace($ExePath)) {
@@ -136,6 +145,13 @@ Write-Host "Prepare the requested static state, then do not touch the mouse or k
 Write-Host "After Enter, use the $WarmupSeconds-second warmup to return focus to mImageViewer for a foreground scenario."
 Write-Host "For a background scenario, leave another window in the foreground during warmup."
 Write-Host "Input during warmup is excluded; stop interacting when the measurement countdown begins."
+$Process = Get-LiveProcess -Id $Process.Id
+$EvidenceStartWall = Get-Date
+$EvidenceStartProcessElapsed = ($EvidenceStartWall - $Process.StartTime).TotalSeconds
+if ($Scenario -eq "video-pin-background") {
+    Write-Host "During setup, open/reload the folder so the pinned-video tile enters the keep range."
+    Write-Host "The gate requires a fresh idle_upgrade_ineligible event before measurement ends."
+}
 if (-not $SkipPrompt) {
     Read-Host "Press Enter when the scenario is ready" | Out-Null
 }
@@ -189,8 +205,16 @@ $AnalyzerArgs = @(
     "--max-reason-streak-secs", (Format-Invariant -Value ([double]$Thresholds.max_reason_streak_seconds)),
     "--max-same-work", ([string][int]$Thresholds.max_same_work),
     "--max-input-events", ([string][int]$Thresholds.max_input_events),
+    "--expected-pid", ([string][int]$Process.Id),
+    "--allow-sleeping-window",
     "--json-out", $PerfReportPath
 )
+if ($Scenario -eq "video-pin-background") {
+    $AnalyzerArgs += @(
+        "--evidence-start-t", (Format-Invariant -Value $EvidenceStartProcessElapsed),
+        "--require-idle-upgrade-ineligible"
+    )
+}
 
 Write-Host ""
 & $Python.Source @AnalyzerArgs

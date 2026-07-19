@@ -15,7 +15,9 @@ use std::time::SystemTime;
 use eframe::egui;
 
 use crate::app::App;
-use crate::settings_restore::{self, BackupSource, BackupSummary, ResetReport, RestoreReport};
+use crate::settings_restore::{
+    self, BackupCompatibility, BackupSource, BackupSummary, ResetReport, RestoreReport,
+};
 use crate::ui_helpers::format_bytes;
 
 const OPERATION_MODAL_SIZE: egui::Vec2 = egui::vec2(720.0, 540.0);
@@ -219,7 +221,7 @@ impl App {
             .resizable(true)
             .collapsible(false)
             .default_pos(dialog_pos)
-            .default_width(640.0)
+            .default_width(860.0)
             .show(ctx, |ui| {
                 draw_body(self, ui);
             });
@@ -227,6 +229,9 @@ impl App {
         if !open || (escape_pressed && !confirm_open && !result_open && !operation_modal_open) {
             self.show_settings_restore = false;
             self.settings_restore_state = SettingsRestoreState::default();
+            if self.settings_incompatible_at_boot {
+                self.show_settings_incompatible_notice = true;
+            }
         }
 
         // 確認 / 完了の各ダイアログ。結果ダイアログは `egui::Modal` で背景全部を
@@ -382,6 +387,9 @@ impl App {
                     // 状態は無傷、アプリ続行可。ダイアログを閉じるだけ。
                     self.show_settings_restore = false;
                     self.settings_restore_state = SettingsRestoreState::default();
+                    if self.settings_incompatible_at_boot {
+                        self.show_settings_incompatible_notice = true;
+                    }
                 }
                 ResultKind::Success | ResultKind::FailedTerminal => {
                     // 成功 or Terminal failure: どちらもアプリを終了する。
@@ -537,11 +545,13 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
             SettingsRestoreTab::Restore,
             "設定の復元",
         );
-        ui.selectable_value(
-            &mut app.settings_restore_state.tab,
-            SettingsRestoreTab::OperationCustomize,
-            "操作カスタマイズ",
-        );
+        if !app.settings_incompatible_at_boot {
+            ui.selectable_value(
+                &mut app.settings_restore_state.tab,
+                SettingsRestoreTab::OperationCustomize,
+                "操作カスタマイズ",
+            );
+        }
     });
     ui.separator();
     ui.add_space(6.0);
@@ -560,17 +570,19 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
 
     // 一覧テーブル。
     let now = SystemTime::now();
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .max_height(360.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("settings_restore_grid")
-                .num_columns(7)
+                .num_columns(9)
                 .striped(true)
                 .spacing(egui::vec2(12.0, 4.0))
                 .show(ui, |ui| {
                     // ヘッダ
                     ui.strong("世代");
+                    ui.strong("保存した版");
+                    ui.strong("互換性");
                     ui.strong("日時");
                     ui.strong("サイズ");
                     ui.strong("お気に入り");
@@ -582,6 +594,27 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
                     for backup in &app.settings_restore_state.backups {
                         // 世代
                         ui.label(backup.source.label());
+                        ui.label(backup.app_version.as_deref().unwrap_or("不明"));
+                        let boot_incompatible_current = app.settings_incompatible_at_boot
+                            && backup.source.is_current();
+                        let newer = boot_incompatible_current
+                            || backup.compatibility == BackupCompatibility::NewerVersion;
+                        if newer {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xc0, 0x40, 0x40),
+                                "利用不可（新しい版）",
+                            );
+                        } else {
+                            match backup.compatibility {
+                                BackupCompatibility::RestoreCandidate => {
+                                    ui.label("復元候補");
+                                }
+                                BackupCompatibility::Unknown => {
+                                    ui.weak("要確認");
+                                }
+                                BackupCompatibility::NewerVersion => unreachable!(),
+                            }
+                        }
                         // 日時 (= mtime の相対表現)
                         let when = backup
                             .mtime
@@ -599,8 +632,14 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
                             BackupSource::Current => {
                                 ui.weak("(現在使用中)");
                             }
-                            BackupSource::Bak(_) => {
-                                if ui.button("この時点に戻す…").clicked() {
+                            BackupSource::Bak(_) | BackupSource::PreUpgrade(_) => {
+                                if ui
+                                    .add_enabled(!newer, egui::Button::new("この時点に戻す…"))
+                                    .on_disabled_hover_text(
+                                        "このバックアップは現在のアプリより新しい版で保存されています。",
+                                    )
+                                    .clicked()
+                                {
                                     app.settings_restore_state.pending =
                                         Some(PendingAction::Restore(backup.source.clone()));
                                 }
@@ -1336,6 +1375,7 @@ fn load_previous_operation_bundle(
         BackupSource::Current => BackupSource::Bak(1),
         BackupSource::Bak(number) if *number < 10 => BackupSource::Bak(number + 1),
         BackupSource::Bak(_) => return Err("前世代はありません。".to_string()),
+        BackupSource::PreUpgrade(_) => return Err("前世代はありません。".to_string()),
     };
     if !backups.iter().any(|backup| backup.source == previous) {
         return Err("前世代はありません。".to_string());

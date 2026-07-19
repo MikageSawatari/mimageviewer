@@ -4723,6 +4723,7 @@ impl App {
 
         egui::Area::new("progress_overlay".into())
             .order(egui::Order::Foreground)
+            .interactable(false)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
@@ -4818,6 +4819,7 @@ impl App {
 
         egui::Area::new("container_enumerate_overlay".into())
             .order(egui::Order::Foreground)
+            .interactable(false)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, y_offset))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
@@ -12053,7 +12055,7 @@ impl App {
         let (fill, text_color, stroke, shadow) = if dark {
             (
                 egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230),
-                egui::Color32::WHITE,
+                style.visuals.text_color(),
                 egui::Stroke::new(
                     1.0,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
@@ -12068,7 +12070,7 @@ impl App {
         } else {
             (
                 egui::Color32::from_rgba_unmultiplied(232, 235, 240, 248),
-                egui::Color32::from_gray(25),
+                style.visuals.text_color(),
                 egui::Stroke::new(1.0, egui::Color32::from_gray(172)),
                 egui::Shadow {
                     offset: [0, 2],
@@ -12121,6 +12123,7 @@ impl App {
 
         egui::Area::new("selection_info".into())
             .order(egui::Order::Middle)
+            .interactable(false)
             .fixed_pos(area_pos)
             .show(ctx, |ui| {
                 popup_frame.show(ui, |ui| {

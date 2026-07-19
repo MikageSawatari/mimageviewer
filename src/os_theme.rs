@@ -54,6 +54,7 @@ pub fn apply_resolved_with_contrast(
     resolved: ResolvedTheme,
     contrast: TextContrast,
 ) {
+    let contrast = contrast.normalized();
     ctx.set_visuals_of(
         egui::Theme::Light,
         app_visuals(ResolvedTheme::Light, contrast),
@@ -92,14 +93,16 @@ pub(crate) fn current_text_contrast(ctx: &egui::Context) -> TextContrast {
 /// ラベルだけでなく widget の全 interaction state を同時に更新するため、ツールバー、
 /// メニュー、ComboBox、Window の通常描画は個別色指定なしで同じ配色になる。
 pub(crate) fn app_visuals(resolved: ResolvedTheme, contrast: TextContrast) -> egui::Visuals {
+    let contrast = contrast.normalized();
+    let strong = contrast == TextContrast::Strong;
     let mut visuals = match resolved {
         ResolvedTheme::Light => egui::Visuals::light(),
         ResolvedTheme::Dark => egui::Visuals::dark(),
     };
 
     let (normal, secondary, interactive, hover, active, open, disabled_alpha) =
-        match (resolved, contrast) {
-            (ResolvedTheme::Light, TextContrast::Standard) => (
+        match (resolved, strong) {
+            (ResolvedTheme::Light, false) => (
                 egui::Color32::from_gray(55),
                 egui::Color32::from_gray(100),
                 egui::Color32::from_gray(45),
@@ -108,7 +111,7 @@ pub(crate) fn app_visuals(resolved: ResolvedTheme, contrast: TextContrast) -> eg
                 egui::Color32::from_gray(20),
                 0.60,
             ),
-            (ResolvedTheme::Light, TextContrast::Strong) => (
+            (ResolvedTheme::Light, true) => (
                 egui::Color32::from_gray(20),
                 egui::Color32::from_gray(70),
                 egui::Color32::from_gray(16),
@@ -117,7 +120,7 @@ pub(crate) fn app_visuals(resolved: ResolvedTheme, contrast: TextContrast) -> eg
                 egui::Color32::BLACK,
                 0.72,
             ),
-            (ResolvedTheme::Dark, TextContrast::Standard) => (
+            (ResolvedTheme::Dark, false) => (
                 egui::Color32::from_gray(205),
                 egui::Color32::from_gray(160),
                 egui::Color32::from_gray(215),
@@ -126,7 +129,7 @@ pub(crate) fn app_visuals(resolved: ResolvedTheme, contrast: TextContrast) -> eg
                 egui::Color32::from_gray(232),
                 0.62,
             ),
-            (ResolvedTheme::Dark, TextContrast::Strong) => (
+            (ResolvedTheme::Dark, true) => (
                 egui::Color32::from_gray(242),
                 egui::Color32::from_gray(205),
                 egui::Color32::from_gray(245),
@@ -148,31 +151,31 @@ pub(crate) fn app_visuals(resolved: ResolvedTheme, contrast: TextContrast) -> eg
 
     match resolved {
         ResolvedTheme::Light => {
-            visuals.warn_fg_color = match contrast {
-                TextContrast::Standard => egui::Color32::from_rgb(120, 78, 0),
-                TextContrast::Strong => egui::Color32::from_rgb(92, 58, 0),
+            visuals.warn_fg_color = match strong {
+                false => egui::Color32::from_rgb(120, 78, 0),
+                true => egui::Color32::from_rgb(92, 58, 0),
             };
-            visuals.error_fg_color = match contrast {
-                TextContrast::Standard => egui::Color32::from_rgb(176, 42, 36),
-                TextContrast::Strong => egui::Color32::from_rgb(135, 24, 20),
+            visuals.error_fg_color = match strong {
+                false => egui::Color32::from_rgb(176, 42, 36),
+                true => egui::Color32::from_rgb(135, 24, 20),
             };
-            visuals.hyperlink_color = match contrast {
-                TextContrast::Standard => egui::Color32::from_rgb(25, 88, 140),
-                TextContrast::Strong => egui::Color32::from_rgb(0, 65, 118),
+            visuals.hyperlink_color = match strong {
+                false => egui::Color32::from_rgb(25, 88, 140),
+                true => egui::Color32::from_rgb(0, 65, 118),
             };
         }
         ResolvedTheme::Dark => {
-            visuals.warn_fg_color = match contrast {
-                TextContrast::Standard => egui::Color32::from_rgb(238, 193, 94),
-                TextContrast::Strong => egui::Color32::from_rgb(255, 213, 120),
+            visuals.warn_fg_color = match strong {
+                false => egui::Color32::from_rgb(238, 193, 94),
+                true => egui::Color32::from_rgb(255, 213, 120),
             };
-            visuals.error_fg_color = match contrast {
-                TextContrast::Standard => egui::Color32::from_rgb(245, 145, 138),
-                TextContrast::Strong => egui::Color32::from_rgb(255, 178, 172),
+            visuals.error_fg_color = match strong {
+                false => egui::Color32::from_rgb(245, 145, 138),
+                true => egui::Color32::from_rgb(255, 178, 172),
             };
-            visuals.hyperlink_color = match contrast {
-                TextContrast::Standard => egui::Color32::from_rgb(145, 196, 245),
-                TextContrast::Strong => egui::Color32::from_rgb(178, 218, 255),
+            visuals.hyperlink_color = match strong {
+                false => egui::Color32::from_rgb(145, 196, 245),
+                true => egui::Color32::from_rgb(178, 218, 255),
             };
         }
     }
@@ -205,10 +208,21 @@ pub(crate) fn dark_popup_frame(ctx: &egui::Context) -> egui::Frame {
 }
 
 /// フルスクリーンの標準 menu popup。背景枠と子 widget の両方を暗色へ揃える。
+fn dark_menu_popup_style(ctx: &egui::Context) -> StyleModifier {
+    let visuals = dark_visuals(current_text_contrast(ctx));
+    StyleModifier::new(move |style| {
+        // Popup::menu installs this modifier by default. Popup::style replaces rather than
+        // composes it, so apply the dark visuals and then restore menu-specific spacing/fills.
+        style.visuals = visuals.clone();
+        egui::containers::menu::menu_style(style);
+    })
+}
+
+/// フルスクリーンの標準 menu popup。背景枠と子 widget の両方を暗色へ揃える。
 #[allow(dead_code)] // lib target には bin 専用 fullscreen UI が含まれない。
 pub(crate) fn dark_menu_popup<'a>(response: &'a egui::Response) -> egui::Popup<'a> {
     egui::Popup::menu(response)
-        .style(dark_popup_style(&response.ctx))
+        .style(dark_menu_popup_style(&response.ctx))
         .frame(dark_popup_frame(&response.ctx))
 }
 
@@ -256,7 +270,8 @@ pub(crate) fn with_dark_context_style<R>(
 ///
 /// 色味は egui のテーマ既定に任せ、幅と opacity だけを調整する。
 fn apply_scrollbar_visibility_style(ctx: &egui::Context) {
-    ctx.style_mut(|style| {
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let mut style = (*ctx.style_of(theme)).clone();
         let scroll = &mut style.spacing.scroll;
         scroll.bar_width = 10.0;
         scroll.floating_width = 8.0;
@@ -267,7 +282,8 @@ fn apply_scrollbar_visibility_style(ctx: &egui::Context) {
         scroll.dormant_handle_opacity = 0.45;
         scroll.active_handle_opacity = 0.65;
         scroll.interact_handle_opacity = 0.80;
-    });
+        ctx.set_style_of(theme, style);
+    }
 }
 
 /// `UiTheme` を解決した結果が Dark かを返す (System の場合は OS 設定に追従)。
@@ -373,6 +389,13 @@ mod tests {
         for resolved in [ResolvedTheme::Light, ResolvedTheme::Dark] {
             for contrast in [TextContrast::Standard, TextContrast::Strong] {
                 let v = app_visuals(resolved, contrast);
+                let widget_background = |widget: &egui::style::WidgetVisuals| {
+                    if widget.weak_bg_fill == Color32::TRANSPARENT {
+                        v.panel_fill
+                    } else {
+                        widget.weak_bg_fill
+                    }
+                };
                 for (name, foreground, background) in [
                     ("normal", v.text_color(), v.panel_fill),
                     ("secondary", v.weak_text_color(), v.panel_fill),
@@ -381,22 +404,22 @@ mod tests {
                     (
                         "inactive widget",
                         v.widgets.inactive.fg_stroke.color,
-                        v.widgets.inactive.bg_fill,
+                        widget_background(&v.widgets.inactive),
                     ),
                     (
                         "hovered widget",
                         v.widgets.hovered.fg_stroke.color,
-                        v.widgets.hovered.bg_fill,
+                        widget_background(&v.widgets.hovered),
                     ),
                     (
                         "active widget",
                         v.widgets.active.fg_stroke.color,
-                        v.widgets.active.bg_fill,
+                        widget_background(&v.widgets.active),
                     ),
                     (
                         "open popup widget",
                         v.widgets.open.fg_stroke.color,
-                        v.widgets.open.bg_fill,
+                        widget_background(&v.widgets.open),
                     ),
                 ] {
                     let ratio = contrast_ratio(foreground, background);
@@ -442,19 +465,53 @@ mod tests {
         let ctx = egui::Context::default();
         apply_resolved(&ctx, ResolvedTheme::Light);
 
-        let style = ctx.style();
-        let scroll = &style.spacing.scroll;
-        assert_eq!(scroll.bar_width, 10.0);
-        assert_eq!(scroll.floating_width, 8.0);
-        assert!(scroll.dormant_handle_opacity >= 0.40);
-        assert!(scroll.active_handle_opacity >= scroll.dormant_handle_opacity);
-        assert!(scroll.interact_handle_opacity >= scroll.active_handle_opacity);
-        assert!(scroll.interact_handle_opacity <= 0.80);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let style = ctx.style_of(theme);
+            let scroll = &style.spacing.scroll;
+            assert_eq!(scroll.bar_width, 10.0, "{theme:?}");
+            assert_eq!(scroll.floating_width, 8.0, "{theme:?}");
+            assert!(scroll.dormant_handle_opacity >= 0.40, "{theme:?}");
+            assert!(
+                scroll.active_handle_opacity >= scroll.dormant_handle_opacity,
+                "{theme:?}"
+            );
+            assert!(
+                scroll.interact_handle_opacity >= scroll.active_handle_opacity,
+                "{theme:?}"
+            );
+            assert!(scroll.interact_handle_opacity <= 0.80, "{theme:?}");
+        }
 
         let default_light = egui::Visuals::light();
         assert_eq!(
-            style.visuals.widgets.inactive.bg_fill,
+            ctx.style_of(egui::Theme::Light)
+                .visuals
+                .widgets
+                .inactive
+                .bg_fill,
             default_light.widgets.inactive.bg_fill,
+        );
+    }
+
+    #[test]
+    fn dark_menu_popup_keeps_egui_menu_spacing_and_strokes() {
+        let ctx = egui::Context::default();
+        apply_resolved_with_contrast(&ctx, ResolvedTheme::Light, TextContrast::Strong);
+        let mut style = (*ctx.style()).clone();
+
+        dark_menu_popup_style(&ctx).apply(&mut style);
+
+        assert_eq!(style.spacing.button_padding, egui::vec2(2.0, 0.0));
+        assert_eq!(
+            style.visuals.widgets.inactive.weak_bg_fill,
+            Color32::TRANSPARENT
+        );
+        assert_eq!(style.visuals.widgets.inactive.bg_stroke, egui::Stroke::NONE);
+        assert_eq!(style.visuals.widgets.hovered.bg_stroke, egui::Stroke::NONE);
+        assert!(style.visuals.dark_mode);
+        assert_eq!(
+            style.visuals.text_color(),
+            dark_visuals(TextContrast::Strong).text_color()
         );
     }
 

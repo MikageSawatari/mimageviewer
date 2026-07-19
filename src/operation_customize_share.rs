@@ -454,7 +454,7 @@ fn is_leap_year(year: u32) -> bool {
 mod tests {
     use super::*;
     use crate::keymap::{KeyBindingOverride, MenuCommandId};
-    use crate::ring_shortcut::RingActionId;
+    use crate::ring_shortcut::{RingActionId, ViewerShortRightClickAction};
 
     fn binding(action: &str, chords: &[&str]) -> KeyBindingOverride {
         KeyBindingOverride {
@@ -479,6 +479,9 @@ mod tests {
         settings.ring_shortcuts.grid.slots[0] = RingActionId::CloseMainWindow;
         settings.ring_shortcuts.grid.slots[1] = RingActionId::GridScrollBottom;
         settings.ring_shortcuts.mouse_buttons_grid.middle = RingActionId::QuitApplication;
+        settings.ring_shortcuts.short_right_click_image = ViewerShortRightClickAction::None;
+        settings.ring_shortcuts.short_right_click_video = ViewerShortRightClickAction::ContextMenu;
+        settings.ring_shortcuts.select_grid_item_on_right_drag_start = true;
         let original = OperationCustomizeBundle::from_settings(&settings).with_label("共有用");
         let mut json: serde_json::Value =
             serde_json::from_str(&to_json(&original).unwrap()).unwrap();
@@ -497,6 +500,20 @@ mod tests {
         assert_eq!(
             parsed.bundle.ring_shortcuts.mouse_buttons_grid.middle,
             RingActionId::QuitApplication
+        );
+        assert_eq!(
+            parsed.bundle.ring_shortcuts.short_right_click_image,
+            ViewerShortRightClickAction::None
+        );
+        assert_eq!(
+            parsed.bundle.ring_shortcuts.short_right_click_video,
+            ViewerShortRightClickAction::ContextMenu
+        );
+        assert!(
+            parsed
+                .bundle
+                .ring_shortcuts
+                .select_grid_item_on_right_drag_start
         );
         assert_eq!(parsed.ignored_items, 0);
     }

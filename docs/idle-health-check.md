@@ -12,7 +12,9 @@
 
 アプリ内に周期 heartbeat を置くと、正常時にもアプリ自身を起こしてしまう。完全に sleep して
 測定区間内の perf event が 0 件になる状態を正常として扱うため、wall time と CPU は
-PowerShell 側で測る。
+PowerShell 側で測る。ただし空の窓を時刻ずれと誤認しないよう、perf log 冒頭の
+`session.start` に記録した PID と測定対象 PID の一致を必須にし、同一セッションが確認できた
+場合だけ「完全 sleep」を明示的に許可する。解析コマンド単体では空の窓は FAIL になる。
 
 ## 2. 実行方法
 
@@ -33,8 +35,9 @@ idle 測定を無効にする。シナリオ名に `foreground` / `background` �
 .\scripts\check-idle-health.ps1 -Scenario static-foreground
 ```
 
-同じプロセスで続ける場合は `-NoLaunch` を使う。背面シナリオでは、別ウィンドウを前面へ
-移してから Enter を押す。
+同じプロセスで続ける場合は `-NoLaunch` を使う。`-NoLaunch` はプロセス名の最新候補ではなく、
+perf log の `session.start.pid` と一致するプロセスを選ぶ。背面シナリオでは、別ウィンドウを
+前面へ移してから Enter を押す。
 
 ```powershell
 .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
@@ -61,6 +64,11 @@ idle 測定を無効にする。シナリオ名に `foreground` / `background` �
 3. 動画を代表画像に固定したフォルダを keep 範囲内へ置き、背面で静止
    (`video-pin-background`)
 
+`video-pin-background` はスクリプトを起動してから対象フォルダを開く／再読み込みする。
+準備開始から測定終了までに `thumb.idle_upgrade_ineligible` が 1 件も無ければ、動画ピンが
+keep 範囲へ入った証拠がないため FAIL になる。既に memo 済みの画面を動かさず測るだけでは
+シナリオ成立とみなさない。
+
 ZIP / PDF / スマートフォルダ、AI、動画・音楽などの非同期経路を変更したリリースでは、対象の
 ロード・解析が完了した状態も追加する。動画再生中、スライドショー中、索引・解析中は継続
 処理が正当なので、静止シナリオへ混ぜない。
@@ -74,7 +82,7 @@ ZIP / PDF / スマートフォルダ、AI、動画・音楽などの非同期経
 | --- | --- | --- |
 | CPU one-core ratio | 目標 0.05 / 上限 0.10 | `CPU time delta / wall time`。1.0 が論理コア約 1 本 |
 | update rate | 目標 2/s / 上限 10/s | 測定区間の `frame.begin` 件数 / wall time |
-| repaint reason streak | 上限 2 秒 | 同じ `requested_nonempty` 等が 500ms 未満の gap で継続した時間 |
+| repaint reason streak | 上限 2 秒 | 同じ `requested_nonempty` 等が 1秒以下の gap で継続した時間。1.5Hz 程度の低頻度ループも検出する |
 | same thumbnail work | 上限 3 回 | kind + key + idx + items generation が同一の work 件数 |
 | input event | 上限 0 | 測定中に操作が混ざった場合は無効な idle 測定として失敗 |
 | 通常ログ増加 | 上限 16 KiB / 15 秒 | 非構造化ログの高速肥大を検出 |
@@ -97,3 +105,6 @@ ZIP / PDF / スマートフォルダ、AI、動画・音楽などの非同期経
 ```powershell
 python scripts\test_analyze_perf.py
 ```
+
+このテストは `scripts/build-dist.ps1` の先頭でも必ず実行され、解析ゲート自体の退行がある
+状態では配布ビルドへ進まない。

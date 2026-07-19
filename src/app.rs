@@ -3199,6 +3199,7 @@ impl DetailsLazyMeta {
 struct DetailsMetaPending {
     visible_revision: u64,
     target_keys: HashSet<String>,
+    normal_target_keys: HashSet<String>,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<DetailsMetaEvent>,
 }
@@ -3229,6 +3230,7 @@ struct DetailsMetaTarget {
     catalog_folder: Option<PathBuf>,
     catalog_key: Option<String>,
     warm_image_dims: Option<(u32, u32)>,
+    page_count_fingerprint: i64,
     image_folder_page_count_options: Option<crate::app::folder_scan::ImageFolderPageCountOptions>,
     pdf_password: Option<String>,
     pdf_password_revision: Option<u64>,
@@ -6300,6 +6302,10 @@ pub struct App {
     pub(crate) show_settings_restore: bool,
     /// 復元ダイアログの状態 (一覧キャッシュ + 確認/結果のステート機械)。
     pub(crate) settings_restore_state: crate::ui_dialogs::settings_restore::SettingsRestoreState,
+    /// 起動時の settings.db が現在のバイナリより新しく、保存抑止で起動したか。
+    pub(crate) settings_incompatible_at_boot: bool,
+    /// 新しい版の設定を検出した案内モーダルを表示する。
+    pub(crate) show_settings_incompatible_notice: bool,
 
     // ── 複数選択 ──────────────────────────────────────────────────
     /// チェック済みアイテムの集合 (スペースキーで追加/削除)
@@ -7448,6 +7454,10 @@ pub struct App {
     pub(crate) smart_folder_saved_folder: Option<PathBuf>,
     pub(crate) smart_folder_snapshots:
         std::collections::HashMap<uuid::Uuid, smart_folder::SmartFolderSnapshot>,
+    /// snapshot / prepare worker と共有中に削除された実パス。定義ごとに保持し、
+    /// ソート変更や履歴復元で削除済み項目を再構築しないための tombstone。
+    pub(crate) smart_folder_removed_paths:
+        std::collections::HashMap<uuid::Uuid, std::collections::HashSet<String>>,
     pub(crate) smart_folder_generation: u64,
     pub(crate) smart_folder_pending: Option<smart_folder::SmartFolderPending>,
     pub(crate) smart_folder_prepare_pending: Option<smart_folder::SmartFolderPreparePending>,
@@ -8027,7 +8037,8 @@ pub struct App {
     pub(crate) trt_restart_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// TRT pack のオンラインインストールダイアログの状態。
     /// Some の間ダイアログが表示され、worker thread が動作している。
-    /// 閉じる (Drop) と worker は cancel される。
+    /// 閉じる (Drop) と worker は cancel される。数 GB の取得中も閲覧を続けられる
+    /// modeless tool window なので `common_modal_dialog_open` には含めない。
     pub(crate) trt_install_state: Option<crate::ui_dialogs::trt_install::TrtInstallState>,
     /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) のオンライン
     /// 取得ダイアログ状態。Some の間ダイアログ表示 + worker 動作 (Drop で cancel)。
@@ -8900,6 +8911,10 @@ impl App {
             crate::video::clock::clamp_playback_speed(settings.video_playback_speed);
         let video_continuous_mode = settings.video_continuous_mode;
         let video_session_muted = settings.video_start_muted || settings.video_muted;
+        let settings_incompatible_at_boot = matches!(
+            load_meta.boot_source,
+            crate::settings_db::BootSource::IncompatibleSettings
+        );
         let show_mouse_nav_migration_prompt =
             Self::should_show_mouse_nav_migration_prompt(&settings, &load_meta);
         // 更新後 初回起動の「重要な変更点」(version_highlights ④)。
@@ -8929,7 +8944,7 @@ impl App {
             env!("CARGO_PKG_VERSION"),
             crate::version_highlights::table(),
         );
-        let show_whats_new = !whats_new_entries.is_empty();
+        let show_whats_new = !settings_incompatible_at_boot && !whats_new_entries.is_empty();
         // 操作中はバックグラウンドインデクサを一時停止するためのゲート。
         // IndexerManager / name_index_supervisor の両方に `Arc` で共有される。
         let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(
@@ -9396,6 +9411,8 @@ impl App {
             show_settings_restore: false,
             settings_restore_state:
                 crate::ui_dialogs::settings_restore::SettingsRestoreState::default(),
+            settings_incompatible_at_boot,
+            show_settings_incompatible_notice: settings_incompatible_at_boot,
             pref_state: None,
             operation_customize_state: None,
             checked: std::collections::HashSet::new(),
@@ -9814,6 +9831,7 @@ impl App {
             current_smart_folder_id: None,
             smart_folder_saved_folder: None,
             smart_folder_snapshots: std::collections::HashMap::new(),
+            smart_folder_removed_paths: std::collections::HashMap::new(),
             smart_folder_generation: 0,
             smart_folder_pending: None,
             smart_folder_prepare_pending: None,
@@ -11078,6 +11096,7 @@ impl App {
             || self.show_preferences
             || self.show_preferences_discard_confirm
             || self.show_settings_restore
+            || self.show_settings_incompatible_notice
             || self.show_operation_customize
             || self.show_operation_customize_discard_confirm
             || self.show_mouse_nav_migration_prompt
@@ -11092,8 +11111,7 @@ impl App {
             || self.archive_convert_dialog_visible()
             || self.video_upscale.is_some()
             || self.tq.show
-            || !self.settings.first_setup_completed
-            || self.trt_install_state.is_some()
+            || (!self.settings_incompatible_at_boot && !self.settings.first_setup_completed)
             || self.show_delete_confirm
             || self.edit_bundle_paste_pending.is_some()
             || self.edit_bundle_apply_pending.is_some()
@@ -17349,6 +17367,7 @@ impl App {
                         self.pdf_current_password = None;
                         self.pdf_passwords.remove(&pdf_path);
                         self.pdf_passwords.save();
+                        self.invalidate_details_pdf_page_count(&pdf_path);
                     }
                     self.prepare_deferred_reopen_for_pdf_password_prompt();
                     // PDF メタキャッシュで placeholder grid を立てていた場合、レンダ
@@ -20061,6 +20080,10 @@ impl App {
         use std::sync::atomic::Ordering;
 
         self.requested.clear();
+        // items / thumbnails are replaced by several synthetic-view paths without going
+        // through install_new_items.  The memo is idx-keyed, so retaining it would make an
+        // unrelated item at the same index permanently ineligible for idle upgrading.
+        self.idle_upgrade_cache_bypass_ineligible.clear();
         self.pending_finalize.clear();
         self.texture_backlog.clear();
         self.checked.clear();
@@ -20359,22 +20382,15 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
-        let removed_subfolder_paths: Vec<std::path::PathBuf> =
-            if self.subfolder_expansion_snapshot.is_some()
-                || self.subfolder_expansion_install_pending.is_some()
-            {
-                sorted_desc_idxs
-                    .iter()
-                    .filter_map(|&i| {
-                        self.items
-                            .get(i)
-                            .and_then(GridItem::drag_source_path)
-                            .map(std::path::Path::to_path_buf)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let removed_snapshot_paths: Vec<std::path::PathBuf> = sorted_desc_idxs
+            .iter()
+            .filter_map(|&i| {
+                self.items
+                    .get(i)
+                    .and_then(GridItem::drag_source_path)
+                    .map(std::path::Path::to_path_buf)
+            })
+            .collect();
 
         // 物理 shift: 降順なので items.remove(i) の再 shift は発生しない。
         for &i in sorted_desc_idxs {
@@ -20389,7 +20405,8 @@ impl App {
             }
         }
         self.items_generation = self.items_generation.wrapping_add(1);
-        self.remove_paths_from_subfolder_expansion_snapshot(&removed_subfolder_paths);
+        self.remove_paths_from_subfolder_expansion_snapshot(&removed_snapshot_paths);
+        self.remove_paths_from_smart_folder_snapshots(&removed_snapshot_paths);
 
         // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
         // 削除 idx 集合は降順入力だが、partition_point には昇順が要るので一度昇順化する。
@@ -24361,6 +24378,7 @@ impl App {
                             "queue",
                             serde_json::Value::from(if is_heavy { "heavy" } else { "regular" }),
                         ),
+                        ("items_gen", serde_json::Value::from(self.items_generation)),
                     ],
                 );
             }
@@ -33806,6 +33824,44 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
+        // ZIP/PDF のページ数は画像寸法より1件あたりのI/Oが重い。大きくスクロールして
+        // 現在の可視近傍が起動時の Normal 優先集合と完全に離れたら、完了済みcacheを
+        // 保ったまま worker を組み直して新しい可視行を先に処理する。少しずつの
+        // スクロールは集合が重なるため再起動せず、cancel連打を避ける。
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.details_meta_pending.is_some()
+        {
+            let current_visible: HashSet<String> = self
+                .details_tag_prewarm_indices
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    self.details_item_requires_lazy_meta(idx)
+                        && self
+                            .details_lazy_meta_for_idx(idx)
+                            .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
+                })
+                .filter_map(|idx| self.details_lazy_cache_key(idx))
+                .collect();
+            let reprioritize = !current_visible.is_empty()
+                && self.details_meta_pending.as_ref().is_some_and(|pending| {
+                    current_visible
+                        .iter()
+                        .any(|key| pending.target_keys.contains(key))
+                        && (pending.normal_target_keys.is_empty()
+                            || current_visible.is_disjoint(&pending.normal_target_keys))
+                });
+            if reprioritize {
+                if let Some(pending) = self.details_meta_pending.take() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+                self.details_lazy_visible_revision =
+                    self.details_lazy_visible_revision.wrapping_add(1);
+                self.details_image_dims_state = LazyColumnState::NotRequested;
+                ctx.request_repaint();
+            }
+        }
+
         if self.selection_info_only_lazy_load() {
             let target_key = self.selection_info_lazy_target_key();
             let pending_is_stale = self.details_meta_pending.as_ref().is_some_and(|pending| {
@@ -34421,6 +34477,10 @@ impl App {
             }
         }
 
+        let normal_target_keys: HashSet<String> = visible_targets
+            .iter()
+            .map(|target| target.key.clone())
+            .collect();
         let normal_targets = visible_targets.len();
         let low_targets = background_targets.len();
         visible_targets.extend(background_targets);
@@ -34484,14 +34544,7 @@ impl App {
                     self.settings.indexer_speed_profile.io_permits().max(1),
                 ))
             });
-        let target_keys = if self.settings.grid_view_mode
-            == crate::settings::GridViewMode::Thumbnail
-            && !ai_facet_load
-        {
-            targets.iter().map(|target| target.key.clone()).collect()
-        } else {
-            HashSet::new()
-        };
+        let target_keys = targets.iter().map(|target| target.key.clone()).collect();
 
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -34552,6 +34605,7 @@ impl App {
         self.details_meta_pending = Some(DetailsMetaPending {
             visible_revision: self.details_lazy_visible_revision,
             target_keys,
+            normal_target_keys,
             cancel,
             rx,
         });
@@ -34730,6 +34784,9 @@ impl App {
             catalog_folder,
             catalog_key,
             warm_image_dims: self.details_warm_image_dims(idx),
+            page_count_fingerprint: crate::app::folder_scan::image_page_recognition_fingerprint(
+                &self.settings,
+            ),
             image_folder_page_count_options,
             pdf_password,
             pdf_password_revision,
@@ -52408,6 +52465,7 @@ impl eframe::App for App {
         self.poll_tq_encode_pending(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
+        self.show_settings_incompatible_dialog(ctx);
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);

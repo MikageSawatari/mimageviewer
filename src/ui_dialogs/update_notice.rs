@@ -78,13 +78,17 @@ impl App {
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("更新内容").strong());
                         ui.add_space(2.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("update_body_scroll")
-                            .max_height(240.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                crate::changelog_markdown::render(ui, &info.body);
-                            });
+                        ui.scope(|ui| {
+                            ui.spacing_mut().scroll =
+                                super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
+                            egui::ScrollArea::vertical()
+                                .id_salt("update_body_scroll")
+                                .max_height(240.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    crate::changelog_markdown::render(ui, &info.body);
+                                });
+                        });
                     }
                     ui.add_space(8.0);
                     ui.separator();

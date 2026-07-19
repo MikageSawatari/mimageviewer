@@ -297,13 +297,17 @@ impl HoverTipExt for egui::Response {
 
     fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
         let anchor = anchor_for(&self);
-        show_offset_tooltip(
-            &self.ctx,
-            egui::Tooltip::for_enabled(&self),
-            true,
-            anchor,
-            text,
-        );
+        // The fullscreen bar contains many buttons. Avoid cloning a complete dark Style for
+        // every button on every frame when no tooltip can be shown.
+        if anchor.is_some() {
+            show_offset_tooltip(
+                &self.ctx,
+                egui::Tooltip::for_enabled(&self),
+                true,
+                anchor,
+                text,
+            );
+        }
         self
     }
 

@@ -2074,6 +2074,12 @@ impl RingShortcutSettings {
         Self::sanitize_right_drag_mode(&mut self.right_drag_image);
         Self::sanitize_right_drag_mode(&mut self.right_drag_video);
         Self::sanitize_right_drag_mode(&mut self.right_drag_edit);
+        // EditMode has no ring context. Imported/shared settings must be normalized
+        // here as well as in the preferences combo, otherwise right drag silently
+        // stops working until that page is opened.
+        if matches!(self.right_drag_edit, Some(RightDragMode::RingShortcut)) {
+            self.right_drag_edit = Some(RightDragMode::Disabled);
+        }
         self.short_right_click_image = self.short_right_click_image.effective();
         self.short_right_click_video = self.short_right_click_video.effective();
         self.mouse_gestures_grid.sanitize(RightDragContext::Grid);
@@ -2379,9 +2385,56 @@ pub struct RingPickerAnchor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GamepadFavoritePickerState {
+pub struct GamepadListCursor {
     pub selected: usize,
     pub scroll_top: usize,
+}
+
+impl GamepadListCursor {
+    pub fn new(selected: usize) -> Self {
+        Self {
+            selected,
+            scroll_top: selected.saturating_sub(5),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GamepadFavoritePickerTab {
+    Favorites,
+    SmartFolders,
+}
+
+impl GamepadFavoritePickerTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Favorites => "お気に入り",
+            Self::SmartFolders => "スマートフォルダ",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadFavoritePickerState {
+    pub tab: GamepadFavoritePickerTab,
+    pub favorites: GamepadListCursor,
+    pub smart_folders: GamepadListCursor,
+}
+
+impl GamepadFavoritePickerState {
+    pub fn active_cursor(&self) -> &GamepadListCursor {
+        match self.tab {
+            GamepadFavoritePickerTab::Favorites => &self.favorites,
+            GamepadFavoritePickerTab::SmartFolders => &self.smart_folders,
+        }
+    }
+
+    pub fn active_cursor_mut(&mut self) -> &mut GamepadListCursor {
+        match self.tab {
+            GamepadFavoritePickerTab::Favorites => &mut self.favorites,
+            GamepadFavoritePickerTab::SmartFolders => &mut self.smart_folders,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2700,6 +2753,17 @@ mod tests {
         assert_eq!(
             settings.right_drag_mode(RightDragContext::VideoFullscreen),
             RightDragMode::RingShortcut
+        );
+    }
+
+    #[test]
+    fn sanitize_disables_imported_edit_mode_ring_shortcut() {
+        let mut settings = RingShortcutSettings::default();
+        settings.right_drag_edit = Some(RightDragMode::RingShortcut);
+        settings.sanitize();
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::EditMode),
+            RightDragMode::Disabled
         );
     }
 

@@ -323,6 +323,9 @@ detached ではこれらが逆効果になるため、detached viewport を配�
 実装方針:
 
 - `NativeVideoPlacement` を導入する。
+- detached 動画では detached host 自身の taskbar preview を使う。in-main native video
+  専用の DWM iconic bitmap を main HWND へ登録せず、main 側は一覧ウィンドウの実内容を
+  preview にする。main → detached の切替途中も main HWND の旧 bitmap を明示解除する。
 
 ```rust
 enum NativeVideoPlacement {

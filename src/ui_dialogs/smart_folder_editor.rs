@@ -196,6 +196,11 @@ impl App {
                 Ok((roots, true))
             };
         }
+        if self.search_filter.is_some() || self.show_search_bar {
+            return Err(
+                "検索中は追加できません（検索を閉じてから追加してください。名前条件は追加ダイアログで指定できます）",
+            );
+        }
         if self.subfolder_expansion_available()
             && let Some(folder) = self.current_folder.clone()
         {
@@ -459,7 +464,9 @@ impl App {
         let mut rule_swap = None;
         let mut open_definition = None;
         let mut invalidated_definition = None;
+        let mut presentation_updated_definition = None;
         let mut deleted_definition = None;
+        let mut normalize_definition_text = false;
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(48.0, 32.0);
 
@@ -554,7 +561,12 @@ impl App {
                         if let Some(definition) = draft.as_mut() {
                             ui.horizontal(|ui| {
                                 ui.label("名前:");
-                                ui.text_edit_singleline(&mut definition.name);
+                                if ui
+                                    .text_edit_singleline(&mut definition.name)
+                                    .lost_focus()
+                                {
+                                    normalize_definition_text = true;
+                                }
                                 if ui
                                     .add_enabled(
                                         !definition.rules.is_empty(),
@@ -642,12 +654,17 @@ impl App {
                                             );
                                             ui.horizontal(|ui| {
                                                 ui.label("名前に含む:");
-                                                ui.add(
+                                                if ui
+                                                    .add(
                                                     egui::TextEdit::singleline(
                                                         &mut rule.filter.name_contains,
                                                     )
                                                     .desired_width(240.0),
-                                                );
+                                                    )
+                                                    .lost_focus()
+                                                {
+                                                    normalize_definition_text = true;
+                                                }
                                             });
                                             ui.label(
                                                 egui::RichText::new(rule_summary(rule))
@@ -688,15 +705,28 @@ impl App {
             {
                 updated.rules.remove(index);
             }
-            updated.name = updated.name.trim().to_string();
-            if updated.name.is_empty() {
-                updated.name = "スマートフォルダ".to_string();
+            // TextEdit の内容を毎フレーム trim / 既定名へ置換すると、末尾空白を
+            // 入力できず、全選択→Delete→打ち直しも壊れる。フォーカス移動や
+            // ダイアログ操作で編集を確定するときだけ正規化する。
+            let commit_text = normalize_definition_text
+                || select_requested.is_some()
+                || open_definition.is_some()
+                || escape_pressed
+                || close_requested
+                || !open;
+            if commit_text {
+                normalize_smart_folder_definition_text(&mut updated);
             }
-            for rule in &mut updated.rules {
-                rule.filter.name_contains = rule.filter.name_contains.trim().to_string();
-            }
-            if self.settings.smart_folders.get(index) != Some(&updated) {
-                invalidated_definition = Some(updated.id);
+            if let Some(previous) = self.settings.smart_folders.get(index)
+                && previous != &updated
+            {
+                // 走査結果を決めるのは rules だけ。表示名や並び方の変更で実フォルダ
+                // snapshot を破棄しない。
+                if previous.rules != updated.rules {
+                    invalidated_definition = Some(updated.id);
+                } else {
+                    presentation_updated_definition = Some(updated.clone());
+                }
                 self.settings.smart_folders[index] = updated;
                 dirty = true;
             }
@@ -773,6 +803,9 @@ impl App {
         if let Some(id) = invalidated_definition {
             self.invalidate_smart_folder_definition(id);
         }
+        if let Some(definition) = presentation_updated_definition {
+            self.update_smart_folder_presentation(definition);
+        }
         if let Some(id) = deleted_definition {
             self.forget_smart_folder_definition(id);
         }
@@ -785,6 +818,16 @@ impl App {
             self.show_smart_folder_editor = false;
             self.smart_folder_delete_confirm = None;
         }
+    }
+}
+
+fn normalize_smart_folder_definition_text(definition: &mut crate::settings::SmartFolderDefinition) {
+    definition.name = definition.name.trim().to_string();
+    if definition.name.is_empty() {
+        definition.name = "スマートフォルダ".to_string();
+    }
+    for rule in &mut definition.rules {
+        rule.filter.name_contains = rule.filter.name_contains.trim().to_string();
     }
 }
 
@@ -815,5 +858,29 @@ mod tests {
         let videos = capture_smart_folder_filter(&facet, [true; 6]);
         assert_eq!(videos.kinds, [FacetItemKind::Video].into_iter().collect());
         assert_eq!(videos.extensions, ["mp4".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn smart_folder_text_is_normalized_only_when_edit_is_committed() {
+        let mut definition = crate::settings::SmartFolderDefinition::new("旅行 写真 ");
+        let mut rule = SmartFolderRule::new(
+            PathBuf::from(r"C:\Photos"),
+            false,
+            SmartFolderFilter::default(),
+        );
+        rule.filter.name_contains = "東方 紅魔郷 ".into();
+        definition.rules.push(rule);
+
+        // TextEdit 中に保持すべき raw 値。内部空白も末尾空白もここでは消さない。
+        assert_eq!(definition.name, "旅行 写真 ");
+        assert_eq!(definition.rules[0].filter.name_contains, "東方 紅魔郷 ");
+
+        normalize_smart_folder_definition_text(&mut definition);
+        assert_eq!(definition.name, "旅行 写真");
+        assert_eq!(definition.rules[0].filter.name_contains, "東方 紅魔郷");
+
+        definition.name.clear();
+        normalize_smart_folder_definition_text(&mut definition);
+        assert_eq!(definition.name, "スマートフォルダ");
     }
 }

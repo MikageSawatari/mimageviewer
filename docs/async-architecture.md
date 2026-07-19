@@ -541,7 +541,8 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
 新しい差し替え経路を増やすときは、必ず以下を揃える:
 
 1. `items_generation` を必ず bump (install_new_items 経由か直接 +1)
-2. `invalidate_idx_state_and_queues()` を呼ぶ — requested / pending_finalize /
+2. `invalidate_idx_state_and_queues()` を呼ぶ — requested / idle upgrade の idx memo /
+   pending_finalize /
    texture_backlog / checked / keep_range / keep_set / keep_*_shared / idx-keyed
    HashMap 群 / in-flight pending (fs_pending / ai_upscale_pending) / reload_queue /
    heavy_io_queue を一括で片付ける
@@ -873,6 +874,8 @@ python scripts/analyze_perf.py <path>/perf_events.jsonl idle-health --start-t 10
 `idle-health` は静止区間の `frame.begin` 件数、`ui.tail_repaint` reason の継続時間、同一
 thumbnail work の反復を検査し、閾値超過で exit 1 を返す。アプリが正常に sleep すると
 区間内 event が 0 件になるため、wall time はプロセス外から `--start-t` / `--end-t` で渡す。
+空区間は既定では窓ずれとして失敗し、外部 sampler が perf log の `session.start.pid` と測定対象
+PID の一致を確認した場合だけ `--allow-sleeping-window` で明示的に許可する。
 CPU time とログ増加量も含むリリース前手順は
 [idle-health-check.md](idle-health-check.md) を参照する。
 

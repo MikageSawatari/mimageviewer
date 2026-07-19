@@ -333,9 +333,15 @@ C:\home\mimageviewer_vendor_backup\
   止めるため、モデルレス Window と将来の登録漏れにも安全側で動く。state が存在しても
   Window を描かない phase がある処理は、state の有無ではなく「現在表示されるか」を返す
   helper を登録すること。
+- 数十分以上続く取得・管理 UI (TensorRT パック等) はモデルレス tool window とし、
+  `common_modal_dialog_open` へ含めて閲覧全体を停止しない。Window 上の入力だけは floating-layer
+  guard で背面へ漏らさない。
 - **ScrollArea の横幅**: ダイアログ右端に縦スクロールバーを置く一覧は
   `.auto_shrink([false, ...])` を指定し、利用可能幅を使い切る。既定の横 shrink のままだと
   内容幅まで縮み、スクロールバーがダイアログの途中に出る。
+- **折り返し本文と floating scrollbar**: 長文を折り返すダイアログでは、floating scrollbar の
+  `floating_allocated_width` を少なくとも `bar_inner_margin + bar_width` 確保する。共通 style は
+  一覧の表示面積を優先して予約幅 0 のため、そのまま使うと右端の文字へバーが重なる。
 - **パターン**: `ui_dialogs/` に 1 ファイル 1 メソッドで追加。
   `mod.rs` に `mod xxx;` を追加し、`app.rs` の `update()` 内で `self.show_xxx(ctx)` を呼ぶ。
   `App` 構造体に `show_xxx: bool` フィールドを追加し、`Default` impl で `false` 初期化。
@@ -1445,6 +1451,9 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - CPU one-core ratio、update rate、repaint reason streak、同一 thumbnail work、通常 / perf
      ログ増加量のどれかが上限を超えたら exit 1。失敗を閾値緩和だけで通さず、
      `target/idle-health/*-perf.json` の原因と反復 key を確認する。
+   - `-Scenario` は上記3値だけを受け付ける。perf log の session PID と測定対象 PID が違えば失敗し、
+     空の測定窓は同一 session を確認できた場合だけ完全 sleep として扱う。動画ピンシナリオは
+     準備開始後の `thumb.idle_upgrade_ineligible` が無ければセットアップ不成立として失敗する。
    - ZIP / PDF / スマートフォルダ、AI、動画・音楽の非同期経路を変更した場合は、その処理が
      完了した静止状態も追加測定する。詳細は `docs/idle-health-check.md`。
 
@@ -1802,6 +1811,24 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 「実機で確認してください」と口頭で頼むだけで済ませず、その時点で起動できるビルドまで揃えてから
 依頼する (対象例: 動画 native presenter / フルスクリーン / 動画→音声モード / VST / D3D11 /
 HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI など)。
+
+### 検証起動時の設定データ保護（必須）
+
+- エージェントは `target\release\mimageviewer.exe`、
+  `target\release\mimageviewer-core.exe`、インストール済み mImageViewer、
+  `%APPDATA%\mimageviewer\runtime\*` を UI / Computer Use 検証のために**起動しない**。
+  通常ビルドは起動だけで実利用中の `%APPDATA%\mimageviewer` を開き、設定DBの migration・
+  bak rotation・quarantine・保存を行い得る。ビルドしてユーザーへ渡すことは可、起動は不可。
+- エージェントが画面を操作するテストは、必ず
+  `.\scripts\prepare-portable-smoke.ps1` で作った使い捨てコピー
+  `target\portable-smoke\mimageviewer.exe` を使う。データ保存先が
+  `target\portable-smoke\data` であることを確認し、利用者のポータブル環境や通常設定を
+  コピーして使わない。
+- 利用者の実設定が必要なシナリオは、こちらではバイナリ準備までで止め、具体的な確認手順を
+  利用者へ渡す。テスト準備として通常設定の削除・リネーム・復元・初期化を行わない。
+- 背景: 2026-07-19、古い設定型の検証バイナリが新しい `DetailsColumnId::PageCount` を
+  `Corrupted` と誤分類し、main と bak1〜bak10 を順に quarantine した。設定ロード側でも
+  unknown variant / field は `Incompatible` として save 抑止し、DB family を変更しない。
 
 - **前提**: `cargo build` / `cargo test` が緑・`cargo fmt --check` 済み・(UI 文言を触ったなら)
   `python scripts/check_ui_glyphs.py` が 0 件であること。**コンパイルが通らない状態で検証

@@ -26,6 +26,7 @@ mod pdf_password;
 pub(crate) mod preferences;
 pub(crate) mod rename_item;
 mod rotation_reset;
+mod settings_incompatible;
 pub(crate) mod settings_restore;
 pub(crate) mod smart_folder_editor;
 mod stats_dialog;
@@ -42,3 +43,41 @@ mod vst3_actions;
 #[cfg(windows)]
 mod vst3_manager;
 mod whats_new;
+
+/// 長文ダイアログの縦スクロールバーが本文へ重ならないよう、floating bar の最大幅を
+/// viewport の右側へ予約する。アプリ共通 style は一覧の表示面積を優先して floating の
+/// 予約幅を 0 にしているため、折り返し本文を持つダイアログだけで局所適用する。
+fn non_overlapping_dialog_scroll_style(
+    mut scroll: eframe::egui::style::ScrollStyle,
+) -> eframe::egui::style::ScrollStyle {
+    if scroll.floating {
+        scroll.floating_allocated_width = scroll
+            .floating_allocated_width
+            .max(scroll.bar_inner_margin + scroll.bar_width);
+    }
+    scroll
+}
+
+#[cfg(test)]
+mod tests {
+    use super::non_overlapping_dialog_scroll_style;
+
+    #[test]
+    fn dialog_scroll_style_reserves_the_full_floating_bar_width() {
+        let mut scroll = eframe::egui::style::ScrollStyle::floating();
+        scroll.bar_width = 10.0;
+        scroll.bar_inner_margin = 4.0;
+        scroll.floating_allocated_width = 0.0;
+
+        let scroll = non_overlapping_dialog_scroll_style(scroll);
+
+        assert_eq!(scroll.floating_allocated_width, 14.0);
+        assert!(scroll.allocated_width() >= scroll.bar_width);
+    }
+
+    #[test]
+    fn dialog_scroll_style_leaves_solid_scrollbars_unchanged() {
+        let scroll = eframe::egui::style::ScrollStyle::solid();
+        assert_eq!(non_overlapping_dialog_scroll_style(scroll), scroll);
+    }
+}

@@ -5,8 +5,17 @@ Claude Code の Computer Use を使って手動実行するテスト。
 
 ## 前提条件
 
-- `cargo build --release` でビルド済み
+- `.\scripts\prepare-portable-smoke.ps1` を実行し、使い捨てのポータブル環境
+  `target\portable-smoke\` を準備済み
 - `testimage/` にテスト画像がある
+
+> **設定データ保護:** エージェントによる E2E では
+> `target\release\mimageviewer.exe` / `mimageviewer-core.exe`、インストール版、
+> `%APPDATA%\mimageviewer\runtime\*` を起動しない。これらは利用者の実設定を開き、
+> 起動だけで migration・bak rotation・quarantine・保存を行い得る。
+> `target\portable-smoke\mimageviewer.exe` だけを起動し、データ保存先が
+> `target\portable-smoke\data` であることを確認する。実設定が必要なシナリオは
+> 自動操作せず、利用者に手動確認を依頼する。
 
 ### 環境準備（重要）
 
@@ -75,9 +84,9 @@ $miv = Get-Process mimageviewer
 ### 1. 起動テスト
 
 **手順:**
-1. `target/release/mimageviewer.exe` を起動
+1. 使い捨てポータブル版を起動
    ```bash
-   cd H:/home/mimageviewer && start target/release/mimageviewer.exe
+   cd H:/home/mimageviewer && start target/portable-smoke/mimageviewer.exe
    ```
 2. `request_access(apps=["mimageviewer.exe"])` でアクセス許可を取得
 3. スクリーンショットを取得
@@ -340,13 +349,10 @@ HEIC / AVIF / JXL / RAW や PI / MAG のような非ネイティブ画像があ�
 
 **手順:**
 1. ツールバーで列数を変更（例: 9 → 4）
-2. アプリを閉じる
-   ```bash
-   powershell -Command "Stop-Process -Name mimageviewer -Force"
-   ```
+2. アプリの通常の終了操作で、使い捨てポータブル版を閉じる
 3. アプリを再起動する
    ```bash
-   start target/release/mimageviewer.exe
+   start target/portable-smoke/mimageviewer.exe
    ```
 4. ツールバーの列数表示を確認
 
@@ -355,7 +361,8 @@ HEIC / AVIF / JXL / RAW や PI / MAG のような非ネイティブ画像があ�
 - 最後に開いたフォルダが復元されている
 - アスペクト比設定が保持されている
 
-**クリーンアップ:** テスト後は列数を元の値に戻す。
+**クリーンアップ:** テスト後は `target\portable-smoke\` を破棄してよい。通常版の設定を
+戻す操作は行わない。
 
 ## ヘルパースクリプト
 

@@ -552,7 +552,9 @@ struct DetailsMetaRequest {
    画像ヘッダ/EXIF、FFmpeg probe、PDF/ZIP 列挙など。
 3. UI が今見ている範囲を優先する。
    サムネ worker と同じ `scroll_hint` / `visible_end_shared` を使うか、request 構築時に
-   `visible_indices` 先頭を優先順へ並べる。
+   `visible_indices` 先頭を優先順へ並べる。ZIP / PDF ページ数など重い列の走行中に可視近傍が
+   起動時の優先集合から完全に離れた場合は、取得済みの安定キー cache を保持して worker を
+   cancel / 再構築し、新しい可視行を Normal priority へ上げる。
 
 I/O は `GlobalIoSemaphore` の `Normal` または `Low` を使う。ユーザーが明示的に詳細列を
 表示した直後の可視行は `Normal`、画面外の補完は `Low` に寄せる。
@@ -735,6 +737,9 @@ worker のルール:
 - cancel はフォルダ切替、検索結果差し替え、列設定変更、ユーザー停止で立てる。
 - `GlobalIoSemaphore` を使う。可視行優先、画面外は低優先。
 - 既存キャッシュ/DB/メモリ値を先に使い、必要なものだけ I/O。
+- ZIP ページ数 cache の identity には Susie 有効状態と対応拡張子集合を含める。横断ビューで
+  親フォルダごとの catalog DB を使う場合、worker 全体で保持する接続は小さい LRU（現行 8）に
+  制限し、スマートフォルダの項目数に比例して SQLite 接続を増やさない。
 - 進捗は UI が毎フレーム `try_recv` で取り込み、`ctx.request_repaint()` する。
 
 ### 16.5 進捗 UI の最終仕様

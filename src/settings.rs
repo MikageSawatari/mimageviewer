@@ -1900,13 +1900,25 @@ pub enum TextContrast {
     #[default]
     Standard,
     Strong,
+    /// A value written by a future version. Normalize to Standard during settings load so
+    /// downgrading never turns the whole settings record into a corrupt record.
+    #[serde(other)]
+    Unknown,
 }
 
 impl TextContrast {
     pub fn label(self) -> &'static str {
-        match self {
+        match self.normalized() {
             Self::Standard => "標準",
             Self::Strong => "強め",
+            Self::Unknown => unreachable!("normalized text contrast"),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Standard,
+            value => value,
         }
     }
 }
@@ -2468,6 +2480,10 @@ pub struct Settings {
     pub grid_view_mode: GridViewMode,
     #[serde(default)]
     pub details_sort_key: DetailsSortKey,
+    /// v2.5.0 が知らない `DetailsSortKey::PageCount` の保存用キャリア。
+    /// 保存時だけ旧版が読める `Toolbar` へ退避し、読み込み後に戻す。
+    #[serde(default)]
+    pub(crate) details_page_count_sort_stash: bool,
     #[serde(default = "default_details_sort_ascending")]
     pub details_sort_ascending: bool,
     #[serde(default)]
@@ -2480,6 +2496,11 @@ pub struct Settings {
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
     pub details_column_widths: Vec<DetailsColumnWidth>,
+    /// v2.5.0 が知らないページ数列の位置・幅を、旧版が無視できる未知フィールドへ退避する。
+    #[serde(default)]
+    pub(crate) details_page_count_column_index_stash: Option<usize>,
+    #[serde(default)]
+    pub(crate) details_page_count_column_width_stash: Option<f32>,
     #[serde(default = "default_true")]
     pub details_show_preview: bool,
     #[serde(default = "default_true")]
@@ -4211,12 +4232,15 @@ impl Default for Settings {
             grid_cols: default_grid_cols(),
             grid_view_mode: GridViewMode::default(),
             details_sort_key: DetailsSortKey::default(),
+            details_page_count_sort_stash: false,
             details_sort_ascending: default_details_sort_ascending(),
             details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_timestamp_show_seconds: false,
             details_row_style: DetailsRowStyle::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
+            details_page_count_column_index_stash: None,
+            details_page_count_column_width_stash: None,
             details_name_width_auto: true,
             details_name_width: default_details_name_width(),
             details_show_preview: true,
@@ -5321,10 +5345,10 @@ impl Settings {
             // 抑止する (= 旧 MAIN_UNREADABLE_THIS_SESSION セマンティクスを継承)。
             // settings_db 側でも `SAVE_SUPPRESSED` が立っているので二重防御。
             MAIN_UNREADABLE_THIS_SESSION.store(true, Ordering::Relaxed);
-            settings_diag_log(
-                "settings: boot returned no DB handle (FailedFallbackDefault); \
-                 save() suppressed for this session",
-            );
+            settings_diag_log(&format!(
+                "settings: boot returned no DB handle ({source:?}); \
+                 save() suppressed for this session"
+            ));
         }
         let mut settings = outcome.settings;
         let previous_last_seen_version = settings.last_seen_version.clone();
@@ -5533,9 +5557,67 @@ impl Settings {
         true
     }
 
+    /// v2.6.0 で追加したページ数列を、v2.5.0 が deserialize できる形へ退避する。
+    ///
+    /// 旧版が読む既存フィールドには既知の variant だけを残し、ページ数列の状態は
+    /// 旧版が無視する追加フィールドへ保存する。live state ではなく永続化用 clone にだけ
+    /// 適用し、読み込み後は `restore_details_page_count_after_load` で元へ戻す。
+    pub(crate) fn stash_details_page_count_for_persist(&mut self) {
+        self.details_page_count_sort_stash =
+            matches!(self.details_sort_key, DetailsSortKey::PageCount);
+        if self.details_page_count_sort_stash {
+            self.details_sort_key = DetailsSortKey::Toolbar;
+        }
+
+        self.details_page_count_column_index_stash = self
+            .details_column_order
+            .iter()
+            .position(|column| *column == DetailsColumnId::PageCount);
+        self.details_column_order
+            .retain(|column| *column != DetailsColumnId::PageCount);
+
+        self.details_page_count_column_width_stash = self
+            .details_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::PageCount)
+            .map(|entry| entry.width);
+        self.details_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::PageCount);
+    }
+
+    fn restore_details_page_count_after_load(&mut self) {
+        if std::mem::take(&mut self.details_page_count_sort_stash) {
+            self.details_sort_key = DetailsSortKey::PageCount;
+        }
+
+        if let Some(index) = self.details_page_count_column_index_stash.take()
+            && !self
+                .details_column_order
+                .contains(&DetailsColumnId::PageCount)
+        {
+            self.details_column_order.insert(
+                index.min(self.details_column_order.len()),
+                DetailsColumnId::PageCount,
+            );
+        }
+
+        if let Some(width) = self.details_page_count_column_width_stash.take()
+            && !self
+                .details_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::PageCount)
+        {
+            self.details_column_widths.push(DetailsColumnWidth {
+                column: DetailsColumnId::PageCount,
+                width,
+            });
+        }
+    }
+
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.grid_display_order.normalize();
         // 環境設定 UI 側のレンジ (1..=30) と整合させる。
@@ -5674,6 +5756,7 @@ impl Settings {
                 true
             });
         }
+        self.restore_details_page_count_after_load();
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
         self.toolbar_facet_filter_items =
@@ -6489,6 +6572,115 @@ mod tests {
     }
 
     #[test]
+    fn page_count_details_stash_keeps_persisted_form_v25_compatible() {
+        let mut settings = Settings::default();
+        settings.details_sort_key = DetailsSortKey::PageCount;
+        settings.details_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::PageCount,
+            DetailsColumnId::Size,
+        ];
+        settings.details_column_widths = vec![
+            DetailsColumnWidth {
+                column: DetailsColumnId::PageCount,
+                width: 96.0,
+            },
+            DetailsColumnWidth {
+                column: DetailsColumnId::Size,
+                width: 128.0,
+            },
+        ];
+
+        let mut persisted = settings.clone();
+        persisted.stash_details_page_count_for_persist();
+        let json = serde_json::to_value(&persisted).unwrap();
+
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum V25DetailsSortKey {
+            Toolbar,
+            Name,
+            Rating,
+            Tags,
+            Kind,
+            Size,
+            Modified,
+            Created,
+            State,
+            ImageDimensions,
+            VideoDuration,
+            VideoDimensions,
+            VideoCodec,
+        }
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum V25DetailsColumnId {
+            Preview,
+            Name,
+            Rating,
+            Tags,
+            Kind,
+            Size,
+            Modified,
+            Created,
+            State,
+            ImageDimensions,
+            VideoDuration,
+            VideoDimensions,
+            VideoCodec,
+        }
+        #[derive(serde::Deserialize)]
+        struct V25DetailsColumnWidth {
+            column: V25DetailsColumnId,
+            width: f32,
+        }
+        #[derive(serde::Deserialize)]
+        struct V25DetailsSettings {
+            details_sort_key: V25DetailsSortKey,
+            details_column_order: Vec<V25DetailsColumnId>,
+            details_column_widths: Vec<V25DetailsColumnWidth>,
+        }
+
+        let v25: V25DetailsSettings = serde_json::from_value(json.clone())
+            .expect("v2.5.0 shape must ignore the page-count carriers");
+        assert_eq!(v25.details_sort_key, V25DetailsSortKey::Toolbar);
+        assert_eq!(
+            v25.details_column_order,
+            vec![
+                V25DetailsColumnId::Preview,
+                V25DetailsColumnId::Name,
+                V25DetailsColumnId::Size,
+            ]
+        );
+        assert!(
+            v25.details_column_widths
+                .iter()
+                .any(|entry| entry.column == V25DetailsColumnId::Size
+                    && (entry.width - 128.0).abs() < 0.1)
+        );
+
+        let mut loaded: Settings = serde_json::from_value(json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.details_sort_key, DetailsSortKey::PageCount);
+        assert_eq!(
+            loaded
+                .details_column_order
+                .iter()
+                .position(|column| *column == DetailsColumnId::PageCount),
+            Some(2)
+        );
+        assert!(
+            loaded
+                .details_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::PageCount
+                    && (entry.width - 96.0).abs() < 0.1)
+        );
+        assert!(!loaded.details_page_count_sort_stash);
+        assert!(loaded.details_page_count_column_index_stash.is_none());
+        assert!(loaded.details_page_count_column_width_stash.is_none());
+    }
+
+    #[test]
     fn stack_separator_defaults_to_underscore_when_missing() {
         // v2.0.0 で追加したファイル名スタックの区切り文字は、旧 settings JSON
         // (フィールド無し) を読んだとき既定 '_' になる (docs/filename-stack-plan.md §6)。
@@ -6766,6 +6958,18 @@ mod tests {
         assert!(follow.is_rtl(ReadingDirection::Rtl));
         assert!(!FullscreenSeekDirection::LeftToRight.is_rtl(ReadingDirection::Rtl));
         assert!(FullscreenSeekDirection::Unknown.is_rtl(ReadingDirection::Rtl));
+    }
+
+    #[test]
+    fn text_contrast_unknown_value_is_forward_compatible() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"text_contrast":"future_contrast"}"#).unwrap();
+        assert_eq!(loaded.text_contrast, TextContrast::Unknown);
+        assert_eq!(loaded.text_contrast.normalized(), TextContrast::Standard);
+
+        loaded.sanitize();
+
+        assert_eq!(loaded.text_contrast, TextContrast::Standard);
     }
 
     #[test]

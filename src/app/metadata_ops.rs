@@ -387,10 +387,7 @@ pub(super) fn run_details_meta_load(
         PathBuf,
         Option<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     > = std::collections::HashMap::new();
-    let mut container_catalogs: std::collections::HashMap<
-        PathBuf,
-        Option<crate::catalog::CatalogDb>,
-    > = std::collections::HashMap::new();
+    let mut container_catalogs = ContainerCatalogCache::new(8);
 
     for target in targets {
         if cancel.load(Ordering::Relaxed) {
@@ -758,7 +755,7 @@ pub(super) fn run_details_meta_load(
 fn load_details_page_count(
     target: &DetailsMetaTarget,
     cache_dir: &Path,
-    catalogs: &mut std::collections::HashMap<PathBuf, Option<crate::catalog::CatalogDb>>,
+    catalogs: &mut ContainerCatalogCache,
     io_sem: &crate::io_semaphore::GlobalIoSemaphore,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Option<u32>, ()> {
@@ -776,17 +773,10 @@ fn load_details_page_count(
             GridItem::Folder(_) => true,
             _ => false,
         };
-    if identity_is_cacheable && !catalogs.contains_key(folder) {
-        let opened = {
-            let _permit = io_sem.acquire(target.priority);
-            crate::catalog::CatalogDb::open(cache_dir, folder).ok()
-        };
-        catalogs.insert(folder.clone(), opened);
-    }
     // The catalog is only an optimization.  A corrupt/unwritable cache must not
     // make an otherwise readable container lose its page count.
     let catalog = identity_is_cacheable
-        .then(|| catalogs.get(folder).and_then(Option::as_ref))
+        .then(|| catalogs.get_or_open(cache_dir, folder, io_sem, target.priority))
         .flatten();
 
     match &target.item {
@@ -799,7 +789,7 @@ fn load_details_page_count(
                         crate::catalog::ContainerPageKind::Zip,
                         target.source_mtime,
                         target.source_size,
-                        0,
+                        target.page_count_fingerprint,
                     )
                 };
                 if let Ok(Some(meta)) = cached {
@@ -821,7 +811,7 @@ fn load_details_page_count(
                     crate::catalog::ContainerPageKind::Zip,
                     target.source_mtime,
                     target.source_size,
-                    0,
+                    target.page_count_fingerprint,
                     Some(count),
                 );
             }
@@ -908,6 +898,52 @@ fn load_details_page_count(
             Ok(Some(count))
         }
         _ => Ok(None),
+    }
+}
+
+/// Cross-folder details views (notably smart folders) can touch hundreds of
+/// catalog DBs. Keep a small LRU instead of holding one SQLite connection per
+/// parent folder until the entire metadata job finishes.
+struct ContainerCatalogCache {
+    capacity: usize,
+    entries: std::collections::HashMap<PathBuf, Option<crate::catalog::CatalogDb>>,
+    lru: std::collections::VecDeque<PathBuf>,
+}
+
+impl ContainerCatalogCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: std::collections::HashMap::new(),
+            lru: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get_or_open(
+        &mut self,
+        cache_dir: &Path,
+        folder: &Path,
+        io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+        priority: crate::io_semaphore::IoPriority,
+    ) -> Option<&crate::catalog::CatalogDb> {
+        if let Some(position) = self.lru.iter().position(|entry| entry == folder) {
+            self.lru.remove(position);
+        }
+        if !self.entries.contains_key(folder) {
+            let opened = {
+                let _permit = io_sem.acquire(priority);
+                crate::catalog::CatalogDb::open(cache_dir, folder).ok()
+            };
+            self.entries.insert(folder.to_path_buf(), opened);
+        }
+        self.lru.push_back(folder.to_path_buf());
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.entries.get(folder).and_then(Option::as_ref)
     }
 }
 
@@ -1386,6 +1422,7 @@ mod tests {
             catalog_folder: Some(temp.path().to_path_buf()),
             catalog_key: Some("book.zip".to_owned()),
             warm_image_dims: None,
+            page_count_fingerprint: 77,
             image_folder_page_count_options: None,
             pdf_password: None,
             pdf_password_revision: None,
@@ -1399,7 +1436,7 @@ mod tests {
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut catalogs = std::collections::HashMap::new();
+        let mut catalogs = ContainerCatalogCache::new(8);
 
         assert_eq!(
             load_details_page_count(&target, &cache_dir, &mut catalogs, &io_sem, &cancel),
@@ -1413,6 +1450,39 @@ mod tests {
             load_details_page_count(&target, &cache_dir, &mut catalogs, &io_sem, &cancel),
             Ok(Some(2))
         );
+
+        let mut changed_rules = target.clone();
+        changed_rules.page_count_fingerprint += 1;
+        assert_eq!(
+            load_details_page_count(&changed_rules, &cache_dir, &mut catalogs, &io_sem, &cancel,),
+            Err(()),
+            "画像認識規則が変わったら古いZIPページ数cacheを再利用しない"
+        );
+    }
+
+    #[test]
+    fn container_catalog_cache_bounds_open_connections() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let mut cache = ContainerCatalogCache::new(2);
+        for name in ["one", "two", "three"] {
+            let folder = temp.path().join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            assert!(
+                cache
+                    .get_or_open(
+                        &cache_dir,
+                        &folder,
+                        &io_sem,
+                        crate::io_semaphore::IoPriority::Normal,
+                    )
+                    .is_some()
+            );
+            assert!(cache.entries.len() <= 2);
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains_key(&temp.path().join("one")));
     }
 
     #[test]

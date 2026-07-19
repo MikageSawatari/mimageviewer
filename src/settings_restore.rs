@@ -1,8 +1,8 @@
 //! 設定 DB の手動復元 / 完全リセット支援。
 //!
 //! 「現在の設定 (= `settings.db` + WAL 適用後)」と世代バックアップ
-//! (`settings.db.bak1` 〜 `settings.db.bak10`) を一覧化し、ユーザーが選んだ世代の
-//! 内容で `settings.db` を入れ替える。
+//! (`settings.db.bak1` 〜 `settings.db.bak10`)、アップグレード前スナップショットを
+//! 一覧化し、ユーザーが選んだ世代の内容で `settings.db` を入れ替える。
 //!
 //! 2026-05-17: cargo test で **本番 `%APPDATA%\mimageviewer\settings.db` を
 //! defaults で踏み潰した事故** に端を発する、ユーザー向け復旧 UI のバックエンド。
@@ -28,6 +28,9 @@ pub enum BackupSource {
     Current,
     /// 世代バックアップ `settings.db.bak1` 〜 `settings.db.bak10`
     Bak(u8),
+    /// バージョン跨ぎ前の `settings.db.preupgrade-v<version>`。
+    /// String は data_dir の列挙で得た安全なファイル名 suffix のみを保持する。
+    PreUpgrade(String),
 }
 
 impl BackupSource {
@@ -36,6 +39,9 @@ impl BackupSource {
         match self {
             BackupSource::Current => "現在の設定".to_string(),
             BackupSource::Bak(n) => format!("バックアップ {n}"),
+            BackupSource::PreUpgrade(version) => {
+                format!("アップグレード前 (v{version})")
+            }
         }
     }
 
@@ -44,12 +50,30 @@ impl BackupSource {
         match self {
             BackupSource::Current => "settings.db".to_string(),
             BackupSource::Bak(n) => format!("settings.db.bak{n}"),
+            BackupSource::PreUpgrade(version) => {
+                format!("settings.db.preupgrade-v{version}")
+            }
         }
     }
 
     /// 「これは現状の settings.db そのもの」か。
     pub fn is_current(&self) -> bool {
         matches!(self, BackupSource::Current)
+    }
+}
+
+/// 保存元バージョンと実行中バイナリの関係。
+/// `RestoreCandidate` は最終的な deserialize 検証を復元直前にも行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupCompatibility {
+    RestoreCandidate,
+    NewerVersion,
+    Unknown,
+}
+
+impl BackupCompatibility {
+    pub fn can_attempt_restore(self) -> bool {
+        self != Self::NewerVersion
     }
 }
 
@@ -66,6 +90,8 @@ pub struct BackupSummary {
     /// 当該 DB を最後に書いた mImageViewer のバージョン。
     /// `schema_meta.app_version` を読むだけなので空も許容する。
     pub app_version: Option<String>,
+    /// app_version による事前判定。実データの最終検証は restore_from でも必ず行う。
+    pub compatibility: BackupCompatibility,
     /// open / SELECT で出た非致命のエラー (= スキーマが古い / 表が無い等)。
     /// UI 側で「壊れている可能性」として表示する。
     pub partial_error: Option<String>,
@@ -159,7 +185,7 @@ impl std::error::Error for RestoreFailure {}
 // 一覧
 // ──────────────────────────────────────────────────────────────────────
 
-/// `<data_dir>` 直下の現在 + bak1..bak10 を新しい順 (= bak1 番号順) で返す。
+/// `<data_dir>` 直下の現在 + bak1..bak10 + preupgrade snapshot を返す。
 /// 存在しない世代はスキップ。各エントリのメタ情報読み取りに失敗しても、
 /// `partial_error` を埋めて返す (= 行自体は表示する)。
 pub fn list_backups(data_dir: &Path) -> Vec<BackupSummary> {
@@ -174,6 +200,25 @@ pub fn list_backups(data_dir: &Path) -> Vec<BackupSummary> {
             continue;
         }
         out.push(read_summary(BackupSource::Bak(n), &path));
+    }
+    let mut preupgrade = std::fs::read_dir(data_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version = name.strip_prefix("settings.db.preupgrade-v")?;
+            if version.is_empty() || !entry.path().is_file() {
+                return None;
+            }
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
+            Some((modified, version.to_string(), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    preupgrade.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+    for (_, version, path) in preupgrade {
+        out.push(read_summary(BackupSource::PreUpgrade(version), &path));
     }
     out
 }
@@ -192,6 +237,7 @@ fn read_summary(source: BackupSource, path: &Path) -> BackupSummary {
         video_resume: 0,
         vst3_plugins: 0,
         app_version: None,
+        compatibility: BackupCompatibility::Unknown,
         partial_error: None,
     };
     // sqlite を read-only で open。WAL siblings は無視 (bak には -wal が無いし、
@@ -239,7 +285,31 @@ fn read_summary(source: BackupSource, path: &Path) -> BackupSummary {
             |r| r.get::<_, String>(0),
         )
         .ok();
+    // preupgrade 名の version は snapshot 作成時の last_seen_version から付けたもの。
+    // 旧実装は DB open 時に app_version を現バイナリへ上書きしてから snapshot していたため、
+    // 既存 preupgrade の schema_meta よりファイル名の方が正確。新実装では両者が一致する。
+    if let BackupSource::PreUpgrade(version) = &summary.source {
+        summary.app_version = Some(version.clone());
+    }
+    summary.compatibility = backup_compatibility(summary.app_version.as_deref());
     summary
+}
+
+fn backup_compatibility(app_version: Option<&str>) -> BackupCompatibility {
+    let Some(saved) = app_version else {
+        return BackupCompatibility::Unknown;
+    };
+    let Ok(saved) = semver::Version::parse(saved.trim_start_matches('v')) else {
+        return BackupCompatibility::Unknown;
+    };
+    let Ok(current) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return BackupCompatibility::Unknown;
+    };
+    if saved > current {
+        BackupCompatibility::NewerVersion
+    } else {
+        BackupCompatibility::RestoreCandidate
+    }
 }
 
 fn count_table(conn: &Connection, table: &str) -> Result<usize, String> {
@@ -690,11 +760,9 @@ mod tests {
 
     /// 並列 `cargo test` のもとでは、AV / Windows Search インデクサ / 直前に閉じた
     /// SQLite ハンドルが settings.db 家族ファイルを一瞬ロックし、`restore_from` /
-    /// `full_reset` が transient な `Recoverable(Io)` (Windows の sharing violation =
-    /// OS error 32「別のプロセスが使用中」) で失敗することがある (2026-07-12 に観測した
-    /// test-isolation flake)。本番の復元はユーザー操作起点の単発呼び出しなので、この
-    /// ロック窓は無視できるほど短く実害にならないが、多数テスト同時実行の FS 負荷下では
-    /// 500ms の内部 retry 予算を超えることがある。
+    /// `full_reset` の snapshot 前に起きた transient な `Recoverable(Io)` も同様に再試行
+    /// できる。削除開始後の失敗は `Terminal` であり、部分削除済みの可能性があるため
+    /// この helper では再試行しない。
     ///
     /// `Recoverable` は「まだファイルを変更していない = 安全に再試行できる」契約なので
     /// (`restore_from` の失敗は全て `Recoverable`。`full_reset` は削除前の snapshot 失敗のみ
@@ -736,6 +804,65 @@ mod tests {
         assert_eq!(summaries.len(), 2);
         assert!(matches!(summaries[0].source, BackupSource::Current));
         assert!(matches!(summaries[1].source, BackupSource::Bak(3)));
+        assert_eq!(
+            summaries[1].app_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            summaries[1].compatibility,
+            BackupCompatibility::RestoreCandidate
+        );
+    }
+
+    #[test]
+    fn list_backups_includes_preupgrade_snapshot_with_saved_version() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            db.backup_to(&dir.join("settings.db.preupgrade-v2.4.1"))
+                .unwrap();
+        }
+
+        let summaries = list_backups(dir);
+        let preupgrade = summaries
+            .iter()
+            .find(|summary| {
+                matches!(
+                    &summary.source,
+                    BackupSource::PreUpgrade(version) if version == "2.4.1"
+                )
+            })
+            .expect("preupgrade snapshot must be listed");
+        assert_eq!(preupgrade.app_version.as_deref(), Some("2.4.1"));
+    }
+
+    #[test]
+    fn list_backups_marks_newer_saved_version_unavailable() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        let conn = Connection::open(dir.join("settings.db.bak1")).unwrap();
+        conn.execute(
+            "UPDATE schema_meta SET value = '999.0.0' WHERE key = 'app_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let summaries = list_backups(dir);
+        let newer = summaries
+            .iter()
+            .find(|summary| summary.source == BackupSource::Bak(1))
+            .unwrap();
+        assert_eq!(newer.app_version.as_deref(), Some("999.0.0"));
+        assert_eq!(newer.compatibility, BackupCompatibility::NewerVersion);
+        assert!(!newer.compatibility.can_attempt_restore());
     }
 
     /// `restore_from(Bak(n))` は `settings.db` を bak の内容で上書きし、
@@ -787,12 +914,13 @@ mod tests {
     fn full_reset_deletes_entire_family_and_snapshots() {
         let guard = DataDirOverrideGuard::new();
         let dir = guard.path();
-        {
-            let db = SettingsDb::create_new(dir).unwrap();
-            db.save_full(&sample_settings()).unwrap();
-            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
-            db.backup_to(&dir.join("settings.db.bak2")).unwrap();
-        }
+        // This test owns the family-file deletion/snapshot contract, not SQLite's
+        // VACUUM INTO behavior (covered by SettingsDb tests). Plain closed files keep
+        // it independent from AV/indexer locks on freshly-created SQLite snapshots
+        // during parallel `cargo test` runs on Windows.
+        std::fs::write(dir.join("settings.db"), b"main").unwrap();
+        std::fs::write(dir.join("settings.db.bak1"), b"bak1").unwrap();
+        std::fs::write(dir.join("settings.db.bak2"), b"bak2").unwrap();
         let report = retry_on_transient_lock(|| full_reset(dir)).unwrap();
         // 退避は最低でも main + bak1 + bak2 の 3 つ (WAL/SHM は有無依存)。
         assert!(report.snapshot_paths.len() >= 3);

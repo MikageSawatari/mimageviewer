@@ -257,6 +257,7 @@ CREATE TABLE schema_meta (
     value TEXT NOT NULL
 );
 -- ('schema_version', '1'), ('migrated_from_json_at', '<unix_ts>'), ('app_version', '0.9.0')
+-- app_version は DB open では更新せず、save_full の commit 内で「最後に正常保存した版」を記録する。
 
 -- スカラ設定 (約 80 個のフィールド)
 CREATE TABLE settings_kv (
@@ -411,8 +412,15 @@ settings_db_family_presence_with_retry(data_dir) で family を tri-state 判定
 
 ├─ Present (= family が見える)
 │   → SettingsDb::open(settings.db) を試行
+│   ├─ schema_meta.app_version > 現バイナリ
+│   │   → PRAGMA / schema 更新前に IncompatibleSettings + save 抑止
+│   │   → 設定復元または終了を選ぶ案内を表示 (初回設定・更新案内は表示しない)
 │   ├─ Success → integrity_check OK?
-│   │       ├─ YES → 通常 load → hash 同期 → 完了
+│   │       ├─ YES → 通常 load
+│   │       │   ├─ deserialize 成功 → hash 同期 → 完了
+│   │       │   └─ unknown variant / unknown field
+│   │       │       → IncompatibleSettings + save 抑止
+│   │       │       → main / WAL / SHM / bak1..bak10 は一切変更しない
 │   │       └─ NO (PRAGMA integrity_check が "ok" 以外) → Corrupted 扱い (下記)
 │   ├─ Transient failure
 │   │   (DatabaseBusy / DatabaseLocked / CannotOpen / SystemIoFailure)
@@ -478,6 +486,10 @@ fn classify_open_error(e: &rusqlite::Error) -> OpenFailureKind {
 
 quarantine は **Corrupted のみ** (NotADatabase / DatabaseCorrupt / integrity_check 失敗)。
 SystemIoFailure 等の I/O 系は transient 扱いで save 抑止のみ、ファイル移動はしない。
+`Settings` の deserialize 中に `unknown variant` / `unknown field` が出た場合は、物理破損では
+なく「新しい版で保存した設定を古い版が読んだ」可能性が高いため `Incompatible` とする。
+この場合も save 抑止のみで、main やバックアップを quarantine・復旧コピーしてはならない。
+その他の型不一致（数値フィールドに文字列など）は従来どおり `Corrupted` とする。
 
 ## 6. バックアップ戦略
 
@@ -485,6 +497,8 @@ SystemIoFailure 等の I/O 系は transient 扱いで save 抑止のみ、ファ
 
 `settings.db.bak1` 〜 `settings.db.bak10` の 10 世代。**プロセスの最初の user save** で 1 回だけ
 rotation。bootstrap (clean install / JSON migration) では rotation を走らせない。
+各 DB の `schema_meta.app_version` は、その内容を最後に正常保存した mImageViewer の版を示す。
+open だけでは更新しないため、rotation 前の版が bak 側に保持される。
 
 ```
 rotate_db_backups:
@@ -533,7 +547,21 @@ VACUUM INTO は SQLite が**新規 .db ファイルに consistent な snapshot �
 - セッション中の `Settings::save()` は全て suppress (= disk 上の残骸を保護)
 - 次回起動時に手動復旧 (= `.corrupted-<ts>-<seq>` の調査) ができる状態を維持
 
-### 6.4 失敗 bootstrap の orphan cleanup
+### 6.4 設定の復元 UI とダウングレード
+
+「設定の復元」は main / bak1..bak10 に加えて `settings.db.preupgrade-v<old>` も一覧化し、
+各行に保存元版と現バイナリとの版互換性を表示する。通常世代は `schema_meta.app_version`、
+preupgrade は旧実装で metadata が open 時に上書きされていた可能性があるためファイル名の
+`v<old>` を正とする。現バイナリより新しい版の行は復元不可とし、同版・旧版・版不明の候補も、実際の置換前に一時コピーを
+`SettingsDb::open + load_into_settings` して最終検証する。
+
+互換性ガードを備えた版で、それより新しい版が保存した設定を起動した場合は main / WAL /
+SHM / backup chain を変更せず、セッション全体の設定保存を抑止する。専用モーダルから
+「設定の復元」またはアプリ終了を選び、復元画面を閉じた場合は保護モーダルへ戻る。
+このガードは v2.6.0 からのため、既公開の v2.5.0 以前へ戻す場合は下記 10.5 の
+保存形式互換も併用する。
+
+### 6.5 失敗 bootstrap の orphan cleanup
 
 `SettingsDb::create_new` または `save_full` が **bootstrap_complete マーカーを書く前**に
 失敗すると、SQLite が `Connection::open_with_flags(SQLITE_OPEN_CREATE)` で作った
@@ -720,8 +748,17 @@ PRAGMA / busy_timeout / retry helper を `src/db_common.rs` に切り出すの�
 
 ### 10.5 旧バージョンとの互換
 
-`.migrated-<ts>` を残すので、ダウングレード時に手動復旧は可能。ただし「migration 後の変更は旧バージョンに
-反映されない」のは仕方ない (受け入れる)。
+`.migrated-<ts>` と `settings.db.preupgrade-v<old>` を残す。v2.6.0 以降のバイナリは、
+自分より新しい版が保存した DB を `schema_meta.app_version` で検出し、設定を上書きせず、
+復元画面で保存元バージョンを確認して互換候補へ戻せる。
+
+既公開の v2.5.0 以前にはこの起動前ガードを後付けできない。そのため v2.6.0 の保存では、
+既存フィールドへ追加した未知 enum (`FacetDatePreset` の追加日付候補、詳細表示のページ数
+ソート・列・列幅) を、旧版が無視できる追加フィールドへ退避してから書く。リング／ジェスチャ
+の新アクションは、旧版側にも未知文字列の受け皿があるため設定全体の読み込み失敗にはならない。
+これにより v2.5.0 へ戻しても設定 DB 全体は読み込めるが、旧版が v2.6.0 専用フィールドを
+保存し直すと、その専用設定（スマートフォルダなど）は保持されない。旧版での利用後に
+v2.6.0 へ戻す場合は、必要に応じて設定の復元から v2.6.0 保存世代を選ぶ。
 
 ## 11. 並行して入れる緊急パッチ (SQLite 化と独立、優先度 高)
 

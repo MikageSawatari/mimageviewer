@@ -97,7 +97,7 @@
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
 | [screenshot-howto.md](screenshot-howto.md) | 製品ページ用スクリーンショット手順 |
 | [e2e-smoke-test.md](e2e-smoke-test.md) | E2E スモークテストのチェックリスト |
-| [release-operations.md](release-operations.md) | **リリース運用メモ**。CLAUDE.md「リリース手順チェックリスト」の補助。過去リリースで踏んだ落とし穴・判断基準・復旧手順 (stale core cache / 署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 / 配布チャネル別の注意) を集約。別セッション / Codex への引き継ぎ用 |
+| [release-operations.md](release-operations.md) | **リリース運用メモ**。CLAUDE.md「リリース手順チェックリスト」の補助。過去リリースで踏んだ落とし穴・判断基準・復旧手順 (stale core cache / 署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 / 通常設定を使わない隔離 UI 検証 / 配布チャネル別の注意) を集約。別セッション / Codex への引き継ぎ用 |
 | [test-video-generation.md](test-video-generation.md) | `testimage/movie/test_*fps_*p_sync.mp4` (FFmpeg testsrc2 + sine ビープ) の再生成手順 |
 | [ui-snapshot-policy.md](ui-snapshot-policy.md) | egui_kittest によるスナップショットテストの運用方針 |
 | [keymap-spec.md](keymap-spec.md) | キー / マウス操作仕様。フルスクリーン横断の詳細は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) も参照 |
@@ -124,7 +124,7 @@
 | [music-lab-plan.md](music-lab-plan.md) | 音楽ファイル対応の分離ラボ設計。`crates/music-core` / `tools/music_lab`、動画の音楽モード化、VST3 bridge 接続を見越した effect-chain 境界 |
 | [music-integration-plan.md](music-integration-plan.md) | **実装中 (Inc 0〜、2026-07-01 起案)**。music lab を本体へ統合する契約書。`VideoPlayer` 再利用で再生/VST3/normalize を得て、`GridItem::Audio` + 音楽ビュー (timeline/spectrum + 上下バー常時) + 左ブックマーク (動画機構 `video_bookmarks*` 再利用) + 動画→音声モードを段階実装。実装=Claude / レビュー=Codex。§7.9 に music 固有のサブシステム配線コントラクト |
 | [vst3-integration.md](vst3-integration.md) | VST3 プラグイン統合 (v0.9.0+) — C++ bridge プロセス + Rust IPC、audio-pump からの bridge 経由、プラグイン GUI のクロスプロセス attach、チェーン編集 UI、再生中 VST3 パネル、後段 safety limiter |
-| [settings-sqlite-migration.md](settings-sqlite-migration.md) | 設定永続化を `settings.json` から `settings.db` (SQLite) に移行する spec。transient NotFound による設定消失事故の構造的解消 + VST3 BLOB の dirty-skip による I/O 浪費解消。4 ラウンドの Codex review 反映済み |
+| [settings-sqlite-migration.md](settings-sqlite-migration.md) | 設定永続化を `settings.json` から `settings.db` (SQLite) に移行する spec。transient NotFound による設定消失事故の構造的解消、将来版の未知設定値を `Incompatible` として無変更・save 抑止にする downgrade 保護、VST3 BLOB の dirty-skip による I/O 浪費解消。4 ラウンドの Codex review 反映済み |
 
 ---
 

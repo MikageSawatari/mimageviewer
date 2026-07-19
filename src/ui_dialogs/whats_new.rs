@@ -36,13 +36,17 @@ impl App {
                 ui.add_space(4.0);
                 ui.label("mImageViewer が新しくなりました。主な変更点です。");
                 ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("whats_new_scroll")
-                    .max_height(320.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        crate::version_highlights::render(ui, &entries);
-                    });
+                ui.scope(|ui| {
+                    ui.spacing_mut().scroll =
+                        super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
+                    egui::ScrollArea::vertical()
+                        .id_salt("whats_new_scroll")
+                        .max_height(320.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            crate::version_highlights::render(ui, &entries);
+                        });
+                });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("すべての変更を見る").clicked() {

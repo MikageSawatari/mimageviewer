@@ -77,6 +77,10 @@ pub enum SettingsDbError {
     /// DB ファイルが壊れている (NotADatabase / DatabaseCorrupt / integrity_check 失敗)。
     /// 呼び出し側は `.corrupted-<ts>` に quarantine してから bak を試行する。
     Corrupted(String),
+    /// DB は物理的に正常だが、このバイナリが知らない設定値を含んでいる。
+    /// 新しい版で保存した設定を古い版で開いた場合など。quarantine / bak 復旧は
+    /// 行わず、ファイルをそのまま残して本セッションの保存を抑止する。
+    Incompatible(String),
     /// 権限エラー (% APPDATA% が ReadOnly 等)。
     Permission(rusqlite::Error),
     /// `create_new` が呼ばれたが既に bootstrap 済み DB が存在する状態
@@ -108,6 +112,7 @@ impl std::fmt::Display for SettingsDbError {
         match self {
             Self::Transient(e) => write!(f, "transient sqlite error: {e}"),
             Self::Corrupted(msg) => write!(f, "settings.db corrupted: {msg}"),
+            Self::Incompatible(msg) => write!(f, "settings.db is newer than this build: {msg}"),
             Self::Permission(e) => write!(f, "permission denied: {e}"),
             Self::AlreadyBootstrapped => {
                 write!(f, "create_new called on already-bootstrapped settings.db")
@@ -131,6 +136,7 @@ impl std::error::Error for SettingsDbError {
             Self::Transient(e) | Self::Permission(e) | Self::Rusqlite(e) => Some(e),
             Self::Serde(e) => Some(e),
             Self::Corrupted(_)
+            | Self::Incompatible(_)
             | Self::Poisoned
             | Self::AlreadyBootstrapped
             | Self::AmbiguousFamilyPresence
@@ -403,6 +409,12 @@ impl SettingsDb {
         };
         let conn = Connection::open_with_flags(path, flags)
             .map_err(|e| classify_rusqlite_error_for_open(e, "Connection::open"))?;
+        // 既存 DB がこのバイナリより新しい版で保存されている場合、PRAGMA や schema
+        // migration を実行する前に止める。downgrade 起動は「読むだけ」で終わらせ、
+        // app_version や schema を古い版で書き換えないことが不変条件。
+        if mode == OpenMode::RequireExisting {
+            reject_newer_app_version(&conn)?;
+        }
         apply_pragmas(&conn).map_err(|e| classify_rusqlite_error_for_open(e, "apply_pragmas"))?;
         check_integrity_classified(&conn)?;
         // Codex P3 v5 (2026-05-13): `RequireExisting` で開いたファイルが「形式上 OK な
@@ -469,7 +481,13 @@ impl SettingsDb {
             .map_or(true, |h| h != slots_hash);
 
         // 2. Settings 全体を Value::Object 化、複合フィールドを取り出す。
-        let mut value = serde_json::to_value(settings)?;
+        // v2.5.0 が知らない enum variant は、旧版が無視できる追加フィールドへ退避した
+        // clone を永続化する。live state は変更しない。
+        let mut persisted = settings.clone();
+        persisted.stash_details_page_count_for_persist();
+        persisted.facet_filter.stash_kind_audio_for_persist();
+        persisted.facet_filter.stash_extended_date_for_persist();
+        let mut value = serde_json::to_value(&persisted)?;
         let map = match value.as_object_mut() {
             Some(m) => m,
             None => {
@@ -478,16 +496,6 @@ impl SettingsDb {
                 )));
             }
         };
-        // facet_filter は「kinds の Audio と追加日付候補を旧版互換キャリアへ退避した形」で書く。
-        // live な settings は変更せず、永続化用クローンにだけ適用する
-        // (詳細は `FacetFilter::kind_audio_stash` のコメント。読み戻しは
-        // `Settings::sanitize` の `restore_kind_audio_after_load`)。
-        {
-            let mut ff = settings.facet_filter.clone();
-            ff.stash_kind_audio_for_persist();
-            ff.stash_extended_date_for_persist();
-            map.insert("facet_filter".into(), serde_json::to_value(ff)?);
-        }
         let complex = extract_complex_fields(map);
 
         // 3. transaction 内で DB 更新
@@ -522,6 +530,13 @@ impl SettingsDb {
         tx.execute(
             "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('bootstrap_complete', '1')",
             [],
+        )?;
+        // app_version は DB を「開いた版」ではなく、設定内容を最後に正常保存した版を示す。
+        // backup rotation はこの save より前に走るため、bak1 側には直前の保存版が残る。
+        tx.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('app_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![env!("CARGO_PKG_VERSION")],
         )?;
         // 補足: complex は読み捨ててもよいが、unused 警告を避けるために保持する
         // (= 将来 complex 側だけ partial save する API を追加するときに使う)。
@@ -1010,6 +1025,55 @@ fn check_integrity_classified(conn: &Connection) -> Result<(), SettingsDbError> 
     }
 }
 
+/// `schema_meta.app_version` が実行中バイナリより新しい場合、既存 DB を一切更新する前に
+/// `Incompatible` を返す。row が無い旧 DB や semver でない開発版ラベルは、従来どおり
+/// deserialize による実互換性判定へ委ねる。
+fn reject_newer_app_version(conn: &Connection) -> Result<(), SettingsDbError> {
+    let meta_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'",
+            [],
+            |_| Ok(true),
+        )
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            other => Err(other),
+        })
+        .map_err(|error| {
+            classify_rusqlite_error_for_open(error, "find schema_meta before version check")
+        })?;
+    if !meta_exists {
+        return Ok(());
+    }
+    let stored = match conn.query_row(
+        "SELECT value FROM schema_meta WHERE key = 'app_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(version) => version,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+        Err(error) => {
+            return Err(classify_rusqlite_error_for_open(
+                error,
+                "read schema_meta.app_version",
+            ));
+        }
+    };
+    let Ok(stored_version) = semver::Version::parse(stored.trim_start_matches('v')) else {
+        return Ok(());
+    };
+    let Ok(current_version) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return Ok(());
+    };
+    if stored_version > current_version {
+        return Err(SettingsDbError::Incompatible(format!(
+            "saved by mImageViewer {stored}; current build is {}",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    Ok(())
+}
+
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_meta (
@@ -1087,7 +1151,10 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_tags_table(conn)?;
 
-    // schema_meta: schema_version / app_version を冪等に upsert する。
+    // schema_version は schema migration 後の現行値へ更新する。新しい版の DB は
+    // reject_newer_app_version で init_schema より前に止まるため、downgrade では触らない。
+    // app_version は open では書き換えず、save_full の commit 内で
+    // 「最後に正常保存した版」へ更新する。
     // migrated_from_json_at は Phase 2 (JSON migration) でセットされる。
     let app_version = env!("CARGO_PKG_VERSION");
     conn.execute(
@@ -1096,8 +1163,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         params![SCHEMA_VERSION],
     )?;
     conn.execute(
-        "INSERT INTO schema_meta(key, value) VALUES ('app_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('app_version', ?1)",
         params![app_version],
     )?;
     Ok(())
@@ -1679,13 +1745,26 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
         serde_json::to_value(custom_apps)?,
     );
 
-    // Codex P2 v10 (2026-05-14): settings_kv の scalar 形が不正 (例: grid_cols が String) で
-    // from_value が失敗するケースは DB 内容の corruption。Serde で返すと Phase 2 の bak
-    // fallback 経路に拾われない可能性があるため Corrupted に統一する。
-    let settings: Settings = serde_json::from_value(Value::Object(map)).map_err(|e| {
-        SettingsDbError::Corrupted(format!("settings_kv shape mismatch in from_value: {e}"))
-    })?;
+    // 型不一致は通常 Corrupted だが、unknown variant / unknown field は「新しい版で追加された
+    // 設定を古い版が読んだ」可能性が高い。これを Corrupted にすると、正常な main と
+    // bak1..bak10 を順に quarantine して設定を失う。未知値だけは Incompatible に分離し、
+    // 上層で DB family を無変更のまま save 抑止へ倒す。
+    let settings: Settings = serde_json::from_value(Value::Object(map))
+        .map_err(classify_settings_deserialization_error)?;
     Ok(settings)
+}
+
+fn classify_settings_deserialization_error(error: serde_json::Error) -> SettingsDbError {
+    let message = error.to_string();
+    if message.contains("unknown variant") || message.contains("unknown field") {
+        SettingsDbError::Incompatible(format!(
+            "settings_kv contains a value unknown to this build: {message}"
+        ))
+    } else {
+        SettingsDbError::Corrupted(format!(
+            "settings_kv shape mismatch in from_value: {message}"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2200,6 +2279,9 @@ pub enum BootSource {
     MigratedFromJson,
     /// `settings.json` も `settings.db` も無く、clean install として bootstrap した。
     CleanInstall,
+    /// 設定 DB は正常だが、このバイナリより新しい版の設定を含む。
+    /// DB family を変更せず、既定値を一時表示して本セッションの保存を抑止する。
+    IncompatibleSettings,
     /// すべての復旧経路が失敗。Defaults を返し、本セッションでは save を抑止する。
     FailedFallbackDefault,
 }
@@ -2248,6 +2330,17 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
                             ));
                             return boot_recover_from_bak(data_dir);
                         }
+                        SettingsDbError::Incompatible(message) => {
+                            log_diag(&format!(
+                                "settings_db: boot: settings are incompatible with this build ({message}); \
+                                 leaving DB family untouched and suppressing save"
+                            ));
+                            return BootOutcome {
+                                settings: Settings::default(),
+                                db: None,
+                                source: BootSource::IncompatibleSettings,
+                            };
+                        }
                         other => {
                             log_diag(&format!(
                                 "settings_db: boot: load_into_settings non-corruption failure ({other}); \
@@ -2288,6 +2381,17 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
                     settings: Settings::default(),
                     db: None,
                     source: BootSource::FailedFallbackDefault,
+                };
+            }
+            Err(SettingsDbError::Incompatible(message)) => {
+                log_diag(&format!(
+                    "settings_db: boot: settings were saved by a newer build ({message}); \
+                     leaving DB family untouched and suppressing save"
+                ));
+                return BootOutcome {
+                    settings: Settings::default(),
+                    db: None,
+                    source: BootSource::IncompatibleSettings,
                 };
             }
             Err(other) => {
@@ -2458,6 +2562,17 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
                             }
                             continue;
                         }
+                        SettingsDbError::Incompatible(message) => {
+                            log_diag(&format!(
+                                "settings_db: boot: restored {bak_name} is incompatible ({message}); \
+                                 aborting bak chain to preserve remaining backups"
+                            ));
+                            return BootOutcome {
+                                settings: Settings::default(),
+                                db: None,
+                                source: BootSource::IncompatibleSettings,
+                            };
+                        }
                         other => {
                             log_diag(&format!(
                                 "settings_db: boot: restored {bak_name} loaded with non-corruption error ({other}); \
@@ -2493,6 +2608,17 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
                             };
                         }
                         continue;
+                    }
+                    SettingsDbError::Incompatible(message) => {
+                        log_diag(&format!(
+                            "settings_db: boot: restored {bak_name} is incompatible ({message}); \
+                             aborting bak chain to preserve remaining backups"
+                        ));
+                        return BootOutcome {
+                            settings: Settings::default(),
+                            db: None,
+                            source: BootSource::IncompatibleSettings,
+                        };
                     }
                     other => {
                         log_diag(&format!(
@@ -3123,6 +3249,79 @@ mod tests {
     }
 
     #[test]
+    fn opening_db_preserves_saved_app_version_until_successful_save() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute(
+            "UPDATE schema_meta SET value = '0.1.0' WHERE key = 'app_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            let saved: String = inner
+                .conn
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'app_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(saved, "0.1.0", "open must not rewrite backup provenance");
+        }
+        db.save_full(&Settings::default()).unwrap();
+        let inner = db.inner.lock().unwrap();
+        let saved: String = inner
+            .conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'app_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn opening_db_saved_by_newer_version_is_read_only_rejected() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let path = dir.path().join("settings.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE schema_meta SET value = '999.0.0' WHERE key = 'app_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = match SettingsDb::open(dir.path()) {
+            Ok(_) => panic!("newer settings must not open"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SettingsDbError::Incompatible(_)));
+        let conn = Connection::open(&path).unwrap();
+        let saved: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'app_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, "999.0.0", "downgrade open rewrote app_version");
+    }
+
+    #[test]
     fn nonfinite_resume_position_is_dropped() {
         // 直接 HashMap に NaN を入れたケースで save が失敗せず、その row が抜けるか。
         let db = SettingsDb::open_in_memory_for_test().unwrap();
@@ -3324,6 +3523,79 @@ mod tests {
             matches!(err, SettingsDbError::Corrupted(_)),
             "expected Corrupted, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn settings_kv_unknown_variant_returns_incompatible() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute(
+            "UPDATE settings_kv
+             SET value = '[\"Preview\",\"FutureColumn\"]'
+             WHERE key = 'details_column_order'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let err = match db.load_into_settings() {
+            Ok(_) => panic!("unknown enum variant must not load"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Incompatible(_)),
+            "expected Incompatible, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn page_count_details_are_persisted_without_v25_unknown_variants() {
+        let dir = TempDir::new().unwrap();
+        let mut settings = Settings::default();
+        settings.details_sort_key = crate::settings::DetailsSortKey::PageCount;
+        settings.details_column_order = vec![
+            crate::settings::DetailsColumnId::Preview,
+            crate::settings::DetailsColumnId::Name,
+            crate::settings::DetailsColumnId::PageCount,
+            crate::settings::DetailsColumnId::Size,
+        ];
+        settings.details_column_widths = vec![
+            crate::settings::DetailsColumnWidth {
+                column: crate::settings::DetailsColumnId::PageCount,
+                width: 96.0,
+            },
+            crate::settings::DetailsColumnWidth {
+                column: crate::settings::DetailsColumnId::Size,
+                width: 128.0,
+            },
+        ];
+
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        let read = |key: &str| -> String {
+            conn.query_row(
+                "SELECT value FROM settings_kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(read("details_sort_key"), "\"Toolbar\"");
+        assert_eq!(
+            read("details_column_order"),
+            "[\"Preview\",\"Name\",\"Size\"]"
+        );
+        assert!(!read("details_column_widths").contains("PageCount"));
+        assert_eq!(read("details_page_count_sort_stash"), "true");
+        assert_eq!(read("details_page_count_column_index_stash"), "2");
+        assert_eq!(read("details_page_count_column_width_stash"), "96.0");
     }
 
     #[test]
@@ -4062,6 +4334,56 @@ mod tests {
         let outcome = boot_settings_db(guard.path());
         assert_eq!(outcome.source, BootSource::LoadedExistingDb);
         assert_eq!(outcome.settings.grid_cols, 6);
+    }
+
+    #[test]
+    fn boot_preserves_main_and_backups_when_settings_are_from_newer_build() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        conn.execute(
+            "UPDATE settings_kv
+             SET value = '[\"Preview\",\"FutureColumn\"]'
+             WHERE key = 'details_column_order'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = boot_settings_db(dir);
+
+        assert_eq!(outcome.source, BootSource::IncompatibleSettings);
+        assert!(outcome.db.is_none());
+        assert!(save_suppressed());
+        assert!(dir.join("settings.db").is_file(), "main DB must remain");
+        assert!(
+            dir.join("settings.db.bak1").is_file(),
+            "backup chain must remain"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupted-"))
+                .count(),
+            0,
+            "forward-incompatible settings must never be quarantined"
+        );
+
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'details_column_order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("FutureColumn"), "main DB was replaced");
     }
 
     #[test]

@@ -65,6 +65,9 @@ v2.6.0 は、複数の場所に分散した本・画像・動画・音声を 1 �
   直下のみ、サブ展開結果から追加するとサブフォルダを含む設定を初期値とし、確認画面で変更できる。
 - 表示中に外部で起きた変更は自動監視しない。明示的な「更新」で再走査できるようにする。
 - 走査完了後の snapshot は保持し、ソート / facet / 表示形式の変更では再走査しない。
+- definition の表示名は走査 identity に含めず、並び単位の変更も保存済み snapshot の
+  prepare だけをやり直す。入力中の名称・名前条件は毎フレーム trim せず、フォーカス移動や
+  ダイアログを閉じる確定時だけ前後空白と空名を正規化する。
 - UI スレッドでは `read_dir`、metadata 取得、再帰走査、大量 DB lookup を実行しない。
 - 既存 `subfolder_expansion` の複数 root、進捗、cancel、reparse point guard、chunk sort、
   `Arc<Vec<_>>` snapshot、prepare worker の規約を共有する。似た walker を別実装しない。
@@ -192,6 +195,11 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
 - `中止`、別の場所を開く、definition 編集 / 削除、アプリ終了で pending scan を cancel する。
 - フォルダバーには `スマートフォルダ: <name>` と表示し、source path を synthetic breadcrumb にしない。
 - 戻る / 進むでは同一セッション中の snapshot を再利用する。snapshot が無ければ definition から再走査する。
+- スマートフォルダ自身が保存条件を所有するため、開く前の通常一覧で有効だった facet / ★
+  フィルタは synthetic scope 中だけ退避し、戻ると復元する（二重適用しない）。
+- 表示中に削除した実パスは definition ごとの tombstone として snapshot prepare に渡す。
+  共有中でなければ snapshot をその場で compact し、ソート変更や履歴復元で削除済み項目を
+  復活させない。明示的な再走査の成功後は新 snapshot を正として tombstone を破棄する。
 - 「更新」は同じ definition で新しい generation を開始し、成功するまで現在 snapshot を保持する。
 - 一部 source が見つからない / 読めない場合は、読めた source の結果を表示し、失敗 source 数と
   詳細を通知する。全 source 失敗時は現在表示を置き換えない。
@@ -208,6 +216,8 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   スマートフォルダ表示時に全体のソート順 / サムネイル・詳細表示を上書きしないこと
 - menu layout の旧設定補完、名前だけの作成 / 現在条件追加 / 管理 / 登録一覧 / 対象外 tooltip
 - synthetic view からの open / back / forward / refresh / file operation 後の clamp
+- 名称の内部空白、空欄からの再入力、名称変更で走査を破棄しないこと、削除後の sort / 履歴復元、
+  通常一覧の facet / ★がスマートフォルダへ二重適用されないこと
 - perf event は scan / prepare / install / cancel を分け、10 万 / 50 万 / 200 万 entry で計測する。
 
 ## 4. v2.6.0 に含めないもの

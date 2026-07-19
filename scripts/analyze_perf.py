@@ -539,6 +539,11 @@ IDLE_HEALTH_WORK_KINDS = {
     "idle_upgrade_ineligible",
 }
 
+# A 500 ms split misses a 1.5 Hz repaint loop even though it wakes the application forever.
+# Static release scenarios have no legitimate periodic work, so keep the same-reason run
+# connected across gaps up to one second.
+IDLE_HEALTH_REASON_STREAK_GAP_SECS = 1.0
+
 
 def analyze_idle_health(
     events: list[dict],
@@ -550,11 +555,16 @@ def analyze_idle_health(
     max_reason_streak_secs: float = 2.0,
     max_same_work: int = 3,
     max_input_events: int = 0,
+    expected_pid: int | None = None,
+    allow_sleeping_window: bool = False,
+    evidence_start_t: float | None = None,
+    require_idle_upgrade_ineligible: bool = False,
 ) -> dict:
     """静止測定区間を解析し、JSON 化可能な report を返す。
 
-    App が正しく sleep すると区間内イベントが 0 件になるため、イベントの最終時刻ではなく
-    呼び出し側が指定した wall-clock 相当の ``start_t`` / ``end_t`` を分母に使う。
+    App が正しく sleep すると区間内イベントが 0 件になる。通常は窓ずれと区別するため
+    FAIL にし、外部 sampler が同一 process/session を検証した場合だけ
+    ``allow_sleeping_window`` で明示的に許可する。
     """
     duration = end_t - start_t
     if duration <= 0.0:
@@ -589,7 +599,7 @@ def analyze_idle_health(
         for cause in event.get("prev_frame_causes", []) or []:
             cause_counts[str(cause)] += 1
 
-    # 同じ理由が短い frame gap で連続する時間を測る。500ms を超えて次の frame が来た
+    # 同じ理由が短い frame gap で連続する時間を測る。1 秒を超えて次の frame が来た
     # 場合は、継続 repaint ではなく sleep 後の別 run とみなす。
     active_reasons: dict[str, tuple[float, float]] = {}
     max_reason_streaks: dict[str, float] = defaultdict(float)
@@ -598,7 +608,7 @@ def analyze_idle_health(
         present = {str(reason) for reason in (event.get("reasons", []) or [])}
         for reason in list(active_reasons):
             run_start, last_t = active_reasons[reason]
-            if reason not in present or t - last_t > 0.5:
+            if reason not in present or t - last_t > IDLE_HEALTH_REASON_STREAK_GAP_SECS:
                 max_reason_streaks[reason] = max(
                     max_reason_streaks[reason],
                     last_t - run_start,
@@ -645,6 +655,52 @@ def analyze_idle_health(
 
     failures: list[str] = []
     warnings: list[str] = []
+    session_events = [
+        e
+        for e in events
+        if e.get("cat") == "session" and e.get("kind") == "start"
+    ]
+    matching_session_events = [
+        e
+        for e in session_events
+        if expected_pid is not None and int(e.get("pid", -1)) == expected_pid
+    ]
+    if expected_pid is not None and not matching_session_events:
+        observed_pids = sorted(
+            {int(e.get("pid", -1)) for e in session_events if "pid" in e}
+        )
+        failures.append(
+            f"perf log の session PID が測定対象 PID {expected_pid} と一致しません "
+            f"(observed={observed_pids})"
+        )
+    if not selected:
+        if not allow_sleeping_window:
+            failures.append(
+                "測定区間に perf event が無く、窓ずれと sleep を区別できません"
+            )
+        elif expected_pid is None:
+            failures.append(
+                "空の測定区間を許可するには同一 session の expected PID が必要です"
+            )
+        else:
+            warnings.append(
+                "測定区間は完全に sleep しており perf event は 0 件です "
+                "(同一 session PID は確認済み)"
+            )
+    if require_idle_upgrade_ineligible:
+        evidence_start = start_t if evidence_start_t is None else evidence_start_t
+        evidence = [
+            e
+            for e in events
+            if evidence_start <= float(e.get("t", 0.0)) <= end_t
+            and e.get("cat") == "thumb"
+            and e.get("kind") == "idle_upgrade_ineligible"
+        ]
+        if not evidence:
+            failures.append(
+                "動画ピン由来の thumb.idle_upgrade_ineligible が準備・測定区間に無く、"
+                "シナリオ成立を確認できません"
+            )
     if not any(e.get("cat") == "frame" and e.get("kind") == "begin" for e in events):
         failures.append("perf log に frame.begin が無く、測定が有効か確認できません")
     if not any(e.get("cat") == "ui" and e.get("kind") == "tail_repaint" for e in events):
@@ -697,6 +753,7 @@ def analyze_idle_health(
             "tail_repaint_events": len(tail_events),
             "input_events": len(input_events),
             "max_same_work": max_work_count,
+            "matching_session_events": len(matching_session_events),
         },
         "thresholds": {
             "target_update_rate_per_sec": target_update_rate,
@@ -704,6 +761,10 @@ def analyze_idle_health(
             "max_reason_streak_secs": max_reason_streak_secs,
             "max_same_work": max_same_work,
             "max_input_events": max_input_events,
+            "expected_pid": expected_pid,
+            "allow_sleeping_window": allow_sleeping_window,
+            "evidence_start_t": evidence_start_t,
+            "require_idle_upgrade_ineligible": require_idle_upgrade_ineligible,
         },
         "action_counts": dict(sorted(action_counts.items())),
         "reason_counts": dict(sorted(reason_counts.items())),
@@ -726,6 +787,10 @@ def cmd_idle_health(
     max_same_work: int,
     max_input_events: int,
     json_out: Path | None,
+    expected_pid: int | None = None,
+    allow_sleeping_window: bool = False,
+    evidence_start_t: float | None = None,
+    require_idle_upgrade_ineligible: bool = False,
 ) -> int:
     if not events:
         print("ERROR: perf event が 0 件です", file=sys.stderr)
@@ -744,6 +809,10 @@ def cmd_idle_health(
             max_reason_streak_secs=max_reason_streak_secs,
             max_same_work=max_same_work,
             max_input_events=max_input_events,
+            expected_pid=expected_pid,
+            allow_sleeping_window=allow_sleeping_window,
+            evidence_start_t=evidence_start_t,
+            require_idle_upgrade_ineligible=require_idle_upgrade_ineligible,
         )
     except ValueError as error:
         print(f"ERROR: {error}", file=sys.stderr)
@@ -1494,6 +1563,14 @@ def main() -> None:
     p_idle.add_argument("--max-reason-streak-secs", type=float, default=2.0)
     p_idle.add_argument("--max-same-work", type=int, default=3)
     p_idle.add_argument("--max-input-events", type=int, default=0)
+    p_idle.add_argument("--expected-pid", type=int, default=None)
+    p_idle.add_argument("--allow-sleeping-window", action="store_true")
+    p_idle.add_argument("--evidence-start-t", type=float, default=None)
+    p_idle.add_argument(
+        "--require-idle-upgrade-ineligible",
+        action="store_true",
+        help="準備開始から測定終了までに動画ピン完成キャッシュ除外の証拠を要求",
+    )
     p_idle.add_argument("--json-out", type=Path, default=None)
     p_avd = subs.add_parser("av_drift")
     p_avd.add_argument(
@@ -1549,6 +1626,10 @@ def main() -> None:
                 args.max_same_work,
                 args.max_input_events,
                 args.json_out,
+                args.expected_pid,
+                args.allow_sleeping_window,
+                args.evidence_start_t,
+                args.require_idle_upgrade_ineligible,
             )
         )
     elif args.cmd == "av_drift":

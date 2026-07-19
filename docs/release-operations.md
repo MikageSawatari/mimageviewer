@@ -15,12 +15,17 @@
 
 ## 1. 全体の位置づけ
 
-- **配布ビルドは `scripts/build-dist.ps1` 一発**。clean → core → launcher → ISCC (installer)
+- **配布ビルドは `scripts/build-dist.ps1` 一発**。idle-health 解析テスト → clean → core → launcher → ISCC (installer)
   → portable を 1 コマンドで実行し、**最初にワークスペースパッケージを `cargo clean --release`**
   してから実コンパイルするので stale 出荷が構造的に起きない。署名は既定 ON。
 - **開発中の素早い反復だけ `scripts/build-release.ps1` 単体** (clean なし・速い・署名は
   `-Sign` 指定時のみ)。**配布物の生成には使わない**。
 - 実機検証用バイナリ (Windows ネイティブ挙動の確認依頼前) も `build-release.ps1` で足りる。
+- ただし、エージェントは通常版の `target\release\mimageviewer*.exe` を起動しない。
+  通常版は `%APPDATA%\mimageviewer` の実設定を使うため、起動確認だけでも migration・
+  bak rotation・quarantine が発生し得る。自動 UI 検証は
+  `scripts\prepare-portable-smoke.ps1` が作る `target\portable-smoke\` の使い捨て
+  ポータブル環境だけで行い、実設定が必要な確認はユーザーへ手順を渡す。
 
 ---
 

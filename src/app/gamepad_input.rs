@@ -11,11 +11,11 @@ use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleas
 use crate::grid_item::GridItem;
 use crate::keymap::KeyAction;
 use crate::ring_shortcut::{
-    GamepadFavoritePickerState, GamepadLocationEntry, GamepadLocationNav,
-    GamepadLocationPickerState, GamepadVideoMarkerPickerState, MOUSE_FLICK_MOVE_THRESHOLD_PX,
-    MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX, MouseButtonSlot,
-    MouseFlickOutcome, MouseFlickState, MouseGestureDirection, MouseGestureState, PickerListMode,
-    PickerListState, RightDragContext, RightDragMode, RingActionId, RingDirection,
+    GamepadFavoritePickerState, GamepadFavoritePickerTab, GamepadListCursor, GamepadLocationEntry,
+    GamepadLocationNav, GamepadLocationPickerState, GamepadVideoMarkerPickerState,
+    MOUSE_FLICK_MOVE_THRESHOLD_PX, MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX,
+    MouseButtonSlot, MouseFlickOutcome, MouseFlickState, MouseGestureDirection, MouseGestureState,
+    PickerListMode, PickerListState, RightDragContext, RightDragMode, RingActionId, RingDirection,
     RingPickerAnchor, RingPickerOriginalState, RingPickerRowId, RingPickerState,
     RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
     mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
@@ -301,6 +301,14 @@ fn update_mouse_middle_click_state(
         *state = None;
     }
     false
+}
+
+fn mouse_button_action_blocked_by_edit_mode(edit_mode_active: bool, action: &RingActionId) -> bool {
+    edit_mode_active
+        && matches!(
+            action,
+            RingActionId::CloseMainWindow | RingActionId::QuitApplication
+        )
 }
 
 /// mIV のいずれかのウィンドウが OS の前面なら、その HWND を返す。
@@ -1170,24 +1178,21 @@ impl App {
         let painter = ui.painter();
         painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
 
+        let tab = picker.tab;
+        let cursor = picker.active_cursor();
+        let len = match tab {
+            GamepadFavoritePickerTab::Favorites => self.settings.favorites.len(),
+            GamepadFavoritePickerTab::SmartFolders => self.settings.smart_folders.len(),
+        };
         let row_h = 34.0;
-        let visible_rows = self
-            .settings
-            .favorites
-            .len()
-            .min(GAMEPAD_LIST_VISIBLE_ROWS)
-            .max(1);
+        let visible_rows = len.min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
         let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
-        let panel_h = 92.0 + row_h * visible_rows as f32;
+        let panel_h = 116.0 + row_h * visible_rows as f32;
         let panel_rect =
             egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        let selected = picker
-            .selected
-            .min(self.settings.favorites.len().saturating_sub(1));
-        let start = picker
-            .scroll_top
-            .min(self.settings.favorites.len().saturating_sub(visible_rows));
-        let end = (start + visible_rows).min(self.settings.favorites.len());
+        let selected = cursor.selected.min(len.saturating_sub(1));
+        let start = cursor.scroll_top.min(len.saturating_sub(visible_rows));
+        let end = (start + visible_rows).min(len);
 
         egui::Area::new(egui::Id::new("gamepad_favorite_picker_overlay"))
             .order(egui::Order::Foreground)
@@ -1201,18 +1206,61 @@ impl App {
                     .inner_margin(egui::Margin::same(14))
                     .show(ui, |ui| {
                         ui.set_width(panel_w - 28.0);
-                        ui.label(
-                            egui::RichText::new("お気に入り")
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
+                        ui.horizontal(|ui| {
+                            for candidate in [
+                                GamepadFavoritePickerTab::Favorites,
+                                GamepadFavoritePickerTab::SmartFolders,
+                            ] {
+                                let active = candidate == tab;
+                                ui.label(
+                                    egui::RichText::new(candidate.label())
+                                        .size(if active { 17.0 } else { 15.0 })
+                                        .color(egui::Color32::from_white_alpha(if active {
+                                            255
+                                        } else {
+                                            180
+                                        }))
+                                        .background_color(if active {
+                                            egui::Color32::from_rgb(56, 94, 138)
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        }),
+                                );
+                                ui.add_space(10.0);
+                            }
+                        });
                         ui.add_space(6.0);
                         let mut first_row_rect = None;
                         let mut last_row_rect = None;
-                        let has_scrollbar = self.settings.favorites.len() > visible_rows;
+                        let has_scrollbar = len > visible_rows;
                         let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
+                        if len == 0 {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_h),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "登録されていません",
+                                egui::FontId::proportional(14.5),
+                                egui::Color32::from_white_alpha(180),
+                            );
+                        }
                         for idx in start..end {
-                            let fav = &self.settings.favorites[idx];
+                            let (label, value) = match tab {
+                                GamepadFavoritePickerTab::Favorites => {
+                                    let favorite = &self.settings.favorites[idx];
+                                    (favorite.name.clone(), favorite.path.display().to_string())
+                                }
+                                GamepadFavoritePickerTab::SmartFolders => {
+                                    let definition = &self.settings.smart_folders[idx];
+                                    (
+                                        definition.name.clone(),
+                                        smart_folder_picker_value(definition),
+                                    )
+                                }
+                            };
                             let is_selected = idx == selected;
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), row_h),
@@ -1239,7 +1287,7 @@ impl App {
                             ui.painter().text(
                                 egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
-                                truncate_ring_overlay_label(&fav.name, 22),
+                                truncate_ring_overlay_label(&label, 22),
                                 egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
                                 egui::Color32::from_white_alpha(if is_selected {
                                     255
@@ -1251,7 +1299,7 @@ impl App {
                             ui.painter().text(
                                 egui::pos2(value_right, row_rect.center().y),
                                 egui::Align2::RIGHT_CENTER,
-                                truncate_ring_overlay_label(&fav.path.display().to_string(), 34),
+                                truncate_ring_overlay_label(&value, 34),
                                 egui::FontId::proportional(12.5),
                                 egui::Color32::from_white_alpha(if is_selected {
                                     235
@@ -1264,14 +1312,14 @@ impl App {
                             draw_picker_scrollbar(
                                 ui.painter(),
                                 egui::Rect::from_min_max(first.min, last.max),
-                                self.settings.favorites.len(),
+                                len,
                                 visible_rows,
                                 start,
                             );
                         }
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new("上下:選択  A:移動  B/Start:閉じる")
+                            egui::RichText::new("左右:タブ切替  上下:選択  A:移動  B/Start:閉じる")
                                 .size(12.0)
                                 .color(egui::Color32::from_white_alpha(190)),
                         );
@@ -2487,8 +2535,23 @@ impl App {
             PadActionKind::Release => None,
             PadActionKind::Press | PadActionKind::Repeat => {
                 if let Some(dir) = button_dir(action.button) {
-                    if matches!(dir, PadDir::Up | PadDir::Down) {
-                        self.move_gamepad_favorite_picker(ctx, dir);
+                    match dir {
+                        PadDir::Up | PadDir::Down => {
+                            self.move_gamepad_favorite_picker(ctx, dir);
+                        }
+                        PadDir::Left if action.kind == PadActionKind::Press => {
+                            self.switch_gamepad_favorite_picker_tab(
+                                ctx,
+                                GamepadFavoritePickerTab::Favorites,
+                            );
+                        }
+                        PadDir::Right if action.kind == PadActionKind::Press => {
+                            self.switch_gamepad_favorite_picker_tab(
+                                ctx,
+                                GamepadFavoritePickerTab::SmartFolders,
+                            );
+                        }
+                        PadDir::Left | PadDir::Right => {}
                     }
                     return None;
                 }
@@ -2520,50 +2583,110 @@ impl App {
         let due = self
             .gamepad_state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
-        if due && let Some(dir @ (PadDir::Up | PadDir::Down)) = stick_dir {
-            self.move_gamepad_favorite_picker(ctx, dir);
+        if due && let Some(dir) = stick_dir {
+            match dir {
+                PadDir::Up | PadDir::Down => self.move_gamepad_favorite_picker(ctx, dir),
+                PadDir::Left => self
+                    .switch_gamepad_favorite_picker_tab(ctx, GamepadFavoritePickerTab::Favorites),
+                PadDir::Right => self.switch_gamepad_favorite_picker_tab(
+                    ctx,
+                    GamepadFavoritePickerTab::SmartFolders,
+                ),
+            }
         }
         active
     }
 
     fn move_gamepad_favorite_picker(&mut self, ctx: &egui::Context, dir: PadDir) {
-        let len = self.settings.favorites.len();
+        let Some(tab) = self
+            .gamepad_favorite_picker
+            .as_ref()
+            .map(|picker| picker.tab)
+        else {
+            return;
+        };
+        let len = match tab {
+            GamepadFavoritePickerTab::Favorites => self.settings.favorites.len(),
+            GamepadFavoritePickerTab::SmartFolders => self.settings.smart_folders.len(),
+        };
         if len == 0 {
-            self.gamepad_favorite_picker = None;
-            self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
-            ctx.request_repaint();
             return;
         }
         if let Some(picker) = self.gamepad_favorite_picker.as_mut() {
             let delta = if dir == PadDir::Down { 1 } else { -1 };
-            picker.selected = cycle_index(len, picker.selected, delta);
-            update_favorite_picker_scroll(picker, len);
+            let cursor = picker.active_cursor_mut();
+            cursor.selected = cycle_index(len, cursor.selected, delta);
+            update_gamepad_list_cursor(cursor, len);
             ctx.request_repaint();
             self.sync_native_video_favorite_picker_overlay(ctx);
         }
     }
 
+    fn switch_gamepad_favorite_picker_tab(
+        &mut self,
+        ctx: &egui::Context,
+        tab: GamepadFavoritePickerTab,
+    ) {
+        let len = match tab {
+            GamepadFavoritePickerTab::Favorites => self.settings.favorites.len(),
+            GamepadFavoritePickerTab::SmartFolders => self.settings.smart_folders.len(),
+        };
+        let Some(picker) = self.gamepad_favorite_picker.as_mut() else {
+            return;
+        };
+        if !set_gamepad_favorite_picker_tab(picker, tab, len) {
+            return;
+        }
+        ctx.request_repaint();
+        self.sync_native_video_favorite_picker_overlay(ctx);
+    }
+
     fn confirm_gamepad_favorite_picker(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
-        let selected = self
-            .gamepad_favorite_picker
-            .as_ref()
-            .map(|picker| picker.selected)
-            .unwrap_or(0)
-            .min(self.settings.favorites.len().saturating_sub(1));
-        let target = self.settings.favorites.get(selected)?.path.clone();
+        let picker = self.gamepad_favorite_picker.as_ref()?;
+        let tab = picker.tab;
+        let selected = picker.active_cursor().selected;
+        let favorite_target = (tab == GamepadFavoritePickerTab::Favorites)
+            .then(|| {
+                self.settings
+                    .favorites
+                    .get(selected)
+                    .map(|favorite| favorite.path.clone())
+            })
+            .flatten();
+        let smart_folder_target = (tab == GamepadFavoritePickerTab::SmartFolders)
+            .then(|| {
+                self.settings
+                    .smart_folders
+                    .get(selected)
+                    .map(|definition| definition.id)
+            })
+            .flatten();
+        if favorite_target.is_none() && smart_folder_target.is_none() {
+            return None;
+        }
         self.gamepad_favorite_picker = None;
         self.clear_native_video_picker_overlay(ctx);
         self.gamepad_state.require_directional_neutral();
         if self.fullscreen_idx.is_some() {
             self.close_fullscreen();
         }
-        self.bump_input_seq(
-            "gamepad_favorite_nav",
-            Some(&format!("path={}", target.display())),
-        );
-        ctx.request_repaint();
-        Some(AddressBarNav::Direct(target))
+        if let Some(target) = favorite_target {
+            self.bump_input_seq(
+                "gamepad_favorite_nav",
+                Some(&format!("path={}", target.display())),
+            );
+            ctx.request_repaint();
+            return Some(AddressBarNav::Direct(target));
+        }
+        if let Some(definition_id) = smart_folder_target {
+            self.bump_input_seq(
+                "gamepad_smart_folder_nav",
+                Some(&format!("definition_id={definition_id}")),
+            );
+            self.open_smart_folder(definition_id, false);
+            ctx.request_repaint();
+        }
+        None
     }
 
     fn dispatch_gamepad_location_picker_button(
@@ -3442,22 +3565,53 @@ impl App {
         &self,
         picker: &GamepadFavoritePickerState,
     ) -> crate::video::native_presenter::NativeOverlayRingPicker {
-        let rows = self
-            .settings
-            .favorites
-            .iter()
-            .map(
-                |favorite| crate::video::native_presenter::NativeOverlayRingPickerRow {
-                    label: favorite.name.clone(),
-                    value: favorite.path.display().to_string(),
-                },
-            )
-            .collect();
+        let (mut rows, selected_row) = match picker.tab {
+            GamepadFavoritePickerTab::Favorites => {
+                let rows: Vec<_> = self
+                    .settings
+                    .favorites
+                    .iter()
+                    .map(
+                        |favorite| crate::video::native_presenter::NativeOverlayRingPickerRow {
+                            label: favorite.name.clone(),
+                            value: favorite.path.display().to_string(),
+                        },
+                    )
+                    .collect();
+                let selected = (!rows.is_empty()).then_some(picker.favorites.selected);
+                (rows, selected)
+            }
+            GamepadFavoritePickerTab::SmartFolders => {
+                let rows: Vec<_> = self
+                    .settings
+                    .smart_folders
+                    .iter()
+                    .map(
+                        |definition| crate::video::native_presenter::NativeOverlayRingPickerRow {
+                            label: definition.name.clone(),
+                            value: smart_folder_picker_value(definition),
+                        },
+                    )
+                    .collect();
+                let selected = (!rows.is_empty()).then_some(picker.smart_folders.selected);
+                (rows, selected)
+            }
+        };
+        if rows.is_empty() {
+            rows.push(crate::video::native_presenter::NativeOverlayRingPickerRow {
+                label: "登録されていません".to_string(),
+                value: String::new(),
+            });
+        }
+        let title = match picker.tab {
+            GamepadFavoritePickerTab::Favorites => "[お気に入り]  ◀ / ▶  スマートフォルダ",
+            GamepadFavoritePickerTab::SmartFolders => "お気に入り  ◀ / ▶  [スマートフォルダ]",
+        };
         crate::video::native_presenter::NativeOverlayRingPicker {
-            title: "お気に入り".to_string(),
+            title: title.to_string(),
             rows,
-            selected_row: Some(picker.selected),
-            footer: "上下:選択  A:移動  B/Start:閉じる".to_string(),
+            selected_row,
+            footer: "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる".to_string(),
             drill: None,
         }
     }
@@ -3993,6 +4147,13 @@ impl App {
         if !action.is_valid_for_mouse_button_context(context) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored invalid mouse button action={} context={context:?}",
+                action.as_str()
+            ));
+            return None;
+        }
+        if mouse_button_action_blocked_by_edit_mode(self.is_overlay_edit_mode_active(), &action) {
+            crate::logger::log(format!(
+                "[input-nav] source={source} ignored mouse button action={} during edit mode",
                 action.as_str()
             ));
             return None;
@@ -5423,16 +5584,34 @@ impl App {
             );
             return None;
         }
-        if self.settings.favorites.is_empty() {
-            self.show_feedback_toast("お気に入りが登録されていません".to_string());
+        if self.settings.favorites.is_empty() && self.settings.smart_folders.is_empty() {
+            self.show_feedback_toast(
+                "お気に入り／スマートフォルダが登録されていません".to_string(),
+            );
             return None;
         }
-        let selected = self.current_gamepad_favorite_index().unwrap_or(0);
+        let favorite_selected = self.current_gamepad_favorite_index().unwrap_or(0);
+        let smart_folder_selected = self
+            .current_smart_folder_id
+            .and_then(|id| {
+                self.settings
+                    .smart_folders
+                    .iter()
+                    .position(|definition| definition.id == id)
+            })
+            .unwrap_or(0);
+        let tab = initial_gamepad_favorite_picker_tab(
+            self.items_are_smart_folder_view,
+            self.settings.favorites.len(),
+            self.settings.smart_folders.len(),
+        );
         let mut picker = GamepadFavoritePickerState {
-            selected,
-            scroll_top: selected.saturating_sub(5),
+            tab,
+            favorites: GamepadListCursor::new(favorite_selected),
+            smart_folders: GamepadListCursor::new(smart_folder_selected),
         };
-        update_favorite_picker_scroll(&mut picker, self.settings.favorites.len());
+        update_gamepad_list_cursor(&mut picker.favorites, self.settings.favorites.len());
+        update_gamepad_list_cursor(&mut picker.smart_folders, self.settings.smart_folders.len());
         self.ring_picker = None;
         self.gamepad_location_picker = None;
         self.gamepad_video_marker_picker = None;
@@ -6315,20 +6494,56 @@ fn cycle_value<T: Copy + PartialEq>(values: &[T], current: T, delta: i32) -> T {
     values[cycle_index(values.len(), current, delta)]
 }
 
-fn update_favorite_picker_scroll(picker: &mut GamepadFavoritePickerState, len: usize) {
+fn smart_folder_picker_value(definition: &crate::settings::SmartFolderDefinition) -> String {
+    let enabled = definition.rules.iter().filter(|rule| rule.enabled).count();
+    if enabled == 0 {
+        "表示条件なし".to_string()
+    } else {
+        format!("有効な条件: {enabled}件")
+    }
+}
+
+fn initial_gamepad_favorite_picker_tab(
+    items_are_smart_folder_view: bool,
+    favorite_len: usize,
+    smart_folder_len: usize,
+) -> GamepadFavoritePickerTab {
+    if items_are_smart_folder_view && smart_folder_len > 0 {
+        GamepadFavoritePickerTab::SmartFolders
+    } else if favorite_len > 0 {
+        GamepadFavoritePickerTab::Favorites
+    } else {
+        GamepadFavoritePickerTab::SmartFolders
+    }
+}
+
+fn set_gamepad_favorite_picker_tab(
+    picker: &mut GamepadFavoritePickerState,
+    tab: GamepadFavoritePickerTab,
+    len: usize,
+) -> bool {
+    if picker.tab == tab {
+        return false;
+    }
+    picker.tab = tab;
+    update_gamepad_list_cursor(picker.active_cursor_mut(), len);
+    true
+}
+
+fn update_gamepad_list_cursor(cursor: &mut GamepadListCursor, len: usize) {
     if len == 0 {
-        picker.selected = 0;
-        picker.scroll_top = 0;
+        cursor.selected = 0;
+        cursor.scroll_top = 0;
         return;
     }
     let visible = len.min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
-    picker.selected = picker.selected.min(len - 1);
-    if picker.selected < picker.scroll_top {
-        picker.scroll_top = picker.selected;
-    } else if picker.selected >= picker.scroll_top + visible {
-        picker.scroll_top = picker.selected + 1 - visible;
+    cursor.selected = cursor.selected.min(len - 1);
+    if cursor.selected < cursor.scroll_top {
+        cursor.scroll_top = cursor.selected;
+    } else if cursor.selected >= cursor.scroll_top + visible {
+        cursor.scroll_top = cursor.selected + 1 - visible;
     }
-    picker.scroll_top = picker.scroll_top.min(len.saturating_sub(visible));
+    cursor.scroll_top = cursor.scroll_top.min(len.saturating_sub(visible));
 }
 
 fn update_video_marker_picker_scroll(picker: &mut GamepadVideoMarkerPickerState, len: usize) {
@@ -6568,19 +6783,22 @@ mod tests {
     use super::{
         MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir, continuous_reading_stick_axis,
         cycle_rating, cycle_video_playback_speed, gamepad_grid_nav_target_pos,
+        initial_gamepad_favorite_picker_tab, mouse_button_action_blocked_by_edit_mode,
         mouse_flick_direction, picker_rows_for_context, post_filter_group_index,
         post_filter_item_index_in_group, rating_label, ring_direction_from_dpad_buttons,
         ring_direction_from_stick, ring_direction_from_stick_with_hysteresis,
-        ring_shortcut_context_for_surface_state, update_mouse_middle_click_state,
+        ring_shortcut_context_for_surface_state, set_gamepad_favorite_picker_tab,
+        update_mouse_middle_click_state,
     };
     use crate::adjustment::PostFilter;
     use crate::app::ActionSurface;
     use crate::gamepad::{GamepadInputState, PadButton};
-    use crate::ring_shortcut::RingShortcutContext;
     use crate::ring_shortcut::{
+        GamepadFavoritePickerState, GamepadFavoritePickerTab, GamepadListCursor,
         MOUSE_FLICK_MOVE_THRESHOLD_PX, MOUSE_FLICK_NEUTRAL_RADIUS_PX, MouseFlickState,
         RingDirection,
     };
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
     use crate::settings::{ReadingDirection, ReadingFlow};
     use eframe::egui;
 
@@ -6602,6 +6820,26 @@ mod tests {
             ),
             RingShortcutContext::ImageFullscreen
         );
+    }
+
+    #[test]
+    fn edit_mode_blocks_mouse_button_exit_actions_only() {
+        assert!(mouse_button_action_blocked_by_edit_mode(
+            true,
+            &RingActionId::QuitApplication,
+        ));
+        assert!(mouse_button_action_blocked_by_edit_mode(
+            true,
+            &RingActionId::CloseMainWindow,
+        ));
+        assert!(!mouse_button_action_blocked_by_edit_mode(
+            true,
+            &RingActionId::CloseFullscreen,
+        ));
+        assert!(!mouse_button_action_blocked_by_edit_mode(
+            false,
+            &RingActionId::QuitApplication,
+        ));
     }
 
     #[test]
@@ -6662,6 +6900,52 @@ mod tests {
             gamepad_grid_nav_target_pos(10, 30, 5, 12, true, PadDir::Up),
             9
         );
+    }
+
+    #[test]
+    fn start_picker_prefers_current_smart_folder_or_first_non_empty_tab() {
+        assert_eq!(
+            initial_gamepad_favorite_picker_tab(true, 3, 2),
+            GamepadFavoritePickerTab::SmartFolders
+        );
+        assert_eq!(
+            initial_gamepad_favorite_picker_tab(false, 3, 2),
+            GamepadFavoritePickerTab::Favorites
+        );
+        assert_eq!(
+            initial_gamepad_favorite_picker_tab(false, 0, 2),
+            GamepadFavoritePickerTab::SmartFolders
+        );
+    }
+
+    #[test]
+    fn start_picker_tab_switch_preserves_each_tab_cursor() {
+        let mut picker = GamepadFavoritePickerState {
+            tab: GamepadFavoritePickerTab::Favorites,
+            favorites: GamepadListCursor::new(4),
+            smart_folders: GamepadListCursor::new(20),
+        };
+
+        assert!(set_gamepad_favorite_picker_tab(
+            &mut picker,
+            GamepadFavoritePickerTab::SmartFolders,
+            3,
+        ));
+        assert_eq!(picker.smart_folders.selected, 2);
+        assert_eq!(picker.smart_folders.scroll_top, 0);
+        assert_eq!(picker.favorites.selected, 4);
+
+        assert!(set_gamepad_favorite_picker_tab(
+            &mut picker,
+            GamepadFavoritePickerTab::Favorites,
+            10,
+        ));
+        assert_eq!(picker.favorites.selected, 4);
+        assert!(!set_gamepad_favorite_picker_tab(
+            &mut picker,
+            GamepadFavoritePickerTab::Favorites,
+            10,
+        ));
     }
 
     #[test]

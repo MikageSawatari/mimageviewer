@@ -42,6 +42,19 @@ pub(crate) fn image_folder_page_count_options(
     if !settings.auto_fullscreen_image_folders_enabled() {
         return None;
     }
+    Some(ImageFolderPageCountOptions {
+        include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+        show_hidden_files: settings.show_hidden_files,
+        skip_duplicate_images: settings.skip_duplicate_images,
+        image_ext_priority: settings.image_ext_priority.clone(),
+        fingerprint: image_page_recognition_fingerprint(settings),
+    })
+}
+
+/// ZIP と画像フォルダのページ数 cache が共有する画像認識規則 fingerprint。
+/// Susie の有効/無効と対応拡張子集合も identity に含め、プラグイン構成変更後に
+/// 古いページ数を恒久再利用しない。
+pub(crate) fn image_page_recognition_fingerprint(settings: &crate::settings::Settings) -> i64 {
     // 永続 cache 用の決定的 FNV-1a。判定規則を変えたときは version bytes を上げる。
     let mut hash = 0xcbf29ce484222325u64;
     let mut mix = |bytes: &[u8]| {
@@ -67,13 +80,7 @@ pub(crate) fn image_folder_page_count_options(
             mix(&[0]);
         }
     }
-    Some(ImageFolderPageCountOptions {
-        include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
-        show_hidden_files: settings.show_hidden_files,
-        skip_duplicate_images: settings.skip_duplicate_images,
-        image_ext_priority: settings.image_ext_priority.clone(),
-        fingerprint: i64::from_ne_bytes(hash.to_ne_bytes()),
-    })
+    i64::from_ne_bytes(hash.to_ne_bytes())
 }
 
 /// 通常フォルダを実際の一覧走査と同じ規則で分類し、本扱いなら表示ページ数を返す。
@@ -550,5 +557,18 @@ mod page_count_tests {
         let temp = tempfile::TempDir::new().unwrap();
         let missing = temp.path().join("missing");
         assert!(image_folder_page_count(&missing, &options(false)).is_err());
+    }
+
+    #[test]
+    fn page_count_fingerprint_changes_with_susie_enablement() {
+        let mut disabled = crate::settings::Settings::default();
+        disabled.susie_enabled = false;
+        let mut enabled = disabled.clone();
+        enabled.susie_enabled = true;
+
+        assert_ne!(
+            image_page_recognition_fingerprint(&disabled),
+            image_page_recognition_fingerprint(&enabled)
+        );
     }
 }

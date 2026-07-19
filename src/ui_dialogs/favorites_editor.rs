@@ -139,7 +139,11 @@ impl App {
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
         let mut open_cache_creator = false;
-        let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+        let has_favorites = !self.settings.favorites.is_empty();
+        let (safe_rect, dialog_size, min_dialog_size) =
+            favorites_editor_dialog_geometry(ctx.content_rect(), has_favorites);
+        let safe_size = safe_rect.size();
+        let dialog_rect = egui::Rect::from_center_size(safe_rect.center(), dialog_size);
         let escape_pressed = self.dialog_escape_pressed(ctx);
         // save 後にトレイ checkmark を同期するかの判定材料。
         let old_pause_minimized = self.settings.pause_indexer_while_minimized;
@@ -243,14 +247,26 @@ impl App {
             .map(|(id, h)| (*id, h.snapshot_stats()))
             .collect();
 
-        let scroll_max_h = (ctx.content_rect().height() - 260.0).min(640.0).max(120.0);
         egui::Window::new("お気に入り")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .collapsible(false)
-            .default_pos(dialog_pos)
+            .default_pos(dialog_rect.min)
+            .default_size(dialog_size)
+            .min_size(min_dialog_size)
+            .max_size(safe_size)
+            .constrain_to(safe_rect)
             .show(ctx, |ui| {
-                ui.set_min_width(760.0);
+                // タイトルバー以外の本文は単一の ScrollArea にまとめる。一覧や
+                // インデクサへ別の縦スクロールを持たせると、下部操作へ到達しづらく
+                // wheel の所有先も分かりにくくなるため、本文全体で 1 本だけにする。
+                let body_height = ui.available_height().max(1.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("favorites_editor_body_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(body_height)
+                    .show(ui, |ui| {
+                        ui.set_min_width((safe_size.x - 40.0).clamp(1.0, 744.0));
 
                 // ── 起動時整合性チェック (インデクサが有効なら表示) ──
                 if reconciling {
@@ -405,16 +421,11 @@ impl App {
                     ui.add_space(6.0);
 
                     let n = self.settings.favorites.len();
-                    egui::ScrollArea::vertical()
-                        .id_salt("fav_edit_scroll")
-                        .max_height(scroll_max_h)
-                        .auto_shrink([false, true])
+                    egui::Grid::new("fav_edit_grid")
+                        .striped(true)
+                        .num_columns(6)
+                        .spacing([8.0, 4.0])
                         .show(ui, |ui| {
-                            egui::Grid::new("fav_edit_grid")
-                                .striped(true)
-                                .num_columns(6)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
                                     // ── ヘッダ (状態は各索引列にインライン) ──
                                     ui.label(egui::RichText::new("番号").strong())
                                         .on_hover_text(
@@ -546,7 +557,6 @@ impl App {
                                         });
                                         ui.end_row();
                                     }
-                                });
                         });
 
                     // ── 一括操作 (チェックボックスの一括 ON/OFF のみ) ──
@@ -684,38 +694,27 @@ impl App {
                             );
                         }
                     });
-                    // 4 行ぶんの高さを常に確保。実行中アイテムが多ければスクロール。
-                    const ROW_H: f32 = 16.0;
-                    const VISIBLE_ROWS: f32 = 4.0;
-                    egui::ScrollArea::vertical()
-                        .id_salt("fav_edit_indexer_progress")
-                        .max_height(ROW_H * VISIBLE_ROWS)
-                        .min_scrolled_height(ROW_H * VISIBLE_ROWS)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_min_height(ROW_H * VISIBLE_ROWS);
-                            if active.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("  (アイドル)")
-                                        .size(11.0)
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                            } else {
-                                for (name, msg) in &active {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "  {}: {}",
-                                            name,
-                                            truncate_name(msg, 100),
-                                        ))
-                                        .size(11.0)
-                                        .monospace()
-                                        .color(ui.visuals().weak_text_color()),
-                                    )
-                                    .on_hover_text(format!("{name}: {msg}"));
-                                }
-                            }
-                        });
+                    if active.is_empty() {
+                        ui.label(
+                            egui::RichText::new("  (アイドル)")
+                                .size(11.0)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    } else {
+                        for (name, msg) in &active {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  {}: {}",
+                                    name,
+                                    truncate_name(msg, 100),
+                                ))
+                                .size(11.0)
+                                .monospace()
+                                .color(ui.visuals().weak_text_color()),
+                            )
+                            .on_hover_text(format!("{name}: {msg}"));
+                        }
+                    }
                     // ライブ更新: 100ms ごとに再描画を要求して進捗を流す。
                     // active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ。
                     ctx.request_repaint_after(Duration::from_millis(100));
@@ -733,6 +732,7 @@ impl App {
                         close_requested = true;
                     }
                 });
+                    });
             });
 
         // ── 削除確認 ────────────────────────────────────────────────
@@ -871,6 +871,18 @@ impl App {
     }
 }
 
+fn favorites_editor_dialog_geometry(
+    content_rect: egui::Rect,
+    has_favorites: bool,
+) -> (egui::Rect, egui::Vec2, egui::Vec2) {
+    let safe_rect = content_rect.shrink2(egui::vec2(16.0, 16.0));
+    let safe_size = safe_rect.size();
+    let preferred_height = if has_favorites { 800.0 } else { 420.0 };
+    let dialog_size = egui::vec2(980.0, preferred_height).min(safe_size);
+    let min_dialog_size = egui::vec2(760.0, 420.0).min(safe_size);
+    (safe_rect, dialog_size, min_dialog_size)
+}
+
 /// 全 supervisor の `EtaSnapshot` を統合し、「残り XX:XX (NN件/秒)」表記を返す。
 ///
 /// 各索引は **並列に** 走るので:
@@ -923,4 +935,31 @@ fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, f
         format!("{label} ({}件)", format_count(file_count))
     };
     ui.label(egui::RichText::new(text).size(11.0).color(color));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::favorites_editor_dialog_geometry;
+
+    #[test]
+    fn favorites_editor_dialog_geometry_stays_inside_small_window() {
+        let content_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 360.0));
+        let (safe_rect, dialog_size, min_dialog_size) =
+            favorites_editor_dialog_geometry(content_rect, true);
+
+        assert_eq!(safe_rect.size(), egui::vec2(608.0, 328.0));
+        assert_eq!(dialog_size, safe_rect.size());
+        assert_eq!(min_dialog_size, safe_rect.size());
+    }
+
+    #[test]
+    fn favorites_editor_dialog_geometry_uses_preferred_height_when_it_fits() {
+        let content_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 1000.0));
+        let (safe_rect, dialog_size, min_dialog_size) =
+            favorites_editor_dialog_geometry(content_rect, true);
+
+        assert_eq!(safe_rect.size(), egui::vec2(1248.0, 968.0));
+        assert_eq!(dialog_size, egui::vec2(980.0, 800.0));
+        assert_eq!(min_dialog_size, egui::vec2(760.0, 420.0));
+    }
 }

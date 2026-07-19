@@ -92,6 +92,22 @@ always-active guidance.
 
 ## Verification Builds (Windows native features)
 
+- **Never launch** `target\release\mimageviewer.exe`,
+  `target\release\mimageviewer-core.exe`, an installed mImageViewer, or an
+  `%APPDATA%\mimageviewer\runtime\*` executable as part of agent-driven UI or
+  Computer Use verification. Normal builds use the user's real
+  `%APPDATA%\mimageviewer` data and may migrate, rotate, quarantine, or rewrite
+  `settings.db` merely by starting. Building these binaries and handing them to
+  the user is allowed; launching them is not.
+- Agent-driven UI verification must use a disposable portable copy prepared by
+  `.\scripts\prepare-portable-smoke.ps1`. Launch only
+  `target\portable-smoke\mimageviewer.exe` and verify that its data directory is
+  `target\portable-smoke\data`. Do not reuse a user's portable installation or
+  copy the user's normal settings into the smoke directory.
+- If a scenario specifically requires the user's real configuration, stop after
+  building and give the user concrete manual steps. Only the user launches the
+  normal verification binary. Do not reset, rename, restore, or otherwise
+  manipulate the normal settings files for test setup.
 - When a change affects Windows-native behavior that unit tests cannot cover
   (native video presenter, fullscreen, video->audio mode, VST, D3D11, HWND
   owner/focus/z-order, real IME behavior, multi-monitor DPI), do not merely ask

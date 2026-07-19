@@ -61,10 +61,12 @@ case "$mode" in
     fetch|"")
         if [[ -d "$TARGET_DIR" ]]; then
             echo "$TARGET_DIR が既に存在します。最新を pull します。"
-            cd "$TARGET_DIR"
-            git fetch --quiet origin
-            git reset --hard origin/master
-            git submodule update --init --recursive
+            (
+                cd "$TARGET_DIR"
+                git fetch --quiet origin
+                git reset --hard origin/master
+                git submodule update --init --recursive
+            )
         else
             echo "$REPO_URL を $TARGET_DIR に clone します..."
             git clone --recursive "$REPO_URL" "$TARGET_DIR"

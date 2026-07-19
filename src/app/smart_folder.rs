@@ -887,6 +887,7 @@ fn prepare_smart_folder(
     snapshot: SmartFolderSnapshot,
     sort: crate::settings::SortOrder,
     refresh: bool,
+    removed_paths: HashSet<String>,
     load_ratings: bool,
     load_tags: bool,
     load_local_adjust: bool,
@@ -980,6 +981,9 @@ fn prepare_smart_folder(
             report(SmartFolderPhase::Filtering, index);
         }
         let entry = &snapshot.entries[index];
+        if removed_paths.contains(&crate::path_key::normalize_keep_drive(&entry.path)) {
+            continue;
+        }
         if entry.matching_rule_indices.iter().any(|rule_index| {
             snapshot
                 .definition
@@ -1115,6 +1119,7 @@ fn spawn_smart_folder_prepare(
     sort: crate::settings::SortOrder,
     generation: u64,
     refresh: bool,
+    removed_paths: HashSet<String>,
     load_ratings: bool,
     load_tags: bool,
     load_local_adjust: bool,
@@ -1130,6 +1135,7 @@ fn spawn_smart_folder_prepare(
                 snapshot,
                 sort,
                 refresh,
+                removed_paths,
                 load_ratings,
                 load_tags,
                 load_local_adjust,
@@ -1151,6 +1157,41 @@ fn spawn_smart_folder_prepare(
         cancel,
         rx,
     })
+}
+
+fn smart_folder_scan_rules_match(
+    left: &crate::settings::SmartFolderDefinition,
+    right: &crate::settings::SmartFolderDefinition,
+) -> bool {
+    left.id == right.id && left.rules == right.rules
+}
+
+fn adopt_smart_folder_presentation(
+    target: &mut crate::settings::SmartFolderDefinition,
+    current: &crate::settings::SmartFolderDefinition,
+) {
+    target.name.clone_from(&current.name);
+    target.grouping = current.grouping;
+}
+
+fn remove_paths_from_smart_folder_snapshot(
+    snapshot: &mut SmartFolderSnapshot,
+    removed: &HashSet<String>,
+) -> bool {
+    let before = snapshot.entries.len();
+    Arc::make_mut(&mut snapshot.entries)
+        .retain(|entry| !removed.contains(&crate::path_key::normalize_keep_drive(&entry.path)));
+    snapshot
+        .video_thumb_overrides
+        .retain(|video_key, image_path| {
+            !removed.contains(video_key)
+                && !removed.contains(&crate::path_key::normalize_keep_drive(image_path))
+        });
+    let changed = snapshot.entries.len() != before;
+    if changed {
+        snapshot.diag.containers_found = snapshot.entries.len();
+    }
+    changed
 }
 
 impl App {
@@ -1216,11 +1257,16 @@ impl App {
             pending.cancel();
         }
         let generation = self.smart_folder_generation;
+        let definition_id = snapshot.definition.id;
         match spawn_smart_folder_prepare(
             snapshot,
             self.settings.sort_order,
             generation,
             refresh,
+            self.smart_folder_removed_paths
+                .get(&definition_id)
+                .cloned()
+                .unwrap_or_default(),
             self.rating_db.is_some(),
             self.tags_db.is_some(),
             self.local_adjust_db.is_some(),
@@ -1250,6 +1296,7 @@ impl App {
     /// 定義変更時に古い snapshot / 進行中 worker を無効化する。
     pub(crate) fn invalidate_smart_folder_definition(&mut self, definition_id: uuid::Uuid) {
         self.smart_folder_snapshots.remove(&definition_id);
+        self.smart_folder_removed_paths.remove(&definition_id);
         let pending_matches = self
             .smart_folder_pending
             .as_ref()
@@ -1313,12 +1360,13 @@ impl App {
         else {
             return false;
         };
-        if let Some(snapshot) = self
+        if let Some(mut snapshot) = self
             .smart_folder_snapshots
             .get(&definition_id)
-            .filter(|snapshot| snapshot.definition == definition)
+            .filter(|snapshot| smart_folder_scan_rules_match(&snapshot.definition, &definition))
             .cloned()
         {
+            adopt_smart_folder_presentation(&mut snapshot.definition, &definition);
             self.current_smart_folder_id = Some(definition_id);
             self.start_smart_folder_prepare(snapshot, false);
         } else {
@@ -1340,19 +1388,32 @@ impl App {
                 Ok(SmartFolderScanEvent::Progress(progress)) => {
                     self.smart_folder_progress = Some(progress);
                 }
-                Ok(SmartFolderScanEvent::Done(result)) => {
+                Ok(SmartFolderScanEvent::Done(mut result)) => {
                     let Some(pending) = self.smart_folder_pending.take() else {
                         break;
                     };
-                    let current_matches = pending.generation == self.smart_folder_generation
-                        && self.settings.smart_folders.iter().any(|definition| {
+                    let current_definition =
+                        self.settings.smart_folders.iter().find(|definition| {
                             definition.id == pending.definition_id
-                                && definition == &result.snapshot.definition
+                                && smart_folder_scan_rules_match(
+                                    definition,
+                                    &result.snapshot.definition,
+                                )
                         });
-                    if !current_matches {
+                    if pending.generation != self.smart_folder_generation
+                        || current_definition.is_none()
+                    {
                         self.smart_folder_progress = None;
                         break;
                     }
+                    adopt_smart_folder_presentation(
+                        &mut result.snapshot.definition,
+                        current_definition.expect("checked above"),
+                    );
+                    // A completed rescan is authoritative. Paths recreated after a delete are
+                    // allowed to reappear in this fresh snapshot.
+                    self.smart_folder_removed_paths
+                        .remove(&pending.definition_id);
                     if result.snapshot.diag.source_failures
                         == active_rules(&result.snapshot.definition).len()
                     {
@@ -1399,14 +1460,37 @@ impl App {
                     let Some(pending) = self.smart_folder_prepare_pending.take() else {
                         break;
                     };
+                    let current_definition = self
+                        .settings
+                        .smart_folders
+                        .iter()
+                        .find(|definition| {
+                            definition.id == pending.definition_id
+                                && smart_folder_scan_rules_match(
+                                    definition,
+                                    &prepared.snapshot.definition,
+                                )
+                        })
+                        .cloned();
                     if pending.generation == self.smart_folder_generation
                         && pending.definition_id == prepared.snapshot.definition.id
-                        && self.settings.smart_folders.iter().any(|definition| {
-                            definition.id == pending.definition_id
-                                && definition == &prepared.snapshot.definition
-                        })
+                        && let Some(current_definition) = current_definition
                     {
-                        self.install_prepared_smart_folder(prepared);
+                        if prepared.snapshot.definition.grouping != current_definition.grouping {
+                            let mut snapshot = prepared.snapshot;
+                            adopt_smart_folder_presentation(
+                                &mut snapshot.definition,
+                                &current_definition,
+                            );
+                            self.start_smart_folder_prepare(snapshot, prepared.refresh);
+                        } else {
+                            let mut prepared = prepared;
+                            adopt_smart_folder_presentation(
+                                &mut prepared.snapshot.definition,
+                                &current_definition,
+                            );
+                            self.install_prepared_smart_folder(prepared);
+                        }
                     }
                     break;
                 }
@@ -1445,11 +1529,23 @@ impl App {
         let definition_name = snapshot.definition.name.clone();
         let diag = snapshot.diag.clone();
         let item_count = items.len();
+        let synthetic_path = smart_folder_synthetic_path(definition_id);
+        // A smart folder definition already owns all of its filtering. Facet / star filters
+        // from the source view must not be applied a second time; suppress them for the
+        // synthetic scope and let the normal scope-exit path restore them on return.
+        self.suppress_current_facet_filter_at(
+            synthetic_path.clone(),
+            "元の一覧の絞り込みを退避しました (戻ると復元)".to_string(),
+        );
+        if self.rating_filter_suppressed_at.is_none() && self.rating_filter_active() {
+            self.rating_filter_suppressed_at =
+                Some((synthetic_path.clone(), self.settings.rating_filter));
+        }
         self.video_thumb_overrides.clear();
         self.video_thumb_overrides
             .extend(snapshot.video_thumb_overrides.clone());
         self.start_loading_subfolder_items(
-            smart_folder_synthetic_path(definition_id),
+            synthetic_path,
             items,
             image_metas,
             video_items,
@@ -1494,6 +1590,82 @@ impl App {
             self.start_smart_folder_prepare(snapshot, false);
         }
         true
+    }
+
+    /// 名前は snapshot identity ではなく表示情報、grouping は走査後の prepare 情報。
+    /// rules が同じなら実フォルダ走査を捨てずに更新する。
+    pub(crate) fn update_smart_folder_presentation(
+        &mut self,
+        definition: crate::settings::SmartFolderDefinition,
+    ) {
+        let grouping_changed = self
+            .smart_folder_snapshots
+            .get(&definition.id)
+            .is_some_and(|snapshot| snapshot.definition.grouping != definition.grouping);
+        if let Some(snapshot) = self.smart_folder_snapshots.get_mut(&definition.id) {
+            adopt_smart_folder_presentation(&mut snapshot.definition, &definition);
+        }
+        if self.current_smart_folder_id == Some(definition.id) {
+            self.address = format!("スマートフォルダ: {}", definition.name);
+            if grouping_changed
+                && let Some(snapshot) = self.smart_folder_snapshots.get(&definition.id).cloned()
+            {
+                self.start_smart_folder_prepare(snapshot, false);
+            }
+        }
+    }
+
+    /// 削除済み実パスを全 snapshot から除外する。prepare worker が Arc を共有中なら
+    /// UI スレッドで巨大 Vec を複製せず tombstone を渡し、worker を再起動する。
+    pub(crate) fn remove_paths_from_smart_folder_snapshots(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() || self.smart_folder_snapshots.is_empty() {
+            return;
+        }
+        let removed: HashSet<String> = paths
+            .iter()
+            .map(|path| crate::path_key::normalize_keep_drive(path))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+
+        let mut affected_ids = Vec::new();
+        for (id, snapshot) in &mut self.smart_folder_snapshots {
+            if snapshot
+                .entries
+                .iter()
+                .any(|entry| removed.contains(&crate::path_key::normalize_keep_drive(&entry.path)))
+            {
+                affected_ids.push(*id);
+                self.smart_folder_removed_paths
+                    .entry(*id)
+                    .or_default()
+                    .extend(removed.iter().cloned());
+                if Arc::strong_count(&snapshot.entries) == 1 {
+                    remove_paths_from_smart_folder_snapshot(snapshot, &removed);
+                }
+            }
+        }
+        if let Some(confirm) = self.smart_folder_confirm_pending.as_mut()
+            && affected_ids.contains(&confirm.snapshot.definition.id)
+        {
+            remove_paths_from_smart_folder_snapshot(&mut confirm.snapshot, &removed);
+        }
+        let pending_affected = self
+            .smart_folder_prepare_pending
+            .as_ref()
+            .is_some_and(|pending| affected_ids.contains(&pending.definition_id));
+        if pending_affected {
+            if let Some(pending) = self.smart_folder_prepare_pending.take() {
+                pending.cancel();
+            }
+            if let Some(id) = self.current_smart_folder_id
+                && affected_ids.contains(&id)
+                && let Some(snapshot) = self.smart_folder_snapshots.get(&id).cloned()
+            {
+                self.start_smart_folder_prepare(snapshot, false);
+            }
+        }
     }
 
     pub(crate) fn render_smart_folder_overlay(&mut self, ctx: &egui::Context) {
@@ -2119,6 +2291,7 @@ mod tests {
             snapshot,
             crate::settings::SortOrder::FileName,
             false,
+            HashSet::new(),
             false,
             false,
             false,
@@ -2139,6 +2312,55 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["m.zip", "z.zip", "a.zip"]);
+    }
+
+    #[test]
+    fn deleted_paths_are_removed_from_cached_smart_folder_snapshot() {
+        let definition = crate::settings::SmartFolderDefinition::new("books");
+        let mut snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(vec![
+                smart_entry(r"C:\Books\keep.zip", 0, ""),
+                smart_entry(r"C:\Books\deleted.zip", 0, ""),
+            ]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag {
+                containers_found: 2,
+                ..Default::default()
+            },
+        };
+        let removed = [crate::path_key::normalize_keep_drive(Path::new(
+            r"C:\Books\deleted.zip",
+        ))]
+        .into_iter()
+        .collect();
+
+        assert!(remove_paths_from_smart_folder_snapshot(
+            &mut snapshot,
+            &removed
+        ));
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.diag.containers_found, 1);
+        assert!(snapshot.entries[0].path.ends_with("keep.zip"));
+    }
+
+    #[test]
+    fn display_name_and_grouping_do_not_change_scan_identity() {
+        let mut left = crate::settings::SmartFolderDefinition::new("before");
+        left.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            PathBuf::from(r"C:\Books"),
+            true,
+            true,
+            Default::default(),
+        ));
+        let mut right = left.clone();
+        right.name = "after".into();
+        right.grouping = crate::settings::SubfolderExpansionOrder::FolderGrouped;
+        assert!(smart_folder_scan_rules_match(&left, &right));
+
+        right.rules[0].include_descendants = false;
+        assert!(!smart_folder_scan_rules_match(&left, &right));
     }
 
     #[test]

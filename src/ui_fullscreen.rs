@@ -6114,16 +6114,31 @@ impl App {
             && self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
     }
 
+    /// The fixed top bar may reserve image space only while the same chrome is drawable.
+    /// Keep this predicate shared with the draw gate so edit/capture/music modes cannot
+    /// leave an empty strip at the top of the fullscreen canvas.
+    fn fullscreen_top_bar_chrome_allowed(&self, fs_idx: usize) -> bool {
+        !self.is_overlay_edit_mode_active()
+            && self.capture_region_selection.is_none()
+            && !self.fs_music_view_active(fs_idx)
+    }
+
+    fn fullscreen_top_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
+        self.settings.fullscreen_top_bar_locked
+            && !is_video
+            && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
+            && self.fullscreen_top_bar_chrome_allowed(fs_idx)
+    }
+
     fn fullscreen_media_rect(
         &self,
         full_rect: egui::Rect,
         fs_idx: usize,
         is_video: bool,
     ) -> egui::Rect {
-        let still_page = !is_video && self.items.get(fs_idx).is_some_and(GridItem::has_page_data);
         fullscreen_rect_excluding_fixed_bars(
             full_rect,
-            still_page && self.settings.fullscreen_top_bar_locked,
+            self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
             self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
         )
     }
@@ -6242,7 +6257,7 @@ impl App {
 
         let painter = ui.painter();
         let font = egui::FontId::monospace(13.0);
-        let text_color = egui::Color32::from_rgb(245, 247, 250);
+        let text_color = ui.visuals().text_color();
         let galley = painter.layout_no_wrap(label, font, text_color);
         let padding = egui::vec2(8.0, 4.0);
         let size = galley.size() + padding * 2.0;
@@ -6393,7 +6408,7 @@ impl App {
                 egui::Align2::CENTER_CENTER,
                 summary,
                 egui::FontId::proportional(14.0),
-                egui::Color32::from_rgb(235, 238, 242),
+                ui.visuals().text_color(),
             );
             return None;
         }
@@ -6436,11 +6451,8 @@ impl App {
             };
         let sample_label = format_fullscreen_page_number_label(total, &sample_positions)
             .unwrap_or_else(|| format!("{} / {}", total, total));
-        let sample_galley = painter.layout_no_wrap(
-            sample_label,
-            font.clone(),
-            egui::Color32::from_rgb(242, 244, 247),
-        );
+        let sample_galley =
+            painter.layout_no_wrap(sample_label, font.clone(), ui.visuals().text_color());
         let label_width = (sample_galley.size().x + 18.0)
             .max(64.0)
             .min((inner.width() * 0.32).max(64.0));
@@ -6570,7 +6582,7 @@ impl App {
             egui::Align2::CENTER_CENTER,
             label,
             font,
-            egui::Color32::from_rgb(242, 244, 247),
+            ui.visuals().text_color(),
         );
         if !primary_down && self.fs_seek_drag_active {
             self.fs_seek_drag_active = false;
@@ -8411,10 +8423,7 @@ impl App {
                         // 消しゴム / 隠蔽加工モード中は上部バーを抑制 (自前パネルと競合させない)。
                         // 音楽ビューも画像用の上部ホバーバーは出さない (music view が自前で
                         // 上情報バー + 下シークバーを描くため、Inc 3 パネル漏れ修正)。
-                        if !self.is_overlay_edit_mode_active()
-                            && self.capture_region_selection.is_none()
-                            && !is_music_view
-                        {
+                        if self.fullscreen_top_bar_chrome_allowed(fs_idx) {
                             let saved_nav = page_nav;
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
                             // Phase 6: 動画モードかどうかを上ホバーバーに通知する。
@@ -8485,26 +8494,48 @@ impl App {
                             let mut bar_analysis_pressed = false;
                             let mut side_panel_mode_pressed = false;
                             let mut top_bar_lock_pressed = false;
-                            let top_bar_page_infos = match spread_pair {
-                                SpreadPair::Single => {
-                                    let mut info = state.top_bar_page_info();
-                                    info.ai_upscale_info =
-                                        self.top_bar_ai_upscale_info(fs_idx, info.image_dims);
-                                    vec![info]
+                            let hover_in_top = ctx.input(|i| {
+                                !self.cursor_hidden
+                                    && i.pointer
+                                        .hover_pos()
+                                        .is_some_and(|p| p.y < TOP_BAR_HOVER_Y)
+                            });
+                            let top_bar_visible = still_top_bar_visible_from_inputs(
+                                StillTopBarVisibilityInputs {
+                                    locked: self.settings.fullscreen_top_bar_locked,
+                                    hover_in_top,
+                                    side_panel_visible,
+                                    spread_popup_open: self.spread_popup_open,
+                                    fit_popup_open: self.fit_popup_open,
+                                    slideshow_popup_open: self.slideshow_popup_open,
+                                    rotation_popup_open: fs_rotation_popup_open(ctx),
+                                    view_trim_mode: self.view_trim_mode,
+                                },
+                            );
+                            let top_bar_page_infos = if top_bar_visible {
+                                match spread_pair {
+                                    SpreadPair::Single => {
+                                        let mut info = state.top_bar_page_info();
+                                        info.ai_upscale_info =
+                                            self.top_bar_ai_upscale_info(fs_idx, info.image_dims);
+                                        vec![info]
+                                    }
+                                    SpreadPair::Double { left, right } => [left, right]
+                                        .into_iter()
+                                        .map(|idx| {
+                                            if idx == fs_idx {
+                                                let mut info = state.top_bar_page_info();
+                                                info.ai_upscale_info = self
+                                                    .top_bar_ai_upscale_info(idx, info.image_dims);
+                                                info
+                                            } else {
+                                                self.cached_top_bar_page_info(idx)
+                                            }
+                                        })
+                                        .collect(),
                                 }
-                                SpreadPair::Double { left, right } => [left, right]
-                                    .into_iter()
-                                    .map(|idx| {
-                                        if idx == fs_idx {
-                                            let mut info = state.top_bar_page_info();
-                                            info.ai_upscale_info = self
-                                                .top_bar_ai_upscale_info(idx, info.image_dims);
-                                            info
-                                        } else {
-                                            self.cached_top_bar_page_info(idx)
-                                        }
-                                    })
-                                    .collect(),
+                            } else {
+                                Vec::new()
                             };
                             Self::draw_fs_hover_bar(
                                 ui, ctx, &self.keymap, full_rect,

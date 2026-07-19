@@ -27,6 +27,15 @@ fn native_video_key_physically_down(
     }
 }
 
+#[cfg(windows)]
+fn main_iconic_video_source_enabled(
+    detached_or_switching: bool,
+    is_video: bool,
+    music_view_active: bool,
+) -> bool {
+    !detached_or_switching && is_video && !music_view_active
+}
+
 /// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
 ///
 /// ピン留めボタンが押されたが thumb worker キャッシュにそのフレームがまだ無い場合、
@@ -2092,15 +2101,21 @@ impl App {
         let Some(hwnd_raw) = self.main_hwnd else {
             return;
         };
+        let detached_or_switching = self.viewer_session_is_detached_or_switching();
         let source = self.fullscreen_idx.and_then(|fs_idx| {
-            if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
+            let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+            let music_view_active = is_video && self.fs_music_view_active(fs_idx);
+            // The explicit DWM bitmap exists only because an in-main native presenter
+            // covers the main HWND. A detached viewer has its own top-level taskbar
+            // preview, so overriding the main HWND would make both previews show the
+            // detached video. Passing None below also clears a bitmap left by a
+            // main -> detached transition.
+            if !main_iconic_video_source_enabled(detached_or_switching, is_video, music_view_active)
+            {
                 return None;
             }
             // 音声モードにトグルした動画 (Inc 7) は音声ファイル扱いなので DWM タスクバー
             // サムネイル (動画フレーム) を出さない (Codex 7d 検証)。
-            if self.fs_music_view_active(fs_idx) {
-                return None;
-            }
             if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
                 if pending.target_idx == fs_idx && !pending.native_output.is_closed() {
                     return Some(crate::dwm_iconic_thumbnail::VideoIconicSource {
@@ -8567,7 +8582,17 @@ impl App {
         self.mark_native_video_hud_activity(ctx);
         if event.button == NativeVideoMouseButton::Right && !event.double_click {
             let pos = egui::pos2(event.x as f32, event.y as f32);
-            if !event.down && self.fs_context_menu_idx.is_some() {
+            if self.fs_context_menu_idx.is_some() {
+                // The presenter receives native input behind the egui menu. Consume both
+                // press and release: letting the press through starts a ring/gesture whose
+                // release is then swallowed, leaving a stuck interaction. A new right press
+                // dismisses the menu only, matching the existing left-click dismissal.
+                self.native_video_secondary_press_start = None;
+                if event.down {
+                    self.fs_context_menu_idx = None;
+                    self.cached_handlers = None;
+                    ctx.request_repaint();
+                }
                 return;
             }
             if event.down {
@@ -8859,5 +8884,18 @@ impl App {
             player.request_native_overlay_render();
         }
         ctx.request_repaint();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod iconic_thumbnail_tests {
+    use super::main_iconic_video_source_enabled;
+
+    #[test]
+    fn main_iconic_video_source_is_only_for_in_main_video() {
+        assert!(main_iconic_video_source_enabled(false, true, false));
+        assert!(!main_iconic_video_source_enabled(true, true, false));
+        assert!(!main_iconic_video_source_enabled(false, false, false));
+        assert!(!main_iconic_video_source_enabled(false, true, true));
     }
 }

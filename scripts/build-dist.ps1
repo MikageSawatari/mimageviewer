@@ -8,11 +8,12 @@
 # so the clean only costs the app recompile (~4 min core), not a full rebuild.
 #
 # Steps:
-#   1. cargo clean --release -p mimageviewer -p mimageviewer-launcher
+#   1. idle-health analyzer regression tests
+#   2. cargo clean --release -p mimageviewer -p mimageviewer-launcher
 #      (+ the portable target dir's mimageviewer package)
-#   2. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core
-#   3. ISCC                -> installer\Output\mImageViewer_setup.exe
-#   4. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
+#   3. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core
+#   4. ISCC                -> installer\Output\mImageViewer_setup.exe
+#   5. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
 #
 # For day-to-day development keep using scripts\build-release.ps1 directly: it is
 # the fast incremental build and does NOT clean. This script is only for cutting
@@ -47,12 +48,18 @@ if ($sign) {
     Assert-MivSignReady
 }
 
+# The idle-health smoke is a release gate, so its analyzer tests must be part of the
+# distribution path rather than relying on a developer remembering a separate command.
+Write-Host "[build-dist] (1/5) python scripts\test_analyze_perf.py"
+& python (Join-Path $scripts 'test_analyze_perf.py')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests failed (exit {0})" -f $LASTEXITCODE) }
+
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
 # NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero
 # exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
 # clean would let the build reuse a stale fingerprint -- the exact bug this script
 # exists to prevent.
-Write-Host "[build-dist] (1/4) cargo clean --release -p mimageviewer -p mimageviewer-launcher"
+Write-Host "[build-dist] (2/5) cargo clean --release -p mimageviewer -p mimageviewer-launcher"
 & cargo clean --release -p mimageviewer -p mimageviewer-launcher
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
 Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer"
@@ -63,7 +70,7 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (e
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }
-Write-Host ("[build-dist] (2/4) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
+Write-Host ("[build-dist] (3/5) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-release.ps1') @releaseArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-release.ps1 failed (exit {0})" -f $LASTEXITCODE) }
 
@@ -79,7 +86,7 @@ if (-not $isccPath) {
     }
 }
 if (-not $isccPath) { throw "[build-dist] ISCC.exe not found. Install Inno Setup 6." }
-Write-Host ("[build-dist] (3/4) {0} installer\mimageviewer.iss" -f $isccPath)
+Write-Host ("[build-dist] (4/5) {0} installer\mimageviewer.iss" -f $isccPath)
 & $isccPath (Join-Path $repoRoot 'installer\mimageviewer.iss')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] ISCC failed (exit {0})" -f $LASTEXITCODE) }
 
@@ -94,7 +101,7 @@ if ($sign) {
 # --- 4. Portable (into target-portable; its app package was cleaned above) ---
 $portableArgs = @()
 if ($sign) { $portableArgs += '-Sign' }
-Write-Host "[build-dist] (4/4) build-portable.ps1"
+Write-Host "[build-dist] (5/5) build-portable.ps1"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-portable.ps1') @portableArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-portable.ps1 failed (exit {0})" -f $LASTEXITCODE) }
 
