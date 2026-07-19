@@ -1749,6 +1749,12 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     // 設定を古い版が読んだ」可能性が高い。これを Corrupted にすると、正常な main と
     // bak1..bak10 を順に quarantine して設定を失う。未知値だけは Incompatible に分離し、
     // 上層で DB family を無変更のまま save 抑止へ倒す。
+    //
+    // 意図的な安全側トレードオフ: SQLite の構造が正常なまま enum 文字列だけが壊れた場合も
+    // `unknown variant` になるため、自動 bak 復旧ではなく Incompatible + 手動復元へ倒れる。
+    // 値破損を自動判別して正常な将来版設定と区別できない以上、バックアップ連鎖を quarantine
+    // するより原本温存を優先する。`unknown field` は現在の Settings が未知 field を無視するため
+    // 通常は到達せず、将来 `deny_unknown_fields` を導入した場合の防御として残す。
     let settings: Settings = serde_json::from_value(Value::Object(map))
         .map_err(classify_settings_deserialization_error)?;
     Ok(settings)

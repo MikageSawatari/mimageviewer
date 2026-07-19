@@ -4,6 +4,28 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
+fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
+    use crate::settings_db::BootSource;
+
+    assert_eq!(
+        settings_boot_problem_source(BootSource::IncompatibleSettings),
+        Some(BootSource::IncompatibleSettings)
+    );
+    assert_eq!(
+        settings_boot_problem_source(BootSource::FailedFallbackDefault),
+        Some(BootSource::FailedFallbackDefault)
+    );
+    for source in [
+        BootSource::LoadedExistingDb,
+        BootSource::RestoredFromDbBackup,
+        BootSource::MigratedFromJson,
+        BootSource::CleanInstall,
+    ] {
+        assert_eq!(settings_boot_problem_source(source), None);
+    }
+}
+
+#[test]
 fn main_window_title_hides_internal_synthetic_paths() {
     let internal = PathBuf::from(r"C:\data\__reading_history__");
     assert_eq!(
@@ -32623,6 +32645,74 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
     });
 
     assert_eq!(app.scroll_offset_y, 56.0);
+}
+
+#[cfg(test)]
+mod details_meta_priority_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn keys(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn details_meta_reprioritize_waits_until_scroll_is_idle() {
+        let now = Instant::now();
+        let current_visible = keys(&["new-a", "new-b"]);
+        let normal_target_keys = keys(&["old-a", "old-b"]);
+
+        assert!(!details_meta_reprioritize_allowed(
+            now,
+            Some(now - Duration::from_millis(50)),
+            &current_visible,
+            &normal_target_keys,
+        ));
+        assert!(details_meta_reprioritize_allowed(
+            now,
+            Some(now - PREFETCH_IDLE_THRESHOLD),
+            &current_visible,
+            &normal_target_keys,
+        ));
+    }
+
+    #[test]
+    fn details_meta_reprioritize_requires_visible_priority_to_move() {
+        let now = Instant::now();
+        let current_visible = keys(&["shared", "new"]);
+        let overlapping_targets = keys(&["old", "shared"]);
+        let no_normal_targets = HashSet::new();
+
+        assert!(!details_meta_reprioritize_allowed(
+            now,
+            None,
+            &current_visible,
+            &overlapping_targets,
+        ));
+        assert!(details_meta_reprioritize_allowed(
+            now,
+            None,
+            &current_visible,
+            &no_normal_targets,
+        ));
+        assert!(!details_meta_reprioritize_allowed(
+            now,
+            None,
+            &HashSet::new(),
+            &no_normal_targets,
+        ));
+    }
+
+    #[test]
+    fn details_meta_selection_staleness_uses_only_selected_target() {
+        assert!(!details_selection_pending_is_stale(
+            Some("selected"),
+            Some("selected"),
+        ));
+        assert!(details_selection_pending_is_stale(Some("new"), Some("old")));
+        assert!(details_selection_pending_is_stale(Some("new"), None));
+        assert!(details_selection_pending_is_stale(None, Some("old")));
+    }
 }
 
 #[test]

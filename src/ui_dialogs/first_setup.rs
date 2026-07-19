@@ -5,9 +5,9 @@ use crate::settings::{AiFeatureMode, UiTheme};
 
 impl App {
     pub(crate) fn show_first_setup_dialog(&mut self, ctx: &egui::Context) {
-        // 新しい版の settings.db を読めず defaults で保護起動した場合は「初回」ではない。
+        // settings.db を読めず defaults で保護起動した場合は「初回」ではない。
         // 復元案内を優先し、既定値を初回設定として保存しようとする誤解を防ぐ。
-        if self.settings_incompatible_at_boot || self.settings.first_setup_completed {
+        if self.settings_boot_problem_source.is_some() || self.settings.first_setup_completed {
             return;
         }
 

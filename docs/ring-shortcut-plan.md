@@ -268,9 +268,10 @@ load meta を `Settings::load` から返す** (current で上書きする前に�
 - `CleanInstall` → **新規**: 既定 = Alt+←/→ を無言で設定、`prompt_done = true`、ダイアログ無し。
 - `LoadedExistingDb` / `MigratedFromJson` / `RestoredFromDbBackup` → **アップグレード**
   (`last_seen_version == None` でも): 当面は従来の Ctrl+↑↓ を維持しつつ **一度だけ選択ダイアログ**。
-- `FailedFallbackDefault` → **prompt も保存もしない** (SAVE_SUPPRESSED を尊重)。実効動作は**安全側で旧
-  Ctrl ナビを session-only** にする (新既定 Alt 履歴にしない)。prompt 表示中にクラッシュ/終了した場合は、
-  保存前なら**次回再表示**でよい (Codex 第4回 P3)。
+- `FailedFallbackDefault` → **戻る/進む移行 prompt は出さず、保存もしない**
+  (SAVE_SUPPRESSED を尊重)。代わりに設定復元または終了の保護モーダルを表示する。実効動作は
+  **安全側で旧 Ctrl ナビを session-only** にする (新既定 Alt 履歴にしない)。通常の移行 prompt
+  表示中にクラッシュ/終了した場合は、保存前なら**次回再表示**でよい (Codex 第4回 P3)。
 
 追加フィールド: `mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video`
 (`MouseButtonProfile { back, forward, middle }`、serde default = 戻る/進むはフォルダ履歴、middle は未割り当て)、旧 `mouse_back_forward_action` (migration 用)、

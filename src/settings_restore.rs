@@ -336,8 +336,8 @@ fn count_table(conn: &Connection, table: &str) -> Result<usize, String> {
 ///
 /// 失敗の分類 (Codex P2 / 2026-05-17 対応):
 /// - `RestoreFailure::Recoverable`: validate / snapshot 失敗 (= まだファイルを触って
-///   いない)。`SAVE_SUPPRESSED` を rollback し、settings.db も無傷。ユーザーは
-///   ダイアログを閉じてそのままアプリを使い続けられる。
+///   いない)。`SAVE_SUPPRESSED` を復元開始時の状態へ戻し、settings.db も無傷。
+///   通常起動からならアプリを使い続けられるが、設定ブート保護中なら抑止を維持する。
 /// - `RestoreFailure::Terminal`: `set_global_db(None)` 後 (= 既に SQLite ハンドルを
 ///   落とした) の失敗。`SAVE_SUPPRESSED` は立ったまま、in-memory `Settings` も disk と
 ///   乖離する。続けて操作すると挙動が崩れるので、UI 側で **強制終了 + 再起動** を促す。
@@ -351,6 +351,11 @@ pub fn restore_from(
     data_dir: &Path,
     source: &BackupSource,
 ) -> Result<RestoreReport, RestoreFailure> {
+    // 設定ブート保護モーダルから呼ばれた場合は既に true。Recoverable 失敗時に
+    // false へ固定すると、読み込めなかった設定 DB に既定値を書き戻せる状態へ
+    // 変わってしまうため、呼び出し時の状態を保存して戻す。
+    let save_suppressed_before_restore = crate::settings_db::save_suppressed();
+
     // 1. 検証: 復元元が `SettingsDb::open + load_into_settings` まで通るか。
     //    壊れた bak (= sqlite として開けるが load 段階で Corrupted になる、e.g.
     //    settings_kv JSON 破損 / UUID 不正 / 必須テーブル欠落) を選んで「復元
@@ -361,12 +366,12 @@ pub fn restore_from(
     crate::settings_db::set_save_suppressed(true);
 
     // 3. 現状家族を退避。ここで失敗したら settings.db は無傷なので
-    //    suppress を巻き戻して Recoverable で return。
+    //    suppress を復元開始時の状態へ戻して Recoverable で return。
     let ts = unix_seconds_now();
     let snapshot_paths = match snapshot_current_family(data_dir, ts) {
         Ok(s) => s,
         Err(e) => {
-            crate::settings_db::set_save_suppressed(false);
+            crate::settings_db::set_save_suppressed(save_suppressed_before_restore);
             return Err(RestoreFailure::Recoverable(e));
         }
     };
@@ -381,12 +386,12 @@ pub fn restore_from(
     //
     //    **checkpoint 失敗は strict 扱い** (Codex P1 round 3 / 2026-05-17): busy 戻り値
     //    も検査して「実は何も checkpoint されていない」状態を弾く。失敗時は何もファイル
-    //    を触っていないので suppress を巻き戻して Recoverable で return する。
+    //    を触っていないので suppress を復元開始時の状態へ戻して Recoverable で return する。
     //    (旧版は best-effort + log だったが、checkpoint 不完全のまま WAL を削除すると
     //    user の直近設定が永久に失われる。)
     if !source.is_current() {
         if let Err(e) = crate::settings_db::checkpoint_global_db() {
-            crate::settings_db::set_save_suppressed(false);
+            crate::settings_db::set_save_suppressed(save_suppressed_before_restore);
             return Err(RestoreFailure::Recoverable(RestoreError::ValidationFailed(
                 format!("復元前の WAL チェックポイント (PRAGMA wal_checkpoint) に失敗: {e}"),
             )));
@@ -409,10 +414,11 @@ pub fn restore_from(
     //
     //    削除は SHM → WAL の順で行う。WAL は「未 checkpoint 分」を持つ本体なので
     //    最後に消し、途中失敗で Recoverable へ戻る場合に WAL 適用後の現行状態を残す。
-    //    main は未変更なので失敗時は Recoverable: suppress を巻き戻して、次回 with_db
-    //    が lazy boot で同じ settings.db を再 open する (= checkpoint 済みなのでデータ無傷)。
+    //    main は未変更なので失敗時は Recoverable: suppress を復元開始時の状態へ戻し、
+    //    抑止されていなければ次回 with_db が lazy boot で同じ settings.db を再 open する
+    //    (= checkpoint 済みなのでデータ無傷)。
     if let Err(e) = drop_wal_sidecars_strict(data_dir) {
-        crate::settings_db::set_save_suppressed(false);
+        crate::settings_db::set_save_suppressed(save_suppressed_before_restore);
         return Err(RestoreFailure::Recoverable(e));
     }
 
@@ -421,13 +427,14 @@ pub fn restore_from(
     //    ここで何もせず success に倒す。
     //
     //    bak 復元の rename 失敗時: main 未変更 + checkpoint 済み + WAL/SHM 削除済み =
-    //    user の元の設定は main にまるごと残っている状態。suppress を巻き戻して Recoverable
-    //    return する (次回 with_db lazy boot で main 再 open、データ無傷)。
+    //    user の元の設定は main にまるごと残っている状態。suppress を復元開始時の状態へ
+    //    戻して Recoverable return する (抑止されていなければ次回 with_db lazy boot で
+    //    main 再 open、データ無傷)。
     if !source.is_current() {
         let src_path = data_dir.join(source.filename());
         let main_path = data_dir.join("settings.db");
         if let Err(e) = replace_file_atomic_with_retry(&src_path, &main_path) {
-            crate::settings_db::set_save_suppressed(false);
+            crate::settings_db::set_save_suppressed(save_suppressed_before_restore);
             return Err(RestoreFailure::Recoverable(e));
         }
     }
@@ -449,13 +456,14 @@ pub fn restore_from(
 ///
 /// 削除後、次回起動は `boot_settings_db_inner` で clean install 経路に入る。
 pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreFailure> {
+    let save_suppressed_before_reset = crate::settings_db::save_suppressed();
     crate::settings_db::set_save_suppressed(true);
 
     let ts = unix_seconds_now();
     let snapshot_paths = match snapshot_current_family(data_dir, ts) {
         Ok(s) => s,
         Err(e) => {
-            crate::settings_db::set_save_suppressed(false);
+            crate::settings_db::set_save_suppressed(save_suppressed_before_reset);
             return Err(RestoreFailure::Recoverable(e));
         }
     };
@@ -988,7 +996,7 @@ mod tests {
 
     /// 2026-05-17 Codex P3 対応: 壊れた bak (= sqlite として開けるが
     /// load_into_settings で Corrupted になる) を選んだら、`ValidationFailed` で
-    /// 失敗して settings.db は **無傷のまま**、save 抑止も立てないこと。
+    /// 失敗して settings.db は **無傷のまま**、save 抑止を呼び出し時から変えないこと。
     #[test]
     fn restore_from_corrupted_bak_fails_validation_and_preserves_state() {
         let guard = DataDirOverrideGuard::new();
@@ -1009,6 +1017,7 @@ mod tests {
         // bak1 として「sqlite ヘッダではない」16 バイトを書く (= open 段階で Corrupted)。
         std::fs::write(dir.join("settings.db.bak1"), b"NOT A SQLITE DB!").unwrap();
 
+        let save_suppressed_before_restore = crate::settings_db::save_suppressed();
         let failure = restore_from(dir, &BackupSource::Bak(1))
             .expect_err("壊れた bak は validate で弾かれる");
         // Recoverable で、内訳は ValidationFailed (= 何もファイルを触っていない失敗)。
@@ -1026,11 +1035,22 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert_eq!(loaded.favorites.len(), original.favorites.len());
 
-        // save 抑止は立っていない (= validate 失敗時には rollback、Codex P2 対応)。
+        // 通常起動では save 抑止を新たに立てない。
+        assert_eq!(
+            crate::settings_db::save_suppressed(),
+            save_suppressed_before_restore,
+            "validate 失敗は呼び出し時の save 抑止状態を変えてはならない"
+        );
+
+        // 非互換 / 読み込み失敗のブート保護中から復元を試した場合は、失敗後も
+        // 抑止を解除しない。既定設定が unreadable な DB を上書きするのを防ぐ。
+        crate::settings_db::set_save_suppressed(true);
+        let failure = restore_from(dir, &BackupSource::Bak(1))
+            .expect_err("ブート保護中でも壊れた bak は validate で弾かれる");
+        assert!(!failure.is_terminal());
         assert!(
-            !crate::settings_db::save_suppressed(),
-            "validate 失敗で save 抑止が残ると、続けて操作したユーザーの save が \
-             silently no-op になる"
+            crate::settings_db::save_suppressed(),
+            "ブート保護中の復元失敗で save 抑止を解除してはならない"
         );
     }
 

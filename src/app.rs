@@ -13,6 +13,17 @@ use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED
 pub(crate) const BOOK_READING_PAGE_ORDER: crate::settings::SortOrder =
     crate::settings::SortOrder::FileName;
 
+fn settings_boot_problem_source(
+    source: crate::settings_db::BootSource,
+) -> Option<crate::settings_db::BootSource> {
+    matches!(
+        source,
+        crate::settings_db::BootSource::IncompatibleSettings
+            | crate::settings_db::BootSource::FailedFallbackDefault
+    )
+    .then_some(source)
+}
+
 fn folder_media_sort_order(
     fallback: crate::settings::SortOrder,
     is_compiled_book: bool,
@@ -3198,10 +3209,38 @@ impl DetailsLazyMeta {
 
 struct DetailsMetaPending {
     visible_revision: u64,
-    target_keys: HashSet<String>,
+    selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<DetailsMetaEvent>,
+}
+
+fn details_meta_reprioritize_candidate(
+    current_visible: &HashSet<String>,
+    normal_target_keys: &HashSet<String>,
+) -> bool {
+    !current_visible.is_empty()
+        && (normal_target_keys.is_empty() || current_visible.is_disjoint(normal_target_keys))
+}
+
+fn details_meta_reprioritize_allowed(
+    now: std::time::Instant,
+    last_scroll_at: Option<std::time::Instant>,
+    current_visible: &HashSet<String>,
+    normal_target_keys: &HashSet<String>,
+) -> bool {
+    details_meta_reprioritize_candidate(current_visible, normal_target_keys)
+        && matches!(
+            decide_prefetch_allowed(now, last_scroll_at, 0),
+            PrefetchDecision::Allow { .. }
+        )
+}
+
+fn details_selection_pending_is_stale(
+    target_key: Option<&str>,
+    pending_target_key: Option<&str>,
+) -> bool {
+    target_key.is_none_or(|target_key| pending_target_key != Some(target_key))
 }
 
 enum DetailsMetaEvent {
@@ -6302,10 +6341,11 @@ pub struct App {
     pub(crate) show_settings_restore: bool,
     /// 復元ダイアログの状態 (一覧キャッシュ + 確認/結果のステート機械)。
     pub(crate) settings_restore_state: crate::ui_dialogs::settings_restore::SettingsRestoreState,
-    /// 起動時の settings.db が現在のバイナリより新しく、保存抑止で起動したか。
-    pub(crate) settings_incompatible_at_boot: bool,
-    /// 新しい版の設定を検出した案内モーダルを表示する。
-    pub(crate) show_settings_incompatible_notice: bool,
+    /// 設定を既定値へ退避し、保存抑止で保護起動した原因。
+    /// `None` なら通常起動。非互換と全復旧失敗を同じ安全側UIへ流す。
+    pub(crate) settings_boot_problem_source: Option<crate::settings_db::BootSource>,
+    /// 設定を読み込めなかった案内モーダルを表示する。
+    pub(crate) show_settings_boot_problem_notice: bool,
 
     // ── 複数選択 ──────────────────────────────────────────────────
     /// チェック済みアイテムの集合 (スペースキーで追加/削除)
@@ -8911,10 +8951,7 @@ impl App {
             crate::video::clock::clamp_playback_speed(settings.video_playback_speed);
         let video_continuous_mode = settings.video_continuous_mode;
         let video_session_muted = settings.video_start_muted || settings.video_muted;
-        let settings_incompatible_at_boot = matches!(
-            load_meta.boot_source,
-            crate::settings_db::BootSource::IncompatibleSettings
-        );
+        let settings_boot_problem_source = settings_boot_problem_source(load_meta.boot_source);
         let show_mouse_nav_migration_prompt =
             Self::should_show_mouse_nav_migration_prompt(&settings, &load_meta);
         // 更新後 初回起動の「重要な変更点」(version_highlights ④)。
@@ -8944,7 +8981,8 @@ impl App {
             env!("CARGO_PKG_VERSION"),
             crate::version_highlights::table(),
         );
-        let show_whats_new = !settings_incompatible_at_boot && !whats_new_entries.is_empty();
+        let show_whats_new =
+            settings_boot_problem_source.is_none() && !whats_new_entries.is_empty();
         // 操作中はバックグラウンドインデクサを一時停止するためのゲート。
         // IndexerManager / name_index_supervisor の両方に `Arc` で共有される。
         let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(
@@ -9411,8 +9449,8 @@ impl App {
             show_settings_restore: false,
             settings_restore_state:
                 crate::ui_dialogs::settings_restore::SettingsRestoreState::default(),
-            settings_incompatible_at_boot,
-            show_settings_incompatible_notice: settings_incompatible_at_boot,
+            settings_boot_problem_source,
+            show_settings_boot_problem_notice: settings_boot_problem_source.is_some(),
             pref_state: None,
             operation_customize_state: None,
             checked: std::collections::HashSet::new(),
@@ -11096,7 +11134,7 @@ impl App {
             || self.show_preferences
             || self.show_preferences_discard_confirm
             || self.show_settings_restore
-            || self.show_settings_incompatible_notice
+            || self.show_settings_boot_problem_notice
             || self.show_operation_customize
             || self.show_operation_customize_discard_confirm
             || self.show_mouse_nav_migration_prompt
@@ -11111,7 +11149,7 @@ impl App {
             || self.archive_convert_dialog_visible()
             || self.video_upscale.is_some()
             || self.tq.show
-            || (!self.settings_incompatible_at_boot && !self.settings.first_setup_completed)
+            || (self.settings_boot_problem_source.is_none() && !self.settings.first_setup_completed)
             || self.show_delete_confirm
             || self.edit_bundle_paste_pending.is_some()
             || self.edit_bundle_apply_pending.is_some()
@@ -33827,7 +33865,8 @@ impl App {
         // ZIP/PDF のページ数は画像寸法より1件あたりのI/Oが重い。大きくスクロールして
         // 現在の可視近傍が起動時の Normal 優先集合と完全に離れたら、完了済みcacheを
         // 保ったまま worker を組み直して新しい可視行を先に処理する。少しずつの
-        // スクロールは集合が重なるため再起動せず、cancel連打を避ける。
+        // スクロールは集合が重なるため再起動しない。大きなドラッグ中も既存の
+        // prefetch idle gate を共有し、静止するまでは cancel / respawn しない。
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && self.details_meta_pending.is_some()
         {
@@ -33843,14 +33882,31 @@ impl App {
                 })
                 .filter_map(|idx| self.details_lazy_cache_key(idx))
                 .collect();
-            let reprioritize = !current_visible.is_empty()
-                && self.details_meta_pending.as_ref().is_some_and(|pending| {
-                    current_visible
-                        .iter()
-                        .any(|key| pending.target_keys.contains(key))
-                        && (pending.normal_target_keys.is_empty()
-                            || current_visible.is_disjoint(&pending.normal_target_keys))
+            let reprioritize_candidate =
+                self.details_meta_pending.as_ref().is_some_and(|pending| {
+                    details_meta_reprioritize_candidate(
+                        &current_visible,
+                        &pending.normal_target_keys,
+                    )
                 });
+            let now = std::time::Instant::now();
+            let reprioritize = self.details_meta_pending.as_ref().is_some_and(|pending| {
+                details_meta_reprioritize_allowed(
+                    now,
+                    self.last_prefetch_scroll_at,
+                    &current_visible,
+                    &pending.normal_target_keys,
+                )
+            });
+            if reprioritize_candidate
+                && !reprioritize
+                && let Some(last_scroll_at) = self.last_prefetch_scroll_at
+            {
+                let elapsed = now.saturating_duration_since(last_scroll_at);
+                if elapsed < PREFETCH_IDLE_THRESHOLD {
+                    ctx.request_repaint_after(PREFETCH_IDLE_THRESHOLD - elapsed);
+                }
+            }
             if reprioritize {
                 if let Some(pending) = self.details_meta_pending.take() {
                     pending.cancel.store(true, Ordering::Relaxed);
@@ -33865,10 +33921,10 @@ impl App {
         if self.selection_info_only_lazy_load() {
             let target_key = self.selection_info_lazy_target_key();
             let pending_is_stale = self.details_meta_pending.as_ref().is_some_and(|pending| {
-                target_key
-                    .as_ref()
-                    .map(|key| !pending.target_keys.contains(key))
-                    .unwrap_or(true)
+                details_selection_pending_is_stale(
+                    target_key.as_deref(),
+                    pending.selection_target_key.as_deref(),
+                )
             });
             if pending_is_stale {
                 if let Some(pending) = self.details_meta_pending.take() {
@@ -34434,17 +34490,17 @@ impl App {
 
         let generation = self.items_generation;
         let ai_facet_load = self.ai_model_facet_should_load();
-        let (order, visible_near): (Vec<usize>, HashSet<usize>) =
-            if self.selection_info_only_lazy_load() {
-                let order: Vec<usize> = self.selection_info_lazy_target_idx().into_iter().collect();
-                let visible_near = order.iter().copied().collect();
-                (order, visible_near)
-            } else {
-                (
-                    self.current_grid_order().to_vec(),
-                    self.details_tag_prewarm_indices.iter().copied().collect(),
-                )
-            };
+        let selection_info_only = self.selection_info_only_lazy_load();
+        let (order, visible_near): (Vec<usize>, HashSet<usize>) = if selection_info_only {
+            let order: Vec<usize> = self.selection_info_lazy_target_idx().into_iter().collect();
+            let visible_near = order.iter().copied().collect();
+            (order, visible_near)
+        } else {
+            (
+                self.current_grid_order().to_vec(),
+                self.details_tag_prewarm_indices.iter().copied().collect(),
+            )
+        };
         let mut visible_targets = Vec::new();
         let mut background_targets = Vec::new();
         let mut cached_done = 0usize;
@@ -34544,7 +34600,11 @@ impl App {
                     self.settings.indexer_speed_profile.io_permits().max(1),
                 ))
             });
-        let target_keys = targets.iter().map(|target| target.key.clone()).collect();
+        let selection_target_key = if selection_info_only {
+            targets.first().map(|target| target.key.clone())
+        } else {
+            None
+        };
 
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -34604,7 +34664,7 @@ impl App {
 
         self.details_meta_pending = Some(DetailsMetaPending {
             visible_revision: self.details_lazy_visible_revision,
-            target_keys,
+            selection_target_key,
             normal_target_keys,
             cancel,
             rx,
@@ -52465,7 +52525,7 @@ impl eframe::App for App {
         self.poll_tq_encode_pending(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
-        self.show_settings_incompatible_dialog(ctx);
+        self.show_settings_boot_problem_dialog(ctx);
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);

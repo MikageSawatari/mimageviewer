@@ -426,6 +426,7 @@ settings_db_family_presence_with_retry(data_dir) で family を tri-state 判定
 │   │   (DatabaseBusy / DatabaseLocked / CannotOpen / SystemIoFailure)
 │   │   → 50ms backoff で最大 3 回 retry
 │   │   → それでも失敗 → FailedFallbackDefault + save 抑止
+│   │   → 設定復元または終了を選ぶ保護モーダルを表示
 │   │   ※ settings.json への fallback は **絶対にしない** (新 DB 変更巻き戻し防止)
 │   └─ Corrupted (NotADatabase / DatabaseCorrupt / integrity_check 失敗 /
 │                 bootstrap_complete marker 欠落)
@@ -435,6 +436,7 @@ settings_db_family_presence_with_retry(data_dir) で family を tri-state 判定
 │
 ├─ Ambiguous (= metadata の non-NotFound エラーや read_dir 失敗が続いた)
 │   → FailedFallbackDefault + save 抑止 で immediate 返却
+│   → 設定復元または終了を選ぶ保護モーダルを表示
 │   ※ defaults で書き込まないので、状況が改善した次回起動で正しく family を発見できる
 │
 └─ ConfirmedAbsent (= 全 metadata NotFound + (read_dir 成功 / data_dir NotFound))
@@ -546,6 +548,8 @@ VACUUM INTO は SQLite が**新規 .db ファイルに consistent な snapshot �
 - `Settings::default()` を返す
 - セッション中の `Settings::save()` は全て suppress (= disk 上の残骸を保護)
 - 次回起動時に手動復旧 (= `.corrupted-<ts>-<seq>` の調査) ができる状態を維持
+- 「設定の読み込みに失敗しました」モーダルを表示し、設定復元または終了を選ばせる。
+  初回設定・重要な変更点・操作カスタマイズ取込は出さず、既定設定を通常起動と誤認させない
 
 ### 6.4 設定の復元 UI とダウングレード
 
@@ -558,6 +562,11 @@ preupgrade は旧実装で metadata が open 時に上書きされていた可�
 互換性ガードを備えた版で、それより新しい版が保存した設定を起動した場合は main / WAL /
 SHM / backup chain を変更せず、セッション全体の設定保存を抑止する。専用モーダルから
 「設定の復元」またはアプリ終了を選び、復元画面を閉じた場合は保護モーダルへ戻る。
+「このまま使う」は提供しない。設定保存だけを抑止しても、旧バイナリによる他の永続DBや
+ファイル操作までは読み取り専用にならないためで、設定を保存した版以降の起動を第一案内とする。
+復元または全リセットがファイル差し替え前に失敗した場合、save 抑止は操作開始時の状態へ戻す。
+通常起動からの失敗では操作を継続できる一方、非互換・読み込み失敗によるブート保護中は
+抑止を維持し、既定設定による unreadable な DB の上書きを許可しない。
 このガードは v2.6.0 からのため、既公開の v2.5.0 以前へ戻す場合は下記 10.5 の
 保存形式互換も併用する。
 

@@ -37,7 +37,9 @@ idle 測定を無効にする。シナリオ名に `foreground` / `background` �
 
 同じプロセスで続ける場合は `-NoLaunch` を使う。`-NoLaunch` はプロセス名の最新候補ではなく、
 perf log の `session.start.pid` と一致するプロセスを選ぶ。背面シナリオでは、別ウィンドウを
-前面へ移してから Enter を押す。
+前面へ移してから Enter を押す。この経路の expected PID 検査は、同じ perf log から取得した
+PID との整合性と計測窓の有効性を確認するもので、独立した PID 情報源との照合ではない。
+独立して対象を指定したい場合は `-ProcessId` または通常の起動経路を使う。
 
 ```powershell
 .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background

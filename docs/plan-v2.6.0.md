@@ -199,7 +199,8 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   フィルタは synthetic scope 中だけ退避し、戻ると復元する（二重適用しない）。
 - 表示中に削除した実パスは definition ごとの tombstone として snapshot prepare に渡す。
   共有中でなければ snapshot をその場で compact し、ソート変更や履歴復元で削除済み項目を
-  復活させない。明示的な再走査の成功後は新 snapshot を正として tombstone を破棄する。
+  復活させない。tombstone は snapshot 世代に属し、worker との共有が解けて snapshot へ
+  反映できた時点、または明示的な再走査の成功後に破棄する。件数上限による破棄は行わない。
 - 「更新」は同じ definition で新しい generation を開始し、成功するまで現在 snapshot を保持する。
 - 一部 source が見つからない / 読めない場合は、読めた source の結果を表示し、失敗 source 数と
   詳細を通知する。全 source 失敗時は現在表示を置き換えない。

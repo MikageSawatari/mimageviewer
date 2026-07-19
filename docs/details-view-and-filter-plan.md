@@ -736,6 +736,10 @@ worker のルール:
 - `items_generation` が一致しない結果は破棄。
 - cancel はフォルダ切替、検索結果差し替え、列設定変更、ユーザー停止で立てる。
 - `GlobalIoSemaphore` を使う。可視行優先、画面外は低優先。
+- 高速スクロールで可視範囲が Normal 優先集合から離れても、既存 prefetch と同じ
+  100 ms のスクロール静止判定を通過するまで worker を cancel / respawn しない。
+- 下部情報だけを遅延取得する経路では選択項目のキーだけを pending に保持する。全対象キーの
+  `HashSet` を作って staleness 判定へ流用せず、詳細表示の大量項目で O(n) の複製を増やさない。
 - 既存キャッシュ/DB/メモリ値を先に使い、必要なものだけ I/O。
 - ZIP ページ数 cache の identity には Susie 有効状態と対応拡張子集合を含める。横断ビューで
   親フォルダごとの catalog DB を使う場合、worker 全体で保持する接続は小さい LRU（現行 8）に

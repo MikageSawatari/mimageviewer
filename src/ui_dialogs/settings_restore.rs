@@ -229,8 +229,8 @@ impl App {
         if !open || (escape_pressed && !confirm_open && !result_open && !operation_modal_open) {
             self.show_settings_restore = false;
             self.settings_restore_state = SettingsRestoreState::default();
-            if self.settings_incompatible_at_boot {
-                self.show_settings_incompatible_notice = true;
+            if self.settings_boot_problem_source.is_some() {
+                self.show_settings_boot_problem_notice = true;
             }
         }
 
@@ -387,8 +387,8 @@ impl App {
                     // 状態は無傷、アプリ続行可。ダイアログを閉じるだけ。
                     self.show_settings_restore = false;
                     self.settings_restore_state = SettingsRestoreState::default();
-                    if self.settings_incompatible_at_boot {
-                        self.show_settings_incompatible_notice = true;
+                    if self.settings_boot_problem_source.is_some() {
+                        self.show_settings_boot_problem_notice = true;
                     }
                 }
                 ResultKind::Success | ResultKind::FailedTerminal => {
@@ -545,7 +545,7 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
             SettingsRestoreTab::Restore,
             "設定の復元",
         );
-        if !app.settings_incompatible_at_boot {
+        if app.settings_boot_problem_source.is_none() {
             ui.selectable_value(
                 &mut app.settings_restore_state.tab,
                 SettingsRestoreTab::OperationCustomize,
@@ -595,7 +595,10 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
                         // 世代
                         ui.label(backup.source.label());
                         ui.label(backup.app_version.as_deref().unwrap_or("不明"));
-                        let boot_incompatible_current = app.settings_incompatible_at_boot
+                        let boot_incompatible_current = matches!(
+                            app.settings_boot_problem_source,
+                            Some(crate::settings_db::BootSource::IncompatibleSettings)
+                        )
                             && backup.source.is_current();
                         let newer = boot_incompatible_current
                             || backup.compatibility == BackupCompatibility::NewerVersion;

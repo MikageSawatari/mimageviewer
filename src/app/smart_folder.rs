@@ -981,7 +981,7 @@ fn prepare_smart_folder(
             report(SmartFolderPhase::Filtering, index);
         }
         let entry = &snapshot.entries[index];
-        if removed_paths.contains(&crate::path_key::normalize_keep_drive(&entry.path)) {
+        if !removed_paths.is_empty() && removed_paths.contains(key) {
             continue;
         }
         if entry.matching_rule_indices.iter().any(|rule_index| {
@@ -1192,6 +1192,20 @@ fn remove_paths_from_smart_folder_snapshot(
         snapshot.diag.containers_found = snapshot.entries.len();
     }
     changed
+}
+
+/// prepare worker と共有していない snapshot なら tombstone を実体へ反映し、
+/// その世代の削除記録を解放できる状態にする。
+fn compact_smart_folder_tombstones_if_unique(
+    snapshot: &mut SmartFolderSnapshot,
+    tombstones: &mut HashSet<String>,
+) -> bool {
+    if tombstones.is_empty() || Arc::strong_count(&snapshot.entries) != 1 {
+        return false;
+    }
+    remove_paths_from_smart_folder_snapshot(snapshot, tombstones);
+    tombstones.clear();
+    true
 }
 
 impl App {
@@ -1518,7 +1532,7 @@ impl App {
 
     fn install_prepared_smart_folder(&mut self, prepared: PreparedSmartFolder) {
         let PreparedSmartFolder {
-            snapshot,
+            mut snapshot,
             items,
             image_metas,
             video_items,
@@ -1526,6 +1540,18 @@ impl App {
             refresh,
         } = prepared;
         let definition_id = snapshot.definition.id;
+        // worker 起動元の旧 snapshot を先に手放し、共有が解けた完成 snapshot へ
+        // その世代の tombstone を実体化してから cache へ戻す。
+        self.smart_folder_snapshots.remove(&definition_id);
+        let tombstones_compacted = self
+            .smart_folder_removed_paths
+            .get_mut(&definition_id)
+            .is_some_and(|tombstones| {
+                compact_smart_folder_tombstones_if_unique(&mut snapshot, tombstones)
+            });
+        if tombstones_compacted {
+            self.smart_folder_removed_paths.remove(&definition_id);
+        }
         let definition_name = snapshot.definition.name.clone();
         let diag = snapshot.diag.clone();
         let item_count = items.len();
@@ -1630,6 +1656,7 @@ impl App {
         }
 
         let mut affected_ids = Vec::new();
+        let mut compacted_ids = Vec::new();
         for (id, snapshot) in &mut self.smart_folder_snapshots {
             if snapshot
                 .entries
@@ -1637,14 +1664,15 @@ impl App {
                 .any(|entry| removed.contains(&crate::path_key::normalize_keep_drive(&entry.path)))
             {
                 affected_ids.push(*id);
-                self.smart_folder_removed_paths
-                    .entry(*id)
-                    .or_default()
-                    .extend(removed.iter().cloned());
-                if Arc::strong_count(&snapshot.entries) == 1 {
-                    remove_paths_from_smart_folder_snapshot(snapshot, &removed);
+                let tombstones = self.smart_folder_removed_paths.entry(*id).or_default();
+                tombstones.extend(removed.iter().cloned());
+                if compact_smart_folder_tombstones_if_unique(snapshot, tombstones) {
+                    compacted_ids.push(*id);
                 }
             }
+        }
+        for id in compacted_ids {
+            self.smart_folder_removed_paths.remove(&id);
         }
         if let Some(confirm) = self.smart_folder_confirm_pending.as_mut()
             && affected_ids.contains(&confirm.snapshot.definition.id)
@@ -2342,6 +2370,71 @@ mod tests {
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.diag.containers_found, 1);
         assert!(snapshot.entries[0].path.ends_with("keep.zip"));
+    }
+
+    #[test]
+    fn smart_folder_tombstones_compact_and_clear_for_unique_snapshot() {
+        let definition = crate::settings::SmartFolderDefinition::new("books");
+        let mut snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(vec![
+                smart_entry(r"C:\Books\keep.zip", 0, ""),
+                smart_entry(r"C:\Books\deleted.zip", 0, ""),
+            ]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag {
+                containers_found: 2,
+                ..Default::default()
+            },
+        };
+        let mut tombstones = [crate::path_key::normalize_keep_drive(Path::new(
+            r"C:\Books\deleted.zip",
+        ))]
+        .into_iter()
+        .collect();
+
+        assert!(compact_smart_folder_tombstones_if_unique(
+            &mut snapshot,
+            &mut tombstones,
+        ));
+        assert!(tombstones.is_empty());
+        assert_eq!(snapshot.entries.len(), 1);
+        assert!(snapshot.entries[0].path.ends_with("keep.zip"));
+    }
+
+    #[test]
+    fn smart_folder_tombstones_wait_for_shared_snapshot_then_compact() {
+        let definition = crate::settings::SmartFolderDefinition::new("books");
+        let mut snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(vec![
+                smart_entry(r"C:\Books\keep.zip", 0, ""),
+                smart_entry(r"C:\Books\deleted.zip", 0, ""),
+            ]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let shared_entries = Arc::clone(&snapshot.entries);
+        let mut tombstones = [crate::path_key::normalize_keep_drive(Path::new(
+            r"C:\Books\deleted.zip",
+        ))]
+        .into_iter()
+        .collect();
+
+        assert!(!compact_smart_folder_tombstones_if_unique(
+            &mut snapshot,
+            &mut tombstones,
+        ));
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(tombstones.len(), 1);
+
+        drop(shared_entries);
+        assert!(compact_smart_folder_tombstones_if_unique(
+            &mut snapshot,
+            &mut tombstones,
+        ));
+        assert!(tombstones.is_empty());
+        assert_eq!(snapshot.entries.len(), 1);
     }
 
     #[test]

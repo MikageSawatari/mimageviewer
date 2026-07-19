@@ -362,10 +362,66 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
+    fn is_transient_tantivy_permission_error(error: &tantivy::TantivyError) -> bool {
+        matches!(
+            error,
+            tantivy::TantivyError::IoError(io)
+                if io.kind() == std::io::ErrorKind::PermissionDenied
+        )
+    }
+
+    /// Windows の並列テストでは、AV / Search Indexer が Tantivy の一時ファイルを
+    /// 数十 ms だけ掴み、テスト fixture の書き込みが OS error 5 になることがある。
+    /// 製品側の検索エラーを隠さないよう、テスト setup の PermissionDenied だけを
+    /// 最大 2 秒再試行し、他のエラーは即時返す。
+    fn retry_tantivy_permission_denied<T>(
+        mut operation: impl FnMut() -> tantivy::Result<T>,
+    ) -> tantivy::Result<T> {
+        let mut retries = 0;
+        loop {
+            match operation() {
+                Err(error) if retries < 40 && is_transient_tantivy_permission_error(&error) => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[test]
+    fn tantivy_fixture_retry_is_limited_to_permission_denied() {
+        let mut permission_attempts = 0;
+        let recovered = retry_tantivy_permission_denied(|| {
+            permission_attempts += 1;
+            if permission_attempts == 1 {
+                Err(tantivy::TantivyError::IoError(std::sync::Arc::new(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "temporary lock"),
+                )))
+            } else {
+                Ok("ok")
+            }
+        })
+        .unwrap();
+        assert_eq!(recovered, "ok");
+        assert_eq!(permission_attempts, 2);
+
+        let mut other_attempts = 0;
+        let error = retry_tantivy_permission_denied(|| {
+            other_attempts += 1;
+            Err::<(), _>(tantivy::TantivyError::InvalidArgument("bad fixture".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(error, tantivy::TantivyError::InvalidArgument(_)));
+        assert_eq!(other_attempts, 1);
+    }
+
     fn setup() -> (TempDir, FtsMetaDb, FtsIndex) {
         let tmp = TempDir::new().unwrap();
         let meta = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
-        let fts = FtsIndex::open_at(&tmp.path().join("fts_index")).unwrap();
+        let fts =
+            retry_tantivy_permission_denied(|| FtsIndex::open_at(&tmp.path().join("fts_index")))
+                .unwrap();
         (tmp, meta, fts)
     }
 
@@ -385,24 +441,23 @@ mod tests {
         };
         meta.upsert_meta_ok(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
             .unwrap();
-        let mut w = fts.writer().unwrap();
-        upsert_doc(
-            &w,
-            fts.fields(),
-            &IndexDoc {
-                path: key.clone(),
-                container: Container::Fs,
-                zip_entry: String::new(),
-                favorite_id: fav,
-                kind: IndexKind::Image,
-                mtime: 0,
-                file_size: 0,
-                norms,
-            },
-        )
+        let doc = IndexDoc {
+            path: key.clone(),
+            container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id: fav,
+            kind: IndexKind::Image,
+            mtime: 0,
+            file_size: 0,
+            norms,
+        };
+        retry_tantivy_permission_denied(|| {
+            let mut writer = fts.writer()?;
+            upsert_doc(&writer, fts.fields(), &doc)?;
+            writer.commit()?;
+            fts.reload_reader()
+        })
         .unwrap();
-        w.commit().unwrap();
-        fts.reload_reader().unwrap();
     }
 
     fn collect_events(
