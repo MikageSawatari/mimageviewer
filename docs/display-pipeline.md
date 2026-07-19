@@ -128,8 +128,10 @@ Image / ZipEntry / PdfPage なら同じ preview を通常 catalog より優先�
 page mtime + size、ZIP/PDF の親代表は保存 worker が記録した container size と thumbnail
 worker が読んだ現在の container mtime + size で stale 判定する。変換アーカイブでは元
 アーカイブではなく、実際にページを読んだ cache ZIP の key / identity を使う。編集 preview
-通知は直接ページだけでなく、その leaf を固定している親セルにも伝播する。自動選定代表への
-反映は別 backlog とする。
+通知は直接ページだけでなく、その leaf を固定している親セルにも伝播する。固定 leaf の個別
+色調補正 key は編集 preview の有無とは独立して load request へ渡し、thumbnail worker が下地へ
+補正を適用してから注釈を合成する。一括補正の変更 / 解除も該当 leaf を固定する親セルを失効させる。
+自動選定代表への反映は別 backlog とする。
 
 既定は有効・上限 1GB。上限超過時は最終アクセスが古い WebP から削除する。encode、ファイル I/O、
 SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッドをブロックしない。
@@ -150,8 +152,8 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
    kind/rel/entry/page/mtime/size の compact 表現、子のフォルダ / ZIP / PDF / ZipDir に
    さらに代表 pin があれば、最終ページまでの経路 hash + leaf identity になる。pin の
    付け替え、途中コンテナ、target ファイルの変更で source_id が自動的に変わるので
-   古い WebP を catch しない。固定 leaf が ZipEntry / PdfPage なら、そのページの編集
-   preview も親コンテナまで引き継ぐ。詳細:
+   古い WebP を catch しない。固定 leaf が Image / ZipEntry / PdfPage なら、そのページの
+   編集 preview と個別色調補正も親コンテナまで引き継ぐ。詳細:
    [virtual-folders.md §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)。
 2. **自動代表選定 (`resolve_folder_thumb_image`)** — Settings の `folder_thumb_sort`
    (Numeric / Modified / etc.) + `folder_thumb_depth` (再帰深さ) で先頭画像を選び、
@@ -205,9 +207,10 @@ seed する。worker は通常の cache_hit で取り出すので、Shell API �
 (600 px 級) で ~3ms/枚 で済むが、70 枚同時に UI スレッドで掛けると 200ms 級の
 フリーズになるため、以下の構造にしている。
 
-**対象**: 画像系グリッドアイテムのみ (`Image` / `ZipImage` / `PdfPage`)。
-フォルダ / 動画 / ZipFile / PdfFile / ConvertibleArchive の
-代表サムネには適用しない (`adjusted_tex` は `None` で素通し)。
+**対象**: 画像系グリッドアイテム (`Image` / `ZipImage` / `PdfPage`)。自動選定されたフォルダ /
+ZipFile / PdfFile / ConvertibleArchive の代表サムネには適用しない (`adjusted_tex` は `None` で
+素通し)。手動固定した親代表だけは、解決済み leaf の個別色調補正を thumbnail worker 内で
+下地へ適用する。
 
 **データ構造** (`App` 内):
 

@@ -69,6 +69,10 @@ v2.6.0 は、複数の場所に分散した本・画像・動画・音声を 1 �
   prepare だけをやり直す。入力中の名称・名前条件は毎フレーム trim せず、フォーカス移動や
   ダイアログを閉じる確定時だけ前後空白と空名を正規化する。
 - UI スレッドでは `read_dir`、metadata 取得、再帰走査、大量 DB lookup を実行しない。
+  prepare worker が対象項目を確定した後、★ / タグに加えて個別補正・crop・表示トリミング・
+  消しゴム・隠蔽・注釈を exact key の batch query で疎に取得する。変換アーカイブ対応表、
+  catalog、固定代表サムネイルも同じ worker で準備し、完成 snapshot の install は同期 DB I/O を
+  行わない。
 - 既存 `subfolder_expansion` の複数 root、進捗、cancel、reparse point guard、chunk sort、
   `Arc<Vec<_>>` snapshot、prepare worker の規約を共有する。似た walker を別実装しない。
 - 各物理フォルダを列挙した直後、保存条件を適用する前に、通常一覧と同じ同名ファイル規則を
@@ -195,8 +199,17 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
 - `中止`、別の場所を開く、definition 編集 / 削除、アプリ終了で pending scan を cancel する。
 - フォルダバーには `スマートフォルダ: <name>` と表示し、source path を synthetic breadcrumb にしない。
 - 戻る / 進むでは同一セッション中の snapshot を再利用する。snapshot が無ければ definition から再走査する。
+- スマートフォルダを開く履歴は scan / prepare が成功して一覧を採用するときだけ追加する。
+  中止や全 source 失敗では現在地と履歴を変えない。
 - スマートフォルダ自身が保存条件を所有するため、開く前の通常一覧で有効だった facet / ★
   フィルタは synthetic scope 中だけ退避し、戻ると復元する（二重適用しない）。
+  スマートフォルダ A から B へ直接切り替える場合も退避状態を引き継ぎ、A の退避値を B 上で
+  復元しない。
+- synthetic path を実フォルダ探索へ渡さない。フルスクリーン、ゲームパッド、リング操作を含む
+  親 / 子 / 兄弟フォルダ移動はスマートフォルダ表示中 no-op とする。
+- リネーム成功時は旧 path とその子孫を snapshot / tombstone 管理から除外して current view を
+  再 prepare する。★ / タグ / 編集状態の変更や表示中 definition の編集も、保存条件を再評価して
+  現在一覧を更新する。
 - 表示中に削除した実パスは definition ごとの tombstone として snapshot prepare に渡す。
   共有中でなければ snapshot をその場で compact し、ソート変更や履歴復元で削除済み項目を
   復活させない。tombstone は snapshot 世代に属し、worker との共有が解けて snapshot へ
@@ -220,6 +233,19 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
 - 名称の内部空白、空欄からの再入力、名称変更で走査を破棄しないこと、削除後の sort / 履歴復元、
   通常一覧の facet / ★がスマートフォルダへ二重適用されないこと
 - perf event は scan / prepare / install / cancel を分け、10 万 / 50 万 / 200 万 entry で計測する。
+
+2026-07-19 の post-scan prepare ベンチマーク（debug test process、完成前 snapshot と prepare
+result を同時に保持した process Peak Working Set を計測）は次のとおり。filesystem scan と
+production DB I/O は含めず、filter / sort / item・metadata 構築の O(N) 部分を測っている。
+
+| entry | prepare | Max WS | process Peak WS |
+| ---: | ---: | ---: | ---: |
+| 100,000 | 202.7 ms | 86.6 MiB | 97.8 MiB |
+| 500,000 | 1,046.5 ms | 401.8 MiB | 415.7 MiB |
+| 2,000,000 | 4,302.8 ms | 1,594.1 MiB | 1,609.1 MiB |
+
+再計測は `MIV_SMART_FOLDER_BENCH_ITEMS=<件数> cargo test --bin mimageviewer-core
+smart_folder_prepare_scale_benchmark -- --ignored --nocapture` を件数ごとに別 process で実行する。
 
 ## 4. v2.6.0 に含めないもの
 

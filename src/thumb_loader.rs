@@ -208,6 +208,10 @@ pub struct LoadRequest {
     /// true のときは page の size ではなく、worker 上で `path` の mtime + size を読み、
     /// 保存済み container identity と照合する。UI thread へ archive stat を追加しない。
     pub edit_preview_validate_container: bool,
+    /// 手動固定した親代表サムネイルが表示する、解決済み子ページの永続キー。
+    /// worker はこのキーのページ個別色調補正だけを親セルへ適用する。edit-preview
+    /// cache を無効にしても必要なため `edit_preview_key` とは所有権を分ける。
+    pub pinned_page_adjustment_key: Option<String>,
     /// 段階 E: true の場合はキャッシュを無視して元画像から再デコードする
     pub skip_cache: bool,
     /// true = 画面上に見えている可視範囲のアイテム。ワーカーは priority 要求を
@@ -896,6 +900,7 @@ pub fn process_load_request(
     // cascade 解決する。`None` のとき従来の純粋 auto-pick になる。
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     edit_preview_db: Option<&Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
+    adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
 ) {
     if let Some(pin) = req.pinned_only.as_ref() {
         if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done) {
@@ -915,6 +920,12 @@ pub fn process_load_request(
     // 永続プレビューを試す。ディスク上は最大辺 2048px / q=90 を保持し、ここで
     // display_px へ縮小した完成済み派生画像を受け取る。後段の idle quality-upgrade で
     // 元画像に差し替えてはいけない。
+    let pinned_page_adjustment = req
+        .pinned_page_adjustment_key
+        .as_deref()
+        .and_then(|key| adjustment_db.and_then(|db| db.get_page_params(key)))
+        .filter(|params| !params.is_color_identity());
+
     let edit_preview = if req.skip_cache {
         None
     } else if let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db) {
@@ -934,9 +945,19 @@ pub fn process_load_request(
         None
     };
     if let Some(preview) = edit_preview {
+        let image = if let Some(params) = pinned_page_adjustment.as_ref() {
+            let adjusted =
+                crate::adjustment::apply_adjustments_fast(&preview.adjustment_base, params);
+            crate::edit_preview_cache::composite_cached_annotation_layers(
+                &adjusted,
+                &preview.annotation_layers,
+            )
+        } else {
+            preview.image
+        };
         let _ = tx.send(ThumbMsg {
             idx: req.idx,
-            image: Some(preview.image),
+            image: Some(image),
             from_cache: true,
             from_edit_preview: true,
             edit_preview_adjustment: Some(ThumbEditPreviewAdjustment {
@@ -987,7 +1008,12 @@ pub fn process_load_request(
             }
         });
         if let Some((webp_data, source_dims)) = cached {
-            let ci = crate::catalog::decode_thumb_to_color_image(&webp_data);
+            let ci = crate::catalog::decode_thumb_to_color_image(&webp_data).map(|image| {
+                match pinned_page_adjustment.as_ref() {
+                    Some(params) => crate::adjustment::apply_adjustments_fast(&image, params),
+                    None => image,
+                }
+            });
             let cache_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
             // from_cache = true: アップグレード対象
             // source_dims はカタログ由来 (旧バージョンで作成された
@@ -1345,6 +1371,7 @@ pub fn process_load_request(
         req.context_epoch,
         cancel_policy,
         req.force_cache,
+        pinned_page_adjustment.as_ref(),
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -2151,9 +2178,12 @@ pub fn load_one_cached(
     // CachePolicy に関係なく catalog に残す。ユーザー明示ピンなど cache-only 復元が
     // 後続で必要なリクエストに限って使う。
     force_cache: bool,
+    // 手動固定した親代表へ伝播する、固定元ページの個別色調補正。
+    // 通常ページは UI 側の `effective_params` で処理するため None。
+    pinned_page_adjustment: Option<&crate::adjustment::AdjustParams>,
 ) {
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
-    // process_load_request 側と同じキー形式を使うこと��
+    // process_load_request 側と同じキー形式を使うこと。
     // cache_key_override が Some のとき: フォルダ一覧の ZipFile/PdfFile 用キーを優先。
     let auto_key_buf: String;
     let display_buf: String;
@@ -2484,6 +2514,10 @@ pub fn load_one_cached(
     //     from_cache = false: 元画像由来の高画質 (段階 E アップグレード不要)
     let t_display = std::time::Instant::now();
     let display_ci = resize_to_display_color_image(&img, display_px);
+    let display_ci = match pinned_page_adjustment {
+        Some(params) => crate::adjustment::apply_adjustments_fast(&display_ci, params),
+        None => display_ci,
+    };
     let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
     // 第 1 シグナル: display ColorImage を UI に送る。UI は Loaded 化するが、
     // from_cache=false のこの経路では `requested` を抜かない (下の cache save が
@@ -2979,6 +3013,7 @@ mod tests {
             0,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             true,
+            None,
         );
 
         let entry = catalog
@@ -2988,6 +3023,69 @@ mod tests {
         assert_eq!(entry.mtime, 123);
         assert_eq!(entry.file_size, 0);
         assert!(cache_map.read().unwrap().contains_key("img.png"));
+    }
+
+    #[test]
+    fn pinned_parent_applies_only_the_leaf_page_override() {
+        let tmp = TempDir::new().expect("tempdir");
+        let img_path = tmp.path().join("leaf.png");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([40, 40, 40, 255]),
+        ))
+        .save(&img_path)
+        .unwrap();
+        let key = crate::adjustment_db::normalize_path(&img_path);
+        let adjustment_db =
+            crate::adjustment_db::AdjustmentDb::open_at(&tmp.path().join("adjustment.db")).unwrap();
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.brightness = 50.0;
+        adjustment_db.set_page_params(&key, &params).unwrap();
+
+        let run = |apply_pinned_page_adjustment: bool| {
+            let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let gen_done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            let keep_start = Arc::new(AtomicUsize::new(0));
+            let keep_end = Arc::new(AtomicUsize::new(1));
+            let req = LoadRequest {
+                idx: 0,
+                path: img_path.clone(),
+                edit_preview_key: Some(key.clone()),
+                pinned_page_adjustment_key: apply_pinned_page_adjustment.then(|| key.clone()),
+                skip_cache: true,
+                items_gen: 1,
+                ..Default::default()
+            };
+            process_load_request(
+                &req,
+                &cache_map,
+                &tx,
+                None,
+                64,
+                75,
+                64,
+                make_decision(CachePolicy::Off, 25, 2_000_000),
+                &gen_done,
+                &stats,
+                None,
+                &keep_start,
+                &keep_end,
+                None,
+                None,
+                Some(&adjustment_db),
+            );
+            rx.try_iter()
+                .find_map(|msg| msg.image)
+                .expect("decoded thumbnail")
+        };
+
+        let pinned = run(true);
+        let ordinary_parent = run(false);
+        assert_ne!(pinned.pixels[0], ordinary_parent.pixels[0]);
+        assert_eq!(ordinary_parent.pixels[0].to_srgba_unmultiplied()[0], 40);
     }
 
     #[test]

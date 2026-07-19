@@ -556,6 +556,10 @@ struct DetailsMetaRequest {
    起動時の優先集合から完全に離れた場合は、取得済みの安定キー cache を保持して worker を
    cancel / 再構築し、新しい可視行を Normal priority へ上げる。
 
+ページ数列を表示していても、ページ数ソート中でない通常表示では可視範囲 + 先読み範囲だけを
+段階取得する。スクロールで次の範囲が現れた時点で追加 request を作り、画面外の全 ZIP / PDF /
+画像のみフォルダを一度に開かない。ページ数ソート時だけ全対象の取得完了を要求する。
+
 I/O は `GlobalIoSemaphore` の `Normal` または `Low` を使う。ユーザーが明示的に詳細列を
 表示した直後の可視行は `Normal`、画面外の補完は `Low` に寄せる。
 
@@ -741,6 +745,9 @@ worker のルール:
 - 下部情報だけを遅延取得する経路では選択項目のキーだけを pending に保持する。全対象キーの
   `HashSet` を作って staleness 判定へ流用せず、詳細表示の大量項目で O(n) の複製を増やさない。
 - 既存キャッシュ/DB/メモリ値を先に使い、必要なものだけ I/O。
+- field fingerprint と画像のみフォルダ判定 option は job ごとに一度だけ snapshot する。
+  保存済み PDF パスワードの DPAPI 復号は UI 側の対象構築ループでは行わず worker で実行する。
+  段階 request は既取得の `DetailsLazyMeta` へ patch を merge し、未要求 field を消さない。
 - ZIP ページ数 cache の identity には Susie 有効状態と対応拡張子集合を含める。横断ビューで
   親フォルダごとの catalog DB を使う場合、worker 全体で保持する接続は小さい LRU（現行 8）に
   制限し、スマートフォルダの項目数に比例して SQLite 接続を増やさない。

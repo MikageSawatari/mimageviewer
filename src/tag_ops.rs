@@ -717,6 +717,9 @@ impl App {
         }
         if tags_cache_changed {
             self.invalidate_tag_apply_suggestions();
+            self.schedule_current_smart_folder_metadata_refresh(
+                crate::app::smart_folder::SmartFolderMetadataDependency::Tags,
+            );
         }
         for (target, tags) in sidecar_updates {
             self.mirror_tag_sidecar_update(&target, &tags);

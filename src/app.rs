@@ -53,7 +53,7 @@ pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
-mod smart_folder;
+pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
@@ -3205,6 +3205,48 @@ impl DetailsLazyMeta {
         let (mtime, size) = source.unwrap_or((0, 0));
         self.source_mtime == mtime && self.source_size == size
     }
+
+    fn apply_patch(&mut self, patch: Self, loaded: DetailsLazyFieldFlags) {
+        if !self.matches_source(Some((patch.source_mtime, patch.source_size))) {
+            *self = Self::default();
+        }
+        self.source_mtime = patch.source_mtime;
+        self.source_size = patch.source_size;
+        if loaded.created_at {
+            self.created_at = patch.created_at;
+            self.created_at_failed = patch.created_at_failed;
+        }
+        if loaded.ai_metadata {
+            self.ai_metadata_checked = patch.ai_metadata_checked;
+            self.ai_models = patch.ai_models;
+            self.ai_tool = patch.ai_tool;
+        }
+        if loaded.page_count {
+            self.page_count = patch.page_count;
+            self.page_count_checked = patch.page_count_checked;
+            self.page_count_failed = patch.page_count_failed;
+            self.page_count_pdf_password_revision = patch.page_count_pdf_password_revision;
+        }
+        if loaded.image_dims {
+            self.image_dims = patch.image_dims;
+            self.image_dims_failed = patch.image_dims_failed;
+        }
+        if loaded.video_meta {
+            self.video_duration_secs = patch.video_duration_secs;
+            self.video_dims = patch.video_dims;
+            self.video_codec = patch.video_codec;
+            self.video_meta_failed = patch.video_meta_failed;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DetailsLazyFieldFlags {
+    page_count: bool,
+    created_at: bool,
+    ai_metadata: bool,
+    image_dims: bool,
+    video_meta: bool,
 }
 
 struct DetailsMetaPending {
@@ -3253,6 +3295,7 @@ enum DetailsMetaEvent {
         generation: u64,
         key: String,
         meta: DetailsLazyMeta,
+        loaded: DetailsLazyFieldFlags,
     },
     Finished {
         generation: u64,
@@ -3269,9 +3312,6 @@ struct DetailsMetaTarget {
     catalog_folder: Option<PathBuf>,
     catalog_key: Option<String>,
     warm_image_dims: Option<(u32, u32)>,
-    page_count_fingerprint: i64,
-    image_folder_page_count_options: Option<crate::app::folder_scan::ImageFolderPageCountOptions>,
-    pdf_password: Option<String>,
     pdf_password_revision: Option<u64>,
     load_page_count: bool,
     load_created_at: bool,
@@ -3279,6 +3319,13 @@ struct DetailsMetaTarget {
     load_image_dims: bool,
     load_video_meta: bool,
     priority: crate::io_semaphore::IoPriority,
+}
+
+#[derive(Clone)]
+struct DetailsPageCountConfig {
+    fingerprint: i64,
+    image_folder_options: Option<crate::app::folder_scan::ImageFolderPageCountOptions>,
+    pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
 }
 
 struct DetailsVideoProbe {
@@ -6515,6 +6562,9 @@ pub struct App {
     pub(crate) edit_preview_repaint_ctx: Option<egui::Context>,
     /// 保存完了後、同じページの通常サムネを編集プレビューへ差し替えるまで追跡する。
     pub(crate) edit_preview_refresh_pending: std::collections::HashMap<String, std::time::Instant>,
+    /// 固定代表の参照元ページで色調補正が変わったキー。
+    /// detached viewer で変更された場合も main context 復帰後に親セルを再ロードする。
+    pub(crate) pinned_adjustment_refresh_keys: std::collections::HashSet<String>,
     /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
     pub(crate) archive_convert: Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
     pub(crate) video_upscale: Option<crate::ui_dialogs::video_upscale::VideoUpscaleState>,
@@ -7503,6 +7553,8 @@ pub struct App {
     pub(crate) smart_folder_prepare_pending: Option<smart_folder::SmartFolderPreparePending>,
     pub(crate) smart_folder_confirm_pending: Option<smart_folder::SmartFolderConfirmPending>,
     pub(crate) smart_folder_progress: Option<smart_folder::SmartFolderProgress>,
+    /// 表示中の保存条件に関係し得る★・タグ・編集状態変更をまとめて再評価する期限。
+    pub(crate) smart_folder_metadata_refresh_due: Option<std::time::Instant>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -9528,6 +9580,7 @@ impl App {
             edit_preview_cache,
             edit_preview_repaint_ctx: None,
             edit_preview_refresh_pending: std::collections::HashMap::new(),
+            pinned_adjustment_refresh_keys: std::collections::HashSet::new(),
             archive_convert: None,
             video_upscale: None,
             show_video_upscale_tasks: false,
@@ -9875,6 +9928,7 @@ impl App {
             smart_folder_prepare_pending: None,
             smart_folder_confirm_pending: None,
             smart_folder_progress: None,
+            smart_folder_metadata_refresh_due: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -16609,6 +16663,23 @@ impl App {
                     .and_then(|layers| zip_level_thumb_reuse_key(it).map(|key| (key, layers)))
             })
             .collect();
+        // A pinned Folder/ZIP/PDF representative can inherit the edit-preview identity of its
+        // resolved child page.  `install_new_items` clears the idx-keyed map, so preserve that
+        // identity with the same content key as the Loaded thumbnail.  Without this, a later
+        // edit notification cannot find and invalidate the reused parent thumbnail.
+        let preserved_thumb_preview_keys: std::collections::HashMap<String, String> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                self.thumb_edit_preview_keys
+                    .get(&i)
+                    .cloned()
+                    .and_then(|preview_key| {
+                        zip_level_thumb_reuse_key(it).map(|reuse_key| (reuse_key, preview_key))
+                    })
+            })
+            .collect();
         // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
         // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
@@ -16632,6 +16703,9 @@ impl App {
                 };
                 if let Some(state) = preserved.get(&key) {
                     self.thumbnails[i] = state.clone();
+                    if let Some(preview_key) = preserved_thumb_preview_keys.get(&key) {
+                        self.thumb_edit_preview_keys.insert(i, preview_key.clone());
+                    }
                     if is_thumb_adjust_target(Some(&self.items[i])) {
                         if let Some(pixels) = preserved_thumb_pixels.get(&key) {
                             self.thumb_pixels.insert(i, Arc::clone(pixels));
@@ -17736,6 +17810,34 @@ impl App {
         Some(catalog)
     }
 
+    /// Register a catalog opened by a background prepare worker without performing any file or
+    /// SQLite I/O on the UI thread.  This mirrors the LRU insertion half of
+    /// `get_or_open_catalog` and is used by large aggregate views.
+    fn cache_preopened_catalog(
+        &mut self,
+        folder_path: &Path,
+        catalog: Arc<crate::catalog::CatalogDb>,
+    ) {
+        const MAX_CACHED: usize = 16;
+        if let Some(pos) = self
+            .catalog_cache_order
+            .iter()
+            .position(|path| crate::folder_tree::path_eq(path, folder_path))
+        {
+            self.catalog_cache_order.remove(pos);
+        }
+        while self.catalog_cache_order.len() >= MAX_CACHED {
+            if let Some(oldest) = self.catalog_cache_order.pop_front() {
+                self.catalog_cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        let key = folder_path.to_path_buf();
+        self.catalog_cache.insert(key.clone(), catalog);
+        self.catalog_cache_order.push_back(key);
+    }
+
     ///
     /// 与えられた `items` / `image_metas` を新しい状態として設定し、
     /// 旧タスクをキャンセル → カタログを開く → 永続ワーカー + 動画スレッドを起動 →
@@ -18021,7 +18123,21 @@ impl App {
         self.pending_grid_scroll = None;
         self.scroll_hint.store(0, Ordering::Relaxed);
 
-        self.install_new_items(items, image_metas);
+        let has_prepared_aggregate = prepared_subfolder
+            .as_ref()
+            .is_some_and(|metadata| metadata.aggregate.is_some());
+        self.install_new_items_inner(items, image_metas, !has_prepared_aggregate);
+        let mut prepared_aggregate = prepared_subfolder
+            .as_mut()
+            .and_then(|metadata| metadata.aggregate.take());
+        if let Some(metadata) = prepared_aggregate.as_mut() {
+            if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
+                pending.cancel();
+            }
+            self.converted_archive_cache_paths =
+                std::mem::take(&mut metadata.converted_archive_cache_paths);
+            self.folder_pin_map = std::mem::take(&mut metadata.folder_pin_map);
+        }
         // 準備 worker が sparse metadata を完成させているため、未登録キーの同期 DB
         // fallback を止めるフラグを prewarm / visible rebuild より先に立てる。
         if prepared_subfolder.is_some() {
@@ -18260,7 +18376,9 @@ impl App {
         // 取り込む。DB にあるエントリは authoritative なので上書きしない。
         // 下の `db.load_page_params` はインポート後に走るので、補填されたエントリも拾える。
         let sidecar_import_t0 = std::time::Instant::now();
-        if self.settings.sidecar_backup_enabled || self.settings.tag_sidecar_backup_enabled {
+        if !has_prepared_aggregate
+            && (self.settings.sidecar_backup_enabled || self.settings.tag_sidecar_backup_enabled)
+        {
             let sidecar_folder = if source_path.is_dir() {
                 source_path.clone()
             } else {
@@ -18285,7 +18403,9 @@ impl App {
         }
 
         let adj_t0 = std::time::Instant::now();
-        if let Some(db) = &self.adjustment_db {
+        if let Some(metadata) = prepared_aggregate.as_mut() {
+            self.adjustment_page_params = std::mem::take(&mut metadata.adjustment_page_params);
+        } else if let Some(db) = &self.adjustment_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let page_map = db.load_page_params(&prefix);
             if !page_map.is_empty() {
@@ -18339,7 +18459,11 @@ impl App {
         // サムネイル画像には反映せず、フルスクリーン表示 / コピー / エクスポートの
         // 最終段だけで使う。
         let crop_t0 = std::time::Instant::now();
-        if let Some(db) = &self.export_crop_db {
+        if let Some(metadata) = prepared_aggregate.as_mut() {
+            self.export_crop_page_settings =
+                std::mem::take(&mut metadata.export_crop_page_settings);
+            self.export_crop_pages = self.export_crop_page_settings.keys().copied().collect();
+        } else if let Some(db) = &self.export_crop_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let page_map = db.load_by_prefix(&prefix);
             if !page_map.is_empty() {
@@ -18367,7 +18491,11 @@ impl App {
         }
 
         let view_trim_t0 = std::time::Instant::now();
-        self.hydrate_view_trim_page_overrides_for_current_items(&source_path);
+        if let Some(metadata) = prepared_aggregate.as_mut() {
+            self.view_trim_page_overrides = std::mem::take(&mut metadata.view_trim_page_overrides);
+        } else {
+            self.hydrate_view_trim_page_overrides_for_current_items(&source_path);
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -18383,7 +18511,11 @@ impl App {
 
         // 消しゴムマスク: フォルダ内でマスクを持つページを列挙
         let mask_t0 = std::time::Instant::now();
-        if let Some(db) = &self.mask_db {
+        if let Some(metadata) = prepared_aggregate.as_mut() {
+            self.mask_pages = std::mem::take(&mut metadata.mask_pages);
+            self.conceal_pages = std::mem::take(&mut metadata.conceal_pages);
+            self.comic_pages = std::mem::take(&mut metadata.comic_pages);
+        } else if let Some(db) = &self.mask_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let mask_keys = db.load_mask_keys(&prefix);
             if !mask_keys.is_empty() {
@@ -18398,7 +18530,9 @@ impl App {
         }
 
         // 隠蔽加工マスク: バッジ用に「マスクを持つページ」を集合化 (mask_db と同様)
-        if let Some(db) = &self.conceal_db {
+        if prepared_aggregate.is_none()
+            && let Some(db) = &self.conceal_db
+        {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let conceal_keys = db.load_conceal_keys(&prefix);
             if !conceal_keys.is_empty() {
@@ -18413,7 +18547,9 @@ impl App {
         }
 
         // テキスト注釈 (comic): バッジ用に「注釈を持つページ」を集合化 (mask_db と同様)。
-        if let Some(db) = &self.comic_db {
+        if prepared_aggregate.is_none()
+            && let Some(db) = &self.comic_db
+        {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let comic_keys = db.load_comic_keys(&prefix);
             if !comic_keys.is_empty() {
@@ -18442,7 +18578,20 @@ impl App {
 
         // ── カタログを開く + cache_map ロード + 削除掃除 ──
         let catalog_open_t0 = std::time::Instant::now();
-        let catalog_arc = self.get_or_open_catalog(&source_path);
+        let aggregate_catalog_was_prepared = prepared_aggregate.is_some();
+        let prepared_catalog = prepared_aggregate
+            .as_mut()
+            .and_then(|metadata| metadata.catalog.take());
+        let catalog_arc = if let Some(prepared) = prepared_catalog.as_ref() {
+            self.cache_preopened_catalog(&source_path, Arc::clone(&prepared.db));
+            Some(Arc::clone(&prepared.db))
+        } else if aggregate_catalog_was_prepared {
+            // The aggregate worker already attempted the open. Never retry failed file/SQLite
+            // I/O synchronously on the UI thread; thumbnails can run without a catalog.
+            None
+        } else {
+            self.get_or_open_catalog(&source_path)
+        };
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -18459,12 +18608,13 @@ impl App {
         let catalog_load_t0 = std::time::Instant::now();
         let cache_map: Arc<
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
-        > = Arc::new(std::sync::RwLock::new(
-            catalog_arc
+        > = Arc::new(std::sync::RwLock::new(match prepared_catalog {
+            Some(prepared) => prepared.entries,
+            None => catalog_arc
                 .as_ref()
                 .and_then(|c| c.load_all().ok())
                 .unwrap_or_default(),
-        ));
+        }));
         let catalog_entries = cache_map.read().unwrap().len();
         crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
@@ -18487,7 +18637,9 @@ impl App {
         // cache_hit して動画フレームをそのまま表示できる (= 動画自身を Shell API で
         // 取り直す経路を踏まない)。`catalog_existing_keys` には既に pinned 形式が
         // 含まれているので、直後の delete_missing がこの seed 行を消すことはない。
-        self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref());
+        if !aggregate_catalog_was_prepared {
+            self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref());
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -18703,6 +18855,15 @@ impl App {
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
     ) {
+        self.install_new_items_inner(items, image_metas, true);
+    }
+
+    fn install_new_items_inner(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        refresh_container_metadata: bool,
+    ) {
         debug_assert_eq!(items.len(), image_metas.len());
         self.persist_pending_view_trim_state();
         self.items = items;
@@ -18753,8 +18914,16 @@ impl App {
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
-        self.start_converted_archive_cache_paths_refresh();
-        self.refresh_folder_pin_map();
+        if refresh_container_metadata {
+            self.start_converted_archive_cache_paths_refresh();
+            self.refresh_folder_pin_map();
+        } else {
+            if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
+                pending.cancel();
+            }
+            self.converted_archive_cache_paths.clear();
+            self.folder_pin_map.clear();
+        }
     }
 
     /// 現在 items の変換アーカイブについて、有効な変換キャッシュ ZIP を
@@ -21331,6 +21500,7 @@ impl App {
                     // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
                     // (角度⑦ P1、Sol/Terra/Luna 一致)。
                     self.rehydrate_contexts_after_rename_migration(&job.old_path, &job.new_path);
+                    self.refresh_smart_folders_after_rename();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -23076,6 +23246,9 @@ impl App {
 
             std::thread::spawn(move || {
                 let (ref mtx, ref cvar) = *queue;
+                // 固定代表が指すページの個別色調補正は UI thread で同期 DB 参照せず、
+                // worker ごとの接続から解決する。
+                let adjustment_db_w = crate::adjustment_db::AdjustmentDb::open().ok();
                 crate::logger::log(format!("  {tag} started"));
                 loop {
                     // priority (可視範囲) を最優先、次に scroll_hint に近い順。
@@ -23190,6 +23363,7 @@ impl App {
                         &ke_w,
                         pin_db_w.as_deref(),
                         edit_preview_db_w.as_ref(),
+                        adjustment_db_w.as_ref(),
                     );
                 }
                 crate::logger::log(format!("  {tag} stopped"));
@@ -33862,6 +34036,22 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
+        // ページ数ソート以外は画面外の全コンテナを開かず、可視範囲 + 先読み範囲だけを
+        // 段階取得する。前の範囲が Ready でもスクロール先に未取得行があれば次ジョブを開始。
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+            && matches!(self.details_image_dims_state, LazyColumnState::Ready { .. })
+            && self.details_tag_prewarm_indices.iter().copied().any(|idx| {
+                self.lazy_load_page_count_for_idx(idx)
+                    && self
+                        .details_lazy_meta_for_idx(idx)
+                        .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta))
+            })
+        {
+            self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+        }
+
         // ZIP/PDF のページ数は画像寸法より1件あたりのI/Oが重い。大きくスクロールして
         // 現在の可視近傍が起動時の Normal 優先集合と完全に離れたら、完了済みcacheを
         // 保ったまま worker を組み直して新しい可視行を先に処理する。少しずつの
@@ -33976,8 +34166,12 @@ impl App {
                     generation,
                     key,
                     meta,
+                    loaded,
                 } if generation == self.items_generation => {
-                    self.details_lazy_meta.insert(key, meta);
+                    self.details_lazy_meta
+                        .entry(key)
+                        .or_default()
+                        .apply_patch(meta, loaded);
                     self.facet_ai_model_counts_cache = None;
                     self.facet_ai_tool_counts_cache = None;
                     ctx.request_repaint();
@@ -34330,7 +34524,9 @@ impl App {
         }
         match self.details_image_dims_state {
             LazyColumnState::Disabled => String::new(),
-            LazyColumnState::Ready { .. } => "-".to_string(),
+            // Ready is stage-local for page counts: a newly scrolled-in row may still be waiting
+            // for the next visible-range job. Only a checked failure is rendered as `-` above.
+            LazyColumnState::Ready { .. } => "...".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
@@ -34491,8 +34687,36 @@ impl App {
         let generation = self.items_generation;
         let ai_facet_load = self.ai_model_facet_should_load();
         let selection_info_only = self.selection_info_only_lazy_load();
+        let load_all_page_counts = self.settings.grid_view_mode
+            == crate::settings::GridViewMode::Details
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::PageCount;
+        let visible_page_count_stage_only = self.settings.grid_view_mode
+            == crate::settings::GridViewMode::Details
+            && !load_all_page_counts
+            && !ai_facet_load
+            && !self.settings.details_show_created
+            && !self.settings.details_show_image_dimensions
+            && !self.settings.details_show_video_duration
+            && !self.settings.details_show_video_dimensions
+            && !self.settings.details_show_video_codec;
+        // ページ認識規則・フォルダ用拡張子列・暗号化PDF資格情報はジョブ単位で1回だけ
+        // snapshot 化する。target ごとの Vec clone / UI thread DPAPI 復号を避ける。
+        let page_count_config = DetailsPageCountConfig {
+            fingerprint: crate::app::folder_scan::image_page_recognition_fingerprint(
+                &self.settings,
+            ),
+            image_folder_options: crate::app::folder_scan::image_folder_page_count_options(
+                &self.settings,
+            ),
+            pdf_passwords: self.pdf_passwords.clone(),
+        };
         let (order, visible_near): (Vec<usize>, HashSet<usize>) = if selection_info_only {
             let order: Vec<usize> = self.selection_info_lazy_target_idx().into_iter().collect();
+            let visible_near = order.iter().copied().collect();
+            (order, visible_near)
+        } else if visible_page_count_stage_only {
+            let mut order = self.details_tag_prewarm_indices.to_vec();
+            order.sort_unstable();
             let visible_near = order.iter().copied().collect();
             (order, visible_near)
         } else {
@@ -34511,9 +34735,9 @@ impl App {
             if !self.details_item_requires_lazy_meta(idx) {
                 continue;
             }
-            total += 1;
             if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
                 if self.details_lazy_meta_satisfies_idx(idx, meta) {
+                    total += 1;
                     cached_done += 1;
                     cached_failed += usize::from(
                         meta.page_count_failed
@@ -34524,7 +34748,12 @@ impl App {
                     continue;
                 }
             }
-            if let Some(target) = self.details_meta_target_for_idx(idx, &visible_near) {
+            if let Some(target) = self.details_meta_target_for_idx(
+                idx,
+                &visible_near,
+                load_all_page_counts || visible_near.contains(&idx),
+            ) {
+                total += 1;
                 if target.priority >= crate::io_semaphore::IoPriority::Normal {
                     visible_targets.push(target);
                 } else {
@@ -34658,6 +34887,7 @@ impl App {
                     io_sem,
                     cancel_w,
                     tx,
+                    page_count_config,
                 );
             })
             .ok();
@@ -34714,16 +34944,10 @@ impl App {
     }
 
     fn details_lazy_meta_satisfies_idx(&self, idx: usize, meta: &DetailsLazyMeta) -> bool {
-        if self.lazy_load_page_count_for_idx(idx) {
-            if !meta.page_count_checked {
-                return false;
-            }
-            if let Some(GridItem::PdfFile(path)) = self.items.get(idx)
-                && meta.page_count_pdf_password_revision
-                    != Some(self.pdf_passwords.credential_revision(path))
-            {
-                return false;
-            }
+        if self.lazy_load_page_count_for_idx(idx)
+            && !self.details_page_count_meta_satisfies_idx(idx, meta)
+        {
+            return false;
         }
         if self.lazy_load_created_for_idx(idx)
             && meta.created_at.is_none()
@@ -34747,6 +34971,17 @@ impl App {
             && !meta.video_meta_failed
         {
             return false;
+        }
+        true
+    }
+
+    fn details_page_count_meta_satisfies_idx(&self, idx: usize, meta: &DetailsLazyMeta) -> bool {
+        if !meta.page_count_checked {
+            return false;
+        }
+        if let Some(GridItem::PdfFile(path)) = self.items.get(idx) {
+            return meta.page_count_pdf_password_revision
+                == Some(self.pdf_passwords.credential_revision(path));
         }
         true
     }
@@ -34799,6 +35034,7 @@ impl App {
         &self,
         idx: usize,
         visible_near: &std::collections::HashSet<usize>,
+        allow_page_count: bool,
     ) -> Option<DetailsMetaTarget> {
         let item = self.items.get(idx)?.clone();
         let key = self.details_lazy_cache_key(idx)?;
@@ -34814,28 +35050,42 @@ impl App {
         } else {
             crate::io_semaphore::IoPriority::Low
         };
-        let load_image_dims = self.lazy_load_image_dims_for_idx(idx);
-        let load_video_meta = self.lazy_load_video_meta_for_idx(idx);
-        let load_page_count = self.lazy_load_page_count_for_idx(idx);
-        let load_created_at = self.lazy_load_created_for_idx(idx);
-        let load_ai_metadata = self.lazy_load_ai_metadata_for_idx(idx);
-        let image_folder_page_count_options =
-            if load_page_count && matches!(&item, GridItem::Folder(_)) {
-                crate::app::folder_scan::image_folder_page_count_options(&self.settings)
-            } else {
-                None
-            };
-        let (pdf_password, pdf_password_revision) = if load_page_count {
+        let existing_meta = self.details_lazy_meta_for_idx(idx);
+        let load_image_dims = self.lazy_load_image_dims_for_idx(idx)
+            && existing_meta
+                .is_none_or(|meta| meta.image_dims.is_none() && !meta.image_dims_failed);
+        let load_video_meta = self.lazy_load_video_meta_for_idx(idx)
+            && existing_meta.is_none_or(|meta| {
+                meta.video_duration_secs.is_none()
+                    && meta.video_dims.is_none()
+                    && meta.video_codec.is_none()
+                    && !meta.video_meta_failed
+            });
+        let load_page_count = allow_page_count
+            && self.lazy_load_page_count_for_idx(idx)
+            && existing_meta
+                .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta));
+        let load_created_at = self.lazy_load_created_for_idx(idx)
+            && existing_meta
+                .is_none_or(|meta| meta.created_at.is_none() && !meta.created_at_failed);
+        let load_ai_metadata = self.lazy_load_ai_metadata_for_idx(idx)
+            && existing_meta.is_none_or(|meta| !meta.ai_metadata_checked);
+        let pdf_password_revision = if load_page_count {
             match &item {
-                GridItem::PdfFile(path) => (
-                    self.pdf_passwords.get(path),
-                    Some(self.pdf_passwords.credential_revision(path)),
-                ),
-                _ => (None, None),
+                GridItem::PdfFile(path) => Some(self.pdf_passwords.credential_revision(path)),
+                _ => None,
             }
         } else {
-            (None, None)
+            None
         };
+        if !load_page_count
+            && !load_created_at
+            && !load_ai_metadata
+            && !load_image_dims
+            && !load_video_meta
+        {
+            return None;
+        }
         Some(DetailsMetaTarget {
             key,
             item,
@@ -34844,11 +35094,6 @@ impl App {
             catalog_folder,
             catalog_key,
             warm_image_dims: self.details_warm_image_dims(idx),
-            page_count_fingerprint: crate::app::folder_scan::image_page_recognition_fingerprint(
-                &self.settings,
-            ),
-            image_folder_page_count_options,
-            pdf_password,
             pdf_password_revision,
             load_page_count,
             load_created_at,
@@ -35250,7 +35495,11 @@ impl App {
         if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
             req.edit_preview_key = None;
             req.edit_preview_validate_container = false;
-            self.thumb_edit_preview_keys.remove(&req.idx);
+            if let Some(key) = req.pinned_page_adjustment_key.as_ref() {
+                self.thumb_edit_preview_keys.insert(req.idx, key.clone());
+            } else {
+                self.thumb_edit_preview_keys.remove(&req.idx);
+            }
             return;
         }
         if req.edit_preview_key.is_none() {
@@ -35266,7 +35515,11 @@ impl App {
                 req.edit_preview_key = self.page_path_key(req.idx);
             }
         }
-        if let Some(key) = req.edit_preview_key.as_ref() {
+        if let Some(key) = req
+            .edit_preview_key
+            .as_ref()
+            .or(req.pinned_page_adjustment_key.as_ref())
+        {
             self.thumb_edit_preview_keys.insert(req.idx, key.clone());
         } else {
             self.thumb_edit_preview_keys.remove(&req.idx);
@@ -36476,6 +36729,9 @@ impl App {
             let _ = db.set_key(&key, rot);
         }
         Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     // ── レーティング ───────────────────────────────────────────────
@@ -36726,6 +36982,9 @@ impl App {
         if matches!(self.items.get(idx), Some(it) if it.is_container_ratable()) {
             self.current_folder_rating_cache = None;
         }
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Rating,
+        );
         // 設定 ON + Image (JPEG/PNG/WebP) のときだけ XMP にも書き込む。
         // コンテナや ZIP 内画像・PDF ページには書き込み先がないので DB 止まり。
         if self.settings.write_rating_to_xmp && !book_page {
@@ -36769,6 +37028,9 @@ impl App {
         }
         self.invalidate_rating_counts_cache();
         self.current_folder_rating_cache = None;
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Rating,
+        );
     }
 
     /// レーティング XMP 書き込み worker を必要なら起動する (遅延初期化)。
@@ -41532,6 +41794,33 @@ impl App {
             .collect()
     }
 
+    fn reconcile_pinned_adjustment_refreshes(&mut self) {
+        if self.pinned_adjustment_refresh_keys.is_empty() {
+            return;
+        }
+        // Only already materialized parent thumbnails can be stale. Future requests always read
+        // the current DB value, so retaining unmatched page keys would grow this set for every
+        // ordinary page adjustment during the process lifetime.
+        let keys = std::mem::take(&mut self.pinned_adjustment_refresh_keys);
+        for key in keys {
+            let matching: Vec<usize> = self
+                .thumb_edit_preview_keys
+                .iter()
+                .filter_map(|(&idx, preview_key)| {
+                    (preview_key == &key
+                        && self
+                            .items
+                            .get(idx)
+                            .is_some_and(|item| !item.has_page_data()))
+                    .then_some(idx)
+                })
+                .collect();
+            for idx in matching {
+                self.evict_thumbnail_for_edit_preview_refresh(idx);
+            }
+        }
+    }
+
     fn poll_edit_preview_cache(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         if let Some(service) = &self.edit_preview_cache {
@@ -41893,6 +42182,9 @@ impl App {
         let sidecar_mask =
             crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// マスクを DB から削除し、サイドカーからも削除する。「マスク全削除」ボタン用。
@@ -41909,6 +42201,9 @@ impl App {
         self.mask_pages.remove(&idx);
         self.bump_erase_mask_generation(idx);
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     // ── 隠蔽加工マスクの永続化 (消しゴムと並列、Phase 4) ────────────────────
@@ -41968,6 +42263,9 @@ impl App {
         let sidecar_conceal =
             crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_conceal(rel, sidecar_conceal));
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// 隠蔽加工マスクを DB + サイドカーから削除する。「マスク全削除」ボタン用 +
@@ -41985,6 +42283,9 @@ impl App {
         self.conceal_pages.remove(&idx);
         self.bump_conceal_mask_generation(idx);
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     // ── local_adjust_cache / conceal_cache の世代管理 + invalidate ヘルパー ──
@@ -42018,6 +42319,9 @@ impl App {
             });
         }
         self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// 指定 idx の補正レイヤー配列を in-memory state だけに反映する。
@@ -45179,6 +45483,9 @@ impl App {
             let objs = objects.to_vec();
             self.with_sidecar_mut(idx, move |sc, rel| sc.set_comic(rel, objs));
         }
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// この画像 (idx) に表示すべき注釈があるかの早期ゲート。下地 (final composite) に
@@ -46938,9 +47245,15 @@ impl App {
         self.invalidate_compare_prepared_for_idx(idx);
         if thumb_color_changed {
             self.thumb_adjust_tex.remove(&idx);
+            if let Some(key) = self.page_path_key(idx) {
+                self.pinned_adjustment_refresh_keys.insert(key);
+            }
         }
         // 360 度パノラマビュー: 補正パラメータが変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// 指定ページの個別設定を解除する (DB からも削除)。
@@ -46967,10 +47280,16 @@ impl App {
         // サムネは色調が実際に変わるときだけ再生成 (post_filter / smart_sharpen は非対象)。
         if !old_params.color_settings_eq(&new_params) {
             self.thumb_adjust_tex.remove(&idx);
+            if let Some(key) = self.page_path_key(idx) {
+                self.pinned_adjustment_refresh_keys.insert(key);
+            }
         }
         if !old_params.ai_settings_eq(&new_params) {
             self.purge_upscale_for_idx(idx);
         }
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// 画像系グリッドアイテム (`Image` / `ZipImage` / `PdfPage`) の (idx, DB キー) 一覧を集める。
@@ -47067,6 +47386,10 @@ impl App {
         }
         self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
+        self.pinned_adjustment_refresh_keys.extend(keys);
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// 現在の一覧の全画像ページから個別設定を削除する (= 全画像を標準設定に戻す)。
@@ -47098,6 +47421,10 @@ impl App {
         }
         self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
+        self.pinned_adjustment_refresh_keys.extend(keys);
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
     }
 
     /// 指定述語にマッチする画像ページ (Image / ZipImage / PdfPage) で個別設定を持たない
@@ -51862,6 +52189,8 @@ impl eframe::App for App {
         let items_gen_pre_late = self.items_generation;
 
         self.poll_edit_preview_cache(ctx);
+        self.reconcile_pinned_adjustment_refreshes();
+        self.poll_smart_folder_metadata_refresh(ctx);
         self.poll_thumbnails(ctx);
         self.reconcile_edit_preview_refreshes(ctx);
         // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
@@ -54219,6 +54548,10 @@ fn make_load_request(
                                 entry,
                             )),
                             edit_preview_validate_container: true,
+                            pinned_page_adjustment_key: Some(crate::adjustment_db::zip_entry_key(
+                                load_zip_path,
+                                entry,
+                            )),
                             cache_key_override: Some(format!(
                                 "{}{}{}",
                                 crate::grid_item::zipdir_cache_key(dir_prefix),
@@ -54255,6 +54588,7 @@ fn make_load_request(
                                     return Some(LoadRequest {
                                         path: load_zip_path.clone(),
                                         zip_entry: resolved.zip_entry,
+                                        pinned_page_adjustment_key: edit_preview_key.clone(),
                                         edit_preview_key,
                                         edit_preview_validate_container,
                                         cache_key_override: Some(cache_key),
@@ -54316,6 +54650,9 @@ fn make_load_request(
                     zip_entry: Some(entry.clone()),
                     edit_preview_key: Some(crate::adjustment_db::zip_entry_key(cached_zip, entry)),
                     edit_preview_validate_container: true,
+                    pinned_page_adjustment_key: Some(crate::adjustment_db::zip_entry_key(
+                        cached_zip, entry,
+                    )),
                     cache_key_override: Some(convertible_archive_pinned_cache_key(
                         &base_key, source, mtime, file_size,
                     )),
@@ -54346,6 +54683,7 @@ fn make_load_request(
                         return Some(LoadRequest {
                             path: cached_zip.clone(),
                             zip_entry: resolved.zip_entry,
+                            pinned_page_adjustment_key: edit_preview_key.clone(),
                             edit_preview_key,
                             edit_preview_validate_container,
                             cache_key_override: Some(cache_key),
@@ -54812,6 +55150,7 @@ fn apply_folder_thumb_pin(
             file_size: resolved.file_size,
             edit_preview_key: None,
             edit_preview_validate_container: false,
+            pinned_page_adjustment_key: None,
             resolve_override: None,
             folder_thumb_sort: base_req.folder_thumb_sort,
             folder_thumb_depth: base_req.folder_thumb_depth,
@@ -54832,6 +55171,7 @@ fn apply_folder_thumb_pin(
         resolved.zip_entry.as_deref(),
         resolved.pdf_page,
     );
+    let pinned_page_adjustment_key = edit_preview_key.clone();
 
     // dispatch field を target 種別ごとに組み立てる。
     let (resolve_override, zip_entry, zip_dir_prefix, pdf_page) = match resolved.kind {
@@ -54867,6 +55207,7 @@ fn apply_folder_thumb_pin(
         file_size: resolved.file_size,
         edit_preview_key,
         edit_preview_validate_container,
+        pinned_page_adjustment_key,
         resolve_override,
         // フォルダ自動選定パラメータ (sort/depth) は Folder strategy のときだけ意味がある。
         // base_req から継承するので Folder → Folder の pin で sort/depth が消えない。

@@ -1830,6 +1830,7 @@ pub(crate) enum FsNavNoOpReason {
     SearchResultList,
     SearchSiblingUnsupported,
     SubfolderExpansion,
+    SmartFolder,
     DetachedIndependent,
     DetachedVideoUnsupported,
     DetachedEditUnavailable,
@@ -13570,6 +13571,11 @@ impl App {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SubfolderExpansion, native_toast);
             return;
         }
+        if self.items_are_smart_folder_view {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SmartFolder, native_toast);
+            return;
+        }
 
         // ネスト ZIP 内: Ctrl+↑↓ は ZIP 内ツリーの DFS で前後の本へ移り、その先頭画像を
         // 開く (#4 改: ルートの直下画像からも最初の本へ降りる)。ツリーの端では false が
@@ -13647,6 +13653,11 @@ impl App {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SubfolderExpansion, native_toast);
             return;
         }
+        if self.items_are_smart_folder_view {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SmartFolder, native_toast);
+            return;
+        }
 
         // 変換キャッシュ閲覧中の起点はユーザー視点の元アーカイブ (Codex P2、上と同様)。
         if let Some(cur) = self.effective_folder() {
@@ -13683,6 +13694,7 @@ impl App {
             FsNavNoOpReason::SearchResultList => "検索結果を開いてからCtrl+↑↓で移動できます",
             FsNavNoOpReason::SearchSiblingUnsupported => "検索中は兄弟フォルダ移動しません",
             FsNavNoOpReason::SubfolderExpansion => "サブ展開中はフォルダ移動しません",
+            FsNavNoOpReason::SmartFolder => "スマートフォルダではフォルダ移動しません",
             FsNavNoOpReason::DetachedIndependent => {
                 "切り離した別ウィンドウではフォルダ移動しません"
             }
@@ -19463,6 +19475,13 @@ impl App {
             } => (
                 Self::nav_noop_title(FsNavNoOpReason::SubfolderExpansion),
                 vec!["サブ展開を解除すると通常フォルダで移動できます"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::SmartFolder,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::SmartFolder),
+                vec!["一覧へ戻ると通常フォルダで移動できます"],
             ),
             FsBoundaryHint::NavNoOp {
                 reason: FsNavNoOpReason::DetachedIndependent,

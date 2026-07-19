@@ -357,6 +357,7 @@ pub(super) fn run_details_meta_load(
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DetailsMetaEvent>,
+    page_count_config: DetailsPageCountConfig,
 ) {
     const SLOW_AI_METADATA_ITEM_MS: f64 = 100.0;
 
@@ -415,6 +416,7 @@ pub(super) fn run_details_meta_load(
                 &mut container_catalogs,
                 &io_sem,
                 &cancel,
+                &page_count_config,
             ) {
                 Ok(count) => {
                     page_count = count;
@@ -651,30 +653,48 @@ pub(super) fn run_details_meta_load(
         let (video_duration_secs, video_dims, video_codec) = video_probe
             .map(|probe| (probe.duration_secs, probe.dims, probe.codec))
             .unwrap_or((None, None, None));
-        let meta = DetailsLazyMeta {
+        let mut meta = DetailsLazyMeta {
             source_mtime: target.source_mtime,
             source_size: target.source_size,
-            created_at,
-            created_at_failed,
-            ai_metadata_checked,
-            ai_models,
-            ai_tool,
-            page_count,
-            page_count_checked,
-            page_count_failed,
-            page_count_pdf_password_revision: target.pdf_password_revision,
-            image_dims: dims,
-            image_dims_failed,
-            video_duration_secs,
-            video_dims,
-            video_codec,
-            video_meta_failed,
+            ..Default::default()
         };
+        if target.load_created_at {
+            meta.created_at = created_at;
+            meta.created_at_failed = created_at_failed;
+        }
+        if target.load_ai_metadata {
+            meta.ai_metadata_checked = ai_metadata_checked;
+            meta.ai_models = ai_models;
+            meta.ai_tool = ai_tool;
+        }
+        if target.load_page_count {
+            meta.page_count = page_count;
+            meta.page_count_checked = page_count_checked;
+            meta.page_count_failed = page_count_failed;
+            meta.page_count_pdf_password_revision = target.pdf_password_revision;
+        }
+        if target.load_image_dims {
+            meta.image_dims = dims;
+            meta.image_dims_failed = image_dims_failed;
+        }
+        if target.load_video_meta {
+            meta.video_duration_secs = video_duration_secs;
+            meta.video_dims = video_dims;
+            meta.video_codec = video_codec;
+            meta.video_meta_failed = video_meta_failed;
+        }
         if tx
             .send(DetailsMetaEvent::Item {
                 generation,
                 key: target.key,
                 meta,
+                loaded: DetailsLazyFieldFlags {
+                    page_count: target.load_page_count,
+                    created_at: target.load_created_at,
+                    ai_metadata: target.load_ai_metadata,
+                    image_dims: target.load_image_dims,
+                    video_meta: target.load_video_meta,
+                },
             })
             .is_err()
         {
@@ -758,6 +778,7 @@ fn load_details_page_count(
     catalogs: &mut ContainerCatalogCache,
     io_sem: &crate::io_semaphore::GlobalIoSemaphore,
     cancel: &Arc<AtomicBool>,
+    config: &DetailsPageCountConfig,
 ) -> Result<Option<u32>, ()> {
     if cancel.load(Ordering::Relaxed) {
         return Err(());
@@ -789,7 +810,7 @@ fn load_details_page_count(
                         crate::catalog::ContainerPageKind::Zip,
                         target.source_mtime,
                         target.source_size,
-                        target.page_count_fingerprint,
+                        config.fingerprint,
                     )
                 };
                 if let Ok(Some(meta)) = cached {
@@ -811,14 +832,14 @@ fn load_details_page_count(
                     crate::catalog::ContainerPageKind::Zip,
                     target.source_mtime,
                     target.source_size,
-                    target.page_count_fingerprint,
+                    config.fingerprint,
                     Some(count),
                 );
             }
             Ok(Some(count))
         }
         GridItem::Folder(path) => {
-            let options = target.image_folder_page_count_options.as_ref().ok_or(())?;
+            let options = config.image_folder_options.as_ref().ok_or(())?;
             if let Some(catalog) = catalog {
                 let cached = {
                     let _permit = io_sem.acquire(target.priority);
@@ -855,13 +876,16 @@ fn load_details_page_count(
             Ok(count)
         }
         GridItem::PdfFile(path) => {
+            // DPAPI 復号は metadata worker 上で行う。UI thread は暗号化ストアと
+            // credential revision の snapshot だけを渡す。
+            let pdf_password = config.pdf_passwords.get(path);
             if let Some(catalog) = catalog {
                 let cached = {
                     let _permit = io_sem.acquire(target.priority);
                     catalog.get_pdf_meta(key, target.source_mtime, target.source_size)
                 };
                 if let Ok(Some((count, password_required))) = cached {
-                    if password_required && target.pdf_password.is_none() {
+                    if password_required && pdf_password.is_none() {
                         return Ok(None);
                     }
                     if count > 0 {
@@ -873,7 +897,7 @@ fn load_details_page_count(
                 let _permit = io_sem.acquire(target.priority);
                 crate::pdf_loader::enumerate_pages_with_cancel(
                     path,
-                    target.pdf_password.as_deref(),
+                    pdf_password.as_deref(),
                     Some(Arc::clone(cancel)),
                 )
                 .map_err(|_| ())?
@@ -892,7 +916,7 @@ fn load_details_page_count(
                     target.source_mtime,
                     target.source_size,
                     count,
-                    target.pdf_password.is_some(),
+                    pdf_password.is_some(),
                 );
             }
             Ok(Some(count))
@@ -1422,9 +1446,6 @@ mod tests {
             catalog_folder: Some(temp.path().to_path_buf()),
             catalog_key: Some("book.zip".to_owned()),
             warm_image_dims: None,
-            page_count_fingerprint: 77,
-            image_folder_page_count_options: None,
-            pdf_password: None,
             pdf_password_revision: None,
             load_page_count: true,
             load_created_at: false,
@@ -1437,9 +1458,21 @@ mod tests {
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut catalogs = ContainerCatalogCache::new(8);
+        let mut config = DetailsPageCountConfig {
+            fingerprint: 77,
+            image_folder_options: None,
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+        };
 
         assert_eq!(
-            load_details_page_count(&target, &cache_dir, &mut catalogs, &io_sem, &cancel),
+            load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut catalogs,
+                &io_sem,
+                &cancel,
+                &config,
+            ),
             Ok(Some(2)),
             "外側画像と実 nested ZIP 内画像を同じ閲覧ページ列として数える"
         );
@@ -1447,17 +1480,87 @@ mod tests {
         // 元 ZIP を壊しても同じ identity なら永続 catalog hit から値を返す。
         std::fs::write(&path, b"broken after cache").unwrap();
         assert_eq!(
-            load_details_page_count(&target, &cache_dir, &mut catalogs, &io_sem, &cancel),
+            load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut catalogs,
+                &io_sem,
+                &cancel,
+                &config,
+            ),
             Ok(Some(2))
         );
 
-        let mut changed_rules = target.clone();
-        changed_rules.page_count_fingerprint += 1;
+        config.fingerprint += 1;
         assert_eq!(
-            load_details_page_count(&changed_rules, &cache_dir, &mut catalogs, &io_sem, &cancel,),
+            load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut catalogs,
+                &io_sem,
+                &cancel,
+                &config,
+            ),
             Err(()),
             "画像認識規則が変わったら古いZIPページ数cacheを再利用しない"
         );
+    }
+
+    #[test]
+    fn staged_metadata_job_preserves_existing_page_count() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("book.zip");
+        std::fs::write(&path, b"metadata-only").unwrap();
+        let target = DetailsMetaTarget {
+            key: crate::adjustment_db::normalize_path(&path),
+            item: GridItem::ZipFile(path),
+            source_mtime: 123,
+            source_size: 13,
+            catalog_folder: None,
+            catalog_key: None,
+            warm_image_dims: None,
+            pdf_password_revision: None,
+            load_page_count: false,
+            load_created_at: true,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        };
+        let (tx, rx) = mpsc::channel();
+        run_details_meta_load(
+            7,
+            vec![target],
+            0,
+            0,
+            1,
+            temp.path().join("cache"),
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            DetailsPageCountConfig {
+                fingerprint: 0,
+                image_folder_options: None,
+                pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            },
+        );
+        let (patch, loaded) = rx
+            .into_iter()
+            .find_map(|event| match event {
+                DetailsMetaEvent::Item { meta, loaded, .. } => Some((meta, loaded)),
+                _ => None,
+            })
+            .expect("metadata item");
+        let mut meta = DetailsLazyMeta {
+            source_mtime: 123,
+            source_size: 13,
+            page_count: Some(42),
+            page_count_checked: true,
+            ..Default::default()
+        };
+        meta.apply_patch(patch, loaded);
+        assert_eq!(meta.page_count, Some(42));
+        assert!(meta.page_count_checked);
     }
 
     #[test]

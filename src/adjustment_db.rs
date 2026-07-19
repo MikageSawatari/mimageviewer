@@ -329,6 +329,41 @@ impl AdjustmentDb {
         map
     }
 
+    /// 指定したページキーだけを一括読込する。
+    ///
+    /// 複数ルートを横断する合成ビューでは共通 prefix が無いため、空 prefix で DB 全体を
+    /// 複製せず、表示候補の exact key を 500 件ずつ問い合わせる。
+    pub fn load_page_params_many(&self, page_keys: &[&str]) -> HashMap<String, AdjustParams> {
+        let mut map = HashMap::new();
+        for chunk in page_keys.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT page_path, params_json FROM page_params WHERE page_path IN ({placeholders})"
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+            else {
+                continue;
+            };
+            for (key, json) in rows.flatten() {
+                if let Ok(params) = serde_json::from_str::<AdjustParams>(&json) {
+                    map.insert(key, params);
+                }
+            }
+        }
+        map
+    }
+
     /// ページ個別パラメータが保存されているページキーを全件読み込む。
     ///
     /// スマートフィルタの状態ロールアップはファイルシステムや書庫を走査せず、
@@ -441,6 +476,20 @@ mod tests {
         assert!(keys.contains(plain));
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn db_load_page_params_many_returns_only_requested_exact_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = AdjustmentDb::open_at(&temp.path().join("adjustment.db")).unwrap();
+        for (key, brightness) in [("c:/a.jpg", 10.0), ("c:/b.jpg", 20.0)] {
+            let mut params = AdjustParams::default();
+            params.brightness = brightness;
+            db.set_page_params(key, &params).unwrap();
+        }
+        let loaded = db.load_page_params_many(&["c:/b.jpg", "c:/missing.jpg"]);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["c:/b.jpg"].brightness, 20.0);
     }
 
     #[test]

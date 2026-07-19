@@ -124,6 +124,42 @@ impl ViewTrimDb {
         }
         map
     }
+
+    /// 複数フォルダを横断する一覧向けに、指定キーだけを一括読込する。
+    pub fn load_page_overrides_many(
+        &self,
+        page_keys: &[&str],
+    ) -> HashMap<String, ViewTrimPageOverride> {
+        let mut map = HashMap::new();
+        for chunk in page_keys.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT page_path, override_json FROM view_trim_pages
+                 WHERE page_path IN ({placeholders})"
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+            else {
+                continue;
+            };
+            for (key, json) in rows.flatten() {
+                if let Ok(page_override) = serde_json::from_str::<ViewTrimPageOverride>(&json) {
+                    map.insert(key, page_override);
+                }
+            }
+        }
+        map
+    }
 }
 
 fn book_key(path: &Path) -> String {
@@ -194,5 +230,19 @@ mod tests {
 
         db.remove_page_override(keep_key).unwrap();
         assert!(db.load_page_overrides_by_prefix("c:/imgs/a_[").is_empty());
+    }
+
+    #[test]
+    fn page_overrides_load_many_returns_only_requested_exact_keys() {
+        let (_temp, db) = open_temp_db();
+        let page_override = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.03,
+            ..Default::default()
+        });
+        db.set_page_override("c:/a.jpg", page_override).unwrap();
+        db.set_page_override("c:/b.jpg", page_override).unwrap();
+        let loaded = db.load_page_overrides_many(&["c:/b.jpg", "c:/missing.jpg"]);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("c:/b.jpg"), Some(&page_override));
     }
 }

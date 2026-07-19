@@ -231,6 +231,11 @@ impl App {
                     &outcome.new_path,
                 );
                 self.rewrite_page_edit_presence_for_rename(&outcome.target, &outcome.new_path);
+                // 合成一覧には旧 path を残さない。新 path の採用は path-keyed メタデータ
+                // 移行完了後の authoritative scan に任せる。
+                self.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(
+                    &outcome.target,
+                ));
                 self.spawn_rename_key_migration(outcome.target.clone(), outcome.new_path.clone());
                 // 再読み込み判定は「お気に入りへ追加できる場所」ではなく、一覧を実際に
                 // 列挙した current_folder と比較する。current_favorite_target() は ZIP/PDF の

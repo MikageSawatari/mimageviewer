@@ -10,11 +10,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const SNAPSHOT_SORT_CHUNK_SIZE: usize = 16_384;
 const SNAPSHOT_SORT_PROGRESS_INTERVAL: usize = 16_384;
+const MAX_RECORDED_READ_DIR_FAILURES: usize = 256;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RecursiveSnapshotWalkDiag {
     pub(crate) dirs_scanned: usize,
     pub(crate) read_dir_errors: usize,
+    /// Directory reads that failed, with the OS error text captured at the I/O boundary.
+    /// Keeping the path here lets aggregate views report which source was unavailable instead
+    /// of reducing all failures to an opaque counter.
+    pub(crate) read_dir_failures: Vec<(PathBuf, String)>,
     pub(crate) depth_limit_hits: usize,
     pub(crate) visited_skips: usize,
 }
@@ -68,8 +73,12 @@ where
         }
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(_) => {
+            Err(error) => {
                 diag.read_dir_errors += 1;
+                if diag.read_dir_failures.len() < MAX_RECORDED_READ_DIR_FAILURES {
+                    diag.read_dir_failures
+                        .push((dir.clone(), error.to_string()));
+                }
                 progress(&diag, Some(&dir));
                 continue;
             }

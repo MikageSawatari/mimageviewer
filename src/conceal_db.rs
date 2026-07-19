@@ -255,6 +255,38 @@ impl ConcealDb {
         set
     }
 
+    /// 指定ページキーのうち、隠蔽加工マスクを持つものだけを返す。
+    pub fn load_existing_conceal_keys(
+        &self,
+        page_keys: &[&str],
+    ) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        for chunk in page_keys.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT page_path FROM conceal_entries
+                 WHERE page_path IN ({placeholders})
+                   AND page_path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'"
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            if let Ok(rows) = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    row.get::<_, String>(0)
+                })
+            {
+                set.extend(rows.flatten());
+            }
+        }
+        set
+    }
+
     /// 隠蔽加工マスクを持つページキーを全件返す。スロットキーは除外する。
     ///
     /// スマートフィルタの親コンテナ判定用。ビットマップ BLOB は読まない。
@@ -387,6 +419,20 @@ mod tests {
         let (got_mask, got_shapes) = db.get_full("test/image.png", w, h).expect("get");
         assert_eq!(got_mask, mask);
         assert_eq!(got_shapes, shapes);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn load_existing_conceal_keys_returns_only_requested_exact_keys() {
+        let (db, p) = tmp_db();
+        let mask = vec![true];
+        db.set("c:/a.jpg", &mask, &[], 1, 1).unwrap();
+        db.set("c:/b.jpg", &mask, &[], 1, 1).unwrap();
+        let loaded = db.load_existing_conceal_keys(&["c:/b.jpg", "c:/missing.jpg"]);
+        assert_eq!(
+            loaded,
+            std::collections::HashSet::from(["c:/b.jpg".to_string()])
+        );
         let _ = std::fs::remove_file(&p);
     }
 

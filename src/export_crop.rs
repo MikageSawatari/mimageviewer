@@ -573,6 +573,47 @@ impl CropDb {
         }
         map
     }
+
+    /// 複数フォルダを横断する一覧向けに、指定キーだけを一括読込する。
+    pub fn load_many(&self, page_keys: &[&str]) -> HashMap<String, CropSettings> {
+        let mut map = HashMap::new();
+        for chunk in page_keys.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT page_path, min_x, min_y, max_x, max_y, aspect_mode
+                 FROM export_crop_pages WHERE page_path IN ({placeholders})"
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) =
+                stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    let aspect: String = row.get(5)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CropSettings {
+                            rect: CropRect {
+                                min_x: row.get::<_, f32>(1)?,
+                                min_y: row.get::<_, f32>(2)?,
+                                max_x: row.get::<_, f32>(3)?,
+                                max_y: row.get::<_, f32>(4)?,
+                            },
+                            aspect_mode: CropAspectMode::from_stable_key(&aspect),
+                        },
+                    ))
+                })
+            else {
+                continue;
+            };
+            map.extend(rows.flatten());
+        }
+        map
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +696,25 @@ mod tests {
         db.set(key, settings).unwrap();
 
         assert_eq!(db.get(key), Some(settings));
+    }
+
+    #[test]
+    fn crop_db_load_many_returns_only_requested_exact_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CropDb::open_at(&dir.path().join("crop.db")).unwrap();
+        let settings = CropSettings {
+            rect: CropRect {
+                min_x: 1.0,
+                min_y: 2.0,
+                max_x: 30.0,
+                max_y: 40.0,
+            },
+            aspect_mode: CropAspectMode::Keep,
+        };
+        db.set("c:/a.jpg", settings).unwrap();
+        db.set("c:/b.jpg", settings).unwrap();
+        let loaded = db.load_many(&["c:/b.jpg", "c:/missing.jpg"]);
+        assert_eq!(loaded, HashMap::from([("c:/b.jpg".to_string(), settings)]));
     }
 
     #[test]

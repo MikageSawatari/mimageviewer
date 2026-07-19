@@ -579,6 +579,7 @@ fn run_bench(
                             None,
                             // 編集プレビューキャッシュはベンチ対象外。
                             None,
+                            None,
                         );
                     }
                     None => {

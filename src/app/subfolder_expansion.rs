@@ -157,6 +157,28 @@ pub(crate) struct PreparedSubfolderMetadata {
     pub(crate) local_adjust_pages: HashSet<usize>,
     pub(crate) video_pin_blobs: HashMap<PathBuf, Vec<u8>>,
     pub(crate) legacy_paths: Vec<PathBuf>,
+    /// Additional exact-key metadata for aggregate views whose items come from unrelated real
+    /// folders.  A normal folder can hydrate by one path prefix; a smart folder cannot, so its
+    /// prepare worker supplies the finished sparse maps instead of making the UI thread query
+    /// databases with a synthetic prefix.
+    pub(crate) aggregate: Option<PreparedAggregateMetadata>,
+}
+
+pub(crate) struct PreparedAggregateCatalog {
+    pub(crate) db: Arc<crate::catalog::CatalogDb>,
+    pub(crate) entries: HashMap<String, crate::catalog::CacheEntry>,
+}
+
+pub(crate) struct PreparedAggregateMetadata {
+    pub(crate) adjustment_page_params: HashMap<usize, crate::adjustment::AdjustParams>,
+    pub(crate) export_crop_page_settings: HashMap<usize, crate::export_crop::CropSettings>,
+    pub(crate) view_trim_page_overrides: HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
+    pub(crate) mask_pages: HashSet<usize>,
+    pub(crate) conceal_pages: HashSet<usize>,
+    pub(crate) comic_pages: HashSet<usize>,
+    pub(crate) folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) converted_archive_cache_paths: HashMap<String, PathBuf>,
+    pub(crate) catalog: Option<PreparedAggregateCatalog>,
 }
 
 #[derive(Clone)]
@@ -178,7 +200,7 @@ pub(crate) struct PreparedSubfolderExpansion {
 
 pub(crate) enum SubfolderExpansionPrepareEvent {
     Progress(SubfolderExpansionPrepareProgress),
-    Done(PreparedSubfolderExpansion),
+    Done(Box<PreparedSubfolderExpansion>),
     Cancelled,
     Error(String),
 }
@@ -942,6 +964,7 @@ fn prepare_subfolder_expansion(
             local_adjust_pages,
             video_pin_blobs,
             legacy_paths,
+            aggregate: None,
         },
     }))
 }
@@ -960,7 +983,7 @@ fn spawn_subfolder_expansion_prepare(
         .spawn(move || {
             let event =
                 match prepare_subfolder_expansion(snapshot, show_toast, options, &cancel_w, &tx) {
-                    Ok(Some(prepared)) => SubfolderExpansionPrepareEvent::Done(prepared),
+                    Ok(Some(prepared)) => SubfolderExpansionPrepareEvent::Done(Box::new(prepared)),
                     Ok(None) => SubfolderExpansionPrepareEvent::Cancelled,
                     Err(message) => SubfolderExpansionPrepareEvent::Error(message),
                 };
@@ -1328,7 +1351,7 @@ impl App {
                 }
                 Ok(SubfolderExpansionPrepareEvent::Done(prepared)) => {
                     self.subfolder_expansion_install_pending = None;
-                    self.install_prepared_subfolder_expansion(prepared);
+                    self.install_prepared_subfolder_expansion(*prepared);
                     return true;
                 }
                 Ok(SubfolderExpansionPrepareEvent::Cancelled) => {
@@ -1884,7 +1907,7 @@ impl App {
                 }
                 Ok(SubfolderExpansionPrepareEvent::Done(prepared)) => {
                     self.subfolder_expansion_install_pending = None;
-                    self.install_prepared_subfolder_expansion(prepared);
+                    self.install_prepared_subfolder_expansion(*prepared);
                     return;
                 }
                 Ok(SubfolderExpansionPrepareEvent::Cancelled) => {

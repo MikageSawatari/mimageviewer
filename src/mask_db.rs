@@ -991,6 +991,35 @@ impl MaskDb {
         set
     }
 
+    /// 指定ページキーのうち、消しゴムマスクを持つものだけを返す。
+    pub fn load_existing_mask_keys(&self, page_keys: &[&str]) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        for chunk in page_keys.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT path FROM masks
+                 WHERE path IN ({placeholders})
+                   AND path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'"
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            if let Ok(rows) = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    row.get::<_, String>(0)
+                })
+            {
+                set.extend(rows.flatten());
+            }
+        }
+        set
+    }
+
     /// 消しゴムマスクを持つページキーを全件返す。スロットキーは除外する。
     ///
     /// スマートフィルタの親コンテナ判定用。BLOB は読まず、キー列だけを使う。
@@ -1128,6 +1157,20 @@ mod tests {
         let compressed = compress_mask(&mask);
         let decompressed = decompress_mask(&compressed, 512, 512).unwrap();
         assert_eq!(mask, decompressed);
+    }
+
+    #[test]
+    fn load_existing_mask_keys_returns_only_requested_exact_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = MaskDb::open_at(&temp.path().join("mask.db")).unwrap();
+        let mask = vec![true];
+        db.set("c:/a.jpg", &mask, &[], 1, 1).unwrap();
+        db.set("c:/b.jpg", &mask, &[], 1, 1).unwrap();
+        let loaded = db.load_existing_mask_keys(&["c:/b.jpg", "c:/missing.jpg"]);
+        assert_eq!(
+            loaded,
+            std::collections::HashSet::from(["c:/b.jpg".to_string()])
+        );
     }
 
     #[test]

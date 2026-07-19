@@ -147,13 +147,15 @@
   ZIP セルで自動選定された代表サムネイルには編集結果が反映されない。
 - v2.6.0 で手動ピン経路は対応済み。cascade 解決後の固定 leaf (直接 Image / ZipEntry /
   PdfPage、ネスト ZipDir、変換アーカイブ) は canonical page key を親要求へ渡し、編集
-  preview を catalog より優先する。保存 / 無効化通知も親セルへ伝播する。
+  preview を catalog より優先する。固定 leaf の個別色調補正も注釈前の下地へ適用し、
+  保存 / 無効化通知を親セルへ伝播する。
 - 残件は **自動代表選定だけ**。worker 内で leaf を選定した後に page key を組み立て、
   対応する編集 preview があれば raw decode / catalog より優先する。自動選定結果と親
   キャッシュの無効化条件も同時に設計する。
 - 不変条件:
   - 現行の編集 preview 内容 (erase / local_adjust / conceal / crop / comic 注釈) だけを
-    反映し、親代表の色調補正規則は変えない。
+    自動選定 leaf へ反映する。自動代表へどの色調補正を適用するかは別途決め、手動固定済みの
+    個別色調補正規則を変えない。
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
 

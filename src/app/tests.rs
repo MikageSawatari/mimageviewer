@@ -11500,6 +11500,66 @@ mod favorite_adjustment_defaults_tests {
         assert_ne!(zip_level_thumb_reuse_key(&img).unwrap(), asc);
     }
 
+    #[test]
+    fn zip_level_rematerialize_preserves_pinned_edit_preview_identity() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path);
+        app.zip_nav = Some(test_zip_nav(&[
+            "bookA/page1.jpg",
+            "bookA/page2.jpg",
+            "bookB/page1.jpg",
+        ]));
+        app.zip_nav_show_current_level();
+        let idx = app
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookA/"
+                )
+            })
+            .expect("bookA ZipDir");
+        let reuse_key = zip_level_thumb_reuse_key(&app.items[idx]).unwrap();
+
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "zip-preview-reuse",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            Default::default(),
+        );
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex,
+            from_cache: false,
+            from_edit_preview: true,
+            rendered_at_px: 128,
+            source_dims: Some((1, 1)),
+        };
+        let preview_key = "c:/test/outer.zip::book/page1.jpg".to_owned();
+        app.thumb_edit_preview_keys.insert(idx, preview_key.clone());
+
+        app.zip_nav_show_current_level();
+
+        let restored_idx = app
+            .items
+            .iter()
+            .position(|item| zip_level_thumb_reuse_key(item).as_deref() == Some(reuse_key.as_str()))
+            .expect("same ZipDir after rematerialize");
+
+        assert!(matches!(
+            app.thumbnails[restored_idx],
+            ThumbnailState::Loaded {
+                from_edit_preview: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            app.thumb_edit_preview_keys.get(&restored_idx),
+            Some(&preview_key)
+        );
+    }
+
     /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
     #[test]
     fn reset_conceal_mode_restores_saved_spread_state() {
@@ -32715,6 +32775,90 @@ mod details_meta_priority_tests {
     }
 }
 
+#[cfg(test)]
+mod smart_folder_transition_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn wait_for_smart_folder(app: &mut App, ctx: &egui::Context, id: uuid::Uuid) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.poll_smart_folder(ctx);
+            if app.items_are_smart_folder_view && app.current_smart_folder_id == Some(id) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("smart folder {id} did not finish");
+    }
+
+    fn definition(name: &str, source: PathBuf) -> crate::settings::SmartFolderDefinition {
+        let mut definition = crate::settings::SmartFolderDefinition::new(name);
+        definition.rules.push(crate::settings::SmartFolderRule::new(
+            source,
+            true,
+            Default::default(),
+        ));
+        definition
+    }
+
+    #[test]
+    fn direct_smart_folder_switch_keeps_filters_suppressed_and_records_history() {
+        let mut app = setup_app();
+        let normal = app.tmp.path().join("normal");
+        let source_a = app.tmp.path().join("source-a");
+        let source_b = app.tmp.path().join("source-b");
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::create_dir_all(source_a.join("book-a")).unwrap();
+        std::fs::create_dir_all(source_b.join("book-b")).unwrap();
+        app.current_folder = Some(normal.clone());
+
+        let a = definition("A", source_a);
+        let b = definition("B", source_b);
+        let a_id = a.id;
+        let b_id = b.id;
+        let a_path = crate::app::smart_folder::smart_folder_synthetic_path(a_id);
+        let b_path = crate::app::smart_folder::smart_folder_synthetic_path(b_id);
+        app.settings.smart_folders = vec![a, b];
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Image);
+        app.settings.rating_filter = [false, true, false, false, false, false];
+        let ctx = egui::Context::default();
+
+        app.open_smart_folder(a_id, false);
+        wait_for_smart_folder(&mut app, &ctx, a_id);
+        assert_eq!(app.folder_history_back_target(), Some(&normal));
+        assert!(app.facet_filter_suppressed());
+        assert_eq!(
+            app.facet_filter_suppression_stack.last().map(|s| &s.anchor),
+            Some(&a_path)
+        );
+        assert_eq!(
+            app.rating_filter_suppressed_at
+                .as_ref()
+                .map(|(path, _)| path),
+            Some(&a_path)
+        );
+
+        app.open_smart_folder(b_id, false);
+        wait_for_smart_folder(&mut app, &ctx, b_id);
+        assert_eq!(app.folder_history_back_target(), Some(&a_path));
+        assert!(!app.settings.facet_filter.is_active());
+        assert_eq!(
+            app.facet_filter_suppression_stack.last().map(|s| &s.anchor),
+            Some(&b_path)
+        );
+        assert_eq!(
+            app.rating_filter_suppressed_at
+                .as_ref()
+                .map(|(path, _)| path),
+            Some(&b_path)
+        );
+    }
+}
+
 #[test]
 fn tooltip_layer_does_not_disable_normal_grid_wheel() {
     let ctx = egui::Context::default();
@@ -33356,9 +33500,143 @@ fn pdf_page_count_auth_result_becomes_stale_after_saved_credential_changes() {
     );
 
     let target = app
-        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]))
+        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]), true)
         .expect("PDF page-count target");
     assert_eq!(target.pdf_password_revision, Some(1));
+}
+
+#[test]
+fn page_count_only_target_is_staged_unless_explicitly_allowed() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1_700_000_000, 4096))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_show_created = false;
+    app.settings.details_show_image_dimensions = false;
+    app.settings.details_show_video_duration = false;
+    app.settings.details_show_video_dimensions = false;
+    app.settings.details_show_video_codec = false;
+
+    let visible = std::collections::HashSet::from([0]);
+    assert!(
+        app.details_meta_target_for_idx(0, &visible, false)
+            .is_none(),
+        "off-screen page-count-only rows must not create background I/O targets"
+    );
+    let target = app
+        .details_meta_target_for_idx(0, &visible, true)
+        .expect("visible page-count target");
+    assert!(target.load_page_count);
+    assert_eq!(target.priority, crate::io_semaphore::IoPriority::Normal);
+}
+
+#[test]
+fn pinned_adjustment_identity_survives_when_edit_preview_cache_is_disabled() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.edit_preview_cache_enabled = false;
+    let key = "c:/pictures/leaf.jpg".to_owned();
+    let mut request = crate::thumb_loader::LoadRequest {
+        idx: 0,
+        edit_preview_key: Some(key.clone()),
+        pinned_page_adjustment_key: Some(key.clone()),
+        ..Default::default()
+    };
+
+    app.attach_edit_preview_to_request(&mut request);
+
+    assert!(request.edit_preview_key.is_none());
+    assert_eq!(
+        request.pinned_page_adjustment_key.as_deref(),
+        Some(key.as_str())
+    );
+    assert_eq!(app.thumb_edit_preview_keys.get(&0), Some(&key));
+}
+
+#[test]
+fn bulk_page_adjustment_marks_pinned_parent_sources_for_refresh() {
+    let mut app = phase_c_support::setup_app();
+    let first = PathBuf::from(r"C:\Pictures\a.jpg");
+    let second = PathBuf::from(r"C:\Pictures\b.jpg");
+    app.install_new_items(
+        vec![
+            GridItem::Image(first.clone()),
+            GridItem::Image(second.clone()),
+        ],
+        vec![Some((1, 10)), Some((2, 20))],
+    );
+    let mut params = crate::adjustment::AdjustParams::default();
+    params.brightness = 25.0;
+
+    app.apply_params_to_all_pages(params);
+
+    assert!(
+        app.pinned_adjustment_refresh_keys
+            .contains(&crate::adjustment_db::normalize_path(&first))
+    );
+    assert!(
+        app.pinned_adjustment_refresh_keys
+            .contains(&crate::adjustment_db::normalize_path(&second))
+    );
+}
+
+#[test]
+fn prepared_aggregate_installs_exact_per_item_edit_state() {
+    let mut app = phase_c_support::setup_app();
+    let path = app.tmp.path().join("edited.jpg");
+    std::fs::write(&path, b"image").unwrap();
+    let mut params = crate::adjustment::AdjustParams::default();
+    params.brightness = 15.0;
+    let crop = crate::export_crop::CropSettings {
+        rect: crate::export_crop::CropRect {
+            min_x: 1.0,
+            min_y: 2.0,
+            max_x: 30.0,
+            max_y: 40.0,
+        },
+        aspect_mode: crate::export_crop::CropAspectMode::Keep,
+    };
+    let page_trim =
+        crate::view_trim::ViewTrimPageOverride::from_margins(crate::view_trim::ViewTrimMargins {
+            left: 0.05,
+            ..Default::default()
+        });
+    let metadata = crate::app::subfolder_expansion::PreparedSubfolderMetadata {
+        rating_cache: Default::default(),
+        tags_cache: Default::default(),
+        local_adjust_pages: std::collections::HashSet::from([0]),
+        video_pin_blobs: Default::default(),
+        legacy_paths: Vec::new(),
+        aggregate: Some(crate::app::subfolder_expansion::PreparedAggregateMetadata {
+            adjustment_page_params: std::collections::HashMap::from([(0, params.clone())]),
+            export_crop_page_settings: std::collections::HashMap::from([(0, crop)]),
+            view_trim_page_overrides: std::collections::HashMap::from([(0, page_trim)]),
+            mask_pages: std::collections::HashSet::from([0]),
+            conceal_pages: std::collections::HashSet::from([0]),
+            comic_pages: std::collections::HashSet::from([0]),
+            folder_pin_map: Default::default(),
+            converted_archive_cache_paths: Default::default(),
+            catalog: None,
+        }),
+    };
+
+    app.start_loading_subfolder_items(
+        PathBuf::from("__smart_folder__\\test"),
+        vec![GridItem::Image(path)],
+        vec![Some((1, 5))],
+        Vec::new(),
+        metadata,
+    );
+
+    assert_eq!(app.adjustment_page_params.get(&0), Some(&params));
+    assert_eq!(app.export_crop_page_settings.get(&0), Some(&crop));
+    assert_eq!(app.view_trim_page_overrides.get(&0), Some(&page_trim));
+    assert!(app.local_adjust_pages.contains(&0));
+    assert!(app.mask_pages.contains(&0));
+    assert!(app.conceal_pages.contains(&0));
+    assert!(app.comic_pages.contains(&0));
 }
 
 #[test]
@@ -33374,13 +33652,12 @@ fn pdf_page_count_does_not_use_session_only_password() {
     app.pdf_current_password = Some("session-only-password".to_owned());
 
     let target = app
-        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]))
+        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]), true)
         .expect("PDF page-count target");
 
-    assert!(
-        target.pdf_password.is_none(),
-        "保存しないセッションパスワードで親一覧のページ数を露出しない"
-    );
+    // target はセッションパスワード自体を保持しない。worker が保存済みストアだけを
+    // 参照するため、保存しないセッションパスワードで親一覧のページ数を露出しない。
+    assert!(target.load_page_count);
     assert_eq!(target.pdf_password_revision, Some(0));
 }
 

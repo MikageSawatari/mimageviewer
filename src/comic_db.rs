@@ -157,6 +157,35 @@ impl ComicDb {
         set
     }
 
+    /// 指定ページキーのうち、テキスト注釈を持つものだけを返す。
+    pub fn load_existing_comic_keys(
+        &self,
+        page_keys: &[&str],
+    ) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        for chunk in page_keys.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("SELECT page_path FROM comic_entries WHERE page_path IN ({placeholders})");
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            if let Ok(rows) = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    row.get::<_, String>(0)
+                })
+            {
+                set.extend(rows.flatten());
+            }
+        }
+        set
+    }
+
     /// テキスト注釈を持つページキーを全件返す。
     ///
     /// スマートフィルタの親コンテナ判定用。`doc_json` は読まない。
@@ -217,6 +246,19 @@ mod tests {
         db.set("c:/foo/img.png", &objs).unwrap();
         let got = db.get("c:/foo/img.png").expect("get");
         assert_eq!(got, objs);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn load_existing_comic_keys_returns_only_requested_exact_keys() {
+        let (db, p) = tmp_db();
+        db.set_raw("c:/a.jpg", DOC_VERSION, "[]").unwrap();
+        db.set_raw("c:/b.jpg", DOC_VERSION, "[]").unwrap();
+        let loaded = db.load_existing_comic_keys(&["c:/b.jpg", "c:/missing.jpg"]);
+        assert_eq!(
+            loaded,
+            std::collections::HashSet::from(["c:/b.jpg".to_string()])
+        );
         let _ = std::fs::remove_file(&p);
     }
 

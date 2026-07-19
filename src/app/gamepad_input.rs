@@ -346,6 +346,19 @@ fn ring_shortcut_context_for_surface_state(
     }
 }
 
+/// A right press belongs to the ring/gesture interaction once its guide delay elapsed,
+/// even if the pointer never moved. `secondary_clicked()` is reported by egui before the
+/// surface-specific release handler classifies that stationary long press as cancelled, so the
+/// context-menu owner must use the same timing boundary independently of update order.
+fn right_drag_press_suppresses_context_menu(
+    start_pos: egui::Pos2,
+    guide_visible: bool,
+    pointer_pos: Option<egui::Pos2>,
+) -> bool {
+    guide_visible
+        || pointer_pos.is_some_and(|pos| pos.distance(start_pos) >= MOUSE_FLICK_MOVE_THRESHOLD_PX)
+}
+
 impl App {
     pub(crate) fn draw_gamepad_ring_overlay(
         &self,
@@ -1001,16 +1014,15 @@ impl App {
             {
                 return false;
             }
-            if flick.armed {
-                return true;
-            }
+            // A stationary long press reaches `secondary_clicked()` on release before the
+            // per-surface updater classifies it as Cancelled.  Once the guide delay elapsed,
+            // the right press belongs to the ring even when it never crossed the move threshold.
             return ctx.input(|i| {
-                i.pointer
-                    .interact_pos()
-                    .or_else(|| i.pointer.latest_pos())
-                    .is_some_and(|pos| {
-                        pos.distance(flick.start_pos) >= MOUSE_FLICK_MOVE_THRESHOLD_PX
-                    })
+                right_drag_press_suppresses_context_menu(
+                    flick.start_pos,
+                    flick.guide_visible(),
+                    i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
+                )
             });
         }
         if let Some(gesture) = self.mouse_gesture.as_ref() {
@@ -1022,16 +1034,14 @@ impl App {
             {
                 return false;
             }
-            if gesture.armed {
-                return true;
-            }
+            // Keep the same ownership rule as the ring path: a gesture long press must not
+            // fall through to the grid context menu merely because no direction was entered.
             return ctx.input(|i| {
-                i.pointer
-                    .interact_pos()
-                    .or_else(|| i.pointer.latest_pos())
-                    .is_some_and(|pos| {
-                        pos.distance(gesture.start_pos) >= MOUSE_FLICK_MOVE_THRESHOLD_PX
-                    })
+                right_drag_press_suppresses_context_menu(
+                    gesture.start_pos,
+                    gesture.guide_visible(),
+                    i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
+                )
             });
         }
         false
@@ -4501,9 +4511,10 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if in_favsearch {
             self.favsearch_ctrl_nav(forward);
-        } else if in_tag_view {
-            self.cancel_pending_folder_nav();
-        } else if self.items_are_subfolder_expansion_view {
+        } else if in_tag_view
+            || self.items_are_subfolder_expansion_view
+            || self.items_are_smart_folder_view
+        {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
         } else if let Some(cur) = self.effective_folder() {
@@ -4550,9 +4561,10 @@ impl App {
             if self.is_snapshot_active() {
                 let _ = self.snapshot_navigate_grid_page(forward);
             } else if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            } else if self.show_search_bar {
-                self.cancel_pending_folder_nav();
-            } else if self.items_are_subfolder_expansion_view {
+            } else if self.show_search_bar
+                || self.items_are_subfolder_expansion_view
+                || self.items_are_smart_folder_view
+            {
                 self.cancel_pending_folder_nav();
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, forward, FolderNavMode::SiblingGrid);
@@ -6785,10 +6797,10 @@ mod tests {
         cycle_rating, cycle_video_playback_speed, gamepad_grid_nav_target_pos,
         initial_gamepad_favorite_picker_tab, mouse_button_action_blocked_by_edit_mode,
         mouse_flick_direction, picker_rows_for_context, post_filter_group_index,
-        post_filter_item_index_in_group, rating_label, ring_direction_from_dpad_buttons,
-        ring_direction_from_stick, ring_direction_from_stick_with_hysteresis,
-        ring_shortcut_context_for_surface_state, set_gamepad_favorite_picker_tab,
-        update_mouse_middle_click_state,
+        post_filter_item_index_in_group, rating_label, right_drag_press_suppresses_context_menu,
+        ring_direction_from_dpad_buttons, ring_direction_from_stick,
+        ring_direction_from_stick_with_hysteresis, ring_shortcut_context_for_surface_state,
+        set_gamepad_favorite_picker_tab, update_mouse_middle_click_state,
     };
     use crate::adjustment::PostFilter;
     use crate::app::ActionSurface;
@@ -6839,6 +6851,26 @@ mod tests {
         assert!(!mouse_button_action_blocked_by_edit_mode(
             false,
             &RingActionId::QuitApplication,
+        ));
+    }
+
+    #[test]
+    fn stationary_long_right_press_suppresses_context_menu() {
+        let start = egui::pos2(40.0, 50.0);
+        assert!(right_drag_press_suppresses_context_menu(
+            start,
+            true,
+            Some(start),
+        ));
+        assert!(!right_drag_press_suppresses_context_menu(
+            start,
+            false,
+            Some(start),
+        ));
+        assert!(right_drag_press_suppresses_context_menu(
+            start,
+            false,
+            Some(start + egui::vec2(MOUSE_FLICK_MOVE_THRESHOLD_PX, 0.0)),
         ));
     }
 
