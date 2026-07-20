@@ -6206,6 +6206,11 @@ pub struct App {
     // ── スマートフォルダ管理ダイアログ ─────────────────────────────
     pub(crate) show_smart_folder_editor: bool,
     pub(crate) smart_folder_editor_selected: Option<uuid::Uuid>,
+    /// 管理ダイアログ内の編集中定義。TextEdit のキー入力を Settings の同期保存や
+    /// snapshot 再走査へ直結させず、フォーカス離脱・選択変更・ダイアログ操作で
+    /// まとめて確定する。
+    pub(crate) smart_folder_editor_draft: Option<crate::settings::SmartFolderDefinition>,
+    pub(crate) smart_folder_editor_name_error: Option<String>,
     pub(crate) smart_folder_delete_confirm: Option<uuid::Uuid>,
     /// `Some` の間は名前だけを入力する新規作成ダイアログを表示する。
     pub(crate) smart_folder_create_name: Option<String>,
@@ -9425,6 +9430,8 @@ impl App {
             favorites_total_eta_cache: None,
             show_smart_folder_editor: false,
             smart_folder_editor_selected: None,
+            smart_folder_editor_draft: None,
+            smart_folder_editor_name_error: None,
             smart_folder_delete_confirm: None,
             smart_folder_create_name: None,
             smart_folder_rule_draft: None,
@@ -36182,6 +36189,7 @@ impl App {
         if lazy_key && !self.details_lazy_sort_ready() {
             return;
         }
+        let previous_key = self.settings.details_sort_key;
         if self.settings.details_sort_key == key {
             if self.settings.details_sort_ascending {
                 self.settings.details_sort_ascending = false;
@@ -36192,6 +36200,18 @@ impl App {
         } else {
             self.settings.details_sort_key = key;
             self.settings.details_sort_ascending = true;
+        }
+        let entered_page_count_sort = previous_key != crate::settings::DetailsSortKey::PageCount
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::PageCount;
+        if entered_page_count_sort {
+            // 通常表示の page-count Ready は「現在の可視近傍を取得済み」という段階状態。
+            // 全件ソートへ遷移するときは別ジョブとして明示的に再始動し、画面外の None を
+            // 並べた不正確な順序を一度も確定しない。
+            if let Some(pending) = self.details_meta_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+            self.details_image_dims_state = LazyColumnState::NotRequested;
         }
         self.rebuild_details_order();
         self.scroll_to_selected = true;
@@ -36208,6 +36228,14 @@ impl App {
             self.settings.details_sort_ascending = true;
             key = self.settings.details_sort_key;
             ascending = self.settings.details_sort_ascending;
+        }
+        if key == crate::settings::DetailsSortKey::PageCount
+            && !self.details_image_dims_state.is_ready()
+        {
+            // PageCount へ切り替えた直後は全件取得が終わるまで toolbar 順を維持する。
+            // Finished で Ready になった時点で poll_details_meta_load が再構築する。
+            self.details_order = self.visible_indices.clone();
+            return;
         }
         if key == crate::settings::DetailsSortKey::Toolbar
             || self.current_folder_is_book_folder()

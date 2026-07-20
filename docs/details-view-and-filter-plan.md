@@ -748,6 +748,9 @@ worker のルール:
 - field fingerprint と画像のみフォルダ判定 option は job ごとに一度だけ snapshot する。
   保存済み PDF パスワードの DPAPI 復号は UI 側の対象構築ループでは行わず worker で実行する。
   段階 request は既取得の `DetailsLazyMeta` へ patch を merge し、未要求 field を消さない。
+- ページ数列の通常表示は可視範囲 + 先読み範囲を段階取得する。この段階の `Ready` は全件取得を
+  意味しないため、ページ数ソートへ切り替えた時点で全行ジョブを再始動し、完了するまでは
+  toolbar 順を維持する。画面外の未取得値を `None` のまま並べた順序を確定しない。
 - ZIP ページ数 cache の identity には Susie 有効状態と対応拡張子集合を含める。横断ビューで
   親フォルダごとの catalog DB を使う場合、worker 全体で保持する接続は小さい LRU（現行 8）に
   制限し、スマートフォルダの項目数に比例して SQLite 接続を増やさない。

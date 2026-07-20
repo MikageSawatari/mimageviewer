@@ -32857,6 +32857,21 @@ mod smart_folder_transition_tests {
             Some(&b_path)
         );
     }
+
+    #[test]
+    fn current_rule_rejects_search_even_during_subfolder_expansion() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![root];
+        app.search_filter = Some(std::collections::HashSet::new());
+
+        let error = app
+            .smart_folder_current_rule_source()
+            .expect_err("Ctrl+F condition must not be silently dropped");
+        assert!(error.contains("検索中は追加できません"));
+    }
 }
 
 #[test]
@@ -33531,6 +33546,37 @@ fn page_count_only_target_is_staged_unless_explicitly_allowed() {
         .expect("visible page-count target");
     assert!(target.load_page_count);
     assert_eq!(target.priority, crate::io_semaphore::IoPriority::Normal);
+}
+
+#[test]
+fn entering_page_count_sort_restarts_full_load_before_reordering() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\visible.cbz")),
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\offscreen-a.cbz")),
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\offscreen-b.cbz")),
+        ],
+        vec![Some((1, 10)), Some((2, 20)), Some((3, 30))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.details_order = app.visible_indices.clone();
+
+    app.set_details_sort_key(crate::settings::DetailsSortKey::PageCount);
+
+    assert_eq!(
+        app.settings.details_sort_key,
+        crate::settings::DetailsSortKey::PageCount
+    );
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(
+        app.details_order, app.visible_indices,
+        "rows must remain in stable toolbar order until the all-row page-count job finishes"
+    );
 }
 
 #[test]

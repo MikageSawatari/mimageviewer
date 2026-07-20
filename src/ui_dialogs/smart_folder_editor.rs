@@ -152,6 +152,34 @@ fn capture_smart_folder_filter(
     filter
 }
 
+fn smart_folder_name_is_duplicate(
+    definitions: &[SmartFolderDefinition],
+    editing_id: uuid::Uuid,
+    candidate: &str,
+) -> bool {
+    definitions.iter().any(|definition| {
+        definition.id != editing_id && definition.name.eq_ignore_ascii_case(candidate)
+    })
+}
+
+fn smart_folder_editor_commit_requested(
+    text_lost_focus: bool,
+    selection_requested: bool,
+    open_requested: bool,
+    close_requested: bool,
+    escape_pressed: bool,
+    window_open: bool,
+    structural_action: bool,
+) -> bool {
+    text_lost_focus
+        || selection_requested
+        || open_requested
+        || close_requested
+        || escape_pressed
+        || !window_open
+        || structural_action
+}
+
 impl App {
     pub(crate) fn begin_new_smart_folder(&mut self) {
         let mut number = self.settings.smart_folders.len() + 1;
@@ -171,12 +199,21 @@ impl App {
     }
 
     pub(crate) fn open_smart_folder_manager(&mut self, selected: Option<uuid::Uuid>) {
-        self.smart_folder_editor_selected = selected.or_else(|| {
+        let selected = selected.or_else(|| {
             self.settings
                 .smart_folders
                 .first()
                 .map(|definition| definition.id)
         });
+        self.smart_folder_editor_selected = selected;
+        self.smart_folder_editor_draft = selected.and_then(|id| {
+            self.settings
+                .smart_folders
+                .iter()
+                .find(|definition| definition.id == id)
+                .cloned()
+        });
+        self.smart_folder_editor_name_error = None;
         self.show_smart_folder_editor = true;
     }
 
@@ -184,6 +221,14 @@ impl App {
     pub(crate) fn smart_folder_current_rule_source(
         &self,
     ) -> Result<(Vec<PathBuf>, bool), &'static str> {
+        // Ctrl+F は通常一覧とサブ展開の両方へ適用されるが、スマートフォルダの
+        // 保存条件には含めない。サブ展開を先に判定すると検索語だけを黙って
+        // 捨てた広いルールになるため、検索中は常にここで拒否する。
+        if self.search_filter.is_some() || self.show_search_bar {
+            return Err(
+                "検索中は追加できません（検索を閉じてから追加してください。名前条件は追加ダイアログで指定できます）",
+            );
+        }
         if self.items_are_subfolder_expansion_view {
             let roots = if self.subfolder_expansion_roots.is_empty() {
                 self.subfolder_expansion_root.iter().cloned().collect()
@@ -195,11 +240,6 @@ impl App {
             } else {
                 Ok((roots, true))
             };
-        }
-        if self.search_filter.is_some() || self.show_search_bar {
-            return Err(
-                "検索中は追加できません（検索を閉じてから追加してください。名前条件は追加ダイアログで指定できます）",
-            );
         }
         if self.subfolder_expansion_available()
             && let Some(folder) = self.current_folder.clone()
@@ -406,22 +446,33 @@ impl App {
                 });
             });
         if confirm {
+            draft.filter.name_contains = draft.filter.name_contains.trim().to_string();
+            let target_id = draft.target_id;
+            let rules_to_add: Vec<_> = draft
+                .sources
+                .into_iter()
+                .map(|source| {
+                    SmartFolderRule::new(source, draft.include_descendants, draft.filter.clone())
+                })
+                .collect();
             if let Some(definition) = self
                 .settings
                 .smart_folders
                 .iter_mut()
-                .find(|definition| definition.id == draft.target_id)
+                .find(|definition| definition.id == target_id)
             {
-                draft.filter.name_contains = draft.filter.name_contains.trim().to_string();
-                for source in draft.sources {
-                    definition.rules.push(SmartFolderRule::new(
-                        source,
-                        draft.include_descendants,
-                        draft.filter.clone(),
-                    ));
-                }
+                definition.rules.extend(rules_to_add.iter().cloned());
                 self.settings.save();
-                self.invalidate_smart_folder_definition(draft.target_id);
+                self.invalidate_smart_folder_definition(target_id);
+                // 管理ダイアログが同時に開いている場合、そのローカル draft にも同じ
+                // 追加を反映する。古い draft を後で確定して新規ルールを消さない。
+                if let Some(editor_draft) = self
+                    .smart_folder_editor_draft
+                    .as_mut()
+                    .filter(|editor_draft| editor_draft.id == target_id)
+                {
+                    editor_draft.rules.extend(rules_to_add);
+                }
             }
             self.smart_folder_rule_draft = None;
         } else if cancel || escape_pressed || !open {
@@ -452,7 +503,17 @@ impl App {
                 .iter()
                 .position(|definition| definition.id == id)
         });
-        let mut draft = selected_index.map(|index| self.settings.smart_folders[index].clone());
+        if self
+            .smart_folder_editor_draft
+            .as_ref()
+            .map(|draft| draft.id)
+            != selected_id
+        {
+            self.smart_folder_editor_draft =
+                selected_index.map(|index| self.settings.smart_folders[index].clone());
+            self.smart_folder_editor_name_error = None;
+        }
+        let mut draft = self.smart_folder_editor_draft.clone();
 
         let mut open = true;
         let mut close_requested = false;
@@ -582,6 +643,9 @@ impl App {
                                     open_definition = Some(definition.id);
                                 }
                             });
+                            if let Some(error) = self.smart_folder_editor_name_error.as_deref() {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            }
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("並び方").strong());
                             ui.horizontal_wrapped(|ui| {
@@ -696,6 +760,21 @@ impl App {
             });
 
         let mut dirty = false;
+        let structural_action = rule_swap.is_some()
+            || rule_remove.is_some()
+            || definition_swap.is_some()
+            || delete_requested.is_some()
+            || create_requested;
+        let commit_requested = smart_folder_editor_commit_requested(
+            normalize_definition_text,
+            select_requested.is_some(),
+            open_definition.is_some(),
+            close_requested,
+            escape_pressed,
+            open,
+            structural_action,
+        );
+        let mut commit_blocked = false;
         if let (Some(index), Some(mut updated)) = (selected_index, draft) {
             if let Some((a, b)) = rule_swap {
                 updated.rules.swap(a, b);
@@ -708,40 +787,53 @@ impl App {
             // TextEdit の内容を毎フレーム trim / 既定名へ置換すると、末尾空白を
             // 入力できず、全選択→Delete→打ち直しも壊れる。フォーカス移動や
             // ダイアログ操作で編集を確定するときだけ正規化する。
-            let commit_text = normalize_definition_text
-                || select_requested.is_some()
-                || open_definition.is_some()
-                || escape_pressed
-                || close_requested
-                || !open;
-            if commit_text {
+            if commit_requested {
                 normalize_smart_folder_definition_text(&mut updated);
             }
-            if let Some(previous) = self.settings.smart_folders.get(index)
-                && previous != &updated
-            {
-                // 走査結果を決めるのは rules だけ。表示名や並び方の変更で実フォルダ
-                // snapshot を破棄しない。
-                if previous.rules != updated.rules {
-                    invalidated_definition = Some(updated.id);
-                } else {
-                    presentation_updated_definition = Some(updated.clone());
+            let duplicate_name = smart_folder_name_is_duplicate(
+                &self.settings.smart_folders,
+                updated.id,
+                &updated.name,
+            );
+            self.smart_folder_editor_name_error =
+                duplicate_name.then(|| "同じ名前のスマートフォルダが既にあります".to_string());
+            if commit_requested && duplicate_name {
+                commit_blocked = true;
+            } else if commit_requested {
+                if let Some(previous) = self.settings.smart_folders.get(index)
+                    && previous != &updated
+                {
+                    // 走査結果を決めるのは rules だけ。表示名や並び方の変更で実フォルダ
+                    // snapshot を破棄しない。
+                    if previous.rules != updated.rules {
+                        invalidated_definition = Some(updated.id);
+                    } else {
+                        presentation_updated_definition = Some(updated.clone());
+                    }
+                    self.settings.smart_folders[index] = updated.clone();
+                    dirty = true;
                 }
-                self.settings.smart_folders[index] = updated;
-                dirty = true;
             }
+            self.smart_folder_editor_draft = Some(updated);
         }
-        if let Some((a, b)) = definition_swap {
+        if !commit_blocked && let Some((a, b)) = definition_swap {
             self.settings.smart_folders.swap(a, b);
             dirty = true;
         }
-        if let Some(id) = select_requested {
+        if !commit_blocked && let Some(id) = select_requested {
             self.smart_folder_editor_selected = Some(id);
+            self.smart_folder_editor_draft = self
+                .settings
+                .smart_folders
+                .iter()
+                .find(|definition| definition.id == id)
+                .cloned();
+            self.smart_folder_editor_name_error = None;
         }
-        if create_requested {
+        if create_requested && !commit_blocked {
             self.begin_new_smart_folder();
         }
-        if let Some(id) = delete_requested {
+        if !commit_blocked && let Some(id) = delete_requested {
             self.smart_folder_delete_confirm = Some(id);
         }
 
@@ -785,6 +877,15 @@ impl App {
                             .smart_folders
                             .get(index.min(self.settings.smart_folders.len().saturating_sub(1)))
                             .map(|definition| definition.id);
+                        self.smart_folder_editor_draft =
+                            self.smart_folder_editor_selected.and_then(|selected| {
+                                self.settings
+                                    .smart_folders
+                                    .iter()
+                                    .find(|definition| definition.id == selected)
+                                    .cloned()
+                            });
+                        self.smart_folder_editor_name_error = None;
                         deleted_definition = Some(id);
                         dirty = true;
                     }
@@ -809,13 +910,15 @@ impl App {
         if let Some(id) = deleted_definition {
             self.forget_smart_folder_definition(id);
         }
-        if let Some(id) = open_definition {
+        if !commit_blocked && let Some(id) = open_definition {
             let refresh =
                 self.items_are_smart_folder_view && self.current_smart_folder_id == Some(id);
             self.open_smart_folder(id, refresh);
         }
-        if escape_pressed || close_requested || !open {
+        if !commit_blocked && (escape_pressed || close_requested || !open) {
             self.show_smart_folder_editor = false;
+            self.smart_folder_editor_draft = None;
+            self.smart_folder_editor_name_error = None;
             self.smart_folder_delete_confirm = None;
         }
     }
@@ -882,5 +985,40 @@ mod tests {
         definition.name.clear();
         normalize_smart_folder_definition_text(&mut definition);
         assert_eq!(definition.name, "スマートフォルダ");
+    }
+
+    #[test]
+    fn editor_keeps_text_changes_as_draft_until_a_commit_boundary() {
+        assert!(
+            !smart_folder_editor_commit_requested(false, false, false, false, false, true, false),
+            "a TextEdit changed frame alone must not synchronously save or invalidate a scan"
+        );
+        assert!(smart_folder_editor_commit_requested(
+            true, false, false, false, false, true, false
+        ));
+        assert!(smart_folder_editor_commit_requested(
+            false, true, false, false, false, true, false
+        ));
+        assert!(smart_folder_editor_commit_requested(
+            false, false, false, true, false, true, false
+        ));
+    }
+
+    #[test]
+    fn rename_rejects_case_insensitive_duplicate_but_allows_current_name() {
+        let current = SmartFolderDefinition::new("動画");
+        let other = SmartFolderDefinition::new("Recent");
+        let definitions = vec![current.clone(), other];
+
+        assert!(smart_folder_name_is_duplicate(
+            &definitions,
+            current.id,
+            "RECENT"
+        ));
+        assert!(!smart_folder_name_is_duplicate(
+            &definitions,
+            current.id,
+            "動画"
+        ));
     }
 }

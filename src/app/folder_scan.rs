@@ -89,11 +89,11 @@ pub(crate) fn image_folder_page_count(
     path: &std::path::Path,
     options: &ImageFolderPageCountOptions,
 ) -> std::io::Result<Option<u32>> {
-    // `scan_directory_with_convertible_archives` は従来互換で read_dir error を空一覧へ
-    // 畳み込むため、失敗を「空フォルダ」として永続 cache しないよう先に確認する。
-    drop(std::fs::read_dir(path)?);
-    let mut scan = scan_directory_with_convertible_archives(
-        path,
+    // ページ数取得では走査失敗を空フォルダとして cache できないため Result を維持する。
+    // 取得済み ReadDir をそのまま共通分類へ渡し、同じディレクトリを二度開かない。
+    let entries = std::fs::read_dir(path)?;
+    let mut scan = scan_directory_entries(
+        entries,
         options.include_convertible_archives,
         options.show_hidden_files,
     );
@@ -143,14 +143,24 @@ pub(crate) fn scan_directory_with_convertible_archives(
     include_convertible_archives: bool,
     show_hidden_files: bool,
 ) -> ScannedDir {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return ScannedDir {
+            folders: Vec::new(),
+            all_media: Vec::new(),
+        };
+    };
+    scan_directory_entries(entries, include_convertible_archives, show_hidden_files)
+}
+
+fn scan_directory_entries(
+    entries: std::fs::ReadDir,
+    include_convertible_archives: bool,
+    show_hidden_files: bool,
+) -> ScannedDir {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)> = Vec::new();
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return ScannedDir { folders, all_media };
-    };
     for entry in entries.flatten() {
         // file_type() は FindFirstFile のキャッシュ読み (syscall なし)。
         // metadata() も同様にキャッシュから返るが、失敗しても fallback 0 で続行する。

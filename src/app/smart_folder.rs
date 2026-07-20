@@ -192,6 +192,8 @@ struct ActiveRule {
     definition_order: usize,
     include_descendants: bool,
     filter: crate::settings::SmartFolderFilter,
+    /// Candidate ごと・ルールごとの小文字化を避けるため、走査開始時に一度だけ作る。
+    name_contains_lower: String,
 }
 
 #[derive(Clone)]
@@ -258,12 +260,17 @@ fn active_rules(definition: &crate::settings::SmartFolderDefinition) -> Vec<Acti
         .iter()
         .enumerate()
         .filter(|(_, rule)| rule.enabled && !rule.source.as_os_str().is_empty())
-        .map(|(definition_order, rule)| ActiveRule {
-            id: rule.id,
-            source: rule.source.clone(),
-            definition_order,
-            include_descendants: rule.include_descendants,
-            filter: rule.filter.clone(),
+        .map(|(definition_order, rule)| {
+            let filter = rule.filter.clone();
+            let name_contains_lower = filter.name_contains.to_lowercase();
+            ActiveRule {
+                id: rule.id,
+                source: rule.source.clone(),
+                definition_order,
+                include_descendants: rule.include_descendants,
+                filter,
+                name_contains_lower,
+            }
         })
         .collect()
 }
@@ -293,23 +300,17 @@ fn now_unix_secs() -> i64 {
 fn passes_cheap_filter_values(
     kind: SmartFolderEntryKind,
     path: &Path,
+    name_lower: &str,
     mtime: i64,
     file_size: i64,
     filter: &crate::settings::SmartFolderFilter,
+    name_contains_lower: &str,
     now: i64,
 ) -> bool {
     if !filter.kinds.is_empty() && !filter.kinds.contains(&kind.setting_kind()) {
         return false;
     }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if !filter.name_contains.is_empty()
-        && !name
-            .to_lowercase()
-            .contains(&filter.name_contains.to_lowercase())
-    {
+    if !filter.name_contains.is_empty() && !name_lower.contains(name_contains_lower) {
         return false;
     }
     if !filter.extensions.is_empty() {
@@ -572,11 +573,25 @@ fn scan_one_directory(
             mtime,
             file_size,
         } = candidate;
+        let name_lower = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         let mut matching_rules = applicable_rules
             .iter()
             .copied()
             .filter(|rule| {
-                passes_cheap_filter_values(kind, &path, mtime, file_size, &rule.filter, now)
+                passes_cheap_filter_values(
+                    kind,
+                    &path,
+                    &name_lower,
+                    mtime,
+                    file_size,
+                    &rule.filter,
+                    &rule.name_contains_lower,
+                    now,
+                )
             })
             .collect::<Vec<_>>();
         if matching_rules.is_empty() {
@@ -972,7 +987,52 @@ fn load_edit_key_sets(
 struct SmartEntrySortKey {
     display_row: usize,
     name: crate::filename_sort::SortNameKey,
-    relative_parent: crate::filename_sort::SortNameKey,
+    relative_parent: Arc<crate::filename_sort::SortNameKey>,
+}
+
+fn build_smart_entry_sort_keys(
+    entries: &[SmartFolderEntry],
+    included: &[usize],
+    sort: crate::settings::SortOrder,
+    display_order: &crate::settings::GridDisplayOrder,
+) -> Vec<SmartEntrySortKey> {
+    let mut relative_parent_keys =
+        HashMap::<PathBuf, Arc<crate::filename_sort::SortNameKey>>::new();
+    included
+        .iter()
+        .map(|&entry_index| {
+            let entry = &entries[entry_index];
+            let name = entry
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let relative_parent = relative_parent_keys
+                .entry(entry.relative_parent.clone())
+                .or_insert_with(|| {
+                    Arc::new(crate::filename_sort::SortNameKey::file_name(
+                        &entry.relative_parent.to_string_lossy(),
+                    ))
+                })
+                .clone();
+            SmartEntrySortKey {
+                display_row: display_order.row_for(match entry.kind {
+                    SmartFolderEntryKind::Folder => crate::settings::GridItemDisplayKind::Folder,
+                    SmartFolderEntryKind::Zip
+                    | SmartFolderEntryKind::Pdf
+                    | SmartFolderEntryKind::Archive => {
+                        crate::settings::GridItemDisplayKind::Archive
+                    }
+                    SmartFolderEntryKind::Image => crate::settings::GridItemDisplayKind::Image,
+                    SmartFolderEntryKind::Video | SmartFolderEntryKind::Audio => {
+                        crate::settings::GridItemDisplayKind::VideoAudio
+                    }
+                }),
+                name: sort.name_key(name),
+                relative_parent,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -1298,35 +1358,7 @@ fn prepare_smart_folder(
     report(SmartFolderPhase::Sorting, 0);
     let grouping = snapshot.definition.grouping;
     let display_order = display_order.normalized();
-    let sort_keys: Vec<_> = snapshot
-        .entries
-        .iter()
-        .map(|entry| {
-            let name = entry
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            SmartEntrySortKey {
-                display_row: display_order.row_for(match entry.kind {
-                    SmartFolderEntryKind::Folder => crate::settings::GridItemDisplayKind::Folder,
-                    SmartFolderEntryKind::Zip
-                    | SmartFolderEntryKind::Pdf
-                    | SmartFolderEntryKind::Archive => {
-                        crate::settings::GridItemDisplayKind::Archive
-                    }
-                    SmartFolderEntryKind::Image => crate::settings::GridItemDisplayKind::Image,
-                    SmartFolderEntryKind::Video | SmartFolderEntryKind::Audio => {
-                        crate::settings::GridItemDisplayKind::VideoAudio
-                    }
-                }),
-                name: sort.name_key(name),
-                relative_parent: crate::filename_sort::SortNameKey::file_name(
-                    &entry.relative_parent.to_string_lossy(),
-                ),
-            }
-        })
-        .collect();
+    let sort_keys = build_smart_entry_sort_keys(&snapshot.entries, &included, sort, &display_order);
     let sorted_positions = super::recursive_snapshot_scan::cancelable_sorted_indices(
         included.len(),
         cancel,
@@ -1335,8 +1367,8 @@ fn prepare_smart_folder(
             let b_index = included[b_position];
             let a = &snapshot.entries[a_index];
             let b = &snapshot.entries[b_index];
-            let ak = &sort_keys[a_index];
-            let bk = &sort_keys[b_index];
+            let ak = &sort_keys[a_position];
+            let bk = &sort_keys[b_position];
             let within = || {
                 sort.compare_name_keys(&ak.name, a.mtime, &bk.name, b.mtime)
                     .then_with(|| a.path.cmp(&b.path))
@@ -2734,9 +2766,11 @@ mod tests {
         assert!(passes_cheap_filter_values(
             SmartFolderEntryKind::Zip,
             &path,
+            "sample.cbz",
             now,
             2 * 1024 * 1024,
             &filter,
+            "sample",
             now,
         ));
         filter.extensions.clear();
@@ -2744,9 +2778,11 @@ mod tests {
         assert!(!passes_cheap_filter_values(
             SmartFolderEntryKind::Zip,
             &path,
+            "sample.cbz",
             now,
             2 * 1024 * 1024,
             &filter,
+            "sample",
             now,
         ));
     }
@@ -2760,19 +2796,48 @@ mod tests {
         assert!(!passes_cheap_filter_values(
             SmartFolderEntryKind::Folder,
             Path::new(r"C:\Books\unknown"),
+            "unknown",
             now_unix_secs(),
             0,
             &filter,
+            "",
             now_unix_secs(),
         ));
         filter.size_preset = None;
         assert!(passes_cheap_filter_values(
             SmartFolderEntryKind::Folder,
             Path::new(r"C:\Books\unknown"),
+            "unknown",
             now_unix_secs(),
             0,
             &filter,
+            "",
             now_unix_secs(),
+        ));
+    }
+
+    #[test]
+    fn prepare_sort_keys_cover_only_included_entries_and_share_parent_keys() {
+        let entries = vec![
+            smart_entry(r"C:\Books\series\a.jpg", 0, "series"),
+            smart_entry(r"C:\Books\excluded.jpg", 0, ""),
+            smart_entry(r"C:\Books\series\b.jpg", 0, "series"),
+        ];
+        let keys = build_smart_entry_sort_keys(
+            &entries,
+            &[0, 2],
+            crate::settings::SortOrder::FileName,
+            &crate::settings::GridDisplayOrder::default(),
+        );
+
+        assert_eq!(
+            keys.len(),
+            2,
+            "excluded snapshot rows must not own sort keys"
+        );
+        assert!(Arc::ptr_eq(
+            &keys[0].relative_parent,
+            &keys[1].relative_parent
         ));
     }
 
