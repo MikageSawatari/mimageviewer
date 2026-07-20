@@ -34250,6 +34250,23 @@ impl App {
         }
     }
 
+    /// 表示列など、遅延メタデータの読み込み要件が変わったときに旧ジョブを無効化する。
+    ///
+    /// `NotRequested` へ戻すだけでは、変更前の列構成を snapshot した worker の
+    /// `Finished` が同じ revision で受理され、新しい列が未取得のまま `Ready` に
+    /// なり得る。cancel と受信側の破棄、revision 更新を同じ所有境界で行う。
+    pub(crate) fn invalidate_details_meta_requirements(&mut self) {
+        if let Some(pending) = self.details_meta_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+        self.details_image_dims_state = if self.details_lazy_columns_visible() {
+            LazyColumnState::NotRequested
+        } else {
+            LazyColumnState::Disabled
+        };
+    }
+
     pub(crate) fn resume_details_meta_loading(&mut self) {
         if self.details_lazy_columns_visible() {
             self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -34929,15 +34946,7 @@ impl App {
     fn invalidate_details_pdf_page_count(&mut self, pdf_path: &Path) {
         self.details_lazy_meta
             .remove(&crate::adjustment_db::normalize_path(pdf_path));
-        if let Some(pending) = self.details_meta_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
-        self.details_image_dims_state = if self.details_lazy_columns_visible() {
-            LazyColumnState::NotRequested
-        } else {
-            LazyColumnState::Disabled
-        };
+        self.invalidate_details_meta_requirements();
     }
 
     fn prune_details_lazy_meta_cache(&mut self) {

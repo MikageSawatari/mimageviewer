@@ -738,7 +738,9 @@ enum DetailsMetaEvent {
 worker のルール:
 
 - `items_generation` が一致しない結果は破棄。
-- cancel はフォルダ切替、検索結果差し替え、列設定変更、ユーザー停止で立てる。
+- cancel はフォルダ切替、検索結果差し替え、列設定変更、ユーザー停止で立てる。列設定変更では
+  worker が snapshot した対象フィールドも変わるため、受信側 pending を破棄して revision も進め、
+  変更前 worker の `Finished` が新しい列構成を `Ready` に確定できないようにする。
 - `GlobalIoSemaphore` を使う。可視行優先、画面外は低優先。
 - 高速スクロールで可視範囲が Normal 優先集合から離れても、既存 prefetch と同じ
   100 ms のスクロール静止判定を通過するまで worker を cancel / respawn しない。

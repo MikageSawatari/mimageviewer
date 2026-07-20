@@ -33660,6 +33660,70 @@ fn leaving_page_count_sort_recovers_loading_state_without_pending_worker() {
 }
 
 #[test]
+fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requirements() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_show_created = false;
+    app.visible_indices = vec![0];
+    app.details_order = app.visible_indices.clone();
+    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
+    let old_revision = app.details_lazy_visible_revision;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(DetailsMetaEvent::Finished {
+        generation: app.items_generation,
+        failed: 0,
+    })
+    .expect("queue old Finished event");
+    app.details_meta_pending = Some(DetailsMetaPending {
+        visible_revision: old_revision,
+        selection_target_key: None,
+        normal_target_keys: Default::default(),
+        cancel: std::sync::Arc::clone(&cancel),
+        rx,
+    });
+
+    // 列設定ダイアログで、旧ジョブには含まれていない作成日時列を追加する。
+    app.settings.details_show_created = true;
+    app.invalidate_details_meta_requirements();
+
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(
+        app.details_lazy_visible_revision,
+        old_revision.wrapping_add(1)
+    );
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+
+    let target = app
+        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]), true)
+        .expect("new lazy-column target");
+    assert!(target.load_page_count);
+    assert!(
+        target.load_created_at,
+        "restarted worker requirements must include the newly enabled column"
+    );
+
+    // 旧 Finished は receiver ごと破棄済みで、次の poll は新revisionのworkerだけを起動する。
+    let ctx = egui::Context::default();
+    app.poll_details_meta_load(&ctx);
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("new requirements worker must be queued");
+    assert_eq!(pending.visible_revision, app.details_lazy_visible_revision);
+    assert!(!matches!(
+        app.details_image_dims_state,
+        LazyColumnState::Ready { .. }
+    ));
+}
+
+#[test]
 fn common_persistence_boundary_commits_smart_folder_editor_draft_without_worker() {
     let mut app = phase_c_support::setup_app();
     let mut saved = crate::settings::SmartFolderDefinition::new("旧名");

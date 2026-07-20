@@ -11010,17 +11010,7 @@ impl App {
                 self.settings.details_show_video_codec,
             );
             if old_lazy != new_lazy {
-                let has_lazy = self.settings.details_show_page_count
-                    || self.settings.details_show_created
-                    || self.settings.details_show_image_dimensions
-                    || self.settings.details_show_video_duration
-                    || self.settings.details_show_video_dimensions
-                    || self.settings.details_show_video_codec;
-                if has_lazy {
-                    self.details_image_dims_state = LazyColumnState::NotRequested;
-                } else {
-                    self.cancel_details_meta_loading();
-                }
+                self.invalidate_details_meta_requirements();
             }
             self.reset_details_sort_if_hidden();
             self.rebuild_details_order();
