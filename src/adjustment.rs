@@ -32,6 +32,7 @@ pub enum AutoMode {
 pub enum PostFilter {
     /// フィルタ無し (補間あり、LINEAR サンプラー) = デフォルト
     #[default]
+    #[serde(alias = "downscale2x", alias = "downscale4x")]
     None,
     /// 補間なし (NEAREST サンプラー、ピクセル転送のみ)
     Nearest,
@@ -123,10 +124,6 @@ pub enum PostFilter {
     // ── 実用 ────────────────────────────────────────────────────────
     /// シャープ化 (アンシャープマスク)
     Sharpen,
-    /// 1/2 縮小 (モアレ低減用)
-    Downscale2x,
-    /// 1/4 縮小 (モアレ低減用)
-    Downscale4x,
 }
 
 impl PostFilter {
@@ -180,8 +177,6 @@ impl PostFilter {
         Self::PseudoColorSkin,
         // 実用
         Self::Sharpen,
-        Self::Downscale2x,
-        Self::Downscale4x,
     ];
 
     /// UI 表示用の日本語ラベル。
@@ -227,8 +222,6 @@ impl PostFilter {
             Self::PseudoColor4 => "疑似カラー（4色刷り）",
             Self::PseudoColorSkin => "疑似カラー（肌色）",
             Self::Sharpen => "シャープ化",
-            Self::Downscale2x => "1/2 縮小（モアレ低減）",
-            Self::Downscale4x => "1/4 縮小（モアレ低減）",
         }
     }
 
@@ -1038,6 +1031,15 @@ mod tests {
         );
         let loaded: AdjustParams = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.smart_sharpen, 0);
+    }
+
+    #[test]
+    fn retired_downscale_filters_deserialize_as_none() {
+        for retired in ["downscale2x", "downscale4x"] {
+            let json = format!("\"{retired}\"");
+            let loaded: PostFilter = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded, PostFilter::None);
+        }
     }
 
     #[test]

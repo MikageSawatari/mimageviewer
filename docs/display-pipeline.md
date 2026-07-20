@@ -638,6 +638,20 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 自分で保証するか、`clamp_dynamic_for_gpu` を掛けてから格納する。UI スレッド側の
 同期 Triangle リサイズを増やさないこと。
 
+**静止画の GPU mipmap**:
+
+- `DISPLAY_IMAGE_TEXTURE_OPTIONS` を指定した managed texture は、ローカル差し替えした
+  `vendor/egui-wgpu` が level 0 upload 後に完全な mip chain を GPU render pass で生成する。
+- 対象は raw static、PDF/ZIP page、編集・補正・AI・注釈・比較用の表示 texture。1 つの
+  `TextureHandle` 内に全 level を保持するので、表示 texture の優先順位、論理サイズ、zoom、
+  見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
+- animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
+  `PostFilter::Nearest` も level 0 + nearest sampler のまま。
+- mip texture の partial update では全下位 level を再生成する。完全な chain の VRAM は level 0
+  の約 1/3 増えるため、フルスクリーンの既存 prefetch / eviction 境界を越えて保持しない。
+
+詳細は [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) を参照。
+
 **原寸表示とダウンスケール警告 (`source_dims`)**:
 
 `FsCacheEntry::Static.source_dims: Option<[usize; 2]>` は **clamp 前** の原寸。

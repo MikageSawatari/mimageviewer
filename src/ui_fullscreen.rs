@@ -204,8 +204,6 @@ const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
         PostFilter::PseudoColorSkin,
     ),
     (KeyAction::FsPostFilterSharpen, PostFilter::Sharpen),
-    (KeyAction::FsPostFilterDownscale2x, PostFilter::Downscale2x),
-    (KeyAction::FsPostFilterDownscale4x, PostFilter::Downscale4x),
 ];
 
 const BOOK_GRID_VIDEO_HINT: &str = "動画は再生中に追加操作を行うと、そのフレームを本へ追加できます";
@@ -15665,7 +15663,7 @@ impl App {
                     slot.source_idx, slot.source_size[0], slot.source_size[1]
                 ),
                 slot.pixels.as_ref().clone(),
-                egui::TextureOptions::LINEAR,
+                crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
             );
             slot.texture = Some(tex);
         }
@@ -15796,7 +15794,7 @@ impl App {
                     label, key, target_size[0], target_size[1]
                 ),
                 pixels.as_ref().clone(),
-                egui::TextureOptions::LINEAR,
+                crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
             );
             *slot = Some(tex);
         }
@@ -19191,7 +19189,7 @@ impl App {
                     p.preview_scale
                 ),
                 upload,
-                egui::TextureOptions::LINEAR,
+                crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
             );
             let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {

@@ -151,6 +151,11 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 
 実装は [src/app.rs `poll_prefetch`](../src/app.rs) 参照。
 
+静止画の `DISPLAY_IMAGE_TEXTURE_OPTIONS` は level 0 upload の直後に vendored `egui-wgpu` の
+render pass で mip chain も生成する。CPU resize や I/O は増えないが、GPU upload slot 1 件あたりの
+仕事量と VRAM は増える（完全な chain は level 0 の約 1/3 追加）。したがって mipmap 対象を同じ
+`fs_upload_backlog` のペーシング下に置き、サムネイルや animated frame へは広げない。
+
 ### 3.2 サムネイルアップロードは per-frame スロットリング不要
 
 `thumb.ready` の `upload_ms` は 1 枚 0.3-1ms 程度 (762×572 RGBA)。1 フレームに 50 枚来ても

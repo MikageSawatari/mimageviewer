@@ -182,45 +182,6 @@
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
 
-### 3.4 トーン漫画の縮小モアレ対策 (手動 post_filter 縮小 → 将来 LOD)
-
-- 正本: **`docs/downscale-moire-lod-plan.md`** (調査結果 + 対策方針)。以下は要約。
-- 背景: トーン (スクリーントーン) を貼った漫画を縮小表示するとモアレが出る
-  (ユーザー報告 2026-07-07)。トーンの高周波が縮小で折り返す aliasing。
-- 現状 (調査済み):
-  - 縮小は `src/fast_resize.rs` (`fast_image_resize`, Bilinear / Lanczos3 の 2 択) に集約。
-  - **主因はフルスクリーン**: `fs_cache` は原寸 (最大 8192px) を保持し、`draw_fs_image` が
-    原寸テクスチャを GPU の **naive bilinear (mipmap なし)** で大縮小するため、
-    縮小率が 0.5 を切るとトーンが折り返す。サムネは Lanczos3 の負ローブで副次的に出る。
-  - `TextureOptions.mipmap_mode` は **egui-wgpu では効かない** (epaint が「egui_glow のみ」と
-    明記、renderer は `mip_level_count:1` 固定・`create_sampler` が mipmap_mode 無視)。
-    実ソースで確認済み → native mipmap は不可。
-- 方針 (段階投資):
-  - ⓪ **(実装済み v2.3.0、`4be5944a`) 手動 post_filter 縮小フィルタ**。ユーザーが選ぶ post_filter
-    として 1/2 / 1/4 縮小 (`PostFilter::Downscale2x` / `Downscale4x`) を追加し、フィット表示の
-    モアレを自衛できる。既存 T (`FsPostFilterNext` の `PostFilter::ALL` 巡回) に乗る。制約:
-    フルスクリーン専用 (サムネ非適用) / 他 post_filter と排他 / 静的倍率。以下 ①〜③ が残作業。
-  - ① **CPU 2 段 (原寸 + 表示解像度版)** から。フィット表示は倍率固定なので worker で
-    Lanczos 縮小した 1 枚を貼り、ズーム拡大時だけ原寸へ持ち替える。原寸→8192 縮小は
-    既に `clamp_dynamic_for_gpu` が worker でやっているので **UI ブロックなし**。
-    フィット / 連結 / 見開きのモアレの大半がこれで消える。
-  - ② 足りなければ **CPU N 段の手動 LOD (手動 mipmap)** に拡張。
-  - ③ ズーム往復の滑らかさまで要れば **GPU pyramid + native texture 登録** (コスト大)。
-  - 縮小は post_filter の**前**・表示解像度基準で掛けるとモアレに強い (疑似カラー等の
-    規則パターン系は原寸適用だと自らモアレる)。編集は原寸のまま、LOD は表示専用派生。
-  - `draw_fs_image` は `handle.size_vec2()` を論理サイズに使う (10+ 経路) ので、
-    「レイアウトは元サイズ・描画 handle だけ差し替え・UV 0..1」の分離が必須。
-    ルーペは原寸固定、pixel grid は論理サイズ必須で LOD 除外。
-  - 連結読み / 見開きはページ単位の個別テクスチャなので案がそのまま乗る (縮小率が高いぶん恩恵大)。
-- 規模 / リスク: CPU 2 段=中 / CPU N 段=中〜大 / GPU pyramid=大。押し上げ要因は
-  `size_vec2()` 経路の分離・`final_composite_cache` 回帰テスト群・編集全経路の再生成配線・
-  **detached-rework 凍結ルール** (表示テクスチャ経路を共有するため、着手前に
-  `docs/detached-rework-plan.md` §2 で境界を確定する)。
-- 優先度: ⓪ 手動 post_filter 縮小フィルタ (回避策) = **実装済み (v2.3.0)**。①〜③ の LOD による
-  根本的解決 = P3、将来再検討 (画質要望の蓄積時 or detached-rework 完了後)。
-
----
-
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計

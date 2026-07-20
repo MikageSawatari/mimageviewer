@@ -3083,7 +3083,7 @@ impl App {
                 format!("fs_inpainted_{idx}")
             },
             egui::ImageData::Color(Arc::clone(&pixels)),
-            egui::TextureOptions::LINEAR,
+            crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
         );
         if pending.is_preview {
             // **Preview 経路**: fs_cache を一切触らず、preview_cache だけを更新する

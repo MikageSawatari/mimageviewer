@@ -1815,22 +1815,6 @@ mod tests {
     }
 
     #[test]
-    fn post_filter_downscale_only_uses_byte_copy_without_resizing() {
-        let mut params = crate::adjustment::AdjustParams::default();
-        params.post_filter = crate::adjustment::PostFilter::Downscale2x;
-
-        assert!(!page_requires_full_composite(
-            &params,
-            crate::rotation_db::Rotation::None,
-            false,
-            false,
-            false,
-            false,
-            false,
-        ));
-    }
-
-    #[test]
     fn full_composite_ignores_display_only_filter_and_sharpen() {
         let base = egui::ColorImage::new(
             [4, 2],
@@ -1848,7 +1832,7 @@ mod tests {
         let mut edits = empty_baked_edits();
         edits.params.brightness = 10.0;
         edits.params.smart_sharpen = 100;
-        edits.params.post_filter = crate::adjustment::PostFilter::Downscale2x;
+        edits.params.post_filter = crate::adjustment::PostFilter::Sepia;
         let expected = crate::adjustment::apply_adjustments_fast(&base, &edits.params);
 
         let result = compose_book_page(base, &edits).unwrap();

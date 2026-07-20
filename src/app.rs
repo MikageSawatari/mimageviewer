@@ -13,6 +13,12 @@ use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED
 pub(crate) const BOOK_READING_PAGE_ORDER: crate::settings::SortOrder =
     crate::settings::SortOrder::FileName;
 
+/// Full-resolution still images use a complete mip chain for stable minification.
+/// Thumbnails, animated frames, masks, and pixel-art filters intentionally keep
+/// their existing texture options.
+pub(crate) const DISPLAY_IMAGE_TEXTURE_OPTIONS: egui::TextureOptions =
+    egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
+
 fn settings_boot_problem_source(
     source: crate::settings_db::BootSource,
 ) -> Option<crate::settings_db::BootSource> {
@@ -3991,7 +3997,7 @@ fn upload_edit_result_texture(
             key.conceal_gen
         ),
         upload.into_owned(),
-        egui::TextureOptions::LINEAR,
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
     )
 }
 
@@ -41790,7 +41796,7 @@ impl App {
             let handle = ctx.load_texture(
                 format!("ai_fs_{idx}_{bg}"),
                 upload.into_owned(),
-                egui::TextureOptions::LINEAR,
+                DISPLAY_IMAGE_TEXTURE_OPTIONS,
             );
             let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
@@ -43772,7 +43778,7 @@ impl App {
                             key.idx, key.input_gen, key.erase_mask_gen, key.local_gen
                         ),
                         upload.into_owned(),
-                        egui::TextureOptions::LINEAR,
+                        DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     );
                     self.local_adjust_cache
                         .insert(key, LocalAdjustCacheEntry { pixels, texture });
@@ -43826,7 +43832,7 @@ impl App {
                         pending.key.layer_idx
                     ),
                     upload.into_owned(),
-                    egui::TextureOptions::LINEAR,
+                    DISPLAY_IMAGE_TEXTURE_OPTIONS,
                 );
                 self.local_adjust_layer_bypass_cache
                     .insert(pending.key, LocalAdjustCacheEntry { pixels, texture });
@@ -43880,7 +43886,7 @@ impl App {
                         pending.key.layer_count
                     ),
                     upload.into_owned(),
-                    egui::TextureOptions::LINEAR,
+                    DISPLAY_IMAGE_TEXTURE_OPTIONS,
                 );
                 self.local_adjust_prefix_preview_cache
                     .insert(pending.key, LocalAdjustCacheEntry { pixels, texture });
@@ -44162,7 +44168,7 @@ impl App {
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
             (*source_pixels).clone(),
-            egui::TextureOptions::LINEAR,
+            DISPLAY_IMAGE_TEXTURE_OPTIONS,
         );
         self.erase_base_tex_cache.insert(idx, tex.clone());
         Some(tex)
@@ -44394,7 +44400,7 @@ impl App {
         let tex = ctx.load_texture(
             format!("conceal_{idx}_g{current_gen}"),
             composed.clone(),
-            egui::TextureOptions::LINEAR,
+            DISPLAY_IMAGE_TEXTURE_OPTIONS,
         );
         let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
         if scaled_edit_mask || compose_ms >= 80.0 || upload_ms >= 80.0 {
@@ -45804,7 +45810,7 @@ impl App {
         let tex_opts = if !self.post_filter_bypassed && params.post_filter.needs_nearest_sampler() {
             egui::TextureOptions::NEAREST
         } else {
-            egui::TextureOptions::LINEAR
+            DISPLAY_IMAGE_TEXTURE_OPTIONS
         };
         let [fc_w, fc_h] = post_filtered.size;
         let t_up0 = perf_on.then(std::time::Instant::now);
@@ -46013,7 +46019,7 @@ impl App {
         let tex_opts = if !self.post_filter_bypassed && params.post_filter.needs_nearest_sampler() {
             egui::TextureOptions::NEAREST
         } else {
-            egui::TextureOptions::LINEAR
+            DISPLAY_IMAGE_TEXTURE_OPTIONS
         };
         let [fc_w, fc_h] = post_filtered.size;
         // 二重 GPU アップロード回避: 色補正/AI/シャープ/ポストフィルタがすべて無変換のとき、
@@ -46604,7 +46610,7 @@ impl App {
                     Arc::as_ptr(&base) as usize
                 ),
                 upload,
-                egui::TextureOptions::LINEAR,
+                DISPLAY_IMAGE_TEXTURE_OPTIONS,
             );
             self.comic_cache.insert(
                 idx,
@@ -48414,7 +48420,7 @@ impl App {
         let tex_opts = if apply_pf && params.post_filter.needs_nearest_sampler() {
             egui::TextureOptions::NEAREST
         } else {
-            egui::TextureOptions::LINEAR
+            DISPLAY_IMAGE_TEXTURE_OPTIONS
         };
         let tex = ctx.load_texture(format!("adj_{idx}"), upload.into_owned(), tex_opts);
         // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
@@ -50334,7 +50340,7 @@ impl App {
         let handle = ctx.load_texture(
             format!("fs_{key}"),
             upload.into_owned(),
-            egui::TextureOptions::LINEAR,
+            DISPLAY_IMAGE_TEXTURE_OPTIONS,
         );
         let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
         // `load_seq` を使うのは、decode 中に別操作が入っても
@@ -50558,7 +50564,7 @@ impl App {
                     let handle = ctx.load_texture(
                         format!("fs_{key}"),
                         upload.into_owned(),
-                        egui::TextureOptions::LINEAR,
+                        DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     );
                     let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
                     let (full_w, full_h) = high_res.dims();

@@ -7923,16 +7923,6 @@ fn draw_sliders(
                 PostFilter::Sharpen,
                 PostFilter::Sharpen.display_label(),
             );
-            ui.selectable_value(
-                &mut params.post_filter,
-                PostFilter::Downscale2x,
-                PostFilter::Downscale2x.display_label(),
-            );
-            ui.selectable_value(
-                &mut params.post_filter,
-                PostFilter::Downscale4x,
-                PostFilter::Downscale4x.display_label(),
-            );
         });
     if params.post_filter != before_pf {
         changed = true;
@@ -10673,7 +10663,7 @@ impl App {
             let texture = ctx.load_texture(
                 format!("local_adjust_edge_preview_{fs_idx}"),
                 image,
-                egui::TextureOptions::LINEAR,
+                crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
             );
             self.local_adjust_edge_preview_cache =
                 Some(LocalAdjustEdgePreviewCache { key, texture });

@@ -17,6 +17,10 @@ pub mod app {
     /// として参照される。本体 (main.rs) の `app` module 内の同名定数と値が一致するよう、
     /// 変更時はここも合わせて更新すること。
     pub const MAX_TEXTURE_DIM: usize = 8192;
+    /// 表示用静止画の sampler 設定。bin 側の `app::DISPLAY_IMAGE_TEXTURE_OPTIONS`
+    /// と一致させること。
+    pub const DISPLAY_IMAGE_TEXTURE_OPTIONS: egui::TextureOptions =
+        egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
     pub const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 3.0;
     pub const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
 }

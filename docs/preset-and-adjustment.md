@@ -244,8 +244,6 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 | 疑似カラー | `PseudoColor4` | モノクロ原画の輝度 → クアッドトーン着色 (影=青 / 明部=橙)。GiCoCu `4color4.cur` 由来 |
 | 疑似カラー | `PseudoColorSkin` | モノクロ原画の輝度 → 肌色寄り暖色着色。再現実装 `c4.cur` 由来 |
 | 実用 | `Sharpen` | 5-tap 分離可能ブラーのアンシャープマスク (amount 0.6) |
-| 実用 | `Downscale2x` | Lanczos3 で 1/2 縮小してからアップロード。フルスクリーン縮小表示時のトーン漫画モアレ低減用 |
-| 実用 | `Downscale4x` | Lanczos3 で 1/4 縮小してからアップロード。大判スキャンのフルスクリーン縮小表示向け |
 
 **複合プリセットの方針**: **非液晶機種 (CRT TV / モニタ接続が標準)** とブラウン管フィルタを
 セットにして、実機の視聴体験に近づける。GameBoy / ゲームギアは LCD なので CRT 合成は除外。
@@ -347,14 +345,13 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 ### サンプラー選択
 
 - `PostFilter::Nearest` のみ `TextureOptions::NEAREST` でアップロード
-- その他 (CRT/減色/複合/縮小系) は `LINEAR` でアップロード。縮小時のモアレを防ぎ、CRT の phosphor
+- その他 (CRT/減色/複合を含む静止画) は linear + linear mipmap でアップロード。縮小時のモアレを防ぎ、CRT の phosphor
   感を出すため。NEAREST だと CRT 結果を画面スケールに合わせる際に周期的黒線が出る。
 
-**手動縮小フィルタ**: `Downscale2x` / `Downscale4x` は、フルスクリーンが原寸テクスチャを
-GPU bilinear で大縮小することによるトーン漫画のモアレを避けるための手動 post_filter。
-`fast_resize::Quality::Lanczos3` で `ColorImage` を 1/2 または 1/4 に縮小し、縮小後の長辺が
-64px 未満になる極小画像では元画像を返す。post_filter 後のサイズは既存の final composite
-レイアウトが吸収するため、fit 表示の画面上サイズは変わらず GPU の実効縮小率だけ下がる。
+**mipmap と旧設定の互換**: v2.7.0 から GPU が静止画の完全な mip chain を自動生成するため、
+手動回避策だった `Downscale2x` / `Downscale4x` は撤去した。保存済み設定にこれらが含まれる場合は
+`PostFilter::None` として読み込む。サムネイル、animated image、動画、mask、`Nearest` は mipmap
+対象外。実装詳細は [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) を参照。
 
 **並列化**: `rayon::par_chunks_mut` で行単位に並列処理。4K 画像でも 4080ms 程度。
 

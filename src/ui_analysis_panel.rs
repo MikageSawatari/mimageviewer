@@ -472,7 +472,11 @@ fn generate_filter_texture(
         pixels: out,
         source_size: egui::Vec2::new(pixels.size[0] as f32, pixels.size[1] as f32),
     };
-    ctx.load_texture("analysis_filter_tex", ci, egui::TextureOptions::LINEAR)
+    ctx.load_texture(
+        "analysis_filter_tex",
+        ci,
+        crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+    )
 }
 
 fn generate_grayscale_texture(
@@ -489,7 +493,11 @@ fn generate_grayscale_texture(
         pixels: out,
         source_size: egui::Vec2::new(pixels.size[0] as f32, pixels.size[1] as f32),
     };
-    ctx.load_texture("analysis_gray_tex", ci, egui::TextureOptions::LINEAR)
+    ctx.load_texture(
+        "analysis_gray_tex",
+        ci,
+        crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+    )
 }
 
 fn draw_mosaic_grid(painter: &egui::Painter, image_rect: egui::Rect, zc: &ZoomCtx) {

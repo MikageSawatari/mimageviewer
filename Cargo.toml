@@ -12,7 +12,10 @@ members = [
     "tools/comic_lab",
     "tools/music_lab",
 ]
-exclude = ["crates/unrar-patched"]
+exclude = ["crates/unrar-patched", "vendor/egui-wgpu"]
+
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + launcher = `mimageviewer.exe`) の
 # バージョンは workspace 経由で 1 箇所で管理する。launcher は `%APPDATA%/mimageviewer/
