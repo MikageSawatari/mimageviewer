@@ -90,7 +90,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | モジュール | 役割 |
 | --- | --- |
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
-| `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う |
+| `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う。終了・トレイ退避の共通保存境界では有効 draft を Settings へ確定するが worker は開始せず、トレイ復帰時だけ遅延した副作用を1回適用する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定 |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は base pixels / mask / preset を snapshot し、隠蔽合成・画像エンコード・メタデータ転記は worker が担当 |

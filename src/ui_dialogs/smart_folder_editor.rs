@@ -32,6 +32,12 @@ pub(crate) struct SmartFolderRuleDraft {
     pub(crate) ignored_conditions: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SmartFolderEditorDeferredCommit {
+    definition: SmartFolderDefinition,
+    rules_changed: bool,
+}
+
 fn filter_summary(filter: &SmartFolderFilter) -> Vec<String> {
     let mut parts = Vec::new();
     if !filter.name_contains.is_empty() {
@@ -180,7 +186,86 @@ fn smart_folder_editor_commit_requested(
         || structural_action
 }
 
+fn commit_smart_folder_editor_draft(
+    definitions: &mut [SmartFolderDefinition],
+    draft: &mut SmartFolderDefinition,
+) -> Result<bool, &'static str> {
+    normalize_smart_folder_definition_text(draft);
+    if smart_folder_name_is_duplicate(definitions, draft.id, &draft.name) {
+        return Err("同じ名前のスマートフォルダが既にあります");
+    }
+    let Some(index) = definitions
+        .iter()
+        .position(|definition| definition.id == draft.id)
+    else {
+        return Err("編集中のスマートフォルダが見つかりません");
+    };
+    if definitions[index] == *draft {
+        return Ok(false);
+    }
+    definitions[index] = draft.clone();
+    Ok(true)
+}
+
+fn smart_folder_editor_change_is_open_target(
+    changed_id: uuid::Uuid,
+    open_definition: Option<uuid::Uuid>,
+) -> bool {
+    open_definition == Some(changed_id)
+}
+
 impl App {
+    /// 終了・トレイ退避の設定保存前に、管理画面のローカル draft を Settings へ確定する。
+    ///
+    /// この境界では worker / snapshot を変更しない。終了時に再走査を始めず、設定の
+    /// 正規化・重複検証・Settings 反映だけを共通永続化処理へ提供する。
+    pub(crate) fn commit_smart_folder_editor_draft_for_persistence(&mut self) -> bool {
+        let Some(mut draft) = self.smart_folder_editor_draft.clone() else {
+            return false;
+        };
+        let previous = self
+            .settings
+            .smart_folders
+            .iter()
+            .find(|definition| definition.id == draft.id)
+            .cloned();
+        match commit_smart_folder_editor_draft(&mut self.settings.smart_folders, &mut draft) {
+            Ok(changed) => {
+                if changed && let Some(previous) = previous {
+                    // 終了時は worker を始めない。トレイ退避から復帰する場合だけ、
+                    // Settings 保存後の最初の可視フレームで必要な副作用を1回適用する。
+                    self.smart_folder_editor_deferred_commit =
+                        Some(SmartFolderEditorDeferredCommit {
+                            rules_changed: previous.rules != draft.rules,
+                            definition: draft.clone(),
+                        });
+                }
+                self.smart_folder_editor_draft = Some(draft);
+                self.smart_folder_editor_name_error = None;
+                changed
+            }
+            Err(message) => {
+                self.smart_folder_editor_draft = Some(draft);
+                self.smart_folder_editor_name_error = Some(message.to_string());
+                crate::logger::log(format!(
+                    "smart-folder editor draft was not persisted: {message}"
+                ));
+                false
+            }
+        }
+    }
+
+    pub(crate) fn apply_smart_folder_editor_deferred_commit_after_restore(&mut self) {
+        let Some(commit) = self.smart_folder_editor_deferred_commit.take() else {
+            return;
+        };
+        if commit.rules_changed {
+            self.invalidate_smart_folder_definition(commit.definition.id);
+        } else {
+            self.update_smart_folder_presentation(commit.definition);
+        }
+    }
+
     pub(crate) fn begin_new_smart_folder(&mut self) {
         let mut number = self.settings.smart_folders.len() + 1;
         loop {
@@ -788,30 +873,28 @@ impl App {
             // 入力できず、全選択→Delete→打ち直しも壊れる。フォーカス移動や
             // ダイアログ操作で編集を確定するときだけ正規化する。
             if commit_requested {
-                normalize_smart_folder_definition_text(&mut updated);
-            }
-            let duplicate_name = smart_folder_name_is_duplicate(
-                &self.settings.smart_folders,
-                updated.id,
-                &updated.name,
-            );
-            self.smart_folder_editor_name_error =
-                duplicate_name.then(|| "同じ名前のスマートフォルダが既にあります".to_string());
-            if commit_requested && duplicate_name {
-                commit_blocked = true;
-            } else if commit_requested {
-                if let Some(previous) = self.settings.smart_folders.get(index)
-                    && previous != &updated
-                {
-                    // 走査結果を決めるのは rules だけ。表示名や並び方の変更で実フォルダ
-                    // snapshot を破棄しない。
-                    if previous.rules != updated.rules {
-                        invalidated_definition = Some(updated.id);
-                    } else {
-                        presentation_updated_definition = Some(updated.clone());
+                let previous = self.settings.smart_folders.get(index).cloned();
+                match commit_smart_folder_editor_draft(
+                    &mut self.settings.smart_folders,
+                    &mut updated,
+                ) {
+                    Ok(changed) => {
+                        self.smart_folder_editor_name_error = None;
+                        if changed && let Some(previous) = previous {
+                            // 走査結果を決めるのは rules だけ。表示名や並び方の変更で
+                            // 実フォルダ snapshot を破棄しない。
+                            if previous.rules != updated.rules {
+                                invalidated_definition = Some(updated.id);
+                            } else {
+                                presentation_updated_definition = Some(updated.clone());
+                            }
+                            dirty = true;
+                        }
                     }
-                    self.settings.smart_folders[index] = updated.clone();
-                    dirty = true;
+                    Err(message) => {
+                        self.smart_folder_editor_name_error = Some(message.to_string());
+                        commit_blocked = true;
+                    }
                 }
             }
             self.smart_folder_editor_draft = Some(updated);
@@ -901,16 +984,28 @@ impl App {
         if dirty {
             self.settings.save();
         }
+        let open_definition = (!commit_blocked).then_some(open_definition).flatten();
         if let Some(id) = invalidated_definition {
-            self.invalidate_smart_folder_definition(id);
+            if smart_folder_editor_change_is_open_target(id, open_definition) {
+                // 続く open が最終的な再走査を1回だけ開始する。ここでは古い
+                // snapshot / worker の無効化だけを行う。
+                self.invalidate_smart_folder_definition_without_reopen(id);
+            } else {
+                self.invalidate_smart_folder_definition(id);
+            }
         }
         if let Some(definition) = presentation_updated_definition {
-            self.update_smart_folder_presentation(definition);
+            if smart_folder_editor_change_is_open_target(definition.id, open_definition) {
+                // open が新定義で再走査するため、表示情報だけ同期してprepareは始めない。
+                self.update_smart_folder_presentation_without_reprepare(definition);
+            } else {
+                self.update_smart_folder_presentation(definition);
+            }
         }
         if let Some(id) = deleted_definition {
             self.forget_smart_folder_definition(id);
         }
-        if !commit_blocked && let Some(id) = open_definition {
+        if let Some(id) = open_definition {
             let refresh =
                 self.items_are_smart_folder_view && self.current_smart_folder_id == Some(id);
             self.open_smart_folder(id, refresh);
@@ -1019,6 +1114,53 @@ mod tests {
             &definitions,
             current.id,
             "動画"
+        ));
+    }
+
+    #[test]
+    fn persistence_commit_normalizes_valid_draft_without_starting_side_effects() {
+        let mut saved = SmartFolderDefinition::new("旧名");
+        saved.rules.push(SmartFolderRule::new(
+            PathBuf::from(r"C:\Photos"),
+            false,
+            SmartFolderFilter::default(),
+        ));
+        let mut draft = saved.clone();
+        draft.name = " 新しい名前 ".into();
+        draft.grouping = SubfolderExpansionOrder::FolderGrouped;
+        draft.rules[0].include_descendants = true;
+        draft.rules[0].filter.name_contains = " 旅行 ".into();
+        let mut definitions = vec![saved];
+
+        assert_eq!(
+            commit_smart_folder_editor_draft(&mut definitions, &mut draft),
+            Ok(true)
+        );
+        assert_eq!(definitions[0], draft);
+        assert_eq!(draft.name, "新しい名前");
+        assert_eq!(draft.rules[0].filter.name_contains, "旅行");
+    }
+
+    #[test]
+    fn persistence_commit_rejects_duplicate_name_without_overwriting_saved_definition() {
+        let saved = SmartFolderDefinition::new("写真");
+        let other = SmartFolderDefinition::new("動画");
+        let mut draft = saved.clone();
+        draft.name = " 動画 ".into();
+        let mut definitions = vec![saved.clone(), other];
+
+        assert!(commit_smart_folder_editor_draft(&mut definitions, &mut draft).is_err());
+        assert_eq!(definitions[0], saved);
+    }
+
+    #[test]
+    fn open_target_defers_change_side_effect_to_single_final_worker() {
+        let id = uuid::Uuid::new_v4();
+        assert!(smart_folder_editor_change_is_open_target(id, Some(id)));
+        assert!(!smart_folder_editor_change_is_open_target(id, None));
+        assert!(!smart_folder_editor_change_is_open_target(
+            id,
+            Some(uuid::Uuid::new_v4())
         ));
     }
 }

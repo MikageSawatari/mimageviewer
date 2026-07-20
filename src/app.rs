@@ -6210,6 +6210,10 @@ pub struct App {
     /// snapshot 再走査へ直結させず、フォーカス離脱・選択変更・ダイアログ操作で
     /// まとめて確定する。
     pub(crate) smart_folder_editor_draft: Option<crate::settings::SmartFolderDefinition>,
+    /// トレイ退避前に Settings だけへ確定した変更。復帰後に snapshot / worker の
+    /// 副作用を1回だけ適用し、終了時には新しい worker を開始しない。
+    pub(crate) smart_folder_editor_deferred_commit:
+        Option<crate::ui_dialogs::smart_folder_editor::SmartFolderEditorDeferredCommit>,
     pub(crate) smart_folder_editor_name_error: Option<String>,
     pub(crate) smart_folder_delete_confirm: Option<uuid::Uuid>,
     /// `Some` の間は名前だけを入力する新規作成ダイアログを表示する。
@@ -9431,6 +9435,7 @@ impl App {
             show_smart_folder_editor: false,
             smart_folder_editor_selected: None,
             smart_folder_editor_draft: None,
+            smart_folder_editor_deferred_commit: None,
             smart_folder_editor_name_error: None,
             smart_folder_delete_confirm: None,
             smart_folder_create_name: None,
@@ -36203,6 +36208,8 @@ impl App {
         }
         let entered_page_count_sort = previous_key != crate::settings::DetailsSortKey::PageCount
             && self.settings.details_sort_key == crate::settings::DetailsSortKey::PageCount;
+        let left_page_count_sort = previous_key == crate::settings::DetailsSortKey::PageCount
+            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount;
         if entered_page_count_sort {
             // 通常表示の page-count Ready は「現在の可視近傍を取得済み」という段階状態。
             // 全件ソートへ遷移するときは別ジョブとして明示的に再始動し、画面外の None を
@@ -36212,6 +36219,21 @@ impl App {
             }
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             self.details_image_dims_state = LazyColumnState::NotRequested;
+        } else if left_page_count_sort {
+            // 進行中の全件ジョブだけを止め、次フレームに現在の列構成へ合わせた
+            // 可視範囲ジョブを再構築する。全件取得済みの Ready + pending なしは、
+            // 他の遅延列も充足済みなので維持し、UI thread の O(N) 再評価を避ける。
+            let had_pending = if let Some(pending) = self.details_meta_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            };
+            if had_pending || self.details_image_dims_state.is_loading() {
+                self.details_lazy_visible_revision =
+                    self.details_lazy_visible_revision.wrapping_add(1);
+                self.details_image_dims_state = LazyColumnState::NotRequested;
+            }
         }
         self.rebuild_details_order();
         self.scroll_to_selected = true;
@@ -42077,6 +42099,10 @@ impl App {
     ///    問題が再発するので fallback しない)。
     /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
     pub(crate) fn persist_window_state_and_flush(&mut self) {
+        // スマートフォルダ管理画面は TextEdit 中の値をローカル draft に保持する。
+        // 終了 / トレイ退避はダイアログ描画より先にこの経路へ来るため、Settings.save
+        // より前に正規化・検証・反映だけを行う（再走査 worker は開始しない）。
+        self.commit_smart_folder_editor_draft_for_persistence();
         if let Some(rect) = self.last_outer_rect {
             let x = crate::settings::viewport_points_to_window_geometry(
                 rect.min.x,

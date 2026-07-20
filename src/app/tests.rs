@@ -33580,6 +33580,114 @@ fn entering_page_count_sort_restarts_full_load_before_reordering() {
 }
 
 #[test]
+fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::PageCount;
+    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.details_meta_pending = Some(DetailsMetaPending {
+        visible_revision: app.details_lazy_visible_revision,
+        selection_target_key: None,
+        normal_target_keys: Default::default(),
+        cancel: std::sync::Arc::clone(&cancel),
+        rx,
+    });
+
+    app.set_details_sort_key(crate::settings::DetailsSortKey::Name);
+
+    assert_eq!(
+        app.settings.details_sort_key,
+        crate::settings::DetailsSortKey::Name
+    );
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn leaving_completed_page_count_sort_preserves_ready_for_another_lazy_column() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_show_created = true;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::PageCount;
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    let revision = app.details_lazy_visible_revision;
+
+    app.set_details_sort_key(crate::settings::DetailsSortKey::Created);
+
+    assert_eq!(
+        app.settings.details_sort_key,
+        crate::settings::DetailsSortKey::Created
+    );
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Ready { failed: 0 }
+    );
+    assert_eq!(app.details_lazy_visible_revision, revision);
+}
+
+#[test]
+fn leaving_page_count_sort_recovers_loading_state_without_pending_worker() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::PageCount;
+    app.details_image_dims_state = LazyColumnState::Loading { done: 1, total: 2 };
+    let revision = app.details_lazy_visible_revision;
+
+    app.set_details_sort_key(crate::settings::DetailsSortKey::Name);
+
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert_eq!(app.details_lazy_visible_revision, revision.wrapping_add(1));
+}
+
+#[test]
+fn common_persistence_boundary_commits_smart_folder_editor_draft_without_worker() {
+    let mut app = phase_c_support::setup_app();
+    let mut saved = crate::settings::SmartFolderDefinition::new("旧名");
+    saved.rules.push(crate::settings::SmartFolderRule::new(
+        app.tmp.path().to_path_buf(),
+        false,
+        Default::default(),
+    ));
+    let mut draft = saved.clone();
+    draft.name = " 新しい名前 ".into();
+    draft.rules[0].include_descendants = true;
+    app.settings.smart_folders = vec![saved];
+    app.smart_folder_editor_draft = Some(draft);
+
+    app.persist_window_state_and_flush();
+
+    assert_eq!(app.settings.smart_folders[0].name, "新しい名前");
+    assert!(app.settings.smart_folders[0].rules[0].include_descendants);
+    assert!(app.smart_folder_pending.is_none());
+    assert!(app.smart_folder_prepare_pending.is_none());
+    assert!(app.smart_folder_editor_deferred_commit.is_some());
+
+    app.apply_smart_folder_editor_deferred_commit_after_restore();
+    assert!(app.smart_folder_editor_deferred_commit.is_none());
+    assert!(app.smart_folder_pending.is_none());
+}
+
+#[test]
 fn pinned_adjustment_identity_survives_when_edit_preview_cache_is_disabled() {
     let mut app = phase_c_support::setup_app();
     app.settings.edit_preview_cache_enabled = false;

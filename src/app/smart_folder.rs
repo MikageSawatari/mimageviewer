@@ -381,6 +381,12 @@ fn rules_for_directory<'a>(rules: &'a [ActiveRule], dir: &Path) -> Vec<&'a Activ
         .collect()
 }
 
+fn applicable_rules_need_name_lower(rules: &[&ActiveRule]) -> bool {
+    rules
+        .iter()
+        .any(|rule| !rule.name_contains_lower.is_empty())
+}
+
 /// 通常一覧と同じ同名ファイル規則を、1 つの物理フォルダ分の候補へ適用する。
 /// 条件適用より先に呼ぶことで、たとえば「画像だけ」のルールでも同名動画の sidecar
 /// 画像を独立アイテムとして復活させない。フラット一覧全体では呼ばない。
@@ -565,6 +571,7 @@ fn scan_one_directory(
     let directory_video_overrides =
         normalize_smart_folder_candidates(&mut candidates, &entry_file_names_ci, options);
     diag.duplicates_removed += before_normalize.saturating_sub(candidates.len());
+    let needs_name_lower = applicable_rules_need_name_lower(&applicable_rules);
 
     for candidate in candidates {
         let SmartFolderCandidate {
@@ -573,11 +580,12 @@ fn scan_one_directory(
             mtime,
             file_size,
         } = candidate;
-        let name_lower = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let name_lower = needs_name_lower.then(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_lowercase()
+        });
         let mut matching_rules = applicable_rules
             .iter()
             .copied()
@@ -585,7 +593,7 @@ fn scan_one_directory(
                 passes_cheap_filter_values(
                     kind,
                     &path,
-                    &name_lower,
+                    name_lower.as_deref().unwrap_or(""),
                     mtime,
                     file_size,
                     &rule.filter,
@@ -2010,13 +2018,7 @@ impl App {
     }
 
     /// 定義変更時に古い snapshot / 進行中 worker を無効化する。
-    pub(crate) fn invalidate_smart_folder_definition(&mut self, definition_id: uuid::Uuid) {
-        let reopen_current = self.current_smart_folder_id == Some(definition_id)
-            && self
-                .settings
-                .smart_folders
-                .iter()
-                .any(|definition| definition.id == definition_id);
+    fn invalidate_smart_folder_definition_state(&mut self, definition_id: uuid::Uuid) {
         self.smart_folder_snapshots.remove(&definition_id);
         self.smart_folder_removed_paths.remove(&definition_id);
         let pending_matches = self
@@ -2034,6 +2036,23 @@ impl App {
         if pending_matches {
             self.cancel_smart_folder_pending();
         }
+    }
+
+    pub(crate) fn invalidate_smart_folder_definition_without_reopen(
+        &mut self,
+        definition_id: uuid::Uuid,
+    ) {
+        self.invalidate_smart_folder_definition_state(definition_id);
+    }
+
+    pub(crate) fn invalidate_smart_folder_definition(&mut self, definition_id: uuid::Uuid) {
+        let reopen_current = self.current_smart_folder_id == Some(definition_id)
+            && self
+                .settings
+                .smart_folders
+                .iter()
+                .any(|definition| definition.id == definition_id);
+        self.invalidate_smart_folder_definition_state(definition_id);
         if reopen_current {
             self.open_smart_folder(definition_id, true);
         }
@@ -2407,24 +2426,40 @@ impl App {
 
     /// 名前は snapshot identity ではなく表示情報、grouping は走査後の prepare 情報。
     /// rules が同じなら実フォルダ走査を捨てずに更新する。
-    pub(crate) fn update_smart_folder_presentation(
+    fn apply_smart_folder_presentation(
         &mut self,
-        definition: crate::settings::SmartFolderDefinition,
-    ) {
+        definition: &crate::settings::SmartFolderDefinition,
+    ) -> bool {
         let grouping_changed = self
             .smart_folder_snapshots
             .get(&definition.id)
             .is_some_and(|snapshot| snapshot.definition.grouping != definition.grouping);
         if let Some(snapshot) = self.smart_folder_snapshots.get_mut(&definition.id) {
-            adopt_smart_folder_presentation(&mut snapshot.definition, &definition);
+            adopt_smart_folder_presentation(&mut snapshot.definition, definition);
         }
         if self.current_smart_folder_id == Some(definition.id) {
             self.address = format!("スマートフォルダ: {}", definition.name);
-            if grouping_changed
-                && let Some(snapshot) = self.smart_folder_snapshots.get(&definition.id).cloned()
-            {
-                self.start_smart_folder_prepare(snapshot, false);
-            }
+        }
+        grouping_changed
+    }
+
+    pub(crate) fn update_smart_folder_presentation_without_reprepare(
+        &mut self,
+        definition: crate::settings::SmartFolderDefinition,
+    ) {
+        self.apply_smart_folder_presentation(&definition);
+    }
+
+    pub(crate) fn update_smart_folder_presentation(
+        &mut self,
+        definition: crate::settings::SmartFolderDefinition,
+    ) {
+        let grouping_changed = self.apply_smart_folder_presentation(&definition);
+        if self.current_smart_folder_id == Some(definition.id)
+            && grouping_changed
+            && let Some(snapshot) = self.smart_folder_snapshots.get(&definition.id).cloned()
+        {
+            self.start_smart_folder_prepare(snapshot, false);
         }
     }
 
@@ -2751,6 +2786,29 @@ mod tests {
             roots,
             [PathBuf::from(r"C:\Books\Done"), PathBuf::from(r"C:\Books")]
         );
+    }
+
+    #[test]
+    fn candidate_names_are_lowercased_only_when_an_applicable_rule_uses_name_filter() {
+        let root = PathBuf::from(r"C:\Books");
+        let mut definition = crate::settings::SmartFolderDefinition::new("books");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root.clone(),
+            true,
+            true,
+            Default::default(),
+        ));
+        let active = active_rules(&definition);
+        assert!(!applicable_rules_need_name_lower(&rules_for_directory(
+            &active, &root
+        )));
+
+        definition.rules[0].filter.name_contains = "Sample".into();
+        let active = active_rules(&definition);
+        assert!(applicable_rules_need_name_lower(&rules_for_directory(
+            &active, &root
+        )));
     }
 
     #[test]
