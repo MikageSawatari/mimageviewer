@@ -2508,6 +2508,7 @@ pub enum FullscreenLeftPanelTab {
     #[default]
     Adjustment,
     ViewTrim,
+    Bookmarks,
 }
 
 impl FullscreenLeftPanelTab {
@@ -2515,6 +2516,7 @@ impl FullscreenLeftPanelTab {
         match self {
             Self::Adjustment => "画像補正",
             Self::ViewTrim => "表示トリム",
+            Self::Bookmarks => "ブックマーク",
         }
     }
 }

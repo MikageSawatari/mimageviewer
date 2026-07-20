@@ -1,6 +1,24 @@
 # v2.7.0 実装計画
 
-更新: 2026-07-20
+更新: 2026-07-21
+
+## 本ブックマークと全メディア横断一覧
+
+v2.7.0 では、既存の動画・音声ブックマークに加え、製本、画像のみフォルダ、ZIP / CBZ / PDF、
+対応アーカイブのページをブックマークできる。画像フルスクリーンの `B` は現在の本ページを登録し、
+透過背景色切替の新規既定は `Shift+B` へ移す。
+
+- 画像フォルダはページ index ではなく相対ファイルパス、アーカイブは完全な entry name、
+  PDF は 0-origin ページ番号で保存する。変換アーカイブは cache ZIP ではなく元パスを保持する。
+- 左パネルを「画像補正 / 表示トリム / ブックマーク」の 3 タブにし、現在の本の登録ページを
+  サムネイル付きで表示、移動、削除できる。
+- `場所▼ > ブックマーク` で動画・音声・本を横断表示し、メディア種別と本 subtype で絞り込む。
+  行削除は DB 上のブックマークだけを対象とし、元ファイルは削除しない。missing 行も保持する。
+- 本 DB と横断一覧の SQLite / filesystem / archive I/O は worker へ分離する。
+
+詳細な確定仕様は [spec.md](spec.md)、identity は [virtual-folders.md](virtual-folders.md)、
+キー優先順位は [keymap-spec.md](keymap-spec.md)、worker 境界は
+[async-architecture.md](async-architecture.md) を参照。
 
 ## UI フォント設定
 

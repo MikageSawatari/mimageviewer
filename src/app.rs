@@ -2324,6 +2324,7 @@ pub(crate) struct PendingRatingViewZipDirOpen {
 pub(crate) enum StartupOpenPathSource {
     InitialStartup,
     Activation,
+    Bookmark,
 }
 
 impl StartupOpenPathSource {
@@ -2331,6 +2332,7 @@ impl StartupOpenPathSource {
         match self {
             Self::InitialStartup => "initial_startup",
             Self::Activation => "activation",
+            Self::Bookmark => "bookmark",
         }
     }
 }
@@ -7001,6 +7003,9 @@ pub struct App {
     /// ユーザーが任意位置に付けた付箋。フルスクリーン左パネルにジャンプサムネとして
     /// 表示される。B キー / 🔖 ボタンで追加。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
+    /// 本のページブックマーク DB を所有する非同期サービス。UI スレッドは SQLite を
+    /// 直接触らず、request / event だけを送受信する。
+    pub(crate) book_bookmark_service: Option<crate::book_bookmarks::BookBookmarkService>,
     /// 動画埋め込みチャプターのジャンプパネル用サムネイル DB。
     /// チャプター自体は動画メタデータ由来なので、サムネだけ mIV 側で path + file identity
     /// + chapter start をキーに永続化する。
@@ -7213,6 +7218,17 @@ pub struct App {
         Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     pub(crate) rating_view_nav_stack: Vec<PathBuf>,
 
+    /// 「場所 > ブックマーク」の全メディア横断一覧。
+    pub(crate) show_bookmark_browser: bool,
+    pub(crate) bookmark_browser_rows: Vec<crate::bookmark_browser::BookmarkBrowserRow>,
+    pub(crate) bookmark_browser_pending: Option<crate::bookmark_browser::BookmarkBrowserPending>,
+    pub(crate) bookmark_delete_pending: Option<crate::bookmark_browser::BookmarkDeletePending>,
+    pub(crate) bookmark_media_filter: crate::bookmark_browser::MediaFilter,
+    pub(crate) bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter,
+    pub(crate) bookmark_browser_selected: Option<(u8, i64)>,
+    pub(crate) bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
+    pub(crate) bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+
     /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
     /// `rebuild_items_from_global_search` の DrilledInto 分岐で `state.all_hits` から
     /// 直接集計する。folder_rating_counter (rating DB を SQL で集計する worker) は
@@ -7231,6 +7247,12 @@ pub struct App {
     /// 直近に DB へ書いた `(コンテナパス, page idx)`。フルスクリーンのページ送り毎の
     /// 重複書き込みを抑止する dedup。
     pub(crate) last_book_resume: Option<(PathBuf, usize)>,
+    /// 左パネル用の現在コンテナの本ブックマーク cache。
+    pub(crate) current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
+    pub(crate) current_book_bookmarks_key: Option<String>,
+    pub(crate) current_book_bookmarks_request: Option<(u64, String)>,
+    pub(crate) book_bookmark_request_seq: u64,
+    pub(crate) book_bookmark_pending_requests: std::collections::HashSet<u64>,
     /// フルスクリーンで読んだ本の履歴 DB。
     pub(crate) reading_history_db: Option<crate::reading_history_db::ReadingHistoryDb>,
     /// 読書履歴の書き込みを UI スレッドから外す background writer。
@@ -7465,7 +7487,7 @@ pub struct App {
     /// 見開きモード描画後のページ矩形。ルーペ描画がカーソル位置から該当ページを
     /// 特定するのに使う。毎フレーム描画後に更新、非見開き時は None。
     pub(crate) fs_spread_layout: Option<crate::ui_fullscreen::FsSpreadLayout>,
-    /// 透過画像の背景サイクル (B キー): 0=黒 / 1=白 / 2=市松
+    /// 透過画像の背景サイクル (Shift+B): 0=黒 / 1=白 / 2=市松
     /// 画像切替時にリセット。永続化しない。
     pub(crate) fs_transparent_bg_mode: u8,
     /// 16×16 の市松テクスチャ (Wrap=Repeat)。最初に B キーで市松にしたとき lazy init。
@@ -9219,6 +9241,9 @@ impl App {
         let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
+        // SQLite の open / schema 初期化を含めて専用 worker で行う。
+        let book_bookmark_service = crate::book_bookmarks::BookBookmarkService::spawn();
+
         let t = std::time::Instant::now();
         let video_chapter_thumb_db = crate::video_chapter_thumbs::VideoChapterThumbDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_video_chapter_thumbs", 0, t);
@@ -9819,6 +9844,7 @@ impl App {
             normalize_auto_scan_suppressed: std::collections::HashSet::new(),
             video_pin_db,
             video_bookmark_db,
+            book_bookmark_service,
             video_chapter_thumb_db,
             folder_thumb_pin_db,
             folder_pin_map: std::collections::HashMap::new(),
@@ -9884,10 +9910,24 @@ impl App {
             rating_view_saved_folder: None,
             rating_view_subfolder_restore: None,
             rating_view_nav_stack: Vec::new(),
+            show_bookmark_browser: false,
+            bookmark_browser_rows: Vec::new(),
+            bookmark_browser_pending: None,
+            bookmark_delete_pending: None,
+            bookmark_media_filter: crate::bookmark_browser::MediaFilter::default(),
+            bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
+            bookmark_browser_selected: None,
+            bookmark_media_open_pending: None,
+            bookmark_book_open_pending: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
             book_resume_writer,
             last_book_resume: None,
+            current_book_bookmarks: Vec::new(),
+            current_book_bookmarks_key: None,
+            current_book_bookmarks_request: None,
+            book_bookmark_request_seq: 0,
+            book_bookmark_pending_requests: std::collections::HashSet::new(),
             reading_history_db,
             reading_history_writer,
             reading_history_rows: std::collections::HashMap::new(),
@@ -22875,6 +22915,504 @@ impl App {
                 .items
                 .iter()
                 .all(|item| matches!(item, GridItem::Image(_)))
+    }
+
+    fn book_bookmark_view_is_synthetic(&self) -> bool {
+        self.items_are_reading_history_view
+            || self.items_are_rating_view
+            || self.items_are_global_search_view
+            || self.items_are_tag_view
+            || self.items_are_subfolder_expansion_view
+            || self.items_are_smart_folder_view
+            || self.items_are_drive_list
+    }
+
+    /// 現在ページを、ページ番号ではなく安定したページ identity を持つ本ブックマークへ変換する。
+    pub(crate) fn current_book_bookmark_draft(
+        &self,
+        idx: usize,
+    ) -> Option<crate::book_bookmarks::NewBookBookmark> {
+        use crate::book_bookmarks::{BookContainerKind, NewBookBookmark, PageIdentity};
+
+        if self.book_bookmark_view_is_synthetic() {
+            return None;
+        }
+        let item = self.items.get(idx)?;
+        let (container_path, container_kind, page_identity) = match item {
+            GridItem::Image(path) => {
+                let folder = self.current_folder.as_ref()?;
+                let kind = if self.current_folder_is_book_folder() {
+                    BookContainerKind::CompiledBook
+                } else if self.settings.auto_fullscreen_image_folders_enabled()
+                    && !self.items.is_empty()
+                    && self
+                        .items
+                        .iter()
+                        .all(|item| matches!(item, GridItem::Image(_)))
+                {
+                    BookContainerKind::ImageFolder
+                } else {
+                    return None;
+                };
+                let relative = path
+                    .strip_prefix(folder)
+                    .ok()
+                    .filter(|relative| !relative.as_os_str().is_empty())
+                    .map(|relative| relative.to_string_lossy().into_owned())
+                    .or_else(|| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                    })?;
+                (folder.clone(), kind, PageIdentity::RelativePath(relative))
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                let container = self
+                    .archive_source_override
+                    .clone()
+                    .unwrap_or_else(|| zip_path.clone());
+                let ext = path_extension_lower(&container);
+                let kind = if crate::folder_tree::is_zip_extension(&ext) {
+                    BookContainerKind::Zip
+                } else {
+                    BookContainerKind::OtherArchive
+                };
+                (
+                    container,
+                    kind,
+                    PageIdentity::ArchiveEntry(entry_name.clone()),
+                )
+            }
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => (
+                pdf_path.clone(),
+                BookContainerKind::Pdf,
+                PageIdentity::PdfPage(*page_num),
+            ),
+            _ => return None,
+        };
+        Some(NewBookBookmark {
+            container_path,
+            container_kind,
+            page_identity,
+            page_index_hint: idx,
+        })
+    }
+
+    fn next_book_bookmark_request_id(&mut self) -> u64 {
+        self.book_bookmark_request_seq = self.book_bookmark_request_seq.wrapping_add(1).max(1);
+        self.book_bookmark_request_seq
+    }
+
+    pub(crate) fn add_current_book_bookmark(&mut self, idx: usize) {
+        let Some(entry) = self.current_book_bookmark_draft(idx) else {
+            self.show_feedback_toast("この画像は本のブックマーク対象ではありません".to_string());
+            return;
+        };
+        let request_id = self.next_book_bookmark_request_id();
+        let Some(service) = self.book_bookmark_service.as_ref() else {
+            self.show_feedback_toast("ブックマークDBを利用できません".to_string());
+            return;
+        };
+        service.add(request_id, entry);
+        self.book_bookmark_pending_requests.insert(request_id);
+    }
+
+    pub(crate) fn ensure_current_book_bookmarks_loaded(&mut self, idx: usize) {
+        let Some(entry) = self.current_book_bookmark_draft(idx) else {
+            self.current_book_bookmarks.clear();
+            self.current_book_bookmarks_key = None;
+            self.current_book_bookmarks_request = None;
+            return;
+        };
+        let key = crate::book_bookmarks::container_key(&entry.container_path);
+        if self.current_book_bookmarks_key.as_deref() == Some(key.as_str())
+            || self
+                .current_book_bookmarks_request
+                .as_ref()
+                .is_some_and(|(_, pending_key)| pending_key == &key)
+        {
+            return;
+        }
+        // 別の本へ移動した直後に、旧コンテナの行を新しい本の行として一瞬表示しない。
+        self.current_book_bookmarks.clear();
+        self.current_book_bookmarks_key = None;
+        let request_id = self.next_book_bookmark_request_id();
+        if let Some(service) = self.book_bookmark_service.as_ref() {
+            service.list_for_container(request_id, entry.container_path);
+            self.current_book_bookmarks_request = Some((request_id, key));
+            self.book_bookmark_pending_requests.insert(request_id);
+        }
+    }
+
+    pub(crate) fn remove_book_bookmark(&mut self, id: i64) {
+        let request_id = self.next_book_bookmark_request_id();
+        if let Some(service) = self.book_bookmark_service.as_ref() {
+            service.remove(request_id, id);
+            self.book_bookmark_pending_requests.insert(request_id);
+        }
+    }
+
+    pub(crate) fn poll_book_bookmarks(&mut self) {
+        loop {
+            let event = match self
+                .book_bookmark_service
+                .as_ref()
+                .map(|service| service.try_recv())
+            {
+                Some(Ok(event)) => event,
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => break,
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.book_bookmark_service = None;
+                    self.book_bookmark_pending_requests.clear();
+                    self.current_book_bookmarks_request = None;
+                    self.show_feedback_toast("ブックマークDBとの接続が終了しました".to_string());
+                    break;
+                }
+            };
+            match event {
+                crate::book_bookmarks::BookBookmarkEvent::Added { request_id, result } => {
+                    self.book_bookmark_pending_requests.remove(&request_id);
+                    match result {
+                        Ok((bookmark, inserted)) => {
+                            if self.current_book_bookmarks_key.as_deref()
+                                == Some(bookmark.container_key.as_str())
+                                && !self
+                                    .current_book_bookmarks
+                                    .iter()
+                                    .any(|entry| entry.id == bookmark.id)
+                            {
+                                self.current_book_bookmarks.push(bookmark);
+                                self.current_book_bookmarks.sort_by_key(|entry| {
+                                    (entry.page_index_hint, entry.created_at_ms)
+                                });
+                            }
+                            self.show_feedback_toast(if inserted {
+                                "ブックマークを追加しました".to_string()
+                            } else {
+                                "このページはブックマーク済みです".to_string()
+                            });
+                            if self.show_bookmark_browser {
+                                self.refresh_bookmark_browser();
+                            }
+                        }
+                        Err(err) => self
+                            .show_feedback_toast(format!("ブックマーク追加に失敗しました: {err}")),
+                    }
+                }
+                crate::book_bookmarks::BookBookmarkEvent::Removed { request_id, result } => {
+                    self.book_bookmark_pending_requests.remove(&request_id);
+                    match result {
+                        Ok(id) => {
+                            self.current_book_bookmarks.retain(|entry| entry.id != id);
+                            self.show_feedback_toast("ブックマークを削除しました".to_string());
+                            if self.show_bookmark_browser {
+                                self.refresh_bookmark_browser();
+                            }
+                        }
+                        Err(err) => self
+                            .show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}")),
+                    }
+                }
+                crate::book_bookmarks::BookBookmarkEvent::ContainerListed {
+                    request_id,
+                    container_key,
+                    result,
+                } => {
+                    self.book_bookmark_pending_requests.remove(&request_id);
+                    if self.current_book_bookmarks_request.as_ref().is_some_and(
+                        |(pending_id, pending_key)| {
+                            *pending_id == request_id && pending_key == &container_key
+                        },
+                    ) {
+                        self.current_book_bookmarks_request = None;
+                        match result {
+                            Ok(rows) => {
+                                self.current_book_bookmarks = rows;
+                                self.current_book_bookmarks_key = Some(container_key);
+                            }
+                            Err(err) => {
+                                // 同じ失敗要求を毎フレーム再送して toast を繰り返さない。
+                                // 別コンテナへ移動して戻れば再試行される。
+                                self.current_book_bookmarks_key = Some(container_key);
+                                self.show_feedback_toast(format!(
+                                    "ブックマーク一覧を読み込めませんでした: {err}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                crate::book_bookmarks::BookBookmarkEvent::AllListed { request_id, .. } => {
+                    self.book_bookmark_pending_requests.remove(&request_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn book_bookmark_item_idx(
+        &self,
+        bookmark: &crate::book_bookmarks::BookBookmark,
+    ) -> Option<usize> {
+        let normalize = |value: &str| value.replace('\\', "/").to_lowercase();
+        self.items.iter().enumerate().find_map(|(idx, item)| {
+            let matches = match (&bookmark.page_identity, item) {
+                (
+                    crate::book_bookmarks::PageIdentity::RelativePath(relative),
+                    GridItem::Image(path),
+                ) => {
+                    let container = self.current_folder.as_ref()?;
+                    path.strip_prefix(container)
+                        .ok()
+                        .map(|value| normalize(&value.to_string_lossy()) == normalize(relative))
+                        .unwrap_or(false)
+                }
+                (
+                    crate::book_bookmarks::PageIdentity::ArchiveEntry(wanted),
+                    GridItem::ZipImage { entry_name, .. },
+                ) => normalize(entry_name) == normalize(wanted),
+                (
+                    crate::book_bookmarks::PageIdentity::PdfPage(wanted),
+                    GridItem::PdfPage { page_num, .. },
+                ) => page_num == wanted,
+                _ => false,
+            };
+            matches.then_some(idx)
+        })
+    }
+
+    pub(crate) fn jump_to_current_book_bookmark(
+        &mut self,
+        ctx: &egui::Context,
+        bookmark: &crate::book_bookmarks::BookBookmark,
+    ) {
+        if let Some(idx) = self.book_bookmark_item_idx(bookmark) {
+            self.open_fullscreen_from_fs_navigation(ctx, idx);
+        } else {
+            self.show_feedback_toast(
+                "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
+            );
+        }
+    }
+
+    pub(crate) fn ensure_bookmark_panel_thumbnails(&mut self, indices: &[usize]) {
+        if indices.is_empty() {
+            return;
+        }
+        for &idx in indices {
+            if idx < self.items.len() {
+                self.keep_set.insert(idx);
+            }
+        }
+        if let (Some(first), Some(last)) =
+            (indices.iter().copied().min(), indices.iter().copied().max())
+        {
+            self.keep_start_shared.store(first, Ordering::Relaxed);
+            self.keep_end_shared
+                .store(last.saturating_add(1), Ordering::Relaxed);
+            for &idx in indices {
+                self.enqueue_details_hover_thumbnail(idx);
+            }
+        }
+    }
+
+    pub(crate) fn open_bookmark_browser(&mut self) {
+        self.show_bookmark_browser = true;
+        self.refresh_bookmark_browser();
+    }
+
+    pub(crate) fn refresh_bookmark_browser(&mut self) {
+        if let Some(pending) = self.bookmark_browser_pending.take() {
+            pending.cancel();
+        }
+        self.bookmark_browser_pending = Some(crate::bookmark_browser::spawn_build());
+    }
+
+    pub(crate) fn delete_bookmark_browser_row(
+        &mut self,
+        row: &crate::bookmark_browser::BookmarkBrowserRow,
+    ) {
+        if self.bookmark_delete_pending.is_none() {
+            self.bookmark_delete_pending = Some(crate::bookmark_browser::spawn_delete(row));
+        }
+    }
+
+    pub(crate) fn open_bookmark_browser_row(
+        &mut self,
+        ctx: &egui::Context,
+        row: &crate::bookmark_browser::BookmarkBrowserRow,
+    ) {
+        if row.missing {
+            self.show_feedback_toast(
+                "ブックマーク先が見つかりません（記録は保持されます）".to_string(),
+            );
+            return;
+        }
+        match &row.source {
+            crate::bookmark_browser::BookmarkRowSource::Media { path, pts_secs, .. } => {
+                self.bookmark_media_open_pending =
+                    Some(crate::bookmark_browser::PendingMediaOpen {
+                        path: path.clone(),
+                        pts_secs: *pts_secs,
+                        started_at: std::time::Instant::now(),
+                    });
+                self.start_startup_open_path_resolve(
+                    path.clone(),
+                    StartupOpenPathSource::Bookmark,
+                    ctx,
+                );
+            }
+            crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
+                self.bookmark_book_open_pending = Some(crate::bookmark_browser::PendingBookOpen {
+                    bookmark: bookmark.clone(),
+                    started_at: std::time::Instant::now(),
+                    entered_archive_prefix: false,
+                });
+                self.start_startup_open_path_resolve(
+                    bookmark.container_path.clone(),
+                    StartupOpenPathSource::Bookmark,
+                    ctx,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn poll_bookmark_browser(&mut self, ctx: &egui::Context) {
+        let build_result = self
+            .bookmark_browser_pending
+            .as_ref()
+            .and_then(|pending| match pending.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("ブックマーク一覧ワーカーが終了しました".to_string()))
+                }
+            });
+        if let Some(result) = build_result {
+            self.bookmark_browser_pending = None;
+            match result {
+                Ok(rows) => self.bookmark_browser_rows = rows,
+                Err(err) => self
+                    .show_feedback_toast(format!("ブックマーク一覧を読み込めませんでした: {err}")),
+            }
+        }
+
+        let delete_result = self
+            .bookmark_delete_pending
+            .as_ref()
+            .and_then(|pending| match pending.rx.try_recv() {
+                Ok(result) => Some((pending.key, result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((
+                    pending.key,
+                    Err("ブックマーク削除ワーカーが終了しました".to_string()),
+                )),
+            });
+        if let Some((key, result)) = delete_result {
+            self.bookmark_delete_pending = None;
+            match result {
+                Ok(()) => {
+                    self.bookmark_browser_rows
+                        .retain(|row| row.stable_key() != key);
+                    if key.0 == 1 {
+                        self.current_book_bookmarks
+                            .retain(|bookmark| bookmark.id != key.1);
+                    }
+                    self.show_feedback_toast("ブックマークを削除しました".to_string());
+                }
+                Err(err) => {
+                    self.show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}"))
+                }
+            }
+        }
+
+        self.poll_bookmark_media_open(ctx);
+        self.poll_bookmark_book_open(ctx);
+        if self.bookmark_browser_pending.is_some()
+            || self.bookmark_delete_pending.is_some()
+            || self.bookmark_media_open_pending.is_some()
+            || self.bookmark_book_open_pending.is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn poll_bookmark_media_open(&mut self, _ctx: &egui::Context) {
+        let Some(pending) = self.bookmark_media_open_pending.clone() else {
+            return;
+        };
+        if pending.started_at.elapsed() > std::time::Duration::from_secs(30) {
+            self.bookmark_media_open_pending = None;
+            self.show_feedback_toast("ブックマーク位置を開けませんでした".to_string());
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        let path_matches = self.items.get(idx).is_some_and(|item| match item {
+            GridItem::Video(path) | GridItem::Audio(path) => {
+                crate::folder_tree::path_eq(path, &pending.path)
+            }
+            _ => false,
+        });
+        if !path_matches {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+            player.seek(pending.pts_secs.max(0.0));
+            self.bookmark_media_open_pending = None;
+        }
+    }
+
+    fn poll_bookmark_book_open(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.bookmark_book_open_pending.clone() else {
+            return;
+        };
+        if pending.started_at.elapsed() > std::time::Duration::from_secs(45) {
+            self.bookmark_book_open_pending = None;
+            self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
+            return;
+        }
+        let same_container = self.effective_folder().is_some_and(|path| {
+            crate::folder_tree::path_eq(&path, &pending.bookmark.container_path)
+        });
+        if !same_container {
+            return;
+        }
+        if let Some(idx) = self.book_bookmark_item_idx(&pending.bookmark) {
+            self.bookmark_book_open_pending = None;
+            self.open_fullscreen_from_fs_navigation(ctx, idx);
+            return;
+        }
+
+        if !pending.entered_archive_prefix
+            && let crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) =
+                &pending.bookmark.page_identity
+        {
+            let normalized = entry_name.replace('\\', "/");
+            if let Some((prefix, _)) = normalized.rsplit_once('/')
+                && !prefix.is_empty()
+                && let Some(nav) = self.zip_nav.as_mut()
+            {
+                nav.enter(&format!("{prefix}/"));
+                pending.entered_archive_prefix = true;
+                self.bookmark_book_open_pending = Some(pending);
+                self.zip_nav_show_current_level();
+                return;
+            }
+        }
+
+        let enumeration_pending = self.zip_enumerate_pending.is_some()
+            || self.pdf_enumerate_pending.is_some()
+            || self.items.is_empty();
+        if !enumeration_pending {
+            self.bookmark_book_open_pending = None;
+            self.show_feedback_toast(
+                "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
+            );
+        }
     }
 
     pub(crate) fn book_address_label_for_path(&self, path: &Path) -> Option<String> {
@@ -41099,6 +41637,9 @@ impl App {
 
         self.reset_fs_side_panel_runtime_for_file_change();
         self.fullscreen_idx = None;
+        if self.show_bookmark_browser {
+            self.refresh_bookmark_browser();
+        }
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
         // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。
         // 進捗中の worker は cancel フラグを立てて自然終了を待つ (= 進行中エントリは
@@ -41425,7 +41966,7 @@ impl App {
 
     /// 消しゴム用の AI 背景モード。
     ///
-    /// 透過画像の消しゴムは黒固定の不透明ベースに統一しているため、B キーで白背景を
+    /// 透過画像の消しゴムは黒固定の不透明ベースに統一しているため、Shift+B で白背景を
     /// 選んでいても composite-first AI cache は bg=0 を使う。これにより白背景が
     /// `erase_base_cache` / MI-GAN 入力へ混ざるのを防ぐ。
     pub(crate) fn erase_upscale_bg_mode(&self, idx: usize) -> u8 {
@@ -52958,6 +53499,11 @@ impl eframe::App for App {
         self.poll_favsearch();
         self.poll_tag_view();
         self.poll_rating_view();
+        self.poll_book_bookmarks();
+        self.poll_bookmark_browser(ctx);
+        if self.current_book_bookmarks_request.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         self.poll_metadata_load();
         // スタックスクリプト (ワーカー) の結果を取り込み、完了したら集約ビューへ差し替える。
         self.poll_stack_script(ctx);
@@ -53578,6 +54124,9 @@ impl eframe::App for App {
         self.show_preferences_dialog(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
+        if !main_viewer_blocked {
+            self.show_bookmark_browser_window(ctx);
+        }
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する (= ui_fullscreen.rs)。
         //    両方のビューポートで描画すると egui::Window の位置が二重管理になり、
@@ -54246,6 +54795,18 @@ impl eframe::App for App {
         }
         if self.video_upscale_running.is_some() {
             reasons.push("video_upscale_running");
+        }
+        if !self.book_bookmark_pending_requests.is_empty() {
+            reasons.push("book_bookmark_pending");
+        }
+        if self.bookmark_browser_pending.is_some() {
+            reasons.push("bookmark_browser_pending");
+        }
+        if self.bookmark_delete_pending.is_some() {
+            reasons.push("bookmark_delete_pending");
+        }
+        if self.bookmark_media_open_pending.is_some() || self.bookmark_book_open_pending.is_some() {
+            reasons.push("bookmark_open_pending");
         }
         // AI upscale worker は別スレッドで完了するが、完了通知は UI thread の
         // poll_ai_upscale() で取り込む。静止フルスクリーン中に egui が寝ると

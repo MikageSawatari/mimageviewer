@@ -9176,6 +9176,72 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn image_folder_bookmark_uses_relative_filename_instead_of_page_number() {
+        use crate::book_bookmarks::{BookContainerKind, PageIdentity};
+
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        let folder = app.tmp.path().join("image-book");
+        let page = folder.join("chapter").join("p002.jpg");
+        app.current_folder = Some(folder.clone());
+        app.items.push(GridItem::Image(folder.join("p001.jpg")));
+        app.items.push(GridItem::Image(page));
+
+        let draft = app
+            .current_book_bookmark_draft(1)
+            .expect("image-only folder is a book");
+        assert_eq!(draft.container_path, folder);
+        assert_eq!(draft.container_kind, BookContainerKind::ImageFolder);
+        assert_eq!(
+            draft.page_identity,
+            PageIdentity::RelativePath(
+                PathBuf::from("chapter")
+                    .join("p002.jpg")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(draft.page_index_hint, 1, "index is only a display hint");
+    }
+
+    #[test]
+    fn converted_archive_bookmark_keeps_original_container_and_full_entry() {
+        use crate::book_bookmarks::{BookContainerKind, PageIdentity};
+
+        let mut app = setup_app();
+        let original = PathBuf::from(r"C:\books\sample.cb7");
+        let cache = app.tmp.path().join("archive-cache").join("book.zip");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(original.clone());
+        app.items.push(GridItem::ZipImage {
+            zip_path: cache,
+            entry_name: "chapter/inner.cbz/p010.jpg".to_string(),
+        });
+
+        let draft = app
+            .current_book_bookmark_draft(0)
+            .expect("converted archive page is bookmarkable");
+        assert_eq!(draft.container_path, original);
+        assert_eq!(draft.container_kind, BookContainerKind::OtherArchive);
+        assert_eq!(
+            draft.page_identity,
+            PageIdentity::ArchiveEntry("chapter/inner.cbz/p010.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn aggregate_image_view_is_not_a_bookmarkable_book() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        let folder = app.tmp.path().join("aggregate-source");
+        app.current_folder = Some(folder.clone());
+        app.items.push(GridItem::Image(folder.join("p001.jpg")));
+        app.items_are_global_search_view = true;
+
+        assert!(app.current_book_bookmark_draft(0).is_none());
+    }
+
+    #[test]
     fn page_order_lock_leaves_synthetic_image_views_unlocked() {
         let mut app = setup_app();
         enable_auto_image_folder_book(&mut app);
@@ -12152,7 +12218,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(crate::app::App::black_flatten_if_transparent(&opaque).is_none());
     }
 
-    /// 透過画像の消しゴムは B キーの白背景に引きずられず、AI composite-first cache も
+    /// 透過画像の消しゴムは Shift+B の白背景に引きずられず、AI composite-first cache も
     /// 黒背景 (bg=0) を使う。白背景に焼き込まれた `(idx,1)` を消しゴム入力にしないための
     /// 回帰ガード。
     #[test]
@@ -12180,7 +12246,7 @@ mod favorite_adjustment_defaults_tests {
             },
         );
         app.ai_upscale_enabled = true;
-        app.fs_transparent_bg_mode = 1; // B キーで白背景
+        app.fs_transparent_bg_mode = 1; // Shift+B で白背景
 
         assert_eq!(app.effective_upscale_bg_mode(), 1, "通常表示は白背景 bg=1");
         assert_eq!(

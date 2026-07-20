@@ -66,7 +66,7 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         egui::RichText::new(
             "フルスクリーン表示は画像鑑賞のためテーマに関係なく黒背景になります。\n\
-             B キーで透過画像の背景色を循環させられます (黒 → 白 → 市松)。",
+             Shift+B キーで透過画像の背景色を循環させられます (黒 → 白 → 市松)。",
         )
         .weak(),
     );

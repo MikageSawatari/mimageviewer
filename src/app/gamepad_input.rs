@@ -2780,6 +2780,10 @@ impl App {
         let nav = match nav {
             GamepadLocationNav::DriveList => AddressBarNav::DriveList(None),
             GamepadLocationNav::ReadingHistory => AddressBarNav::ReadingHistory,
+            GamepadLocationNav::Bookmarks => {
+                self.open_bookmark_browser();
+                return None;
+            }
             GamepadLocationNav::RatingView(stars) => {
                 self.bump_input_seq("gamepad_rating_view", Some(&stars.to_string()));
                 self.enter_rating_view(stars);
@@ -5703,6 +5707,11 @@ impl App {
                 value: "最近読んだ本".to_string(),
                 nav: GamepadLocationNav::ReadingHistory,
             },
+            GamepadLocationEntry {
+                label: "ブックマーク".to_string(),
+                value: "動画・音声・本".to_string(),
+                nav: GamepadLocationNav::Bookmarks,
+            },
         ];
 
         for stars in 1..=5u8 {
@@ -5750,6 +5759,7 @@ impl App {
         entries.iter().position(|entry| match &entry.nav {
             GamepadLocationNav::DriveList => self.items_are_drive_list,
             GamepadLocationNav::ReadingHistory => self.items_are_reading_history_view,
+            GamepadLocationNav::Bookmarks => self.show_bookmark_browser,
             GamepadLocationNav::RatingView(stars) => {
                 self.items_are_rating_view && self.rating_view_stars == *stars
             }

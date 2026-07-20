@@ -287,7 +287,7 @@ fn apply_scrollbar_visibility_style(ctx: &egui::Context) {
 }
 
 /// `UiTheme` を解決した結果が Dark かを返す (System の場合は OS 設定に追従)。
-/// B キーの透過背景「反対色」判定などに使う。
+/// Shift+B の透過背景「反対色」判定などに使う。
 pub fn is_dark_effective(theme: UiTheme) -> bool {
     matches!(resolve(theme), ResolvedTheme::Dark)
 }

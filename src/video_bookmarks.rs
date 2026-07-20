@@ -42,6 +42,17 @@ pub struct VideoBookmark {
     pub thumb_webp: Vec<u8>,
 }
 
+/// 動画・音声・本の横断一覧で使う、元パスと登録日時を含む行。
+#[derive(Clone, Debug)]
+pub struct GlobalVideoBookmark {
+    pub id: i64,
+    pub path: PathBuf,
+    pub pts_secs: f64,
+    pub title: Option<String>,
+    pub thumb_webp: Vec<u8>,
+    pub created_at_ms: i64,
+}
+
 /// 一括ブックマーク登録の結果サマリ。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BulkAddSummary {
@@ -116,8 +127,32 @@ impl VideoBookmarkDb {
         )
     }
 
-    fn db_path() -> PathBuf {
+    pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("video_bookmarks.db")
+    }
+
+    /// 横断一覧用に全ブックマークを登録日時の新しい順で返す。
+    /// 呼び出し側は必ず worker スレッドから利用する。
+    pub fn list_all_global(&self) -> Result<Vec<GlobalVideoBookmark>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, pts_secs, title, thumb_webp, created_at
+               FROM video_bookmarks
+              ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created_at: i64 = row.get(5)?;
+            Ok(GlobalVideoBookmark {
+                id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                pts_secs: row.get(2)?,
+                title: row
+                    .get::<_, Option<String>>(3)?
+                    .filter(|value| !value.is_empty()),
+                thumb_webp: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                created_at_ms: created_at.saturating_mul(1000),
+            })
+        })?;
+        rows.collect()
     }
 
     /// `list` の軽量版: thumbnail BLOB を読まずに `(pts_secs, title)` だけ返す。

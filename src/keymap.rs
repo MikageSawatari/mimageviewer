@@ -1384,6 +1384,7 @@ pub enum KeyAction {
     FsLocalAdjustMode,
     FsConcealMode,
     FsTextMode,
+    FsBookBookmark,
     FsBgCycle,
     FsPin,
     FsSpreadSingle,
@@ -1780,6 +1781,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsLocalAdjustMode,
     KeyAction::FsConcealMode,
     KeyAction::FsTextMode,
+    KeyAction::FsBookBookmark,
     KeyAction::FsBgCycle,
     KeyAction::FsPin,
     KeyAction::FsSpreadSingle,
@@ -3212,6 +3214,7 @@ impl KeyAction {
             FsLocalAdjustMode => "FsLocalAdjustMode",
             FsConcealMode => "FsConcealMode",
             FsTextMode => "FsTextMode",
+            FsBookBookmark => "FsBookBookmark",
             FsBgCycle => "FsBgCycle",
             FsPin => "FsPin",
             FsSpreadSingle => "FsSpreadSingle",
@@ -3726,6 +3729,7 @@ impl KeyAction {
             FsLocalAdjustMode => "補正レイヤーモードを開始する",
             FsConcealMode => "隠蔽加工モードを開始または終了する",
             FsTextMode => "テキスト注釈モードを開始または終了する",
+            FsBookBookmark => "現在の本のページにブックマークを追加する",
             FsBgCycle => "透過背景色を切り替える",
             FsPin => "現在の項目を代表サムネイルに固定または解除する",
             FsSpreadSingle => "単ページ表示に切り替える",
@@ -4109,6 +4113,7 @@ impl KeyAction {
             | FsLocalAdjustMode
             | FsConcealMode
             | FsTextMode
+            | FsBookBookmark
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
@@ -4478,6 +4483,7 @@ impl KeyAction {
             | FsLocalAdjustMode
             | FsConcealMode
             | FsTextMode
+            | FsBookBookmark
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
@@ -4871,7 +4877,8 @@ impl KeyAction {
             FsLocalAdjustMode => ChordList::one(Chord::ctrl(G)),
             FsConcealMode => ChordList::one(Chord::ctrl(M)),
             FsTextMode => ChordList::one(Chord::ctrl(T)),
-            FsBgCycle => ChordList::one(Chord::key(B)),
+            FsBookBookmark => ChordList::one(Chord::key(B)),
+            FsBgCycle => ChordList::one(Chord::shift(B)),
             FsPin => ChordList::one(Chord::key(P)),
             FsSpreadSingle => digit_pair(Num1, Numpad1),
             FsSpreadLtr => digit_pair(Num2, Numpad2),

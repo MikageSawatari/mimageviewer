@@ -871,7 +871,7 @@ rect のうち bbox 部分だけを UV 指定して描く。内部的にはト�
 
 **表示トリム** (`ui_view_trim.rs` / `view_trim.rs` / `view_trim_db.rs`) は、
 漫画ビューア用途で読みながら使う表示専用トリム。左端 / 上端 / 右端ホバーで開く左パネルの
-`画像補正 / 表示トリム` タブから操作し、選択中タブは `Settings::fullscreen_left_panel_tab`
+`画像補正 / 表示トリム / ブックマーク` タブから操作し、選択中タブは `Settings::fullscreen_left_panel_tab`
 へ保存する。
 本側の基本モードは `ViewTrimApplyMode::{None, Auto, Book}` のラジオで選ぶ。
 `None` は bbox を使わず、`Auto` は表示中ページごとに `cached_margin_bbox` を使う。

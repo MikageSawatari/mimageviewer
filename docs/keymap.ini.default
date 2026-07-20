@@ -306,7 +306,8 @@
 # FsLocalAdjustMode = Ctrl+G ; 補正レイヤーモードを開始する
 # FsConcealMode = Ctrl+M ; 隠蔽加工モードを開始または終了する
 # FsTextMode = Ctrl+T ; テキスト注釈モードを開始または終了する
-# FsBgCycle = B ; 透過背景色を切り替える
+# FsBookBookmark = B ; 現在の本のページにブックマークを追加する
+# FsBgCycle = Shift+B ; 透過背景色を切り替える
 # FsPin = P ; 現在の項目を代表サムネイルに固定または解除する
 # FsSpreadSingle.1 = 1 ; 単ページ表示に切り替える
 # FsSpreadSingle.2 = Numpad1 ; 単ページ表示に切り替える

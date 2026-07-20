@@ -1607,7 +1607,7 @@ fn choose_layout_base_size(
     valid_layout_size_or_fallback(rotated_display_size(selected, rotation), fallback)
 }
 
-/// 透過背景の描画スタイル。B キーで 3 モードを循環する。
+/// 透過背景の描画スタイル。Shift+B で 3 モードを循環する。
 ///
 /// フルスクリーンのビューポート背景は `ui_fullscreen.rs` で `Color32::BLACK` に
 /// ハードコードされており、テーマ設定 (Light/Dark/System) に関係なく常に黒。
@@ -1980,7 +1980,7 @@ impl App {
     }
 
     /// 現在 fullscreen 表示中の画像 (Static) が透過 (alpha<255) を含むか。
-    /// 透過がある画像でのみ B キーの背景切替が意味を持つ (不透明画像は背景が画像の裏に
+    /// 透過がある画像でのみ Shift+B の背景切替が意味を持つ (不透明画像は背景が画像の裏に
     /// 隠れて見た目が変わらない)。Static 以外 (アニメ / 動画 / 未ロード) は判定せず `true` を
     /// 返し、従来どおり切替を許可する (誤って無効化しないため)。
     pub(crate) fn fs_image_has_alpha(&self, idx: usize) -> bool {
@@ -8200,7 +8200,7 @@ impl App {
                             is_spread_double,
                         );
 
-                        // ── 透過背景インジケータ (B キー変更直後のみフェード表示) ──
+                        // ── 透過背景インジケータ (Shift+B 変更直後のみフェード表示) ──
                         self.draw_fs_transparent_bg_indicator(ui, full_rect);
                         self.draw_original_preview_indicator(ui, full_rect, state.original_preview_active);
                         self.sync_slideshow_anchor_for_frame(ctx, fs_idx, &state);
@@ -11134,8 +11134,13 @@ impl App {
                 .consume_action(ctx, KeyAction::FsLoupeLockToggle);
         let key_e =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsEraseMode);
-        // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
-        // 音声では B はブックマーク追加 (先行処理済み)。
+        // B: 本の現在ページへブックマークを追加。編集サブモードでは各モードの B 操作が
+        // 先に consume される。動画・音声の B はそれぞれ既存のブックマーク経路で処理済み。
+        let key_b_bookmark = !is_video_fs
+            && !fs_music_view_active
+            && self.fs_context_menu_idx.is_none()
+            && self.keymap.consume_action(ctx, KeyAction::FsBookBookmark);
+        // Shift+B: 透過画像の背景サイクル。
         let key_b_bg =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
         // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
@@ -11693,7 +11698,11 @@ impl App {
             });
         }
 
-        // B: 透過画像の背景サイクル (分析・補正・動画モード外)。
+        if key_b_bookmark {
+            self.add_current_book_bookmark(fs_idx);
+        }
+
+        // Shift+B: 透過画像の背景サイクル (分析・補正・動画モード外)。
         // 消しゴムモードは別ブランチ (handle_erase_keys) で処理済みのためここには来ない。
         // 通常: 黒 → 白 → 市松 の 3 モード循環。
         // AI アップスケール有効時 (composite-first): 市松は出力にパターンが焼き込まれて崩れるので
@@ -14091,7 +14100,7 @@ impl App {
             } else {
                 ui.painter().clone()
             };
-            // 透過画像用背景 (B キーで切替)。回転時は img_rect が回転前の bbox になるため
+            // 透過画像用背景 (Shift+B で切替)。回転時は img_rect が回転前の bbox になるため
             // 視覚的ズレを避けて rotation が None のときのみ適用する。
             if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
                 paint_transparent_bg(&painter, paint_rect, bg_style);
@@ -22108,7 +22117,7 @@ impl App {
         let mute_key = self.keymap.consume_action(ctx, KeyAction::VideoMute);
         let loop_key = self.keymap.consume_action(ctx, KeyAction::VideoLoop);
         // Phase 5.4.1: B キーで現在位置にブックマーク追加 (動画モード限定)。
-        // 画像モードの B (透過背景循環) とは handle_video_input 先行 consume で分離。
+        // 画像モードの Shift+B (透過背景循環) とは handle_video_input 先行 consume で分離。
         let bookmark_key = self.keymap.consume_action(ctx, KeyAction::VideoBookmark);
         let save_frame_key = self.keymap.consume_action(ctx, KeyAction::VideoCapture);
         let add_book_key = self

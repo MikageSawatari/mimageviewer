@@ -22,7 +22,7 @@ impl App {
         ctx.request_repaint();
     }
 
-    pub(super) fn start_startup_open_path_resolve(
+    pub(crate) fn start_startup_open_path_resolve(
         &mut self,
         requested: PathBuf,
         source: StartupOpenPathSource,
@@ -134,7 +134,7 @@ impl App {
         result: StartupOpenPathResolveResult,
     ) {
         let requested_display = result.requested.display().to_string();
-        if self.apply_startup_open_path_resolve_result(result) {
+        if self.apply_startup_open_path_resolve_result(source, result) {
             return;
         }
         if matches!(source, StartupOpenPathSource::InitialStartup) {
@@ -149,6 +149,7 @@ impl App {
 
     fn apply_startup_open_path_resolve_result(
         &mut self,
+        source: StartupOpenPathSource,
         result: StartupOpenPathResolveResult,
     ) -> bool {
         let Some(resolution) = result.resolved else {
@@ -172,8 +173,8 @@ impl App {
                 resolution.kind,
                 crate::folder_tree::OpenablePathKind::Directory
             );
-        let auto_fullscreen =
-            startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
+        let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
+            || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
         let outcome =
             self.load_folder_or_convert_archive_with_auto_fullscreen(openable, auto_fullscreen);
         if matches!(outcome, FolderOpenOutcome::Ignored) {
@@ -209,6 +210,7 @@ impl App {
             GridItem::Folder(path)
             | GridItem::Image(path)
             | GridItem::Video(path)
+            | GridItem::Audio(path)
             | GridItem::ZipFile(path)
             | GridItem::PdfFile(path) => crate::folder_tree::path_eq(path, requested),
             GridItem::ConvertibleArchive { path, .. } => {
@@ -237,7 +239,10 @@ impl App {
 }
 
 pub(crate) fn startup_file_should_open_fullscreen(item: &GridItem) -> bool {
-    matches!(item, GridItem::Image(_) | GridItem::Video(_))
+    matches!(
+        item,
+        GridItem::Image(_) | GridItem::Video(_) | GridItem::Audio(_)
+    )
 }
 
 pub(crate) fn startup_openable_should_auto_fullscreen(

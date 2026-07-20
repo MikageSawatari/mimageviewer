@@ -35,7 +35,7 @@ const TAB_ROW_H: f32 = 24.0;
 const SECTION_FONT: f32 = 12.0;
 
 /// 左パネルの幅
-// ヘッダーには 画像補正 / 表示トリム のタブと、画像補正タブ用のツール入口アイコン
+// ヘッダーには 画像補正 / 表示トリム / ブックマーク のタブと、画像補正タブ用のツール入口アイコン
 // (消しゴム/補正/隠蔽/切り取り/テキスト/エクスポート) を置く。
 pub const LEFT_PANEL_WIDTH: f32 = 292.0;
 /// 左パネルの下端をウィンドウ下端から少し浮かせる余白。
@@ -11645,6 +11645,159 @@ impl App {
         );
     }
 
+    fn draw_bookmark_panel_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        body_width: f32,
+        body_height: f32,
+    ) {
+        if self.current_book_bookmark_draft(fs_idx).is_none() {
+            ui.add_space(12.0);
+            ui.label("この画像は本のブックマーク対象ではありません。");
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "製本、画像のみフォルダ本、ZIP・PDF・対応アーカイブで利用できます。",
+                )
+                .small()
+                .color(egui::Color32::from_gray(170)),
+            );
+            return;
+        }
+
+        self.ensure_current_book_bookmarks_loaded(fs_idx);
+        let rows = self.current_book_bookmarks.clone();
+        let resolved: Vec<_> = rows
+            .iter()
+            .map(|bookmark| self.book_bookmark_item_idx(bookmark))
+            .collect();
+        let thumb_indices: Vec<usize> = resolved.iter().flatten().copied().collect();
+        self.ensure_bookmark_panel_thumbnails(&thumb_indices);
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("この本のブックマーク").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("{} 件", rows.len()));
+            });
+        });
+        ui.separator();
+        if self.current_book_bookmarks_request.is_some() && rows.is_empty() {
+            ui.add_space(12.0);
+            ui.spinner();
+            ui.label("読み込み中…");
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
+        if rows.is_empty() {
+            ui.add_space(12.0);
+            ui.label("ブックマークはまだありません。");
+            ui.label(
+                egui::RichText::new("B キーで現在ページを追加できます。")
+                    .small()
+                    .color(egui::Color32::from_gray(170)),
+            );
+            return;
+        }
+
+        let mut remove_id = None;
+        let mut jump_to = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(body_height - 32.0)
+            .show(ui, |ui| {
+                ui.set_width((body_width - BODY_SCROLLBAR_RESERVE).max(120.0));
+                for (bookmark, item_idx) in rows.iter().zip(resolved.iter()) {
+                    let is_current = *item_idx == Some(fs_idx);
+                    let fill = if is_current {
+                        egui::Color32::from_rgba_unmultiplied(55, 105, 165, 150)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(45, 45, 45, 175)
+                    };
+                    let frame = egui::Frame::new()
+                        .fill(fill)
+                        .corner_radius(5.0)
+                        .inner_margin(egui::Margin::same(6));
+                    let inner = frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let thumb_size = egui::vec2(58.0, 58.0);
+                            let (thumb_rect, _) =
+                                ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                            ui.painter()
+                                .rect_filled(thumb_rect, 3.0, egui::Color32::from_gray(28));
+                            if let Some(idx) = item_idx
+                                && let Some(crate::grid_item::ThumbnailState::Loaded {
+                                    tex, ..
+                                }) = self.thumbnails.get(*idx)
+                            {
+                                let [tw, th] = tex.size();
+                                let scale = (thumb_rect.width() / tw.max(1) as f32)
+                                    .min(thumb_rect.height() / th.max(1) as f32);
+                                let paint_size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+                                let paint_rect =
+                                    egui::Rect::from_center_size(thumb_rect.center(), paint_size);
+                                ui.painter().image(
+                                    tex.id(),
+                                    paint_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter().text(
+                                    thumb_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    if item_idx.is_some() { "…" } else { "!" },
+                                    egui::FontId::proportional(18.0),
+                                    egui::Color32::from_gray(165),
+                                );
+                            }
+
+                            ui.vertical(|ui| {
+                                ui.set_max_width((body_width - 116.0).max(80.0));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} ページ",
+                                        (*item_idx)
+                                            .unwrap_or(bookmark.page_index_hint)
+                                            .saturating_add(1)
+                                    ))
+                                    .strong(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(bookmark.page_identity.display_name())
+                                        .small(),
+                                );
+                                if item_idx.is_none() {
+                                    ui.label(
+                                        egui::RichText::new("ページが見つかりません")
+                                            .small()
+                                            .color(egui::Color32::from_rgb(240, 170, 90)),
+                                    );
+                                }
+                            });
+                            if ui.small_button("削除").clicked() {
+                                remove_id = Some(bookmark.id);
+                            }
+                        });
+                    });
+                    let row_response = inner.response.interact(egui::Sense::click());
+                    if row_response.clicked() && remove_id != Some(bookmark.id) {
+                        jump_to = Some(bookmark.clone());
+                    }
+                    ui.add_space(5.0);
+                }
+            });
+        if let Some(id) = remove_id {
+            self.remove_book_bookmark(id);
+        } else if let Some(bookmark) = jump_to {
+            self.jump_to_current_book_bookmark(ctx, &bookmark);
+        }
+    }
+
     /// 左パネルの画像補正パネルを描画する。
     pub(crate) fn draw_adjustment_panel(
         &mut self,
@@ -11688,7 +11841,7 @@ impl App {
         crate::os_theme::apply_dark_ui(&mut child);
 
         // ── ヘッダー ──
-        // 左ホバーパネルは 画像補正 / 表示トリム のタブ式。
+        // 左ホバーパネルは 画像補正 / 表示トリム / ブックマーク のタブ式。
         // 画像補正タブだけ、処理順の入口 (消しゴム / 補正レイヤー / 隠蔽加工 /
         // 切り取り / テキスト / エクスポート) を 2 行目に並べる。
         let header_rect =
@@ -11706,10 +11859,13 @@ impl App {
         } else {
             0.0
         };
-        let tab_w =
-            ((header_rect.width() - BODY_PAD_LEFT - BODY_PAD_RIGHT - tab_gap - close_reserved)
-                * 0.5)
-                .max(80.0);
+        let tab_w = ((header_rect.width()
+            - BODY_PAD_LEFT
+            - BODY_PAD_RIGHT
+            - tab_gap * 2.0
+            - close_reserved)
+            / 3.0)
+            .max(62.0);
         let tab_y = header_rect.min.y + 6.0;
         let tab_x = header_rect.min.x + BODY_PAD_LEFT;
         let adjustment_tab_rect =
@@ -11718,11 +11874,15 @@ impl App {
             egui::pos2(tab_x + tab_w + tab_gap, tab_y),
             egui::vec2(tab_w, TAB_ROW_H),
         );
+        let bookmarks_tab_rect = egui::Rect::from_min_size(
+            egui::pos2(tab_x + (tab_w + tab_gap) * 2.0, tab_y),
+            egui::vec2(tab_w, TAB_ROW_H),
+        );
         let close_clicked = click_to_show
             && draw_left_panel_close_button(
                 &mut child,
                 egui::Rect::from_min_size(
-                    egui::pos2(view_trim_tab_rect.right() + tab_gap, tab_y),
+                    egui::pos2(bookmarks_tab_rect.right() + tab_gap, tab_y),
                     egui::vec2(CLOSE_BTN_SIZE, CLOSE_BTN_SIZE),
                 ),
             )
@@ -11741,7 +11901,14 @@ impl App {
             crate::settings::FullscreenLeftPanelTab::ViewTrim,
             &mut selected_tab,
         );
-        let tab_changed = adjustment_tab_changed || view_trim_tab_changed;
+        let bookmarks_tab_changed = draw_left_panel_tab_button(
+            &mut child,
+            bookmarks_tab_rect,
+            "left_panel_bookmarks_tab",
+            crate::settings::FullscreenLeftPanelTab::Bookmarks,
+            &mut selected_tab,
+        );
+        let tab_changed = adjustment_tab_changed || view_trim_tab_changed || bookmarks_tab_changed;
         if tab_changed {
             if self.settings.fullscreen_left_panel_tab
                 == crate::settings::FullscreenLeftPanelTab::ViewTrim
@@ -11958,6 +12125,25 @@ impl App {
         let body_height = body_rect.height();
         let body_width = body_rect.width();
         let content_width = (body_width - BODY_SCROLLBAR_RESERVE).max(120.0);
+
+        if selected_tab == crate::settings::FullscreenLeftPanelTab::Bookmarks {
+            let ctx = child.ctx().clone();
+            body_child.allocate_ui_with_layout(
+                egui::vec2(body_width, body_height),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_width(content_width);
+                    self.draw_bookmark_panel_body(
+                        ui,
+                        &ctx,
+                        fs_root_idx,
+                        content_width,
+                        body_height,
+                    );
+                },
+            );
+            return;
+        }
 
         if selected_tab == crate::settings::FullscreenLeftPanelTab::ViewTrim {
             let ctx = child.ctx().clone();
