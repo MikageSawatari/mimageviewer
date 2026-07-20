@@ -4511,12 +4511,12 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if in_favsearch {
             self.favsearch_ctrl_nav(forward);
-        } else if in_tag_view
-            || self.items_are_subfolder_expansion_view
-            || self.items_are_smart_folder_view
-        {
+        } else if in_tag_view {
+            self.cancel_pending_folder_nav();
+        } else if self.items_are_subfolder_expansion_view {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
+        } else if self.start_smart_folder_scope_nav(forward, false) {
         } else if let Some(cur) = self.effective_folder() {
             self.start_folder_nav(cur, forward, FolderNavMode::Grid);
         }
@@ -5823,6 +5823,7 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
             // ネスト ZIP 内: ツリーを DFS で前後のノードへ (#4 改)。端では false → 下で ZIP を抜ける。
+        } else if self.start_smart_folder_scope_nav(forward, false) {
         } else if let Some(cur) = self.effective_folder() {
             self.start_folder_nav(cur, forward, FolderNavMode::Grid);
         }
@@ -5866,6 +5867,7 @@ impl App {
                 }
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
+                self.begin_smart_folder_drill(&p);
                 Some(AddressBarNav::Direct(p))
             }
             Some(GridItem::Image(_))

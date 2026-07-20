@@ -16,6 +16,7 @@
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |
+| [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
 | [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) + [key-command-catalog-plan.md](key-command-catalog-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 / コマンドカタログ化を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |
 
@@ -58,7 +59,7 @@
 | [ring-keyaction-parity.md](ring-keyaction-parity.md) | RingActionId と KeyAction の対応棚卸し。リング / パッド / ジェスチャ側だけに操作を足してキーボード側の KeyAction 化を忘れないための恒久チェック表。`src/keymap.rs` の parity テストと合わせて更新する |
 | [operation-customize-share-plan.md](operation-customize-share-plan.md) | **実装済み** (バックログ §4.6 の正本)。操作カスタマイズ (keymap / ring_shortcuts / menu_layout の 3 点セット) を `.mivkeys.json` にエクスポート / インポート (置換のみ) して共有し、標準 / 現在 / 前世代との差分を表表示し、`settings.db` 世代 (bak1..bak10) から操作カスタマイズだけを再起動なしでライブ取り込みする機能。既存「設定の復元」ダイアログをタブ化 (`設定の復元` / `操作カスタマイズ`) して集約。スキーマ非変更 (世代を読むだけ + ファイル入出力 + 純関数差分) |
 | [file-drag-drop-design.md](file-drag-drop-design.md) | グリッドからエクスプローラ等へファイルをドラッグ送出 (コピー) する機能の実装設計＋実装メモ。シェル `IDataObject` + `SHDoDragDrop` 方式。実装済み (2026-05、`src/file_drag.rs`)、残るは §8.2 の実機検証 |
-| [subfolder-expansion-view-plan.md](subfolder-expansion-view-plan.md) | **実装済み (2026-07-17 更新)**。現在フォルダ以下の画像/動画を snapshot 一覧化する `サブ展開` ビュー。全体/フォルダ単位ソート、10万件以上の続行確認、キャンセル可能な非同期表示準備、既存の詳細表示/★/タグ/場所 facet との連携を記載。ZIP/PDF/変換アーカイブ内部は対象外 |
+| [subfolder-expansion-view-plan.md](subfolder-expansion-view-plan.md) | **実装済み (2026-07-20 更新)**。現在フォルダ以下の画像/動画、ZIP/PDF 本体、設定上の画像フォルダ本を snapshot 一覧化する `サブ展開` ビュー。全体/フォルダ単位ソート、10万件以上の続行確認、キャンセル可能な非同期表示準備、既存の詳細表示/★/タグ/場所 facet との連携を記載。ZIP/PDF/変換アーカイブ内部は対象外 |
 | [ring-shortcut-plan.md](ring-shortcut-plan.md) | マウス右ドラッグ (リング / ジェスチャ) / ゲームパッド X リングショートカット + パッド専用ピッカーパネルの設計。右ドラッグ mode は 4 文脈ごとに `未使用` / `リングショートカット` / `マウスジェスチャ` を保存し、設定メニュー「操作カスタマイズ」から右ドラッグ mode / リング / マウスジェスチャ / マウス進む・戻る / ゲームパッド X+方向リングを編集する。ゲームパッド固定ボタン単体は既定動作固定。マウスジェスチャ追加は実際の右ドラッグ軌跡を記録する |
 | [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md) | サムネイル比率の自動選択 (`thumb_aspect_auto`) の設計と実装計画。`log(ratio)` の中央値 → 最近接バケット方式 + 6 段ゲート (min_samples / 連勝継続 / cooldown / 切替上限 / 入力 idle / log 距離マージン)。実装済み (2026-05、`src/auto_aspect.rs`) |
 | [reading-history-plan.md](reading-history-plan.md) | 最近読んだフォルダ / ZIP / PDF を「読書履歴」として専用ビューに集める機能の実装メモ。記録対象は `Image` / `ZipImage` / `PdfPage` をフルスクリーンで開いた時、動画は除外。Ctrl+S コンテナ検索は対象、Ctrl+G アイテム検索とタグビューは対象外。変換アーカイブはキャッシュ ZIP ではなく元 RAR/7z/LZH を保存する。MVP 実装済み (2026-06、`src/reading_history_db.rs`) |

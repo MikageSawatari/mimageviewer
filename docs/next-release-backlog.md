@@ -149,38 +149,6 @@
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
 
-### 1.23 最上位一覧ビューの状態所有と復元先を単一型へ統合 + スマートフォルダ内階層移動
-
-- 背景: 検索（Ctrl+F / S / G / T）、★固定、サブ展開、スマートフォルダ、読書履歴、
-  レーティング一覧が個別の `active` flag / synthetic path / saved folder を持つため、
-  新しい合成ビュー追加時に相互排他・worker世代・履歴復元の接続漏れが起きやすい。
-- v2.6.0 の安全策: 各入口の共通終了処理、検索入口からのsmart worker cancel、完了通知側の
-  所有権再確認を追加済み。検索結果 / 検索由来Snapshot → smart、検索結果 → smart処理中 →
-  別検索、検索 / 検索由来Snapshot → 別検索、pending smart → 別smartの直行では最小の
-  `ViewReturnContext`（path + サブ展開snapshot）を復元なしで原子的に移譲し、restore stateの
-  所有者を1つに限定した。
-- 将来方針: `TopLevelGridView`（通常 / 検索 / サブ展開 / スマート / 履歴 / レーティング等）を
-  Appの正本にし、現在は移譲用途だけの`ViewReturnContext`を全復元可能snapshotへ拡張して、
-  enter / leave / restore / cancel / generationを1つのtransition APIへ集約する。既存flagは描画用の
-  派生値へ段階移行する。
-- スマートフォルダ内階層移動（今後のバージョン）:
-  - スマートフォルダ直下は現行どおり、複数の検索元を横断したフラットなsnapshotとする。
-  - 結果内の実フォルダを開いた後もスマートフォルダの閲覧scopeを保持し、場所を
-    `スマートフォルダ名 > フォルダ名 > 子フォルダ名` として管理する。フォルダの中身には
-    スマートフォルダの絞り込み条件を再適用せず、条件は入口となる結果項目の選定にだけ使う。
-  - BS / 親移動はscope内の親へ戻り、入口まで戻ったら再走査せず保持snapshotへ戻る。
-    現行の履歴←によるスマートフォルダ復帰は、この機能を実装するまでの利用方法として維持する。
-  - Ctrl+↑/↓は実ファイルシステム全体へ抜けず、現在の入口フォルダ内を深さ優先で移動する。
-    入口内の端へ達したら、スマートフォルダsnapshotの表示順に従って前後のフォルダ項目へ移る。
-  - `TopLevelGridView::SmartFolder`配下に root / scoped drill の位置と戻りstackを所有させ、
-    検索・履歴・別スマートフォルダへの遷移では同じtransition APIでscopeごと退避・復元する。
-    キーボード、リング、ゲームパッド、フルスクリーンの各ナビ経路は同じ判定を利用する。
-- 回帰確認: smart root→実フォルダ→子フォルダ→BS、Ctrl+↑/↓の入口内移動と入口間移動、
-  検索 / Snapshot / 履歴との往復、表示中のrename/delete/refreshを組み合わせて確認する。
-- 規模 / 優先度: Large / P2 architecture。v2.6.0直前に全面移行せず、次の合成ビュー追加前に
-  独立フェーズで行う。階層移動単体はMediumだが、同じ戻り先の二重実装を避けるためこの整理後に
-  実装する。
-
 ### 2.1 folder pane scan worker の thread 構成判断
 
 - 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。

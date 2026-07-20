@@ -35,6 +35,7 @@
 | 通常グリッド | `FolderNavMode::Grid` で DFS。画像 / 動画を含む通常フォルダ、画像入り ZIP、PDF、RAR/7z/LZH などの変換アーカイブが停止対象 | なし |
 | 通常グリッド | `FolderNavMode::SiblingGrid` で兄弟限定移動。空フォルダも skip せず、最後の兄弟を越えた場合は右上トースト | 「次/前の兄弟フォルダはありません」 |
 | Ctrl+F ローカル検索中 | `visible_indices` は Ctrl+F で絞られる。Ctrl+↑↓ は no-op。検索バーにフォーカスがある間はショートカットをブロック | 必要なら no-op toast |
+| スマートフォルダ root / scoped drill | `FolderNavMode::SmartFolder`。現在 entry 内だけを DFS し、端では root snapshot の表示順で前後の実フォルダ entry へ移る | root 表示順の端では「次/前のフォルダはありません」 |
 
 Ctrl+F は「現在一覧に対するフィルタ」。フォーカスが検索バーから外れていても
 Ctrl+↑↓ でフォルダ横断しない。
@@ -51,6 +52,7 @@ Ctrl+↑↓ でフォルダ横断しない。
 | 移動先に画像 / 動画が見つからない | `FsBoundaryHint::NoImageFolder` を表示 |
 | 兄弟が無い | `FsBoundaryHint::NoSiblingFolder` を表示 |
 | Ctrl+G DrilledInto 中の Ctrl+↑↓ | `global_search_ctrl_nav_fullscreen` で検索結果スコープ内を移動し、先頭 / 末尾で `SearchEnd` を表示。移動先は方向に関わらず先頭 image-like |
+| スマートフォルダ scoped drill 中の Ctrl+↑↓ | `FolderNavMode::SmartFolder { fullscreen: true }`。entry scope 内または前後 entryへ移動し、方向に関わらず先頭 image-likeへ着地 |
 
 注意: 以前の docs には「Ctrl+↑ は前フォルダの末尾画像へ」と書かれていたが、現在の実装は「方向に関わらず移動先の先頭」。
 
@@ -109,9 +111,10 @@ Ctrl+↑↓ の「現在コンテキスト」は以下の優先順位で解釈�
 0. Ctrl+F / Ctrl+S / Ctrl+G の検索バーにフォーカスがある間: 文字編集を優先し、既存どおりショートカットをブロックする。
 1. Ctrl+G DrilledInto 中: Ctrl+G の検索結果ツリー内を移動する。
 2. Ctrl+S で実結果を開いている中: Ctrl+S の `nav_stack` スコープ内を移動する。
-3. Ctrl+F active 中: 移動しない。Ctrl+F は現在一覧のフィルタとして扱い、フォルダ横断を開始しない。
-4. 通常表示: 実フォルダツリーを DFS で移動する。
-5. Ctrl+G Aggregated / Ctrl+S 結果一覧: まだ開いている container が無いので、移動せず案内だけ出す。
+3. スマートフォルダ中: 現在 entry 内を移動し、端だけ root snapshot の前後 entry へ移る。
+4. Ctrl+F active 中: 移動しない。Ctrl+F は現在一覧のフィルタとして扱い、フォルダ横断を開始しない。
+5. 通常表示: 実フォルダツリーを DFS で移動する。
+6. Ctrl+G Aggregated / Ctrl+S 結果一覧: まだ開いている container が無いので、移動せず案内だけ出す。
 
 Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を見ていたのにフォルダ移動で
 検索が外れる」「移動先でも同じ filter を適用して 0 件になる」など、ユーザーが現在地を
@@ -209,6 +212,7 @@ no-op 案内は段階を分ける:
 - [x] Ctrl+F フィルタ中は、同一一覧移動はフィルタ後の `visible_indices`、Ctrl+↑↓ は no-op。
 - [x] Ctrl+S で結果を開いた後、グリッド / フルスクリーン / 動画の Ctrl+↑↓ が `nav_stack` スコープを維持する。
 - [x] Ctrl+G DrilledInto で、グリッド / フルスクリーン / 動画の Ctrl+↑↓ が検索結果スコープを維持する。
+- [x] スマートフォルダで、グリッド / リング / ゲームパッド / フルスクリーン / native 動画の Ctrl+↑↓ が同じ entry scope と root 表示順を使う。
 - [x] Ctrl+G Aggregated / Ctrl+S 結果一覧では no-op でもよいが、必要なら案内を出す。
 - [x] Ctrl+PageUp/PageDown は通常フォルダで兄弟だけを移動し、空フォルダも skip せず、子や祖先の兄弟へ入らない。検索中は no-op。
 - [x] 切り離した detached / always-new 窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown が main bundle を動かさず no-op になる。

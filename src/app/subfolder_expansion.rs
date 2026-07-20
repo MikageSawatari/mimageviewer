@@ -1,8 +1,8 @@
 //! サブフォルダ展開ビュー (snapshot flat view) の App グルーと走査ワーカー。
 //!
-//! 現在フォルダ以下の実ファイル画像/動画だけを、その時点のスナップショットとして
-//! synthetic path に流し込む。ZIP/PDF/変換アーカイブの内部展開や watcher 追従は
-//! 初期版では扱わない。
+//! 現在フォルダ以下の画像/動画と ZIP/PDF 本体を、その時点のスナップショットとして
+//! synthetic path に流し込む。設定で有効な場合は画像だけのフォルダも本として 1 項目に
+//! 集約する。ZIP/PDF/変換アーカイブの内部展開や watcher 追従は扱わない。
 
 use super::*;
 
@@ -24,7 +24,11 @@ const SUBFOLDER_SORT_PROGRESS_INTERVAL: usize = 16_384;
 pub(crate) struct SubfolderExpansionOptions {
     skip_image_if_video_exists: bool,
     skip_duplicate_images: bool,
+    skip_zip_if_folder_exists: bool,
     video_thumb_use_sidecar_image: bool,
+    image_folder_books: bool,
+    include_convertible_archives: bool,
+    show_hidden_files: bool,
     image_ext_priority: Vec<String>,
 }
 
@@ -33,7 +37,11 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
         Self {
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             skip_duplicate_images: settings.skip_duplicate_images,
+            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            image_folder_books: settings.auto_fullscreen_image_folders_enabled(),
+            include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+            show_hidden_files: settings.show_hidden_files,
             image_ext_priority: settings.image_ext_priority.clone(),
         }
     }
@@ -42,7 +50,7 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SubfolderExpansionDiag {
     pub(crate) dirs_scanned: usize,
-    pub(crate) media_found: usize,
+    pub(crate) items_found: usize,
     pub(crate) read_dir_errors: usize,
     pub(crate) entry_errors: usize,
     pub(crate) file_type_errors: usize,
@@ -54,7 +62,7 @@ pub(crate) struct SubfolderExpansionDiag {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SubfolderExpansionProgress {
     pub(crate) dirs_scanned: usize,
-    pub(crate) media_found: usize,
+    pub(crate) items_found: usize,
     pub(crate) current_dir: Option<PathBuf>,
 }
 
@@ -62,8 +70,38 @@ impl SubfolderExpansionProgress {
     fn from_diag(diag: &SubfolderExpansionDiag, current_dir: Option<PathBuf>) -> Self {
         Self {
             dirs_scanned: diag.dirs_scanned,
-            media_found: diag.media_found,
+            items_found: diag.items_found,
             current_dir,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubfolderExpansionEntryKind {
+    Folder,
+    Zip,
+    Pdf,
+    Image,
+    Video,
+}
+
+impl SubfolderExpansionEntryKind {
+    fn to_grid_item(self, path: PathBuf) -> GridItem {
+        match self {
+            Self::Folder => GridItem::Folder(path),
+            Self::Zip => GridItem::ZipFile(path),
+            Self::Pdf => GridItem::PdfFile(path),
+            Self::Image => GridItem::Image(path),
+            Self::Video => GridItem::Video(path),
+        }
+    }
+
+    fn display_kind(self) -> crate::settings::GridItemDisplayKind {
+        match self {
+            Self::Folder => crate::settings::GridItemDisplayKind::Folder,
+            Self::Zip | Self::Pdf => crate::settings::GridItemDisplayKind::Archive,
+            Self::Image => crate::settings::GridItemDisplayKind::Image,
+            Self::Video => crate::settings::GridItemDisplayKind::VideoAudio,
         }
     }
 }
@@ -71,7 +109,7 @@ impl SubfolderExpansionProgress {
 #[derive(Clone, Debug)]
 pub(crate) struct SubfolderExpansionEntry {
     pub(crate) path: PathBuf,
-    pub(crate) is_video: bool,
+    pub(crate) kind: SubfolderExpansionEntryKind,
     pub(crate) mtime: i64,
     pub(crate) file_size: i64,
 }
@@ -99,7 +137,7 @@ pub(crate) struct SubfolderExpansionSnapshot {
     pub(crate) diag: SubfolderExpansionDiag,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SubfolderExpansionRestoreState {
     pub(crate) root: Option<PathBuf>,
     pub(crate) roots: Vec<PathBuf>,
@@ -157,6 +195,9 @@ pub(crate) struct PreparedSubfolderMetadata {
     pub(crate) local_adjust_pages: HashSet<usize>,
     pub(crate) video_pin_blobs: HashMap<PathBuf, Vec<u8>>,
     pub(crate) legacy_paths: Vec<PathBuf>,
+    /// サブ展開は synthetic path のため、通常フォルダの同期 lookup を使わず prepare
+    /// worker でコンテナ項目だけを一括照会する。スマートフォルダは aggregate 側に持つ。
+    pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
     /// Additional exact-key metadata for aggregate views whose items come from unrelated real
     /// folders.  A normal folder can hydrate by one path prefix; a smart folder cannot, so its
     /// prepare worker supplies the finished sparse maps instead of making the UI thread query
@@ -293,7 +334,7 @@ fn scan_subfolder_expansion(
         video_thumb_overrides: HashMap::new(),
         diag: SubfolderExpansionDiag::default(),
     };
-    let media_found = std::cell::Cell::new(0usize);
+    let items_found = std::cell::Cell::new(0usize);
     let last_progress = std::cell::Cell::new(Instant::now());
     let walk_diag = super::recursive_snapshot_scan::walk_snapshot_roots(
         &roots,
@@ -301,10 +342,10 @@ fn scan_subfolder_expansion(
         &cancel,
         Some(io_sem),
         Some(activity_gate),
-        |_, _dir, entries, cancel| {
+        |_, dir, entries, cancel| {
             let mut subdirs = Vec::new();
-            scan_one_directory(entries, &options, cancel, &mut result, &mut subdirs);
-            media_found.set(result.diag.media_found);
+            scan_one_directory(dir, entries, &options, cancel, &mut result, &mut subdirs);
+            items_found.set(result.diag.items_found);
             subdirs
         },
         |diag, current_dir| {
@@ -312,7 +353,7 @@ fn scan_subfolder_expansion(
                 let _ = tx.send(SubfolderExpansionEvent::Progress(
                     SubfolderExpansionProgress {
                         dirs_scanned: diag.dirs_scanned,
-                        media_found: media_found.get(),
+                        items_found: items_found.get(),
                         current_dir: current_dir.map(Path::to_path_buf),
                     },
                 ));
@@ -357,6 +398,7 @@ fn normalize_expansion_roots(root: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn scan_one_directory(
+    dir: &Path,
     read_dir: std::fs::ReadDir,
     options: &SubfolderExpansionOptions,
     cancel: &AtomicBool,
@@ -364,6 +406,9 @@ fn scan_one_directory(
     subdirs: &mut Vec<PathBuf>,
 ) {
     let mut media: Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)> = Vec::new();
+    let mut containers: Vec<SubfolderExpansionEntry> = Vec::new();
+    let mut real_folder_names = HashSet::new();
+    let mut has_book_container = false;
     let mut entry_file_names_ci = HashSet::new();
 
     for entry_result in read_dir {
@@ -377,8 +422,6 @@ fn scan_one_directory(
                 continue;
             }
         };
-        entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
-
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(_) => {
@@ -387,10 +430,18 @@ fn scan_one_directory(
             }
         };
         let kind = crate::fs_entry::classify_dir_entry(&entry, &file_type);
+        entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
+        if crate::fs_entry::should_hide_fs_entry(&entry, options.show_hidden_files) {
+            continue;
+        }
         let path = entry.path();
 
         if kind.is_directory() {
             if !crate::video::upscale::paths::has_work_dir_suffix(&path) {
+                has_book_container = true;
+                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    real_folder_names.insert(name.to_lowercase());
+                }
                 subdirs.push(path);
             }
             continue;
@@ -403,15 +454,33 @@ fn scan_one_directory(
             continue;
         };
         let ext_lower = ext.to_ascii_lowercase();
-        // サブ展開ビューは現状 画像 / 動画 のフラット一覧。音声 (GridItem::Audio) は
-        // 通常フォルダ一覧にのみ出し、サブ展開ビューへの取り込みは後続 Inc とする。
-        let kind = if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
-            super::folder_scan::ScanMediaKind::Image
+        let media_kind = if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
+            Some(super::folder_scan::ScanMediaKind::Image)
         } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
-            super::folder_scan::ScanMediaKind::Video
+            Some(super::folder_scan::ScanMediaKind::Video)
+        } else if crate::folder_tree::is_audio_ext(&ext_lower) {
+            // 音声はサブ展開の表示対象外だが、画像だけの本ではないという判定には使う。
+            Some(super::folder_scan::ScanMediaKind::Audio)
         } else {
-            continue;
+            None
         };
+
+        let entry_kind = if crate::folder_tree::is_zip_extension(&ext_lower) {
+            Some(SubfolderExpansionEntryKind::Zip)
+        } else if ext_lower == "pdf" {
+            Some(SubfolderExpansionEntryKind::Pdf)
+        } else {
+            None
+        };
+        if entry_kind.is_some()
+            || (options.include_convertible_archives
+                && crate::archive_converter::ArchiveFormat::from_extension(&ext_lower).is_some())
+        {
+            has_book_container = true;
+        }
+        if media_kind.is_none() && entry_kind.is_none() {
+            continue;
+        }
 
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
@@ -420,17 +489,45 @@ fn scan_one_directory(
                 continue;
             }
         };
-        media.push((
-            path,
-            kind,
-            crate::ui_helpers::mtime_secs(&metadata),
-            metadata.len() as i64,
-        ));
+        let mtime = crate::ui_helpers::mtime_secs(&metadata);
+        let file_size = metadata.len() as i64;
+        if let Some(kind) = media_kind {
+            media.push((path, kind, mtime, file_size));
+        } else if let Some(kind) = entry_kind {
+            containers.push(SubfolderExpansionEntry {
+                path,
+                kind,
+                mtime,
+                file_size,
+            });
+        }
     }
 
     super::folder_scan::filter_upscaled_video_pairs_fast(&mut media, &entry_file_names_ci);
+    if options.image_folder_books
+        && super::folder_scan::is_image_only_book_contents(has_book_container, &media)
+    {
+        let metadata = std::fs::metadata(dir).ok();
+        if metadata.is_none() {
+            result.diag.metadata_errors += 1;
+        }
+        result.entries.push(SubfolderExpansionEntry {
+            path: dir.to_path_buf(),
+            kind: SubfolderExpansionEntryKind::Folder,
+            mtime: metadata.as_ref().map_or(0, crate::ui_helpers::mtime_secs),
+            file_size: 0,
+        });
+        result.diag.items_found += 1;
+        return;
+    }
+
+    if options.skip_zip_if_folder_exists {
+        containers.retain(|entry| !real_folder_names.contains(&super::stem_lower(&entry.path)));
+    }
     apply_duplicate_filters_to_media(&mut media, options, &mut result.video_thumb_overrides);
-    result.diag.media_found += media.len();
+    media.retain(|(_, kind, _, _)| *kind != super::folder_scan::ScanMediaKind::Audio);
+    result.diag.items_found += media.len() + containers.len();
+    result.entries.extend(containers);
     result
         .entries
         .extend(
@@ -438,7 +535,17 @@ fn scan_one_directory(
                 .into_iter()
                 .map(|(path, kind, mtime, file_size)| SubfolderExpansionEntry {
                     path,
-                    is_video: kind == super::folder_scan::ScanMediaKind::Video,
+                    kind: match kind {
+                        super::folder_scan::ScanMediaKind::Image => {
+                            SubfolderExpansionEntryKind::Image
+                        }
+                        super::folder_scan::ScanMediaKind::Video => {
+                            SubfolderExpansionEntryKind::Video
+                        }
+                        super::folder_scan::ScanMediaKind::Audio => unreachable!(
+                            "audio entries are excluded from subfolder expansion output"
+                        ),
+                    },
                     mtime,
                     file_size,
                 }),
@@ -581,8 +688,6 @@ fn sorted_entry_indices_for_view(
     mut progress: Option<&mut dyn FnMut(usize)>,
     chunk_size: usize,
 ) -> Option<Vec<usize>> {
-    use crate::settings::GridItemDisplayKind;
-
     let total = entries.len();
     if total == 0 {
         report_subfolder_sort_progress(&mut progress, 0);
@@ -613,11 +718,7 @@ fn sorted_entry_indices_for_view(
             .and_then(|parent| parent.strip_prefix(root).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let kind = if entry.is_video {
-            GridItemDisplayKind::VideoAudio
-        } else {
-            GridItemDisplayKind::Image
-        };
+        let kind = entry.kind.display_kind();
         keys.push(SubfolderEntrySortKey {
             name: sort.name_key(name),
             parent: crate::filename_sort::SortNameKey::file_name(&parent),
@@ -748,6 +849,7 @@ struct SubfolderExpansionPrepareOptions {
     load_tags: bool,
     load_local_adjust: bool,
     load_video_pins: bool,
+    folder_pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     removed_paths: HashSet<String>,
     /// 表示中のサブ展開を並び替える場合は、DB を再読込せず現在の
     /// sparse cache を新しい idx へ割り当て直す。
@@ -834,11 +936,7 @@ fn prepare_subfolder_expansion(
             continue;
         }
         let display_idx = items.len();
-        let item = if entry.is_video {
-            GridItem::Video(entry.path.clone())
-        } else {
-            GridItem::Image(entry.path.clone())
-        };
+        let item = entry.kind.to_grid_item(entry.path.clone());
         items.push(item);
         image_metas.push(Some((entry.mtime, entry.file_size)));
         if let Some(reused) = reused_metadata {
@@ -947,6 +1045,15 @@ fn prepare_subfolder_expansion(
         return Ok(None);
     }
 
+    let folder_pin_map = options
+        .folder_pin_db
+        .as_ref()
+        .map(|db| db.lookup_many(items.iter().filter_map(GridItem::container_path)))
+        .unwrap_or_default();
+    if cancelled(cancel) {
+        return Ok(None);
+    }
+
     // 数百万件では正規化キー文字列だけでも大きい。legacy seed 用 path snapshot を
     // 作る前に DB lookup 用バッファを明示的に解放して peak memory を抑える。
     drop(key_by_idx);
@@ -969,6 +1076,7 @@ fn prepare_subfolder_expansion(
             local_adjust_pages,
             video_pin_blobs,
             legacy_paths,
+            folder_pin_map: Some(folder_pin_map),
             aggregate: None,
         },
     }))
@@ -1033,10 +1141,10 @@ impl App {
     pub(crate) fn subfolder_expansion_action_tooltip(&self) -> String {
         let roots = self.selected_subfolder_expansion_roots();
         if roots.is_empty() {
-            "現在のフォルダ以下の画像と動画をフラット表示\nフォルダを Space / Ctrl+クリックで選ぶと、選んだフォルダだけをまとめて展開できます".to_string()
+            "現在のフォルダ以下の画像・動画・ZIP・PDFを一覧表示\n「画像のみのフォルダを本として扱う」がオンなら、そのフォルダは1項目にまとめます\nフォルダを Space / Ctrl+クリックで選ぶと、選んだフォルダだけをまとめて展開できます".to_string()
         } else {
             format!(
-                "チェックした {} 個のフォルダ以下の画像と動画をまとめてフラット表示",
+                "チェックした {} 個のフォルダ以下の画像・動画・ZIP・PDFをまとめて一覧表示",
                 roots.len()
             )
         }
@@ -1098,12 +1206,12 @@ impl App {
                 if current.is_empty() {
                     format!(
                         "サブフォルダを走査中\n{}件 / {}フォルダ\n中止ボタンでキャンセル",
-                        progress.media_found, progress.dirs_scanned
+                        progress.items_found, progress.dirs_scanned
                     )
                 } else {
                     format!(
                         "サブフォルダを走査中\n{}件 / {}フォルダ\n現在: {current}\n中止ボタンでキャンセル",
-                        progress.media_found, progress.dirs_scanned
+                        progress.items_found, progress.dirs_scanned
                     )
                 }
             }
@@ -1243,6 +1351,13 @@ impl App {
         self.subfolder_expansion_confirm_pending = None;
         self.subfolder_expansion_progress = None;
         self.subfolder_expansion_diag = None;
+        if matches!(
+            self.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::SubfolderExpansion
+        ) {
+            self.top_level_grid_view
+                .replace_surface(super::top_level_grid_view::TopLevelGridSurface::Folder);
+        }
     }
 
     pub(crate) fn restore_subfolder_expansion_view_state_after_items_install(&mut self) {
@@ -1259,6 +1374,8 @@ impl App {
             self.subfolder_expansion_roots.clone()
         };
         self.items_are_subfolder_expansion_view = true;
+        self.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SubfolderExpansion);
         self.subfolder_expansion_root = Some(root.clone());
         self.subfolder_expansion_roots = roots.clone();
         self.subfolder_expansion_saved_folder
@@ -1455,6 +1572,7 @@ impl App {
             load_tags: self.tags_db.is_some(),
             load_local_adjust: self.local_adjust_db.is_some(),
             load_video_pins: self.video_pin_db.is_some(),
+            folder_pin_db: self.folder_thumb_pin_db.clone(),
             removed_paths: self.subfolder_expansion_removed_paths.clone(),
             reused_metadata,
         };
@@ -1479,10 +1597,8 @@ impl App {
                 if stars == 0 {
                     return None;
                 }
-                let path = match self.items.get(idx)? {
-                    GridItem::Image(path) | GridItem::Video(path) => path,
-                    _ => return None,
-                };
+                let item = self.items.get(idx)?;
+                let path = item.drag_source_path().or_else(|| item.container_path())?;
                 Some((crate::adjustment_db::normalize_path(path), stars))
             })
             .collect();
@@ -1696,6 +1812,8 @@ impl App {
         }
         let state_t0 = Instant::now();
         self.items_are_subfolder_expansion_view = true;
+        self.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SubfolderExpansion);
         self.subfolder_expansion_root = Some(root.clone());
         self.subfolder_expansion_roots = roots.clone();
         self.subfolder_expansion_saved_folder = Some(root.clone());
@@ -1775,7 +1893,7 @@ impl App {
                     ui.heading("サブフォルダを走査中...");
                 });
                 ui.add_space(6.0);
-                ui.label(format!("画像・動画: {} 件", progress.media_found));
+                ui.label(format!("表示項目: {} 件", progress.items_found));
                 ui.label(format!("確認済みフォルダ: {} 件", progress.dirs_scanned));
                 if let Some(current_dir) = current_dir.as_deref() {
                     ui.label("現在のフォルダ:").on_hover_text(current_dir);
@@ -1816,7 +1934,7 @@ impl App {
                 ui.set_min_width(420.0);
                 ui.heading("大量の項目をサブ展開");
                 ui.add_space(8.0);
-                ui.label(format!("{item_count} 件の画像・動画が見つかりました。"));
+                ui.label(format!("{item_count} 件の表示項目が見つかりました。"));
                 ui.label("一覧の準備には時間がかかることがあります。");
                 ui.label("準備中は「中止」以外の操作はできません。");
                 ui.add_space(10.0);
@@ -1956,7 +2074,7 @@ fn remove_paths_from_snapshot(
         });
     let changed = snapshot.entries.len() != before;
     if changed {
-        snapshot.diag.media_found = snapshot.entries.len();
+        snapshot.diag.items_found = snapshot.entries.len();
     }
     changed
 }
@@ -1965,9 +2083,51 @@ fn remove_paths_from_snapshot(
 mod tests {
     use super::*;
 
+    fn test_scan_options(image_folder_books: bool) -> SubfolderExpansionOptions {
+        SubfolderExpansionOptions {
+            skip_image_if_video_exists: false,
+            skip_duplicate_images: false,
+            skip_zip_if_folder_exists: false,
+            video_thumb_use_sidecar_image: true,
+            image_folder_books,
+            include_convertible_archives: false,
+            show_hidden_files: true,
+            image_ext_priority: Vec::new(),
+        }
+    }
+
+    fn scan_test_root(root: &Path, options: SubfolderExpansionOptions) -> SubfolderExpansionResult {
+        let (tx, _rx) = mpsc::channel();
+        scan_subfolder_expansion(
+            root.to_path_buf(),
+            vec![root.to_path_buf()],
+            options,
+            Arc::new(AtomicBool::new(false)),
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+            &crate::activity_gate::ActivityGate::new(0),
+            &tx,
+        )
+        .expect("scan should finish")
+    }
+
     #[test]
     fn synthetic_path_is_registered_as_synthetic_view() {
         assert!(is_synthetic_view_path(&subfolder_expansion_synthetic_path()));
+    }
+
+    #[test]
+    fn scan_option_uses_the_existing_effective_image_folder_book_setting() {
+        let mut settings = crate::settings::Settings::default();
+        settings.detached_viewer_open_images_in_window = false;
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.auto_fullscreen_image_folders = false;
+        assert!(!SubfolderExpansionOptions::from(&settings).image_folder_books);
+
+        settings.auto_fullscreen_image_folders = true;
+        assert!(SubfolderExpansionOptions::from(&settings).image_folder_books);
+
+        settings.auto_fullscreen_zip_pdf = false;
+        assert!(!SubfolderExpansionOptions::from(&settings).image_folder_books);
     }
 
     #[test]
@@ -1993,7 +2153,11 @@ mod tests {
             SubfolderExpansionOptions {
                 skip_image_if_video_exists: false,
                 skip_duplicate_images: false,
+                skip_zip_if_folder_exists: false,
                 video_thumb_use_sidecar_image: true,
+                image_folder_books: false,
+                include_convertible_archives: false,
+                show_hidden_files: true,
                 image_ext_priority: Vec::new(),
             },
             Arc::new(AtomicBool::new(false)),
@@ -2015,6 +2179,205 @@ mod tests {
     }
 
     #[test]
+    fn image_only_folder_is_expanded_to_individual_images_when_setting_is_off() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("001.jpg"), b"first").unwrap();
+        std::fs::write(book.join("002.png"), b"second").unwrap();
+
+        let result = scan_test_root(&root, test_scan_options(false));
+
+        assert_eq!(result.entries.len(), 2);
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|entry| entry.kind == SubfolderExpansionEntryKind::Image)
+        );
+    }
+
+    #[test]
+    fn image_only_folder_is_one_book_item_when_setting_is_on() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("001.jpg"), b"first").unwrap();
+        std::fs::write(book.join("002.png"), b"second").unwrap();
+
+        let result = scan_test_root(&root, test_scan_options(true));
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, book);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
+    }
+
+    #[test]
+    fn zip_and_pdf_are_each_listed_once_without_enumerating_their_contents() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("book.zip"), b"not opened by scan").unwrap();
+        std::fs::write(root.join("comic.cbz"), b"not opened by scan").unwrap();
+        std::fs::write(root.join("document.pdf"), b"not opened by scan").unwrap();
+
+        let result = scan_test_root(&root, test_scan_options(true));
+        let kinds = result
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<Vec<_>>();
+
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == SubfolderExpansionEntryKind::Zip)
+                .count(),
+            2
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == SubfolderExpansionEntryKind::Pdf)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn prepare_materializes_folder_zip_pdf_image_and_video_grid_items() {
+        let root = PathBuf::from(r"C:\root");
+        let entries = [
+            (SubfolderExpansionEntryKind::Folder, "folder"),
+            (SubfolderExpansionEntryKind::Zip, "book.zip"),
+            (SubfolderExpansionEntryKind::Pdf, "document.pdf"),
+            (SubfolderExpansionEntryKind::Image, "image.jpg"),
+            (SubfolderExpansionEntryKind::Video, "video.mp4"),
+        ]
+        .into_iter()
+        .map(|(kind, name)| SubfolderExpansionEntry {
+            path: root.join(name),
+            kind,
+            mtime: 1,
+            file_size: 1,
+        })
+        .collect::<Vec<_>>();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            entries: Arc::new(entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        };
+        let options = SubfolderExpansionPrepareOptions {
+            sort: crate::settings::SortOrder::FileName,
+            order: crate::settings::SubfolderExpansionOrder::Flat,
+            display_order: crate::settings::GridDisplayOrder::default(),
+            load_ratings: false,
+            load_tags: false,
+            load_local_adjust: false,
+            load_video_pins: false,
+            folder_pin_db: None,
+            removed_paths: HashSet::new(),
+            reused_metadata: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+
+        let prepared =
+            prepare_subfolder_expansion(snapshot, false, options, &AtomicBool::new(false), &tx)
+                .unwrap()
+                .unwrap();
+
+        assert!(
+            prepared
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::Folder(_)))
+        );
+        assert!(
+            prepared
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::ZipFile(_)))
+        );
+        assert!(
+            prepared
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::PdfFile(_)))
+        );
+        assert!(
+            prepared
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(_)))
+        );
+        assert!(
+            prepared
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::Video(_)))
+        );
+    }
+
+    #[test]
+    fn image_folder_with_video_or_container_is_not_collapsed_as_a_book() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let mixed = root.join("mixed");
+        let with_pdf = root.join("with-pdf");
+        std::fs::create_dir_all(&mixed).unwrap();
+        std::fs::create_dir_all(&with_pdf).unwrap();
+        std::fs::write(mixed.join("still.jpg"), b"image").unwrap();
+        std::fs::write(mixed.join("movie.mp4"), b"video").unwrap();
+        std::fs::write(with_pdf.join("still.jpg"), b"image").unwrap();
+        std::fs::write(with_pdf.join("document.pdf"), b"pdf").unwrap();
+
+        let result = scan_test_root(&root, test_scan_options(true));
+
+        assert_eq!(result.entries.len(), 4);
+        assert!(
+            !result
+                .entries
+                .iter()
+                .any(|entry| entry.kind == SubfolderExpansionEntryKind::Folder)
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|entry| entry.kind == SubfolderExpansionEntryKind::Video)
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|entry| entry.kind == SubfolderExpansionEntryKind::Pdf)
+        );
+    }
+
+    #[test]
+    fn same_name_zip_is_hidden_in_favor_of_image_folder_book_when_configured() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let book = root.join("volume");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("001.jpg"), b"image").unwrap();
+        std::fs::write(root.join("volume.zip"), b"zip").unwrap();
+        let mut options = test_scan_options(true);
+        options.skip_zip_if_folder_exists = true;
+
+        let result = scan_test_root(&root, options);
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, book);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
+    }
+
+    #[test]
     fn duplicate_filter_is_scoped_to_one_parent() {
         use crate::app::folder_scan::ScanMediaKind;
         let a = PathBuf::from(r"C:\root\a\same.jpg");
@@ -2026,7 +2389,11 @@ mod tests {
         let options = SubfolderExpansionOptions {
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
+            skip_zip_if_folder_exists: false,
             video_thumb_use_sidecar_image: true,
+            image_folder_books: false,
+            include_convertible_archives: false,
+            show_hidden_files: true,
             image_ext_priority: vec!["jpg".into(), "png".into()],
         };
         let mut overrides = HashMap::new();
@@ -2049,13 +2416,13 @@ mod tests {
         let entries = vec![
             SubfolderExpansionEntry {
                 path: root.join("b").join("same.jpg"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
             SubfolderExpansionEntry {
                 path: root.join("a").join("same.jpg"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
@@ -2071,19 +2438,19 @@ mod tests {
         let entries = vec![
             SubfolderExpansionEntry {
                 path: root.join("b").join("1.png"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
             SubfolderExpansionEntry {
                 path: root.join("a").join("2.png"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
             SubfolderExpansionEntry {
                 path: root.join("a").join("1.png"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
@@ -2119,19 +2486,19 @@ mod tests {
         let entries = vec![
             SubfolderExpansionEntry {
                 path: root.join("a").join("2.png"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
             SubfolderExpansionEntry {
                 path: root.join("b").join("1.png"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
             SubfolderExpansionEntry {
                 path: root.join("a").join("1.png"),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
@@ -2169,13 +2536,13 @@ mod tests {
         let entries = Arc::new(vec![
             SubfolderExpansionEntry {
                 path: removed_path.clone(),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
             SubfolderExpansionEntry {
                 path: kept_path.clone(),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 2,
                 file_size: 2,
             },
@@ -2195,6 +2562,7 @@ mod tests {
             load_tags: false,
             load_local_adjust: false,
             load_video_pins: false,
+            folder_pin_db: None,
             removed_paths: HashSet::from([crate::adjustment_db::normalize_path(&removed_path)]),
             reused_metadata: None,
         };
@@ -2225,19 +2593,19 @@ mod tests {
         let entries = Arc::new(vec![
             SubfolderExpansionEntry {
                 path: b1.clone(),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 1,
             },
             SubfolderExpansionEntry {
                 path: a2.clone(),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 2,
                 file_size: 2,
             },
             SubfolderExpansionEntry {
                 path: a1.clone(),
-                is_video: false,
+                kind: SubfolderExpansionEntryKind::Image,
                 mtime: 3,
                 file_size: 3,
             },
@@ -2261,6 +2629,7 @@ mod tests {
             load_tags: true,
             load_local_adjust: true,
             load_video_pins: false,
+            folder_pin_db: None,
             removed_paths: HashSet::new(),
             reused_metadata: Some(ReusedSubfolderMetadata {
                 ratings_by_path: HashMap::from([(b1_key, 4)]),
@@ -2302,7 +2671,7 @@ mod tests {
         let root = PathBuf::from(r"C:\root");
         let entries = vec![SubfolderExpansionEntry {
             path: root.join("a").join("1.png"),
-            is_video: false,
+            kind: SubfolderExpansionEntryKind::Image,
             mtime: 1,
             file_size: 1,
         }];
@@ -2329,7 +2698,11 @@ mod tests {
                 path: root
                     .join(format!("folder_{:02}", i % 11))
                     .join(format!("image_{:04}.png", (i * 37) % count)),
-                is_video: i % 5 == 0,
+                kind: if i % 5 == 0 {
+                    SubfolderExpansionEntryKind::Video
+                } else {
+                    SubfolderExpansionEntryKind::Image
+                },
                 mtime: (i % 13) as i64,
                 file_size: i as i64,
             })
@@ -2342,8 +2715,6 @@ mod tests {
         display_order: &crate::settings::GridDisplayOrder,
         root: &Path,
     ) -> Vec<SubfolderEntrySortKey> {
-        use crate::settings::GridItemDisplayKind;
-
         entries
             .iter()
             .map(|entry| {
@@ -2358,11 +2729,7 @@ mod tests {
                     .and_then(|parent| parent.strip_prefix(root).ok())
                     .map(|parent| parent.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let kind = if entry.is_video {
-                    GridItemDisplayKind::VideoAudio
-                } else {
-                    GridItemDisplayKind::Image
-                };
+                let kind = entry.kind.display_kind();
                 SubfolderEntrySortKey {
                     name: sort.name_key(name),
                     parent: crate::filename_sort::SortNameKey::file_name(&parent),
@@ -2484,19 +2851,19 @@ mod tests {
             entries: Arc::new(vec![
                 SubfolderExpansionEntry {
                     path: kept_video.clone(),
-                    is_video: true,
+                    kind: SubfolderExpansionEntryKind::Video,
                     mtime: 1,
                     file_size: 10,
                 },
                 SubfolderExpansionEntry {
                     path: removed_video.clone(),
-                    is_video: true,
+                    kind: SubfolderExpansionEntryKind::Video,
                     mtime: 2,
                     file_size: 20,
                 },
                 SubfolderExpansionEntry {
                     path: kept_image.clone(),
-                    is_video: false,
+                    kind: SubfolderExpansionEntryKind::Image,
                     mtime: 3,
                     file_size: 30,
                 },
@@ -2512,7 +2879,7 @@ mod tests {
                 ),
             ]),
             diag: SubfolderExpansionDiag {
-                media_found: 3,
+                items_found: 3,
                 ..Default::default()
             },
         };
@@ -2532,6 +2899,6 @@ mod tests {
                 .video_thumb_overrides
                 .contains_key(&crate::path_key::normalize_keep_drive(&kept_video))
         );
-        assert_eq!(snapshot.diag.media_found, 2);
+        assert_eq!(snapshot.diag.items_found, 2);
     }
 }

@@ -21,7 +21,7 @@
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
 | Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
 | 操作カスタマイズ共有 / 世代取り込み | `std::thread` (操作ごとの短命 worker) + mpsc | 「設定の復元」ダイアログ中に最大 1 本 | 過去世代 DB の一時コピーと読み込み、`.mivkeys.json` の読み書き、取り込み前の自動退避を UI スレッド外で行う。UI は native ファイルダイアログでパスを選び、50ms polling で結果を受け取ってから差分表示またはライブ適用する |
-| サブ展開 snapshot | `std::thread` (`subfolder-expansion` / `subfolder-view-prepare`) + mpsc | 最大 1 scan + 1 prepare | 現在地以下の画像 / 動画を共通 recursive snapshot walker で列挙する。`GlobalIoSemaphore` Normal priority と `ActivityGate` を通し、`Arc<AtomicBool>` で cancel、generation で stale 結果を破棄する。大量ソートと metadata 構築も worker 側で行う |
+| サブ展開 snapshot | `std::thread` (`subfolder-expansion` / `subfolder-view-prepare`) + mpsc | 最大 1 scan + 1 prepare | 現在地以下の画像 / 動画、ZIP/PDF 本体、設定上の画像フォルダ本を共通 recursive snapshot walker で列挙する。ZIP/PDF 内部は開かない。`GlobalIoSemaphore` Normal priority と `ActivityGate` を通し、`Arc<AtomicBool>` で cancel、generation で stale 結果を破棄する。大量ソート、metadata 構築、コンテナピンの一括照会も worker 側で行う |
 | スマートフォルダ snapshot | `std::thread` (`smart-folder-scan` / `smart-folder-prepare`) + mpsc | 最大 1 scan + 1 prepare | 保存済みの複数ルールを OR 結合し、ルールごとの実検索元 / 再帰指定からフォルダ / 画像 / 動画 / 音声 / ZIP / PDF / 対応アーカイブを列挙する。各 `read_dir` の候補へ通常一覧と同じ同名ファイル規則を物理フォルダ単位で適用してから保存条件を判定し、動画 sidecar は full-path key の snapshot で表示準備へ渡す。★ / タグ / 編集状態と一覧復元用の個別編集状態は prepare worker で exact-key batch 取得し、変換アーカイブ対応表、catalog、固定代表も同 worker で準備する。開始時に snapshot した現在の全体ソート順と定義固有のグループ化単位でフラット一覧を構築し、UI は同期 DB I/O をせず完成 snapshot だけを install する。削除は scan 開始世代以後の tombstone を成功 snapshot へ適用してから破棄し、全 source 失敗では保持する。★ / タグ / 編集状態・定義変更は再 prepare する。通常一覧のソート順・サムネイル / 詳細表示は上書きしない。定義変更・移動・終了時は cancel、generation と定義 snapshot の一致で stale 結果を拒否する。cancel時はreceiver内に到着済みの巨大な`Done`結果と大件数確認待ちsnapshotをpending所有者ごと専用drop workerへ移し、UIスレッドで破棄しない |
 | 孤児メタデータ整理 | `std::thread` (`metadata-cleanup-scan` / `metadata-cleanup-delete`) + mpsc | 明示操作ごとに 1 本 | `rename_key_migration::STORES` の全行列挙と path 存在確認、確認後の DELETE を UI スレッド外で行う。`Arc<AtomicBool>` で行境界キャンセル、atomic 進捗、削除直前のオフライン再判定、descriptor 単位 transaction rollback を持つ |
 | 削除 purge journal 再試行 | `std::thread` (`delete-purge-retry`) + mpsc | 最大 1 | Shell 削除成功後の hard purge が最終失敗した path を `delete_purge_journal.json` から読み、起動時 / 1 秒入力 idle 後 / 失敗時 10 秒 backoff 後にピンポイント再 purge。孤児整理と同じ親到達可能 + path 不在を再確認し、成功 entry だけ atomic に消し込む |
@@ -178,9 +178,9 @@ cancel を見ていなかったので、cancel 済みスレッドも DFS を最�
 これにより 30 回連打は 30 ステップ分の DFS を逐次的に進める (並行ではなく直列)。
 各 DFS 間で cancel チェックが入るので、途中で方向が反転しても即座に対応できる。
 
-#### 3.1.5.1 モード別後処理 (grid / fullscreen / favsearch)
+#### 3.1.5.1 モード別後処理 (grid / fullscreen / favsearch / smart folder)
 
-Ctrl+↑↓ は 3 つの起点から発火し、DFS 完了時に異なる後処理が必要になる。同じ非同期
+Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処理が必要になる。同じ非同期
 パイプラインで扱えるように `FolderNavMode` をキーにして後処理を分岐している:
 
 | モード | 発火元 | DFS 完了時の処理 |
@@ -189,6 +189,7 @@ Ctrl+↑↓ は 3 つの起点から発火し、DFS 完了時に異なる後処�
 | `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder_nav_target(p)` → `open_fullscreen(先頭 image-like idx)` |
 | `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `load_folder_nav_target + nav_stack.push + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
 | `Favsearch { root, fullscreen: true }` | フルスクリーン中の Ctrl+S スコープナビ | 上記に加えて `close_fullscreen` → `open_fullscreen(先頭 image-like idx)` でフルスクリーンを維持 |
+| `SmartFolder { state, fullscreen }` | スマートフォルダ root / scoped drill のグリッド、リング、ゲームパッド、フルスクリーン | `entry_root` 内だけを DFS。端では root snapshot の表示順で前後 entry へ移る。着地前に `SmartFolderViewState` を更新し、`fullscreen=true` は先頭 image-like を再表示 |
 
 実装上の要点:
 
@@ -204,6 +205,8 @@ Ctrl+↑↓ は 3 つの起点から発火し、DFS 完了時に異なる後処�
   `chain_folder_nav_if_pending` がそれを参照して次の `spawn_folder_nav` に渡す。
 - Favsearch モードでは起点フォルダが `nav_stack.last()` なので、連鎖時には
   `current_folder` ではなくスタックトップを使う。
+- SmartFolder モードでは worker に渡した state snapshot だけで範囲を判定する。連鎖時は
+  `TopLevelGridView` の最新 scoped current / entry index から mode を作り直し、古い entry へ戻らない。
 
 モード境界のキャンセル:
 

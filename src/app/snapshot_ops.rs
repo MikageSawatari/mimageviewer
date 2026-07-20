@@ -219,6 +219,24 @@ impl App {
         } else {
             None
         };
+        let mut top_level_return = self.current_top_level_restore_snapshot();
+        // 旧 state / テスト補助経路などで検索 active flag と TopLevelGridView の同期前に
+        // snapshot が開始されても、結果一覧の合成 path を戻り先にしない。通常経路では
+        // return_to が既に完全な SmartFolder state 等を持つため、その値を優先する。
+        if self.global_search.active || self.favsearch.active {
+            top_level_return = self.top_level_grid_view.return_to().cloned().or_else(|| {
+                let subfolder_restore = if self.global_search.active {
+                    self.global_search_subfolder_restore.clone()
+                } else {
+                    self.favsearch_subfolder_restore.clone()
+                };
+                Some(self.view_return_context_from_parts(
+                    pre_snapshot_search_origin.clone(),
+                    subfolder_restore,
+                    None,
+                ))
+            });
+        }
         let mut membership: std::collections::HashMap<SnapshotKey, usize> =
             std::collections::HashMap::with_capacity(captured_entries.len());
         for (idx, entry) in captured_entries.iter().enumerate() {
@@ -293,6 +311,10 @@ impl App {
             list_view_thumbnails,
             pre_snapshot_search_origin,
         });
+        self.top_level_grid_view.begin(
+            super::top_level_grid_view::TopLevelGridSurface::Snapshot,
+            top_level_return,
+        );
         // ★items_generation bump + invalidate_idx_state_and_queues (= Codex P1-1):
         // items を差し替えたので、旧 ThumbMsg / pending / keep_set / idx-keyed cache が
         // 新 idx に着地して「サムネが化ける/消える」事故を防ぐ。`invalidate_idx_state_and_queues`
@@ -348,7 +370,7 @@ impl App {
     /// the latter as return ownership instead of recording the result-grid path in history.
     pub(crate) fn dismiss_snapshot_without_restore(
         &mut self,
-    ) -> Option<crate::app::ViewReturnContext> {
+    ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
         let snap = self.snapshot.take()?;
         let _ = self.restore_rating_filter_suppression();
         let at_origin = self.current_folder.as_ref().is_some_and(|path| {
@@ -377,11 +399,14 @@ impl App {
             None
         };
         self.show_feedback_toast("★固定を解除しました".into());
-        Some(crate::app::ViewReturnContext {
-            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
-            path,
-            subfolder_restore,
-        })
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        let fallback =
+            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
+        Some(
+            self.top_level_grid_view
+                .take_return_to()
+                .unwrap_or(fallback),
+        )
     }
 
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
@@ -396,6 +421,7 @@ impl App {
         let Some(snap) = self.snapshot.take() else {
             return;
         };
+        let top_level_return = self.top_level_grid_view.take_return_to();
         // filter suppress も解除 (= snapshot 内 folder enter で発動していた可能性がある)
         let _ = self.restore_rating_filter_suppression();
         // current_folder が snapshot origin と一致するか
@@ -407,6 +433,35 @@ impl App {
                     == crate::snapshot::snapshot_key_from_path(&snap.origin)
             })
             .unwrap_or(false);
+        if let Some(super::top_level_grid_view::TopLevelGridRestore::SmartFolder(mut state)) =
+            top_level_return.as_ref().cloned()
+        {
+            let current_in_scope = self.current_folder.as_deref().is_some_and(|current| {
+                if state.contains_scoped_path(current) {
+                    state.move_to(current)
+                } else {
+                    state.enter_containing_path(current)
+                }
+            });
+            if at_origin || current_in_scope {
+                self.restore_view_return_context(
+                    super::top_level_grid_view::TopLevelGridRestore::SmartFolder(state),
+                );
+                self.show_feedback_toast("★固定を解除しました".into());
+                return;
+            }
+        }
+        if at_origin
+            && let Some(return_context) = top_level_return
+            && !matches!(
+                return_context,
+                super::top_level_grid_view::TopLevelGridRestore::Folder(_)
+            )
+        {
+            self.restore_view_return_context(return_context);
+            self.show_feedback_toast("★固定を解除しました".into());
+            return;
+        }
         // ユーザー報告 fix (3 段階目): Ctrl+G/Ctrl+S 検索 view から ★固定した場合、
         // snapshot は検索 mode を consume したので解除しても自然な表示にならない (= items
         // だけ復元しても active=false で UI 不整合 / 「🌐 アイテム検索: ...」表示が残る)。
@@ -437,12 +492,14 @@ impl App {
                 // Use the same owner-aware restore boundary as search/smart-folder transitions.
                 // Besides suppressing history, this restores synthetic subfolder/smart views
                 // instead of handing their paths to the real-folder loader.
-                self.restore_view_return_context(crate::app::ViewReturnContext {
-                    rating_view_stars: self
-                        .view_return_rating_view_stars_for_path(Some(&restore_to)),
-                    path: Some(restore_to),
+                let rating_view_stars =
+                    self.view_return_rating_view_stars_for_path(Some(&restore_to));
+                let return_context = self.view_return_context_from_parts(
+                    Some(restore_to),
                     subfolder_restore,
-                });
+                    rating_view_stars,
+                );
+                self.restore_view_return_context(return_context);
                 self.show_feedback_toast("★固定を解除しました".into());
                 return;
             }

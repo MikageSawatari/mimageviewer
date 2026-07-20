@@ -9856,6 +9856,7 @@ impl App {
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
                         self.record_rating_view_nav_open(&p);
+                        self.begin_smart_folder_drill(&p);
                         if auto_fs {
                             self.pending_auto_fs_open = true;
                         }

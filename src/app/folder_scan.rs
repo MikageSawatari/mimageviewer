@@ -97,13 +97,7 @@ pub(crate) fn image_folder_page_count(
         options.include_convertible_archives,
         options.show_hidden_files,
     );
-    if !scan.folders.is_empty()
-        || scan.all_media.is_empty()
-        || !scan
-            .all_media
-            .iter()
-            .all(|(_, kind, _, _)| *kind == ScanMediaKind::Image)
-    {
+    if !is_image_only_book_contents(!scan.folders.is_empty(), &scan.all_media) {
         return Ok(None);
     }
     if options.skip_duplicate_images {
@@ -112,6 +106,22 @@ pub(crate) fn image_folder_page_count(
     u32::try_from(scan.all_media.len())
         .map(Some)
         .map_err(|_| std::io::Error::other("画像のみフォルダのページ数が上限を超えています"))
+}
+
+/// 1 ディレクトリ分の分類結果が「画像だけの本」かを判定する共通述語。
+///
+/// 通常一覧のページ数判定とサブフォルダ展開の集約判定が同じ境界を使うために分離する。
+/// `has_container` は実サブフォルダ、ZIP/PDF、設定上有効な変換アーカイブのいずれかが
+/// 1 件でもあれば true。テキスト等の非対応ファイルは従来どおり判定に影響しない。
+pub(super) fn is_image_only_book_contents(
+    has_container: bool,
+    all_media: &[(PathBuf, ScanMediaKind, i64, i64)],
+) -> bool {
+    !has_container
+        && !all_media.is_empty()
+        && all_media
+            .iter()
+            .all(|(_, kind, _, _)| *kind == ScanMediaKind::Image)
 }
 
 /// ディレクトリ走査: `read_dir` + 各エントリの `file_type()` / `metadata()` 呼び出し。

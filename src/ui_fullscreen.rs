@@ -13571,18 +13571,18 @@ impl App {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SubfolderExpansion, native_toast);
             return;
         }
-        if self.items_are_smart_folder_view {
-            self.cancel_pending_folder_nav();
-            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SmartFolder, native_toast);
-            return;
-        }
-
         // ネスト ZIP 内: Ctrl+↑↓ は ZIP 内ツリーの DFS で前後の本へ移り、その先頭画像を
         // 開く (#4 改: ルートの直下画像からも最初の本へ降りる)。ツリーの端では false が
         // 返り nav は不変なので、下の current_folder 分岐に落ちて ZIP を抜けて実フォルダ
         // DFS へ続く (グリッド側 zip_nav_handle_ctrl_updown と対称)。
         // holdover は移動確定後に zip_nav_dfs_fullscreen 内で取る (端で lock が残るのを防ぐ)。
         if self.zip_nav.is_some() && self.zip_nav_dfs_fullscreen(fs_idx, forward) {
+            return;
+        }
+
+        if self.top_level_grid_view.smart_folder().is_some() {
+            self.capture_fs_nav_holdover(fs_idx);
+            let _ = self.start_smart_folder_scope_nav(forward, true);
             return;
         }
 

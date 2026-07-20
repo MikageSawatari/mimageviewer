@@ -730,14 +730,17 @@ Tantivy commit自体を強制中断はしない。そこで上位のIndexerManag
 Ctrl+F / S / G / T、検索由来Snapshot、スマートフォルダは同じ最上位一覧を所有する。
 これらを直接切り替える入口では、既存ビューを通常closeして元一覧を再構築してはならない。
 `dismiss_*_without_restore` / `dismiss_snapshot_without_restore` / pending smartのoriginから
-`ViewReturnContext`を取得し、次の検索またはsmartへ直接移譲する。これにより検索結果用synthetic
+`TopLevelGridRestore`を取得し、次の検索またはsmartへ直接移譲する。これにより検索結果用synthetic
 pathをsaved folderへ保存せず、smart / サブ展開の復元workerを開始直後にcancelする競合も防ぐ。
 Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、非同期prepare中に入力された最新queryを
 完成一覧へ再適用する。
 
 戻り先は実フォルダに限らない。ドライブ一覧・読書履歴・レーティング一覧などのsynthetic pathは
 `dispatch_synthetic_folder_history_target`と同じ専用経路で復元し、`load_folder`へ渡さない。
-レーティング一覧はpathだけでは星数を表現できないため、`ViewReturnContext`が星数も保持する。
+レーティング一覧はpathだけでは星数を表現できないため、`TopLevelGridRestore`が星数も保持する。
+スマートフォルダはpathだけではroot / scoped drill、entry表示順、現在地、親stackを表現できないため、
+`SmartFolderViewState`をそのまま保持する。検索・検索由来Snapshotを閉じると、開いていた子階層まで
+同じsnapshotから復元する。詳細は [top-level-grid-view.md](top-level-grid-view.md) を参照。
 
 ---
 
@@ -753,8 +756,9 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
   `wait_for_search_hits` 等のハーネス
 - `src/app.rs::phase_c_key_tests` — 検索バーの相互排他 (Ctrl+F/S/G が常に ≤1 active)
 - `src/app/tests.rs::smart_folder_transition_tests` — 検索→検索、検索由来Snapshot→検索、
-  pending smart→検索 / 別smartの`ViewReturnContext`移譲、Ctrl+F query再適用、ドライブ一覧・
-  読書履歴・レーティング一覧（直接 / Snapshot経由）への検索終了時復元
+  pending smart→検索 / 別smartの`TopLevelGridRestore`移譲、Ctrl+F query再適用、ドライブ一覧・
+  読書履歴・レーティング一覧（直接 / Snapshot経由）への検索終了時復元、スマートフォルダの
+  scoped drill と検索 / Snapshot / 履歴の往復
 
 進行中の Phase C (フルスタック egui_kittest ハーネス) は
 [search-test-plan.md](search-test-plan.md) 参照。

@@ -1786,6 +1786,7 @@ fn prepare_smart_folder(
             local_adjust_pages,
             video_pin_blobs,
             legacy_paths: Vec::new(),
+            folder_pin_map: None,
             aggregate: Some(super::subfolder_expansion::PreparedAggregateMetadata {
                 adjustment_page_params,
                 export_crop_page_settings,
@@ -2098,13 +2099,17 @@ impl App {
     /// Search close is intentionally allowed to restore its saved origin first.  That restored
     /// real/synthetic location becomes the smart folder's history/return origin; the later smart
     /// install remains the only operation that replaces the grid.
-    fn close_transient_views_before_smart_folder(&mut self) -> super::ViewReturnContext {
+    fn close_transient_views_before_smart_folder(
+        &mut self,
+    ) -> super::top_level_grid_view::TopLevelGridRestore {
         let path = self.folder_nav_current_location();
-        let mut return_context = super::ViewReturnContext {
-            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
-            path,
-            subfolder_restore: None,
-        };
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        let mut return_context = self
+            .top_level_grid_view
+            .smart_folder()
+            .cloned()
+            .map(super::top_level_grid_view::TopLevelGridRestore::SmartFolder)
+            .unwrap_or_else(|| self.view_return_context_from_parts(path, None, rating_view_stars));
         if self.is_snapshot_active() {
             if let Some(snapshot_origin) = self.dismiss_snapshot_without_restore() {
                 return_context = snapshot_origin;
@@ -2149,7 +2154,7 @@ impl App {
     /// invariant below is the final guard, but cancelling here avoids wasting I/O until it notices.
     pub(crate) fn take_smart_folder_origin_for_search_entry(
         &mut self,
-    ) -> Option<super::ViewReturnContext> {
+    ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
         let origin = self.smart_folder_open_origin.take();
         self.cancel_smart_folder_pending();
         origin
@@ -2234,8 +2239,13 @@ impl App {
         let visible_origin = self.close_transient_views_before_smart_folder();
         let open_origin = inherited_origin.unwrap_or(visible_origin);
         self.cancel_smart_folder_pending();
-        self.smart_folder_open_origin = Some(open_origin);
-        self.smart_folder_generation = self.smart_folder_generation.wrapping_add(1);
+        self.smart_folder_open_origin = Some(open_origin.clone());
+        self.smart_folder_generation = self.top_level_grid_view.begin(
+            super::top_level_grid_view::TopLevelGridSurface::SmartFolder(
+                super::top_level_grid_view::SmartFolderViewState::root(definition_id, Vec::new()),
+            ),
+            Some(open_origin),
+        );
         let generation = self.smart_folder_generation;
         if !self.items_are_smart_folder_view {
             self.smart_folder_saved_folder = self
@@ -2486,6 +2496,175 @@ impl App {
         self.items_are_smart_folder_view = false;
         self.current_smart_folder_id = None;
         self.smart_folder_saved_folder = None;
+        if self.top_level_grid_view.smart_folder().is_some() {
+            self.top_level_grid_view
+                .replace_surface(super::top_level_grid_view::TopLevelGridSurface::Folder);
+        }
+    }
+
+    pub(crate) fn begin_smart_folder_drill(&mut self, path: &Path) -> bool {
+        if !self.items_are_smart_folder_view {
+            return false;
+        }
+        self.prepare_smart_folder_nav_target(path)
+    }
+
+    /// スマートフォルダ内ナビの着地先を scope state へ反映する。
+    /// root entry を跨ぐ場合は新しい entry scope を開始し、同じ entry 内なら
+    /// Backspace 用の親 lineage を更新する。
+    pub(crate) fn prepare_smart_folder_nav_target(&mut self, path: &Path) -> bool {
+        let Some(mut next_state) = self.top_level_grid_view.smart_folder().cloned() else {
+            return false;
+        };
+        let accepted = if next_state.contains_scoped_path(path) {
+            next_state.move_to(path)
+        } else {
+            next_state.enter_containing_path(path)
+        };
+        if !accepted {
+            return false;
+        }
+        self.record_smart_folder_scope_transition(&next_state);
+        let definition_id = next_state.definition_id;
+        if let Some(state) = self.top_level_grid_view.smart_folder_mut() {
+            *state = next_state;
+        }
+        self.current_smart_folder_id = Some(definition_id);
+        // `start_loading_items` は root snapshot 以外を通常一覧として描画する。scope の正本は
+        // TopLevelGridView に残るため、この presentation flag だけ先に倒して clear を防ぐ。
+        self.items_are_smart_folder_view = false;
+        if let Some(top) = self.facet_filter_suppression_stack.last_mut() {
+            top.anchor = path.to_path_buf();
+        }
+        if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_mut() {
+            *anchor = path.to_path_buf();
+        }
+        true
+    }
+
+    pub(crate) fn start_smart_folder_scope_nav(&mut self, forward: bool, fullscreen: bool) -> bool {
+        let Some(state) = self.top_level_grid_view.smart_folder().cloned() else {
+            return false;
+        };
+        let current = state
+            .scoped_current()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| smart_folder_synthetic_path(state.definition_id));
+        self.start_folder_nav(
+            current,
+            forward,
+            super::FolderNavMode::SmartFolder { state, fullscreen },
+        );
+        true
+    }
+
+    pub(crate) fn smart_folder_parent_nav_target(&self) -> Option<crate::ui_main::AddressBarNav> {
+        let state = self.top_level_grid_view.smart_folder()?;
+        match state.parent_target()? {
+            super::top_level_grid_view::SmartFolderParentTarget::Root => {
+                Some(crate::ui_main::AddressBarNav::Direct(
+                    smart_folder_synthetic_path(state.definition_id),
+                ))
+            }
+            super::top_level_grid_view::SmartFolderParentTarget::Folder(path) => {
+                Some(crate::ui_main::AddressBarNav::Direct(path))
+            }
+        }
+    }
+
+    pub(crate) fn reconcile_smart_folder_scoped_real_folder_load(&mut self, path: &Path) {
+        let Some(mut next_state) = self.top_level_grid_view.smart_folder().cloned() else {
+            return;
+        };
+        let definition_id = next_state.definition_id;
+        let was_root_grid = self.items_are_smart_folder_view;
+        let accepted = if next_state.contains_scoped_path(path) {
+            next_state.move_to(path)
+        } else if was_root_grid {
+            next_state.enter_containing_path(path)
+        } else {
+            false
+        };
+        if accepted {
+            self.record_smart_folder_scope_transition(&next_state);
+            if let Some(state) = self.top_level_grid_view.smart_folder_mut() {
+                *state = next_state;
+            }
+            self.current_smart_folder_id = Some(definition_id);
+            self.items_are_smart_folder_view = false;
+        } else if !was_root_grid {
+            self.clear_smart_folder_view_state();
+        }
+    }
+
+    pub(crate) fn restore_smart_folder_view_state(
+        &mut self,
+        state: super::top_level_grid_view::SmartFolderViewState,
+    ) {
+        let definition_id = state.definition_id;
+        match state.position.clone() {
+            super::top_level_grid_view::SmartFolderPosition::Root => {
+                self.top_level_grid_view.replace_surface(
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state),
+                );
+                let synthetic = smart_folder_synthetic_path(definition_id);
+                if !self.restore_smart_folder_for_synthetic_path(&synthetic) {
+                    self.show_feedback_toast("スマートフォルダを復元できませんでした".into());
+                }
+            }
+            super::top_level_grid_view::SmartFolderPosition::Scoped { current, .. } => {
+                self.cancel_smart_folder_pending();
+                self.current_smart_folder_id = Some(definition_id);
+                self.items_are_smart_folder_view = false;
+                self.top_level_grid_view.replace_surface(
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state),
+                );
+                if let Some(top) = self.facet_filter_suppression_stack.last_mut() {
+                    top.anchor = current.clone();
+                }
+                if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_mut() {
+                    *anchor = current.clone();
+                }
+                self.suppress_nav_record_for_search_restore = true;
+                self.load_folder(current);
+                self.update_smart_folder_scoped_address();
+            }
+        }
+    }
+
+    pub(crate) fn update_smart_folder_scoped_address(&mut self) {
+        let Some(state) = self.top_level_grid_view.smart_folder() else {
+            return;
+        };
+        let Some(current) = state.scoped_current() else {
+            return;
+        };
+        let Some(name) = self
+            .settings
+            .smart_folders
+            .iter()
+            .find(|definition| definition.id == state.definition_id)
+            .map(|definition| definition.name.clone())
+        else {
+            return;
+        };
+        let entry_root = state.scoped_entry_root().unwrap_or(current);
+        let relative = current.strip_prefix(entry_root).ok();
+        let mut segments = vec![name];
+        if let Some(entry_name) = entry_root.file_name().and_then(|value| value.to_str()) {
+            segments.push(entry_name.to_string());
+        } else {
+            segments.push(entry_root.display().to_string());
+        }
+        if let Some(relative) = relative {
+            segments.extend(
+                relative
+                    .components()
+                    .filter_map(|component| component.as_os_str().to_str())
+                    .map(str::to_string),
+            );
+        }
+        self.address = segments.join(" > ");
     }
 
     pub(crate) fn restore_smart_folder_for_synthetic_path(&mut self, path: &Path) -> bool {
@@ -2501,6 +2680,20 @@ impl App {
         else {
             return false;
         };
+        let retained_folder_entries = self
+            .top_level_grid_view
+            .smart_folder()
+            .filter(|state| state.definition_id == definition_id)
+            .map(|state| state.folder_entries.as_ref().clone())
+            .unwrap_or_default();
+        let root_state = super::top_level_grid_view::SmartFolderViewState::root(
+            definition_id,
+            retained_folder_entries,
+        );
+        self.record_smart_folder_scope_transition(&root_state);
+        self.top_level_grid_view.replace_surface(
+            super::top_level_grid_view::TopLevelGridSurface::SmartFolder(root_state),
+        );
         if let Some(mut snapshot) = self
             .smart_folder_snapshots
             .get(&definition_id)
@@ -2838,15 +3031,22 @@ impl App {
         let definition_name = snapshot.definition.name.clone();
         let diag = snapshot.diag.clone();
         let item_count = items.len();
+        let root_folder_entries = items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Folder(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let synthetic_path = smart_folder_synthetic_path(definition_id);
         // Opening becomes a history transition only now that scan+prepare succeeded.  A failed
         // or cancelled scan therefore never creates a dead entry in the Back stack.
-        if let Some(origin) = open_origin.as_ref().and_then(|origin| origin.path.clone()) {
-            self.record_folder_nav_transition_from(&synthetic_path, origin);
+        if let Some(origin) = open_origin.as_ref() {
+            self.record_folder_nav_transition_from_restore(&synthetic_path, origin);
         } else {
             self.record_folder_nav_transition(&synthetic_path);
         }
-        if let Some(restore) = open_origin.and_then(|origin| origin.subfolder_restore) {
+        if let Some(restore) = open_origin.and_then(|origin| origin.subfolder_restore()) {
             self.folder_nav_subfolder_restore = Some(restore);
         } else if self.items_are_subfolder_expansion_view {
             let subfolder_path = super::subfolder_expansion_synthetic_path();
@@ -2886,6 +3086,18 @@ impl App {
         self.items_are_subfolder_expansion_view = false;
         self.items_are_smart_folder_view = true;
         self.current_smart_folder_id = Some(definition_id);
+        let mut top_level_state = self
+            .top_level_grid_view
+            .smart_folder()
+            .filter(|state| state.definition_id == definition_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                super::top_level_grid_view::SmartFolderViewState::root(definition_id, Vec::new())
+            });
+        let _ = top_level_state.refresh_folder_entries(root_folder_entries);
+        self.top_level_grid_view.replace_surface(
+            super::top_level_grid_view::TopLevelGridSurface::SmartFolder(top_level_state),
+        );
         self.smart_folder_snapshots.insert(definition_id, snapshot);
         let retired = self
             .smart_folder_resort_metadata
@@ -2993,6 +3205,7 @@ impl App {
         }
         if self.current_smart_folder_id == Some(definition.id) {
             self.address = format!("スマートフォルダ: {}", definition.name);
+            self.update_smart_folder_scoped_address();
         }
         grouping_changed
     }

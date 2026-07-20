@@ -36,6 +36,12 @@ ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは�
 `grid_item::arrange_grid_items` を通常フォルダ、ZIP materialize、ファイル名スタック、
 レーティング一覧、サブフォルダ展開から共有する。全文検索の flat result は対象外。
 
+サブフォルダ展開では、再帰走査で見つけた ZIP/CBZ と PDF の**本体だけ**をそれぞれ
+`ZipFile` / `PdfFile` 1 項目として同じ外側リストへ入れ、内部の `ZipImage` / `PdfPage` は
+列挙しない。「画像のみのフォルダを本として扱う」が実効 ON の場合は、通常一覧のページ数判定と
+同じ「子コンテナなし・認識メディアが画像だけ」という述語で該当フォルダを `Folder` 1 項目にする。
+設定 OFF ではフォルダ項目へ集約せず、その中の `Image` を 1 枚ずつ表示する。
+
 ただし、本として読むページ列は一覧整理用の `sort_order` から独立する。ZIP / CBZ / 直接閲覧
 RAR / CBR / 変換キャッシュ ZIP のページと ZIP 内階層は、常にファイル名順
 (`SortOrder::FileName`、Windows に近い自然順) で materialize する。画像のみの通常フォルダも

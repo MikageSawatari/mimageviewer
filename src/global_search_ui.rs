@@ -1473,8 +1473,8 @@ impl App {
         self.global_search.active = true;
         self.global_search.focus_request = true;
         if let Some(origin) = transferred_origin {
-            self.global_search.saved_folder = origin.path.or(fallback_origin);
-            self.global_search_subfolder_restore = origin.subfolder_restore;
+            self.global_search.saved_folder = origin.legacy_path().or(fallback_origin);
+            self.global_search_subfolder_restore = origin.subfolder_restore();
         } else {
             self.global_search.saved_folder = fallback_origin;
             self.global_search_subfolder_restore = None;
@@ -1501,7 +1501,7 @@ impl App {
     /// 元の合成ビューを一度prepareして直後にcancelする競合を避ける。
     pub(crate) fn dismiss_global_search_without_restore(
         &mut self,
-    ) -> crate::app::ViewReturnContext {
+    ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
@@ -1543,11 +1543,12 @@ impl App {
             .global_search_subfolder_restore
             .take()
             .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
-        crate::app::ViewReturnContext {
-            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
-            path,
-            subfolder_restore,
-        }
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        let fallback =
+            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
+        self.top_level_grid_view
+            .take_return_to()
+            .unwrap_or(fallback)
     }
 
     /// debounce 経過チェック + 新クエリがあれば検索 spawn (App::update から毎フレーム呼ぶ)。

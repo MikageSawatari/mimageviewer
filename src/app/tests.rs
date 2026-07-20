@@ -3529,7 +3529,7 @@ mod phase_c_folder_nav_history_tests {
             roots: vec![root],
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -3661,7 +3661,7 @@ mod phase_c_folder_nav_history_tests {
             roots: vec![a],
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -5239,7 +5239,7 @@ mod phase_c_drill_nav_tests {
             roots: vec![a.clone()],
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -5288,7 +5288,7 @@ mod phase_c_drill_nav_tests {
             roots: vec![a],
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -5336,7 +5336,7 @@ mod phase_c_drill_nav_tests {
             roots: vec![a],
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -5382,7 +5382,7 @@ mod phase_c_drill_nav_tests {
             roots: vec![a],
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -5482,7 +5482,7 @@ mod phase_c_drill_nav_tests {
             roots: vec![a],
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -32874,6 +32874,242 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn smart_folder_drill_parent_search_snapshot_and_history_round_trip_keep_scope() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let normal = app.tmp.path().join("normal-scope-roundtrip");
+        let source = app.tmp.path().join("smart-scope-source");
+        let entry = source.join("entry");
+        let child = entry.join("child");
+        let grandchild = child.join("grandchild");
+        let page = child.join("page.jpg");
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::create_dir_all(&grandchild).unwrap();
+        std::fs::write(&page, []).unwrap();
+        std::fs::write(grandchild.join("nested.jpg"), []).unwrap();
+        let definition = definition("Smart Scope", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+
+        let state = super::top_level_grid_view::SmartFolderViewState::root(id, vec![entry.clone()]);
+        app.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state));
+        app.items_are_smart_folder_view = true;
+        app.current_smart_folder_id = Some(id);
+        app.current_folder = Some(crate::app::smart_folder::smart_folder_synthetic_path(id));
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+        app.load_folder(child.clone());
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(child.as_path())
+        );
+        assert!(app.address.contains("Smart Scope"));
+        assert!(app.address.contains("entry"));
+        assert!(app.address.contains("child"));
+        assert!(matches!(
+            app.resolve_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::Direct(path))
+                if crate::folder_tree::path_eq(&path, &entry)
+        ));
+        app.load_folder(entry.clone());
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(matches!(
+            app.resolve_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::Direct(path))
+                if crate::folder_tree::path_eq(&path, &synthetic)
+        ));
+
+        app.load_folder(child.clone());
+        app.open_global_search();
+        app.close_global_search();
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(child.as_path()),
+            "search close must restore the scoped current folder"
+        );
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        app.deactivate_snapshot();
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(child.as_path()),
+            "snapshot release must restore the scoped current folder"
+        );
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.load_folder(grandchild.clone());
+        app.deactivate_snapshot();
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(grandchild.as_path()),
+            "snapshot child navigation must remain in the original smart scope"
+        );
+        app.load_folder(child.clone());
+
+        app.folder_nav_back_stack = vec![normal.clone()];
+        app.folder_nav_back_rating_view_stars = vec![None];
+        app.folder_nav_back_smart_folder_states = vec![None];
+        let back = app.navigate_folder_history_back().expect("history back");
+        assert_eq!(back, normal);
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&back),
+            super::SyntheticFolderHistoryDispatch::NotSynthetic
+        );
+        app.load_folder(back);
+        let forward = app
+            .navigate_folder_history_forward()
+            .expect("history forward");
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&forward),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(child.as_path()),
+            "history forward must restore the entire smart-folder scope"
+        );
+    }
+
+    #[test]
+    fn smart_folder_ctrl_nav_stays_in_entry_then_uses_root_display_order() {
+        let app = setup_app();
+        let first = app.tmp.path().join("smart-nav-first");
+        let first_child = first.join("child");
+        let second = app.tmp.path().join("smart-nav-second");
+        std::fs::create_dir_all(&first_child).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first_child.join("page.jpg"), []).unwrap();
+        std::fs::write(second.join("page.jpg"), []).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut state = super::top_level_grid_view::SmartFolderViewState::root(
+            id,
+            vec![first.clone(), second.clone()],
+        );
+        let opts = crate::folder_tree::FolderTreeOptions::from_settings(&app.settings);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let root_target = super::navigate_smart_folder_scope(
+            &state,
+            &crate::app::smart_folder::smart_folder_synthetic_path(id),
+            true,
+            opts,
+            app.settings.folder_skip_limit,
+            &cancel,
+        )
+        .expect("first root entry");
+        assert_eq!(root_target.path, first);
+
+        assert!(state.enter_containing_path(&first));
+        let child_target = super::navigate_smart_folder_scope(
+            &state,
+            &first,
+            true,
+            opts,
+            app.settings.folder_skip_limit,
+            &cancel,
+        )
+        .expect("child in first entry");
+        assert_eq!(child_target.path, first_child);
+        assert!(state.move_to(&first_child));
+        let next_entry = super::navigate_smart_folder_scope(
+            &state,
+            &first_child,
+            true,
+            opts,
+            app.settings.folder_skip_limit,
+            &cancel,
+        )
+        .expect("next root entry");
+        assert_eq!(next_entry.path, second);
+    }
+
+    #[test]
+    fn smart_folder_history_treats_root_and_scoped_position_as_separate_entries() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-history-source");
+        let entry = source.join("entry");
+        let child = entry.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        std::fs::write(child.join("child.jpg"), []).unwrap();
+        let definition = definition("Smart History", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        let state = super::top_level_grid_view::SmartFolderViewState::root(id, vec![entry.clone()]);
+        app.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state));
+        app.items_are_smart_folder_view = true;
+        app.current_smart_folder_id = Some(id);
+        app.current_folder = Some(synthetic.clone());
+
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+        assert_eq!(app.folder_history_back_target(), Some(&synthetic));
+
+        let back = app.navigate_folder_history_back().expect("history back");
+        assert_eq!(back, synthetic);
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&back),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert!(matches!(
+            app.top_level_grid_view
+                .smart_folder()
+                .map(|state| &state.position),
+            Some(super::top_level_grid_view::SmartFolderPosition::Root)
+        ));
+
+        let forward = app
+            .navigate_folder_history_forward()
+            .expect("history forward");
+        assert_eq!(forward, synthetic);
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&forward),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(entry.as_path())
+        );
+        assert!(
+            !app.suppress_folder_nav_record_once,
+            "scoped history restore must not suppress the next user transition"
+        );
+
+        let _ = app.begin_smart_folder_drill(&child);
+        app.load_folder(child);
+        let back_to_entry = app.navigate_folder_history_back().expect("back to entry");
+        assert_eq!(back_to_entry, synthetic);
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&back_to_entry),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(entry.as_path()),
+            "each scoped current must remain a separate history location"
+        );
+    }
+
+    #[test]
     fn search_exit_restores_all_synthetic_origins_with_and_without_snapshot() {
         for origin in [
             SyntheticSearchOrigin::DriveList,
@@ -33281,15 +33517,15 @@ mod smart_folder_transition_tests {
         assert_eq!(
             app.smart_folder_open_origin
                 .as_ref()
-                .and_then(|origin| origin.path.as_ref()),
-            Some(&normal)
+                .and_then(|origin| origin.legacy_path()),
+            Some(normal.clone())
         );
         app.open_smart_folder(b_id, false);
         assert_eq!(
             app.smart_folder_open_origin
                 .as_ref()
-                .and_then(|origin| origin.path.as_ref()),
-            Some(&normal)
+                .and_then(|origin| origin.legacy_path()),
+            Some(normal.clone())
         );
         wait_for_smart_folder_idle(&mut app, &ctx, b_id);
         assert_eq!(app.folder_history_back_target(), Some(&normal));
@@ -33343,8 +33579,8 @@ mod smart_folder_transition_tests {
             assert_eq!(
                 app.smart_folder_open_origin
                     .as_ref()
-                    .and_then(|origin| origin.path.as_ref()),
-                Some(&normal)
+                    .and_then(|origin| origin.legacy_path()),
+                Some(normal.clone())
             );
             match incoming {
                 SearchMode::LocalMeta => app.open_local_metadata_search(),
@@ -33727,7 +33963,7 @@ mod smart_folder_transition_tests {
             roots: vec![root],
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
-                is_video: false,
+                kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
                 mtime: 1,
                 file_size: 10,
             }]
@@ -34794,6 +35030,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
         local_adjust_pages: std::collections::HashSet::from([0]),
         video_pin_blobs: Default::default(),
         legacy_paths: Vec::new(),
+        folder_pin_map: None,
         aggregate: Some(crate::app::subfolder_expansion::PreparedAggregateMetadata {
             adjustment_page_params: std::collections::HashMap::from([(0, params.clone())]),
             export_crop_page_settings: std::collections::HashMap::from([(0, crop)]),
