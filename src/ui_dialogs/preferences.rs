@@ -84,6 +84,7 @@ pub enum Vst3ScanMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PreferencesPage {
     General,
+    Font,
     StartupFolder,
     ExplorerIntegration,
     Thumbnail,
@@ -127,6 +128,7 @@ impl PreferencesPage {
     fn label(self) -> &'static str {
         match self {
             Self::General => "全体設定",
+            Self::Font => "フォント",
             Self::StartupFolder => "起動時に開く場所",
             Self::ExplorerIntegration => "エクスプローラ連携",
             Self::Thumbnail => "サムネイル",
@@ -353,6 +355,7 @@ const TREE: &[TreeCategory] = &[
         label: "表示",
         page: None,
         children: &[
+            PreferencesPage::Font,
             PreferencesPage::Thumbnail,
             PreferencesPage::SpreadMode,
             PreferencesPage::Slideshow,
@@ -415,6 +418,24 @@ pub(crate) struct PreferencesState {
     pub right_panel_scroll_generation: u64,
     /// 展開中のカテゴリラベル
     pub expanded: HashSet<&'static str>,
+
+    // ── UI フォント設定 ──────────────────────────────────────────
+    /// システムフォント列挙結果。走査は Font ページ初回表示時に worker で開始する。
+    pub ui_font_catalog: Vec<crate::ui_font_catalog::UiFontFace>,
+    pub ui_font_filter: String,
+    pub ui_font_catalog_rx:
+        Option<std::sync::mpsc::Receiver<Result<Vec<crate::ui_font_catalog::UiFontFace>, String>>>,
+    pub ui_font_catalog_started: bool,
+    pub ui_font_import_rx:
+        Option<std::sync::mpsc::Receiver<Result<Vec<crate::ui_font_catalog::UiFontFace>, String>>>,
+    pub ui_font_message: Option<String>,
+    pub ui_font_initial: crate::settings::UiFontSettings,
+    pub ui_font_preview_rx:
+        Option<std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>>,
+    pub ui_font_preview_texture: Option<egui::TextureHandle>,
+    pub ui_font_preview_ready_key: Option<String>,
+    pub ui_font_preview_requested_at: Option<std::time::Instant>,
+    pub ui_font_preview_error: Option<String>,
 
     // ページ固有の一時状態
     pub manual_threads: usize,
@@ -629,6 +650,18 @@ impl PreferencesState {
             selected: PreferencesPage::General,
             right_panel_scroll_generation: 0,
             expanded,
+            ui_font_catalog: Vec::new(),
+            ui_font_filter: String::new(),
+            ui_font_catalog_rx: None,
+            ui_font_catalog_started: false,
+            ui_font_import_rx: None,
+            ui_font_message: None,
+            ui_font_initial: s.ui_font.clone(),
+            ui_font_preview_rx: None,
+            ui_font_preview_texture: None,
+            ui_font_preview_ready_key: None,
+            ui_font_preview_requested_at: None,
+            ui_font_preview_error: None,
             manual_threads,
             capture_output_dir_input: s
                 .capture_output_dir
@@ -723,6 +756,200 @@ impl PreferencesState {
             diag_export_result: None,
         }
     }
+
+    pub(super) fn ensure_ui_font_tasks_started(&mut self, ctx: &egui::Context) {
+        if !self.ui_font_catalog_started {
+            self.ui_font_catalog_started = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.ui_font_catalog_rx = Some(rx);
+            let ctx = ctx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("ui-font-catalog".to_string())
+                .spawn(move || {
+                    let _ = tx.send(crate::ui_font_catalog::enumerate_ui_fonts());
+                    ctx.request_repaint();
+                });
+            if let Err(err) = spawned {
+                self.ui_font_catalog_rx = None;
+                self.ui_font_message = Some(format!("フォント一覧を開始できませんでした: {err}"));
+            }
+        }
+        if self.ui_font_preview_ready_key.is_none()
+            && self.ui_font_preview_rx.is_none()
+            && self.ui_font_preview_requested_at.is_none()
+        {
+            self.ui_font_preview_requested_at = Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(200))
+                    .unwrap_or_else(std::time::Instant::now),
+            );
+        }
+    }
+
+    pub(super) fn mark_ui_font_changed(&mut self, ctx: &egui::Context) {
+        self.settings.ui_font.sanitize();
+        self.ui_font_preview_requested_at = Some(std::time::Instant::now());
+        self.ui_font_preview_error = None;
+        ctx.request_repaint_after(std::time::Duration::from_millis(160));
+    }
+
+    pub(super) fn start_ui_font_import(&mut self, path: std::path::PathBuf, ctx: &egui::Context) {
+        if self.ui_font_import_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ui_font_import_rx = Some(rx);
+        self.ui_font_message = Some("フォントを取り込んでいます…".to_string());
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ui-font-import".to_string())
+            .spawn(move || {
+                let _ = tx.send(crate::ui_font_catalog::import_ui_font(&path));
+                ctx.request_repaint();
+            });
+        if let Err(err) = spawned {
+            self.ui_font_import_rx = None;
+            self.ui_font_message = Some(format!("フォント追加を開始できませんでした: {err}"));
+        }
+    }
+
+    pub(super) fn poll_ui_font_tasks(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.ui_font_catalog_rx.as_ref()
+            && let Ok(result) = rx.try_recv()
+        {
+            self.ui_font_catalog_rx = None;
+            match result {
+                Ok(faces) => {
+                    self.ui_font_catalog = faces;
+                    if matches!(
+                        self.settings.ui_font.selection,
+                        crate::settings::UiFontSelection::Face { .. }
+                    ) {
+                        let canonical = self
+                            .ui_font_catalog
+                            .iter()
+                            .find(|face| {
+                                face.selection
+                                    .same_source_face(&self.settings.ui_font.selection)
+                            })
+                            .map(|face| face.selection.clone());
+                        if let Some(canonical) = canonical {
+                            // ラベル改善前の保存値でも path + face index が同じなら有効。
+                            // 説明用ラベルだけを更新し、フォント再構築や未保存扱いにはしない。
+                            if canonical != self.settings.ui_font.selection {
+                                self.settings.ui_font.selection = canonical.clone();
+                                if canonical.same_source_face(&self.ui_font_initial.selection) {
+                                    self.ui_font_initial.selection = canonical;
+                                }
+                            }
+                        } else {
+                            self.settings.ui_font.selection =
+                                crate::settings::UiFontSelection::Default;
+                            self.settings.ui_font.vertical_adjust = 0.0;
+                            self.ui_font_message = Some(
+                                "保存されていたフォントは日本語の通常書体として利用できないため、既定へ戻しました。"
+                                    .to_string(),
+                            );
+                            self.mark_ui_font_changed(ctx);
+                        }
+                    }
+                }
+                Err(err) => self.ui_font_message = Some(err),
+            }
+        }
+
+        if let Some(rx) = self.ui_font_import_rx.as_ref()
+            && let Ok(result) = rx.try_recv()
+        {
+            self.ui_font_import_rx = None;
+            match result {
+                Ok(mut faces) => {
+                    if let Some(first) = faces.first() {
+                        self.settings.ui_font.selection = first.selection.clone();
+                        self.settings.ui_font.vertical_adjust = 0.0;
+                    }
+                    for face in faces.drain(..) {
+                        let exists = self
+                            .ui_font_catalog
+                            .iter()
+                            .any(|existing| existing.selection.same_source_face(&face.selection));
+                        if !exists {
+                            self.ui_font_catalog.push(face);
+                        }
+                    }
+                    crate::ui_font_catalog::sort_ui_font_faces(&mut self.ui_font_catalog);
+                    self.ui_font_message = Some("フォントを追加しました。".to_string());
+                    self.mark_ui_font_changed(ctx);
+                }
+                Err(err) => self.ui_font_message = Some(err),
+            }
+        }
+
+        if let Some(rx) = self.ui_font_preview_rx.as_ref()
+            && let Ok((key, result)) = rx.try_recv()
+        {
+            self.ui_font_preview_rx = None;
+            if key == ui_font_settings_key(&self.settings.ui_font) {
+                match result {
+                    Ok(image) => {
+                        self.ui_font_preview_texture = Some(ctx.load_texture(
+                            "ui-font-preview",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self.ui_font_preview_ready_key = Some(key);
+                        self.ui_font_preview_error = None;
+                    }
+                    Err(err) => {
+                        self.ui_font_preview_ready_key = None;
+                        self.ui_font_preview_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        let current_key = ui_font_settings_key(&self.settings.ui_font);
+        let needs_preview = self.ui_font_preview_ready_key.as_deref() != Some(&current_key);
+        let debounce_elapsed = self
+            .ui_font_preview_requested_at
+            .is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(150));
+        if needs_preview && debounce_elapsed && self.ui_font_preview_rx.is_none() {
+            self.ui_font_preview_requested_at = None;
+            let settings = self.settings.ui_font.clone();
+            let key = current_key;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.ui_font_preview_rx = Some(rx);
+            let ctx = ctx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("ui-font-preview".to_string())
+                .spawn(move || {
+                    let result = crate::ui_font_catalog::render_preview(&settings);
+                    if result.is_ok() {
+                        crate::ui_fonts::prepare_fonts(&settings);
+                    }
+                    let _ = tx.send((key, result));
+                    ctx.request_repaint();
+                });
+            if let Err(err) = spawned {
+                self.ui_font_preview_rx = None;
+                self.ui_font_preview_error =
+                    Some(format!("フォントの準備を開始できませんでした: {err}"));
+            }
+        }
+    }
+
+    pub(super) fn ui_font_apply_ready(&self) -> bool {
+        if self.settings.ui_font == self.ui_font_initial {
+            return true;
+        }
+        self.ui_font_preview_error.is_none()
+            && self.ui_font_preview_ready_key.as_deref()
+                == Some(ui_font_settings_key(&self.settings.ui_font).as_str())
+    }
+}
+
+fn ui_font_settings_key(settings: &crate::settings::UiFontSettings) -> String {
+    serde_json::to_string(settings).unwrap_or_else(|_| format!("{settings:?}"))
 }
 
 fn advance_preferences_scroll_generation(
@@ -911,6 +1138,9 @@ impl App {
             .default_size([720.0, 520.0])
             .show(ctx, |ui| {
                 let state = self.pref_state.as_mut().unwrap();
+                if state.ui_font_catalog_started {
+                    state.poll_ui_font_tasks(ctx);
+                }
 
                 // ── メインエリア: 左ツリー + 右パネル ──
                 let available = ui.available_size();
@@ -995,12 +1225,19 @@ impl App {
                 }
 
                 ui.horizontal(|ui| {
-                    if ui.button("  OK  ").clicked() {
+                    let font_ready = state.ui_font_apply_ready();
+                    if ui
+                        .add_enabled(font_ready, egui::Button::new("  OK  "))
+                        .clicked()
+                    {
                         apply = true;
                         // (note: 「TRT 全エンジンビルド」ボタンのフラグは下のブロックで処理する)
                     }
                     if ui.button("キャンセル").clicked() {
                         cancel = true;
+                    }
+                    if !font_ready {
+                        ui.small("フォントの準備完了後に適用できます。");
                     }
                 });
             });
@@ -1039,6 +1276,7 @@ impl App {
                 let old_keymap_settings = self.settings.keymap.clone();
                 let old_fullscreen_side_panel_mode =
                     self.settings.fullscreen_side_panel_mode.normalized();
+                let old_ui_font = self.settings.ui_font.clone();
 
                 // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
                 // 無効化トリガに使う)
@@ -1098,6 +1336,21 @@ impl App {
                     .reading_history_limit
                     .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
                 self.settings = state.settings;
+                if old_ui_font != self.settings.ui_font {
+                    #[cfg(windows)]
+                    {
+                        // detached viewer / native HUD はそれぞれ独立した egui Context を
+                        // 持つため、表示倍率変更と同じ正規 teardown 経路で閉じる。
+                        // 再度開いた時点で新しいフォント設定を使って生成される。
+                        let closed_detached = self.close_all_detached_viewers_for_mode_change(ctx);
+                        if !closed_detached && self.fullscreen_idx.is_some() {
+                            self.close_fullscreen();
+                        }
+                        self.request_main_font_atlas_resync("ui_font_change");
+                    }
+                    #[cfg(not(windows))]
+                    crate::ui_fonts::configure_fonts_with_settings(ctx, &self.settings.ui_font);
+                }
                 if old_fullscreen_side_panel_mode
                     != self.settings.fullscreen_side_panel_mode.normalized()
                 {
@@ -1929,6 +2182,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 
     match state.selected {
         PreferencesPage::General => page_general(ui, state),
+        PreferencesPage::Font => page_font(ui, state),
         PreferencesPage::StartupFolder => page_startup_folder(ui, state),
         PreferencesPage::ExplorerIntegration => page_explorer_integration(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
@@ -1980,5 +2234,21 @@ mod tests {
             &mut generation,
         );
         assert_eq!(generation, 8);
+    }
+
+    #[test]
+    fn font_page_is_under_display_not_general() {
+        let display = TREE
+            .iter()
+            .find(|category| category.label == "表示")
+            .expect("display category should exist");
+        assert!(display.children.contains(&PreferencesPage::Font));
+
+        let general = TREE
+            .iter()
+            .find(|category| category.label == "全体設定")
+            .expect("general category should exist");
+        assert_eq!(general.page, Some(PreferencesPage::General));
+        assert!(!general.children.contains(&PreferencesPage::Font));
     }
 }

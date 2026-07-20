@@ -866,8 +866,8 @@ impl App {
     /// 頭出し / 再生・一時停止 / 前後ブックマークジャンプ / ループ / 位置・長さ / 再生速度 /
     /// ミュート / 音量スライダー + シークバー上のブックマークマーカー。常時表示。
     ///
-    /// (音量ノーマライズは動画のようなスキャン UI が必要なため、この HUD には載せていない。
-    /// 音量正規化は開いた時点で `audio_normalize_db` キャッシュ値が適用される。)
+    /// 音量ノーマライズは動画と同じ状態・操作を HUD に載せ、必要な場合は音声用の
+    /// スキャン UI を重ねる。
     /// 非 Windows stub: HUD 描画は native_presenter のアイコン helper (cfg(windows)) 依存。
     #[cfg(not(windows))]
     #[allow(clippy::too_many_arguments)]
@@ -973,8 +973,13 @@ impl App {
         let controls_cy = (hud_rect.top() + seek_row_h + hud_rect.bottom()) * 0.5;
         // 動画 native HUD と同じ 2 系統: アイコン/ドット/スライダーは幾何中心 (controls_cy)、
         // テキストは +4.0 した baseline (text_center_y) に置く。egui の CENTER 揃えは text bbox の
-        // 中心を合わせるので、13px フォントだと光学的に上寄りに見え、ドット/アイコンと縦がずれる。
-        // 動画側 `text_center_y = center_y + 4.0` (native_presenter/mod.rs) と同値。
+        // 中心を合わせるので、13px の既定 HUD フォントだと光学的に上寄りに見え、
+        // ドット/アイコンと縦がずれる。動画側 `text_center_y = center_y + 4.0`
+        // (native_presenter/mod.rs) と同値。
+        //
+        // この固定座標へ置く Norm / dB / 時刻 / 速度は必ず `hud_text_font` を使う。
+        // 通常の Proportional family は選択 UI フォント用の自動縦補正を含むため、ここで使うと
+        // BIZ UDPGothic 等の選択時だけ固定 +4.0 と補正が重なって動画 HUD と位置がずれる。
         let text_center_y = controls_cy + 4.0;
         // レイアウト寸法は動画 native HUD (native_presenter/mod.rs) と同値にする (Inc 7 ③):
         // 端 padding = side_pad、ボタン間 = gap、グループ境界 = gap + group_gap_extra。
@@ -1307,7 +1312,7 @@ impl App {
             egui::pos2(rx, text_center_y),
             egui::Align2::RIGHT_CENTER,
             vol_db_label,
-            egui::FontId::proportional(13.0),
+            crate::ui_fonts::hud_text_font(13.0),
             vol_label_color,
         );
         rx -= vol_label_w + 8.0;
@@ -1428,7 +1433,7 @@ impl App {
                 egui::pos2(norm_rect.center().x, text_center_y),
                 egui::Align2::CENTER_CENTER,
                 "Norm",
-                egui::FontId::proportional(11.0),
+                crate::ui_fonts::hud_text_font(11.0),
                 norm_color,
             );
             if !is_scanning && norm_resp.clicked() {
@@ -1505,7 +1510,7 @@ impl App {
             egui::pos2(rx - time_w, text_center_y),
             egui::Align2::LEFT_CENTER,
             format!("{} / {}", format_hms(pos), format_hms(dur)),
-            egui::FontId::proportional(14.0),
+            crate::ui_fonts::hud_text_font(14.0),
             egui::Color32::from_rgb(238, 238, 238),
         );
 

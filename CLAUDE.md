@@ -993,22 +993,29 @@ BOM 不要 (= Linux / macOS / git diff の互換性のため)。
 
 ## UI 文字列の Unicode グリフ選定ルール
 
-mIV はプライマリ proportional フォントに **Yu Gothic Medium** (Windows 標準) を
-使う ([src/ui_fonts.rs](src/ui_fonts.rs))。通常 UI と native overlay は同じ
-`ui_fonts::configure_fonts()` を通り、動画メタデータなどユーザー由来テキスト向けに
+mIV は既定のプライマリ proportional フォントに **Yu Gothic Medium** (Windows 標準) を
+使い、v2.7.0 から `Settings.ui_font` で Windows のシステムフォントまたはユーザー追加
+TTF/OTF/TTC/OTC の日本語 upright face を選べる。日本語なし / Italic / Oblique は候補外
+([src/ui_fonts.rs](src/ui_fonts.rs),
+[src/ui_font_catalog.rs](src/ui_font_catalog.rs))。通常 UI と native overlay は同じ
+`ui_fonts::configure_fonts_with_settings()` を通り、動画メタデータなどユーザー由来テキスト向けに
 `miv-user-text` family を別途登録する。この family は text-presentation 記号、
-数学英字、絵文字の fallback を明示し、ttf-parser で Yu Gothic の日本語 glyph と
+数学英字、絵文字の fallback を明示し、ttf-parser で選択 face / Yu Gothic の代表 glyph と
 Segoe UI Emoji の代表 glyph の中心を読んで
 baseline 補正を計算する。egui 0.33 は `ab_glyph` の outline 描画を使うため、
 計測も outline bbox を優先し、raster image bounds は bbox が取れない場合の fallback
-にする。複数サンプルは中央値で扱う。`✉` / `⋈` のような text-presentation 記号は
+とする。動画・音声 HUD の固定サイズ control label は選択 face ではなく `miv-hud-text`
+(無補正の既定日本語フォント) を使い、VST 等の固定 glyph はベクター描画する。
+複数サンプルは中央値で扱う。ツールバーは既定 Yu Gothic の実測補正値に
+選択 face との差分を加え、環境設定の ±4pt 微調整を最後に加える。`✉` / `⋈` のような text-presentation 記号は
 Cambria Math や Segoe UI Emoji より前の Meiryo fallback で拾わせ、ブラウザに近い
 文字表示へ寄せる。数学英字は Cambria Math、色付き絵文字は Segoe UI Emoji へ回す。
 Cambria Math の数学英字も代表 glyph の中心から `FontTweak` 補正を導出し、`…` など
 主フォント側の句読点と極端に上下ずれしないようにする。
 Segoe UI Historic / Segoe UI Symbol も
-縦位置補正付きで使う。通常 UI の proportional family ではこれらを egui 既定 font の
-後ろに置き、固定 UI 文言の幅変化を抑える。Yu Gothic は日本語 + 基本 Latin
+縦位置補正付きで使う。通常 UI の proportional family では選択 face を先頭、既定日本語
+font を次順位に置き、各 fallback は egui 既定 font の後ろに置く。選択 face が持たない
+日本語 glyph は既定日本語 font へ回る。Yu Gothic は日本語 + 基本 Latin
 + Latin-1 Supplement までは網羅するが、**Misc Symbols** や **絵文字**は欠落
 していることが多い。fallback はユーザー由来テキストの文字化けを軽減するためのもので、
 UI の固定文言・ボタン・状態表示へ絵文字や環境依存記号を新規採用する理由にはしない。

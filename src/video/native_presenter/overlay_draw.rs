@@ -2838,7 +2838,7 @@ pub(super) fn draw_top_bar_text_lines(
         egui::pos2(14.0, 39.0),
         egui::Align2::LEFT_CENTER,
         truncate_overlay_text(sub_text, sub_truncate),
-        egui::FontId::proportional(12.0),
+        crate::ui_fonts::hud_text_font(12.0),
         egui::Color32::from_rgb(190, 190, 190),
     );
 }
@@ -5474,7 +5474,7 @@ pub(crate) fn draw_overlay_speed_control(
         egui::pos2(speed_rect.center().x, text_center_y),
         egui::Align2::CENTER_CENTER,
         format_playback_speed(playback_speed),
-        egui::FontId::proportional(12.0),
+        crate::ui_fonts::hud_text_font(12.0),
         egui::Color32::from_rgb(238, 238, 238),
     );
     // リセットはダブルクリックのみ (音量スライダーと同じ理由。右クリックは背後の
@@ -5540,7 +5540,7 @@ pub(crate) fn draw_overlay_speed_control(
                                     button_rect.center() + egui::vec2(0.0, speed_choice_text_y),
                                     egui::Align2::CENTER_CENTER,
                                     label,
-                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    crate::ui_fonts::hud_text_font(12.0),
                                     visuals.fg_stroke.color,
                                 );
                                 if button_resp.clicked() {

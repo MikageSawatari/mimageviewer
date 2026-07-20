@@ -138,6 +138,7 @@ pub mod sys_memory;
 pub mod tag_write_worker;
 pub mod tags_db;
 pub mod thumb_loader;
+pub mod ui_font_catalog;
 pub mod ui_fonts;
 pub mod ui_helpers;
 pub mod ui_music_spectrum;

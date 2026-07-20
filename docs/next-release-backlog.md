@@ -181,42 +181,6 @@
   独立フェーズで行う。階層移動単体はMediumだが、同じ戻り先の二重実装を避けるためこの整理後に
   実装する。
 
-### 1.24 UI フォント / フォントサイズ設定
-
-- 出典: 5ch 専用スレ レス83 (2026-07-20)。「フォントとフォントサイズ設定させて欲しい」
-  「Meiryo UIも大っきらい!!で14ptで使ってるんだけどmImageViewerには反映されない」。
-- 背景:
-  - egui アプリは Windows の UI フォント変更ツール（Meiryo UI も大っきらい!! 等）の設定を
-    自動反映しないため、OS 側で UI フォント / サイズを変えているユーザーの見た目と
-    mIV が一致しない。
-  - 既存の `ui_scale_factor` は全体倍率、`text_contrast` は文字色の調整であり、
-    フォントファミリーや基準文字サイズの指定とは別の需要。
-- 要望:
-  - mImageViewer 内で UI フォントファミリーと UI フォントサイズ（基準 pt）を設定できるようにする。
-- 方針:
-  - 既存の `ui_scale_factor` / `text_contrast` とは別設定として扱う。
-  - フォントファミリーは「既定」「Meiryo UI」「Yu Gothic UI」「MS UI Gothic」などの代表候補と、
-    任意フォント選択の扱いを検討する。
-  - フォントサイズは egui の text style（Body / Button / Small / Heading / Monospace）へ
-    一括反映する。単純に全テキストを同じ pt に固定すると、ボタン、表、HUD、詳細行の行高が
-    崩れやすいため、スタイルごとの比率維持を基本にする。
-  - Windows のシステムフォント設定を自動取得して追従する案は環境依存が大きいため、
-    まずはアプリ内設定を優先する。将来「Windows 設定に合わせる」を追加するかは別途判断。
-- 不変条件:
-  - UI 倍率とフォントサイズの二重拡大で画面が壊れないよう、設定範囲の制限とプレビューを用意する。
-  - フォント変更後に font atlas / text style を再構築し、メイン画面、別ウィンドウ、
-    フルスクリーン HUD、詳細表示、設定画面で文字化け・欠け・重なりが起きないこと。
-  - 日本語、半角英数、記号、絵文字 fallback、monospace 用途（ページ番号、詳細列など）を壊さない。
-  - レイアウト崩れ検出 QA（§1.17）とあわせて、代表画面の見切れを確認する。
-- 関連領域:
-  - UI テーマ / フォント / 表示設定。
-  - 実装前に `docs/spec.md`, `docs/ui-snapshot-policy.md`, `docs/display-pipeline.md`,
-    `docs/video-architecture.md` を確認する。
-- 規模 / 優先度:
-  - Medium〜Large / P2 candidate。
-  - 単なる設定項目追加ではなく、egui font definitions / text styles / snapshot 更新 /
-    native HUD 連携確認が必要。
-
 ### 2.1 folder pane scan worker の thread 構成判断
 
 - 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。

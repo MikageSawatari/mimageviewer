@@ -379,6 +379,9 @@ renderer 側 font atlas texture のサイズが一時的にずれることがあ
 `request_main_font_atlas_resync` を立て、`configure_fonts_for_texture_resync` で font atlas を
 full upload から再開させる。通常の `configure_fonts` は定義が同一だと egui が再読み込みを
 省略するため、未使用の一意な font family marker を混ぜて強制リロードさせる。
+v2.7.0 の UI フォント変更も同じ経路を使う。resync は固定の既定定義ではなく
+`Settings.ui_font` に対応する準備済み定義へ marker を加えるため、切り替え直後や
+detached cleanup 後に既定フォントへ戻らない。
 
 `configure_fonts_for_texture_resync` の `set_fonts` は egui 仕様で「次 pass の begin_pass で
 適用」されるため、フル atlas アップロードが効く前にメイン UI を描くと上記 panic が再発する。

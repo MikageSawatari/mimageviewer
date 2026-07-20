@@ -160,6 +160,7 @@ mod ui_crop;
 pub mod ui_dialogs;
 mod ui_erase;
 mod ui_folder_pane;
+pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
 pub mod ui_helpers;
@@ -1044,7 +1045,7 @@ fn main() -> eframe::Result {
             emit_startup("creator_enter", None);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
             let t = Instant::now();
-            ui_fonts::configure_fonts(&cc.egui_ctx);
+            ui_fonts::configure_fonts_with_settings(&cc.egui_ctx, &saved.ui_font);
             emit_startup("setup_fonts", Some(t));
             // 起動時点で UI テーマを先行適用して、初回フレームでの
             // ダーク/ライト切替ちらつきを避ける (set_visuals は次フレームから

@@ -133,6 +133,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         cursor_hide_delay_secs: crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
         ui_scale: 1.0,
         text_contrast: crate::settings::TextContrast::Standard,
+        ui_font: crate::settings::UiFontSettings::default(),
         // CP4: prototype CLI は HUD overlay HWND を作らない (= フォールバック経路で
         // 従来通り presenter HWND の DComp tree に egui overlay を載せる)。
         hud_event_tx: None,

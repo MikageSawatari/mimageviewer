@@ -366,6 +366,16 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "2.7.0",
+        must_read: &[],
+        highlights: &[HighlightItem {
+            title: "画面全体のフォントを選択",
+            body: "環境設定の「表示 → フォント」から、Windows の日本語フォントや\
+                   追加した日本語フォントを選べます。見本を確認し、文字の縦位置も微調整できます。\
+                   文字の大きさは従来どおり「設定 → スケーリング」で変更できます。",
+        }],
+    },
 ];
 
 #[cfg(test)]

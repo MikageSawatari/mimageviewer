@@ -1924,6 +1924,140 @@ impl TextContrast {
 }
 
 // -----------------------------------------------------------------------
+// UiFontSettings (v2.7.0 UI フォント)
+// -----------------------------------------------------------------------
+
+pub const UI_FONT_VERTICAL_ADJUST_MIN: f32 = -4.0;
+pub const UI_FONT_VERTICAL_ADJUST_MAX: f32 = 4.0;
+
+/// UI フォントの選択元。
+///
+/// 任意フォントは TTC/OTC 内の face を一意に復元できるよう、ファイルパスだけでなく
+/// face index も保存する。`display_name` / `post_script_name` は設定画面と、ファイルが
+/// 一時的に見つからない場合の説明用であり、実際のロードは `path + face_index` が正本。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiFontSelection {
+    /// 従来どおり Yu Gothic Medium → Meiryo → MS Gothic の順で使う。
+    #[default]
+    Default,
+    Face {
+        display_name: String,
+        path: PathBuf,
+        face_index: u32,
+        #[serde(default)]
+        post_script_name: String,
+    },
+    /// 将来版が書いた未知 variant は既定フォントへ安全に戻す。
+    #[serde(other)]
+    Unknown,
+}
+
+impl UiFontSelection {
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Default | Self::Unknown => "既定 (Yu Gothic Medium)",
+            Self::Face { display_name, .. } => display_name,
+        }
+    }
+
+    pub fn normalized(&self) -> Self {
+        match self {
+            Self::Face {
+                display_name,
+                path,
+                face_index,
+                post_script_name,
+            } if !display_name.trim().is_empty()
+                && !path.as_os_str().is_empty()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        matches!(
+                            ext.to_ascii_lowercase().as_str(),
+                            "ttf" | "otf" | "ttc" | "otc"
+                        )
+                    }) =>
+            {
+                Self::Face {
+                    display_name: display_name.trim().to_string(),
+                    path: path.clone(),
+                    face_index: *face_index,
+                    post_script_name: post_script_name.trim().to_string(),
+                }
+            }
+            _ => Self::Default,
+        }
+    }
+
+    /// 表示名などの説明用メタデータを除き、実際に読み込む font face が同じかを返す。
+    ///
+    /// `display_name` はカタログのラベル改善で変わり得るため、保存済み設定の有効性判定に
+    /// `PartialEq` を使うと、同じ `path + face_index` なのに既定へ戻してしまう。
+    pub fn same_source_face(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Default, Self::Default) => true,
+            (
+                Self::Face {
+                    path: left_path,
+                    face_index: left_index,
+                    ..
+                },
+                Self::Face {
+                    path: right_path,
+                    face_index: right_index,
+                    ..
+                },
+            ) => {
+                let same_path = if cfg!(windows) {
+                    left_path
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&right_path.to_string_lossy())
+                } else {
+                    left_path == right_path
+                };
+                same_path && left_index == right_index
+            }
+            _ => false,
+        }
+    }
+}
+
+/// UI フォントと、ツールバー等の中央揃え widget に対するユーザー微調整。
+///
+/// 自動補正値はフォントの実メトリクスから `ui_fonts` が導出する。この値はその結果へ
+/// 加える logical point 数で、UI倍率に従って物理ピクセルへ拡大される。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct UiFontSettings {
+    #[serde(default)]
+    pub selection: UiFontSelection,
+    #[serde(default)]
+    pub vertical_adjust: f32,
+}
+
+impl Default for UiFontSettings {
+    fn default() -> Self {
+        Self {
+            selection: UiFontSelection::Default,
+            vertical_adjust: 0.0,
+        }
+    }
+}
+
+impl UiFontSettings {
+    pub fn sanitize(&mut self) {
+        self.selection = self.selection.normalized();
+        self.vertical_adjust = if self.vertical_adjust.is_finite() {
+            self.vertical_adjust
+                .clamp(UI_FONT_VERTICAL_ADJUST_MIN, UI_FONT_VERTICAL_ADJUST_MAX)
+        } else {
+            0.0
+        };
+    }
+}
+
+// -----------------------------------------------------------------------
 // AiFeatureMode (AI 利用範囲)
 // -----------------------------------------------------------------------
 
@@ -3084,6 +3218,10 @@ pub struct Settings {
     /// OS DPI とは独立したアプリ内 UI 表示倍率 (50%..=200%、10% 刻み)。
     #[serde(default = "default_ui_scale_factor")]
     pub ui_scale_factor: f32,
+
+    /// UI の主フォントと、メトリクス由来の自動縦位置へ加える微調整。
+    #[serde(default)]
+    pub ui_font: UiFontSettings,
 
     /// 初回セットアップダイアログを完了したか。
     #[serde(default)]
@@ -4362,6 +4500,7 @@ impl Default for Settings {
             ui_theme: UiTheme::default(),
             text_contrast: TextContrast::default(),
             ui_scale_factor: default_ui_scale_factor(),
+            ui_font: UiFontSettings::default(),
             first_setup_completed: false,
             ai_feature_mode: AiFeatureMode::default(),
             tags: Vec::new(),
@@ -5619,6 +5758,7 @@ impl Settings {
     fn sanitize(&mut self) {
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
+        self.ui_font.sanitize();
         self.grid_display_order.normalize();
         // 環境設定 UI 側のレンジ (1..=30) と整合させる。
         // 下限 0 は navigate_folder_with_skip が first を評価せず Ctrl+↑↓ が
@@ -6175,6 +6315,70 @@ mod tests {
         assert_f32_close(Settings::default().ui_scale_factor, 1.0);
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert_f32_close(loaded.ui_scale_factor, 1.0);
+    }
+
+    #[test]
+    fn ui_font_defaults_and_round_trips_collection_face() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.ui_font, UiFontSettings::default());
+
+        let value = UiFontSettings {
+            selection: UiFontSelection::Face {
+                display_name: "Meiryo Bold".to_string(),
+                path: PathBuf::from(r"C:\Windows\Fonts\meiryob.ttc"),
+                face_index: 2,
+                post_script_name: "Meiryo-Bold".to_string(),
+            },
+            vertical_adjust: 1.25,
+        };
+        let json = serde_json::to_string(&value).unwrap();
+        let restored: UiFontSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, value);
+    }
+
+    #[test]
+    fn ui_font_sanitize_repairs_invalid_selection_and_adjustment() {
+        let mut settings = UiFontSettings {
+            selection: UiFontSelection::Face {
+                display_name: "  ".to_string(),
+                path: PathBuf::from("font.exe"),
+                face_index: 99,
+                post_script_name: String::new(),
+            },
+            vertical_adjust: f32::INFINITY,
+        };
+        settings.sanitize();
+        assert_eq!(settings, UiFontSettings::default());
+
+        settings.vertical_adjust = 100.0;
+        settings.sanitize();
+        assert_f32_close(settings.vertical_adjust, UI_FONT_VERTICAL_ADJUST_MAX);
+    }
+
+    #[test]
+    fn ui_font_source_identity_ignores_display_metadata() {
+        let old = UiFontSelection::Face {
+            display_name: "Noto Sans JP".to_string(),
+            path: PathBuf::from(r"C:\Windows\Fonts\NotoSansJP-Medium.otf"),
+            face_index: 0,
+            post_script_name: String::new(),
+        };
+        let relabeled = UiFontSelection::Face {
+            display_name: "Noto Sans JP (Medium)".to_string(),
+            path: PathBuf::from(r"c:\windows\fonts\NotoSansJP-Medium.otf"),
+            face_index: 0,
+            post_script_name: "NotoSansJP-Medium".to_string(),
+        };
+        let other_face = UiFontSelection::Face {
+            display_name: "Noto Sans JP (Medium)".to_string(),
+            path: PathBuf::from(r"c:\windows\fonts\NotoSansJP-Medium.otf"),
+            face_index: 1,
+            post_script_name: "NotoSansJP-Medium".to_string(),
+        };
+
+        assert!(old.same_source_face(&relabeled));
+        assert!(!old.same_source_face(&other_face));
+        assert!(!old.same_source_face(&UiFontSelection::Default));
     }
 
     #[test]

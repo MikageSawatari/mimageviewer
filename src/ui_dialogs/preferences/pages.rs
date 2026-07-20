@@ -13,7 +13,8 @@ use crate::ring_shortcut::{
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
     FullscreenSeekDirection, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
-    SortOrder, SpreadMode, StartupFolderMode, TextContrast, UiTheme,
+    SortOrder, SpreadMode, StartupFolderMode, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX,
+    UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -199,6 +200,147 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         )
         .weak(),
     );
+}
+
+pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let ctx = ui.ctx().clone();
+    state.ensure_ui_font_tasks_started(&ctx);
+    state.poll_ui_font_tasks(&ctx);
+
+    ui.label(egui::RichText::new("UI フォント").strong());
+    ui.label(
+        egui::RichText::new(
+            "選択した日本語フォントを画面全体で使用します。Italic / Oblique や日本語を含まないフォントは候補に表示しません。記号・絵文字は既定フォントで補います。",
+        )
+        .weak(),
+    );
+    ui.label(
+        egui::RichText::new(
+            "フォントの大きさは、設定メニューの「スケーリング」で UI 全体と一緒に調整できます。",
+        )
+        .weak(),
+    );
+    ui.add_space(4.0);
+
+    let mut selected = state.settings.ui_font.selection.clone();
+    let selected_label = selected.display_name().to_string();
+    let filter = state.ui_font_filter.trim().to_lowercase();
+    ui.horizontal(|ui| {
+        ui.label("フォント:");
+        egui::ComboBox::from_id_salt("ui_font_face")
+            .selected_text(selected_label)
+            .width(270.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected, UiFontSelection::Default, "既定 (Yu Gothic)");
+                ui.separator();
+                if state.ui_font_catalog_rx.is_some() {
+                    ui.label(egui::RichText::new("システムフォントを読み込み中…").weak());
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("ui_font_face_list")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for face in &state.ui_font_catalog {
+                            if !filter.is_empty() && !face.search_text().contains(&filter) {
+                                continue;
+                            }
+                            let suffix = if face.imported { "  [追加]" } else { "" };
+                            ui.selectable_value(
+                                &mut selected,
+                                face.selection.clone(),
+                                format!("{}{suffix}", face.label),
+                            );
+                        }
+                    });
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label("絞り込み:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.ui_font_filter)
+                .desired_width(210.0)
+                .hint_text("フォント名"),
+        );
+        let import_busy = state.ui_font_import_rx.is_some();
+        if ui
+            .add_enabled(!import_busy, egui::Button::new("フォントファイルを追加…"))
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("TrueType / OpenType", &["ttf", "otf", "ttc", "otc"])
+                .pick_file()
+        {
+            state.start_ui_font_import(path, &ctx);
+        }
+    });
+
+    if selected != state.settings.ui_font.selection {
+        state.settings.ui_font.selection = selected;
+        state.settings.ui_font.vertical_adjust = 0.0;
+        state.mark_ui_font_changed(&ctx);
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("縦位置の微調整:");
+        let response = ui.add(
+            egui::Slider::new(
+                &mut state.settings.ui_font.vertical_adjust,
+                UI_FONT_VERTICAL_ADJUST_MIN..=UI_FONT_VERTICAL_ADJUST_MAX,
+            )
+            .suffix(" pt")
+            .step_by(0.25),
+        );
+        if response.changed() {
+            state.mark_ui_font_changed(&ctx);
+        }
+        if ui
+            .add_enabled(
+                state.settings.ui_font.vertical_adjust != 0.0,
+                egui::Button::new("0 に戻す"),
+            )
+            .clicked()
+        {
+            state.settings.ui_font.vertical_adjust = 0.0;
+            state.mark_ui_font_changed(&ctx);
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "文字の実メトリクスから自動補正した位置に加える値です。正の値で下へ移動します。",
+        )
+        .weak(),
+    );
+
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("プレビュー").strong());
+    egui::Frame::new()
+        .fill(egui::Color32::from_gray(36))
+        .inner_margin(egui::Margin::same(6))
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.set_min_width(420.0);
+            if let Some(texture) = &state.ui_font_preview_texture {
+                let available = ui.available_width().min(texture.size_vec2().x);
+                let size = egui::vec2(
+                    available,
+                    texture.size_vec2().y * available / texture.size_vec2().x,
+                );
+                ui.image((texture.id(), size));
+            } else if state.ui_font_preview_error.is_none() {
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("プレビューを作成中…");
+                });
+                ui.add_space(20.0);
+            }
+        });
+    if let Some(error) = &state.ui_font_preview_error {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
+    if let Some(message) = &state.ui_font_message {
+        ui.label(egui::RichText::new(message).weak());
+    }
 }
 
 pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {

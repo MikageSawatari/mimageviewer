@@ -79,6 +79,138 @@ fn snapshot_with_theme_and_contrast(
     harness.snapshot(name);
 }
 
+#[cfg(windows)]
+fn snapshot_with_ui_font(
+    name: &str,
+    settings: mimageviewer::settings::UiFontSettings,
+    mut build_ui: impl FnMut(&mut egui::Ui),
+) {
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(480.0, 260.0))
+        .build(move |ctx| {
+            mimageviewer::os_theme::apply_resolved(
+                ctx,
+                mimageviewer::os_theme::ResolvedTheme::Dark,
+            );
+            if !fonts_ready {
+                mimageviewer::ui_fonts::configure_fonts_with_settings(ctx, &settings);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| build_ui(ui));
+        });
+    harness.run();
+    harness.snapshot(name);
+}
+
+#[cfg(windows)]
+fn windows_font_settings(
+    display_name: &str,
+    path: &str,
+    family: &str,
+) -> mimageviewer::settings::UiFontSettings {
+    let mut db = fontdb::Database::new();
+    db.load_font_file(path)
+        .unwrap_or_else(|err| panic!("{display_name} should load from {path}: {err}"));
+    let face = db
+        .faces()
+        .find(|face| {
+            face.families
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(family))
+        })
+        .unwrap_or_else(|| panic!("{path} should contain the {family} face"));
+    mimageviewer::settings::UiFontSettings {
+        selection: mimageviewer::settings::UiFontSelection::Face {
+            display_name: display_name.to_owned(),
+            path: std::path::PathBuf::from(path),
+            face_index: face.index,
+            post_script_name: face.post_script_name.clone(),
+        },
+        vertical_adjust: 0.0,
+    }
+}
+
+#[cfg(windows)]
+fn recommended_ui_font_fixture(ui: &mut egui::Ui, label: &str, typographic_points: f32) {
+    // Windows の 9/10pt を 96 DPI 時の egui logical point へ換算する。
+    let size = typographic_points * (96.0 / 72.0);
+    let body_font = egui::FontId::new(size, egui::FontFamily::Proportional);
+    let toolbar_font = egui::FontId::new(
+        size,
+        egui::FontFamily::Name(std::sync::Arc::<str>::from(
+            mimageviewer::ui_fonts::TOOLBAR_TEXT_FAMILY_NAME,
+        )),
+    );
+
+    ui.set_width(440.0);
+    ui.heading(format!("{label}  {typographic_points}pt"));
+    ui.label(egui::RichText::new("mImageViewer  表示サンプル  Aa 0123").font(body_font.clone()));
+    ui.label(
+        egui::RichText::new("日本語・簡体字测试・한글・💗・𝓈𝒸𝓇𝑒𝒶𝓂")
+            .font(mimageviewer::ui_fonts::user_text_font(size)),
+    );
+    ui.add_space(8.0);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(430.0, 34.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(egui::RichText::new("フォルダー:").font(toolbar_font.clone()));
+                let _ = ui.add_sized(
+                    [68.0, 28.0],
+                    egui::Button::new(egui::RichText::new("前へ").font(toolbar_font.clone())),
+                );
+                let _ = ui.add_sized(
+                    [68.0, 28.0],
+                    egui::Button::new(egui::RichText::new("次へ").font(toolbar_font)),
+                );
+            },
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("動画・音声 HUD:").weak());
+        let (speed_rect, _) = ui.allocate_exact_size(egui::vec2(43.0, 28.0), egui::Sense::hover());
+        ui.painter().text(
+            speed_rect.center() + egui::vec2(0.0, 4.0),
+            egui::Align2::CENTER_CENTER,
+            "x1",
+            mimageviewer::ui_fonts::hud_text_font(12.0),
+            egui::Color32::from_rgb(238, 238, 238),
+        );
+        let (norm_rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(norm_rect, 5.0, egui::Color32::from_rgb(55, 105, 170));
+        ui.painter().text(
+            norm_rect.center() + egui::vec2(0.0, 4.0),
+            egui::Align2::CENTER_CENTER,
+            "Norm",
+            mimageviewer::ui_fonts::hud_text_font(11.0),
+            egui::Color32::from_rgb(255, 198, 62),
+        );
+        ui.painter().text(
+            egui::pos2(norm_rect.max.x + 68.0, norm_rect.center().y + 4.0),
+            egui::Align2::RIGHT_CENTER,
+            "0.0dB",
+            mimageviewer::ui_fonts::hud_text_font(13.0),
+            egui::Color32::from_rgb(238, 238, 238),
+        );
+        ui.add_space(72.0);
+        ui.painter().text(
+            egui::pos2(norm_rect.max.x + 82.0, norm_rect.center().y + 4.0),
+            egui::Align2::LEFT_CENTER,
+            "01:23 / 04:56",
+            mimageviewer::ui_fonts::hud_text_font(14.0),
+            egui::Color32::from_rgb(238, 238, 238),
+        );
+        ui.add_space(110.0);
+    });
+    ui.separator();
+    ui.label(egui::RichText::new("実メトリクスから自動補正・手動調整 0pt").weak());
+}
+
 fn contrast_fixture(ui: &mut egui::Ui) {
     ui.set_min_width(440.0);
     ui.heading("文字コントラスト");
@@ -191,6 +323,83 @@ fn metadata_text_fallback_emoji_symbols_dark() {
                 let _ = ui.button("↻ プラグインを再読み込み");
             });
         },
+    );
+}
+
+/// v2.7.0: 任意 UI フォントを設定した場合の通常文字・ツールバー文字と、
+/// 日本語 / 記号 fallback の縦位置を同時に固定する。
+#[cfg(windows)]
+#[test]
+fn custom_ui_font_meiryo_bold_alignment_dark() {
+    let settings = mimageviewer::settings::UiFontSettings {
+        selection: mimageviewer::settings::UiFontSelection::Face {
+            display_name: "Meiryo Bold".to_string(),
+            path: std::path::PathBuf::from(r"C:\Windows\Fonts\meiryob.ttc"),
+            face_index: 0,
+            post_script_name: String::new(),
+        },
+        vertical_adjust: 0.75,
+    };
+    snapshot_with_ui_font(
+        "custom_ui_font_meiryo_bold_alignment_dark",
+        settings,
+        |ui| {
+            ui.set_width(440.0);
+            ui.heading("UI フォント");
+            ui.label("mImageViewer  表示サンプル  Aa 0123");
+            ui.label(
+                egui::RichText::new("日本語・簡体字测试・한글・💗・𝓈𝒸𝓇𝑒𝒶𝓂")
+                    .font(mimageviewer::ui_fonts::user_text_font(18.0)),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let toolbar_font = egui::FontId::new(
+                    14.0,
+                    egui::FontFamily::Name(std::sync::Arc::<str>::from(
+                        mimageviewer::ui_fonts::TOOLBAR_TEXT_FAMILY_NAME,
+                    )),
+                );
+                ui.label(egui::RichText::new("フォルダー:").font(toolbar_font.clone()));
+                let _ = ui.button(egui::RichText::new("前へ").font(toolbar_font.clone()));
+                let _ = ui.button(egui::RichText::new("次へ").font(toolbar_font));
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("自動補正 + 0.75 pt").weak());
+        },
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn recommended_ui_font_biz_udp_gothic_9pt_alignment_dark() {
+    snapshot_with_ui_font(
+        "recommended_ui_font_biz_udp_gothic_9pt_alignment_dark",
+        windows_font_settings(
+            "BIZ UDPGothic",
+            r"C:\Windows\Fonts\BIZ-UDGothicR.ttc",
+            "BIZ UDPGothic",
+        ),
+        |ui| recommended_ui_font_fixture(ui, "BIZ UDPGothic", 9.0),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn recommended_ui_font_meiryo_10pt_alignment_dark() {
+    snapshot_with_ui_font(
+        "recommended_ui_font_meiryo_10pt_alignment_dark",
+        windows_font_settings("Meiryo", r"C:\Windows\Fonts\meiryo.ttc", "Meiryo"),
+        |ui| recommended_ui_font_fixture(ui, "Meiryo", 10.0),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn recommended_ui_font_meiryo_ui_10pt_alignment_dark() {
+    snapshot_with_ui_font(
+        "recommended_ui_font_meiryo_ui_10pt_alignment_dark",
+        windows_font_settings("Meiryo UI", r"C:\Windows\Fonts\meiryo.ttc", "Meiryo UI"),
+        |ui| recommended_ui_font_fixture(ui, "Meiryo UI", 10.0),
     );
 }
 

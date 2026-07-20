@@ -28291,7 +28291,11 @@ impl App {
                 ctx.will_discard()
             ));
         }
-        crate::ui_fonts::configure_fonts_for_texture_resync(ctx, generation);
+        crate::ui_fonts::configure_fonts_for_texture_resync(
+            ctx,
+            generation,
+            &self.settings.ui_font,
+        );
         if !final_fire {
             // 次フレームでも再発行する。surface が戻るまで full upload を出し続ける。
             ctx.request_repaint();
@@ -39354,6 +39358,7 @@ impl App {
                             self.checked.contains(&idx),
                             self.settings.ui_scale_factor,
                             self.settings.text_contrast,
+                            self.settings.ui_font.clone(),
                             self.settings.fullscreen_cursor_hide_delay_secs,
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                             Some(self.dsp_bridge.editor_hwnds_snapshot()),
@@ -55954,6 +55959,7 @@ fn native_video_presenter_config(
     checked: bool,
     ui_scale: f32,
     text_contrast: crate::settings::TextContrast,
+    ui_font: crate::settings::UiFontSettings,
     cursor_hide_delay_secs: f32,
     editor_hwnds_snapshot: Option<
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
@@ -55982,6 +55988,7 @@ fn native_video_presenter_config(
         checked,
         ui_scale: crate::settings::normalize_ui_scale_factor(ui_scale),
         text_contrast,
+        ui_font,
         cursor_hide_delay_secs: crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
             cursor_hide_delay_secs,
         ),

@@ -319,6 +319,14 @@ python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベン
 [idle-health-check.md](idle-health-check.md) を参照する。新しい polling / retry / idle work を
 追加するときは、同じ安定状態を複数回評価して最終的に work 0 へ収束する単体テストも追加する。
 
+### 7.3 UI フォント設定
+
+v2.7.0 の UI フォント設定では、`fontdb::Database::load_system_fonts`、font file 読み込み、
+TTC/OTC face ごとの glyph coverage 判定、`ab_glyph` プレビュー生成、egui font definitions の
+準備をすべて worker で行う。UI スレッドで許可するのは、完了 channel の `try_recv`、小さい
+プレビューの `load_texture`、準備済み定義の `Context::set_fonts` だけ。縦位置 slider は
+150ms debounce し、連続ドラッグ中に大型 CJK font data の読み込み worker を増殖させない。
+
 ---
 
 ## 7a. 既知の同期 I/O 残課題 (v0.8.2 以降で worker 化)

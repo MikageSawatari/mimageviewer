@@ -3884,6 +3884,7 @@ dependencies = [
 name = "mimageviewer"
 version = "2.6.0"
 dependencies = [
+ "ab_glyph",
  "base64",
  "comic-core",
  "cpal",
@@ -3897,6 +3898,7 @@ dependencies = [
  "fast_image_resize",
  "ffmpeg-the-third",
  "flate2",
+ "fontdb",
  "gilrs",
  "image",
  "kamadak-exif",

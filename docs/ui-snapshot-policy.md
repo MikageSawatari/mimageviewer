@@ -59,6 +59,7 @@ UI コードをスナップショットしたい場合は、まずロジック�
 
 - `snapshot_with_theme(name, theme, build_ui)`: 任意 UI + テーマ指定（文字コントラストは標準）
 - `snapshot_with_theme_and_contrast(name, theme, contrast, build_ui)`: 任意 UI + テーマ + 文字コントラスト指定
+- `snapshot_with_ui_font(name, settings, build_ui)` (Windows): 任意 UI フォント + 縦位置補正指定
 - `snapshot_diagnostic(name, status, plugins)`: Susie 診断専用
 
 これらはすべて `install_app_fonts()` を呼んで、本体と同じ `ui_fonts::configure_fonts()`
@@ -69,6 +70,13 @@ UI コードをスナップショットしたい場合は、まずロジック�
 通常文字・薄い文字・ボタン状態の配色を変える場合は、Light / Dark の標準 snapshot に加えて
 `TextContrast::Strong` の Light / Dark snapshot も更新し、背景色まで意図せず変わっていないことを
 目視確認する。
+
+UI フォント経路を変更する場合は `custom_ui_font_meiryo_bold_alignment_dark` に加え、
+`recommended_ui_font_*_alignment_dark` (BIZ UDPGothic 9pt / Meiryo 10pt /
+Meiryo UI 10pt) も更新し、通常文字、ツールバー専用 family、日本語 / CJK / 記号
+fallback の縦位置を確認する。9/10pt は 96 DPI の typographic point を egui logical
+point へ換算して描画する。同じ snapshot の「動画・音声 HUD」は `x1`、`Norm`、`0.0dB`、
+再生時間を `miv-hud-text` で描き、選択フォントを変えても字面・位置が変わらないことを確認する。
 
 ### 3. サイズは固定
 

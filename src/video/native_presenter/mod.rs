@@ -131,6 +131,8 @@ pub struct NativePresenterConfig {
     pub ui_scale: f32,
     /// main UI と同じ標準 / 強めの文字コントラスト。
     pub text_contrast: crate::settings::TextContrast,
+    /// main UI と同じフォント指定と縦位置補正。
+    pub ui_font: crate::settings::UiFontSettings,
     /// HUD overlay HWND の wndproc が拾った mouse / DPI / raise 要求を流す sender。
     /// `Some` のとき、presenter は HUD overlay HWND を作って egui overlay を
     /// その DComp tree にぶら下げる (CP4 反映)。`None` または HUD HWND 作成失敗時は
@@ -1492,8 +1494,8 @@ fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), 
     Ok((device, context))
 }
 
-fn configure_overlay_fonts(ctx: &egui::Context) {
-    crate::ui_fonts::configure_fonts(ctx);
+fn configure_overlay_fonts(ctx: &egui::Context, ui_font: &crate::settings::UiFontSettings) {
+    crate::ui_fonts::configure_fonts_with_settings(ctx, ui_font);
 }
 
 fn configure_overlay_style(ctx: &egui::Context, text_contrast: crate::settings::TextContrast) {
@@ -1720,6 +1722,7 @@ impl NativeVideoPresenter {
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
                         config.text_contrast,
+                        config.ui_font.clone(),
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -1774,6 +1777,7 @@ impl NativeVideoPresenter {
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
                         config.text_contrast,
+                        config.ui_font.clone(),
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -3900,6 +3904,7 @@ impl NativeEguiOverlay {
         cursor_hide_delay_secs: f32,
         ui_scale: f32,
         text_contrast: crate::settings::TextContrast,
+        ui_font: crate::settings::UiFontSettings,
         cursor_was_hidden_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -3947,7 +3952,7 @@ impl NativeEguiOverlay {
         let egui_ctx = egui::Context::default();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
-        configure_overlay_fonts(&egui_ctx);
+        configure_overlay_fonts(&egui_ctx, &ui_font);
         configure_overlay_style(&egui_ctx, text_contrast);
         let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
         let pixels_per_point =
@@ -6900,7 +6905,7 @@ impl NativeEguiOverlay {
                                     egui::pos2(c.x, c.y - r * 0.55),
                                     egui::Align2::CENTER_CENTER,
                                     "CH",
-                                    egui::FontId::proportional(11.0),
+                                    crate::ui_fonts::hud_text_font(11.0),
                                     egui::Color32::from_rgb(115, 210, 255),
                                 );
                             }
@@ -7285,7 +7290,7 @@ impl NativeEguiOverlay {
                             egui::pos2(time_x, text_center_y),
                             egui::Align2::LEFT_CENTER,
                             label,
-                            egui::FontId::proportional(14.0),
+                            crate::ui_fonts::hud_text_font(14.0),
                             egui::Color32::from_rgb(238, 238, 238),
                         );
 
@@ -7609,7 +7614,7 @@ impl NativeEguiOverlay {
                                     egui::pos2(action_rect.max.x - 8.0, action_rect.center().y),
                                     egui::Align2::RIGHT_CENTER,
                                     time_label,
-                                    egui::FontId::proportional(13.0),
+                                    crate::ui_fonts::hud_text_font(13.0),
                                     egui::Color32::from_rgb(245, 245, 245),
                                 );
                             }
@@ -7715,7 +7720,7 @@ impl NativeEguiOverlay {
                             egui::pos2(norm_rect.center().x, text_center_y),
                             egui::Align2::CENTER_CENTER,
                             "Norm",
-                            egui::FontId::proportional(11.0),
+                            crate::ui_fonts::hud_text_font(11.0),
                             norm_color,
                         );
                         let norm_resp = norm_resp.hover_tip_dark(norm_hover_label);
@@ -7768,7 +7773,7 @@ impl NativeEguiOverlay {
                                 egui::pos2(vol_rect.max.x + gap + vol_label_w, text_center_y),
                                 egui::Align2::RIGHT_CENTER,
                                 volume_label,
-                                egui::FontId::proportional(13.0),
+                                crate::ui_fonts::hud_text_font(13.0),
                                 volume_label_color,
                             );
                         }

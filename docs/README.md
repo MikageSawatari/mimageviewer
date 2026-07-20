@@ -26,6 +26,7 @@
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
 | [feature-expansion-ideas.md](feature-expansion-ideas.md) | v0.10 候補 3 機能 (キャプチャ保存 / 比較ビュー / 動画連続再生) + スクロールバー視認性改善 の詳細仕様。Codex 第 2 ラウンドレビュー反映済、実装状況と設計メモを併記 |
 | [plan-v2.6.0.md](plan-v2.6.0.md) | **v2.6.0 実装計画の正本**。現在の一覧条件を複数実フォルダへ保存し、フォルダ / 画像 / 動画 / 音声 / 書庫 / PDF を収集する索引なしスマートフォルダ（フラット snapshot）、独立メニュー / 条件付きツールバー、次版送りバックログの実装順と非対象を固定 |
+| [plan-v2.7.0.md](plan-v2.7.0.md) | **v2.7.0 UI フォント設定の実装メモ**。システム / 任意フォント選択、TTC face、実メトリクスによる縦位置自動補正、±4pt 微調整、非同期プレビュー、font atlas / native HUD 反映と検証範囲を整理 |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。未対応の P2/P3・要判断項目、ユーザー要望、依存ライブラリ更新、リリース前確認だけを恒久管理。完了した項目はこのファイルから削除する |
 | [detached-viewer-implementation-plan.md](detached-viewer-implementation-plan.md) | 画像・動画を共通の別ウィンドウビューアとして扱う設計・実装メモ。F12 別ウィンドウモード、別ウィンドウの F11 仮想フルスクリーン、×/Esc/Enter/右クリックで session close、メイン一覧カーソルとの双方向同期、動画 native presenter の `NativeVideoPlacement::DetachedViewerChild` 化、close-to-tray 時の再生継続、ClaudeCode レビュー反映メモを整理 |
 | [detached-image-window-stabilization-review-request.md](detached-image-window-stabilization-review-request.md) | 画像別ウィンドウ複数表示の安定化レビュー依頼メモ。context 分離前の暫定安定化記録で、現在の PDF / ZIP detached book viewer は [detached-viewer-context-separation-plan.md](detached-viewer-context-separation-plan.md) を正とする |

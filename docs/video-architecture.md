@@ -223,6 +223,14 @@ Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源�
 再 open で新倍率を適用するため、短い再生中断は許容する。presenter HWND 自身
 (= video transform / background) には影響させず、VST editor の別 HWND にもアプリ内倍率を掛けない。
 
+**UI フォント / コントラストの同期**: `NativeVideoOutputConfig` → `NativePresenterConfig` は
+`text_contrast` に加えて `UiFontSettings` も保持し、`NativeEguiOverlay` の独立
+`egui::Context` を main UI と同じ font definitions で初期化する。フォント変更は live command を
+追加せず、UI 表示倍率と同様に active presenter を閉じて再 open 時に反映する。メタデータや
+パネル本文は選択フォントを使うが、動画 HUD と音声 HUD の固定 28pt ボタンに配置する `Norm`、再生速度、時刻、音量等は
+`miv-hud-text` (= 無補正の既定日本語フォント) を使う。これらは既定フォント向けの固定 Y 基準と
+幅を持つため、任意 UI フォントの字面を伝播させない。VST 等の固定 glyph はベクター描画のまま。
+
 **フォールバック経路**: HUD HWND 生成失敗 / 環境変数 `MIV_HUD_OVERLAY=0` でフォールバック有効化。
 従来通り egui overlay を presenter HWND の DComp tree に attach (`NativeEguiOverlay::new` の
 `after_visual=Some(&video_visual)`、`dcomp_hwnd=focus_hwnd=presenter_hwnd`)。VST GUI 裏に bars が

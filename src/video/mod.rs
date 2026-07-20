@@ -322,6 +322,8 @@ pub struct NativeVideoOutputConfig {
     pub ui_scale: f32,
     /// main egui Context と native HUD で共有する文字コントラスト。
     pub text_contrast: crate::settings::TextContrast,
+    /// main egui Context と native HUD で共有する UI フォント。
+    pub ui_font: crate::settings::UiFontSettings,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -1976,6 +1978,7 @@ fn run_native_video_output(
             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
             ui_scale: config.ui_scale,
             text_contrast: config.text_contrast,
+            ui_font: config.ui_font.clone(),
             hud_event_tx,
         },
     ) {
@@ -2915,6 +2918,7 @@ fn run_native_video_output(
                                             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
                                             ui_scale: cur_ui_scale,
                                             text_contrast: cur_text_contrast,
+                                            ui_font: config.ui_font.clone(),
                                             hud_event_tx: new_hud_event_tx,
                                         },
                                     );

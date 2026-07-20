@@ -131,6 +131,8 @@ image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 fast_image_resize = { version = "5", features = ["image"] }
 png = "0.18"
 ttf-parser = "0.25"
+fontdb = "0.23"
+ab_glyph = "0.2"
 flate2 = "1"
 local-adjust-core = { path = "crates/local-adjust-core" }
 # テキスト注釈 (吹き出し/テキスト/スタンプ/メッセージウィンドウ) の純ロジック。
