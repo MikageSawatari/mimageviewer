@@ -1544,6 +1544,7 @@ impl App {
             .take()
             .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
         crate::app::ViewReturnContext {
+            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
             path,
             subfolder_restore,
         }

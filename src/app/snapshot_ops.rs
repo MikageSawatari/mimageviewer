@@ -378,6 +378,7 @@ impl App {
         };
         self.show_feedback_toast("★固定を解除しました".into());
         Some(crate::app::ViewReturnContext {
+            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
             path,
             subfolder_restore,
         })
@@ -437,6 +438,8 @@ impl App {
                 // Besides suppressing history, this restores synthetic subfolder/smart views
                 // instead of handing their paths to the real-folder loader.
                 self.restore_view_return_context(crate::app::ViewReturnContext {
+                    rating_view_stars: self
+                        .view_return_rating_view_stars_for_path(Some(&restore_to)),
                     path: Some(restore_to),
                     subfolder_restore,
                 });

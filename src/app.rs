@@ -3412,11 +3412,13 @@ pub(crate) enum SearchMode {
 
 /// Return ownership transferred between transient top-level views without first rebuilding the
 /// source view. This is intentionally smaller than the future `TopLevelGridView` state machine:
-/// it carries only the path and the one snapshot type that otherwise gets moved twice.
+/// it carries only the path plus the small amount of state needed to restore synthetic origins
+/// without rebuilding an intermediate view.
 #[derive(Debug, Default)]
 pub(crate) struct ViewReturnContext {
     pub(crate) path: Option<PathBuf>,
     pub(crate) subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+    pub(crate) rating_view_stars: Option<u8>,
 }
 
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
@@ -12444,6 +12446,10 @@ impl App {
         .then_some(self.rating_view_stars)
     }
 
+    pub(crate) fn view_return_rating_view_stars_for_path(&self, path: Option<&Path>) -> Option<u8> {
+        path.and_then(|path| self.folder_nav_rating_view_stars_for_path(path))
+    }
+
     fn record_folder_nav_transition_with_rating(
         &mut self,
         target: &Path,
@@ -15095,39 +15101,58 @@ impl App {
         if let Some(pending) = self.favsearch_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+        let path = self.favsearch.saved_folder.take();
         ViewReturnContext {
-            path: self.favsearch.saved_folder.take(),
+            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
+            path,
             subfolder_restore: self.favsearch_subfolder_restore.take(),
         }
     }
 
     pub(crate) fn restore_view_return_context(&mut self, context: ViewReturnContext) {
-        let Some(saved) = context.path else {
+        let ViewReturnContext {
+            path,
+            subfolder_restore,
+            rating_view_stars,
+        } = context;
+        let Some(saved) = path else {
             return;
         };
         self.suppress_nav_record_for_search_restore = true;
-        if self.restore_subfolder_expansion_for_synthetic_path_with_state(
-            &saved,
-            context.subfolder_restore,
-        ) {
+        if self.restore_subfolder_expansion_for_synthetic_path_with_state(&saved, subfolder_restore)
+        {
             self.suppress_nav_record_for_search_restore = false;
-        } else if smart_folder::is_smart_folder_synthetic_path(&saved) {
-            if self.restore_smart_folder_for_synthetic_path(&saved) {
+            return;
+        }
+
+        let smart_target = smart_folder::is_smart_folder_synthetic_path(&saved);
+        self.pending_folder_nav_rating_view_stars = rating_view_stars;
+        match self.dispatch_synthetic_folder_history_target(&saved) {
+            SyntheticFolderHistoryDispatch::Restored if smart_target => {
                 // Until async prepare installs the smart grid, the previous search result may
                 // remain visible. Keep the actual restore target as the worker-owned origin so
                 // another search entered in this window cannot inherit that stale synthetic path.
                 self.smart_folder_open_origin = Some(ViewReturnContext {
-                    path: Some(saved.clone()),
+                    path: Some(saved),
                     subfolder_restore: None,
+                    rating_view_stars: None,
                 });
                 // snapshot miss may route through `open_smart_folder`, whose normal cancel boundary
                 // clears stale suppression. This restore owns it, so re-arm until async install.
                 self.suppress_nav_record_for_search_restore = true;
-            } else {
-                self.suppress_nav_record_for_search_restore = false;
             }
-        } else {
-            self.load_folder(saved);
+            SyntheticFolderHistoryDispatch::Restored => {
+                // Drive list / reading history / rating view restoration does not call the real
+                // folder loader, so consume the one-shot explicitly at this ownership boundary.
+                self.suppress_nav_record_for_search_restore = false;
+                self.set_active_folder_nav_suppress_record_once(false);
+            }
+            SyntheticFolderHistoryDispatch::NotSynthetic => self.load_folder(saved),
+            SyntheticFolderHistoryDispatch::Unavailable => {
+                // Never hand a recognized but unavailable synthetic path to `load_folder`.
+                self.suppress_nav_record_for_search_restore = false;
+                self.set_active_folder_nav_suppress_record_once(false);
+            }
         }
     }
 
@@ -15156,8 +15181,10 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
+        let path = self.tag_view.saved_folder.take();
         ViewReturnContext {
-            path: self.tag_view.saved_folder.take(),
+            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
+            path,
             subfolder_restore: self.tag_view_subfolder_restore.take(),
         }
     }

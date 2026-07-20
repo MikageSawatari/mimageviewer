@@ -32837,6 +32837,92 @@ mod smart_folder_transition_tests {
         assert!(!app.is_snapshot_active(), "Snapshot Lock must be released");
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum SyntheticSearchOrigin {
+        DriveList,
+        ReadingHistory,
+        RatingView,
+    }
+
+    fn install_synthetic_search_origin(app: &mut App, origin: SyntheticSearchOrigin) -> PathBuf {
+        match origin {
+            SyntheticSearchOrigin::DriveList => app.enter_drive_list(None),
+            SyntheticSearchOrigin::ReadingHistory => app.enter_reading_history(),
+            SyntheticSearchOrigin::RatingView => {
+                app.rating_view_stars = 4;
+                app.rating_view_rows_stars = Some(4);
+                app.rating_view_rows.clear();
+                app.install_rating_view_rows();
+            }
+        }
+        app.current_folder
+            .clone()
+            .expect("synthetic view must install its location")
+    }
+
+    fn assert_synthetic_search_origin_restored(app: &App, origin: SyntheticSearchOrigin) {
+        match origin {
+            SyntheticSearchOrigin::DriveList => assert!(app.items_are_drive_list),
+            SyntheticSearchOrigin::ReadingHistory => {
+                assert!(app.items_are_reading_history_view)
+            }
+            SyntheticSearchOrigin::RatingView => {
+                assert!(app.items_are_rating_view);
+                assert_eq!(app.rating_view_stars, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn search_exit_restores_all_synthetic_origins_with_and_without_snapshot() {
+        for origin in [
+            SyntheticSearchOrigin::DriveList,
+            SyntheticSearchOrigin::ReadingHistory,
+            SyntheticSearchOrigin::RatingView,
+        ] {
+            for mode in [
+                SearchMode::Favsearch,
+                SearchMode::Global,
+                SearchMode::TagView,
+            ] {
+                for snapshot in [false, true] {
+                    let mut app = setup_app();
+                    app.active_quick_folder_slot = None;
+                    let expected_path = install_synthetic_search_origin(&mut app, origin);
+
+                    if snapshot {
+                        let image = app
+                            .tmp
+                            .path()
+                            .join(format!("synthetic-{origin:?}-{mode:?}.jpg"));
+                        app.items = vec![GridItem::Image(image)];
+                        app.thumbnails = vec![ThumbnailState::Failed];
+                        app.visible_indices = vec![0];
+                        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                        assert!(app.is_snapshot_active());
+                    }
+
+                    match mode {
+                        SearchMode::Favsearch => app.open_favsearch(),
+                        SearchMode::Global => app.open_global_search(),
+                        SearchMode::TagView => app.open_tag_view(),
+                        SearchMode::LocalMeta => unreachable!(),
+                    }
+                    match mode {
+                        SearchMode::Favsearch => app.close_favsearch(),
+                        SearchMode::Global => app.close_global_search(),
+                        SearchMode::TagView => app.close_tag_view(),
+                        SearchMode::LocalMeta => unreachable!(),
+                    }
+
+                    assert_eq!(app.current_folder.as_ref(), Some(&expected_path));
+                    assert_synthetic_search_origin_restored(&app, origin);
+                    assert!(!app.suppress_nav_record_for_search_restore);
+                }
+            }
+        }
+    }
+
     #[test]
     fn smart_folder_entry_owns_top_level_view_against_all_search_modes() {
         let mut app = setup_app();

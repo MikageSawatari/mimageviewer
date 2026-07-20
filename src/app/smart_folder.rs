@@ -174,6 +174,30 @@ struct PreparedSmartFolder {
 /// boundary explicit while allowing both cached metadata and complete prepared results.
 pub(crate) type RetiredSmartFolderPayload = Box<dyn Send + 'static>;
 
+/// Cancel in-flight work and move every owner that can retain a large queued result into the
+/// payload-drop lane.  Dropping only the receiver on the UI thread is not cheap: a `Done` message
+/// may already contain a million-entry snapshot/prepared grid, and a confirmation owner retains
+/// the scanned snapshot directly.
+fn cancelled_smart_folder_payloads(
+    scan: Option<SmartFolderPending>,
+    prepare: Option<SmartFolderPreparePending>,
+    confirm: Option<SmartFolderConfirmPending>,
+) -> Vec<RetiredSmartFolderPayload> {
+    let mut retired = Vec::with_capacity(3);
+    if let Some(pending) = scan {
+        pending.cancel();
+        retired.push(Box::new(pending) as RetiredSmartFolderPayload);
+    }
+    if let Some(pending) = prepare {
+        pending.cancel();
+        retired.push(Box::new(pending) as RetiredSmartFolderPayload);
+    }
+    if let Some(confirm) = confirm {
+        retired.push(Box::new(confirm) as RetiredSmartFolderPayload);
+    }
+    retired
+}
+
 /// Path-keyed state retained from the currently installed smart-folder generation.  A sort-only
 /// rebuild changes indices, not membership or metadata, so it can remap these values without
 /// reopening every metadata database.
@@ -2075,8 +2099,10 @@ impl App {
     /// real/synthetic location becomes the smart folder's history/return origin; the later smart
     /// install remains the only operation that replaces the grid.
     fn close_transient_views_before_smart_folder(&mut self) -> super::ViewReturnContext {
+        let path = self.folder_nav_current_location();
         let mut return_context = super::ViewReturnContext {
-            path: self.folder_nav_current_location(),
+            rating_view_stars: self.view_return_rating_view_stars_for_path(path.as_deref()),
+            path,
             subfolder_restore: None,
         };
         if self.is_snapshot_active() {
@@ -2287,9 +2313,9 @@ impl App {
             self.smart_folder_local_search_reapply = Some(self.search_query.clone());
             self.cancel_search_pending();
         }
-        if let Some(pending) = self.smart_folder_prepare_pending.take() {
-            pending.cancel();
-        }
+        let retired =
+            cancelled_smart_folder_payloads(None, self.smart_folder_prepare_pending.take(), None);
+        self.retire_smart_folder_payloads(retired);
         let is_sort_only = reused_metadata.is_some();
         let reused_catalog_db = is_sort_only
             .then(|| self.current_color_catalog.clone())
@@ -2359,13 +2385,12 @@ impl App {
     pub(crate) fn cancel_smart_folder_pending(&mut self) {
         let scan_pending = self.smart_folder_pending.is_some();
         let prepare_pending = self.smart_folder_prepare_pending.is_some();
-        if let Some(pending) = self.smart_folder_pending.take() {
-            pending.cancel();
-        }
-        if let Some(pending) = self.smart_folder_prepare_pending.take() {
-            pending.cancel();
-        }
-        self.smart_folder_confirm_pending = None;
+        let retired = cancelled_smart_folder_payloads(
+            self.smart_folder_pending.take(),
+            self.smart_folder_prepare_pending.take(),
+            self.smart_folder_confirm_pending.take(),
+        );
+        self.retire_smart_folder_payloads(retired);
         self.smart_folder_progress = None;
         self.smart_folder_open_origin = None;
         self.smart_folder_local_search_reapply = None;
@@ -2513,6 +2538,9 @@ impl App {
                 }
                 Ok(SmartFolderScanEvent::Done(mut result)) => {
                     let Some(pending) = self.smart_folder_pending.take() else {
+                        self.retire_smart_folder_payloads(std::iter::once(
+                            Box::new(result) as RetiredSmartFolderPayload
+                        ));
                         break;
                     };
                     let current_definition =
@@ -2527,6 +2555,10 @@ impl App {
                         || current_definition.is_none()
                     {
                         self.smart_folder_progress = None;
+                        self.retire_smart_folder_payloads([
+                            Box::new(pending) as RetiredSmartFolderPayload,
+                            Box::new(result) as RetiredSmartFolderPayload,
+                        ]);
                         break;
                     }
                     adopt_smart_folder_presentation(
@@ -2541,13 +2573,22 @@ impl App {
                             "スマートフォルダの検索元を1件も読み込めませんでした".into(),
                         );
                         self.restore_pending_smart_folder_origin();
+                        self.retire_smart_folder_payloads([
+                            Box::new(pending) as RetiredSmartFolderPayload,
+                            Box::new(result) as RetiredSmartFolderPayload,
+                        ]);
                     } else if result.snapshot.entries.len() >= SMART_FOLDER_CONFIRM_THRESHOLD {
-                        self.smart_folder_confirm_pending = Some(SmartFolderConfirmPending {
-                            snapshot: result.snapshot,
-                            generation: pending.generation,
-                            refresh: pending.refresh,
-                            tombstones_at_start: pending.tombstones_at_start,
-                        });
+                        let replaced =
+                            self.smart_folder_confirm_pending
+                                .replace(SmartFolderConfirmPending {
+                                    snapshot: result.snapshot,
+                                    generation: pending.generation,
+                                    refresh: pending.refresh,
+                                    tombstones_at_start: pending.tombstones_at_start,
+                                });
+                        self.retire_smart_folder_payloads(
+                            replaced.map(|confirm| Box::new(confirm) as RetiredSmartFolderPayload),
+                        );
                     } else {
                         self.start_smart_folder_prepare_after_scan(
                             result.snapshot,
@@ -2558,14 +2599,24 @@ impl App {
                     break;
                 }
                 Ok(SmartFolderScanEvent::Cancelled) => {
-                    self.smart_folder_pending = None;
+                    let retired = cancelled_smart_folder_payloads(
+                        self.smart_folder_pending.take(),
+                        None,
+                        None,
+                    );
+                    self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
                     self.restore_pending_smart_folder_origin();
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.smart_folder_pending = None;
+                    let retired = cancelled_smart_folder_payloads(
+                        self.smart_folder_pending.take(),
+                        None,
+                        None,
+                    );
+                    self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
                     self.show_feedback_toast("スマートフォルダ走査が中断されました".into());
                     self.restore_pending_smart_folder_origin();
@@ -2657,12 +2708,22 @@ impl App {
                     break;
                 }
                 Ok(SmartFolderPrepareEvent::Cancelled) => {
-                    self.smart_folder_prepare_pending = None;
+                    let retired = cancelled_smart_folder_payloads(
+                        None,
+                        self.smart_folder_prepare_pending.take(),
+                        None,
+                    );
+                    self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
                     break;
                 }
                 Ok(SmartFolderPrepareEvent::Error(message)) => {
-                    self.smart_folder_prepare_pending = None;
+                    let retired = cancelled_smart_folder_payloads(
+                        None,
+                        self.smart_folder_prepare_pending.take(),
+                        None,
+                    );
+                    self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
                     self.show_feedback_toast(message);
                     self.restore_pending_smart_folder_origin();
@@ -2670,7 +2731,12 @@ impl App {
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.smart_folder_prepare_pending = None;
+                    let retired = cancelled_smart_folder_payloads(
+                        None,
+                        self.smart_folder_prepare_pending.take(),
+                        None,
+                    );
+                    self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
                     self.show_feedback_toast("スマートフォルダの表示準備が中断されました".into());
                     self.restore_pending_smart_folder_origin();
@@ -3011,9 +3077,12 @@ impl App {
             .as_ref()
             .is_some_and(|pending| affected_ids.contains(&pending.definition_id));
         if pending_affected {
-            if let Some(pending) = self.smart_folder_prepare_pending.take() {
-                pending.cancel();
-            }
+            let retired = cancelled_smart_folder_payloads(
+                None,
+                self.smart_folder_prepare_pending.take(),
+                None,
+            );
+            self.retire_smart_folder_payloads(retired);
             if let Some(id) = self.current_smart_folder_id
                 && affected_ids.contains(&id)
                 && let Some(snapshot) = self.smart_folder_snapshots.get(&id).cloned()
@@ -3066,10 +3135,19 @@ impl App {
                             confirm.refresh,
                             confirm.tombstones_at_start,
                         );
+                    } else {
+                        self.retire_smart_folder_payloads(std::iter::once(
+                            Box::new(confirm) as RetiredSmartFolderPayload
+                        ));
                     }
                 }
             } else if cancel {
-                self.smart_folder_confirm_pending = None;
+                let retired = cancelled_smart_folder_payloads(
+                    None,
+                    None,
+                    self.smart_folder_confirm_pending.take(),
+                );
+                self.retire_smart_folder_payloads(retired);
                 self.smart_folder_progress = None;
                 self.restore_pending_smart_folder_origin();
             }
@@ -3184,6 +3262,101 @@ mod tests {
             video_thumb_use_sidecar_image: true,
             image_ext_priority: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cancelling_pending_owners_moves_queued_results_and_confirm_snapshot_together() {
+        struct DropProbe {
+            tx: std::sync::mpsc::Sender<std::thread::ThreadId>,
+        }
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let _ = self.tx.send(std::thread::current().id());
+            }
+        }
+
+        let mut definition = crate::settings::SmartFolderDefinition::new("queued-drop");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            PathBuf::from(r"C:\Books"),
+            true,
+            true,
+            Default::default(),
+        ));
+
+        let queued_entries = Arc::new(vec![smart_entry(r"C:\Books\queued.zip", 0, "")]);
+        let queued_entries_weak = Arc::downgrade(&queued_entries);
+        let queued_snapshot = SmartFolderSnapshot {
+            definition: definition.clone(),
+            entries: Arc::clone(&queued_entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        drop(queued_entries);
+        let (scan_tx, scan_rx) = mpsc::channel();
+        scan_tx
+            .send(SmartFolderScanEvent::Done(SmartFolderScanResult {
+                snapshot: queued_snapshot,
+            }))
+            .unwrap();
+        drop(scan_tx);
+        let scan_cancel = Arc::new(AtomicBool::new(false));
+        let scan_pending = SmartFolderPending {
+            definition_id: definition.id,
+            generation: 1,
+            refresh: false,
+            tombstones_at_start: HashSet::new(),
+            cancel: Arc::clone(&scan_cancel),
+            rx: scan_rx,
+        };
+
+        let (_prepare_tx, prepare_rx) = mpsc::channel();
+        let prepare_cancel = Arc::new(AtomicBool::new(false));
+        let prepare_pending = SmartFolderPreparePending {
+            definition_id: definition.id,
+            generation: 1,
+            cancel: Arc::clone(&prepare_cancel),
+            rx: prepare_rx,
+        };
+
+        let confirm_entries = Arc::new(vec![smart_entry(r"C:\Books\confirm.zip", 0, "")]);
+        let confirm_entries_weak = Arc::downgrade(&confirm_entries);
+        let confirm = SmartFolderConfirmPending {
+            snapshot: SmartFolderSnapshot {
+                definition,
+                entries: Arc::clone(&confirm_entries),
+                video_thumb_overrides: HashMap::new(),
+                diag: SmartFolderDiag::default(),
+            },
+            generation: 1,
+            refresh: false,
+            tombstones_at_start: HashSet::new(),
+        };
+        drop(confirm_entries);
+
+        let mut retired = cancelled_smart_folder_payloads(
+            Some(scan_pending),
+            Some(prepare_pending),
+            Some(confirm),
+        );
+        assert!(scan_cancel.load(Ordering::Relaxed));
+        assert!(prepare_cancel.load(Ordering::Relaxed));
+        assert_eq!(retired.len(), 3);
+        assert!(queued_entries_weak.upgrade().is_some());
+        assert!(confirm_entries_weak.upgrade().is_some());
+
+        let ui_thread = std::thread::current().id();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        retired.push(Box::new(DropProbe { tx: drop_tx }) as RetiredSmartFolderPayload);
+        std::thread::Builder::new()
+            .name("smart-folder-cancel-drop-test".into())
+            .spawn(move || drop(retired))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_ne!(drop_rx.recv().unwrap(), ui_thread);
+        assert!(queued_entries_weak.upgrade().is_none());
+        assert!(confirm_entries_weak.upgrade().is_none());
     }
 
     #[test]

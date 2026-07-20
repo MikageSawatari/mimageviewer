@@ -205,13 +205,14 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   スマートフォルダ worker を cancel する。完了通知側でも所有権を再確認し、別ビューへ
   移った後の旧 generation を install しない。
 - Ctrl+S / G / T の結果一覧からスマートフォルダへ直行するときは、検索元を一度再構築せず
-  `ViewReturnContext`（検索開始前のpath + サブ展開snapshot）を新しいビューへ移譲する。
+  `ViewReturnContext`（検索開始前のpath + サブ展開snapshot + レーティング一覧の星数）を新しいビューへ移譲する。
   検索由来の★固定から直行する場合も検索前のcontextを履歴へ渡し、検索結果用synthetic pathや
   drill先を保存しない。Ctrl+S / G / T・検索由来Snapshotから別検索へ切り替える場合も、元viewを
   一度復元せずcontextを次の検索へ直接渡す。smart処理中に別のCtrl+F / S / G / T、または別の
   smartへ切り替える場合は、cancel前に同じcontextを次の所有者へ原子的に移譲する。Ctrl+Fは
   完成済みスマート一覧内のfilterとして許可し、sort / metadata prepare後に、worker中に更新された
-  最新queryを新しいitem indexへ再実行する。
+  最新queryを新しいitem indexへ再実行する。ドライブ一覧・読書履歴・レーティング一覧へ戻すときは
+  synthetic pathを実フォルダとしてloadせず、履歴と同じ専用dispatchで復元する。
 - 開くと現在の一覧を残したまま背景をグレーアウトした scan / prepare modal を表示し、
   「中止」以外の背面操作を止める。完成 snapshot だけを一括 install する。
 - stale definition ID / scan generation / source set の結果は破棄する。
@@ -243,7 +244,9 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   DB書込完了でもmetadata revisionを進め、完了通知もrevisionが古ければinstallせず最新DBから
   prepareし直す。失効した大容量cacheだけでなく、metadata revision / tombstone / generation /
   表示定義の不一致で採用しない完成済みprepare結果も、全件items・metadataを専用drop workerへ
-  移譲してUIスレッド外で破棄する。sort-onlyではDB照会用の全件key配列を生成しない。
+  移譲してUIスレッド外で破棄する。cancelしたscan / prepareのreceiverに到着済みの結果と、
+  大件数確認待ちsnapshotも所有者ごと同じworkerへ移す。sort-onlyではDB照会用の全件key配列を
+  生成しない。
 - 一部 source が見つからない / 読めない場合は、読めた source の結果を表示し、失敗 source 数と
   詳細を通知する。全 source 失敗時は現在表示を置き換えない。
 
@@ -261,7 +264,8 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
 - synthetic view からの open / back / forward / refresh / file operation 後の clamp
 - Ctrl+F / S / G / T・検索由来★固定からスマートフォルダを開いた際の相互排他と正しい戻り先、
   検索→検索、検索由来Snapshot→検索、進行中smart→検索 / 別smartのorigin移譲、stale worker破棄、
-  最新query再適用、採用しない巨大prepare結果がUIスレッド外でdropされること
+  最新query再適用、ドライブ一覧・読書履歴・レーティング一覧から検索（直接 / Snapshot経由）後の
+  復元、採用しない巨大prepare結果とcancel済みpending所有物がUIスレッド外でdropされること
 - サブ展開 → スマートフォルダ → 履歴戻る / 進むで同じ snapshot を復元すること
 - 名称の内部空白、空欄からの再入力、名称変更で走査を破棄しないこと、削除後の sort / 履歴復元、
   通常一覧の facet / ★がスマートフォルダへ二重適用されないこと

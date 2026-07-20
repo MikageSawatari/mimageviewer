@@ -735,6 +735,10 @@ pathをsaved folderへ保存せず、smart / サブ展開の復元workerを開�
 Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、非同期prepare中に入力された最新queryを
 完成一覧へ再適用する。
 
+戻り先は実フォルダに限らない。ドライブ一覧・読書履歴・レーティング一覧などのsynthetic pathは
+`dispatch_synthetic_folder_history_target`と同じ専用経路で復元し、`load_folder`へ渡さない。
+レーティング一覧はpathだけでは星数を表現できないため、`ViewReturnContext`が星数も保持する。
+
 ---
 
 ## 8. テストと計装
@@ -749,7 +753,8 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
   `wait_for_search_hits` 等のハーネス
 - `src/app.rs::phase_c_key_tests` — 検索バーの相互排他 (Ctrl+F/S/G が常に ≤1 active)
 - `src/app/tests.rs::smart_folder_transition_tests` — 検索→検索、検索由来Snapshot→検索、
-  pending smart→検索 / 別smartの`ViewReturnContext`移譲とCtrl+F query再適用
+  pending smart→検索 / 別smartの`ViewReturnContext`移譲、Ctrl+F query再適用、ドライブ一覧・
+  読書履歴・レーティング一覧（直接 / Snapshot経由）への検索終了時復元
 
 進行中の Phase C (フルスタック egui_kittest ハーネス) は
 [search-test-plan.md](search-test-plan.md) 参照。
