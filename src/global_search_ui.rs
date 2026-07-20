@@ -1472,12 +1472,20 @@ impl App {
         if self.is_snapshot_active() {
             self.deactivate_snapshot();
         }
+        let fallback_origin = self.current_folder.clone();
+        let transferred_origin = self.take_smart_folder_origin_for_search_entry();
         self.cancel_pending_folder_nav();
         // 他の検索バー (Ctrl+F / Ctrl+S) が開いていれば閉じる (相互排他)
         self.close_other_search_bars(crate::app::SearchMode::Global);
         self.global_search.active = true;
         self.global_search.focus_request = true;
-        self.global_search.saved_folder = self.current_folder.clone();
+        if let Some(origin) = transferred_origin {
+            self.global_search.saved_folder = origin.path.or(fallback_origin);
+            self.global_search_subfolder_restore = origin.subfolder_restore;
+        } else {
+            self.global_search.saved_folder = fallback_origin;
+            self.global_search_subfolder_restore = None;
+        }
         // Ctrl+G 中は current_folder_rating() が 0 を返す規約なので、
         // 旧フォルダの★が残っているとアドレスバーにちらつく。
         self.current_folder_rating_cache = None;
@@ -1492,6 +1500,15 @@ impl App {
         if !self.global_search.active {
             return;
         }
+        let return_context = self.dismiss_global_search_without_restore();
+        self.restore_view_return_context(return_context);
+    }
+
+    /// Ctrl+G を終了して戻り先だけを引き渡す。スマートフォルダ等へ直行する場合に、
+    /// 元の合成ビューを一度prepareして直後にcancelする競合を避ける。
+    pub(crate) fn dismiss_global_search_without_restore(
+        &mut self,
+    ) -> crate::app::ViewReturnContext {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
@@ -1524,18 +1541,18 @@ impl App {
         self.global_search.truncated = false;
         self.global_search.total_valid = 0;
         self.global_search.total_scanned = 0;
+        self.items_are_global_search_view = false;
         // Ctrl+G 専用のサブフォルダ件数キャッシュも破棄する。folder_rating_match が
         // 旧データを誤って返さないように、saved_folder への load_folder より先に消す。
         self.search_drilled_folder_counts.clear();
-        // 元のフォルダに戻る。この復帰 load_folder は履歴 (back/forward/recent) に
-        // 積まない (検索は透明な一時オーバーレイ)。
-        if let Some(folder) = self.global_search.saved_folder.take() {
-            self.suppress_nav_record_for_search_restore = true;
-            if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
-                self.suppress_nav_record_for_search_restore = false;
-            } else {
-                self.load_folder(folder);
-            }
+        let path = self.global_search.saved_folder.take();
+        let subfolder_restore = self
+            .global_search_subfolder_restore
+            .take()
+            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
+        crate::app::ViewReturnContext {
+            path,
+            subfolder_restore,
         }
     }
 

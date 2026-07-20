@@ -340,6 +340,49 @@ impl App {
         self.show_feedback_toast(msg);
     }
 
+    /// Leave Snapshot Lock for another top-level view without rebuilding the captured source.
+    ///
+    /// A snapshot created from Ctrl+S / Ctrl+G owns two locations: `origin` is the result grid
+    /// (or its drill target), while `pre_snapshot_search_origin` is the real view to which the
+    /// user should return.  Callers that transition directly to another synthetic view must take
+    /// the latter as return ownership instead of recording the result-grid path in history.
+    pub(crate) fn dismiss_snapshot_without_restore(
+        &mut self,
+    ) -> Option<crate::app::ViewReturnContext> {
+        let snap = self.snapshot.take()?;
+        let _ = self.restore_rating_filter_suppression();
+        let at_origin = self.current_folder.as_ref().is_some_and(|path| {
+            crate::snapshot::snapshot_key_from_path(path)
+                == crate::snapshot::snapshot_key_from_path(&snap.origin)
+        });
+        let path = if at_origin {
+            snap.pre_snapshot_search_origin
+                .clone()
+                .or_else(|| Some(snap.origin.clone()))
+        } else {
+            self.current_folder.clone()
+        };
+        let subfolder_restore = if path.as_deref().is_some_and(|path| {
+            crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path())
+        }) {
+            match snap.source_label {
+                SnapshotSourceLabel::FavSearch { .. } => self.favsearch_subfolder_restore.take(),
+                SnapshotSourceLabel::GlobalSearch { .. } => {
+                    self.global_search_subfolder_restore.take()
+                }
+                _ => None,
+            }
+            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()))
+        } else {
+            None
+        };
+        self.show_feedback_toast("★固定を解除しました".into());
+        Some(crate::app::ViewReturnContext {
+            path,
+            subfolder_restore,
+        })
+    }
+
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
     ///
     /// 検索 state は **consume 済み** で復元しない (= §4.5 mutual exclusion の対称性)。
@@ -378,14 +421,25 @@ impl App {
         //   child folder の中で解除した場合は既存「解除直前のフォルダ維持」path に落ちる。
         if at_origin {
             if let Some(restore_to) = snap.pre_snapshot_search_origin.clone() {
-                // 検索 close と同じく履歴抑止: suppress_nav_record_for_search_restore を
-                // 立てる (Codex P2-2 fix)。これで back/recent 履歴に drilled origin が
-                // 積まれない (= close_global_search / close_favsearch と同じ抑止)。
-                self.suppress_nav_record_for_search_restore = true;
-                // snapshot は既に take() で None なので load_folder の guard は通る。
-                // load_folder 経路で items/thumbnails/visible_indices/items_generation/cache が
-                // 全部入れ替わる (= invalidate も自動)。
-                self.load_folder(restore_to);
+                let subfolder_restore = match snap.source_label {
+                    SnapshotSourceLabel::FavSearch { .. } => {
+                        self.favsearch_subfolder_restore.take()
+                    }
+                    SnapshotSourceLabel::GlobalSearch { .. } => {
+                        self.global_search_subfolder_restore.take()
+                    }
+                    _ => None,
+                }
+                .or_else(|| {
+                    self.take_subfolder_expansion_restore_for_synthetic_path(Some(&restore_to))
+                });
+                // Use the same owner-aware restore boundary as search/smart-folder transitions.
+                // Besides suppressing history, this restores synthetic subfolder/smart views
+                // instead of handing their paths to the real-folder loader.
+                self.restore_view_return_context(crate::app::ViewReturnContext {
+                    path: Some(restore_to),
+                    subfolder_restore,
+                });
                 self.show_feedback_toast("★固定を解除しました".into());
                 return;
             }

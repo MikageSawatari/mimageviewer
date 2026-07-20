@@ -167,6 +167,11 @@ pub(crate) struct PreparedSubfolderMetadata {
 pub(crate) struct PreparedAggregateCatalog {
     pub(crate) db: Arc<crate::catalog::CatalogDb>,
     pub(crate) entries: HashMap<String, crate::catalog::CacheEntry>,
+    /// A sort-only rebuild can keep using the already loaded generation cache.  This avoids a
+    /// second catalog `load_all` and, more importantly, keeps thumbnail workers and the rebuilt
+    /// grid on the same in-memory cache rather than creating divergent copies.
+    pub(crate) shared_entries:
+        Option<Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>>,
 }
 
 pub(crate) struct PreparedAggregateMetadata {

@@ -819,6 +819,9 @@ impl App {
                 }
                 if changed {
                     self.invalidate_tag_apply_suggestions();
+                    self.schedule_current_smart_folder_metadata_refresh(
+                        crate::app::smart_folder::SmartFolderMetadataDependency::Tags,
+                    );
                 }
 
                 crate::logger::log(format!(

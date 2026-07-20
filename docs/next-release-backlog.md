@@ -14,16 +14,6 @@
 
 ## 1. 優先候補
 
-### 1.1 v2.6.0 スマートフォルダ — 対応中
-
-- 通常一覧の現在条件を実フォルダごとのルールとして保存し、複数ルールを OR 結合してフォルダ /
-  画像 / 動画 / 音声 / ZIP / PDF / 対応アーカイブを background scan で収集する snapshot view。
-- お気に入りとは別概念。索引 / watcher は MVP に含めず、開く / 更新時に再走査する。
-- 元階層は source-relative path として保持し、表示は横断フラット。全体 sort とフォルダごと sort を持つ。
-  場所 / AI モデル / 生成ツール / 画像色は保存せず、除外内容を追加確認画面で明示する。
-- 独立したメニューを常設し、ツールバーセクションは定義が 1 件以上あるときだけ表示する。
-- 正本: `docs/plan-v2.6.0.md`。完了したら本節を削除する。
-
 ### 1.7 detached 中の発火面解決の残り (? / トースト / スタック) — BA 報告
 
 - 残り (P3、発火面の window_id 粒度が必要):
@@ -158,6 +148,22 @@
     個別色調補正規則を変えない。
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
+
+### 1.23 最上位一覧ビューの状態所有と復元先を単一型へ統合
+
+- 背景: 検索（Ctrl+F / S / G / T）、★固定、サブ展開、スマートフォルダ、読書履歴、
+  レーティング一覧が個別の `active` flag / synthetic path / saved folder を持つため、
+  新しい合成ビュー追加時に相互排他・worker世代・履歴復元の接続漏れが起きやすい。
+- v2.6.0 の安全策: 各入口の共通終了処理、検索入口からのsmart worker cancel、完了通知側の
+  所有権再確認を追加済み。検索結果 / 検索由来Snapshot → smart、検索結果 → smart処理中 →
+  別検索の直行では最小の`ViewReturnContext`（path + サブ展開snapshot）を復元なしで原子的に
+  移譲し、restore stateの所有者を1つに限定した。
+- 将来方針: `TopLevelGridView`（通常 / 検索 / サブ展開 / スマート / 履歴 / レーティング等）を
+  Appの正本にし、現在は移譲用途だけの`ViewReturnContext`を全復元可能snapshotへ拡張して、
+  enter / leave / restore / cancel / generationを1つのtransition APIへ集約する。既存flagは描画用の
+  派生値へ段階移行する。
+- 規模 / 優先度: Large / P2 architecture。v2.6.0直前に全面移行せず、次の合成ビュー追加前に
+  独立フェーズで行う。
 
 ### 2.1 folder pane scan worker の thread 構成判断
 

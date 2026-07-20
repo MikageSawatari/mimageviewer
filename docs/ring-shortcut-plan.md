@@ -596,8 +596,8 @@ set・列数 set 等は既存 `KeyAction` を流用できる。
    ← 入力より先に副作用と保存を固める。
 2. **ゲームパッド一発リング**: `West`/X 状態機械 (§4.2) + リング描画 (§4.4) + 一発 action 発火。
 3. **ピッカーコア**: パッド専用パネル (§6)、modal 入力消費、編集セッション (§6.7)、ドリルイン。
-   **読み方向 picker (`PickerCommand::SetReadingDirection(ReadingDirection)` / `RingPickerRowId::ReadingDirection`)
-   は現行 `ring_shortcut.rs` に未実装なので追加する** (Codex 第6回 P2)。
+   読み方向 picker (`PickerCommand::SetReadingDirection(ReadingDirection)` /
+   `RingPickerRowId::ReadingDirection`) も実装済み。
 4. **動画 / native 連携**: 音量・速度・連続再生など native presenter 経路の適用。
 5. **マウスフリック**: 右ボタン ジェスチャ状態機械 (§4.1) → フリック発動 (FS・グリッド)。グリッド短押しメニューと、フルスクリーン短押し close / 右フリック OFF 長押しメニューの分担を保つ。
 6. **マウスボタン バインド**: 戻る/進む のカスタマイズ化 + 既定 Alt+←/→ + 移行ダイアログ (§5.3)。
@@ -651,7 +651,7 @@ ImageFS/VideoFS でも `AddressBarNav::HistoryBack/Forward` へ流す方針に�
 
 **Codex 第6回レビュー反映済み**: §8/§9 の保存対象を全列挙 (8 スロット×3 + マウス右ドラッグトグル + 互換用 `gamepad_ring_enabled` / shift/alt wheel pair +
 `mouse_buttons_*` + 旧 `mouse_back_forward_action` / `mouse_nav_prompt_done`)、`WheelPairActionId` も `Unknown` 安全化を明記、
-読み方向 picker は実装側 (`ring_shortcut.rs`) 未追加なので §11 Phase 3 で追加と明記、残った略記
+読み方向 picker を §11 Phase 3 の実装対象として明記（現在は実装済み）、残った略記
 (`FS / 動画`・`FS/video`) を掃除。
 
 **Codex 第7回レビュー反映済み**: §8/§9 の保存対象に `x_picker_hint_shown` (X 単体ピッカー初回案内) を追加。

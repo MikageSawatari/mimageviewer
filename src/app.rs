@@ -3410,6 +3410,15 @@ pub(crate) enum SearchMode {
     TagView,
 }
 
+/// Return ownership transferred between transient top-level views without first rebuilding the
+/// source view. This is intentionally smaller than the future `TopLevelGridView` state machine:
+/// it carries only the path and the one snapshot type that otherwise gets moved twice.
+#[derive(Debug, Default)]
+pub(crate) struct ViewReturnContext {
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+}
+
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
 ///
 /// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
@@ -6327,6 +6336,8 @@ pub struct App {
 
     // ── Ctrl+G グローバルメタ検索 UI 状態 (docs §10.3) ──────────────
     pub(crate) global_search: crate::global_search_ui::GlobalSearchState,
+    pub(crate) global_search_subfolder_restore:
+        Option<subfolder_expansion::SubfolderExpansionRestoreState>,
 
     // ── Ctrl+T タグビュー UI 状態 ─────────────────────────────────
     pub(crate) tag_view: crate::tag_view::TagViewState,
@@ -7553,6 +7564,24 @@ pub struct App {
     pub(crate) smart_folder_saved_folder: Option<PathBuf>,
     pub(crate) smart_folder_snapshots:
         std::collections::HashMap<uuid::Uuid, smart_folder::SmartFolderSnapshot>,
+    /// Completed generation metadata keyed by real item path. Sort-only rebuilds clone only the
+    /// Arc and remap on the prepare worker; the UI thread never reconstructs this O(N) state.
+    pub(crate) smart_folder_resort_metadata:
+        std::collections::HashMap<uuid::Uuid, Arc<smart_folder::ReusedSmartFolderMetadata>>,
+    /// A thread-spawn failure must not make invalidation synchronously destroy a million-item
+    /// cache on the UI thread.  Such rare handoff failures are retained here and retried at the
+    /// next retirement boundary (or dropped during application shutdown).
+    pub(crate) smart_folder_retired_resort_metadata:
+        Vec<Arc<smart_folder::ReusedSmartFolderMetadata>>,
+    /// Advances on every path-keyed metadata write that can affect a smart-folder grid. Prepare
+    /// results captured before the write are rejected at install time.
+    pub(crate) smart_folder_metadata_revision: u64,
+    /// Source view captured when a smart-folder scan starts. Search result synthetic paths are
+    /// never stored here; their pre-search return context is transferred directly instead.
+    pub(crate) smart_folder_open_origin: Option<ViewReturnContext>,
+    /// Ctrl+F is an in-view filter for an installed smart folder. A prepare replaces item indices,
+    /// so the query is re-run against the new order after installation.
+    pub(crate) smart_folder_local_search_reapply: Option<String>,
     /// snapshot / prepare worker と共有中に削除された実パス。定義ごとに保持し、
     /// ソート変更や履歴復元で削除済み項目を再構築しないための tombstone。
     pub(crate) smart_folder_removed_paths:
@@ -9481,6 +9510,7 @@ impl App {
             name_index_supervisors: std::collections::HashMap::new(),
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
+            global_search_subfolder_restore: None,
             tag_view: crate::tag_view::TagViewState::default(),
             tag_view_subfolder_restore: None,
             show_open_folder_dialog: false,
@@ -9934,6 +9964,11 @@ impl App {
             current_smart_folder_id: None,
             smart_folder_saved_folder: None,
             smart_folder_snapshots: std::collections::HashMap::new(),
+            smart_folder_resort_metadata: std::collections::HashMap::new(),
+            smart_folder_retired_resort_metadata: Vec::new(),
+            smart_folder_metadata_revision: 0,
+            smart_folder_open_origin: None,
+            smart_folder_local_search_reapply: None,
             smart_folder_removed_paths: std::collections::HashMap::new(),
             smart_folder_generation: 0,
             smart_folder_pending: None,
@@ -11921,8 +11956,8 @@ impl App {
         if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
         }
-        if let Some(nav) = self.smart_folder_back_nav() {
-            return Some(nav);
+        if self.items_are_smart_folder_view {
+            return None;
         }
         let cur = self.effective_folder()?;
         if let Some(parent) = cur.parent() {
@@ -11942,8 +11977,8 @@ impl App {
         if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
         }
-        if let Some(nav) = self.smart_folder_back_nav() {
-            return Some(nav);
+        if self.items_are_smart_folder_view {
+            return None;
         }
         let cur = self.effective_folder()?;
         let nav = if let Some(parent) = cur.parent() {
@@ -12002,8 +12037,8 @@ impl App {
         if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
         }
-        if let Some(nav) = self.smart_folder_back_nav() {
-            return Some(nav);
+        if self.items_are_smart_folder_view {
+            return None;
         }
         let cur = self.effective_folder()?;
         let parent = cur.parent()?;
@@ -12383,6 +12418,19 @@ impl App {
         self.record_folder_nav_transition_with_rating(target, None);
     }
 
+    /// Record a completed transition using an origin whose ownership was transferred from a
+    /// transient view (for example smart A -> Ctrl+G results -> smart B). The result grid's
+    /// synthetic marker must never become the Back target.
+    pub(crate) fn record_folder_nav_transition_from(&mut self, target: &Path, from: PathBuf) {
+        let from_rating_view_stars = self.folder_nav_rating_view_stars_for_path(&from);
+        self.record_folder_nav_transition_from_current(
+            target,
+            None,
+            Some(from),
+            from_rating_view_stars,
+        );
+    }
+
     fn folder_nav_current_location(&self) -> Option<PathBuf> {
         if self.items_are_drive_list {
             Some(drive_list_synthetic_path())
@@ -12401,6 +12449,25 @@ impl App {
         &mut self,
         target: &Path,
         target_rating_view_stars: Option<u8>,
+    ) {
+        let current = self.folder_nav_current_location();
+        let current_rating_view_stars = current
+            .as_deref()
+            .and_then(|path| self.folder_nav_rating_view_stars_for_path(path));
+        self.record_folder_nav_transition_from_current(
+            target,
+            target_rating_view_stars,
+            current,
+            current_rating_view_stars,
+        );
+    }
+
+    fn record_folder_nav_transition_from_current(
+        &mut self,
+        target: &Path,
+        target_rating_view_stars: Option<u8>,
+        current: Option<PathBuf>,
+        current_rating_view_stars: Option<u8>,
     ) {
         if self.detached_viewer_suppresses_main_history_persistence() {
             self.suppress_nav_record_for_search_restore = false;
@@ -12427,10 +12494,6 @@ impl App {
             crate::folder_tree::path_eq(target, &rating_view_synthetic_path())
                 && (1..=5).contains(stars)
         });
-        let current = self.folder_nav_current_location();
-        let current_rating_view_stars = current
-            .as_deref()
-            .and_then(|path| self.folder_nav_rating_view_stars_for_path(path));
         if current.as_deref().is_some_and(|current| {
             Self::folder_nav_targets_eq(
                 current,
@@ -12609,6 +12672,7 @@ impl App {
         &mut self,
         target: &Path,
     ) -> SyntheticFolderHistoryDispatch {
+        let smart_folder_target = smart_folder::is_smart_folder_synthetic_path(target);
         let target_rating_view_stars = self.pending_folder_nav_rating_view_stars.take();
         let dispatch = if crate::folder_tree::path_eq(target, &drive_list_synthetic_path()) {
             let origin = self.effective_folder();
@@ -12655,7 +12719,7 @@ impl App {
             } else {
                 SyntheticFolderHistoryDispatch::Unavailable
             }
-        } else if smart_folder::is_smart_folder_synthetic_path(target) {
+        } else if smart_folder_target {
             if self.restore_smart_folder_for_synthetic_path(target) {
                 SyntheticFolderHistoryDispatch::Restored
             } else {
@@ -12667,8 +12731,10 @@ impl App {
 
         if dispatch == SyntheticFolderHistoryDispatch::Restored {
             // 合成ビュー再構築は load_folder を通らないため、navigate_* が立てた
-            // suppress ワンショットをここで消費し、次の通常ナビへ漏らさない。
-            self.set_active_folder_nav_suppress_record_once(false);
+            // suppress ワンショットをここで消費する。ただしスマートフォルダは非同期install
+            // が履歴遷移を記録するため、そのinstallまで維持する。snapshot missでopen経路が
+            // 一度clearしていても、history dispatchが所有権を立て直す。
+            self.set_active_folder_nav_suppress_record_once(smart_folder_target);
         }
         dispatch
     }
@@ -13232,7 +13298,7 @@ impl App {
     }
 
     pub(crate) fn persist_view_trim_page_override(
-        &self,
+        &mut self,
         idx: usize,
         page_override: crate::view_trim::ViewTrimPageOverride,
     ) {
@@ -13244,9 +13310,10 @@ impl App {
                 "view_trim: failed to save page override idx={idx}: {err}"
             ));
         }
+        self.invalidate_smart_folder_resort_metadata();
     }
 
-    pub(crate) fn remove_view_trim_page_override(&self, idx: usize) {
+    pub(crate) fn remove_view_trim_page_override(&mut self, idx: usize) {
         let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
             return;
         };
@@ -13255,6 +13322,7 @@ impl App {
                 "view_trim: failed to remove page override idx={idx}: {err}"
             ));
         }
+        self.invalidate_smart_folder_resort_metadata();
     }
 
     pub(crate) fn hydrate_view_trim_page_overrides_for_current_items(
@@ -14872,6 +14940,8 @@ impl App {
         if self.is_snapshot_active() {
             self.deactivate_snapshot();
         }
+        let fallback_origin = self.current_folder.clone();
+        let transferred_origin = self.take_smart_folder_origin_for_search_entry();
         self.cancel_pending_folder_nav();
         self.close_other_search_bars(SearchMode::Favsearch);
         self.favsearch.active = true;
@@ -14879,8 +14949,12 @@ impl App {
         self.favsearch.nav_stack.clear();
         self.favsearch.results_paths.clear();
         // 検索モードに入る際、現在のフォルダを保存して戻れるようにする
-        if self.favsearch.saved_folder.is_none() {
-            self.favsearch.saved_folder = self.current_folder.clone();
+        if let Some(origin) = transferred_origin {
+            self.favsearch.saved_folder = origin.path.or(fallback_origin);
+            self.favsearch_subfolder_restore = origin.subfolder_restore;
+        } else if self.favsearch.saved_folder.is_none() {
+            self.favsearch.saved_folder = fallback_origin;
+            self.favsearch_subfolder_restore = None;
         }
     }
 
@@ -14915,11 +14989,19 @@ impl App {
         if self.is_snapshot_active() {
             self.deactivate_snapshot();
         }
+        let fallback_origin = self.current_folder.clone();
+        let transferred_origin = self.take_smart_folder_origin_for_search_entry();
         self.cancel_pending_folder_nav();
         self.close_other_search_bars(SearchMode::TagView);
         self.tag_view.active = true;
         self.tag_view.focus_request = focus_request;
-        self.tag_view.saved_folder = self.current_folder.clone();
+        if let Some(origin) = transferred_origin {
+            self.tag_view.saved_folder = origin.path.or(fallback_origin);
+            self.tag_view_subfolder_restore = origin.subfolder_restore;
+        } else {
+            self.tag_view.saved_folder = fallback_origin;
+            self.tag_view_subfolder_restore = None;
+        }
         if let Some(query) = query {
             self.tag_view.query = query;
             self.tag_view.last_executed.clear();
@@ -14941,6 +15023,21 @@ impl App {
         // ★固定 中は scope mutual exclusion で snapshot を先に解除する (= §4.5)。
         if self.is_snapshot_active() {
             self.deactivate_snapshot();
+        }
+        let transferred_origin = self.take_smart_folder_origin_for_search_entry();
+        let restore_smart_folder = transferred_origin.as_ref().is_some_and(|origin| {
+            origin
+                .path
+                .as_deref()
+                .is_some_and(smart_folder::is_smart_folder_synthetic_path)
+        });
+        if let Some(origin) = transferred_origin {
+            self.restore_view_return_context(origin);
+            if restore_smart_folder {
+                // Keep the pending smart restore as the owner of the grid.  Its install boundary
+                // will run the query typed while the worker is active against the final indices.
+                self.smart_folder_local_search_reapply = Some(String::new());
+            }
         }
         // スタック集約計算待ち (通常フォルダ表示中) に Ctrl+F が来たら、検索を優先する。
         // 放置するとワーカー完了時の `apply_stack_script_result` → `start_loading_items` が
@@ -14985,6 +15082,13 @@ impl App {
 
     /// お気に入り検索バーを閉じて、元のフォルダに戻る。
     pub(crate) fn close_favsearch(&mut self) {
+        let return_context = self.dismiss_favsearch_without_restore();
+        self.restore_view_return_context(return_context);
+    }
+
+    /// Ctrl+S の状態だけを終了し、元ビューの再構築は行わず戻り先の所有権を返す。
+    /// 別の最上位ビューへ直行するとき、復元 worker を起動直後にキャンセルする競合を防ぐ。
+    pub(crate) fn dismiss_favsearch_without_restore(&mut self) -> ViewReturnContext {
         self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
@@ -14995,18 +15099,32 @@ impl App {
         if let Some(pending) = self.favsearch_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+        ViewReturnContext {
+            path: self.favsearch.saved_folder.take(),
+            subfolder_restore: self.favsearch_subfolder_restore.take(),
+        }
+    }
 
-        // 検索モードで保存していた元フォルダがあれば戻す。この復帰 load_folder は
-        // 履歴 (back/forward/recent) に積まない (検索は透明な一時オーバーレイ)。
-        let restore_state = self.favsearch_subfolder_restore.take();
-        if let Some(saved) = self.favsearch.saved_folder.take() {
-            self.suppress_nav_record_for_search_restore = true;
-            if self.restore_subfolder_expansion_for_synthetic_path_with_state(&saved, restore_state)
-            {
-                self.suppress_nav_record_for_search_restore = false;
+    pub(crate) fn restore_view_return_context(&mut self, context: ViewReturnContext) {
+        let Some(saved) = context.path else {
+            return;
+        };
+        self.suppress_nav_record_for_search_restore = true;
+        if self.restore_subfolder_expansion_for_synthetic_path_with_state(
+            &saved,
+            context.subfolder_restore,
+        ) {
+            self.suppress_nav_record_for_search_restore = false;
+        } else if smart_folder::is_smart_folder_synthetic_path(&saved) {
+            if self.restore_smart_folder_for_synthetic_path(&saved) {
+                // snapshot miss may route through `open_smart_folder`, whose normal cancel boundary
+                // clears stale suppression. This restore owns it, so re-arm until async install.
+                self.suppress_nav_record_for_search_restore = true;
             } else {
-                self.load_folder(saved);
+                self.suppress_nav_record_for_search_restore = false;
             }
+        } else {
+            self.load_folder(saved);
         }
     }
 
@@ -15015,6 +15133,11 @@ impl App {
         if !self.tag_view.active {
             return;
         }
+        let return_context = self.dismiss_tag_view_without_restore();
+        self.restore_view_return_context(return_context);
+    }
+
+    pub(crate) fn dismiss_tag_view_without_restore(&mut self) -> ViewReturnContext {
         self.cancel_pending_folder_nav();
         if let Some(pending) = self.tag_view_pending.take() {
             pending.cancel();
@@ -15030,15 +15153,9 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
-        let restore_state = self.tag_view_subfolder_restore.take();
-        if let Some(saved) = self.tag_view.saved_folder.take() {
-            self.suppress_nav_record_for_search_restore = true;
-            if self.restore_subfolder_expansion_for_synthetic_path_with_state(&saved, restore_state)
-            {
-                self.suppress_nav_record_for_search_restore = false;
-            } else {
-                self.load_folder(saved);
-            }
+        ViewReturnContext {
+            path: self.tag_view.saved_folder.take(),
+            subfolder_restore: self.tag_view_subfolder_restore.take(),
         }
     }
 
@@ -17928,10 +18045,16 @@ impl App {
         // 進行中のスタックスクリプトワーカーも破棄 (旧フォルダ向けの結果を適用しない)。
         self.cancel_stack_script_pending();
         if !crate::folder_tree::path_eq(&source_path, &subfolder_expansion_synthetic_path()) {
-            if !is_synthetic_view_path(&source_path) && self.items_are_subfolder_expansion_view {
-                let synthetic = subfolder_expansion_synthetic_path();
-                self.folder_nav_subfolder_restore =
-                    self.take_subfolder_expansion_restore_for_synthetic_path(Some(&synthetic));
+            if self.items_are_subfolder_expansion_view {
+                // Search/rating/synthetic views own their dedicated restore state. Taking it again
+                // here after their first transfer leaves a root-only duplicate. Real-folder
+                // navigation keeps the generic history restore; smart-folder install performs an
+                // explicit synthetic-to-synthetic transfer at its ownership boundary.
+                if !is_synthetic_view_path(&source_path) {
+                    let synthetic = subfolder_expansion_synthetic_path();
+                    self.folder_nav_subfolder_restore =
+                        self.take_subfolder_expansion_restore_for_synthetic_path(Some(&synthetic));
+                }
             }
             self.cancel_subfolder_expansion_pending();
             self.clear_subfolder_expansion_view_state();
@@ -18618,15 +18741,20 @@ impl App {
         }
 
         let catalog_load_t0 = std::time::Instant::now();
+        let shared_prepared_entries = prepared_catalog
+            .as_ref()
+            .and_then(|prepared| prepared.shared_entries.clone());
         let cache_map: Arc<
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
-        > = Arc::new(std::sync::RwLock::new(match prepared_catalog {
-            Some(prepared) => prepared.entries,
-            None => catalog_arc
-                .as_ref()
-                .and_then(|c| c.load_all().ok())
-                .unwrap_or_default(),
-        }));
+        > = shared_prepared_entries.unwrap_or_else(|| {
+            Arc::new(std::sync::RwLock::new(match prepared_catalog {
+                Some(prepared) => prepared.entries,
+                None => catalog_arc
+                    .as_ref()
+                    .and_then(|c| c.load_all().ok())
+                    .unwrap_or_default(),
+            }))
+        });
         let catalog_entries = cache_map.read().unwrap().len();
         crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
@@ -19640,6 +19768,7 @@ impl App {
             Ok(()) => {
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.insert(key, source);
+                self.invalidate_smart_folder_resort_metadata();
                 self.folder_thumb_pin_dirty = true;
                 crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
                 true
@@ -19660,6 +19789,7 @@ impl App {
             Ok(()) => {
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.remove(&key);
+                self.invalidate_smart_folder_resort_metadata();
                 self.folder_thumb_pin_dirty = true;
                 crate::logger::log(format!("folder_thumb_pin removed: {}", container.display()));
                 true
@@ -37841,9 +37971,10 @@ impl App {
         if capture_undo && before != stars {
             self.capture_container_rating_undo(before, stars);
         }
-        if let Some(db) = self.rating_db.as_ref() {
-            let _ = db.set_user_rating(&key, stars, Some(&meta));
-        }
+        let rating_written = self
+            .rating_db
+            .as_ref()
+            .is_some_and(|db| db.set_user_rating(&key, stars, Some(&meta)).is_ok());
         self.invalidate_rating_counts_cache();
         self.current_folder_rating_cache = Some(stars);
         // items 内の同じ rating key を指すコンテナがあればキャッシュ更新。
@@ -37860,6 +37991,11 @@ impl App {
             .collect();
         for i in matching {
             self.rating_cache.insert(i, stars);
+        }
+        if rating_written && before != stars {
+            self.schedule_current_smart_folder_metadata_refresh(
+                smart_folder::SmartFolderMetadataDependency::Rating,
+            );
         }
         self.rebuild_visible_indices();
         true
@@ -38073,6 +38209,11 @@ impl App {
             }
             changed = true;
         }
+        if changed {
+            self.schedule_current_smart_folder_metadata_refresh(
+                smart_folder::SmartFolderMetadataDependency::Tags,
+            );
+        }
         if changed && self.settings.facet_filter.uses_tag_state() {
             self.rebuild_visible_indices();
         }
@@ -38144,10 +38285,16 @@ impl App {
                 }
             }
         }
+        let mut rating_written = false;
         for (key, stars, path) in &to_write {
             let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
                 .with_source_path(path);
-            let _ = db.set_imported_rating(key, *stars, Some(&meta));
+            rating_written |= db.set_imported_rating(key, *stars, Some(&meta)).is_ok();
+        }
+        if rating_written {
+            self.schedule_current_smart_folder_metadata_refresh(
+                smart_folder::SmartFolderMetadataDependency::Rating,
+            );
         }
         self.invalidate_rating_counts_cache();
         // 子孫★集計バッジにも反映 (to_write は DB が 0 だった path のみ = old_stars=0)。
@@ -42499,6 +42646,7 @@ impl App {
         // crop は edit-result / final AI を作り直さないが、永続編集プレビューの最終段には
         // 含まれる。確定した矩形が変わった時点で旧 WebP だけを失効させる。
         self.invalidate_edit_preview_cache_for_key(&key);
+        self.invalidate_smart_folder_resort_metadata();
         // crop は表示パイプライン (edit_result / final composite) に含まれない (暗転
         // overlay のみ。実切り出しは save 時)。よって edit_result / final AI キャッシュは
         // 無効化しない。無効化すると crop ドラッグのたびに AI アップスケールを無駄に
@@ -46483,6 +46631,22 @@ impl App {
                     stats.imported_tags,
                     sidecar_folder.display()
                 ));
+            }
+            if stats.imported_adjust > 0
+                || stats.imported_mask > 0
+                || stats.imported_conceal > 0
+                || stats.imported_local_adjust > 0
+                || stats.imported_export_crop > 0
+                || stats.imported_comic > 0
+            {
+                self.schedule_current_smart_folder_metadata_refresh(
+                    smart_folder::SmartFolderMetadataDependency::Edits,
+                );
+            }
+            if stats.imported_tags > 0 {
+                self.schedule_current_smart_folder_metadata_refresh(
+                    smart_folder::SmartFolderMetadataDependency::Tags,
+                );
             }
             // import で comic.db に追加した行が、それ以前に空としてキャッシュされた
             // comic_docs に隠れて再起動まで見えない、という stale read を防ぐ (Codex P3)。

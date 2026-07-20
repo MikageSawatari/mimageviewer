@@ -200,12 +200,24 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
 ### 3.9 開く・更新・ナビゲーション
 
 - synthetic path は definition UUID から生成し、実 filesystem path と混同しない。
+- 検索（Ctrl+F / S / G / T）、★固定、スマートフォルダは同じ最上位一覧を所有する。
+  スマートフォルダを開く入口では検索を終了して★固定を解除し、検索入口では進行中の
+  スマートフォルダ worker を cancel する。完了通知側でも所有権を再確認し、別ビューへ
+  移った後の旧 generation を install しない。
+- Ctrl+S / G / T の結果一覧からスマートフォルダへ直行するときは、検索元を一度再構築せず
+  `ViewReturnContext`（検索開始前のpath + サブ展開snapshot）を新しいビューへ移譲する。
+  検索由来の★固定から直行する場合も検索前のcontextを履歴へ渡し、検索結果用synthetic pathや
+  drill先を保存しない。smart処理中に別のCtrl+F / S / G / Tへ入る場合は、cancel前に同じcontextを
+  次の検索へ原子的に移譲する。Ctrl+Fは完成済みスマート一覧内のfilterとして許可し、sort /
+  metadata prepare後に、worker中に更新された最新queryを新しいitem indexへ再実行する。
 - 開くと現在の一覧を残したまま背景をグレーアウトした scan / prepare modal を表示し、
   「中止」以外の背面操作を止める。完成 snapshot だけを一括 install する。
 - stale definition ID / scan generation / source set の結果は破棄する。
 - `中止`、別の場所を開く、definition 編集 / 削除、アプリ終了で pending scan を cancel する。
 - フォルダバーには `スマートフォルダ: <name>` と表示し、source path を synthetic breadcrumb にしない。
 - 戻る / 進むでは同一セッション中の snapshot を再利用する。snapshot が無ければ definition から再走査する。
+- サブフォルダ展開から別の synthetic view へ移る場合も、root / roots / snapshot を履歴用の
+  復元 state へ退避する。遷移先が synthetic であることを理由に破棄しない。
 - スマートフォルダを開く履歴は scan / prepare が成功して一覧を採用するときだけ追加する。
   中止や全 source 失敗では現在地と履歴を変えない。
 - スマートフォルダ自身が保存条件を所有するため、開く前の通常一覧で有効だった facet / ★
@@ -222,6 +234,13 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   復活させない。tombstone は snapshot 世代に属し、worker との共有が解けて snapshot へ
   反映できた時点、または明示的な再走査の成功後に破棄する。件数上限による破棄は行わない。
 - 「更新」は同じ definition で新しい generation を開始し、成功するまで現在 snapshot を保持する。
+- ソート変更は完成済み generation の正規化key配列・採用entry index・sparse metadataと共有
+  catalog cacheを`Arc`で再利用し、全path文字列の再複製・Hash照合・DB再照会を行わず、index
+  再割当てとsort / item構築だけをworkerで行う。★・タグ・補正・crop・表示トリミング・マスク・
+  注釈・代表ピン等に加え、XMP自動取込・旧タグseed・旧XMP手動取込・sidecar取込・現在フォルダ★の
+  DB書込完了でもmetadata revisionを進め、完了通知もrevisionが古ければinstallせず最新DBから
+  prepareし直す。失効した大容量cacheの最終`Arc`はUIスレッド外で破棄する。sort-onlyではDB照会用の
+  全件key配列を生成しない。
 - 一部 source が見つからない / 読めない場合は、読めた source の結果を表示し、失敗 source 数と
   詳細を通知する。全 source 失敗時は現在表示を置き換えない。
 
@@ -237,6 +256,9 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   スマートフォルダ表示時に全体のソート順 / サムネイル・詳細表示を上書きしないこと
 - menu layout の旧設定補完、名前だけの作成 / 現在条件追加 / 管理 / 登録一覧 / 対象外 tooltip
 - synthetic view からの open / back / forward / refresh / file operation 後の clamp
+- Ctrl+F / S / G / T・検索由来★固定からスマートフォルダを開いた際の相互排他と正しい戻り先、
+  進行中のスマートフォルダから別検索へ移った際のorigin移譲・stale worker破棄・最新query再適用
+- サブ展開 → スマートフォルダ → 履歴戻る / 進むで同じ snapshot を復元すること
 - 名称の内部空白、空欄からの再入力、名称変更で走査を破棄しないこと、削除後の sort / 履歴復元、
   通常一覧の facet / ★がスマートフォルダへ二重適用されないこと
 - perf event は scan / prepare / install / cancel を分け、10 万 / 50 万 / 200 万 entry で計測する。
@@ -245,11 +267,16 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
 result を同時に保持した process Peak Working Set を計測）は次のとおり。filesystem scan と
 production DB I/O は含めず、filter / sort / item・metadata 構築の O(N) 部分を測っている。
 
-| entry | prepare | Max WS | process Peak WS |
+| entry | 旧prepare baseline | Max WS | process Peak WS |
 | ---: | ---: | ---: | ---: |
 | 100,000 | 202.7 ms | 86.6 MiB | 97.8 MiB |
 | 500,000 | 1,046.5 ms | 401.8 MiB | 415.7 MiB |
 | 2,000,000 | 4,302.8 ms | 1,594.1 MiB | 1,609.1 MiB |
+
+2026-07-20 に再ソートcacheを全path HashSetからsnapshot-indexed Arcへ変更した後の同じdebug
+testでは、100,000件が初回235.1 ms / sort-only 191.7 ms、500,000件が初回1,115.3 ms /
+sort-only 940.5 ms。DBなし条件でもsort-onlyが初回を下回ることを確認した。上表のWorking Setは
+旧構造のbaselineであり、新構造のPeak Working Setとproduction DB込み効果はリリース前実測を別途行う。
 
 再計測は `MIV_SMART_FOLDER_BENCH_ITEMS=<件数> cargo test --bin mimageviewer-core
 smart_folder_prepare_scale_benchmark -- --ignored --nocapture` を件数ごとに別 process で実行する。
