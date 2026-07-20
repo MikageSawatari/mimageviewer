@@ -156,8 +156,9 @@
   新しい合成ビュー追加時に相互排他・worker世代・履歴復元の接続漏れが起きやすい。
 - v2.6.0 の安全策: 各入口の共通終了処理、検索入口からのsmart worker cancel、完了通知側の
   所有権再確認を追加済み。検索結果 / 検索由来Snapshot → smart、検索結果 → smart処理中 →
-  別検索の直行では最小の`ViewReturnContext`（path + サブ展開snapshot）を復元なしで原子的に
-  移譲し、restore stateの所有者を1つに限定した。
+  別検索、検索 / 検索由来Snapshot → 別検索、pending smart → 別smartの直行では最小の
+  `ViewReturnContext`（path + サブ展開snapshot）を復元なしで原子的に移譲し、restore stateの
+  所有者を1つに限定した。
 - 将来方針: `TopLevelGridView`（通常 / 検索 / サブ展開 / スマート / 履歴 / レーティング等）を
   Appの正本にし、現在は移譲用途だけの`ViewReturnContext`を全復元可能snapshotへ拡張して、
   enter / leave / restore / cancel / generationを1つのtransition APIへ集約する。既存flagは描画用の

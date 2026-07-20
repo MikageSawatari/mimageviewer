@@ -725,6 +725,16 @@ Tantivy commit自体を強制中断はしない。そこで上位のIndexerManag
 - `notify::Watcher::new()` → supervisor spawn 時のみ
 - `std::fs::read_dir` → walker スレッドのみ。UI からは呼ばない
 
+### 7.4 検索ビュー切替時の戻り先所有権
+
+Ctrl+F / S / G / T、検索由来Snapshot、スマートフォルダは同じ最上位一覧を所有する。
+これらを直接切り替える入口では、既存ビューを通常closeして元一覧を再構築してはならない。
+`dismiss_*_without_restore` / `dismiss_snapshot_without_restore` / pending smartのoriginから
+`ViewReturnContext`を取得し、次の検索またはsmartへ直接移譲する。これにより検索結果用synthetic
+pathをsaved folderへ保存せず、smart / サブ展開の復元workerを開始直後にcancelする競合も防ぐ。
+Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、非同期prepare中に入力された最新queryを
+完成一覧へ再適用する。
+
 ---
 
 ## 8. テストと計装
@@ -738,6 +748,8 @@ Tantivy commit自体を強制中断はしない。そこで上位のIndexerManag
 - [tests/common/mod.rs](../tests/common/mod.rs) — `FixtureRoot` / `start_indexer_at` /
   `wait_for_search_hits` 等のハーネス
 - `src/app.rs::phase_c_key_tests` — 検索バーの相互排他 (Ctrl+F/S/G が常に ≤1 active)
+- `src/app/tests.rs::smart_folder_transition_tests` — 検索→検索、検索由来Snapshot→検索、
+  pending smart→検索 / 別smartの`ViewReturnContext`移譲とCtrl+F query再適用
 
 進行中の Phase C (フルスタック egui_kittest ハーネス) は
 [search-test-plan.md](search-test-plan.md) 参照。

@@ -169,6 +169,11 @@ struct PreparedSmartFolder {
     applied_tombstones: HashSet<String>,
 }
 
+/// Type-erased ownership sent to the smart-folder drop worker. Payloads are never read again;
+/// only their destructors matter. Keeping the type `Send` makes the UI-to-worker ownership
+/// boundary explicit while allowing both cached metadata and complete prepared results.
+pub(crate) type RetiredSmartFolderPayload = Box<dyn Send + 'static>;
+
 /// Path-keyed state retained from the currently installed smart-folder generation.  A sort-only
 /// rebuild changes indices, not membership or metadata, so it can remap these values without
 /// reopening every metadata database.
@@ -1976,23 +1981,23 @@ fn smart_folder_definition_uses_metadata(
 }
 
 impl App {
-    /// Move the final `Arc` drops for million-item sort metadata away from the UI thread.
+    /// Move final drops for million-item smart-folder data away from the UI thread.
     ///
     /// The channel handoff is deliberate: if thread creation fails, the closure (and everything
     /// it captured) is destroyed by `Builder::spawn` on the caller.  Keeping the heavy values out
     /// of the closure until spawn succeeds prevents that failure path from recreating the stall.
-    fn retire_smart_folder_resort_metadata(
+    pub(crate) fn retire_smart_folder_payloads(
         &mut self,
-        values: impl IntoIterator<Item = Arc<ReusedSmartFolderMetadata>>,
+        values: impl IntoIterator<Item = RetiredSmartFolderPayload>,
     ) {
-        let mut retired = std::mem::take(&mut self.smart_folder_retired_resort_metadata);
+        let mut retired = std::mem::take(&mut self.smart_folder_retired_payloads);
         retired.extend(values);
         if retired.is_empty() {
             return;
         }
-        let (tx, rx) = mpsc::channel::<Vec<Arc<ReusedSmartFolderMetadata>>>();
+        let (tx, rx) = mpsc::channel::<Vec<RetiredSmartFolderPayload>>();
         match std::thread::Builder::new()
-            .name("smart-folder-cache-drop".into())
+            .name("smart-folder-payload-drop".into())
             .spawn(move || {
                 if let Ok(retired) = rx.recv() {
                     drop(retired);
@@ -2000,16 +2005,56 @@ impl App {
             }) {
             Ok(_thread) => {
                 if let Err(error) = tx.send(retired) {
-                    self.smart_folder_retired_resort_metadata = error.0;
+                    self.smart_folder_retired_payloads = error.0;
                 }
             }
             Err(error) => {
                 crate::logger::log(format!(
-                    "smart_folder: failed to spawn cache drop worker; defer until next boundary: {error}"
+                    "smart_folder: failed to spawn payload drop worker; defer until next boundary: {error}"
                 ));
-                self.smart_folder_retired_resort_metadata = retired;
+                self.smart_folder_retired_payloads = retired;
             }
         }
+    }
+
+    fn retire_smart_folder_resort_metadata(
+        &mut self,
+        values: impl IntoIterator<Item = Arc<ReusedSmartFolderMetadata>>,
+    ) {
+        self.retire_smart_folder_payloads(
+            values
+                .into_iter()
+                .map(|value| Box::new(value) as RetiredSmartFolderPayload),
+        );
+    }
+
+    fn retire_prepared_smart_folder(&mut self, prepared: PreparedSmartFolder) {
+        self.retire_smart_folder_payloads(std::iter::once(
+            Box::new(prepared) as RetiredSmartFolderPayload
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retire_prepared_smart_folder_install_payload(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+        metadata: super::subfolder_expansion::PreparedSubfolderMetadata,
+        resort_metadata: Arc<ReusedSmartFolderMetadata>,
+        applied_tombstones: HashSet<String>,
+    ) {
+        // These fields may collectively own several million rows. The tuple is intentionally
+        // opaque: after a retry decision only its destructor is meaningful.
+        let payload = Box::new((
+            items,
+            image_metas,
+            video_items,
+            metadata,
+            resort_metadata,
+            applied_tombstones,
+        )) as RetiredSmartFolderPayload;
+        self.retire_smart_folder_payloads(std::iter::once(payload));
     }
 
     /// Invalidate all installed sort metadata after a path-keyed metadata write. A cached smart
@@ -2156,7 +2201,12 @@ impl App {
             self.open_smart_folder_manager(Some(definition_id));
             return;
         }
-        let open_origin = self.close_transient_views_before_smart_folder();
+        // A previous smart-folder open may still be scanning/preparing while its source search
+        // result remains on screen. Preserve that worker's real origin before cancellation;
+        // rebuilding from the visible synthetic path would create an unrestorable Back entry.
+        let inherited_origin = self.smart_folder_open_origin.take();
+        let visible_origin = self.close_transient_views_before_smart_folder();
+        let open_origin = inherited_origin.unwrap_or(visible_origin);
         self.cancel_smart_folder_pending();
         self.smart_folder_open_origin = Some(open_origin);
         self.smart_folder_generation = self.smart_folder_generation.wrapping_add(1);
@@ -2536,6 +2586,7 @@ impl App {
                 Ok(SmartFolderPrepareEvent::Done(prepared)) => {
                     let prepared = *prepared;
                     let Some(pending) = self.smart_folder_prepare_pending.take() else {
+                        self.retire_prepared_smart_folder(prepared);
                         break;
                     };
                     let current_definition = self
@@ -2550,32 +2601,57 @@ impl App {
                                 )
                         })
                         .cloned();
-                    if pending.generation == self.smart_folder_generation
-                        && pending.definition_id == prepared.snapshot.definition.id
-                        && let Some(current_definition) = current_definition
+                    let Some(current_definition) = current_definition else {
+                        self.retire_prepared_smart_folder(prepared);
+                        break;
+                    };
+                    if pending.generation != self.smart_folder_generation
+                        || pending.definition_id != prepared.snapshot.definition.id
                     {
-                        if prepared.snapshot.definition.grouping != current_definition.grouping {
-                            let mut snapshot = prepared.snapshot;
-                            adopt_smart_folder_presentation(
-                                &mut snapshot.definition,
-                                &current_definition,
-                            );
-                            self.start_smart_folder_prepare_inner(
-                                snapshot,
-                                prepared.refresh,
-                                prepared.authoritative_rescan,
-                                prepared.authoritative_ignored_tombstones,
-                                None,
-                            );
-                        } else {
-                            let mut prepared = prepared;
-                            adopt_smart_folder_presentation(
-                                &mut prepared.snapshot.definition,
-                                &current_definition,
-                            );
-                            if self.install_prepared_smart_folder(prepared) {
-                                self.reapply_local_search_after_smart_folder_prepare(ctx);
-                            }
+                        self.retire_prepared_smart_folder(prepared);
+                        break;
+                    }
+                    if prepared.snapshot.definition.grouping != current_definition.grouping {
+                        let PreparedSmartFolder {
+                            mut snapshot,
+                            items,
+                            image_metas,
+                            video_items,
+                            metadata,
+                            resort_metadata,
+                            metadata_revision: _,
+                            refresh,
+                            authoritative_rescan,
+                            authoritative_ignored_tombstones,
+                            applied_tombstones,
+                        } = prepared;
+                        adopt_smart_folder_presentation(
+                            &mut snapshot.definition,
+                            &current_definition,
+                        );
+                        self.retire_prepared_smart_folder_install_payload(
+                            items,
+                            image_metas,
+                            video_items,
+                            metadata,
+                            resort_metadata,
+                            applied_tombstones,
+                        );
+                        self.start_smart_folder_prepare_inner(
+                            snapshot,
+                            refresh,
+                            authoritative_rescan,
+                            authoritative_ignored_tombstones,
+                            None,
+                        );
+                    } else {
+                        let mut prepared = prepared;
+                        adopt_smart_folder_presentation(
+                            &mut prepared.snapshot.definition,
+                            &current_definition,
+                        );
+                        if self.install_prepared_smart_folder(prepared) {
+                            self.reapply_local_search_after_smart_folder_prepare(ctx);
                         }
                     }
                     break;
@@ -2627,6 +2703,14 @@ impl App {
         if metadata_revision != self.smart_folder_metadata_revision {
             // A metadata write raced this worker. Rebuild from the same filesystem snapshot with
             // fresh DB reads; never install a completed but stale metadata generation.
+            self.retire_prepared_smart_folder_install_payload(
+                items,
+                image_metas,
+                video_items,
+                metadata,
+                resort_metadata,
+                applied_tombstones,
+            );
             self.start_smart_folder_prepare_inner(
                 snapshot,
                 refresh,
@@ -2651,6 +2735,14 @@ impl App {
                 // A delete landed after this prepare worker captured its tombstones. Re-run the
                 // cheap metadata/sort/build phase against the already scanned snapshot rather
                 // than installing a row that was removed concurrently.
+                self.retire_prepared_smart_folder_install_payload(
+                    items,
+                    image_metas,
+                    video_items,
+                    metadata,
+                    resort_metadata,
+                    applied_tombstones,
+                );
                 self.start_smart_folder_prepare_inner(
                     snapshot,
                     refresh,

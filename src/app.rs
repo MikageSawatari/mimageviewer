@@ -3397,7 +3397,7 @@ fn hash_adjust_final_params(
     })
 }
 
-/// 検索モード。相互排他制御 (`close_other_search_bars`) 用。
+/// 検索モード。相互排他と戻り先移譲 (`take_origin_for_search_entry`) 用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchMode {
     /// Ctrl+F: ローカルフォルダのメタデータ検索
@@ -7569,10 +7569,9 @@ pub struct App {
     pub(crate) smart_folder_resort_metadata:
         std::collections::HashMap<uuid::Uuid, Arc<smart_folder::ReusedSmartFolderMetadata>>,
     /// A thread-spawn failure must not make invalidation synchronously destroy a million-item
-    /// cache on the UI thread.  Such rare handoff failures are retained here and retried at the
+    /// result on the UI thread. Such rare handoff failures are retained here and retried at the
     /// next retirement boundary (or dropped during application shutdown).
-    pub(crate) smart_folder_retired_resort_metadata:
-        Vec<Arc<smart_folder::ReusedSmartFolderMetadata>>,
+    pub(crate) smart_folder_retired_payloads: Vec<smart_folder::RetiredSmartFolderPayload>,
     /// Advances on every path-keyed metadata write that can affect a smart-folder grid. Prepare
     /// results captured before the write are rejected at install time.
     pub(crate) smart_folder_metadata_revision: u64,
@@ -9965,7 +9964,7 @@ impl App {
             smart_folder_saved_folder: None,
             smart_folder_snapshots: std::collections::HashMap::new(),
             smart_folder_resort_metadata: std::collections::HashMap::new(),
-            smart_folder_retired_resort_metadata: Vec::new(),
+            smart_folder_retired_payloads: Vec::new(),
             smart_folder_metadata_revision: 0,
             smart_folder_open_origin: None,
             smart_folder_local_search_reapply: None,
@@ -14936,14 +14935,8 @@ impl App {
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
     /// 他の検索バー (Ctrl+F / Ctrl+G) が開いていれば閉じて相互排他を保つ。
     pub(crate) fn open_favsearch(&mut self) {
-        // ★固定 中は scope mutual exclusion で snapshot を先に解除する (= §4.5)。
-        if self.is_snapshot_active() {
-            self.deactivate_snapshot();
-        }
         let fallback_origin = self.current_folder.clone();
-        let transferred_origin = self.take_smart_folder_origin_for_search_entry();
-        self.cancel_pending_folder_nav();
-        self.close_other_search_bars(SearchMode::Favsearch);
+        let transferred_origin = self.take_origin_for_search_entry(SearchMode::Favsearch);
         self.favsearch.active = true;
         self.favsearch.focus_request = true;
         self.favsearch.nav_stack.clear();
@@ -14986,13 +14979,8 @@ impl App {
             }
             return;
         }
-        if self.is_snapshot_active() {
-            self.deactivate_snapshot();
-        }
         let fallback_origin = self.current_folder.clone();
-        let transferred_origin = self.take_smart_folder_origin_for_search_entry();
-        self.cancel_pending_folder_nav();
-        self.close_other_search_bars(SearchMode::TagView);
+        let transferred_origin = self.take_origin_for_search_entry(SearchMode::TagView);
         self.tag_view.active = true;
         self.tag_view.focus_request = focus_request;
         if let Some(origin) = transferred_origin {
@@ -15020,11 +15008,7 @@ impl App {
     /// Ctrl+F のローカルメタデータ検索バーを開く。
     /// 他の検索バーが開いていれば閉じる (相互排他)。
     pub(crate) fn open_local_metadata_search(&mut self) {
-        // ★固定 中は scope mutual exclusion で snapshot を先に解除する (= §4.5)。
-        if self.is_snapshot_active() {
-            self.deactivate_snapshot();
-        }
-        let transferred_origin = self.take_smart_folder_origin_for_search_entry();
+        let transferred_origin = self.take_origin_for_search_entry(SearchMode::LocalMeta);
         let restore_smart_folder = transferred_origin.as_ref().is_some_and(|origin| {
             origin
                 .path
@@ -15049,16 +15033,21 @@ impl App {
             self.cancel_stack_script_pending();
             self.stack_mode_requested = false;
         }
-        self.cancel_pending_folder_nav();
-        self.close_other_search_bars(SearchMode::LocalMeta);
         self.show_search_bar = true;
         self.search_focus_request = true;
     }
 
-    /// 指定した検索モード以外の検索バーをすべて閉じる。
-    /// Ctrl+F / Ctrl+S / Ctrl+G / Ctrl+T はユーザー操作がややこしくなるため同時には 1 つだけ
-    /// アクティブにする方針 (2026-04 ユーザー指摘)。
-    pub(crate) fn close_other_search_bars(&mut self, keep: SearchMode) {
+    /// 新しい検索へ入る前に、既存の最上位一時ビューが所有する本来の戻り先を取得する。
+    ///
+    /// 既存検索や検索由来Snapshotを通常closeすると、smart/subfolderの非同期復元を開始して
+    /// 直後に次の検索がcancelする競合になる。ここでは表示を復元せず`ViewReturnContext`だけを
+    /// 次の所有者へ移譲する。Ctrl+Fは一覧内filterなので、呼び出し側がcontextを復元してから
+    /// 最終一覧へqueryを再適用する。
+    pub(crate) fn take_origin_for_search_entry(
+        &mut self,
+        keep: SearchMode,
+    ) -> Option<ViewReturnContext> {
+        let mut transferred = self.dismiss_snapshot_without_restore();
         if !matches!(keep, SearchMode::LocalMeta) && self.show_search_bar {
             self.show_search_bar = false;
             self.search_query.clear();
@@ -15070,14 +15059,21 @@ impl App {
             self.rebuild_visible_indices();
         }
         if !matches!(keep, SearchMode::Favsearch) && self.favsearch.active {
-            self.close_favsearch();
+            transferred = Some(self.dismiss_favsearch_without_restore());
         }
         if !matches!(keep, SearchMode::Global) && self.global_search.active {
-            self.close_global_search();
+            transferred = Some(self.dismiss_global_search_without_restore());
         }
         if !matches!(keep, SearchMode::TagView) && self.tag_view.active {
-            self.close_tag_view();
+            transferred = Some(self.dismiss_tag_view_without_restore());
         }
+        // A pending smart-folder worker may still own the pre-search origin while the previous
+        // result grid remains visible. Its context is more authoritative than that synthetic path.
+        if let Some(origin) = self.take_smart_folder_origin_for_search_entry() {
+            transferred = Some(origin);
+        }
+        self.cancel_pending_folder_nav();
+        transferred
     }
 
     /// お気に入り検索バーを閉じて、元のフォルダに戻る。
@@ -15117,6 +15113,13 @@ impl App {
             self.suppress_nav_record_for_search_restore = false;
         } else if smart_folder::is_smart_folder_synthetic_path(&saved) {
             if self.restore_smart_folder_for_synthetic_path(&saved) {
+                // Until async prepare installs the smart grid, the previous search result may
+                // remain visible. Keep the actual restore target as the worker-owned origin so
+                // another search entered in this window cannot inherit that stale synthetic path.
+                self.smart_folder_open_origin = Some(ViewReturnContext {
+                    path: Some(saved.clone()),
+                    subfolder_restore: None,
+                });
                 // snapshot miss may route through `open_smart_folder`, whose normal cancel boundary
                 // clears stale suppression. This restore owns it, so re-arm until async install.
                 self.suppress_nav_record_for_search_restore = true;

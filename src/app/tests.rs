@@ -32989,6 +32989,250 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn search_view_switch_transfers_real_origin_without_intermediate_restore() {
+        for source in [
+            SearchMode::Favsearch,
+            SearchMode::Global,
+            SearchMode::TagView,
+        ] {
+            for target in [
+                SearchMode::Favsearch,
+                SearchMode::Global,
+                SearchMode::TagView,
+            ] {
+                if source == target {
+                    continue;
+                }
+                let mut app = setup_app();
+                let normal = app.tmp.path().join(format!("normal-{source:?}-{target:?}"));
+                std::fs::create_dir_all(&normal).unwrap();
+                let result_path = super::search_results_synthetic_path();
+                app.current_folder = Some(result_path.clone());
+                match source {
+                    SearchMode::Favsearch => {
+                        app.favsearch.active = true;
+                        app.favsearch.saved_folder = Some(normal.clone());
+                    }
+                    SearchMode::Global => {
+                        app.global_search.active = true;
+                        app.global_search.saved_folder = Some(normal.clone());
+                    }
+                    SearchMode::TagView => {
+                        app.tag_view.active = true;
+                        app.tag_view.saved_folder = Some(normal.clone());
+                    }
+                    SearchMode::LocalMeta => unreachable!(),
+                }
+
+                match target {
+                    SearchMode::Favsearch => app.open_favsearch(),
+                    SearchMode::Global => app.open_global_search(),
+                    SearchMode::TagView => app.open_tag_view(),
+                    SearchMode::LocalMeta => unreachable!(),
+                }
+
+                let saved = match target {
+                    SearchMode::Favsearch => app.favsearch.saved_folder.as_ref(),
+                    SearchMode::Global => app.global_search.saved_folder.as_ref(),
+                    SearchMode::TagView => app.tag_view.saved_folder.as_ref(),
+                    SearchMode::LocalMeta => unreachable!(),
+                };
+                assert_eq!(saved, Some(&normal), "{source:?} -> {target:?}");
+                assert_eq!(
+                    app.current_folder.as_ref(),
+                    Some(&result_path),
+                    "the source grid must not be synchronously restored between searches"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_view_to_local_filter_restores_smart_origin_and_query() {
+        for source_mode in [
+            SearchMode::Favsearch,
+            SearchMode::Global,
+            SearchMode::TagView,
+        ] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let normal = app.tmp.path().join(format!("normal-local-{source_mode:?}"));
+            let source = app.tmp.path().join(format!("smart-local-{source_mode:?}"));
+            std::fs::create_dir_all(&normal).unwrap();
+            std::fs::create_dir_all(source.join("book")).unwrap();
+            app.current_folder = Some(normal);
+            let definition = definition("Smart", source);
+            let id = definition.id;
+            let smart_path = crate::app::smart_folder::smart_folder_synthetic_path(id);
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+            match source_mode {
+                SearchMode::Favsearch => app.open_favsearch(),
+                SearchMode::Global => app.open_global_search(),
+                SearchMode::TagView => app.open_tag_view(),
+                SearchMode::LocalMeta => unreachable!(),
+            }
+            app.current_folder = Some(super::search_results_synthetic_path());
+            app.open_local_metadata_search();
+            app.search_query = "book".into();
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+            assert_eq!(app.current_folder.as_ref(), Some(&smart_path));
+            assert!(app.show_search_bar);
+            assert_eq!(app.search_query, "book");
+        }
+    }
+
+    #[test]
+    fn local_restore_pending_to_another_search_keeps_smart_origin() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let normal = app.tmp.path().join("normal-local-reentry");
+        let source = app.tmp.path().join("smart-local-reentry");
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::create_dir_all(source.join("book")).unwrap();
+        app.current_folder = Some(normal);
+        let definition = definition("Smart", source);
+        let id = definition.id;
+        let smart_path = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        app.open_favsearch();
+        app.current_folder = Some(super::search_results_synthetic_path());
+        app.open_local_metadata_search();
+        assert!(app.smart_folder_prepare_pending.is_some());
+        app.open_global_search();
+
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert_eq!(app.global_search.saved_folder.as_ref(), Some(&smart_path));
+    }
+
+    #[test]
+    fn search_snapshot_to_another_search_keeps_smart_origin() {
+        for target in [
+            SearchMode::LocalMeta,
+            SearchMode::Favsearch,
+            SearchMode::Global,
+            SearchMode::TagView,
+        ] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let normal = app.tmp.path().join(format!("normal-snapshot-{target:?}"));
+            let source = app.tmp.path().join(format!("smart-snapshot-{target:?}"));
+            std::fs::create_dir_all(&normal).unwrap();
+            std::fs::create_dir_all(source.join("book")).unwrap();
+            app.current_folder = Some(normal);
+            let definition = definition("Smart", source);
+            let id = definition.id;
+            let smart_path = crate::app::smart_folder::smart_folder_synthetic_path(id);
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+            app.open_favsearch();
+            let result_path = super::search_results_synthetic_path();
+            app.current_folder = Some(result_path);
+            app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+            app.thumbnails = vec![ThumbnailState::Failed];
+            app.visible_indices = vec![0];
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::FavSearch {
+                query: "page".into(),
+            });
+
+            match target {
+                SearchMode::LocalMeta => {
+                    app.open_local_metadata_search();
+                    app.search_query = "book".into();
+                    wait_for_smart_folder_idle(&mut app, &ctx, id);
+                    assert_eq!(app.current_folder.as_ref(), Some(&smart_path));
+                    assert_eq!(app.search_query, "book");
+                }
+                SearchMode::Favsearch => {
+                    app.open_favsearch();
+                    assert_eq!(app.favsearch.saved_folder.as_ref(), Some(&smart_path));
+                }
+                SearchMode::Global => {
+                    app.open_global_search();
+                    assert_eq!(app.global_search.saved_folder.as_ref(), Some(&smart_path));
+                }
+                SearchMode::TagView => {
+                    app.open_tag_view();
+                    assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&smart_path));
+                }
+            }
+            assert!(!app.is_snapshot_active());
+        }
+    }
+
+    #[test]
+    fn pending_smart_folder_switch_inherits_original_search_origin() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let normal = app.tmp.path().join("normal-pending-switch");
+        let source_a = app.tmp.path().join("smart-pending-a");
+        let source_b = app.tmp.path().join("smart-pending-b");
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::create_dir_all(source_a.join("book-a")).unwrap();
+        std::fs::create_dir_all(source_b.join("book-b")).unwrap();
+        app.current_folder = Some(super::search_results_synthetic_path());
+        app.favsearch.active = true;
+        app.favsearch.saved_folder = Some(normal.clone());
+        let a = definition("A", source_a);
+        let b = definition("B", source_b);
+        let a_id = a.id;
+        let b_id = b.id;
+        app.settings.smart_folders = vec![a, b];
+        let ctx = egui::Context::default();
+
+        app.open_smart_folder(a_id, false);
+        assert_eq!(
+            app.smart_folder_open_origin
+                .as_ref()
+                .and_then(|origin| origin.path.as_ref()),
+            Some(&normal)
+        );
+        app.open_smart_folder(b_id, false);
+        assert_eq!(
+            app.smart_folder_open_origin
+                .as_ref()
+                .and_then(|origin| origin.path.as_ref()),
+            Some(&normal)
+        );
+        wait_for_smart_folder_idle(&mut app, &ctx, b_id);
+        assert_eq!(app.folder_history_back_target(), Some(&normal));
+    }
+
+    #[test]
+    fn retired_smart_folder_payload_is_dropped_off_the_ui_thread() {
+        struct DropProbe {
+            tx: std::sync::mpsc::Sender<std::thread::ThreadId>,
+        }
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let _ = self.tx.send(std::thread::current().id());
+            }
+        }
+
+        let mut app = setup_app();
+        let ui_thread = std::thread::current().id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.retire_smart_folder_payloads(std::iter::once(
+            Box::new(DropProbe { tx }) as crate::app::smart_folder::RetiredSmartFolderPayload
+        ));
+        let drop_thread = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("drop worker did not consume the retired payload");
+        assert_ne!(drop_thread, ui_thread);
+    }
+
+    #[test]
     fn search_entry_takes_origin_from_cancelled_smart_folder_open() {
         for incoming in [
             SearchMode::LocalMeta,
