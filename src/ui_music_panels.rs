@@ -380,6 +380,9 @@ impl App {
         // 境界集合が変わったのでブックマーク区間ループの target / baseline を再計算する
         // (でないと初回ブックマーク追加時に stale baseline で誤ループする、Codex P2)。
         self.apply_music_loop_mode(fs_idx);
+        if added.is_some() {
+            self.notify_bookmarks_changed();
+        }
         match added {
             Some(_) => self.show_feedback_toast(format!("ブックマークを追加: {}", format_hms(pos))),
             None => self.show_feedback_toast("既存のブックマークと近すぎます".to_string()),
@@ -399,6 +402,7 @@ impl App {
         }
         self.reload_music_bookmarks(&path);
         self.apply_music_loop_mode(fs_idx);
+        self.notify_bookmarks_changed();
     }
 
     fn rename_music_bookmark(&mut self, fs_idx: usize, id: i64, title: &str) {
@@ -440,6 +444,9 @@ impl App {
             Some(Ok(s)) => {
                 self.reload_music_bookmarks(&path);
                 self.apply_music_loop_mode(fs_idx);
+                if s.added > 0 {
+                    self.notify_bookmarks_changed();
+                }
                 self.show_feedback_toast(format!(
                     "一括登録: {} 件追加 / 重複 {} / エラー {}",
                     s.added, s.skipped_duplicates, s.errors
@@ -494,6 +501,7 @@ impl App {
         self.apply_music_loop_mode(fs_idx);
         match result {
             Some(Ok(())) => {
+                self.notify_bookmarks_changed();
                 self.show_feedback_toast("ブックマークをすべて削除しました".to_string())
             }
             Some(Err(e)) => self.show_feedback_toast(format!("削除に失敗しました: {e}")),

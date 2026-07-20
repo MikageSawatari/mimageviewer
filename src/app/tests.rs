@@ -4432,6 +4432,54 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn facet_bookmark_state_filters_across_media_and_book_containers() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::FacetEditFlag;
+
+        let mut app = setup_app();
+        let video = std::path::PathBuf::from(r"C:\Media\saved.mp4");
+        let audio = std::path::PathBuf::from(r"C:\Media\plain.flac");
+        let book = std::path::PathBuf::from(r"C:\Books\saved");
+        let plain_zip = std::path::PathBuf::from(r"C:\Books\plain.cbz");
+        app.items = vec![
+            GridItem::Video(video.clone()),
+            GridItem::Audio(audio),
+            GridItem::Folder(book.clone()),
+            GridItem::ZipFile(plain_zip),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.bookmark_presence = Some(crate::bookmark_browser::BookmarkPresence::from_rows(
+            std::collections::HashSet::from([crate::path_key::normalize_keep_drive(&video)]),
+            vec![BookBookmark {
+                id: 1,
+                container_key: crate::book_bookmarks::container_key(&book),
+                container_path: book,
+                container_kind: BookContainerKind::ImageFolder,
+                page_identity: PageIdentity::RelativePath("001.jpg".into()),
+                page_index_hint: 0,
+                created_at_ms: 1,
+            }],
+        ));
+
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::Bookmarked);
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0, 2]);
+
+        app.settings.facet_filter.edits.clear();
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::Unbookmarked);
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![1, 3]);
+    }
+
+    #[test]
     fn facet_edit_rollup_matches_converted_archive_cache_zip_keys() {
         use crate::archive_converter::ArchiveFormat;
         use crate::grid_item::{GridItem, ThumbnailState};

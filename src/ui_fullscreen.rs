@@ -22431,6 +22431,7 @@ impl App {
                         "video bookmark added: pts={pts:.2}s {}",
                         path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                     ));
+                    self.notify_bookmarks_changed();
                     self.refresh_fullscreen_video_marker_cache(fs_idx);
                     #[cfg(windows)]
                     self.sync_native_video_timeline_markers(fs_idx);

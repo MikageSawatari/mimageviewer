@@ -89,6 +89,7 @@ pub(crate) enum SmartFolderPhase {
     Ratings,
     Tags,
     Adjustments,
+    Bookmarks,
     Filtering,
     Sorting,
     Building,
@@ -101,6 +102,7 @@ impl SmartFolderPhase {
             Self::Ratings => "レーティングを読み込み中",
             Self::Tags => "タグを読み込み中",
             Self::Adjustments => "編集状態を確認中",
+            Self::Bookmarks => "ブックマークを確認中",
             Self::Filtering => "条件を適用中",
             Self::Sorting => "並び順を計算中",
             Self::Building => "一覧を構築中",
@@ -864,6 +866,7 @@ fn metadata_filter_passes(
     ratings: &HashMap<String, u8>,
     tags: &HashMap<String, Vec<String>>,
     edits: &SmartEditKeySets,
+    bookmarks: &crate::bookmark_browser::BookmarkPresence,
     converted_archive_paths: &HashMap<String, PathBuf>,
 ) -> bool {
     use crate::settings::{FacetEditFlag, FacetTagMode};
@@ -938,12 +941,30 @@ fn metadata_filter_passes(
             FacetEditFlag::Untagged => item_tags.is_empty(),
             FacetEditFlag::Rated => rating > 0,
             FacetEditFlag::Unrated => rating == 0,
+            FacetEditFlag::Bookmarked => bookmark_matches_for_entry(bookmarks, entry),
+            FacetEditFlag::Unbookmarked => !bookmark_matches_for_entry(bookmarks, entry),
         };
         if !matched {
             return false;
         }
     }
     true
+}
+
+fn bookmark_matches_for_entry(
+    bookmarks: &crate::bookmark_browser::BookmarkPresence,
+    entry: &SmartFolderEntry,
+) -> bool {
+    match entry.kind {
+        SmartFolderEntryKind::Video | SmartFolderEntryKind::Audio => {
+            bookmarks.has_media_path(&entry.path)
+        }
+        SmartFolderEntryKind::Folder
+        | SmartFolderEntryKind::Zip
+        | SmartFolderEntryKind::Pdf
+        | SmartFolderEntryKind::Archive => bookmarks.has_book_container(&entry.path),
+        SmartFolderEntryKind::Image => false,
+    }
 }
 
 fn edit_key_matches_for_entry(
@@ -1330,6 +1351,19 @@ fn prepare_smart_folder(
     } else {
         load_edit_key_sets(&wanted_edit_flags, local_adjust.iter().cloned().collect())?
     };
+    let bookmark_presence = if reuse_metadata
+        || !wanted_edit_flags.iter().any(|flag| {
+            matches!(
+                flag,
+                crate::settings::FacetEditFlag::Bookmarked
+                    | crate::settings::FacetEditFlag::Unbookmarked
+            )
+        }) {
+        crate::bookmark_browser::BookmarkPresence::default()
+    } else {
+        report(SmartFolderPhase::Bookmarks, 0);
+        crate::bookmark_browser::load_presence()?
+    };
     let mut converted_archive_paths_for_filter = reused_metadata
         .as_ref()
         .map(|metadata| metadata.converted_archive_cache_paths.clone())
@@ -1413,6 +1447,7 @@ fn prepare_smart_folder(
                             &ratings,
                             &tags,
                             &edit_keys,
+                            &bookmark_presence,
                             &converted_archive_paths_for_filter,
                         )
                     })
@@ -1962,6 +1997,7 @@ pub(crate) enum SmartFolderMetadataDependency {
     Rating,
     Tags,
     Edits,
+    Bookmarks,
 }
 
 fn smart_folder_definition_uses_metadata(
@@ -2000,6 +2036,13 @@ fn smart_folder_definition_uses_metadata(
                     | crate::settings::FacetEditFlag::Conceal
                     | crate::settings::FacetEditFlag::Annotation
                     | crate::settings::FacetEditFlag::Rotation
+            )
+        }),
+        SmartFolderMetadataDependency::Bookmarks => rule.filter.edits.iter().any(|flag| {
+            matches!(
+                flag,
+                crate::settings::FacetEditFlag::Bookmarked
+                    | crate::settings::FacetEditFlag::Unbookmarked
             )
         }),
     })
@@ -3595,6 +3638,10 @@ mod tests {
             &definition,
             SmartFolderMetadataDependency::Edits
         ));
+        assert!(!smart_folder_definition_uses_metadata(
+            &definition,
+            SmartFolderMetadataDependency::Bookmarks
+        ));
 
         definition.rules[0].filter.ratings[0] = false;
         assert!(smart_folder_definition_uses_metadata(
@@ -3620,6 +3667,15 @@ mod tests {
         assert!(smart_folder_definition_uses_metadata(
             &definition,
             SmartFolderMetadataDependency::Edits
+        ));
+        definition.rules[0].filter.edits.clear();
+        definition.rules[0]
+            .filter
+            .edits
+            .insert(crate::settings::FacetEditFlag::Bookmarked);
+        assert!(smart_folder_definition_uses_metadata(
+            &definition,
+            SmartFolderMetadataDependency::Bookmarks
         ));
     }
 
@@ -4155,14 +4211,15 @@ mod tests {
         filter.tags.insert("あとで読む".into());
         let entry = smart_entry(r"C:\Books\sample.cbz", 0, "");
         let edits = SmartEditKeySets::default();
+        let bookmarks = crate::bookmark_browser::BookmarkPresence::default();
         let converted = HashMap::new();
         assert!(metadata_filter_passes(
-            &filter, &entry, &key, &ratings, &tags, &edits, &converted,
+            &filter, &entry, &key, &ratings, &tags, &edits, &bookmarks, &converted,
         ));
         filter.tags.clear();
         filter.include_untagged = true;
         assert!(!metadata_filter_passes(
-            &filter, &entry, &key, &ratings, &tags, &edits, &converted,
+            &filter, &entry, &key, &ratings, &tags, &edits, &bookmarks, &converted,
         ));
     }
 
@@ -4180,6 +4237,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &SmartEditKeySets::default(),
+            &crate::bookmark_browser::BookmarkPresence::default(),
             &HashMap::new(),
         ));
     }
@@ -4211,6 +4269,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &edits,
+            &crate::bookmark_browser::BookmarkPresence::default(),
             &converted,
         ));
     }

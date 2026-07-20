@@ -5886,6 +5886,7 @@ impl App {
                 self.sync_native_video_timeline_markers(fs_idx);
                 // BM ループ中なら境界リストが変わったので loop_target を再計算
                 self.apply_loop_mode_to_player(fs_idx);
+                self.notify_bookmarks_changed();
             }
         }
         self.mark_native_video_hud_activity(ctx);
@@ -5995,6 +5996,7 @@ impl App {
             self.refresh_fullscreen_video_marker_cache(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.apply_loop_mode_to_player(fs_idx);
+            self.notify_bookmarks_changed();
         }
         let mut msg_parts = vec![format!("一括登録: {added} 件追加")];
         if skipped_duplicates > 0 {
@@ -6081,6 +6083,7 @@ impl App {
                 self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
                 self.apply_loop_mode_to_player(fs_idx);
+                self.notify_bookmarks_changed();
                 crate::logger::log(format!(
                     "video bookmark cleared for {}",
                     path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
@@ -6150,6 +6153,7 @@ impl App {
                 self.sync_native_video_timeline_markers(fs_idx);
                 // BM ループ中なら新 bookmark を含めて loop_target を再計算
                 self.apply_loop_mode_to_player(fs_idx);
+                self.notify_bookmarks_changed();
             }
         }
     }

@@ -28,6 +28,7 @@
 | 読書履歴 writer | `std::thread` (`reading-history-writer`) + mpsc | 1 | フルスクリーンで読んだ画像フォルダ / ZIP / PDF / 変換アーカイブを `reading_history.db` へ upsert / prune する。UI スレッドは履歴 entry を送るだけで、ファイルサイズ / mtime の `metadata()` 補完も writer 側で行う。キャンセルは持たず、App drop 時に tx close → queue drain → join |
 | 本ブックマーク DB | `std::thread` (`book-bookmarks`) + mpsc | App-global 1 | `book_bookmarks.db` の追加 / コンテナ別一覧 / 全件一覧 / 削除を直列処理する。UI は正規化前の表示値と identity を request で送り、result event からメモリ上の現在本一覧を更新する。SQLite open / schema 作成を含め UI スレッドでは行わない |
 | 横断ブックマーク一覧 | `std::thread` (`bookmark-browser-build` / `bookmark-browser-delete`) + mpsc | 一覧再読込または削除ごとに最大 1 | `video_bookmarks.db` と `book_bookmarks.db` を共通 read model にまとめ、登録日時順ソートと元コンテナ / ページの存在確認を行う。動画・音声の種別判定、ZIP entry / PDF page の確認も worker 側。削除 worker は DB 行だけを削除し、元メディアへ filesystem 操作を行わない。UI は media / book subtype filter と選択状態だけを扱う |
+| ブックマーク状態フィルタ | `std::thread` (`bookmark-presence-build`) + mpsc | 状態条件の初回使用または CRUD 後に最大 1 | 動画・音声 path、本 container / page identity の軽量集合だけを両 DB から読み、通常一覧へ渡す。行ごとのフィルタ判定は在メモリ。スマートフォルダは既存 prepare worker 内で同じ snapshot を読み、UI スレッドから DB を開かない |
 | テキスト注釈ベイク | `std::thread` (`comic-bake`) + mpsc | 閲覧時最大 2 | Ctrl+T 注釈を final composite 上へ焼き込む。閲覧時は stamp 画像の cache miss デコードも worker 側で行い、完了時に `comic_stamp_cache` へ merge する。編集中はライブ追従を優先し、プレビュー解像度で同期ベイクする |
 | 音声出力 warm-up | `std::thread` (`cpal-warmup`) | 起動時 1 本 | WASAPI の初回 audio session 確立をバックグラウンドで済ませる。小さな無音 cpal stream を短時間だけ開いて閉じ、初回動画 open の UI スレッド停止を避ける |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |

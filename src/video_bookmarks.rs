@@ -155,6 +155,16 @@ impl VideoBookmarkDb {
         rows.collect()
     }
 
+    /// 状態フィルタ用に、1 件以上ブックマークを持つ media path だけを返す。
+    /// thumbnail BLOB や時刻行は読み込まない。呼び出し側は worker スレッドに限定する。
+    pub fn list_all_path_keys(&self) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT path FROM video_bookmarks")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// `list` の軽量版: thumbnail BLOB を読まずに `(pts_secs, title)` だけ返す。
     /// シークバーマーカー描画や J/K ジャンプのように毎フレーム呼ばれる経路で使う
     /// (4K WebP サムネを 60fps でクローンするのを避ける)。

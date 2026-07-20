@@ -158,6 +158,11 @@ pub struct SmartFolderFilter {
     pub edits: std::collections::BTreeSet<FacetEditFlag>,
     #[serde(default)]
     pub edit_include_descendants: bool,
+    /// v2.6.0 が知らないブックマーク状態候補の保存用キャリア。
+    #[serde(default)]
+    pub bookmarked_stash: bool,
+    #[serde(default)]
+    pub unbookmarked_stash: bool,
 }
 
 fn default_smart_folder_ratings() -> [bool; 6] {
@@ -178,6 +183,24 @@ impl Default for SmartFolderFilter {
             include_untagged: false,
             edits: std::collections::BTreeSet::new(),
             edit_include_descendants: false,
+            bookmarked_stash: false,
+            unbookmarked_stash: false,
+        }
+    }
+}
+
+impl SmartFolderFilter {
+    pub fn stash_bookmark_states_for_persist(&mut self) {
+        self.bookmarked_stash = self.edits.remove(&FacetEditFlag::Bookmarked);
+        self.unbookmarked_stash = self.edits.remove(&FacetEditFlag::Unbookmarked);
+    }
+
+    pub fn restore_bookmark_states_after_load(&mut self) {
+        if std::mem::take(&mut self.bookmarked_stash) {
+            self.edits.insert(FacetEditFlag::Bookmarked);
+        }
+        if std::mem::take(&mut self.unbookmarked_stash) {
+            self.edits.insert(FacetEditFlag::Unbookmarked);
         }
     }
 }
@@ -1027,6 +1050,8 @@ pub enum FacetEditFlag {
     Untagged,
     Rated,
     Unrated,
+    Bookmarked,
+    Unbookmarked,
 }
 
 impl FacetEditFlag {
@@ -1043,6 +1068,8 @@ impl FacetEditFlag {
             Self::Untagged => "タグなし",
             Self::Rated => "★あり",
             Self::Unrated => "★なし",
+            Self::Bookmarked => "ブックマークあり",
+            Self::Unbookmarked => "ブックマークなし",
         }
     }
 
@@ -1059,6 +1086,8 @@ impl FacetEditFlag {
             Self::Untagged => "タグなし",
             Self::Rated => "★あり",
             Self::Unrated => "★なし",
+            Self::Bookmarked => "ブックマークあり",
+            Self::Unbookmarked => "ブックマークなし",
         }
     }
 
@@ -1074,6 +1103,8 @@ impl FacetEditFlag {
             Self::Untagged,
             Self::Rated,
             Self::Unrated,
+            Self::Bookmarked,
+            Self::Unbookmarked,
         ]
     }
 }
@@ -1119,6 +1150,11 @@ pub struct FacetFilter {
     /// この bool は永続化の瞬間にだけ意味を持つ。
     #[serde(default)]
     pub kind_audio_stash: bool,
+    /// v2.6.0 の `FacetEditFlag` に無いブックマーク条件を未知フィールドへ退避する。
+    #[serde(default)]
+    pub bookmarked_stash: bool,
+    #[serde(default)]
+    pub unbookmarked_stash: bool,
 }
 
 impl FacetFilter {
@@ -1159,6 +1195,20 @@ impl FacetFilter {
         }
     }
 
+    pub fn stash_bookmark_states_for_persist(&mut self) {
+        self.bookmarked_stash = self.edits.remove(&FacetEditFlag::Bookmarked);
+        self.unbookmarked_stash = self.edits.remove(&FacetEditFlag::Unbookmarked);
+    }
+
+    pub fn restore_bookmark_states_after_load(&mut self) {
+        if std::mem::take(&mut self.bookmarked_stash) {
+            self.edits.insert(FacetEditFlag::Bookmarked);
+        }
+        if std::mem::take(&mut self.unbookmarked_stash) {
+            self.edits.insert(FacetEditFlag::Unbookmarked);
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         !self.kinds.is_empty()
             || !self.exts.is_empty()
@@ -1177,6 +1227,11 @@ impl FacetFilter {
             || self.include_untagged
             || self.edits.contains(&FacetEditFlag::Tagged)
             || self.edits.contains(&FacetEditFlag::Untagged)
+    }
+
+    pub fn uses_bookmark_state(&self) -> bool {
+        self.edits.contains(&FacetEditFlag::Bookmarked)
+            || self.edits.contains(&FacetEditFlag::Unbookmarked)
     }
 
     pub fn clear(&mut self) {
@@ -5894,6 +5949,7 @@ impl Settings {
                 if rule.filter.edits.remove(&FacetEditFlag::AiAdjustment) {
                     rule.filter.edits.insert(FacetEditFlag::Adjustment);
                 }
+                rule.filter.restore_bookmark_states_after_load();
                 rule.filter.date_preset = rule.filter.date_preset.map(FacetDatePreset::sanitized);
                 true
             });
@@ -5918,6 +5974,7 @@ impl Settings {
             self.facet_filter.edits.insert(FacetEditFlag::Adjustment);
         }
         self.facet_filter.restore_extended_date_after_load();
+        self.facet_filter.restore_bookmark_states_after_load();
         self.facet_filter.date_preset = self
             .facet_filter
             .date_preset
@@ -6730,6 +6787,58 @@ mod tests {
         roundtrip.stash_kind_audio_for_persist();
         roundtrip.restore_kind_audio_after_load();
         assert_eq!(roundtrip, ff);
+    }
+
+    #[test]
+    fn bookmark_state_stash_keeps_persisted_filters_v26_compatible() {
+        let mut facet = FacetFilter::default();
+        facet.edits.insert(FacetEditFlag::Tagged);
+        facet.edits.insert(FacetEditFlag::Bookmarked);
+        facet.edits.insert(FacetEditFlag::Unbookmarked);
+        let original = facet.clone();
+        facet.stash_bookmark_states_for_persist();
+        let json = serde_json::to_value(&facet).unwrap();
+        let edits = json["edits"].as_array().unwrap();
+        assert!(edits.iter().all(|value| value != "Bookmarked"));
+        assert!(edits.iter().all(|value| value != "Unbookmarked"));
+        assert_eq!(json["bookmarked_stash"], serde_json::Value::Bool(true));
+        assert_eq!(json["unbookmarked_stash"], serde_json::Value::Bool(true));
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum V26EditFlag {
+            Adjustment,
+            AiAdjustment,
+            LocalAdjustment,
+            Mask,
+            Conceal,
+            Annotation,
+            Rotation,
+            Tagged,
+            Untagged,
+            Rated,
+            Unrated,
+        }
+        #[derive(serde::Deserialize)]
+        struct V26FacetFilter {
+            #[serde(default)]
+            edits: Vec<V26EditFlag>,
+        }
+        let v26: V26FacetFilter = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(v26.edits.len(), 1);
+
+        let mut loaded: FacetFilter = serde_json::from_value(json).unwrap();
+        loaded.restore_bookmark_states_after_load();
+        assert_eq!(loaded, original);
+
+        let mut smart = SmartFolderFilter::default();
+        smart.edits.insert(FacetEditFlag::Bookmarked);
+        smart.stash_bookmark_states_for_persist();
+        assert!(!smart.edits.contains(&FacetEditFlag::Bookmarked));
+        assert!(smart.bookmarked_stash);
+        smart.restore_bookmark_states_after_load();
+        assert!(smart.edits.contains(&FacetEditFlag::Bookmarked));
+        assert!(!smart.bookmarked_stash);
     }
 
     #[test]

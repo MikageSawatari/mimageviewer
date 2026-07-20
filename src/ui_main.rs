@@ -7866,6 +7866,12 @@ impl App {
                 ui.close();
             }
             ui.separator();
+            if self.settings.facet_filter.uses_bookmark_state()
+                && self.bookmark_presence_pending.is_some()
+            {
+                ui.label("ブックマーク状態を読み込み中…");
+                ui.separator();
+            }
             for &flag in FacetEditFlag::all() {
                 let mut selected = self.settings.facet_filter.edits.contains(&flag);
                 if ui.checkbox(&mut selected, flag.menu_label()).changed() {

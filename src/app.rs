@@ -7222,6 +7222,9 @@ pub struct App {
     pub(crate) show_bookmark_browser: bool,
     pub(crate) bookmark_browser_rows: Vec<crate::bookmark_browser::BookmarkBrowserRow>,
     pub(crate) bookmark_browser_pending: Option<crate::bookmark_browser::BookmarkBrowserPending>,
+    /// 状態フィルタ用の全メディア横断ブックマーク集合。DB 読み出しは worker 側で行う。
+    pub(crate) bookmark_presence: Option<crate::bookmark_browser::BookmarkPresence>,
+    pub(crate) bookmark_presence_pending: Option<crate::bookmark_browser::BookmarkPresencePending>,
     pub(crate) bookmark_delete_pending: Option<crate::bookmark_browser::BookmarkDeletePending>,
     pub(crate) bookmark_media_filter: crate::bookmark_browser::MediaFilter,
     pub(crate) bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter,
@@ -9913,6 +9916,8 @@ impl App {
             show_bookmark_browser: false,
             bookmark_browser_rows: Vec::new(),
             bookmark_browser_pending: None,
+            bookmark_presence: None,
+            bookmark_presence_pending: None,
             bookmark_delete_pending: None,
             bookmark_media_filter: crate::bookmark_browser::MediaFilter::default(),
             bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
@@ -22073,6 +22078,10 @@ impl App {
                     // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
                     // (角度⑦ P1、Sol/Terra/Luna 一致)。
                     self.rehydrate_contexts_after_rename_migration(&job.old_path, &job.new_path);
+                    if self.bookmark_presence.is_some() || self.bookmark_presence_pending.is_some()
+                    {
+                        self.refresh_bookmark_presence();
+                    }
                     self.refresh_smart_folders_after_rename();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -23095,6 +23104,9 @@ impl App {
                             } else {
                                 "このページはブックマーク済みです".to_string()
                             });
+                            if inserted {
+                                self.notify_bookmarks_changed();
+                            }
                             if self.show_bookmark_browser {
                                 self.refresh_bookmark_browser();
                             }
@@ -23108,6 +23120,7 @@ impl App {
                     match result {
                         Ok(id) => {
                             self.current_book_bookmarks.retain(|entry| entry.id != id);
+                            self.notify_bookmarks_changed();
                             self.show_feedback_toast("ブックマークを削除しました".to_string());
                             if self.show_bookmark_browser {
                                 self.refresh_bookmark_browser();
@@ -23218,6 +23231,104 @@ impl App {
         }
     }
 
+    fn ensure_bookmark_presence_loaded(&mut self) {
+        if self.settings.facet_filter.uses_bookmark_state()
+            && self.bookmark_presence.is_none()
+            && self.bookmark_presence_pending.is_none()
+        {
+            self.refresh_bookmark_presence();
+        }
+    }
+
+    fn refresh_bookmark_presence(&mut self) {
+        if let Some(pending) = self.bookmark_presence_pending.take() {
+            pending.cancel();
+        }
+        self.bookmark_presence_pending = Some(crate::bookmark_browser::spawn_presence_build());
+    }
+
+    /// 動画・音声・本のブックマーク CRUD 後に、状態フィルタと保存済みスマートフォルダを
+    /// 同じ DB 状態へ追従させる。通常一覧の DB 再読込は必要なセッションだけ非同期で行う。
+    pub(crate) fn notify_bookmarks_changed(&mut self) {
+        if self.bookmark_presence.is_some()
+            || self.bookmark_presence_pending.is_some()
+            || self.settings.facet_filter.uses_bookmark_state()
+        {
+            self.refresh_bookmark_presence();
+        }
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Bookmarks,
+        );
+    }
+
+    fn poll_bookmark_presence(&mut self, ctx: &egui::Context) {
+        let result = self.bookmark_presence_pending.as_ref().and_then(|pending| {
+            match pending.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("ブックマーク状態ワーカーが終了しました".to_string()))
+                }
+            }
+        });
+        if let Some(result) = result {
+            self.bookmark_presence_pending = None;
+            match result {
+                Ok(presence) => {
+                    self.bookmark_presence = Some(presence);
+                    if self.settings.facet_filter.uses_bookmark_state() {
+                        self.rebuild_visible_indices();
+                    }
+                }
+                Err(error) if error == "cancelled" => {}
+                Err(error) => {
+                    // 読み込み失敗を毎フレーム再試行しない。空 snapshot なら「あり」は 0 件、
+                    // 「なし」は全件となり、フィルタ結果が未確定のまま残らない。
+                    self.bookmark_presence = Some(Default::default());
+                    if self.settings.facet_filter.uses_bookmark_state() {
+                        self.rebuild_visible_indices();
+                    }
+                    self.show_feedback_toast(format!(
+                        "ブックマーク状態を読み込めませんでした: {error}"
+                    ));
+                }
+            }
+        }
+        if self.bookmark_presence_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn item_has_bookmark(
+        &self,
+        idx: usize,
+        item: &GridItem,
+        presence: &crate::bookmark_browser::BookmarkPresence,
+    ) -> bool {
+        match item {
+            GridItem::Video(path) | GridItem::Audio(path) => presence.has_media_path(path),
+            GridItem::Folder(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => presence.has_book_container(path),
+            GridItem::SearchContainer { path, .. } => presence.has_book_container(path),
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            } => {
+                let container = self.archive_source_override.as_deref().unwrap_or(zip_path);
+                presence.has_archive_prefix(container, dir_prefix)
+            }
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
+                self.current_book_bookmark_draft(idx).is_some_and(|draft| {
+                    presence.has_book_page(&draft.container_path, &draft.page_identity)
+                })
+            }
+            GridItem::Stack { .. } => false,
+        }
+    }
+
     pub(crate) fn open_bookmark_browser(&mut self) {
         self.show_bookmark_browser = true;
         self.refresh_bookmark_browser();
@@ -23320,6 +23431,7 @@ impl App {
                         self.current_book_bookmarks
                             .retain(|bookmark| bookmark.id != key.1);
                     }
+                    self.notify_bookmarks_changed();
                     self.show_feedback_toast("ブックマークを削除しました".to_string());
                 }
                 Err(err) => {
@@ -36411,6 +36523,7 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
+        self.ensure_bookmark_presence_loaded();
         let color_filter_t0 = if self.color_filter.enabled && crate::perf::is_enabled() {
             Some(std::time::Instant::now())
         } else {
@@ -37225,6 +37338,14 @@ impl App {
                     }
                     FacetEditFlag::Rated => item.accepts_rating() && stars > 0,
                     FacetEditFlag::Unrated => item.accepts_rating() && stars == 0,
+                    FacetEditFlag::Bookmarked => self
+                        .bookmark_presence
+                        .as_ref()
+                        .is_none_or(|presence| self.item_has_bookmark(idx, &item, presence)),
+                    FacetEditFlag::Unbookmarked => self
+                        .bookmark_presence
+                        .as_ref()
+                        .is_none_or(|presence| !self.item_has_bookmark(idx, &item, presence)),
                 };
                 if !matched {
                     return false;
@@ -53500,6 +53621,7 @@ impl eframe::App for App {
         self.poll_tag_view();
         self.poll_rating_view();
         self.poll_book_bookmarks();
+        self.poll_bookmark_presence(ctx);
         self.poll_bookmark_browser(ctx);
         if self.current_book_bookmarks_request.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -54801,6 +54923,9 @@ impl eframe::App for App {
         }
         if self.bookmark_browser_pending.is_some() {
             reasons.push("bookmark_browser_pending");
+        }
+        if self.bookmark_presence_pending.is_some() {
+            reasons.push("bookmark_presence_pending");
         }
         if self.bookmark_delete_pending.is_some() {
             reasons.push("bookmark_delete_pending");

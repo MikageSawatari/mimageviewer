@@ -1,9 +1,138 @@
 //! 動画・音声・本を横断するブックマーク一覧の read model と worker。
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+
+/// 「状態 > ブックマークあり/なし」の在メモリ判定用スナップショット。
+///
+/// DB 全件読み出しは worker で行い、一覧の再評価中はこの集合だけを参照する。
+#[derive(Clone, Debug, Default)]
+pub struct BookmarkPresence {
+    media_keys: HashSet<String>,
+    book_container_keys: HashSet<String>,
+    book_page_keys: HashSet<(String, String)>,
+    archive_entries_by_container: HashMap<String, Vec<String>>,
+}
+
+impl BookmarkPresence {
+    pub(crate) fn from_rows(
+        media_keys: HashSet<String>,
+        books: Vec<crate::book_bookmarks::BookBookmark>,
+    ) -> Self {
+        let media_keys = media_keys
+            .into_iter()
+            .map(|key| crate::path_key::normalize_keep_drive(Path::new(&key)))
+            .collect();
+        let mut presence = Self {
+            media_keys,
+            ..Self::default()
+        };
+        for bookmark in books {
+            let container_key = crate::book_bookmarks::container_key(&bookmark.container_path);
+            let page_key = book_page_identity_key(&bookmark.page_identity);
+            presence.book_container_keys.insert(container_key.clone());
+            presence
+                .book_page_keys
+                .insert((container_key.clone(), page_key));
+            if let crate::book_bookmarks::PageIdentity::ArchiveEntry(entry) = bookmark.page_identity
+            {
+                presence
+                    .archive_entries_by_container
+                    .entry(container_key)
+                    .or_default()
+                    .push(normalize_virtual_path(&entry));
+            }
+        }
+        presence
+    }
+
+    pub fn has_media_path(&self, path: &Path) -> bool {
+        self.media_keys
+            .contains(&crate::path_key::normalize_keep_drive(path))
+    }
+
+    pub fn has_book_container(&self, path: &Path) -> bool {
+        self.book_container_keys
+            .contains(&crate::book_bookmarks::container_key(path))
+    }
+
+    pub fn has_book_page(
+        &self,
+        container_path: &Path,
+        identity: &crate::book_bookmarks::PageIdentity,
+    ) -> bool {
+        self.book_page_keys.contains(&(
+            crate::book_bookmarks::container_key(container_path),
+            book_page_identity_key(identity),
+        ))
+    }
+
+    pub fn has_archive_prefix(&self, container_path: &Path, prefix: &str) -> bool {
+        let container_key = crate::book_bookmarks::container_key(container_path);
+        let prefix = normalize_virtual_path(prefix);
+        self.archive_entries_by_container
+            .get(&container_key)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.starts_with(&prefix)))
+    }
+}
+
+fn normalize_virtual_path(value: &str) -> String {
+    value.replace('\\', "/").to_lowercase()
+}
+
+fn book_page_identity_key(identity: &crate::book_bookmarks::PageIdentity) -> String {
+    match identity {
+        crate::book_bookmarks::PageIdentity::RelativePath(value) => {
+            format!("relative:{}", normalize_virtual_path(value))
+        }
+        crate::book_bookmarks::PageIdentity::ArchiveEntry(value) => {
+            format!("archive:{}", normalize_virtual_path(value))
+        }
+        crate::book_bookmarks::PageIdentity::PdfPage(page) => format!("pdf:{page}"),
+    }
+}
+
+pub struct BookmarkPresencePending {
+    cancel: Arc<AtomicBool>,
+    pub rx: mpsc::Receiver<Result<BookmarkPresence, String>>,
+}
+
+impl BookmarkPresencePending {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn spawn_presence_build() -> BookmarkPresencePending {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = Arc::clone(&cancel);
+    let (tx, rx) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("bookmark-presence-build".to_string())
+        .spawn(move || {
+            let result = load_presence().and_then(|presence| {
+                if cancel_worker.load(Ordering::Relaxed) {
+                    Err("cancelled".to_string())
+                } else {
+                    Ok(presence)
+                }
+            });
+            let _ = tx.send(result);
+        });
+    BookmarkPresencePending { cancel, rx }
+}
+
+pub(crate) fn load_presence() -> Result<BookmarkPresence, String> {
+    let media_keys = crate::video_bookmarks::VideoBookmarkDb::open()
+        .and_then(|db| db.list_all_path_keys())
+        .map_err(|error| format!("動画・音声ブックマーク DB を読み込めませんでした: {error}"))?;
+    let books = crate::book_bookmarks::load_all_from_disk()
+        .map_err(|error| format!("本ブックマーク DB を読み込めませんでした: {error}"))?;
+    Ok(BookmarkPresence::from_rows(media_keys, books))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MediaFilter {
@@ -271,5 +400,44 @@ mod tests {
         assert!(
             !BookKindFilter::ImageFolder.matches(crate::book_bookmarks::BookContainerKind::Pdf)
         );
+    }
+
+    #[test]
+    fn presence_matches_media_containers_pages_and_archive_prefixes() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let media = HashSet::from([r"C:\Media\Clip.MP4".to_string()]);
+        let folder = PathBuf::from(r"C:\Books\FolderBook");
+        let archive = PathBuf::from(r"C:\Books\Story.CBZ");
+        let rows = vec![
+            BookBookmark {
+                id: 1,
+                container_key: crate::book_bookmarks::container_key(&folder),
+                container_path: folder.clone(),
+                container_kind: BookContainerKind::ImageFolder,
+                page_identity: PageIdentity::RelativePath("Chapter/001.JPG".into()),
+                page_index_hint: 0,
+                created_at_ms: 1,
+            },
+            BookBookmark {
+                id: 2,
+                container_key: crate::book_bookmarks::container_key(&archive),
+                container_path: archive.clone(),
+                container_kind: BookContainerKind::Zip,
+                page_identity: PageIdentity::ArchiveEntry("Part/002.PNG".into()),
+                page_index_hint: 1,
+                created_at_ms: 2,
+            },
+        ];
+        let presence = BookmarkPresence::from_rows(media, rows);
+
+        assert!(presence.has_media_path(Path::new(r"c:\media\clip.mp4")));
+        assert!(presence.has_book_container(&folder));
+        assert!(presence.has_book_page(
+            &folder,
+            &PageIdentity::RelativePath("chapter\\001.jpg".into())
+        ));
+        assert!(presence.has_archive_prefix(&archive, "part/"));
+        assert!(!presence.has_archive_prefix(&archive, "other/"));
     }
 }
