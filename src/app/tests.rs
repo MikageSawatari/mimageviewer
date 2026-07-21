@@ -6355,6 +6355,71 @@ fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
     }
 }
 
+fn bookmark_grid_test_row(id: i64) -> crate::bookmark_browser::BookmarkBrowserRow {
+    let path = PathBuf::from(format!(r"C:\Media\marker-{id}.mp4"));
+    crate::bookmark_browser::BookmarkBrowserRow {
+        source: crate::bookmark_browser::BookmarkRowSource::Media {
+            id,
+            path: path.clone(),
+            pts_secs: id as f64,
+            title: None,
+            is_audio: false,
+        },
+        item: GridItem::Video(path),
+        image_meta: None,
+        marker_thumbnail: None,
+        created_at_ms: id,
+        missing: false,
+    }
+}
+
+#[test]
+fn bookmark_return_preserves_exact_scroll_when_rows_are_unchanged() {
+    let mut app = phase_c_support::setup_app();
+    let rows = vec![
+        bookmark_grid_test_row(1),
+        bookmark_grid_test_row(2),
+        bookmark_grid_test_row(3),
+    ];
+    let state = super::BookmarkViewReturnGridState::capture(&rows, Some(2), (0, 3), 240.0);
+    app.bookmark_browser_rows = rows;
+    app.visible_indices = vec![0, 1, 2];
+    app.pending_grid_scroll = Some(super::GridScrollIntent::Top);
+
+    app.restore_bookmark_view_grid(state, &[(0, 1), (0, 2), (0, 3)]);
+
+    assert_eq!(app.selected, Some(2));
+    assert_eq!(app.scroll_offset_y, 240.0);
+    assert!(!app.scroll_to_selected);
+    assert!(app.pending_grid_scroll.is_none());
+}
+
+#[test]
+fn bookmark_return_keeps_opened_row_visible_when_rows_changed() {
+    let mut app = phase_c_support::setup_app();
+    let previous_rows = vec![
+        bookmark_grid_test_row(1),
+        bookmark_grid_test_row(2),
+        bookmark_grid_test_row(3),
+    ];
+    let state = super::BookmarkViewReturnGridState::capture(&previous_rows, Some(2), (0, 3), 0.0);
+    app.bookmark_browser_rows = vec![
+        bookmark_grid_test_row(9),
+        bookmark_grid_test_row(1),
+        bookmark_grid_test_row(2),
+        bookmark_grid_test_row(3),
+    ];
+    app.visible_indices = vec![0, 1, 2, 3];
+    app.last_viewport_h = 200.0;
+
+    app.restore_bookmark_view_grid(state, &[(0, 9), (0, 1), (0, 2), (0, 3)]);
+
+    assert_eq!(app.selected, Some(3));
+    assert!(app.scroll_to_selected);
+    app.apply_scroll_to_selected(1, 100.0);
+    assert_eq!(app.scroll_offset_y, 200.0);
+}
+
 #[test]
 fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
     let mut app = phase_c_support::setup_app();
@@ -6445,12 +6510,19 @@ fn native_immediate_close_consumes_bookmark_return_in_same_dispatch() {
         Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(
             PathBuf::from("c:/media/target.mp4"),
         ));
+    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState {
+        row_keys: vec![(0, 7)],
+        selected_key: Some((0, 7)),
+        opened_key: (0, 7),
+        scroll_offset_y: 240.0,
+    });
 
     app.handle_fullscreen_close_request_immediate();
 
     assert!(!app.pending_return_to_parent);
     assert!(app.items_are_bookmark_view);
     assert!(app.bookmark_view_return_target.is_none());
+    assert!(app.bookmark_view_return_grid.is_some());
     assert_eq!(app.fullscreen_idx, None);
 }
 
@@ -6461,12 +6533,19 @@ fn bookmark_return_target_is_cleared_only_after_container_navigation() {
         Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(
             PathBuf::from("c:/media/target.mp4"),
         ));
+    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState {
+        row_keys: vec![(0, 7)],
+        selected_key: Some((0, 7)),
+        opened_key: (0, 7),
+        scroll_offset_y: 240.0,
+    });
 
     app.reconcile_bookmark_return_target_for_folder_load(Path::new(r"C:\Media"));
     assert!(app.bookmark_view_return_target.is_some());
 
     app.reconcile_bookmark_return_target_for_folder_load(Path::new(r"C:\Other"));
     assert!(app.bookmark_view_return_target.is_none());
+    assert!(app.bookmark_view_return_grid.is_none());
 }
 
 #[cfg(windows)]
@@ -6498,12 +6577,20 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
         entered_archive_prefix: false,
     });
     app.bookmark_view_return_target = Some(return_target.clone());
+    let return_grid = super::BookmarkViewReturnGridState {
+        row_keys: vec![(0, 5), (0, 7)],
+        selected_key: Some((0, 7)),
+        opened_key: (0, 7),
+        scroll_offset_y: 360.0,
+    };
+    app.bookmark_view_return_grid = Some(return_grid.clone());
     let mut other = super::ViewerContextBundle::empty();
 
     app.swap_viewer_context_bundle(&mut other);
     assert!(app.bookmark_media_open_pending.is_none());
     assert!(app.bookmark_book_open_pending.is_none());
     assert!(app.bookmark_view_return_target.is_none());
+    assert!(app.bookmark_view_return_grid.is_none());
     assert_eq!(
         other
             .bookmark_media_open_pending
@@ -6512,6 +6599,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
         Some(path.as_path())
     );
     assert_eq!(other.bookmark_view_return_target, Some(return_target));
+    assert_eq!(other.bookmark_view_return_grid, Some(return_grid));
     assert_eq!(
         other
             .bookmark_book_open_pending
@@ -6524,6 +6612,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     assert!(app.bookmark_media_open_pending.is_some());
     assert!(app.bookmark_book_open_pending.is_some());
     assert!(app.bookmark_view_return_target.is_some());
+    assert!(app.bookmark_view_return_grid.is_some());
 }
 
 // =======================================================================

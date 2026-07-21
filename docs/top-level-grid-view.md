@@ -19,7 +19,9 @@ surface を共有する。現在の最上位 surface と一時ビューからの
 Delete と右クリック削除は元ファイル操作へ流さず DB 行だけを削除する。
 一覧から項目を開いた viewer context は元コンテナと `Bookmarks` 戻り先を保持し、Esc / 閉じる / 親移動で
 実フォルダの親ではなく同じ一覧へ戻る。動画・音声の登録時刻への最終 seek pending もプレイヤーと同じ
-context が所有し、detached / ParkedLive への移動後に main context へ取り残さない。
+context が所有し、detached / ParkedLive への移動後に main context へ取り残さない。戻り先 state は
+開く直前の stable row ID 列、選択 ID、スクロール offset も所有する。非同期再構築後の ID 列が同一なら
+offset をそのまま復元し、増減・並べ替えがあれば開いた ID を選択して ensure-visible する。
 
 ## 2. スマートフォルダ
 

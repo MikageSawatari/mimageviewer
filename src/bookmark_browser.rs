@@ -301,6 +301,20 @@ impl BookmarkBrowserRow {
         }
     }
 
+    /// 詳細ビューの名前列。位置は専用列に表示されるため、ここでは元コンテナ名を
+    /// 常に残し、任意のブックマーク名があれば併記する。
+    pub fn details_name(&self) -> String {
+        let source_name = self
+            .source_path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.source_path().display().to_string());
+        match self.title() {
+            Some(title) if title != source_name => format!("{source_name} — {title}"),
+            _ => source_name,
+        }
+    }
+
     /// サムネイル中央に重ねる、ユーザーが明示的に付けた名称。
     /// 未設定時はファイル名を中央表示せず、通常の名前表示へ任せる。
     pub fn title(&self) -> Option<&str> {
@@ -816,5 +830,17 @@ mod tests {
 
         assert_eq!(row.title(), Some("伏線"));
         assert_eq!(row.display_name(), "伏線 — 5 ページ");
+        assert_eq!(row.details_name(), "story.pdf — 伏線");
+    }
+
+    #[test]
+    fn details_name_keeps_media_filename_beside_bookmark_title() {
+        let mut row = media_row(7, 1_000, "clip");
+        let BookmarkRowSource::Media { title, .. } = &mut row.source else {
+            unreachable!();
+        };
+        *title = Some("見どころ".to_string());
+
+        assert_eq!(row.details_name(), "clip.mp4 — 見どころ");
     }
 }

@@ -1700,6 +1700,40 @@ pub(crate) struct ParkedLiveMusicWindowInfo {
     pub(crate) bookmarks_loaded: bool,
 }
 
+/// ブックマーク一覧から viewer を開く直前のグリッド状態。
+///
+/// 一覧は viewer を閉じたときに DB から非同期で再構築されるため、単なる index では
+/// 選択とスクロール位置を復元できない。安定 ID の並びが同じなら pixel offset をそのまま
+/// 復元し、並びが変わった場合は `opened_key` を可視範囲へ戻すために保持する。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BookmarkViewReturnGridState {
+    pub(crate) row_keys: Vec<(u8, i64)>,
+    pub(crate) selected_key: Option<(u8, i64)>,
+    pub(crate) opened_key: (u8, i64),
+    pub(crate) scroll_offset_y: f32,
+}
+
+impl BookmarkViewReturnGridState {
+    fn capture(
+        rows: &[crate::bookmark_browser::BookmarkBrowserRow],
+        selected: Option<usize>,
+        opened_key: (u8, i64),
+        scroll_offset_y: f32,
+    ) -> Self {
+        Self {
+            row_keys: rows
+                .iter()
+                .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key)
+                .collect(),
+            selected_key: selected
+                .and_then(|idx| rows.get(idx))
+                .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key),
+            opened_key,
+            scroll_offset_y,
+        }
+    }
+}
+
 #[cfg(windows)]
 struct ViewerContextBundle {
     address: String,
@@ -1819,6 +1853,7 @@ struct ViewerContextBundle {
     items_are_drive_list: bool,
     reading_history_return_from: Option<PathBuf>,
     bookmark_view_return_target: Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
+    bookmark_view_return_grid: Option<BookmarkViewReturnGridState>,
     bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
     bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
     fs_open_intent_from_grid: bool,
@@ -2050,6 +2085,7 @@ impl ViewerContextBundle {
             items_are_drive_list: false,
             reading_history_return_from: None,
             bookmark_view_return_target: None,
+            bookmark_view_return_grid: None,
             bookmark_media_open_pending: None,
             bookmark_book_open_pending: None,
             fs_open_intent_from_grid: false,
@@ -7262,6 +7298,8 @@ pub struct App {
     /// 開いた実コンテナと一致する context だけが `Bookmarks` ナビを返す。
     pub(crate) bookmark_view_return_target:
         Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
+    /// viewer 復帰後の非同期再構築で、一覧のスクロール位置と stable row identity を戻す。
+    pub(crate) bookmark_view_return_grid: Option<BookmarkViewReturnGridState>,
 
     /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
     /// `rebuild_items_from_global_search` の DrilledInto 分岐で `state.all_hits` から
@@ -9958,6 +9996,7 @@ impl App {
             bookmark_media_open_pending: None,
             bookmark_book_open_pending: None,
             bookmark_view_return_target: None,
+            bookmark_view_return_grid: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
             book_resume_writer,
@@ -11631,6 +11670,7 @@ impl App {
             items_are_drive_list,
             reading_history_return_from,
             bookmark_view_return_target,
+            bookmark_view_return_grid,
             bookmark_media_open_pending,
             bookmark_book_open_pending,
             fs_open_intent_from_grid,
@@ -11825,6 +11865,7 @@ impl App {
         swap_field!(items_are_drive_list);
         swap_field!(reading_history_return_from);
         swap_field!(bookmark_view_return_target);
+        swap_field!(bookmark_view_return_grid);
         swap_field!(bookmark_media_open_pending);
         swap_field!(bookmark_book_open_pending);
         swap_field!(fs_open_intent_from_grid);
@@ -12069,20 +12110,25 @@ impl App {
         still_at_target.then_some(crate::ui_main::AddressBarNav::Bookmarks)
     }
 
+    pub(crate) fn clear_bookmark_view_return_state(&mut self) {
+        self.bookmark_view_return_target = None;
+        self.bookmark_view_return_grid = None;
+    }
+
     fn reconcile_bookmark_return_target_for_folder_load(&mut self, path: &Path) {
         if self
             .bookmark_view_return_target
             .as_ref()
             .is_some_and(|target| !target.matches_loaded_container(path))
         {
-            self.bookmark_view_return_target = None;
+            self.clear_bookmark_view_return_state();
         }
     }
 
     fn bookmark_view_close_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         let nav = self.bookmark_view_back_nav();
         if nav.is_none() && self.bookmark_view_return_target.is_some() {
-            self.bookmark_view_return_target = None;
+            self.clear_bookmark_view_return_state();
         }
         nav
     }
@@ -13847,7 +13893,7 @@ impl App {
         self.gamepad_location_picker = None;
         // 読書履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
         self.reading_history_return_from = None;
-        self.bookmark_view_return_target = None;
+        self.clear_bookmark_view_return_state();
 
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
@@ -16263,7 +16309,7 @@ impl App {
         crate::logger::log("=== enter_reading_history ===");
         // いま読書履歴ビューにいるので、戻り先予約は消費済み扱いにする。
         self.reading_history_return_from = None;
-        self.bookmark_view_return_target = None;
+        self.clear_bookmark_view_return_state();
         self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
@@ -23517,6 +23563,7 @@ impl App {
     }
 
     pub(crate) fn open_bookmark_browser(&mut self) {
+        self.clear_bookmark_view_return_state();
         self.record_folder_nav_transition(&bookmark_view_synthetic_path());
         self.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::default();
         self.enter_bookmark_view();
@@ -23524,8 +23571,8 @@ impl App {
 
     /// 動画・音声・本のブックマークを、通常のメイン一覧 surface へ読み込む。
     pub(crate) fn enter_bookmark_view(&mut self) {
-        // いま戻り先の一覧へ復帰したので、同じ実フォルダを後から通常経路で開いても
-        // stale な予約が効かないようここで消費する。
+        // viewer target はここで消費するが、一覧の復帰 snapshot は DB 再構築完了後に
+        // `install_bookmark_view_rows` が消費する。
         self.bookmark_view_return_target = None;
         self.gamepad_location_picker = None;
         if self.global_search.active {
@@ -23624,6 +23671,7 @@ impl App {
         let previous_key = previous_selected
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
+        let return_grid = self.bookmark_view_return_grid.take();
         crate::bookmark_browser::sort_rows(
             &mut self.bookmark_browser_rows,
             self.bookmark_view_sort,
@@ -23662,6 +23710,11 @@ impl App {
                     .and_then(std::collections::VecDeque::pop_front)
                     .expect("arranged bookmark item must retain its source row")
             })
+            .collect();
+        let installed_keys: Vec<_> = self
+            .bookmark_browser_rows
+            .iter()
+            .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key)
             .collect();
         let video_items: Vec<(usize, PathBuf, u64)> = self
             .bookmark_browser_rows
@@ -23712,15 +23765,44 @@ impl App {
             });
         }
         self.rebuild_visible_indices();
-        self.selected = previous_key
+        if let Some(return_grid) = return_grid {
+            self.restore_bookmark_view_grid(return_grid, &installed_keys);
+        } else {
+            self.selected = previous_key
+                .and_then(|key| {
+                    self.bookmark_browser_rows
+                        .iter()
+                        .position(|row| row.stable_key() == key)
+                })
+                .filter(|idx| self.visible_indices.contains(idx))
+                .or_else(|| self.visible_indices.first().copied());
+            self.scroll_to_selected = self.selected.is_some();
+        }
+    }
+
+    fn restore_bookmark_view_grid(
+        &mut self,
+        return_grid: BookmarkViewReturnGridState,
+        installed_keys: &[(u8, i64)],
+    ) {
+        let rows_changed = return_grid.row_keys != installed_keys;
+        let restore_key = if rows_changed {
+            Some(return_grid.opened_key)
+        } else {
+            return_grid.selected_key
+        };
+        self.selected = restore_key
             .and_then(|key| {
                 self.bookmark_browser_rows
                     .iter()
                     .position(|row| row.stable_key() == key)
             })
-            .filter(|idx| self.visible_indices.contains(idx))
-            .or_else(|| self.visible_indices.first().copied());
-        self.scroll_to_selected = self.selected.is_some();
+            .filter(|idx| self.visible_indices.contains(idx));
+        self.scroll_offset_y = return_grid.scroll_offset_y;
+        self.pending_grid_scroll = None;
+        // 同一一覧なら位置を一切動かさない。一覧が増減・並べ替えされた場合だけ、
+        // 開いていた行が見切れていれば既存の ensure-visible 処理に任せる。
+        self.scroll_to_selected = rows_changed && self.selected.is_some();
     }
 
     pub(crate) fn open_bookmark_browser_row(
@@ -23734,6 +23816,12 @@ impl App {
             );
             return;
         }
+        self.bookmark_view_return_grid = Some(BookmarkViewReturnGridState::capture(
+            &self.bookmark_browser_rows,
+            self.selected,
+            row.stable_key(),
+            self.scroll_offset_y,
+        ));
         match &row.source {
             crate::bookmark_browser::BookmarkRowSource::Media { path, pts_secs, .. } => {
                 self.bookmark_view_return_target = Some(
@@ -23803,8 +23891,12 @@ impl App {
                         self.install_bookmark_view_rows();
                     }
                 }
-                Err(err) => self
-                    .show_feedback_toast(format!("ブックマーク一覧を読み込めませんでした: {err}")),
+                Err(err) => {
+                    self.bookmark_view_return_grid = None;
+                    self.show_feedback_toast(format!(
+                        "ブックマーク一覧を読み込めませんでした: {err}"
+                    ));
+                }
             }
         }
 
@@ -33235,6 +33327,7 @@ impl App {
             items_are_drive_list,
             reading_history_return_from,
             bookmark_view_return_target,
+            bookmark_view_return_grid,
             bookmark_media_open_pending,
             bookmark_book_open_pending,
             fs_open_intent_from_grid,
@@ -33363,6 +33456,7 @@ impl App {
             items_are_drive_list,
             reading_history_return_from,
             bookmark_view_return_target,
+            bookmark_view_return_grid,
         );
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
@@ -42333,12 +42427,12 @@ impl App {
         let cf_was_open = self.fullscreen_idx.is_some();
         let cf_fs_cache = self.fs_cache.len();
         let cf_ai_cache = self.ai_upscale_cache.len();
-        if cf_was_open {
+        if cf_was_open && self.bookmark_view_return_target.is_some() {
             // 一覧へ戻る close は `handle_fullscreen_close_request` が先に nav を予約し、
             // `enter_bookmark_view` でこの target を消費してからここへ来る。ここに target が
             // 残っている real close は、別ファイル移動後 / BS 等で実フォルダへ戻る経路なので、
             // 後から元ファイルを再度開いた際に stale な一覧復帰が発火しないよう破棄する。
-            self.bookmark_view_return_target = None;
+            self.clear_bookmark_view_return_state();
         }
         if crate::perf::is_enabled() {
             crate::perf::event(

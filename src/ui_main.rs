@@ -11353,7 +11353,7 @@ impl App {
             DetailsColumn::Preview => String::new(),
             DetailsColumn::Name => self
                 .bookmark_view_row(idx)
-                .map(crate::bookmark_browser::BookmarkBrowserRow::display_name)
+                .map(crate::bookmark_browser::BookmarkBrowserRow::details_name)
                 .unwrap_or_else(|| item.name().into_owned()),
             DetailsColumn::Rating => {
                 let rating = if self.items_are_drive_list {
