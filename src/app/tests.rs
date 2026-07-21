@@ -6300,15 +6300,20 @@ mod phase_c_drill_nav_tests {
 fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
     for is_audio in [false, true] {
         let mut app = phase_c_support::setup_app();
-        let path = PathBuf::from(if is_audio {
-            r"C:\Media\marker.flac"
+        let actual_path = PathBuf::from(if is_audio {
+            r"C:\Media\Marker.FLAC"
         } else {
-            r"C:\Media\marker.mp4"
+            r"C:\Media\Marker.MP4"
+        });
+        let bookmark_db_path = PathBuf::from(if is_audio {
+            "c:/media/marker.flac"
+        } else {
+            "c:/media/marker.mp4"
         });
         app.items = vec![if is_audio {
-            GridItem::Audio(path.clone())
+            GridItem::Audio(actual_path.clone())
         } else {
-            GridItem::Video(path.clone())
+            GridItem::Video(actual_path.clone())
         }];
         app.fullscreen_idx = Some(0);
         app.fs_cache.insert(
@@ -6316,14 +6321,14 @@ fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
             FsCacheEntry::Video {
                 // info=None は実 player が fs_cache に入り、decoder の info を待っている状態。
                 player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
-                    path.clone(),
+                    actual_path,
                     3.0,
                 )),
                 load_seq: 0,
             },
         );
         app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
-            path,
+            path: bookmark_db_path,
             pts_secs: 42.0,
             started_at: std::time::Instant::now(),
             last_wait: None,
@@ -6334,6 +6339,14 @@ fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
         assert!(
             app.bookmark_media_open_pending.is_some(),
             "{} bookmark seek must remain pending until player info arrives",
+            if is_audio { "audio" } else { "video" }
+        );
+        assert_eq!(
+            app.bookmark_media_open_pending
+                .as_ref()
+                .and_then(|pending| pending.last_wait),
+            Some(crate::bookmark_browser::PendingMediaOpenWait::PlayerInfo),
+            "{} DB key spelling must match the loaded item and player path",
             if is_audio { "audio" } else { "video" }
         );
     }

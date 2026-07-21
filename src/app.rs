@@ -12042,7 +12042,8 @@ impl App {
     pub(crate) fn bookmark_view_back_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
         let from = self.bookmark_view_return_from.as_ref()?;
         let cur = self.effective_folder()?;
-        crate::folder_tree::path_eq(&cur, from).then_some(crate::ui_main::AddressBarNav::Bookmarks)
+        crate::path_key::eq_keep_drive(&cur, from)
+            .then_some(crate::ui_main::AddressBarNav::Bookmarks)
     }
 
     /// 読書履歴ビューの項目を開く直前に、消えたコンテナへ入らないようにする。
@@ -23893,7 +23894,7 @@ impl App {
         };
         let path_matches = self.items.get(idx).is_some_and(|item| match item {
             GridItem::Video(path) | GridItem::Audio(path) => {
-                crate::folder_tree::path_eq(path, &pending.path)
+                crate::path_key::eq_keep_drive(path, &pending.path)
             }
             _ => false,
         });
@@ -23909,7 +23910,7 @@ impl App {
             );
             return;
         };
-        if !crate::folder_tree::path_eq(player.path(), &pending.path) {
+        if !crate::path_key::eq_keep_drive(player.path(), &pending.path) {
             self.note_bookmark_media_open_wait(
                 crate::bookmark_browser::PendingMediaOpenWait::Player,
             );

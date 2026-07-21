@@ -18,7 +18,8 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   元ファイルは削除しない。missing 行も保持する。
 - 一覧から開いた位置と戻り先は viewer context の状態として保持する。detached viewer / ParkedLive
   音声窓でも実プレイヤーを所有する context が初期化完了後の最終 seek を発行する。開く処理は待機段階、
-  対象 path、player state、seek serial を `[bookmark-open]` として常時ログへ記録する。
+  対象 path、player state、seek serial を `[bookmark-open]` として常時ログへ記録する。メディア DB の
+  正規化 path key とフォルダ列挙・プレイヤーの実 path は、ドライブを保持した同一の正規化規則で照合する。
 - スマートフィルタの `状態` に `ブックマークあり / ブックマークなし` を追加する。動画・音声は
   対象ファイル、本はコンテナまたは表示中ページの安定 identity で判定し、スマートフォルダの
   保存条件にも含める。

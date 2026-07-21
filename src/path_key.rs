@@ -35,6 +35,12 @@ pub fn normalize_keep_drive(path: &Path) -> String {
     path.to_string_lossy().to_lowercase().replace('\\', "/")
 }
 
+/// DB キーと実ファイル列挙結果のように、表記が異なり得る 2 パスを
+/// `normalize_keep_drive` と同じ規則で比較する。
+pub fn eq_keep_drive(a: &Path, b: &Path) -> bool {
+    normalize_keep_drive(a) == normalize_keep_drive(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +69,18 @@ mod tests {
             normalize(Path::new(r"C:\Mixed/Slash\Path")),
             "/mixed/slash/path"
         );
+    }
+
+    #[test]
+    fn keep_drive_equality_accepts_db_key_and_filesystem_spelling() {
+        assert!(eq_keep_drive(
+            Path::new("c:/media/bookmark.mp4"),
+            Path::new(r"C:\Media\Bookmark.mp4")
+        ));
+        assert!(!eq_keep_drive(
+            Path::new("c:/media/bookmark.mp4"),
+            Path::new(r"D:\Media\Bookmark.mp4")
+        ));
     }
 
     #[test]

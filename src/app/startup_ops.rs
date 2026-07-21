@@ -221,18 +221,7 @@ impl App {
     }
 
     fn open_startup_file_if_visible(&mut self, requested: &Path) {
-        let Some(idx) = self.items.iter().position(|item| match item {
-            GridItem::Folder(path)
-            | GridItem::Image(path)
-            | GridItem::Video(path)
-            | GridItem::Audio(path)
-            | GridItem::ZipFile(path)
-            | GridItem::PdfFile(path) => crate::folder_tree::path_eq(path, requested),
-            GridItem::ConvertibleArchive { path, .. } => {
-                crate::folder_tree::path_eq(path, requested)
-            }
-            _ => false,
-        }) else {
+        let Some(idx) = startup_file_idx(&self.items, requested) else {
             crate::logger::log(format!(
                 "startup open: requested file not found in loaded folder: {}",
                 requested.display()
@@ -251,6 +240,22 @@ impl App {
             self.open_fullscreen(idx);
         }
     }
+}
+
+fn startup_file_idx(items: &[GridItem], requested: &Path) -> Option<usize> {
+    items.iter().position(|item| {
+        let path = match item {
+            GridItem::Folder(path)
+            | GridItem::Image(path)
+            | GridItem::Video(path)
+            | GridItem::Audio(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => path,
+            _ => return false,
+        };
+        crate::path_key::eq_keep_drive(path, requested)
+    })
 }
 
 pub(crate) fn startup_file_should_open_fullscreen(item: &GridItem) -> bool {
@@ -304,5 +309,27 @@ fn resolve_startup_open_path(
         requested,
         resolved,
         elapsed_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_file_lookup_matches_normalized_db_paths_for_video_and_audio() {
+        let items = vec![
+            GridItem::Video(PathBuf::from(r"C:\Media\Movie.MP4")),
+            GridItem::Audio(PathBuf::from(r"C:\Media\Track.FLAC")),
+        ];
+
+        assert_eq!(
+            startup_file_idx(&items, Path::new("c:/media/movie.mp4")),
+            Some(0)
+        );
+        assert_eq!(
+            startup_file_idx(&items, Path::new("c:/media/track.flac")),
+            Some(1)
+        );
     }
 }
