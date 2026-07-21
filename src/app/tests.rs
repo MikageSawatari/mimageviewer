@@ -29,15 +29,19 @@ fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
 fn main_window_title_hides_internal_synthetic_paths() {
     let internal = PathBuf::from(r"C:\data\__reading_history__");
     assert_eq!(
-        main_window_title(Some(&internal), true, false, None, false),
+        main_window_title(Some(&internal), true, false, false, None, false),
         "読書履歴 - mimageviewer"
     );
     assert_eq!(
-        main_window_title(Some(&internal), false, true, None, false),
+        main_window_title(Some(&internal), false, true, false, None, false),
+        "ブックマーク - mimageviewer"
+    );
+    assert_eq!(
+        main_window_title(Some(&internal), false, false, true, None, false),
         "サブフォルダ展開 - mimageviewer"
     );
     assert_eq!(
-        main_window_title(Some(&internal), false, false, Some("未整理"), false),
+        main_window_title(Some(&internal), false, false, false, Some("未整理"), false,),
         "スマートフォルダ: 未整理 - mimageviewer"
     );
 }
@@ -46,11 +50,11 @@ fn main_window_title_hides_internal_synthetic_paths() {
 fn main_window_title_preserves_real_path_and_indexing_suffix() {
     let folder = PathBuf::from(r"C:\Pictures");
     assert_eq!(
-        main_window_title(Some(&folder), false, false, None, true),
+        main_window_title(Some(&folder), false, false, false, None, true),
         r"C:\Pictures - mimageviewer  (インデックス更新中)"
     );
     assert_eq!(
-        main_window_title(None, false, false, None, false),
+        main_window_title(None, false, false, false, None, false),
         "mimageviewer"
     );
 }

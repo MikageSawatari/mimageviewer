@@ -1,10 +1,16 @@
 //! 動画・音声・本を横断するブックマーク一覧の read model と worker。
+//!
+//! 一覧は専用ダイアログではなく、通常の `App.items` を使う最上位グリッドへ install する。
+//! このモジュールの row は `GridItem` に載らないブックマーク ID / 再生位置 / 登録日時と、
+//! 動画 marker の保存済みサムネイルを保持する sidecar である。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+
+use crate::grid_item::GridItem;
 
 /// 「状態 > ブックマークあり/なし」の在メモリ判定用スナップショット。
 ///
@@ -166,6 +172,29 @@ pub enum BookKindFilter {
     OtherArchive,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BookmarkViewSort {
+    Normal(crate::settings::SortOrder),
+    CreatedAtDesc,
+    CreatedAtAsc,
+}
+
+impl Default for BookmarkViewSort {
+    fn default() -> Self {
+        Self::CreatedAtDesc
+    }
+}
+
+impl BookmarkViewSort {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Normal(order) => order.short_label(),
+            Self::CreatedAtDesc => "登録日時↓",
+            Self::CreatedAtAsc => "登録日時↑",
+        }
+    }
+}
+
 impl BookKindFilter {
     pub const ALL: [Self; 5] = [
         Self::All,
@@ -212,9 +241,13 @@ pub enum BookmarkRowSource {
     Book(crate::book_bookmarks::BookBookmark),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BookmarkBrowserRow {
     pub source: BookmarkRowSource,
+    pub item: GridItem,
+    pub image_meta: Option<(i64, i64)>,
+    /// 動画・音声 bookmark に保存された位置サムネイル。decode は build worker 側。
+    pub marker_thumbnail: Option<Arc<egui::ColorImage>>,
     pub created_at_ms: i64,
     pub missing: bool,
 }
@@ -233,6 +266,105 @@ impl BookmarkBrowserRow {
             BookmarkRowSource::Media { id, .. } => (0, *id),
             BookmarkRowSource::Book(bookmark) => (1, bookmark.id),
         }
+    }
+
+    pub fn display_name(&self) -> String {
+        match &self.source {
+            BookmarkRowSource::Media {
+                path,
+                pts_secs,
+                title,
+                ..
+            } => {
+                let fallback = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                format!(
+                    "{} — {}",
+                    title.as_deref().unwrap_or(&fallback),
+                    format_media_position(*pts_secs)
+                )
+            }
+            BookmarkRowSource::Book(bookmark) => {
+                let container = bookmark
+                    .container_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| bookmark.container_path.display().to_string());
+                format!("{container} — {}", bookmark.page_identity.display_name())
+            }
+        }
+    }
+
+    pub fn position_label(&self) -> String {
+        let base = match &self.source {
+            BookmarkRowSource::Media { pts_secs, .. } => format_media_position(*pts_secs),
+            BookmarkRowSource::Book(bookmark) => format!(
+                "{} / {} ページ",
+                bookmark.container_kind.label(),
+                bookmark.page_index_hint.saturating_add(1)
+            ),
+        };
+        if self.missing {
+            format!("{base} / 見つかりません")
+        } else {
+            base
+        }
+    }
+
+    pub fn badge_label(&self) -> String {
+        match &self.source {
+            BookmarkRowSource::Media { pts_secs, .. } => format_media_position(*pts_secs),
+            BookmarkRowSource::Book(bookmark) => {
+                format!("P.{}", bookmark.page_index_hint.saturating_add(1))
+            }
+        }
+    }
+
+    pub fn source_path(&self) -> &Path {
+        match &self.source {
+            BookmarkRowSource::Media { path, .. } => path,
+            BookmarkRowSource::Book(bookmark) => &bookmark.container_path,
+        }
+    }
+}
+
+fn format_media_position(pts_secs: f64) -> String {
+    let total = pts_secs.max(0.0).round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+pub fn sort_rows(rows: &mut [BookmarkBrowserRow], sort: BookmarkViewSort) {
+    match sort {
+        BookmarkViewSort::CreatedAtDesc => rows.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| a.stable_key().cmp(&b.stable_key()))
+        }),
+        BookmarkViewSort::CreatedAtAsc => rows.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.stable_key().cmp(&b.stable_key()))
+        }),
+        BookmarkViewSort::Normal(order) => rows.sort_by(|a, b| {
+            let name_a = a.display_name();
+            let name_b = b.display_name();
+            let key_a = order.name_key(&name_a);
+            let key_b = order.name_key(&name_b);
+            let mtime_a = a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
+            let mtime_b = b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
+            order
+                .compare_name_keys(&key_a, mtime_a, &key_b, mtime_b)
+                .then_with(|| a.stable_key().cmp(&b.stable_key()))
+        }),
     }
 }
 
@@ -276,6 +408,14 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
             .to_lowercase();
         let is_audio = crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS.contains(&ext.as_str());
         let missing = !bookmark.path.try_exists().unwrap_or(false);
+        let item = if is_audio {
+            GridItem::Audio(bookmark.path.clone())
+        } else {
+            GridItem::Video(bookmark.path.clone())
+        };
+        let image_meta = source_meta(&bookmark.path)
+            .map(|(_, size)| (bookmark.created_at_ms.div_euclid(1000), size));
+        let marker_thumbnail = decode_marker_thumbnail(&bookmark.thumb_webp).map(Arc::new);
         rows.push(BookmarkBrowserRow {
             source: BookmarkRowSource::Media {
                 id: bookmark.id,
@@ -284,23 +424,121 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
                 title: bookmark.title,
                 is_audio,
             },
+            item,
+            image_meta,
+            marker_thumbnail,
             created_at_ms: bookmark.created_at_ms,
             missing,
         });
     }
+    let archive_cache = crate::archive_cache::ArchiveCacheDb::open().ok();
     for bookmark in crate::book_bookmarks::load_all_from_disk()? {
         if cancel.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }
         let missing = book_page_missing(&bookmark);
+        let item = book_grid_item(&bookmark, archive_cache.as_ref());
+        let image_meta = match &item {
+            GridItem::Image(path) => source_meta(path),
+            _ => source_meta(&bookmark.container_path),
+        }
+        .map(|(_, size)| (bookmark.created_at_ms.div_euclid(1000), size));
         rows.push(BookmarkBrowserRow {
             created_at_ms: bookmark.created_at_ms,
+            item,
+            image_meta,
+            marker_thumbnail: None,
             source: BookmarkRowSource::Book(bookmark),
             missing,
         });
     }
-    rows.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    sort_rows(&mut rows, BookmarkViewSort::default());
     Ok(rows)
+}
+
+fn source_meta(path: &Path) -> Option<(i64, i64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .min(i64::MAX as u64) as i64;
+    Some((mtime, metadata.len().min(i64::MAX as u64) as i64))
+}
+
+fn decode_marker_thumbnail(webp: &[u8]) -> Option<egui::ColorImage> {
+    if webp.is_empty() {
+        return None;
+    }
+    let (width, height, rgba) = crate::catalog::decode_thumb_to_rgba(webp)?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() != expected {
+        return None;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [width as usize, height as usize],
+        &rgba,
+    ))
+}
+
+fn book_grid_item(
+    bookmark: &crate::book_bookmarks::BookBookmark,
+    archive_cache: Option<&crate::archive_cache::ArchiveCacheDb>,
+) -> GridItem {
+    use crate::book_bookmarks::{BookContainerKind, PageIdentity};
+    match (&bookmark.container_kind, &bookmark.page_identity) {
+        (
+            BookContainerKind::CompiledBook | BookContainerKind::ImageFolder,
+            PageIdentity::RelativePath(relative),
+        ) => GridItem::Image(
+            bookmark
+                .container_path
+                .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        ),
+        (BookContainerKind::Pdf, PageIdentity::PdfPage(page_num)) => GridItem::PdfPage {
+            pdf_path: bookmark.container_path.clone(),
+            page_num: *page_num,
+            content_type: None,
+        },
+        (BookContainerKind::Zip, PageIdentity::ArchiveEntry(entry_name)) => GridItem::ZipImage {
+            zip_path: bookmark.container_path.clone(),
+            entry_name: entry_name.clone(),
+        },
+        (BookContainerKind::OtherArchive, PageIdentity::ArchiveEntry(entry_name)) => {
+            let backing_path = source_meta(&bookmark.container_path)
+                .and_then(|(mtime, size)| {
+                    archive_cache.and_then(|db| db.peek(&bookmark.container_path, mtime, size))
+                })
+                .unwrap_or_else(|| bookmark.container_path.clone());
+            GridItem::ZipImage {
+                zip_path: backing_path,
+                entry_name: entry_name.clone(),
+            }
+        }
+        // DB 行が将来の kind / identity 組み合わせを持っていても、元コンテナを表示して
+        // ブックマーク自体は削除できるよう非破壊側へ倒す。
+        _ => match bookmark.container_kind {
+            BookContainerKind::CompiledBook | BookContainerKind::ImageFolder => {
+                GridItem::Folder(bookmark.container_path.clone())
+            }
+            BookContainerKind::Zip => GridItem::ZipFile(bookmark.container_path.clone()),
+            BookContainerKind::Pdf => GridItem::PdfFile(bookmark.container_path.clone()),
+            BookContainerKind::OtherArchive => GridItem::ConvertibleArchive {
+                path: bookmark.container_path.clone(),
+                format: bookmark
+                    .container_path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+                    .unwrap_or(crate::archive_converter::ArchiveFormat::Zip),
+            },
+        },
+    }
 }
 
 fn book_page_missing(bookmark: &crate::book_bookmarks::BookBookmark) -> bool {
@@ -341,32 +579,43 @@ fn book_page_missing(bookmark: &crate::book_bookmarks::BookBookmark) -> bool {
 }
 
 pub struct BookmarkDeletePending {
-    pub key: (u8, i64),
+    pub keys: Vec<(u8, i64)>,
     pub rx: mpsc::Receiver<Result<(), String>>,
 }
 
-pub fn spawn_delete(row: &BookmarkBrowserRow) -> BookmarkDeletePending {
-    let key = row.stable_key();
-    let source = row.source.clone();
+pub fn spawn_delete(rows: &[BookmarkBrowserRow]) -> BookmarkDeletePending {
+    let keys = rows.iter().map(BookmarkBrowserRow::stable_key).collect();
+    let sources: Vec<_> = rows.iter().map(|row| row.source.clone()).collect();
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("bookmark-browser-delete".to_string())
         .spawn(move || {
-            let result = match source {
-                BookmarkRowSource::Media { id, .. } => {
-                    crate::video_bookmarks::VideoBookmarkDb::open()
-                        .and_then(|db| db.remove(id))
-                        .map_err(|err| err.to_string())
+            let result = (|| {
+                let media_db = sources
+                    .iter()
+                    .any(|source| matches!(source, BookmarkRowSource::Media { .. }))
+                    .then(crate::video_bookmarks::VideoBookmarkDb::open)
+                    .transpose()
+                    .map_err(|err| err.to_string())?;
+                for source in sources {
+                    match source {
+                        BookmarkRowSource::Media { id, .. } => media_db
+                            .as_ref()
+                            .expect("media DB opened for media bookmark")
+                            .remove(id)
+                            .map_err(|err| err.to_string())?,
+                        BookmarkRowSource::Book(bookmark) => {
+                            crate::book_bookmarks::remove_from_disk(bookmark.id)
+                                .map_err(|err| err.to_string())?;
+                        }
+                    }
                 }
-                BookmarkRowSource::Book(bookmark) => {
-                    crate::book_bookmarks::remove_from_disk(bookmark.id)
-                        .map_err(|err| err.to_string())
-                }
-            };
+                Ok(())
+            })();
             let _ = tx.send(result);
         })
         .ok();
-    BookmarkDeletePending { key, rx }
+    BookmarkDeletePending { keys, rx }
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +635,24 @@ pub struct PendingBookOpen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media_row(id: i64, created_at_ms: i64, name: &str) -> BookmarkBrowserRow {
+        let path = PathBuf::from(format!(r"C:\media\{name}.mp4"));
+        BookmarkBrowserRow {
+            source: BookmarkRowSource::Media {
+                id,
+                path: path.clone(),
+                pts_secs: id as f64,
+                title: None,
+                is_audio: false,
+            },
+            item: GridItem::Video(path),
+            image_meta: Some((created_at_ms.div_euclid(1000), 10)),
+            marker_thumbnail: None,
+            created_at_ms,
+            missing: false,
+        }
+    }
 
     #[test]
     fn book_kind_filter_groups_compiled_with_image_folders() {
@@ -439,5 +706,29 @@ mod tests {
         ));
         assert!(presence.has_archive_prefix(&archive, "part/"));
         assert!(!presence.has_archive_prefix(&archive, "other/"));
+    }
+
+    #[test]
+    fn bookmark_view_defaults_to_newest_registration_and_keeps_duplicate_media_rows() {
+        let mut rows = vec![
+            media_row(1, 1_000, "same"),
+            media_row(2, 3_000, "same"),
+            media_row(3, 2_000, "other"),
+        ];
+        sort_rows(&mut rows, BookmarkViewSort::default());
+        assert_eq!(
+            rows.iter()
+                .map(BookmarkBrowserRow::stable_key)
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (0, 3), (0, 1)]
+        );
+    }
+
+    #[test]
+    fn missing_bookmark_keeps_position_in_display_text() {
+        let mut row = media_row(7, 1_000, "clip");
+        row.missing = true;
+        assert_eq!(row.badge_label(), "0:07");
+        assert_eq!(row.position_label(), "0:07 / 見つかりません");
     }
 }

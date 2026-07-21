@@ -371,6 +371,99 @@ fn windows_path_root_for_file_operation(path: &Path) -> Option<String> {
 }
 
 impl crate::app::App {
+    fn show_bookmark_grid_context_menu(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<ContextMenuAction> {
+        let row = self.bookmark_browser_rows.get(idx)?.clone();
+        let source = row.source_path().to_path_buf();
+        let explorer_target = match &row.source {
+            crate::bookmark_browser::BookmarkRowSource::Book(bookmark)
+                if matches!(
+                    bookmark.container_kind,
+                    crate::book_bookmarks::BookContainerKind::CompiledBook
+                        | crate::book_bookmarks::BookContainerKind::ImageFolder
+                ) =>
+            {
+                Some(source.clone())
+            }
+            _ => source.parent().map(Path::to_path_buf),
+        };
+        let mut open = true;
+        let mut close = false;
+        let mut open_bookmark = false;
+        let mut delete_bookmark = false;
+        let mut open_explorer = false;
+        let checked_count = self.checked.len();
+        let pos = self.context_menu_pos;
+        egui::Window::new("bookmark-grid-context")
+            .id(egui::Id::new("bookmark_grid_context_menu"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .fixed_pos(pos)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if ui
+                    .add_enabled(!row.missing, egui::Button::new("ブックマーク位置を開く"))
+                    .clicked()
+                {
+                    open_bookmark = true;
+                    close = true;
+                }
+                if ui.button("パスをコピー").clicked() {
+                    copy_path_text(ctx, &source);
+                    close = true;
+                }
+                if explorer_target.is_some()
+                    && ui.button("このフォルダをエクスプローラで開く").clicked()
+                {
+                    open_explorer = true;
+                    close = true;
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.bookmark_delete_pending.is_none(),
+                        egui::Button::new(if checked_count > 0 {
+                            format!("ブックマークを {checked_count} 件削除")
+                        } else {
+                            "ブックマークを削除".to_string()
+                        }),
+                    )
+                    .clicked()
+                {
+                    delete_bookmark = true;
+                    close = true;
+                }
+                if ui.input(|input| input.pointer.any_click()) && !ui.ui_contains_pointer() {
+                    close = true;
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if open_bookmark {
+            self.open_bookmark_browser_row(ctx, &row);
+        }
+        if open_explorer && let Some(folder) = explorer_target {
+            open_directory_in_explorer(&folder);
+        }
+        if delete_bookmark {
+            if self.checked.is_empty() {
+                self.delete_bookmark_browser_rows(std::slice::from_ref(&row));
+            } else {
+                self.delete_selected_bookmarks();
+            }
+        }
+        if close || !open {
+            self.context_menu_idx = None;
+            self.cached_handlers = None;
+        }
+        None
+    }
+
     /// コンテキストメニューを表示する。
     pub(crate) fn show_context_menu(&mut self, ctx: &egui::Context) -> Option<ContextMenuAction> {
         let idx = match self.context_menu_idx {
@@ -401,6 +494,9 @@ impl crate::app::App {
 
         let has_checked = !is_folder_context && !self.checked.is_empty();
         let checked_count = self.checked.len();
+        if self.items_are_bookmark_view && !is_folder_context {
+            return self.show_bookmark_grid_context_menu(ctx, idx);
+        }
         let mut nav: Option<ContextMenuAction> = None;
         // 検索結果ビュー中だけ「フォルダに移動」を出す。タグビューも対象 —
         // ディスク中に散在するタグ付きヒットから収納フォルダへ飛ぶのは
@@ -1987,6 +2083,11 @@ impl crate::app::App {
             .keymap
             .pressed_action(ctx, crate::keymap::KeyAction::GridDelete);
         if !del {
+            return;
+        }
+
+        if self.items_are_bookmark_view {
+            self.delete_selected_bookmarks();
             return;
         }
 

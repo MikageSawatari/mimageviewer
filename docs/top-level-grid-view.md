@@ -2,7 +2,7 @@
 
 ## 1. 正本
 
-検索、★固定、サブ展開、スマートフォルダ、読書履歴、レーティング一覧は同じ `App.items`
+検索、★固定、サブ展開、スマートフォルダ、読書履歴、ブックマーク一覧、レーティング一覧は同じ `App.items`
 surface を共有する。現在の最上位 surface と一時ビューからの復元先は
 `app/top_level_grid_view.rs` の `TopLevelGridView` / `TopLevelGridRestore` を正本とする。
 個別の `active` / `items_are_*` flag と synthetic path は描画・既存経路との互換情報であり、
@@ -12,6 +12,11 @@ surface を共有する。現在の最上位 surface と一時ビューからの
 検索・★固定・別スマートフォルダへ直接切り替える場合は、元一覧を途中で再構築せず、
 `take_return_to()` で snapshot を次の遷移へ移譲する。戻る時は
 `restore_view_return_context()` が実フォルダと synthetic view を同じ型から振り分ける。
+
+ブックマーク一覧は `TopLevelGridSurface::Bookmarks` を所有者とし、動画・音声・本の各ブックマークを
+`App.items` の 1 行へ materialize する。ブックマーク ID、登録位置、登録日時、欠落状態、保存済み動画
+サムネイルは同じ index の sidecar row に保持する。通常の facet / rating / tag / details 表示を共有する一方、
+Delete と右クリック削除は元ファイル操作へ流さず DB 行だけを削除する。
 
 ## 2. スマートフォルダ
 

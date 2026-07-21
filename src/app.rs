@@ -1812,6 +1812,7 @@ struct ViewerContextBundle {
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
     items_are_reading_history_view: bool,
+    items_are_bookmark_view: bool,
     items_are_rating_view: bool,
     items_are_subfolder_expansion_view: bool,
     items_are_smart_folder_view: bool,
@@ -2039,6 +2040,7 @@ impl ViewerContextBundle {
             items_are_global_search_view: false,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
+            items_are_bookmark_view: false,
             items_are_rating_view: false,
             items_are_subfolder_expansion_view: false,
             items_are_smart_folder_view: false,
@@ -4559,6 +4561,12 @@ pub(crate) fn reading_history_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__reading_history__")
 }
 
+/// ブックマーク一覧ビューで current_folder に設定する合成パス。
+/// `%APPDATA%/mimageviewer/__bookmarks__` (実在させない、カタログキーとしてのみ使用)。
+pub(crate) fn bookmark_view_synthetic_path() -> PathBuf {
+    crate::data_dir::get().join("__bookmarks__")
+}
+
 /// レーティング一覧ビューで current_folder に設定する合成パス。
 /// `%APPDATA%/mimageviewer/__rating_view__` (実在させない、カタログキーとしてのみ使用)。
 pub(crate) fn rating_view_synthetic_path() -> PathBuf {
@@ -4580,12 +4588,15 @@ pub(crate) fn subfolder_expansion_synthetic_path() -> PathBuf {
 fn main_window_title(
     effective_folder: Option<&Path>,
     reading_history_view: bool,
+    bookmark_view: bool,
     subfolder_expansion_view: bool,
     smart_folder_name: Option<&str>,
     indexing_active: bool,
 ) -> String {
     let base = if reading_history_view {
         "読書履歴 - mimageviewer".to_string()
+    } else if bookmark_view {
+        "ブックマーク - mimageviewer".to_string()
     } else if subfolder_expansion_view {
         "サブフォルダ展開 - mimageviewer".to_string()
     } else if let Some(name) = smart_folder_name {
@@ -4609,6 +4620,7 @@ fn main_window_title(
 pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
     crate::folder_tree::path_eq(path, &search_results_synthetic_path())
         || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
+        || crate::folder_tree::path_eq(path, &bookmark_view_synthetic_path())
         || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
         || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
         || smart_folder::is_smart_folder_synthetic_path(path)
@@ -6241,6 +6253,8 @@ pub struct App {
     pub(crate) items_are_tag_view: bool,
     /// 現在の `items` が読書履歴の仮想ビューかを示す。
     pub(crate) items_are_reading_history_view: bool,
+    /// 現在の `items` がブックマーク一覧の仮想ビューかを示す。
+    pub(crate) items_are_bookmark_view: bool,
     /// 現在の `items` がレーティング一覧の仮想ビューかを示す。
     pub(crate) items_are_rating_view: bool,
     /// 現在の `items` がサブフォルダ展開のスナップショット仮想ビューかを示す。
@@ -7218,8 +7232,7 @@ pub struct App {
         Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     pub(crate) rating_view_nav_stack: Vec<PathBuf>,
 
-    /// 「場所 > ブックマーク」の全メディア横断一覧。
-    pub(crate) show_bookmark_browser: bool,
+    /// 「場所 > ブックマーク」の全メディア横断一覧。`items` と同じ順序の sidecar。
     pub(crate) bookmark_browser_rows: Vec<crate::bookmark_browser::BookmarkBrowserRow>,
     pub(crate) bookmark_browser_pending: Option<crate::bookmark_browser::BookmarkBrowserPending>,
     /// 状態フィルタ用の全メディア横断ブックマーク集合。DB 読み出しは worker 側で行う。
@@ -7228,7 +7241,7 @@ pub struct App {
     pub(crate) bookmark_delete_pending: Option<crate::bookmark_browser::BookmarkDeletePending>,
     pub(crate) bookmark_media_filter: crate::bookmark_browser::MediaFilter,
     pub(crate) bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter,
-    pub(crate) bookmark_browser_selected: Option<(u8, i64)>,
+    pub(crate) bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort,
     pub(crate) bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
     pub(crate) bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
 
@@ -9555,6 +9568,7 @@ impl App {
             items_are_global_search_view: false,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
+            items_are_bookmark_view: false,
             items_are_rating_view: false,
             items_are_subfolder_expansion_view: false,
             items_are_smart_folder_view: false,
@@ -9913,7 +9927,6 @@ impl App {
             rating_view_saved_folder: None,
             rating_view_subfolder_restore: None,
             rating_view_nav_stack: Vec::new(),
-            show_bookmark_browser: false,
             bookmark_browser_rows: Vec::new(),
             bookmark_browser_pending: None,
             bookmark_presence: None,
@@ -9921,7 +9934,7 @@ impl App {
             bookmark_delete_pending: None,
             bookmark_media_filter: crate::bookmark_browser::MediaFilter::default(),
             bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
-            bookmark_browser_selected: None,
+            bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
             bookmark_media_open_pending: None,
             bookmark_book_open_pending: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
@@ -11579,6 +11592,7 @@ impl App {
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
+            items_are_bookmark_view,
             items_are_rating_view,
             items_are_subfolder_expansion_view,
             items_are_smart_folder_view,
@@ -11769,6 +11783,7 @@ impl App {
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
         swap_field!(items_are_reading_history_view);
+        swap_field!(items_are_bookmark_view);
         swap_field!(items_are_rating_view);
         swap_field!(items_are_subfolder_expansion_view);
         swap_field!(items_are_smart_folder_view);
@@ -12076,6 +12091,12 @@ impl App {
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
         }
+        if self.items_are_bookmark_view || self.bookmark_browser_pending.is_some() {
+            return self
+                .folder_history_back_target()
+                .is_some()
+                .then_some(crate::ui_main::AddressBarNav::HistoryBack);
+        }
         if self.rating_view_parent_nav_available() {
             return Some(crate::ui_main::AddressBarNav::RatingViewBack);
         }
@@ -12099,6 +12120,12 @@ impl App {
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
+        }
+        if self.items_are_bookmark_view || self.bookmark_browser_pending.is_some() {
+            return self
+                .folder_history_back_target()
+                .is_some()
+                .then_some(crate::ui_main::AddressBarNav::HistoryBack);
         }
         if self.rating_view_parent_nav_available() {
             return Some(crate::ui_main::AddressBarNav::RatingViewBack);
@@ -12680,6 +12707,7 @@ impl App {
             }
             TopLevelGridSurface::DriveList => Some(TopLevelGridRestore::DriveList),
             TopLevelGridSurface::ReadingHistory => Some(TopLevelGridRestore::ReadingHistory),
+            TopLevelGridSurface::Bookmarks => Some(TopLevelGridRestore::Bookmarks),
             TopLevelGridSurface::Rating { stars } => {
                 Some(TopLevelGridRestore::Rating { stars: *stars })
             }
@@ -13005,6 +13033,9 @@ impl App {
             SyntheticFolderHistoryDispatch::Restored
         } else if crate::folder_tree::path_eq(target, &reading_history_synthetic_path()) {
             self.enter_reading_history();
+            SyntheticFolderHistoryDispatch::Restored
+        } else if crate::folder_tree::path_eq(target, &bookmark_view_synthetic_path()) {
+            self.enter_bookmark_view();
             SyntheticFolderHistoryDispatch::Restored
         } else if crate::folder_tree::path_eq(target, &rating_view_synthetic_path()) {
             let stars = target_rating_view_stars.or_else(|| {
@@ -13426,6 +13457,17 @@ impl App {
             self.install_rating_view_rows();
             return;
         }
+        if self.items_are_bookmark_view {
+            if matches!(
+                self.bookmark_view_sort,
+                crate::bookmark_browser::BookmarkViewSort::Normal(_)
+            ) {
+                self.bookmark_view_sort =
+                    crate::bookmark_browser::BookmarkViewSort::Normal(self.settings.sort_order);
+            }
+            self.install_bookmark_view_rows();
+            return;
+        }
         if self.reprepare_current_smart_folder_for_sort() {
             return;
         }
@@ -13719,6 +13761,7 @@ impl App {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
                 || self.items_are_reading_history_view
+                || self.items_are_bookmark_view
                 || self.items_are_rating_view
                 || is_synthetic_view_path(&cur);
             if !leaving_search_view && !self.items_are_drive_list {
@@ -14008,6 +14051,7 @@ impl App {
             self.top_level_grid_view.surface(),
             top_level_grid_view::TopLevelGridSurface::DriveList
                 | top_level_grid_view::TopLevelGridSurface::ReadingHistory
+                | top_level_grid_view::TopLevelGridSurface::Bookmarks
         ) {
             self.top_level_grid_view
                 .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
@@ -15512,6 +15556,7 @@ impl App {
             }
             TopLevelGridRestore::DriveList => (drive_list_synthetic_path(), None),
             TopLevelGridRestore::ReadingHistory => (reading_history_synthetic_path(), None),
+            TopLevelGridRestore::Bookmarks => (bookmark_view_synthetic_path(), None),
             TopLevelGridRestore::Rating { stars } => (rating_view_synthetic_path(), Some(stars)),
         };
         self.suppress_nav_record_for_search_restore = true;
@@ -18597,6 +18642,7 @@ impl App {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
                 || self.items_are_reading_history_view
+                || self.items_are_bookmark_view
                 || self.items_are_rating_view
                 || is_synthetic_view_path(&cur);
             let has_grid_state_to_save =
@@ -19482,6 +19528,7 @@ impl App {
         self.items_are_global_search_view = false;
         self.items_are_tag_view = false;
         self.items_are_reading_history_view = false;
+        self.items_are_bookmark_view = false;
         self.items_are_rating_view = false;
         self.items_are_subfolder_expansion_view = false;
         self.items_are_smart_folder_view = false;
@@ -22915,6 +22962,7 @@ impl App {
 
         self.settings.auto_fullscreen_image_folders_enabled()
             && !self.items_are_rating_view
+            && !self.items_are_bookmark_view
             && !self.items_are_global_search_view
             && !self.items_are_tag_view
             && !self.items_are_subfolder_expansion_view
@@ -22928,6 +22976,7 @@ impl App {
 
     fn book_bookmark_view_is_synthetic(&self) -> bool {
         self.items_are_reading_history_view
+            || self.items_are_bookmark_view
             || self.items_are_rating_view
             || self.items_are_global_search_view
             || self.items_are_tag_view
@@ -23107,9 +23156,6 @@ impl App {
                             if inserted {
                                 self.notify_bookmarks_changed();
                             }
-                            if self.show_bookmark_browser {
-                                self.refresh_bookmark_browser();
-                            }
                         }
                         Err(err) => self
                             .show_feedback_toast(format!("ブックマーク追加に失敗しました: {err}")),
@@ -23122,9 +23168,6 @@ impl App {
                             self.current_book_bookmarks.retain(|entry| entry.id != id);
                             self.notify_bookmarks_changed();
                             self.show_feedback_toast("ブックマークを削除しました".to_string());
-                            if self.show_bookmark_browser {
-                                self.refresh_bookmark_browser();
-                            }
                         }
                         Err(err) => self
                             .show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}")),
@@ -23259,6 +23302,9 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Bookmarks,
         );
+        if self.items_are_bookmark_view {
+            self.refresh_bookmark_browser();
+        }
     }
 
     fn poll_bookmark_presence(&mut self, ctx: &egui::Context) {
@@ -23305,6 +23351,9 @@ impl App {
         item: &GridItem,
         presence: &crate::bookmark_browser::BookmarkPresence,
     ) -> bool {
+        if self.items_are_bookmark_view && self.bookmark_browser_rows.get(idx).is_some() {
+            return true;
+        }
         match item {
             GridItem::Video(path) | GridItem::Audio(path) => presence.has_media_path(path),
             GridItem::Folder(path)
@@ -23330,7 +23379,51 @@ impl App {
     }
 
     pub(crate) fn open_bookmark_browser(&mut self) {
-        self.show_bookmark_browser = true;
+        self.record_folder_nav_transition(&bookmark_view_synthetic_path());
+        self.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::default();
+        self.enter_bookmark_view();
+    }
+
+    /// 動画・音声・本のブックマークを、通常のメイン一覧 surface へ読み込む。
+    pub(crate) fn enter_bookmark_view(&mut self) {
+        self.gamepad_location_picker = None;
+        if self.global_search.active {
+            self.global_search.saved_folder = None;
+            self.close_global_search();
+        }
+        if self.favsearch.active {
+            self.favsearch.saved_folder = None;
+            self.close_favsearch();
+        }
+        if self.tag_view.active {
+            self.tag_view.saved_folder = None;
+            self.close_tag_view();
+        }
+        if self.show_search_bar {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            self.search_has_focus = false;
+            self.search_tag_bridge.clear();
+            self.cancel_search_pending();
+        }
+        if let Some(pending) = self.bookmark_browser_pending.take() {
+            pending.cancel();
+        }
+        self.bookmark_browser_rows.clear();
+        self.start_loading_items(
+            bookmark_view_synthetic_path(),
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        self.items_are_bookmark_view = true;
+        self.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Bookmarks);
+        self.address = "ブックマークを読み込み中…".to_string();
         self.refresh_bookmark_browser();
     }
 
@@ -23341,13 +23434,152 @@ impl App {
         self.bookmark_browser_pending = Some(crate::bookmark_browser::spawn_build());
     }
 
-    pub(crate) fn delete_bookmark_browser_row(
+    pub(crate) fn delete_bookmark_browser_rows(
         &mut self,
-        row: &crate::bookmark_browser::BookmarkBrowserRow,
+        rows: &[crate::bookmark_browser::BookmarkBrowserRow],
     ) {
-        if self.bookmark_delete_pending.is_none() {
-            self.bookmark_delete_pending = Some(crate::bookmark_browser::spawn_delete(row));
+        if !rows.is_empty() && self.bookmark_delete_pending.is_none() {
+            self.bookmark_delete_pending = Some(crate::bookmark_browser::spawn_delete(rows));
         }
+    }
+
+    pub(crate) fn delete_selected_bookmarks(&mut self) {
+        if !self.items_are_bookmark_view || self.bookmark_delete_pending.is_some() {
+            return;
+        }
+        let indices: Vec<usize> = if self.checked.is_empty() {
+            self.selected.into_iter().collect()
+        } else {
+            self.checked.iter().copied().collect()
+        };
+        let rows: Vec<_> = indices
+            .into_iter()
+            .filter_map(|idx| self.bookmark_browser_rows.get(idx).cloned())
+            .collect();
+        self.delete_bookmark_browser_rows(&rows);
+    }
+
+    pub(crate) fn bookmark_view_row(
+        &self,
+        idx: usize,
+    ) -> Option<&crate::bookmark_browser::BookmarkBrowserRow> {
+        self.items_are_bookmark_view
+            .then(|| self.bookmark_browser_rows.get(idx))
+            .flatten()
+    }
+
+    pub(crate) fn set_bookmark_view_sort(
+        &mut self,
+        sort: crate::bookmark_browser::BookmarkViewSort,
+    ) {
+        self.bookmark_view_sort = sort;
+        if self.items_are_bookmark_view {
+            self.install_bookmark_view_rows();
+        }
+    }
+
+    fn install_bookmark_view_rows(&mut self) {
+        let previous_selected = self.selected;
+        let previous_key = previous_selected
+            .and_then(|idx| self.bookmark_browser_rows.get(idx))
+            .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
+        crate::bookmark_browser::sort_rows(
+            &mut self.bookmark_browser_rows,
+            self.bookmark_view_sort,
+        );
+        let mut items: Vec<GridItem> = self
+            .bookmark_browser_rows
+            .iter()
+            .map(|row| row.item.clone())
+            .collect();
+        let mut image_metas: Vec<Option<(i64, i64)>> = self
+            .bookmark_browser_rows
+            .iter()
+            .map(|row| row.image_meta)
+            .collect();
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut image_metas,
+            &self.settings.grid_display_order,
+            None,
+        );
+        let mut rows_by_item: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<crate::bookmark_browser::BookmarkBrowserRow>,
+        > = std::collections::HashMap::new();
+        for row in self.bookmark_browser_rows.drain(..) {
+            rows_by_item
+                .entry(row.item.perf_key())
+                .or_default()
+                .push_back(row);
+        }
+        self.bookmark_browser_rows = items
+            .iter()
+            .map(|item| {
+                rows_by_item
+                    .get_mut(&item.perf_key())
+                    .and_then(std::collections::VecDeque::pop_front)
+                    .expect("arranged bookmark item must retain its source row")
+            })
+            .collect();
+        let video_items: Vec<(usize, PathBuf, u64)> = self
+            .bookmark_browser_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| match &row.item {
+                GridItem::Video(path) if !row.missing && row.marker_thumbnail.is_none() => {
+                    let size = row
+                        .image_meta
+                        .map(|(_, size)| size.max(0) as u64)
+                        .unwrap_or(0);
+                    Some((idx, path.clone(), size))
+                }
+                _ => None,
+            })
+            .collect();
+        let existing_keys = std::collections::HashSet::new();
+        self.start_loading_items(
+            bookmark_view_synthetic_path(),
+            items,
+            image_metas,
+            existing_keys,
+            video_items,
+            None,
+        );
+        self.items_are_bookmark_view = true;
+        self.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Bookmarks);
+        self.address = "ブックマーク".to_string();
+        for (idx, image) in self
+            .bookmark_browser_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| row.marker_thumbnail.as_ref().map(|image| (idx, image)))
+        {
+            let [width, height] = image.size;
+            self.texture_backlog.push(crate::thumb_loader::ThumbMsg {
+                idx,
+                image: Some((**image).clone()),
+                from_cache: true,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((width as u32, height as u32)),
+                canceled: false,
+                finalized: false,
+                input_seq: self.input_seq,
+                items_gen: self.items_generation,
+            });
+        }
+        self.rebuild_visible_indices();
+        self.selected = previous_key
+            .and_then(|key| {
+                self.bookmark_browser_rows
+                    .iter()
+                    .position(|row| row.stable_key() == key)
+            })
+            .filter(|idx| self.visible_indices.contains(idx))
+            .or_else(|| self.visible_indices.first().copied());
+        self.scroll_to_selected = self.selected.is_some();
     }
 
     pub(crate) fn open_bookmark_browser_row(
@@ -23404,7 +23636,12 @@ impl App {
         if let Some(result) = build_result {
             self.bookmark_browser_pending = None;
             match result {
-                Ok(rows) => self.bookmark_browser_rows = rows,
+                Ok(rows) => {
+                    self.bookmark_browser_rows = rows;
+                    if self.items_are_bookmark_view {
+                        self.install_bookmark_view_rows();
+                    }
+                }
                 Err(err) => self
                     .show_feedback_toast(format!("ブックマーク一覧を読み込めませんでした: {err}")),
             }
@@ -23414,25 +23651,31 @@ impl App {
             .bookmark_delete_pending
             .as_ref()
             .and_then(|pending| match pending.rx.try_recv() {
-                Ok(result) => Some((pending.key, result)),
+                Ok(result) => Some((pending.keys.clone(), result)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((
-                    pending.key,
+                    pending.keys.clone(),
                     Err("ブックマーク削除ワーカーが終了しました".to_string()),
                 )),
             });
-        if let Some((key, result)) = delete_result {
+        if let Some((keys, result)) = delete_result {
             self.bookmark_delete_pending = None;
             match result {
                 Ok(()) => {
+                    let key_set: std::collections::HashSet<_> = keys.iter().copied().collect();
                     self.bookmark_browser_rows
-                        .retain(|row| row.stable_key() != key);
-                    if key.0 == 1 {
-                        self.current_book_bookmarks
-                            .retain(|bookmark| bookmark.id != key.1);
+                        .retain(|row| !key_set.contains(&row.stable_key()));
+                    self.current_book_bookmarks
+                        .retain(|bookmark| !key_set.contains(&(1, bookmark.id)));
+                    self.checked.clear();
+                    if self.items_are_bookmark_view {
+                        self.install_bookmark_view_rows();
                     }
                     self.notify_bookmarks_changed();
-                    self.show_feedback_toast("ブックマークを削除しました".to_string());
+                    self.show_feedback_toast(format!(
+                        "ブックマークを {} 件削除しました",
+                        keys.len()
+                    ));
                 }
                 Err(err) => {
                     self.show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}"))
@@ -26957,6 +27200,12 @@ impl App {
                 // (フルスクリーン中と
                 // 同じ挙動をグリッドからも使えるようにする)。
                 if let Some(idx) = self.selected {
+                    if self.items_are_bookmark_view {
+                        if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
+                            self.open_bookmark_browser_row(ctx, &row);
+                        }
+                        return None;
+                    }
                     if !self.guard_reading_history_open(idx) {
                         return None;
                     }
@@ -32714,6 +32963,7 @@ impl App {
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
+            items_are_bookmark_view,
             items_are_rating_view,
             items_are_subfolder_expansion_view,
             items_are_smart_folder_view,
@@ -32838,6 +33088,7 @@ impl App {
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
+            items_are_bookmark_view,
             items_are_rating_view,
             items_are_subfolder_expansion_view,
             items_are_smart_folder_view,
@@ -36568,6 +36819,9 @@ impl App {
                     }
                 }
             }
+            if !self.bookmark_view_matches_filter(i) {
+                continue;
+            }
             if !self.items_are_reading_history_view && !self.passes_facet_filter(i, None) {
                 continue;
             }
@@ -36700,6 +36954,9 @@ impl App {
                     }
                 }
             }
+            if !self.bookmark_view_matches_filter(i) {
+                continue;
+            }
             if self.items_are_reading_history_view || self.passes_facet_filter(i, Some(ignore)) {
                 out.push(i);
             }
@@ -36711,6 +36968,26 @@ impl App {
         self.items.get(idx).map(facet_kind_for_item)
     }
 
+    pub(crate) fn bookmark_view_matches_filter(&self, idx: usize) -> bool {
+        if !self.items_are_bookmark_view {
+            return true;
+        }
+        let Some(row) = self.bookmark_browser_rows.get(idx) else {
+            return false;
+        };
+        if self.bookmark_media_filter != crate::bookmark_browser::MediaFilter::All
+            && row.media_filter() != self.bookmark_media_filter
+        {
+            return false;
+        }
+        match &row.source {
+            crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => self
+                .bookmark_book_kind_filter
+                .matches(bookmark.container_kind),
+            _ => true,
+        }
+    }
+
     pub(crate) fn facet_item_ext(&self, idx: usize) -> String {
         self.items
             .get(idx)
@@ -36719,8 +36996,8 @@ impl App {
     }
 
     pub(crate) fn facet_place_label_for_key(&self, key: &str) -> String {
-        for item in &self.items {
-            let Some(path) = self.facet_place_path_for_item(item) else {
+        for (idx, _item) in self.items.iter().enumerate() {
+            let Some(path) = self.facet_place_path_for_idx(idx) else {
                 continue;
             };
             if crate::adjustment_db::normalize_path(&path) == key {
@@ -36757,6 +37034,30 @@ impl App {
             }
             GridItem::PdfPage { pdf_path, .. } => pdf_path.parent().map(Path::to_path_buf),
         }
+    }
+
+    pub(crate) fn facet_place_path_for_idx(&self, idx: usize) -> Option<PathBuf> {
+        if let Some(row) = self.bookmark_view_row(idx) {
+            return match &row.source {
+                crate::bookmark_browser::BookmarkRowSource::Media { path, .. } => {
+                    path.parent().map(Path::to_path_buf)
+                }
+                crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
+                    if matches!(
+                        bookmark.container_kind,
+                        crate::book_bookmarks::BookContainerKind::CompiledBook
+                            | crate::book_bookmarks::BookContainerKind::ImageFolder
+                    ) {
+                        Some(bookmark.container_path.clone())
+                    } else {
+                        bookmark.container_path.parent().map(Path::to_path_buf)
+                    }
+                }
+            };
+        }
+        self.items
+            .get(idx)
+            .and_then(|item| self.facet_place_path_for_item(item))
     }
 
     pub(crate) fn facet_filter_active(&self) -> bool {
@@ -37166,7 +37467,7 @@ impl App {
 
         if ignore != Some(FacetField::Place) && !self.settings.facet_filter.place_keys.is_empty() {
             let Some(place_key) = self
-                .facet_place_path_for_item(&item)
+                .facet_place_path_for_idx(idx)
                 .map(|path| crate::adjustment_db::normalize_path(&path))
             else {
                 return false;
@@ -41758,7 +42059,7 @@ impl App {
 
         self.reset_fs_side_panel_runtime_for_file_change();
         self.fullscreen_idx = None;
-        if self.show_bookmark_browser {
+        if self.items_are_bookmark_view {
             self.refresh_bookmark_browser();
         }
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
@@ -53800,6 +54101,7 @@ impl eframe::App for App {
         let title = main_window_title(
             self.effective_folder().as_deref(),
             self.items_are_reading_history_view,
+            self.items_are_bookmark_view,
             self.items_are_subfolder_expansion_view,
             self.items_are_smart_folder_view
                 .then_some(smart_folder_name)
@@ -54246,9 +54548,6 @@ impl eframe::App for App {
         self.show_preferences_dialog(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
-        if !main_viewer_blocked {
-            self.show_bookmark_browser_window(ctx);
-        }
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する (= ui_fullscreen.rs)。
         //    両方のビューポートで描画すると egui::Window の位置が二重管理になり、

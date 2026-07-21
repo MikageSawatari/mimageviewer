@@ -2433,261 +2433,7 @@ mod grid_right_drag_start_selection_tests {
     }
 }
 
-fn bookmark_browser_row_text(
-    row: &crate::bookmark_browser::BookmarkBrowserRow,
-) -> (&'static str, String, String, String) {
-    match &row.source {
-        crate::bookmark_browser::BookmarkRowSource::Media {
-            path,
-            pts_secs,
-            title,
-            is_audio,
-            ..
-        } => {
-            let total_seconds = pts_secs.max(0.0).round() as u64;
-            let position = format!("{}:{:02}", total_seconds / 60, total_seconds % 60);
-            let fallback = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            (
-                if *is_audio { "音声" } else { "動画" },
-                title.clone().unwrap_or(fallback),
-                format!("再生位置 {position}"),
-                path.display().to_string(),
-            )
-        }
-        crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
-            let container = bookmark
-                .container_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| bookmark.container_path.display().to_string());
-            (
-                "本",
-                format!("{container} — {}", bookmark.page_identity.display_name()),
-                format!(
-                    "{} / {} ページ",
-                    bookmark.container_kind.label(),
-                    bookmark.page_index_hint.saturating_add(1)
-                ),
-                bookmark.container_path.display().to_string(),
-            )
-        }
-    }
-}
-
 impl App {
-    pub(crate) fn show_bookmark_browser_window(&mut self, ctx: &egui::Context) {
-        if !self.show_bookmark_browser {
-            return;
-        }
-        let media_filter = self.bookmark_media_filter;
-        let book_filter = self.bookmark_book_kind_filter;
-        let rows: Vec<_> = self
-            .bookmark_browser_rows
-            .iter()
-            .filter(|row| {
-                (media_filter == crate::bookmark_browser::MediaFilter::All
-                    || row.media_filter() == media_filter)
-                    && match &row.source {
-                        crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
-                            book_filter.matches(bookmark.container_kind)
-                        }
-                        _ => true,
-                    }
-            })
-            .cloned()
-            .collect();
-        let mut window_open = self.show_bookmark_browser;
-        let mut open_row = None;
-        let mut delete_row = None;
-        egui::Window::new("ブックマーク")
-            .id(egui::Id::new("bookmark_browser"))
-            .open(&mut window_open)
-            .default_size(egui::vec2(720.0, 560.0))
-            .min_size(egui::vec2(520.0, 320.0))
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("種類");
-                    egui::ComboBox::from_id_salt("bookmark_media_filter")
-                        .selected_text(self.bookmark_media_filter.label())
-                        .show_ui(ui, |ui| {
-                            for filter in crate::bookmark_browser::MediaFilter::ALL {
-                                ui.selectable_value(
-                                    &mut self.bookmark_media_filter,
-                                    filter,
-                                    filter.label(),
-                                );
-                            }
-                        });
-                    if matches!(
-                        self.bookmark_media_filter,
-                        crate::bookmark_browser::MediaFilter::All
-                            | crate::bookmark_browser::MediaFilter::Book
-                    ) {
-                        ui.label("本の種類");
-                        egui::ComboBox::from_id_salt("bookmark_book_kind_filter")
-                            .selected_text(self.bookmark_book_kind_filter.label())
-                            .show_ui(ui, |ui| {
-                                for filter in crate::bookmark_browser::BookKindFilter::ALL {
-                                    ui.selectable_value(
-                                        &mut self.bookmark_book_kind_filter,
-                                        filter,
-                                        filter.label(),
-                                    );
-                                }
-                            });
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("{} 件", rows.len()));
-                        if ui.small_button("再読み込み").clicked() {
-                            self.refresh_bookmark_browser();
-                        }
-                    });
-                });
-                ui.separator();
-
-                if self.bookmark_browser_pending.is_some() && self.bookmark_browser_rows.is_empty()
-                {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("ブックマークを読み込み中…");
-                    });
-                    return;
-                }
-                if rows.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("条件に一致するブックマークはありません");
-                    });
-                    return;
-                }
-
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for row in &rows {
-                            let key = row.stable_key();
-                            let selected = self.bookmark_browser_selected == Some(key);
-                            let fill = if selected {
-                                ui.visuals().selection.bg_fill
-                            } else {
-                                ui.visuals().faint_bg_color
-                            };
-                            let inner = egui::Frame::new()
-                                .fill(fill)
-                                .corner_radius(5.0)
-                                .inner_margin(egui::Margin::same(8))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let (kind, title, detail, location) =
-                                            bookmark_browser_row_text(row);
-                                        let (icon_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(58.0, 58.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        let icon_color = match row.media_filter() {
-                                            crate::bookmark_browser::MediaFilter::Video => {
-                                                egui::Color32::from_rgb(70, 110, 170)
-                                            }
-                                            crate::bookmark_browser::MediaFilter::Audio => {
-                                                egui::Color32::from_rgb(120, 85, 165)
-                                            }
-                                            _ => egui::Color32::from_rgb(105, 125, 80),
-                                        };
-                                        ui.painter().rect_filled(icon_rect, 5.0, icon_color);
-                                        ui.painter().text(
-                                            icon_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            kind,
-                                            egui::FontId::proportional(12.0),
-                                            egui::Color32::WHITE,
-                                        );
-                                        ui.vertical(|ui| {
-                                            ui.set_max_width(
-                                                (ui.available_width() - 128.0).max(140.0),
-                                            );
-                                            ui.label(egui::RichText::new(title).strong());
-                                            ui.label(egui::RichText::new(detail).small());
-                                            ui.label(
-                                                egui::RichText::new(location)
-                                                    .small()
-                                                    .color(ui.visuals().weak_text_color()),
-                                            );
-                                            if row.missing {
-                                                ui.label(
-                                                    egui::RichText::new("見つかりません")
-                                                        .small()
-                                                        .color(egui::Color32::from_rgb(
-                                                            220, 130, 70,
-                                                        )),
-                                                );
-                                            }
-                                        });
-                                        ui.vertical(|ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    !row.missing,
-                                                    egui::Button::new("開く"),
-                                                )
-                                                .clicked()
-                                            {
-                                                open_row = Some(row.clone());
-                                            }
-                                            if ui
-                                                .add_enabled(
-                                                    self.bookmark_delete_pending.is_none(),
-                                                    egui::Button::new("削除"),
-                                                )
-                                                .clicked()
-                                            {
-                                                delete_row = Some(row.clone());
-                                            }
-                                        });
-                                    });
-                                });
-                            let response = inner.response.interact(egui::Sense::click());
-                            if response.clicked() {
-                                self.bookmark_browser_selected = Some(key);
-                            }
-                            if response.double_clicked() && !row.missing {
-                                open_row = Some(row.clone());
-                            }
-                            response.context_menu(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        self.bookmark_delete_pending.is_none(),
-                                        egui::Button::new("ブックマークを削除"),
-                                    )
-                                    .clicked()
-                                {
-                                    delete_row = Some(row.clone());
-                                    ui.close();
-                                }
-                            });
-                            ui.add_space(5.0);
-                        }
-                    });
-            });
-        self.show_bookmark_browser = window_open;
-
-        let delete_pressed =
-            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
-        if delete_pressed
-            && delete_row.is_none()
-            && let Some(key) = self.bookmark_browser_selected
-        {
-            delete_row = rows.iter().find(|row| row.stable_key() == key).cloned();
-        }
-        if let Some(row) = delete_row {
-            self.delete_bookmark_browser_row(&row);
-        }
-        if let Some(row) = open_row {
-            self.open_bookmark_browser_row(ctx, &row);
-        }
-    }
-
     // ── メニューバー ─────────────────────────────────────────────────
 
     /// メニューバーを描画し、ナビゲーション先とソート変更の有無を返す。
@@ -5664,6 +5410,9 @@ impl App {
                             for &order in &tb_sorts {
                                 let selected = if book_sort_locked {
                                     false
+                                } else if self.items_are_bookmark_view {
+                                    self.bookmark_view_sort
+                                        == crate::bookmark_browser::BookmarkViewSort::Normal(order)
                                 } else if self.items_are_rating_view {
                                     self.rating_view_sort
                                         == crate::rating_view::RatingViewSort::Normal(order)
@@ -5686,7 +5435,11 @@ impl App {
                                 if resp.clicked() && !selected {
                                     self.settings.sort_order = order;
                                     self.settings.save();
-                                    if self.items_are_rating_view {
+                                    if self.items_are_bookmark_view {
+                                        self.set_bookmark_view_sort(
+                                            crate::bookmark_browser::BookmarkViewSort::Normal(order),
+                                        );
+                                    } else if self.items_are_rating_view {
                                         self.set_rating_view_sort(
                                             crate::rating_view::RatingViewSort::Normal(order),
                                         );
@@ -5710,11 +5463,28 @@ impl App {
                                     }
                                 }
                             }
+                            if self.items_are_bookmark_view {
+                                for sort in [
+                                    crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc,
+                                    crate::bookmark_browser::BookmarkViewSort::CreatedAtAsc,
+                                ] {
+                                    let selected = self.bookmark_view_sort == sort;
+                                    let resp = ui.add_enabled(
+                                        !sort_disabled,
+                                        egui::Button::selectable(selected, sort.short_label()),
+                                    );
+                                    if resp.clicked() && !selected {
+                                        self.set_bookmark_view_sort(sort);
+                                    }
+                                }
+                            }
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
                             ui.add_enabled_ui(!sort_disabled, |ui| {
                                 let current_text = if book_sort_locked {
                                     "固定".to_string()
+                                } else if self.items_are_bookmark_view {
+                                    self.bookmark_view_sort.short_label().to_string()
                                 } else if self.items_are_rating_view {
                                     self.rating_view_sort.short_label().to_string()
                                 } else {
@@ -5727,7 +5497,10 @@ impl App {
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
                                         for &order in &tb_sorts {
-                                            let selected = if self.items_are_rating_view {
+                                            let selected = if self.items_are_bookmark_view {
+                                                self.bookmark_view_sort
+                                                    == crate::bookmark_browser::BookmarkViewSort::Normal(order)
+                                            } else if self.items_are_rating_view {
                                                 self.rating_view_sort
                                                     == crate::rating_view::RatingViewSort::Normal(order)
                                             } else {
@@ -5740,7 +5513,11 @@ impl App {
                                             {
                                                 self.settings.sort_order = order;
                                                 self.settings.save();
-                                                if self.items_are_rating_view {
+                                                if self.items_are_bookmark_view {
+                                                    self.set_bookmark_view_sort(
+                                                        crate::bookmark_browser::BookmarkViewSort::Normal(order),
+                                                    );
+                                                } else if self.items_are_rating_view {
                                                     self.set_rating_view_sort(
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
@@ -5762,6 +5539,22 @@ impl App {
                                                     && !selected
                                                 {
                                                     self.set_rating_view_sort(sort);
+                                                }
+                                            }
+                                        }
+                                        if self.items_are_bookmark_view {
+                                            ui.separator();
+                                            for sort in [
+                                                crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc,
+                                                crate::bookmark_browser::BookmarkViewSort::CreatedAtAsc,
+                                            ] {
+                                                let selected = self.bookmark_view_sort == sort;
+                                                if ui
+                                                    .selectable_label(selected, sort.short_label())
+                                                    .clicked()
+                                                    && !selected
+                                                {
+                                                    self.set_bookmark_view_sort(sort);
                                                 }
                                             }
                                         }
@@ -7009,6 +6802,7 @@ impl App {
         let mut non_place_facet_changed = false;
         let mut rating_changed = false;
         let mut color_changed = false;
+        let mut bookmark_filter_changed = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
@@ -7019,6 +6813,47 @@ impl App {
                 show_sticky_context_menu(&filter_label_response, |ui| {
                     self.draw_facet_filter_bar_settings_menu(ui);
                 });
+                if self.items_are_bookmark_view {
+                    egui::ComboBox::from_id_salt("bookmark_grid_media_filter")
+                        .selected_text(format!(
+                            "ブックマーク種別: {}",
+                            self.bookmark_media_filter.label()
+                        ))
+                        .show_ui(ui, |ui| {
+                            for filter in crate::bookmark_browser::MediaFilter::ALL {
+                                bookmark_filter_changed |= ui
+                                    .selectable_value(
+                                        &mut self.bookmark_media_filter,
+                                        filter,
+                                        filter.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    if matches!(
+                        self.bookmark_media_filter,
+                        crate::bookmark_browser::MediaFilter::All
+                            | crate::bookmark_browser::MediaFilter::Book
+                    ) {
+                        egui::ComboBox::from_id_salt("bookmark_grid_book_kind_filter")
+                            .selected_text(format!(
+                                "本: {}",
+                                self.bookmark_book_kind_filter.label()
+                            ))
+                            .show_ui(ui, |ui| {
+                                for filter in crate::bookmark_browser::BookKindFilter::ALL {
+                                    bookmark_filter_changed |= ui
+                                        .selectable_value(
+                                            &mut self.bookmark_book_kind_filter,
+                                            filter,
+                                            filter.label(),
+                                        )
+                                        .changed();
+                                }
+                            });
+                    }
+                    ui.separator();
+                }
                 let mut facet_items = crate::settings::ToolbarFacetFilterItem::visible_order(
                     &self.settings.toolbar_facet_filter_items,
                 );
@@ -7111,7 +6946,16 @@ impl App {
                 }
 
                 let rating_filter_visible = self.rating_filter_active() && !self.items_are_rating_view;
-                if self.facet_filter_active() || rating_filter_visible || self.color_filter.enabled {
+                let bookmark_filter_active = self.items_are_bookmark_view
+                    && (self.bookmark_media_filter
+                        != crate::bookmark_browser::MediaFilter::All
+                        || self.bookmark_book_kind_filter
+                            != crate::bookmark_browser::BookKindFilter::All);
+                if self.facet_filter_active()
+                    || rating_filter_visible
+                    || self.color_filter.enabled
+                    || bookmark_filter_active
+                {
                     ui.separator();
                     self.draw_facet_active_chips(ui);
                     self.draw_color_filter_active_chip(ui);
@@ -7127,6 +6971,13 @@ impl App {
                         if self.color_filter.enabled {
                             self.color_filter.clear_filter();
                             color_changed = true;
+                        }
+                        if bookmark_filter_active {
+                            self.bookmark_media_filter =
+                                crate::bookmark_browser::MediaFilter::All;
+                            self.bookmark_book_kind_filter =
+                                crate::bookmark_browser::BookKindFilter::All;
+                            bookmark_filter_changed = true;
                         }
                     }
                 }
@@ -7168,6 +7019,9 @@ impl App {
             } else {
                 self.rebuild_visible_indices();
             }
+        }
+        if bookmark_filter_changed {
+            self.rebuild_visible_indices();
         }
     }
 
@@ -8468,10 +8322,7 @@ impl App {
         let candidate_count = indices.len();
         let mut counts = BTreeMap::new();
         for idx in indices {
-            let Some(item) = self.items.get(idx) else {
-                continue;
-            };
-            let Some(path) = self.facet_place_path_for_item(item) else {
+            let Some(path) = self.facet_place_path_for_idx(idx) else {
                 continue;
             };
             let key = crate::adjustment_db::normalize_path(&path);
@@ -10078,6 +9929,12 @@ impl App {
             self.selected = Some(idx);
             self.update_last_selected_image();
         }
+        if response.double_clicked() && self.items_are_bookmark_view {
+            if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
+                self.open_bookmark_browser_row(ctx, &row);
+            }
+            return None;
+        }
         if response.double_clicked() && self.guard_reading_history_open(idx) {
             // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
             self.note_reading_history_open(idx);
@@ -10866,13 +10723,68 @@ impl App {
         });
     }
 
+    fn draw_bookmark_view_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize) {
+        let Some(row) = self.bookmark_view_row(idx) else {
+            return;
+        };
+        let badge = if row.missing {
+            format!("! {}", row.badge_label())
+        } else {
+            row.badge_label()
+        };
+        let font = egui::FontId::proportional(11.0);
+        let text_size = ui
+            .painter()
+            .layout_no_wrap(badge.clone(), font.clone(), egui::Color32::WHITE)
+            .size();
+        let badge_rect = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(5.0, 5.0),
+            text_size + egui::vec2(10.0, 5.0),
+        );
+        let fill = if row.missing {
+            egui::Color32::from_rgb(180, 70, 50)
+        } else {
+            egui::Color32::from_black_alpha(190)
+        };
+        ui.painter().rect_filled(badge_rect, 4.0, fill);
+        ui.painter().text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            badge,
+            font,
+            egui::Color32::WHITE,
+        );
+        let source = row.source_path().display().to_string();
+        let position = row.position_label();
+        let registered = format_details_mtime(
+            row.created_at_ms.div_euclid(1000),
+            self.settings.details_timestamp_show_seconds,
+        );
+        let response = ui.interact(
+            rect,
+            ui.id().with(("bookmark_view_tooltip", idx)),
+            egui::Sense::hover(),
+        );
+        response.on_hover_ui_at_pointer(|ui| {
+            ui.label(format!("場所 {source}"));
+            ui.label(format!("位置 {position}"));
+            ui.label(format!("登録日時 {registered}"));
+        });
+    }
+
     fn details_header_title(
         &self,
         col: DetailsColumn,
         book_sort_locked: bool,
         show_sort_indicator: bool,
     ) -> String {
-        let mut base_title = if self.items_are_reading_history_view {
+        let mut base_title = if self.items_are_bookmark_view {
+            match col {
+                DetailsColumn::Modified => "登録日時".to_string(),
+                DetailsColumn::State => "位置".to_string(),
+                _ => col.title().to_string(),
+            }
+        } else if self.items_are_reading_history_view {
             match col {
                 DetailsColumn::Modified => "最終閲覧".to_string(),
                 DetailsColumn::State => "既読位置".to_string(),
@@ -11281,7 +11193,10 @@ impl App {
     ) -> String {
         match column {
             DetailsColumn::Preview => String::new(),
-            DetailsColumn::Name => item.name().into_owned(),
+            DetailsColumn::Name => self
+                .bookmark_view_row(idx)
+                .map(crate::bookmark_browser::BookmarkBrowserRow::display_name)
+                .unwrap_or_else(|| item.name().into_owned()),
             DetailsColumn::Rating => {
                 let rating = if self.items_are_drive_list {
                     0
@@ -11307,7 +11222,16 @@ impl App {
                 })
                 .unwrap_or_default(),
             DetailsColumn::Modified => {
-                if self.items_are_reading_history_view {
+                if self.items_are_bookmark_view {
+                    self.bookmark_view_row(idx)
+                        .map(|row| {
+                            format_details_mtime(
+                                row.created_at_ms.div_euclid(1000),
+                                self.settings.details_timestamp_show_seconds,
+                            )
+                        })
+                        .unwrap_or_default()
+                } else if self.items_are_reading_history_view {
                     self.reading_history_last_read_for_idx(idx)
                         .unwrap_or_default()
                 } else {
@@ -11551,6 +11475,12 @@ impl App {
     }
 
     fn details_state_text(&mut self, idx: usize) -> String {
+        if self.items_are_bookmark_view {
+            return self
+                .bookmark_view_row(idx)
+                .map(crate::bookmark_browser::BookmarkBrowserRow::position_label)
+                .unwrap_or_default();
+        }
         if self.items_are_reading_history_view {
             return self
                 .reading_history_progress_for_idx(idx)
@@ -11616,7 +11546,13 @@ impl App {
                     // Drop されて worker が cancel する。
                     let loading = self.zip_enumerate_pending.is_some()
                         || self.pdf_enumerate_pending.is_some();
-                    let msg = if global_searching {
+                    let msg = if self.items_are_bookmark_view
+                        && self.bookmark_browser_pending.is_some()
+                    {
+                        "ブックマークを読み込み中…"
+                    } else if self.items_are_bookmark_view {
+                        "ブックマークはありません"
+                    } else if global_searching {
                         "検索中"
                     } else if loading {
                         "読み込み中…"
@@ -11629,7 +11565,8 @@ impl App {
                     // 空フォルダでも右クリックでフォルダ操作可能にする
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
-                    if ui.rect_contains_pointer(ui.max_rect())
+                    if !self.items_are_bookmark_view
+                        && ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
                         && !self.mouse_ring_context_menu_suppressed(ctx)
                     {
@@ -11679,7 +11616,9 @@ impl App {
                 if self.visible_indices.is_empty() {
                     self.pending_grid_scroll = None;
                     ui.centered_and_justified(|ui| {
-                        ui.label(if global_searching {
+                        ui.label(if self.items_are_bookmark_view {
+                            "条件に一致するブックマークはありません"
+                        } else if global_searching {
                             "検索中"
                         } else {
                             "検索結果なし"
@@ -11687,7 +11626,8 @@ impl App {
                     });
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
-                    if ui.rect_contains_pointer(ui.max_rect())
+                    if !self.items_are_bookmark_view
+                        && ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
                         && !self.mouse_ring_context_menu_suppressed(ctx)
                     {
@@ -11936,6 +11876,7 @@ impl App {
                                 }
 
                                 self.draw_reading_history_tooltip(ui, cell_rect, idx);
+                                self.draw_bookmark_view_overlay(ui, cell_rect, idx);
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
                                 if self.selected == Some(idx) {
@@ -12046,15 +11987,28 @@ impl App {
 
         let idx = self.selected?;
         let item = self.items.get(idx)?;
+        let bookmark_row = self.bookmark_view_row(idx);
         let mut lines = Vec::new();
         if self.settings.thumb_tooltip_show_filename {
-            let name = item.name().into_owned();
+            let name = bookmark_row
+                .map(crate::bookmark_browser::BookmarkBrowserRow::display_name)
+                .unwrap_or_else(|| item.name().into_owned());
             if !name.is_empty() {
                 lines.push(name);
             }
         }
         if let Some(history_lines) = self.reading_history_selection_info_lines(idx) {
             lines.push(history_lines.join("   "));
+        }
+        if let Some(row) = bookmark_row {
+            lines.push(format!(
+                "位置 {}   登録日時 {}",
+                row.position_label(),
+                format_details_mtime(
+                    row.created_at_ms.div_euclid(1000),
+                    self.settings.details_timestamp_show_seconds,
+                )
+            ));
         }
 
         let mut fields = Vec::new();
@@ -12178,7 +12132,9 @@ impl App {
             }
         }
         if self.settings.thumb_tooltip_show_full_location {
-            if let Some(path) = self.facet_place_path_for_item(item) {
+            if let Some(row) = bookmark_row {
+                full_location_line = Some(format!("場所 {}", row.source_path().display()));
+            } else if let Some(path) = self.facet_place_path_for_item(item) {
                 let location = self.facet_place_label_for_path(&path);
                 if !location.is_empty() {
                     full_location_line = Some(format!("場所 {location}"));

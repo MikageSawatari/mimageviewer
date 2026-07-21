@@ -227,6 +227,7 @@ pub(crate) enum TopLevelGridRestore {
     Folder(PathBuf),
     DriveList,
     ReadingHistory,
+    Bookmarks,
     Rating { stars: u8 },
     SubfolderExpansion(SubfolderExpansionRestoreState),
     SmartFolder(SmartFolderViewState),
@@ -249,6 +250,8 @@ impl TopLevelGridRestore {
             Self::DriveList
         } else if crate::folder_tree::path_eq(&path, &super::reading_history_synthetic_path()) {
             Self::ReadingHistory
+        } else if crate::folder_tree::path_eq(&path, &super::bookmark_view_synthetic_path()) {
+            Self::Bookmarks
         } else if crate::folder_tree::path_eq(&path, &super::rating_view_synthetic_path()) {
             rating_view_stars
                 .filter(|stars| (1..=5).contains(stars))
@@ -272,6 +275,7 @@ impl TopLevelGridRestore {
             Self::Folder(path) => Some(path.clone()),
             Self::DriveList => Some(super::drive_list_synthetic_path()),
             Self::ReadingHistory => Some(super::reading_history_synthetic_path()),
+            Self::Bookmarks => Some(super::bookmark_view_synthetic_path()),
             Self::Rating { .. } => Some(super::rating_view_synthetic_path()),
             Self::SubfolderExpansion(_) => Some(super::subfolder_expansion_synthetic_path()),
             Self::SmartFolder(state) => Some(super::smart_folder::smart_folder_synthetic_path(
@@ -304,6 +308,7 @@ pub(crate) enum TopLevelGridSurface {
     SubfolderExpansion,
     SmartFolder(SmartFolderViewState),
     ReadingHistory,
+    Bookmarks,
     Rating { stars: u8 },
 }
 
@@ -461,6 +466,21 @@ mod tests {
         assert!(matches!(
             view.return_to(),
             Some(TopLevelGridRestore::Folder(path)) if path == Path::new(r"D:\origin")
+        ));
+    }
+
+    #[test]
+    fn bookmark_synthetic_path_restores_bookmark_surface() {
+        let restore = TopLevelGridRestore::from_legacy_parts(
+            Some(super::super::bookmark_view_synthetic_path()),
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(restore, TopLevelGridRestore::Bookmarks));
+        assert!(crate::folder_tree::path_eq(
+            &restore.legacy_path().expect("bookmark path"),
+            &super::super::bookmark_view_synthetic_path()
         ));
     }
 }

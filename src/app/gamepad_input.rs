@@ -5759,7 +5759,7 @@ impl App {
         entries.iter().position(|entry| match &entry.nav {
             GamepadLocationNav::DriveList => self.items_are_drive_list,
             GamepadLocationNav::ReadingHistory => self.items_are_reading_history_view,
-            GamepadLocationNav::Bookmarks => self.show_bookmark_browser,
+            GamepadLocationNav::Bookmarks => self.items_are_bookmark_view,
             GamepadLocationNav::RatingView(stars) => {
                 self.items_are_rating_view && self.rating_view_stars == *stars
             }
