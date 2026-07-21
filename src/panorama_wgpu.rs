@@ -10,7 +10,8 @@
 //! - 静的リソース ([`PanoStaticGpu`]) は `target_format` 単位で 1 つだけ作る
 //! - `BindGroup` は [`UploadedPanoTexture`] 構築時に焼き付ける (毎フレーム再生成しない)
 //!
-//! Phase 1 では mipmap / 異方性フィルタ無し、Linear + Repeat(U)/ClampToEdge(V) のみ。
+//! Base texture uses a complete mip chain with trilinear filtering. The screen-sized
+//! settle overlay remains single-level; anisotropic filtering is not used.
 
 use std::sync::Arc;
 
@@ -205,6 +206,7 @@ pub struct PanoStaticGpu {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub sampler: wgpu::Sampler,
+    mipmap_generator: egui_wgpu::MipmapGenerator,
 }
 
 impl PanoStaticGpu {
@@ -275,7 +277,7 @@ impl PanoStaticGpu {
             cache: None,
         });
         // U 方向は経度ラップ (Repeat)、V 方向は極でクランプ (ClampToEdge)。
-        // Linear + mipmap_filter=Nearest (Phase 1 は mipmap 無し)。
+        // 広角 FOV での強い縮小に備えて、mip level 間も Linear 補間する。
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("miv_panorama_sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -283,7 +285,7 @@ impl PanoStaticGpu {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         Self {
@@ -291,6 +293,7 @@ impl PanoStaticGpu {
             pipeline,
             bind_group_layout,
             sampler,
+            mipmap_generator: egui_wgpu::MipmapGenerator::new(device),
         }
     }
 
@@ -304,6 +307,7 @@ impl PanoStaticGpu {
     /// **コスト見積もり** (8K = 8192×4096 RGBA8 = 134 MB):
     /// - `create_texture`: ~1 ms
     /// - `queue.write_texture`: ~10-30 ms (PCIe 転送)
+    /// - mip chain generation: GPU render passes (level 0 に対して約 1/3 texel 追加)
     /// - `create_bind_group`: <1 ms
     pub fn create_uploaded_texture(
         &self,
@@ -323,11 +327,13 @@ impl PanoStaticGpu {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("miv_panorama_texture"),
             size: extent,
-            mip_level_count: 1,
+            mip_level_count: egui_wgpu::mip_level_count(width, height),
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         queue.write_texture(
@@ -345,6 +351,7 @@ impl PanoStaticGpu {
             },
             extent,
         );
+        self.mipmap_generator.generate(device, queue, &texture);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Uniform buffer は paint() の前 (prepare()) で毎フレーム write_buffer される。

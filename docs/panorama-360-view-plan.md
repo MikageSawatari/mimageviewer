@@ -206,9 +206,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 ### 3.4 サンプリング品質
 
 - **ミップマップ**: 広角 (FOV 大) で 1 ピクセルが多数のテクセルを覆うとモアレが
-  出る。リリース版ではミップマップを生成する (`mip_level_count > 1`、
-  `queue.write_texture` 後に compute / blit でダウンサンプル、または `image` クレートで
-  CPU 側生成してから全レベル `write_texture`)。
+  出る。8K baseは`vendor/egui-wgpu`と共用するGPU生成器で、level 0 upload後に完全な
+  mip chainを生成し、Linearのlevel間補間でsampleする。画面解像度相当のsettle overlayは
+  縮小表示しないため1 mipのままとする。
 - **異方性フィルタ**: wgpu 0.x で wgpu の `Sampler` に `anisotropy_clamp` を渡せるが、
   optional feature の `ANISOTROPIC_FILTERING` が必要 (`docs/video-architecture.md` で
   すでに使われているか要確認、未使用なら追加負担あり)。**Phase 1 では mipmap +
@@ -2039,7 +2039,7 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 
 **スコープ**: 8K base + WGSL equirect 描画 + UI トグル + GPano XMP 検出。
 **含まれないもの (Phase 2a 以降)**: settle-refinement / フル RGBA 保持 /
-mipmap / ミニコンパス / 慣性ドラッグ。
+ミニコンパス / 慣性ドラッグ。mipmapは共通GPU生成器の導入後に8K baseへ追加済み。
 
 - [ ] `src/xmp_reader.rs` に GPano パーサ追加: `read_panorama_info(path)` +
       `read_panorama_info_from_bytes(bytes)` + `XmpPanoramaInfo` 型 (Codex P2 反映)

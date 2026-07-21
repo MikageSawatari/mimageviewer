@@ -26,6 +26,7 @@ mod renderer;
 
 mod setup;
 
+pub use mipmap::{MipmapGenerator, mip_chain_texel_count, mip_level_count};
 pub use renderer::*;
 pub use setup::{NativeAdapterSelectorMethod, WgpuSetup, WgpuSetupCreateNew, WgpuSetupExisting};
 

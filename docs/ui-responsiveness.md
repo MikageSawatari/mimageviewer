@@ -155,6 +155,9 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 render pass で mip chain も生成する。CPU resize や I/O は増えないが、GPU upload slot 1 件あたりの
 仕事量と VRAM は増える（完全な chain は level 0 の約 1/3 追加）。したがって mipmap 対象を同じ
 `fs_upload_backlog` のペーシング下に置き、サムネイルや animated frame へは広げない。
+wipe/diff比較はpair生成時、360度パノラマはbase upload時だけ同じGPU生成を行う。360のsettle
+overlayは画面解像度相当なので1 mipのままにする。連結読みのtexel上限は完全なmip chainと
+同時保持する後段表示textureを含めて見積もる。
 
 ### 3.2 サムネイルアップロードは per-frame スロットリング不要
 

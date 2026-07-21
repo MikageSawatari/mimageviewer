@@ -79,6 +79,7 @@ struct CompareGpuResources {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    mipmap_generator: egui_wgpu::MipmapGenerator,
     pairs: HashMap<u64, CompareGpuPair>,
 }
 
@@ -177,7 +178,7 @@ impl CompareGpuResources {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         Self {
@@ -185,6 +186,7 @@ impl CompareGpuResources {
             pipeline,
             bind_group_layout,
             sampler,
+            mipmap_generator: egui_wgpu::MipmapGenerator::new(device),
             pairs: HashMap::new(),
         }
     }
@@ -211,6 +213,7 @@ impl CompareGpuResources {
                 callback.width,
                 callback.height,
                 &callback.pinned_rgba,
+                &self.mipmap_generator,
             );
             let current = upload_rgba_texture(
                 device,
@@ -219,6 +222,7 @@ impl CompareGpuResources {
                 callback.width,
                 callback.height,
                 &callback.current_rgba,
+                &self.mipmap_generator,
             );
             let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("miv_compare_uniform"),
@@ -284,6 +288,7 @@ fn upload_rgba_texture(
     width: u32,
     height: u32,
     rgba: &[u8],
+    mipmap_generator: &egui_wgpu::MipmapGenerator,
 ) -> UploadedTexture {
     let size = wgpu::Extent3d {
         width,
@@ -293,11 +298,13 @@ fn upload_rgba_texture(
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size,
-        mip_level_count: 1,
+        mip_level_count: egui_wgpu::mip_level_count(width, height),
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     queue.write_texture(
@@ -315,6 +322,7 @@ fn upload_rgba_texture(
         },
         size,
     );
+    mipmap_generator.generate(device, queue, &texture);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     UploadedTexture { texture, view }
 }

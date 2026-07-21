@@ -642,7 +642,8 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 
 - `DISPLAY_IMAGE_TEXTURE_OPTIONS` を指定した managed texture は、ローカル差し替えした
   `vendor/egui-wgpu` が level 0 upload 後に完全な mip chain を GPU render pass で生成する。
-- 対象は raw static、PDF/ZIP page、編集・補正・AI・注釈・比較用の表示 texture。1 つの
+- 対象は raw static、PDF/ZIP page、編集・補正・AI・注釈・比較用の表示 texture。Windowsの
+  wipe/diff比較と360度パノラマの独自`Rgba8Unorm` textureも同じGPU生成器を使う。1つの
   `TextureHandle` 内に全 level を保持するので、表示 texture の優先順位、論理サイズ、zoom、
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な

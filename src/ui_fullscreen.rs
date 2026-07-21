@@ -659,7 +659,8 @@ const VERTICAL_READING_MAX_VISIBLE_PAGES: usize = 16;
 const VERTICAL_READING_PREFETCH_PAD: usize = 2;
 /// 連結読み: fs_cache に残すページ数上限。
 const VERTICAL_READING_MAX_CACHE_PAGES: usize = 20;
-/// 連結読み: fs_cache に残すテクスチャの推定総ピクセル数上限。
+/// 連結読み: raw + 後段表示キャッシュに残すテクスチャの推定総 texel 数上限。
+/// mipmap 対象は完全な chain を含め、同じ TextureId の clone は重複計上しない。
 const VERTICAL_READING_MAX_CACHE_TEXELS: usize = 320_000_000;
 /// 連結読み: final composite / comic 合成を新規生成するページ数の 1 フレーム上限。
 const VERTICAL_READING_PROCESSED_UPLOADS_PER_FRAME: usize = 1;
@@ -669,6 +670,43 @@ const ZOOM_NEAR_ONE: f32 = 1.001;
 const TRANSFORM_EPSILON: f32 = 0.001;
 /// パンがゼロとみなせるしきい値（length_sq）
 const PAN_EPSILON_SQ: f32 = 0.25;
+
+fn texture_size_texels(size: [usize; 2], mipmapped: bool) -> usize {
+    let width = u32::try_from(size[0].max(1)).unwrap_or(u32::MAX);
+    let height = u32::try_from(size[1].max(1)).unwrap_or(u32::MAX);
+    if mipmapped {
+        usize::try_from(egui_wgpu::mip_chain_texel_count(width, height)).unwrap_or(usize::MAX)
+    } else {
+        size[0].max(1).saturating_mul(size[1].max(1))
+    }
+}
+
+fn add_texture_texels(
+    seen: &mut std::collections::HashSet<egui::TextureId>,
+    total: &mut usize,
+    texture: &egui::TextureHandle,
+    mipmapped: bool,
+) {
+    if seen.insert(texture.id()) {
+        *total = total.saturating_add(texture_size_texels(texture.size(), mipmapped));
+    }
+}
+
+fn add_fs_cache_entry_texels(
+    seen: &mut std::collections::HashSet<egui::TextureId>,
+    total: &mut usize,
+    entry: &FsCacheEntry,
+) {
+    match entry {
+        FsCacheEntry::Static { tex, .. } => add_texture_texels(seen, total, tex, true),
+        FsCacheEntry::Animated { frames, .. } => {
+            for (texture, _) in frames {
+                add_texture_texels(seen, total, texture, false);
+            }
+        }
+        FsCacheEntry::Failed | FsCacheEntry::Video { .. } => {}
+    }
+}
 /// バー内ボタンのサイズ
 pub(crate) const BAR_BUTTON_SIZE: f32 = 32.0;
 /// バー内ボタンの上下マージン
@@ -15014,20 +15052,34 @@ impl App {
     }
 
     fn vertical_reading_loaded_texels(&self, idx: usize) -> usize {
-        match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { tex, .. }) => {
-                let s = tex.size_vec2();
-                (s.x.max(1.0) as usize).saturating_mul(s.y.max(1.0) as usize)
-            }
-            Some(FsCacheEntry::Animated { frames, .. }) => frames
-                .iter()
-                .map(|(tex, _)| {
-                    let s = tex.size_vec2();
-                    (s.x.max(1.0) as usize).saturating_mul(s.y.max(1.0) as usize)
-                })
-                .sum(),
-            _ => 0,
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0usize;
+
+        if let Some(entry) = self.fs_cache.get(&idx) {
+            add_fs_cache_entry_texels(&mut seen, &mut total, entry);
         }
+        if let Some(entry) = self.adjustment_cache.get(&idx) {
+            add_fs_cache_entry_texels(&mut seen, &mut total, entry);
+        }
+        for (key, entry) in &self.edit_result_cache {
+            if key.idx == idx
+                && let Some(texture) = entry.texture.as_ref()
+            {
+                add_texture_texels(&mut seen, &mut total, texture, true);
+            }
+        }
+        for (key, entry) in &self.final_composite_cache {
+            if key.edit_key.idx == idx {
+                // Nearest の level-0 texture もここでは完全 chain として保守的に見積もる。
+                // TextureHandle から sampler options は取得できず、過大見積もりは安全側になる。
+                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+            }
+        }
+        if let Some(entry) = self.comic_cache.get(&idx) {
+            add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+        }
+
+        total
     }
 
     fn continuous_visible_page_count(
@@ -25086,6 +25138,14 @@ mod tests {
     fn vertical_reading_offsets_center_current_page() {
         let offsets = vertical_reading_offsets(&[100.0, 100.0, 100.0], 10.0, 1);
         assert_eq!(offsets, vec![-110.0, 0.0, 110.0]);
+    }
+
+    #[test]
+    fn mipmapped_texture_texel_estimate_counts_complete_chain() {
+        assert_eq!(texture_size_texels([1, 1], true), 1);
+        assert_eq!(texture_size_texels([4, 3], true), 15);
+        assert_eq!(texture_size_texels([4, 3], false), 12);
+        assert_eq!(texture_size_texels([3, 1], true), 4);
     }
 
     #[test]

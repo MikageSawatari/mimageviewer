@@ -28,6 +28,8 @@
 - sampler の `mipmap_filter` は `TextureFilter::{Nearest, Linear}` に追従する。
 - `mipmap_mode = None` の texture view は level 0 だけを公開し、従来挙動を保つ。
 - partial update を受けた mip texture は全下位 level を再生成する。
+- 同じ `Rgba8Unorm` 生成器を公開APIとして、比較 callback と360度パノラマの独自
+  wgpu textureでも共用する。
 
 生成は `Queue::write_texture` と同じ queue に submit するため順序が保たれる。CPU resize や
 追加 I/O は行わない。完全な mip chain の追加 VRAM は元 texture の約 1/3。
@@ -39,6 +41,10 @@
 - `fs_cache` の通常画像 / ZIP 画像 / PDF ページ / static panorama
 - edit、消しゴム、補正レイヤー、隠蔽、注釈、AI、final composite の表示 texture
 - 比較表示の pinned/current/diff texture
+
+Windowsのwipe/diff比較と360度パノラマはmanaged `TextureHandle`を使わず独自に
+`Rgba8Unorm` textureを作るため、同じGPU生成器で完全なmip chainを構築し、trilinear samplingする。
+画面解像度で描く360度パノラマのsettle overlayは1 mipのままとする。
 
 サムネイル、animated GIF/APNG/WebP の各 frame、動画、mask、checker、UI/font preview、
 `PostFilter::Nearest` は opt-in しない。これにより小 texture や頻繁に更新する texture の
@@ -53,6 +59,12 @@
 - texture cache の invalidation は従来どおり `TextureHandle` 単位。再 upload 時に mip chain も
   一緒に作り直されるため、LOD 専用の世代管理は追加しない。
 - `PostFilter::Nearest` は level 0 + nearest sampler のままとし、意図したドット表示を守る。
+- 連結読みの320M texel上限は、raw staticの完全なmip chainに加え、同時保持するedit、
+  final composite、comic、補正textureもTextureIdで重複排除して見積もる。animated frameは従来どおり
+  level 0だけを数える。
+- 表示トリムは画像全体から生成したmipを部分UVで描く。強い縮小時は、切り落とした余白色が
+  境界の低LOD texelへ混ざる可能性があるが、通常は画面上1〜2px程度であり、専用crop textureの
+  キャッシュ複雑化を避けるためv2.7.0では既知制約として受容する。
 
 ## 4. 旧手動縮小フィルタの撤去
 
@@ -68,6 +80,8 @@
 - 1/2 より大きい縮小率のトーン画像で、従来より周期的なモアレが減ること。
 - fit、見開き、縦横連結、ズーム往復、ルーペ、pixel grid の寸法と位置が変わらないこと。
 - 補正、AI、消しゴム、隠蔽、注釈の結果更新後も古い mip level が残らないこと。
+- Windowsのwipe/diff比較と360度パノラマを大縮小してもモアレが再発しないこと。
+- 連結読みの320M texel上限が完全なmip chainと後段表示textureを含むこと。
 - `Nearest`、animated image、動画、サムネイルの挙動が変わらないこと。
 - 旧 `downscale2x` / `downscale4x` を含む保存設定が `None` でロードできること。
 

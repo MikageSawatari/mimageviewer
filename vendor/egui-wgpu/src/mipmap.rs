@@ -1,12 +1,17 @@
 use std::borrow::Cow;
 
-pub(crate) struct MipmapGenerator {
+/// GPU mip-chain generator for two-dimensional `Rgba8Unorm` textures.
+///
+/// The texture must include [`wgpu::TextureUsages::TEXTURE_BINDING`] and
+/// [`wgpu::TextureUsages::RENDER_ATTACHMENT`]. Level 0 must be populated before
+/// calling [`Self::generate`].
+pub struct MipmapGenerator {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl MipmapGenerator {
-    pub(crate) fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
         profiling::function_scope!();
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -71,12 +76,7 @@ impl MipmapGenerator {
         }
     }
 
-    pub(crate) fn generate(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        texture: &wgpu::Texture,
-    ) {
+    pub fn generate(&self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) {
         profiling::function_scope!();
 
         let mip_level_count = texture.mip_level_count();
@@ -134,13 +134,33 @@ impl MipmapGenerator {
     }
 }
 
-pub(crate) fn mip_level_count(width: u32, height: u32) -> u32 {
+/// Number of mip levels in a complete chain down to `1 x 1`.
+pub fn mip_level_count(width: u32, height: u32) -> u32 {
     u32::BITS - width.max(height).max(1).leading_zeros()
+}
+
+/// Exact number of texels allocated by a complete mip chain.
+///
+/// Unlike the common `4 / 3` approximation, this also handles odd and highly
+/// asymmetric dimensions. Saturation keeps the helper total for arbitrary
+/// `u32` inputs even though real GPU texture limits are much smaller.
+pub fn mip_chain_texel_count(width: u32, height: u32) -> u64 {
+    let mut width = u64::from(width.max(1));
+    let mut height = u64::from(height.max(1));
+    let mut total = 0_u64;
+    loop {
+        total = total.saturating_add(width.saturating_mul(height));
+        if width == 1 && height == 1 {
+            return total;
+        }
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::mip_level_count;
+    use super::{mip_chain_texel_count, mip_level_count};
 
     #[test]
     fn mip_count_reaches_one_by_one() {
@@ -149,5 +169,15 @@ mod tests {
         assert_eq!(mip_level_count(3, 1), 2);
         assert_eq!(mip_level_count(4, 3), 3);
         assert_eq!(mip_level_count(8192, 5000), 14);
+    }
+
+    #[test]
+    fn mip_texel_count_uses_exact_level_dimensions() {
+        assert_eq!(mip_chain_texel_count(1, 1), 1);
+        assert_eq!(mip_chain_texel_count(2, 1), 3);
+        assert_eq!(mip_chain_texel_count(3, 1), 4);
+        assert_eq!(mip_chain_texel_count(4, 3), 15);
+        assert_eq!(mip_chain_texel_count(0, 0), 1);
+        assert_eq!(mip_chain_texel_count(u32::MAX, u32::MAX), u64::MAX);
     }
 }
