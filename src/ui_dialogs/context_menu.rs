@@ -47,6 +47,36 @@ enum DeleteConfirmAction {
     Cancel,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DeleteConfirmModalResponse {
+    delete_clicked: bool,
+    cancel_clicked: bool,
+}
+
+/// 削除確認をモーダル表示し、背面 UI への pointer 入力を backdrop で遮断する。
+///
+/// backdrop のクリックは閉じる操作にせず吸収する。破壊的操作の確認結果は、明示的な
+/// ボタンまたは `consume_delete_confirm_action` が扱う Y / N / Esc だけで決める。
+fn show_delete_confirm_modal(ctx: &egui::Context, label: &str) -> DeleteConfirmModalResponse {
+    let mut response = DeleteConfirmModalResponse::default();
+    egui::Modal::new(egui::Id::new("delete_confirm_modal")).show(ctx, |ui| {
+        ui.set_min_width(320.0);
+        ui.heading("削除の確認");
+        ui.add_space(8.0);
+        ui.label(label);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("削除[Y]").clicked() {
+                response.delete_clicked = true;
+            }
+            if ui.button("キャンセル[N]").clicked() {
+                response.cancel_clicked = true;
+            }
+        });
+    });
+    response
+}
+
 fn resolve_delete_confirm_action(
     y_pressed: bool,
     n_pressed: bool,
@@ -1972,33 +2002,15 @@ impl crate::app::App {
         }
         let label = self.delete_confirm_label.clone().unwrap_or_default();
 
-        // CLAUDE.md の IME 定型どおり Window closure の前で capture する。
+        // CLAUDE.md の IME 定型どおり Modal closure の前で capture する。
         let ime_active = self.ime_input_active();
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let key_action = consume_delete_confirm_action(ctx, ime_active, escape_pressed);
-        let mut open = true;
-        let mut delete_clicked = false;
-        let mut cancel_clicked = false;
-        egui::Window::new("削除の確認")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(&label);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("削除[Y]").clicked() {
-                        delete_clicked = true;
-                    }
-                    if ui.button("キャンセル[N]").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
+        let modal_response = show_delete_confirm_modal(ctx, &label);
 
-        let action = if cancel_clicked || !open || key_action == DeleteConfirmAction::Cancel {
+        let action = if modal_response.cancel_clicked || key_action == DeleteConfirmAction::Cancel {
             DeleteConfirmAction::Cancel
-        } else if delete_clicked || key_action == DeleteConfirmAction::Delete {
+        } else if modal_response.delete_clicked || key_action == DeleteConfirmAction::Delete {
             DeleteConfirmAction::Delete
         } else {
             DeleteConfirmAction::None
@@ -2836,6 +2848,44 @@ mod delete_confirm_tests {
             resolve_delete_confirm_action(false, true, false, true),
             DeleteConfirmAction::None
         );
+    }
+
+    #[test]
+    fn delete_confirm_modal_blocks_background_pointer_action() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let background_clicked = Arc::new(AtomicBool::new(false));
+        let clicked_in_ui = Arc::clone(&background_clicked);
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if ui.button("Background action").clicked() {
+                        clicked_in_ui.store(true, Ordering::Relaxed);
+                    }
+                });
+                let _ = show_delete_confirm_modal(ctx, "sample.jpg をゴミ箱に移動しますか？");
+            });
+
+        harness.get_by_label("Background action").click();
+        harness.run();
+        assert!(
+            !background_clicked.load(Ordering::Relaxed),
+            "削除確認の backdrop は背面ボタンへの pointer 操作を遮断する"
+        );
+        harness.snapshot("delete_confirm_modal_blocks_background_light");
     }
 
     #[test]
