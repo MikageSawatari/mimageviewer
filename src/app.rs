@@ -1818,7 +1818,7 @@ struct ViewerContextBundle {
     items_are_smart_folder_view: bool,
     items_are_drive_list: bool,
     reading_history_return_from: Option<PathBuf>,
-    bookmark_view_return_from: Option<PathBuf>,
+    bookmark_view_return_target: Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
     bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
     bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
     fs_open_intent_from_grid: bool,
@@ -2049,7 +2049,7 @@ impl ViewerContextBundle {
             items_are_smart_folder_view: false,
             items_are_drive_list: false,
             reading_history_return_from: None,
-            bookmark_view_return_from: None,
+            bookmark_view_return_target: None,
             bookmark_media_open_pending: None,
             bookmark_book_open_pending: None,
             fs_open_intent_from_grid: false,
@@ -7260,7 +7260,8 @@ pub struct App {
     pub(crate) bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
     /// 横断ブックマーク一覧から開いた viewer を閉じたときの戻り先。
     /// 開いた実コンテナと一致する context だけが `Bookmarks` ナビを返す。
-    pub(crate) bookmark_view_return_from: Option<PathBuf>,
+    pub(crate) bookmark_view_return_target:
+        Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
 
     /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
     /// `rebuild_items_from_global_search` の DrilledInto 分岐で `state.all_hits` から
@@ -9956,7 +9957,7 @@ impl App {
             bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
             bookmark_media_open_pending: None,
             bookmark_book_open_pending: None,
-            bookmark_view_return_from: None,
+            bookmark_view_return_target: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
             book_resume_writer,
@@ -10655,6 +10656,13 @@ impl App {
             return None;
         }
         let path = self.effective_folder()?;
+        // ブックマーク一覧は内容を非同期で組み立てる安定した top-level surface。
+        // 復帰時は一度 empty items を install してから実 rows を install するため、
+        // この synthetic identity に前回値を保存しないと毎回 Square を経由する。
+        // 検索・★一覧等の内容依存 synthetic surface は従来どおり対象外にする。
+        if crate::folder_tree::path_eq(&path, &bookmark_view_synthetic_path()) {
+            return Some(path);
+        }
         if is_synthetic_view_path(&path) {
             return None;
         }
@@ -10785,14 +10793,17 @@ impl App {
             return;
         }
 
+        // ブックマーク一覧は非同期 build の前に empty items 世代を 1 度 install する。
+        // eligible_total==0 でもキャッシュを先に復元し、実 rows が届くまでのフレームで
+        // Auto 未確定時の Square を描画しない。通常の空フォルダでも、セルが無いため
+        // 前回値を楽観的に保持して問題はない。
+        self.restore_cached_auto_aspect();
+
         // 集計対象母数は items ベース (動画含む)。
         let eligible_total: usize = self.auto_aspect_eligible_total();
         if eligible_total == 0 {
             return;
         }
-        // 前回このフォルダで統計確定した比率があれば、Square の代わりに初期値に使う。
-        // catalog seed が十分なら直後の maybe_apply_auto_aspect(true) で検証・補正される。
-        self.restore_cached_auto_aspect();
 
         let min_samples = crate::auto_aspect::min_samples_for(eligible_total);
         let mut probe_budget: usize = min_samples.saturating_mul(2);
@@ -11619,7 +11630,7 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
-            bookmark_view_return_from,
+            bookmark_view_return_target,
             bookmark_media_open_pending,
             bookmark_book_open_pending,
             fs_open_intent_from_grid,
@@ -11813,7 +11824,7 @@ impl App {
         swap_field!(items_are_smart_folder_view);
         swap_field!(items_are_drive_list);
         swap_field!(reading_history_return_from);
-        swap_field!(bookmark_view_return_from);
+        swap_field!(bookmark_view_return_target);
         swap_field!(bookmark_media_open_pending);
         swap_field!(bookmark_book_open_pending);
         swap_field!(fs_open_intent_from_grid);
@@ -12040,10 +12051,40 @@ impl App {
     /// 実ファイルの親ではなく一覧へ戻す。ページ identity を直接開く操作なので、
     /// ネスト ZIP 内でも現在のユーザー視点コンテナが一致すれば一覧へ直帰する。
     pub(crate) fn bookmark_view_back_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
-        let from = self.bookmark_view_return_from.as_ref()?;
-        let cur = self.effective_folder()?;
-        crate::path_key::eq_keep_drive(&cur, from)
-            .then_some(crate::ui_main::AddressBarNav::Bookmarks)
+        let target = self.bookmark_view_return_target.as_ref()?;
+        let still_at_target = match target {
+            crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_path) => self
+                .fullscreen_idx
+                .and_then(|idx| self.items.get(idx))
+                .is_some_and(|item| match item {
+                    GridItem::Video(path) | GridItem::Audio(path) => {
+                        crate::path_key::eq_keep_drive(path, target_path)
+                    }
+                    _ => false,
+                }),
+            crate::bookmark_browser::BookmarkViewReturnTarget::Book(container_path) => self
+                .effective_folder()
+                .is_some_and(|current| crate::path_key::eq_keep_drive(&current, container_path)),
+        };
+        still_at_target.then_some(crate::ui_main::AddressBarNav::Bookmarks)
+    }
+
+    fn reconcile_bookmark_return_target_for_folder_load(&mut self, path: &Path) {
+        if self
+            .bookmark_view_return_target
+            .as_ref()
+            .is_some_and(|target| !target.matches_loaded_container(path))
+        {
+            self.bookmark_view_return_target = None;
+        }
+    }
+
+    fn bookmark_view_close_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        let nav = self.bookmark_view_back_nav();
+        if nav.is_none() && self.bookmark_view_return_target.is_some() {
+            self.bookmark_view_return_target = None;
+        }
+        nav
     }
 
     /// 読書履歴ビューの項目を開く直前に、消えたコンテナへ入らないようにする。
@@ -13806,7 +13847,7 @@ impl App {
         self.gamepad_location_picker = None;
         // 読書履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
         self.reading_history_return_from = None;
-        self.bookmark_view_return_from = None;
+        self.bookmark_view_return_target = None;
 
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
@@ -14116,13 +14157,7 @@ impl App {
         {
             self.reading_history_return_from = None;
         }
-        if self
-            .bookmark_view_return_from
-            .as_ref()
-            .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
-        {
-            self.bookmark_view_return_from = None;
-        }
+        self.reconcile_bookmark_return_target_for_folder_load(&path);
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
         // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
         // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
@@ -16228,7 +16263,7 @@ impl App {
         crate::logger::log("=== enter_reading_history ===");
         // いま読書履歴ビューにいるので、戻り先予約は消費済み扱いにする。
         self.reading_history_return_from = None;
-        self.bookmark_view_return_from = None;
+        self.bookmark_view_return_target = None;
         self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
@@ -23491,7 +23526,7 @@ impl App {
     pub(crate) fn enter_bookmark_view(&mut self) {
         // いま戻り先の一覧へ復帰したので、同じ実フォルダを後から通常経路で開いても
         // stale な予約が効かないようここで消費する。
-        self.bookmark_view_return_from = None;
+        self.bookmark_view_return_target = None;
         self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
@@ -23701,10 +23736,9 @@ impl App {
         }
         match &row.source {
             crate::bookmark_browser::BookmarkRowSource::Media { path, pts_secs, .. } => {
-                self.bookmark_view_return_from = path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .or_else(|| Some(path.clone()));
+                self.bookmark_view_return_target = Some(
+                    crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone()),
+                );
                 crate::logger::log(format!(
                     "[bookmark-open] request media path={} pts={:.3} presentation={:?}",
                     path.display(),
@@ -23725,7 +23759,10 @@ impl App {
                 );
             }
             crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
-                self.bookmark_view_return_from = Some(bookmark.container_path.clone());
+                self.bookmark_view_return_target =
+                    Some(crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                        bookmark.container_path.clone(),
+                    ));
                 crate::logger::log(format!(
                     "[bookmark-open] request book container={} page={} presentation={:?}",
                     bookmark.container_path.display(),
@@ -33197,7 +33234,7 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
-            bookmark_view_return_from,
+            bookmark_view_return_target,
             bookmark_media_open_pending,
             bookmark_book_open_pending,
             fs_open_intent_from_grid,
@@ -33325,7 +33362,7 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
-            bookmark_view_return_from,
+            bookmark_view_return_target,
         );
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
@@ -41998,7 +42035,7 @@ impl App {
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
-        if self.bookmark_view_back_nav().is_some() {
+        if self.bookmark_view_close_nav().is_some() {
             self.pending_return_to_parent = true;
             return;
         }
@@ -42020,6 +42057,23 @@ impl App {
             }
         }
         self.close_fullscreen();
+    }
+
+    /// `App::update` の通常の pending-nav 消化点より後で届く close イベント向け。
+    ///
+    /// Windows native presenter のキー・マウス・ウィンドウイベントは、そのフレームの
+    /// pending-nav 消化後に処理されることがある。通常の close 要求を発行した直後に同じ
+    /// ナビをここで消化し、ブックマーク一覧への復帰を次フレームへ取り残さない。
+    pub(crate) fn handle_fullscreen_close_request_immediate(&mut self) {
+        self.handle_fullscreen_close_request();
+        let Some(nav) = self.take_pending_return_to_parent_nav() else {
+            return;
+        };
+        if !self.apply_fullscreen_close_nav_immediate(nav) {
+            // 現在 resolve_return_to_parent_nav が返すナビはすべて即時適用可能だが、
+            // 将来対象外のナビが増えても要求を失わず通常の update 経路へ戻す。
+            self.pending_return_to_parent = true;
+        }
     }
 
     #[cfg(windows)]
@@ -42279,6 +42333,13 @@ impl App {
         let cf_was_open = self.fullscreen_idx.is_some();
         let cf_fs_cache = self.fs_cache.len();
         let cf_ai_cache = self.ai_upscale_cache.len();
+        if cf_was_open {
+            // 一覧へ戻る close は `handle_fullscreen_close_request` が先に nav を予約し、
+            // `enter_bookmark_view` でこの target を消費してからここへ来る。ここに target が
+            // 残っている real close は、別ファイル移動後 / BS 等で実フォルダへ戻る経路なので、
+            // 後から元ファイルを再度開いた際に stale な一覧復帰が発火しないよう破棄する。
+            self.bookmark_view_return_target = None;
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",

@@ -5924,7 +5924,10 @@ mod phase_c_drill_nav_tests {
         // ブックマーク一覧から開いた変換アーカイブも、cache ZIP ではなく元アーカイブを
         // 戻り先 identity に使う。
         app.reading_history_return_from = None;
-        app.bookmark_view_return_from = Some(std::path::PathBuf::from("c:/books/a.rar"));
+        app.bookmark_view_return_target =
+            Some(crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                std::path::PathBuf::from("c:/books/a.rar"),
+            ));
         assert!(matches!(
             app.bookmark_view_back_nav(),
             Some(crate::ui_main::AddressBarNav::Bookmarks)
@@ -6357,7 +6360,9 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
     let mut app = phase_c_support::setup_app();
     let container = PathBuf::from(r"C:\Books\volume.zip");
     app.current_folder = Some(container.clone());
-    app.bookmark_view_return_from = Some(container);
+    app.bookmark_view_return_target = Some(
+        crate::bookmark_browser::BookmarkViewReturnTarget::Book(container),
+    );
 
     assert!(matches!(
         app.bookmark_view_back_nav(),
@@ -6371,7 +6376,97 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
     ));
 
     app.enter_bookmark_view();
-    assert!(app.bookmark_view_return_from.is_none());
+    assert!(app.bookmark_view_return_target.is_none());
+}
+
+#[test]
+fn bookmark_media_close_returns_only_while_original_file_is_open() {
+    for is_audio in [false, true] {
+        let target_actual = PathBuf::from(if is_audio {
+            r"C:\Media\Target.FLAC"
+        } else {
+            r"C:\Media\Target.MP4"
+        });
+        let target_db = PathBuf::from(if is_audio {
+            "c:/media/target.flac"
+        } else {
+            "c:/media/target.mp4"
+        });
+        let other = PathBuf::from(if is_audio {
+            r"C:\Media\Other.FLAC"
+        } else {
+            r"C:\Media\Other.MP4"
+        });
+        let make_item = |path: PathBuf| {
+            if is_audio {
+                GridItem::Audio(path)
+            } else {
+                GridItem::Video(path)
+            }
+        };
+
+        let mut same = phase_c_support::setup_app();
+        same.current_folder = Some(PathBuf::from(r"C:\Media"));
+        same.items = vec![make_item(target_actual.clone())];
+        same.fullscreen_idx = Some(0);
+        same.bookmark_view_return_target = Some(
+            crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_db.clone()),
+        );
+        assert!(matches!(
+            same.bookmark_view_close_nav(),
+            Some(crate::ui_main::AddressBarNav::Bookmarks)
+        ));
+        assert!(same.bookmark_view_return_target.is_some());
+        same.fullscreen_idx = None;
+        drop(same);
+
+        let mut moved = phase_c_support::setup_app();
+        moved.current_folder = Some(PathBuf::from(r"C:\Media"));
+        moved.items = vec![make_item(target_actual), make_item(other)];
+        moved.fullscreen_idx = Some(1);
+        moved.bookmark_view_return_target = Some(
+            crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_db),
+        );
+        assert!(moved.bookmark_view_close_nav().is_none());
+        assert!(moved.bookmark_view_return_target.is_none());
+        moved.fullscreen_idx = None;
+        drop(moved);
+    }
+}
+
+#[test]
+fn native_immediate_close_consumes_bookmark_return_in_same_dispatch() {
+    let mut app = phase_c_support::setup_app();
+    let actual_path = PathBuf::from(r"C:\Media\Target.MP4");
+    app.current_folder = Some(PathBuf::from(r"C:\Media"));
+    app.items = vec![GridItem::Video(actual_path)];
+    app.fullscreen_idx = Some(0);
+    app.bookmark_view_return_target =
+        Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(
+            PathBuf::from("c:/media/target.mp4"),
+        ));
+
+    app.handle_fullscreen_close_request_immediate();
+
+    assert!(!app.pending_return_to_parent);
+    assert!(app.items_are_bookmark_view);
+    assert!(app.bookmark_view_return_target.is_none());
+    assert_eq!(app.fullscreen_idx, None);
+}
+
+#[test]
+fn bookmark_return_target_is_cleared_only_after_container_navigation() {
+    let mut app = phase_c_support::setup_app();
+    app.bookmark_view_return_target =
+        Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(
+            PathBuf::from("c:/media/target.mp4"),
+        ));
+
+    app.reconcile_bookmark_return_target_for_folder_load(Path::new(r"C:\Media"));
+    assert!(app.bookmark_view_return_target.is_some());
+
+    app.reconcile_bookmark_return_target_for_folder_load(Path::new(r"C:\Other"));
+    assert!(app.bookmark_view_return_target.is_none());
 }
 
 #[cfg(windows)]
@@ -6379,7 +6474,7 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
 fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     let mut app = phase_c_support::setup_app();
     let path = PathBuf::from(r"C:\Media\marker.mp4");
-    let return_from = PathBuf::from(r"C:\Media");
+    let return_target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone());
     app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
         path: path.clone(),
         pts_secs: 42.0,
@@ -6402,13 +6497,13 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
         started_at: std::time::Instant::now(),
         entered_archive_prefix: false,
     });
-    app.bookmark_view_return_from = Some(return_from.clone());
+    app.bookmark_view_return_target = Some(return_target.clone());
     let mut other = super::ViewerContextBundle::empty();
 
     app.swap_viewer_context_bundle(&mut other);
     assert!(app.bookmark_media_open_pending.is_none());
     assert!(app.bookmark_book_open_pending.is_none());
-    assert!(app.bookmark_view_return_from.is_none());
+    assert!(app.bookmark_view_return_target.is_none());
     assert_eq!(
         other
             .bookmark_media_open_pending
@@ -6416,7 +6511,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
             .map(|pending| pending.path.as_path()),
         Some(path.as_path())
     );
-    assert_eq!(other.bookmark_view_return_from, Some(return_from));
+    assert_eq!(other.bookmark_view_return_target, Some(return_target));
     assert_eq!(
         other
             .bookmark_book_open_pending
@@ -6428,7 +6523,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     app.swap_viewer_context_bundle(&mut other);
     assert!(app.bookmark_media_open_pending.is_some());
     assert!(app.bookmark_book_open_pending.is_some());
-    assert!(app.bookmark_view_return_from.is_some());
+    assert!(app.bookmark_view_return_target.is_some());
 }
 
 // =======================================================================
@@ -12798,6 +12893,43 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Portrait3x4));
         assert_eq!(app.auto_aspect.cached_sample_gate, None);
         assert_eq!(app.auto_aspect.switches_done, 1);
+    }
+
+    #[test]
+    fn bookmark_view_restores_cached_auto_aspect_during_empty_async_phase() {
+        use crate::settings::ThumbAspect;
+
+        let mut app = setup_app();
+        let bookmark_path = super::bookmark_view_synthetic_path();
+        app.settings.thumb_aspect_auto = true;
+        app.current_folder = Some(bookmark_path.clone());
+        app.items.clear();
+        app.image_metas.clear();
+        app.auto_aspect_cache_db
+            .as_ref()
+            .expect("test app should open auto-aspect cache")
+            .upsert(&bookmark_path, ThumbAspect::Landscape16x9, 114, 288)
+            .expect("cache bookmark aspect");
+        let cache_map =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.reset_and_seed_auto_aspect(&cache_map);
+
+        assert_eq!(
+            app.auto_aspect_cache_target_path().as_deref(),
+            Some(bookmark_path.as_path())
+        );
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Landscape16x9));
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(114));
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Landscape16x9);
+    }
+
+    #[test]
+    fn query_dependent_synthetic_view_stays_out_of_auto_aspect_cache() {
+        let mut app = setup_app();
+        app.current_folder = Some(super::search_results_synthetic_path());
+
+        assert!(app.auto_aspect_cache_target_path().is_none());
     }
 
     #[test]

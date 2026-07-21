@@ -667,6 +667,26 @@ pub struct PendingBookOpen {
     pub entered_archive_prefix: bool,
 }
 
+/// 横断ブックマーク一覧から開いた viewer が、一覧へ戻れる元の対象。
+///
+/// メディアは親フォルダではなくファイル自身を保持し、同じフォルダ内の別ファイルへ
+/// 移動した場合も元のブックマーク対象から離れたことを判定できるようにする。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BookmarkViewReturnTarget {
+    Media(PathBuf),
+    Book(PathBuf),
+}
+
+impl BookmarkViewReturnTarget {
+    pub fn matches_loaded_container(&self, path: &Path) -> bool {
+        let container = match self {
+            Self::Media(media_path) => media_path.parent().unwrap_or(media_path.as_path()),
+            Self::Book(container_path) => container_path.as_path(),
+        };
+        crate::path_key::eq_keep_drive(container, path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

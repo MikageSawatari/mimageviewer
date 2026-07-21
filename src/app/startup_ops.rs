@@ -159,7 +159,7 @@ impl App {
         ));
         self.bookmark_media_open_pending = None;
         self.bookmark_book_open_pending = None;
-        self.bookmark_view_return_from = None;
+        self.bookmark_view_return_target = None;
     }
 
     fn apply_startup_open_path_resolve_result(

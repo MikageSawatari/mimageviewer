@@ -233,9 +233,10 @@ impl App {
             .as_ref()
             .is_some_and(|from| crate::folder_tree::path_eq(from, &src));
         let restore_bookmark_view = self
-            .bookmark_view_return_from
+            .bookmark_view_return_target
             .as_ref()
-            .is_some_and(|from| crate::folder_tree::path_eq(from, &src));
+            .filter(|target| target.matches_loaded_container(&src))
+            .cloned();
         self.load_folder(cached_zip.clone());
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
         // 変わらない (load_zip_as_folder が current_folder = cache_zip を同期セットする前に
@@ -260,8 +261,8 @@ impl App {
         if restore_reading_history {
             self.reading_history_return_from = Some(src.clone());
         }
-        if restore_bookmark_view {
-            self.bookmark_view_return_from = Some(src.clone());
+        if let Some(target) = restore_bookmark_view {
+            self.bookmark_view_return_target = Some(target);
         }
         self.archive_source_override = Some(src);
         true
@@ -525,10 +526,12 @@ impl App {
                     (Some(s), Some(from)) => crate::folder_tree::path_eq(from, s),
                     _ => false,
                 };
-                let restore_bookmark_view = match (&src, &self.bookmark_view_return_from) {
-                    (Some(s), Some(from)) => crate::folder_tree::path_eq(from, s),
-                    _ => false,
-                };
+                let restore_bookmark_view = src.as_ref().and_then(|source| {
+                    self.bookmark_view_return_target
+                        .as_ref()
+                        .filter(|target| target.matches_loaded_container(source))
+                        .cloned()
+                });
                 // 明示オープンからの変換 (state.auto_fullscreen=true) のときだけ、変換成功
                 // 直後に 1 ページ目を自動フルスクリーン表示する (履歴/アドレスバー経由の
                 // 変換は false なので発火しない)。
@@ -579,8 +582,8 @@ impl App {
                     if restore_reading_history {
                         self.reading_history_return_from = Some(src.clone());
                     }
-                    if restore_bookmark_view {
-                        self.bookmark_view_return_from = Some(src.clone());
+                    if let Some(target) = restore_bookmark_view {
+                        self.bookmark_view_return_target = Some(target);
                     }
                     self.archive_source_override = Some(src);
                 }

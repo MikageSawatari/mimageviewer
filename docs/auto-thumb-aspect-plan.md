@@ -310,8 +310,8 @@ decode が進んで分布が大きく変わったら 2 回目で修正、それ�
 
 ### 4.6 フォルダ別の前回結果キャッシュ (2026-05 追補)
 
-`%APPDATA%/mimageviewer/auto_aspect_cache.db` に、フォルダ / ZIP / PDF コンテナごとの
-前回 auto-aspect 確定値を保存する。再訪時は `reset_and_seed_auto_aspect` の直後、
+`%APPDATA%/mimageviewer/auto_aspect_cache.db` に、フォルダ / ZIP / PDF コンテナ、および
+安定した仮想一覧であるブックマーク一覧ごとの前回 auto-aspect 確定値を保存する。再訪時は `reset_and_seed_auto_aspect` の直後、
 catalog seed より前に `auto_aspect.current` をこの値で初期化し、従来の
 「未確定なら 1:1」から始まる表示切替を減らす。
 
@@ -321,7 +321,9 @@ catalog seed より前に `auto_aspect.current` をこの値で初期化し、�
   実統計が既存の 6 段ゲートを通れば補正される。ただしキャッシュ復元時は、保存時の
   `sample_count` と同等以上 (`min(sample_count, 現在の eligible_total)`) の実測 sample が
   集まるまでは上書きしない。前回より少ない部分統計だけで比率が即変更されるのを避けるため。
-- Ctrl+G / Ctrl+S の検索結果ビューや `__search_results__` 合成パスは、クエリ依存で
+- ブックマーク一覧は非同期 build 前の空一覧段階でも前回値を復元し、実 rows の到着前に
+  `1:1` を描画しない。後続の実サムネイル統計は通常どおりキャッシュ値を検証・補正する。
+- Ctrl+G / Ctrl+S の検索結果ビュー、★一覧などの内容依存合成パスは、条件によって
   中身が変わるため保存・復元対象外。
 
 ## 5. アーキテクチャ
@@ -476,10 +478,12 @@ impl App {
 #### 永続キャッシュ (`src/auto_aspect_cache.rs`)
 
 `AutoAspectCacheDb` は `auto_aspect_cache.db` に `folder_key -> aspect` を保存する。
-`App::reset_and_seed_auto_aspect` は Auto モードかつ検索結果ビューでない場合に
+`App::reset_and_seed_auto_aspect` は Auto モードかつ検索結果等の内容依存ビューでない場合に
 前回値を復元し、`maybe_apply_auto_aspect` は実際の切替または no-op 確定時に
 現在の確定値を upsert する。書き込みは 1 フォルダあたり通常 1〜2 回で、毎フレームの
 DB アクセスは行わない。
+ブックマーク一覧は stable synthetic path を cache key とし、非同期 build の空一覧世代でも
+`eligible_total == 0` の判定より前に復元する。
 復元した値は、保存時の `sample_count` と同等以上の実測 sample が集まるまで
 `cached_sample_gate` で保護される。
 リセットはサムネイルキャッシュ管理ダイアログの削除操作に連動する:

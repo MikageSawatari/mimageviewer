@@ -3044,7 +3044,7 @@ impl App {
             if matches!(event, Ev::CloseFullscreen { .. })
                 || matches!(&event, Ev::Window(w) if matches!(w, WinEv::CloseRequested { .. }))
             {
-                self.close_fullscreen();
+                self.handle_fullscreen_close_request_immediate();
                 ctx.request_repaint();
                 return;
             }
@@ -3183,7 +3183,7 @@ impl App {
                 if !self.accept_native_video_close(fs_idx, generation, "output_close") {
                     return;
                 }
-                self.close_fullscreen();
+                self.handle_fullscreen_close_request_immediate();
             }
             crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
                 self.toggle_video_window_mode_for_input(ctx);
@@ -3387,7 +3387,7 @@ impl App {
                 if !self.accept_native_video_close(fs_idx, generation, "window_close_requested") {
                     return;
                 }
-                self.close_fullscreen();
+                self.handle_fullscreen_close_request_immediate();
             }
             event if self.ime_input_active() => {
                 let _ = event;
@@ -6399,7 +6399,7 @@ impl App {
             && !key.alt
             && matches!(key.virtual_key, 0x0D | 0x1B)
         {
-            self.close_fullscreen();
+            self.handle_fullscreen_close_request_immediate();
             return;
         }
         let mut hud_activity = true;
@@ -6442,7 +6442,7 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::VideoCloseFullscreen, &key) =>
             {
-                self.close_fullscreen();
+                self.handle_fullscreen_close_request_immediate();
                 hud_activity = false;
             }
             // Shift+Enter: open in external player, matching the legacy egui
@@ -6484,7 +6484,7 @@ impl App {
                 } else if self.close_video_tile_mode() {
                     self.sync_native_video_tile_overlay(ctx, fs_idx);
                 } else {
-                    self.close_fullscreen();
+                    self.handle_fullscreen_close_request_immediate();
                 }
             }
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsBackToList, &key) => {
@@ -8822,7 +8822,7 @@ impl App {
             Some(fs_idx),
             pos,
         ) {
-            self.handle_fullscreen_close_request();
+            self.handle_fullscreen_close_request_immediate();
         }
         ctx.request_repaint();
     }
