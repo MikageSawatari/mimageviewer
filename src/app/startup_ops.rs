@@ -121,6 +121,9 @@ impl App {
                 if matches!(source, StartupOpenPathSource::InitialStartup) {
                     self.open_default_startup_target();
                 } else {
+                    if matches!(source, StartupOpenPathSource::Bookmark) {
+                        self.abandon_bookmark_open_after_path_failure("resolve_disconnected");
+                    }
                     self.show_feedback_toast("パスの確認を完了できませんでした".to_string());
                 }
                 ctx.request_repaint();
@@ -140,11 +143,23 @@ impl App {
         if matches!(source, StartupOpenPathSource::InitialStartup) {
             self.open_default_startup_target();
         } else {
+            if matches!(source, StartupOpenPathSource::Bookmark) {
+                self.abandon_bookmark_open_after_path_failure("not_openable");
+            }
             crate::logger::log(format!(
                 "startup open: activation open failed for {requested_display}"
             ));
             self.show_feedback_toast("開けるパスが見つかりませんでした".to_string());
         }
+    }
+
+    fn abandon_bookmark_open_after_path_failure(&mut self, reason: &'static str) {
+        crate::logger::log(format!(
+            "[bookmark-open] abandon before viewer context reason={reason}"
+        ));
+        self.bookmark_media_open_pending = None;
+        self.bookmark_book_open_pending = None;
+        self.bookmark_view_return_from = None;
     }
 
     fn apply_startup_open_path_resolve_result(

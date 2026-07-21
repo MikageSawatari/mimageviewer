@@ -225,11 +225,15 @@ impl App {
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
         }
-        // load_folder(cache_zip) は load_folder_with_scan のクリアで読書履歴の戻り先予約を
-        // 落とす (cache_zip != 元アーカイブのため)。読書履歴から開いた本なら、override を
-        // 元パスへ戻すのと同じく予約も元アーカイブへ復元する (= 閉じると読書履歴へ戻れる)。
+        // load_folder(cache_zip) は load_folder_with_scan のクリアで履歴 / ブックマーク一覧の
+        // 戻り先予約を落とす (cache_zip != 元アーカイブのため)。元アーカイブから開いた
+        // viewer なら、override と同じく予約も元パスへ復元する。
         let restore_reading_history = self
             .reading_history_return_from
+            .as_ref()
+            .is_some_and(|from| crate::folder_tree::path_eq(from, &src));
+        let restore_bookmark_view = self
+            .bookmark_view_return_from
             .as_ref()
             .is_some_and(|from| crate::folder_tree::path_eq(from, &src));
         self.load_folder(cached_zip.clone());
@@ -255,6 +259,9 @@ impl App {
         self.update_active_quick_folder_target(&src);
         if restore_reading_history {
             self.reading_history_return_from = Some(src.clone());
+        }
+        if restore_bookmark_view {
+            self.bookmark_view_return_from = Some(src.clone());
         }
         self.archive_source_override = Some(src);
         true
@@ -518,6 +525,10 @@ impl App {
                     (Some(s), Some(from)) => crate::folder_tree::path_eq(from, s),
                     _ => false,
                 };
+                let restore_bookmark_view = match (&src, &self.bookmark_view_return_from) {
+                    (Some(s), Some(from)) => crate::folder_tree::path_eq(from, s),
+                    _ => false,
+                };
                 // 明示オープンからの変換 (state.auto_fullscreen=true) のときだけ、変換成功
                 // 直後に 1 ページ目を自動フルスクリーン表示する (履歴/アドレスバー経由の
                 // 変換は false なので発火しない)。
@@ -567,6 +578,9 @@ impl App {
                     self.update_active_quick_folder_target(&src);
                     if restore_reading_history {
                         self.reading_history_return_from = Some(src.clone());
+                    }
+                    if restore_bookmark_view {
+                        self.bookmark_view_return_from = Some(src.clone());
                     }
                     self.archive_source_override = Some(src);
                 }

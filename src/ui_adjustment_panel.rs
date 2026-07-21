@@ -7941,6 +7941,27 @@ fn draw_sliders(
     (changed, dragging)
 }
 
+fn bookmark_row_should_jump(
+    row_contains_pointer: bool,
+    primary_clicked: bool,
+    control_clicked: bool,
+) -> bool {
+    row_contains_pointer && primary_clicked && !control_clicked
+}
+
+#[cfg(test)]
+mod bookmark_panel_input_tests {
+    use super::bookmark_row_should_jump;
+
+    #[test]
+    fn child_controls_own_bookmark_row_clicks() {
+        assert!(bookmark_row_should_jump(true, true, false));
+        assert!(!bookmark_row_should_jump(true, true, true));
+        assert!(!bookmark_row_should_jump(false, true, false));
+        assert!(!bookmark_row_should_jump(true, false, false));
+    }
+}
+
 impl App {
     /// 補正レイヤーモードへ入る共通の状態遷移。
     ///
@@ -11841,8 +11862,16 @@ impl App {
                         });
                         control_clicked
                     });
-                    let row_response = inner.response.interact(egui::Sense::click());
-                    if row_response.clicked() && !inner.inner {
+                    // 行全体の click widget を子ボタンの後から重ねると、後勝ちの
+                    // interaction が「名前を編集」「削除」の click を奪う。Frame は
+                    // hover のままにして、行内の生 click を読み、子 control が処理した
+                    // click だけを除外する。
+                    let row_primary_clicked = ui.input(|input| input.pointer.primary_clicked());
+                    if bookmark_row_should_jump(
+                        inner.response.contains_pointer(),
+                        row_primary_clicked,
+                        inner.inner,
+                    ) {
                         jump_to = Some(bookmark.clone());
                     }
                     ui.add_space(5.0);

@@ -17,6 +17,9 @@ surface を共有する。現在の最上位 surface と一時ビューからの
 `App.items` の 1 行へ materialize する。ブックマーク ID、登録位置、登録日時、欠落状態、保存済み動画
 サムネイルは同じ index の sidecar row に保持する。通常の facet / rating / tag / details 表示を共有する一方、
 Delete と右クリック削除は元ファイル操作へ流さず DB 行だけを削除する。
+一覧から項目を開いた viewer context は元コンテナと `Bookmarks` 戻り先を保持し、Esc / 閉じる / 親移動で
+実フォルダの親ではなく同じ一覧へ戻る。動画・音声の登録時刻への最終 seek pending もプレイヤーと同じ
+context が所有し、detached / ParkedLive への移動後に main context へ取り残さない。
 
 ## 2. スマートフォルダ
 

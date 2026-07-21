@@ -633,11 +633,31 @@ pub fn spawn_delete(rows: &[BookmarkBrowserRow]) -> BookmarkDeletePending {
     BookmarkDeletePending { keys, rx }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingMediaOpenWait {
+    Fullscreen,
+    MatchingPath,
+    Player,
+    PlayerInfo,
+}
+
+impl PendingMediaOpenWait {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fullscreen => "fullscreen",
+            Self::MatchingPath => "matching_path",
+            Self::Player => "player",
+            Self::PlayerInfo => "player_info",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingMediaOpen {
     pub path: PathBuf,
     pub pts_secs: f64,
     pub started_at: std::time::Instant,
+    pub last_wait: Option<PendingMediaOpenWait>,
 }
 
 #[derive(Clone, Debug)]

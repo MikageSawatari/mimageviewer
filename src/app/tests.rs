@@ -5920,6 +5920,15 @@ mod phase_c_drill_nav_tests {
             app.reading_history_back_nav(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory)
         ));
+
+        // ブックマーク一覧から開いた変換アーカイブも、cache ZIP ではなく元アーカイブを
+        // 戻り先 identity に使う。
+        app.reading_history_return_from = None;
+        app.bookmark_view_return_from = Some(std::path::PathBuf::from("c:/books/a.rar"));
+        assert!(matches!(
+            app.bookmark_view_back_nav(),
+            Some(crate::ui_main::AddressBarNav::Bookmarks)
+        ));
     }
 
     /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
@@ -6317,6 +6326,7 @@ fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
             path,
             pts_secs: 42.0,
             started_at: std::time::Instant::now(),
+            last_wait: None,
         });
 
         app.poll_bookmark_media_open(&egui::Context::default());
@@ -6327,6 +6337,85 @@ fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
             if is_audio { "audio" } else { "video" }
         );
     }
+}
+
+#[test]
+fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
+    let mut app = phase_c_support::setup_app();
+    let container = PathBuf::from(r"C:\Books\volume.zip");
+    app.current_folder = Some(container.clone());
+    app.bookmark_view_return_from = Some(container);
+
+    assert!(matches!(
+        app.bookmark_view_back_nav(),
+        Some(crate::ui_main::AddressBarNav::Bookmarks)
+    ));
+    app.handle_fullscreen_close_request();
+    assert!(app.pending_return_to_parent);
+    assert!(matches!(
+        app.take_pending_return_to_parent_nav(),
+        Some(crate::ui_main::AddressBarNav::Bookmarks)
+    ));
+
+    app.enter_bookmark_view();
+    assert!(app.bookmark_view_return_from.is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
+    let mut app = phase_c_support::setup_app();
+    let path = PathBuf::from(r"C:\Media\marker.mp4");
+    let return_from = PathBuf::from(r"C:\Media");
+    app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
+        path: path.clone(),
+        pts_secs: 42.0,
+        started_at: std::time::Instant::now(),
+        last_wait: None,
+    });
+    app.bookmark_book_open_pending = Some(crate::bookmark_browser::PendingBookOpen {
+        bookmark: crate::book_bookmarks::BookBookmark {
+            id: 7,
+            container_key: "c:/books/volume.zip".to_string(),
+            container_path: PathBuf::from(r"C:\Books\volume.zip"),
+            container_kind: crate::book_bookmarks::BookContainerKind::Zip,
+            page_identity: crate::book_bookmarks::PageIdentity::ArchiveEntry(
+                "page-001.jpg".to_string(),
+            ),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        },
+        started_at: std::time::Instant::now(),
+        entered_archive_prefix: false,
+    });
+    app.bookmark_view_return_from = Some(return_from.clone());
+    let mut other = super::ViewerContextBundle::empty();
+
+    app.swap_viewer_context_bundle(&mut other);
+    assert!(app.bookmark_media_open_pending.is_none());
+    assert!(app.bookmark_book_open_pending.is_none());
+    assert!(app.bookmark_view_return_from.is_none());
+    assert_eq!(
+        other
+            .bookmark_media_open_pending
+            .as_ref()
+            .map(|pending| pending.path.as_path()),
+        Some(path.as_path())
+    );
+    assert_eq!(other.bookmark_view_return_from, Some(return_from));
+    assert_eq!(
+        other
+            .bookmark_book_open_pending
+            .as_ref()
+            .map(|pending| pending.bookmark.id),
+        Some(7)
+    );
+
+    app.swap_viewer_context_bundle(&mut other);
+    assert!(app.bookmark_media_open_pending.is_some());
+    assert!(app.bookmark_book_open_pending.is_some());
+    assert!(app.bookmark_view_return_from.is_some());
 }
 
 // =======================================================================

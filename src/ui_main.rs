@@ -89,6 +89,7 @@ pub(crate) enum AddressBarNav {
     Direct(PathBuf),
     DriveList(Option<PathBuf>),
     ReadingHistory,
+    Bookmarks,
     RatingViewBack,
     BooksRoot,
     HistoryBack,
@@ -8733,6 +8734,9 @@ impl App {
                                     }
                                     Some(AddressBarNav::ReadingHistory) => {
                                         "読書履歴へ戻る [BS]".to_string()
+                                    }
+                                    Some(AddressBarNav::Bookmarks) => {
+                                        "ブックマークへ戻る [BS]".to_string()
                                     }
                                     Some(AddressBarNav::RatingViewBack) => {
                                         if self.rating_view_nav_stack.is_empty() {

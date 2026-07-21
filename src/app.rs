@@ -1818,6 +1818,9 @@ struct ViewerContextBundle {
     items_are_smart_folder_view: bool,
     items_are_drive_list: bool,
     reading_history_return_from: Option<PathBuf>,
+    bookmark_view_return_from: Option<PathBuf>,
+    bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
+    bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
     fs_open_intent_from_grid: bool,
     pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
     fs_zoom: f32,
@@ -2046,6 +2049,9 @@ impl ViewerContextBundle {
             items_are_smart_folder_view: false,
             items_are_drive_list: false,
             reading_history_return_from: None,
+            bookmark_view_return_from: None,
+            bookmark_media_open_pending: None,
+            bookmark_book_open_pending: None,
             fs_open_intent_from_grid: false,
             pending_detached_video_host_switch: None,
             fs_zoom: 1.0,
@@ -7252,6 +7258,9 @@ pub struct App {
     pub(crate) bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort,
     pub(crate) bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
     pub(crate) bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+    /// 横断ブックマーク一覧から開いた viewer を閉じたときの戻り先。
+    /// 開いた実コンテナと一致する context だけが `Bookmarks` ナビを返す。
+    pub(crate) bookmark_view_return_from: Option<PathBuf>,
 
     /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
     /// `rebuild_items_from_global_search` の DrilledInto 分岐で `state.all_hits` から
@@ -9947,6 +9956,7 @@ impl App {
             bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
             bookmark_media_open_pending: None,
             bookmark_book_open_pending: None,
+            bookmark_view_return_from: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
             book_resume_writer,
@@ -11609,6 +11619,9 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
+            bookmark_view_return_from,
+            bookmark_media_open_pending,
+            bookmark_book_open_pending,
             fs_open_intent_from_grid,
             pending_detached_video_host_switch,
             fs_zoom,
@@ -11800,6 +11813,9 @@ impl App {
         swap_field!(items_are_smart_folder_view);
         swap_field!(items_are_drive_list);
         swap_field!(reading_history_return_from);
+        swap_field!(bookmark_view_return_from);
+        swap_field!(bookmark_media_open_pending);
+        swap_field!(bookmark_book_open_pending);
         swap_field!(fs_open_intent_from_grid);
         swap_field!(pending_detached_video_host_switch);
         swap_field!(fs_zoom);
@@ -12020,6 +12036,15 @@ impl App {
             .then_some(crate::ui_main::AddressBarNav::ReadingHistory)
     }
 
+    /// 横断ブックマーク一覧から直接開いた本・動画・音声を閉じるときだけ、
+    /// 実ファイルの親ではなく一覧へ戻す。ページ identity を直接開く操作なので、
+    /// ネスト ZIP 内でも現在のユーザー視点コンテナが一致すれば一覧へ直帰する。
+    pub(crate) fn bookmark_view_back_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
+        let from = self.bookmark_view_return_from.as_ref()?;
+        let cur = self.effective_folder()?;
+        crate::folder_tree::path_eq(&cur, from).then_some(crate::ui_main::AddressBarNav::Bookmarks)
+    }
+
     /// 読書履歴ビューの項目を開く直前に、消えたコンテナへ入らないようにする。
     ///
     /// 表示直後に履歴全体を検査すると、外付けドライブやネットワークパスで UI が重くなったり、
@@ -12099,6 +12124,9 @@ impl App {
     }
 
     pub(crate) fn grid_parent_nav_target(&self) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(nav) = self.bookmark_view_back_nav() {
+            return Some(nav);
+        }
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
         }
@@ -12129,6 +12157,9 @@ impl App {
     }
 
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(nav) = self.bookmark_view_back_nav() {
+            return Some(nav);
+        }
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
         }
@@ -12206,6 +12237,9 @@ impl App {
     /// では `effective_folder() == current_folder` なので挙動不変)。親が取れない
     /// (ドライブ root 等) ときは `None` を返し、呼び出し側が close にフォールバックする。
     pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(nav) = self.bookmark_view_back_nav() {
+            return Some(nav);
+        }
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
         }
@@ -12275,6 +12309,10 @@ impl App {
             }
             crate::ui_main::AddressBarNav::ReadingHistory => {
                 self.enter_reading_history();
+                true
+            }
+            crate::ui_main::AddressBarNav::Bookmarks => {
+                self.enter_bookmark_view();
                 true
             }
             crate::ui_main::AddressBarNav::RatingViewBack => {
@@ -13767,6 +13805,7 @@ impl App {
         self.gamepad_location_picker = None;
         // 読書履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
         self.reading_history_return_from = None;
+        self.bookmark_view_return_from = None;
 
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
@@ -14075,6 +14114,13 @@ impl App {
             .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
         {
             self.reading_history_return_from = None;
+        }
+        if self
+            .bookmark_view_return_from
+            .as_ref()
+            .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
+        {
+            self.bookmark_view_return_from = None;
         }
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
         // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
@@ -16181,6 +16227,7 @@ impl App {
         crate::logger::log("=== enter_reading_history ===");
         // いま読書履歴ビューにいるので、戻り先予約は消費済み扱いにする。
         self.reading_history_return_from = None;
+        self.bookmark_view_return_from = None;
         self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
@@ -23441,6 +23488,9 @@ impl App {
 
     /// 動画・音声・本のブックマークを、通常のメイン一覧 surface へ読み込む。
     pub(crate) fn enter_bookmark_view(&mut self) {
+        // いま戻り先の一覧へ復帰したので、同じ実フォルダを後から通常経路で開いても
+        // stale な予約が効かないようここで消費する。
+        self.bookmark_view_return_from = None;
         self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
@@ -23650,11 +23700,22 @@ impl App {
         }
         match &row.source {
             crate::bookmark_browser::BookmarkRowSource::Media { path, pts_secs, .. } => {
+                self.bookmark_view_return_from = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .or_else(|| Some(path.clone()));
+                crate::logger::log(format!(
+                    "[bookmark-open] request media path={} pts={:.3} presentation={:?}",
+                    path.display(),
+                    pts_secs,
+                    self.viewer_presentation
+                ));
                 self.bookmark_media_open_pending =
                     Some(crate::bookmark_browser::PendingMediaOpen {
                         path: path.clone(),
                         pts_secs: *pts_secs,
                         started_at: std::time::Instant::now(),
+                        last_wait: None,
                     });
                 self.start_startup_open_path_resolve(
                     path.clone(),
@@ -23663,6 +23724,13 @@ impl App {
                 );
             }
             crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
+                self.bookmark_view_return_from = Some(bookmark.container_path.clone());
+                crate::logger::log(format!(
+                    "[bookmark-open] request book container={} page={} presentation={:?}",
+                    bookmark.container_path.display(),
+                    bookmark.page_identity.display_name(),
+                    self.viewer_presentation
+                ));
                 self.bookmark_book_open_pending = Some(crate::bookmark_browser::PendingBookOpen {
                     bookmark: bookmark.clone(),
                     started_at: std::time::Instant::now(),
@@ -23749,16 +23817,78 @@ impl App {
         }
     }
 
+    fn note_bookmark_media_open_wait(
+        &mut self,
+        wait: crate::bookmark_browser::PendingMediaOpenWait,
+    ) {
+        let Some(pending) = self.bookmark_media_open_pending.as_ref() else {
+            return;
+        };
+        if pending.last_wait == Some(wait) {
+            return;
+        }
+        let fullscreen_idx = self.fullscreen_idx;
+        let current_item = fullscreen_idx
+            .and_then(|idx| self.items.get(idx))
+            .map(GridItem::display_path)
+            .unwrap_or_else(|| "<none>".to_string());
+        let player_diag = fullscreen_idx
+            .and_then(|idx| self.fs_cache.get(&idx))
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => Some(format!(
+                    "path={} info={} state={} pos={:.3} serial={}",
+                    player.path().display(),
+                    player.info().is_some(),
+                    player.engine_state_name(),
+                    player.position(),
+                    player.current_seek_serial()
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| "<none>".to_string());
+        crate::logger::log(format!(
+            "[bookmark-open] wait={} elapsed_ms={} target={} pts={:.3} presentation={:?} fullscreen_idx={:?} current_item={} player={}",
+            wait.label(),
+            pending.started_at.elapsed().as_millis(),
+            pending.path.display(),
+            pending.pts_secs,
+            self.viewer_presentation,
+            fullscreen_idx,
+            current_item,
+            player_diag
+        ));
+        if let Some(pending) = self.bookmark_media_open_pending.as_mut() {
+            pending.last_wait = Some(wait);
+        }
+    }
+
     fn poll_bookmark_media_open(&mut self, _ctx: &egui::Context) {
         let Some(pending) = self.bookmark_media_open_pending.clone() else {
             return;
         };
         if pending.started_at.elapsed() > std::time::Duration::from_secs(30) {
+            let current_item = self
+                .fullscreen_idx
+                .and_then(|idx| self.items.get(idx))
+                .map(GridItem::display_path)
+                .unwrap_or_else(|| "<none>".to_string());
+            crate::logger::log(format!(
+                "[bookmark-open] timeout media target={} pts={:.3} last_wait={:?} presentation={:?} fullscreen_idx={:?} current_item={}",
+                pending.path.display(),
+                pending.pts_secs,
+                pending.last_wait,
+                self.viewer_presentation,
+                self.fullscreen_idx,
+                current_item
+            ));
             self.bookmark_media_open_pending = None;
             self.show_feedback_toast("ブックマーク位置を開けませんでした".to_string());
             return;
         }
         let Some(idx) = self.fullscreen_idx else {
+            self.note_bookmark_media_open_wait(
+                crate::bookmark_browser::PendingMediaOpenWait::Fullscreen,
+            );
             return;
         };
         let path_matches = self.items.get(idx).is_some_and(|item| match item {
@@ -23768,19 +23898,51 @@ impl App {
             _ => false,
         });
         if !path_matches {
+            self.note_bookmark_media_open_wait(
+                crate::bookmark_browser::PendingMediaOpenWait::MatchingPath,
+            );
             return;
         }
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-            // player は info 到着前に fs_cache へ入る。ここで先に marker seek を出すと、
-            // info 受信時の open-time resume が後から同じ clock を上書きしてしまう。
-            // resume の適用が完了した `info.is_some()` を所有境界として待ち、その後に
-            // ユーザーが選んだブックマーク位置を最後の seek として発行する。
-            if player.info().is_none() {
-                return;
-            }
-            player.seek(pending.pts_secs.max(0.0));
-            self.bookmark_media_open_pending = None;
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) else {
+            self.note_bookmark_media_open_wait(
+                crate::bookmark_browser::PendingMediaOpenWait::Player,
+            );
+            return;
+        };
+        if !crate::folder_tree::path_eq(player.path(), &pending.path) {
+            self.note_bookmark_media_open_wait(
+                crate::bookmark_browser::PendingMediaOpenWait::Player,
+            );
+            return;
         }
+        // player は info 到着前に fs_cache へ入る。ここで先に marker seek を出すと、
+        // info 受信時の open-time resume が後から同じ clock を上書きしてしまう。
+        // resume の適用が完了した `info.is_some()` を所有境界として待ち、その後に
+        // ユーザーが選んだブックマーク位置を最後の seek として発行する。
+        if player.info().is_none() {
+            self.note_bookmark_media_open_wait(
+                crate::bookmark_browser::PendingMediaOpenWait::PlayerInfo,
+            );
+            return;
+        }
+        let target = pending.pts_secs.max(0.0);
+        let before = player.position();
+        let before_serial = player.current_seek_serial();
+        let state = player.engine_state_name();
+        let duration = player.duration();
+        crate::logger::log(format!(
+            "[bookmark-open] seek media path={} target={target:.3} before={before:.3} duration={duration:.3} state={state} serial_before={before_serial} presentation={:?}",
+            player.path().display(),
+            self.viewer_presentation
+        ));
+        player.seek(target);
+        crate::logger::log(format!(
+            "[bookmark-open] seek issued path={} after={:.3} serial_after={}",
+            player.path().display(),
+            player.position(),
+            player.current_seek_serial()
+        ));
+        self.bookmark_media_open_pending = None;
     }
 
     fn poll_bookmark_book_open(&mut self, ctx: &egui::Context) {
@@ -31395,6 +31557,7 @@ impl App {
             let saved_input_window_id = self.native_video_parked_live_input_window_id;
             self.native_video_parked_live_input_window_id = Some(id);
             self.poll_video(ctx);
+            self.poll_bookmark_media_open(ctx);
             self.update_parked_live_audio_music_view_state(ctx);
             self.native_video_parked_live_input_window_id = saved_input_window_id;
             self.swap_viewer_context_bundle(&mut bundle);
@@ -32470,6 +32633,8 @@ impl App {
                 if app.current_viewer_context_contains_video() {
                     app.poll_video(ctx);
                 }
+                app.poll_bookmark_media_open(ctx);
+                app.poll_bookmark_book_open(ctx);
                 app.poll_ai_upscale(ctx);
                 app.poll_final_ai(ctx);
                 app.poll_erase_inpaint(ctx);
@@ -33031,6 +33196,9 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
+            bookmark_view_return_from,
+            bookmark_media_open_pending,
+            bookmark_book_open_pending,
             fs_open_intent_from_grid,
             pending_detached_video_host_switch,
             fs_zoom,
@@ -33156,6 +33324,7 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
+            bookmark_view_return_from,
         );
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
@@ -33217,6 +33386,8 @@ impl App {
             music_bookmarks,
             music_bookmarks_loaded_for,
             last_loop_pos,
+            bookmark_media_open_pending,
+            bookmark_book_open_pending,
         );
 
         viewer_session.swap_with_mounted(
@@ -41826,6 +41997,10 @@ impl App {
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
+        if self.bookmark_view_back_nav().is_some() {
+            self.pending_return_to_parent = true;
+            return;
+        }
         if self.auto_open_for_current_container() {
             self.pending_return_to_parent = true;
             return;
@@ -55113,6 +55288,10 @@ impl eframe::App for App {
                         self.enter_reading_history_from_menu();
                         None
                     }
+                    crate::ui_main::AddressBarNav::Bookmarks => {
+                        self.enter_bookmark_view();
+                        None
+                    }
                     crate::ui_main::AddressBarNav::RatingViewBack => {
                         self.rating_view_parent_nav();
                         None
@@ -55186,6 +55365,10 @@ impl eframe::App for App {
                             }
                             crate::ui_main::AddressBarNav::ReadingHistory => {
                                 self.enter_reading_history();
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::Bookmarks => {
+                                self.enter_bookmark_view();
                                 None
                             }
                             crate::ui_main::AddressBarNav::RatingViewBack => {
