@@ -15056,8 +15056,65 @@ mod pipeline_cache_refactor_tests {
         key
     }
 
+    fn insert_edit_intermediate_caches(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) -> (
+        EraseResultKey,
+        LocalAdjustResultKey,
+        LocalAdjustLayerBypassPreviewKey,
+        LocalAdjustPrefixPreviewKey,
+    ) {
+        let make_entry = |suffix: &str| {
+            let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(50, 60, 70)]);
+            let texture = ctx.load_texture(
+                format!("{label}_{suffix}"),
+                image.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            (Arc::new(image), texture)
+        };
+
+        let erase_key = app.current_erase_result_key(idx);
+        let (pixels, texture) = make_entry("erase");
+        app.erase_result_cache
+            .insert(erase_key, EraseResultCacheEntry { pixels, texture });
+
+        let local_key = insert_local_adjust_cache(app, ctx, idx, &format!("{label}_local"));
+
+        let bypass_key = LocalAdjustLayerBypassPreviewKey {
+            result_key: local_key,
+            layer_idx: 0,
+        };
+        let (pixels, texture) = make_entry("bypass");
+        app.local_adjust_layer_bypass_cache
+            .insert(bypass_key, LocalAdjustCacheEntry { pixels, texture });
+
+        let prefix_key = LocalAdjustPrefixPreviewKey {
+            result_key: local_key,
+            layer_count: 1,
+        };
+        let (pixels, texture) = make_entry("prefix");
+        app.local_adjust_prefix_preview_cache
+            .insert(prefix_key, LocalAdjustCacheEntry { pixels, texture });
+
+        let (pixels, texture) = make_entry("conceal");
+        app.conceal_cache.insert(
+            idx,
+            ConcealCacheEntry {
+                pixels,
+                texture,
+                generation: app.conceal_generation,
+            },
+        );
+
+        (erase_key, local_key, bypass_key, prefix_key)
+    }
+
     #[test]
-    fn explicit_keep_set_evicts_pipeline_and_adjustment_caches() {
+    fn explicit_keep_set_evicts_pipeline_adjustment_and_edit_intermediate_caches() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let keep_idx = push_image(&mut app, "C:/pics/keep.jpg");
@@ -15065,6 +15122,10 @@ mod pipeline_cache_refactor_tests {
 
         let (keep_edit, keep_final) = insert_edit_and_final_cache(&mut app, &ctx, keep_idx, "keep");
         let (drop_edit, drop_final) = insert_edit_and_final_cache(&mut app, &ctx, drop_idx, "drop");
+        let (keep_erase, keep_local, keep_bypass, keep_prefix) =
+            insert_edit_intermediate_caches(&mut app, &ctx, keep_idx, "keep");
+        let (drop_erase, drop_local, drop_bypass, drop_prefix) =
+            insert_edit_intermediate_caches(&mut app, &ctx, drop_idx, "drop");
         for (idx, label) in [(keep_idx, "keep_adjust"), (drop_idx, "drop_adjust")] {
             let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(30, 40, 50)]);
             let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
@@ -15087,6 +15148,28 @@ mod pipeline_cache_refactor_tests {
         assert!(!app.edit_result_cache.contains_key(&drop_edit));
         assert!(app.final_composite_cache.contains_key(&keep_final));
         assert!(!app.final_composite_cache.contains_key(&drop_final));
+        assert!(app.erase_result_cache.contains_key(&keep_erase));
+        assert!(!app.erase_result_cache.contains_key(&drop_erase));
+        assert!(app.local_adjust_cache.contains_key(&keep_local));
+        assert!(!app.local_adjust_cache.contains_key(&drop_local));
+        assert!(
+            app.local_adjust_layer_bypass_cache
+                .contains_key(&keep_bypass)
+        );
+        assert!(
+            !app.local_adjust_layer_bypass_cache
+                .contains_key(&drop_bypass)
+        );
+        assert!(
+            app.local_adjust_prefix_preview_cache
+                .contains_key(&keep_prefix)
+        );
+        assert!(
+            !app.local_adjust_prefix_preview_cache
+                .contains_key(&drop_prefix)
+        );
+        assert!(app.conceal_cache.contains_key(&keep_idx));
+        assert!(!app.conceal_cache.contains_key(&drop_idx));
         assert!(
             app.final_ai_cache
                 .keys()

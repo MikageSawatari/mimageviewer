@@ -105,10 +105,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let texture_uv_raw = (sphere_uv - params.crop.xy) / params.crop.zw;
     // **crop 時は軸別に half-texel inset で clamp** (Codex P2 第 22/23 ラウンド)。
     //
-    // 背景: sampler は `address_mode_u: Repeat` + `address_mode_v: ClampToEdge` の
-    // 組み合わせ。フル equirect の U 経度シーム (u=0 と u=1 の連続) を自然にラップ
-    // させるため U は Repeat にしている。crop 時に texture_uv.x が [0,1] 範囲外に
-    // なると Repeat が反対側の画素を取りに行き、欠落視野に画像が複製表示される。
+    // 背景: フル equirect / 垂直 crop は U=Repeat + V=ClampToEdge、水平 crop は
+    // U/V=ClampToEdge の bind group を paint 時に選ぶ。前者は U 経度シーム
+    // (u=0 と u=1 の連続) を自然にラップし、後者は選択された低LOD mip自身の端で
+    // clampして、欠落視野へ反対端が混ざるのを防ぐ。
     //
     // **軸別判定**: 垂直 crop のみ (= DSLR 三脚 nodal panhead 撮影の典型、水平 360° は
     // フルに覆い垂直は天頂 / 地面が抜けている) のとき、U は Repeat の seam wrap が
@@ -116,11 +116,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // されてしまい、シーム位置で 1 texel ぶん端色が引き伸ばされて不自然になる。
     // U / V を別フラグで判定して、必要な軸だけ clamp する (第 23 ラウンド反映)。
     //
-    // **Linear filter 対応 (half-texel inset)**: `u = 0.0 ちょうど` をサンプルすると
-    // Linear が左右の隣接 texel を補間する。Repeat の場合「u<0 相当」は反対端 texel
-    // を取りに行くため、境界 1 texel ぶんで反対端の色が 50% 混ざる。これを防ぐには、
-    // 最外側 texel の **中心** に対応する `[0.5/W, 1 - 0.5/W]` に clamp する
-    // (= ハードウェア ClampToEdge 相当の動作)。
+    // **Linear filter 対応 (half-texel inset)**: level 0では最外側 texelの **中心** に
+    // 対応する `[0.5/W, 1 - 0.5/W]` へ寄せる。低LOD時の端処理は上記の
+    // ClampToEdge samplerが選択mipの寸法に合わせて保証する。
     //
     // **判定**: `u_crop` / `v_crop` は scale が 1 から離れている (= 部分覆い) または
     // offset が 0 から離れている (= 位置ずれ、稀) のどちらかで真。フル equirect
@@ -175,7 +173,7 @@ pub struct PanoramaShaderCallback {
 /// App 側で `Option<Arc<UploadedPanoTexture>>` を持ち、毎フレーム CallbackResources に
 /// `Arc::clone` を newtype 包んで insert する。
 ///
-/// `uniform` フィールドは `bind_group` の binding(2) に焼き込まれているため、
+/// `uniform` フィールドは両方の `bind_group` の binding(2) に焼き込まれているため、
 /// 構造体内で **必ず保持** する必要がある (drop されると bind_group が dangling 化)。
 /// 毎フレーム `prepare()` 内で `queue.write_buffer(&uniform, ..)` で yaw/pitch/fov を更新する。
 ///
@@ -188,7 +186,10 @@ pub struct UploadedPanoTexture {
     pub target_format: wgpu::TextureFormat,
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
-    pub bind_group: wgpu::BindGroup,
+    /// フル360°または垂直crop専用。U seamを自然に跨ぐRepeat samplerを使う。
+    pub repeat_bind_group: wgpu::BindGroup,
+    /// 水平crop専用。選択されたmip level自身の端へClampToEdgeする。
+    pub horizontal_crop_bind_group: wgpu::BindGroup,
     pub uniform: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
@@ -200,12 +201,14 @@ pub struct UploadedPanoTexture {
 pub struct UploadedPanoTextureRef(pub Arc<UploadedPanoTexture>);
 
 /// `target_format` 単位で 1 つだけ作る静的リソース。pipeline / bind_group_layout /
-/// sampler を含む。target_format が変わったら作り直す (compare_wgpu と同パターン)。
+/// Repeat / horizontal-crop sampler を含む。target_format が変わったら作り直す
+/// (compare_wgpu と同パターン)。
 pub struct PanoStaticGpu {
     pub target_format: wgpu::TextureFormat,
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
-    pub sampler: wgpu::Sampler,
+    pub repeat_sampler: wgpu::Sampler,
+    pub horizontal_crop_sampler: wgpu::Sampler,
     mipmap_generator: egui_wgpu::MipmapGenerator,
 }
 
@@ -278,9 +281,21 @@ impl PanoStaticGpu {
         });
         // U 方向は経度ラップ (Repeat)、V 方向は極でクランプ (ClampToEdge)。
         // 広角 FOV での強い縮小に備えて、mip level 間も Linear 補間する。
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("miv_panorama_sampler"),
+        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("miv_panorama_repeat_sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // 水平方向が欠けたpartial panoramaでは、低LODでもそのmip level自身の端に
+        // clampする。level 0基準のhalf-texel insetだけではRepeatの反対端が混ざる。
+        let horizontal_crop_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("miv_panorama_horizontal_crop_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
@@ -292,7 +307,8 @@ impl PanoStaticGpu {
             target_format,
             pipeline,
             bind_group_layout,
-            sampler,
+            repeat_sampler,
+            horizontal_crop_sampler,
             mipmap_generator: egui_wgpu::MipmapGenerator::new(device),
         }
     }
@@ -362,24 +378,32 @@ impl PanoStaticGpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("miv_panorama_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: uniform.as_entire_binding(),
-                },
-            ],
-        });
+        let create_bind_group = |label, sampler: &wgpu::Sampler| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: uniform.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let repeat_bind_group =
+            create_bind_group("miv_panorama_repeat_bind_group", &self.repeat_sampler);
+        let horizontal_crop_bind_group = create_bind_group(
+            "miv_panorama_horizontal_crop_bind_group",
+            &self.horizontal_crop_sampler,
+        );
 
         // uniform は `bind_group` の binding(2) に焼き込まれているので、struct に
         // 保持して dangling 化を防ぐ。`prepare()` 内で `queue.write_buffer` 経由で
@@ -390,7 +414,8 @@ impl PanoStaticGpu {
             target_format: self.target_format,
             texture,
             view,
-            bind_group,
+            repeat_bind_group,
+            horizontal_crop_bind_group,
             uniform,
             width,
             height,
@@ -458,7 +483,12 @@ impl egui_wgpu::CallbackTrait for PanoramaShaderCallback {
             return;
         }
         render_pass.set_pipeline(&resources.pipeline);
-        render_pass.set_bind_group(0, &uploaded.0.bind_group, &[]);
+        let bind_group = if self.uv_transform.has_horizontal_crop() {
+            &uploaded.0.horizontal_crop_bind_group
+        } else {
+            &uploaded.0.repeat_bind_group
+        };
+        render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.draw(0..6, 0..1);
     }
 }

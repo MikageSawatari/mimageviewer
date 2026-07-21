@@ -208,7 +208,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 - **ミップマップ**: 広角 (FOV 大) で 1 ピクセルが多数のテクセルを覆うとモアレが
   出る。8K baseは`vendor/egui-wgpu`と共用するGPU生成器で、level 0 upload後に完全な
   mip chainを生成し、Linearのlevel間補間でsampleする。画面解像度相当のsettle overlayは
-  縮小表示しないため1 mipのままとする。
+  縮小表示しないため1 mipのままとする。水平cropされた部分パノラマではU方向を
+  ClampToEdgeへ切り替え、選択されたmip levelの反対端が混ざるのを防ぐ。
 - **異方性フィルタ**: wgpu 0.x で wgpu の `Sampler` に `anisotropy_clamp` を渡せるが、
   optional feature の `ANISOTROPIC_FILTERING` が必要 (`docs/video-architecture.md` で
   すでに使われているか要確認、未使用なら追加負担あり)。**Phase 1 では mipmap +
@@ -2135,9 +2136,10 @@ GPano `CroppedArea*` 宣言で「フル球面の一部しか覆っていない�
 
 **欠落領域の埋め方** (Codex P2 第 21/22/23 ラウンドで段階的に精度向上):
 
-- **Sampler 設定**: `address_mode_u: Repeat` / `address_mode_v: ClampToEdge`。
-  フル equirect の経度シーム (U=0/1 連続) を自然に wrap させるため U は Repeat。
-  V は極の外挿を避けるため ClampToEdge。
+- **Sampler 設定**: 2つのbind groupを同じtexture/uniformに対して作り、描画時に選ぶ。
+  - フル equirect / 垂直cropのみ: `U=Repeat` / `V=ClampToEdge`。経度シームを自然にwrapする。
+  - 水平cropあり: `U=ClampToEdge` / `V=ClampToEdge`。選択された低LOD mip自身の端でclampし、
+    反対端の色が混ざるのを防ぐ。
 - **シェーダで軸別の half-texel inset clamp** (第 23 ラウンド反映):
   ```wgsl
   let u_crop = (crop.z < 0.999) || (abs(crop.x) > 0.001);
@@ -2154,11 +2156,9 @@ GPano `CroppedArea*` 宣言で「フル球面の一部しか覆っていない�
   - **両方 crop**: 両方 clamp
   - **フル equirect (IDENTITY)**: 両方とも偽、`texture_uv_raw` 素通しで U Repeat
     + V ClampToEdge の「平時」挙動を維持
-- **Linear filter 対応 (half-texel inset)**: `u = 0.0 ちょうど` をサンプルすると
-  Linear が左右の隣接 texel を補間する。Repeat の場合「u<0 相当」は反対端 texel を
-  取りに行くため、境界 1 texel ぶんで反対端の色が 50% 混ざる。これを防ぐため、
-  最外側 texel の **中心** に対応する `[0.5/W, 1 - 0.5/W]` に clamp する
-  (= ハードウェア ClampToEdge 相当の動作を Repeat sampler でも再現)。
+- **Linear filter 対応 (half-texel inset)**: level 0では最外側texelの中心に対応する
+  `[0.5/W, 1 - 0.5/W]` へclampする。mipmap導入後はlevel 0基準のinsetだけでは低LODの
+  最外texel中心にならないため、水平crop用ClampToEdge samplerが各LODの端処理を担当する。
 - **結果**: 欠落視野は端 texel の色 (空 / 地面っぽい色になりやすい) が均一に
   引き伸ばされ、反対端の画像が混ざる現象が出ない。垂直 crop only の典型ケースで
   U の seam wrap が無駄に無効化されることもない。
@@ -2502,7 +2502,7 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
       §3.5 末尾のタイル方式 + 1px オーバーラップでシーム処理 + mipmap 対応
 - [ ] little planet (stereographic 下向き) モード
 - [ ] cubemap 変換オプション (フィルタ品質、シーム完全排除)
-- [ ] 部分パノラマ (GPano CroppedAreaImage*) サポート
+- [ ] 部分パノラマの欠落領域を「黒」「透過」等から選ぶ表示オプション
 - [ ] アニメーション GIF / APNG の equirect 再生
 - [ ] 360 動画 (FFmpeg 経路、別議論)
 - [ ] サムネのインポスタ表示 (バッジで「360°」と表示)

@@ -643,7 +643,9 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 - `DISPLAY_IMAGE_TEXTURE_OPTIONS` を指定した managed texture は、ローカル差し替えした
   `vendor/egui-wgpu` が level 0 upload 後に完全な mip chain を GPU render pass で生成する。
 - 対象は raw static、PDF/ZIP page、編集・補正・AI・注釈・比較用の表示 texture。Windowsの
-  wipe/diff比較と360度パノラマの独自`Rgba8Unorm` textureも同じGPU生成器を使う。1つの
+  wipe/diff比較と360度パノラマの独自`Rgba8Unorm` textureも同じGPU生成器を使う。パノラマは
+  水平フル/垂直cropではU=Repeat、水平cropではU=ClampToEdgeを選び、低LODで部分画像の
+  反対端が混ざらないようにする。1つの
   `TextureHandle` 内に全 level を保持するので、表示 texture の優先順位、論理サイズ、zoom、
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
@@ -938,7 +940,9 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 を表示ユニットとして縦または横へ仮想配置する。巨大キャンバスは作らず、各ユニットの表示矩形を
 スクロール位置から毎フレーム計算し、GPU に保持するのは可視範囲と前後少数ページだけにする。
 同時可視ページ数は最大 16 ページ程度、`fs_cache` の連結読み用 keep set は最大 20 ページ程度に
-抑え、推定総テクセル数でも追加の安全弁をかける。連結読みのページ/見開きユニット間隔は
+抑え、推定総テクセル数でも追加の安全弁をかける。推定にはrawだけでなく、erase、local-adjust、
+conceal、edit、final composite、comic、補正の完全mip chainをTextureId重複排除つきで含め、
+同じkeep setでevictionする。連結読みのページ/見開きユニット間隔は
 `continuous_reading_gap_px` (既定 20px) を使い、見開きユニット内部の左右ページ間隔は
 通常見開きと同じ `spread_page_gap_px` を使う。見開き構成の縦連結 + 横幅フィットでは、
 表紙・横長ページ・端数の単独ページも仮想的な 2 ページ幅で fit scale を求め、実ページを中央寄せする。

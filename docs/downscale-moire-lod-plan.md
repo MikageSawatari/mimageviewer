@@ -45,6 +45,8 @@
 Windowsのwipe/diff比較と360度パノラマはmanaged `TextureHandle`を使わず独自に
 `Rgba8Unorm` textureを作るため、同じGPU生成器で完全なmip chainを構築し、trilinear samplingする。
 画面解像度で描く360度パノラマのsettle overlayは1 mipのままとする。
+360度パノラマは水平フル/垂直cropではU方向Repeat、水平cropではU方向ClampToEdgeの
+bind groupを選び、低LODで部分画像の反対端が混ざらないようにする。
 
 サムネイル、animated GIF/APNG/WebP の各 frame、動画、mask、checker、UI/font preview、
 `PostFilter::Nearest` は opt-in しない。これにより小 texture や頻繁に更新する texture の
@@ -59,9 +61,10 @@ Windowsのwipe/diff比較と360度パノラマはmanaged `TextureHandle`を使�
 - texture cache の invalidation は従来どおり `TextureHandle` 単位。再 upload 時に mip chain も
   一緒に作り直されるため、LOD 専用の世代管理は追加しない。
 - `PostFilter::Nearest` は level 0 + nearest sampler のままとし、意図したドット表示を守る。
-- 連結読みの320M texel上限は、raw staticの完全なmip chainに加え、同時保持するedit、
-  final composite、comic、補正textureもTextureIdで重複排除して見積もる。animated frameは従来どおり
-  level 0だけを数える。
+- 連結読みの320M texel上限は、raw staticの完全なmip chainに加え、同時保持するerase、
+  local-adjust（レイヤー比較previewを含む）、conceal、edit、final composite、comic、補正textureも
+  TextureIdで重複排除して見積もる。これらの編集cacheはkeep-set evictionにも追従する。
+  animated frameは従来どおりlevel 0だけを数える。
 - 表示トリムは画像全体から生成したmipを部分UVで描く。強い縮小時は、切り落とした余白色が
   境界の低LOD texelへ混ざる可能性があるが、通常は画面上1〜2px程度であり、専用crop textureの
   キャッシュ複雑化を避けるためv2.7.0では既知制約として受容する。
@@ -81,6 +84,7 @@ Windowsのwipe/diff比較と360度パノラマはmanaged `TextureHandle`を使�
 - fit、見開き、縦横連結、ズーム往復、ルーペ、pixel grid の寸法と位置が変わらないこと。
 - 補正、AI、消しゴム、隠蔽、注釈の結果更新後も古い mip level が残らないこと。
 - Windowsのwipe/diff比較と360度パノラマを大縮小してもモアレが再発しないこと。
+- 水平cropされた部分パノラマを広角表示しても、欠落領域へ画像の反対端が混ざらないこと。
 - 連結読みの320M texel上限が完全なmip chainと後段表示textureを含むこと。
 - `Nearest`、animated image、動画、サムネイルの挙動が変わらないこと。
 - 旧 `downscale2x` / `downscale4x` を含む保存設定が `None` でロードできること。

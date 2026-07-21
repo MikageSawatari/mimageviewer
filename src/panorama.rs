@@ -158,6 +158,14 @@ impl PanoUvTransform {
         self.u_offset == 0.0 && self.v_offset == 0.0 && self.u_scale == 1.0 && self.v_scale == 1.0
     }
 
+    /// 水平方向がフル 360° を覆わず、U の seam wrap を無効にすべきか。
+    ///
+    /// WGSL 側の crop 判定と同じ許容幅を使う。垂直方向だけが欠けた典型的な
+    /// partial panorama では false のままなので、U=Repeat の自然な seam を維持する。
+    pub fn has_horizontal_crop(&self) -> bool {
+        self.u_scale < 0.999 || self.u_offset.abs() > 0.001
+    }
+
     /// GPano XMP の `CroppedArea*` + `FullPano*` 値から UV transform を計算する。
     /// すべての必須フィールドが揃っているとき `Some(_)` を返し、欠けるか不正値
     /// (= ゼロ除算 / 範囲外) の場合は `None` (= フル equirect 扱いに fallback)。
@@ -908,6 +916,28 @@ mod tests {
         let expected_v_offset = 883.0 / 7562.0;
         assert!((x.v_offset - expected_v_offset).abs() < 0.001);
         assert!(!x.is_identity());
+        assert!(!x.has_horizontal_crop());
+    }
+
+    #[test]
+    fn uv_transform_detects_horizontal_crop_for_sampler_selection() {
+        assert!(!PanoUvTransform::IDENTITY.has_horizontal_crop());
+
+        let horizontal = PanoUvTransform {
+            u_offset: 0.1,
+            v_offset: 0.0,
+            u_scale: 0.8,
+            v_scale: 1.0,
+        };
+        assert!(horizontal.has_horizontal_crop());
+
+        let vertical_only = PanoUvTransform {
+            u_offset: 0.0,
+            v_offset: 0.1,
+            u_scale: 1.0,
+            v_scale: 0.8,
+        };
+        assert!(!vertical_only.has_horizontal_crop());
     }
 
     #[test]

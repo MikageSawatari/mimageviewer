@@ -48204,6 +48204,18 @@ impl App {
         &mut self,
         keep_set: &std::collections::HashSet<usize>,
     ) {
+        // source-resolutionの編集中間textureもfinal cacheと同じkeep-setへ追従させる。
+        // これらはすべて完全なmip chainを持つため、範囲外ページに残すと連結読みの
+        // VRAM上限を回避して蓄積する。
+        self.erase_result_cache
+            .retain(|key, _| keep_set.contains(&key.idx));
+        self.local_adjust_cache
+            .retain(|key, _| keep_set.contains(&key.idx));
+        self.local_adjust_layer_bypass_cache
+            .retain(|key, _| keep_set.contains(&key.result_key.idx));
+        self.local_adjust_prefix_preview_cache
+            .retain(|key, _| keep_set.contains(&key.result_key.idx));
+        self.conceal_cache.retain(|idx, _| keep_set.contains(idx));
         self.edit_result_cache
             .retain(|key, _| keep_set.contains(&key.idx));
         self.final_ai_cache

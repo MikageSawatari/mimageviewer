@@ -15061,6 +15061,29 @@ impl App {
         if let Some(entry) = self.adjustment_cache.get(&idx) {
             add_fs_cache_entry_texels(&mut seen, &mut total, entry);
         }
+        for (key, entry) in &self.erase_result_cache {
+            if key.idx == idx {
+                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+            }
+        }
+        for (key, entry) in &self.local_adjust_cache {
+            if key.idx == idx {
+                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+            }
+        }
+        for (key, entry) in &self.local_adjust_layer_bypass_cache {
+            if key.result_key.idx == idx {
+                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+            }
+        }
+        for (key, entry) in &self.local_adjust_prefix_preview_cache {
+            if key.result_key.idx == idx {
+                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+            }
+        }
+        if let Some(entry) = self.conceal_cache.get(&idx) {
+            add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+        }
         for (key, entry) in &self.edit_result_cache {
             if key.idx == idx
                 && let Some(texture) = entry.texture.as_ref()
@@ -25146,6 +25169,67 @@ mod tests {
         assert_eq!(texture_size_texels([4, 3], true), 15);
         assert_eq!(texture_size_texels([4, 3], false), 12);
         assert_eq!(texture_size_texels([3, 1], true), 4);
+    }
+
+    #[test]
+    fn vertical_reading_texel_estimate_includes_edit_intermediate_textures() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let idx = 7;
+        let make_texture = |name: &str| {
+            let image = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
+            (
+                Arc::new(image.clone()),
+                ctx.load_texture(name, image, egui::TextureOptions::LINEAR),
+            )
+        };
+
+        let erase_key = app.current_erase_result_key(idx);
+        let (pixels, texture) = make_texture("estimate_erase");
+        app.erase_result_cache.insert(
+            erase_key,
+            crate::app::EraseResultCacheEntry { pixels, texture },
+        );
+
+        let local_key = app.current_local_adjust_key(idx);
+        let (pixels, texture) = make_texture("estimate_local");
+        app.local_adjust_cache.insert(
+            local_key,
+            crate::app::LocalAdjustCacheEntry { pixels, texture },
+        );
+
+        let bypass_key = crate::app::LocalAdjustLayerBypassPreviewKey {
+            result_key: local_key,
+            layer_idx: 0,
+        };
+        let (pixels, texture) = make_texture("estimate_bypass");
+        app.local_adjust_layer_bypass_cache.insert(
+            bypass_key,
+            crate::app::LocalAdjustCacheEntry { pixels, texture },
+        );
+
+        let prefix_key = crate::app::LocalAdjustPrefixPreviewKey {
+            result_key: local_key,
+            layer_count: 1,
+        };
+        let (pixels, texture) = make_texture("estimate_prefix");
+        app.local_adjust_prefix_preview_cache.insert(
+            prefix_key,
+            crate::app::LocalAdjustCacheEntry { pixels, texture },
+        );
+
+        let (pixels, texture) = make_texture("estimate_conceal");
+        app.conceal_cache.insert(
+            idx,
+            crate::app::ConcealCacheEntry {
+                pixels,
+                texture,
+                generation: app.conceal_generation,
+            },
+        );
+
+        // 4x4 の完全chainは 16+4+1=21 texel。独立した5 textureをすべて数える。
+        assert_eq!(app.vertical_reading_loaded_texels(idx), 5 * 21);
     }
 
     #[test]

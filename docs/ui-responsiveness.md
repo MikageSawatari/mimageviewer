@@ -157,7 +157,8 @@ render pass で mip chain も生成する。CPU resize や I/O は増えない�
 `fs_upload_backlog` のペーシング下に置き、サムネイルや animated frame へは広げない。
 wipe/diff比較はpair生成時、360度パノラマはbase upload時だけ同じGPU生成を行う。360のsettle
 overlayは画面解像度相当なので1 mipのままにする。連結読みのtexel上限は完全なmip chainと
-同時保持する後段表示textureを含めて見積もる。
+同時保持するerase / local-adjust / conceal / edit / final composite / comic / adjustment textureを
+TextureIdで重複排除して見積もり、補正レイヤーの比較previewも同じkeep-set evictionへ追従させる。
 
 ### 3.2 サムネイルアップロードは per-frame スロットリング不要
 
