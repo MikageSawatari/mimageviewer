@@ -4464,6 +4464,7 @@ mod phase_c_drill_nav_tests {
                 page_identity: PageIdentity::RelativePath("001.jpg".into()),
                 page_index_hint: 0,
                 created_at_ms: 1,
+                title: None,
             }],
         ));
 
@@ -6283,6 +6284,48 @@ mod phase_c_drill_nav_tests {
         // BS 1 回でトップレベル (一覧) へ戻る
         app.drill_back_one_level();
         assert!(app.global_search.drill.is_none(), "BS 1 回で一覧へ戻る");
+    }
+}
+
+#[test]
+fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
+    for is_audio in [false, true] {
+        let mut app = phase_c_support::setup_app();
+        let path = PathBuf::from(if is_audio {
+            r"C:\Media\marker.flac"
+        } else {
+            r"C:\Media\marker.mp4"
+        });
+        app.items = vec![if is_audio {
+            GridItem::Audio(path.clone())
+        } else {
+            GridItem::Video(path.clone())
+        }];
+        app.fullscreen_idx = Some(0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                // info=None は実 player が fs_cache に入り、decoder の info を待っている状態。
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    path.clone(),
+                    3.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
+            path,
+            pts_secs: 42.0,
+            started_at: std::time::Instant::now(),
+        });
+
+        app.poll_bookmark_media_open(&egui::Context::default());
+
+        assert!(
+            app.bookmark_media_open_pending.is_some(),
+            "{} bookmark seek must remain pending until player info arrives",
+            if is_audio { "audio" } else { "video" }
+        );
     }
 }
 

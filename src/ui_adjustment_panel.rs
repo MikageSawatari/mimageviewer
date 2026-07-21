@@ -11703,6 +11703,10 @@ impl App {
 
         let mut remove_id = None;
         let mut jump_to = None;
+        let mut title_edit = self.book_bookmark_title_edit.take();
+        let mut start_title_edit = None;
+        let mut save_title = None;
+        let mut cancel_title_edit = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .max_height(body_height - 32.0)
@@ -11720,6 +11724,7 @@ impl App {
                         .corner_radius(5.0)
                         .inner_margin(egui::Margin::same(6));
                     let inner = frame.show(ui, |ui| {
+                        let mut control_clicked = false;
                         ui.horizontal(|ui| {
                             let thumb_size = egui::vec2(58.0, 58.0);
                             let (thumb_rect, _) =
@@ -11757,16 +11762,50 @@ impl App {
                             }
 
                             ui.vertical(|ui| {
-                                ui.set_max_width((body_width - 116.0).max(80.0));
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} ページ",
-                                        (*item_idx)
-                                            .unwrap_or(bookmark.page_index_hint)
-                                            .saturating_add(1)
-                                    ))
-                                    .strong(),
-                                );
+                                ui.set_max_width((body_width - 86.0).max(100.0));
+                                if title_edit.as_ref().map(|edit| edit.id) == Some(bookmark.id) {
+                                    // TextEdit 内のクリックを行ジャンプへ流さない。
+                                    control_clicked = true;
+                                    let edit = title_edit
+                                        .as_mut()
+                                        .expect("matching book bookmark title edit");
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(&mut edit.title)
+                                            .desired_width(ui.available_width())
+                                            .hint_text("未設定"),
+                                    );
+                                    if edit.request_focus {
+                                        response.request_focus();
+                                        edit.request_focus = false;
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("保存").clicked() {
+                                            save_title = Some((bookmark.id, edit.title.clone()));
+                                            control_clicked = true;
+                                        }
+                                        if ui.small_button("名称なし").clicked() {
+                                            save_title = Some((bookmark.id, String::new()));
+                                            control_clicked = true;
+                                        }
+                                        if ui.small_button("キャンセル").clicked() {
+                                            cancel_title_edit = true;
+                                            control_clicked = true;
+                                        }
+                                    });
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            bookmark.title.as_deref().unwrap_or("名称なし"),
+                                        )
+                                        .strong(),
+                                    );
+                                }
+                                ui.label(format!(
+                                    "{} ページ",
+                                    (*item_idx)
+                                        .unwrap_or(bookmark.page_index_hint)
+                                        .saturating_add(1)
+                                ));
                                 ui.label(
                                     egui::RichText::new(bookmark.page_identity.display_name())
                                         .small(),
@@ -11778,19 +11817,48 @@ impl App {
                                             .color(egui::Color32::from_rgb(240, 170, 90)),
                                     );
                                 }
+                                if title_edit.as_ref().map(|edit| edit.id) != Some(bookmark.id) {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("名前を編集").clicked() {
+                                            start_title_edit =
+                                                Some(crate::app::BookBookmarkTitleEdit {
+                                                    id: bookmark.id,
+                                                    title: bookmark
+                                                        .title
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    request_focus: true,
+                                                });
+                                            control_clicked = true;
+                                        }
+                                        if ui.small_button("削除").clicked() {
+                                            remove_id = Some(bookmark.id);
+                                            control_clicked = true;
+                                        }
+                                    });
+                                }
                             });
-                            if ui.small_button("削除").clicked() {
-                                remove_id = Some(bookmark.id);
-                            }
                         });
+                        control_clicked
                     });
                     let row_response = inner.response.interact(egui::Sense::click());
-                    if row_response.clicked() && remove_id != Some(bookmark.id) {
+                    if row_response.clicked() && !inner.inner {
                         jump_to = Some(bookmark.clone());
                     }
                     ui.add_space(5.0);
                 }
             });
+        if let Some(edit) = start_title_edit {
+            title_edit = Some(edit);
+        }
+        if cancel_title_edit {
+            title_edit = None;
+        }
+        if let Some((id, title)) = save_title {
+            title_edit = None;
+            self.set_book_bookmark_title(id, title);
+        }
+        self.book_bookmark_title_edit = title_edit;
         if let Some(id) = remove_id {
             self.remove_book_bookmark(id);
         } else if let Some(bookmark) = jump_to {

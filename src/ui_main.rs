@@ -10778,6 +10778,46 @@ impl App {
             font,
             egui::Color32::WHITE,
         );
+        if let Some(title) = row.title() {
+            let font = crate::ui_fonts::user_text_font(13.0);
+            let max_text_width = (rect.width() - 28.0).max(0.0);
+            if max_text_width >= 8.0 {
+                let initial = crate::ui_helpers::truncate_name(title, 36);
+                let mut galley = ui.painter().layout_no_wrap(
+                    initial.clone(),
+                    font.clone(),
+                    egui::Color32::WHITE,
+                );
+                if galley.size().x > max_text_width {
+                    let chars: Vec<char> = initial.chars().collect();
+                    for take in (1..chars.len()).rev() {
+                        let candidate = chars[..take].iter().collect::<String>() + "…";
+                        let candidate_galley = ui.painter().layout_no_wrap(
+                            candidate,
+                            font.clone(),
+                            egui::Color32::WHITE,
+                        );
+                        if candidate_galley.size().x <= max_text_width {
+                            galley = candidate_galley;
+                            break;
+                        }
+                    }
+                }
+                if galley.size().x <= max_text_width {
+                    let plate_rect = egui::Rect::from_center_size(
+                        rect.center(),
+                        galley.size() + egui::vec2(14.0, 8.0),
+                    );
+                    ui.painter()
+                        .rect_filled(plate_rect, 4.0, egui::Color32::from_black_alpha(190));
+                    ui.painter().galley(
+                        plate_rect.center() - galley.size() * 0.5,
+                        galley,
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
+        }
         let source = row.source_path().display().to_string();
         let position = row.position_label();
         let registered = format_details_mtime(
@@ -10790,6 +10830,9 @@ impl App {
             egui::Sense::hover(),
         );
         response.on_hover_ui_at_pointer(|ui| {
+            if let Some(title) = row.title() {
+                ui.label(format!("名前 {title}"));
+            }
             ui.label(format!("場所 {source}"));
             ui.label(format!("位置 {position}"));
             ui.label(format!("登録日時 {registered}"));

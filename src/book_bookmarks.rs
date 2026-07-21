@@ -107,6 +107,8 @@ pub struct BookBookmark {
     pub page_identity: PageIdentity,
     pub page_index_hint: usize,
     pub created_at_ms: i64,
+    /// ユーザーが任意で付けた名称。空文字は保存せず `None` として扱う。
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +120,10 @@ pub enum BookBookmarkEvent {
     Removed {
         request_id: u64,
         result: Result<i64, String>,
+    },
+    TitleUpdated {
+        request_id: u64,
+        result: Result<(i64, Option<String>), String>,
     },
     ContainerListed {
         request_id: u64,
@@ -133,6 +139,7 @@ pub enum BookBookmarkEvent {
 enum BookBookmarkRequest {
     Add(u64, NewBookBookmark),
     Remove(u64, i64),
+    SetTitle(u64, i64, String),
     ListContainer(u64, PathBuf),
     ListAll(u64),
 }
@@ -172,6 +179,12 @@ impl BookBookmarkService {
                                         result: Err(message.clone()),
                                     }
                                 }
+                                BookBookmarkRequest::SetTitle(request_id, _, _) => {
+                                    BookBookmarkEvent::TitleUpdated {
+                                        request_id,
+                                        result: Err(message.clone()),
+                                    }
+                                }
                                 BookBookmarkRequest::ListContainer(request_id, path) => {
                                     BookBookmarkEvent::ContainerListed {
                                         request_id,
@@ -203,6 +216,15 @@ impl BookBookmarkService {
                             request_id,
                             result: db.remove(id).map(|_| id).map_err(|err| err.to_string()),
                         },
+                        BookBookmarkRequest::SetTitle(request_id, id, title) => {
+                            BookBookmarkEvent::TitleUpdated {
+                                request_id,
+                                result: db
+                                    .set_title(id, Some(&title))
+                                    .map(|title| (id, title))
+                                    .map_err(|err| err.to_string()),
+                            }
+                        }
                         BookBookmarkRequest::ListContainer(request_id, path) => {
                             let container_key = container_key(&path);
                             BookBookmarkEvent::ContainerListed {
@@ -238,6 +260,12 @@ impl BookBookmarkService {
     pub fn remove(&self, request_id: u64, id: i64) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(BookBookmarkRequest::Remove(request_id, id));
+        }
+    }
+
+    pub fn set_title(&self, request_id: u64, id: i64, title: String) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(BookBookmarkRequest::SetTitle(request_id, id, title));
         }
     }
 
@@ -299,13 +327,15 @@ impl BookBookmarkDb {
                 page_key        TEXT NOT NULL,
                 page_index_hint INTEGER NOT NULL DEFAULT 0,
                 created_at_ms   INTEGER NOT NULL,
+                title           TEXT,
                 UNIQUE(container_key, page_kind, page_key)
              );
              CREATE INDEX IF NOT EXISTS idx_book_bookmarks_container
                 ON book_bookmarks(container_key);
              CREATE INDEX IF NOT EXISTS idx_book_bookmarks_created
                 ON book_bookmarks(created_at_ms DESC);",
-        )
+        )?;
+        ensure_column(conn, "title", "TEXT")
     }
 
     fn add(&self, entry: &NewBookBookmark) -> Result<(BookBookmark, bool), rusqlite::Error> {
@@ -330,7 +360,7 @@ impl BookBookmarkDb {
         )? > 0;
         let bookmark = self.conn.query_row(
             "SELECT id, container_key, container_path, container_kind, page_kind,
-                    page_value, page_index_hint, created_at_ms
+                    page_value, page_index_hint, created_at_ms, title
                FROM book_bookmarks
               WHERE container_key = ?1 AND page_kind = ?2 AND page_key = ?3",
             rusqlite::params![key, page_kind, page_key],
@@ -345,11 +375,20 @@ impl BookBookmarkDb {
         Ok(())
     }
 
+    fn set_title(&self, id: i64, title: Option<&str>) -> Result<Option<String>, rusqlite::Error> {
+        let title = normalize_bookmark_title(title);
+        self.conn.execute(
+            "UPDATE book_bookmarks SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title.as_deref(), id],
+        )?;
+        Ok(title)
+    }
+
     fn list_for_container(&self, path: &Path) -> Result<Vec<BookBookmark>, rusqlite::Error> {
         let key = container_key(path);
         self.list_query(
             "SELECT id, container_key, container_path, container_kind, page_kind,
-                    page_value, page_index_hint, created_at_ms
+                    page_value, page_index_hint, created_at_ms, title
                FROM book_bookmarks
               WHERE container_key = ?1
               ORDER BY page_index_hint ASC, created_at_ms ASC",
@@ -360,7 +399,7 @@ impl BookBookmarkDb {
     fn list_all(&self) -> Result<Vec<BookBookmark>, rusqlite::Error> {
         self.list_query(
             "SELECT id, container_key, container_path, container_kind, page_kind,
-                    page_value, page_index_hint, created_at_ms
+                    page_value, page_index_hint, created_at_ms, title
                FROM book_bookmarks
               ORDER BY created_at_ms DESC, id DESC",
             None,
@@ -404,7 +443,49 @@ fn row_to_bookmark(row: &rusqlite::Row<'_>) -> Result<BookBookmark, rusqlite::Er
         page_identity,
         page_index_hint: page_index_hint.max(0) as usize,
         created_at_ms: row.get(7)?,
+        title: row.get(8)?,
     })
+}
+
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let exists = {
+        let mut stmt = conn.prepare("PRAGMA table_info(book_bookmarks)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for name in rows {
+            if name? == column {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if exists {
+        return Ok(());
+    }
+    match conn.execute(
+        &format!("ALTER TABLE book_bookmarks ADD COLUMN {column} {definition}"),
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("duplicate column") =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn normalize_bookmark_title(title: Option<&str>) -> Option<String> {
+    title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
 }
 
 pub fn db_path() -> PathBuf {
@@ -506,5 +587,71 @@ mod tests {
         let (saved, _) = db.add(&entry).unwrap();
         db.remove(saved.id).unwrap();
         assert!(db.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn title_is_trimmed_persisted_and_can_be_cleared() {
+        let db = open_in_memory();
+        let entry = NewBookBookmark {
+            container_path: PathBuf::from("C:/Books/a.pdf"),
+            container_kind: BookContainerKind::Pdf,
+            page_identity: PageIdentity::PdfPage(2),
+            page_index_hint: 2,
+        };
+        let (saved, _) = db.add(&entry).unwrap();
+
+        assert_eq!(
+            db.set_title(saved.id, Some("  重要なページ  ")).unwrap(),
+            Some("重要なページ".to_string())
+        );
+        assert_eq!(
+            db.list_all().unwrap()[0].title.as_deref(),
+            Some("重要なページ")
+        );
+
+        assert_eq!(db.set_title(saved.id, Some("   ")).unwrap(), None);
+        assert_eq!(db.list_all().unwrap()[0].title, None);
+    }
+
+    #[test]
+    fn old_schema_is_migrated_with_nullable_title() {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory DB");
+        conn.execute_batch(
+            "CREATE TABLE book_bookmarks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                container_key   TEXT NOT NULL,
+                container_path  TEXT NOT NULL,
+                container_kind  TEXT NOT NULL,
+                page_kind       TEXT NOT NULL,
+                page_value      TEXT NOT NULL,
+                page_key        TEXT NOT NULL,
+                page_index_hint INTEGER NOT NULL DEFAULT 0,
+                created_at_ms   INTEGER NOT NULL,
+                UNIQUE(container_key, page_kind, page_key)
+             );",
+        )
+        .unwrap();
+
+        BookBookmarkDb::init_schema(&conn).expect("migrate schema");
+        let mut stmt = conn.prepare("PRAGMA table_info(book_bookmarks)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "title"));
+        drop(stmt);
+
+        let db = BookBookmarkDb { conn };
+        let entry = NewBookBookmark {
+            container_path: PathBuf::from("C:/Books/legacy.cbz"),
+            container_kind: BookContainerKind::Zip,
+            page_identity: PageIdentity::ArchiveEntry("001.jpg".to_string()),
+            page_index_hint: 0,
+        };
+        let (saved, _) = db.add(&entry).unwrap();
+        assert_eq!(saved.title, None);
+        db.set_title(saved.id, Some("表紙")).unwrap();
+        assert_eq!(db.list_all().unwrap()[0].title.as_deref(), Some("表紙"));
     }
 }

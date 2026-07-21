@@ -292,9 +292,24 @@ impl BookmarkBrowserRow {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| bookmark.container_path.display().to_string());
-                format!("{container} — {}", bookmark.page_identity.display_name())
+                format!(
+                    "{} — {}",
+                    bookmark.title.as_deref().unwrap_or(&container),
+                    bookmark.page_identity.display_name()
+                )
             }
         }
+    }
+
+    /// サムネイル中央に重ねる、ユーザーが明示的に付けた名称。
+    /// 未設定時はファイル名を中央表示せず、通常の名前表示へ任せる。
+    pub fn title(&self) -> Option<&str> {
+        match &self.source {
+            BookmarkRowSource::Media { title, .. } => title.as_deref(),
+            BookmarkRowSource::Book(bookmark) => bookmark.title.as_deref(),
+        }
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
     }
 
     pub fn position_label(&self) -> String {
@@ -685,6 +700,7 @@ mod tests {
                 page_identity: PageIdentity::RelativePath("Chapter/001.JPG".into()),
                 page_index_hint: 0,
                 created_at_ms: 1,
+                title: None,
             },
             BookBookmark {
                 id: 2,
@@ -694,6 +710,7 @@ mod tests {
                 page_identity: PageIdentity::ArchiveEntry("Part/002.PNG".into()),
                 page_index_hint: 1,
                 created_at_ms: 2,
+                title: None,
             },
         ];
         let presence = BookmarkPresence::from_rows(media, rows);
@@ -730,5 +747,34 @@ mod tests {
         row.missing = true;
         assert_eq!(row.badge_label(), "0:07");
         assert_eq!(row.position_label(), "0:07 / 見つかりません");
+    }
+
+    #[test]
+    fn explicit_bookmark_title_is_used_for_name_and_thumbnail_overlay() {
+        let path = PathBuf::from(r"C:\Books\story.pdf");
+        let row = BookmarkBrowserRow {
+            source: BookmarkRowSource::Book(crate::book_bookmarks::BookBookmark {
+                id: 9,
+                container_key: crate::book_bookmarks::container_key(&path),
+                container_path: path.clone(),
+                container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+                page_identity: crate::book_bookmarks::PageIdentity::PdfPage(4),
+                page_index_hint: 4,
+                created_at_ms: 1,
+                title: Some("伏線".to_string()),
+            }),
+            item: GridItem::PdfPage {
+                pdf_path: path,
+                page_num: 4,
+                content_type: None,
+            },
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 1,
+            missing: false,
+        };
+
+        assert_eq!(row.title(), Some("伏線"));
+        assert_eq!(row.display_name(), "伏線 — 5 ページ");
     }
 }

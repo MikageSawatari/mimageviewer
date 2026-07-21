@@ -2552,6 +2552,13 @@ pub(crate) struct StampEmbedPending {
     pub(crate) cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BookBookmarkTitleEdit {
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    pub(crate) request_focus: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CompareViewMode {
     Off,
@@ -7268,6 +7275,8 @@ pub struct App {
     pub(crate) current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
     pub(crate) current_book_bookmarks_key: Option<String>,
     pub(crate) current_book_bookmarks_request: Option<(u64, String)>,
+    /// 左パネルで編集中の本ブックマーク名称。
+    pub(crate) book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
     pub(crate) book_bookmark_request_seq: u64,
     pub(crate) book_bookmark_pending_requests: std::collections::HashSet<u64>,
     /// フルスクリーンで読んだ本の履歴 DB。
@@ -9945,6 +9954,7 @@ impl App {
             current_book_bookmarks: Vec::new(),
             current_book_bookmarks_key: None,
             current_book_bookmarks_request: None,
+            book_bookmark_title_edit: None,
             book_bookmark_request_seq: 0,
             book_bookmark_pending_requests: std::collections::HashSet::new(),
             reading_history_db,
@@ -23085,6 +23095,7 @@ impl App {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;
             self.current_book_bookmarks_request = None;
+            self.book_bookmark_title_edit = None;
             return;
         };
         let key = crate::book_bookmarks::container_key(&entry.container_path);
@@ -23099,6 +23110,7 @@ impl App {
         // 別の本へ移動した直後に、旧コンテナの行を新しい本の行として一瞬表示しない。
         self.current_book_bookmarks.clear();
         self.current_book_bookmarks_key = None;
+        self.book_bookmark_title_edit = None;
         let request_id = self.next_book_bookmark_request_id();
         if let Some(service) = self.book_bookmark_service.as_ref() {
             service.list_for_container(request_id, entry.container_path);
@@ -23115,6 +23127,16 @@ impl App {
         }
     }
 
+    pub(crate) fn set_book_bookmark_title(&mut self, id: i64, title: String) {
+        let request_id = self.next_book_bookmark_request_id();
+        let Some(service) = self.book_bookmark_service.as_ref() else {
+            self.show_feedback_toast("ブックマークDBを利用できません".to_string());
+            return;
+        };
+        service.set_title(request_id, id, title);
+        self.book_bookmark_pending_requests.insert(request_id);
+    }
+
     pub(crate) fn poll_book_bookmarks(&mut self) {
         loop {
             let event = match self
@@ -23128,6 +23150,7 @@ impl App {
                     self.book_bookmark_service = None;
                     self.book_bookmark_pending_requests.clear();
                     self.current_book_bookmarks_request = None;
+                    self.book_bookmark_title_edit = None;
                     self.show_feedback_toast("ブックマークDBとの接続が終了しました".to_string());
                     break;
                 }
@@ -23167,11 +23190,42 @@ impl App {
                     match result {
                         Ok(id) => {
                             self.current_book_bookmarks.retain(|entry| entry.id != id);
+                            if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
+                                == Some(id)
+                            {
+                                self.book_bookmark_title_edit = None;
+                            }
                             self.notify_bookmarks_changed();
                             self.show_feedback_toast("ブックマークを削除しました".to_string());
                         }
                         Err(err) => self
                             .show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}")),
+                    }
+                }
+                crate::book_bookmarks::BookBookmarkEvent::TitleUpdated { request_id, result } => {
+                    self.book_bookmark_pending_requests.remove(&request_id);
+                    match result {
+                        Ok((id, title)) => {
+                            if let Some(bookmark) = self
+                                .current_book_bookmarks
+                                .iter_mut()
+                                .find(|bookmark| bookmark.id == id)
+                            {
+                                bookmark.title = title;
+                            }
+                            if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
+                                == Some(id)
+                            {
+                                self.book_bookmark_title_edit = None;
+                            }
+                            if self.items_are_bookmark_view {
+                                self.refresh_bookmark_browser();
+                            }
+                            self.show_feedback_toast("ブックマーク名を更新しました".to_string());
+                        }
+                        Err(err) => self.show_feedback_toast(format!(
+                            "ブックマーク名の更新に失敗しました: {err}"
+                        )),
                     }
                 }
                 crate::book_bookmarks::BookBookmarkEvent::ContainerListed {
@@ -23717,6 +23771,13 @@ impl App {
             return;
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+            // player は info 到着前に fs_cache へ入る。ここで先に marker seek を出すと、
+            // info 受信時の open-time resume が後から同じ clock を上書きしてしまう。
+            // resume の適用が完了した `info.is_some()` を所有境界として待ち、その後に
+            // ユーザーが選んだブックマーク位置を最後の seek として発行する。
+            if player.info().is_none() {
+                return;
+            }
             player.seek(pending.pts_secs.max(0.0));
             self.bookmark_media_open_pending = None;
         }

@@ -411,8 +411,7 @@ fn fullscreen_side_panel_contains_pointer(
     } else {
         metadata_panel_hover_activation_rect(full_rect)
     };
-    let in_left_panel =
-        left_panel_visible && pos.x < adjustment_panel_rect(full_rect).max.x && pos.y >= 60.0;
+    let in_left_panel = left_panel_visible && adjustment_panel_rect(full_rect).contains(pos);
     let in_left_callout = click_mode
         && panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Left).contains(pos);
     right_rect.contains(pos) || in_left_panel || in_left_callout
@@ -494,6 +493,27 @@ pub(crate) fn metadata_panel_hover_active_at(
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
     pointer_pos
         .is_some_and(|p| activation_rect.contains(p) || (was_active && sustain_rect.contains(p)))
+}
+
+/// 画像用左パネルの端ホバーラッチを現在座標から更新する。
+/// 新規表示は左端の細いトリガだけ、表示後は実描画矩形の周囲にヒステリシス余白を持たせる。
+/// タブへ斜めに移動する途中でトリガを抜けても、余白内なら閉じない。
+fn adjustment_panel_hover_active_at(
+    full_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    was_active: bool,
+) -> bool {
+    let strip =
+        crate::ui_helpers::panel_edge_trigger_px(full_rect.width()).min(full_rect.width().max(0.0));
+    let activation_rect = egui::Rect::from_min_max(
+        full_rect.left_top(),
+        egui::pos2(full_rect.left() + strip, full_rect.bottom()),
+    );
+    let sustain_rect = adjustment_panel_rect(full_rect)
+        .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
+    pointer_pos.is_some_and(|pos| {
+        activation_rect.contains(pos) || (was_active && sustain_rect.contains(pos))
+    })
 }
 
 fn should_handle_fullscreen_wheel(
@@ -12368,28 +12388,22 @@ impl App {
             self.adjustment_mode = false;
         } else {
             let mode = self.settings.fullscreen_side_panel_mode.normalized();
-            let left_edge_hover = passive_hover_enabled
+            let left_panel_hover_active = passive_hover_enabled
                 && crate::ui_helpers::edge_summons_adjustment(
                     mode,
                     crate::ui_helpers::PanelEdge::Left,
                 )
-                && ctx.input(|i| {
-                    i.pointer
-                        .hover_pos()
-                        .map(|p| {
-                            let edge = crate::ui_helpers::panel_edge_trigger_px(full_rect.width());
-                            p.x < full_rect.min.x + edge
-                        })
-                        .unwrap_or(false)
-                });
-            if left_edge_hover
                 && !self.analysis_mode
                 && self.reading_flow.is_paged()
                 && self.fullscreen_idx.is_some()
-            {
+                && adjustment_panel_hover_active_at(
+                    full_rect,
+                    ctx.input(|input| input.pointer.hover_pos()),
+                    self.adjustment_mode,
+                );
+            if left_panel_hover_active {
                 self.adjustment_mode = true;
-            } else if !cursor_in_panel
-                && !left_edge_hover
+            } else if !left_panel_hover_active
                 && self.adjustment_mode
                 && !self.adjustment_dragging
                 && mode == crate::settings::FsSidePanelMode::Hover
@@ -23713,6 +23727,62 @@ mod tests {
             viewport,
             Some(inside_left),
             false
+        ));
+    }
+
+    #[test]
+    fn adjustment_panel_hover_uses_activation_strip_then_sustain_margin() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(900.0, 700.0));
+        let panel = adjustment_panel_rect(viewport);
+        let sustain = crate::ui_helpers::panel_hover_sustain_px(viewport.width());
+
+        assert!(adjustment_panel_hover_active_at(
+            viewport,
+            Some(egui::pos2(viewport.left() + 1.0, viewport.center().y)),
+            false,
+        ));
+
+        // 左端からタブへ斜めに移動するとき、パネル上端の少し上を通っても維持する。
+        let above_tab_path = egui::pos2(panel.center().x, panel.top() - sustain * 0.5);
+        assert!(adjustment_panel_hover_active_at(
+            viewport,
+            Some(above_tab_path),
+            true,
+        ));
+        assert!(!adjustment_panel_hover_active_at(
+            viewport,
+            Some(above_tab_path),
+            false,
+        ));
+
+        assert!(!adjustment_panel_hover_active_at(
+            viewport,
+            Some(egui::pos2(panel.right() + sustain + 1.0, panel.center().y,)),
+            true,
+        ));
+        assert!(!adjustment_panel_hover_active_at(viewport, None, true));
+    }
+
+    #[test]
+    fn fullscreen_side_panel_hit_test_matches_adjustment_panel_rect() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(900.0, 700.0));
+        let panel = adjustment_panel_rect(viewport);
+        let mode = crate::settings::FsSidePanelMode::Hover;
+        assert!(fullscreen_side_panel_contains_pointer(
+            viewport,
+            panel.left_top() + egui::vec2(1.0, 1.0),
+            true,
+            mode,
+            false,
+            true,
+        ));
+        assert!(!fullscreen_side_panel_contains_pointer(
+            viewport,
+            egui::pos2(panel.center().x, panel.top() - 1.0),
+            true,
+            mode,
+            false,
+            true,
         ));
     }
 
