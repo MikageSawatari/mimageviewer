@@ -8040,6 +8040,24 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// ブックマーク一覧の row install は `start_loading_items` を使い、その内部で
+    /// viewer 未起動でも teardown 用に `close_fullscreen` を呼ぶ。ここで一覧 refresh を
+    /// 起動すると build/install が無限に循環し、自動比率も世代ごとに 1:1 へ戻ってしまう。
+    #[test]
+    fn close_fullscreen_without_viewer_does_not_refresh_bookmark_surface() {
+        let mut app = setup_app();
+        app.items_are_bookmark_view = true;
+        app.fullscreen_idx = None;
+        assert!(app.bookmark_browser_pending.is_none());
+
+        app.close_fullscreen();
+
+        assert!(
+            app.bookmark_browser_pending.is_none(),
+            "viewer 未起動の teardown からブックマーク一覧を再 build してはならない"
+        );
+    }
+
     /// Codex P3 (動画レーティング対応): `rating_path_key` / `set_rating` / `get_rating`
     /// の Video 経路がフィルタテストだけでなく永続化往復で機能することを確認する。
     /// パス正規化キーが取れ、rating_db に書いた値がキャッシュ経由でなく DB ヒットでも

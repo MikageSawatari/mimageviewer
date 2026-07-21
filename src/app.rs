@@ -42097,7 +42097,13 @@ impl App {
 
         self.reset_fs_side_panel_runtime_for_file_change();
         self.fullscreen_idx = None;
-        if self.items_are_bookmark_view {
+        // `close_fullscreen` is also used as a generic teardown from
+        // `start_loading_items`, even when no viewer is open.  Refreshing the
+        // bookmark surface in that path creates a loop:
+        // install rows -> start_loading_items -> close_fullscreen -> refresh -> install rows.
+        // Only a real viewer close may need to pick up bookmark changes made
+        // while the viewer was open.
+        if cf_was_open && self.items_are_bookmark_view {
             self.refresh_bookmark_browser();
         }
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
