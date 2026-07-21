@@ -34870,6 +34870,81 @@ fn page_count_only_target_is_staged_unless_explicitly_allowed() {
 }
 
 #[test]
+fn image_folder_page_count_is_available_without_auto_open() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.auto_fullscreen_zip_pdf = false;
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.auto_fullscreen_image_folders = false;
+    app.install_new_items(
+        vec![GridItem::Folder(PathBuf::from(r"C:\Books\images"))],
+        vec![Some((1_700_000_000, 0))],
+    );
+
+    assert!(!app.settings.auto_fullscreen_image_folders_enabled());
+    assert!(app.details_item_supports_page_count(0));
+}
+
+#[test]
+fn child_archive_page_count_uses_warm_zip_tree_total() {
+    let mut app = phase_c_support::setup_app();
+    let zip_path = PathBuf::from(r"C:\Books\outer.zip");
+    let entries = [
+        "book-a.zip/001.jpg",
+        "book-a.zip/chapter/002.jpg",
+        "book-a.zip/chapter/003.jpg",
+        "book-b.rar/001.jpg",
+    ]
+    .into_iter()
+    .map(|entry_name| crate::zip_loader::ZipImageEntry {
+        entry_name: entry_name.to_owned(),
+        uncompressed_size: 100,
+        mtime: 1_700_000_000,
+    })
+    .collect();
+    let nav = crate::zip_tree::ZipNavState::new(std::sync::Arc::new(
+        crate::zip_tree::ZipTree::build(zip_path, entries),
+    ));
+    let (items, metas) = nav.materialize_current(crate::settings::SortOrder::FileName);
+    app.install_new_items(items, metas);
+    app.zip_nav = Some(nav);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+
+    let idx = app
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "book-a.zip/"))
+        .expect("child ZIP cell");
+    assert!(app.details_item_supports_page_count(idx));
+    let target = app
+        .details_meta_target_for_idx(idx, &std::collections::HashSet::from([idx]), true)
+        .expect("child ZIP page-count target");
+    assert_eq!(target.warm_page_count, Some(3));
+}
+
+#[test]
+fn direct_rar_is_a_background_page_count_target() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ConvertibleArchive {
+            path: PathBuf::from(r"C:\Books\book.rar"),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }],
+        vec![Some((1_700_000_000, 4096))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+
+    assert!(app.details_item_supports_page_count(0));
+    let target = app
+        .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]), true)
+        .expect("RAR page-count target");
+    assert!(target.load_page_count);
+    assert_eq!(target.warm_page_count, None);
+    assert_eq!(target.catalog_key.as_deref(), Some("book.rar"));
+}
+
+#[test]
 fn entering_page_count_sort_restarts_full_load_before_reordering() {
     let mut app = phase_c_support::setup_app();
     app.install_new_items(

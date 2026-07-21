@@ -783,6 +783,9 @@ fn load_details_page_count(
     if cancel.load(Ordering::Relaxed) {
         return Err(());
     }
+    if let Some(count) = target.warm_page_count {
+        return Ok(Some(count));
+    }
     let folder = target.catalog_folder.as_ref().ok_or(())?;
     let key = target.catalog_key.as_deref().ok_or(())?;
     // Metadata acquisition can fail during directory enumeration.  In that case
@@ -792,6 +795,7 @@ fn load_details_page_count(
         && match &target.item {
             GridItem::ZipFile(_) | GridItem::PdfFile(_) => target.source_size > 0,
             GridItem::Folder(_) => true,
+            GridItem::ConvertibleArchive { .. } => target.source_size > 0,
             _ => false,
         };
     // The catalog is only an optimization.  A corrupt/unwritable cache must not
@@ -870,6 +874,47 @@ fn load_details_page_count(
                     target.source_mtime,
                     target.source_size,
                     options.fingerprint,
+                    count,
+                );
+            }
+            Ok(count)
+        }
+        GridItem::ConvertibleArchive {
+            path,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        } => {
+            if let Some(catalog) = catalog {
+                let cached = {
+                    let _permit = io_sem.acquire(target.priority);
+                    catalog.get_container_page_meta(
+                        key,
+                        crate::catalog::ContainerPageKind::Archive,
+                        target.source_mtime,
+                        target.source_size,
+                        config.fingerprint,
+                    )
+                };
+                if let Ok(Some(meta)) = cached {
+                    return Ok(meta.page_count);
+                }
+            }
+            let inspection = {
+                let _permit = io_sem.acquire(target.priority);
+                crate::rar_loader::inspect_for_direct_read(path).map_err(|_| ())?
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(());
+            }
+            let count = (inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct)
+                .then_some(inspection.summary.image_count);
+            if let Some(catalog) = catalog {
+                let _permit = io_sem.acquire(target.priority);
+                let _ = catalog.set_container_page_meta(
+                    key,
+                    crate::catalog::ContainerPageKind::Archive,
+                    target.source_mtime,
+                    target.source_size,
+                    config.fingerprint,
                     count,
                 );
             }
@@ -1446,6 +1491,7 @@ mod tests {
             catalog_folder: Some(temp.path().to_path_buf()),
             catalog_key: Some("book.zip".to_owned()),
             warm_image_dims: None,
+            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: true,
             load_created_at: false,
@@ -1507,6 +1553,83 @@ mod tests {
     }
 
     #[test]
+    fn details_page_count_reads_and_caches_direct_rar() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in [
+            "real-split-control.part1.rar",
+            "real-split-control.part2.rar",
+        ] {
+            std::fs::copy(fixture_dir.join(name), temp.path().join(name)).unwrap();
+        }
+        let path = temp.path().join("real-split-control.part1.rar");
+        let expected = u32::try_from(
+            crate::zip_loader::enumerate_image_entries(&path)
+                .unwrap()
+                .len(),
+        )
+        .unwrap();
+        assert!(expected > 0);
+        let source_size = std::fs::metadata(&path).unwrap().len() as i64;
+        let target = DetailsMetaTarget {
+            key: crate::adjustment_db::normalize_path(&path),
+            item: GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            source_mtime: 456,
+            source_size,
+            catalog_folder: Some(temp.path().to_path_buf()),
+            catalog_key: Some("real-split-control.part1.rar".to_owned()),
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: true,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        };
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut catalogs = ContainerCatalogCache::new(8);
+        let config = DetailsPageCountConfig {
+            fingerprint: 88,
+            image_folder_options: None,
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+        };
+
+        assert_eq!(
+            load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut catalogs,
+                &io_sem,
+                &cancel,
+                &config,
+            ),
+            Ok(Some(expected))
+        );
+
+        // The second lookup must come from the catalog rather than reopening the RAR.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut catalogs,
+                &io_sem,
+                &cancel,
+                &config,
+            ),
+            Ok(Some(expected))
+        );
+    }
+
+    #[test]
     fn staged_metadata_job_preserves_existing_page_count() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("book.zip");
@@ -1519,6 +1642,7 @@ mod tests {
             catalog_folder: None,
             catalog_key: None,
             warm_image_dims: None,
+            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: false,
             load_created_at: true,

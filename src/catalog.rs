@@ -44,11 +44,12 @@ pub struct CacheEntry {
     pub source_dims: Option<(u32, u32)>,
 }
 
-/// ZIP / 画像のみフォルダのページ数キャッシュ種別。
+/// ZIP / 画像のみフォルダ / 変換対象アーカイブのページ数キャッシュ種別。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContainerPageKind {
     Folder = 1,
     Zip = 2,
+    Archive = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,8 +435,8 @@ impl CatalogDb {
         Ok(())
     }
 
-    /// ZIP / 画像のみフォルダのページ数を、内容 identity と判定設定 fingerprint が
-    /// 完全一致するときだけ返す。失敗結果は保存せず、`page_count=NULL` はフォルダを
+    /// ZIP / 画像のみフォルダ / 変換対象アーカイブのページ数を、内容 identity と判定設定
+    /// fingerprint が完全一致するときだけ返す。失敗結果は保存せず、`page_count=NULL` はフォルダを
     /// 正常に走査した結果「本として扱う対象外」だったことを表す。
     pub fn get_container_page_meta(
         &self,
@@ -983,6 +984,15 @@ mod tests {
         let db = open_in_memory();
         db.set_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2_048, 0, Some(123))
             .unwrap();
+        db.set_container_page_meta(
+            "book.rar",
+            ContainerPageKind::Archive,
+            300,
+            4_096,
+            77,
+            Some(45),
+        )
+        .unwrap();
 
         assert_eq!(
             db.get_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2_048, 0)
@@ -1008,6 +1018,14 @@ mod tests {
                 .unwrap(),
             None,
             "同名でもコンテナ種別を混同しない"
+        );
+        assert_eq!(
+            db.get_container_page_meta("book.rar", ContainerPageKind::Archive, 300, 4_096, 77,)
+                .unwrap(),
+            Some(ContainerPageMeta {
+                page_count: Some(45)
+            }),
+            "変換対象アーカイブのページ数を独立して保存する"
         );
     }
 

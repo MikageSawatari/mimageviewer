@@ -1349,17 +1349,34 @@ fn details_fixed_columns_width(settings: &crate::settings::Settings) -> f32 {
 fn details_layout(
     avail_w: f32,
     gutter: f32,
+    pixels_per_point: f32,
     settings: &crate::settings::Settings,
 ) -> DetailsLayout {
     let fixed = details_fixed_columns_width(settings);
     let columns_avail = (avail_w - gutter).max(0.0);
-    let name_w = if settings.details_name_width_auto {
-        (columns_avail - fixed).max(DetailsColumn::Name.default_width())
+    let auto_fits = settings.details_name_width_auto
+        && columns_avail >= fixed + DetailsColumn::Name.default_width();
+    let rounding_slack = 1.0 / normalized_pixels_per_point(pixels_per_point);
+    let name_w = if auto_fits {
+        (columns_avail - fixed - rounding_slack).max(DetailsColumn::Name.min_width())
+    } else if settings.details_name_width_auto {
+        DetailsColumn::Name.default_width()
     } else {
         details_name_fixed_width(settings)
     };
     let columns_w = name_w + fixed;
-    let pane_w = columns_w.max(columns_avail);
+    // Leave one physical pixel of slack when auto-fit has enough room. At UI
+    // scales below 100%, f32 add/subtract can otherwise round the content one
+    // device pixel past the horizontal ScrollArea viewport and show a phantom bar.
+    let pane_w = if auto_fits {
+        columns_w
+    } else if columns_w <= columns_avail - rounding_slack {
+        // Fixed-width columns may also fit with spare room. Keep the list pane
+        // almost full-width, but preserve the same device-pixel rounding guard.
+        columns_avail - rounding_slack
+    } else {
+        columns_w.max(columns_avail)
+    };
     let extent = pane_w + gutter;
     DetailsLayout {
         name_w,
@@ -7027,7 +7044,8 @@ impl App {
 
     pub(crate) fn render_details_lazy_status_bar(&mut self, ctx: &egui::Context) {
         if self.settings.grid_view_mode != GridViewMode::Details
-            || !(self.settings.details_show_created
+            || !(self.settings.details_show_page_count
+                || self.settings.details_show_created
                 || self.settings.details_show_image_dimensions
                 || self.settings.details_show_video_duration
                 || self.settings.details_show_video_dimensions
@@ -7048,7 +7066,9 @@ impl App {
             return;
         }
 
-        egui::TopBottomPanel::top("details_lazy_status_bar")
+        // Keep the list origin fixed while metadata loads. A top panel made the
+        // entire list jump by one row when it disappeared at completion.
+        egui::TopBottomPanel::bottom("details_lazy_status_bar")
             .exact_height(25.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -10315,8 +10335,9 @@ impl App {
             details_name_fixed_width(&self.settings)
         };
         let h_overflow = name_w_unconstrained + fixed_cols_w > avail_w + 0.5;
+        let details_scroll_style = egui::style::ScrollStyle::solid();
         let hbar = if h_overflow {
-            ui.spacing().scroll.allocated_width()
+            details_scroll_style.allocated_width()
         } else {
             0.0
         };
@@ -10330,7 +10351,7 @@ impl App {
         } else {
             0.0
         };
-        let layout = details_layout(avail_w, gutter, &self.settings);
+        let layout = details_layout(avail_w, gutter, ui.ctx().pixels_per_point(), &self.settings);
         let content_w = layout.pane_w;
         self.last_details_name_width = layout.name_w;
 
@@ -10345,6 +10366,8 @@ impl App {
         let mut body_inner_rect = egui::Rect::NOTHING;
         let mut egui_offset_y = self.scroll_offset_y;
         let mut hovered_preview: Option<(usize, egui::Rect)> = None;
+        let previous_scroll_style = ui.spacing().scroll;
+        ui.spacing_mut().scroll = details_scroll_style;
         egui::ScrollArea::horizontal()
             .id_salt("details_list_horizontal")
             .auto_shrink([false, false])
@@ -10448,6 +10471,7 @@ impl App {
                 body_inner_rect = scroll_output.inner_rect;
                 egui_offset_y = scroll_output.state.offset.y;
             });
+        ui.spacing_mut().scroll = previous_scroll_style;
 
         self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
         self.update_grid_mouse_ring_flick(ctx);
@@ -10860,6 +10884,74 @@ impl App {
         });
     }
 
+    fn details_best_fit_column_width(
+        &mut self,
+        ui: &egui::Ui,
+        column: DetailsColumn,
+        book_sort_locked: bool,
+    ) -> f32 {
+        let started = std::time::Instant::now();
+        let button_font = egui::TextStyle::Button.resolve(ui.style());
+        let body_font = egui::TextStyle::Body.resolve(ui.style());
+        let measure = |text: String, font: egui::FontId| {
+            ui.painter()
+                .layout_no_wrap(text, font, egui::Color32::WHITE)
+                .size()
+                .x
+        };
+        let mut widest = measure(
+            self.details_header_title(column, book_sort_locked, true),
+            button_font,
+        );
+
+        match column {
+            DetailsColumn::Preview => widest = widest.max(column.default_width() - 12.0),
+            // These columns have a small bounded vocabulary. Avoid calling the regular row
+            // formatter for every item because Rating may perform a cache-miss DB lookup.
+            DetailsColumn::Rating => {
+                widest = widest.max(measure("★★★★★".to_owned(), body_font));
+            }
+            DetailsColumn::State => {
+                for sample in ["補 レ 消 隠 文 回 ピ", "9999 / 9999", "未読"] {
+                    widest = widest.max(measure(sample.to_owned(), body_font.clone()));
+                }
+            }
+            _ => {
+                let order = self.current_grid_order().to_vec();
+                for idx in order.iter().copied() {
+                    let Some(item) = self.items.get(idx).cloned() else {
+                        continue;
+                    };
+                    let meta = self.image_metas.get(idx).copied().flatten();
+                    let text = self.details_cell_text(idx, &item, meta, column);
+                    if !text.is_empty() {
+                        widest = widest.max(measure(text, body_font.clone()));
+                    }
+                    if widest >= 788.0 {
+                        break;
+                    }
+                }
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "details",
+                        "column_best_fit",
+                        None,
+                        self.items_generation,
+                        &[
+                            ("rows", serde_json::Value::from(order.len())),
+                            (
+                                "ms",
+                                serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                            ),
+                        ],
+                    );
+                }
+            }
+        }
+
+        (widest + 14.0).ceil().clamp(column.min_width(), 800.0)
+    }
+
     fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
@@ -10876,9 +10968,10 @@ impl App {
         let header_drag_id = ui.id().with("details_header_drag_state");
         for (col, col_rect) in columns.iter().copied() {
             let mut header_hit = col_rect;
-            // 右端 6px は列幅リサイズ用に空けておく (名前列も固定幅化のためリサイズ可)。
-            if header_hit.width() > 12.0 {
-                header_hit.max.x -= 6.0;
+            // 右端 8px は列幅リサイズ専用にする。ヘッダ本体と重ねないことで、境界の
+            // ダブルクリックがソートや列入れ替えにも伝わるのを防ぐ。
+            if header_hit.width() > 16.0 {
+                header_hit.max.x -= 8.0;
             }
             let response = ui.interact(
                 header_hit,
@@ -10987,11 +11080,13 @@ impl App {
                     egui::pos2(col_rect.right() - 8.0, col_rect.top()),
                     egui::pos2(col_rect.right(), col_rect.bottom()),
                 );
-                let resize_response = ui.interact(
-                    resize_rect,
-                    ui.id().with(("details_header_resize", col)),
-                    egui::Sense::drag(),
-                );
+                let resize_response = ui
+                    .interact(
+                        resize_rect,
+                        ui.id().with(("details_header_resize", col)),
+                        egui::Sense::click_and_drag(),
+                    )
+                    .on_hover_text("ドラッグで幅変更 / ダブルクリックで内容に合わせる");
                 if resize_response.hovered() || resize_response.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     ui.painter().line_segment(
@@ -10999,7 +11094,23 @@ impl App {
                         egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
                     );
                 }
-                if resize_response.dragged() {
+                if resize_response.double_clicked() {
+                    let width = self.details_best_fit_column_width(ui, col, book_sort_locked);
+                    let changed = if col == DetailsColumn::Name {
+                        set_details_name_width(&mut self.settings, width)
+                    } else {
+                        set_details_column_width(&mut self.settings, col, width)
+                    };
+                    if changed {
+                        crate::logger::log(format!(
+                            "details column best-fit: {:?} -> {:.1}",
+                            col.id(),
+                            width
+                        ));
+                        self.settings.save();
+                        ui.ctx().request_repaint();
+                    }
+                } else if resize_response.dragged() {
                     let changed = if col == DetailsColumn::Name {
                         // 名前列の境界ドラッグ = 自動調整をやめ、その幅を固定幅として保存する。
                         set_details_name_width(
@@ -12170,7 +12281,8 @@ impl App {
             .show_separator_line(true)
             .show(ctx, |ui| {
                 let avail_w = ui.available_width().max(1.0);
-                let full_layout = details_layout(avail_w, 0.0, &self.settings);
+                let full_layout =
+                    details_layout(avail_w, 0.0, ui.ctx().pixels_per_point(), &self.settings);
                 let content_w = details_content_width_for_column_set(
                     full_layout.pane_w,
                     &self.settings,
@@ -12657,6 +12769,38 @@ mod selection_info_tests {
         let (before, after, central) = measured.unwrap();
         assert!(before - after >= SELECTION_INFO_BAR_HEIGHT - 0.5);
         assert!(central <= after + 0.5);
+    }
+
+    #[test]
+    fn details_lazy_status_reserves_bottom_without_moving_list_origin() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_page_count = true;
+        app.settings.details_show_created = false;
+        app.settings.details_show_image_dimensions = false;
+        app.settings.details_show_video_duration = false;
+        app.settings.details_show_video_dimensions = false;
+        app.settings.details_show_video_codec = false;
+        app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.details_image_dims_state = LazyColumnState::Loading { done: 1, total: 2 };
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let mut measured = None;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            let before = ctx.available_rect();
+            app.render_details_lazy_status_bar(ctx);
+            let after = ctx.available_rect();
+            measured = Some((before, after));
+        });
+
+        let (before, after) = measured.unwrap();
+        assert!((after.top() - before.top()).abs() < 0.01);
+        assert!(before.bottom() - after.bottom() >= 24.5);
     }
 
     #[test]
@@ -13275,35 +13419,78 @@ mod compute_cell_size_tests {
         ));
 
         // avail が狭くても、保存済みの広い列のために pane は名前列既定幅 + その列幅まで広がる。
-        let layout = details_layout(200.0, 0.0, &settings);
+        let layout = details_layout(200.0, 0.0, 1.0, &settings);
         assert_eq!(layout.pane_w, DetailsColumn::Name.default_width() + 220.0);
         assert_eq!(layout.extent, layout.pane_w, "gutter 0 なら extent == pane");
     }
 
     #[test]
     fn details_layout_reserves_gutter_and_avoids_horizontal_scroll() {
-        // 名前列が残り幅を埋める通常ケース。縦バー gutter を引いた幅に列を収めれば、
-        // 総コンテンツ幅 (extent) は avail と一致 → 余計な横スクロールバーは出ない。
+        // 名前列が残り幅を埋める通常ケース。縦バー gutter と丸め余白を引いて収める。
         let settings = minimal_details_settings(); // Name + Size(92)
         let gutter = 10.0;
-        let layout = details_layout(600.0, gutter, &settings);
-        assert!((layout.extent - 600.0).abs() < 0.01, "extent == avail");
+        let layout = details_layout(600.0, gutter, 1.0, &settings);
+        assert!((layout.extent - 599.0).abs() < 0.01);
         assert!(
-            (layout.pane_w - (600.0 - gutter)).abs() < 0.01,
-            "pane は gutter を引いた幅"
+            (layout.pane_w - (600.0 - gutter - 1.0)).abs() < 0.01,
+            "pane は gutter と 1 physical px の余白を引いた幅"
         );
         assert!(
-            (layout.name_w - (600.0 - gutter - 92.0)).abs() < 0.01,
+            (layout.name_w - (600.0 - gutter - 1.0 - 92.0)).abs() < 0.01,
             "名前列が残り幅を埋める"
         );
     }
 
     #[test]
-    fn details_layout_without_gutter_fills_pane() {
+    fn details_layout_without_gutter_leaves_one_physical_pixel() {
         let settings = minimal_details_settings();
-        let layout = details_layout(600.0, 0.0, &settings);
-        assert!((layout.extent - 600.0).abs() < 0.01);
-        assert!((layout.pane_w - 600.0).abs() < 0.01);
+        let layout = details_layout(600.0, 0.0, 1.0, &settings);
+        assert!((layout.extent - 599.0).abs() < 0.01);
+        assert!((layout.pane_w - 599.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn details_layout_rounding_slack_is_one_device_pixel_across_ui_scales() {
+        let settings = minimal_details_settings();
+        for pixels_per_point in [0.8, 0.9, 1.0, 1.25, 1.5] {
+            let layout = details_layout(600.0, 10.0, pixels_per_point, &settings);
+            let device_pixel_gap = (600.0 - layout.extent) * pixels_per_point;
+            assert!(
+                (device_pixel_gap - 1.0).abs() < 0.01,
+                "pixels_per_point={pixels_per_point}, gap={device_pixel_gap}"
+            );
+            assert!(layout.extent < 600.0);
+        }
+    }
+
+    #[test]
+    fn details_best_fit_name_width_measures_current_rows() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.items = vec![GridItem::Image(PathBuf::from(format!(
+            r"C:\Pictures\{}.png",
+            "very-wide-file-name-".repeat(8)
+        )))];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.details_order = vec![0];
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(900.0, 200.0),
+        ));
+        let mut measured = None;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                measured = Some(app.details_best_fit_column_width(ui, DetailsColumn::Name, false));
+            });
+        });
+
+        let width = measured.expect("best-fit width");
+        assert!(width > DetailsColumn::Name.default_width());
+        assert!(width <= 800.0);
     }
 
     #[test]
@@ -13332,7 +13519,7 @@ mod compute_cell_size_tests {
     fn bottom_bar_text_columns_keep_details_widths() {
         let mut settings = minimal_details_settings();
         settings.details_show_preview = true;
-        let full_layout = details_layout(600.0, 0.0, &settings);
+        let full_layout = details_layout(600.0, 0.0, 1.0, &settings);
         let text_width = details_content_width_for_column_set(
             full_layout.pane_w,
             &settings,
@@ -13360,7 +13547,7 @@ mod compute_cell_size_tests {
         let mut settings = minimal_details_settings();
         settings.details_name_width_auto = false;
         settings.details_name_width = 500.0;
-        let layout = details_layout(300.0, 10.0, &settings);
+        let layout = details_layout(300.0, 10.0, 1.0, &settings);
         assert!((layout.name_w - 500.0).abs() < 0.01, "固定幅を尊重");
         assert!(
             layout.extent > 300.0,
@@ -13373,14 +13560,14 @@ mod compute_cell_size_tests {
         let mut settings = minimal_details_settings();
         settings.details_name_width_auto = false;
         settings.details_name_width = 120.0;
-        let layout = details_layout(600.0, 10.0, &settings);
+        let layout = details_layout(600.0, 10.0, 1.0, &settings);
         assert!((layout.name_w - 120.0).abs() < 0.01);
         let columns_w = layout.name_w + details_fixed_columns_width(&settings);
         assert!(
             columns_w < layout.pane_w,
             "固定名前列が pane より狭いと右側に余白が残る"
         );
-        assert!((layout.extent - 600.0).abs() < 0.01, "横スクロールは不要");
+        assert!((layout.extent - 599.0).abs() < 0.01, "横スクロールは不要");
     }
 
     #[test]

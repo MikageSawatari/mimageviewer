@@ -24,6 +24,13 @@ ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは�
 | `Stack { key, representative, count }` | ファイル名スタック | 複数画像を畳んだ集約セル。クリックでメンバーへドリルインする |
 | `SearchContainer { path, kind, hit_count, representative }` | Ctrl+G 検索集約ビュー | ヒットを含む親フォルダ/ZIP を 1 セルで表現 (v0.8.0) |
 
+通常フォルダの詳細表示 / 選択情報に出す `ページ数` は、ZIP / PDF に加えて画像のみフォルダ、
+親 ZIP 内の子 ZIP・RAR (`ZipDir`)、直接閲覧 RAR/CBR (`ConvertibleArchive`) を対象にする。
+`ZipDir` は外側 ZIP を開いたときの列挙済み `ZipTree` 部分木から画像数を数え、UI スレッドで
+書庫を開き直さない。RAR/CBR は details meta worker 上の header scan で取得し、元ファイルの
+mtime / size と画像認識 fingerprint を identity に catalog cache へ保存する。画像のみフォルダも
+自動表示設定の ON/OFF とは独立して同じ worker / catalog 経路で判定する。
+
 `Folder/Image/Video/ZipFile/PdfFile/ConvertibleArchive` は「外側」= 通常フォルダのリスト。
 `ZipImage/ZipDir/PdfPage` は「内側」= 仮想フォルダのリスト。`SearchContainer` は Ctrl+G 専用ビュー。
 同じリストに外側と内側が混在することはない。

@@ -38,17 +38,17 @@ pub(crate) struct ImageFolderPageCountOptions {
 
 pub(crate) fn image_folder_page_count_options(
     settings: &crate::settings::Settings,
-) -> Option<ImageFolderPageCountOptions> {
-    if !settings.auto_fullscreen_image_folders_enabled() {
-        return None;
-    }
-    Some(ImageFolderPageCountOptions {
+) -> ImageFolderPageCountOptions {
+    // Page-count metadata is independent of auto-opening image-only folders.
+    // Even when auto-open is disabled, image-only child folders should expose
+    // the same background-loaded page count as ZIP and PDF containers.
+    ImageFolderPageCountOptions {
         include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
         show_hidden_files: settings.show_hidden_files,
         skip_duplicate_images: settings.skip_duplicate_images,
         image_ext_priority: settings.image_ext_priority.clone(),
         fingerprint: image_page_recognition_fingerprint(settings),
-    })
+    }
 }
 
 /// ZIP と画像フォルダのページ数 cache が共有する画像認識規則 fingerprint。
@@ -515,6 +515,22 @@ mod page_count_tests {
             image_ext_priority: vec!["png".to_owned(), "jpg".to_owned()],
             fingerprint: 1,
         }
+    }
+
+    #[test]
+    fn page_count_options_do_not_depend_on_image_folder_auto_open() {
+        let mut settings = crate::settings::Settings::default();
+        settings.auto_fullscreen_zip_pdf = false;
+        settings.detached_viewer_open_images_in_window = false;
+        settings.auto_fullscreen_image_folders = false;
+
+        assert!(!settings.auto_fullscreen_image_folders_enabled());
+        let options = image_folder_page_count_options(&settings);
+        assert_eq!(options.show_hidden_files, settings.show_hidden_files);
+        assert_eq!(
+            options.skip_duplicate_images,
+            settings.skip_duplicate_images
+        );
     }
 
     #[test]

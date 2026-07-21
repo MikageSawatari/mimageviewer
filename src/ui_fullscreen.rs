@@ -3764,6 +3764,10 @@ pub(crate) struct FsSeekInfo {
     other_count: usize,
 }
 
+// Page labels live on the fullscreen viewer's fixed dark surfaces. They must
+// not inherit the main-window theme text color (high-contrast mode can darken it).
+const FULLSCREEN_PAGE_NUMBER_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(248, 250, 255);
+
 fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Option<String> {
     if total == 0 || positions.is_empty() {
         return None;
@@ -6256,7 +6260,7 @@ impl App {
 
         let painter = ui.painter();
         let font = egui::FontId::monospace(13.0);
-        let text_color = ui.visuals().text_color();
+        let text_color = FULLSCREEN_PAGE_NUMBER_TEXT_COLOR;
         let galley = painter.layout_no_wrap(label, font, text_color);
         let padding = egui::vec2(8.0, 4.0);
         let size = galley.size() + padding * 2.0;
@@ -6450,8 +6454,11 @@ impl App {
             };
         let sample_label = format_fullscreen_page_number_label(total, &sample_positions)
             .unwrap_or_else(|| format!("{} / {}", total, total));
-        let sample_galley =
-            painter.layout_no_wrap(sample_label, font.clone(), ui.visuals().text_color());
+        let sample_galley = painter.layout_no_wrap(
+            sample_label,
+            font.clone(),
+            FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
+        );
         let label_width = (sample_galley.size().x + 18.0)
             .max(64.0)
             .min((inner.width() * 0.32).max(64.0));
@@ -6581,7 +6588,7 @@ impl App {
             egui::Align2::CENTER_CENTER,
             label,
             font,
-            ui.visuals().text_color(),
+            FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
         );
         if !primary_down && self.fs_seek_drag_active {
             self.fs_seek_drag_active = false;
@@ -24994,6 +25001,15 @@ mod tests {
             format_fullscreen_page_number_label(200, &[3, 2]).as_deref(),
             Some("3, 2 / 200")
         );
+    }
+
+    #[test]
+    fn fullscreen_page_number_color_stays_bright_on_dark_surface() {
+        let color = FULLSCREEN_PAGE_NUMBER_TEXT_COLOR;
+        assert!(color.r() >= 240);
+        assert!(color.g() >= 240);
+        assert!(color.b() >= 240);
+        assert_eq!(color.a(), 255);
     }
 
     #[test]

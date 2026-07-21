@@ -3336,6 +3336,7 @@ struct DetailsMetaTarget {
     catalog_folder: Option<PathBuf>,
     catalog_key: Option<String>,
     warm_image_dims: Option<(u32, u32)>,
+    warm_page_count: Option<u32>,
     pdf_password_revision: Option<u64>,
     load_page_count: bool,
     load_created_at: bool,
@@ -35452,9 +35453,21 @@ impl App {
             return Some(key);
         }
         match self.items.get(idx)? {
-            GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
+            GridItem::Folder(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => {
                 Some(crate::adjustment_db::normalize_path(path))
             }
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            } => Some(format!(
+                "{}::zipdir:{}",
+                crate::adjustment_db::normalize_path(zip_path),
+                dir_prefix.to_lowercase()
+            )),
             _ => None,
         }
     }
@@ -36255,9 +36268,9 @@ impl App {
             fingerprint: crate::app::folder_scan::image_page_recognition_fingerprint(
                 &self.settings,
             ),
-            image_folder_options: crate::app::folder_scan::image_folder_page_count_options(
+            image_folder_options: Some(crate::app::folder_scan::image_folder_page_count_options(
                 &self.settings,
-            ),
+            )),
             pdf_passwords: self.pdf_passwords.clone(),
         };
         let (order, visible_near): (Vec<usize>, HashSet<usize>) = if selection_info_only {
@@ -36538,9 +36551,14 @@ impl App {
     pub(crate) fn details_item_supports_page_count(&self, idx: usize) -> bool {
         match self.items.get(idx) {
             Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_)) => true,
-            Some(GridItem::Folder(_)) => {
-                crate::app::folder_scan::image_folder_page_count_options(&self.settings).is_some()
-            }
+            Some(GridItem::Folder(_)) => true,
+            Some(GridItem::ZipDir {
+                is_archive: true, ..
+            }) => true,
+            Some(GridItem::ConvertibleArchive {
+                format: crate::archive_converter::ArchiveFormat::Rar,
+                ..
+            }) => true,
             _ => false,
         }
     }
@@ -36620,6 +36638,22 @@ impl App {
         } else {
             None
         };
+        let warm_page_count = if load_page_count {
+            match &item {
+                GridItem::ZipDir {
+                    zip_path,
+                    dir_prefix,
+                    ..
+                } => self
+                    .zip_nav
+                    .as_ref()
+                    .filter(|nav| nav.tree.zip_path == *zip_path)
+                    .and_then(|nav| nav.tree.page_count_for_prefix_str(dir_prefix)),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if !load_page_count
             && !load_created_at
             && !load_ai_metadata
@@ -36636,6 +36670,7 @@ impl App {
             catalog_folder,
             catalog_key,
             warm_image_dims: self.details_warm_image_dims(idx),
+            warm_page_count,
             pdf_password_revision,
             load_page_count,
             load_created_at,
@@ -36676,7 +36711,10 @@ impl App {
                 Some(pdf_path.clone()),
                 Some(crate::grid_item::pdf_page_cache_key(*page_num)),
             ),
-            GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path) => (
+            GridItem::Folder(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => (
                 path.parent().map(Path::to_path_buf),
                 path.file_name()
                     .and_then(|name| name.to_str())

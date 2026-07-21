@@ -107,6 +107,20 @@ impl ZipTree {
         representative_image(node, sort)
     }
 
+    /// Return the number of image pages below a child container prefix.
+    ///
+    /// This only walks the already-enumerated outer ZIP tree. Showing counts for
+    /// child ZIP/RAR cells therefore never reopens an archive on the UI thread.
+    pub fn page_count_for_prefix_str(&self, dir_prefix: &str) -> Option<u32> {
+        let segs: Vec<String> = dir_prefix
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let count = self.node_at(&segs)?.total_image_count();
+        u32::try_from(count).ok()
+    }
+
     /// 冗長ラッパー階層の自動降下 (D1)。
     ///
     /// `start` から始めて、「直下画像 0 枚・子ディレクトリちょうど 1 個」の階層を
@@ -773,6 +787,24 @@ mod tests {
         assert!(segment_is_archive("ch01.rar"));
         assert!(segment_is_archive("ch02.7z"));
         assert!(segment_is_archive("old.LZH"));
+    }
+
+    #[test]
+    fn page_count_for_child_archive_uses_enumerated_subtree() {
+        let tree = tree(&[
+            "book-a.zip/001.jpg",
+            "book-a.zip/chapter/002.jpg",
+            "book-a.zip/chapter/003.jpg",
+            "book-b.rar/001.jpg",
+        ]);
+
+        assert_eq!(tree.page_count_for_prefix_str("book-a.zip/"), Some(3));
+        assert_eq!(
+            tree.page_count_for_prefix_str("book-a.zip/chapter/"),
+            Some(2)
+        );
+        assert_eq!(tree.page_count_for_prefix_str("book-b.rar/"), Some(1));
+        assert_eq!(tree.page_count_for_prefix_str("missing.zip/"), None);
     }
 
     #[test]
