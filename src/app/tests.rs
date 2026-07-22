@@ -6615,6 +6615,154 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     assert!(app.bookmark_view_return_grid.is_some());
 }
 
+#[cfg(windows)]
+fn begin_detached_bookmark_media_test(
+    app: &mut phase_c_support::AppTestEnv,
+    is_audio: bool,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let media_dir = app
+        .tmp
+        .path()
+        .join(if is_audio { "audio" } else { "video" });
+    std::fs::create_dir_all(&media_dir).expect("create media dir");
+    let extension = if is_audio { "flac" } else { "mp4" };
+    let target = media_dir.join(format!("target.{extension}"));
+    let other = media_dir.join(format!("other.{extension}"));
+    std::fs::write(&target, []).expect("create target media");
+    std::fs::write(&other, []).expect("create other media");
+
+    app.settings.fullfeature_media_window = true;
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.vst3_enabled = false;
+    app.current_folder = Some(super::bookmark_view_synthetic_path());
+    app.items = vec![if is_audio {
+        GridItem::Audio(target.clone())
+    } else {
+        GridItem::Video(target.clone())
+    }];
+    app.image_metas = vec![None];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    app.items_are_bookmark_view = true;
+    app.bookmark_view_return_target = Some(
+        crate::bookmark_browser::BookmarkViewReturnTarget::Media(target.clone()),
+    );
+    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState {
+        row_keys: vec![(0, 7)],
+        selected_key: Some((0, 7)),
+        opened_key: (0, 7),
+        scroll_offset_y: 240.0,
+    });
+    app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
+        path: target.clone(),
+        pts_secs: 42.0,
+        started_at: std::time::Instant::now(),
+        last_wait: None,
+    });
+
+    assert!(app.open_bookmark_media_in_detached_context(
+        &egui::Context::default(),
+        &target,
+        media_dir.clone(),
+        true,
+    ));
+    (media_dir, target, other)
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
+    for is_audio in [false, true] {
+        let mut app = phase_c_support::setup_app();
+        let (media_dir, target, _) = begin_detached_bookmark_media_test(&mut app, is_audio);
+
+        assert!(app.items_are_bookmark_view);
+        assert_eq!(
+            app.current_folder.as_deref(),
+            Some(super::bookmark_view_synthetic_path().as_path())
+        );
+        assert!(app.bookmark_view_return_grid.is_some());
+        assert!(app.bookmark_media_open_pending.is_none());
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("media must be owned by detached context from the start");
+        assert_eq!(
+            active.bundle.current_folder.as_deref(),
+            Some(media_dir.as_path())
+        );
+        assert!(active.bundle.bookmark_view_return_grid.is_none());
+        assert_eq!(
+            active
+                .bundle
+                .fullscreen_idx
+                .and_then(|idx| active.bundle.items.get(idx))
+                .and_then(|item| match item {
+                    GridItem::Video(path) | GridItem::Audio(path) => Some(path.as_path()),
+                    _ => None,
+                }),
+            Some(target.as_path())
+        );
+
+        app.with_active_detached_viewer_context(|detached| {
+            detached.handle_fullscreen_close_request();
+            assert_eq!(detached.fullscreen_idx, None);
+            assert!(detached.bookmark_view_return_target.is_some());
+        })
+        .expect("active detached context");
+        assert!(app.update_active_detached_viewer_context(&egui::Context::default()));
+
+        assert!(app.active_detached_viewer_context.is_none());
+        assert!(app.items_are_bookmark_view);
+        assert_eq!(
+            app.current_folder.as_deref(),
+            Some(super::bookmark_view_synthetic_path().as_path())
+        );
+        assert!(app.bookmark_view_return_target.is_none());
+        assert!(app.bookmark_view_return_grid.is_some());
+        assert!(app.bookmark_browser_pending.is_some());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
+    let mut app = phase_c_support::setup_app();
+    let (media_dir, _, other) = begin_detached_bookmark_media_test(&mut app, false);
+
+    app.with_active_detached_viewer_context(|detached| {
+        let other_idx = detached
+            .items
+            .iter()
+            .position(|item| {
+                matches!(item, GridItem::Video(path) if crate::path_key::eq_keep_drive(path, &other))
+            })
+            .expect("other video in real folder context");
+        detached.fullscreen_idx = Some(other_idx);
+        detached.selected = Some(other_idx);
+        detached.handle_fullscreen_close_request();
+        assert_eq!(detached.fullscreen_idx, None);
+        assert!(detached.bookmark_view_return_target.is_none());
+    })
+    .expect("active detached context");
+    assert!(app.update_active_detached_viewer_context(&egui::Context::default()));
+
+    assert!(app.active_detached_viewer_context.is_none());
+    assert!(!app.items_are_bookmark_view);
+    assert_eq!(app.current_folder.as_deref(), Some(media_dir.as_path()));
+    assert_eq!(
+        app.selected
+            .and_then(|idx| app.items.get(idx))
+            .and_then(|item| match item {
+                GridItem::Video(path) => Some(path.as_path()),
+                _ => None,
+            }),
+        Some(other.as_path())
+    );
+    assert!(app.bookmark_view_return_target.is_none());
+    assert!(app.bookmark_view_return_grid.is_none());
+}
+
 // =======================================================================
 // Phase C - Ctrl+G drill view アドレスバー表示テスト (2026-04 報告)
 //

@@ -32872,6 +32872,85 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn reconcile_closed_bookmark_media_detached_context(&mut self, closed: &ViewerContextBundle) {
+        let Some(main_target @ crate::bookmark_browser::BookmarkViewReturnTarget::Media(_)) =
+            self.bookmark_view_return_target.clone()
+        else {
+            return;
+        };
+        // main が別の場所へ移動済みなら、その後のユーザー操作を detached close で巻き戻さない。
+        // 通常の folder load は `reconcile_bookmark_return_target_for_folder_load` でも marker を
+        // 消すが、surface も ownership の確認に含めて stale state に対して保守的に扱う。
+        if !self.items_are_bookmark_view || self.bookmark_view_return_grid.is_none() {
+            return;
+        }
+
+        let stayed_at_opened_bookmark = closed
+            .bookmark_view_return_target
+            .as_ref()
+            .is_some_and(|target| target == &main_target);
+        if stayed_at_opened_bookmark {
+            // 一覧は main に表示されたままなので enter_bookmark_view は不要。viewer 中の
+            // 名称変更・追加・削除だけを非同期再構築し、保存済み grid snapshot で位置を戻す。
+            // 別ウィンドウ再生中も main は操作できるため、選択・スクロールは「開く直前」より
+            // 現在の main 状態を優先する。row_keys / opened_key は増減検知と可視化用に維持する。
+            let current_selected_key = self
+                .selected
+                .and_then(|idx| self.bookmark_browser_rows.get(idx))
+                .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
+            if let Some(return_grid) = self.bookmark_view_return_grid.as_mut() {
+                return_grid.selected_key = current_selected_key;
+                return_grid.scroll_offset_y = self.scroll_offset_y;
+            }
+            self.bookmark_view_return_target = None;
+            crate::logger::log(
+                "[bookmark-open] detached media closed at target; refresh main bookmark grid",
+            );
+            self.refresh_bookmark_browser();
+            return;
+        }
+
+        // Ctrl+↑↓ や前後ファイル移動で対象を離れた場合は、従来仕様どおり viewer が最後に
+        // 表示していた実フォルダへ main を移す。close_fullscreen は cursor を selected へ戻すため、
+        // bundle の selected item を再選択すれば同じファイルを可視範囲へ戻せる。
+        let selected_media_path = closed.selected.and_then(|idx| {
+            closed.items.get(idx).and_then(|item| match item {
+                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                _ => None,
+            })
+        });
+        let destination = closed
+            .archive_source_override
+            .clone()
+            .or_else(|| closed.current_folder.clone());
+        self.clear_bookmark_view_return_state();
+        let Some(destination) = destination else {
+            return;
+        };
+        crate::logger::log(format!(
+            "[bookmark-open] detached media closed after navigation; load main folder={}",
+            destination.display()
+        ));
+        if !matches!(
+            self.load_folder_or_convert_archive_with_auto_fullscreen(destination, false),
+            FolderOpenOutcome::Loaded
+        ) {
+            return;
+        }
+        if let Some(path) = selected_media_path
+            && let Some(idx) = self.items.iter().position(|item| match item {
+                GridItem::Video(candidate) | GridItem::Audio(candidate) => {
+                    crate::path_key::eq_keep_drive(candidate, &path)
+                }
+                _ => false,
+            })
+        {
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn update_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
         if self.active_detached_viewer_context.is_none() {
             return false;
@@ -33008,8 +33087,8 @@ impl App {
             })
             .unwrap_or(false);
 
-        if should_drop {
-            self.active_detached_viewer_context = None;
+        if should_drop && let Some(closed) = self.active_detached_viewer_context.take() {
+            self.reconcile_closed_bookmark_media_detached_context(&closed.bundle);
         }
         true
     }
@@ -42282,10 +42361,30 @@ impl App {
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
-        if self.bookmark_view_close_nav().is_some() {
-            self.pending_return_to_parent = true;
-            return;
-        }
+        // ブックマーク media を独立 bundle で開いた場合、一覧 surface は main bundle に
+        // 表示されたままなので detached 側で Bookmarks へナビしてはいけない。
+        // `bookmark_view_return_grid == None` がその ownership invariant。対象から動いていなければ
+        // target を close_fullscreen の stale-state cleanup から一時退避し、outer context の drop
+        // 時に「一覧を維持」と判定できるよう戻す。別ファイルへ動いていれば target を消して
+        // outer 側へ「実フォルダへ移る」disposition を渡す。
+        let separated_bookmark_target = if self.bookmark_view_return_grid.is_none()
+            && matches!(
+                self.bookmark_view_return_target,
+                Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(_))
+            ) {
+            if self.bookmark_view_back_nav().is_some() {
+                self.bookmark_view_return_target.take()
+            } else {
+                self.bookmark_view_return_target = None;
+                None
+            }
+        } else {
+            if self.bookmark_view_close_nav().is_some() {
+                self.pending_return_to_parent = true;
+                return;
+            }
+            None
+        };
         if self.auto_open_for_current_container() {
             self.pending_return_to_parent = true;
             return;
@@ -42304,6 +42403,9 @@ impl App {
             }
         }
         self.close_fullscreen();
+        if separated_bookmark_target.is_some() {
+            self.bookmark_view_return_target = separated_bookmark_target;
+        }
     }
 
     /// `App::update` の通常の pending-nav 消化点より後で届く close イベント向け。

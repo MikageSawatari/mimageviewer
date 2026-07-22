@@ -169,6 +169,14 @@ main `start_loading_items` または active viewer context へ分岐する。
 既存の passive snapshot + active viewer 退避モデルを使う。新規 detached pending は、
 main がページ一覧へ遷移してしまうコンテナ open 問題に絞る。
 
+横断ブックマーク一覧から動画・音声を別ウィンドウで開く場合も、同じ context ownership 境界を使う。
+前後ファイル移動のために実フォルダの `items` が必要でも、main を実フォルダへ遷移させてから
+後追いで一覧へ戻してはならない。main のブックマーク一覧 bundle を退避した状態で実フォルダを
+active detached bundle へロードし、player とブックマーク時刻への seek pending もその bundle に
+持たせる。終了時は、元のファイルから動いていなければ main 一覧を維持して DB 由来の行だけを
+再構築し、別ファイル・別フォルダへ移動済みなら detached bundle の最終フォルダと選択を main へ
+反映する。これにより「一覧へ戻す close」と「player を閉じる close」が二段階に分裂しない。
+
 ### 3.4 passive window は stable viewport と paused context を持つ
 
 passive / paused window は active 処理対象ではないが、OS ウィンドウを閉じず、active 時と同じ

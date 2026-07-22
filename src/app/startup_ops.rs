@@ -72,7 +72,7 @@ impl App {
                     "startup open: resolve worker spawn failed: {e}; running synchronously"
                 ));
                 let result = resolve_startup_open_path(requested, source);
-                self.finish_startup_open_path_resolve(source, result);
+                self.finish_startup_open_path_resolve(source, result, ctx);
             }
         }
     }
@@ -88,7 +88,7 @@ impl App {
                 let pending = self.startup_open_path_resolve_pending.take().unwrap();
                 let source = pending.source;
                 drop(pending);
-                self.finish_startup_open_path_resolve(source, result);
+                self.finish_startup_open_path_resolve(source, result, ctx);
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -135,9 +135,10 @@ impl App {
         &mut self,
         source: StartupOpenPathSource,
         result: StartupOpenPathResolveResult,
+        ctx: &egui::Context,
     ) {
         let requested_display = result.requested.display().to_string();
-        if self.apply_startup_open_path_resolve_result(source, result) {
+        if self.apply_startup_open_path_resolve_result(source, result, ctx) {
             return;
         }
         if matches!(source, StartupOpenPathSource::InitialStartup) {
@@ -166,6 +167,7 @@ impl App {
         &mut self,
         source: StartupOpenPathSource,
         result: StartupOpenPathResolveResult,
+        ctx: &egui::Context,
     ) -> bool {
         let Some(resolution) = result.resolved else {
             crate::logger::log(format!(
@@ -188,6 +190,22 @@ impl App {
                 resolution.kind,
                 crate::folder_tree::OpenablePathKind::Directory
             );
+        #[cfg(windows)]
+        if matches!(source, StartupOpenPathSource::Bookmark)
+            && self.settings.effective_media_in_media_window()
+            && self.bookmark_media_open_pending.is_some()
+            && matches!(
+                self.bookmark_view_return_target,
+                Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(_))
+            )
+        {
+            return self.open_bookmark_media_in_detached_context(
+                ctx,
+                &result.requested,
+                openable,
+                select_requested_file,
+            );
+        }
         let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
             || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
         let outcome =
@@ -198,6 +216,117 @@ impl App {
         if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
             self.open_startup_file_if_visible(&result.requested);
         }
+        true
+    }
+
+    /// 「フル機能ウィンドウ + 動画・音声を別ウィンドウ」でブックマークを開く。
+    ///
+    /// ブックマーク一覧を載せた main context を実フォルダへ切り替えてから media window を
+    /// 開くと、一覧とプレイヤーが同じ `ViewerContextBundle` を共有する。その状態で Esc を押すと
+    /// 一覧復帰の folder load がプレイヤーを別 bundle へ promote し、1 回目は一覧復帰だけ、
+    /// 2 回目で再生終了という二段 close になる。ここでは book detached context と同じ ownership
+    /// seam で、実フォルダ・player・bookmark seek を最初から active detached bundle に載せる。
+    /// main bundle はブックマーク一覧と復帰時の grid snapshot を保持したままにする。
+    #[cfg(windows)]
+    pub(super) fn open_bookmark_media_in_detached_context(
+        &mut self,
+        ctx: &egui::Context,
+        requested: &Path,
+        openable: PathBuf,
+        select_requested_file: bool,
+    ) -> bool {
+        let Some(pending) = self.bookmark_media_open_pending.take() else {
+            return false;
+        };
+        let Some(target) = self.bookmark_view_return_target.clone() else {
+            self.bookmark_media_open_pending = Some(pending);
+            return false;
+        };
+
+        // 同じ media window が既に生きている場合は、コンテキストを作り直さず seek だけ
+        // 新しいブックマークへ差し替える。main 側の grid snapshot は今回のクリック時点の値。
+        if self.raise_active_detached_media_for_grid_open(ctx, &pending.path) {
+            let Some(active) = self.active_detached_viewer_context.as_mut() else {
+                self.bookmark_media_open_pending = Some(pending);
+                return false;
+            };
+            active.bundle.bookmark_media_open_pending = Some(pending);
+            active.bundle.bookmark_view_return_target = Some(target);
+            active.bundle.bookmark_view_return_grid = None;
+            crate::logger::log(format!(
+                "[bookmark-open] reuse detached media context path={}",
+                requested.display()
+            ));
+            return true;
+        }
+
+        // 別の detached viewer があれば、通常の grid media open と同じ handoff seam で
+        // park/close する。新しい boolean ownership state は作らず bundle 自体を所有境界にする。
+        if !self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx) {
+            self.bookmark_media_open_pending = Some(pending);
+            return false;
+        }
+
+        let mut main_context = self.take_current_viewer_context_bundle();
+        let context_serial = self.assign_next_detached_viewer_context_generation();
+        self.reset_active_detached_viewport_runtime_for_new_window(
+            context_serial,
+            "bookmark_media_detached_context",
+        );
+        self.bookmark_media_open_pending = Some(pending);
+        // detached 側は target の複製だけを持つ。grid snapshot が None であることは
+        // 「一覧 surface は main bundle が保持中」という構造上の不変条件でもある。
+        self.bookmark_view_return_target = Some(target);
+        self.bookmark_view_return_grid = None;
+
+        let outcome = self.with_detached_viewer_main_history_suppressed(|app| {
+            let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen(openable, true);
+            if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
+                app.open_startup_file_if_visible(requested);
+            }
+            outcome
+        });
+        let opened_target = matches!(outcome, FolderOpenOutcome::Loaded)
+            && self
+                .fullscreen_idx
+                .and_then(|idx| self.items.get(idx))
+                .is_some_and(|item| match item {
+                    GridItem::Video(path) | GridItem::Audio(path) => {
+                        crate::path_key::eq_keep_drive(path, requested)
+                    }
+                    _ => false,
+                });
+
+        if !opened_target {
+            let closing_window_id = self
+                .active_detached_session
+                .map(|session| session.window_id)
+                .or(self.detached_viewer_window_id);
+            self.begin_active_detached_session_close("bookmark_media_detached_open_failed");
+            self.finish_active_detached_session_close("bookmark_media_detached_open_failed");
+            self.close_fullscreen();
+            if let Some(window_id) = closing_window_id {
+                self.remove_detached_window_runtime(
+                    window_id,
+                    "bookmark_media_detached_open_failed",
+                );
+            }
+            let _failed_context = self.take_current_viewer_context_bundle();
+            self.swap_viewer_context_bundle(&mut main_context);
+            return false;
+        }
+
+        let active_context = self.take_current_viewer_context_bundle();
+        self.swap_viewer_context_bundle(&mut main_context);
+        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+        crate::logger::log(format!(
+            "[bookmark-open] detached media context started path={} main_bookmarks={}",
+            requested.display(),
+            self.items_are_bookmark_view
+        ));
+        ctx.request_repaint();
         true
     }
 
