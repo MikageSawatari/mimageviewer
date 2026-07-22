@@ -276,6 +276,7 @@ where
     for (index, entry) in manifest.entries.iter().enumerate() {
         check_cancel(cancel)?;
         let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
+        validate_bookmark_page_targets(&path, entry)?;
         match verify_target(&path, entry) {
             TargetState::Ready => preview.existing_entries += 1,
             TargetState::Missing => preview.missing_entries += 1,
@@ -311,7 +312,11 @@ where
     let resolved_paths = manifest
         .entries
         .iter()
-        .map(|entry| resolve_entry_path(root, &canonical_root, &entry.path))
+        .map(|entry| {
+            let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
+            validate_bookmark_page_targets(&path, entry)?;
+            Ok(path)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     ensure_database_schemas(data_dir)?;
     let mut conn = open_import_connection(data_dir)?;
@@ -450,13 +455,11 @@ where
             "フォルダ階層が深すぎます（上限 {MAX_RECURSION_DEPTH} 階層）"
         )));
     }
-    let mut children = fs::read_dir(dir)
-        .map_err(|error| TransferError::Io(format!("{}: {error}", dir.display())))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| TransferError::Io(error.to_string()))?;
-    children.sort_by_key(|entry| entry.file_name());
+    let children = fs::read_dir(dir)
+        .map_err(|error| TransferError::Io(format!("{}: {error}", dir.display())))?;
     for child in children {
         check_cancel(cancel)?;
+        let child = child.map_err(|error| TransferError::Io(error.to_string()))?;
         if is_sidecar_name(&child.file_name()) || is_temp_sidecar_name(&child.file_name()) {
             continue;
         }
@@ -472,12 +475,12 @@ where
         };
         let path = child.path();
         let rel = relative_string(root, &path)?;
-        out.push(make_enumerated(&path, rel.clone(), portable_kind)?);
-        if out.len() > MAX_ENTRIES {
+        if out.len() >= MAX_ENTRIES {
             return Err(TransferError::Invalid(format!(
                 "対象が多すぎます（上限 {MAX_ENTRIES} 件）"
             )));
         }
+        out.push(make_enumerated(&path, rel.clone(), portable_kind)?);
         progress(TransferProgress {
             phase: TransferPhase::Scanning,
             processed: out.len(),
@@ -524,6 +527,41 @@ fn make_enumerated(
     })
 }
 
+/// read-only のメタ情報 DB ごとに、一時DBへ今回の物理キーだけを登録する。
+/// `CROSS JOIN` の外側をこの小さい表に固定し、主DBの path index を exact/range seek
+/// することで、対象フォルダが小さいときにグローバルDB全体を走査しない。
+fn prepare_metadata_scope(
+    conn: &mut Connection,
+    physical_index: &HashMap<String, usize>,
+    cancel: &AtomicBool,
+) -> Result<(), TransferError> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE metadata_transfer_scope (
+            item_key      TEXT PRIMARY KEY,
+            virtual_lower TEXT NOT NULL,
+            virtual_upper TEXT NOT NULL
+         ) WITHOUT ROWID;",
+    )
+    .map_err(db_error)?;
+    let tx = conn.transaction().map_err(db_error)?;
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO metadata_transfer_scope
+                    (item_key, virtual_lower, virtual_upper)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(db_error)?;
+        for key in physical_index.keys() {
+            check_cancel(cancel)?;
+            insert
+                .execute(params![key, format!("{key}::"), format!("{key}:;")])
+                .map_err(db_error)?;
+        }
+    }
+    tx.commit().map_err(db_error)
+}
+
 fn attach_metadata<F>(
     data_dir: &Path,
     entries: &mut [EnumeratedEntry],
@@ -543,11 +581,23 @@ where
 
     let rating_path = data_dir.join("rating.db");
     if rating_path.is_file() {
-        let conn = open_readonly(&rating_path)?;
+        let mut conn = open_readonly(&rating_path)?;
+        prepare_metadata_scope(&mut conn, &index, cancel)?;
         let mut stmt = conn
             .prepare(
-                "SELECT path, stars, rated_at_ms, kind, entry_name, page_num, dir_prefix,
-                        archive_format, zipdir_is_archive, zipdir_representative FROM ratings",
+                "SELECT r.path, r.stars, r.rated_at_ms, r.kind, r.entry_name, r.page_num,
+                        r.dir_prefix, r.archive_format, r.zipdir_is_archive,
+                        r.zipdir_representative
+                   FROM metadata_transfer_scope AS s
+                  CROSS JOIN ratings AS r
+                  WHERE r.path = s.item_key
+                 UNION ALL
+                 SELECT r.path, r.stars, r.rated_at_ms, r.kind, r.entry_name, r.page_num,
+                        r.dir_prefix, r.archive_format, r.zipdir_is_archive,
+                        r.zipdir_representative
+                   FROM metadata_transfer_scope AS s
+                  CROSS JOIN ratings AS r
+                  WHERE r.path >= s.virtual_lower AND r.path < s.virtual_upper",
             )
             .map_err(db_error)?;
         let rows = stmt
@@ -593,11 +643,24 @@ where
 
     let tags_path = data_dir.join("tags.db");
     if tags_path.is_file() {
-        let conn = open_readonly(&tags_path)?;
+        let mut conn = open_readonly(&tags_path)?;
+        prepare_metadata_scope(&mut conn, &index, cancel)?;
         let mut tags_by_key: HashMap<String, Vec<String>> = HashMap::new();
         {
             let mut stmt = conn
-                .prepare("SELECT item_key, tag FROM item_tags ORDER BY applied_at, tag_key")
+                .prepare(
+                    "SELECT t.item_key, t.tag, t.applied_at, t.tag_key
+                       FROM metadata_transfer_scope AS s
+                      CROSS JOIN item_tags AS t
+                      WHERE t.item_key = s.item_key
+                     UNION ALL
+                     SELECT t.item_key, t.tag, t.applied_at, t.tag_key
+                       FROM metadata_transfer_scope AS s
+                      CROSS JOIN item_tags AS t
+                      WHERE t.item_key >= s.virtual_lower
+                        AND t.item_key < s.virtual_upper
+                      ORDER BY 3, 4",
+                )
                 .map_err(db_error)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -614,7 +677,18 @@ where
         let mut decided = HashSet::new();
         {
             let mut stmt = conn
-                .prepare("SELECT item_key FROM tag_item_state")
+                .prepare(
+                    "SELECT t.item_key
+                       FROM metadata_transfer_scope AS s
+                      CROSS JOIN tag_item_state AS t
+                      WHERE t.item_key = s.item_key
+                     UNION ALL
+                     SELECT t.item_key
+                       FROM metadata_transfer_scope AS s
+                      CROSS JOIN tag_item_state AS t
+                      WHERE t.item_key >= s.virtual_lower
+                        AND t.item_key < s.virtual_upper",
+                )
                 .map_err(db_error)?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
@@ -642,11 +716,15 @@ where
 
     let video_path = data_dir.join("video_bookmarks.db");
     if video_path.is_file() {
-        let conn = open_readonly(&video_path)?;
+        let mut conn = open_readonly(&video_path)?;
+        prepare_metadata_scope(&mut conn, &index, cancel)?;
         let mut stmt = conn
             .prepare(
-                "SELECT path, pts_secs, title, created_at
-                   FROM video_bookmarks ORDER BY path, pts_secs, id",
+                "SELECT v.path, v.pts_secs, v.title, v.created_at
+                   FROM metadata_transfer_scope AS s
+                  CROSS JOIN video_bookmarks AS v
+                  WHERE v.path = s.item_key
+                  ORDER BY v.path, v.pts_secs, v.id",
             )
             .map_err(db_error)?;
         let rows = stmt
@@ -676,12 +754,16 @@ where
 
     let book_path = data_dir.join("book_bookmarks.db");
     if book_path.is_file() {
-        let conn = open_readonly(&book_path)?;
+        let mut conn = open_readonly(&book_path)?;
+        prepare_metadata_scope(&mut conn, &index, cancel)?;
         let mut stmt = conn
             .prepare(
-                "SELECT container_key, container_kind, page_kind, page_value,
-                        page_index_hint, created_at_ms, title
-                   FROM book_bookmarks ORDER BY container_key, page_index_hint, id",
+                "SELECT b.container_key, b.container_kind, b.page_kind, b.page_value,
+                        b.page_index_hint, b.created_at_ms, b.title
+                   FROM metadata_transfer_scope AS s
+                  CROSS JOIN book_bookmarks AS b
+                  WHERE b.container_key = s.item_key
+                  ORDER BY b.container_key, b.page_index_hint, b.id",
             )
             .map_err(db_error)?;
         let rows = stmt
@@ -886,27 +968,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
             validate_title(bookmark.title.as_deref())?;
         }
         for bookmark in &entry.book_bookmarks {
-            if !matches!(
-                bookmark.container_kind.as_str(),
-                "compiled_book" | "image_folder" | "zip" | "pdf" | "other_archive"
-            ) || !matches!(
-                bookmark.page_kind.as_str(),
-                "relative_path" | "archive_entry" | "pdf_page"
-            ) {
-                return Err(TransferError::Invalid(format!(
-                    "本ブックマークの種類が不正です: {}",
-                    entry.path
-                )));
-            }
-            if bookmark.page_value.chars().count() > MAX_MEMBER_KEY_CHARS
-                || bookmark.page_value.contains('\0')
-                || (bookmark.page_kind == "pdf_page" && bookmark.page_value.parse::<u32>().is_err())
-            {
-                return Err(TransferError::Invalid(format!(
-                    "本ブックマークのページ指定が不正です: {}",
-                    entry.path
-                )));
-            }
+            validate_book_bookmark(bookmark, entry.kind, &entry.path)?;
             validate_title(bookmark.title.as_deref())?;
         }
         let mut member_keys = HashSet::new();
@@ -985,6 +1047,85 @@ fn validate_title(title: Option<&str>) -> Result<(), TransferError> {
     }
 }
 
+fn validate_book_bookmark(
+    bookmark: &PortableBookBookmark,
+    entry_kind: PortableEntryKind,
+    entry_path: &str,
+) -> Result<(), TransferError> {
+    let valid_pair = matches!(
+        (
+            bookmark.container_kind.as_str(),
+            bookmark.page_kind.as_str(),
+            entry_kind,
+        ),
+        (
+            "compiled_book" | "image_folder",
+            "relative_path",
+            PortableEntryKind::Directory,
+        ) | (
+            "zip" | "other_archive",
+            "archive_entry",
+            PortableEntryKind::File,
+        ) | ("pdf", "pdf_page", PortableEntryKind::File)
+    );
+    if !valid_pair {
+        return Err(TransferError::Invalid(format!(
+            "本ブックマークのコンテナとページ種別の組み合わせが不正です: {entry_path}"
+        )));
+    }
+
+    match bookmark.page_kind.as_str() {
+        "relative_path" | "archive_entry" => {
+            validate_bookmark_page_path(&bookmark.page_value, entry_path)
+        }
+        "pdf_page" => {
+            let valid = !bookmark.page_value.is_empty()
+                && bookmark.page_value.chars().count() <= MAX_MEMBER_KEY_CHARS
+                && !bookmark.page_value.contains('\0')
+                && bookmark
+                    .page_value
+                    .parse::<u32>()
+                    .is_ok_and(|page| page.to_string() == bookmark.page_value);
+            if valid {
+                Ok(())
+            } else {
+                Err(TransferError::Invalid(format!(
+                    "本ブックマークのページ指定が不正です: {entry_path}"
+                )))
+            }
+        }
+        _ => Err(TransferError::Invalid(format!(
+            "本ブックマークのページ種別が不正です: {entry_path}"
+        ))),
+    }
+}
+
+/// 本ブックマークのページ指定は OS パスや archive member として後段へ渡る。
+/// `\\` も区切りとして扱い、絶対パス、drive-relative path、`.` / `..` を拒否する。
+fn validate_bookmark_page_path(value: &str, entry_path: &str) -> Result<(), TransferError> {
+    let normalized = value.replace('\\', "/");
+    let has_drive_prefix = normalized.as_bytes().get(1) == Some(&b':')
+        && normalized
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+    let invalid = normalized.is_empty()
+        || normalized.chars().count() > MAX_MEMBER_KEY_CHARS
+        || normalized.contains('\0')
+        || normalized.starts_with('/')
+        || has_drive_prefix
+        || normalized
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..");
+    if invalid {
+        Err(TransferError::Invalid(format!(
+            "本ブックマークのページ指定が不正です: {entry_path}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_relative_path(value: &str) -> Result<(), TransferError> {
     if value.is_empty()
         || value.chars().count() > MAX_PATH_CHARS
@@ -1039,6 +1180,45 @@ fn resolve_entry_path(
         }
     }
     Ok(path)
+}
+
+fn validate_bookmark_page_targets(
+    container_path: &Path,
+    entry: &PortableEntry,
+) -> Result<(), TransferError> {
+    let Some(canonical_container) = fs::canonicalize(container_path).ok() else {
+        // 欠落コンテナは通常の import preview / skip 経路で扱う。
+        return Ok(());
+    };
+    let container_key = crate::path_key::normalize_keep_drive(&canonical_container);
+    let descendant_prefix = if container_key.ends_with('/') {
+        container_key.clone()
+    } else {
+        format!("{container_key}/")
+    };
+
+    for bookmark in &entry.book_bookmarks {
+        if bookmark.page_kind != "relative_path" {
+            continue;
+        }
+        // validate_manifest 済みなので absolute / traversal component は含まれない。
+        let relative = bookmark
+            .page_value
+            .replace('\\', std::path::MAIN_SEPARATOR_STR);
+        let page_path = container_path.join(relative);
+        let Ok(canonical_page) = fs::canonicalize(&page_path) else {
+            // 欠落ページはブックマーク一覧の missing 表示に委ねる。
+            continue;
+        };
+        let page_key = crate::path_key::normalize_keep_drive(&canonical_page);
+        if page_key == container_key || !page_key.starts_with(&descendant_prefix) {
+            return Err(TransferError::Invalid(format!(
+                "本ブックマークがコンテナ外を指しています: {} / {}",
+                entry.path, bookmark.page_value
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1559,6 +1739,41 @@ mod tests {
             .collect()
     }
 
+    fn manifest_with_bookmark(
+        entry_kind: PortableEntryKind,
+        container_kind: &str,
+        page_kind: &str,
+        page_value: &str,
+    ) -> Manifest {
+        Manifest {
+            format: FORMAT_NAME.to_string(),
+            version: FORMAT_VERSION,
+            exported_at_ms: 0,
+            recursive: false,
+            sections: ManifestSections::default(),
+            entries: vec![PortableEntry {
+                path: "book".to_string(),
+                kind: entry_kind,
+                fingerprint: (entry_kind == PortableEntryKind::File).then_some(FileFingerprint {
+                    size: 1,
+                    modified_ms: None,
+                }),
+                rating: None,
+                tags: Vec::new(),
+                timed_bookmarks: Vec::new(),
+                book_bookmarks: vec![PortableBookBookmark {
+                    container_kind: container_kind.to_string(),
+                    page_kind: page_kind.to_string(),
+                    page_value: page_value.to_string(),
+                    page_index_hint: 0,
+                    created_at_ms: 0,
+                    title: None,
+                }],
+                virtual_items: Vec::new(),
+            }],
+        }
+    }
+
     #[test]
     fn round_trip_maps_physical_and_virtual_metadata_to_new_root() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -1826,6 +2041,95 @@ mod tests {
     }
 
     #[test]
+    fn export_reads_only_metadata_for_enumerated_items() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        let data = temp.path().join("data");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("inside.jpg"), b"x").unwrap();
+        fs::write(root.join("nested/deep.jpg"), b"x").unwrap();
+        fs::write(outside.join("other.jpg"), b"x").unwrap();
+        init_data_dir(&data);
+        set_rating(&data, &root.join("inside.jpg"), 1);
+        set_rating(&data, &root.join("nested/deep.jpg"), 2);
+        set_rating(&data, &outside.join("other.jpg"), 3);
+
+        let cancel = AtomicBool::new(false);
+        let mut read_rows = 0;
+        let summary = export_at(&data, &root, false, &cancel, |progress| {
+            if progress.phase == TransferPhase::ReadingMetadata {
+                read_rows = read_rows.max(progress.processed);
+            }
+        })
+        .unwrap();
+        assert_eq!(summary.ratings, 1);
+        assert_eq!(read_rows, 1);
+    }
+
+    #[test]
+    fn metadata_scope_query_seeks_rating_path_index() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        init_data_dir(&data);
+        let mut scope = HashMap::new();
+        scope.insert("c:/photos/a.jpg".to_string(), 0);
+        let cancel = AtomicBool::new(false);
+        let mut conn = open_readonly(&data.join("rating.db")).unwrap();
+        prepare_metadata_scope(&mut conn, &scope, &cancel).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT r.path
+                   FROM metadata_transfer_scope AS s
+                  CROSS JOIN ratings AS r
+                  WHERE r.path = s.item_key
+                 UNION ALL
+                 SELECT r.path
+                   FROM metadata_transfer_scope AS s
+                  CROSS JOIN ratings AS r
+                  WHERE r.path >= s.virtual_lower AND r.path < s.virtual_upper",
+            )
+            .unwrap();
+        let details = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| detail.contains("SEARCH r")),
+            "query plan should seek the ratings path index: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("SCAN r")),
+            "query plan must not scan the global ratings table: {details:?}"
+        );
+    }
+
+    #[test]
+    fn export_scan_observes_cancel_between_directory_entries() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..16 {
+            fs::write(root.join(format!("{index:02}.jpg")), b"x").unwrap();
+        }
+        init_data_dir(&data);
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, |progress| {
+                if progress.phase == TransferPhase::Scanning {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }),
+            Err(TransferError::Cancelled)
+        ));
+        assert!(!root.join(SIDECAR_FILENAME).exists());
+    }
+
+    #[test]
     fn recursive_export_rejects_excessive_depth_instead_of_truncating() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
@@ -1998,6 +2302,75 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsafe_bookmark_page_paths_and_mismatched_kinds() {
+        for value in [
+            "../../outside.jpg",
+            "../outside.jpg",
+            "/outside.jpg",
+            r"C:\outside.jpg",
+            r"chapter\..\outside.jpg",
+        ] {
+            assert!(matches!(
+                validate_manifest(&manifest_with_bookmark(
+                    PortableEntryKind::Directory,
+                    "image_folder",
+                    "relative_path",
+                    value,
+                )),
+                Err(TransferError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            validate_manifest(&manifest_with_bookmark(
+                PortableEntryKind::File,
+                "zip",
+                "archive_entry",
+                "../outside.jpg",
+            )),
+            Err(TransferError::Invalid(_))
+        ));
+
+        for (entry_kind, container_kind, page_kind, value) in [
+            (PortableEntryKind::File, "pdf", "relative_path", "001.jpg"),
+            (
+                PortableEntryKind::Directory,
+                "image_folder",
+                "pdf_page",
+                "0",
+            ),
+            (PortableEntryKind::File, "zip", "pdf_page", "0"),
+            (
+                PortableEntryKind::Directory,
+                "image_folder",
+                "relative_path",
+                "001.jpg",
+            ),
+        ] {
+            let manifest = manifest_with_bookmark(entry_kind, container_kind, page_kind, value);
+            let should_be_valid = container_kind == "image_folder" && page_kind == "relative_path";
+            assert_eq!(validate_manifest(&manifest).is_ok(), should_be_valid);
+        }
+        assert!(
+            validate_manifest(&manifest_with_bookmark(
+                PortableEntryKind::File,
+                "zip",
+                "archive_entry",
+                r"chapter\001.jpg",
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_manifest(&manifest_with_bookmark(
+                PortableEntryKind::File,
+                "pdf",
+                "pdf_page",
+                "42",
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn import_rejects_existing_reparse_path_outside_root() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
@@ -2043,6 +2416,42 @@ mod tests {
         assert!(matches!(
             inspect_import_at(&root, &cancel, no_progress),
             Err(TransferError::Invalid(message)) if message.contains("フォルダ外")
+        ));
+    }
+
+    #[test]
+    fn import_rejects_bookmark_page_reparse_path_outside_container() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let album = root.join("album");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&album).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.jpg"), b"x").unwrap();
+        let link = album.join("link");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&outside, &link).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let mut manifest = manifest_with_bookmark(
+            PortableEntryKind::Directory,
+            "image_folder",
+            "relative_path",
+            "link/secret.jpg",
+        );
+        manifest.entries[0].path = "album".to_string();
+        fs::write(
+            root.join(SIDECAR_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            inspect_import_at(&root, &cancel, no_progress),
+            Err(TransferError::Invalid(message)) if message.contains("コンテナ外")
         ));
     }
 }
