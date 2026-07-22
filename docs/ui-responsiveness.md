@@ -180,6 +180,9 @@ TextureIdで重複排除して見積もり、補正レイヤーの比較preview�
 - [ ] **SQLite クエリ**: キャッシュヒット時は OK だが、cold open や大量 SELECT は
       worker thread に出す。
 - [ ] **`ctx.load_texture`**: 1 フレームに 1 回程度か? 複数来る場合はペーシング必要。
+- [ ] **UI context 依存の大量 CPU 処理** (文字レイアウト等): worker へ移せない場合は 1 frame の
+      件数上限を持つ state transition に分割し、全件 exact へ収束させる。sample 化で既存機能を
+      近似へ変えない。入力世代・表示順・font/style/DPI 変更時は古い state を破棄する。
 - [ ] **画像デコード / XMP / EXIF 読み取り**: 絶対に worker thread。
       既存 `fs_pending` / `metadata_pending` に乗せられないか確認。
 - [ ] **cancel パス**: フォルダ切替 / close_fullscreen / 新リクエスト投入時、

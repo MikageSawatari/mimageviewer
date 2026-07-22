@@ -44,9 +44,10 @@ const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
 // CentralPanel より先に予約し、グリッドの仮想 viewport から確実に除外する。
 const SELECTION_INFO_BAR_HEIGHT: f32 = 58.0;
 // 列境界のダブルクリックは UI thread 上で egui の font atlas を使って文字幅を測る。
-// 大量一覧でも 1 frame の仕事量を一定にするため、可視行 + 一覧全体の均等サンプルだけを測る。
-const DETAILS_BEST_FIT_MAX_SAMPLES: usize = 192;
-const DETAILS_BEST_FIT_VISIBLE_OVERSCAN_ROWS: usize = 8;
+// 全行の exact max を維持したまま 1 frame の仕事量を一定にするため、分割 job で測る。
+const DETAILS_BEST_FIT_ROWS_PER_FRAME: usize = 192;
+const DETAILS_BEST_FIT_HORIZONTAL_PADDING: f32 = 14.0;
+const DETAILS_BEST_FIT_MAX_WIDTH: f32 = 800.0;
 const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [86, 86, 86],
     [255, 255, 255],
@@ -934,6 +935,82 @@ pub(crate) enum DetailsColumnSet {
     TextOnly,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct DetailsBestFitJobKey {
+    items_generation: u64,
+    order_revision: u64,
+    total_rows: usize,
+    column: DetailsColumn,
+    book_sort_locked: bool,
+    header_title: String,
+    button_font: egui::FontId,
+    body_font: egui::FontId,
+    pixels_per_point_bits: u32,
+    ui_font: crate::settings::UiFontSettings,
+}
+
+#[derive(Clone, Debug)]
+struct DetailsBestFitJob {
+    key: DetailsBestFitJobKey,
+    next_row: usize,
+    widest: f32,
+    started: std::time::Instant,
+    measured_rows: usize,
+    batches: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DetailsBestFitFrameBudget {
+    frame_nr: u64,
+    claimed: bool,
+}
+
+impl DetailsBestFitFrameBudget {
+    fn claim(&mut self, frame_nr: u64) -> bool {
+        if self.frame_nr != frame_nr {
+            self.frame_nr = frame_nr;
+            self.claimed = false;
+        }
+        if self.claimed {
+            return false;
+        }
+        self.claimed = true;
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DetailsBestFitBatch {
+    Stale,
+    Complete,
+    Measure {
+        range: std::ops::Range<usize>,
+        completes_job: bool,
+    },
+}
+
+impl DetailsBestFitJob {
+    fn next_batch(&mut self, current_key: &DetailsBestFitJobKey) -> DetailsBestFitBatch {
+        if self.key != *current_key {
+            return DetailsBestFitBatch::Stale;
+        }
+        if self.next_row >= self.key.total_rows {
+            return DetailsBestFitBatch::Complete;
+        }
+
+        let start = self.next_row;
+        let end = start
+            .saturating_add(DETAILS_BEST_FIT_ROWS_PER_FRAME)
+            .min(self.key.total_rows);
+        self.next_row = end;
+        self.batches += 1;
+        DetailsBestFitBatch::Measure {
+            range: start..end,
+            completes_job: end == self.key.total_rows,
+        }
+    }
+}
+
 impl DetailsColumnSet {
     fn includes(self, column: DetailsColumn) -> bool {
         self == Self::All || column != DetailsColumn::Preview
@@ -1142,67 +1219,6 @@ fn details_visible_columns(
     details_ordered_columns(settings, false)
         .into_iter()
         .filter(|column| details_column_is_visible(settings, column_set, *column))
-        .collect()
-}
-
-fn details_best_fit_sample_indices(
-    order: &[usize],
-    visible_range: std::ops::Range<usize>,
-) -> Vec<usize> {
-    if order.len() <= DETAILS_BEST_FIT_MAX_SAMPLES {
-        return order.to_vec();
-    }
-
-    fn push_evenly_sampled_positions(
-        positions: &mut Vec<usize>,
-        start: usize,
-        len: usize,
-        budget: usize,
-    ) {
-        if len == 0 || budget == 0 {
-            return;
-        }
-        if budget == 1 {
-            let position = start + len / 2;
-            if !positions.contains(&position) {
-                positions.push(position);
-            }
-            return;
-        }
-        for slot in 0..budget {
-            let position = start + slot * (len - 1) / (budget - 1);
-            if !positions.contains(&position) {
-                positions.push(position);
-            }
-        }
-    }
-
-    let visible_start = visible_range.start.min(order.len());
-    let visible_end = visible_range.end.min(order.len()).max(visible_start);
-    let visible_len = visible_end - visible_start;
-    let visible_budget = visible_len.min(DETAILS_BEST_FIT_MAX_SAMPLES / 2);
-    let mut positions = Vec::with_capacity(DETAILS_BEST_FIT_MAX_SAMPLES);
-    push_evenly_sampled_positions(&mut positions, visible_start, visible_len, visible_budget);
-
-    let global_budget = DETAILS_BEST_FIT_MAX_SAMPLES - positions.len();
-    push_evenly_sampled_positions(&mut positions, 0, order.len(), global_budget);
-
-    // 可視範囲と全体サンプルが重なった場合は、残り枠を等間隔の中点で補う。
-    if positions.len() < DETAILS_BEST_FIT_MAX_SAMPLES {
-        let stride = (order.len() / DETAILS_BEST_FIT_MAX_SAMPLES).max(1);
-        let mut position = stride / 2;
-        while position < order.len() && positions.len() < DETAILS_BEST_FIT_MAX_SAMPLES {
-            if !positions.contains(&position) {
-                positions.push(position);
-            }
-            position = position.saturating_add(stride);
-        }
-    }
-
-    positions.sort_unstable();
-    positions
-        .into_iter()
-        .map(|position| order[position])
         .collect()
 }
 
@@ -10453,15 +10469,6 @@ impl App {
         // 多めに確保する方へ倒す (余分に取っても右に空き帯が出るだけで無害) ため概算を少し小さめにする。
         let viewport_h_est =
             (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - hbar - 2.0).max(0.0);
-        let first_visible_row =
-            ((self.scroll_offset_y.max(0.0) / Self::DETAILS_ROW_H) as usize).min(row_count);
-        let visible_row_count = (viewport_h_est / Self::DETAILS_ROW_H).ceil() as usize + 2;
-        let best_fit_visible_range = first_visible_row
-            .saturating_sub(DETAILS_BEST_FIT_VISIBLE_OVERSCAN_ROWS)
-            ..first_visible_row
-                .saturating_add(visible_row_count)
-                .saturating_add(DETAILS_BEST_FIT_VISIBLE_OVERSCAN_ROWS)
-                .min(row_count);
         let needs_vscroll = natural_h > viewport_h_est;
         let gutter = if needs_vscroll {
             egui::style::ScrollStyle::solid().allocated_width()
@@ -10496,7 +10503,7 @@ impl App {
                     egui::vec2(content_w, Self::DETAILS_HEADER_H),
                     egui::Sense::hover(),
                 );
-                self.draw_details_header(ui, header_rect, best_fit_visible_range.clone());
+                self.draw_details_header(ui, header_rect);
 
                 let viewport_h = ui.available_height().max(0.0);
                 self.last_viewport_h = viewport_h;
@@ -11044,93 +11051,286 @@ impl App {
         });
     }
 
-    fn details_best_fit_column_width(
-        &mut self,
+    fn details_best_fit_job_id() -> egui::Id {
+        egui::Id::new("details_best_fit_job")
+    }
+
+    fn details_best_fit_frame_budget_id() -> egui::Id {
+        egui::Id::new("details_best_fit_frame_budget")
+    }
+
+    fn claim_details_best_fit_frame_budget(ctx: &egui::Context) -> bool {
+        let frame_nr = ctx.cumulative_frame_nr();
+        ctx.data_mut(|data| {
+            let id = Self::details_best_fit_frame_budget_id();
+            let mut budget = data
+                .get_temp::<DetailsBestFitFrameBudget>(id)
+                .unwrap_or_default();
+            let claimed = budget.claim(frame_nr);
+            data.insert_temp(id, budget);
+            claimed
+        })
+    }
+
+    fn cancel_details_best_fit_job(ctx: &egui::Context) {
+        ctx.data_mut(|data| {
+            data.remove_temp::<Option<DetailsBestFitJob>>(Self::details_best_fit_job_id());
+        });
+    }
+
+    fn details_best_fit_measure(ui: &egui::Ui, text: String, font: egui::FontId) -> f32 {
+        ui.painter()
+            .layout_no_wrap(text, font, egui::Color32::WHITE)
+            .size()
+            .x
+    }
+
+    fn details_best_fit_job_key(
+        &self,
         ui: &egui::Ui,
         column: DetailsColumn,
         book_sort_locked: bool,
-        visible_range: &std::ops::Range<usize>,
-    ) -> f32 {
-        let started = std::time::Instant::now();
-        let button_font = egui::TextStyle::Button.resolve(ui.style());
-        let body_font = egui::TextStyle::Body.resolve(ui.style());
-        let measure = |text: String, font: egui::FontId| {
-            ui.painter()
-                .layout_no_wrap(text, font, egui::Color32::WHITE)
-                .size()
-                .x
-        };
-        let mut widest = measure(
-            self.details_header_title(column, book_sort_locked, true),
-            button_font,
-        );
+    ) -> DetailsBestFitJobKey {
+        DetailsBestFitJobKey {
+            items_generation: self.items_generation,
+            order_revision: self.details_order_revision,
+            total_rows: self.current_grid_order().len(),
+            column,
+            book_sort_locked,
+            header_title: self.details_header_title(column, book_sort_locked, true),
+            button_font: egui::TextStyle::Button.resolve(ui.style()),
+            body_font: egui::TextStyle::Body.resolve(ui.style()),
+            pixels_per_point_bits: ui.ctx().pixels_per_point().to_bits(),
+            ui_font: self.settings.ui_font.clone(),
+        }
+    }
 
-        match column {
-            DetailsColumn::Preview => widest = widest.max(column.default_width() - 12.0),
+    fn details_best_fit_seed_width(
+        &self,
+        ui: &egui::Ui,
+        key: &DetailsBestFitJobKey,
+    ) -> (f32, bool) {
+        let mut widest =
+            Self::details_best_fit_measure(ui, key.header_title.clone(), key.button_font.clone());
+        let needs_dynamic_rows = match key.column {
+            DetailsColumn::Preview => {
+                widest = widest.max(key.column.default_width() - 12.0);
+                false
+            }
             // These columns have a small bounded vocabulary. Avoid calling the regular row
             // formatter for every item because Rating may perform a cache-miss DB lookup.
             DetailsColumn::Rating => {
-                widest = widest.max(measure("★★★★★".to_owned(), body_font));
+                widest = widest.max(Self::details_best_fit_measure(
+                    ui,
+                    "★★★★★".to_owned(),
+                    key.body_font.clone(),
+                ));
+                false
             }
             DetailsColumn::State => {
                 for sample in ["補 レ 消 隠 文 回 ピ", "9999 / 9999", "未読"] {
-                    widest = widest.max(measure(sample.to_owned(), body_font.clone()));
+                    widest = widest.max(Self::details_best_fit_measure(
+                        ui,
+                        sample.to_owned(),
+                        key.body_font.clone(),
+                    ));
                 }
+                false
             }
-            _ => {
-                let total_rows = self.current_grid_order().len();
-                let sample_indices = details_best_fit_sample_indices(
-                    self.current_grid_order(),
-                    visible_range.clone(),
-                );
-                let mut sampled_rows = 0;
-                for idx in sample_indices.iter().copied() {
-                    let Some(item) = self.items.get(idx).cloned() else {
-                        continue;
-                    };
-                    sampled_rows += 1;
-                    let meta = self.image_metas.get(idx).copied().flatten();
-                    let text = self.details_cell_text(idx, &item, meta, column);
-                    if !text.is_empty() {
-                        widest = widest.max(measure(text, body_font.clone()));
-                    }
-                    if widest >= 788.0 {
-                        break;
-                    }
-                }
+            _ => true,
+        };
+        (widest, needs_dynamic_rows)
+    }
+
+    fn apply_details_best_fit_width(&mut self, ui: &egui::Ui, column: DetailsColumn, widest: f32) {
+        let width = (widest + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+            .ceil()
+            .clamp(column.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
+        let changed = if column == DetailsColumn::Name {
+            set_details_name_width(&mut self.settings, width)
+        } else {
+            set_details_column_width(&mut self.settings, column, width)
+        };
+        if changed {
+            crate::logger::log(format!(
+                "details column best-fit: {:?} -> {:.1}",
+                column.id(),
+                width
+            ));
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn finish_details_best_fit_job(
+        &mut self,
+        ui: &egui::Ui,
+        job: DetailsBestFitJob,
+        saturated: bool,
+    ) {
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "details",
+                "column_best_fit",
+                None,
+                job.key.items_generation,
+                &[
+                    ("rows", serde_json::Value::from(job.key.total_rows)),
+                    ("measured_rows", serde_json::Value::from(job.measured_rows)),
+                    ("batches", serde_json::Value::from(job.batches)),
+                    ("saturated", serde_json::Value::from(saturated)),
+                    (
+                        "ms",
+                        serde_json::Value::from(job.started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
+        self.apply_details_best_fit_width(ui, job.key.column, job.widest);
+    }
+
+    fn advance_details_best_fit_job(&mut self, ui: &egui::Ui, book_sort_locked: bool) {
+        let job_id = Self::details_best_fit_job_id();
+        let Some(mut job) = ui.ctx().data_mut(|data| {
+            data.remove_temp::<Option<DetailsBestFitJob>>(job_id)
+                .flatten()
+        }) else {
+            return;
+        };
+
+        if !details_visible_columns(&self.settings, DetailsColumnSet::All).contains(&job.key.column)
+        {
+            return;
+        }
+        let current_key = self.details_best_fit_job_key(ui, job.key.column, book_sort_locked);
+        if job.key == current_key
+            && job.next_row < job.key.total_rows
+            && !Self::claim_details_best_fit_frame_budget(ui.ctx())
+        {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(job_id, Some(job)));
+            ui.ctx().request_repaint();
+            return;
+        }
+        let batch = job.next_batch(&current_key);
+        match batch {
+            DetailsBestFitBatch::Stale => {
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "details",
-                        "column_best_fit",
+                        "column_best_fit_cancel",
                         None,
                         self.items_generation,
                         &[
-                            ("rows", serde_json::Value::from(total_rows)),
-                            ("sampled_rows", serde_json::Value::from(sampled_rows)),
                             (
-                                "ms",
-                                serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                                "started_generation",
+                                serde_json::Value::from(job.key.items_generation),
+                            ),
+                            (
+                                "started_order_revision",
+                                serde_json::Value::from(job.key.order_revision),
+                            ),
+                            (
+                                "current_order_revision",
+                                serde_json::Value::from(self.details_order_revision),
                             ),
                         ],
                     );
                 }
             }
+            DetailsBestFitBatch::Complete => {
+                self.finish_details_best_fit_job(ui, job, false);
+            }
+            DetailsBestFitBatch::Measure {
+                range,
+                completes_job,
+            } => {
+                let batch_started = std::time::Instant::now();
+                // current_grid_order の全体 clone は避け、今 frame に測る最大 192 idx だけを
+                // 借用解除用にコピーする。order revision が変われば次 frame で job を破棄する。
+                let indices = self.current_grid_order()[range].to_vec();
+                for idx in indices.iter().copied() {
+                    let Some(item) = self.items.get(idx).cloned() else {
+                        continue;
+                    };
+                    job.measured_rows += 1;
+                    let meta = self.image_metas.get(idx).copied().flatten();
+                    let text = self.details_cell_text(idx, &item, meta, job.key.column);
+                    if !text.is_empty() {
+                        job.widest = job.widest.max(Self::details_best_fit_measure(
+                            ui,
+                            text,
+                            job.key.body_font.clone(),
+                        ));
+                    }
+                }
+                let saturated =
+                    job.widest + DETAILS_BEST_FIT_HORIZONTAL_PADDING >= DETAILS_BEST_FIT_MAX_WIDTH;
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "details",
+                        "column_best_fit_batch",
+                        None,
+                        job.key.items_generation,
+                        &[
+                            ("batch_rows", serde_json::Value::from(indices.len())),
+                            ("measured_rows", serde_json::Value::from(job.measured_rows)),
+                            ("rows", serde_json::Value::from(job.key.total_rows)),
+                            (
+                                "ms",
+                                serde_json::Value::from(
+                                    batch_started.elapsed().as_secs_f64() * 1000.0,
+                                ),
+                            ),
+                        ],
+                    );
+                }
+                if completes_job || saturated {
+                    self.finish_details_best_fit_job(ui, job, saturated);
+                } else {
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(job_id, Some(job)));
+                    ui.ctx().request_repaint();
+                }
+            }
         }
-
-        (widest + 14.0).ceil().clamp(column.min_width(), 800.0)
     }
 
-    fn draw_details_header(
+    fn start_details_best_fit_job(
         &mut self,
-        ui: &mut egui::Ui,
-        rect: egui::Rect,
-        best_fit_visible_range: std::ops::Range<usize>,
+        ui: &egui::Ui,
+        column: DetailsColumn,
+        book_sort_locked: bool,
     ) {
+        let key = self.details_best_fit_job_key(ui, column, book_sort_locked);
+        let (widest, needs_dynamic_rows) = self.details_best_fit_seed_width(ui, &key);
+        if !needs_dynamic_rows {
+            Self::cancel_details_best_fit_job(ui.ctx());
+            self.apply_details_best_fit_width(ui, column, widest);
+            return;
+        }
+
+        let job = DetailsBestFitJob {
+            key,
+            next_row: 0,
+            widest,
+            started: std::time::Instant::now(),
+            measured_rows: 0,
+            batches: 0,
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(Self::details_best_fit_job_id(), Some(job)));
+        // クリック frame で最初の batch を測る。小規模一覧はこの 1 回で exact 幅になる。
+        self.advance_details_best_fit_job(ui, book_sort_locked);
+    }
+
+    fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
         let hover_bg = ui.visuals().widgets.hovered.bg_fill;
         let book_sort_locked = self.page_order_locked_for_current_view();
+        self.advance_details_best_fit_job(ui, book_sort_locked);
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
@@ -11268,27 +11468,10 @@ impl App {
                     );
                 }
                 if resize_response.double_clicked() {
-                    let width = self.details_best_fit_column_width(
-                        ui,
-                        col,
-                        book_sort_locked,
-                        &best_fit_visible_range,
-                    );
-                    let changed = if col == DetailsColumn::Name {
-                        set_details_name_width(&mut self.settings, width)
-                    } else {
-                        set_details_column_width(&mut self.settings, col, width)
-                    };
-                    if changed {
-                        crate::logger::log(format!(
-                            "details column best-fit: {:?} -> {:.1}",
-                            col.id(),
-                            width
-                        ));
-                        self.settings.save();
-                        ui.ctx().request_repaint();
-                    }
+                    self.start_details_best_fit_job(ui, col, book_sort_locked);
                 } else if resize_response.dragged() {
+                    // 手動幅変更はユーザーの最新意思。進行中の自動測定結果で後から上書きしない。
+                    Self::cancel_details_best_fit_job(ui.ctx());
                     let changed = if col == DetailsColumn::Name {
                         // 名前列の境界ドラッグ = 自動調整をやめ、その幅を固定幅として保存する。
                         set_details_name_width(
@@ -11342,6 +11525,7 @@ impl App {
             .on_hover_text("OFF にすると現在の名前列幅で固定します (境界ドラッグでも固定されます)")
             .changed()
         {
+            Self::cancel_details_best_fit_job(ui.ctx());
             if name_auto {
                 self.settings.details_name_width_auto = true;
                 self.settings.details_name_width = DetailsColumn::Name.default_width();
@@ -11455,6 +11639,7 @@ impl App {
         }
 
         if changed {
+            Self::cancel_details_best_fit_job(ui.ctx());
             let new_lazy = (
                 self.settings.details_show_page_count,
                 self.settings.details_show_created,
@@ -11822,6 +12007,9 @@ impl App {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             self.details_hover_thumb_viewport_open = false;
             self.set_details_hover_thumbnail_idx(None);
+        }
+        if self.settings.grid_view_mode != GridViewMode::Details || self.items.is_empty() {
+            Self::cancel_details_best_fit_job(ctx);
         }
 
         egui::CentralPanel::default()
@@ -13490,6 +13678,32 @@ mod compute_cell_size_tests {
         settings
     }
 
+    fn best_fit_test_key(total_rows: usize) -> DetailsBestFitJobKey {
+        DetailsBestFitJobKey {
+            items_generation: 7,
+            order_revision: 11,
+            total_rows,
+            column: DetailsColumn::Name,
+            book_sort_locked: false,
+            header_title: "名前".to_owned(),
+            button_font: egui::FontId::proportional(14.0),
+            body_font: egui::FontId::proportional(14.0),
+            pixels_per_point_bits: 1.0_f32.to_bits(),
+            ui_font: crate::settings::UiFontSettings::default(),
+        }
+    }
+
+    fn best_fit_test_job(total_rows: usize) -> DetailsBestFitJob {
+        DetailsBestFitJob {
+            key: best_fit_test_key(total_rows),
+            next_row: 0,
+            widest: 0.0,
+            started: std::time::Instant::now(),
+            measured_rows: 0,
+            batches: 0,
+        }
+    }
+
     #[test]
     fn details_separator_stays_one_physical_pixel() {
         for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
@@ -13658,22 +13872,184 @@ mod compute_cell_size_tests {
             egui::Pos2::ZERO,
             egui::vec2(900.0, 200.0),
         ));
-        let mut measured = None;
-
         let _ = ctx.run(raw_input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                measured = Some(app.details_best_fit_column_width(
-                    ui,
-                    DetailsColumn::Name,
-                    false,
-                    &(0..1),
-                ));
+                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
             });
         });
 
-        let width = measured.expect("best-fit width");
+        let width = app.settings.details_name_width;
+        assert!(!app.settings.details_name_width_auto);
         assert!(width > DetailsColumn::Name.default_width());
-        assert!(width <= 800.0);
+        assert!(width <= DETAILS_BEST_FIT_MAX_WIDTH);
+    }
+
+    #[test]
+    fn details_best_fit_exact_width_reaches_longest_row_after_first_batch() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
+        let longest_name = format!("{}tail.png", "outside-first-batch-".repeat(4));
+        app.items = (0..row_count)
+            .map(|idx| {
+                let name = if idx + 1 == row_count {
+                    longest_name.clone()
+                } else {
+                    format!("short-{idx}.png")
+                };
+                GridItem::Image(PathBuf::from(format!(r"C:\Pictures\{name}")))
+            })
+            .collect();
+        app.image_metas = vec![None; row_count];
+        app.visible_indices = (0..row_count).collect();
+        app.details_order = app.visible_indices.clone();
+        app.details_order_revision = 1;
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
+            });
+        });
+        assert!(
+            app.settings.details_name_width_auto,
+            "最初の 192 行だけでは未標本の最長行を見ず、確定幅を適用しない"
+        );
+
+        let mut expected = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                expected = (App::details_best_fit_measure(
+                    ui,
+                    longest_name.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                    .ceil()
+                    .clamp(DetailsColumn::Name.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+
+        assert!(!app.settings.details_name_width_auto);
+        assert!(
+            (app.settings.details_name_width - expected).abs() < 0.01,
+            "全行完了後は可視範囲外の最長値へ exact に収束する"
+        );
+    }
+
+    #[test]
+    fn details_best_fit_uses_current_filtered_and_sorted_order_exactly() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        let item_count = 221;
+        let filtered_longest = format!("{}tail.png", "filtered-long-".repeat(4));
+        app.items = (0..item_count)
+            .map(|idx| {
+                let name = match idx {
+                    0 => format!("{}hidden.png", "filtered-out-".repeat(100)),
+                    1 => filtered_longest.clone(),
+                    _ => format!("short-{idx}.png"),
+                };
+                GridItem::Image(PathBuf::from(format!(r"C:\Pictures\{name}")))
+            })
+            .collect();
+        app.image_metas = vec![None; item_count];
+        app.visible_indices = (1..item_count).collect();
+        // ソート後の順序を模し、可視集合内の最長行を 2 batch 目の末尾へ置く。
+        app.details_order = app.visible_indices.iter().rev().copied().collect();
+        app.details_order_revision = 9;
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
+            });
+        });
+        let mut expected = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                expected = (App::details_best_fit_measure(
+                    ui,
+                    filtered_longest.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                    .ceil()
+                    .clamp(DetailsColumn::Name.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+
+        assert!((app.settings.details_name_width - expected).abs() < 0.01);
+        assert!(
+            app.settings.details_name_width < DETAILS_BEST_FIT_MAX_WIDTH,
+            "filter で除外した最長値は測定対象へ戻さない"
+        );
+    }
+
+    #[test]
+    fn details_best_fit_discards_job_when_items_generation_changes_mid_scan() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 10;
+        app.items = (0..row_count)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\Pictures\short-{idx}.png"))))
+            .collect();
+        app.image_metas = vec![None; row_count];
+        app.visible_indices = (0..row_count).collect();
+        app.details_order = app.visible_indices.clone();
+        app.details_order_revision = 3;
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
+            });
+        });
+        app.items_generation = app.items_generation.wrapping_add(1);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+
+        assert!(app.settings.details_name_width_auto);
+        assert!(
+            ctx.data(|data| {
+                data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
+                    .flatten()
+                    .is_none()
+            }),
+            "古い generation の job は再投入しない"
+        );
+    }
+
+    #[test]
+    fn details_best_fit_keeps_fixed_samples_and_dynamic_column_scans() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        let ctx = egui::Context::default();
+        let mut checked = false;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rating_key = app.details_best_fit_job_key(ui, DetailsColumn::Rating, false);
+                let (rating_width, rating_dynamic) =
+                    app.details_best_fit_seed_width(ui, &rating_key);
+                let five_stars = App::details_best_fit_measure(
+                    ui,
+                    "★★★★★".to_owned(),
+                    rating_key.body_font.clone(),
+                );
+                assert!(!rating_dynamic);
+                assert!(rating_width >= five_stars);
+
+                let tags_key = app.details_best_fit_job_key(ui, DetailsColumn::Tags, false);
+                let (_, tags_dynamic) = app.details_best_fit_seed_width(ui, &tags_key);
+                assert!(tags_dynamic, "タグは現在一覧の動的値を全行測る");
+                checked = true;
+            });
+        });
+        assert!(checked);
     }
 
     #[test]
@@ -13754,39 +14130,75 @@ mod compute_cell_size_tests {
     }
 
     #[test]
-    fn details_best_fit_samples_every_row_for_small_lists() {
-        let order = (1000..1100).collect::<Vec<_>>();
+    fn details_best_fit_small_list_completes_in_one_bounded_batch() {
+        let key = best_fit_test_key(100);
+        let mut job = best_fit_test_job(100);
         assert_eq!(
-            details_best_fit_sample_indices(&order, 20..40),
-            order,
-            "上限以下の一覧では従来どおり全行を測る"
+            job.next_batch(&key),
+            DetailsBestFitBatch::Measure {
+                range: 0..100,
+                completes_job: true,
+            }
         );
     }
 
     #[test]
-    fn details_best_fit_large_list_sampling_is_bounded_and_keeps_visible_rows() {
-        let order = (10_000..20_000).collect::<Vec<_>>();
-        let samples = details_best_fit_sample_indices(&order, 400..430);
-        assert!(samples.len() <= DETAILS_BEST_FIT_MAX_SAMPLES);
-        assert_eq!(
-            samples.first(),
-            order.first(),
-            "一覧先頭を全体サンプルに含める"
-        );
-        assert_eq!(
-            samples.last(),
-            order.last(),
-            "一覧末尾を全体サンプルに含める"
-        );
+    fn details_best_fit_large_list_visits_every_row_with_a_per_frame_cap() {
+        let key = best_fit_test_key(1_003);
+        let mut job = best_fit_test_job(1_003);
+        let mut visited = Vec::new();
+        loop {
+            match job.next_batch(&key) {
+                DetailsBestFitBatch::Measure {
+                    range,
+                    completes_job,
+                } => {
+                    assert!(range.len() <= DETAILS_BEST_FIT_ROWS_PER_FRAME);
+                    visited.extend(range);
+                    if completes_job {
+                        break;
+                    }
+                }
+                other => panic!("unexpected transition: {other:?}"),
+            }
+        }
+        assert_eq!(visited, (0..1_003).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn details_best_fit_all_jobs_share_one_batch_budget_per_frame() {
+        let mut budget = DetailsBestFitFrameBudget::default();
+        assert!(budget.claim(10));
         assert!(
-            order[400..430].iter().all(|idx| samples.contains(idx)),
-            "現在の可視行はすべて測定対象に含める"
+            !budget.claim(10),
+            "同じ frame で別の列 job を開始しても 2 batch 目は測らない"
         );
-        assert_eq!(
-            samples.iter().copied().collect::<HashSet<_>>().len(),
-            samples.len(),
-            "同じ行を重複測定しない"
-        );
+        assert!(budget.claim(11), "次 frame で上限を再び使える");
+    }
+
+    #[test]
+    fn details_best_fit_rejects_generation_sort_filter_font_and_dpi_changes() {
+        let mut job = best_fit_test_job(250);
+        let base = job.key.clone();
+        let mut changed = base.clone();
+        changed.items_generation += 1;
+        assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
+
+        changed = base.clone();
+        changed.order_revision += 1;
+        assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
+
+        changed = base.clone();
+        changed.column = DetailsColumn::Tags;
+        assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
+
+        changed = base.clone();
+        changed.body_font = egui::FontId::proportional(15.0);
+        assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
+
+        changed = base;
+        changed.pixels_per_point_bits = 1.25_f32.to_bits();
+        assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
     }
 
     #[test]

@@ -1778,6 +1778,7 @@ struct ViewerContextBundle {
     texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
     visible_indices: Vec<usize>,
     details_order: Vec<usize>,
+    details_order_revision: u64,
     details_tag_prewarm_indices: Vec<usize>,
     details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
     details_meta_pending: Option<DetailsMetaPending>,
@@ -2064,6 +2065,7 @@ impl ViewerContextBundle {
             texture_backlog: Vec::new(),
             visible_indices: Vec::new(),
             details_order: Vec::new(),
+            details_order_revision: 0,
             details_tag_prewarm_indices: Vec::new(),
             details_lazy_meta: std::collections::HashMap::new(),
             details_meta_pending: None,
@@ -7056,6 +7058,9 @@ pub struct App {
     /// 詳細表示専用の表示順。`visible_indices` は昇順のまま保ち、詳細モードの描画 /
     /// キーボード移動 / Shift 範囲選択だけこの順序を見る。
     pub(crate) details_order: Vec<usize>,
+    /// 詳細一覧の表示集合またはソート順を再構築した世代。分割 UI job は開始時の
+    /// 一覧と一致する間だけ結果を適用し、filter / sort 変更後の古い測定を破棄する。
+    pub(crate) details_order_revision: u64,
     /// 詳細表示で現在画面付近にある idx。サムネ用 `keep_set` を空にしても、
     /// XMP rating hydration はこの集合で可視行だけ進める。
     pub(crate) details_tag_prewarm_indices: Vec<usize>,
@@ -9970,6 +9975,7 @@ impl App {
             search_filter_origin_folder: None,
             visible_indices: Vec::new(),
             details_order: Vec::new(),
+            details_order_revision: 0,
             details_tag_prewarm_indices: Vec::new(),
             details_lazy_meta: std::collections::HashMap::new(),
             details_meta_pending: None,
@@ -11690,6 +11696,7 @@ impl App {
             texture_backlog,
             visible_indices,
             details_order,
+            details_order_revision,
             details_tag_prewarm_indices,
             details_lazy_meta,
             details_meta_pending,
@@ -11891,6 +11898,7 @@ impl App {
         swap_field!(texture_backlog);
         swap_field!(visible_indices);
         swap_field!(details_order);
+        swap_field!(details_order_revision);
         swap_field!(details_tag_prewarm_indices);
         swap_field!(details_lazy_meta);
         swap_field!(details_meta_pending);
@@ -33677,6 +33685,7 @@ impl App {
             texture_backlog,
             visible_indices,
             details_order,
+            details_order_revision,
             details_tag_prewarm_indices,
             details_lazy_meta,
             details_meta_pending,
@@ -33873,6 +33882,7 @@ impl App {
             thumbnail_eviction_generation,
             visible_indices,
             details_order,
+            details_order_revision,
             search_filter,
             search_filter_origin_folder,
             checked,
@@ -38571,6 +38581,7 @@ impl App {
                 self.clear_details_hover_keep();
                 self.cancel_details_meta_loading();
                 self.details_order.clear();
+                self.details_order_revision = self.details_order_revision.wrapping_add(1);
                 self.details_tag_prewarm_indices.clear();
             }
         }
@@ -38684,6 +38695,7 @@ impl App {
     }
 
     pub(crate) fn rebuild_details_order(&mut self) {
+        self.details_order_revision = self.details_order_revision.wrapping_add(1);
         self.cached_nav_indices = None;
         self.cached_fs_seek_info = None;
         let mut key = self.settings.details_sort_key;
