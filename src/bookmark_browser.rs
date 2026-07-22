@@ -229,7 +229,7 @@ impl BookKindFilter {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BookmarkRowSource {
     Media {
         id: i64,
@@ -253,6 +253,17 @@ pub struct BookmarkBrowserRow {
 }
 
 impl BookmarkBrowserRow {
+    /// 一覧セルの再構築が必要になる表示内容が同じかを判定する。
+    /// marker thumbnail は source の保存位置から生成されるため、ここでは有無だけを見る。
+    /// 同じ bookmark id をその場で更新できる項目（名称・位置・missing・meta）は個別比較する。
+    pub fn has_same_grid_content(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.image_meta == other.image_meta
+            && self.marker_thumbnail.is_some() == other.marker_thumbnail.is_some()
+            && self.created_at_ms == other.created_at_ms
+            && self.missing == other.missing
+    }
+
     pub fn media_filter(&self) -> MediaFilter {
         match &self.source {
             BookmarkRowSource::Media { is_audio: true, .. } => MediaFilter::Audio,
@@ -357,6 +368,23 @@ impl BookmarkBrowserRow {
             BookmarkRowSource::Book(bookmark) => &bookmark.container_path,
         }
     }
+}
+
+/// worker の返した read model が現在表示中の一覧と同一なら、`start_loading_items` を
+/// 再実行する必要はない。表示順はユーザー設定で並べ替え済みなので stable key で照合する。
+pub fn rows_have_same_grid_content(
+    current: &[BookmarkBrowserRow],
+    incoming: &[BookmarkBrowserRow],
+) -> bool {
+    if current.len() != incoming.len() {
+        return false;
+    }
+    let current_by_key: HashMap<_, _> = current.iter().map(|row| (row.stable_key(), row)).collect();
+    incoming.iter().all(|row| {
+        current_by_key
+            .get(&row.stable_key())
+            .is_some_and(|current| current.has_same_grid_content(row))
+    })
 }
 
 fn format_media_position(pts_secs: f64) -> String {
@@ -920,5 +948,18 @@ mod tests {
         *title = Some("見どころ".to_string());
 
         assert_eq!(row.details_name(), "clip.mp4 — 見どころ");
+    }
+
+    #[test]
+    fn grid_content_comparison_uses_stable_keys_and_detects_title_changes() {
+        let current = vec![media_row(1, 1_000, "one"), media_row(2, 2_000, "two")];
+        let mut reordered = vec![current[1].clone(), current[0].clone()];
+        assert!(rows_have_same_grid_content(&current, &reordered));
+
+        let BookmarkRowSource::Media { title, .. } = &mut reordered[0].source else {
+            unreachable!();
+        };
+        *title = Some("更新後".to_string());
+        assert!(!rows_have_same_grid_content(&current, &reordered));
     }
 }

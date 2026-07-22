@@ -1749,6 +1749,7 @@ struct ViewerContextBundle {
     items: Vec<GridItem>,
     thumbnails: Vec<ThumbnailState>,
     image_metas: Vec<Option<(i64, i64)>>,
+    video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     auto_aspect: crate::auto_aspect::AutoAspectState,
     selected: Option<usize>,
     scroll_offset_y: f32,
@@ -1770,7 +1771,19 @@ struct ViewerContextBundle {
     details_meta_pending: Option<DetailsMetaPending>,
     details_lazy_visible_revision: u64,
     details_image_dims_state: LazyColumnState,
+    metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
+    exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
+    xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    xmp_panorama_info:
+        std::collections::HashMap<String, Option<crate::xmp_reader::XmpPanoramaInfo>>,
+    metadata_pending: Option<MetadataLoadPending>,
+    /// 一覧ごとの tags.db 表示キャッシュ。detached context の実フォルダ load が
+    /// main 一覧のタグを消さないよう、item 列と同じ ownership で交換する。
+    tags_cache: std::collections::HashMap<String, Vec<String>>,
+    tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
     tag_prewarm_queued: std::collections::HashSet<usize>,
+    tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
+    user_set_rating_keys: std::collections::HashSet<String>,
     pending_finalize: std::collections::HashSet<usize>,
     // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
     // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
@@ -1803,6 +1816,15 @@ struct ViewerContextBundle {
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
     rating_cache: std::collections::HashMap<usize, u8>,
     current_folder_rating_cache: Option<u8>,
+    current_folder_last_mtime: Option<std::time::SystemTime>,
+    current_folder_signature: Option<u64>,
+    folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    converted_archive_cache_paths: std::collections::HashMap<String, PathBuf>,
+    converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
+    current_color_cache_map: Option<
+        Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
+    >,
+    current_color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
     /// VST3 startup load 完了まで start_fs_load を保留している、この context の media idx。
     vst3_deferred_media_open: Option<usize>,
     fullscreen_idx: Option<usize>,
@@ -1976,6 +1998,18 @@ impl Drop for ViewerContextBundle {
         if let Some(q) = &self.heavy_io_queue {
             q.1.notify_all();
         }
+        if let Some(pending) = self.tag_prewarm_pending.as_ref() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.metadata_pending.as_ref() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2000,6 +2034,7 @@ impl ViewerContextBundle {
             items: Vec::new(),
             thumbnails: Vec::new(),
             image_metas: Vec::new(),
+            video_thumb_overrides: std::collections::HashMap::new(),
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             selected: None,
             scroll_offset_y: 0.0,
@@ -2021,7 +2056,16 @@ impl ViewerContextBundle {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
+            metadata_cache: std::collections::HashMap::new(),
+            exif_cache: std::collections::HashMap::new(),
+            xmp_cache: std::collections::HashMap::new(),
+            xmp_panorama_info: std::collections::HashMap::new(),
+            metadata_pending: None,
+            tags_cache: std::collections::HashMap::new(),
+            tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
+            tag_legacy_seed_pending: None,
+            user_set_rating_keys: std::collections::HashSet::new(),
             pending_finalize: std::collections::HashSet::new(),
             tx,
             rx,
@@ -2042,6 +2086,13 @@ impl ViewerContextBundle {
             rotation_cache: std::collections::HashMap::new(),
             rating_cache: std::collections::HashMap::new(),
             current_folder_rating_cache: None,
+            current_folder_last_mtime: None,
+            current_folder_signature: None,
+            folder_pin_map: std::collections::HashMap::new(),
+            converted_archive_cache_paths: std::collections::HashMap::new(),
+            converted_archive_cache_paths_pending: None,
+            current_color_cache_map: None,
+            current_color_catalog: None,
             vst3_deferred_media_open: None,
             fullscreen_idx: None,
             viewer_session: ViewerSession::default(),
@@ -11597,6 +11648,7 @@ impl App {
             items,
             thumbnails,
             image_metas,
+            video_thumb_overrides,
             auto_aspect,
             selected,
             scroll_offset_y,
@@ -11618,7 +11670,16 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
+            metadata_cache,
+            exif_cache,
+            xmp_cache,
+            xmp_panorama_info,
+            metadata_pending,
+            tags_cache,
+            tag_prewarm_pending,
             tag_prewarm_queued,
+            tag_legacy_seed_pending,
+            user_set_rating_keys,
             pending_finalize,
             tx,
             rx,
@@ -11639,6 +11700,13 @@ impl App {
             rotation_cache,
             rating_cache,
             current_folder_rating_cache,
+            current_folder_last_mtime,
+            current_folder_signature,
+            folder_pin_map,
+            converted_archive_cache_paths,
+            converted_archive_cache_paths_pending,
+            current_color_cache_map,
+            current_color_catalog,
             vst3_deferred_media_open,
             fullscreen_idx,
             viewer_session,
@@ -11781,6 +11849,7 @@ impl App {
         swap_field!(items);
         swap_field!(thumbnails);
         swap_field!(image_metas);
+        swap_field!(video_thumb_overrides);
         swap_field!(auto_aspect);
         swap_field!(selected);
         swap_field!(scroll_offset_y);
@@ -11802,7 +11871,16 @@ impl App {
         swap_field!(details_meta_pending);
         swap_field!(details_lazy_visible_revision);
         swap_field!(details_image_dims_state);
+        swap_field!(metadata_cache);
+        swap_field!(exif_cache);
+        swap_field!(xmp_cache);
+        swap_field!(xmp_panorama_info);
+        swap_field!(metadata_pending);
+        swap_field!(tags_cache);
+        swap_field!(tag_prewarm_pending);
         swap_field!(tag_prewarm_queued);
+        swap_field!(tag_legacy_seed_pending);
+        swap_field!(user_set_rating_keys);
         swap_field!(pending_finalize);
         // per-context ロード複合体 (review-v2.3.0 P2-8/P2-9)。channel/token/キューが
         // コンテキストと一緒に移動するので、requested / pending_finalize の bookkeeping は
@@ -11826,6 +11904,13 @@ impl App {
         swap_field!(rotation_cache);
         swap_field!(rating_cache);
         swap_field!(current_folder_rating_cache);
+        swap_field!(current_folder_last_mtime);
+        swap_field!(current_folder_signature);
+        swap_field!(folder_pin_map);
+        swap_field!(converted_archive_cache_paths);
+        swap_field!(converted_archive_cache_paths_pending);
+        swap_field!(current_color_cache_map);
+        swap_field!(current_color_catalog);
         // VST3 deferred open は fullscreen_idx / items と同じ context ownership。
         // (review-v2.3.0 追補 BA-7: vst3 deferred)
         swap_field!(vst3_deferred_media_open);
@@ -24012,8 +24097,23 @@ impl App {
             self.bookmark_browser_pending = None;
             match result {
                 Ok(rows) => {
-                    self.bookmark_browser_rows = rows;
-                    if self.items_are_bookmark_view {
+                    let grid_content_unchanged = self.items_are_bookmark_view
+                        && crate::bookmark_browser::rows_have_same_grid_content(
+                            &self.bookmark_browser_rows,
+                            &rows,
+                        );
+                    if grid_content_unchanged {
+                        // detached viewer の close 時も DB は再照合するが、行が同じなら
+                        // start_loading_items で可視グリッドとタグキャッシュを作り直さない。
+                        // return snapshot は現在の一覧がそのまま残っているので消費済みにする。
+                        self.bookmark_view_return_grid = None;
+                        crate::logger::log(
+                            "[bookmark-open] bookmark grid refresh unchanged; keep mounted grid",
+                        );
+                    } else {
+                        self.bookmark_browser_rows = rows;
+                    }
+                    if self.items_are_bookmark_view && !grid_content_unchanged {
                         self.install_bookmark_view_rows();
                     }
                 }
@@ -32997,6 +33097,11 @@ impl App {
                 }
                 app.poll_bookmark_media_open(ctx);
                 app.poll_bookmark_book_open(ctx);
+                // metadata / tag hydrate は表示 context ごとの cache と pending を持つ。
+                // active bundle を mount している間に回収し、main grid へ結果を混入させない。
+                app.poll_metadata_load();
+                app.poll_tag_prewarm_results();
+                app.poll_tag_legacy_seed_results();
                 app.poll_ai_upscale(ctx);
                 app.poll_final_ai(ctx);
                 app.poll_erase_inpaint(ctx);
@@ -33474,6 +33579,7 @@ impl App {
             items,
             thumbnails,
             image_metas,
+            video_thumb_overrides,
             auto_aspect,
             selected,
             scroll_offset_y,
@@ -33495,7 +33601,16 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
+            metadata_cache,
+            exif_cache,
+            xmp_cache,
+            xmp_panorama_info,
+            metadata_pending,
+            tags_cache,
+            tag_prewarm_pending,
             tag_prewarm_queued,
+            tag_legacy_seed_pending,
+            user_set_rating_keys,
             pending_finalize,
             tx,
             rx,
@@ -33516,6 +33631,13 @@ impl App {
             rotation_cache,
             rating_cache,
             current_folder_rating_cache,
+            current_folder_last_mtime,
+            current_folder_signature,
+            folder_pin_map,
+            converted_archive_cache_paths,
+            converted_archive_cache_paths_pending,
+            current_color_cache_map,
+            current_color_catalog,
             vst3_deferred_media_open,
             fullscreen_idx,
             viewer_session,
@@ -33676,6 +33798,10 @@ impl App {
             rotation_cache,
             rating_cache,
             current_folder_rating_cache,
+            tags_cache,
+            user_set_rating_keys,
+            current_folder_last_mtime,
+            current_folder_signature,
             items_generation,
             top_level_grid_view,
             items_are_global_search_view,
@@ -33776,7 +33902,15 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
+            video_thumb_overrides,
+            metadata_cache,
+            exif_cache,
+            xmp_cache,
+            xmp_panorama_info,
+            metadata_pending,
+            tag_prewarm_pending,
             tag_prewarm_queued,
+            tag_legacy_seed_pending,
             pending_finalize,
             tx,
             rx,
@@ -33791,6 +33925,11 @@ impl App {
             vis_settle_at,
             vis_first_logged,
             vis_all_logged,
+            folder_pin_map,
+            converted_archive_cache_paths,
+            converted_archive_cache_paths_pending,
+            current_color_cache_map,
+            current_color_catalog,
             view_trim_mode,
             view_trim_apply_mode,
             view_trim_page_apply_root_idx,

@@ -108,6 +108,13 @@ Phase 1 では、まず main だけを `ViewerContextBundle` 化して挙動を�
 - `export_crop_page_settings`, `export_crop_pages`
 - `view_trim_page_overrides`, `view_trim_dirty_page_overrides`, `view_trim_page_apply_root_idx`
 - `rotation_cache`, `rating_cache`, `checked`, `search_filter`, `tag_prewarm_queued`
+- 現在一覧専用の path-keyed cache / worker: `tags_cache`, `tag_prewarm_pending`,
+  `tag_legacy_seed_pending`, `user_set_rating_keys`, `metadata_cache`, `exif_cache`, `xmp_cache`,
+  `xmp_panorama_info`, `metadata_pending`, `video_thumb_overrides`, `folder_pin_map`,
+  `converted_archive_cache_paths`, `converted_archive_cache_paths_pending`,
+  `current_color_cache_map`, `current_color_catalog`。path キーでも、フォルダ切替で全消去・差替えする
+  状態は共有キャッシュではない。実フォルダを detached context へロードしても、main grid の
+  タグ・メタデータ・代表サムネ状態や進行中 worker を初期化しない
 - 動画 / native viewer の idx-keyed 一時状態: `normalize_ui_states`,
   `normalize_auto_scan_suppressed`, `last_loop_pos`
 - `fs_vertical_cache_keep_set`
@@ -176,6 +183,9 @@ active detached bundle へロードし、player とブックマーク時刻へ�
 持たせる。終了時は、元のファイルから動いていなければ main 一覧を維持して DB 由来の行だけを
 再構築し、別ファイル・別フォルダへ移動済みなら detached bundle の最終フォルダと選択を main へ
 反映する。これにより「一覧へ戻す close」と「player を閉じる close」が二段階に分裂しない。
+終了時の DB 再照合結果が表示中の read model と同一なら `start_loading_items` は再実行せず、
+メイン一覧、タグバッジ、選択、スクロールを載せたままにする。名称変更・追加・削除・missing 状態など
+表示内容が変わった場合だけ一覧を再構築する。
 
 ### 3.4 passive window は stable viewport と paused context を持つ
 

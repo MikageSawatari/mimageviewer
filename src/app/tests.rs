@@ -6421,6 +6421,43 @@ fn bookmark_return_keeps_opened_row_visible_when_rows_changed() {
 }
 
 #[test]
+fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
+    let mut app = phase_c_support::setup_app();
+    let row = bookmark_grid_test_row(7);
+    let item_key = crate::tags_db::item_key_for_path(row.source_path());
+    app.items = vec![row.item.clone()];
+    app.image_metas = vec![row.image_meta];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    app.items_are_bookmark_view = true;
+    app.bookmark_browser_rows = vec![row.clone()];
+    app.tags_cache
+        .insert(item_key.clone(), vec!["#一覧タグ".to_string()]);
+    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState::capture(
+        &app.bookmark_browser_rows,
+        app.selected,
+        row.stable_key(),
+        180.0,
+    ));
+    let generation_before = app.items_generation;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok(vec![row])).expect("send bookmark rows");
+    app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+    });
+    app.poll_bookmark_browser(&egui::Context::default());
+
+    assert_eq!(app.items_generation, generation_before);
+    assert_eq!(
+        app.tags_cache.get(&item_key),
+        Some(&vec!["#一覧タグ".to_string()])
+    );
+    assert!(app.bookmark_view_return_grid.is_none());
+}
+
+#[test]
 fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
     let mut app = phase_c_support::setup_app();
     let container = PathBuf::from(r"C:\Books\volume.zip");
@@ -6659,6 +6696,44 @@ fn begin_detached_bookmark_media_test(
         started_at: std::time::Instant::now(),
         last_wait: None,
     });
+    app.tags_cache.insert(
+        crate::tags_db::item_key_for_path(&target),
+        vec!["#detached-cache-test".to_string()],
+    );
+    app.metadata_cache
+        .insert("main-grid-meta".to_string(), None);
+    app.exif_cache.insert("main-grid-meta".to_string(), None);
+    app.xmp_cache.insert("main-grid-meta".to_string(), None);
+    app.xmp_panorama_info
+        .insert("main-grid-meta".to_string(), None);
+    app.video_thumb_overrides.insert(
+        "main-grid-video".to_string(),
+        PathBuf::from(r"C:\main-grid\cover.jpg"),
+    );
+    app.folder_pin_map.insert(
+        "main-grid-folder".to_string(),
+        crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "cover.jpg".to_string(),
+            kind: crate::folder_thumb_pins::FileKind::Image,
+        },
+    );
+    app.converted_archive_cache_paths.insert(
+        "main-grid-archive".to_string(),
+        PathBuf::from(r"C:\main-grid\cached.zip"),
+    );
+    app.current_color_cache_map = Some(std::sync::Arc::new(std::sync::RwLock::new(
+        std::collections::HashMap::from([(
+            "main-grid-color".to_string(),
+            crate::catalog::CacheEntry {
+                mtime: 1,
+                file_size: 2,
+                jpeg_data: Vec::new(),
+                source_dims: None,
+            },
+        )]),
+    )));
+    app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+    app.current_folder_signature = Some(0xCAFE);
 
     assert!(app.open_bookmark_media_in_detached_context(
         &egui::Context::default(),
@@ -6683,10 +6758,39 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
         );
         assert!(app.bookmark_view_return_grid.is_some());
         assert!(app.bookmark_media_open_pending.is_none());
+        assert_eq!(app.cell_tag_list(0), ["#detached-cache-test".to_string()]);
+        assert!(app.metadata_cache.contains_key("main-grid-meta"));
+        assert!(app.exif_cache.contains_key("main-grid-meta"));
+        assert!(app.xmp_cache.contains_key("main-grid-meta"));
+        assert!(app.xmp_panorama_info.contains_key("main-grid-meta"));
+        assert!(app.video_thumb_overrides.contains_key("main-grid-video"));
+        assert!(app.folder_pin_map.contains_key("main-grid-folder"));
+        assert!(
+            app.converted_archive_cache_paths
+                .contains_key("main-grid-archive")
+        );
+        assert!(app.current_color_cache_map.as_ref().is_some_and(|cache| {
+            cache
+                .read()
+                .is_ok_and(|entries| entries.contains_key("main-grid-color"))
+        }));
+        assert_eq!(
+            app.current_folder_last_mtime,
+            Some(std::time::SystemTime::UNIX_EPOCH)
+        );
+        assert_eq!(app.current_folder_signature, Some(0xCAFE));
         let active = app
             .active_detached_viewer_context
             .as_ref()
             .expect("media must be owned by detached context from the start");
+        assert!(
+            !active
+                .bundle
+                .tags_cache
+                .values()
+                .flatten()
+                .any(|tag| tag == "#detached-cache-test")
+        );
         assert_eq!(
             active.bundle.current_folder.as_deref(),
             Some(media_dir.as_path())
