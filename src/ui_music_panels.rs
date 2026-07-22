@@ -54,6 +54,7 @@ const PANEL_DIVIDER: egui::Color32 = egui::Color32::from_rgba_premultiplied(255,
 const TITLE_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(28, 28, 36, 240);
 const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 168, 205);
 const VALUE_COLOR: egui::Color32 = egui::Color32::from_rgb(228, 230, 236);
+const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
 const TITLE_H: f32 = 30.0;
 
 fn draw_music_panel_close_icon(painter: &egui::Painter, rect: egui::Rect) {
@@ -210,12 +211,36 @@ fn format_channels(ch: u16) -> String {
     }
 }
 
-/// ラベル + 値の 1 行を描く (値は折り返し可)。
-fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal_wrapped(|ui| {
+/// ラベル + 値の 1 行を描く。値は折り返しと改行を保持し、HTTP(S) URL をリンク化する。
+/// クリックされた最初の URL は `clicked_url` へ返し、呼び出し側で再生停止後に開く。
+fn info_row(ui: &mut egui::Ui, label: &str, value: &str, clicked_url: &mut Option<String>) {
+    if crate::ui_text_links::find_http_urls(value).is_empty() {
+        // URL のない既存行は従来の inline layout を維持する。
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(egui::RichText::new(label).color(LABEL_COLOR).size(12.0));
+            ui.label(egui::RichText::new(value).color(VALUE_COLOR).size(13.0));
+        });
+        ui.add_space(2.0);
+        return;
+    }
+
+    ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(egui::RichText::new(label).color(LABEL_COLOR).size(12.0));
-        ui.label(egui::RichText::new(value).color(VALUE_COLOR).size(13.0));
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            if let Some(url) = crate::ui_text_links::draw_text_with_links(
+                ui,
+                value,
+                crate::ui_fonts::user_text_font(13.0),
+                VALUE_COLOR,
+                LINK_COLOR,
+            ) && clicked_url.is_none()
+            {
+                *clicked_url = Some(url);
+            }
+        });
     });
     ui.add_space(2.0);
 }
@@ -589,6 +614,7 @@ impl App {
             .unwrap_or_default();
         let stars = self.get_rating(fs_idx);
         let mut set_rating: Option<u8> = None;
+        let mut open_external_url: Option<String> = None;
 
         egui::ScrollArea::vertical()
             .id_salt(("music_right_scroll", fs_idx))
@@ -622,23 +648,43 @@ impl App {
                 ui.add_space(6.0);
                 if let Some(p) = probe.as_ref() {
                     if !p.format_name.is_empty() {
-                        info_row(ui, "形式", &p.format_name);
+                        info_row(ui, "形式", &p.format_name, &mut open_external_url);
                     }
                     if !p.codec_name.is_empty() {
-                        info_row(ui, "コーデック", &p.codec_name);
+                        info_row(ui, "コーデック", &p.codec_name, &mut open_external_url);
                     }
                     if p.duration_secs > 0.0 {
-                        info_row(ui, "長さ", &format_hms(p.duration_secs));
+                        info_row(
+                            ui,
+                            "長さ",
+                            &format_hms(p.duration_secs),
+                            &mut open_external_url,
+                        );
                     }
-                    info_row(ui, "サンプルレート", &format_sample_rate(p.sample_rate));
-                    info_row(ui, "チャンネル", &format_channels(p.channels));
+                    info_row(
+                        ui,
+                        "サンプルレート",
+                        &format_sample_rate(p.sample_rate),
+                        &mut open_external_url,
+                    );
+                    info_row(
+                        ui,
+                        "チャンネル",
+                        &format_channels(p.channels),
+                        &mut open_external_url,
+                    );
                     if p.bit_rate_bps > 0 {
-                        info_row(ui, "ビットレート", &format_bitrate(p.bit_rate_bps));
+                        info_row(
+                            ui,
+                            "ビットレート",
+                            &format_bitrate(p.bit_rate_bps),
+                            &mut open_external_url,
+                        );
                     }
                     if !p.tags.is_empty() {
                         ui.add_space(4.0);
                         for (label, value) in &p.tags {
-                            info_row(ui, label, value);
+                            info_row(ui, label, value, &mut open_external_url);
                         }
                     }
                 } else {
@@ -654,6 +700,14 @@ impl App {
         if let Some(new_stars) = set_rating {
             // draw_rating_stars が「同★再クリック=0」を解決済み。
             self.set_rating(fs_idx, new_stars);
+        }
+        if let Some(url) = open_external_url {
+            // 動画 native 右パネルの OpenExternalUrl と同じく、外部ブラウザへ移る前に
+            // 音声を一時停止する。音声ファイル／動画→音声モードはいずれも同じ player 経路。
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_playing(false);
+            }
+            crate::ui_helpers::open_url(&url);
         }
         if close_requested {
             self.toggle_fullscreen_click_info_open();
@@ -1783,6 +1837,54 @@ mod tests {
         assert_eq!(format_channels(2), "2 (ステレオ)");
         assert_eq!(format_channels(6), "6 ch");
         assert_eq!(format_channels(0), "-");
+    }
+
+    #[test]
+    fn music_info_row_exposes_http_url_as_a_clickable_link() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::sync::{Arc, Mutex};
+
+        let clicked = Arc::new(Mutex::new(None));
+        let clicked_in_ui = Arc::clone(&clicked);
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(430.0, 120.0))
+            .build(move |ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut frame_clicked = None;
+                    info_row(
+                        ui,
+                        "コメント",
+                        "配布元 https://example.com/music?id=7 を参照",
+                        &mut frame_clicked,
+                    );
+                    if frame_clicked.is_some() {
+                        *clicked_in_ui.lock().expect("clicked URL lock") = frame_clicked;
+                    }
+                });
+            });
+
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("https://example.com/music?id=7")
+                .is_some(),
+            "音声メタデータ内の URL が独立したクリック要素として描画される"
+        );
+        harness
+            .get_by_label("https://example.com/music?id=7")
+            .click();
+        harness.run();
+        assert_eq!(
+            clicked.lock().expect("clicked URL lock").as_deref(),
+            Some("https://example.com/music?id=7")
+        );
     }
 
     #[cfg(windows)]
