@@ -43,6 +43,10 @@ const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
 // 詳細ヘッダ + 詳細行 + パネル内の最小余白。下部情報バーはこの 2 行を
 // CentralPanel より先に予約し、グリッドの仮想 viewport から確実に除外する。
 const SELECTION_INFO_BAR_HEIGHT: f32 = 58.0;
+// 列境界のダブルクリックは UI thread 上で egui の font atlas を使って文字幅を測る。
+// 大量一覧でも 1 frame の仕事量を一定にするため、可視行 + 一覧全体の均等サンプルだけを測る。
+const DETAILS_BEST_FIT_MAX_SAMPLES: usize = 192;
+const DETAILS_BEST_FIT_VISIBLE_OVERSCAN_ROWS: usize = 8;
 const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [86, 86, 86],
     [255, 255, 255],
@@ -1138,6 +1142,67 @@ fn details_visible_columns(
     details_ordered_columns(settings, false)
         .into_iter()
         .filter(|column| details_column_is_visible(settings, column_set, *column))
+        .collect()
+}
+
+fn details_best_fit_sample_indices(
+    order: &[usize],
+    visible_range: std::ops::Range<usize>,
+) -> Vec<usize> {
+    if order.len() <= DETAILS_BEST_FIT_MAX_SAMPLES {
+        return order.to_vec();
+    }
+
+    fn push_evenly_sampled_positions(
+        positions: &mut Vec<usize>,
+        start: usize,
+        len: usize,
+        budget: usize,
+    ) {
+        if len == 0 || budget == 0 {
+            return;
+        }
+        if budget == 1 {
+            let position = start + len / 2;
+            if !positions.contains(&position) {
+                positions.push(position);
+            }
+            return;
+        }
+        for slot in 0..budget {
+            let position = start + slot * (len - 1) / (budget - 1);
+            if !positions.contains(&position) {
+                positions.push(position);
+            }
+        }
+    }
+
+    let visible_start = visible_range.start.min(order.len());
+    let visible_end = visible_range.end.min(order.len()).max(visible_start);
+    let visible_len = visible_end - visible_start;
+    let visible_budget = visible_len.min(DETAILS_BEST_FIT_MAX_SAMPLES / 2);
+    let mut positions = Vec::with_capacity(DETAILS_BEST_FIT_MAX_SAMPLES);
+    push_evenly_sampled_positions(&mut positions, visible_start, visible_len, visible_budget);
+
+    let global_budget = DETAILS_BEST_FIT_MAX_SAMPLES - positions.len();
+    push_evenly_sampled_positions(&mut positions, 0, order.len(), global_budget);
+
+    // 可視範囲と全体サンプルが重なった場合は、残り枠を等間隔の中点で補う。
+    if positions.len() < DETAILS_BEST_FIT_MAX_SAMPLES {
+        let stride = (order.len() / DETAILS_BEST_FIT_MAX_SAMPLES).max(1);
+        let mut position = stride / 2;
+        while position < order.len() && positions.len() < DETAILS_BEST_FIT_MAX_SAMPLES {
+            if !positions.contains(&position) {
+                positions.push(position);
+            }
+            position = position.saturating_add(stride);
+        }
+    }
+
+    positions.sort_unstable();
+    positions
+        .into_iter()
+        .map(|position| order[position])
         .collect()
 }
 
@@ -10381,6 +10446,15 @@ impl App {
         // 多めに確保する方へ倒す (余分に取っても右に空き帯が出るだけで無害) ため概算を少し小さめにする。
         let viewport_h_est =
             (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - hbar - 2.0).max(0.0);
+        let first_visible_row =
+            ((self.scroll_offset_y.max(0.0) / Self::DETAILS_ROW_H) as usize).min(row_count);
+        let visible_row_count = (viewport_h_est / Self::DETAILS_ROW_H).ceil() as usize + 2;
+        let best_fit_visible_range = first_visible_row
+            .saturating_sub(DETAILS_BEST_FIT_VISIBLE_OVERSCAN_ROWS)
+            ..first_visible_row
+                .saturating_add(visible_row_count)
+                .saturating_add(DETAILS_BEST_FIT_VISIBLE_OVERSCAN_ROWS)
+                .min(row_count);
         let needs_vscroll = natural_h > viewport_h_est;
         let gutter = if needs_vscroll {
             egui::style::ScrollStyle::solid().allocated_width()
@@ -10415,7 +10489,7 @@ impl App {
                     egui::vec2(content_w, Self::DETAILS_HEADER_H),
                     egui::Sense::hover(),
                 );
-                self.draw_details_header(ui, header_rect);
+                self.draw_details_header(ui, header_rect, best_fit_visible_range.clone());
 
                 let viewport_h = ui.available_height().max(0.0);
                 self.last_viewport_h = viewport_h;
@@ -10968,6 +11042,7 @@ impl App {
         ui: &egui::Ui,
         column: DetailsColumn,
         book_sort_locked: bool,
+        visible_range: &std::ops::Range<usize>,
     ) -> f32 {
         let started = std::time::Instant::now();
         let button_font = egui::TextStyle::Button.resolve(ui.style());
@@ -10996,11 +11071,17 @@ impl App {
                 }
             }
             _ => {
-                let order = self.current_grid_order().to_vec();
-                for idx in order.iter().copied() {
+                let total_rows = self.current_grid_order().len();
+                let sample_indices = details_best_fit_sample_indices(
+                    self.current_grid_order(),
+                    visible_range.clone(),
+                );
+                let mut sampled_rows = 0;
+                for idx in sample_indices.iter().copied() {
                     let Some(item) = self.items.get(idx).cloned() else {
                         continue;
                     };
+                    sampled_rows += 1;
                     let meta = self.image_metas.get(idx).copied().flatten();
                     let text = self.details_cell_text(idx, &item, meta, column);
                     if !text.is_empty() {
@@ -11017,7 +11098,8 @@ impl App {
                         None,
                         self.items_generation,
                         &[
-                            ("rows", serde_json::Value::from(order.len())),
+                            ("rows", serde_json::Value::from(total_rows)),
+                            ("sampled_rows", serde_json::Value::from(sampled_rows)),
                             (
                                 "ms",
                                 serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
@@ -11031,7 +11113,12 @@ impl App {
         (widest + 14.0).ceil().clamp(column.min_width(), 800.0)
     }
 
-    fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn draw_details_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        best_fit_visible_range: std::ops::Range<usize>,
+    ) {
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
@@ -11174,7 +11261,12 @@ impl App {
                     );
                 }
                 if resize_response.double_clicked() {
-                    let width = self.details_best_fit_column_width(ui, col, book_sort_locked);
+                    let width = self.details_best_fit_column_width(
+                        ui,
+                        col,
+                        book_sort_locked,
+                        &best_fit_visible_range,
+                    );
                     let changed = if col == DetailsColumn::Name {
                         set_details_name_width(&mut self.settings, width)
                     } else {
@@ -13563,7 +13655,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(raw_input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                measured = Some(app.details_best_fit_column_width(ui, DetailsColumn::Name, false));
+                measured = Some(app.details_best_fit_column_width(
+                    ui,
+                    DetailsColumn::Name,
+                    false,
+                    &(0..1),
+                ));
             });
         });
 
@@ -13647,6 +13744,42 @@ mod compute_cell_size_tests {
             "固定名前列が pane より狭いと右側に余白が残る"
         );
         assert!((layout.extent - 599.0).abs() < 0.01, "横スクロールは不要");
+    }
+
+    #[test]
+    fn details_best_fit_samples_every_row_for_small_lists() {
+        let order = (1000..1100).collect::<Vec<_>>();
+        assert_eq!(
+            details_best_fit_sample_indices(&order, 20..40),
+            order,
+            "上限以下の一覧では従来どおり全行を測る"
+        );
+    }
+
+    #[test]
+    fn details_best_fit_large_list_sampling_is_bounded_and_keeps_visible_rows() {
+        let order = (10_000..20_000).collect::<Vec<_>>();
+        let samples = details_best_fit_sample_indices(&order, 400..430);
+        assert!(samples.len() <= DETAILS_BEST_FIT_MAX_SAMPLES);
+        assert_eq!(
+            samples.first(),
+            order.first(),
+            "一覧先頭を全体サンプルに含める"
+        );
+        assert_eq!(
+            samples.last(),
+            order.last(),
+            "一覧末尾を全体サンプルに含める"
+        );
+        assert!(
+            order[400..430].iter().all(|idx| samples.contains(idx)),
+            "現在の可視行はすべて測定対象に含める"
+        );
+        assert_eq!(
+            samples.iter().copied().collect::<HashSet<_>>().len(),
+            samples.len(),
+            "同じ行を重複測定しない"
+        );
     }
 
     #[test]

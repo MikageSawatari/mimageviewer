@@ -339,6 +339,9 @@ fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn copy_font_without_overwrite(source: &Path, target_dir: &Path) -> io::Result<PathBuf> {
+    // 保存先を create_new する前に入力元を確保する。入力元が消えた / 開けない場合に
+    // user_fonts へ空ファイルだけ残さないため、TOCTOU の失敗境界を出力作成より前へ置く。
+    let mut input = std::fs::File::open(source)?;
     let stem = source
         .file_stem()
         .and_then(|value| value.to_str())
@@ -362,7 +365,6 @@ fn copy_font_without_overwrite(source: &Path, target_dir: &Path) -> io::Result<P
             .open(&target)
         {
             Ok(mut output) => {
-                let mut input = std::fs::File::open(source)?;
                 if let Err(err) = io::copy(&mut input, &mut output) {
                     drop(output);
                     let _ = std::fs::remove_file(&target);
@@ -412,6 +414,25 @@ mod tests {
         let image = render_preview(&UiFontSettings::default()).expect("preview should render");
         assert_eq!(image.size, [PREVIEW_WIDTH, PREVIEW_HEIGHT]);
         assert!(image.pixels.iter().any(|pixel| pixel.a() != 0));
+    }
+
+    #[test]
+    fn copy_font_source_open_failure_does_not_leave_empty_target() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let missing_source = source_dir.path().join("missing-font.ttf");
+
+        let err = copy_font_without_overwrite(&missing_source, target_dir.path())
+            .expect_err("missing source must fail before creating the target");
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::read_dir(target_dir.path())
+                .expect("target directory")
+                .count(),
+            0,
+            "入力元 open 失敗では保存先に空ファイルを残さない"
+        );
     }
 
     #[test]
