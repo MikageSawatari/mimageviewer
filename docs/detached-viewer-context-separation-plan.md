@@ -109,12 +109,17 @@ Phase 1 では、まず main だけを `ViewerContextBundle` 化して挙動を�
 - `view_trim_page_overrides`, `view_trim_dirty_page_overrides`, `view_trim_page_apply_root_idx`
 - `rotation_cache`, `rating_cache`, `checked`, `search_filter`, `tag_prewarm_queued`
 - 現在一覧専用の path-keyed cache / worker: `tags_cache`, `tag_prewarm_pending`,
-  `tag_legacy_seed_pending`, `user_set_rating_keys`, `metadata_cache`, `exif_cache`, `xmp_cache`,
+  `tag_legacy_seed_pending`, `metadata_cache`, `exif_cache`, `xmp_cache`,
   `xmp_panorama_info`, `metadata_pending`, `video_thumb_overrides`, `folder_pin_map`,
   `converted_archive_cache_paths`, `converted_archive_cache_paths_pending`,
   `current_color_cache_map`, `current_color_catalog`。path キーでも、フォルダ切替で全消去・差替えする
   状態は共有キャッシュではない。実フォルダを detached context へロードしても、main grid の
   タグ・メタデータ・代表サムネ状態や進行中 worker を初期化しない
+- rating の表示 cache (`rating_cache`) と反映済み世代
+  (`rating_session_write_seen_generation`) は一覧 context ごとに所有する。一方、DB と同じ path identity
+  に属する最終値・書込世代 (`rating_session_writes`) は App-global とし、bundle の swap 前後に現在
+  context へ同期する。XMP hydrate job は投入時の path 世代を持ち、より新しいユーザー書込があれば
+  結果を破棄する。抑止状態を context ごとに複製してはならない
 - 動画 / native viewer の idx-keyed 一時状態: `normalize_ui_states`,
   `normalize_auto_scan_suppressed`, `last_loop_pos`
 - `fs_vertical_cache_keep_set`

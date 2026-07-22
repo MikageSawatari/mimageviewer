@@ -56,6 +56,9 @@ pub struct BookTransferSummary {
     pub source_entries: Vec<BookPageEntry>,
     pub edit_moves: Vec<BookPathMapping>,
     pub edit_copies: Vec<BookPathMapping>,
+    /// Filesystem 変更前に永続化した本ブックマーク移行 intent。
+    /// UI は `edit_moves` と一緒に bookmark worker へ渡し、DB commit と同時に消去する。
+    pub bookmark_migration_journal_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -71,6 +74,7 @@ pub enum BookOpResult {
         old_name: String,
         new_name: String,
         edit_moves: Vec<BookPathMapping>,
+        bookmark_migration_journal_id: Option<String>,
     },
     Deleted {
         name: String,
@@ -79,7 +83,59 @@ pub enum BookOpResult {
         folder: PathBuf,
         count: usize,
         edit_moves: Vec<BookPathMapping>,
+        bookmark_migration_journal_id: Option<String>,
     },
+}
+
+/// Filesystem と SQLite を跨ぐ本ページ移動の write-ahead intent。
+/// 通常エラーでは Drop が破棄し、成功時だけ UI/bookmark worker へ所有権を渡す。
+/// プロセス強制終了では Drop 自体が走らないため、次回起動の recovery 用に残る。
+struct PreparedBookmarkMigration {
+    job_id: Option<String>,
+    armed: bool,
+}
+
+impl PreparedBookmarkMigration {
+    fn prepare(mappings: &[BookPathMapping]) -> Result<Self, String> {
+        let mappings = mappings
+            .iter()
+            .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+            .collect::<Vec<_>>();
+        let job_id = crate::book_bookmarks::prepare_path_migration(&mappings)
+            .map_err(|error| format!("本ブックマークの移行準備に失敗しました: {error}"))?;
+        Ok(Self {
+            job_id,
+            armed: true,
+        })
+    }
+
+    fn commit(mut self) -> Option<String> {
+        self.armed = false;
+        self.job_id.take()
+    }
+
+    /// 通常エラーでも filesystem を元に戻せなかった場合は intent を残す。
+    /// 最終 mapping の自動 recovery と診断情報を、誤って破棄しないための経路。
+    fn preserve(mut self) {
+        self.armed = false;
+        self.job_id = None;
+    }
+}
+
+impl Drop for PreparedBookmarkMigration {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(job_id) = self.job_id.as_deref() else {
+            return;
+        };
+        if let Err(error) = crate::book_bookmarks::discard_prepared_path_migration(job_id) {
+            crate::logger::log(format!(
+                "book bookmark migration journal discard failed job={job_id}: {error}"
+            ));
+        }
+    }
 }
 
 pub struct BookOpPending {
@@ -335,6 +391,7 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
             old_name,
             new_name,
             edit_moves: Vec::new(),
+            bookmark_migration_journal_id: None,
         });
     }
     let from = book_folder(root, &old_name);
@@ -343,6 +400,18 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     if to.exists() {
         return Err(format!("同名の本が既にあります: {new_name}"));
     }
+    let edit_moves = book_page_paths(&from)?
+        .into_iter()
+        .filter_map(|old_path| {
+            let name = old_path.file_name()?.to_owned();
+            Some(BookPathMapping {
+                from: old_path,
+                to: to.join(name),
+            })
+        })
+        .collect::<Vec<_>>();
+    // ファイルを一つでも変更する前に、元 page identity → 最終 identity を永続化する。
+    let migration = PreparedBookmarkMigration::prepare(&edit_moves)?;
     fs::rename(&from, &to).map_err(|e| {
         format!(
             "本の名前を変更できません: {} → {}: {e}",
@@ -350,20 +419,12 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
             to.display()
         )
     })?;
-    let edit_moves = book_page_paths(&to)?
-        .into_iter()
-        .filter_map(|new_path| {
-            let name = new_path.file_name()?.to_owned();
-            Some(BookPathMapping {
-                from: from.join(name),
-                to: new_path,
-            })
-        })
-        .collect();
+    let bookmark_migration_journal_id = migration.commit();
     Ok(BookOpResult::Renamed {
         old_name,
         new_name,
         edit_moves,
+        bookmark_migration_journal_id,
     })
 }
 
@@ -438,12 +499,16 @@ pub fn append_pages(
 }
 
 pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<BookOpResult, String> {
-    let edit_moves = flush_reorder_paths(folder.clone(), ordered_paths)?;
+    let edit_moves = plan_reorder_paths(&folder, &ordered_paths)?;
+    let migration = PreparedBookmarkMigration::prepare(&edit_moves)?;
+    apply_reorder_plan(&folder, &edit_moves)?;
     let count = edit_moves.len();
+    let bookmark_migration_journal_id = migration.commit();
     Ok(BookOpResult::Reordered {
         folder,
         count,
         edit_moves,
+        bookmark_migration_journal_id,
     })
 }
 
@@ -467,13 +532,6 @@ pub fn transfer_pages_between_books(
     if crate::folder_tree::path_eq(&source_folder, &target_folder) {
         return Err("同じ本への移動/コピーはまだ対応していません".to_string());
     }
-    fs::create_dir_all(&target_folder).map_err(|e| {
-        format!(
-            "移動先の本フォルダを作成できません: {}: {e}",
-            target_folder.display()
-        )
-    })?;
-    ensure_direct_book_target(&root, &target_folder)?;
 
     let selected_keys = selected_paths
         .iter()
@@ -496,7 +554,9 @@ pub fn transfer_pages_between_books(
         ));
     }
 
-    let commit_mappings = flush_reorder_paths(source_folder.clone(), current_order_paths.clone())?;
+    // commit / transfer / compaction の最終 mapping を、最初の filesystem 変更前に確定する。
+    // 一時ファイル名は journal に含めない。
+    let commit_mappings = plan_reorder_paths(&source_folder, &current_order_paths)?;
     let committed_paths = commit_mappings
         .iter()
         .map(|mapping| mapping.to.clone())
@@ -514,34 +574,13 @@ pub fn transfer_pages_between_books(
         return Err("選択ページが現在の本に見つかりません".to_string());
     }
 
-    let mut completed = Vec::with_capacity(selected_committed.len());
     let mut transfer_mappings = Vec::with_capacity(selected_committed.len());
     for (offset, src) in selected_committed.iter().enumerate() {
         let dest = destination_for_existing_page(&target_folder, start + offset, src)?;
-        let result = match kind {
-            BookTransferKind::Copy => copy_page_to_destination(src, &dest)
-                .map(|_| CompletedTransfer::Copied { dest: dest.clone() }),
-            BookTransferKind::Move => {
-                move_page_to_destination(src, &dest).map(|mode| CompletedTransfer::Moved {
-                    src: src.clone(),
-                    dest: dest.clone(),
-                    mode,
-                })
-            }
-        };
-        match result {
-            Ok(done) => {
-                transfer_mappings.push(BookPathMapping {
-                    from: src.clone(),
-                    to: dest.clone(),
-                });
-                completed.push(done);
-            }
-            Err(err) => {
-                rollback_completed_transfers(&completed);
-                return Err(err);
-            }
-        }
+        transfer_mappings.push(BookPathMapping {
+            from: src.clone(),
+            to: dest,
+        });
     }
 
     let edit_copies = if kind == BookTransferKind::Copy {
@@ -550,25 +589,10 @@ pub fn transfer_pages_between_books(
         Vec::new()
     };
 
-    let mut compact_mappings = Vec::new();
-    let source_after_paths = if kind == BookTransferKind::Move {
-        match flush_reorder_paths(source_folder.clone(), remaining_committed) {
-            Ok(mappings) => {
-                let paths = mappings
-                    .iter()
-                    .map(|mapping| mapping.to.clone())
-                    .collect::<Vec<_>>();
-                compact_mappings = mappings;
-                paths
-            }
-            Err(err) => {
-                return Err(format!(
-                    "ページ移動は完了しましたが、元本の番号整理に失敗しました: {err}"
-                ));
-            }
-        }
+    let compact_mappings = if kind == BookTransferKind::Move {
+        plan_reorder_paths(&source_folder, &remaining_committed)?
     } else {
-        committed_paths
+        Vec::new()
     };
     // Move may run commit -> transfer -> compaction in one worker. Collapse those
     // phases into original-key -> final-key mappings before the DB remap layer
@@ -576,8 +600,76 @@ pub fn transfer_pages_between_books(
     let edit_moves = if kind == BookTransferKind::Move {
         compose_book_path_mapping_phases(&[&commit_mappings, &transfer_mappings, &compact_mappings])
     } else {
-        commit_mappings
+        commit_mappings.clone()
     };
+    let migration = PreparedBookmarkMigration::prepare(&edit_moves)?;
+
+    fs::create_dir_all(&target_folder).map_err(|e| {
+        format!(
+            "移動先の本フォルダを作成できません: {}: {e}",
+            target_folder.display()
+        )
+    })?;
+    ensure_direct_book_target(&root, &target_folder)?;
+    apply_reorder_plan(&source_folder, &commit_mappings)?;
+
+    let mut completed = Vec::with_capacity(transfer_mappings.len());
+    for mapping in &transfer_mappings {
+        let result = match kind {
+            BookTransferKind::Copy => {
+                copy_page_to_destination(&mapping.from, &mapping.to).map(|_| {
+                    CompletedTransfer::Copied {
+                        dest: mapping.to.clone(),
+                    }
+                })
+            }
+            BookTransferKind::Move => {
+                move_page_to_destination(&mapping.from, &mapping.to).map(|mode| {
+                    CompletedTransfer::Moved {
+                        src: mapping.from.clone(),
+                        dest: mapping.to.clone(),
+                        mode,
+                    }
+                })
+            }
+        };
+        if let Err(error) = result {
+            rollback_completed_transfers(&completed);
+            let rollback = rollback_applied_reorder(&source_folder, &commit_mappings);
+            if let Err(rollback_error) = rollback {
+                migration.preserve();
+                return Err(format!(
+                    "{error} / 元本の順序も復元できませんでした: {rollback_error}"
+                ));
+            }
+            return Err(error);
+        }
+        completed.push(result.expect("checked above"));
+    }
+
+    if kind == BookTransferKind::Move
+        && let Err(error) = apply_reorder_plan(&source_folder, &compact_mappings)
+    {
+        rollback_completed_transfers(&completed);
+        let rollback = rollback_applied_reorder(&source_folder, &commit_mappings);
+        if let Err(rollback_error) = rollback {
+            migration.preserve();
+            return Err(format!(
+                "元本の番号整理に失敗しました: {error} / 元の順序も復元できませんでした: {rollback_error}"
+            ));
+        }
+        return Err(format!("元本の番号整理に失敗しました: {error}"));
+    }
+
+    let source_after_paths = if kind == BookTransferKind::Move {
+        compact_mappings
+            .iter()
+            .map(|mapping| mapping.to.clone())
+            .collect::<Vec<_>>()
+    } else {
+        committed_paths
+    };
+    let bookmark_migration_journal_id = migration.commit();
     let source_entries = source_after_paths
         .into_iter()
         .map(|path| {
@@ -599,6 +691,7 @@ pub fn transfer_pages_between_books(
         source_entries,
         edit_moves,
         edit_copies,
+        bookmark_migration_journal_id,
     }))
 }
 
@@ -639,9 +732,9 @@ fn compose_book_path_mapping_phases(phases: &[&[BookPathMapping]]) -> Vec<BookPa
         .collect()
 }
 
-fn flush_reorder_paths(
-    folder: PathBuf,
-    ordered_paths: Vec<PathBuf>,
+fn plan_reorder_paths(
+    folder: &Path,
+    ordered_paths: &[PathBuf],
 ) -> Result<Vec<BookPathMapping>, String> {
     if ordered_paths.len() > MAX_BOOK_PAGES {
         return Err(format!("本のページ数が上限 {} を超えます", MAX_BOOK_PAGES));
@@ -649,7 +742,7 @@ fn flush_reorder_paths(
     if !folder.is_dir() {
         return Err(format!("本フォルダではありません: {}", folder.display()));
     }
-    for path in &ordered_paths {
+    for path in ordered_paths {
         if path
             .parent()
             .is_none_or(|parent| !crate::folder_tree::path_eq(parent, &folder))
@@ -661,13 +754,25 @@ fn flush_reorder_paths(
         }
     }
 
+    Ok(ordered_paths
+        .iter()
+        .enumerate()
+        .map(|(idx, from)| BookPathMapping {
+            from: from.clone(),
+            to: folder.join(final_reorder_name(idx + 1, from)),
+        })
+        .collect())
+}
+
+fn apply_reorder_plan(folder: &Path, mappings: &[BookPathMapping]) -> Result<(), String> {
     let pid = std::process::id();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let mut moved = Vec::with_capacity(ordered_paths.len());
-    for (idx, src) in ordered_paths.iter().enumerate() {
+    let mut moved = Vec::with_capacity(mappings.len());
+    for (idx, mapping) in mappings.iter().enumerate() {
+        let src = &mapping.from;
         let temp = unique_temp_path(&folder, pid, stamp, idx)?;
         fs::rename(src, &temp).map_err(|e| {
             rollback_temp_moves(&moved);
@@ -677,9 +782,8 @@ fn flush_reorder_paths(
     }
 
     let mut finalized = Vec::with_capacity(moved.len());
-    for (idx, (original, temp)) in moved.iter().enumerate() {
-        let final_name = final_reorder_name(idx + 1, original);
-        let dest = folder.join(final_name);
+    for ((original, temp), mapping) in moved.iter().zip(mappings) {
+        let dest = &mapping.to;
         if dest.exists() {
             rollback_reorder_pass2(&finalized, &moved);
             return Err(format!("並べ替え先が既に存在します: {}", dest.display()));
@@ -691,13 +795,21 @@ fn flush_reorder_paths(
                 dest.display()
             ));
         }
-        finalized.push((original.clone(), dest));
+        finalized.push((original.clone(), dest.clone()));
     }
 
-    Ok(finalized
-        .into_iter()
-        .map(|(from, to)| BookPathMapping { from, to })
-        .collect())
+    Ok(())
+}
+
+fn rollback_applied_reorder(folder: &Path, mappings: &[BookPathMapping]) -> Result<(), String> {
+    let reverse = mappings
+        .iter()
+        .map(|mapping| BookPathMapping {
+            from: mapping.to.clone(),
+            to: mapping.from.clone(),
+        })
+        .collect::<Vec<_>>();
+    apply_reorder_plan(folder, &reverse)
 }
 
 fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {

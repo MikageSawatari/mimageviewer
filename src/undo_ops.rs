@@ -282,7 +282,7 @@ impl App {
     /// `after` を新しい値として書き戻す。
     ///
     /// 現在のグリッドに該当 path のアイテムがあれば、そのまま `App::set_rating(idx, ...)`
-    /// を呼ぶ — これで rating_db / rating_cache / user_set_rating_keys /
+    /// を呼ぶ — これで rating_db / rating_cache / App-global rating 世代台帳 /
     /// folder_rating_counts / current_folder_rating_cache / XMP worker submit など
     /// すべての副作用が一括で正しく走る (Undo 用に再実装するとフォルダ★件数バッジの
     /// 更新が抜けやすい)。フォルダ移動で undo_stack はクリアされるので、
@@ -316,7 +316,7 @@ impl App {
                 let _ = db.set_user_rating(&c.path_key, target, meta);
             }
             self.invalidate_rating_counts_cache();
-            self.user_set_rating_keys.insert(c.path_key.clone());
+            self.record_rating_session_write(c.path_key.clone(), target, true);
             if self
                 .current_container_rating_key_and_source()
                 .is_some_and(|(key, _)| key == c.path_key)

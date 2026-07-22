@@ -90,8 +90,11 @@ RAR / CBR / 変換キャッシュ ZIP のページと ZIP 内階層は、常に�
 各行は安定 identity とは別に nullable な任意名称を持つ。名称の変更や解除はページ identity と
 登録日時を変えず、空文字または空白だけの入力は名称なし (`NULL`) として保存する。
 アプリ内で本 / ページをリネームした場合、および製本ページを並べ替えたり別の本へ移動した場合は、
-ファイル操作が返す旧 path → 新 path の対応を同一 transaction で identity へ反映する。ページ交換時は
-一時 identity へ退避して一意制約との衝突を避け、別の本へ移したページは新しい親をコンテナにする。
+最初のファイル変更前に旧 path → 最終 path の対応を `book_bookmarks.db` 内の永続 journal へ記録する。
+ファイル操作成功後は同じ対応を identity へ適用し、journal 消去と同一 transaction で commit する。
+異常終了・DB busy で残った entry は次回起動時に冪等に再実行する。ページ交換時は一時 identity へ
+退避して一意制約との衝突を避けるが、journal には一時ファイル名を保存しない。別の本へ移したページは
+新しい親をコンテナにする。
 アプリ外で行われたリネームや移動は対応関係を確定できないため自動追従せず、missing 行として保持する。
 
 ### ネスト ZIP のツリーナビ (v1.3.0)
@@ -106,7 +109,9 @@ Enter/ダブルクリック/ゲームパッド/Ctrl+↑↓(本またぎ)/Backspa
 [nested-zip-tree-plan.md](nested-zip-tree-plan.md)。
 本ブックマークから開く場合は完全な `entry_name` の prefix を `ZipNavState` へ渡して対象階層を
 materialize してからページを解決するため、現在表示中とは別の ZIP 内階層にも左パネル / 横断一覧の
-どちらからでも移動できる。
+どちらからでも移動できる。`/` を含まない直下 entry の親は空 prefix (= ZIP root) とする。
+非空 prefix は `ZipTree` に存在することを確認してから `ZipNavState` を変更し、stale な保存 entry では
+現在階層と現在一覧を維持する。保存値に `\` が混在していても prefix 解決前に `/` へ正規化する。
 
 ### 拡張子 → 扱いの対応 (comic-book 別名を含む)
 

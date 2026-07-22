@@ -50,9 +50,12 @@ impl TagPrewarmPending {
     /// 重複チェックは UI 側 (`tag_prewarm_queued` HashSet) で済ませる想定。
     /// worker は XMP パケットから xmp:Rating を抽出して `TagPrewarmResult::rating` に
     /// 載せて返す (「rating を読まないジョブ」は存在しない — 読まないなら push しない)。
-    pub(crate) fn push_job(&self, path: PathBuf) {
+    pub(crate) fn push_job(&self, path: PathBuf, rating_generation: u64) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _ = self.job_tx.send(PrewarmJob { path });
+        let _ = self.job_tx.send(PrewarmJob {
+            path,
+            rating_generation,
+        });
     }
 
     /// UI が 1 件 drain した後に呼ぶ。`is_busy` を下げる。
@@ -69,6 +72,8 @@ impl TagPrewarmPending {
 
 struct PrewarmJob {
     path: PathBuf,
+    /// XMP 読み取りを投入した時点の App-global path rating 世代。
+    rating_generation: u64,
 }
 
 /// 1 ファイル分のプリフェッチ結果。
@@ -76,6 +81,7 @@ struct PrewarmJob {
 pub(crate) struct TagPrewarmResult {
     pub path: PathBuf,
     pub rating: Option<u8>,
+    pub rating_generation: u64,
 }
 
 /// worker スレッドを起動する。フォルダ切替時に 1 回呼ぶ。
@@ -137,6 +143,7 @@ fn run_worker(
                     .send(TagPrewarmResult {
                         path: job.path,
                         rating,
+                        rating_generation: job.rating_generation,
                     })
                     .is_err()
                 {
@@ -158,12 +165,13 @@ mod tests {
     #[test]
     fn returns_empty_rating_for_nonexistent_path() {
         let pending = spawn();
-        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"));
+        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"), 7);
         let start = Instant::now();
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
                     assert_eq!(res.rating, None);
+                    assert_eq!(res.rating_generation, 7);
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -184,7 +192,7 @@ mod tests {
         let pending = spawn();
         assert!(!pending.is_busy(), "初期状態は idle");
 
-        pending.push_job(PathBuf::from("Z:/nope/a.jpg"));
+        pending.push_job(PathBuf::from("Z:/nope/a.jpg"), 0);
         assert!(pending.is_busy(), "push 直後は busy");
 
         // worker が送ってくるのを受け取り、on_result_drained で in_flight を戻す
@@ -212,7 +220,7 @@ mod tests {
     fn cancel_stops_worker_loop() {
         let pending = spawn();
         for i in 0..1000 {
-            pending.push_job(PathBuf::from(format!("Z:/nope/{i}.jpg")));
+            pending.push_job(PathBuf::from(format!("Z:/nope/{i}.jpg")), 0);
         }
         pending.cancel();
         drop(pending);

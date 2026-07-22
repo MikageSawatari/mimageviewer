@@ -72,8 +72,8 @@ impl App {
         self.folder_rating_counts_loaded = false;
         self.tags_cache
             .retain(|key, _| !deleted.contains(key.as_str()));
-        self.user_set_rating_keys
-            .retain(|key| !deleted.contains(key.as_str()));
+        self.rating_session_writes
+            .retain(|key, _| !deleted.contains(key.as_str()));
         self.folder_pin_map
             .retain(|key, _| !deleted.contains(key.as_str()));
         self.rating_view_rows

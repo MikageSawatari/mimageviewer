@@ -147,7 +147,7 @@ enum BookBookmarkRequest {
     SetTitle(u64, i64, String),
     ListContainer(u64, PathBuf),
     ListAll(u64),
-    MigratePaths(u64, Vec<(PathBuf, PathBuf)>),
+    MigratePaths(u64, Vec<(PathBuf, PathBuf)>, Option<String>),
 }
 
 /// SQLite を専用スレッドに閉じ込める本ブックマークサービス。
@@ -204,7 +204,7 @@ impl BookBookmarkService {
                                         result: Err(message.clone()),
                                     }
                                 }
-                                BookBookmarkRequest::MigratePaths(request_id, _) => {
+                                BookBookmarkRequest::MigratePaths(request_id, _, _) => {
                                     BookBookmarkEvent::PathsMigrated {
                                         request_id,
                                         result: Err(message.clone()),
@@ -218,6 +218,7 @@ impl BookBookmarkService {
                         return;
                     }
                 };
+                db.recover_path_migration_journal();
                 while let Ok(request) = request_rx.recv() {
                     let event = match request {
                         BookBookmarkRequest::Add(request_id, entry) => BookBookmarkEvent::Added {
@@ -249,10 +250,12 @@ impl BookBookmarkService {
                             request_id,
                             result: db.list_all().map_err(|err| err.to_string()),
                         },
-                        BookBookmarkRequest::MigratePaths(request_id, mappings) => {
+                        BookBookmarkRequest::MigratePaths(request_id, mappings, journal_id) => {
                             BookBookmarkEvent::PathsMigrated {
                                 request_id,
-                                result: db.migrate_paths(&mappings).map_err(|err| err.to_string()),
+                                result: db
+                                    .migrate_paths_with_journal(&mappings, journal_id.as_deref())
+                                    .map_err(|err| err.to_string()),
                             }
                         }
                     };
@@ -300,8 +303,19 @@ impl BookBookmarkService {
     }
 
     pub fn migrate_paths(&self, request_id: u64, mappings: Vec<(PathBuf, PathBuf)>) {
+        self.migrate_paths_with_journal(request_id, mappings, None);
+    }
+
+    pub fn migrate_paths_with_journal(
+        &self,
+        request_id: u64,
+        mappings: Vec<(PathBuf, PathBuf)>,
+        journal_id: Option<String>,
+    ) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(BookBookmarkRequest::MigratePaths(request_id, mappings));
+            let _ = tx.send(BookBookmarkRequest::MigratePaths(
+                request_id, mappings, journal_id,
+            ));
         }
     }
 
@@ -357,7 +371,14 @@ impl BookBookmarkDb {
              CREATE INDEX IF NOT EXISTS idx_book_bookmarks_container
                 ON book_bookmarks(container_key);
              CREATE INDEX IF NOT EXISTS idx_book_bookmarks_created
-                ON book_bookmarks(created_at_ms DESC);",
+                ON book_bookmarks(created_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS book_bookmark_path_migrations (
+                job_id          TEXT PRIMARY KEY,
+                mappings_json   TEXT NOT NULL,
+                created_at_ms   INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_book_bookmark_path_migrations_created
+                ON book_bookmark_path_migrations(created_at_ms, job_id);",
         )?;
         ensure_column(conn, "title", "TEXT")
     }
@@ -447,7 +468,18 @@ impl BookBookmarkDb {
     /// 全対象行を一度 internal key へ退避してから確定するため、ページ同士の入れ替えでも
     /// UNIQUE(container_key, page_kind, page_key) の一時衝突を起こさない。
     fn migrate_paths(&mut self, mappings: &[(PathBuf, PathBuf)]) -> Result<usize, rusqlite::Error> {
-        if mappings.is_empty() {
+        self.migrate_paths_with_journal(mappings, None)
+    }
+
+    /// `journal_id` がある場合、path migration と journal 消去を同じ SQLite transaction で
+    /// commit する。DB busy / 一時失敗 / panic では transaction が完了せず journal が残るため、
+    /// 次回起動の `recover_path_migration_journal` が同じ最終 mapping を冪等に再実行できる。
+    fn migrate_paths_with_journal(
+        &mut self,
+        mappings: &[(PathBuf, PathBuf)],
+        journal_id: Option<&str>,
+    ) -> Result<usize, rusqlite::Error> {
+        if mappings.is_empty() && journal_id.is_none() {
             return Ok(0);
         }
         let mappings = PathMappingIndex::new(mappings);
@@ -456,7 +488,7 @@ impl BookBookmarkDb {
             .into_iter()
             .filter_map(|bookmark| migration_target(&bookmark, &mappings))
             .collect();
-        if targets.is_empty() {
+        if targets.is_empty() && journal_id.is_none() {
             return Ok(0);
         }
 
@@ -510,8 +542,55 @@ impl BookBookmarkDb {
                 Err(error) => return Err(error),
             }
         }
+        if let Some(journal_id) = journal_id {
+            tx.execute(
+                "DELETE FROM book_bookmark_path_migrations WHERE job_id = ?1",
+                [journal_id],
+            )?;
+        }
         tx.commit()?;
         Ok(targets.len())
+    }
+
+    fn recover_path_migration_journal(&mut self) {
+        let pending = (|| -> Result<Vec<(String, String)>, rusqlite::Error> {
+            let mut stmt = self.conn.prepare(
+                "SELECT job_id, mappings_json
+                   FROM book_bookmark_path_migrations
+                  ORDER BY created_at_ms ASC, job_id ASC",
+            )?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect()
+        })();
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "book bookmark migration journal read failed: {error}"
+                ));
+                return;
+            }
+        };
+        for (job_id, mappings_json) in pending {
+            let mappings: Vec<(PathBuf, PathBuf)> = match serde_json::from_str(&mappings_json) {
+                Ok(mappings) => mappings,
+                Err(error) => {
+                    // 壊れた intent を黙って消すと回復不能になる。行は保持し、診断可能にする。
+                    crate::logger::log(format!(
+                        "book bookmark migration journal parse failed job={job_id}: {error}"
+                    ));
+                    continue;
+                }
+            };
+            match self.migrate_paths_with_journal(&mappings, Some(&job_id)) {
+                Ok(rows) => crate::logger::log(format!(
+                    "book bookmark migration journal recovered job={job_id} rows={rows}"
+                )),
+                Err(error) => crate::logger::log(format!(
+                    "book bookmark migration journal retry failed job={job_id}: {error}"
+                )),
+            }
+        }
     }
 }
 
@@ -704,6 +783,58 @@ fn normalize_bookmark_title(title: Option<&str>) -> Option<String> {
 
 pub fn db_path() -> PathBuf {
     crate::data_dir::get().join("book_bookmarks.db")
+}
+
+/// 製本 worker が最初の page path を変更する前に、最終 old → new mapping を永続化する。
+/// journal を作れない場合は filesystem 操作を開始してはならないため、失敗を呼び出し元へ返す。
+pub fn prepare_path_migration(mappings: &[(PathBuf, PathBuf)]) -> Result<Option<String>, String> {
+    prepare_path_migration_at(&db_path(), mappings)
+}
+
+fn prepare_path_migration_at(
+    db_path: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+) -> Result<Option<String>, String> {
+    let mappings = mappings
+        .iter()
+        .filter(|(from, to)| !crate::folder_tree::path_eq(from, to))
+        .cloned()
+        .collect::<Vec<_>>();
+    if mappings.is_empty() {
+        return Ok(None);
+    }
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let mappings_json = serde_json::to_string(&mappings).map_err(|error| error.to_string())?;
+    let db = BookBookmarkDb::open_at(db_path).map_err(|error| error.to_string())?;
+    db.conn
+        .execute(
+            "INSERT INTO book_bookmark_path_migrations
+                (job_id, mappings_json, created_at_ms)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![job_id, mappings_json, now_ms()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(Some(job_id))
+}
+
+/// filesystem 操作が通常エラーで完了しなかった場合だけ prepared intent を破棄する。
+/// プロセスクラッシュ時はこの関数が呼ばれず、次回起動の recovery 対象として残る。
+pub fn discard_prepared_path_migration(job_id: &str) -> Result<(), String> {
+    discard_prepared_path_migration_at(&db_path(), job_id)
+}
+
+fn discard_prepared_path_migration_at(db_path: &Path, job_id: &str) -> Result<(), String> {
+    let db = BookBookmarkDb::open_at(db_path).map_err(|error| error.to_string())?;
+    db.conn
+        .execute(
+            "DELETE FROM book_bookmark_path_migrations WHERE job_id = ?1",
+            [job_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// 指定先に本ブックマーク DB の現行 schema を用意する。
@@ -948,6 +1079,180 @@ mod tests {
         assert_eq!(row.page_index_hint, 2);
     }
 
+    fn journal_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM book_bookmark_path_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn journal_recovery_is_idempotent_after_filesystem_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("book_bookmarks.db");
+        let book = temp.path().join("story");
+        std::fs::create_dir(&book).unwrap();
+        let old_page = book.join("0001_old.jpg");
+        let new_page = book.join("0001_new.jpg");
+        std::fs::write(&old_page, b"page").unwrap();
+
+        let db = BookBookmarkDb::open_at(&db_path).unwrap();
+        let (saved, _) = db
+            .add(&NewBookBookmark {
+                container_path: book.clone(),
+                container_kind: BookContainerKind::CompiledBook,
+                page_identity: PageIdentity::RelativePath("0001_old.jpg".to_string()),
+                page_index_hint: 0,
+            })
+            .unwrap();
+        db.set_title(saved.id, Some("recover me")).unwrap();
+        drop(db);
+
+        let mappings = vec![(old_page.clone(), new_page.clone())];
+        let job_id = prepare_path_migration_at(&db_path, &mappings)
+            .unwrap()
+            .expect("journal id");
+        std::fs::rename(&old_page, &new_page).unwrap();
+
+        let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
+        assert_eq!(journal_count(&restarted.conn), 1);
+        restarted.recover_path_migration_journal();
+        let row = restarted.list_all().unwrap().pop().unwrap();
+        assert_eq!(
+            row.page_identity,
+            PageIdentity::RelativePath("0001_new.jpg".to_string())
+        );
+        assert_eq!(row.title.as_deref(), Some("recover me"));
+        assert_eq!(journal_count(&restarted.conn), 0);
+
+        // journal は DB migration と同時に消えるため、二度目は完全な no-op になる。
+        restarted.recover_path_migration_journal();
+        assert_eq!(restarted.list_all().unwrap(), vec![row]);
+        assert_eq!(journal_count(&restarted.conn), 0);
+        assert!(!job_id.is_empty());
+    }
+
+    #[test]
+    fn journal_recovery_preserves_bookmarks_through_swap_and_three_page_cycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("book_bookmarks.db");
+        let db = BookBookmarkDb::open_at(&db_path).unwrap();
+        let swap = temp.path().join("swap");
+        let cycle = temp.path().join("cycle");
+
+        for (book, names) in [
+            (&swap, &["a.jpg", "b.jpg"][..]),
+            (&cycle, &["a.jpg", "b.jpg", "c.jpg"][..]),
+        ] {
+            for name in names {
+                let (saved, _) = db
+                    .add(&NewBookBookmark {
+                        container_path: book.clone(),
+                        container_kind: BookContainerKind::CompiledBook,
+                        page_identity: PageIdentity::RelativePath((*name).to_string()),
+                        page_index_hint: 0,
+                    })
+                    .unwrap();
+                db.set_title(saved.id, Some(&format!("{}:{name}", book.display())))
+                    .unwrap();
+            }
+        }
+        drop(db);
+
+        let mappings = vec![
+            (swap.join("a.jpg"), swap.join("b.jpg")),
+            (swap.join("b.jpg"), swap.join("a.jpg")),
+            (cycle.join("a.jpg"), cycle.join("b.jpg")),
+            (cycle.join("b.jpg"), cycle.join("c.jpg")),
+            (cycle.join("c.jpg"), cycle.join("a.jpg")),
+        ];
+        prepare_path_migration_at(&db_path, &mappings)
+            .unwrap()
+            .expect("journal id");
+
+        let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
+        restarted.recover_path_migration_journal();
+        let rows = restarted.list_all().unwrap();
+        let page_for_title = |title: &str| {
+            rows.iter()
+                .find(|row| row.title.as_deref() == Some(title))
+                .map(|row| row.page_identity.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            page_for_title(&format!("{}:a.jpg", swap.display())),
+            PageIdentity::RelativePath("b.jpg".to_string())
+        );
+        assert_eq!(
+            page_for_title(&format!("{}:b.jpg", swap.display())),
+            PageIdentity::RelativePath("a.jpg".to_string())
+        );
+        assert_eq!(
+            page_for_title(&format!("{}:a.jpg", cycle.display())),
+            PageIdentity::RelativePath("b.jpg".to_string())
+        );
+        assert_eq!(
+            page_for_title(&format!("{}:b.jpg", cycle.display())),
+            PageIdentity::RelativePath("c.jpg".to_string())
+        );
+        assert_eq!(
+            page_for_title(&format!("{}:c.jpg", cycle.display())),
+            PageIdentity::RelativePath("a.jpg".to_string())
+        );
+        assert_eq!(journal_count(&restarted.conn), 0);
+    }
+
+    #[test]
+    fn busy_database_keeps_journal_until_a_later_retry_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("book_bookmarks.db");
+        let book = temp.path().join("story");
+        let old_page = book.join("0001_old.jpg");
+        let new_page = book.join("0001_new.jpg");
+        let db = BookBookmarkDb::open_at(&db_path).unwrap();
+        db.add(&NewBookBookmark {
+            container_path: book,
+            container_kind: BookContainerKind::CompiledBook,
+            page_identity: PageIdentity::RelativePath("0001_old.jpg".to_string()),
+            page_index_hint: 0,
+        })
+        .unwrap();
+        drop(db);
+        let mappings = vec![(old_page, new_page)];
+        let job_id = prepare_path_migration_at(&db_path, &mappings)
+            .unwrap()
+            .expect("journal id");
+
+        let mut retrying = BookBookmarkDb::open_at(&db_path).unwrap();
+        retrying
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        let blocker = rusqlite::Connection::open(&db_path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        assert!(
+            retrying
+                .migrate_paths_with_journal(&mappings, Some(&job_id))
+                .is_err()
+        );
+        assert_eq!(journal_count(&blocker), 1);
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(
+            retrying
+                .migrate_paths_with_journal(&mappings, Some(&job_id))
+                .unwrap(),
+            1
+        );
+        assert_eq!(journal_count(&retrying.conn), 0);
+        assert_eq!(
+            retrying.list_all().unwrap()[0].page_identity,
+            PageIdentity::RelativePath("0001_new.jpg".to_string())
+        );
+    }
+
     #[test]
     fn old_schema_is_migrated_with_nullable_title() {
         let conn = rusqlite::Connection::open_in_memory().expect("memory DB");
@@ -976,6 +1281,7 @@ mod tests {
             .unwrap();
         assert!(columns.iter().any(|column| column == "title"));
         drop(stmt);
+        assert_eq!(journal_count(&conn), 0);
 
         let db = BookBookmarkDb { conn };
         let entry = NewBookBookmark {

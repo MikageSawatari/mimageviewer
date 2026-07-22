@@ -1734,6 +1734,18 @@ impl BookmarkViewReturnGridState {
     }
 }
 
+/// このプロセスで path-keyed rating DB に適用した最新値。
+///
+/// DB は main / detached / parked context で共有されるため、idx cache と違ってこの台帳は
+/// context bundle に入れない。非同期 XMP hydration は開始時世代と現在世代を比較し、後から
+/// 行われたユーザー操作を古い読み取り結果で上書きしない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RatingSessionWrite {
+    generation: u64,
+    stars: u8,
+    explicit_user: bool,
+}
+
 #[cfg(windows)]
 struct ViewerContextBundle {
     address: String,
@@ -1783,7 +1795,6 @@ struct ViewerContextBundle {
     tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
     tag_prewarm_queued: std::collections::HashSet<usize>,
     tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
-    user_set_rating_keys: std::collections::HashSet<String>,
     pending_finalize: std::collections::HashSet<usize>,
     // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
     // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
@@ -1815,6 +1826,8 @@ struct ViewerContextBundle {
     checked: std::collections::HashSet<usize>,
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
     rating_cache: std::collections::HashMap<usize, u8>,
+    /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
+    rating_session_write_seen_generation: u64,
     current_folder_rating_cache: Option<u8>,
     current_folder_last_mtime: Option<std::time::SystemTime>,
     current_folder_signature: Option<u64>,
@@ -2065,7 +2078,6 @@ impl ViewerContextBundle {
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
             tag_legacy_seed_pending: None,
-            user_set_rating_keys: std::collections::HashSet::new(),
             pending_finalize: std::collections::HashSet::new(),
             tx,
             rx,
@@ -2085,6 +2097,7 @@ impl ViewerContextBundle {
             checked: std::collections::HashSet::new(),
             rotation_cache: std::collections::HashMap::new(),
             rating_cache: std::collections::HashMap::new(),
+            rating_session_write_seen_generation: 0,
             current_folder_rating_cache: None,
             current_folder_last_mtime: None,
             current_folder_signature: None,
@@ -7284,11 +7297,13 @@ pub struct App {
     pub(crate) tags_db: Option<crate::tags_db::TagsDb>,
     /// 現在フォルダのアイテムごとのレーティングキャッシュ (idx → 0..=5)
     pub(crate) rating_cache: std::collections::HashMap<usize, u8>,
-    /// ユーザが明示的に set_rating した path (normalize 済みキー) の記録。
-    /// tag_prewarm が古い XMP を背景で読み戻してきても、ここに入っている path は
-    /// ハイドレーション対象から外す (F6 で 0 にしたのに古い★が蘇る race の防止)。
-    /// フォルダ切替で load_folder がクリアする。
-    pub(crate) user_set_rating_keys: std::collections::HashSet<String>,
+    /// App-global path 更新台帳の最新世代。main / detached / parked のどの context から
+    /// 書いても、各 context は mount 時に未反映世代だけ idx cache へ取り込む。
+    pub(crate) rating_session_write_generation: u64,
+    pub(crate) rating_session_writes: std::collections::HashMap<String, RatingSessionWrite>,
+    /// 現在 mount 中の context が `rating_session_writes` を反映済みの世代。
+    /// idx cache と同じ context ownership なので `ViewerContextBundle` と交換する。
+    pub(crate) rating_session_write_seen_generation: u64,
     /// `current_folder` (コンテナ) 自身のレーティングキャッシュ。アドレスバー描画で
     /// 毎フレーム参照されるので SQLite を叩かない。`None` は未計算を意味する。
     /// `load_folder` / `set_current_folder_rating` / `set_rating` (コンテナ変更時) で
@@ -10031,7 +10046,9 @@ impl App {
             tags_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
-            user_set_rating_keys: std::collections::HashSet::new(),
+            rating_session_write_generation: 0,
+            rating_session_writes: std::collections::HashMap::new(),
+            rating_session_write_seen_generation: 0,
             current_folder_rating_cache: None,
             rating_counts_cache: None,
             folder_rating_counts: std::collections::HashMap::new(),
@@ -11628,6 +11645,11 @@ impl App {
     /// BS / Ctrl+↑↓ / タイトルバー / アドレスバー表示で使うこと。
     #[cfg(windows)]
     fn swap_viewer_context_bundle(&mut self, bundle: &mut ViewerContextBundle) {
+        // path-keyed DB 更新は context-global。退避する側も復元する側も、idx-keyed cache を
+        // その時点の最新世代へ揃えてから ownership を渡す。
+        if self.sync_current_context_rating_session_writes() {
+            self.rebuild_visible_indices();
+        }
         macro_rules! swap_field {
             ($field:ident) => {
                 std::mem::swap(&mut self.$field, $field);
@@ -11679,7 +11701,6 @@ impl App {
             tag_prewarm_pending,
             tag_prewarm_queued,
             tag_legacy_seed_pending,
-            user_set_rating_keys,
             pending_finalize,
             tx,
             rx,
@@ -11699,6 +11720,7 @@ impl App {
             checked,
             rotation_cache,
             rating_cache,
+            rating_session_write_seen_generation,
             current_folder_rating_cache,
             current_folder_last_mtime,
             current_folder_signature,
@@ -11880,7 +11902,6 @@ impl App {
         swap_field!(tag_prewarm_pending);
         swap_field!(tag_prewarm_queued);
         swap_field!(tag_legacy_seed_pending);
-        swap_field!(user_set_rating_keys);
         swap_field!(pending_finalize);
         // per-context ロード複合体 (review-v2.3.0 P2-8/P2-9)。channel/token/キューが
         // コンテキストと一緒に移動するので、requested / pending_finalize の bookkeeping は
@@ -11903,6 +11924,7 @@ impl App {
         swap_field!(checked);
         swap_field!(rotation_cache);
         swap_field!(rating_cache);
+        swap_field!(rating_session_write_seen_generation);
         swap_field!(current_folder_rating_cache);
         swap_field!(current_folder_last_mtime);
         swap_field!(current_folder_signature);
@@ -12053,6 +12075,9 @@ impl App {
         // 毎フレーム消え、Pending サムネがフレームごとに重複エンキュー/重複デコードされる
         // churn になっていた (review-v2.3.0 P2-8)。channel/token/キューを bundle 化した現在は
         // bookkeeping がコンテキストと一緒に移動するため clear 不要。
+        if self.sync_current_context_rating_session_writes() {
+            self.rebuild_visible_indices();
+        }
     }
 
     #[cfg(windows)]
@@ -18925,8 +18950,6 @@ impl App {
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
         self.current_folder_rating_cache = None;
-        // フォルダ切替でユーザ明示設定の記録もリセット (別フォルダでは無関係)
-        self.user_set_rating_keys.clear();
         self.reset_folder_rating_counts();
         // ★フィルタ suppression scope の判定: anchor の subtree 外に出たら復元する。
         // 判定は current_folder 反映直後に行うため、`effective_folder()` が最新値を返す。
@@ -19061,6 +19084,9 @@ impl App {
         } else {
             self.prewarm_rating_cache();
         }
+        // DB prewarm 後、別 context からこのセッション中に書かれた path の最新値を重ねる。
+        // 特に明示クリア (DB 行なし) は DB だけでは区別できないため、global 台帳が正本になる。
+        self.sync_current_context_rating_session_writes();
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -22049,7 +22075,8 @@ impl App {
         self.invalidate_rating_counts_cache();
         self.reset_folder_rating_counts();
         self.tags_cache.retain(|key, _| !matches_key(key));
-        self.user_set_rating_keys.retain(|key| !matches_key(key));
+        self.rating_session_writes
+            .retain(|key, _| !matches_key(key));
         self.folder_pin_map.retain(|key, _| !matches_key(key));
         self.search_drilled_folder_counts
             .retain(|key, _| !matches_key(key));
@@ -22129,10 +22156,22 @@ impl App {
         &mut self,
         applied_rating_keys: &[String],
     ) {
-        self.user_set_rating_keys
-            .extend(applied_rating_keys.iter().cloned());
+        let imported_ratings = self
+            .rating_db
+            .as_ref()
+            .map(|db| {
+                applied_rating_keys
+                    .iter()
+                    .map(|key| (key.clone(), db.get(key)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (key, stars) in imported_ratings {
+            self.record_rating_session_write(key, stars, true);
+        }
         self.rating_cache.clear();
         self.prewarm_rating_cache();
+        self.sync_current_context_rating_session_writes();
         self.current_folder_rating_cache = None;
         self.invalidate_rating_counts_cache();
         self.reset_folder_rating_counts();
@@ -22394,6 +22433,13 @@ impl App {
                     self.migrate_video_resume_positions_for_renamed_path(
                         &job.old_path,
                         &job.new_path,
+                    );
+                    let old_rating_key = crate::adjustment_db::normalize_path(&job.old_path);
+                    let new_rating_key = crate::adjustment_db::normalize_path(&job.new_path);
+                    migrate_key_map_for_rename(
+                        &mut self.rating_session_writes,
+                        &old_rating_key,
+                        &new_rating_key,
                     );
                     // ★ / タグの path-keyed 表示キャッシュはグローバルに引き直す (安全)。
                     self.rating_cache.clear();
@@ -23634,16 +23680,32 @@ impl App {
             return false;
         };
         let normalized = entry_name.replace('\\', "/");
-        let Some((prefix, _)) = normalized.rsplit_once('/') else {
-            return false;
-        };
-        if prefix.is_empty() {
-            return false;
-        }
+        // `/` を含まない entry の親は ZIP root (`[]`)。保存済み identity に先頭 `/`
+        // や `\\` が混ざっていても、空 segment を除いた絶対 prefix として解決する。
+        let prefix = normalized
+            .rsplit_once('/')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or_default();
+        let segments: Vec<String> = prefix
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
         let Some(nav) = self.zip_nav.as_mut() else {
             return false;
         };
-        nav.enter(&format!("{prefix}/"));
+        // `ZipNavState::enter` は通常 UI の実在 `ZipDir` 用で、任意 prefix 自体は検証しない。
+        // bookmark identity は stale になり得るため、現在階層を変更する前に tree 上の存在を
+        // 確認する。root の空 segments は `node_at(&[])` で有効になる。
+        if nav.tree.node_at(&segments).is_none() {
+            return false;
+        }
+        let absolute_prefix = if segments.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", segments.join("/"))
+        };
+        nav.enter(&absolute_prefix);
         self.zip_nav_show_current_level();
         true
     }
@@ -24538,11 +24600,12 @@ impl App {
         self.finish_book_page_semantic_mapping(errors);
     }
 
-    pub(crate) fn apply_book_page_edit_moves(
+    pub(crate) fn apply_book_page_edit_moves_with_journal(
         &mut self,
         mappings: &[crate::books::BookPathMapping],
+        bookmark_migration_journal_id: Option<&str>,
     ) {
-        self.migrate_book_page_bookmarks(mappings);
+        self.migrate_book_page_bookmarks(mappings, bookmark_migration_journal_id);
         let mappings = Self::normalized_book_page_edit_mappings(mappings);
         if mappings.is_empty() {
             return;
@@ -24574,13 +24637,17 @@ impl App {
         self.finish_book_page_edit_mapping("move", errors);
     }
 
-    fn migrate_book_page_bookmarks(&mut self, mappings: &[crate::books::BookPathMapping]) {
+    fn migrate_book_page_bookmarks(
+        &mut self,
+        mappings: &[crate::books::BookPathMapping],
+        journal_id: Option<&str>,
+    ) {
         let mappings: Vec<_> = mappings
             .iter()
             .filter(|mapping| !crate::folder_tree::path_eq(&mapping.from, &mapping.to))
             .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
             .collect();
-        if mappings.is_empty() {
+        if mappings.is_empty() && journal_id.is_none() {
             return;
         }
         let request_id = self.next_book_bookmark_request_id();
@@ -24588,7 +24655,7 @@ impl App {
             self.show_feedback_toast("ブックマークDBを利用できません".to_string());
             return;
         };
-        service.migrate_paths(request_id, mappings);
+        service.migrate_paths_with_journal(request_id, mappings, journal_id.map(str::to_string));
         self.book_bookmark_pending_requests.insert(request_id);
     }
 
@@ -24848,7 +24915,10 @@ impl App {
                 }
             }
             Ok(crate::books::BookOpResult::Transfer(summary)) => {
-                self.apply_book_page_edit_moves(&summary.edit_moves);
+                self.apply_book_page_edit_moves_with_journal(
+                    &summary.edit_moves,
+                    summary.bookmark_migration_journal_id.as_deref(),
+                );
                 self.apply_book_page_edit_copies(&summary.edit_copies);
                 self.book_list_cache = None;
                 if self.current_folder.as_ref().is_some_and(|current| {
@@ -24889,8 +24959,12 @@ impl App {
                 old_name,
                 new_name,
                 edit_moves,
+                bookmark_migration_journal_id,
             }) => {
-                self.apply_book_page_edit_moves(&edit_moves);
+                self.apply_book_page_edit_moves_with_journal(
+                    &edit_moves,
+                    bookmark_migration_journal_id.as_deref(),
+                );
                 if self.settings.active_book_name == old_name {
                     self.settings.active_book_name = new_name.clone();
                     self.settings.save();
@@ -24935,8 +25009,12 @@ impl App {
                 folder,
                 count,
                 edit_moves,
+                bookmark_migration_journal_id,
             }) => {
-                self.apply_book_page_edit_moves(&edit_moves);
+                self.apply_book_page_edit_moves_with_journal(
+                    &edit_moves,
+                    bookmark_migration_journal_id.as_deref(),
+                );
                 self.book_list_cache = None;
                 if self
                     .current_folder
@@ -33610,7 +33688,6 @@ impl App {
             tag_prewarm_pending,
             tag_prewarm_queued,
             tag_legacy_seed_pending,
-            user_set_rating_keys,
             pending_finalize,
             tx,
             rx,
@@ -33630,6 +33707,7 @@ impl App {
             checked,
             rotation_cache,
             rating_cache,
+            rating_session_write_seen_generation,
             current_folder_rating_cache,
             current_folder_last_mtime,
             current_folder_signature,
@@ -33797,9 +33875,9 @@ impl App {
             checked,
             rotation_cache,
             rating_cache,
+            rating_session_write_seen_generation,
             current_folder_rating_cache,
             tags_cache,
-            user_set_rating_keys,
             current_folder_last_mtime,
             current_folder_signature,
             items_generation,
@@ -39333,11 +39411,76 @@ impl App {
         Some(meta)
     }
 
+    fn rating_session_generation_for_key(&self, key: &str) -> u64 {
+        self.rating_session_writes
+            .get(key)
+            .map(|write| write.generation)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn record_rating_session_write(
+        &mut self,
+        key: String,
+        stars: u8,
+        explicit_user: bool,
+    ) {
+        self.rating_session_write_generation =
+            self.rating_session_write_generation.wrapping_add(1).max(1);
+        self.rating_session_writes.insert(
+            key,
+            RatingSessionWrite {
+                generation: self.rating_session_write_generation,
+                stars: stars.min(5),
+                explicit_user,
+            },
+        );
+    }
+
+    /// App-global path rating 更新を、現在 mount 中 context の idx cache へ反映する。
+    ///
+    /// context ごとの cache ownership は維持しつつ、DB とユーザー最終値だけを共有する。
+    /// `ViewerContextBundle` の swap 前後と新規一覧の DB prewarm 後に呼ばれるため、行 identity が
+    /// 同じで bookmark grid の再 install を省略しても古い星を表示し続けない。
+    fn sync_current_context_rating_session_writes(&mut self) -> bool {
+        let seen = self.rating_session_write_seen_generation;
+        let current = self.rating_session_write_generation;
+        if seen == current {
+            return false;
+        }
+
+        let item_updates = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| {
+                let key = self.rating_path_key(idx)?;
+                let write = self.rating_session_writes.get(&key)?;
+                (write.generation > seen).then_some((idx, write.stars))
+            })
+            .collect::<Vec<_>>();
+        let folder_update = self
+            .current_container_rating_key_and_source()
+            .and_then(|(key, _)| self.rating_session_writes.get(&key).copied())
+            .filter(|write| write.generation > seen)
+            .map(|write| write.stars);
+
+        let mut changed = false;
+        for (idx, stars) in item_updates {
+            changed |= self.rating_cache.insert(idx, stars) != Some(stars);
+        }
+        if let Some(stars) = folder_update {
+            changed |= self.current_folder_rating_cache.replace(stars) != Some(stars);
+        }
+        self.rating_session_write_seen_generation = current;
+        changed
+    }
+
     /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。
     /// 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     /// 非対象アイテムはキャッシュを汚さないように insert しない。
     pub(crate) fn get_rating(&mut self, idx: usize) -> u8 {
+        self.sync_current_context_rating_session_writes();
         if let Some(&v) = self.rating_cache.get(&idx) {
             return v;
         }
@@ -39367,6 +39510,7 @@ impl App {
         if !accepts {
             return;
         }
+        self.sync_current_context_rating_session_writes();
         let book_page = self.idx_is_compiled_book_page(idx);
         let stars = stars.min(5);
         let key = match self.rating_path_key(idx) {
@@ -39377,12 +39521,13 @@ impl App {
         // prewarm で全 item が cache に載っている前提。未取得なら 0 扱いで OK。
         let old_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
         self.rating_cache.insert(idx, stars);
-        // ユーザが明示的に値を書いた path として記録。tag_prewarm の古い XMP 読み戻しで
-        // 値を上書きされないように hydrate_ratings_from_xmp が参照する。
-        self.user_set_rating_keys.insert(key.clone());
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set_user_rating(&key, stars, meta.as_ref());
         }
+        // DB と同じ path identity の App-global 台帳へ記録してから、同一 context 内の重複行も
+        // 更新する。detached unmount 時は swap 境界が main / parked cache へ同じ値を反映する。
+        self.record_rating_session_write(key.clone(), stars, true);
+        self.sync_current_context_rating_session_writes();
         self.invalidate_rating_counts_cache();
         // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
         // ZIP 内画像 / PDF ページ) のみ親フォルダの集計に伝搬する。
@@ -39434,12 +39579,13 @@ impl App {
         let key = crate::adjustment_db::normalize_path(folder);
         let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Folder)
             .with_source_path(folder);
-        self.user_set_rating_keys.insert(key.clone());
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set_user_rating(&key, stars, Some(&meta));
         }
+        self.record_rating_session_write(key, stars, true);
+        self.sync_current_context_rating_session_writes();
         self.invalidate_rating_counts_cache();
-        self.current_folder_rating_cache = None;
+        self.current_folder_rating_cache = Some(stars);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Rating,
         );
@@ -40358,7 +40504,8 @@ impl App {
                 continue;
             }
             self.tag_prewarm_queued.insert(idx);
-            pending.push_job(p.clone());
+            let key = crate::adjustment_db::normalize_path(p);
+            pending.push_job(p.clone(), self.rating_session_generation_for_key(&key));
         }
     }
 
@@ -40370,7 +40517,7 @@ impl App {
             return;
         };
         // このフレームで届いた分だけ drain。
-        let mut rating_hydrations: Vec<(PathBuf, u8)> = Vec::new();
+        let mut rating_hydrations: Vec<(PathBuf, u8, u64)> = Vec::new();
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
@@ -40378,7 +40525,11 @@ impl App {
                     // (DB を UI スレッドで触らないように後段でまとめて書く)。
                     if let Some(stars) = res.rating {
                         if stars > 0 {
-                            rating_hydrations.push((res.path.clone(), stars));
+                            rating_hydrations.push((
+                                res.path.clone(),
+                                stars,
+                                res.rating_generation,
+                            ));
                         }
                     }
                     pending.on_result_drained();
@@ -40466,29 +40617,38 @@ impl App {
     /// 実装: normalize_path を 1 回だけ走らせ、items の逆引き HashMap を 1 回構築、
     /// `db.get_many` でバッチ SELECT、何も変化しなければ `rebuild_visible_indices` は
     /// 呼ばない (大フォルダで UI スレッドに来たときの per-frame 再構築コスト回避)。
-    fn hydrate_ratings_from_xmp(&mut self, hydrations: Vec<(PathBuf, u8)>) {
+    fn hydrate_ratings_from_xmp(&mut self, hydrations: Vec<(PathBuf, u8, u64)>) {
         let Some(db) = self.rating_db.as_ref() else {
             return;
         };
         if hydrations.is_empty() {
             return;
         }
-        // key → (XMP 由来★, 元 path) の最終マップ (path の重複 push があっても 1 エントリに縮む)
-        let mut target: std::collections::HashMap<String, (u8, PathBuf)> =
+        // key → (XMP 由来★, 元 path, request 開始時の path 世代) の最終マップ。
+        let mut target: std::collections::HashMap<String, (u8, PathBuf, u64)> =
             std::collections::HashMap::with_capacity(hydrations.len());
-        for (path, stars) in hydrations {
-            target.insert(crate::adjustment_db::normalize_path(&path), (stars, path));
+        for (path, stars, generation) in hydrations {
+            target.insert(
+                crate::adjustment_db::normalize_path(&path),
+                (stars, path, generation),
+            );
         }
         // DB の現在値を 1 クエリでまとめて引く
         let keys: Vec<String> = target.keys().cloned().collect();
         let current = db.get_many(&keys);
         // DB が 0 (未登録) のエントリだけ実際にハイドレート対象にする。
-        // ただし user_set_rating_keys にある path はユーザが明示的に書いたので、
-        // 古い XMP 由来の値で上書きしない (F6 でクリア直後にレースで蘇るのを防止)。
+        // request 後に同じ path へ書き込みがあれば世代不一致で破棄する。さらに、request
+        // 開始前の明示クリアも XMP writer より古い値を読めるため、最新ユーザー値が 0 の
+        // path は同世代でも取り込まない。
         let mut to_write: Vec<(String, u8, PathBuf)> = Vec::new();
-        for (key, (stars, path)) in &target {
+        for (key, (stars, path, started_generation)) in &target {
+            let session_write = self.rating_session_writes.get(key).copied();
+            let current_generation = session_write.map(|write| write.generation).unwrap_or(0);
+            let explicitly_cleared =
+                session_write.is_some_and(|write| write.explicit_user && write.stars == 0);
             if current.get(key).copied().unwrap_or(0) == 0
-                && !self.user_set_rating_keys.contains(key)
+                && current_generation == *started_generation
+                && !explicitly_cleared
             {
                 to_write.push((key.clone(), *stars, path.clone()));
             }
@@ -40509,11 +40669,19 @@ impl App {
             }
         }
         let mut rating_written = false;
+        let mut imported_writes = Vec::new();
         for (key, stars, path) in &to_write {
             let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
                 .with_source_path(path);
-            rating_written |= db.set_imported_rating(key, *stars, Some(&meta)).is_ok();
+            if db.set_imported_rating(key, *stars, Some(&meta)).is_ok() {
+                rating_written = true;
+                imported_writes.push((key.clone(), *stars));
+            }
         }
+        for (key, stars) in imported_writes {
+            self.record_rating_session_write(key, stars, false);
+        }
+        self.sync_current_context_rating_session_writes();
         if rating_written {
             self.schedule_current_smart_folder_metadata_refresh(
                 smart_folder::SmartFolderMetadataDependency::Rating,

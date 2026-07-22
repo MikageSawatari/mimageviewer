@@ -3994,8 +3994,12 @@ impl App {
                             folder,
                             count,
                             edit_moves,
+                            bookmark_migration_journal_id,
                         }) => {
-                            self.apply_book_page_edit_moves(&edit_moves);
+                            self.apply_book_page_edit_moves_with_journal(
+                                &edit_moves,
+                                bookmark_migration_journal_id.as_deref(),
+                            );
                             self.book_reorder = None;
                             if self.current_folder.as_ref().is_some_and(|current| {
                                 crate::folder_tree::path_eq(current, &folder)
@@ -4032,7 +4036,10 @@ impl App {
                     }
                     match result {
                         Ok(crate::books::BookOpResult::Transfer(summary)) => {
-                            self.apply_book_page_edit_moves(&summary.edit_moves);
+                            self.apply_book_page_edit_moves_with_journal(
+                                &summary.edit_moves,
+                                summary.bookmark_migration_journal_id.as_deref(),
+                            );
                             self.apply_book_page_edit_copies(&summary.edit_copies);
                             self.book_list_cache = None;
                             if self.current_folder.as_ref().is_some_and(|current| {

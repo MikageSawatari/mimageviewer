@@ -9914,6 +9914,94 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn book_bookmark_returns_from_child_prefix_to_zip_root() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&["cover.jpg", "chapter/001.jpg"]));
+        app.zip_nav.as_mut().expect("zip nav").enter("chapter/");
+        app.zip_nav_show_current_level();
+        let bookmark = BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&zip_path),
+            container_path: zip_path,
+            container_kind: BookContainerKind::Zip,
+            page_identity: PageIdentity::ArchiveEntry("cover.jpg".to_string()),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+
+        assert!(app.book_bookmark_item_idx(&bookmark).is_none());
+        assert!(app.enter_book_bookmark_archive_prefix(&bookmark));
+        assert!(
+            app.book_bookmark_item_idx(&bookmark).is_some(),
+            "a page directly under the ZIP root must be reachable from a child prefix"
+        );
+    }
+
+    #[test]
+    fn stale_bookmark_zip_prefix_does_not_change_current_level() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&["cover.jpg", "chapter/001.jpg"]));
+        app.zip_nav.as_mut().expect("zip nav").enter("chapter/");
+        app.zip_nav_show_current_level();
+        let before_prefix = app.zip_nav.as_ref().expect("zip nav").current().to_vec();
+        let before_items = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
+        let bookmark = BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&zip_path),
+            container_path: zip_path,
+            container_kind: BookContainerKind::Zip,
+            page_identity: PageIdentity::ArchiveEntry("missing\\001.jpg".to_string()),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+
+        assert!(!app.enter_book_bookmark_archive_prefix(&bookmark));
+        assert_eq!(
+            app.zip_nav.as_ref().expect("zip nav").current(),
+            before_prefix
+        );
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            before_items,
+            "a stale prefix must not materialize an empty level"
+        );
+    }
+
+    #[test]
+    fn book_bookmark_archive_prefix_accepts_mixed_separators() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&["cover.jpg", "chapter/001.jpg"]));
+        app.zip_nav_show_current_level();
+        let bookmark = BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&zip_path),
+            container_path: zip_path,
+            container_kind: BookContainerKind::Zip,
+            page_identity: PageIdentity::ArchiveEntry("chapter\\001.jpg".to_string()),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+
+        assert!(app.enter_book_bookmark_archive_prefix(&bookmark));
+        assert!(app.book_bookmark_item_idx(&bookmark).is_some());
+    }
+
+    #[test]
     fn aggregate_image_view_is_not_a_bookmarkable_book() {
         let mut app = setup_app();
         enable_auto_image_folder_book(&mut app);
@@ -19353,6 +19441,30 @@ mod native_video_rating_key_tests {
     use super::phase_c_support::setup_app;
     use super::*;
 
+    fn bookmark_image_rating_row(path: PathBuf) -> crate::bookmark_browser::BookmarkBrowserRow {
+        let container_path = path.parent().unwrap().to_path_buf();
+        let page_name = path.file_name().unwrap().to_string_lossy().to_string();
+        crate::bookmark_browser::BookmarkBrowserRow {
+            source: crate::bookmark_browser::BookmarkRowSource::Book(
+                crate::book_bookmarks::BookBookmark {
+                    id: 71,
+                    container_key: crate::book_bookmarks::container_key(&container_path),
+                    container_path,
+                    container_kind: crate::book_bookmarks::BookContainerKind::ImageFolder,
+                    page_identity: crate::book_bookmarks::PageIdentity::RelativePath(page_name),
+                    page_index_hint: 0,
+                    created_at_ms: 71,
+                    title: None,
+                },
+            ),
+            item: GridItem::Image(path),
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 71,
+            missing: false,
+        }
+    }
+
     fn native_key(
         virtual_key: u32,
         shift: bool,
@@ -19499,6 +19611,131 @@ mod native_video_rating_key_tests {
             app.current_folder_rating_cache, None,
             "main-context rating cache must stay untouched (the bundle owns its own cache)"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_rating_write_updates_main_cache_without_grid_reinstall() {
+        let mut app = setup_app();
+        app.settings.write_rating_to_xmp = false;
+        let path = PathBuf::from(r"C:\pics\bookmark-rating.jpg");
+        let row = bookmark_image_rating_row(path.clone());
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 4, None)
+            .unwrap();
+        app.items = vec![row.item.clone()];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.rating_cache.insert(0, 4);
+        app.items_are_bookmark_view = true;
+        app.bookmark_browser_rows = vec![row.clone()];
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![row.item.clone()];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.visible_indices = vec![0];
+        bundle.rating_cache.insert(0, 4);
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        app.with_active_detached_viewer_context(|detached| detached.set_rating(0, 2))
+            .expect("detached context");
+
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 2);
+        assert_eq!(app.rating_cache.get(&0), Some(&2));
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| active.bundle.rating_cache.get(&0)),
+            Some(&2),
+            "both context-local caches must observe the shared path write"
+        );
+        assert!(
+            app.items_are_bookmark_view,
+            "cache synchronization must not reinstall or leave the bookmark grid"
+        );
+
+        // close 後の再照合で row identity が同じ (`grid_content_unchanged == true`) でも、
+        // main の rating cache は共有 path 世代から更新済みで、grid install は不要。
+        let generation_before = app.items_generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(vec![row])).unwrap();
+        app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+        });
+        app.poll_bookmark_browser(&egui::Context::default());
+        assert_eq!(app.items_generation, generation_before);
+        assert_eq!(app.rating_cache.get(&0), Some(&2));
+    }
+
+    #[test]
+    fn stale_xmp_hydration_cannot_restore_an_explicitly_cleared_rating() {
+        let mut app = setup_app();
+        app.settings.write_rating_to_xmp = false;
+        let path = PathBuf::from(r"C:\pics\stale-xmp-rating.jpg");
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.rating_cache.insert(0, 4);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 4, None)
+            .unwrap();
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image(path.clone())];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.visible_indices = vec![0];
+        bundle.rating_cache.insert(0, 4);
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        let pending_generation = app.rating_session_generation_for_key(&key);
+        app.with_active_detached_viewer_context(|detached| detached.set_rating(0, 0))
+            .expect("detached context");
+        let clear_generation = app.rating_session_generation_for_key(&key);
+        assert!(clear_generation > pending_generation);
+
+        // clear より前に開始した読み取りと、clear 後だが XMP writer 完了前に開始した読み取りの
+        // どちらも、ユーザー最終値 0 を復活させてはならない。
+        app.hydrate_ratings_from_xmp(vec![(path.clone(), 4, pending_generation)]);
+        app.hydrate_ratings_from_xmp(vec![(path, 4, clear_generation)]);
+
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+        assert_eq!(app.rating_cache.get(&0), Some(&0));
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| active.bundle.rating_cache.get(&0)),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn xmp_hydration_still_imports_without_a_newer_path_write() {
+        let mut app = setup_app();
+        let path = PathBuf::from(r"C:\pics\fresh-xmp-rating.jpg");
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.rating_cache.insert(0, 0);
+        let generation = app.rating_session_generation_for_key(&key);
+
+        app.hydrate_ratings_from_xmp(vec![(path, 3, generation)]);
+
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
+        assert_eq!(app.rating_cache.get(&0), Some(&3));
     }
 
     /// F11 (VK 0x7A) で `toggle_video_window_mode` 経路が走っても、
@@ -34965,7 +35202,9 @@ mod smart_folder_transition_tests {
         let xmp_path = source.join("xmp-only.jpg");
         app.items.push(GridItem::Image(xmp_path.clone()));
         let revision = app.smart_folder_metadata_revision;
-        app.hydrate_ratings_from_xmp(vec![(xmp_path, 2)]);
+        let rating_generation =
+            app.rating_session_generation_for_key(&crate::adjustment_db::normalize_path(&xmp_path));
+        app.hydrate_ratings_from_xmp(vec![(xmp_path, 2, rating_generation)]);
         assert!(app.smart_folder_metadata_revision > revision);
         assert!(app.smart_folder_resort_metadata.is_empty());
     }
