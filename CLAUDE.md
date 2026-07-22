@@ -52,6 +52,26 @@ detached viewer (F12 別ウィンドウ / 複数ウィンドウ) は構造リワ
 - リワーク作業自体は `detached-rework` ブランチで行い、他セッションと並行して
   detached を触らない。
 
+## バグ修正の一般原則
+
+- 修正前に、観測された失敗、守るべき不変条件、違反を作ったコード経路をログ・テスト・
+  source inspection で特定する。症状を消す guard、delay、retry、追加 repaint、一括 reset、
+  silent fallback を根本原因の代わりに追加しない。
+- 共有状態、複数の入力入口、非同期完了、複数 viewer context をまたぐ問題では、再現した
+  経路だけで完了しない。同じ状態の producer / consumer と open / switch / close / cancel /
+  error lifecycle を列挙し、同型の入口・終了経路も確認してから修正する。
+- 相互排他的な状態を複数の bool / `Option` / pending、または field の有無を sentinel として
+  表現している場合、新しい分岐を足さず、単一の typed request / state owner / router への
+  集約を検討する。正しい構造修正が現在の範囲を超えるなら、症状パッチを入れずに報告する。
+- items、cache、texture、queue、channel、generation、cancel token、worker など context 固有の
+  resource は、create / mutate / drain / cancel / invalidation / drop が所有 context だけに作用する
+  ことを確認する。読み取り専用の open / close は、変更時用の失効通知や別 context の再ロードを
+  発生させてはならない。
+- 状態バグには状態遷移テスト、入力 routing バグには handler-level test、非同期・multi-window
+  lifecycle には request 相関と sibling context 不変を検証するテストまたはログ検査を追加する。
+  v2.7.0 出荷前の具体的な横断監査は
+  [docs/review-v2.7.0/systemic-review-plan.md](docs/review-v2.7.0/systemic-review-plan.md) を正本とする。
+
 キー操作を追加・変更するときは、ユーザーが明示していなくても keymap 対応を検討する。
 閲覧・編集・動画の通常ショートカットは `KeyAction` に追加し、`ini_name()` / `context()` /
 `trigger()` / `default_chords()` / `ALL_ACTIONS` / 呼び出し側 helper / `docs/keymap.ini.default` を

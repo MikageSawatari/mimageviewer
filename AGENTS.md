@@ -60,10 +60,26 @@ always-active guidance.
   invariant, and the code path that violates it. Use logs, traces, tests, and
   source inspection to confirm the root cause instead of patching the most
   visible symptom.
+- When a bug crosses shared state, multiple input entry points, asynchronous
+  completion paths, or multiple viewer contexts, do not stop at the reproduced
+  path. Inventory equivalent producers, consumers, and the
+  open/switch/close/cancel/error lifecycle, then check sibling routes for the
+  same broken invariant before editing.
 - Fix the root cause at the ownership boundary where the incorrect state or
   transition is created. Avoid adding guards, delays, retries, extra repaint
   calls, blanket resets, or silent fallbacks unless they are part of the root
   cause fix and their invariants are documented.
+- Do not add another bool, `Option`, pending field, or field-presence sentinel
+  to represent a mutually exclusive state that is already split across fields.
+  Prefer one typed request/state owner and route equivalent entry points through
+  it. If that restructuring is larger than the current scope, stop and report
+  the architectural boundary instead of adding another branch.
+- For context-scoped resources such as items, caches, textures, queues,
+  channels, generations, cancellation tokens, and workers, verify that create,
+  mutate, drain, cancel, invalidation, and drop affect only the owning context.
+  Read-only open/close must not publish mutation-style invalidation or reset an
+  unchanged sibling context. Add cross-context regression coverage when these
+  boundaries change.
 - If the investigation shows that the correct fix is larger than the current
   scope, stop and explain the trade-off to the user before editing further.
   Offer coherent options, such as spending more time on the architectural fix,

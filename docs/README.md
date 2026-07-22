@@ -49,6 +49,12 @@
 | [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | リワーク出荷前の実機 smoke マトリクス (F/W/V/P/R 系)。V9 = detached×音声モードは v2.3.0 レビューで追加 |
 | detached-rework-findings-4〜19.md | 実機検証で見つかった問題の調査・修正記録シリーズ (findings-19 は fix1〜15 まで) |
 | [review-v2.3.0/final-report.md](review-v2.3.0/final-report.md) | **v2.3.0 出荷前 品質レビュー統合レポート** (Codex×Claude 二重レビュー + 検収)。確定 P2 一覧・修正記録・追加バグハント結果・残課題。素材 (brief / codex-* / claude-*) と実機確認チェックリストも同ディレクトリ |
+| [review-v2.7.0/bookmark-feedback.md](review-v2.7.0/bookmark-feedback.md) | v2.7.0 ブックマーク拡張の再レビューフィードバック |
+| [review-v2.7.0/metadata-transfer-feedback.md](review-v2.7.0/metadata-transfer-feedback.md) | v2.7.0 メタ情報インポート・エクスポートの再レビューフィードバック |
+| [review-v2.7.0/mipmap-feedback.md](review-v2.7.0/mipmap-feedback.md) | v2.7.0 ミップマップ対応の再レビューフィードバック |
+| [review-v2.7.0/misc-feedback.md](review-v2.7.0/misc-feedback.md) | v2.7.0 その他不具合・要望の再レビューフィードバック |
+| [review-v2.7.0/systemic-review-plan.md](review-v2.7.0/systemic-review-plan.md) | **v2.7.0 出荷前の横断レビュー計画**。open routing、状態所有権、非同期 request 相関、detached lifecycle、サムネイル/cache/worker 所有権を機能横断で監査する |
+| [review-v2.7.0/systemic-review-report.md](review-v2.7.0/systemic-review-report.md) | v2.7.0 横断レビューの進捗・指摘・再レビュー結果を機能単位で残す台帳 |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/場所/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、長さ/動画解像度/コーデック列まで実装済み (長さ・コーデックは音声も対応)。場所は元ファイル/元コンテナの親フォルダで、製本フォルダは `本棚 > 本名` 表記。場所条件は移動で解除される非永続の一時条件。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
 | [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md) | **一部実装済み**。Windows Shell の `IFileOperation` とネイティブ右クリックメニューへ寄せるファイル整理機能の実装計画。A/B クイックフォルダ、実ファイル/実フォルダの Shell 標準右クリックメニュー、rename、delete-to-recycle は実装済み。copy/move/drop の `IFileOperation` 化、仮想 ZIP/PDF アイテム向けの native custom menu は後続 |
 | [key-customization-plan.md](key-customization-plan.md) | **設計履歴**。キー操作カスタマイズの調査・設計。現状の 3 入力経路 (egui consume / key_pressed / Win32 VK)・hold ジェスチャ・コンテキスト分割を調査し、フル版と簡易版 (テキスト ini / GUI なし / 競合検知なし) を比較。§8 が簡易版の確定設計 (入力パターン分類・複数チョード) |
