@@ -2449,6 +2449,9 @@ impl StartupOpenPathSource {
 pub(crate) struct StartupOpenPathResolveResult {
     requested: PathBuf,
     resolved: Option<crate::folder_tree::OpenablePathResolution>,
+    /// 本ブックマークの relative page だけ、open 時点の containment + existence。
+    /// `None` は通常の起動 path / media / archive / PDF bookmark。
+    bookmark_relative_page_openable: Option<bool>,
     elapsed_ms: f64,
 }
 

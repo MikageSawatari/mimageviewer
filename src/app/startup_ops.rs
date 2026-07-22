@@ -41,6 +41,14 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let worker_requested = requested.clone();
+        let bookmark = matches!(source, StartupOpenPathSource::Bookmark)
+            .then(|| {
+                self.bookmark_book_open_pending
+                    .as_ref()
+                    .map(|pending| pending.bookmark.clone())
+            })
+            .flatten();
+        let worker_bookmark = bookmark.clone();
         let repaint_ctx = ctx.clone();
         let spawn_result = std::thread::Builder::new()
             .name("startup-open-resolve".to_string())
@@ -48,7 +56,8 @@ impl App {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = resolve_startup_open_path(worker_requested, source);
+                let result =
+                    resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref());
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
@@ -71,7 +80,7 @@ impl App {
                 crate::logger::log(format!(
                     "startup open: resolve worker spawn failed: {e}; running synchronously"
                 ));
-                let result = resolve_startup_open_path(requested, source);
+                let result = resolve_startup_open_path(requested, source, bookmark.as_ref());
                 self.finish_startup_open_path_resolve(source, result, ctx);
             }
         }
@@ -137,6 +146,18 @@ impl App {
         result: StartupOpenPathResolveResult,
         ctx: &egui::Context,
     ) {
+        if matches!(source, StartupOpenPathSource::Bookmark)
+            && result.bookmark_relative_page_openable == Some(false)
+        {
+            crate::logger::log(
+                "[bookmark-open] relative page rejected by usage-time containment check",
+            );
+            self.abandon_bookmark_open_after_path_failure("relative_page_missing_or_unsafe");
+            self.show_feedback_toast(
+                "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
+            );
+            return;
+        }
         let requested_display = result.requested.display().to_string();
         if self.apply_startup_open_path_resolve_result(source, result, ctx) {
             return;
@@ -417,8 +438,19 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
 fn resolve_startup_open_path(
     requested: PathBuf,
     source: StartupOpenPathSource,
+    bookmark: Option<&crate::book_bookmarks::BookBookmark>,
 ) -> StartupOpenPathResolveResult {
     let t0 = std::time::Instant::now();
+    let bookmark_relative_page_openable = bookmark.and_then(|bookmark| {
+        let crate::book_bookmarks::PageIdentity::RelativePath(relative) = &bookmark.page_identity
+        else {
+            return None;
+        };
+        Some(matches!(
+            crate::book_bookmarks::resolve_relative_page_path(&bookmark.container_path, relative),
+            crate::book_bookmarks::RelativePagePathResolution::Existing(_)
+        ))
+    });
     let resolved = crate::folder_tree::resolve_openable_path_detailed(&requested);
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if crate::perf::is_enabled() {
@@ -437,6 +469,7 @@ fn resolve_startup_open_path(
     StartupOpenPathResolveResult {
         requested,
         resolved,
+        bookmark_relative_page_openable,
         elapsed_ms,
     }
 }
@@ -444,6 +477,16 @@ fn resolve_startup_open_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
 
     #[test]
     fn startup_file_lookup_matches_normalized_db_paths_for_video_and_audio() {
@@ -460,5 +503,35 @@ mod tests {
             startup_file_idx(&items, Path::new("c:/media/track.flac")),
             Some(1)
         );
+    }
+
+    #[test]
+    fn bookmark_open_resolver_rechecks_relative_page_containment() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("future.jpg"), b"outside").unwrap();
+        if !create_dir_link(&outside, &album.join("link")) {
+            return;
+        }
+        let bookmark = crate::book_bookmarks::BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&album),
+            container_path: album.clone(),
+            container_kind: crate::book_bookmarks::BookContainerKind::ImageFolder,
+            page_identity: crate::book_bookmarks::PageIdentity::RelativePath(
+                "link/future.jpg".to_string(),
+            ),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+
+        let result =
+            resolve_startup_open_path(album, StartupOpenPathSource::Bookmark, Some(&bookmark));
+        assert!(result.resolved.is_some());
+        assert_eq!(result.bookmark_relative_page_openable, Some(false));
     }
 }

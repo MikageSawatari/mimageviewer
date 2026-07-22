@@ -494,8 +494,12 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
         if cancel.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }
-        let missing = book_page_missing(&bookmark, &mut book_missing_cache);
-        let item = book_grid_item(&bookmark, archive_cache.as_ref());
+        let (item, relative_page_missing) = book_grid_item(&bookmark, archive_cache.as_ref());
+        // Filesystem relative page は materialize と存在判定を1回の containment check で
+        // 行う。unsafe/missing path を GridItem::Image にせず、後段の metadata / thumb
+        // I/O に渡さない。
+        let missing = relative_page_missing
+            .unwrap_or_else(|| book_page_missing(&bookmark, &mut book_missing_cache));
         let image_meta = match &item {
             GridItem::Image(path) => source_meta(path),
             _ => source_meta(&bookmark.container_path),
@@ -547,55 +551,76 @@ fn decode_marker_thumbnail(webp: &[u8]) -> Option<egui::ColorImage> {
 fn book_grid_item(
     bookmark: &crate::book_bookmarks::BookBookmark,
     archive_cache: Option<&crate::archive_cache::ArchiveCacheDb>,
-) -> GridItem {
-    use crate::book_bookmarks::{BookContainerKind, PageIdentity};
+) -> (GridItem, Option<bool>) {
+    use crate::book_bookmarks::{BookContainerKind, PageIdentity, RelativePagePathResolution};
     match (&bookmark.container_kind, &bookmark.page_identity) {
         (
             BookContainerKind::CompiledBook | BookContainerKind::ImageFolder,
             PageIdentity::RelativePath(relative),
-        ) => GridItem::Image(
-            bookmark
-                .container_path
-                .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        ) => match crate::book_bookmarks::resolve_relative_page_path(
+            &bookmark.container_path,
+            relative,
+        ) {
+            RelativePagePathResolution::Existing(path) => (GridItem::Image(path), Some(false)),
+            RelativePagePathResolution::Missing(_) | RelativePagePathResolution::Unsafe => {
+                // 行と削除導線は残すが、信頼できない page path は画像として downstream
+                // loader へ渡さない。
+                (
+                    GridItem::Folder(bookmark.container_path.clone()),
+                    Some(true),
+                )
+            }
+        },
+        (BookContainerKind::Pdf, PageIdentity::PdfPage(page_num)) => (
+            GridItem::PdfPage {
+                pdf_path: bookmark.container_path.clone(),
+                page_num: *page_num,
+                content_type: None,
+            },
+            None,
         ),
-        (BookContainerKind::Pdf, PageIdentity::PdfPage(page_num)) => GridItem::PdfPage {
-            pdf_path: bookmark.container_path.clone(),
-            page_num: *page_num,
-            content_type: None,
-        },
-        (BookContainerKind::Zip, PageIdentity::ArchiveEntry(entry_name)) => GridItem::ZipImage {
-            zip_path: bookmark.container_path.clone(),
-            entry_name: entry_name.clone(),
-        },
+        (BookContainerKind::Zip, PageIdentity::ArchiveEntry(entry_name)) => (
+            GridItem::ZipImage {
+                zip_path: bookmark.container_path.clone(),
+                entry_name: entry_name.clone(),
+            },
+            None,
+        ),
         (BookContainerKind::OtherArchive, PageIdentity::ArchiveEntry(entry_name)) => {
             let backing_path = source_meta(&bookmark.container_path)
                 .and_then(|(mtime, size)| {
                     archive_cache.and_then(|db| db.peek(&bookmark.container_path, mtime, size))
                 })
                 .unwrap_or_else(|| bookmark.container_path.clone());
-            GridItem::ZipImage {
-                zip_path: backing_path,
-                entry_name: entry_name.clone(),
-            }
+            (
+                GridItem::ZipImage {
+                    zip_path: backing_path,
+                    entry_name: entry_name.clone(),
+                },
+                None,
+            )
         }
         // DB 行が将来の kind / identity 組み合わせを持っていても、元コンテナを表示して
         // ブックマーク自体は削除できるよう非破壊側へ倒す。
-        _ => match bookmark.container_kind {
-            BookContainerKind::CompiledBook | BookContainerKind::ImageFolder => {
-                GridItem::Folder(bookmark.container_path.clone())
-            }
-            BookContainerKind::Zip => GridItem::ZipFile(bookmark.container_path.clone()),
-            BookContainerKind::Pdf => GridItem::PdfFile(bookmark.container_path.clone()),
-            BookContainerKind::OtherArchive => GridItem::ConvertibleArchive {
-                path: bookmark.container_path.clone(),
-                format: bookmark
-                    .container_path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .and_then(crate::archive_converter::ArchiveFormat::from_extension)
-                    .unwrap_or(crate::archive_converter::ArchiveFormat::Zip),
+        _ => (
+            match bookmark.container_kind {
+                BookContainerKind::CompiledBook | BookContainerKind::ImageFolder => {
+                    GridItem::Folder(bookmark.container_path.clone())
+                }
+                BookContainerKind::Zip => GridItem::ZipFile(bookmark.container_path.clone()),
+                BookContainerKind::Pdf => GridItem::PdfFile(bookmark.container_path.clone()),
+                BookContainerKind::OtherArchive => GridItem::ConvertibleArchive {
+                    path: bookmark.container_path.clone(),
+                    format: bookmark
+                        .container_path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+                        .unwrap_or(crate::archive_converter::ArchiveFormat::Zip),
+                },
             },
-        },
+            None,
+        ),
     }
 }
 
@@ -651,11 +676,10 @@ fn book_page_missing(
         (
             BookContainerMissingIndex::Filesystem,
             crate::book_bookmarks::PageIdentity::RelativePath(relative),
-        ) => !bookmark
-            .container_path
-            .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
-            .try_exists()
-            .unwrap_or(false),
+        ) => !matches!(
+            crate::book_bookmarks::resolve_relative_page_path(&bookmark.container_path, relative),
+            crate::book_bookmarks::RelativePagePathResolution::Existing(_)
+        ),
         (
             BookContainerMissingIndex::ZipEntries(entries),
             crate::book_bookmarks::PageIdentity::ArchiveEntry(wanted),
@@ -770,6 +794,16 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[cfg(windows)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
     fn media_row(id: i64, created_at_ms: i64, name: &str) -> BookmarkBrowserRow {
         let path = PathBuf::from(format!(r"C:\media\{name}.mp4"));
         BookmarkBrowserRow {
@@ -883,6 +917,67 @@ mod tests {
             &mut cache
         ));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn relative_page_materialization_rechecks_containment_after_path_swap() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("future.jpg"), b"outside").unwrap();
+        let bookmark = BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&album),
+            container_path: album.clone(),
+            container_kind: BookContainerKind::ImageFolder,
+            page_identity: PageIdentity::RelativePath("link/future.jpg".to_string()),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+
+        // import 時点相当: 通常の欠落 path は保持するが画像 item にはしない。
+        let (item, missing) = book_grid_item(&bookmark, None);
+        assert!(matches!(item, GridItem::Folder(ref path) if path == &album));
+        assert_eq!(missing, Some(true));
+
+        // 利用前に欠落 ancestor が外部 link へ置き換わっても、一覧 materialize は
+        // external path を GridItem::Image として downstream I/O へ渡さない。
+        if !create_dir_link(&outside, &album.join("link")) {
+            return;
+        }
+        let (item, missing) = book_grid_item(&bookmark, None);
+        assert!(matches!(item, GridItem::Folder(ref path) if path == &album));
+        assert_eq!(missing, Some(true));
+    }
+
+    #[test]
+    fn existing_safe_relative_page_materializes_as_image() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let page = album.join("chapter/page.jpg");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::write(&page, b"page").unwrap();
+        let bookmark = BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&album),
+            container_path: album,
+            container_kind: BookContainerKind::ImageFolder,
+            page_identity: PageIdentity::RelativePath("chapter/page.jpg".to_string()),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+
+        let (item, missing) = book_grid_item(&bookmark, None);
+        assert!(matches!(item, GridItem::Image(ref path) if path == &page));
+        assert_eq!(missing, Some(false));
     }
 
     #[test]

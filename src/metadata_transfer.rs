@@ -1186,32 +1186,14 @@ fn validate_bookmark_page_targets(
     container_path: &Path,
     entry: &PortableEntry,
 ) -> Result<(), TransferError> {
-    let Some(canonical_container) = fs::canonicalize(container_path).ok() else {
-        // 欠落コンテナは通常の import preview / skip 経路で扱う。
-        return Ok(());
-    };
-    let container_key = crate::path_key::normalize_keep_drive(&canonical_container);
-    let descendant_prefix = if container_key.ends_with('/') {
-        container_key.clone()
-    } else {
-        format!("{container_key}/")
-    };
-
     for bookmark in &entry.book_bookmarks {
         if bookmark.page_kind != "relative_path" {
             continue;
         }
-        // validate_manifest 済みなので absolute / traversal component は含まれない。
-        let relative = bookmark
-            .page_value
-            .replace('\\', std::path::MAIN_SEPARATOR_STR);
-        let page_path = container_path.join(relative);
-        let Ok(canonical_page) = fs::canonicalize(&page_path) else {
-            // 欠落ページはブックマーク一覧の missing 表示に委ねる。
-            continue;
-        };
-        let page_key = crate::path_key::normalize_keep_drive(&canonical_page);
-        if page_key == container_key || !page_key.starts_with(&descendant_prefix) {
+        if matches!(
+            crate::book_bookmarks::resolve_relative_page_path(container_path, &bookmark.page_value),
+            crate::book_bookmarks::RelativePagePathResolution::Unsafe
+        ) {
             return Err(TransferError::Invalid(format!(
                 "本ブックマークがコンテナ外を指しています: {} / {}",
                 entry.path, bookmark.page_value
@@ -2452,6 +2434,75 @@ mod tests {
         assert!(matches!(
             inspect_import_at(&root, &cancel, no_progress),
             Err(TransferError::Invalid(message)) if message.contains("コンテナ外")
+        ));
+    }
+
+    #[test]
+    fn import_rejects_missing_bookmark_page_below_external_reparse_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let album = root.join("album");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&album).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let link = album.join("link");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&outside, &link).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let mut manifest = manifest_with_bookmark(
+            PortableEntryKind::Directory,
+            "image_folder",
+            "relative_path",
+            "link/future.jpg",
+        );
+        manifest.entries[0].path = "album".to_string();
+        fs::write(
+            root.join(SIDECAR_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            inspect_import_at(&root, &cancel, no_progress),
+            Err(TransferError::Invalid(message)) if message.contains("コンテナ外")
+        ));
+    }
+
+    #[test]
+    fn import_allows_safe_missing_bookmark_page() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let album = root.join("album");
+        let data = temp.path().join("data");
+        fs::create_dir_all(album.join("chapter")).unwrap();
+        init_data_dir(&data);
+
+        let mut manifest = manifest_with_bookmark(
+            PortableEntryKind::Directory,
+            "image_folder",
+            "relative_path",
+            "chapter/future.jpg",
+        );
+        manifest.entries[0].path = "album".to_string();
+        fs::write(
+            root.join(SIDECAR_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let preview = inspect_import_at(&root, &cancel, no_progress).unwrap();
+        assert_eq!(preview.existing_entries, 1);
+        let summary = import_at(&data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(summary.applied_entries, 1);
+        assert!(matches!(
+            crate::book_bookmarks::resolve_relative_page_path(&album, "chapter/future.jpg"),
+            crate::book_bookmarks::RelativePagePathResolution::Missing(_)
         ));
     }
 }

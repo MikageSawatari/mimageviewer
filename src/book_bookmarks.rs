@@ -868,6 +868,108 @@ pub fn container_key(path: &Path) -> String {
     crate::path_key::normalize_keep_drive(path)
 }
 
+/// 画像フォルダ系ブックマークの相対ページを、実体の container 境界まで確認した結果。
+///
+/// 欠落ページはブックマークとして保持できるため `Missing` と `Unsafe` を区別する。
+/// `Existing` / `Missing` の path は lexical validation 済みで、container との join に
+/// 使用できる。symlink / junction は一律拒否せず、canonical target が container 内に
+/// 留まるものだけ許可する。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RelativePagePathResolution {
+    Existing(PathBuf),
+    Missing(PathBuf),
+    Unsafe,
+}
+
+/// 信頼できない相対ページ path を、leaf が欠落していても安全に解決する。
+///
+/// 完成 path の `canonicalize` だけでは、欠落 leaf の手前にある reparse point を
+/// 見落とす。そこで最も近い既存 ancestor まで遡って canonicalize し、その実体が
+/// canonical container 配下にあることを確認する。利用時にも同じ関数を呼び直すことで、
+/// import 後に path 構造が置き換わったケースを通常の missing/invalid として扱える。
+pub(crate) fn resolve_relative_page_path(
+    container: &Path,
+    relative: &str,
+) -> RelativePagePathResolution {
+    let Some(candidate) = relative_page_candidate(container, relative) else {
+        return RelativePagePathResolution::Unsafe;
+    };
+    let canonical_container = match std::fs::canonicalize(container) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RelativePagePathResolution::Missing(candidate);
+        }
+        Err(_) => return RelativePagePathResolution::Unsafe,
+    };
+
+    let mut probe = candidate.as_path();
+    let mut leaf_missing = false;
+    loop {
+        match std::fs::canonicalize(probe) {
+            Ok(canonical_probe) => {
+                if !canonical_path_is_within(&canonical_probe, &canonical_container) {
+                    return RelativePagePathResolution::Unsafe;
+                }
+                if !leaf_missing
+                    && crate::path_key::eq_keep_drive(&canonical_probe, &canonical_container)
+                {
+                    // ページ自体が container directory へ解決される値は画像ではない。
+                    return RelativePagePathResolution::Unsafe;
+                }
+                return if leaf_missing {
+                    RelativePagePathResolution::Missing(candidate)
+                } else {
+                    RelativePagePathResolution::Existing(candidate)
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                leaf_missing = true;
+                let Some(parent) = probe.parent() else {
+                    return RelativePagePathResolution::Unsafe;
+                };
+                probe = parent;
+            }
+            Err(_) => return RelativePagePathResolution::Unsafe,
+        }
+    }
+}
+
+fn relative_page_candidate(container: &Path, relative: &str) -> Option<PathBuf> {
+    if relative.is_empty() || relative.chars().count() > 32_768 || relative.contains('\0') {
+        return None;
+    }
+    let normalized = relative.replace('\\', "/");
+    let has_drive_prefix = normalized.as_bytes().get(1) == Some(&b':')
+        && normalized
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+    if normalized.starts_with('/')
+        || has_drive_prefix
+        || normalized
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return None;
+    }
+    let relative_path = normalized.split('/').collect::<PathBuf>();
+    Some(container.join(relative_path))
+}
+
+fn canonical_path_is_within(path: &Path, container: &Path) -> bool {
+    let path_key = crate::path_key::normalize_keep_drive(path);
+    let container_key = crate::path_key::normalize_keep_drive(container);
+    if path_key == container_key {
+        return true;
+    }
+    let prefix = if container_key.ends_with('/') {
+        container_key
+    } else {
+        format!("{container_key}/")
+    };
+    path_key.starts_with(&prefix)
+}
+
 fn normalize_page_path(value: &str) -> String {
     value.replace('\\', "/").to_lowercase()
 }
@@ -887,6 +989,109 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("memory DB");
         BookBookmarkDb::init_schema(&conn).expect("schema");
         BookBookmarkDb { conn }
+    }
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[test]
+    fn relative_page_candidate_rejects_escape_syntax() {
+        let container = Path::new("C:/Books/album");
+        for unsafe_path in [
+            "",
+            "/absolute.jpg",
+            r"C:\absolute.jpg",
+            r"\\server\share\outside.jpg",
+            "../outside.jpg",
+            "chapter/../../outside.jpg",
+            "chapter//page.jpg",
+            "chapter/./page.jpg",
+        ] {
+            assert!(
+                relative_page_candidate(container, unsafe_path).is_none(),
+                "accepted {unsafe_path:?}"
+            );
+        }
+        let candidate = relative_page_candidate(container, r"chapter\page.jpg").unwrap();
+        assert_eq!(
+            crate::path_key::normalize_keep_drive(&candidate),
+            "c:/books/album/chapter/page.jpg"
+        );
+    }
+
+    #[test]
+    fn canonical_containment_uses_component_boundary() {
+        let container = Path::new("C:/Books/album");
+        assert!(canonical_path_is_within(container, container));
+        assert!(canonical_path_is_within(
+            Path::new("C:/Books/album/chapter/page.jpg"),
+            container
+        ));
+        assert!(!canonical_path_is_within(
+            Path::new("C:/Books/album-other/page.jpg"),
+            container
+        ));
+    }
+
+    #[test]
+    fn relative_page_resolution_allows_safe_missing_and_existing_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(album.join("chapter")).unwrap();
+
+        assert!(matches!(
+            resolve_relative_page_path(&album, "chapter/future.jpg"),
+            RelativePagePathResolution::Missing(path)
+                if path == album.join("chapter").join("future.jpg")
+        ));
+
+        std::fs::write(album.join("chapter/page.jpg"), b"page").unwrap();
+        assert!(matches!(
+            resolve_relative_page_path(&album, "chapter/page.jpg"),
+            RelativePagePathResolution::Existing(path)
+                if path == album.join("chapter").join("page.jpg")
+        ));
+    }
+
+    #[test]
+    fn relative_page_resolution_rejects_missing_leaf_below_external_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        if !create_dir_link(&outside, &album.join("link")) {
+            // Windows Developer Mode / symlink privilege がない環境では作成不能。
+            return;
+        }
+
+        assert_eq!(
+            resolve_relative_page_path(&album, "link/future.jpg"),
+            RelativePagePathResolution::Unsafe
+        );
+    }
+
+    #[test]
+    fn relative_page_resolution_allows_internal_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let inside = album.join("inside");
+        std::fs::create_dir_all(&inside).unwrap();
+        if !create_dir_link(&inside, &album.join("link")) {
+            return;
+        }
+
+        assert!(matches!(
+            resolve_relative_page_path(&album, "link/future.jpg"),
+            RelativePagePathResolution::Missing(_)
+        ));
     }
 
     #[test]
