@@ -40,6 +40,12 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   同じ終了経路を通り、1 回の操作で再生を終了する。対象から移動していた場合だけ、detached context の
   最終フォルダと選択ファイルをメインへ反映する。終了時の DB 再照合で一覧内容が同一なら、
   メイン一覧を再構築せず現在の表示を維持する。
+  「画像を別ウィンドウで開く」複数ウィンドウモードでは、本のブックマークも通常の本を開く経路と
+  同じ independent detached viewer context を使う。PDF / ZIP / 画像フォルダ / 製本 / 変換済み
+  対応アーカイブのページ列挙と対象ページ解決は detached context が所有し、メインウィンドウは
+  ブックマーク一覧・選択・スクロール・タグ表示を変更しない。本の中でページ移動しても main 一覧は
+  独立しているため維持し、続けて別の本を開く操作は既存 viewer を main へ載せ替えず通常の
+  always-new handoff で別ウィンドウを作る。
   rating の idx cache は各 context が所有する一方、path ごとの最終書込値と世代は App-global に置く。
   通常画像、path 指定、現在のフォルダ / ZIP / PDF の全ユーザー書込を同じ DB + 世代記録 boundary に
   通す。SQLite 書込が成功した場合だけ App-global 世代と各 context の表示 cache を更新し、失敗時は
@@ -53,6 +59,10 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   音声窓でも実プレイヤーを所有する context が初期化完了後の最終 seek を発行する。開く処理は待機段階、
   対象 path、player state、seek serial を `[bookmark-open]` として常時ログへ記録する。メディア DB の
   正規化 path key とフォルダ列挙・プレイヤーの実 path は、ドライブを保持した同一の正規化規則で照合する。
+  開く要求は media / book の独立した `Option` を併存させず、単一の型付き pending とする。戻り先も
+  origin grid を所有する `Opening`、DB 再構築後に位置を戻す `Restoring`、別 viewer context 側の
+  `Detached` を明示し、snapshot の有無を ownership 判定に流用しない。マウス、Enter、ゲームパッドは
+  すべて同じブックマーク open router を通す。
 - スマートフィルタの `状態` に `ブックマークあり / ブックマークなし` を追加する。動画・音声は
   対象ファイル、本はコンテナまたは表示中ページの安定 identity で判定し、スマートフォルダの
   保存条件にも含める。

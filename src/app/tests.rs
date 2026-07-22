@@ -5924,10 +5924,17 @@ mod phase_c_drill_nav_tests {
         // ブックマーク一覧から開いた変換アーカイブも、cache ZIP ではなく元アーカイブを
         // 戻り先 identity に使う。
         app.reading_history_return_from = None;
-        app.bookmark_view_return_target =
-            Some(crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+        app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(
                 std::path::PathBuf::from("c:/books/a.rar"),
-            ));
+            ),
+            grid: super::BookmarkViewReturnGridState {
+                row_keys: Vec::new(),
+                selected_key: None,
+                opened_key: (1, 1),
+                scroll_offset_y: 0.0,
+            },
+        });
         assert!(matches!(
             app.bookmark_view_back_nav(),
             Some(crate::ui_main::AddressBarNav::Bookmarks)
@@ -6330,23 +6337,26 @@ fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
                 load_seq: 0,
             },
         );
-        app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
-            path: bookmark_db_path,
-            pts_secs: 42.0,
-            started_at: std::time::Instant::now(),
-            last_wait: None,
-        });
+        app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+            crate::bookmark_browser::PendingMediaOpen {
+                path: bookmark_db_path,
+                pts_secs: 42.0,
+                started_at: std::time::Instant::now(),
+                last_wait: None,
+            },
+        ));
 
         app.poll_bookmark_media_open(&egui::Context::default());
 
         assert!(
-            app.bookmark_media_open_pending.is_some(),
+            app.bookmark_open_pending.is_some(),
             "{} bookmark seek must remain pending until player info arrives",
             if is_audio { "audio" } else { "video" }
         );
         assert_eq!(
-            app.bookmark_media_open_pending
+            app.bookmark_open_pending
                 .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
                 .and_then(|pending| pending.last_wait),
             Some(crate::bookmark_browser::PendingMediaOpenWait::PlayerInfo),
             "{} DB key spelling must match the loaded item and player path",
@@ -6532,12 +6542,14 @@ fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
     app.bookmark_browser_rows = vec![row.clone()];
     app.tags_cache
         .insert(item_key.clone(), vec!["#一覧タグ".to_string()]);
-    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState::capture(
-        &app.bookmark_browser_rows,
-        app.selected,
-        row.stable_key(),
-        180.0,
-    ));
+    app.bookmark_view_state = Some(super::BookmarkViewState::Restoring {
+        grid: super::BookmarkViewReturnGridState::capture(
+            &app.bookmark_browser_rows,
+            app.selected,
+            row.stable_key(),
+            180.0,
+        ),
+    });
     let generation_before = app.items_generation;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -6553,7 +6565,7 @@ fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
         app.tags_cache.get(&item_key),
         Some(&vec!["#一覧タグ".to_string()])
     );
-    assert!(app.bookmark_view_return_grid.is_none());
+    assert!(app.bookmark_view_state.is_none());
 }
 
 #[test]
@@ -6561,9 +6573,15 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
     let mut app = phase_c_support::setup_app();
     let container = PathBuf::from(r"C:\Books\volume.zip");
     app.current_folder = Some(container.clone());
-    app.bookmark_view_return_target = Some(
-        crate::bookmark_browser::BookmarkViewReturnTarget::Book(container),
-    );
+    app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container),
+        grid: super::BookmarkViewReturnGridState {
+            row_keys: vec![(1, 7)],
+            selected_key: Some((1, 7)),
+            opened_key: (1, 7),
+            scroll_offset_y: 0.0,
+        },
+    });
 
     assert!(matches!(
         app.bookmark_view_back_nav(),
@@ -6577,7 +6595,10 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
     ));
 
     app.enter_bookmark_view();
-    assert!(app.bookmark_view_return_target.is_none());
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(super::BookmarkViewState::Restoring { .. })
+    ));
 }
 
 #[test]
@@ -6610,14 +6631,20 @@ fn bookmark_media_close_returns_only_while_original_file_is_open() {
         same.current_folder = Some(PathBuf::from(r"C:\Media"));
         same.items = vec![make_item(target_actual.clone())];
         same.fullscreen_idx = Some(0);
-        same.bookmark_view_return_target = Some(
-            crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_db.clone()),
-        );
+        same.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_db.clone()),
+            grid: super::BookmarkViewReturnGridState {
+                row_keys: vec![(0, 7)],
+                selected_key: Some((0, 7)),
+                opened_key: (0, 7),
+                scroll_offset_y: 0.0,
+            },
+        });
         assert!(matches!(
             same.bookmark_view_close_nav(),
             Some(crate::ui_main::AddressBarNav::Bookmarks)
         ));
-        assert!(same.bookmark_view_return_target.is_some());
+        assert!(same.bookmark_view_state.is_some());
         same.fullscreen_idx = None;
         drop(same);
 
@@ -6625,11 +6652,17 @@ fn bookmark_media_close_returns_only_while_original_file_is_open() {
         moved.current_folder = Some(PathBuf::from(r"C:\Media"));
         moved.items = vec![make_item(target_actual), make_item(other)];
         moved.fullscreen_idx = Some(1);
-        moved.bookmark_view_return_target = Some(
-            crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_db),
-        );
+        moved.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_db),
+            grid: super::BookmarkViewReturnGridState {
+                row_keys: vec![(0, 7)],
+                selected_key: Some((0, 7)),
+                opened_key: (0, 7),
+                scroll_offset_y: 0.0,
+            },
+        });
         assert!(moved.bookmark_view_close_nav().is_none());
-        assert!(moved.bookmark_view_return_target.is_none());
+        assert!(moved.bookmark_view_state.is_none());
         moved.fullscreen_idx = None;
         drop(moved);
     }
@@ -6642,46 +6675,49 @@ fn native_immediate_close_consumes_bookmark_return_in_same_dispatch() {
     app.current_folder = Some(PathBuf::from(r"C:\Media"));
     app.items = vec![GridItem::Video(actual_path)];
     app.fullscreen_idx = Some(0);
-    app.bookmark_view_return_target =
-        Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(
-            PathBuf::from("c:/media/target.mp4"),
-        ));
-    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState {
-        row_keys: vec![(0, 7)],
-        selected_key: Some((0, 7)),
-        opened_key: (0, 7),
-        scroll_offset_y: 240.0,
+    app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(PathBuf::from(
+            "c:/media/target.mp4",
+        )),
+        grid: super::BookmarkViewReturnGridState {
+            row_keys: vec![(0, 7)],
+            selected_key: Some((0, 7)),
+            opened_key: (0, 7),
+            scroll_offset_y: 240.0,
+        },
     });
 
     app.handle_fullscreen_close_request_immediate();
 
     assert!(!app.pending_return_to_parent);
     assert!(app.items_are_bookmark_view);
-    assert!(app.bookmark_view_return_target.is_none());
-    assert!(app.bookmark_view_return_grid.is_some());
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(super::BookmarkViewState::Restoring { .. })
+    ));
     assert_eq!(app.fullscreen_idx, None);
 }
 
 #[test]
 fn bookmark_return_target_is_cleared_only_after_container_navigation() {
     let mut app = phase_c_support::setup_app();
-    app.bookmark_view_return_target =
-        Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(
-            PathBuf::from("c:/media/target.mp4"),
-        ));
-    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState {
-        row_keys: vec![(0, 7)],
-        selected_key: Some((0, 7)),
-        opened_key: (0, 7),
-        scroll_offset_y: 240.0,
+    app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(PathBuf::from(
+            "c:/media/target.mp4",
+        )),
+        grid: super::BookmarkViewReturnGridState {
+            row_keys: vec![(0, 7)],
+            selected_key: Some((0, 7)),
+            opened_key: (0, 7),
+            scroll_offset_y: 240.0,
+        },
     });
 
     app.reconcile_bookmark_return_target_for_folder_load(Path::new(r"C:\Media"));
-    assert!(app.bookmark_view_return_target.is_some());
+    assert!(app.bookmark_view_state.is_some());
 
     app.reconcile_bookmark_return_target_for_folder_load(Path::new(r"C:\Other"));
-    assert!(app.bookmark_view_return_target.is_none());
-    assert!(app.bookmark_view_return_grid.is_none());
+    assert!(app.bookmark_view_state.is_none());
 }
 
 #[cfg(windows)]
@@ -6690,66 +6726,371 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     let mut app = phase_c_support::setup_app();
     let path = PathBuf::from(r"C:\Media\marker.mp4");
     let return_target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone());
-    app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
-        path: path.clone(),
-        pts_secs: 42.0,
-        started_at: std::time::Instant::now(),
-        last_wait: None,
-    });
-    app.bookmark_book_open_pending = Some(crate::bookmark_browser::PendingBookOpen {
-        bookmark: crate::book_bookmarks::BookBookmark {
-            id: 7,
-            container_key: "c:/books/volume.zip".to_string(),
-            container_path: PathBuf::from(r"C:\Books\volume.zip"),
-            container_kind: crate::book_bookmarks::BookContainerKind::Zip,
-            page_identity: crate::book_bookmarks::PageIdentity::ArchiveEntry(
-                "page-001.jpg".to_string(),
-            ),
-            page_index_hint: 0,
-            created_at_ms: 1,
-            title: None,
+    app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+        crate::bookmark_browser::PendingMediaOpen {
+            path: path.clone(),
+            pts_secs: 42.0,
+            started_at: std::time::Instant::now(),
+            last_wait: None,
         },
-        relative_page_provenance: None,
-        started_at: std::time::Instant::now(),
-        entered_archive_prefix: false,
-    });
-    app.bookmark_view_return_target = Some(return_target.clone());
+    ));
     let return_grid = super::BookmarkViewReturnGridState {
         row_keys: vec![(0, 5), (0, 7)],
         selected_key: Some((0, 7)),
         opened_key: (0, 7),
         scroll_offset_y: 360.0,
     };
-    app.bookmark_view_return_grid = Some(return_grid.clone());
+    app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+        target: return_target.clone(),
+        grid: return_grid.clone(),
+    });
     let mut other = super::ViewerContextBundle::empty();
 
     app.swap_viewer_context_bundle(&mut other);
-    assert!(app.bookmark_media_open_pending.is_none());
-    assert!(app.bookmark_book_open_pending.is_none());
-    assert!(app.bookmark_view_return_target.is_none());
-    assert!(app.bookmark_view_return_grid.is_none());
+    assert!(app.bookmark_open_pending.is_none());
+    assert!(app.bookmark_view_state.is_none());
     assert_eq!(
         other
-            .bookmark_media_open_pending
+            .bookmark_open_pending
             .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
             .map(|pending| pending.path.as_path()),
         Some(path.as_path())
     );
-    assert_eq!(other.bookmark_view_return_target, Some(return_target));
-    assert_eq!(other.bookmark_view_return_grid, Some(return_grid));
     assert_eq!(
-        other
-            .bookmark_book_open_pending
-            .as_ref()
-            .map(|pending| pending.bookmark.id),
-        Some(7)
+        other.bookmark_view_state,
+        Some(super::BookmarkViewState::Opening {
+            target: return_target,
+            grid: return_grid,
+        })
     );
 
     app.swap_viewer_context_bundle(&mut other);
-    assert!(app.bookmark_media_open_pending.is_some());
-    assert!(app.bookmark_book_open_pending.is_some());
-    assert!(app.bookmark_view_return_target.is_some());
-    assert!(app.bookmark_view_return_grid.is_some());
+    assert!(app.bookmark_open_pending.is_some());
+    assert!(app.bookmark_view_state.is_some());
+}
+
+#[test]
+fn gamepad_accept_uses_bookmark_open_router() {
+    let mut app = phase_c_support::setup_app();
+    let row = bookmark_grid_test_row(41);
+    app.items = vec![row.item.clone()];
+    app.image_metas = vec![row.image_meta];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    app.items_are_bookmark_view = true;
+    app.bookmark_browser_rows = vec![row];
+
+    assert!(
+        app.handle_gamepad_grid_accept(&egui::Context::default())
+            .is_none()
+    );
+
+    assert!(matches!(
+        app.bookmark_open_pending,
+        Some(crate::bookmark_browser::PendingBookmarkOpen::Media(_))
+    ));
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(super::BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(_),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn consecutive_bookmark_opens_replace_the_single_typed_request() {
+    let mut app = phase_c_support::setup_app();
+    let media = bookmark_grid_test_row(51);
+    let pdf = PathBuf::from(r"C:\Books\volume.pdf");
+    let bookmark = crate::book_bookmarks::BookBookmark {
+        id: 52,
+        container_key: crate::adjustment_db::normalize_path(&pdf),
+        container_path: pdf.clone(),
+        container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+        page_identity: crate::book_bookmarks::PageIdentity::PdfPage(3),
+        page_index_hint: 3,
+        created_at_ms: 2,
+        title: None,
+    };
+    let book = crate::bookmark_browser::BookmarkBrowserRow {
+        source: crate::bookmark_browser::BookmarkRowSource::Book(bookmark),
+        item: GridItem::PdfPage {
+            pdf_path: pdf.clone(),
+            page_num: 3,
+            content_type: None,
+        },
+        relative_page_provenance: None,
+        image_meta: None,
+        marker_thumbnail: None,
+        created_at_ms: 2,
+        missing: false,
+    };
+    app.bookmark_browser_rows = vec![media.clone(), book.clone()];
+    app.items_are_bookmark_view = true;
+
+    app.open_bookmark_browser_row(&egui::Context::default(), &media);
+    assert!(matches!(
+        app.bookmark_open_pending,
+        Some(crate::bookmark_browser::PendingBookmarkOpen::Media(_))
+    ));
+    app.open_bookmark_browser_row(&egui::Context::default(), &book);
+
+    assert!(matches!(
+        app.bookmark_open_pending,
+        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+    ));
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(super::BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(ref path),
+            ..
+        }) if crate::path_key::eq_keep_drive(path, &pdf)
+    ));
+}
+
+#[cfg(windows)]
+fn arm_detached_bookmark_book_open(
+    app: &mut phase_c_support::AppTestEnv,
+    container: PathBuf,
+    kind: crate::book_bookmarks::BookContainerKind,
+    page: crate::book_bookmarks::PageIdentity,
+) {
+    app.settings.detached_viewer_open_images_in_window = true;
+    app.current_folder = Some(super::bookmark_view_synthetic_path());
+    app.items_are_bookmark_view = true;
+    app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container.clone()),
+        grid: super::BookmarkViewReturnGridState {
+            row_keys: vec![(1, 9)],
+            selected_key: Some((1, 9)),
+            opened_key: (1, 9),
+            scroll_offset_y: 320.0,
+        },
+    });
+    app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+        crate::bookmark_browser::PendingBookOpen {
+            bookmark: crate::book_bookmarks::BookBookmark {
+                id: 9,
+                container_key: crate::adjustment_db::normalize_path(&container),
+                container_path: container,
+                container_kind: kind,
+                page_identity: page,
+                page_index_hint: 0,
+                created_at_ms: 1,
+                title: None,
+            },
+            relative_page_provenance: None,
+            stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+        },
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
+    let mut app = phase_c_support::setup_app();
+    let pdf = app.tmp.path().join("bookmark.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\n%%EOF\n").expect("create placeholder PDF");
+    arm_detached_bookmark_book_open(
+        &mut app,
+        pdf.clone(),
+        crate::book_bookmarks::BookContainerKind::Pdf,
+        crate::book_bookmarks::PageIdentity::PdfPage(0),
+    );
+
+    assert_eq!(
+        app.open_bookmark_book_in_detached_context(
+            &egui::Context::default(),
+            pdf.clone(),
+            crate::folder_tree::OpenablePathKind::File,
+        ),
+        Some(true)
+    );
+
+    assert!(app.items_are_bookmark_view);
+    assert_eq!(
+        app.current_folder.as_deref(),
+        Some(super::bookmark_view_synthetic_path().as_path())
+    );
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(super::BookmarkViewState::Opening { .. })
+    ));
+    assert!(app.bookmark_open_pending.is_none());
+    let active = app
+        .active_detached_viewer_context
+        .as_ref()
+        .expect("PDF bookmark must own a detached reader context");
+    assert!(
+        active
+            .bundle
+            .pdf_enumerate_pending
+            .as_ref()
+            .is_some_and(|(path, _, _)| crate::path_key::eq_keep_drive(path, &pdf))
+    );
+    assert!(matches!(
+        active.bundle.bookmark_view_state,
+        Some(super::BookmarkViewState::Detached {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
+        })
+    ));
+    assert!(matches!(
+        active.bundle.bookmark_open_pending,
+        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+            crate::bookmark_browser::PendingBookOpen {
+                stage: crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { .. },
+                ..
+            }
+        ))
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
+    let mut app = phase_c_support::setup_app();
+    let zip = app.tmp.path().join("bookmark.zip");
+    std::fs::write(&zip, []).expect("create placeholder ZIP");
+    arm_detached_bookmark_book_open(
+        &mut app,
+        zip.clone(),
+        crate::book_bookmarks::BookContainerKind::Zip,
+        crate::book_bookmarks::PageIdentity::ArchiveEntry("page-001.jpg".to_string()),
+    );
+
+    assert_eq!(
+        app.open_bookmark_book_in_detached_context(
+            &egui::Context::default(),
+            zip.clone(),
+            crate::folder_tree::OpenablePathKind::File,
+        ),
+        Some(true)
+    );
+    assert!(app.items_are_bookmark_view);
+    let active = app
+        .active_detached_viewer_context
+        .as_ref()
+        .expect("ZIP bookmark must own a detached reader context");
+    assert!(
+        active
+            .bundle
+            .zip_enumerate_pending
+            .as_ref()
+            .is_some_and(|pending| crate::path_key::eq_keep_drive(&pending.zip_path, &zip))
+    );
+    assert!(matches!(
+        active.bundle.bookmark_open_pending,
+        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn converted_bookmark_archive_enters_the_same_detached_book_context() {
+    let mut app = phase_c_support::setup_app();
+    let source = app.tmp.path().join("bookmark.rar");
+    let backing = app.tmp.path().join("bookmark-cache.zip");
+    std::fs::write(&source, []).expect("create source archive");
+    std::fs::write(&backing, []).expect("create cache archive");
+    arm_detached_bookmark_book_open(
+        &mut app,
+        source.clone(),
+        crate::book_bookmarks::BookContainerKind::OtherArchive,
+        crate::book_bookmarks::PageIdentity::ArchiveEntry("page-001.jpg".to_string()),
+    );
+
+    assert_eq!(
+        app.open_converted_bookmark_in_detached_context(
+            &egui::Context::default(),
+            backing.clone(),
+        ),
+        Some(true)
+    );
+    assert!(app.items_are_bookmark_view);
+    let active = app
+        .active_detached_viewer_context
+        .as_ref()
+        .expect("converted archive bookmark must own a detached reader context");
+    assert_eq!(
+        active.bundle.archive_source_override.as_deref(),
+        Some(source.as_path())
+    );
+    assert!(
+        active
+            .bundle
+            .zip_enumerate_pending
+            .as_ref()
+            .is_some_and(|pending| crate::path_key::eq_keep_drive(&pending.zip_path, &backing))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("image-book");
+    std::fs::create_dir_all(&folder).expect("create image book");
+    std::fs::write(folder.join("page-001.jpg"), []).expect("create page");
+    arm_detached_bookmark_book_open(
+        &mut app,
+        folder.clone(),
+        crate::book_bookmarks::BookContainerKind::ImageFolder,
+        crate::book_bookmarks::PageIdentity::RelativePath("page-001.jpg".to_string()),
+    );
+
+    assert_eq!(
+        app.open_bookmark_book_in_detached_context(
+            &egui::Context::default(),
+            folder.clone(),
+            crate::folder_tree::OpenablePathKind::Directory,
+        ),
+        Some(true)
+    );
+    assert!(app.items_are_bookmark_view);
+    let active = app
+        .active_detached_viewer_context
+        .as_ref()
+        .expect("image-folder bookmark must own a detached reader context");
+    assert_eq!(
+        active.bundle.current_folder.as_deref(),
+        Some(folder.as_path())
+    );
+    assert!(
+        active
+            .bundle
+            .items
+            .iter()
+            .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("page-001.jpg")))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_bookmark_book_close_restores_main_grid_even_after_page_navigation() {
+    let mut app = phase_c_support::setup_app();
+    let container = PathBuf::from(r"C:\Books\volume.pdf");
+    arm_detached_bookmark_book_open(
+        &mut app,
+        container.clone(),
+        crate::book_bookmarks::BookContainerKind::Pdf,
+        crate::book_bookmarks::PageIdentity::PdfPage(0),
+    );
+    let mut closed = super::ViewerContextBundle::empty();
+    closed.bookmark_view_state = Some(super::BookmarkViewState::Detached {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container),
+    });
+    closed.current_folder = Some(PathBuf::from(r"C:\Books\another-volume.pdf"));
+
+    app.reconcile_closed_bookmark_detached_context(&closed);
+
+    assert!(app.items_are_bookmark_view);
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(super::BookmarkViewState::Restoring { .. })
+    ));
+    assert!(app.bookmark_browser_pending.is_some());
 }
 
 #[cfg(windows)]
@@ -6781,21 +7122,23 @@ fn begin_detached_bookmark_media_test(
     app.visible_indices = vec![0];
     app.selected = Some(0);
     app.items_are_bookmark_view = true;
-    app.bookmark_view_return_target = Some(
-        crate::bookmark_browser::BookmarkViewReturnTarget::Media(target.clone()),
-    );
-    app.bookmark_view_return_grid = Some(super::BookmarkViewReturnGridState {
-        row_keys: vec![(0, 7)],
-        selected_key: Some((0, 7)),
-        opened_key: (0, 7),
-        scroll_offset_y: 240.0,
+    app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(target.clone()),
+        grid: super::BookmarkViewReturnGridState {
+            row_keys: vec![(0, 7)],
+            selected_key: Some((0, 7)),
+            opened_key: (0, 7),
+            scroll_offset_y: 240.0,
+        },
     });
-    app.bookmark_media_open_pending = Some(crate::bookmark_browser::PendingMediaOpen {
-        path: target.clone(),
-        pts_secs: 42.0,
-        started_at: std::time::Instant::now(),
-        last_wait: None,
-    });
+    app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+        crate::bookmark_browser::PendingMediaOpen {
+            path: target.clone(),
+            pts_secs: 42.0,
+            started_at: std::time::Instant::now(),
+            last_wait: None,
+        },
+    ));
     app.tags_cache.insert(
         crate::tags_db::item_key_for_path(&target),
         vec!["#detached-cache-test".to_string()],
@@ -6856,8 +7199,11 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             app.current_folder.as_deref(),
             Some(super::bookmark_view_synthetic_path().as_path())
         );
-        assert!(app.bookmark_view_return_grid.is_some());
-        assert!(app.bookmark_media_open_pending.is_none());
+        assert!(matches!(
+            app.bookmark_view_state,
+            Some(super::BookmarkViewState::Opening { .. })
+        ));
+        assert!(app.bookmark_open_pending.is_none());
         assert_eq!(app.cell_tag_list(0), ["#detached-cache-test".to_string()]);
         assert!(app.metadata_cache.contains_key("main-grid-meta"));
         assert!(app.exif_cache.contains_key("main-grid-meta"));
@@ -6895,7 +7241,10 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             active.bundle.current_folder.as_deref(),
             Some(media_dir.as_path())
         );
-        assert!(active.bundle.bookmark_view_return_grid.is_none());
+        assert!(matches!(
+            active.bundle.bookmark_view_state,
+            Some(super::BookmarkViewState::Detached { .. })
+        ));
         assert_eq!(
             active
                 .bundle
@@ -6911,7 +7260,10 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
         app.with_active_detached_viewer_context(|detached| {
             detached.handle_fullscreen_close_request();
             assert_eq!(detached.fullscreen_idx, None);
-            assert!(detached.bookmark_view_return_target.is_some());
+            assert!(matches!(
+                detached.bookmark_view_state,
+                Some(super::BookmarkViewState::Detached { .. })
+            ));
         })
         .expect("active detached context");
         assert!(app.update_active_detached_viewer_context(&egui::Context::default()));
@@ -6922,8 +7274,10 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             app.current_folder.as_deref(),
             Some(super::bookmark_view_synthetic_path().as_path())
         );
-        assert!(app.bookmark_view_return_target.is_none());
-        assert!(app.bookmark_view_return_grid.is_some());
+        assert!(matches!(
+            app.bookmark_view_state,
+            Some(super::BookmarkViewState::Restoring { .. })
+        ));
         assert!(app.bookmark_browser_pending.is_some());
     }
 }
@@ -6946,7 +7300,7 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
         detached.selected = Some(other_idx);
         detached.handle_fullscreen_close_request();
         assert_eq!(detached.fullscreen_idx, None);
-        assert!(detached.bookmark_view_return_target.is_none());
+        assert!(detached.bookmark_view_state.is_none());
     })
     .expect("active detached context");
     assert!(app.update_active_detached_viewer_context(&egui::Context::default()));
@@ -6963,8 +7317,7 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
             }),
         Some(other.as_path())
     );
-    assert!(app.bookmark_view_return_target.is_none());
-    assert!(app.bookmark_view_return_grid.is_none());
+    assert!(app.bookmark_view_state.is_none());
 }
 
 // =======================================================================

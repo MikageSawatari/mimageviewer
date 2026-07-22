@@ -803,11 +803,70 @@ pub struct PendingMediaOpen {
 }
 
 #[derive(Clone, Debug)]
+pub enum PendingBookOpenStage {
+    /// Path resolution or archive conversion has not yet selected the viewer
+    /// context that will own page enumeration.
+    Resolving,
+    /// The target container is mounted and its page list may still be loading.
+    AwaitingPage {
+        started_at: std::time::Instant,
+        entered_archive_prefix: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct PendingBookOpen {
     pub bookmark: crate::book_bookmarks::BookBookmark,
     pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
-    pub started_at: std::time::Instant,
-    pub entered_archive_prefix: bool,
+    pub stage: PendingBookOpenStage,
+}
+
+impl PendingBookOpen {
+    pub fn begin_page_wait(&mut self) {
+        self.stage = PendingBookOpenStage::AwaitingPage {
+            started_at: std::time::Instant::now(),
+            entered_archive_prefix: false,
+        };
+    }
+}
+
+/// A bookmark grid can have only one open request. Keeping media and book
+/// requests in one enum prevents a cancelled path resolver from leaving the
+/// other request type alive and acting on the next open.
+#[derive(Clone, Debug)]
+pub enum PendingBookmarkOpen {
+    Media(PendingMediaOpen),
+    Book(PendingBookOpen),
+}
+
+impl PendingBookmarkOpen {
+    pub fn media(&self) -> Option<&PendingMediaOpen> {
+        match self {
+            Self::Media(pending) => Some(pending),
+            Self::Book(_) => None,
+        }
+    }
+
+    pub fn media_mut(&mut self) -> Option<&mut PendingMediaOpen> {
+        match self {
+            Self::Media(pending) => Some(pending),
+            Self::Book(_) => None,
+        }
+    }
+
+    pub fn book(&self) -> Option<&PendingBookOpen> {
+        match self {
+            Self::Book(pending) => Some(pending),
+            Self::Media(_) => None,
+        }
+    }
+
+    pub fn book_mut(&mut self) -> Option<&mut PendingBookOpen> {
+        match self {
+            Self::Book(pending) => Some(pending),
+            Self::Media(_) => None,
+        }
+    }
 }
 
 /// 横断ブックマーク一覧から開いた viewer が、一覧へ戻れる元の対象。

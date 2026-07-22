@@ -233,9 +233,13 @@ impl App {
             .as_ref()
             .is_some_and(|from| crate::folder_tree::path_eq(from, &src));
         let restore_bookmark_view = self
-            .bookmark_view_return_target
+            .bookmark_view_state
             .as_ref()
-            .filter(|target| target.matches_loaded_container(&src))
+            .filter(|state| {
+                state
+                    .target()
+                    .is_some_and(|target| target.matches_loaded_container(&src))
+            })
             .cloned();
         self.load_folder(cached_zip.clone());
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
@@ -261,8 +265,8 @@ impl App {
         if restore_reading_history {
             self.reading_history_return_from = Some(src.clone());
         }
-        if let Some(target) = restore_bookmark_view {
-            self.bookmark_view_return_target = Some(target);
+        if let Some(state) = restore_bookmark_view {
+            self.bookmark_view_state = Some(state);
         }
         self.archive_source_override = Some(src);
         true
@@ -450,6 +454,16 @@ impl App {
                 .as_mut()
                 .and_then(|state| state.deferred_fullscreen.take());
             self.archive_convert = None;
+            #[cfg(windows)]
+            if let Some(opened) = self.open_converted_bookmark_in_detached_context(ctx, src.clone())
+            {
+                if !opened {
+                    self.show_feedback_toast(
+                        "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
+                    );
+                }
+                return;
+            }
             if auto_fs {
                 self.pending_auto_fs_open = true;
             }
@@ -527,9 +541,13 @@ impl App {
                     _ => false,
                 };
                 let restore_bookmark_view = src.as_ref().and_then(|source| {
-                    self.bookmark_view_return_target
+                    self.bookmark_view_state
                         .as_ref()
-                        .filter(|target| target.matches_loaded_container(source))
+                        .filter(|state| {
+                            state
+                                .target()
+                                .is_some_and(|target| target.matches_loaded_container(source))
+                        })
                         .cloned()
                 });
                 // 明示オープンからの変換 (state.auto_fullscreen=true) のときだけ、変換成功
@@ -550,6 +568,20 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.nav_history_rollback.clone());
                 self.archive_convert = None;
+                #[cfg(windows)]
+                if let Some(opened) =
+                    self.open_converted_bookmark_in_detached_context(ctx, nav.clone())
+                {
+                    if deferred_fullscreen.is_some() {
+                        self.release_fs_nav_lock();
+                    }
+                    if !opened {
+                        self.show_feedback_toast(
+                            "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
+                        );
+                    }
+                    return;
+                }
                 if auto_fs {
                     self.pending_auto_fs_open = true;
                 }
@@ -582,8 +614,8 @@ impl App {
                     if restore_reading_history {
                         self.reading_history_return_from = Some(src.clone());
                     }
-                    if let Some(target) = restore_bookmark_view {
-                        self.bookmark_view_return_target = Some(target);
+                    if let Some(state) = restore_bookmark_view {
+                        self.bookmark_view_state = Some(state);
                     }
                     self.archive_source_override = Some(src);
                 }
@@ -907,6 +939,14 @@ impl App {
                 .and_then(|state| state.deferred_fullscreen.take())
                 .is_some();
             self.archive_convert = None;
+            if self.bookmark_open_pending.as_ref().is_some_and(|pending| {
+                matches!(
+                    pending,
+                    crate::bookmark_browser::PendingBookmarkOpen::Book(_)
+                )
+            }) {
+                self.abandon_bookmark_open_after_path_failure("archive_dialog_closed");
+            }
             if let Some(snapshot) = nav_history_rollback {
                 self.restore_folder_nav_history(snapshot);
             }
@@ -1008,6 +1048,16 @@ impl App {
                     let nav_history_rollback = state.nav_history_rollback.clone();
                     let had_deferred = state.deferred_fullscreen.is_some();
                     self.archive_convert = None;
+                    if self.bookmark_open_pending.as_ref().is_some_and(|pending| {
+                        matches!(
+                            pending,
+                            crate::bookmark_browser::PendingBookmarkOpen::Book(_)
+                        )
+                    }) {
+                        self.abandon_bookmark_open_after_path_failure(
+                            "archive_conversion_cancelled",
+                        );
+                    }
                     if let Some(snapshot) = nav_history_rollback {
                         self.restore_folder_nav_history(snapshot);
                     }

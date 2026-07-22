@@ -43,8 +43,9 @@ impl App {
         let worker_requested = requested.clone();
         let bookmark = matches!(source, StartupOpenPathSource::Bookmark)
             .then(|| {
-                self.bookmark_book_open_pending
+                self.bookmark_open_pending
                     .as_ref()
+                    .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
                     .map(|pending| pending.bookmark.clone())
             })
             .flatten();
@@ -175,12 +176,11 @@ impl App {
         }
     }
 
-    fn abandon_bookmark_open_after_path_failure(&mut self, reason: &'static str) {
+    pub(crate) fn abandon_bookmark_open_after_path_failure(&mut self, reason: &'static str) {
         crate::logger::log(format!(
             "[bookmark-open] abandon before viewer context reason={reason}"
         ));
-        self.bookmark_media_open_pending = None;
-        self.bookmark_book_open_pending = None;
+        self.bookmark_open_pending = None;
         self.clear_bookmark_view_return_state();
     }
 
@@ -214,10 +214,17 @@ impl App {
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
             && self.settings.effective_media_in_media_window()
-            && self.bookmark_media_open_pending.is_some()
+            && self
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
+                .is_some()
             && matches!(
-                self.bookmark_view_return_target,
-                Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(_))
+                self.bookmark_view_state,
+                Some(BookmarkViewState::Opening {
+                    target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(_),
+                    ..
+                })
             )
         {
             return self.open_bookmark_media_in_detached_context(
@@ -227,6 +234,14 @@ impl App {
                 select_requested_file,
             );
         }
+        #[cfg(windows)]
+        if matches!(source, StartupOpenPathSource::Bookmark)
+            && self.settings.detached_viewer_open_images_in_window
+            && let Some(opened) =
+                self.open_bookmark_book_in_detached_context(ctx, openable.clone(), resolution.kind)
+        {
+            return opened;
+        }
         let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
             || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
         let outcome =
@@ -234,10 +249,105 @@ impl App {
         if matches!(outcome, FolderOpenOutcome::Ignored) {
             return false;
         }
+        if matches!(source, StartupOpenPathSource::Bookmark)
+            && matches!(outcome, FolderOpenOutcome::Loaded)
+            && let Some(pending) = self
+                .bookmark_open_pending
+                .as_mut()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::book_mut)
+        {
+            pending.begin_page_wait();
+        }
         if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
             self.open_startup_file_if_visible(&result.requested);
         }
         true
+    }
+
+    /// Route a bookmark-backed book into the same independent context seam used by normal
+    /// PDF/ZIP grid opens. `None` means the container still needs the archive-conversion flow;
+    /// `Some` means this method owns the request and main must not load the container.
+    #[cfg(windows)]
+    pub(super) fn open_bookmark_book_in_detached_context(
+        &mut self,
+        ctx: &egui::Context,
+        openable: PathBuf,
+        kind: crate::folder_tree::OpenablePathKind,
+    ) -> Option<bool> {
+        let pending = self
+            .bookmark_open_pending
+            .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)?;
+        let target_matches = matches!(
+            self.bookmark_view_state.as_ref(),
+            Some(BookmarkViewState::Opening {
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path),
+                ..
+            }) if crate::path_key::eq_keep_drive(path, &pending.bookmark.container_path)
+        );
+        if !target_matches {
+            return None;
+        }
+
+        let descriptor = match pending.bookmark.container_kind {
+            crate::book_bookmarks::BookContainerKind::Pdf
+                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
+            {
+                ViewerContextDescriptor::Pdf {
+                    path: openable,
+                    page_num: None,
+                }
+            }
+            crate::book_bookmarks::BookContainerKind::Zip
+                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
+            {
+                ViewerContextDescriptor::Zip {
+                    path: openable,
+                    entry_name: None,
+                    archive_source_override: None,
+                }
+            }
+            crate::book_bookmarks::BookContainerKind::CompiledBook
+            | crate::book_bookmarks::BookContainerKind::ImageFolder
+                if matches!(kind, crate::folder_tree::OpenablePathKind::Directory) =>
+            {
+                ViewerContextDescriptor::BookFolder { path: openable }
+            }
+            crate::book_bookmarks::BookContainerKind::OtherArchive => {
+                let source = pending.bookmark.container_path.clone();
+                let cached = self.try_archive_cache_lookup(&source)?;
+                ViewerContextDescriptor::Zip {
+                    path: cached,
+                    entry_name: None,
+                    archive_source_override: Some(source),
+                }
+            }
+            _ => return None,
+        };
+
+        let pending = match self.bookmark_open_pending.take() {
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,
+            other => {
+                self.bookmark_open_pending = other;
+                return None;
+            }
+        };
+        let base_placement = self.active_detached_viewer_current_placement();
+        let had_active_detached =
+            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        if !self.park_and_close_current_active_detached_viewer(ctx) {
+            self.bookmark_open_pending =
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
+            return Some(false);
+        }
+        let placement_seed = had_active_detached
+            .then(|| self.offset_detached_image_window_placement(base_placement));
+        Some(self.start_active_detached_book_context(
+            descriptor,
+            ctx,
+            placement_seed,
+            Some(pending),
+        ))
     }
 
     /// 「フル機能ウィンドウ + 動画・音声を別ウィンドウ」でブックマークを開く。
@@ -256,11 +366,14 @@ impl App {
         openable: PathBuf,
         select_requested_file: bool,
     ) -> bool {
-        let Some(pending) = self.bookmark_media_open_pending.take() else {
+        let Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending)) =
+            self.bookmark_open_pending.take()
+        else {
             return false;
         };
-        let Some(target) = self.bookmark_view_return_target.clone() else {
-            self.bookmark_media_open_pending = Some(pending);
+        let Some(target) = self.bookmark_view_target().cloned() else {
+            self.bookmark_open_pending =
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
             return false;
         };
 
@@ -268,12 +381,13 @@ impl App {
         // 新しいブックマークへ差し替える。main 側の grid snapshot は今回のクリック時点の値。
         if self.raise_active_detached_media_for_grid_open(ctx, &pending.path) {
             let Some(active) = self.active_detached_viewer_context.as_mut() else {
-                self.bookmark_media_open_pending = Some(pending);
+                self.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
                 return false;
             };
-            active.bundle.bookmark_media_open_pending = Some(pending);
-            active.bundle.bookmark_view_return_target = Some(target);
-            active.bundle.bookmark_view_return_grid = None;
+            active.bundle.bookmark_open_pending =
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+            active.bundle.bookmark_view_state = Some(BookmarkViewState::Detached { target });
             crate::logger::log(format!(
                 "[bookmark-open] reuse detached media context path={}",
                 requested.display()
@@ -284,7 +398,8 @@ impl App {
         // 別の detached viewer があれば、通常の grid media open と同じ handoff seam で
         // park/close する。新しい boolean ownership state は作らず bundle 自体を所有境界にする。
         if !self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx) {
-            self.bookmark_media_open_pending = Some(pending);
+            self.bookmark_open_pending =
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
             return false;
         }
 
@@ -294,11 +409,9 @@ impl App {
             context_serial,
             "bookmark_media_detached_context",
         );
-        self.bookmark_media_open_pending = Some(pending);
-        // detached 側は target の複製だけを持つ。grid snapshot が None であることは
-        // 「一覧 surface は main bundle が保持中」という構造上の不変条件でもある。
-        self.bookmark_view_return_target = Some(target);
-        self.bookmark_view_return_grid = None;
+        self.bookmark_open_pending =
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+        self.bookmark_view_state = Some(BookmarkViewState::Detached { target });
 
         let outcome = self.with_detached_viewer_main_history_suppressed(|app| {
             let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen(openable, true);

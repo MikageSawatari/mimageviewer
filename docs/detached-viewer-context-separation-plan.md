@@ -192,6 +192,18 @@ active detached bundle へロードし、player とブックマーク時刻へ�
 メイン一覧、タグバッジ、選択、スクロールを載せたままにする。名称変更・追加・削除・missing 状態など
 表示内容が変わった場合だけ一覧を再構築する。
 
+本ブックマークも同じ境界を使う。path resolve 後に main の汎用 startup loader へ流してページ一覧へ
+遷移させず、PDF / ZIP / 画像フォルダ / 製本は `ViewerContextDescriptor` から active detached book
+context を開始する。RAR / 7z / LZH は direct-read probe または変換完了までは要求を `Resolving` として
+保持し、readable backing archive が確定した時点で同じ context 開始関数へ渡す。active context が
+ページ列挙と stable page identity の解決を所有し、main は一覧 bundle を mount したままにする。
+
+ブックマーク起点の状態は `PendingBookmarkOpen::{Media, Book}` と
+`BookmarkViewState::{Opening, Restoring, Detached}` に集約する。media/book の pending を別々に持つこと、
+grid snapshot の `None` を detached ownership の印にすることは禁止する。入力ハンドラは行を選ぶだけで、
+mouse / Enter / gamepad のいずれも単一 router へ渡す。close は mounted context の明示 ownership から
+origin grid の refresh または実フォルダへの disposition を決める。
+
 ### 3.4 passive window は stable viewport と paused context を持つ
 
 passive / paused window は active 処理対象ではないが、OS ウィンドウを閉じず、active 時と同じ
@@ -299,6 +311,10 @@ active viewer 内のキーは active context へ作用する。
   既存 `load_pdf_as_folder` / `load_zip_as_folder` を実行してから main context を復元する。
   これにより、メインウィンドウは親の本一覧に残り、PDF / ZIP の enumerate pending とページ列は
   active detached context 側へ入る。
+- 横断ブックマーク一覧の本も同じ context 起動 seam を使う。`BookFolder` descriptor は画像フォルダと
+  製本ルート自体を mount し、ブックマーク pending が列挙後に対象ページを開く。変換アーカイブは
+  cache hit、RAR direct-read、変換完了の各出口をこの seam へ合流させる。main / active の ownership は
+  `BookmarkViewState` で明示し、メイン一覧を一度実フォルダへ遷移させて戻す処理は行わない。
 - active context の PDF / ZIP enumerate、fullscreen work、AI 先読み、local adjustment 起動、
   fullscreen viewport 描画は `update_active_detached_viewer_context` 内で mount して処理する。
 - active context を mount して `load_pdf_as_folder` / `load_zip_as_folder` /

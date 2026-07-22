@@ -1644,6 +1644,9 @@ pub(crate) enum ViewerContextDescriptor {
         entry_name: Option<String>,
         archive_source_override: Option<PathBuf>,
     },
+    /// A directory-backed image book (plain image folder or compiled book root).
+    /// Unlike `Image`, this descriptor mounts the directory itself as the reader context.
+    BookFolder { path: PathBuf },
     /// 通常画像。parked still の再オープン**フォールバック専用** (findings-19):
     /// 同期スタンプが main の現行 items で解決できないとき、親フォルダを窓内
     /// コンテキストとして読み込んでこの画像を開き直す。グリッドからの open
@@ -1730,6 +1733,48 @@ impl BookmarkViewReturnGridState {
                 .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key),
             opened_key,
             scroll_offset_y,
+        }
+    }
+}
+
+/// Ownership state for a viewer opened from the bookmark grid.
+///
+/// The old representation used two independent `Option`s and treated a
+/// missing grid snapshot as an implicit "detached" marker. That allowed media
+/// and book requests to disagree about which context owned the grid. These
+/// variants make every valid transition explicit:
+///
+/// - `Opening`: the origin context owns the bookmark grid while a viewer is
+///   open (embedded or in another context).
+/// - `Restoring`: the viewer closed and the next bookmark read-model build
+///   should restore the captured grid position.
+/// - `Detached`: this mounted viewer context is separate from the origin grid.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BookmarkViewState {
+    Opening {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget,
+        grid: BookmarkViewReturnGridState,
+    },
+    Restoring {
+        grid: BookmarkViewReturnGridState,
+    },
+    Detached {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget,
+    },
+}
+
+impl BookmarkViewState {
+    pub(crate) fn target(&self) -> Option<&crate::bookmark_browser::BookmarkViewReturnTarget> {
+        match self {
+            Self::Opening { target, .. } | Self::Detached { target } => Some(target),
+            Self::Restoring { .. } => None,
+        }
+    }
+
+    fn origin_grid_mut(&mut self) -> Option<&mut BookmarkViewReturnGridState> {
+        match self {
+            Self::Opening { grid, .. } | Self::Restoring { grid } => Some(grid),
+            Self::Detached { .. } => None,
         }
     }
 }
@@ -1889,10 +1934,8 @@ struct ViewerContextBundle {
     items_are_smart_folder_view: bool,
     items_are_drive_list: bool,
     reading_history_return_from: Option<PathBuf>,
-    bookmark_view_return_target: Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
-    bookmark_view_return_grid: Option<BookmarkViewReturnGridState>,
-    bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
-    bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+    bookmark_view_state: Option<BookmarkViewState>,
+    bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
     fs_open_intent_from_grid: bool,
     pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
     fs_zoom: f32,
@@ -2152,10 +2195,8 @@ impl ViewerContextBundle {
             items_are_smart_folder_view: false,
             items_are_drive_list: false,
             reading_history_return_from: None,
-            bookmark_view_return_target: None,
-            bookmark_view_return_grid: None,
-            bookmark_media_open_pending: None,
-            bookmark_book_open_pending: None,
+            bookmark_view_state: None,
+            bookmark_open_pending: None,
             fs_open_intent_from_grid: false,
             pending_detached_video_host_switch: None,
             fs_zoom: 1.0,
@@ -6037,6 +6078,7 @@ fn detached_window_references_removed(
                 archive_source_override,
                 ..
             } => (path, archive_source_override.as_deref()),
+            ViewerContextDescriptor::BookFolder { path } => (path, None),
             ViewerContextDescriptor::Image { path } => (path, None),
         };
         if matches_key(&crate::adjustment_db::normalize_path(path)) {
@@ -7425,18 +7467,14 @@ pub struct App {
     pub(crate) bookmark_media_filter: crate::bookmark_browser::MediaFilter,
     pub(crate) bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter,
     pub(crate) bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort,
-    pub(crate) bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
-    pub(crate) bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+    pub(crate) bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
     /// ブックマークから既存 items の relative page を開く1回だけの loader trust root。
     /// `open_fullscreen` が同期的に fs / metadata worker へ snapshot した直後に破棄する。
     bookmark_relative_page_open_once:
         Option<(usize, crate::book_bookmarks::RelativePageProvenance)>,
     /// 横断ブックマーク一覧から開いた viewer を閉じたときの戻り先。
     /// 開いた実コンテナと一致する context だけが `Bookmarks` ナビを返す。
-    pub(crate) bookmark_view_return_target:
-        Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
-    /// viewer 復帰後の非同期再構築で、一覧のスクロール位置と stable row identity を戻す。
-    pub(crate) bookmark_view_return_grid: Option<BookmarkViewReturnGridState>,
+    pub(crate) bookmark_view_state: Option<BookmarkViewState>,
 
     /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
     /// `rebuild_items_from_global_search` の DrilledInto 分岐で `state.all_hits` から
@@ -10135,11 +10173,9 @@ impl App {
             bookmark_media_filter: crate::bookmark_browser::MediaFilter::default(),
             bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
             bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
-            bookmark_media_open_pending: None,
-            bookmark_book_open_pending: None,
+            bookmark_open_pending: None,
             bookmark_relative_page_open_once: None,
-            bookmark_view_return_target: None,
-            bookmark_view_return_grid: None,
+            bookmark_view_state: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
             book_resume_writer,
@@ -11837,10 +11873,8 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
-            bookmark_view_return_target,
-            bookmark_view_return_grid,
-            bookmark_media_open_pending,
-            bookmark_book_open_pending,
+            bookmark_view_state,
+            bookmark_open_pending,
             fs_open_intent_from_grid,
             pending_detached_video_host_switch,
             fs_zoom,
@@ -12051,10 +12085,8 @@ impl App {
         swap_field!(items_are_smart_folder_view);
         swap_field!(items_are_drive_list);
         swap_field!(reading_history_return_from);
-        swap_field!(bookmark_view_return_target);
-        swap_field!(bookmark_view_return_grid);
-        swap_field!(bookmark_media_open_pending);
-        swap_field!(bookmark_book_open_pending);
+        swap_field!(bookmark_view_state);
+        swap_field!(bookmark_open_pending);
         swap_field!(fs_open_intent_from_grid);
         swap_field!(pending_detached_video_host_switch);
         swap_field!(fs_zoom);
@@ -12282,7 +12314,17 @@ impl App {
     /// 実ファイルの親ではなく一覧へ戻す。ページ identity を直接開く操作なので、
     /// ネスト ZIP 内でも現在のユーザー視点コンテナが一致すれば一覧へ直帰する。
     pub(crate) fn bookmark_view_back_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
-        let target = self.bookmark_view_return_target.as_ref()?;
+        let BookmarkViewState::Opening { target, .. } = self.bookmark_view_state.as_ref()? else {
+            return None;
+        };
+        self.bookmark_target_is_current(target)
+            .then_some(crate::ui_main::AddressBarNav::Bookmarks)
+    }
+
+    fn bookmark_target_is_current(
+        &self,
+        target: &crate::bookmark_browser::BookmarkViewReturnTarget,
+    ) -> bool {
         let still_at_target = match target {
             crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_path) => self
                 .fullscreen_idx
@@ -12297,30 +12339,76 @@ impl App {
                 .effective_folder()
                 .is_some_and(|current| crate::path_key::eq_keep_drive(&current, container_path)),
         };
-        still_at_target.then_some(crate::ui_main::AddressBarNav::Bookmarks)
+        still_at_target
     }
 
     pub(crate) fn clear_bookmark_view_return_state(&mut self) {
-        self.bookmark_view_return_target = None;
-        self.bookmark_view_return_grid = None;
+        self.bookmark_view_state = None;
     }
 
     fn reconcile_bookmark_return_target_for_folder_load(&mut self, path: &Path) {
-        if self
-            .bookmark_view_return_target
-            .as_ref()
-            .is_some_and(|target| !target.matches_loaded_container(path))
-        {
+        let should_clear = match self.bookmark_view_state.as_ref() {
+            Some(BookmarkViewState::Opening { target, .. }) => {
+                !target.matches_loaded_container(path)
+            }
+            Some(BookmarkViewState::Detached {
+                target: target @ crate::bookmark_browser::BookmarkViewReturnTarget::Media(_),
+            }) => !target.matches_loaded_container(path),
+            // A detached book owns all navigation inside its own context. The origin bookmark
+            // grid stays mounted in main even when the reader moves to another page/container.
+            Some(BookmarkViewState::Detached {
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(_),
+            })
+            | Some(BookmarkViewState::Restoring { .. })
+            | None => false,
+        };
+        if should_clear {
             self.clear_bookmark_view_return_state();
         }
     }
 
     fn bookmark_view_close_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         let nav = self.bookmark_view_back_nav();
-        if nav.is_none() && self.bookmark_view_return_target.is_some() {
+        if nav.is_none()
+            && matches!(
+                self.bookmark_view_state,
+                Some(BookmarkViewState::Opening { .. })
+            )
+        {
             self.clear_bookmark_view_return_state();
         }
         nav
+    }
+
+    pub(crate) fn bookmark_view_target(
+        &self,
+    ) -> Option<&crate::bookmark_browser::BookmarkViewReturnTarget> {
+        self.bookmark_view_state
+            .as_ref()
+            .and_then(BookmarkViewState::target)
+    }
+
+    fn bookmark_view_begin_restore(&mut self) {
+        let Some(state) = self.bookmark_view_state.take() else {
+            return;
+        };
+        self.bookmark_view_state = match state {
+            BookmarkViewState::Opening { grid, .. } | BookmarkViewState::Restoring { grid } => {
+                Some(BookmarkViewState::Restoring { grid })
+            }
+            detached @ BookmarkViewState::Detached { .. } => Some(detached),
+        };
+    }
+
+    fn take_bookmark_restore_grid(&mut self) -> Option<BookmarkViewReturnGridState> {
+        match self.bookmark_view_state.take() {
+            Some(BookmarkViewState::Restoring { grid }) => Some(grid),
+            Some(other) => {
+                self.bookmark_view_state = Some(other);
+                None
+            }
+            None => None,
+        }
     }
 
     /// 読書履歴ビューの項目を開く直前に、消えたコンテナへ入らないようにする。
@@ -23929,9 +24017,9 @@ impl App {
 
     /// 動画・音声・本のブックマークを、通常のメイン一覧 surface へ読み込む。
     pub(crate) fn enter_bookmark_view(&mut self) {
-        // viewer target はここで消費するが、一覧の復帰 snapshot は DB 再構築完了後に
-        // `install_bookmark_view_rows` が消費する。
-        self.bookmark_view_return_target = None;
+        // Embedded viewer close transitions the explicit origin state to Restoring. A detached
+        // context never calls this: its main context already owns the mounted bookmark grid.
+        self.bookmark_view_begin_restore();
         self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
@@ -24029,7 +24117,7 @@ impl App {
         let previous_key = previous_selected
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
-        let return_grid = self.bookmark_view_return_grid.take();
+        let return_grid = self.take_bookmark_restore_grid();
         crate::bookmark_browser::sort_rows(
             &mut self.bookmark_browser_rows,
             self.bookmark_view_sort,
@@ -24174,30 +24262,34 @@ impl App {
             );
             return;
         }
-        self.bookmark_view_return_grid = Some(BookmarkViewReturnGridState::capture(
+        let return_grid = BookmarkViewReturnGridState::capture(
             &self.bookmark_browser_rows,
             self.selected,
             row.stable_key(),
             self.scroll_offset_y,
-        ));
+        );
         match &row.source {
             crate::bookmark_browser::BookmarkRowSource::Media { path, pts_secs, .. } => {
-                self.bookmark_view_return_target = Some(
-                    crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone()),
-                );
+                let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone());
+                self.bookmark_view_state = Some(BookmarkViewState::Opening {
+                    target,
+                    grid: return_grid,
+                });
                 crate::logger::log(format!(
                     "[bookmark-open] request media path={} pts={:.3} presentation={:?}",
                     path.display(),
                     pts_secs,
                     self.viewer_presentation
                 ));
-                self.bookmark_media_open_pending =
-                    Some(crate::bookmark_browser::PendingMediaOpen {
-                        path: path.clone(),
-                        pts_secs: *pts_secs,
-                        started_at: std::time::Instant::now(),
-                        last_wait: None,
-                    });
+                self.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+                        crate::bookmark_browser::PendingMediaOpen {
+                            path: path.clone(),
+                            pts_secs: *pts_secs,
+                            started_at: std::time::Instant::now(),
+                            last_wait: None,
+                        },
+                    ));
                 self.start_startup_open_path_resolve(
                     path.clone(),
                     StartupOpenPathSource::Bookmark,
@@ -24205,22 +24297,27 @@ impl App {
                 );
             }
             crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
-                self.bookmark_view_return_target =
-                    Some(crate::bookmark_browser::BookmarkViewReturnTarget::Book(
-                        bookmark.container_path.clone(),
-                    ));
+                let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                    bookmark.container_path.clone(),
+                );
+                self.bookmark_view_state = Some(BookmarkViewState::Opening {
+                    target,
+                    grid: return_grid,
+                });
                 crate::logger::log(format!(
                     "[bookmark-open] request book container={} page={} presentation={:?}",
                     bookmark.container_path.display(),
                     bookmark.page_identity.display_name(),
                     self.viewer_presentation
                 ));
-                self.bookmark_book_open_pending = Some(crate::bookmark_browser::PendingBookOpen {
-                    bookmark: bookmark.clone(),
-                    relative_page_provenance: row.relative_page_provenance.clone(),
-                    started_at: std::time::Instant::now(),
-                    entered_archive_prefix: false,
-                });
+                self.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+                        crate::bookmark_browser::PendingBookOpen {
+                            bookmark: bookmark.clone(),
+                            relative_page_provenance: row.relative_page_provenance.clone(),
+                            stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+                        },
+                    ));
                 self.start_startup_open_path_resolve(
                     bookmark.container_path.clone(),
                     StartupOpenPathSource::Bookmark,
@@ -24254,7 +24351,12 @@ impl App {
                         // detached viewer の close 時も DB は再照合するが、行が同じなら
                         // start_loading_items で可視グリッドとタグキャッシュを作り直さない。
                         // return snapshot は現在の一覧がそのまま残っているので消費済みにする。
-                        self.bookmark_view_return_grid = None;
+                        if matches!(
+                            self.bookmark_view_state,
+                            Some(BookmarkViewState::Restoring { .. })
+                        ) {
+                            self.bookmark_view_state = None;
+                        }
                         crate::logger::log(
                             "[bookmark-open] bookmark grid refresh unchanged; keep mounted grid",
                         );
@@ -24266,7 +24368,12 @@ impl App {
                     }
                 }
                 Err(err) => {
-                    self.bookmark_view_return_grid = None;
+                    if matches!(
+                        self.bookmark_view_state,
+                        Some(BookmarkViewState::Restoring { .. })
+                    ) {
+                        self.bookmark_view_state = None;
+                    }
                     self.show_feedback_toast(format!(
                         "ブックマーク一覧を読み込めませんでした: {err}"
                     ));
@@ -24314,8 +24421,7 @@ impl App {
         self.poll_bookmark_book_open(ctx);
         if self.bookmark_browser_pending.is_some()
             || self.bookmark_delete_pending.is_some()
-            || self.bookmark_media_open_pending.is_some()
-            || self.bookmark_book_open_pending.is_some()
+            || self.bookmark_open_pending.is_some()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -24325,7 +24431,11 @@ impl App {
         &mut self,
         wait: crate::bookmark_browser::PendingMediaOpenWait,
     ) {
-        let Some(pending) = self.bookmark_media_open_pending.as_ref() else {
+        let Some(pending) = self
+            .bookmark_open_pending
+            .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
+        else {
             return;
         };
         if pending.last_wait == Some(wait) {
@@ -24361,13 +24471,22 @@ impl App {
             current_item,
             player_diag
         ));
-        if let Some(pending) = self.bookmark_media_open_pending.as_mut() {
+        if let Some(pending) = self
+            .bookmark_open_pending
+            .as_mut()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::media_mut)
+        {
             pending.last_wait = Some(wait);
         }
     }
 
     fn poll_bookmark_media_open(&mut self, _ctx: &egui::Context) {
-        let Some(pending) = self.bookmark_media_open_pending.clone() else {
+        let Some(pending) = self
+            .bookmark_open_pending
+            .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
+            .cloned()
+        else {
             return;
         };
         if pending.started_at.elapsed() > std::time::Duration::from_secs(30) {
@@ -24385,7 +24504,7 @@ impl App {
                 self.fullscreen_idx,
                 current_item
             ));
-            self.bookmark_media_open_pending = None;
+            self.bookmark_open_pending = None;
             self.show_feedback_toast("ブックマーク位置を開けませんでした".to_string());
             return;
         }
@@ -24446,15 +24565,27 @@ impl App {
             player.position(),
             player.current_seek_serial()
         ));
-        self.bookmark_media_open_pending = None;
+        self.bookmark_open_pending = None;
     }
 
     fn poll_bookmark_book_open(&mut self, ctx: &egui::Context) {
-        let Some(mut pending) = self.bookmark_book_open_pending.clone() else {
+        let Some(mut pending) = self
+            .bookmark_open_pending
+            .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+            .cloned()
+        else {
             return;
         };
-        if pending.started_at.elapsed() > std::time::Duration::from_secs(45) {
-            self.bookmark_book_open_pending = None;
+        let (started_at, mut entered_archive_prefix) = match &pending.stage {
+            crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
+                started_at,
+                entered_archive_prefix,
+            } => (*started_at, *entered_archive_prefix),
+            crate::bookmark_browser::PendingBookOpenStage::Resolving => return,
+        };
+        if started_at.elapsed() > std::time::Duration::from_secs(45) {
+            self.bookmark_open_pending = None;
             self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
             return;
         }
@@ -24465,7 +24596,7 @@ impl App {
             return;
         }
         if let Some(idx) = self.book_bookmark_item_idx(&pending.bookmark) {
-            self.bookmark_book_open_pending = None;
+            self.bookmark_open_pending = None;
             let provenance = pending.relative_page_provenance.clone().or_else(|| {
                 let crate::book_bookmarks::PageIdentity::RelativePath(relative) =
                     &pending.bookmark.page_identity
@@ -24481,11 +24612,14 @@ impl App {
             return;
         }
 
-        if !pending.entered_archive_prefix
-            && self.enter_book_bookmark_archive_prefix(&pending.bookmark)
-        {
-            pending.entered_archive_prefix = true;
-            self.bookmark_book_open_pending = Some(pending);
+        if !entered_archive_prefix && self.enter_book_bookmark_archive_prefix(&pending.bookmark) {
+            entered_archive_prefix = true;
+            pending.stage = crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
+                started_at,
+                entered_archive_prefix,
+            };
+            self.bookmark_open_pending =
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
             return;
         }
 
@@ -24493,7 +24627,7 @@ impl App {
             || self.pdf_enumerate_pending.is_some()
             || self.items.is_empty();
         if !enumeration_pending {
-            self.bookmark_book_open_pending = None;
+            self.bookmark_open_pending = None;
             self.show_feedback_toast(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
@@ -31563,6 +31697,7 @@ impl App {
         match descriptor {
             Some(ViewerContextDescriptor::Pdf { .. }) => "pdf",
             Some(ViewerContextDescriptor::Zip { .. }) => "zip",
+            Some(ViewerContextDescriptor::BookFolder { .. }) => "book-folder",
             Some(ViewerContextDescriptor::Image { .. }) => "image",
             None => "none",
         }
@@ -32719,8 +32854,29 @@ impl App {
         ctx: &egui::Context,
         placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
     ) -> bool {
+        self.start_active_detached_book_context(descriptor, ctx, placement_seed, None)
+    }
+
+    #[cfg(windows)]
+    fn start_active_detached_book_context(
+        &mut self,
+        descriptor: ViewerContextDescriptor,
+        ctx: &egui::Context,
+        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        mut bookmark_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+    ) -> bool {
         let target = Self::detached_book_context_target(&descriptor);
         let mut main_context = self.take_current_viewer_context_bundle();
+        if let Some(pending) = bookmark_pending.as_mut() {
+            pending.begin_page_wait();
+            self.bookmark_view_state = Some(BookmarkViewState::Detached {
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                    pending.bookmark.container_path.clone(),
+                ),
+            });
+        }
+        self.bookmark_open_pending =
+            bookmark_pending.map(crate::bookmark_browser::PendingBookmarkOpen::Book);
         let context_serial = self.assign_next_detached_viewer_context_generation();
         self.reset_active_detached_viewport_runtime_for_new_window(
             context_serial,
@@ -32756,8 +32912,9 @@ impl App {
         // Image はフォルダ load 後に明示 open_fullscreen するので auto-fullscreen 予約を
         // 立てない (立てると「画像のみフォルダ」設定次第で先頭画像が先に開いて二重になる)。
         let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
-        self.pending_auto_fs_open = !is_image_reopen;
-        self.fs_open_intent_from_grid = !is_image_reopen;
+        let bookmark_open = self.bookmark_open_pending.is_some();
+        self.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
+        self.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
 
         self.with_detached_viewer_main_history_suppressed(|app| match descriptor {
             ViewerContextDescriptor::Zip {
@@ -32773,6 +32930,9 @@ impl App {
             }
             ViewerContextDescriptor::Pdf { path, .. } => {
                 app.load_pdf_as_folder(path);
+            }
+            ViewerContextDescriptor::BookFolder { path } => {
+                app.load_folder(path);
             }
             ViewerContextDescriptor::Image { path } => {
                 // 親フォルダを窓内コンテキストとして同期スキャンし、対象画像を
@@ -32816,7 +32976,7 @@ impl App {
             }
         });
 
-        if let Some(target) = target {
+        if !bookmark_open && let Some(target) = target {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow: false,
                 target: Some(target),
@@ -32915,6 +33075,66 @@ impl App {
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
         self.start_active_detached_book_context_from_descriptor(descriptor, ctx, placement_seed)
+    }
+
+    /// Finish an OtherArchive bookmark open after direct-read probing or conversion selected the
+    /// readable backing archive. The conversion dialog is App-global, but the resulting reader
+    /// still enters the standard detached book context so it cannot replace the main grid.
+    #[cfg(windows)]
+    pub(crate) fn open_converted_bookmark_in_detached_context(
+        &mut self,
+        ctx: &egui::Context,
+        backing_archive: PathBuf,
+    ) -> Option<bool> {
+        if !self.settings.detached_viewer_open_images_in_window {
+            return None;
+        }
+        let pending = self
+            .bookmark_open_pending
+            .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)?;
+        if pending.bookmark.container_kind != crate::book_bookmarks::BookContainerKind::OtherArchive
+            || !matches!(
+                self.bookmark_view_state.as_ref(),
+                Some(BookmarkViewState::Opening {
+                    target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path),
+                    ..
+                }) if crate::path_key::eq_keep_drive(path, &pending.bookmark.container_path)
+            )
+        {
+            return None;
+        }
+        let bookmark_container = pending.bookmark.container_path.clone();
+        let pending = match self.bookmark_open_pending.take() {
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,
+            other => {
+                self.bookmark_open_pending = other;
+                return None;
+            }
+        };
+        let base_placement = self.active_detached_viewer_current_placement();
+        let had_active_detached =
+            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        if !self.park_and_close_current_active_detached_viewer(ctx) {
+            self.bookmark_open_pending =
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
+            return Some(false);
+        }
+        let placement_seed = had_active_detached
+            .then(|| self.offset_detached_image_window_placement(base_placement));
+        let descriptor = ViewerContextDescriptor::Zip {
+            path: backing_archive,
+            entry_name: None,
+            // Keep the DB identity as effective_folder even when a multi-volume RAR probe
+            // resolves a different first-volume backing path.
+            archive_source_override: Some(bookmark_container),
+        };
+        Some(self.start_active_detached_book_context(
+            descriptor,
+            ctx,
+            placement_seed,
+            Some(pending),
+        ))
     }
 
     #[cfg(windows)]
@@ -33175,24 +33395,30 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn reconcile_closed_bookmark_media_detached_context(&mut self, closed: &ViewerContextBundle) {
-        let Some(main_target @ crate::bookmark_browser::BookmarkViewReturnTarget::Media(_)) =
-            self.bookmark_view_return_target.clone()
+    fn reconcile_closed_bookmark_detached_context(&mut self, closed: &ViewerContextBundle) {
+        let Some(BookmarkViewState::Opening {
+            target: main_target,
+            ..
+        }) = self.bookmark_view_state.as_ref()
         else {
             return;
         };
+        let main_target = main_target.clone();
         // main が別の場所へ移動済みなら、その後のユーザー操作を detached close で巻き戻さない。
-        // 通常の folder load は `reconcile_bookmark_return_target_for_folder_load` でも marker を
-        // 消すが、surface も ownership の確認に含めて stale state に対して保守的に扱う。
-        if !self.items_are_bookmark_view || self.bookmark_view_return_grid.is_none() {
+        if !self.items_are_bookmark_view {
             return;
         }
 
         let stayed_at_opened_bookmark = closed
-            .bookmark_view_return_target
+            .bookmark_view_state
             .as_ref()
-            .is_some_and(|target| target == &main_target);
-        if stayed_at_opened_bookmark {
+            .and_then(BookmarkViewState::target)
+            == Some(&main_target);
+        let keep_origin_grid = matches!(
+            main_target,
+            crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
+        ) || stayed_at_opened_bookmark;
+        if keep_origin_grid {
             // 一覧は main に表示されたままなので enter_bookmark_view は不要。viewer 中の
             // 名称変更・追加・削除だけを非同期再構築し、保存済み grid snapshot で位置を戻す。
             // 別ウィンドウ再生中も main は操作できるため、選択・スクロールは「開く直前」より
@@ -33201,13 +33427,17 @@ impl App {
                 .selected
                 .and_then(|idx| self.bookmark_browser_rows.get(idx))
                 .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
-            if let Some(return_grid) = self.bookmark_view_return_grid.as_mut() {
+            if let Some(return_grid) = self
+                .bookmark_view_state
+                .as_mut()
+                .and_then(BookmarkViewState::origin_grid_mut)
+            {
                 return_grid.selected_key = current_selected_key;
                 return_grid.scroll_offset_y = self.scroll_offset_y;
             }
-            self.bookmark_view_return_target = None;
+            self.bookmark_view_begin_restore();
             crate::logger::log(
-                "[bookmark-open] detached media closed at target; refresh main bookmark grid",
+                "[bookmark-open] detached viewer closed; refresh main bookmark grid",
             );
             self.refresh_bookmark_browser();
             return;
@@ -33317,6 +33547,10 @@ impl App {
                 if app.pdf_enumerate_pending.is_some()
                     || app.zip_enumerate_pending.is_some()
                     || app.fs_nav_deferred_reopen_wait_active()
+                    || matches!(
+                        app.bookmark_open_pending,
+                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+                    )
                 {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 }
@@ -33384,6 +33618,10 @@ impl App {
                 let should_drop = app.fullscreen_idx.is_none()
                     && app.pdf_enumerate_pending.is_none()
                     && app.zip_enumerate_pending.is_none()
+                    && !matches!(
+                        app.bookmark_open_pending,
+                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+                    )
                     && !app.fs_viewport_shown;
                 if should_drop
                     && !detached_viewport_finalized
@@ -33396,7 +33634,7 @@ impl App {
             .unwrap_or(false);
 
         if should_drop && let Some(closed) = self.active_detached_viewer_context.take() {
-            self.reconcile_closed_bookmark_media_detached_context(&closed.bundle);
+            self.reconcile_closed_bookmark_detached_context(&closed.bundle);
         }
         true
     }
@@ -33885,10 +34123,8 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
-            bookmark_view_return_target,
-            bookmark_view_return_grid,
-            bookmark_media_open_pending,
-            bookmark_book_open_pending,
+            bookmark_view_state,
+            bookmark_open_pending,
             fs_open_intent_from_grid,
             pending_detached_video_host_switch,
             fs_zoom,
@@ -34020,8 +34256,7 @@ impl App {
             items_are_smart_folder_view,
             items_are_drive_list,
             reading_history_return_from,
-            bookmark_view_return_target,
-            bookmark_view_return_grid,
+            bookmark_view_state,
         );
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
@@ -34083,8 +34318,7 @@ impl App {
             music_bookmarks,
             music_bookmarks_loaded_for,
             last_loop_pos,
-            bookmark_media_open_pending,
-            bookmark_book_open_pending,
+            bookmark_open_pending,
         );
 
         viewer_session.swap_with_mounted(
@@ -43019,30 +43253,28 @@ impl App {
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
-        // ブックマーク media を独立 bundle で開いた場合、一覧 surface は main bundle に
-        // 表示されたままなので detached 側で Bookmarks へナビしてはいけない。
-        // `bookmark_view_return_grid == None` がその ownership invariant。対象から動いていなければ
-        // target を close_fullscreen の stale-state cleanup から一時退避し、outer context の drop
-        // 時に「一覧を維持」と判定できるよう戻す。別ファイルへ動いていれば target を消して
-        // outer 側へ「実フォルダへ移る」disposition を渡す。
-        let separated_bookmark_target = if self.bookmark_view_return_grid.is_none()
-            && matches!(
-                self.bookmark_view_return_target,
-                Some(crate::bookmark_browser::BookmarkViewReturnTarget::Media(_))
-            ) {
-            if self.bookmark_view_back_nav().is_some() {
-                self.bookmark_view_return_target.take()
-            } else {
-                self.bookmark_view_return_target = None;
-                None
-            }
-        } else {
-            if self.bookmark_view_close_nav().is_some() {
-                self.pending_return_to_parent = true;
-                return;
-            }
-            None
-        };
+        // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
+        // origin grid is still mounted in main. Embedded viewers instead use the normal Bookmarks
+        // navigation transition. Ownership is explicit in BookmarkViewState, not inferred from a
+        // missing grid snapshot.
+        if !matches!(
+            self.bookmark_view_state,
+            Some(BookmarkViewState::Detached { .. })
+        ) && self.bookmark_view_close_nav().is_some()
+        {
+            self.pending_return_to_parent = true;
+            return;
+        }
+        if let Some(BookmarkViewState::Detached {
+            target: target @ crate::bookmark_browser::BookmarkViewReturnTarget::Media(_),
+        }) = self.bookmark_view_state.as_ref()
+            && !self.bookmark_target_is_current(target)
+        {
+            // Media navigation changes the detached context's disposition: closing after moving
+            // to another file returns main to that real folder. Books intentionally keep their
+            // origin grid even after page/container navigation.
+            self.bookmark_view_state = None;
+        }
         if self.auto_open_for_current_container() {
             self.pending_return_to_parent = true;
             return;
@@ -43061,9 +43293,6 @@ impl App {
             }
         }
         self.close_fullscreen();
-        if separated_bookmark_target.is_some() {
-            self.bookmark_view_return_target = separated_bookmark_target;
-        }
     }
 
     /// `App::update` の通常の pending-nav 消化点より後で届く close イベント向け。
@@ -43340,7 +43569,12 @@ impl App {
         let cf_was_open = self.fullscreen_idx.is_some();
         let cf_fs_cache = self.fs_cache.len();
         let cf_ai_cache = self.ai_upscale_cache.len();
-        if cf_was_open && self.bookmark_view_return_target.is_some() {
+        if cf_was_open
+            && matches!(
+                self.bookmark_view_state,
+                Some(BookmarkViewState::Opening { .. })
+            )
+        {
             // 一覧へ戻る close は `handle_fullscreen_close_request` が先に nav を予約し、
             // `enter_bookmark_view` でこの target を消費してからここへ来る。ここに target が
             // 残っている real close は、別ファイル移動後 / BS 等で実フォルダへ戻る経路なので、
@@ -56612,7 +56846,7 @@ impl eframe::App for App {
         if self.bookmark_delete_pending.is_some() {
             reasons.push("bookmark_delete_pending");
         }
-        if self.bookmark_media_open_pending.is_some() || self.bookmark_book_open_pending.is_some() {
+        if self.bookmark_open_pending.is_some() {
             reasons.push("bookmark_open_pending");
         }
         // AI upscale worker は別スレッドで完了するが、完了通知は UI thread の

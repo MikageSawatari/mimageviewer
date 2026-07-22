@@ -5918,7 +5918,10 @@ impl App {
         }
     }
 
-    fn handle_gamepad_grid_accept(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+    pub(super) fn handle_gamepad_grid_accept(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<AddressBarNav> {
         if self.folder_pane_blocks_grid_keyboard() {
             if let Some(FolderPaneCommand::Open(path)) = self
                 .folder_pane
@@ -5934,6 +5937,12 @@ impl App {
             return None;
         }
         let idx = self.selected?;
+        if self.items_are_bookmark_view {
+            if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
+                self.open_bookmark_browser_row(ctx, &row);
+            }
+            return None;
+        }
         if !self.guard_reading_history_open(idx) {
             return None;
         }
