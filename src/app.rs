@@ -27739,10 +27739,12 @@ impl App {
         // visible_indices の有無に関係なく処理する。
         {
             let shift_rating_key = self.keymap.consume_rating_action(ctx, true);
-            if let Some(stars) = shift_rating_key
-                && self.set_current_folder_rating(stars)
-            {
-                self.show_container_rating_toast(stars);
+            if let Some(stars) = shift_rating_key {
+                match self.set_current_folder_rating(stars) {
+                    Ok(true) => self.show_container_rating_toast(stars),
+                    Ok(false) => {}
+                    Err(error) => self.report_rating_write_error(&error),
+                }
             }
             let rating_key = self.keymap.consume_rating_action(ctx, false);
             if let Some(stars) = rating_key {
@@ -39604,19 +39606,28 @@ impl App {
     /// The path generation ledger is App-global while display caches remain
     /// context-local, so detached and main contexts converge without sharing a
     /// mutable cache instance.
-    fn write_user_rating_shared(
+    pub(crate) fn write_user_rating_shared(
         &mut self,
         key: &str,
         stars: u8,
         meta: Option<&crate::rating_db::RatingMeta>,
-    ) -> bool {
-        let written = self
-            .rating_db
+    ) -> Result<(), String> {
+        self.rating_db
             .as_ref()
-            .is_some_and(|db| db.set_user_rating(key, stars, meta).is_ok());
+            .ok_or_else(|| "レーティング DB を利用できません".to_string())?
+            .set_user_rating(key, stars, meta)
+            .map_err(|error| format!("レーティング DB への保存に失敗しました: {error}"))?;
+        // A generation is a publication record, not an attempted-write
+        // counter. Detached/main contexts may consume it only after SQLite is
+        // the durable source of truth.
         self.record_rating_session_write(key.to_string(), stars, true);
         self.sync_current_context_rating_session_writes();
-        written
+        Ok(())
+    }
+
+    pub(crate) fn report_rating_write_error(&mut self, error: &str) {
+        crate::logger::log(format!("[RATING] user write failed: {error}"));
+        self.show_feedback_toast(format!("レーティングを保存できませんでした: {error}"));
     }
 
     /// App-global path rating 更新を、現在 mount 中 context の idx cache へ反映する。
@@ -39688,26 +39699,36 @@ impl App {
     /// 指定 idx のレーティングを設定する (0..=5)。
     /// レーティング対象外アイテムの場合は何もしない。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
-    pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) {
+    pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) -> bool {
+        match self.set_rating_result(idx, stars) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.report_rating_write_error(&error);
+                false
+            }
+        }
+    }
+
+    fn set_rating_result(&mut self, idx: usize, stars: u8) -> Result<bool, String> {
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
-            return;
+            return Ok(false);
         }
         self.sync_current_context_rating_session_writes();
         let book_page = self.idx_is_compiled_book_page(idx);
         let stars = stars.min(5);
         let key = match self.rating_path_key(idx) {
             Some(k) => k,
-            None => return,
+            None => return Ok(false),
         };
         let meta = self.rating_meta_for_idx(idx);
         // prewarm で全 item が cache に載っている前提。未取得なら 0 扱いで OK。
         let old_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
-        self.rating_cache.insert(idx, stars);
         // DB write と App-global path generation の記録を同じ ownership
         // boundary に通す。detached unmount 時は swap 境界が main / parked
         // cache へ同じ値を反映する。
-        self.write_user_rating_shared(&key, stars, meta.as_ref());
+        self.write_user_rating_shared(&key, stars, meta.as_ref())?;
+        self.rating_cache.insert(idx, stars);
         self.invalidate_rating_counts_cache();
         // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
         // ZIP 内画像 / PDF ページ) のみ親フォルダの集計に伝搬する。
@@ -39741,6 +39762,7 @@ impl App {
                 }
             }
         }
+        Ok(true)
     }
 
     /// 任意のフォルダパスの★ (コンテナレーティング) を DB から読む (Inc 5 FB)。
@@ -39754,17 +39776,25 @@ impl App {
     /// 任意のフォルダパスの★ (コンテナレーティング) を設定する (Inc 5 FB)。
     /// `set_rating` のコンテナ分岐と同じキャッシュ無効化を行う (idx キャッシュはフォルダに
     /// エントリを持たないので触らない。グリッド復帰時に DB から読み直される)。
-    pub(crate) fn set_folder_rating_by_path(&mut self, folder: &std::path::Path, stars: u8) {
+    pub(crate) fn set_folder_rating_by_path(
+        &mut self,
+        folder: &std::path::Path,
+        stars: u8,
+    ) -> bool {
         let stars = stars.min(5);
         let key = crate::adjustment_db::normalize_path(folder);
         let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Folder)
             .with_source_path(folder);
-        self.write_user_rating_shared(&key, stars, Some(&meta));
+        if let Err(error) = self.write_user_rating_shared(&key, stars, Some(&meta)) {
+            self.report_rating_write_error(&error);
+            return false;
+        }
         self.invalidate_rating_counts_cache();
         self.current_folder_rating_cache = Some(stars);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Rating,
         );
+        true
     }
 
     /// レーティング XMP 書き込み worker を必要なら起動する (遅延初期化)。
@@ -40491,21 +40521,26 @@ impl App {
     }
 
     /// 現在一覧表示中のコンテナにレーティングを設定する (Shift+F1〜F6 用)。
-    /// 合成パス (検索結果ビュー等) はスキップして false を返す。
+    /// 合成パス (検索結果ビュー等) はスキップして `Ok(false)` を返す。
     /// Ctrl+G 検索中は `current_folder` が検索前のフォルダを指したままなので、
-    /// 直前に開いていた実フォルダを誤って書き換えないよう false を返す。
-    /// 成功時は rating_cache も同期し、visible_indices を rebuild する。
-    pub(crate) fn set_current_folder_rating(&mut self, stars: u8) -> bool {
+    /// 直前に開いていた実フォルダを誤って書き換えないよう `Ok(false)` を返す。
+    /// DB エラーは表示 cache を変えず `Err`、成功時は rating_cache も同期して
+    /// visible_indices を rebuild する。
+    pub(crate) fn set_current_folder_rating(&mut self, stars: u8) -> Result<bool, String> {
         self.set_current_folder_rating_internal(stars, true)
     }
 
-    pub(crate) fn preview_current_folder_rating(&mut self, stars: u8) -> bool {
+    pub(crate) fn preview_current_folder_rating(&mut self, stars: u8) -> Result<bool, String> {
         self.set_current_folder_rating_internal(stars, false)
     }
 
-    fn set_current_folder_rating_internal(&mut self, stars: u8, capture_undo: bool) -> bool {
+    fn set_current_folder_rating_internal(
+        &mut self,
+        stars: u8,
+        capture_undo: bool,
+    ) -> Result<bool, String> {
         let Some((key, _, meta)) = self.current_container_rating_target() else {
-            return false;
+            return Ok(false);
         };
         let stars = stars.min(5);
         // Undo 用に変更前の値をキャッシュ or DB から取得 (なければ 0)。
@@ -40513,10 +40548,10 @@ impl App {
             .current_folder_rating_cache
             .or_else(|| self.rating_db.as_ref().map(|db| db.get(&key)))
             .unwrap_or(0);
+        self.write_user_rating_shared(&key, stars, Some(&meta))?;
         if capture_undo && before != stars {
             self.capture_container_rating_undo(before, stars);
         }
-        let rating_written = self.write_user_rating_shared(&key, stars, Some(&meta));
         self.invalidate_rating_counts_cache();
         self.current_folder_rating_cache = Some(stars);
         // items 内の同じ rating key を指すコンテナがあればキャッシュ更新。
@@ -40534,13 +40569,13 @@ impl App {
         for i in matching {
             self.rating_cache.insert(i, stars);
         }
-        if rating_written && before != stars {
+        if before != stars {
             self.schedule_current_smart_folder_metadata_refresh(
                 smart_folder::SmartFolderMetadataDependency::Rating,
             );
         }
         self.rebuild_visible_indices();
-        true
+        Ok(true)
     }
 
     pub(crate) fn set_tags_cache_entry(&mut self, key: String, tags: Vec<String>) -> bool {
@@ -41247,17 +41282,39 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        // set_rating 内で rating_cache が書き換わるので、Undo 用 before は事前に確定させる。
-        let mut undo_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
+        // DB write に成功した項目だけを Undo / 派生ビュー更新の対象にする。失敗項目を
+        // optimistic cache や undo stack へ公開しない。
+        let mut pending_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
         for &idx in &targets {
             let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
-            undo_records.push((idx, before, stars));
+            pending_records.push((idx, before, stars));
         }
-        let summary = if targets.len() > 1 {
+        let mut successful_targets = Vec::with_capacity(targets.len());
+        let mut undo_records = Vec::with_capacity(targets.len());
+        let mut first_error = None;
+        for record @ (idx, _, _) in pending_records {
+            match self.set_rating_result(idx, stars) {
+                Ok(true) => {
+                    successful_targets.push(idx);
+                    undo_records.push(record);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            self.report_rating_write_error(&error);
+        }
+        if successful_targets.is_empty() {
+            return;
+        }
+        let summary = if successful_targets.len() > 1 {
             if stars == 0 {
-                format!("★解除を {} 件に適用", targets.len())
+                format!("★解除を {} 件に適用", successful_targets.len())
             } else {
-                format!("★{stars} を {} 件に付与", targets.len())
+                format!("★{stars} を {} 件に付与", successful_targets.len())
             }
         } else if stars == 0 {
             "★解除".to_string()
@@ -41266,25 +41323,25 @@ impl App {
         };
         self.capture_rating_undo(undo_records, summary);
         let rating_view_changes: Vec<(String, u8)> = if self.items_are_rating_view {
-            targets
+            successful_targets
                 .iter()
                 .filter_map(|&idx| self.rating_path_key(idx).map(|key| (key, stars)))
                 .collect()
         } else {
             Vec::new()
         };
-        for &idx in &targets {
-            self.set_rating(idx, stars);
-        }
-        let bulk = targets.len() > 1;
+        let bulk = successful_targets.len() > 1;
         if bulk {
             crate::logger::log(format!(
                 "[RATING] Bulk apply {stars} stars to {} items",
-                targets.len(),
+                successful_targets.len(),
             ));
             self.checked.clear();
         } else {
-            crate::logger::log(format!("[RATING] Set {stars} stars on idx {}", targets[0]));
+            crate::logger::log(format!(
+                "[RATING] Set {stars} stars on idx {}",
+                successful_targets[0]
+            ));
         }
         // Ctrl+G ヒットの stars はバッチ受信時の snapshot。レーティング変更後に
         // drilled view のサブフォルダ件数 / 枝刈りが古いまま残らないよう、
@@ -41294,8 +41351,8 @@ impl App {
         // 実体ビューなので、ここで rebuild_items_from_global_search を呼ぶと
         // ページ一覧が検索 drilled view の合成 items に置き換わる事故になる
         // (Codex P2)。
-        if self.global_search.active && !targets.is_empty() {
-            self.refresh_global_search_hit_stars(&targets);
+        if self.global_search.active {
+            self.refresh_global_search_hit_stars(&successful_targets);
         }
         if self.items_are_rating_view {
             self.refresh_rating_view_after_rating_changes(&rating_view_changes);

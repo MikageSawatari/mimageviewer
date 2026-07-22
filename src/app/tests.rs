@@ -11985,7 +11985,7 @@ mod favorite_adjustment_defaults_tests {
         app.zip_nav = Some(test_zip_nav_for(cache.clone(), &["p1.jpg", "p2.jpg"]));
         app.zip_nav_show_current_level();
 
-        assert!(app.set_current_folder_rating(2));
+        assert!(app.set_current_folder_rating(2).unwrap());
 
         let source_key = crate::adjustment_db::normalize_path(&src);
         let cache_key = crate::adjustment_db::normalize_path(&cache);
@@ -12022,7 +12022,7 @@ mod favorite_adjustment_defaults_tests {
         app.zip_nav = Some(nav);
         app.zip_nav_show_current_level();
 
-        assert!(app.set_current_folder_rating(4));
+        assert!(app.set_current_folder_rating(4).unwrap());
 
         let source_book_key = crate::adjustment_db::normalize_path(&src.join("bookA"));
         let cache_book_key = crate::adjustment_db::normalize_path(&cache.join("bookA"));
@@ -12057,7 +12057,7 @@ mod favorite_adjustment_defaults_tests {
         app.zip_nav = Some(nav);
         app.zip_nav_show_current_level();
 
-        assert!(app.set_current_folder_rating(4));
+        assert!(app.set_current_folder_rating(4).unwrap());
 
         let book_key = crate::adjustment_db::normalize_path(&zip_path.join("bookA"));
         let outer_key = crate::adjustment_db::normalize_path(&zip_path);
@@ -12092,7 +12092,7 @@ mod favorite_adjustment_defaults_tests {
         app.zip_nav = Some(nav);
         app.zip_nav_show_current_level();
 
-        assert!(app.set_current_folder_rating(5));
+        assert!(app.set_current_folder_rating(5).unwrap());
 
         let literal_key = crate::adjustment_db::normalize_path(&zip_path.join("bookB"));
         let effective_key =
@@ -12264,7 +12264,7 @@ mod favorite_adjustment_defaults_tests {
         app.zip_nav = Some(nav);
         app.zip_nav_show_current_level();
 
-        assert!(app.set_current_folder_rating(3));
+        assert!(app.set_current_folder_rating(3).unwrap());
         let book_key = crate::adjustment_db::normalize_path(&zip_path.join("bookA"));
         assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 3);
 
@@ -19812,7 +19812,7 @@ mod native_video_rating_key_tests {
 
             let stale_generation = app.rating_session_generation_for_key(&key);
             app.with_active_detached_viewer_context(|detached| {
-                assert!(detached.set_current_folder_rating(4));
+                assert!(detached.set_current_folder_rating(4).unwrap());
             })
             .expect("detached context");
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
@@ -19825,7 +19825,7 @@ mod native_video_rating_key_tests {
             assert_eq!(app.rating_cache.get(&idx), Some(&4));
 
             app.with_active_detached_viewer_context(|detached| {
-                assert!(detached.set_current_folder_rating(0));
+                assert!(detached.set_current_folder_rating(0).unwrap());
             })
             .expect("detached context");
             let clear_generation = app.rating_session_generation_for_key(&key);
@@ -35358,7 +35358,7 @@ mod smart_folder_transition_tests {
         app.current_smart_folder_id = None;
         app.current_folder = Some(source.clone());
         let revision = app.smart_folder_metadata_revision;
-        assert!(app.set_current_folder_rating(3));
+        assert!(app.set_current_folder_rating(3).unwrap());
         assert!(app.smart_folder_metadata_revision > revision);
         assert!(app.smart_folder_resort_metadata.is_empty());
 
@@ -36723,4 +36723,57 @@ fn details_cell_content_revisions_follow_only_changed_cache_columns() {
         app.details_cell_content_revisions.video_meta,
         before_replacement.video_meta.wrapping_add(1)
     );
+}
+
+#[cfg(test)]
+mod rating_write_failure_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    #[test]
+    fn missing_rating_db_does_not_publish_generation_or_optimistic_item_cache() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("page.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.rating_cache.insert(0, 2);
+        let key = crate::adjustment_db::normalize_path(&path);
+        let generation = app.rating_session_write_generation;
+        app.rating_db = None;
+
+        assert!(!app.set_rating(0, 4));
+        assert_eq!(app.rating_cache.get(&0), Some(&2));
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert!(!app.rating_session_writes.contains_key(&key));
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("レーティングを保存できませんでした")
+                && toast.0.contains("DB を利用できません")
+        }));
+    }
+
+    #[test]
+    fn sqlite_write_failure_does_not_publish_container_cache_or_generation() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("book");
+        std::fs::create_dir(&folder).unwrap();
+        app.current_folder = Some(folder.clone());
+        app.current_folder_rating_cache = Some(1);
+        let key = crate::adjustment_db::normalize_path(&folder);
+        let generation = app.rating_session_write_generation;
+
+        // Reopen the initialized DB read-only so the handle exists but
+        // `set_user_rating` itself fails.
+        app.rating_db = None;
+        app.rating_db = Some(
+            crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
+                .unwrap(),
+        );
+
+        let error = app.set_current_folder_rating(5).unwrap_err();
+        assert!(error.contains("保存に失敗"));
+        assert_eq!(app.current_folder_rating_cache, Some(1));
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert!(!app.rating_session_writes.contains_key(&key));
+        assert_eq!(app.meta_undo.undo_len(), 0);
+    }
 }

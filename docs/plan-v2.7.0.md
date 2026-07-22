@@ -13,10 +13,14 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   アプリ内の本 / ページのリネーム、製本ページの並べ替え・別本への移動では、操作結果の path mapping を
   `book_bookmarks.db` にも transaction で適用する。ファイル変更前に元 path → 最終 path と、永続
   temp 名・copy/move の SHA-256 identity を含む filesystem step plan を同 DB の `Prepared` journal
-  へ記録する。`Applying` / `RollingBack` は step 進捗と診断を保持し、filesystem commit 後だけ
-  bookmark mapping を適用する。`Prepared` のまま異常終了した操作は no-op 破棄し、適用中または
-  rollback 中の操作は次回起動時に実 filesystem 状態から冪等に収束させる。全 rollback step の成功を
-  証明できた場合だけ journal を消す。外部変更は missing 行として保持する。
+  へ記録する。copy/move は最終 path へ直接書かず、journal 固有の sibling staging file を
+  `create_new` で完成・同期してから atomic no-clobber で公開する。復旧時に最終 path の identity が
+  異なる場合は外部ファイルとして一切削除せず、診断付きで journal を保持する。rename / create /
+  delete 後は影響する親ディレクトリを同期し、その namespace barrier が成功した step だけ進捗へ
+  記録する。`Applying` / `RollingBack` は step 進捗と診断を保持し、全 filesystem step の barrier 後
+  だけ filesystem committed として bookmark mapping を適用する。`Prepared` のまま異常終了した操作は
+  no-op 破棄し、適用中または rollback 中の操作は次回起動時に実 filesystem 状態から冪等に収束させる。
+  全 rollback step の成功を証明できた場合だけ journal を消す。外部変更は missing 行として保持する。
 - 左パネルを「画像補正 / 表示トリム / ブックマーク」の 3 タブにし、現在の本の登録ページを
   サムネイル付きで表示、移動、任意名称の編集、削除ができる。
   ネスト ZIP では完全な entry prefix の階層を materialize してからページを解決し、現在表示中とは
@@ -38,8 +42,10 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   メイン一覧を再構築せず現在の表示を維持する。
   rating の idx cache は各 context が所有する一方、path ごとの最終書込値と世代は App-global に置く。
   通常画像、path 指定、現在のフォルダ / ZIP / PDF の全ユーザー書込を同じ DB + 世代記録 boundary に
-  通す。XMP hydrate は投入時世代より新しい書込があれば破棄し、detached での変更・0 クリアを main
-  一覧へ swap 境界で同期するため、一覧再構築を省略しても古い星や古い XMP 値を復活させない。
+  通す。SQLite 書込が成功した場合だけ App-global 世代と各 context の表示 cache を更新し、失敗時は
+  楽観表示・Undo・XMP 書込を公開せずエラーを通知する。XMP hydrate は投入時世代より新しい書込が
+  あれば破棄し、detached での変更・0 クリアを main 一覧へ swap 境界で同期するため、一覧再構築を
+  省略しても古い星や古い XMP 値を復活させない。
   一覧が同一なら開く直前のスクロール位置を保持し、ブックマークの増減等で一覧が変わった場合は
   開いた行が可視範囲へ入るようにスクロールする。
   行削除は DB 上のブックマークだけを対象とし、元ファイルは削除しない。missing 行も保持する。

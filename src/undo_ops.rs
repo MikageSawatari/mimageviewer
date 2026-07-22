@@ -303,20 +303,20 @@ impl App {
             // 現在のグリッドに無い (= 通常はコンテナレーティングの Undo: current_folder
             // 自身は self.items に含まれないため、ここに来る)。永続化に加えて、現在表示中
             // フォルダと一致する場合はアドレスバー側のキャッシュも同期する (Codex P2)。
-            if let Some(db) = self.rating_db.as_ref() {
-                let fallback_meta;
-                let meta = match c.meta.as_ref() {
-                    Some(meta) => Some(meta),
-                    None => {
-                        fallback_meta =
-                            self.rating_meta_for_key_and_source(&c.path_key, &c.source_path);
-                        fallback_meta.as_ref()
-                    }
-                };
-                let _ = db.set_user_rating(&c.path_key, target, meta);
+            let fallback_meta;
+            let meta = match c.meta.as_ref() {
+                Some(meta) => Some(meta),
+                None => {
+                    fallback_meta =
+                        self.rating_meta_for_key_and_source(&c.path_key, &c.source_path);
+                    fallback_meta.as_ref()
+                }
+            };
+            if let Err(error) = self.write_user_rating_shared(&c.path_key, target, meta) {
+                self.report_rating_write_error(&error);
+                return;
             }
             self.invalidate_rating_counts_cache();
-            self.record_rating_session_write(c.path_key.clone(), target, true);
             if self
                 .current_container_rating_key_and_source()
                 .is_some_and(|(key, _)| key == c.path_key)

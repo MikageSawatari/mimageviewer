@@ -3321,8 +3321,9 @@ impl App {
                 self.handle_native_video_open_external_url_command(ctx, fs_idx, url);
             }
             crate::video::NativeVideoOutputEvent::SetRating { stars } => {
-                self.set_rating(fs_idx, stars);
-                self.sync_native_video_metadata(fs_idx);
+                if self.set_rating(fs_idx, stars) {
+                    self.sync_native_video_metadata(fs_idx);
+                }
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleTag { name } => {
@@ -6405,10 +6406,13 @@ impl App {
         let mut hud_activity = true;
         if let Some(rating_key) = self.keymap.native_video_rating_action(&key) {
             if rating_key.container {
-                if self.set_current_folder_rating(rating_key.stars) {
-                    self.show_container_rating_toast(rating_key.stars);
-                } else {
-                    hud_activity = false;
+                match self.set_current_folder_rating(rating_key.stars) {
+                    Ok(true) => self.show_container_rating_toast(rating_key.stars),
+                    Ok(false) => hud_activity = false,
+                    Err(error) => {
+                        self.report_rating_write_error(&error);
+                        hud_activity = false;
+                    }
                 }
             } else {
                 self.apply_native_video_rating_key(fs_idx, rating_key.stars);
@@ -6849,6 +6853,9 @@ impl App {
     #[cfg(windows)]
     fn apply_native_video_rating_key(&mut self, fs_idx: usize, stars: u8) {
         let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
+        if !self.set_rating(fs_idx, stars) {
+            return;
+        }
         if before != stars {
             let summary = if stars == 0 {
                 "★解除".to_string()
@@ -6857,7 +6864,6 @@ impl App {
             };
             self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
         }
-        self.set_rating(fs_idx, stars);
         self.rebuild_visible_indices();
         if stars == 0 {
             self.show_feedback_toast("[★解除]".to_string());

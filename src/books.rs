@@ -680,20 +680,46 @@ pub fn transfer_pages_between_books(
         &job_id,
         "commit",
     )?);
-    for (original, mapping) in selected_original.iter().zip(&transfer_mappings) {
+    for (transfer_idx, (original, mapping)) in
+        selected_original.iter().zip(&transfer_mappings).enumerate()
+    {
         let identity = BookFileIdentity::read(original)
             .map_err(|error| format!("移動元ページの identity を読み取れません: {error}"))?;
+        let staging = journal_transfer_staging_path(&mapping.to, &job_id, transfer_idx, "forward")?;
+        if !filesystem_path_is_missing(&staging)? {
+            return Err(format!(
+                "転送用の一時ファイルが既に存在します: {}",
+                staging.display()
+            ));
+        }
         filesystem_steps.push(match kind {
             BookTransferKind::Copy => BookFsStep::CopyFile {
                 from: mapping.from.clone(),
                 to: mapping.to.clone(),
+                staging: Some(staging),
                 identity,
             },
-            BookTransferKind::Move => BookFsStep::MoveFile {
-                from: mapping.from.clone(),
-                to: mapping.to.clone(),
-                identity,
-            },
+            BookTransferKind::Move => {
+                let rollback_staging = journal_transfer_staging_path(
+                    &mapping.from,
+                    &job_id,
+                    transfer_idx,
+                    "rollback",
+                )?;
+                if !filesystem_path_is_missing(&rollback_staging)? {
+                    return Err(format!(
+                        "復旧用の一時ファイルが既に存在します: {}",
+                        rollback_staging.display()
+                    ));
+                }
+                BookFsStep::MoveFile {
+                    from: mapping.from.clone(),
+                    to: mapping.to.clone(),
+                    staging: Some(staging),
+                    rollback_staging: Some(rollback_staging),
+                    identity,
+                }
+            }
         });
     }
     if kind == BookTransferKind::Move {
@@ -841,6 +867,20 @@ fn plan_reorder_filesystem_steps(
         });
     }
     Ok(steps)
+}
+
+fn journal_transfer_staging_path(
+    anchor: &Path,
+    job_id: &str,
+    index: usize,
+    direction: &str,
+) -> Result<PathBuf, String> {
+    let parent = anchor
+        .parent()
+        .ok_or_else(|| format!("転送先に親フォルダがありません: {}", anchor.display()))?;
+    Ok(parent.join(format!(
+        ".miv-book-op-{job_id}-transfer-{index:04}-{direction}.tmp"
+    )))
 }
 
 fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {

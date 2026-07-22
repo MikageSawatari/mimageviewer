@@ -11319,10 +11319,12 @@ impl App {
         // (フォルダ / ZIP / PDF) にレーティング / 解除。
         // current_folder がそのまま親コンテナなので、そちらに書き込めば一覧画面で★絞り込みできる。
         let container_rating_key = self.keymap.consume_rating_action(ctx, true);
-        if let Some(stars) = container_rating_key
-            && self.set_current_folder_rating(stars)
-        {
-            self.show_container_rating_toast(stars);
+        if let Some(stars) = container_rating_key {
+            match self.set_current_folder_rating(stars) {
+                Ok(true) => self.show_container_rating_toast(stars),
+                Ok(false) => {}
+                Err(error) => self.report_rating_write_error(&error),
+            }
         }
 
         // レーティング 1〜5 / 解除 (既定: F1〜F6)
@@ -11330,21 +11332,22 @@ impl App {
         if let Some(stars) = rating_key {
             // Undo 用にフルスクリーン現在ページの before/after を 1 件分積む。
             let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
-            if before != stars {
-                let summary = if stars == 0 {
-                    "★解除".to_string()
+            if self.set_rating(fs_idx, stars) {
+                if before != stars {
+                    let summary = if stars == 0 {
+                        "★解除".to_string()
+                    } else {
+                        format!("★{stars}")
+                    };
+                    self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
+                }
+                // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
+                self.rebuild_visible_indices();
+                if stars == 0 {
+                    self.show_feedback_toast("[★解除]".to_string());
                 } else {
-                    format!("★{stars}")
-                };
-                self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
-            }
-            self.set_rating(fs_idx, stars);
-            // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
-            self.rebuild_visible_indices();
-            if stars == 0 {
-                self.show_feedback_toast("[★解除]".to_string());
-            } else {
-                self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
+                    self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
+                }
             }
         }
         if key_p_pin {

@@ -6249,12 +6249,16 @@ impl App {
             self.apply_rating_to_selection(n);
         }
         if let Some(n) = toolbar_rating_assign_container {
-            if self.set_current_folder_rating(n) {
-                self.show_container_rating_toast(n);
-            } else {
-                // 合成ビュー等で実コンテナが無い場合。常に何らかのフィードバックを返す
-                // (グリッドからのコンテナ付与で無反応に見えないように)。
-                self.show_feedback_toast("この画面ではこの場所に評価を付けられません".to_string());
+            match self.set_current_folder_rating(n) {
+                Ok(true) => self.show_container_rating_toast(n),
+                Ok(false) => {
+                    // 合成ビュー等で実コンテナが無い場合。常に何らかのフィードバックを返す
+                    // (グリッドからのコンテナ付与で無反応に見えないように)。
+                    self.show_feedback_toast(
+                        "この画面ではこの場所に評価を付けられません".to_string(),
+                    );
+                }
+                Err(error) => self.report_rating_write_error(&error),
             }
         }
 

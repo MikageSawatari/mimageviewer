@@ -3014,7 +3014,9 @@ impl App {
             RingPickerRowId::ContainerRating
                 if self.current_folder_rating() != picker.container_rating =>
             {
-                self.preview_current_folder_rating(picker.container_rating);
+                if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+                    self.report_rating_write_error(&error);
+                }
             }
             _ => {}
         }
@@ -3061,7 +3063,9 @@ impl App {
             RingPickerRowId::ContainerRating
                 if self.current_folder_rating() != picker.container_rating =>
             {
-                self.preview_current_folder_rating(picker.container_rating);
+                if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+                    self.report_rating_write_error(&error);
+                }
             }
             RingPickerRowId::PostFilter
                 if self.reading_flow.is_paged()
@@ -3119,7 +3123,9 @@ impl App {
             RingPickerRowId::ContainerRating
                 if self.current_folder_rating() != picker.container_rating =>
             {
-                self.preview_current_folder_rating(picker.container_rating);
+                if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+                    self.report_rating_write_error(&error);
+                }
             }
             _ => {}
         }
@@ -3131,8 +3137,9 @@ impl App {
         }
         let mut touched = Vec::with_capacity(picker.original.item_rating_records.len());
         for &(idx, _) in &picker.original.item_rating_records {
-            self.set_rating(idx, stars);
-            touched.push(idx);
+            if self.set_rating(idx, stars) {
+                touched.push(idx);
+            }
         }
         if self.global_search.active {
             self.refresh_global_search_hit_stars(&touched);
@@ -3822,9 +3829,12 @@ impl App {
             .dirty_rows
             .contains(&RingPickerRowId::ContainerRating)
             && self.current_folder_rating() != picker.container_rating
-            && self.set_current_folder_rating(picker.container_rating)
         {
-            self.show_container_rating_toast(picker.container_rating);
+            match self.set_current_folder_rating(picker.container_rating) {
+                Ok(true) => self.show_container_rating_toast(picker.container_rating),
+                Ok(false) => {}
+                Err(error) => self.report_rating_write_error(&error),
+            }
         }
     }
 
@@ -3904,9 +3914,12 @@ impl App {
             .dirty_rows
             .contains(&RingPickerRowId::ContainerRating)
             && self.current_folder_rating() != picker.container_rating
-            && self.set_current_folder_rating(picker.container_rating)
         {
-            self.show_container_rating_toast(picker.container_rating);
+            match self.set_current_folder_rating(picker.container_rating) {
+                Ok(true) => self.show_container_rating_toast(picker.container_rating),
+                Ok(false) => {}
+                Err(error) => self.report_rating_write_error(&error),
+            }
         }
         if self.reading_flow.is_paged() {
             if picker.dirty_rows.contains(&RingPickerRowId::PostFilter) {
@@ -3968,9 +3981,12 @@ impl App {
             .dirty_rows
             .contains(&RingPickerRowId::ContainerRating)
             && self.current_folder_rating() != picker.container_rating
-            && self.set_current_folder_rating(picker.container_rating)
         {
-            self.show_container_rating_toast(picker.container_rating);
+            match self.set_current_folder_rating(picker.container_rating) {
+                Ok(true) => self.show_container_rating_toast(picker.container_rating),
+                Ok(false) => {}
+                Err(error) => self.report_rating_write_error(&error),
+            }
         }
     }
 
@@ -3979,13 +3995,15 @@ impl App {
         if before == stars {
             return;
         }
+        if !self.set_rating(fs_idx, stars) {
+            return;
+        }
         let summary = if stars == 0 {
             "★解除".to_string()
         } else {
             format!("★{stars}")
         };
         self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
-        self.set_rating(fs_idx, stars);
         self.rebuild_visible_indices();
         if stars == 0 {
             self.show_feedback_toast("[★解除]".to_string());
