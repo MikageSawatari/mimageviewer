@@ -4,9 +4,53 @@
 //! [`PageIdentity`] で保持する。SQLite は [`BookBookmarkService`] の専用 worker
 //! だけが触り、UI スレッドは request / event の送受信だけを行う。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock, mpsc};
+
+const MIGRATION_PHASE_PREPARED: &str = "prepared";
+const MIGRATION_PHASE_APPLYING: &str = "applying";
+const MIGRATION_PHASE_ROLLING_BACK: &str = "rolling_back";
+const MIGRATION_PHASE_FILESYSTEM_COMMITTED: &str = "filesystem_committed";
+
+/// A second App/service can exist transiently in tests and activation flows.
+/// Startup recovery must not mistake an operation whose writer is alive in
+/// this process for a crash remnant.
+static ACTIVE_PATH_MIGRATION_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn active_path_migration_jobs() -> &'static Mutex<HashSet<String>> {
+    ACTIVE_PATH_MIGRATION_JOBS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_active_path_migration(job_id: &str) {
+    active_path_migration_jobs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(job_id.to_string());
+}
+
+fn unregister_active_path_migration(job_id: &str) {
+    active_path_migration_jobs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(job_id);
+}
+
+fn path_migration_is_active(job_id: &str) -> bool {
+    active_path_migration_jobs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(job_id)
+}
+
+#[derive(Debug)]
+struct PathMigrationJournalEntry {
+    job_id: String,
+    mappings_json: String,
+    operation_json: Option<String>,
+    phase: String,
+    next_step: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BookContainerKind {
@@ -375,12 +419,38 @@ impl BookBookmarkDb {
              CREATE TABLE IF NOT EXISTS book_bookmark_path_migrations (
                 job_id          TEXT PRIMARY KEY,
                 mappings_json   TEXT NOT NULL,
+                operation_json  TEXT,
+                phase           TEXT NOT NULL DEFAULT 'legacy_ambiguous',
+                next_step       INTEGER NOT NULL DEFAULT 0,
+                diagnostic      TEXT,
                 created_at_ms   INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_book_bookmark_path_migrations_created
                 ON book_bookmark_path_migrations(created_at_ms, job_id);",
         )?;
-        ensure_column(conn, "title", "TEXT")
+        ensure_column(conn, "book_bookmarks", "title", "TEXT")?;
+        // Rows created by the pre-phase v2.7 development build cannot be
+        // classified safely from path existence (swap/cycle are ambiguous).
+        // Keep them as legacy_ambiguous for diagnosis instead of guessing.
+        ensure_column(
+            conn,
+            "book_bookmark_path_migrations",
+            "operation_json",
+            "TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "book_bookmark_path_migrations",
+            "phase",
+            "TEXT NOT NULL DEFAULT 'legacy_ambiguous'",
+        )?;
+        ensure_column(
+            conn,
+            "book_bookmark_path_migrations",
+            "next_step",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(conn, "book_bookmark_path_migrations", "diagnostic", "TEXT")
     }
 
     fn add(&self, entry: &NewBookBookmark) -> Result<(BookBookmark, bool), rusqlite::Error> {
@@ -482,7 +552,35 @@ impl BookBookmarkDb {
         if mappings.is_empty() && journal_id.is_none() {
             return Ok(0);
         }
-        let mappings = PathMappingIndex::new(mappings);
+        // A journaled completion must use the durable mapping, not the UI
+        // message copy. This keeps filesystem and bookmark identity coupled
+        // even after a restart or a stale completion event.
+        let journal_mappings = if let Some(journal_id) = journal_id {
+            let (phase, mappings_json): (String, String) = self.conn.query_row(
+                "SELECT phase, mappings_json
+                   FROM book_bookmark_path_migrations
+                  WHERE job_id = ?1",
+                [journal_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if phase != MIGRATION_PHASE_FILESYSTEM_COMMITTED {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Some(
+                serde_json::from_str::<Vec<(PathBuf, PathBuf)>>(&mappings_json).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let mappings = PathMappingIndex::new(journal_mappings.as_deref().unwrap_or(mappings));
         let targets: Vec<_> = self
             .list_all()?
             .into_iter()
@@ -553,14 +651,23 @@ impl BookBookmarkDb {
     }
 
     fn recover_path_migration_journal(&mut self) {
-        let pending = (|| -> Result<Vec<(String, String)>, rusqlite::Error> {
+        let pending = (|| -> Result<Vec<PathMigrationJournalEntry>, rusqlite::Error> {
             let mut stmt = self.conn.prepare(
-                "SELECT job_id, mappings_json
+                "SELECT job_id, mappings_json, operation_json, phase, next_step
                    FROM book_bookmark_path_migrations
                   ORDER BY created_at_ms ASC, job_id ASC",
             )?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect()
+            stmt.query_map([], |row| {
+                let next_step = row.get::<_, i64>(4)?.max(0) as usize;
+                Ok(PathMigrationJournalEntry {
+                    job_id: row.get(0)?,
+                    mappings_json: row.get(1)?,
+                    operation_json: row.get(2)?,
+                    phase: row.get(3)?,
+                    next_step,
+                })
+            })?
+            .collect()
         })();
         let pending = match pending {
             Ok(pending) => pending,
@@ -571,25 +678,218 @@ impl BookBookmarkDb {
                 return;
             }
         };
-        for (job_id, mappings_json) in pending {
-            let mappings: Vec<(PathBuf, PathBuf)> = match serde_json::from_str(&mappings_json) {
-                Ok(mappings) => mappings,
-                Err(error) => {
-                    // 壊れた intent を黙って消すと回復不能になる。行は保持し、診断可能にする。
-                    crate::logger::log(format!(
-                        "book bookmark migration journal parse failed job={job_id}: {error}"
-                    ));
-                    continue;
-                }
-            };
-            match self.migrate_paths_with_journal(&mappings, Some(&job_id)) {
-                Ok(rows) => crate::logger::log(format!(
-                    "book bookmark migration journal recovered job={job_id} rows={rows}"
-                )),
-                Err(error) => crate::logger::log(format!(
-                    "book bookmark migration journal retry failed job={job_id}: {error}"
-                )),
+        for entry in pending {
+            let job_id = entry.job_id.as_str();
+            if path_migration_is_active(job_id) {
+                crate::logger::log(format!(
+                    "book bookmark migration recovery skipped active writer job={job_id}"
+                ));
+                continue;
             }
+            match entry.phase.as_str() {
+                MIGRATION_PHASE_PREPARED => {
+                    // No filesystem decision was made. Prepared is the only
+                    // phase that can be discarded without inspecting paths.
+                    match self.conn.execute(
+                        "DELETE FROM book_bookmark_path_migrations
+                          WHERE job_id = ?1 AND phase = ?2",
+                        rusqlite::params![job_id, MIGRATION_PHASE_PREPARED],
+                    ) {
+                        Ok(1) => crate::logger::log(format!(
+                            "book bookmark migration prepared intent discarded job={job_id}"
+                        )),
+                        Ok(_) => crate::logger::log(format!(
+                            "book bookmark migration prepared intent changed during recovery job={job_id}"
+                        )),
+                        Err(error) => crate::logger::log(format!(
+                            "book bookmark migration prepared discard failed job={job_id}: {error}"
+                        )),
+                    }
+                }
+                MIGRATION_PHASE_APPLYING => {
+                    let Some(plan) = self.parse_filesystem_plan(&entry) else {
+                        continue;
+                    };
+                    let result = crate::book_fs_journal::execute_forward(
+                        &plan,
+                        entry.next_step,
+                        |next_step| {
+                            self.update_journal_progress(
+                                job_id,
+                                MIGRATION_PHASE_APPLYING,
+                                next_step,
+                            )
+                        },
+                    );
+                    if let Err(error) = result {
+                        self.keep_journal_diagnostic(job_id, &error.message);
+                        continue;
+                    }
+                    if let Err(error) = self.transition_journal_phase(
+                        job_id,
+                        MIGRATION_PHASE_APPLYING,
+                        MIGRATION_PHASE_FILESYSTEM_COMMITTED,
+                        plan.len(),
+                        None,
+                    ) {
+                        self.keep_journal_diagnostic(job_id, &error);
+                        continue;
+                    }
+                    self.finish_recovered_journal(job_id, &entry.mappings_json);
+                }
+                MIGRATION_PHASE_ROLLING_BACK => {
+                    let Some(plan) = self.parse_filesystem_plan(&entry) else {
+                        continue;
+                    };
+                    let result = crate::book_fs_journal::execute_rollback(
+                        &plan,
+                        entry.next_step,
+                        |next_step| {
+                            self.update_journal_progress(
+                                job_id,
+                                MIGRATION_PHASE_ROLLING_BACK,
+                                next_step,
+                            )
+                        },
+                    );
+                    match result {
+                        Ok(()) => match self.conn.execute(
+                            "DELETE FROM book_bookmark_path_migrations
+                              WHERE job_id = ?1 AND phase = ?2 AND next_step = 0",
+                            rusqlite::params![job_id, MIGRATION_PHASE_ROLLING_BACK],
+                        ) {
+                            Ok(1) => crate::logger::log(format!(
+                                "book bookmark migration rollback recovered job={job_id}"
+                            )),
+                            Ok(_) => crate::logger::log(format!(
+                                "book bookmark migration rollback completion changed job={job_id}"
+                            )),
+                            Err(error) => self.keep_journal_diagnostic(
+                                job_id,
+                                &format!("rollback journal discard failed: {error}"),
+                            ),
+                        },
+                        Err(error) => self.keep_journal_diagnostic(job_id, &error.message),
+                    }
+                }
+                MIGRATION_PHASE_FILESYSTEM_COMMITTED => {
+                    self.finish_recovered_journal(job_id, &entry.mappings_json);
+                }
+                phase => {
+                    // Pre-phase development rows are intrinsically ambiguous
+                    // for swap/cycle operations. Preserve them for diagnosis.
+                    self.keep_journal_diagnostic(
+                        job_id,
+                        &format!("unsupported or legacy migration phase: {phase}"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn parse_filesystem_plan(
+        &self,
+        entry: &PathMigrationJournalEntry,
+    ) -> Option<crate::book_fs_journal::BookFsOperationPlan> {
+        let Some(operation_json) = entry.operation_json.as_deref() else {
+            self.keep_journal_diagnostic(&entry.job_id, "filesystem operation plan is missing");
+            return None;
+        };
+        match serde_json::from_str(operation_json) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                self.keep_journal_diagnostic(
+                    &entry.job_id,
+                    &format!("filesystem operation plan parse failed: {error}"),
+                );
+                None
+            }
+        }
+    }
+
+    fn update_journal_progress(
+        &self,
+        job_id: &str,
+        phase: &str,
+        next_step: usize,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE book_bookmark_path_migrations
+                    SET next_step = ?1, diagnostic = NULL
+                  WHERE job_id = ?2 AND phase = ?3",
+                rusqlite::params![next_step.min(i64::MAX as usize) as i64, job_id, phase],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "journal phase changed while recording progress: {phase}"
+            ))
+        }
+    }
+
+    fn transition_journal_phase(
+        &self,
+        job_id: &str,
+        from: &str,
+        to: &str,
+        next_step: usize,
+        diagnostic: Option<&str>,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE book_bookmark_path_migrations
+                    SET phase = ?1, next_step = ?2, diagnostic = ?3
+                  WHERE job_id = ?4 AND phase = ?5",
+                rusqlite::params![
+                    to,
+                    next_step.min(i64::MAX as usize) as i64,
+                    diagnostic,
+                    job_id,
+                    from
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(format!("journal phase transition rejected: {from} -> {to}"))
+        }
+    }
+
+    fn keep_journal_diagnostic(&self, job_id: &str, diagnostic: &str) {
+        let _ = self.conn.execute(
+            "UPDATE book_bookmark_path_migrations SET diagnostic = ?1 WHERE job_id = ?2",
+            rusqlite::params![diagnostic, job_id],
+        );
+        crate::logger::log(format!(
+            "book bookmark migration journal retained job={job_id}: {diagnostic}"
+        ));
+    }
+
+    fn finish_recovered_journal(&mut self, job_id: &str, mappings_json: &str) {
+        let mappings: Vec<(PathBuf, PathBuf)> = match serde_json::from_str(mappings_json) {
+            Ok(mappings) => mappings,
+            Err(error) => {
+                self.keep_journal_diagnostic(
+                    job_id,
+                    &format!("bookmark mapping parse failed: {error}"),
+                );
+                return;
+            }
+        };
+        match self.migrate_paths_with_journal(&mappings, Some(job_id)) {
+            Ok(rows) => crate::logger::log(format!(
+                "book bookmark migration journal recovered job={job_id} rows={rows}"
+            )),
+            Err(error) => self.keep_journal_diagnostic(
+                job_id,
+                &format!("bookmark migration retry failed: {error}"),
+            ),
         }
     }
 }
@@ -742,11 +1042,12 @@ fn row_to_bookmark(row: &rusqlite::Row<'_>) -> Result<BookBookmark, rusqlite::Er
 
 fn ensure_column(
     conn: &rusqlite::Connection,
+    table: &str,
     column: &str,
     definition: &str,
 ) -> Result<(), rusqlite::Error> {
     let exists = {
-        let mut stmt = conn.prepare("PRAGMA table_info(book_bookmarks)")?;
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
         let mut found = false;
         for name in rows {
@@ -761,7 +1062,7 @@ fn ensure_column(
         return Ok(());
     }
     match conn.execute(
-        &format!("ALTER TABLE book_bookmarks ADD COLUMN {column} {definition}"),
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
         [],
     ) {
         Ok(_) => Ok(()),
@@ -785,56 +1086,194 @@ pub fn db_path() -> PathBuf {
     crate::data_dir::get().join("book_bookmarks.db")
 }
 
-/// 製本 worker が最初の page path を変更する前に、最終 old → new mapping を永続化する。
-/// journal を作れない場合は filesystem 操作を開始してはならないため、失敗を呼び出し元へ返す。
-pub fn prepare_path_migration(mappings: &[(PathBuf, PathBuf)]) -> Result<Option<String>, String> {
-    prepare_path_migration_at(&db_path(), mappings)
+pub(crate) fn new_path_migration_job_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
+/// Persist the complete deterministic filesystem plan while it is still in the
+/// no-op `prepared` phase. The caller must durably transition to `applying`
+/// before executing the first step.
+pub(crate) fn prepare_path_migration(
+    job_id: &str,
+    mappings: &[(PathBuf, PathBuf)],
+    plan: &crate::book_fs_journal::BookFsOperationPlan,
+) -> Result<Option<PathMigrationJournalWriter>, String> {
+    let path = db_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let db = BookBookmarkDb::open_at(&path).map_err(|error| error.to_string())?;
+    register_active_path_migration(job_id);
+    match insert_prepared_path_migration(&db, job_id, mappings, plan) {
+        Ok(true) => {}
+        Ok(false) => {
+            unregister_active_path_migration(job_id);
+            return Ok(None);
+        }
+        Err(error) => {
+            unregister_active_path_migration(job_id);
+            return Err(error);
+        }
+    }
+    Ok(Some(PathMigrationJournalWriter {
+        db,
+        job_id: job_id.to_string(),
+    }))
+}
+
+#[cfg(test)]
 fn prepare_path_migration_at(
     db_path: &Path,
+    job_id: &str,
     mappings: &[(PathBuf, PathBuf)],
+    plan: &crate::book_fs_journal::BookFsOperationPlan,
 ) -> Result<Option<String>, String> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let db = BookBookmarkDb::open_at(db_path).map_err(|error| error.to_string())?;
+    if !insert_prepared_path_migration(&db, job_id, mappings, plan)? {
+        return Ok(None);
+    }
+    Ok(Some(job_id.to_string()))
+}
+
+fn insert_prepared_path_migration(
+    db: &BookBookmarkDb,
+    job_id: &str,
+    mappings: &[(PathBuf, PathBuf)],
+    plan: &crate::book_fs_journal::BookFsOperationPlan,
+) -> Result<bool, String> {
     let mappings = mappings
         .iter()
         .filter(|(from, to)| !crate::folder_tree::path_eq(from, to))
         .cloned()
         .collect::<Vec<_>>();
-    if mappings.is_empty() {
-        return Ok(None);
+    if mappings.is_empty() && plan.is_empty() {
+        return Ok(false);
     }
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let job_id = uuid::Uuid::new_v4().to_string();
     let mappings_json = serde_json::to_string(&mappings).map_err(|error| error.to_string())?;
-    let db = BookBookmarkDb::open_at(db_path).map_err(|error| error.to_string())?;
+    let operation_json = serde_json::to_string(plan).map_err(|error| error.to_string())?;
     db.conn
         .execute(
             "INSERT INTO book_bookmark_path_migrations
-                (job_id, mappings_json, created_at_ms)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![job_id, mappings_json, now_ms()],
+                (job_id, mappings_json, operation_json, phase, next_step, diagnostic, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5)",
+            rusqlite::params![
+                job_id,
+                mappings_json,
+                operation_json,
+                MIGRATION_PHASE_PREPARED,
+                now_ms()
+            ],
         )
         .map_err(|error| error.to_string())?;
-    Ok(Some(job_id))
+    Ok(true)
 }
 
-/// filesystem 操作が通常エラーで完了しなかった場合だけ prepared intent を破棄する。
-/// プロセスクラッシュ時はこの関数が呼ばれず、次回起動の recovery 対象として残る。
-pub fn discard_prepared_path_migration(job_id: &str) -> Result<(), String> {
-    discard_prepared_path_migration_at(&db_path(), job_id)
+pub(crate) struct PathMigrationJournalWriter {
+    db: BookBookmarkDb,
+    job_id: String,
 }
 
-fn discard_prepared_path_migration_at(db_path: &Path, job_id: &str) -> Result<(), String> {
-    let db = BookBookmarkDb::open_at(db_path).map_err(|error| error.to_string())?;
-    db.conn
-        .execute(
-            "DELETE FROM book_bookmark_path_migrations WHERE job_id = ?1",
-            [job_id],
+impl PathMigrationJournalWriter {
+    pub(crate) fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub(crate) fn begin(&self) -> Result<(), String> {
+        self.db.transition_journal_phase(
+            &self.job_id,
+            MIGRATION_PHASE_PREPARED,
+            MIGRATION_PHASE_APPLYING,
+            0,
+            None,
         )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    }
+
+    pub(crate) fn record_progress(
+        &self,
+        rolling_back: bool,
+        next_step: usize,
+    ) -> Result<(), String> {
+        self.db.update_journal_progress(
+            &self.job_id,
+            if rolling_back {
+                MIGRATION_PHASE_ROLLING_BACK
+            } else {
+                MIGRATION_PHASE_APPLYING
+            },
+            next_step,
+        )
+    }
+
+    pub(crate) fn begin_rollback(
+        &self,
+        affected_steps: usize,
+        diagnostic: &str,
+    ) -> Result<(), String> {
+        self.db.transition_journal_phase(
+            &self.job_id,
+            MIGRATION_PHASE_APPLYING,
+            MIGRATION_PHASE_ROLLING_BACK,
+            affected_steps,
+            Some(diagnostic),
+        )
+    }
+
+    pub(crate) fn mark_filesystem_committed(&self, completed_steps: usize) -> Result<(), String> {
+        self.db.transition_journal_phase(
+            &self.job_id,
+            MIGRATION_PHASE_APPLYING,
+            MIGRATION_PHASE_FILESYSTEM_COMMITTED,
+            completed_steps,
+            None,
+        )
+    }
+
+    pub(crate) fn discard_prepared(&self) -> Result<(), String> {
+        let changed = self
+            .db
+            .conn
+            .execute(
+                "DELETE FROM book_bookmark_path_migrations
+                  WHERE job_id = ?1 AND phase = ?2",
+                rusqlite::params![self.job_id, MIGRATION_PHASE_PREPARED],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("journal is no longer in prepared phase".to_string())
+        }
+    }
+
+    pub(crate) fn discard_rolled_back(&self) -> Result<(), String> {
+        let changed = self
+            .db
+            .conn
+            .execute(
+                "DELETE FROM book_bookmark_path_migrations
+                  WHERE job_id = ?1 AND phase = ?2 AND next_step = 0",
+                rusqlite::params![self.job_id, MIGRATION_PHASE_ROLLING_BACK],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("rollback is not durably complete".to_string())
+        }
+    }
+
+    pub(crate) fn into_job_id(self) -> String {
+        self.job_id.clone()
+    }
+}
+
+impl Drop for PathMigrationJournalWriter {
+    fn drop(&mut self) {
+        unregister_active_path_migration(&self.job_id);
+    }
 }
 
 /// 指定先に本ブックマーク DB の現行 schema を用意する。
@@ -1293,8 +1732,29 @@ mod tests {
         .unwrap()
     }
 
+    fn single_rename_plan(from: &Path, to: &Path) -> crate::book_fs_journal::BookFsOperationPlan {
+        crate::book_fs_journal::BookFsOperationPlan::new(vec![
+            crate::book_fs_journal::BookFsStep::Rename {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+            },
+        ])
+    }
+
+    fn add_compiled_bookmark(db: &BookBookmarkDb, book: &Path, name: &str, title: &str) {
+        let (saved, _) = db
+            .add(&NewBookBookmark {
+                container_path: book.to_path_buf(),
+                container_kind: BookContainerKind::CompiledBook,
+                page_identity: PageIdentity::RelativePath(name.to_string()),
+                page_index_hint: 0,
+            })
+            .unwrap();
+        db.set_title(saved.id, Some(title)).unwrap();
+    }
+
     #[test]
-    fn journal_recovery_is_idempotent_after_filesystem_move() {
+    fn prepared_journal_without_filesystem_change_is_discarded_as_noop() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("book_bookmarks.db");
         let book = temp.path().join("story");
@@ -1304,22 +1764,15 @@ mod tests {
         std::fs::write(&old_page, b"page").unwrap();
 
         let db = BookBookmarkDb::open_at(&db_path).unwrap();
-        let (saved, _) = db
-            .add(&NewBookBookmark {
-                container_path: book.clone(),
-                container_kind: BookContainerKind::CompiledBook,
-                page_identity: PageIdentity::RelativePath("0001_old.jpg".to_string()),
-                page_index_hint: 0,
-            })
-            .unwrap();
-        db.set_title(saved.id, Some("recover me")).unwrap();
+        add_compiled_bookmark(&db, &book, "0001_old.jpg", "stay old");
         drop(db);
 
         let mappings = vec![(old_page.clone(), new_page.clone())];
-        let job_id = prepare_path_migration_at(&db_path, &mappings)
+        let plan = single_rename_plan(&old_page, &new_page);
+        let job_id = "prepared-only";
+        prepare_path_migration_at(&db_path, job_id, &mappings, &plan)
             .unwrap()
             .expect("journal id");
-        std::fs::rename(&old_page, &new_page).unwrap();
 
         let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
         assert_eq!(journal_count(&restarted.conn), 1);
@@ -1327,134 +1780,239 @@ mod tests {
         let row = restarted.list_all().unwrap().pop().unwrap();
         assert_eq!(
             row.page_identity,
-            PageIdentity::RelativePath("0001_new.jpg".to_string())
+            PageIdentity::RelativePath("0001_old.jpg".to_string())
         );
-        assert_eq!(row.title.as_deref(), Some("recover me"));
+        assert!(old_page.exists());
+        assert!(!new_page.exists());
         assert_eq!(journal_count(&restarted.conn), 0);
-
-        // journal は DB migration と同時に消えるため、二度目は完全な no-op になる。
-        restarted.recover_path_migration_journal();
-        assert_eq!(restarted.list_all().unwrap(), vec![row]);
-        assert_eq!(journal_count(&restarted.conn), 0);
-        assert!(!job_id.is_empty());
     }
 
     #[test]
-    fn journal_recovery_preserves_bookmarks_through_swap_and_three_page_cycle() {
+    fn recovery_skips_a_journal_with_a_live_in_process_writer() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("book_bookmarks.db");
-        let db = BookBookmarkDb::open_at(&db_path).unwrap();
-        let swap = temp.path().join("swap");
-        let cycle = temp.path().join("cycle");
+        let from = temp.path().join("from.jpg");
+        let to = temp.path().join("to.jpg");
+        std::fs::write(&from, b"page").unwrap();
+        let mappings = vec![(from.clone(), to.clone())];
+        let plan = single_rename_plan(&from, &to);
+        let job_id = "live-writer";
+        prepare_path_migration_at(&db_path, job_id, &mappings, &plan).unwrap();
+        register_active_path_migration(job_id);
 
-        for (book, names) in [
-            (&swap, &["a.jpg", "b.jpg"][..]),
-            (&cycle, &["a.jpg", "b.jpg", "c.jpg"][..]),
-        ] {
-            for name in names {
-                let (saved, _) = db
-                    .add(&NewBookBookmark {
-                        container_path: book.clone(),
-                        container_kind: BookContainerKind::CompiledBook,
-                        page_identity: PageIdentity::RelativePath((*name).to_string()),
-                        page_index_hint: 0,
-                    })
-                    .unwrap();
-                db.set_title(saved.id, Some(&format!("{}:{name}", book.display())))
-                    .unwrap();
-            }
-        }
-        drop(db);
+        let mut db = BookBookmarkDb::open_at(&db_path).unwrap();
+        db.recover_path_migration_journal();
+        assert_eq!(journal_count(&db.conn), 1);
+        assert!(from.exists());
+        assert!(!to.exists());
 
-        let mappings = vec![
-            (swap.join("a.jpg"), swap.join("b.jpg")),
-            (swap.join("b.jpg"), swap.join("a.jpg")),
-            (cycle.join("a.jpg"), cycle.join("b.jpg")),
-            (cycle.join("b.jpg"), cycle.join("c.jpg")),
-            (cycle.join("c.jpg"), cycle.join("a.jpg")),
-        ];
-        prepare_path_migration_at(&db_path, &mappings)
-            .unwrap()
-            .expect("journal id");
-
-        let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
-        restarted.recover_path_migration_journal();
-        let rows = restarted.list_all().unwrap();
-        let page_for_title = |title: &str| {
-            rows.iter()
-                .find(|row| row.title.as_deref() == Some(title))
-                .map(|row| row.page_identity.clone())
-                .unwrap()
-        };
-        assert_eq!(
-            page_for_title(&format!("{}:a.jpg", swap.display())),
-            PageIdentity::RelativePath("b.jpg".to_string())
-        );
-        assert_eq!(
-            page_for_title(&format!("{}:b.jpg", swap.display())),
-            PageIdentity::RelativePath("a.jpg".to_string())
-        );
-        assert_eq!(
-            page_for_title(&format!("{}:a.jpg", cycle.display())),
-            PageIdentity::RelativePath("b.jpg".to_string())
-        );
-        assert_eq!(
-            page_for_title(&format!("{}:b.jpg", cycle.display())),
-            PageIdentity::RelativePath("c.jpg".to_string())
-        );
-        assert_eq!(
-            page_for_title(&format!("{}:c.jpg", cycle.display())),
-            PageIdentity::RelativePath("a.jpg".to_string())
-        );
-        assert_eq!(journal_count(&restarted.conn), 0);
+        unregister_active_path_migration(job_id);
+        db.recover_path_migration_journal();
+        assert_eq!(journal_count(&db.conn), 0);
     }
 
     #[test]
-    fn busy_database_keeps_journal_until_a_later_retry_succeeds() {
+    fn applying_move_recovers_filesystem_then_bookmark_and_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("book_bookmarks.db");
         let book = temp.path().join("story");
+        std::fs::create_dir(&book).unwrap();
         let old_page = book.join("0001_old.jpg");
         let new_page = book.join("0001_new.jpg");
+        std::fs::write(&old_page, b"page").unwrap();
         let db = BookBookmarkDb::open_at(&db_path).unwrap();
-        db.add(&NewBookBookmark {
-            container_path: book,
-            container_kind: BookContainerKind::CompiledBook,
-            page_identity: PageIdentity::RelativePath("0001_old.jpg".to_string()),
-            page_index_hint: 0,
+        add_compiled_bookmark(&db, &book, "0001_old.jpg", "recover me");
+        drop(db);
+
+        let mappings = vec![(old_page.clone(), new_page.clone())];
+        let plan = single_rename_plan(&old_page, &new_page);
+        let job_id = "one-move";
+        prepare_path_migration_at(&db_path, job_id, &mappings, &plan).unwrap();
+        let journal = BookBookmarkDb::open_at(&db_path).unwrap();
+        journal
+            .transition_journal_phase(
+                job_id,
+                MIGRATION_PHASE_PREPARED,
+                MIGRATION_PHASE_APPLYING,
+                0,
+                None,
+            )
+            .unwrap();
+        crate::book_fs_journal::execute_forward(&plan, 0, |next_step| {
+            journal.update_journal_progress(job_id, MIGRATION_PHASE_APPLYING, next_step)
         })
         .unwrap();
-        drop(db);
-        let mappings = vec![(old_page, new_page)];
-        let job_id = prepare_path_migration_at(&db_path, &mappings)
-            .unwrap()
-            .expect("journal id");
+        drop(journal); // crash after filesystem, before phase/DB commit
 
+        let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
+        restarted.recover_path_migration_journal();
+        let row = restarted.list_all().unwrap().pop().unwrap();
+        assert_eq!(
+            row.page_identity,
+            PageIdentity::RelativePath("0001_new.jpg".to_string())
+        );
+        assert!(!old_page.exists());
+        assert!(new_page.exists());
+        assert_eq!(journal_count(&restarted.conn), 0);
+
+        restarted.recover_path_migration_journal();
+        assert_eq!(restarted.list_all().unwrap(), vec![row]);
+        assert_eq!(journal_count(&restarted.conn), 0);
+    }
+
+    fn assert_cycle_recovers_from_every_step(names: &[&str], destinations: &[usize]) {
+        for crash_after in 0..=(names.len() * 2) {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("book_bookmarks.db");
+            let book = temp.path().join("book");
+            std::fs::create_dir(&book).unwrap();
+            let paths = names.iter().map(|name| book.join(name)).collect::<Vec<_>>();
+            for (name, path) in names.iter().zip(&paths) {
+                std::fs::write(path, name.as_bytes()).unwrap();
+            }
+            let db = BookBookmarkDb::open_at(&db_path).unwrap();
+            for name in names {
+                add_compiled_bookmark(&db, &book, name, name);
+            }
+            drop(db);
+
+            let mappings = paths
+                .iter()
+                .enumerate()
+                .map(|(idx, path)| (path.clone(), paths[destinations[idx]].clone()))
+                .collect::<Vec<_>>();
+            let temp_paths = (0..names.len())
+                .map(|idx| book.join(format!(".journal-temp-{idx}")))
+                .collect::<Vec<_>>();
+            let mut steps = paths
+                .iter()
+                .zip(&temp_paths)
+                .map(|(from, to)| crate::book_fs_journal::BookFsStep::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+                .collect::<Vec<_>>();
+            steps.extend(temp_paths.iter().enumerate().map(|(idx, from)| {
+                crate::book_fs_journal::BookFsStep::Rename {
+                    from: from.clone(),
+                    to: paths[destinations[idx]].clone(),
+                }
+            }));
+            let plan = crate::book_fs_journal::BookFsOperationPlan::new(steps);
+            let job_id = format!("cycle-{crash_after}");
+            prepare_path_migration_at(&db_path, &job_id, &mappings, &plan).unwrap();
+            let journal = BookBookmarkDb::open_at(&db_path).unwrap();
+            journal
+                .transition_journal_phase(
+                    &job_id,
+                    MIGRATION_PHASE_PREPARED,
+                    MIGRATION_PHASE_APPLYING,
+                    0,
+                    None,
+                )
+                .unwrap();
+            let prefix = crate::book_fs_journal::BookFsOperationPlan::new(
+                plan.steps[..crash_after].to_vec(),
+            );
+            crate::book_fs_journal::execute_forward(&prefix, 0, |next_step| {
+                journal.update_journal_progress(&job_id, MIGRATION_PHASE_APPLYING, next_step)
+            })
+            .unwrap();
+            drop(journal);
+
+            let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
+            restarted.recover_path_migration_journal();
+            let rows = restarted.list_all().unwrap();
+            for (idx, name) in names.iter().enumerate() {
+                let destination = &paths[destinations[idx]];
+                assert_eq!(
+                    std::fs::read(destination).unwrap(),
+                    name.as_bytes(),
+                    "crash_after={crash_after}"
+                );
+                let row = rows
+                    .iter()
+                    .find(|row| row.title.as_deref() == Some(*name))
+                    .unwrap();
+                assert_eq!(
+                    row.page_identity,
+                    PageIdentity::RelativePath(
+                        destination
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string()
+                    ),
+                    "crash_after={crash_after}"
+                );
+            }
+            assert!(temp_paths.iter().all(|path| !path.exists()));
+            assert_eq!(journal_count(&restarted.conn), 0);
+            let rows_before_second_recovery = rows.clone();
+            restarted.recover_path_migration_journal();
+            assert_eq!(restarted.list_all().unwrap(), rows_before_second_recovery);
+        }
+    }
+
+    #[test]
+    fn swap_and_three_page_cycle_recover_from_every_step_boundary() {
+        assert_cycle_recovers_from_every_step(&["a.jpg", "b.jpg"], &[1, 0]);
+        assert_cycle_recovers_from_every_step(&["a.jpg", "b.jpg", "c.jpg"], &[1, 2, 0]);
+    }
+
+    #[test]
+    fn failed_rollback_is_retained_and_later_recovery_converges() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("book_bookmarks.db");
+        let book = temp.path().join("story");
+        std::fs::create_dir(&book).unwrap();
+        let old_page = book.join("0001_old.jpg");
+        let new_page = book.join("0001_new.jpg");
+        std::fs::write(&new_page, b"operation-page").unwrap();
+        std::fs::write(&old_page, b"rollback-conflict").unwrap();
+        let db = BookBookmarkDb::open_at(&db_path).unwrap();
+        add_compiled_bookmark(&db, &book, "0001_old.jpg", "old identity");
+        drop(db);
+        let mappings = vec![(old_page.clone(), new_page.clone())];
+        let plan = single_rename_plan(&old_page, &new_page);
+        let job_id = "rollback-retry";
+        prepare_path_migration_at(&db_path, job_id, &mappings, &plan).unwrap();
         let mut retrying = BookBookmarkDb::open_at(&db_path).unwrap();
         retrying
-            .conn
-            .busy_timeout(std::time::Duration::from_millis(10))
+            .transition_journal_phase(
+                job_id,
+                MIGRATION_PHASE_PREPARED,
+                MIGRATION_PHASE_APPLYING,
+                0,
+                None,
+            )
             .unwrap();
-        let blocker = rusqlite::Connection::open(&db_path).unwrap();
-        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        assert!(
-            retrying
-                .migrate_paths_with_journal(&mappings, Some(&job_id))
-                .is_err()
-        );
-        assert_eq!(journal_count(&blocker), 1);
-        blocker.execute_batch("ROLLBACK").unwrap();
-
-        assert_eq!(
-            retrying
-                .migrate_paths_with_journal(&mappings, Some(&job_id))
-                .unwrap(),
-            1
-        );
-        assert_eq!(journal_count(&retrying.conn), 0);
+        retrying
+            .transition_journal_phase(
+                job_id,
+                MIGRATION_PHASE_APPLYING,
+                MIGRATION_PHASE_ROLLING_BACK,
+                1,
+                Some("injected rename rollback failure"),
+            )
+            .unwrap();
+        retrying.recover_path_migration_journal();
+        assert_eq!(journal_count(&retrying.conn), 1);
         assert_eq!(
             retrying.list_all().unwrap()[0].page_identity,
-            PageIdentity::RelativePath("0001_new.jpg".to_string())
+            PageIdentity::RelativePath("0001_old.jpg".to_string())
+        );
+
+        // Resolve the injected conflict; the same durable rollback plan now
+        // restores the original path and is safe to delete.
+        std::fs::remove_file(&old_page).unwrap();
+        retrying.recover_path_migration_journal();
+        assert_eq!(journal_count(&retrying.conn), 0);
+        assert!(old_page.exists());
+        assert!(!new_page.exists());
+        assert_eq!(
+            retrying.list_all().unwrap()[0].page_identity,
+            PageIdentity::RelativePath("0001_old.jpg".to_string())
         );
     }
 
@@ -1499,5 +2057,44 @@ mod tests {
         assert_eq!(saved.title, None);
         db.set_title(saved.id, Some("表紙")).unwrap();
         assert_eq!(db.list_all().unwrap()[0].title.as_deref(), Some("表紙"));
+    }
+
+    #[test]
+    fn pre_phase_journal_schema_is_preserved_as_legacy_ambiguous() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE book_bookmark_path_migrations (
+                job_id TEXT PRIMARY KEY,
+                mappings_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO book_bookmark_path_migrations
+                (job_id, mappings_json, created_at_ms)
+             VALUES ('legacy', '[]', 1);",
+        )
+        .unwrap();
+        BookBookmarkDb::init_schema(&conn).unwrap();
+        let row: (Option<String>, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT operation_json, phase, next_step, diagnostic
+                   FROM book_bookmark_path_migrations WHERE job_id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, "legacy_ambiguous".to_string(), 0, None));
+
+        let mut db = BookBookmarkDb { conn };
+        db.recover_path_migration_journal();
+        assert_eq!(journal_count(&db.conn), 1);
+        let diagnostic: String = db
+            .conn
+            .query_row(
+                "SELECT diagnostic FROM book_bookmark_path_migrations WHERE job_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(diagnostic.contains("legacy migration phase"));
     }
 }

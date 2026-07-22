@@ -81,6 +81,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `operation_customize_share.rs` | 操作カスタマイズ 3 点セット (`keymap` / `ring_shortcuts` / `menu_layout`) の共有 JSON、未知項目の警告付き正規化、実効チョード単位の差分計算を担う純ロジック |
 | `settings_restore.rs` | 設定全体の世代復元に加え、過去世代を一時ディレクトリへ読み取り専用展開して操作カスタマイズだけを抽出し、取り込み前の `.mivkeys.json` 自動退避を管理 |
 | `books.rs` | 製本機能。製本ルート直下の通常フォルダを本として扱い、`0001_元名.ext` のページ保存、通常画像/ZIP 内画像の無加工コピー、補正/PDF/動画フレームの焼き込み追加、2 パス temp rename による並べ替えフラッシュを担当 |
+| `book_fs_journal.rs` | 製本の改名・並べ替え・別本移動を crash-safe な filesystem step plan として実行する。永続 temp 名、copy/move の SHA-256 identity、冪等な forward / rollback 判定を所有し、phase と進捗の SQLite 永続化は `book_bookmarks.rs` に委譲する |
 | `reading_history_db.rs` | 読書履歴 (`%APPDATA%/mimageviewer/reading_history.db`)。フルスクリーンで読んだ画像フォルダ / ZIP / PDF / 変換アーカイブを MRU として保持し、`reading-history-writer` で upsert / prune と file metadata 補完を行う |
 | `metadata_cleanup.rs` | 明示操作の孤児メタデータ整理。`rename_key_migration::STORES` を正本に全 path-keyed DB を worker で走査し、親フォルダ到達可能な missing だけを確認後に transaction DELETE する。切断ドライブ、本棚、逆引き不能キーは非破壊側へ倒す。mIV 削除後の purge 最終失敗は `delete_purge_journal.json` に path 単位で残し、同じ孤児安全判定 + 共通 hard-purge を起動時 / idle 時にピンポイント再実行する |
 | `logger.rs` | ファイルロガー (`mimageviewer.log`)。常時記録 + 16 MiB ローテーション |

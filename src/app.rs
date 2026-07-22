@@ -39451,6 +39451,25 @@ impl App {
         );
     }
 
+    /// Single ownership boundary for every user-originated rating DB write.
+    /// The path generation ledger is App-global while display caches remain
+    /// context-local, so detached and main contexts converge without sharing a
+    /// mutable cache instance.
+    fn write_user_rating_shared(
+        &mut self,
+        key: &str,
+        stars: u8,
+        meta: Option<&crate::rating_db::RatingMeta>,
+    ) -> bool {
+        let written = self
+            .rating_db
+            .as_ref()
+            .is_some_and(|db| db.set_user_rating(key, stars, meta).is_ok());
+        self.record_rating_session_write(key.to_string(), stars, true);
+        self.sync_current_context_rating_session_writes();
+        written
+    }
+
     /// App-global path rating 更新を、現在 mount 中 context の idx cache へ反映する。
     ///
     /// context ごとの cache ownership は維持しつつ、DB とユーザー最終値だけを共有する。
@@ -39536,13 +39555,10 @@ impl App {
         // prewarm で全 item が cache に載っている前提。未取得なら 0 扱いで OK。
         let old_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
         self.rating_cache.insert(idx, stars);
-        if let Some(db) = self.rating_db.as_ref() {
-            let _ = db.set_user_rating(&key, stars, meta.as_ref());
-        }
-        // DB と同じ path identity の App-global 台帳へ記録してから、同一 context 内の重複行も
-        // 更新する。detached unmount 時は swap 境界が main / parked cache へ同じ値を反映する。
-        self.record_rating_session_write(key.clone(), stars, true);
-        self.sync_current_context_rating_session_writes();
+        // DB write と App-global path generation の記録を同じ ownership
+        // boundary に通す。detached unmount 時は swap 境界が main / parked
+        // cache へ同じ値を反映する。
+        self.write_user_rating_shared(&key, stars, meta.as_ref());
         self.invalidate_rating_counts_cache();
         // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
         // ZIP 内画像 / PDF ページ) のみ親フォルダの集計に伝搬する。
@@ -39594,11 +39610,7 @@ impl App {
         let key = crate::adjustment_db::normalize_path(folder);
         let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Folder)
             .with_source_path(folder);
-        if let Some(db) = self.rating_db.as_ref() {
-            let _ = db.set_user_rating(&key, stars, Some(&meta));
-        }
-        self.record_rating_session_write(key, stars, true);
-        self.sync_current_context_rating_session_writes();
+        self.write_user_rating_shared(&key, stars, Some(&meta));
         self.invalidate_rating_counts_cache();
         self.current_folder_rating_cache = Some(stars);
         self.schedule_current_smart_folder_metadata_refresh(
@@ -40355,10 +40367,7 @@ impl App {
         if capture_undo && before != stars {
             self.capture_container_rating_undo(before, stars);
         }
-        let rating_written = self
-            .rating_db
-            .as_ref()
-            .is_some_and(|db| db.set_user_rating(&key, stars, Some(&meta)).is_ok());
+        let rating_written = self.write_user_rating_shared(&key, stars, Some(&meta));
         self.invalidate_rating_counts_cache();
         self.current_folder_rating_cache = Some(stars);
         // items 内の同じ rating key を指すコンテナがあればキャッシュ更新。

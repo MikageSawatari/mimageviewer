@@ -19675,6 +19675,72 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn detached_current_container_ratings_share_generation_with_main_and_stale_hydrate() {
+        let mut app = setup_app();
+        app.settings.write_rating_to_xmp = false;
+        let parent = PathBuf::from(r"C:\library");
+        let child = parent.join("child");
+        let zip = parent.join("book.zip");
+        let pdf = parent.join("book.pdf");
+        let targets = [child.clone(), zip.clone(), pdf.clone()];
+        app.current_folder = Some(parent);
+        app.items = vec![
+            GridItem::Folder(child.clone()),
+            GridItem::ZipFile(zip.clone()),
+            GridItem::PdfFile(pdf.clone()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; targets.len()];
+        app.visible_indices = (0..targets.len()).collect();
+
+        for (idx, target) in targets.iter().enumerate() {
+            let key = crate::adjustment_db::normalize_path(target);
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 1, None)
+                .unwrap();
+            app.rating_cache.insert(idx, 1);
+
+            let mut bundle = ViewerContextBundle::empty();
+            bundle.current_folder = Some(target.clone());
+            bundle.current_folder_rating_cache = Some(1);
+            bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+            bundle.viewer_session.independent_active = true;
+            app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+            let stale_generation = app.rating_session_generation_for_key(&key);
+            app.with_active_detached_viewer_context(|detached| {
+                assert!(detached.set_current_folder_rating(4));
+            })
+            .expect("detached context");
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+            assert_eq!(app.rating_cache.get(&idx), Some(&4));
+            assert!(app.rating_session_generation_for_key(&key) > stale_generation);
+
+            // A hydrate result started before the detached write must not win.
+            app.hydrate_ratings_from_xmp(vec![(target.clone(), 2, stale_generation)]);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+            assert_eq!(app.rating_cache.get(&idx), Some(&4));
+
+            app.with_active_detached_viewer_context(|detached| {
+                assert!(detached.set_current_folder_rating(0));
+            })
+            .expect("detached context");
+            let clear_generation = app.rating_session_generation_for_key(&key);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+            assert_eq!(app.rating_cache.get(&idx), Some(&0));
+
+            // Even a same-generation XMP result cannot resurrect an explicit
+            // user clear while the writer catches up.
+            app.hydrate_ratings_from_xmp(vec![(target.clone(), 3, clear_generation)]);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+            assert_eq!(app.rating_cache.get(&idx), Some(&0));
+            app.active_detached_viewer_context = None;
+        }
+    }
+
+    #[test]
     fn stale_xmp_hydration_cannot_restore_an_explicitly_cleared_rating() {
         let mut app = setup_app();
         app.settings.write_rating_to_xmp = false;

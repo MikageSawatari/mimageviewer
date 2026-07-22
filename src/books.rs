@@ -7,6 +7,10 @@ use std::sync::atomic::AtomicBool;
 
 use eframe::egui;
 
+use crate::book_fs_journal::{
+    BookFileIdentity, BookFsOperationPlan, BookFsStep, execute_forward, execute_rollback,
+};
+
 pub const DEFAULT_BOOK_NAME: &str = "名前なし";
 pub const MAX_BOOK_PAGES: usize = 9999;
 
@@ -87,52 +91,104 @@ pub enum BookOpResult {
     },
 }
 
-/// Filesystem と SQLite を跨ぐ本ページ移動の write-ahead intent。
-/// 通常エラーでは Drop が破棄し、成功時だけ UI/bookmark worker へ所有権を渡す。
-/// プロセス強制終了では Drop 自体が走らないため、次回起動の recovery 用に残る。
+/// Filesystem と SQLite を跨ぐ本ページ移動の phase-aware journal owner。
+/// Drop で消せるのは filesystem decision 前の Prepared だけ。Applying 以降は
+/// recovery が forward/rollback plan を再開できるよう必ず行を残す。
 struct PreparedBookmarkMigration {
-    job_id: Option<String>,
-    armed: bool,
+    journal: Option<crate::book_bookmarks::PathMigrationJournalWriter>,
+    discard_if_prepared: bool,
 }
 
 impl PreparedBookmarkMigration {
-    fn prepare(mappings: &[BookPathMapping]) -> Result<Self, String> {
+    fn prepare(
+        job_id: String,
+        mappings: &[BookPathMapping],
+        plan: &BookFsOperationPlan,
+    ) -> Result<Self, String> {
         let mappings = mappings
             .iter()
             .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
             .collect::<Vec<_>>();
-        let job_id = crate::book_bookmarks::prepare_path_migration(&mappings)
+        let journal = crate::book_bookmarks::prepare_path_migration(&job_id, &mappings, plan)
             .map_err(|error| format!("本ブックマークの移行準備に失敗しました: {error}"))?;
         Ok(Self {
-            job_id,
-            armed: true,
+            journal,
+            discard_if_prepared: true,
         })
     }
 
-    fn commit(mut self) -> Option<String> {
-        self.armed = false;
-        self.job_id.take()
-    }
+    fn execute(mut self, plan: &BookFsOperationPlan) -> Result<Option<String>, String> {
+        let Some(journal) = self.journal.take() else {
+            execute_forward(plan, 0, |_| Ok(())).map_err(|error| error.message)?;
+            return Ok(None);
+        };
+        let job_id = journal.job_id().to_string();
+        if let Err(error) = journal.begin() {
+            if let Err(discard_error) = journal.discard_prepared() {
+                crate::logger::log(format!(
+                    "book bookmark prepared journal discard failed job={job_id}: {discard_error}"
+                ));
+            }
+            return Err(format!("filesystem 適用開始を記録できません: {error}"));
+        }
+        self.discard_if_prepared = false;
 
-    /// 通常エラーでも filesystem を元に戻せなかった場合は intent を残す。
-    /// 最終 mapping の自動 recovery と診断情報を、誤って破棄しないための経路。
-    fn preserve(mut self) {
-        self.armed = false;
-        self.job_id = None;
+        let forward = execute_forward(plan, 0, |next_step| {
+            journal.record_progress(false, next_step)
+        });
+        if let Err(error) = forward {
+            // The rollback decision itself must be durable before touching the
+            // filesystem in reverse. If this write fails, Applying is retained
+            // and startup recovery safely completes forward instead.
+            if let Err(phase_error) = journal.begin_rollback(error.affected_steps, &error.message) {
+                return Err(format!(
+                    "{} / rollback 開始を記録できないため recovery に保持しました: {phase_error}",
+                    error.message
+                ));
+            }
+            match execute_rollback(plan, error.affected_steps, |next_step| {
+                journal.record_progress(true, next_step)
+            }) {
+                Ok(()) => {
+                    journal.discard_rolled_back().map_err(|discard_error| {
+                            format!(
+                                "{} / rollback は完了しましたが journal を破棄できません: {discard_error}",
+                                error.message
+                            )
+                        })?;
+                    return Err(error.message);
+                }
+                Err(rollback_error) => {
+                    return Err(format!(
+                        "{} / rollback も失敗したため journal を保持しました: {}",
+                        error.message, rollback_error.message
+                    ));
+                }
+            }
+        }
+
+        journal
+            .mark_filesystem_committed(plan.len())
+            .map_err(|error| {
+                format!("filesystem commit 済み状態を記録できません（journal を保持）: {error}")
+            })?;
+        self.discard_if_prepared = false;
+        Ok(Some(journal.into_job_id()))
     }
 }
 
 impl Drop for PreparedBookmarkMigration {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.discard_if_prepared {
             return;
         }
-        let Some(job_id) = self.job_id.as_deref() else {
+        let Some(journal) = self.journal.as_ref() else {
             return;
         };
-        if let Err(error) = crate::book_bookmarks::discard_prepared_path_migration(job_id) {
+        if let Err(error) = journal.discard_prepared() {
             crate::logger::log(format!(
-                "book bookmark migration journal discard failed job={job_id}: {error}"
+                "book bookmark migration journal discard failed job={}: {error}",
+                journal.job_id()
             ));
         }
     }
@@ -410,16 +466,13 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
             })
         })
         .collect::<Vec<_>>();
-    // ファイルを一つでも変更する前に、元 page identity → 最終 identity を永続化する。
-    let migration = PreparedBookmarkMigration::prepare(&edit_moves)?;
-    fs::rename(&from, &to).map_err(|e| {
-        format!(
-            "本の名前を変更できません: {} → {}: {e}",
-            from.display(),
-            to.display()
-        )
-    })?;
-    let bookmark_migration_journal_id = migration.commit();
+    let job_id = crate::book_bookmarks::new_path_migration_job_id();
+    let plan = BookFsOperationPlan::new(vec![BookFsStep::Rename {
+        from: from.clone(),
+        to: to.clone(),
+    }]);
+    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let bookmark_migration_journal_id = migration.execute(&plan)?;
     Ok(BookOpResult::Renamed {
         old_name,
         new_name,
@@ -500,10 +553,16 @@ pub fn append_pages(
 
 pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<BookOpResult, String> {
     let edit_moves = plan_reorder_paths(&folder, &ordered_paths)?;
-    let migration = PreparedBookmarkMigration::prepare(&edit_moves)?;
-    apply_reorder_plan(&folder, &edit_moves)?;
+    let job_id = crate::book_bookmarks::new_path_migration_job_id();
+    let plan = BookFsOperationPlan::new(plan_reorder_filesystem_steps(
+        &folder,
+        &edit_moves,
+        &job_id,
+        "reorder",
+    )?);
+    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let bookmark_migration_journal_id = migration.execute(&plan)?;
     let count = edit_moves.len();
-    let bookmark_migration_journal_id = migration.commit();
     Ok(BookOpResult::Reordered {
         folder,
         count,
@@ -529,6 +588,7 @@ pub fn transfer_pages_between_books(
     ensure_direct_book_target(&root, &source_folder)?;
     let target_book_name = normalize_book_name(&target_book_name);
     let target_folder = book_folder(&root, &target_book_name);
+    ensure_direct_book_target(&root, &target_folder)?;
     if crate::folder_tree::path_eq(&source_folder, &target_folder) {
         return Err("同じ本への移動/コピーはまだ対応していません".to_string());
     }
@@ -561,10 +621,12 @@ pub fn transfer_pages_between_books(
         .iter()
         .map(|mapping| mapping.to.clone())
         .collect::<Vec<_>>();
+    let mut selected_original = Vec::new();
     let mut selected_committed = Vec::new();
     let mut remaining_committed = Vec::new();
     for (old_path, committed_path) in current_order_paths.iter().zip(committed_paths.iter()) {
         if selected_keys.contains(&crate::search_index_db::normalize_path(old_path)) {
+            selected_original.push(old_path.clone());
             selected_committed.push(committed_path.clone());
         } else {
             remaining_committed.push(committed_path.clone());
@@ -577,6 +639,9 @@ pub fn transfer_pages_between_books(
     let mut transfer_mappings = Vec::with_capacity(selected_committed.len());
     for (offset, src) in selected_committed.iter().enumerate() {
         let dest = destination_for_existing_page(&target_folder, start + offset, src)?;
+        if !filesystem_path_is_missing(&dest)? {
+            return Err(format!("移動先ページが既に存在します: {}", dest.display()));
+        }
         transfer_mappings.push(BookPathMapping {
             from: src.clone(),
             to: dest,
@@ -602,64 +667,46 @@ pub fn transfer_pages_between_books(
     } else {
         commit_mappings.clone()
     };
-    let migration = PreparedBookmarkMigration::prepare(&edit_moves)?;
-
-    fs::create_dir_all(&target_folder).map_err(|e| {
-        format!(
-            "移動先の本フォルダを作成できません: {}: {e}",
-            target_folder.display()
-        )
-    })?;
-    ensure_direct_book_target(&root, &target_folder)?;
-    apply_reorder_plan(&source_folder, &commit_mappings)?;
-
-    let mut completed = Vec::with_capacity(transfer_mappings.len());
-    for mapping in &transfer_mappings {
-        let result = match kind {
-            BookTransferKind::Copy => {
-                copy_page_to_destination(&mapping.from, &mapping.to).map(|_| {
-                    CompletedTransfer::Copied {
-                        dest: mapping.to.clone(),
-                    }
-                })
-            }
-            BookTransferKind::Move => {
-                move_page_to_destination(&mapping.from, &mapping.to).map(|mode| {
-                    CompletedTransfer::Moved {
-                        src: mapping.from.clone(),
-                        dest: mapping.to.clone(),
-                        mode,
-                    }
-                })
-            }
-        };
-        if let Err(error) = result {
-            rollback_completed_transfers(&completed);
-            let rollback = rollback_applied_reorder(&source_folder, &commit_mappings);
-            if let Err(rollback_error) = rollback {
-                migration.preserve();
-                return Err(format!(
-                    "{error} / 元本の順序も復元できませんでした: {rollback_error}"
-                ));
-            }
-            return Err(error);
-        }
-        completed.push(result.expect("checked above"));
+    let job_id = crate::book_bookmarks::new_path_migration_job_id();
+    let mut filesystem_steps = Vec::new();
+    if filesystem_path_is_missing(&target_folder)? {
+        filesystem_steps.push(BookFsStep::CreateDir {
+            path: target_folder.clone(),
+        });
     }
-
-    if kind == BookTransferKind::Move
-        && let Err(error) = apply_reorder_plan(&source_folder, &compact_mappings)
-    {
-        rollback_completed_transfers(&completed);
-        let rollback = rollback_applied_reorder(&source_folder, &commit_mappings);
-        if let Err(rollback_error) = rollback {
-            migration.preserve();
-            return Err(format!(
-                "元本の番号整理に失敗しました: {error} / 元の順序も復元できませんでした: {rollback_error}"
-            ));
-        }
-        return Err(format!("元本の番号整理に失敗しました: {error}"));
+    filesystem_steps.extend(plan_reorder_filesystem_steps(
+        &source_folder,
+        &commit_mappings,
+        &job_id,
+        "commit",
+    )?);
+    for (original, mapping) in selected_original.iter().zip(&transfer_mappings) {
+        let identity = BookFileIdentity::read(original)
+            .map_err(|error| format!("移動元ページの identity を読み取れません: {error}"))?;
+        filesystem_steps.push(match kind {
+            BookTransferKind::Copy => BookFsStep::CopyFile {
+                from: mapping.from.clone(),
+                to: mapping.to.clone(),
+                identity,
+            },
+            BookTransferKind::Move => BookFsStep::MoveFile {
+                from: mapping.from.clone(),
+                to: mapping.to.clone(),
+                identity,
+            },
+        });
     }
+    if kind == BookTransferKind::Move {
+        filesystem_steps.extend(plan_reorder_filesystem_steps(
+            &source_folder,
+            &compact_mappings,
+            &job_id,
+            "compact",
+        )?);
+    }
+    let plan = BookFsOperationPlan::new(filesystem_steps);
+    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let bookmark_migration_journal_id = migration.execute(&plan)?;
 
     let source_after_paths = if kind == BookTransferKind::Move {
         compact_mappings
@@ -669,7 +716,6 @@ pub fn transfer_pages_between_books(
     } else {
         committed_paths
     };
-    let bookmark_migration_journal_id = migration.commit();
     let source_entries = source_after_paths
         .into_iter()
         .map(|path| {
@@ -764,52 +810,37 @@ fn plan_reorder_paths(
         .collect())
 }
 
-fn apply_reorder_plan(folder: &Path, mappings: &[BookPathMapping]) -> Result<(), String> {
-    let pid = std::process::id();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let mut moved = Vec::with_capacity(mappings.len());
-    for (idx, mapping) in mappings.iter().enumerate() {
-        let src = &mapping.from;
-        let temp = unique_temp_path(&folder, pid, stamp, idx)?;
-        fs::rename(src, &temp).map_err(|e| {
-            rollback_temp_moves(&moved);
-            format!("一時ファイルへ移動できません: {}: {e}", src.display())
-        })?;
-        moved.push((src.clone(), temp));
-    }
-
-    let mut finalized = Vec::with_capacity(moved.len());
-    for ((original, temp), mapping) in moved.iter().zip(mappings) {
-        let dest = &mapping.to;
-        if dest.exists() {
-            rollback_reorder_pass2(&finalized, &moved);
-            return Err(format!("並べ替え先が既に存在します: {}", dest.display()));
-        }
-        if let Err(e) = fs::rename(temp, &dest) {
-            rollback_reorder_pass2(&finalized, &moved);
+fn plan_reorder_filesystem_steps(
+    folder: &Path,
+    mappings: &[BookPathMapping],
+    job_id: &str,
+    label: &str,
+) -> Result<Vec<BookFsStep>, String> {
+    let mut temp_paths = Vec::with_capacity(mappings.len());
+    for idx in 0..mappings.len() {
+        let temp = folder.join(format!(".miv-book-op-{job_id}-{label}-{idx:04}.tmp"));
+        if !filesystem_path_is_missing(&temp)? {
             return Err(format!(
-                "ページ番号を確定できません: {}: {e}",
-                dest.display()
+                "並べ替え用の一時ファイルが既に存在します: {}",
+                temp.display()
             ));
         }
-        finalized.push((original.clone(), dest.clone()));
+        temp_paths.push(temp);
     }
-
-    Ok(())
-}
-
-fn rollback_applied_reorder(folder: &Path, mappings: &[BookPathMapping]) -> Result<(), String> {
-    let reverse = mappings
-        .iter()
-        .map(|mapping| BookPathMapping {
-            from: mapping.to.clone(),
-            to: mapping.from.clone(),
-        })
-        .collect::<Vec<_>>();
-    apply_reorder_plan(folder, &reverse)
+    let mut steps = Vec::with_capacity(mappings.len() * 2);
+    for (mapping, temp) in mappings.iter().zip(&temp_paths) {
+        steps.push(BookFsStep::Rename {
+            from: mapping.from.clone(),
+            to: temp.clone(),
+        });
+    }
+    for (mapping, temp) in mappings.iter().zip(&temp_paths) {
+        steps.push(BookFsStep::Rename {
+            from: temp.clone(),
+            to: mapping.to.clone(),
+        });
+    }
+    Ok(steps)
 }
 
 fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
@@ -1466,88 +1497,6 @@ fn copy_file_snapshot(src: &Path, dest: &Path) -> Result<(), String> {
         .map_err(|e| format!("ページを flush できません: {}: {e}", dest.display()))
 }
 
-#[derive(Clone, Copy)]
-enum MoveMode {
-    Rename,
-    CopyDelete,
-}
-
-enum CompletedTransfer {
-    Copied {
-        dest: PathBuf,
-    },
-    Moved {
-        src: PathBuf,
-        dest: PathBuf,
-        mode: MoveMode,
-    },
-}
-
-fn copy_page_to_destination(src: &Path, dest: &Path) -> Result<(), String> {
-    match copy_file_snapshot(src, dest) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(dest);
-            Err(err)
-        }
-    }
-}
-
-fn move_page_to_destination(src: &Path, dest: &Path) -> Result<MoveMode, String> {
-    if dest.exists() {
-        return Err(format!("移動先ページが既に存在します: {}", dest.display()));
-    }
-    match fs::rename(src, dest) {
-        Ok(()) => Ok(MoveMode::Rename),
-        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
-            copy_page_to_destination(src, dest)?;
-            if let Err(delete_err) = fs::remove_file(src) {
-                let _ = fs::remove_file(dest);
-                return Err(format!(
-                    "移動元ページを削除できません: {}: {delete_err}",
-                    src.display()
-                ));
-            }
-            Ok(MoveMode::CopyDelete)
-        }
-        Err(err) => Err(format!(
-            "ページを移動できません: {} → {}: {err}",
-            src.display(),
-            dest.display()
-        )),
-    }
-}
-
-fn rollback_completed_transfers(completed: &[CompletedTransfer]) {
-    for item in completed.iter().rev() {
-        match item {
-            CompletedTransfer::Copied { dest } => {
-                let _ = fs::remove_file(dest);
-            }
-            CompletedTransfer::Moved { src, dest, mode } => {
-                rollback_moved_page(src, dest, *mode);
-            }
-        }
-    }
-}
-
-fn rollback_moved_page(src: &Path, dest: &Path, mode: MoveMode) {
-    if src.exists() {
-        let _ = fs::remove_file(dest);
-        return;
-    }
-    match mode {
-        MoveMode::Rename => {
-            let _ = fs::rename(dest, src);
-        }
-        MoveMode::CopyDelete => {
-            if copy_file_snapshot(dest, src).is_ok() {
-                let _ = fs::remove_file(dest);
-            }
-        }
-    }
-}
-
 fn write_bytes_create_new(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     let Some(parent) = dest.parent() else {
         return Err(format!("保存先が不正です: {}", dest.display()));
@@ -1717,30 +1666,14 @@ fn ensure_direct_book_target(root: &Path, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn unique_temp_path(folder: &Path, pid: u32, stamp: u128, idx: usize) -> Result<PathBuf, String> {
-    for retry in 0..100 {
-        let path = folder.join(format!(".miv-book-tmp-{pid}-{stamp}-{idx:04}-{retry:02}"));
-        if !path.exists() {
-            return Ok(path);
-        }
-    }
-    Err("並べ替え用の一時ファイル名を作れません".to_string())
-}
-
-fn rollback_temp_moves(moved: &[(PathBuf, PathBuf)]) {
-    for (original, temp) in moved.iter().rev() {
-        let _ = fs::rename(temp, original);
-    }
-}
-
-fn rollback_reorder_pass2(finalized: &[(PathBuf, PathBuf)], moved: &[(PathBuf, PathBuf)]) {
-    for (original, dest) in finalized.iter().rev() {
-        let _ = fs::rename(dest, original);
-    }
-    for (original, temp) in moved.iter().rev() {
-        if temp.exists() {
-            let _ = fs::rename(temp, original);
-        }
+fn filesystem_path_is_missing(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "ファイル状態を確認できません: {}: {error}",
+            path.display()
+        )),
     }
 }
 

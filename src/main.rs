@@ -12,6 +12,7 @@ pub mod audio_normalize_db;
 pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod book_bookmarks;
+mod book_fs_journal;
 pub mod book_resume_db;
 pub mod bookmark_browser;
 pub mod books;
