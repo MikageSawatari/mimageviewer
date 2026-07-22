@@ -6689,6 +6689,9 @@ pub struct App {
     pub(crate) metadata_cleanup_pending: Option<crate::metadata_cleanup::CleanupPending>,
     pub(crate) metadata_cleanup_scan: Option<crate::metadata_cleanup::ScanReport>,
     pub(crate) metadata_cleanup_result: Option<crate::metadata_cleanup::DeleteReport>,
+    /// 明示メタ情報エクスポート / インポートの完全モーダル状態。
+    pub(crate) metadata_transfer:
+        Option<crate::ui_dialogs::metadata_transfer::MetadataTransferState>,
     /// キャッシュ管理の「◯日以上古い」入力値
     pub(crate) cache_manager_days: u32,
     /// 開いたときに取得するキャッシュ統計: (フォルダ数, 合計バイト)
@@ -9786,6 +9789,7 @@ impl App {
             metadata_cleanup_pending: None,
             metadata_cleanup_scan: None,
             metadata_cleanup_result: None,
+            metadata_transfer: None,
             cache_manager_days: 90,
             cache_manager_stats: None,
             cache_manager_tile_bytes: None,
@@ -11454,6 +11458,7 @@ impl App {
             || self.show_archive_cache_manager
             || self.show_metadata_cleanup
             || self.metadata_cleanup_pending.is_some()
+            || self.metadata_transfer.is_some()
             || self.cc.show
             || self.archive_convert_dialog_visible()
             || self.video_upscale.is_some()
@@ -22023,6 +22028,46 @@ impl App {
         self.sidecars
             .retain(|folder, _| !matches_key(&crate::adjustment_db::normalize_path(folder)));
         self.invalidate_tag_apply_suggestions();
+    }
+
+    /// 明示メタ情報インポート完了後、DB を正本にして表示用キャッシュを再構築する。
+    /// worker は別接続で複数 DB を更新するため、既存接続そのものは再生成せず、
+    /// path-keyed な派生キャッシュだけを捨てる。
+    pub(crate) fn refresh_after_metadata_transfer_import(
+        &mut self,
+        applied_rating_keys: &[String],
+    ) {
+        self.user_set_rating_keys
+            .extend(applied_rating_keys.iter().cloned());
+        self.rating_cache.clear();
+        self.prewarm_rating_cache();
+        self.current_folder_rating_cache = None;
+        self.invalidate_rating_counts_cache();
+        self.reset_folder_rating_counts();
+
+        self.tags_cache.clear();
+        self.prewarm_grid_tags();
+        self.invalidate_tag_apply_suggestions();
+
+        self.current_book_bookmarks.clear();
+        self.current_book_bookmarks_key = None;
+        self.current_book_bookmarks_request = None;
+        self.book_bookmark_title_edit = None;
+        self.fullscreen_video_marker_cache = None;
+        self.cancel_fullscreen_video_marker_thumb_decode();
+        self.music_bookmarks.clear();
+        self.music_bookmarks_loaded_for = None;
+
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Rating,
+        );
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Tags,
+        );
+        self.notify_bookmarks_changed();
+        if self.settings.facet_filter.is_active() {
+            self.rebuild_visible_indices();
+        }
     }
 
     /// リネーム移行が使う data_dir (テストでは tempdir に差し替え可能)。
@@ -54981,6 +55026,7 @@ impl eframe::App for App {
         self.draw_book_reorder(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_metadata_cleanup_dialog(ctx);
+        self.show_metadata_transfer_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);

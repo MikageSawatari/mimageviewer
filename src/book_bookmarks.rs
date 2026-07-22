@@ -492,6 +492,13 @@ pub fn db_path() -> PathBuf {
     crate::data_dir::get().join("book_bookmarks.db")
 }
 
+/// 指定先に本ブックマーク DB の現行 schema を用意する。
+/// 明示メタ情報転送 worker とテストが、サービス専用接続を横取りせずに使うための入口。
+pub fn ensure_schema_at(path: &Path) -> Result<(), rusqlite::Error> {
+    drop(BookBookmarkDb::open_at(path)?);
+    Ok(())
+}
+
 /// 横断一覧 worker 用の全件読み出し。UI スレッドから直接呼ばないこと。
 pub fn load_all_from_disk() -> Result<Vec<BookBookmark>, rusqlite::Error> {
     BookBookmarkDb::open()?.list_all()

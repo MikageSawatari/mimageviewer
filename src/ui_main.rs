@@ -2492,6 +2492,12 @@ impl App {
         let local_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FileLocalSearch);
+        let metadata_export_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::FileMetadataExport);
+        let metadata_import_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::FileMetadataImport);
         let open_capture_folder_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FileOpenCaptureFolder);
@@ -2630,6 +2636,32 @@ impl App {
                                                 self.open_local_metadata_search();
                                                 ui.close();
                                             }
+                                        }
+                                        MenuCommandId::FileMetadataExport => {
+                                            let response = ui.add_enabled(
+                                                self.metadata_transfer_target().is_some(),
+                                                egui::Button::new(&metadata_export_menu_label),
+                                            );
+                                            if response.clicked() {
+                                                self.open_metadata_export_dialog();
+                                                ui.close();
+                                            }
+                                            response.on_disabled_hover_text(
+                                                "実フォルダを表示しているときに使用できます",
+                                            );
+                                        }
+                                        MenuCommandId::FileMetadataImport => {
+                                            let response = ui.add_enabled(
+                                                self.metadata_transfer_target().is_some(),
+                                                egui::Button::new(&metadata_import_menu_label),
+                                            );
+                                            if response.clicked() {
+                                                self.open_metadata_import_dialog();
+                                                ui.close();
+                                            }
+                                            response.on_disabled_hover_text(
+                                                "実フォルダを表示しているときに使用できます",
+                                            );
                                         }
                                         MenuCommandId::FileOpenCaptureFolder => {
                                             if ui.button(&open_capture_folder_menu_label).clicked()

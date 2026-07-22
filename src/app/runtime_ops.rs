@@ -290,6 +290,10 @@ impl App {
     /// scroll_settle helper 群を inherent impl に逃がす都合上、本体を inherent
     /// メソッドに移して trait impl 側から委譲する。
     pub(super) fn on_exit_inner(&mut self) {
+        // 明示メタ情報転送を先にキャンセルして worker を join する。import は現在項目の
+        // transaction 境界まで、export は原子的 publish 前までで止まり、その後の終了時
+        // DB flush と競合しない。
+        drop(self.metadata_transfer.take());
         // VST3 プラグイン内部状態 (= EQ カーブ / chunk) と GUI ウィンドウ位置 / サイズを
         // bridge から snapshot して settings.json に永続化する。終了前に取らないと再起動時に
         // 全部 default に戻る。bridge teardown は eframe の Drop で走るので、ここで先に

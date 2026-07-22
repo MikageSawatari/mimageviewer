@@ -139,6 +139,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_music_timeline.rs` | 音楽ビュー中央の行分割波形タイムライン。row raster worker + 行テクスチャキャッシュ (`TimelineTextureCache`、解析の版数 = `music_analysis_version` で再ラスタ判定)。行数は `TIMELINE_MAX_ROWS` でキャップ |
 | `ui_music_spectrum.rs` | 下段 108band スペクトラム + 鍵盤。専用 worker が共有 `MusicPcm` の窓を FFT (in-flight 1 件 coalesce) |
 | `ui_music_panels.rs` | 音楽ビューの左右ホバーパネル (ブックマーク / ループ / 行秒数) と下 HUD (動画 native HUD とレイアウト一致) |
+| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` の versioned JSON、root-relative path 検証、再帰走査、rating/tags/video+audio bookmarks/book bookmarks の収集とファイル単位 import transaction を worker で実行する。UI は完全モーダルの確認・進捗・キャンセルと、完了後の表示 cache invalidation だけを担当する |
 | App の `music_*` 状態 | 解析ワーカー / `MusicPcm` / spectrum / timeline cache は **ViewerContextBundle に入れず global** (stage-audio §3.5: ParkedLive 音楽窓も同じ global を消費する)。表示ゲートの中央述語は `fs_music_view_active`、動画→音声モードの transient は `video_audio_mode` / `video_audio_vst` |
 
 ### マルチウィンドウ / detached viewer (F12)
@@ -314,6 +315,15 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 ### フォルダ側サイドカー (`mimageviewer.dat`)
 
 `adjustment.db` (ページ個別補正)、`mask.db` (消しゴムマスク)、`conceal.db` (隠蔽加工マスク)、`local_adjust.db` (補正レイヤー)、`export_crop.db` (最後段 crop)、`comic.db` (Ctrl+T 注釈) のバックアップとして、各ユーザーフォルダの直下に `mimageviewer.dat` を置く (Hidden + System 属性付きの JSON)。中央 DB が authoritative で、フォルダを丸ごと別ドライブへ移動した際に中央のパスキーが無効化されるケースの復旧経路。設定トグル (`sidecar_backup_enabled`、デフォルト ON) で ON/OFF できる。補正レイヤーは各エントリの `local_adjust_layers` 配列、最後段 crop は `export_crop`、Ctrl+T 注釈は `comic` として保存し、中央 DB に既存エントリがある場合はインポート時に上書きしない。書き込むモジュール: `sidecar.rs`。詳細は [preset-and-adjustment.md](preset-and-adjustment.md) §9 と [virtual-folders.md](virtual-folders.md) §6 を参照。
+
+### 明示メタ情報転送 (`mimageviewer.meta.miv`)
+
+`ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
+`mimageviewer.dat` と独立した versioned JSON を実フォルダ直下へ作る。評価、タグ、
+動画・音声ブックマーク、本ブックマークを対象にし、再帰 export でも sidecar は root の
+1 個だけ。import は manifest に記載された物理項目だけを上書きし、未記載項目を保持する。
+実装と境界条件は `metadata_transfer.rs`、モーダルと writer drain は
+`ui_dialogs/metadata_transfer.rs` が所有する。
 
 ---
 

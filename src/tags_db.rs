@@ -50,6 +50,7 @@ pub mod source {
     pub const TANTIVY_MIGRATION: &str = "tantivy_migration";
     pub const XMP_LEGACY: &str = "xmp_legacy";
     pub const SIDECAR: &str = "sidecar";
+    pub const METADATA_IMPORT: &str = "metadata_import";
 }
 
 pub struct TagsDb {
