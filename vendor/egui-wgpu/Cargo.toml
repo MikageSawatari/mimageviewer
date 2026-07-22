@@ -21,8 +21,8 @@ authors = [
 ]
 build = false
 include = [
-    "../LICENSE-APACHE",
-    "../LICENSE-MIT",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
     "**/*.rs",
     "**/*.wgsl",
     "Cargo.toml",

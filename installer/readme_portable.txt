@@ -65,6 +65,8 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   models\                         AI 用モデル
   LICENSE-ffmpeg.txt              FFmpeg のライセンス本文
   UNRAR-LICENSE.txt               UnRAR のライセンス本文
+  egui-LICENSE-MIT.txt            egui の MIT ライセンス本文
+  egui-LICENSE-APACHE.txt         egui の Apache-2.0 ライセンス本文
   readme.txt                      このファイル
   data\                           （初回起動時に自動作成）
                                   設定・キャッシュ・ログ等の保存先
@@ -114,7 +116,8 @@ TensorRT 高速化パックを利用する場合のみ、ユーザー操作に�
   - ONNX Runtime (MIT): Microsoft
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - libjpeg-turbo (BSD-3-Clause / zlib)
-  - eframe / egui (MIT or Apache-2.0): Rerun Technologies
+  - eframe / egui (MIT OR Apache-2.0): Emil Ernerfeldt and contributors
+    同梱の egui-LICENSE-MIT.txt / egui-LICENSE-APACHE.txt を参照してください。
   - FFmpeg (LGPLv3-or-later): FFmpeg project
     同梱の LICENSE-ffmpeg.txt および以下を参照してください:
     https://mikage.to/mimageviewer/

@@ -645,7 +645,9 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 - 対象は raw static、PDF/ZIP page、編集・補正・AI・注釈・比較用の表示 texture。Windowsの
   wipe/diff比較と360度パノラマの独自`Rgba8Unorm` textureも同じGPU生成器を使う。パノラマは
   水平フル/垂直cropではU=Repeat、水平cropではU=ClampToEdgeを選び、低LODで部分画像の
-  反対端が混ざらないようにする。1つの
+  反対端が混ざらないようにする。経度シームではU微分を周期補正して`textureSampleGrad`へ渡し、
+  シームだけ過度に粗いmipが選ばれることを防ぐ。比較callbackは現在のpinned/current 1組だけを
+  保持し、解除・再準備時に旧組を解放する。右下のピン表示は72x54以下の専用textureを使う。1つの
   `TextureHandle` 内に全 level を保持するので、表示 texture の優先順位、論理サイズ、zoom、
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な

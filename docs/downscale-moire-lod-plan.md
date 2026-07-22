@@ -44,9 +44,14 @@
 
 Windowsのwipe/diff比較と360度パノラマはmanaged `TextureHandle`を使わず独自に
 `Rgba8Unorm` textureを作るため、同じGPU生成器で完全なmip chainを構築し、trilinear samplingする。
+wipe/diffのcallback resourceは現在の比較組（pinned/currentの2枚）だけを保持し、比較解除・
+再準備時には旧組を新規確保前にdropする。右下のピン表示はpin workerで72x54以下へ縮小した
+専用textureを使い、インジケーターだけのためにフル解像度mip chainを保持しない。
 画面解像度で描く360度パノラマのsettle overlayは1 mipのままとする。
 360度パノラマは水平フル/垂直cropではU方向Repeat、水平cropではU方向ClampToEdgeの
 bind groupを選び、低LODで部分画像の反対端が混ざらないようにする。
+また、`atan2`の経度シームでUが1から0へ飛ぶ差を周期1でwrapした明示微分を
+`textureSampleGrad`へ渡し、シーム付近だけ過度に粗いmipが選ばれることを防ぐ。
 
 サムネイル、animated GIF/APNG/WebP の各 frame、動画、mask、checker、UI/font preview、
 `PostFilter::Nearest` は opt-in しない。これにより小 texture や頻繁に更新する texture の
@@ -84,6 +89,10 @@ bind groupを選び、低LODで部分画像の反対端が混ざらないよう�
 - fit、見開き、縦横連結、ズーム往復、ルーペ、pixel grid の寸法と位置が変わらないこと。
 - 補正、AI、消しゴム、隠蔽、注釈の結果更新後も古い mip level が残らないこと。
 - Windowsのwipe/diff比較と360度パノラマを大縮小してもモアレが再発しないこと。
+- wipe/diffで多数の高解像度画像を切り替えても、比較callbackのVRAMが過去組数に比例して
+  増えず、比較解除後に現在組が解放されること。
+- 360度パノラマの経度シームを画面中央へ置いても、シーム沿いだけ粗いmipによる縦線・ぼけが
+  出ないこと。
 - 水平cropされた部分パノラマを広角表示しても、欠落領域へ画像の反対端が混ざらないこと。
 - 連結読みの320M texel上限が完全なmip chainと後段表示textureを含むこと。
 - `Nearest`、animated image、動画、サムネイルの挙動が変わらないこと。

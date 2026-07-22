@@ -3,6 +3,9 @@
 use crate::app::App;
 use eframe::egui;
 
+const EGUI_LICENSE_MIT: &str = include_str!("../../vendor/egui-wgpu/LICENSE-MIT");
+const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-APACHE");
+
 impl App {
     pub(crate) fn show_about_dialog_window(&mut self, ctx: &egui::Context) {
         if !self.show_about_dialog {
@@ -16,7 +19,10 @@ impl App {
         egui::Window::new("バージョン情報")
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .vscroll(true)
+            .default_width(620.0)
+            .max_height((ctx.content_rect().height() - 80.0).max(320.0))
             .default_pos(dialog_pos)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
@@ -50,6 +56,10 @@ impl App {
                         ui.label("UnRAR license — Alexander Roshal / RARLAB");
                         ui.end_row();
 
+                        ui.label("eframe / egui");
+                        ui.label("MIT OR Apache-2.0 — Emil Ernerfeldt and contributors");
+                        ui.end_row();
+
                         ui.label("Real-ESRGAN");
                         ui.label("BSD-3-Clause — Xintao");
                         ui.end_row();
@@ -73,6 +83,42 @@ impl App {
                         ui.label("絵文字 (Twemoji)");
                         ui.label("CC-BY 4.0 — Twitter, Inc. and other contributors");
                         ui.end_row();
+                    });
+
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("egui MIT License 全文")
+                    .id_salt("about_egui_mit_license")
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("about_egui_mit_license_scroll")
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(EGUI_LICENSE_MIT)
+                                            .monospace()
+                                            .size(10.0),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                    });
+                egui::CollapsingHeader::new("egui Apache License 2.0 全文")
+                    .id_salt("about_egui_apache_license")
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("about_egui_apache_license_scroll")
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(EGUI_LICENSE_APACHE)
+                                            .monospace()
+                                            .size(10.0),
+                                    )
+                                    .wrap(),
+                                );
+                            });
                     });
 
                 // 編集用追加パック (導入済みのときだけ表示、spec §10)。
@@ -115,5 +161,17 @@ impl App {
         if !open || escape_pressed {
             self.show_about_dialog = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT};
+
+    #[test]
+    fn egui_license_texts_are_embedded_with_attribution() {
+        assert!(EGUI_LICENSE_MIT.contains("Copyright (c) 2018-2021 Emil Ernerfeldt"));
+        assert!(EGUI_LICENSE_APACHE.contains("Apache License"));
+        assert!(EGUI_LICENSE_APACHE.contains("Version 2.0, January 2004"));
     }
 }

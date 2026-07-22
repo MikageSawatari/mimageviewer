@@ -36,6 +36,21 @@ use crate::settings::{
 };
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
+const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
+const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
+
+fn compare_indicator_size(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let scale = (COMPARE_INDICATOR_MAX_WIDTH as f64 / width as f64)
+        .min(COMPARE_INDICATOR_MAX_HEIGHT as f64 / height as f64)
+        .min(1.0);
+    let target_width = ((width as f64 * scale).round() as u32).max(1);
+    let target_height = ((height as f64 * scale).round() as u32).max(1);
+    Some((target_width, target_height))
+}
+
 fn fs_loupe_suppressed_by_edit_mode(
     analysis_mode: bool,
     adjustment_mode: bool,
@@ -11699,6 +11714,7 @@ impl App {
 
         if esc && self.compare_view_mode.is_overlay() {
             self.compare_view_mode = crate::app::CompareViewMode::Off;
+            self.clear_compare_gpu_pair();
             self.compare_wipe_dragging = false;
             self.show_feedback_toast("[比較: Normal]".to_string());
         } else if esc && !pano_active_now && self.close_click_side_panels() {
@@ -14634,6 +14650,7 @@ impl App {
 
     pub(crate) fn disable_non_paged_fullscreen_modes(&mut self, fs_idx: usize) {
         self.compare_view_mode = crate::app::CompareViewMode::Off;
+        self.clear_compare_gpu_pair();
         if self.is_panorama_mode_active(fs_idx) {
             self.toggle_panorama_mode(fs_idx);
         }
@@ -15789,6 +15806,25 @@ impl App {
         slot.texture.clone()
     }
 
+    fn ensure_compare_pin_indicator_texture(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
+        let slot = self.pinned_compare_slot.as_mut()?;
+        if slot.indicator_texture.is_none() {
+            let tex = ctx.load_texture(
+                format!(
+                    "compare_pin_indicator_{}_{}x{}",
+                    slot.source_idx, slot.indicator_pixels.size[0], slot.indicator_pixels.size[1]
+                ),
+                slot.indicator_pixels.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            slot.indicator_texture = Some(tex);
+        }
+        slot.indicator_texture.clone()
+    }
+
     fn compare_prepared_pair_matches(&self, fs_idx: usize) -> bool {
         let Some(slot) = self.pinned_compare_slot.as_ref() else {
             return false;
@@ -15823,12 +15859,14 @@ impl App {
             Ok(work) => work,
             Err(err) => {
                 self.compare_view_mode = crate::app::CompareViewMode::Off;
+                self.clear_compare_gpu_pair();
                 self.compare_wipe_dragging = false;
                 self.show_feedback_toast(err);
                 return false;
             }
         };
         self.compare_prepared_pair = None;
+        self.clear_compare_gpu_pair();
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("compare-prepare".into())
@@ -16898,7 +16936,7 @@ impl App {
         else {
             return;
         };
-        let tex = self.ensure_compare_pinned_texture(ctx);
+        let tex = self.ensure_compare_pin_indicator_texture(ctx);
 
         let max_label_chars = 28usize;
         let label = if display_name.chars().count() > max_label_chars {
@@ -19831,6 +19869,7 @@ impl App {
             self.compare_pin_load_pending = None;
             self.compare_prepare_pending = None;
             self.compare_prepared_pair = None;
+            self.clear_compare_gpu_pair();
             self.compare_wipe_dragging = false;
             self.show_feedback_toast("比較画像を解除しました".to_string());
             ctx.request_repaint();
@@ -19868,15 +19907,34 @@ impl App {
         let thread = std::thread::Builder::new()
             .name("compare-pin".into())
             .spawn(move || {
-                let result =
-                    crate::capture::run_pixel_work(work).map(|(basename, width, height, rgba)| {
-                        crate::app::ComparePinResult {
+                let result = crate::capture::run_pixel_work(work).and_then(
+                    |(basename, width, height, rgba)| {
+                        let source = image::RgbaImage::from_raw(width, height, rgba)
+                            .ok_or_else(|| "比較画像のRGBAサイズが不正です".to_string())?;
+                        let (indicator_width, indicator_height) =
+                            compare_indicator_size(width, height)
+                                .ok_or_else(|| "比較画像の寸法が不正です".to_string())?;
+                        let indicator = if indicator_width == width && indicator_height == height {
+                            source.clone()
+                        } else {
+                            crate::fast_resize::resize_rgba8_exact(
+                                &source,
+                                indicator_width,
+                                indicator_height,
+                                crate::fast_resize::Quality::Lanczos3,
+                            )
+                        };
+                        Ok(crate::app::ComparePinResult {
                             basename,
                             width,
                             height,
-                            rgba,
-                        }
-                    });
+                            rgba: source.into_raw(),
+                            indicator_width,
+                            indicator_height,
+                            indicator_rgba: indicator.into_raw(),
+                        })
+                    },
+                );
                 let _ = tx.send(result);
             });
 
@@ -19885,6 +19943,7 @@ impl App {
                 self.compare_pin_load_pending = None;
                 self.compare_prepare_pending = None;
                 self.compare_prepared_pair = None;
+                self.clear_compare_gpu_pair();
                 self.compare_pin_pending = Some(crate::app::ComparePinPending { source_idx, rx });
                 self.show_feedback_toast("比較画像を準備中".to_string());
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -19966,6 +20025,7 @@ impl App {
             crate::app::CompareViewMode::Diff => crate::app::CompareViewMode::Off,
         };
         self.compare_wipe_dragging = false;
+        self.clear_compare_gpu_pair();
         if matches!(
             self.compare_view_mode,
             crate::app::CompareViewMode::PinnedNormal
@@ -19994,6 +20054,8 @@ impl App {
             crate::app::CompareViewMode::Wipe { .. }
         ) {
             self.ensure_compare_prepared_pair(ctx, fs_idx);
+        } else {
+            self.clear_compare_gpu_pair();
         }
         let label = match self.compare_view_mode {
             crate::app::CompareViewMode::Wipe { .. } => "[比較: Wipe]",
@@ -20014,6 +20076,8 @@ impl App {
         self.compare_wipe_dragging = false;
         if matches!(self.compare_view_mode, crate::app::CompareViewMode::Diff) {
             self.ensure_compare_prepared_pair(ctx, fs_idx);
+        } else {
+            self.clear_compare_gpu_pair();
         }
         let label = match self.compare_view_mode {
             crate::app::CompareViewMode::Diff => "[比較: Diff]",
@@ -23218,6 +23282,15 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[test]
+    fn compare_indicator_size_fits_without_upscaling() {
+        assert_eq!(compare_indicator_size(8192, 8192), Some((54, 54)));
+        assert_eq!(compare_indicator_size(8192, 4096), Some((72, 36)));
+        assert_eq!(compare_indicator_size(4096, 8192), Some((27, 54)));
+        assert_eq!(compare_indicator_size(32, 24), Some((32, 24)));
+        assert_eq!(compare_indicator_size(0, 24), None);
+    }
 
     #[test]
     fn viewer_short_right_click_action_applies_close_none_and_shared_menu_state() {

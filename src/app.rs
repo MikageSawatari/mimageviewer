@@ -2624,6 +2624,10 @@ impl CompareViewMode {
 pub(crate) struct PinnedCompareSlot {
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) texture: Option<egui::TextureHandle>,
+    /// 右下インジケーター専用の小型画像。フル解像度textureを72x54表示のためだけに
+    /// uploadしないよう、compare-pin workerで事前縮小する。
+    pub(crate) indicator_pixels: Arc<egui::ColorImage>,
+    pub(crate) indicator_texture: Option<egui::TextureHandle>,
     pub(crate) display_name: String,
     pub(crate) source_idx: usize,
     pub(crate) source_size: [usize; 2],
@@ -2634,6 +2638,9 @@ pub(crate) struct ComparePinResult {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) rgba: Vec<u8>,
+    pub(crate) indicator_width: u32,
+    pub(crate) indicator_height: u32,
+    pub(crate) indicator_rgba: Vec<u8>,
 }
 
 pub(crate) struct ComparePinPending {
@@ -22945,7 +22952,13 @@ impl App {
         match result {
             Ok(result) => {
                 let expected = result.width as usize * result.height as usize * 4;
-                if result.rgba.len() != expected {
+                let indicator_expected =
+                    result.indicator_width as usize * result.indicator_height as usize * 4;
+                if result.rgba.len() != expected
+                    || result.indicator_rgba.len() != indicator_expected
+                    || result.indicator_width == 0
+                    || result.indicator_height == 0
+                {
                     self.show_feedback_toast("比較画像のサイズが不正です".to_string());
                     return;
                 }
@@ -22954,16 +22967,26 @@ impl App {
                     &result.rgba,
                 );
                 let display_name = result.basename;
+                let indicator_pixels = egui::ColorImage::from_rgba_unmultiplied(
+                    [
+                        result.indicator_width as usize,
+                        result.indicator_height as usize,
+                    ],
+                    &result.indicator_rgba,
+                );
                 self.pinned_compare_slot = Some(PinnedCompareSlot {
                     source_size: pixels.size,
                     pixels: Arc::new(pixels),
                     texture: None,
+                    indicator_pixels: Arc::new(indicator_pixels),
+                    indicator_texture: None,
                     display_name: display_name.clone(),
                     source_idx,
                 });
                 self.compare_view_mode = CompareViewMode::Off;
                 self.compare_prepare_pending = None;
                 self.compare_prepared_pair = None;
+                self.clear_compare_gpu_pair();
                 self.compare_wipe_dragging = false;
                 self.show_feedback_toast(format!("比較画像を設定: {display_name}"));
                 ctx.request_repaint();
@@ -30624,6 +30647,7 @@ impl App {
         self.clear_fullscreen_tag_picker_state();
 
         self.compare_view_mode = CompareViewMode::Off;
+        self.clear_compare_gpu_pair();
         if self.panorama_state.is_some() {
             self.toggle_panorama_mode(fs_idx);
         }
@@ -49924,6 +49948,15 @@ impl App {
         self.erase_base_tex_cache.remove(&idx);
     }
 
+    /// Wipe/Diff callbackが所有する現在の高解像度texture 2枚を解放する。
+    /// pipelineとsamplerは残すため、比較を再開しても静的GPUリソースは再構築しない。
+    pub(crate) fn clear_compare_gpu_pair(&self) {
+        if let Some(render_state) = self.wgpu_render_state.as_ref() {
+            let mut renderer = render_state.renderer.write();
+            crate::compare_wgpu::clear_gpu_pair(&mut renderer.callback_resources);
+        }
+    }
+
     pub(crate) fn invalidate_compare_prepared_for_idx(&mut self, idx: usize) {
         let prepared_affected = self
             .compare_prepared_pair
@@ -49935,6 +49968,7 @@ impl App {
             .is_some_and(|pending| pending.current_idx == idx || pending.pinned_source_idx == idx);
         if prepared_affected {
             self.compare_prepared_pair = None;
+            self.clear_compare_gpu_pair();
         }
         if pending_affected {
             self.compare_prepare_pending = None;
@@ -49951,6 +49985,7 @@ impl App {
     /// しないため取りこぼす (Codex P2)。
     pub(crate) fn invalidate_all_compare_prepared(&mut self) {
         self.compare_prepared_pair = None;
+        self.clear_compare_gpu_pair();
         self.compare_prepare_pending = None;
         self.compare_wipe_dragging = false;
         // ピン留め (X) スロットは焼き込み済み pixels を保持するので、フォントソース変更では
@@ -50034,6 +50069,7 @@ impl App {
         self.thumb_adjust_tex.clear();
         self.compare_prepare_pending = None;
         self.compare_prepared_pair = None;
+        self.clear_compare_gpu_pair();
         self.compare_wipe_dragging = false;
         self.clear_all_final_pipeline_caches();
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
@@ -51487,6 +51523,7 @@ impl App {
         self.analysis_mode = false;
         self.reset_erase_mode();
         self.compare_view_mode = crate::app::CompareViewMode::Off;
+        self.clear_compare_gpu_pair();
         self.show_metadata_panel = false;
         self.metadata_panel_hover_active = false;
     }

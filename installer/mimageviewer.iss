@@ -61,6 +61,9 @@ Source: "..\vendor\ffmpeg\LICENSE.txt"; DestDir: "{app}"; DestName: "FFmpeg-LICE
 ; RAR 展開には unrar crate 経由で RARLAB UnRAR ソースを組み込むため、
 ; UnRAR ライセンス本文をインストール先にも配置する。
 Source: "..\UNRAR-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+; ローカル差し替えした egui-wgpu を含む egui 0.33.3 のデュアルライセンス本文。
+Source: "..\vendor\egui-wgpu\LICENSE-MIT"; DestDir: "{app}"; DestName: "egui-LICENSE-MIT.txt"; Flags: ignoreversion
+Source: "..\vendor\egui-wgpu\LICENSE-APACHE"; DestDir: "{app}"; DestName: "egui-LICENSE-APACHE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

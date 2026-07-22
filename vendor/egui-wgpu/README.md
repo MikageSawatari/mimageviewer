@@ -15,3 +15,6 @@ This directory is based on `egui-wgpu` 0.33.3. The local patch adds opt-in mipma
 GPU mip-chain generation, and mipmap sampler filtering for managed textures whose
 `TextureOptions::mipmap_mode` is set. See `docs/downscale-moire-lod-plan.md` in the application
 repository for the behavior and maintenance notes.
+
+The upstream 0.33.3 license texts and copyright notice are preserved in
+[`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).

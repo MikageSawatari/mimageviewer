@@ -156,7 +156,9 @@ Windows の「設定」→「アプリ」→「インストールされている
   - ONNX Runtime (MIT): Microsoft
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - libjpeg-turbo (BSD-3-Clause / zlib)
-  - eframe / egui (MIT or Apache-2.0): Rerun Technologies
+  - eframe / egui (MIT OR Apache-2.0): Emil Ernerfeldt and contributors
+    ライセンス全文はインストール先の egui-LICENSE-MIT.txt /
+    egui-LICENSE-APACHE.txt を参照してください。
   - FFmpeg (LGPLv3-or-later): FFmpeg project
     Source and license notes: https://mikage.to/mimageviewer/
   - UnRAR source code (UnRAR license): Alexander Roshal / RARLAB

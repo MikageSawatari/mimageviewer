@@ -99,6 +99,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let lat = asin(clamp(wd.y, -1.0, 1.0));
     // フル球面 UV (0..1)
     let sphere_uv = vec2<f32>(lon * INV_TWO_PI + 0.5, 0.5 - lat * INV_PI);
+    // atan2のbranch cutではUが1→0へ飛ぶ。textureSampleの暗黙微分へそのまま
+    // 渡すと、隣接fragment間の局所差ではなく約1.0の差として粗いmipを選ぶ。
+    // Uの周期1を考慮して差を[-0.5, 0.5]へ戻し、textureSampleGradへ明示する。
+    // dpdx/dpdyはuniform control flow内で評価し、crop scaleは後段UVと同じく反映する。
+    let sphere_dx_raw = dpdx(sphere_uv);
+    let sphere_dy_raw = dpdy(sphere_uv);
+    let sphere_dx = vec2<f32>(
+        sphere_dx_raw.x - round(sphere_dx_raw.x),
+        sphere_dx_raw.y,
+    );
+    let sphere_dy = vec2<f32>(
+        sphere_dy_raw.x - round(sphere_dy_raw.x),
+        sphere_dy_raw.y,
+    );
+    let texture_dx = sphere_dx / params.crop.zw;
+    let texture_dy = sphere_dy / params.crop.zw;
     // 画像が球面の crop 範囲 (crop.xy ～ crop.xy+crop.zw) しか覆っていない場合に、
     // 球面 UV を画像テクスチャ UV に変換する (Phase 1.5: 部分 FOV equirect 対応)。
     // フル equirect なら crop = (0,0,1,1) で恒等変換。
@@ -141,7 +157,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             v_crop,
         ),
     );
-    return textureSample(pano_tex, pano_samp, texture_uv);
+    return textureSampleGrad(pano_tex, pano_samp, texture_uv, texture_dx, texture_dy);
 }
 "#;
 
@@ -824,6 +840,20 @@ impl egui_wgpu::CallbackTrait for SettleOverlayCallback {
         render_pass.set_pipeline(&resources.pipeline);
         render_pass.set_bind_group(0, &overlay_ref.gpu.bind_group, &[]);
         render_pass.draw(0..6, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SHADER;
+
+    #[test]
+    fn panorama_shader_uses_wrapped_explicit_gradients() {
+        assert!(SHADER.contains("sphere_dx_raw.x - round(sphere_dx_raw.x)"));
+        assert!(SHADER.contains("sphere_dy_raw.x - round(sphere_dy_raw.x)"));
+        assert!(SHADER.contains(
+            "textureSampleGrad(pano_tex, pano_samp, texture_uv, texture_dx, texture_dy)"
+        ));
     }
 }
 

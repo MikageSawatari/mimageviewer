@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 const SHADER: &str = r#"
@@ -80,7 +79,10 @@ struct CompareGpuResources {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     mipmap_generator: egui_wgpu::MipmapGenerator,
-    pairs: HashMap<u64, CompareGpuPair>,
+    // App側が保持する準備済み比較組は常に1組だけで、keyも再利用されない。
+    // 過去組をHashMapへ残すと、完全なmip chainを持つ2 textureが組数分だけ
+    // VRAMへ蓄積するため、GPU側も現在組1つだけを所有する。
+    pair: Option<(u64, CompareGpuPair)>,
 }
 
 struct CompareGpuPair {
@@ -187,7 +189,7 @@ impl CompareGpuResources {
             bind_group_layout,
             sampler,
             mipmap_generator: egui_wgpu::MipmapGenerator::new(device),
-            pairs: HashMap::new(),
+            pair: None,
         }
     }
 
@@ -198,14 +200,19 @@ impl CompareGpuResources {
         callback: &CompareShaderCallback,
     ) {
         let recreate = self
-            .pairs
-            .get(&callback.key)
-            .map(|p| p.width != callback.width || p.height != callback.height)
+            .pair
+            .as_ref()
+            .map(|(key, pair)| {
+                *key != callback.key
+                    || pair.width != callback.width
+                    || pair.height != callback.height
+            })
             .unwrap_or(true);
         if recreate {
-            if self.pairs.len() > 8 {
-                self.pairs.clear();
-            }
+            // 新textureを確保する前に旧組をdropし、8K比較で旧/new組が同時に
+            // VRAMへ残る時間を作らない。wgpu backend側のin-flight解放遅延を除けば、
+            // CompareGpuResourcesが所有する完全mip chainは常に2枚までになる。
+            self.pair = None;
             let pinned = upload_rgba_texture(
                 device,
                 queue,
@@ -252,7 +259,7 @@ impl CompareGpuResources {
                     },
                 ],
             });
-            self.pairs.insert(
+            self.pair = Some((
                 callback.key,
                 CompareGpuPair {
                     _pinned_texture: pinned.texture,
@@ -264,15 +271,25 @@ impl CompareGpuResources {
                     width: callback.width,
                     height: callback.height,
                 },
-            );
+            ));
         }
-        if let Some(pair) = self.pairs.get(&callback.key) {
+        if let Some((key, pair)) = self.pair.as_ref()
+            && *key == callback.key
+        {
             queue.write_buffer(
                 &pair.uniform,
                 0,
                 &uniform_bytes(callback.mode, callback.wipe_fraction),
             );
         }
+    }
+}
+
+/// 比較overlayを使わない状態へ移るとき、pipeline/samplerは保持したまま
+/// 高解像度texture 2枚だけを即時dropする。
+pub fn clear_gpu_pair(callback_resources: &mut egui_wgpu::CallbackResources) {
+    if let Some(resources) = callback_resources.get_mut::<CompareGpuResources>() {
+        resources.pair = None;
     }
 }
 
@@ -370,9 +387,12 @@ impl egui_wgpu::CallbackTrait for CompareShaderCallback {
         let Some(resources) = callback_resources.get::<CompareGpuResources>() else {
             return;
         };
-        let Some(pair) = resources.pairs.get(&self.key) else {
+        let Some((key, pair)) = resources.pair.as_ref() else {
             return;
         };
+        if *key != self.key {
+            return;
+        }
         render_pass.set_pipeline(&resources.pipeline);
         render_pass.set_bind_group(0, &pair.bind_group, &[]);
         render_pass.draw(0..6, 0..1);

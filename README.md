@@ -569,4 +569,8 @@ Windows 向け高速サムネイルビューワー
 **Copyright © 2026 SANO Taku (佐野 拓).** mImageViewer is developed and maintained by
 SANO Taku (online handle "Mikage Sawatari"), GitHub [@MikageSawatari](https://github.com/MikageSawatari).
 
+eframe / egui は Emil Ernerfeldt および contributors により
+`MIT OR Apache-2.0` で提供されています。ライセンス全文は
+[MIT](vendor/egui-wgpu/LICENSE-MIT) / [Apache-2.0](vendor/egui-wgpu/LICENSE-APACHE) を参照してください。
+
 RAR 展開には RARLAB UnRAR source code を利用します。UnRAR のライセンス全文は [UNRAR-LICENSE.txt](UNRAR-LICENSE.txt) を参照してください。

@@ -2156,6 +2156,9 @@ GPano `CroppedArea*` 宣言で「フル球面の一部しか覆っていない�
   - **両方 crop**: 両方 clamp
   - **フル equirect (IDENTITY)**: 両方とも偽、`texture_uv_raw` 素通しで U Repeat
     + V ClampToEdge の「平時」挙動を維持
+- **mipmap LODの経度シーム補正**: `atan2`由来のU座標はシームで1→0へ不連続になるため、
+  暗黙微分のままでは約1.0の差として過度に粗いmipを選ぶ。`dpdx` / `dpdy`のU成分を周期1で
+  `[-0.5, 0.5]`へwrapし、crop scaleを反映した明示微分を`textureSampleGrad`へ渡す。
 - **Linear filter 対応 (half-texel inset)**: level 0では最外側texelの中心に対応する
   `[0.5/W, 1 - 0.5/W]` へclampする。mipmap導入後はlevel 0基準のinsetだけでは低LODの
   最外texel中心にならないため、水平crop用ClampToEdge samplerが各LODの端処理を担当する。

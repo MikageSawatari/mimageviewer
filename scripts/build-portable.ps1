@@ -126,6 +126,8 @@ $copies = @(
     #  CLAUDE.md encoding policy: .ps1 = ASCII only.)
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
+    @{ src = 'vendor\egui-wgpu\LICENSE-MIT';         dst = 'egui-LICENSE-MIT.txt' }
+    @{ src = 'vendor\egui-wgpu\LICENSE-APACHE';      dst = 'egui-LICENSE-APACHE.txt' }
     @{ src = 'installer\readme_portable.txt';        dst = 'readme.txt' }
 )
 
