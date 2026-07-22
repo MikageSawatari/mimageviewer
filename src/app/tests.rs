@@ -36791,6 +36791,7 @@ mod rating_write_failure_tests {
                 path_key: key,
                 source_path: path,
                 meta,
+                xmp_target: None,
                 before: 1,
                 after: 4,
             }],
@@ -36829,6 +36830,7 @@ mod rating_write_failure_tests {
                 path_key: key,
                 source_path: path,
                 meta,
+                xmp_target: None,
                 before: 1,
                 after: 4,
             }],
@@ -36877,7 +36879,9 @@ mod rating_write_failure_tests {
         // same value again but must derive one original->durable transition.
         assert!(app.set_rating(0, 4));
         let (records, container) = app.finalize_live_picker_ratings(&picker);
-        assert_eq!(records, vec![(0, 1, 4)]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path_key, key);
+        assert_eq!((records[0].before, records[0].after), (1, 4));
         app.commit_live_picker_undo(records, container);
 
         assert_eq!(app.meta_undo.undo_len(), 1);
@@ -36907,5 +36911,105 @@ mod rating_write_failure_tests {
 
         assert_eq!(app.meta_undo.undo_len(), 0);
         assert_eq!(app.rating_cache.get(&0), Some(&2));
+    }
+
+    #[test]
+    fn ring_rating_keeps_stable_target_after_items_are_reordered() {
+        let mut app = setup_app();
+        app.settings.write_rating_to_xmp = false;
+        let path_a = app.tmp.path().join("a.jpg");
+        let path_b = app.tmp.path().join("b.jpg");
+        app.items = vec![
+            GridItem::Image(path_a.clone()),
+            GridItem::Image(path_b.clone()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        let key_a = crate::adjustment_db::normalize_path(&path_a);
+        let key_b = crate::adjustment_db::normalize_path(&path_b);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_ratings(&[
+                (key_a.as_str(), 1, app.rating_meta_for_idx(0).as_ref()),
+                (key_b.as_str(), 2, app.rating_meta_for_idx(1).as_ref()),
+            ])
+            .unwrap();
+        app.rating_cache.insert(0, 1);
+        app.rating_cache.insert(1, 2);
+        let mut picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        picker
+            .dirty_rows
+            .push(crate::ring_shortcut::RingPickerRowId::ItemRating);
+        picker.item_rating = 4;
+
+        // Model the result of a sort-preview reload: indices now point at the
+        // opposite files and their index-owned caches have been rebuilt.
+        app.items.swap(0, 1);
+        app.thumbnails.swap(0, 1);
+        app.rating_cache.clear();
+        app.rating_cache.insert(0, 2);
+        app.rating_cache.insert(1, 1);
+        app.selected = Some(1);
+
+        app.preview_picker_item_rating(&picker, 4);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key_a), 4);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key_b), 2);
+        assert_eq!(app.rating_cache.get(&0), Some(&2));
+        assert_eq!(app.rating_cache.get(&1), Some(&4));
+
+        let (changes, container) = app.finalize_live_picker_ratings(&picker);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path_key, key_a);
+        assert_eq!((changes[0].before, changes[0].after), (1, 4));
+        app.commit_live_picker_undo(changes, container);
+        let Some(crate::undo_stack::UndoEntry::Rating { changes, .. }) = app.meta_undo.peek_undo()
+        else {
+            panic!("ring rating must create a rating undo entry");
+        };
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path_key, key_a);
+    }
+
+    #[test]
+    fn compiled_book_page_rating_undo_redo_never_starts_xmp_writer() {
+        let mut app = setup_app();
+        app.settings.write_rating_to_xmp = true;
+        let book_folder = crate::books::book_folder(&app.book_root_path(), "XmpUndoBook");
+        std::fs::create_dir_all(&book_folder).unwrap();
+        let page = book_folder.join("page.jpg");
+        std::fs::write(&page, b"not decoded by this test").unwrap();
+        app.items = vec![GridItem::Image(page.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = crate::adjustment_db::normalize_path(&page);
+        let meta = app.rating_meta_for_idx(0);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, meta.as_ref())
+            .unwrap();
+        app.rating_cache.insert(0, 1);
+
+        assert!(app.idx_is_compiled_book_page(0));
+        assert_eq!(app.rating_xmp_target_for_idx(0), None);
+        app.apply_rating_to_selection(4);
+        assert!(app.rating_write_handle.is_none());
+        let Some(crate::undo_stack::UndoEntry::Rating { changes, .. }) = app.meta_undo.peek_undo()
+        else {
+            panic!("book page rating must create a rating undo entry");
+        };
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].xmp_target, None);
+
+        app.apply_meta_undo();
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 1);
+        assert!(app.rating_write_handle.is_none());
+        app.apply_meta_redo();
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+        assert!(app.rating_write_handle.is_none());
     }
 }

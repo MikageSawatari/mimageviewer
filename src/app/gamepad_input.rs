@@ -16,8 +16,8 @@ use crate::ring_shortcut::{
     MOUSE_FLICK_MOVE_THRESHOLD_PX, MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX,
     MouseButtonSlot, MouseFlickOutcome, MouseFlickState, MouseGestureDirection, MouseGestureState,
     PickerListMode, PickerListState, RightDragContext, RightDragMode, RingActionId, RingDirection,
-    RingPickerAnchor, RingPickerOriginalState, RingPickerRowId, RingPickerState,
-    RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
+    RingPickerAnchor, RingPickerOriginalState, RingPickerRatingTarget, RingPickerRowId,
+    RingPickerState, RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
     mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
@@ -25,6 +25,7 @@ use crate::settings::{
     ThumbAspect, format_video_volume_db, step_video_volume_by_fader_key_step,
 };
 use crate::ui_main::AddressBarNav;
+use crate::undo_stack::RatingChange;
 use crate::video::VideoContinuousMode;
 
 const BUTTON_REPEAT_INTERVAL: Duration = Duration::from_millis(95);
@@ -2234,7 +2235,7 @@ impl App {
         let params = fs_idx.map(|idx| self.effective_params(idx).clone());
         let item_rating_records = self.current_picker_item_rating_records(context);
         let item_rating = if item_rating_records.len() == 1 {
-            item_rating_records[0].1
+            item_rating_records[0].before
         } else {
             0
         };
@@ -2335,20 +2336,32 @@ impl App {
     fn current_picker_item_rating_records(
         &mut self,
         context: RingShortcutContext,
-    ) -> Vec<(usize, u8)> {
-        match context {
-            RingShortcutContext::Grid => {
-                let targets = self.ratable_targets();
-                targets
-                    .into_iter()
-                    .map(|idx| (idx, self.get_rating(idx)))
-                    .collect()
+    ) -> Vec<RingPickerRatingTarget> {
+        let indices = match context {
+            RingShortcutContext::Grid => self.ratable_targets(),
+            RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen => {
+                self.fullscreen_idx.map(|idx| vec![idx]).unwrap_or_default()
             }
-            RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen => self
-                .fullscreen_idx
-                .map(|idx| vec![(idx, self.get_rating(idx))])
-                .unwrap_or_default(),
-        }
+        };
+        indices
+            .into_iter()
+            .filter_map(|idx| {
+                let path_key = self.rating_path_key(idx)?;
+                let source_path = self.rating_source_path(idx)?;
+                let meta = self.rating_meta_for_idx(idx);
+                let xmp_target = self.rating_xmp_target_for_idx(idx);
+                let session_generation = self.rating_session_generation_for_key(&path_key);
+                let before = self.get_rating(idx);
+                Some(RingPickerRatingTarget {
+                    path_key,
+                    source_path,
+                    meta,
+                    xmp_target,
+                    before,
+                    session_generation,
+                })
+            })
+            .collect()
     }
 
     fn dispatch_gamepad_picker_button(&mut self, ctx: &egui::Context, action: PadAction) {
@@ -3134,15 +3147,60 @@ impl App {
         }
     }
 
-    fn preview_picker_item_rating(&mut self, picker: &RingPickerState, stars: u8) {
+    fn apply_picker_item_rating_targets(
+        &mut self,
+        picker: &RingPickerState,
+        stars: u8,
+    ) -> (Vec<usize>, Option<String>) {
+        let target_keys = picker
+            .original
+            .item_rating_records
+            .iter()
+            .map(|target| target.path_key.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let current_indices = (0..self.items.len())
+            .filter_map(|idx| {
+                let key = self.rating_path_key(idx)?;
+                target_keys.contains(key.as_str()).then_some((key, idx))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut touched = Vec::with_capacity(picker.original.item_rating_records.len());
+        let mut first_error = None;
+        for target in &picker.original.item_rating_records {
+            let Some(&idx) = current_indices.get(&target.path_key) else {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "リングの評価対象が現在の一覧に見つかりません: {}",
+                        target.source_path.display()
+                    )
+                });
+                continue;
+            };
+            match self.set_rating_result(idx, stars) {
+                Ok(true) => touched.push(idx),
+                Ok(false) => {
+                    first_error.get_or_insert_with(|| {
+                        format!(
+                            "リングの評価対象を更新できません: {}",
+                            target.source_path.display()
+                        )
+                    });
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        (touched, first_error)
+    }
+
+    pub(crate) fn preview_picker_item_rating(&mut self, picker: &RingPickerState, stars: u8) {
         if picker.original.item_rating_records.is_empty() {
             return;
         }
-        let mut touched = Vec::with_capacity(picker.original.item_rating_records.len());
-        for &(idx, _) in &picker.original.item_rating_records {
-            if self.set_rating(idx, stars) {
-                touched.push(idx);
-            }
+        let (touched, error) = self.apply_picker_item_rating_targets(picker, stars);
+        if let Some(error) = error {
+            self.report_rating_write_error(&error);
         }
         if self.global_search.active {
             self.refresh_global_search_hit_stars(&touched);
@@ -3736,53 +3794,55 @@ impl App {
         }
         self.gamepad_state.cancel_west_ring();
         self.gamepad_state.require_directional_neutral();
-        let (item_rating_records, container_rating_record) =
+        let (item_rating_changes, container_rating_record) =
             self.finalize_live_picker_ratings(&picker);
-        self.commit_live_picker_undo(item_rating_records, container_rating_record);
+        self.commit_live_picker_undo(item_rating_changes, container_rating_record);
         self.apply_ring_picker_state(ctx, picker);
         ctx.request_repaint();
     }
 
     /// Re-apply the selected final value, then return only durable changes from
-    /// the picker-open snapshot. Rating caches are updated strictly after DB
-    /// success, so they are the per-target publication record for both earlier
-    /// live previews and this final write; dirty state alone proves nothing.
+    /// the picker-open snapshot. App-global rating generations are published
+    /// strictly after DB success, so they are the stable per-target record for
+    /// both earlier live previews and this final write; dirty state and display
+    /// indices alone prove nothing.
     pub(crate) fn finalize_live_picker_ratings(
         &mut self,
         picker: &RingPickerState,
-    ) -> (Vec<(usize, u8, u8)>, Option<(u8, u8)>) {
-        let mut item_records = Vec::new();
+    ) -> (Vec<RatingChange>, Option<(u8, u8)>) {
+        let mut item_changes = Vec::new();
         if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
-            let mut first_error = None;
-            let mut touched = Vec::new();
-            for &(idx, _) in &picker.original.item_rating_records {
-                match self.set_rating_result(idx, picker.item_rating) {
-                    Ok(true) => touched.push(idx),
-                    Ok(false) => {}
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-            if let Some(error) = first_error {
+            let (touched, error) =
+                self.apply_picker_item_rating_targets(picker, picker.item_rating);
+            if let Some(error) = error {
                 self.report_rating_write_error(&error);
             }
 
-            for &(idx, before) in &picker.original.item_rating_records {
-                let actual = self.rating_cache.get(&idx).copied().unwrap_or(before);
-                if before != actual {
-                    item_records.push((idx, before, actual));
+            for target in &picker.original.item_rating_records {
+                let actual = self
+                    .rating_session_writes
+                    .get(&target.path_key)
+                    .filter(|write| write.generation > target.session_generation)
+                    .map(|write| write.stars)
+                    .unwrap_or(target.before);
+                if target.before != actual {
+                    item_changes.push(RatingChange {
+                        path_key: target.path_key.clone(),
+                        source_path: target.source_path.clone(),
+                        meta: target.meta.clone(),
+                        xmp_target: target.xmp_target.clone(),
+                        before: target.before,
+                        after: actual,
+                    });
                 }
             }
             if self.global_search.active {
                 self.refresh_global_search_hit_stars(&touched);
             }
             if self.items_are_rating_view {
-                let changes = item_records
+                let changes = item_changes
                     .iter()
-                    .filter_map(|&(idx, _, actual)| {
-                        self.rating_path_key(idx).map(|key| (key, actual))
-                    })
+                    .map(|change| (change.path_key.clone(), change.after))
                     .collect::<Vec<_>>();
                 self.refresh_rating_view_after_rating_changes(&changes);
             } else if self.global_search.active && self.items_are_global_search_view {
@@ -3790,7 +3850,7 @@ impl App {
             } else {
                 self.rebuild_visible_indices();
             }
-            if touched.len() > 1 {
+            if item_changes.len() > 1 {
                 self.checked.clear();
             }
         }
@@ -3810,28 +3870,33 @@ impl App {
                 container_record = Some((picker.original.container_rating, actual));
             }
         }
-        (item_records, container_record)
+        (item_changes, container_record)
     }
 
     pub(crate) fn commit_live_picker_undo(
         &mut self,
-        item_records: Vec<(usize, u8, u8)>,
+        item_changes: Vec<RatingChange>,
         container_record: Option<(u8, u8)>,
     ) {
-        if !item_records.is_empty() {
-            let actual = item_records[0].2;
-            let summary = if item_records.len() > 1 {
-                if actual == 0 {
-                    format!("★解除を {} 件に適用", item_records.len())
+        if !item_changes.is_empty() {
+            let common_after = item_changes
+                .first()
+                .map(|first| first.after)
+                .filter(|after| item_changes.iter().all(|change| change.after == *after));
+            let summary = if item_changes.len() > 1 {
+                if common_after == Some(0) {
+                    format!("★解除を {} 件に適用", item_changes.len())
+                } else if let Some(after) = common_after {
+                    format!("★{after} を {} 件に付与", item_changes.len())
                 } else {
-                    format!("★{actual} を {} 件に付与", item_records.len())
+                    format!("評価を {} 件に適用", item_changes.len())
                 }
-            } else if actual == 0 {
+            } else if common_after == Some(0) {
                 "★解除".to_string()
             } else {
-                format!("★{actual}")
+                format!("★{}", common_after.unwrap_or_default())
             };
-            self.capture_rating_undo(item_records, summary);
+            self.push_rating_undo_entry(item_changes, summary);
         }
         if let Some((before, after)) = container_record {
             self.capture_container_rating_undo(before, after);

@@ -2334,12 +2334,29 @@ impl RingPickerRowId {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RingPickerRatingTarget {
+    /// Stable rating.db identity. Display indices are deliberately excluded:
+    /// sort/filter/view rebuilds may rebind them while the picker stays open.
+    pub path_key: String,
+    pub source_path: PathBuf,
+    pub meta: Option<crate::rating_db::RatingMeta>,
+    /// Exact physical XMP target captured with the normal rating eligibility
+    /// rules. Compiled-book pages and virtual pages keep this as `None`.
+    pub xmp_target: Option<PathBuf>,
+    pub before: u8,
+    /// App-global rating publication generation when the picker opened. A
+    /// later generation for this key proves that preview/final DB persistence
+    /// succeeded even if a subsequent attempt fails.
+    pub session_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerOriginalState {
     pub grid_cols: usize,
     pub sort_order: crate::settings::SortOrder,
     pub thumb_aspect_auto: bool,
     pub thumb_aspect: crate::settings::ThumbAspect,
-    pub item_rating_records: Vec<(usize, u8)>,
+    pub item_rating_records: Vec<RingPickerRatingTarget>,
     pub container_rating: u8,
     pub spread_mode: crate::settings::SpreadMode,
     pub reading_flow: crate::settings::ReadingFlow,

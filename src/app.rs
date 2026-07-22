@@ -39460,6 +39460,22 @@ impl App {
         }
     }
 
+    /// Return the exact physical file that may receive `xmp:Rating` for this
+    /// item. This is the shared eligibility boundary for normal writes and
+    /// Undo/Redo capture: compiled-book pages are intentionally DB-only even
+    /// though their source files are writable JPEG/PNG/WebP images.
+    pub(crate) fn rating_xmp_target_for_idx(&self, idx: usize) -> Option<PathBuf> {
+        if self.idx_is_compiled_book_page(idx) {
+            return None;
+        }
+        match self.items.get(idx) {
+            Some(GridItem::Image(path)) if crate::xmp_writer::is_writable_format(path) => {
+                Some(path.clone())
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn rating_meta_for_idx(&self, idx: usize) -> Option<crate::rating_db::RatingMeta> {
         use crate::rating_db::{RatingItemKind, RatingMeta};
         let item = self.items.get(idx)?;
@@ -39742,13 +39758,13 @@ impl App {
             return Ok(false);
         }
         self.sync_current_context_rating_session_writes();
-        let book_page = self.idx_is_compiled_book_page(idx);
         let stars = stars.min(5);
         let key = match self.rating_path_key(idx) {
             Some(k) => k,
             None => return Ok(false),
         };
         let meta = self.rating_meta_for_idx(idx);
+        let xmp_target = self.rating_xmp_target_for_idx(idx);
         // prewarm で全 item が cache に載っている前提。未取得なら 0 扱いで OK。
         let old_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
         // DB write と App-global path generation の記録を同じ ownership
@@ -39772,21 +39788,15 @@ impl App {
         );
         // 設定 ON + Image (JPEG/PNG/WebP) のときだけ XMP にも書き込む。
         // コンテナや ZIP 内画像・PDF ページには書き込み先がないので DB 止まり。
-        if self.settings.write_rating_to_xmp && !book_page {
-            let writable_path: Option<PathBuf> = match self.items.get(idx) {
-                Some(GridItem::Image(p)) if crate::xmp_writer::is_writable_format(p) => {
-                    Some(p.clone())
-                }
-                _ => None,
-            };
-            if let Some(path) = writable_path {
-                self.ensure_rating_write_handle();
-                if let Some(h) = self.rating_write_handle.as_ref() {
-                    h.submit(crate::rating_write_worker::RatingWriteJob {
-                        path,
-                        rating: if stars == 0 { None } else { Some(stars) },
-                    });
-                }
+        if self.settings.write_rating_to_xmp
+            && let Some(path) = xmp_target
+        {
+            self.ensure_rating_write_handle();
+            if let Some(h) = self.rating_write_handle.as_ref() {
+                h.submit(crate::rating_write_worker::RatingWriteJob {
+                    path,
+                    rating: if stars == 0 { None } else { Some(stars) },
+                });
             }
         }
         Ok(true)

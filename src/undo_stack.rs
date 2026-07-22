@@ -90,6 +90,9 @@ pub struct RatingChange {
     /// rating.db の復元用メタデータ。ZipDir など、path/source だけでは
     /// 種別を復元できない仮想コンテナの Undo/Redo で使う。
     pub meta: Option<crate::rating_db::RatingMeta>,
+    /// 通常の評価書き込みと同じ適用条件で確定した物理 XMP 対象。
+    /// 製本ページ・ZIP/PDF 内ページ・コンテナは `None`。
+    pub xmp_target: Option<PathBuf>,
     pub before: u8,
     pub after: u8,
 }
@@ -245,6 +248,7 @@ mod tests {
                 path_key: path.to_lowercase(),
                 source_path: PathBuf::from(path),
                 meta: None,
+                xmp_target: None,
                 before,
                 after,
             }],

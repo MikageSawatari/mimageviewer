@@ -337,12 +337,12 @@ impl App {
                 self.apply_rating_delta_to_folder_counts(&change.path_key, old, target);
             }
             if self.settings.write_rating_to_xmp
-                && crate::xmp_writer::is_writable_format(&change.source_path)
+                && let Some(xmp_target) = change.xmp_target.as_ref()
             {
                 self.ensure_rating_write_handle();
                 if let Some(handle) = self.rating_write_handle.as_ref() {
                     handle.submit(crate::rating_write_worker::RatingWriteJob {
-                        path: change.source_path.clone(),
+                        path: xmp_target.clone(),
                         rating: (target != 0).then_some(target),
                     });
                 }
@@ -599,6 +599,7 @@ impl App {
                 path_key,
                 source_path,
                 meta: self.rating_meta_for_idx(idx),
+                xmp_target: self.rating_xmp_target_for_idx(idx),
                 before,
                 after,
             });
@@ -621,6 +622,7 @@ impl App {
                 path_key,
                 source_path,
                 meta: Some(meta),
+                xmp_target: None,
                 before,
                 after,
             }],
