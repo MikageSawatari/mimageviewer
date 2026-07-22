@@ -140,6 +140,7 @@ pub mod settings_db;
 pub mod settings_restore;
 pub mod shell_file_ops;
 pub mod sidecar;
+pub mod spread_db;
 pub mod stats;
 pub mod susie_loader;
 pub mod sys_memory;

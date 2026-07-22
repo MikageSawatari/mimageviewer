@@ -289,10 +289,15 @@ impl FolderThumbPinDb {
     /// DB を開く (なければ作成)。
     pub fn open() -> SqlResult<Self> {
         let path = Self::db_path();
+        Self::open_at(&path)
+    }
+
+    /// 任意の data directory 配下で使うため、DB ファイルを明示して開く。
+    pub fn open_at(path: &Path) -> SqlResult<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = Connection::open(&path)?;
+        let conn = Connection::open(path)?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -847,7 +852,7 @@ fn decode_row(
 }
 
 /// `FolderPinSource` を validate する (set 時 / lookup 時で共通)。
-fn validate_source(source: &FolderPinSource) -> Result<(), FolderPinError> {
+pub(crate) fn validate_source(source: &FolderPinSource) -> Result<(), FolderPinError> {
     match source {
         FolderPinSource::File { rel, kind } => {
             if rel.is_empty() {

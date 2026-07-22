@@ -215,6 +215,12 @@ impl App {
                 .as_ref()
                 .map(|state| state.operation)
                 .expect("state checked above");
+            // writer の結果反映で sidecar / view-trim が再び dirty になり得るため、
+            // WaitingForWriters を抜ける実行直前にも確定する。
+            self.persist_pending_view_trim_state();
+            if operation == Operation::Import {
+                self.flush_all_sidecars();
+            }
             if let Some(state) = self.metadata_transfer.as_mut() {
                 match operation {
                     Operation::Export => start_export_worker(state),
@@ -231,12 +237,18 @@ impl App {
         match action {
             DialogAction::None => {}
             DialogAction::StartExport => {
+                // 表示トリムは操作中に debounce 保存されるため、worker が DB snapshot を
+                // 読む前に現在の編集を確定する。モーダル中は以後の入力が発生しない。
+                self.persist_pending_view_trim_state();
                 if let Some(state) = self.metadata_transfer.as_mut() {
                     state.stage = Stage::WaitingForWriters;
                     state.progress = None;
                 }
             }
             DialogAction::StartImport => {
+                // import 後の再 hydrate が、未保存の旧 UI 状態を DB へ書き戻さないよう
+                // 適用開始前に dirty state を排出する。
+                self.persist_pending_view_trim_state();
                 if let Some(state) = self.metadata_transfer.as_mut() {
                     state.stage = Stage::WaitingForWriters;
                     state.progress = None;
@@ -291,6 +303,7 @@ impl App {
             }
         }
         let mut imported_rating_keys = Vec::new();
+        let mut imported_page_state_families = Vec::new();
         for message in messages {
             let Some(state) = self.metadata_transfer.as_mut() else {
                 break;
@@ -308,11 +321,13 @@ impl App {
                     state.rx = None;
                     state.stage = Stage::Result(ResultState::Export(result));
                 }
-                WorkerMessage::Import(result) => {
-                    if let Ok(summary) = &result
+                WorkerMessage::Import(mut result) => {
+                    if let Ok(summary) = &mut result
                         && summary.applied_entries > 0
                     {
-                        imported_rating_keys = summary.applied_rating_keys.clone();
+                        imported_rating_keys = std::mem::take(&mut summary.applied_rating_keys);
+                        imported_page_state_families =
+                            std::mem::take(&mut summary.applied_page_state_families);
                     }
                     state.rx = None;
                     state.stage = Stage::Result(ResultState::Import(result));
@@ -336,7 +351,10 @@ impl App {
             };
         }
         if !imported_rating_keys.is_empty() {
-            self.refresh_after_metadata_transfer_import(&imported_rating_keys);
+            self.refresh_after_metadata_transfer_import(
+                &imported_rating_keys,
+                &imported_page_state_families,
+            );
         }
     }
 }
@@ -411,7 +429,10 @@ fn draw_dialog(
                     );
                 }
                 ui.add_space(6.0);
-                ui.label("記載されたファイル単位で、評価・タグ・ブックマークを上書きします。");
+                ui.label("記載されたファイル単位で、付随メタ情報を上書きします。");
+                ui.small(
+                    "評価・タグ・ブックマーク・見開き・表示トリム・回転・ページ編集・代表サムネを含みます。",
+                );
                 ui.small("このファイルに記載がない項目の既存メタ情報は保持します。");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -496,12 +517,15 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
         ResultState::Export(Ok(summary)) => {
             ui.label("エクスポートが完了しました。");
             ui.label(format!(
-                "{} 項目 / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {}",
+                "{} 項目 / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / サムネピン {}",
                 summary.entries,
                 summary.ratings,
                 summary.tagged_items,
                 summary.timed_bookmarks,
-                summary.book_bookmarks
+                summary.book_bookmarks,
+                summary.page_states,
+                summary.container_states,
+                summary.thumbnail_pins,
             ));
         }
         ResultState::Import(Ok(summary)) => {

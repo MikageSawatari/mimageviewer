@@ -84,10 +84,15 @@ impl VideoPinDb {
     /// DB を開く (なければ作成)。スキーマだけ作成し、行は何も入らない。
     pub fn open() -> Result<Self, rusqlite::Error> {
         let path = Self::db_path();
+        Self::open_at(&path)
+    }
+
+    /// 任意の data directory 配下で使うため、DB ファイルを明示して開く。
+    pub fn open_at(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = rusqlite::Connection::open(&path)?;
+        let conn = rusqlite::Connection::open(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS video_pins (
                 path TEXT PRIMARY KEY,

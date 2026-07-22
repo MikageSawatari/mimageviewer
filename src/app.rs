@@ -22311,6 +22311,7 @@ impl App {
     pub(crate) fn refresh_after_metadata_transfer_import(
         &mut self,
         applied_rating_keys: &[String],
+        applied_page_state_families: &[crate::metadata_transfer::ImportedPageStateFamily],
     ) {
         let imported_ratings = self
             .rating_db
@@ -22345,6 +22346,33 @@ impl App {
         self.music_bookmarks.clear();
         self.music_bookmarks_loaded_for = None;
 
+        // v2 で上書きした page-key family だけを差分更新する。各 DB の全件走査を
+        // UI thread へ持ち込まず、manifest にない family の既存 rollup は保持する。
+        for family in applied_page_state_families {
+            let virtual_prefix = format!("{}::", family.base_key);
+            let keep = |key: &String| key != &family.base_key && !key.starts_with(&virtual_prefix);
+            self.adjusted_page_keys.retain(keep);
+            self.local_adjust_page_keys.retain(keep);
+            self.mask_page_keys.retain(keep);
+            self.conceal_page_keys.retain(keep);
+            self.comic_page_keys.retain(keep);
+            self.rotation_page_keys.retain(keep);
+            for item in &family.items {
+                Self::set_page_key_presence(&mut self.adjusted_page_keys, &item.key, item.adjusted);
+                Self::set_page_key_presence(
+                    &mut self.local_adjust_page_keys,
+                    &item.key,
+                    item.local_adjusted,
+                );
+                Self::set_page_key_presence(&mut self.mask_page_keys, &item.key, item.masked);
+                Self::set_page_key_presence(&mut self.conceal_page_keys, &item.key, item.concealed);
+                Self::set_page_key_presence(&mut self.comic_page_keys, &item.key, item.comic);
+                Self::set_page_key_presence(&mut self.rotation_page_keys, &item.key, item.rotated);
+            }
+        }
+        self.rotation_cache.clear();
+        self.clear_all_final_pipeline_caches();
+
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Rating,
         );
@@ -22354,6 +22382,14 @@ impl App {
         self.notify_bookmarks_changed();
         if self.settings.facet_filter.is_active() {
             self.rebuild_visible_indices();
+        }
+
+        // 代表サムネ / 動画ピンの WebP はフォルダ準備 worker が snapshot する。
+        // 明示 import のモーダル中は current_folder が変化しないため、一度だけ同じ
+        // 実フォルダを再ロードすれば、見開き・表示トリムを含む全キャッシュが揃う。
+        if let Some(current_folder) = self.current_folder.clone() {
+            self.folder_history.remove(&current_folder);
+            self.load_folder(current_folder);
         }
     }
 

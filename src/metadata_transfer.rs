@@ -1,7 +1,8 @@
 //! 明示操作によるポータブル・メタ情報のエクスポート / インポート。
 //!
 //! 既存の `mimageviewer.dat`（編集情報の自動 sidecar）とは責務を分離し、
-//! `mimageviewer.meta.miv` 1 個にフォルダ配下の評価・タグ・ブックマークをまとめる。
+//! `mimageviewer.meta.miv` 1 個に、フォルダ配下のユーザー作成メタ情報をまとめる。
+//! 自動 sidecar の設定が OFF でも、この manifest 単体で別環境へ復元できる。
 //! このモジュールの公開 API は worker スレッドから呼ぶこと。
 
 use std::collections::{HashMap, HashSet};
@@ -12,12 +13,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 pub const SIDECAR_FILENAME: &str = "mimageviewer.meta.miv";
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
 const MAX_SIDECAR_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 500_000;
 const MAX_PATH_CHARS: usize = 32_768;
@@ -25,6 +28,9 @@ const MAX_MEMBER_KEY_CHARS: usize = 65_536;
 const MAX_TITLE_CHARS: usize = 1_024;
 const MAX_BOOKMARKS_PER_ENTRY: usize = 100_000;
 const MAX_RECURSION_DEPTH: usize = 40;
+const MAX_MASK_PIXELS: u64 = 100_000_000;
+const MAX_MASK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_VIDEO_THUMB_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferPhase {
@@ -50,6 +56,9 @@ pub struct ExportSummary {
     pub tagged_items: usize,
     pub timed_bookmarks: usize,
     pub book_bookmarks: usize,
+    pub page_states: usize,
+    pub container_states: usize,
+    pub thumbnail_pins: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,6 +82,26 @@ pub struct ImportSummary {
     /// XMP rating hydration が明示 import の「評価なし」を直後に復活させないための
     /// session-local suppression key。UI 表示には使わない。
     pub applied_rating_keys: Vec<String>,
+    /// import で上書きした page-key family。UI 側の編集有無 rollup を DB 全走査せず
+    /// 差分更新するための session-local 情報。
+    pub applied_page_state_families: Vec<ImportedPageStateFamily>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportedPageStateFamily {
+    pub base_key: String,
+    pub items: Vec<ImportedPageState>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportedPageState {
+    pub key: String,
+    pub adjusted: bool,
+    pub local_adjusted: bool,
+    pub masked: bool,
+    pub concealed: bool,
+    pub comic: bool,
+    pub rotated: bool,
 }
 
 #[derive(Debug)]
@@ -112,6 +141,12 @@ struct ManifestSections {
     tags: bool,
     timed_bookmarks: bool,
     book_bookmarks: bool,
+    #[serde(default)]
+    page_state: bool,
+    #[serde(default)]
+    container_state: bool,
+    #[serde(default)]
+    thumbnail_pins: bool,
 }
 
 impl Default for ManifestSections {
@@ -121,6 +156,9 @@ impl Default for ManifestSections {
             tags: true,
             timed_bookmarks: true,
             book_bookmarks: true,
+            page_state: true,
+            container_state: true,
+            thumbnail_pins: true,
         }
     }
 }
@@ -150,6 +188,14 @@ struct PortableEntry {
     timed_bookmarks: Vec<PortableTimedBookmark>,
     #[serde(default)]
     book_bookmarks: Vec<PortableBookBookmark>,
+    #[serde(default, skip_serializing_if = "PortablePageState::is_empty")]
+    page_state: PortablePageState,
+    #[serde(default, skip_serializing_if = "PortableContainerState::is_empty")]
+    container_state: PortableContainerState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    nested_containers: Vec<PortableNestedContainer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video_pin: Option<PortableVideoPin>,
     #[serde(default)]
     virtual_items: Vec<PortableVirtualItem>,
 }
@@ -160,6 +206,92 @@ struct PortableVirtualItem {
     rating: Option<PortableRating>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "PortablePageState::is_empty")]
+    page_state: PortablePageState,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PortablePageState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rotation_degrees: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adjustment: Option<crate::adjustment::AdjustParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mask: Option<crate::sidecar::SidecarMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conceal: Option<crate::sidecar::SidecarMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_adjust_layers: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    export_crop: Option<crate::export_crop::CropSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comic: Option<Vec<comic_core::AnnotationObject>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    view_trim: Option<crate::view_trim::ViewTrimPageOverride>,
+}
+
+impl PortablePageState {
+    fn is_empty(&self) -> bool {
+        self.rotation_degrees.is_none()
+            && self.adjustment.is_none()
+            && self.mask.is_none()
+            && self.conceal.is_none()
+            && self.local_adjust_layers.is_none()
+            && self.export_crop.is_none()
+            && self.comic.is_none()
+            && self.view_trim.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PortableContainerState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spread: Option<PortableSpreadState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    view_trim: Option<crate::view_trim::ViewTrimBookState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folder_thumb_pin: Option<PortableFolderThumbPin>,
+}
+
+impl PortableContainerState {
+    fn is_empty(&self) -> bool {
+        self.spread.is_none() && self.view_trim.is_none() && self.folder_thumb_pin.is_none()
+    }
+
+    fn has_view_state(&self) -> bool {
+        self.spread.is_some() || self.view_trim.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PortableNestedContainer {
+    member_key: String,
+    #[serde(default)]
+    state: PortableContainerState,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct PortableSpreadState {
+    mode: i32,
+    flow: i32,
+    direction: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PortableFolderThumbPin {
+    source_kind: String,
+    source_rel: String,
+    source_entry: Option<String>,
+    source_page: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PortableVideoPin {
+    pin_pts_secs: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumb_webp_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumb_pts_secs: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -320,6 +452,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     ensure_database_schemas(data_dir)?;
     let mut conn = open_import_connection(data_dir)?;
+    let mut auxiliary_conn = open_auxiliary_import_connection(data_dir)?;
     let mut summary = ImportSummary {
         total_entries: manifest.entries.len(),
         ..ImportSummary::default()
@@ -366,6 +499,7 @@ where
         }
         match apply_entry(
             &mut conn,
+            &mut auxiliary_conn,
             path,
             entry,
             manifest.sections,
@@ -376,6 +510,11 @@ where
                 summary
                     .applied_rating_keys
                     .push(crate::path_key::normalize_keep_drive(path));
+                if manifest.sections.page_state {
+                    summary
+                        .applied_page_state_families
+                        .push(imported_page_state_family(path, entry));
+                }
             }
             Err(error) => {
                 crate::logger::log(format!(
@@ -393,6 +532,31 @@ where
         });
     }
     Ok(summary)
+}
+
+fn imported_page_state_family(path: &Path, entry: &PortableEntry) -> ImportedPageStateFamily {
+    let base_key = crate::path_key::normalize_keep_drive(path);
+    let mut items = Vec::with_capacity(entry.virtual_items.len() + 1);
+    items.push(imported_page_state(&base_key, &entry.page_state));
+    items.extend(entry.virtual_items.iter().map(|item| {
+        imported_page_state(
+            &format!("{base_key}::{}", item.member_key.to_lowercase()),
+            &item.page_state,
+        )
+    }));
+    ImportedPageStateFamily { base_key, items }
+}
+
+fn imported_page_state(key: &str, state: &PortablePageState) -> ImportedPageState {
+    ImportedPageState {
+        key: key.to_string(),
+        adjusted: state.adjustment.is_some(),
+        local_adjusted: state.local_adjust_layers.is_some(),
+        masked: state.mask.is_some(),
+        concealed: state.conceal.is_some(),
+        comic: state.comic.is_some(),
+        rotated: state.rotation_degrees.is_some(),
+    }
 }
 
 fn validate_root(root: &Path) -> Result<(), TransferError> {
@@ -460,7 +624,10 @@ where
     for child in children {
         check_cancel(cancel)?;
         let child = child.map_err(|error| TransferError::Io(error.to_string()))?;
-        if is_sidecar_name(&child.file_name()) || is_temp_sidecar_name(&child.file_name()) {
+        if is_sidecar_name(&child.file_name())
+            || is_automatic_sidecar_name(&child.file_name())
+            || is_temp_sidecar_name(&child.file_name())
+        {
             continue;
         }
         let file_type = child
@@ -522,6 +689,10 @@ fn make_enumerated(
             tags: Vec::new(),
             timed_bookmarks: Vec::new(),
             book_bookmarks: Vec::new(),
+            page_state: PortablePageState::default(),
+            container_state: PortableContainerState::default(),
+            nested_containers: Vec::new(),
+            video_pin: None,
             virtual_items: Vec::new(),
         },
     })
@@ -797,10 +968,24 @@ where
         }
     }
 
+    attach_extended_metadata(
+        data_dir,
+        entries,
+        &index,
+        &mut virtual_index,
+        cancel,
+        &mut metadata_rows,
+        progress,
+    )?;
+
     for entry in entries {
         entry
             .portable
             .virtual_items
+            .sort_by(|a, b| a.member_key.cmp(&b.member_key));
+        entry
+            .portable
+            .nested_containers
             .sort_by(|a, b| a.member_key.cmp(&b.member_key));
     }
     progress(TransferProgress {
@@ -810,6 +995,480 @@ where
         current_path: None,
     });
     Ok(())
+}
+
+fn page_state_for_key_mut<'a>(
+    entries: &'a mut [EnumeratedEntry],
+    virtual_index: &mut HashMap<(usize, String), usize>,
+    physical_index: &HashMap<String, usize>,
+    key: &str,
+) -> Option<&'a mut PortablePageState> {
+    let (entry_index, member) = locate_item_key(key, physical_index)?;
+    Some(if let Some(member) = member {
+        &mut get_virtual_item(entries, virtual_index, entry_index, member).page_state
+    } else {
+        &mut entries[entry_index].portable.page_state
+    })
+}
+
+fn get_nested_container<'a>(
+    entries: &'a mut [EnumeratedEntry],
+    index: &mut HashMap<(usize, String), usize>,
+    entry_index: usize,
+    member: String,
+) -> &'a mut PortableContainerState {
+    let key = (entry_index, member.clone());
+    let container_index = if let Some(&index) = index.get(&key) {
+        index
+    } else {
+        let new_index = entries[entry_index].portable.nested_containers.len();
+        entries[entry_index]
+            .portable
+            .nested_containers
+            .push(PortableNestedContainer {
+                member_key: member,
+                state: PortableContainerState::default(),
+            });
+        index.insert(key, new_index);
+        new_index
+    };
+    &mut entries[entry_index].portable.nested_containers[container_index].state
+}
+
+fn locate_container_key(
+    key: &str,
+    physical_index: &HashMap<String, usize>,
+    entries: &[EnumeratedEntry],
+) -> Option<(usize, Option<String>)> {
+    if let Some(&index) = physical_index.get(key) {
+        return Some((index, None));
+    }
+    let mut end = key.len();
+    while let Some(offset) = key[..end].rfind('/') {
+        let base = &key[..offset];
+        if let Some(&index) = physical_index.get(base) {
+            if entries[index].portable.kind == PortableEntryKind::File {
+                let member = &key[offset + 1..];
+                if !member.is_empty() {
+                    return Some((index, Some(member.to_string())));
+                }
+            }
+        }
+        end = offset;
+    }
+    None
+}
+
+fn prepare_container_scope(
+    conn: &mut Connection,
+    entries: &[EnumeratedEntry],
+    physical_index: &HashMap<String, usize>,
+    cancel: &AtomicBool,
+) -> Result<(), TransferError> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.metadata_transfer_container_scope;
+         CREATE TEMP TABLE metadata_transfer_container_scope (
+             item_key TEXT PRIMARY KEY,
+             nested_lower TEXT NOT NULL,
+             nested_upper TEXT NOT NULL,
+             include_nested INTEGER NOT NULL
+         ) WITHOUT ROWID;",
+    )
+    .map_err(db_error)?;
+    let tx = conn.transaction().map_err(db_error)?;
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO metadata_transfer_container_scope
+                    (item_key, nested_lower, nested_upper, include_nested)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db_error)?;
+        for (key, &entry_index) in physical_index {
+            check_cancel(cancel)?;
+            insert
+                .execute(params![
+                    key,
+                    format!("{key}/"),
+                    format!("{key}0"),
+                    i64::from(entries[entry_index].portable.kind == PortableEntryKind::File),
+                ])
+                .map_err(db_error)?;
+        }
+    }
+    tx.commit().map_err(db_error)
+}
+
+fn attach_extended_metadata<F>(
+    data_dir: &Path,
+    entries: &mut [EnumeratedEntry],
+    physical_index: &HashMap<String, usize>,
+    virtual_index: &mut HashMap<(usize, String), usize>,
+    cancel: &AtomicBool,
+    metadata_rows: &mut usize,
+    progress: &mut F,
+) -> Result<(), TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    let mut attach_page_rows = |db_name: &str,
+                                sql: &str,
+                                mut apply: Box<
+        dyn FnMut(&rusqlite::Row<'_>, &mut PortablePageState) -> rusqlite::Result<()>,
+    >|
+     -> Result<(), TransferError> {
+        let path = data_dir.join(db_name);
+        if !path.is_file() {
+            return Ok(());
+        }
+        let mut conn = open_readonly(&path)?;
+        prepare_metadata_scope(&mut conn, physical_index, cancel)?;
+        let mut stmt = conn.prepare(sql).map_err(db_error)?;
+        let mut rows = stmt.query([]).map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            check_cancel(cancel)?;
+            let key: String = row.get(0).map_err(db_error)?;
+            report_metadata_progress(metadata_rows, &key, progress);
+            if let Some(state) =
+                page_state_for_key_mut(entries, virtual_index, physical_index, &key)
+            {
+                apply(row, state).map_err(db_error)?;
+            }
+        }
+        Ok(())
+    };
+
+    attach_page_rows(
+        "rotation.db",
+        "SELECT r.path, r.angle
+           FROM metadata_transfer_scope AS s CROSS JOIN rotations AS r
+          WHERE r.path = s.item_key
+         UNION ALL
+         SELECT r.path, r.angle
+           FROM metadata_transfer_scope AS s CROSS JOIN rotations AS r
+          WHERE r.path >= s.virtual_lower AND r.path < s.virtual_upper",
+        Box::new(|row, state| {
+            let angle = row.get::<_, i32>(1)?;
+            if matches!(angle, 90 | 180 | 270) {
+                state.rotation_degrees = Some(angle);
+            }
+            Ok(())
+        }),
+    )?;
+    attach_page_rows(
+        "adjustment.db",
+        "SELECT p.page_path, p.params_json
+           FROM metadata_transfer_scope AS s CROSS JOIN page_params AS p
+          WHERE p.page_path = s.item_key
+         UNION ALL
+         SELECT p.page_path, p.params_json
+           FROM metadata_transfer_scope AS s CROSS JOIN page_params AS p
+          WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
+        Box::new(|row, state| {
+            let json: String = row.get(1)?;
+            state.adjustment = Some(parse_db_json(&json, 1)?);
+            Ok(())
+        }),
+    )?;
+    attach_page_rows(
+        "mask.db",
+        "SELECT m.path, m.mask_data, m.width, m.height, m.vectors
+           FROM metadata_transfer_scope AS s CROSS JOIN masks AS m
+          WHERE m.path = s.item_key
+         UNION ALL
+         SELECT m.path, m.mask_data, m.width, m.height, m.vectors
+           FROM metadata_transfer_scope AS s CROSS JOIN masks AS m
+          WHERE m.path >= s.virtual_lower AND m.path < s.virtual_upper",
+        Box::new(|row, state| {
+            let raw: Vec<u8> = row.get(1)?;
+            let width: i64 = row.get(2)?;
+            let height: i64 = row.get(3)?;
+            let vectors: Option<String> = row.get(4)?;
+            if let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) {
+                let shapes = vectors
+                    .as_deref()
+                    .map(crate::mask_db::shapes_from_json)
+                    .unwrap_or_default();
+                state.mask = Some(crate::sidecar::SidecarMask::from_raw(
+                    &raw, &shapes, width, height,
+                ));
+            }
+            Ok(())
+        }),
+    )?;
+    attach_page_rows(
+        "conceal.db",
+        "SELECT c.page_path, c.bitmap_data, c.bitmap_w, c.bitmap_h, c.shapes
+           FROM metadata_transfer_scope AS s CROSS JOIN conceal_entries AS c
+          WHERE c.page_path = s.item_key
+         UNION ALL
+         SELECT c.page_path, c.bitmap_data, c.bitmap_w, c.bitmap_h, c.shapes
+           FROM metadata_transfer_scope AS s CROSS JOIN conceal_entries AS c
+          WHERE c.page_path >= s.virtual_lower AND c.page_path < s.virtual_upper",
+        Box::new(|row, state| {
+            let raw: Vec<u8> = row.get(1)?;
+            let width: i64 = row.get(2)?;
+            let height: i64 = row.get(3)?;
+            let vectors: Option<String> = row.get(4)?;
+            if let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) {
+                let shapes = vectors
+                    .as_deref()
+                    .map(crate::mask_db::shapes_from_json)
+                    .unwrap_or_default();
+                state.conceal = Some(crate::sidecar::SidecarMask::from_raw(
+                    &raw, &shapes, width, height,
+                ));
+            }
+            Ok(())
+        }),
+    )?;
+    attach_page_rows(
+        "local_adjust.db",
+        "SELECT p.page_path, p.layers_json
+           FROM metadata_transfer_scope AS s CROSS JOIN local_adjust_pages AS p
+          WHERE p.page_path = s.item_key
+         UNION ALL
+         SELECT p.page_path, p.layers_json
+           FROM metadata_transfer_scope AS s CROSS JOIN local_adjust_pages AS p
+          WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
+        Box::new(|row, state| {
+            let json: String = row.get(1)?;
+            state.local_adjust_layers = Some(parse_db_json(&json, 1)?);
+            Ok(())
+        }),
+    )?;
+    attach_page_rows(
+        "export_crop.db",
+        "SELECT p.page_path, p.min_x, p.min_y, p.max_x, p.max_y, p.aspect_mode
+           FROM metadata_transfer_scope AS s CROSS JOIN export_crop_pages AS p
+          WHERE p.page_path = s.item_key
+         UNION ALL
+         SELECT p.page_path, p.min_x, p.min_y, p.max_x, p.max_y, p.aspect_mode
+           FROM metadata_transfer_scope AS s CROSS JOIN export_crop_pages AS p
+          WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
+        Box::new(|row, state| {
+            let aspect: String = row.get(5)?;
+            state.export_crop = Some(crate::export_crop::CropSettings {
+                rect: crate::export_crop::CropRect {
+                    min_x: row.get(1)?,
+                    min_y: row.get(2)?,
+                    max_x: row.get(3)?,
+                    max_y: row.get(4)?,
+                },
+                aspect_mode: crate::export_crop::CropAspectMode::from_stable_key(&aspect),
+            });
+            Ok(())
+        }),
+    )?;
+    attach_page_rows(
+        "comic.db",
+        "SELECT c.page_path, c.doc_json
+           FROM metadata_transfer_scope AS s CROSS JOIN comic_entries AS c
+          WHERE c.page_path = s.item_key
+         UNION ALL
+         SELECT c.page_path, c.doc_json
+           FROM metadata_transfer_scope AS s CROSS JOIN comic_entries AS c
+          WHERE c.page_path >= s.virtual_lower AND c.page_path < s.virtual_upper",
+        Box::new(|row, state| {
+            let json: String = row.get(1)?;
+            state.comic = Some(parse_db_json(&json, 1)?);
+            Ok(())
+        }),
+    )?;
+    attach_page_rows(
+        "view_trim.db",
+        "SELECT p.page_path, p.override_json
+           FROM metadata_transfer_scope AS s CROSS JOIN view_trim_pages AS p
+          WHERE p.page_path = s.item_key
+         UNION ALL
+         SELECT p.page_path, p.override_json
+           FROM metadata_transfer_scope AS s CROSS JOIN view_trim_pages AS p
+          WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
+        Box::new(|row, state| {
+            let json: String = row.get(1)?;
+            state.view_trim = Some(parse_db_json(&json, 1)?);
+            Ok(())
+        }),
+    )?;
+    drop(attach_page_rows);
+
+    let stripped_index: HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (crate::path_key::normalize(&entry.path), index))
+        .collect();
+    let mut nested_index = HashMap::new();
+
+    let spread_path = data_dir.join("spread.db");
+    if spread_path.is_file() {
+        let mut conn = open_readonly(&spread_path)?;
+        prepare_container_scope(&mut conn, entries, &stripped_index, cancel)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.path, p.mode, p.flow, p.direction
+                   FROM metadata_transfer_container_scope AS s CROSS JOIN spreads AS p
+                  WHERE p.path = s.item_key
+                     OR (s.include_nested != 0 AND p.path >= s.nested_lower AND p.path < s.nested_upper)",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PortableSpreadState {
+                        mode: row.get(1)?,
+                        flow: row.get(2)?,
+                        direction: row.get(3)?,
+                    },
+                ))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            check_cancel(cancel)?;
+            let (key, spread) = row.map_err(db_error)?;
+            report_metadata_progress(metadata_rows, &key, progress);
+            if let Some((entry_index, member)) =
+                locate_container_key(&key, &stripped_index, entries)
+            {
+                if let Some(member) = member {
+                    get_nested_container(entries, &mut nested_index, entry_index, member).spread =
+                        Some(spread);
+                } else {
+                    entries[entry_index].portable.container_state.spread = Some(spread);
+                }
+            }
+        }
+    }
+
+    let view_trim_path = data_dir.join("view_trim.db");
+    if view_trim_path.is_file() {
+        let mut conn = open_readonly(&view_trim_path)?;
+        prepare_container_scope(&mut conn, entries, &stripped_index, cancel)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.book_key, p.state_json
+                   FROM metadata_transfer_container_scope AS s CROSS JOIN view_trim_books AS p
+                  WHERE p.book_key = s.item_key
+                     OR (s.include_nested != 0 AND p.book_key >= s.nested_lower AND p.book_key < s.nested_upper)",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            check_cancel(cancel)?;
+            let (key, json) = row.map_err(db_error)?;
+            report_metadata_progress(metadata_rows, &key, progress);
+            let state = serde_json::from_str(&json).map_err(|error| {
+                TransferError::Database(format!("view_trim.db state_json: {error}"))
+            })?;
+            if let Some((entry_index, member)) =
+                locate_container_key(&key, &stripped_index, entries)
+            {
+                if let Some(member) = member {
+                    get_nested_container(entries, &mut nested_index, entry_index, member)
+                        .view_trim = Some(state);
+                } else {
+                    entries[entry_index].portable.container_state.view_trim = Some(state);
+                }
+            }
+        }
+    }
+
+    let folder_pin_path = data_dir.join("folder_thumb_pins.db");
+    if folder_pin_path.is_file() {
+        let mut conn = open_readonly(&folder_pin_path)?;
+        prepare_container_scope(&mut conn, entries, physical_index, cancel)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.container_key, p.source_kind, p.source_rel, p.source_entry, p.source_page
+                   FROM metadata_transfer_container_scope AS s
+                  CROSS JOIN folder_thumb_pins AS p
+                  WHERE p.container_key = s.item_key
+                     OR (s.include_nested != 0 AND p.container_key >= s.nested_lower AND p.container_key < s.nested_upper)",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PortableFolderThumbPin {
+                        source_kind: row.get(1)?,
+                        source_rel: row.get(2)?,
+                        source_entry: row.get(3)?,
+                        source_page: row
+                            .get::<_, Option<i64>>(4)?
+                            .and_then(|value| u32::try_from(value).ok()),
+                    },
+                ))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            check_cancel(cancel)?;
+            let (key, pin) = row.map_err(db_error)?;
+            report_metadata_progress(metadata_rows, &key, progress);
+            if let Some((entry_index, member)) = locate_container_key(&key, physical_index, entries)
+            {
+                if let Some(member) = member {
+                    get_nested_container(entries, &mut nested_index, entry_index, member)
+                        .folder_thumb_pin = Some(pin);
+                } else {
+                    entries[entry_index]
+                        .portable
+                        .container_state
+                        .folder_thumb_pin = Some(pin);
+                }
+            }
+        }
+    }
+
+    let video_pin_path = data_dir.join("video_pins.db");
+    if video_pin_path.is_file() {
+        let mut conn = open_readonly(&video_pin_path)?;
+        prepare_metadata_scope(&mut conn, physical_index, cancel)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.path, p.pin_pts_secs, p.thumb_webp, p.thumb_pts_secs
+                   FROM metadata_transfer_scope AS s CROSS JOIN video_pins AS p
+                  WHERE p.path = s.item_key",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let webp: Option<Vec<u8>> = row.get(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PortableVideoPin {
+                        pin_pts_secs: row.get(1)?,
+                        thumb_webp_base64: webp
+                            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+                        thumb_pts_secs: row.get(3)?,
+                    },
+                ))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            check_cancel(cancel)?;
+            let (key, pin) = row.map_err(db_error)?;
+            report_metadata_progress(metadata_rows, &key, progress);
+            if let Some(&entry_index) = physical_index.get(&key) {
+                entries[entry_index].portable.video_pin = Some(pin);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_db_json<T: serde::de::DeserializeOwned>(json: &str, column: usize) -> rusqlite::Result<T> {
+    serde_json::from_str(json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 fn report_metadata_progress<F>(processed: &mut usize, key: &str, progress: &mut F)
@@ -845,6 +1504,7 @@ fn get_virtual_item<'a>(
                 member_key: member,
                 rating: None,
                 tags: Vec::new(),
+                page_state: PortablePageState::default(),
             });
         index.insert(key, new_index);
         new_index
@@ -876,9 +1536,24 @@ fn summarize_export(manifest: &Manifest) -> ExportSummary {
         summary.tagged_items += usize::from(!entry.tags.is_empty());
         summary.timed_bookmarks += entry.timed_bookmarks.len();
         summary.book_bookmarks += entry.book_bookmarks.len();
+        summary.page_states += usize::from(!entry.page_state.is_empty());
+        summary.container_states += usize::from(entry.container_state.has_view_state());
+        summary.container_states += entry
+            .nested_containers
+            .iter()
+            .filter(|container| container.state.has_view_state())
+            .count();
+        summary.thumbnail_pins += usize::from(entry.video_pin.is_some());
+        summary.thumbnail_pins += usize::from(entry.container_state.folder_thumb_pin.is_some());
+        summary.thumbnail_pins += entry
+            .nested_containers
+            .iter()
+            .filter(|container| container.state.folder_thumb_pin.is_some())
+            .count();
         for virtual_item in &entry.virtual_items {
             summary.ratings += usize::from(virtual_item.rating.is_some());
             summary.tagged_items += usize::from(!virtual_item.tags.is_empty());
+            summary.page_states += usize::from(!virtual_item.page_state.is_empty());
         }
     }
     summary
@@ -920,7 +1595,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
             "形式識別子が一致しません".to_string(),
         ));
     }
-    if manifest.version != FORMAT_VERSION {
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&manifest.version) {
         return Err(TransferError::Invalid(format!(
             "未対応のバージョンです: {}",
             manifest.version
@@ -952,6 +1627,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
         if entry.timed_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
             || entry.book_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
             || entry.virtual_items.len() > MAX_BOOKMARKS_PER_ENTRY
+            || entry.nested_containers.len() > MAX_BOOKMARKS_PER_ENTRY
         {
             return Err(TransferError::Invalid(format!(
                 "1項目あたりのメタ情報が多すぎます: {}",
@@ -971,11 +1647,12 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
             validate_book_bookmark(bookmark, entry.kind, &entry.path)?;
             validate_title(bookmark.title.as_deref())?;
         }
+        validate_page_state(&entry.page_state, &entry.path)?;
+        validate_container_state(&entry.container_state, &entry.path)?;
+        validate_video_pin(entry.video_pin.as_ref(), &entry.path)?;
         let mut member_keys = HashSet::new();
         for item in &entry.virtual_items {
-            if item.member_key.is_empty()
-                || item.member_key.chars().count() > MAX_MEMBER_KEY_CHARS
-                || item.member_key.contains('\0')
+            if validate_member_key(&item.member_key).is_err()
                 || !member_keys.insert(item.member_key.to_lowercase())
             {
                 return Err(TransferError::Invalid(format!(
@@ -985,9 +1662,247 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
             }
             validate_rating(item.rating.as_ref())?;
             validate_tags(&item.tags)?;
+            validate_page_state(&item.page_state, &entry.path)?;
+        }
+        let mut container_keys = HashSet::new();
+        for container in &entry.nested_containers {
+            if entry.kind != PortableEntryKind::File
+                || validate_member_key(&container.member_key).is_err()
+                || !container_keys.insert(container.member_key.to_lowercase())
+            {
+                return Err(TransferError::Invalid(format!(
+                    "仮想コンテナキーが不正または重複しています: {}",
+                    entry.path
+                )));
+            }
+            validate_container_state(&container.state, &entry.path)?;
         }
     }
     Ok(())
+}
+
+fn validate_member_key(value: &str) -> Result<(), TransferError> {
+    validate_bookmark_page_path(value, "仮想項目")
+}
+
+fn validate_page_state(state: &PortablePageState, entry_path: &str) -> Result<(), TransferError> {
+    if state
+        .rotation_degrees
+        .is_some_and(|degrees| !matches!(degrees, 90 | 180 | 270))
+    {
+        return Err(TransferError::Invalid(format!(
+            "回転角が不正です: {entry_path}"
+        )));
+    }
+    if let Some(mask) = &state.mask {
+        validate_mask(mask, entry_path)?;
+    }
+    if let Some(mask) = &state.conceal {
+        validate_mask(mask, entry_path)?;
+    }
+    if state
+        .local_adjust_layers
+        .as_ref()
+        .is_some_and(|layers| layers.len() > MAX_BOOKMARKS_PER_ENTRY)
+        || state
+            .comic
+            .as_ref()
+            .is_some_and(|objects| objects.len() > MAX_BOOKMARKS_PER_ENTRY)
+    {
+        return Err(TransferError::Invalid(format!(
+            "ページ編集情報が多すぎます: {entry_path}"
+        )));
+    }
+    if let Some(crop) = state.export_crop {
+        let rect = crop.rect;
+        let values = [rect.min_x, rect.min_y, rect.max_x, rect.max_y];
+        if values.iter().any(|value| !value.is_finite())
+            || rect.min_x < 0.0
+            || rect.min_y < 0.0
+            || rect.max_x > 1.0
+            || rect.max_y > 1.0
+            || rect.min_x >= rect.max_x
+            || rect.min_y >= rect.max_y
+        {
+            return Err(TransferError::Invalid(format!(
+                "書き出しクロップが不正です: {entry_path}"
+            )));
+        }
+    }
+    if let Some(page_trim) = state.view_trim {
+        validate_trim_margins(page_trim.margins, entry_path)?;
+    }
+    Ok(())
+}
+
+fn validate_mask(
+    mask: &crate::sidecar::SidecarMask,
+    entry_path: &str,
+) -> Result<(), TransferError> {
+    let pixels = u64::from(mask.w).saturating_mul(u64::from(mask.h));
+    if mask.w == 0
+        || mask.h == 0
+        || pixels > MAX_MASK_PIXELS
+        || mask.vectors.len() > MAX_BOOKMARKS_PER_ENTRY
+    {
+        return Err(TransferError::Invalid(format!(
+            "マスク寸法または要素数が不正です: {entry_path}"
+        )));
+    }
+    let decoded = mask.decode().ok_or_else(|| {
+        TransferError::Invalid(format!("マスクの base64 が不正です: {entry_path}"))
+    })?;
+    if decoded.len() > MAX_MASK_BYTES {
+        return Err(TransferError::Invalid(format!(
+            "マスクデータが大きすぎます: {entry_path}"
+        )));
+    }
+    let expected_bytes = usize::try_from((pixels + 7) / 8)
+        .map_err(|_| TransferError::Invalid(format!("マスク寸法が不正です: {entry_path}")))?;
+    let mut unpacked = Vec::with_capacity(expected_bytes.min(1024 * 1024));
+    let mut decoder = flate2::read::DeflateDecoder::new(decoded.as_slice())
+        .take(u64::try_from(expected_bytes).unwrap_or(u64::MAX) + 1);
+    decoder
+        .read_to_end(&mut unpacked)
+        .map_err(|_| TransferError::Invalid(format!("マスク圧縮データが不正です: {entry_path}")))?;
+    if unpacked.len() != expected_bytes {
+        return Err(TransferError::Invalid(format!(
+            "マスク圧縮データの長さが不正です: {entry_path}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_trim_margins(
+    margins: crate::view_trim::ViewTrimMargins,
+    entry_path: &str,
+) -> Result<(), TransferError> {
+    let values = [margins.left, margins.top, margins.right, margins.bottom];
+    if values.iter().any(|value| {
+        !value.is_finite() || *value < 0.0 || *value > crate::view_trim::MAX_VIEW_TRIM_MARGIN
+    }) {
+        return Err(TransferError::Invalid(format!(
+            "表示トリム値が不正です: {entry_path}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_container_state(
+    state: &PortableContainerState,
+    entry_path: &str,
+) -> Result<(), TransferError> {
+    if let Some(spread) = state.spread {
+        if !(0..=5).contains(&spread.mode)
+            || !(0..=2).contains(&spread.flow)
+            || !(0..=1).contains(&spread.direction)
+        {
+            return Err(TransferError::Invalid(format!(
+                "見開き設定が不正です: {entry_path}"
+            )));
+        }
+    }
+    if let Some(trim) = state.view_trim {
+        validate_trim_margins(trim.book_settings.single, entry_path)?;
+        validate_trim_margins(trim.book_settings.spread_left, entry_path)?;
+        validate_trim_margins(trim.book_settings.spread_right, entry_path)?;
+        let linked = trim.book_settings.spread_linked;
+        for value in [linked.top, linked.bottom, linked.inner, linked.outer] {
+            if !value.is_finite() || value < 0.0 || value > crate::view_trim::MAX_VIEW_TRIM_MARGIN {
+                return Err(TransferError::Invalid(format!(
+                    "表示トリム値が不正です: {entry_path}"
+                )));
+            }
+        }
+    }
+    if let Some(pin) = &state.folder_thumb_pin {
+        for value in [Some(pin.source_rel.as_str()), pin.source_entry.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if value.contains('\0') || value.chars().count() > MAX_MEMBER_KEY_CHARS {
+                return Err(TransferError::Invalid(format!(
+                    "代表サムネ設定が不正です: {entry_path}"
+                )));
+            }
+        }
+        if let Some(entry) = pin.source_entry.as_deref() {
+            let entry = entry.trim_end_matches('/');
+            if entry.is_empty() || validate_member_key(entry).is_err() {
+                return Err(TransferError::Invalid(format!(
+                    "代表サムネ設定が不正です: {entry_path}"
+                )));
+            }
+        }
+        let source = portable_folder_pin_source(pin).ok_or_else(|| {
+            TransferError::Invalid(format!("代表サムネ設定が不正です: {entry_path}"))
+        })?;
+        crate::folder_thumb_pins::validate_source(&source).map_err(|error| {
+            TransferError::Invalid(format!("代表サムネ設定が不正です: {entry_path}: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_video_pin(
+    pin: Option<&PortableVideoPin>,
+    entry_path: &str,
+) -> Result<(), TransferError> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+    if !pin.pin_pts_secs.is_finite()
+        || pin.pin_pts_secs < 0.0
+        || pin
+            .thumb_pts_secs
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(TransferError::Invalid(format!(
+            "動画ピン位置が不正です: {entry_path}"
+        )));
+    }
+    if let Some(encoded) = &pin.thumb_webp_base64 {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(|_| {
+                TransferError::Invalid(format!("動画サムネの base64 が不正です: {entry_path}"))
+            })?;
+        if decoded.len() > MAX_VIDEO_THUMB_BYTES {
+            return Err(TransferError::Invalid(format!(
+                "動画サムネが大きすぎます: {entry_path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn portable_folder_pin_source(
+    pin: &PortableFolderThumbPin,
+) -> Option<crate::folder_thumb_pins::FolderPinSource> {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    match pin.source_kind.as_str() {
+        "image" | "video" | "folder" | "zipfile" | "pdffile"
+            if pin.source_entry.is_none() && pin.source_page.is_none() =>
+        {
+            Some(FolderPinSource::File {
+                rel: pin.source_rel.clone(),
+                kind: FileKind::from_db_str(&pin.source_kind)?,
+            })
+        }
+        "zipentry" if pin.source_page.is_none() => Some(FolderPinSource::ZipEntry {
+            zip_rel: pin.source_rel.clone(),
+            entry: pin.source_entry.clone()?,
+        }),
+        "zipdir" if pin.source_page.is_none() => Some(FolderPinSource::ZipDir {
+            zip_rel: pin.source_rel.clone(),
+            dir_prefix: pin.source_entry.clone()?,
+        }),
+        "pdfpage" if pin.source_entry.is_none() => Some(FolderPinSource::PdfPage {
+            pdf_rel: pin.source_rel.clone(),
+            page: pin.source_page?,
+        }),
+        _ => None,
+    }
 }
 
 fn validate_rating(rating: Option<&PortableRating>) -> Result<(), TransferError> {
@@ -1241,6 +2156,32 @@ fn ensure_database_schemas(data_dir: &Path) -> Result<(), TransferError> {
     );
     crate::book_bookmarks::ensure_schema_at(&data_dir.join("book_bookmarks.db"))
         .map_err(db_error)?;
+    drop(
+        crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db"))
+            .map_err(db_error)?,
+    );
+    drop(crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db")).map_err(db_error)?);
+    drop(crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db")).map_err(db_error)?);
+    drop(
+        crate::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db"))
+            .map_err(db_error)?,
+    );
+    drop(crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db")).map_err(db_error)?);
+    drop(crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).map_err(db_error)?);
+    drop(
+        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
+            .map_err(db_error)?,
+    );
+    drop(crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db")).map_err(db_error)?);
+    drop(crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).map_err(db_error)?);
+    drop(
+        crate::folder_thumb_pins::FolderThumbPinDb::open_at(&data_dir.join("folder_thumb_pins.db"))
+            .map_err(db_error)?,
+    );
+    drop(
+        crate::video_pins::VideoPinDb::open_at(&data_dir.join("video_pins.db"))
+            .map_err(db_error)?,
+    );
     Ok(())
 }
 
@@ -1269,18 +2210,56 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
             .as_ref()],
     )
     .map_err(db_error)?;
+    for (schema, filename) in [
+        ("adjustment", "adjustment.db"),
+        ("mask", "mask.db"),
+        ("conceal", "conceal.db"),
+        ("local_adjust", "local_adjust.db"),
+        ("crop", "export_crop.db"),
+        ("comic", "comic.db"),
+        ("view_trim", "view_trim.db"),
+    ] {
+        conn.execute(
+            &format!("ATTACH DATABASE ?1 AS {schema}"),
+            [data_dir.join(filename).to_string_lossy().as_ref()],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(conn)
+}
+
+fn open_auxiliary_import_connection(data_dir: &Path) -> Result<Connection, TransferError> {
+    let conn = Connection::open(data_dir.join("rotation.db")).map_err(db_error)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(db_error)?;
+    for (schema, filename) in [
+        ("spread", "spread.db"),
+        ("folder_pin", "folder_thumb_pins.db"),
+        ("video_pin", "video_pins.db"),
+    ] {
+        conn.execute(
+            &format!("ATTACH DATABASE ?1 AS {schema}"),
+            [data_dir.join(filename).to_string_lossy().as_ref()],
+        )
+        .map_err(db_error)?;
+    }
     Ok(conn)
 }
 
 fn apply_entry(
     conn: &mut Connection,
+    auxiliary_conn: &mut Connection,
     path: &Path,
     entry: &PortableEntry,
     sections: ManifestSections,
     fallback_time_ms: i64,
 ) -> Result<(), TransferError> {
     let base_key = crate::path_key::normalize_keep_drive(path);
+    let automatic_sidecar_sync = automatic_sidecar_sync(path, entry.kind);
     let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let auxiliary_tx = auxiliary_conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
     if sections.ratings {
@@ -1371,7 +2350,330 @@ fn apply_entry(
             .map_err(db_error)?;
         }
     }
-    tx.commit().map_err(db_error)
+    if let Some((folder_key, modified_secs)) = automatic_sidecar_sync {
+        // 明示 import が正本になった後、同じ場所へ残っている自動 backup の旧値を
+        // 「DB に行が無い」項目へ再 import して復活させない。v1 は新しい page_state
+        // section を持たないため、従来どおり編集 sidecar を利用できる。
+        if sections.page_state {
+            tx.execute(
+                "INSERT INTO adjustment.sidecar_sync (folder_key, sidecar_mtime)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = ?2",
+                params![folder_key, modified_secs],
+            )
+            .map_err(db_error)?;
+        }
+        if sections.tags {
+            tx.execute(
+                "INSERT INTO tags.tag_sidecar_sync (folder_key, sidecar_mtime)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = ?2",
+                params![folder_key, modified_secs],
+            )
+            .map_err(db_error)?;
+        }
+    }
+    if sections.page_state {
+        delete_key_family(&tx, "adjustment.page_params", "page_path", &base_key)?;
+        delete_key_family(&tx, "mask.masks", "path", &base_key)?;
+        delete_key_family(&tx, "conceal.conceal_entries", "page_path", &base_key)?;
+        delete_key_family(
+            &tx,
+            "local_adjust.local_adjust_pages",
+            "page_path",
+            &base_key,
+        )?;
+        delete_key_family(&tx, "crop.export_crop_pages", "page_path", &base_key)?;
+        delete_key_family(&tx, "comic.comic_entries", "page_path", &base_key)?;
+        delete_key_family(&tx, "view_trim.view_trim_pages", "page_path", &base_key)?;
+        delete_key_family(&auxiliary_tx, "rotations", "path", &base_key)?;
+        insert_page_state(&tx, &auxiliary_tx, &base_key, &entry.page_state)?;
+        for item in &entry.virtual_items {
+            insert_page_state(
+                &tx,
+                &auxiliary_tx,
+                &format!("{base_key}::{}", item.member_key.to_lowercase()),
+                &item.page_state,
+            )?;
+        }
+    }
+    if sections.container_state {
+        let container_key = crate::path_key::normalize(path);
+        let include_nested = entry.kind == PortableEntryKind::File;
+        delete_container_family(
+            &auxiliary_tx,
+            "spread.spreads",
+            "path",
+            &container_key,
+            include_nested,
+        )?;
+        delete_container_family(
+            &tx,
+            "view_trim.view_trim_books",
+            "book_key",
+            &container_key,
+            include_nested,
+        )?;
+        insert_container_state(&tx, &auxiliary_tx, &container_key, &entry.container_state)?;
+        for container in &entry.nested_containers {
+            insert_container_state(
+                &tx,
+                &auxiliary_tx,
+                &join_container_key(&container_key, &container.member_key),
+                &container.state,
+            )?;
+        }
+    }
+    if sections.thumbnail_pins {
+        let include_nested = entry.kind == PortableEntryKind::File;
+        delete_container_family(
+            &auxiliary_tx,
+            "folder_pin.folder_thumb_pins",
+            "container_key",
+            &base_key,
+            include_nested,
+        )?;
+        auxiliary_tx
+            .execute(
+                "DELETE FROM video_pin.video_pins WHERE path = ?1",
+                [&base_key],
+            )
+            .map_err(db_error)?;
+        insert_folder_pin(
+            &auxiliary_tx,
+            &base_key,
+            entry.container_state.folder_thumb_pin.as_ref(),
+        )?;
+        for container in &entry.nested_containers {
+            insert_folder_pin(
+                &auxiliary_tx,
+                &join_container_key(&base_key, &container.member_key),
+                container.state.folder_thumb_pin.as_ref(),
+            )?;
+        }
+        if let Some(pin) = &entry.video_pin {
+            let webp = pin
+                .thumb_webp_base64
+                .as_ref()
+                .map(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()))
+                .transpose()
+                .map_err(|_| TransferError::Invalid("動画サムネの base64 が不正です".into()))?;
+            auxiliary_tx
+                .execute(
+                    "INSERT INTO video_pin.video_pins
+                        (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![base_key, pin.pin_pts_secs, webp, pin.thumb_pts_secs],
+                )
+                .map_err(db_error)?;
+        }
+    }
+    tx.commit().map_err(db_error)?;
+    auxiliary_tx.commit().map_err(db_error)
+}
+
+fn automatic_sidecar_sync(path: &Path, kind: PortableEntryKind) -> Option<(String, i64)> {
+    let folder = match kind {
+        PortableEntryKind::Directory => path,
+        PortableEntryKind::File => path.parent()?,
+    };
+    let metadata = fs::metadata(folder.join(crate::sidecar::SIDECAR_FILENAME)).ok()?;
+    let modified_secs = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .min(i64::MAX as u64) as i64;
+    Some((crate::adjustment_db::normalize_path(folder), modified_secs))
+}
+
+fn insert_page_state(
+    tx: &rusqlite::Transaction<'_>,
+    auxiliary_tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    state: &PortablePageState,
+) -> Result<(), TransferError> {
+    if let Some(angle) = state.rotation_degrees {
+        auxiliary_tx
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, ?2)",
+                params![key, angle],
+            )
+            .map_err(db_error)?;
+    }
+    if let Some(adjustment) = &state.adjustment {
+        let json = serde_json::to_string(adjustment)
+            .map_err(|error| TransferError::Invalid(format!("画像補正: {error}")))?;
+        tx.execute(
+            "INSERT INTO adjustment.page_params (page_path, params_json) VALUES (?1, ?2)",
+            params![key, json],
+        )
+        .map_err(db_error)?;
+    }
+    insert_mask(tx, "mask.masks", "path", key, state.mask.as_ref())?;
+    insert_mask(
+        tx,
+        "conceal.conceal_entries",
+        "page_path",
+        key,
+        state.conceal.as_ref(),
+    )?;
+    if let Some(layers) = &state.local_adjust_layers {
+        let json = serde_json::to_string(layers)
+            .map_err(|error| TransferError::Invalid(format!("部分補正: {error}")))?;
+        tx.execute(
+            "INSERT INTO local_adjust.local_adjust_pages (page_path, layers_json, updated_at)
+             VALUES (?1, ?2, unixepoch())",
+            params![key, json],
+        )
+        .map_err(db_error)?;
+    }
+    if let Some(crop) = state.export_crop {
+        tx.execute(
+            "INSERT INTO crop.export_crop_pages
+                (page_path, min_x, min_y, max_x, max_y, aspect_mode, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())",
+            params![
+                key,
+                crop.rect.min_x,
+                crop.rect.min_y,
+                crop.rect.max_x,
+                crop.rect.max_y,
+                crop.aspect_mode.stable_key(),
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    if let Some(objects) = &state.comic {
+        let json = serde_json::to_string(objects)
+            .map_err(|error| TransferError::Invalid(format!("テキスト注釈: {error}")))?;
+        tx.execute(
+            "INSERT INTO comic.comic_entries (page_path, doc_version, doc_json)
+             VALUES (?1, ?2, ?3)",
+            params![key, crate::comic_db::DOC_VERSION, json],
+        )
+        .map_err(db_error)?;
+    }
+    if let Some(view_trim) = state.view_trim {
+        let json = serde_json::to_string(&view_trim)
+            .map_err(|error| TransferError::Invalid(format!("表示トリム: {error}")))?;
+        tx.execute(
+            "INSERT INTO view_trim.view_trim_pages (page_path, override_json, updated_at)
+             VALUES (?1, ?2, unixepoch())",
+            params![key, json],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(())
+}
+
+fn insert_mask(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_column: &str,
+    key: &str,
+    mask: Option<&crate::sidecar::SidecarMask>,
+) -> Result<(), TransferError> {
+    let Some(mask) = mask else {
+        return Ok(());
+    };
+    let data = mask
+        .decode()
+        .ok_or_else(|| TransferError::Invalid("マスクの base64 が不正です".into()))?;
+    let vectors = crate::mask_db::shapes_to_json(&mask.vectors);
+    let sql = if table == "mask.masks" {
+        format!(
+            "INSERT INTO {table} ({key_column}, mask_data, width, height, vectors)
+             VALUES (?1, ?2, ?3, ?4, ?5)"
+        )
+    } else {
+        format!(
+            "INSERT INTO {table} ({key_column}, bitmap_data, bitmap_w, bitmap_h, shapes)
+             VALUES (?1, ?2, ?3, ?4, ?5)"
+        )
+    };
+    tx.execute(&sql, params![key, data, mask.w, mask.h, vectors])
+        .map_err(db_error)?;
+    Ok(())
+}
+
+fn insert_container_state(
+    tx: &rusqlite::Transaction<'_>,
+    auxiliary_tx: &rusqlite::Transaction<'_>,
+    stripped_key: &str,
+    state: &PortableContainerState,
+) -> Result<(), TransferError> {
+    if let Some(spread) = state.spread {
+        auxiliary_tx
+            .execute(
+                "INSERT INTO spread.spreads (path, mode, flow, direction)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![stripped_key, spread.mode, spread.flow, spread.direction],
+            )
+            .map_err(db_error)?;
+    }
+    if let Some(view_trim) = state.view_trim {
+        let json = serde_json::to_string(&view_trim)
+            .map_err(|error| TransferError::Invalid(format!("表示トリム: {error}")))?;
+        tx.execute(
+            "INSERT INTO view_trim.view_trim_books (book_key, state_json, updated_at)
+             VALUES (?1, ?2, unixepoch())",
+            params![stripped_key, json],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(())
+}
+
+fn insert_folder_pin(
+    auxiliary_tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    pin: Option<&PortableFolderThumbPin>,
+) -> Result<(), TransferError> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+    portable_folder_pin_source(pin)
+        .ok_or_else(|| TransferError::Invalid("代表サムネ設定が不正です".into()))?;
+    auxiliary_tx
+        .execute(
+            "INSERT INTO folder_pin.folder_thumb_pins
+                (container_key, source_kind, source_rel, source_entry, source_page)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key,
+                pin.source_kind,
+                pin.source_rel,
+                pin.source_entry,
+                pin.source_page,
+            ],
+        )
+        .map_err(db_error)?;
+    Ok(())
+}
+
+fn delete_container_family(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    base_key: &str,
+    include_nested: bool,
+) -> Result<(), TransferError> {
+    let sql = if include_nested {
+        format!(
+            "DELETE FROM {table} WHERE {column} = ?1
+                OR ({column} >= ?1 || '/' AND {column} < ?1 || '0')"
+        )
+    } else {
+        format!("DELETE FROM {table} WHERE {column} = ?1")
+    };
+    tx.execute(&sql, [base_key]).map_err(db_error)?;
+    Ok(())
+}
+
+fn join_container_key(base: &str, member: &str) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), member.to_lowercase())
 }
 
 fn delete_key_family(
@@ -1557,6 +2859,11 @@ fn is_temp_sidecar_name(name: &std::ffi::OsStr) -> bool {
 fn is_sidecar_name(name: &std::ffi::OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.eq_ignore_ascii_case(SIDECAR_FILENAME))
+}
+
+fn is_automatic_sidecar_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(crate::sidecar::SIDECAR_FILENAME))
 }
 
 fn rating_kind_name(value: i64) -> Option<&'static str> {
@@ -1751,6 +3058,10 @@ mod tests {
                     created_at_ms: 0,
                     title: None,
                 }],
+                page_state: PortablePageState::default(),
+                container_state: PortableContainerState::default(),
+                nested_containers: Vec::new(),
+                video_pin: None,
                 virtual_items: Vec::new(),
             }],
         }
@@ -1924,6 +3235,329 @@ mod tests {
     }
 
     #[test]
+    fn v2_round_trip_is_self_contained_without_automatic_sidecar() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for name in ["a.jpg", "book.zip", "clip.mp4"] {
+            fs::write(source.join(name), name.as_bytes()).unwrap();
+            fs::write(destination.join(name), name.as_bytes()).unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        assert!(!source.join(crate::sidecar::SIDECAR_FILENAME).exists());
+
+        let source_root = crate::path_key::normalize(&source);
+        let source_root_keep = crate::path_key::normalize_keep_drive(&source);
+        let source_nested_book = join_container_key(
+            &crate::path_key::normalize(&source.join("book.zip")),
+            "chapter",
+        );
+        let source_nested_book_keep = join_container_key(
+            &crate::path_key::normalize_keep_drive(&source.join("book.zip")),
+            "chapter",
+        );
+        let image_key = crate::path_key::normalize_keep_drive(&source.join("a.jpg"));
+        let virtual_key = format!(
+            "{}::page/001.jpg",
+            crate::path_key::normalize_keep_drive(&source.join("book.zip"))
+        );
+        Connection::open(source_data.join("spread.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO spreads (path, mode, flow, direction)
+                    VALUES ('{}', 2, 1, 1), ('{}', 3, 2, 0)",
+                source_root.replace('\'', "''"),
+                source_nested_book.replace('\'', "''")
+            ))
+            .unwrap();
+        let book_trim = crate::view_trim::ViewTrimBookState {
+            apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+            book_settings: crate::view_trim::ViewTrimBookSettings {
+                enabled: true,
+                single: crate::view_trim::ViewTrimMargins {
+                    left: 0.01,
+                    top: 0.02,
+                    right: 0.03,
+                    bottom: 0.04,
+                },
+                ..Default::default()
+            },
+        };
+        let page_trim = crate::view_trim::ViewTrimPageOverride::from_margins(
+            crate::view_trim::ViewTrimMargins {
+                left: 0.05,
+                top: 0.06,
+                right: 0.07,
+                bottom: 0.08,
+            },
+        );
+        let view_trim = Connection::open(source_data.join("view_trim.db")).unwrap();
+        view_trim
+            .execute(
+                "INSERT INTO view_trim_books (book_key, state_json) VALUES (?1, ?2)",
+                params![source_root, serde_json::to_string(&book_trim).unwrap()],
+            )
+            .unwrap();
+        view_trim
+            .execute(
+                "INSERT INTO view_trim_pages (page_path, override_json) VALUES (?1, ?2)",
+                params![image_key, serde_json::to_string(&page_trim).unwrap()],
+            )
+            .unwrap();
+        Connection::open(source_data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 90), (?2, 270)",
+                params![image_key, virtual_key],
+            )
+            .unwrap();
+        Connection::open(source_data.join("adjustment.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)",
+                params![
+                    image_key,
+                    serde_json::to_string(&crate::adjustment::AdjustParams::default()).unwrap()
+                ],
+            )
+            .unwrap();
+        let compressed = crate::mask_db::compress_mask(&[true, false, false, true]);
+        Connection::open(source_data.join("mask.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO masks (path, mask_data, width, height, vectors)
+                 VALUES (?1, ?2, 2, 2, '[]')",
+                params![image_key, compressed],
+            )
+            .unwrap();
+        Connection::open(source_data.join("conceal.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO conceal_entries
+                    (page_path, bitmap_w, bitmap_h, bitmap_data, shapes)
+                 VALUES (?1, 2, 2, ?2, '[]')",
+                params![
+                    image_key,
+                    crate::mask_db::compress_mask(&[false, true, true, false])
+                ],
+            )
+            .unwrap();
+        Connection::open(source_data.join("local_adjust.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO local_adjust_pages (page_path, layers_json) VALUES (?1, '[]')",
+                [&image_key],
+            )
+            .unwrap();
+        Connection::open(source_data.join("export_crop.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO export_crop_pages
+                    (page_path, min_x, min_y, max_x, max_y, aspect_mode)
+                 VALUES (?1, 0.1, 0.2, 0.8, 0.9, '4x3')",
+                [&image_key],
+            )
+            .unwrap();
+        Connection::open(source_data.join("comic.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO comic_entries (page_path, doc_version, doc_json)
+                 VALUES (?1, 1, '[]')",
+                [&image_key],
+            )
+            .unwrap();
+        Connection::open(source_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO folder_thumb_pins
+                    (container_key, source_kind, source_rel, source_entry, source_page)
+                 VALUES (?1, 'image', 'a.jpg', NULL, NULL)",
+                [&source_root_keep],
+            )
+            .unwrap();
+        Connection::open(source_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO folder_thumb_pins
+                    (container_key, source_kind, source_rel, source_entry, source_page)
+                 VALUES (?1, 'zipentry', '', 'page/001.jpg', NULL)",
+                [&source_nested_book_keep],
+            )
+            .unwrap();
+        Connection::open(source_data.join("video_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
+                 VALUES (?1, 12.5, ?2, 12.5)",
+                params![
+                    crate::path_key::normalize_keep_drive(&source.join("clip.mp4")),
+                    b"webp".as_slice()
+                ],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        assert!(exported.page_states >= 2);
+        assert!(exported.container_states >= 1);
+        assert_eq!(exported.thumbnail_pins, 3);
+        fs::copy(
+            source.join(SIDECAR_FILENAME),
+            destination.join(SIDECAR_FILENAME),
+        )
+        .unwrap();
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+
+        let destination_root = crate::path_key::normalize(&destination);
+        let destination_root_keep = crate::path_key::normalize_keep_drive(&destination);
+        let destination_image = crate::path_key::normalize_keep_drive(&destination.join("a.jpg"));
+        let destination_virtual = format!(
+            "{}::page/001.jpg",
+            crate::path_key::normalize_keep_drive(&destination.join("book.zip"))
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("spread.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT mode, flow, direction FROM spreads WHERE path = ?1",
+                    [&destination_root],
+                    |row| Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?
+                    ))
+                )
+                .unwrap(),
+            (2, 1, 1)
+        );
+        let destination_nested_book = join_container_key(
+            &crate::path_key::normalize(&destination.join("book.zip")),
+            "chapter",
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("spread.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT mode, flow, direction FROM spreads WHERE path = ?1",
+                    [&destination_nested_book],
+                    |row| Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?
+                    ))
+                )
+                .unwrap(),
+            (3, 2, 0)
+        );
+        let destination_view_trim =
+            Connection::open(destination_data.join("view_trim.db")).unwrap();
+        assert_eq!(
+            destination_view_trim
+                .query_row(
+                    "SELECT state_json FROM view_trim_books WHERE book_key = ?1",
+                    [&destination_root],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            serde_json::to_string(&book_trim).unwrap()
+        );
+        assert_eq!(
+            destination_view_trim
+                .query_row(
+                    "SELECT override_json FROM view_trim_pages WHERE page_path = ?1",
+                    [&destination_image],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            serde_json::to_string(&page_trim).unwrap()
+        );
+        let rotations = Connection::open(destination_data.join("rotation.db")).unwrap();
+        assert_eq!(
+            rotations
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&destination_image],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            90
+        );
+        assert_eq!(
+            rotations
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&destination_virtual],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            270
+        );
+        for (db, table, column) in [
+            ("adjustment.db", "page_params", "page_path"),
+            ("mask.db", "masks", "path"),
+            ("conceal.db", "conceal_entries", "page_path"),
+            ("local_adjust.db", "local_adjust_pages", "page_path"),
+            ("export_crop.db", "export_crop_pages", "page_path"),
+            ("comic.db", "comic_entries", "page_path"),
+        ] {
+            let count = Connection::open(destination_data.join(db))
+                .unwrap()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    [&destination_image],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing imported state in {db}");
+        }
+        assert_eq!(
+            Connection::open(destination_data.join("folder_thumb_pins.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT source_kind, source_rel FROM folder_thumb_pins WHERE container_key = ?1",
+                    [&destination_root_keep],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            ("image".to_string(), "a.jpg".to_string())
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("folder_thumb_pins.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT source_kind, source_entry FROM folder_thumb_pins WHERE container_key = ?1",
+                    [join_container_key(
+                        &crate::path_key::normalize_keep_drive(&destination.join("book.zip")),
+                        "chapter"
+                    )],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            ("zipentry".to_string(), "page/001.jpg".to_string())
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("video_pins.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT pin_pts_secs, thumb_webp FROM video_pins WHERE path = ?1",
+                    [crate::path_key::normalize_keep_drive(
+                        &destination.join("clip.mp4")
+                    )],
+                    |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                )
+                .unwrap(),
+            (12.5, b"webp".to_vec())
+        );
+        assert!(!destination.join(crate::sidecar::SIDECAR_FILENAME).exists());
+    }
+
+    #[test]
     fn import_clears_listed_empty_metadata_and_preserves_unlisted_items() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -1998,6 +3632,133 @@ mod tests {
         assert_eq!(
             rating(&destination_data, &destination.join("unlisted.jpg")),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn v1_manifest_does_not_clear_v2_metadata_sections() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("a.jpg"), b"x").unwrap();
+        fs::write(destination.join("a.jpg"), b"x").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let destination_key = crate::path_key::normalize_keep_drive(&destination.join("a.jpg"));
+        Connection::open(destination_data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 180)",
+                [&destination_key],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(source.join(SIDECAR_FILENAME)).unwrap()).unwrap();
+        json["version"] = serde_json::Value::from(1);
+        let sections = json["sections"].as_object_mut().unwrap();
+        for field in ["page_state", "container_state", "thumbnail_pins"] {
+            sections.remove(field);
+        }
+        for entry in json["entries"].as_array_mut().unwrap() {
+            let entry = entry.as_object_mut().unwrap();
+            for field in [
+                "page_state",
+                "container_state",
+                "nested_containers",
+                "video_pin",
+            ] {
+                entry.remove(field);
+            }
+            for item in entry
+                .get_mut("virtual_items")
+                .and_then(serde_json::Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                item.as_object_mut().unwrap().remove("page_state");
+            }
+        }
+        fs::write(
+            destination.join(SIDECAR_FILENAME),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+
+        import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(
+            Connection::open(destination_data.join("rotation.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&destination_key],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            180
+        );
+    }
+
+    #[test]
+    fn v2_import_marks_existing_automatic_sidecar_as_consumed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("a.jpg"), b"x").unwrap();
+        fs::write(destination.join("a.jpg"), b"x").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        fs::copy(
+            source.join(SIDECAR_FILENAME),
+            destination.join(SIDECAR_FILENAME),
+        )
+        .unwrap();
+        let automatic_sidecar = destination.join(crate::sidecar::SIDECAR_FILENAME);
+        fs::write(&automatic_sidecar, br#"{"version":1,"items":{}}"#).unwrap();
+        let modified_secs = fs::metadata(&automatic_sidecar)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        let folder_key = crate::adjustment_db::normalize_path(&destination);
+        assert_eq!(
+            Connection::open(destination_data.join("adjustment.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT sidecar_mtime FROM sidecar_sync WHERE folder_key = ?1",
+                    [&folder_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            modified_secs
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("tags.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT sidecar_mtime FROM tag_sidecar_sync WHERE folder_key = ?1",
+                    [&folder_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            modified_secs
         );
     }
 
@@ -2267,6 +4028,10 @@ mod tests {
                 tags: Vec::new(),
                 timed_bookmarks: Vec::new(),
                 book_bookmarks: Vec::new(),
+                page_state: PortablePageState::default(),
+                container_state: PortableContainerState::default(),
+                nested_containers: Vec::new(),
+                video_pin: None,
                 virtual_items: Vec::new(),
             }],
         };
@@ -2353,6 +4118,61 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsafe_or_malformed_v2_state_before_import() {
+        let mut base =
+            manifest_with_bookmark(PortableEntryKind::File, "zip", "archive_entry", "page.jpg");
+        base.entries[0].book_bookmarks.clear();
+        assert!(validate_manifest(&base).is_ok());
+
+        let mut invalid_nested = base.clone();
+        invalid_nested.entries[0]
+            .nested_containers
+            .push(PortableNestedContainer {
+                member_key: "../outside".to_string(),
+                state: PortableContainerState::default(),
+            });
+        assert!(matches!(
+            validate_manifest(&invalid_nested),
+            Err(TransferError::Invalid(_))
+        ));
+
+        let mut invalid_pin = base.clone();
+        invalid_pin.entries[0].container_state.folder_thumb_pin = Some(PortableFolderThumbPin {
+            source_kind: "image".to_string(),
+            source_rel: "../outside.jpg".to_string(),
+            source_entry: None,
+            source_page: None,
+        });
+        assert!(matches!(
+            validate_manifest(&invalid_pin),
+            Err(TransferError::Invalid(_))
+        ));
+
+        let mut invalid_mask = base.clone();
+        invalid_mask.entries[0].page_state.mask = Some(crate::sidecar::SidecarMask {
+            w: 2,
+            h: 2,
+            data: base64::engine::general_purpose::STANDARD.encode([1, 2, 3]),
+            vectors: Vec::new(),
+        });
+        assert!(matches!(
+            validate_manifest(&invalid_mask),
+            Err(TransferError::Invalid(_))
+        ));
+
+        let mut invalid_spread = base;
+        invalid_spread.entries[0].container_state.spread = Some(PortableSpreadState {
+            mode: 99,
+            flow: 0,
+            direction: 0,
+        });
+        assert!(matches!(
+            validate_manifest(&invalid_spread),
+            Err(TransferError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn import_rejects_existing_reparse_path_outside_root() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
@@ -2386,6 +4206,10 @@ mod tests {
                 tags: Vec::new(),
                 timed_bookmarks: Vec::new(),
                 book_bookmarks: Vec::new(),
+                page_state: PortablePageState::default(),
+                container_state: PortableContainerState::default(),
+                nested_containers: Vec::new(),
+                video_pin: None,
                 virtual_items: Vec::new(),
             }],
         };
