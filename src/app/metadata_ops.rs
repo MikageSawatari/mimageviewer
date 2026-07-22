@@ -266,6 +266,7 @@ pub(super) fn is_ai_metadata_path(path: &std::path::Path) -> bool {
 pub(super) fn run_metadata_load(
     key: String,
     item: GridItem,
+    relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     hidden: &[String],
     cancel: &AtomicBool,
 ) -> Option<MetadataLoadResult> {
@@ -276,18 +277,41 @@ pub(super) fn run_metadata_load(
 
     let (metadata, exif, xmp, panorama) = match &item {
         GridItem::Image(p) => {
-            let metadata = crate::png_metadata::extract_metadata(p);
+            let verified_bytes = match relative_page_provenance.as_ref() {
+                Some(provenance) => provenance.read_verified().ok(),
+                None => None,
+            };
+            if relative_page_provenance.is_some() && verified_bytes.is_none() {
+                return Some(MetadataLoadResult {
+                    key,
+                    metadata: None,
+                    exif: None,
+                    xmp: None,
+                    panorama: None,
+                    sidecar: None,
+                });
+            }
+            let metadata = match verified_bytes.as_ref() {
+                Some(bytes) => crate::png_metadata::extract_metadata_from_bytes(bytes),
+                None => crate::png_metadata::extract_metadata(p),
+            };
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            let exif = crate::exif_reader::read_exif(p, hidden);
+            let exif = match verified_bytes.as_ref() {
+                Some(bytes) => crate::exif_reader::read_exif_from_bytes(bytes, hidden),
+                None => crate::exif_reader::read_exif(p, hidden),
+            };
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
             // xtw (X/Twitter) と GPano は同じ XMP packet を参照するので 1 回読み +
             // 1 回 extract_xmp_packet にまとめる (Codex P2 第 19 ラウンド: 旧コードは
             // 2 回 fs::read + 2 回 extract を実行していた)。
-            let bundle = crate::xmp_reader::read_xmp_bundle(p);
+            let bundle = match verified_bytes.as_ref() {
+                Some(bytes) => crate::xmp_reader::read_xmp_bundle_from_bytes(bytes),
+                None => crate::xmp_reader::read_xmp_bundle(p),
+            };
             (metadata, exif, bundle.tweet, bundle.panorama)
         }
         GridItem::Video(p) => {
@@ -332,8 +356,11 @@ pub(super) fn run_metadata_load(
     // 外部メタデータサイドカー (FS 画像のみ。docs §11)。動画 / ZIP 内画像 / PDF ページは
     // サイドカー対象外なので None (Codex P2-6: metadata_cache_key は Video も返すため
     // GridItem::Image で明示ゲートする)。
-    let sidecar = match &item {
-        GridItem::Image(p) => crate::external_metadata::read_for_display(p),
+    let sidecar = match (&item, relative_page_provenance.as_ref()) {
+        (GridItem::Image(_), Some(provenance)) => {
+            crate::external_metadata::read_for_display_verified(provenance)
+        }
+        (GridItem::Image(p), None) => crate::external_metadata::read_for_display(p),
         _ => None,
     };
 
@@ -403,6 +430,8 @@ pub(super) fn run_details_meta_load(
         let mut page_count_checked = false;
         let mut page_count_failed = false;
         let mut zip_entry_bytes: Option<Vec<u8>> = None;
+        let mut relative_page_bytes: Option<Vec<u8>> = None;
+        let mut relative_page_bytes_loaded = false;
         let mut dims = if target.load_image_dims {
             target.warm_image_dims
         } else {
@@ -434,9 +463,14 @@ pub(super) fn run_details_meta_load(
         {
             created_at = {
                 let _permit = io_sem.acquire(target.priority);
-                std::fs::metadata(path)
-                    .ok()
-                    .and_then(|m| m.created().ok().and_then(|t| system_time_to_unix_secs(t)))
+                let metadata = match target.relative_page_provenance.as_ref() {
+                    Some(provenance) => provenance
+                        .open_verified()
+                        .ok()
+                        .and_then(|opened| opened.metadata().ok()),
+                    None => std::fs::metadata(path).ok(),
+                };
+                metadata.and_then(|m| m.created().ok().and_then(|t| system_time_to_unix_secs(t)))
             };
         }
 
@@ -474,7 +508,18 @@ pub(super) fn run_details_meta_load(
                         item_permit_wait_ms += t0.elapsed().as_secs_f64() * 1000.0;
                     }
                     let extract_t0 = perf_on.then(std::time::Instant::now);
-                    let metadata = crate::png_metadata::extract_metadata(path);
+                    let metadata =
+                        if let Some(provenance) = target.relative_page_provenance.as_ref() {
+                            if !relative_page_bytes_loaded {
+                                relative_page_bytes = provenance.read_verified().ok();
+                                relative_page_bytes_loaded = true;
+                            }
+                            relative_page_bytes.as_ref().and_then(|bytes| {
+                                crate::png_metadata::extract_metadata_from_bytes(bytes)
+                            })
+                        } else {
+                            crate::png_metadata::extract_metadata(path)
+                        };
                     if let Some(t0) = extract_t0 {
                         item_extract_ms += t0.elapsed().as_secs_f64() * 1000.0;
                     }
@@ -586,7 +631,16 @@ pub(super) fn run_details_meta_load(
         {
             let probed = {
                 let _permit = io_sem.acquire(target.priority);
-                crate::fast_resize::probe_dims(path)
+                if let Some(provenance) = target.relative_page_provenance.as_ref() {
+                    if !relative_page_bytes_loaded {
+                        relative_page_bytes = provenance.read_verified().ok();
+                    }
+                    relative_page_bytes
+                        .as_deref()
+                        .and_then(crate::fast_resize::probe_dims_from_bytes)
+                } else {
+                    crate::fast_resize::probe_dims(path)
+                }
             };
             dims = probed.map(|[w, h]| (w as u32, h as u32));
         }
@@ -770,6 +824,145 @@ pub(super) fn run_details_meta_load(
         );
     }
     let _ = tx.send(DetailsMetaEvent::Finished { generation, failed });
+}
+
+#[cfg(test)]
+mod relative_page_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    fn write_png(path: &Path, width: u32, height: u32) {
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height))
+            .save(path)
+            .unwrap();
+    }
+
+    #[test]
+    fn metadata_and_sidecar_do_not_read_swapped_external_relative_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let chapter = album.join("chapter");
+        let parked = album.join("chapter-safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(chapter.join("page.jpg"), b"inside").unwrap();
+        std::fs::write(chapter.join("page.jpg.txt"), b"inside-sidecar").unwrap();
+        std::fs::write(outside.join("page.jpg"), b"outside-secret").unwrap();
+        std::fs::write(outside.join("page.jpg.txt"), b"outside-sidecar").unwrap();
+        let crate::book_bookmarks::RelativePagePathResolution::Existing(provenance) =
+            crate::book_bookmarks::resolve_relative_page_path(&album, "chapter/page.jpg")
+        else {
+            panic!("safe page should materialize");
+        };
+        let item = GridItem::Image(provenance.candidate_path());
+        let cancel = AtomicBool::new(false);
+
+        let safe = run_metadata_load(
+            "safe".to_string(),
+            item.clone(),
+            Some(provenance.clone()),
+            &[],
+            &cancel,
+        )
+        .unwrap();
+        assert!(matches!(
+            safe.sidecar,
+            Some(crate::external_metadata::SidecarDisplay::Text(ref text))
+                if text == "inside-sidecar"
+        ));
+
+        std::fs::rename(&chapter, &parked).unwrap();
+        if !create_dir_link(&outside, &chapter) {
+            return;
+        }
+        let rejected =
+            run_metadata_load("rejected".to_string(), item, Some(provenance), &[], &cancel)
+                .unwrap();
+        assert!(rejected.metadata.is_none());
+        assert!(rejected.exif.is_none());
+        assert!(rejected.xmp.is_none());
+        assert!(rejected.panorama.is_none());
+        assert!(rejected.sidecar.is_none());
+    }
+
+    #[test]
+    fn details_metadata_does_not_probe_swapped_external_relative_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let chapter = album.join("chapter");
+        let parked = album.join("chapter-safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        write_png(&chapter.join("page.png"), 2, 2);
+        write_png(&outside.join("page.png"), 9, 7);
+        let crate::book_bookmarks::RelativePagePathResolution::Existing(provenance) =
+            crate::book_bookmarks::resolve_relative_page_path(&album, "chapter/page.png")
+        else {
+            panic!("safe page should materialize");
+        };
+        let item = GridItem::Image(provenance.candidate_path());
+
+        std::fs::rename(&chapter, &parked).unwrap();
+        if !create_dir_link(&outside, &chapter) {
+            return;
+        }
+        let target = DetailsMetaTarget {
+            key: "relative-page".to_string(),
+            item,
+            relative_page_provenance: Some(provenance),
+            source_mtime: 1,
+            source_size: 1,
+            catalog_folder: None,
+            catalog_key: None,
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: false,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: true,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        };
+        let (tx, rx) = mpsc::channel();
+        run_details_meta_load(
+            1,
+            vec![target],
+            0,
+            0,
+            1,
+            temp.path().join("cache"),
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            DetailsPageCountConfig {
+                fingerprint: 0,
+                image_folder_options: None,
+                pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            },
+        );
+        let meta = rx
+            .into_iter()
+            .find_map(|event| match event {
+                DetailsMetaEvent::Item { meta, .. } => Some(meta),
+                _ => None,
+            })
+            .expect("details metadata result");
+        assert!(meta.image_dims.is_none());
+        assert!(meta.image_dims_failed);
+    }
 }
 
 fn load_details_page_count(
@@ -1486,6 +1679,7 @@ mod tests {
         let target = DetailsMetaTarget {
             key: crate::adjustment_db::normalize_path(&path),
             item: GridItem::ZipFile(path.clone()),
+            relative_page_provenance: None,
             source_mtime: 123,
             source_size,
             catalog_folder: Some(temp.path().to_path_buf()),
@@ -1578,6 +1772,7 @@ mod tests {
                 path: path.clone(),
                 format: crate::archive_converter::ArchiveFormat::Rar,
             },
+            relative_page_provenance: None,
             source_mtime: 456,
             source_size,
             catalog_folder: Some(temp.path().to_path_buf()),
@@ -1637,6 +1832,7 @@ mod tests {
         let target = DetailsMetaTarget {
             key: crate::adjustment_db::normalize_path(&path),
             item: GridItem::ZipFile(path),
+            relative_page_provenance: None,
             source_mtime: 123,
             source_size: 13,
             catalog_folder: None,

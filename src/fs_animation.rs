@@ -163,11 +163,22 @@ fn rgba_frame_to_color_image(buf: image::RgbaImage) -> egui::ColorImage {
 /// GIF をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）や失敗時は None を返す。
 pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    decode_gif_frames_from_reader(reader)
+}
+
+pub fn decode_gif_frames_from_bytes(bytes: &[u8]) -> Option<Vec<(egui::ColorImage, f64)>> {
+    decode_gif_frames_from_reader(std::io::Cursor::new(bytes))
+}
+
+fn decode_gif_frames_from_reader<R>(reader: R) -> Option<Vec<(egui::ColorImage, f64)>>
+where
+    R: std::io::BufRead + std::io::Seek,
+{
     use image::AnimationDecoder;
     use image::codecs::gif::GifDecoder;
 
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
     let decoder = GifDecoder::new(reader).ok()?;
     let frames = decoder.into_frames().collect_frames().ok()?;
     if frames.len() <= 1 {
@@ -188,11 +199,22 @@ pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
 /// APNG をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）・非 APNG・失敗時は None を返す。
 pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    decode_apng_frames_from_reader(reader)
+}
+
+pub fn decode_apng_frames_from_bytes(bytes: &[u8]) -> Option<Vec<(egui::ColorImage, f64)>> {
+    decode_apng_frames_from_reader(std::io::Cursor::new(bytes))
+}
+
+fn decode_apng_frames_from_reader<R>(reader: R) -> Option<Vec<(egui::ColorImage, f64)>>
+where
+    R: std::io::BufRead + std::io::Seek,
+{
     use image::AnimationDecoder;
     use image::codecs::png::PngDecoder;
 
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
     let decoder = PngDecoder::new(reader).ok()?;
     if !decoder.is_apng().ok()? {
         return None;

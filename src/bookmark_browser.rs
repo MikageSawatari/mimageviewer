@@ -245,6 +245,8 @@ pub enum BookmarkRowSource {
 pub struct BookmarkBrowserRow {
     pub source: BookmarkRowSource,
     pub item: GridItem,
+    /// manifest の relative page を通常 path と区別したまま loader まで運ぶ trust root。
+    pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     pub image_meta: Option<(i64, i64)>,
     /// 動画・音声 bookmark に保存された位置サムネイル。decode は build worker 側。
     pub marker_thumbnail: Option<Arc<egui::ColorImage>>,
@@ -258,6 +260,7 @@ impl BookmarkBrowserRow {
     /// 同じ bookmark id をその場で更新できる項目（名称・位置・missing・meta）は個別比較する。
     pub fn has_same_grid_content(&self, other: &Self) -> bool {
         self.source == other.source
+            && self.relative_page_provenance == other.relative_page_provenance
             && self.image_meta == other.image_meta
             && self.marker_thumbnail.is_some() == other.marker_thumbnail.is_some()
             && self.created_at_ms == other.created_at_ms
@@ -482,6 +485,7 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
                 is_audio,
             },
             item,
+            relative_page_provenance: None,
             image_meta,
             marker_thumbnail,
             created_at_ms: bookmark.created_at_ms,
@@ -494,20 +498,31 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
         if cancel.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }
-        let (item, relative_page_missing) = book_grid_item(&bookmark, archive_cache.as_ref());
+        let (mut item, relative_page_missing, mut relative_page_provenance) =
+            book_grid_item(&bookmark, archive_cache.as_ref());
         // Filesystem relative page は materialize と存在判定を1回の containment check で
         // 行う。unsafe/missing path を GridItem::Image にせず、後段の metadata / thumb
         // I/O に渡さない。
-        let missing = relative_page_missing
+        let mut missing = relative_page_missing
             .unwrap_or_else(|| book_page_missing(&bookmark, &mut book_missing_cache));
-        let image_meta = match &item {
-            GridItem::Image(path) => source_meta(path),
+        let mut image_meta = match (&item, relative_page_provenance.as_ref()) {
+            (GridItem::Image(_), Some(provenance)) => source_meta_verified(provenance),
+            (GridItem::Image(path), None) => source_meta(path),
             _ => source_meta(&bookmark.container_path),
         }
         .map(|(_, size)| (bookmark.created_at_ms.div_euclid(1000), size));
+        if relative_page_provenance.is_some() && image_meta.is_none() {
+            // materialize 後から source_meta の同一ハンドル検証までに差し替わった場合も、
+            // 通常画像として一覧へ流さず missing/invalid 行へ戻す。
+            item = GridItem::Folder(bookmark.container_path.clone());
+            relative_page_provenance = None;
+            missing = true;
+            image_meta = None;
+        }
         rows.push(BookmarkBrowserRow {
             created_at_ms: bookmark.created_at_ms,
             item,
+            relative_page_provenance,
             image_meta,
             marker_thumbnail: None,
             source: BookmarkRowSource::Book(bookmark),
@@ -520,6 +535,18 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
 
 fn source_meta(path: &Path) -> Option<(i64, i64)> {
     let metadata = std::fs::metadata(path).ok()?;
+    source_meta_from_metadata(&metadata)
+}
+
+fn source_meta_verified(
+    provenance: &crate::book_bookmarks::RelativePageProvenance,
+) -> Option<(i64, i64)> {
+    let opened = provenance.open_verified().ok()?;
+    let metadata = opened.metadata().ok()?;
+    source_meta_from_metadata(&metadata)
+}
+
+fn source_meta_from_metadata(metadata: &std::fs::Metadata) -> Option<(i64, i64)> {
     let mtime = metadata
         .modified()
         .ok()?
@@ -551,7 +578,11 @@ fn decode_marker_thumbnail(webp: &[u8]) -> Option<egui::ColorImage> {
 fn book_grid_item(
     bookmark: &crate::book_bookmarks::BookBookmark,
     archive_cache: Option<&crate::archive_cache::ArchiveCacheDb>,
-) -> (GridItem, Option<bool>) {
+) -> (
+    GridItem,
+    Option<bool>,
+    Option<crate::book_bookmarks::RelativePageProvenance>,
+) {
     use crate::book_bookmarks::{BookContainerKind, PageIdentity, RelativePagePathResolution};
     match (&bookmark.container_kind, &bookmark.page_identity) {
         (
@@ -561,13 +592,18 @@ fn book_grid_item(
             &bookmark.container_path,
             relative,
         ) {
-            RelativePagePathResolution::Existing(path) => (GridItem::Image(path), Some(false)),
+            RelativePagePathResolution::Existing(provenance) => (
+                GridItem::Image(provenance.candidate_path()),
+                Some(false),
+                Some(provenance),
+            ),
             RelativePagePathResolution::Missing(_) | RelativePagePathResolution::Unsafe => {
                 // 行と削除導線は残すが、信頼できない page path は画像として downstream
                 // loader へ渡さない。
                 (
                     GridItem::Folder(bookmark.container_path.clone()),
                     Some(true),
+                    None,
                 )
             }
         },
@@ -578,12 +614,14 @@ fn book_grid_item(
                 content_type: None,
             },
             None,
+            None,
         ),
         (BookContainerKind::Zip, PageIdentity::ArchiveEntry(entry_name)) => (
             GridItem::ZipImage {
                 zip_path: bookmark.container_path.clone(),
                 entry_name: entry_name.clone(),
             },
+            None,
             None,
         ),
         (BookContainerKind::OtherArchive, PageIdentity::ArchiveEntry(entry_name)) => {
@@ -597,6 +635,7 @@ fn book_grid_item(
                     zip_path: backing_path,
                     entry_name: entry_name.clone(),
                 },
+                None,
                 None,
             )
         }
@@ -619,6 +658,7 @@ fn book_grid_item(
                         .unwrap_or(crate::archive_converter::ArchiveFormat::Zip),
                 },
             },
+            None,
             None,
         ),
     }
@@ -765,6 +805,7 @@ pub struct PendingMediaOpen {
 #[derive(Clone, Debug)]
 pub struct PendingBookOpen {
     pub bookmark: crate::book_bookmarks::BookBookmark,
+    pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     pub started_at: std::time::Instant,
     pub entered_archive_prefix: bool,
 }
@@ -815,6 +856,7 @@ mod tests {
                 is_audio: false,
             },
             item: GridItem::Video(path),
+            relative_page_provenance: None,
             image_meta: Some((created_at_ms.div_euclid(1000), 10)),
             marker_thumbnail: None,
             created_at_ms,
@@ -941,18 +983,20 @@ mod tests {
         };
 
         // import 時点相当: 通常の欠落 path は保持するが画像 item にはしない。
-        let (item, missing) = book_grid_item(&bookmark, None);
+        let (item, missing, provenance) = book_grid_item(&bookmark, None);
         assert!(matches!(item, GridItem::Folder(ref path) if path == &album));
         assert_eq!(missing, Some(true));
+        assert!(provenance.is_none());
 
         // 利用前に欠落 ancestor が外部 link へ置き換わっても、一覧 materialize は
         // external path を GridItem::Image として downstream I/O へ渡さない。
         if !create_dir_link(&outside, &album.join("link")) {
             return;
         }
-        let (item, missing) = book_grid_item(&bookmark, None);
+        let (item, missing, provenance) = book_grid_item(&bookmark, None);
         assert!(matches!(item, GridItem::Folder(ref path) if path == &album));
         assert_eq!(missing, Some(true));
+        assert!(provenance.is_none());
     }
 
     #[test]
@@ -975,9 +1019,39 @@ mod tests {
             title: None,
         };
 
-        let (item, missing) = book_grid_item(&bookmark, None);
+        let (item, missing, provenance) = book_grid_item(&bookmark, None);
         assert!(matches!(item, GridItem::Image(ref path) if path == &page));
         assert_eq!(missing, Some(false));
+        assert!(provenance.is_some());
+    }
+
+    #[test]
+    fn relative_page_source_meta_rejects_swap_after_materialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let chapter = album.join("chapter");
+        let parked = album.join("chapter-safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(chapter.join("page.jpg"), b"inside").unwrap();
+        std::fs::write(outside.join("page.jpg"), vec![0u8; 4096]).unwrap();
+
+        let crate::book_bookmarks::RelativePagePathResolution::Existing(provenance) =
+            crate::book_bookmarks::resolve_relative_page_path(&album, "chapter/page.jpg")
+        else {
+            panic!("safe page should materialize");
+        };
+        assert!(source_meta_verified(&provenance).is_some());
+
+        std::fs::rename(&chapter, &parked).unwrap();
+        if !create_dir_link(&outside, &chapter) {
+            return;
+        }
+        assert!(
+            source_meta_verified(&provenance).is_none(),
+            "metadata must not come from the swapped external file"
+        );
     }
 
     #[test]
@@ -1023,6 +1097,7 @@ mod tests {
                 page_num: 4,
                 content_type: None,
             },
+            relative_page_provenance: None,
             image_meta: None,
             marker_thumbnail: None,
             created_at_ms: 1,

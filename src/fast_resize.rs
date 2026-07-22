@@ -113,6 +113,15 @@ pub fn probe_dims(path: &std::path::Path) -> Option<[usize; 2]> {
     Some([w as usize, h as usize])
 }
 
+/// path を再 open できない検証済み relative page / archive entry 用。
+pub fn probe_dims_from_bytes(bytes: &[u8]) -> Option<[usize; 2]> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (w, h) = reader.into_dimensions().ok()?;
+    Some([w as usize, h as usize])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

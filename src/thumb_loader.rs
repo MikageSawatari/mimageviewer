@@ -200,6 +200,9 @@ pub struct LoadRequest {
     pub idx: usize,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
     pub path: std::path::PathBuf,
+    /// manifest relative page の trust root。Some の通常画像は path から直接読まず、
+    /// open 済みハンドルを containment 検証した後の bytes だけを decoder へ渡す。
+    pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     pub mtime: i64,
     pub file_size: i64,
     /// 非破壊編集プレビューのページキー。編集済み画像系アイテムだけに設定する。
@@ -1345,10 +1348,26 @@ pub fn process_load_request(
         crate::pdf_loader::CancelWaitPolicy::AbortOnCancel
     };
 
+    let verified_source_bytes = match req.relative_page_provenance.as_ref() {
+        Some(provenance) => match with_verified_relative_page_bytes(provenance, |bytes| bytes) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "thumb_loader: rejected relative bookmark page {}: {error}",
+                    req.path.display()
+                ));
+                send_thumb_failed(req, tx, gen_done);
+                return;
+            }
+        },
+        None => None,
+    };
+
     load_one_cached(
         load_path,
         zip_entry_ref,
         preloaded_zip_bytes,
+        verified_source_bytes,
         req.pdf_page,
         req.pdf_password.as_deref(),
         req.cache_key_override.as_deref(),
@@ -1387,6 +1406,15 @@ pub fn process_load_request(
             ],
         );
     }
+}
+
+/// open / containment check / use を1つの境界にまとめる。consumer は検証完了後の
+/// owned bytes だけを受け取り、candidate path を再 open できない。
+pub(crate) fn with_verified_relative_page_bytes<T>(
+    provenance: &crate::book_bookmarks::RelativePageProvenance,
+    consume: impl FnOnce(Vec<u8>) -> T,
+) -> std::io::Result<T> {
+    provenance.read_verified().map(consume)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2143,6 +2171,9 @@ pub fn load_one_cached(
     // プリロード済み ZIP エントリバイト列。Some の場合 read_entry_bytes を省略する。
     // `read_first_image_bytes` で ZIP 1 回 open に統合した場合に使用。
     preloaded_zip_bytes: Option<Vec<u8>>,
+    // manifest relative page の検証済み同一ハンドルから読み出した bytes。
+    // Some のとき通常ファイル path を decoder へ渡してはならない。
+    verified_source_bytes: Option<Vec<u8>>,
     pdf_page: Option<u32>,
     pdf_password: Option<&str>,
     cache_key_override: Option<&str>,
@@ -2214,7 +2245,8 @@ pub fn load_one_cached(
     // source_dims を **元寸法** で保存する (DCT scaled buffer ではない)。
     let mut decode_source = crate::stats::DecodeSource::Native;
     let mut dct_stats: Option<ScaleStats> = None;
-    let mut zip_orientation: u16 = 1;
+    let mut byte_orientation: u16 = 1;
+    let has_verified_source = verified_source_bytes.is_some();
     let img_result = if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
         // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
@@ -2270,6 +2302,36 @@ pub fn load_one_cached(
             res.image
         })
         .map_err(|e| image::ImageError::IoError(e))
+    } else if let Some(bytes) = verified_source_bytes {
+        byte_orientation = read_exif_orientation_from_bytes(&bytes);
+        let hint = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if is_jpeg_ext(path) {
+            let target_px = display_px.max(thumb_px);
+            match decode_jpeg_turbo_scaled_from_bytes(&bytes, target_px) {
+                Ok((img, stats)) => {
+                    dct_stats = Some(stats);
+                    Ok(img)
+                }
+                Err(DctDecodeError::TerminalRejection(msg)) => {
+                    crate::logger::log(format!(
+                        "DCT terminal rejection verified relative page {path:?}: {msg}"
+                    ));
+                    Err(image::ImageError::Limits(
+                        image::error::LimitError::from_kind(
+                            image::error::LimitErrorKind::InsufficientMemory,
+                        ),
+                    ))
+                }
+                Err(DctDecodeError::Fallback(_)) => {
+                    decode_zip_chain(&bytes, hint, priority, cancel.cloned(), &mut decode_source)
+                }
+            }
+        } else {
+            decode_zip_chain(&bytes, hint, priority, cancel.cloned(), &mut decode_source)
+        }
     } else if let Some(entry_name) = zip_entry {
         // プリロード済みバイト列があれば ZIP を再度 open せずにデコード
         let bytes_result = if let Some(bytes) = preloaded_zip_bytes {
@@ -2283,7 +2345,7 @@ pub fn load_one_cached(
             Ok(bytes) => {
                 // ZIP 内 RAW/WIC 系の orientation は rexif で読めないため 1 扱いになる。
                 // JPEG 等、rexif が読める EXIF は通常ファイルと同じ向きに揃える。
-                zip_orientation = read_exif_orientation_from_bytes(&bytes);
+                byte_orientation = read_exif_orientation_from_bytes(&bytes);
                 // JPEG なら TurboJPEG DCT scale で高速デコードを試す
                 if is_jpeg_entry(entry_name) {
                     let target_px = display_px.max(thumb_px);
@@ -2468,8 +2530,8 @@ pub fn load_one_cached(
     // ZIP はエントリのバイト列から読み、PDF はレンダ済みページなので常に 1。
     let orientation: u16 = if pdf_page.is_some() {
         1
-    } else if zip_entry.is_some() {
-        zip_orientation
+    } else if zip_entry.is_some() || has_verified_source {
+        byte_orientation
     } else {
         read_exif_orientation(path)
     };
@@ -2655,6 +2717,45 @@ mod tests {
     use crate::settings::{CachePolicy, SortOrder};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[test]
+    fn relative_page_thumbnail_decoder_is_not_called_after_ancestor_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let chapter = album.join("chapter");
+        let parked = album.join("chapter-safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(chapter.join("page.jpg"), b"inside").unwrap();
+        std::fs::write(outside.join("page.jpg"), b"outside-secret").unwrap();
+        let crate::book_bookmarks::RelativePagePathResolution::Existing(provenance) =
+            crate::book_bookmarks::resolve_relative_page_path(&album, "chapter/page.jpg")
+        else {
+            panic!("safe page should materialize");
+        };
+
+        std::fs::rename(&chapter, &parked).unwrap();
+        if !create_dir_link(&outside, &chapter) {
+            return;
+        }
+        let decoder_called = std::sync::atomic::AtomicBool::new(false);
+        let result = with_verified_relative_page_bytes(&provenance, |_| {
+            decoder_called.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(result.is_err());
+        assert!(!decoder_called.load(std::sync::atomic::Ordering::Relaxed));
+    }
 
     fn make_decision(policy: CachePolicy, threshold_ms: u32, size_bytes: u64) -> CacheDecision {
         CacheDecision {
@@ -2989,6 +3090,7 @@ mod tests {
 
         load_one_cached(
             &img_path,
+            None,
             None,
             None,
             None,

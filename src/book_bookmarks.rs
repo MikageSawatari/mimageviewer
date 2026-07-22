@@ -5,6 +5,7 @@
 //! だけが触り、UI スレッドは request / event の送受信だけを行う。
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, mpsc};
 
@@ -1310,14 +1311,157 @@ pub fn container_key(path: &Path) -> String {
 /// 画像フォルダ系ブックマークの相対ページを、実体の container 境界まで確認した結果。
 ///
 /// 欠落ページはブックマークとして保持できるため `Missing` と `Unsafe` を区別する。
-/// `Existing` / `Missing` の path は lexical validation 済みで、container との join に
-/// 使用できる。symlink / junction は一律拒否せず、canonical target が container 内に
-/// 留まるものだけ許可する。
+/// `Existing` は manifest 由来であることと検証済み trust root を保持する。後段の
+/// loader は通常の path open へ戻さず、[`RelativePageProvenance::open_verified`] で
+/// 開いた同一ハンドルの実体を再検証してから利用する。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RelativePagePathResolution {
-    Existing(PathBuf),
+    Existing(RelativePageProvenance),
     Missing(PathBuf),
     Unsafe,
+}
+
+/// 信頼しない sidecar の relative page が由来とする container 境界。
+///
+/// `canonical_container` は materialize 時の trust root を固定する。ファイルを使う
+/// ときは candidate path を検証してから開き直すのではなく、先に開いたハンドルの
+/// final path がこの root 内にあることを確認し、そのハンドル自体から読む。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelativePageProvenance {
+    container: PathBuf,
+    relative: String,
+    canonical_container: Option<PathBuf>,
+}
+
+impl RelativePageProvenance {
+    /// 現在一覧に既にある item へのブックマークジャンプ用。UI スレッドでは lexical
+    /// validation だけを行い、canonicalize / open は loader worker に委ねる。
+    #[allow(dead_code)] // lib target does not compile the App consumers
+    pub(crate) fn unresolved(container: &Path, relative: &str) -> Option<Self> {
+        relative_page_candidate(container, relative)?;
+        Some(Self {
+            container: container.to_path_buf(),
+            relative: relative.replace('\\', "/"),
+            canonical_container: None,
+        })
+    }
+
+    fn materialized(container: &Path, relative: &str, canonical_container: PathBuf) -> Self {
+        Self {
+            container: container.to_path_buf(),
+            relative: relative.replace('\\', "/"),
+            canonical_container: Some(canonical_container),
+        }
+    }
+
+    pub(crate) fn candidate_path(&self) -> PathBuf {
+        // construction 時に lexical validation 済み。
+        self.container
+            .join(self.relative.split('/').collect::<PathBuf>())
+    }
+
+    /// 同じ画像に対応する sidecar candidate へ trust root を引き継ぐ。
+    #[allow(dead_code)] // lib target does not compile the App metadata consumer
+    pub(crate) fn for_candidate(&self, candidate: &Path) -> Option<Self> {
+        let relative = candidate.strip_prefix(&self.container).ok()?;
+        let relative = relative.to_str()?.replace('\\', "/");
+        relative_page_candidate(&self.container, &relative)?;
+        Some(Self {
+            container: self.container.clone(),
+            relative,
+            canonical_container: self.canonical_container.clone(),
+        })
+    }
+
+    /// candidate を開き、開いた同一ハンドルの実体が trust root 内にある場合だけ返す。
+    pub(crate) fn open_verified(&self) -> std::io::Result<VerifiedRelativePageFile> {
+        let canonical_container = match &self.canonical_container {
+            Some(path) => path.clone(),
+            None => std::fs::canonicalize(&self.container)?,
+        };
+        let candidate = self.candidate_path();
+        let file = std::fs::File::open(&candidate)?;
+        let final_path = opened_file_final_path(&file)?;
+        if !canonical_path_is_within(&final_path, &canonical_container)
+            || crate::path_key::eq_keep_drive(&final_path, &canonical_container)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "relative bookmark page resolved outside its container",
+            ));
+        }
+        Ok(VerifiedRelativePageFile { file })
+    }
+
+    pub(crate) fn read_verified(&self) -> std::io::Result<Vec<u8>> {
+        self.open_verified()?.read_to_end()
+    }
+}
+
+/// containment を確認した同一ハンドル。path を再 open する API は意図的に持たない。
+pub(crate) struct VerifiedRelativePageFile {
+    file: std::fs::File,
+}
+
+impl VerifiedRelativePageFile {
+    pub(crate) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    pub(crate) fn read_to_end(mut self) -> std::io::Result<Vec<u8>> {
+        self.file.rewind()?;
+        let mut bytes = Vec::new();
+        self.file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+#[cfg(windows)]
+fn opened_file_final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+
+    let handle = HANDLE(file.as_raw_handle());
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let length = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, VOLUME_NAME_DOS) };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+#[cfg(unix)]
+fn opened_file_final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    for root in ["/proc/self/fd", "/dev/fd"] {
+        let link = Path::new(root).join(fd.to_string());
+        if let Ok(path) = std::fs::read_link(link) {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cannot resolve opened file descriptor path",
+    ))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn opened_file_final_path(_file: &std::fs::File) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opened file path verification is unavailable on this platform",
+    ))
 }
 
 /// 信頼できない相対ページ path を、leaf が欠落していても安全に解決する。
@@ -1358,7 +1502,11 @@ pub(crate) fn resolve_relative_page_path(
                 return if leaf_missing {
                     RelativePagePathResolution::Missing(candidate)
                 } else {
-                    RelativePagePathResolution::Existing(candidate)
+                    RelativePagePathResolution::Existing(RelativePageProvenance::materialized(
+                        container,
+                        relative,
+                        canonical_container,
+                    ))
                 };
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1494,9 +1642,15 @@ mod tests {
         std::fs::write(album.join("chapter/page.jpg"), b"page").unwrap();
         assert!(matches!(
             resolve_relative_page_path(&album, "chapter/page.jpg"),
-            RelativePagePathResolution::Existing(path)
-                if path == album.join("chapter").join("page.jpg")
+            RelativePagePathResolution::Existing(provenance)
+                if provenance.candidate_path() == album.join("chapter").join("page.jpg")
         ));
+        let RelativePagePathResolution::Existing(provenance) =
+            resolve_relative_page_path(&album, "chapter/page.jpg")
+        else {
+            panic!("existing page provenance");
+        };
+        assert_eq!(provenance.read_verified().unwrap(), b"page");
     }
 
     #[test]
@@ -1531,6 +1685,41 @@ mod tests {
             resolve_relative_page_path(&album, "link/future.jpg"),
             RelativePagePathResolution::Missing(_)
         ));
+
+        std::fs::write(inside.join("page.jpg"), b"inside").unwrap();
+        let RelativePagePathResolution::Existing(provenance) =
+            resolve_relative_page_path(&album, "link/page.jpg")
+        else {
+            panic!("internal link page should materialize");
+        };
+        assert_eq!(provenance.read_verified().unwrap(), b"inside");
+    }
+
+    #[test]
+    fn verified_relative_page_read_rejects_swap_after_materialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let chapter = album.join("chapter");
+        let parked = album.join("chapter-safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(chapter.join("page.jpg"), b"inside").unwrap();
+        std::fs::write(outside.join("page.jpg"), b"outside-secret").unwrap();
+
+        let RelativePagePathResolution::Existing(provenance) =
+            resolve_relative_page_path(&album, "chapter/page.jpg")
+        else {
+            panic!("safe page should materialize");
+        };
+        std::fs::rename(&chapter, &parked).unwrap();
+        if !create_dir_link(&outside, &chapter) {
+            return;
+        }
+
+        let result = provenance.read_verified();
+        assert!(result.is_err(), "swapped external target must be rejected");
+        assert_ne!(result.ok().as_deref(), Some(b"outside-secret".as_slice()));
     }
 
     #[test]

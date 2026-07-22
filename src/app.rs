@@ -3456,6 +3456,7 @@ enum DetailsMetaEvent {
 struct DetailsMetaTarget {
     key: String,
     item: GridItem,
+    relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     source_mtime: i64,
     source_size: i64,
     catalog_folder: Option<PathBuf>,
@@ -3747,7 +3748,8 @@ pub(crate) use crate::thumb_loader::{
 };
 
 use crate::fs_animation::{
-    FsCacheEntry, FsLoadResult, decode_apng_frames, decode_gif_frames, decode_webp_frames,
+    FsCacheEntry, FsLoadResult, decode_apng_frames, decode_apng_frames_from_bytes,
+    decode_gif_frames, decode_gif_frames_from_bytes, decode_webp_frames,
     decode_webp_frames_from_bytes,
 };
 use crate::grid_item::{GridItem, ThumbnailState};
@@ -7378,6 +7380,10 @@ pub struct App {
     pub(crate) bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort,
     pub(crate) bookmark_media_open_pending: Option<crate::bookmark_browser::PendingMediaOpen>,
     pub(crate) bookmark_book_open_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+    /// ブックマークから既存 items の relative page を開く1回だけの loader trust root。
+    /// `open_fullscreen` が同期的に fs / metadata worker へ snapshot した直後に破棄する。
+    bookmark_relative_page_open_once:
+        Option<(usize, crate::book_bookmarks::RelativePageProvenance)>,
     /// 横断ブックマーク一覧から開いた viewer を閉じたときの戻り先。
     /// 開いた実コンテナと一致する context だけが `Bookmarks` ナビを返す。
     pub(crate) bookmark_view_return_target:
@@ -10083,6 +10089,7 @@ impl App {
             bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
             bookmark_media_open_pending: None,
             bookmark_book_open_pending: None,
+            bookmark_relative_page_open_once: None,
             bookmark_view_return_target: None,
             bookmark_view_return_grid: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
@@ -23670,7 +23677,24 @@ impl App {
             item_idx = self.book_bookmark_item_idx(bookmark);
         }
         if let Some(idx) = item_idx {
-            self.open_fullscreen_from_fs_navigation(ctx, idx);
+            let provenance = match &bookmark.page_identity {
+                crate::book_bookmarks::PageIdentity::RelativePath(relative) => {
+                    let Some(provenance) =
+                        crate::book_bookmarks::RelativePageProvenance::unresolved(
+                            &bookmark.container_path,
+                            relative,
+                        )
+                    else {
+                        self.show_feedback_toast(
+                            "ブックマーク先のページが不正です（記録は保持されます）".to_string(),
+                        );
+                        return;
+                    };
+                    Some(provenance)
+                }
+                _ => None,
+            };
+            self.open_bookmark_item_with_provenance(ctx, idx, provenance);
         } else {
             self.show_feedback_toast(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
@@ -24143,6 +24167,7 @@ impl App {
                 ));
                 self.bookmark_book_open_pending = Some(crate::bookmark_browser::PendingBookOpen {
                     bookmark: bookmark.clone(),
+                    relative_page_provenance: row.relative_page_provenance.clone(),
                     started_at: std::time::Instant::now(),
                     entered_archive_prefix: false,
                 });
@@ -24391,7 +24416,18 @@ impl App {
         }
         if let Some(idx) = self.book_bookmark_item_idx(&pending.bookmark) {
             self.bookmark_book_open_pending = None;
-            self.open_fullscreen_from_fs_navigation(ctx, idx);
+            let provenance = pending.relative_page_provenance.clone().or_else(|| {
+                let crate::book_bookmarks::PageIdentity::RelativePath(relative) =
+                    &pending.bookmark.page_identity
+                else {
+                    return None;
+                };
+                crate::book_bookmarks::RelativePageProvenance::unresolved(
+                    &pending.bookmark.container_path,
+                    relative,
+                )
+            });
+            self.open_bookmark_item_with_provenance(ctx, idx, provenance);
             return;
         }
 
@@ -24412,6 +24448,31 @@ impl App {
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
         }
+    }
+
+    fn open_bookmark_item_with_provenance(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
+    ) {
+        self.bookmark_relative_page_open_once = provenance.map(|value| (idx, value));
+        self.open_fullscreen_from_fs_navigation(ctx, idx);
+        self.bookmark_relative_page_open_once = None;
+    }
+
+    fn relative_page_provenance_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::book_bookmarks::RelativePageProvenance> {
+        self.bookmark_relative_page_open_once
+            .as_ref()
+            .filter(|(candidate_idx, _)| *candidate_idx == idx)
+            .map(|(_, provenance)| provenance.clone())
+            .or_else(|| {
+                self.bookmark_view_row(idx)
+                    .and_then(|row| row.relative_page_provenance.clone())
+            })
     }
 
     pub(crate) fn book_address_label_for_path(&self, path: &Path) -> Option<String> {
@@ -27234,6 +27295,7 @@ impl App {
                 self.idle_upgrade_cache_bypass_ineligible.insert(i);
                 continue;
             }
+            req.relative_page_provenance = self.relative_page_provenance_for_idx(i);
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
             req.items_gen = self.items_generation;
             // PDF render pool の context epoch を UI スレッドで焼き付ける (TOCTOU 防止)。
@@ -36329,6 +36391,7 @@ impl App {
             Some(g) => g.clone(),
             None => return,
         };
+        let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         let hidden: Vec<String> = self.settings.exif_hidden_tags.clone();
         let key_owned = key.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -36338,7 +36401,13 @@ impl App {
         std::thread::Builder::new()
             .name(format!("metadata-load-{idx}"))
             .spawn(move || {
-                let result = run_metadata_load(key_owned, item, &hidden, &cancel_w);
+                let result = run_metadata_load(
+                    key_owned,
+                    item,
+                    relative_page_provenance,
+                    &hidden,
+                    &cancel_w,
+                );
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
@@ -37491,6 +37560,7 @@ impl App {
         Some(DetailsMetaTarget {
             key,
             item,
+            relative_page_provenance: self.relative_page_provenance_for_idx(idx),
             source_mtime,
             source_size,
             catalog_folder,
@@ -37949,6 +38019,7 @@ impl App {
     }
 
     fn attach_edit_preview_to_request(&mut self, req: &mut LoadRequest) {
+        req.relative_page_provenance = self.relative_page_provenance_for_idx(req.idx);
         if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
             req.edit_preview_key = None;
             req.edit_preview_validate_container = false;
@@ -41645,6 +41716,13 @@ impl App {
         cancel_flag_set || error.kind() == std::io::ErrorKind::Interrupted
     }
 
+    fn with_verified_fullscreen_relative_page_bytes<T>(
+        provenance: &crate::book_bookmarks::RelativePageProvenance,
+        consume: impl FnOnce(Vec<u8>) -> T,
+    ) -> std::io::Result<T> {
+        provenance.read_verified().map(consume)
+    }
+
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG (通常画像) と WebP (通常画像 / ZIP 内画像) は
@@ -41879,6 +41957,7 @@ impl App {
             ),
             _ => return,
         };
+        let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
 
         if pdf_page.is_some() {
             if self.has_retained_pdf_final_ai_for_current_params(idx) {
@@ -41999,6 +42078,25 @@ impl App {
                 emit_exit("early_cancel");
                 return;
             }
+            let verified_source_bytes = match relative_page_provenance.as_ref() {
+                Some(provenance) => {
+                    match Self::with_verified_fullscreen_relative_page_bytes(provenance, |bytes| {
+                        bytes
+                    }) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "  fs relative bookmark page rejected: {error}  {}",
+                                path.display()
+                            ));
+                            let _ = tx.send(FsLoadResult::Failed);
+                            emit_exit("relative_page_rejected");
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
             let t = std::time::Instant::now();
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -42013,7 +42111,11 @@ impl App {
             // ローカル画像ファイルはヘッダ数バイトで寸法が取れる (数 ms)。
             // 本デコード前にホバーバーへサイズ / ダウンスケール警告を出すため先行送信。
             if pdf_page.is_none() && zip_entry.is_none() {
-                if let Some(dims) = crate::fast_resize::probe_dims(&path) {
+                let dims = match verified_source_bytes.as_deref() {
+                    Some(bytes) => crate::fast_resize::probe_dims_from_bytes(bytes),
+                    None => crate::fast_resize::probe_dims(&path),
+                };
+                if let Some(dims) = dims {
                     let _ = tx.send(FsLoadResult::DimsOnly { source_dims: dims });
                 }
             }
@@ -42157,10 +42259,15 @@ impl App {
             } else {
                 None
             };
+            let source_bytes = verified_source_bytes.or(zip_bytes);
 
             // GIF: アニメーション試行 (通常パスのみ, ZIP は未対応)
-            if ext == "gif" && zip_bytes.is_none() {
-                if let Some(frames) = decode_gif_frames(&path) {
+            if ext == "gif" && zip_entry.is_none() {
+                let frames = match source_bytes.as_deref() {
+                    Some(bytes) => decode_gif_frames_from_bytes(bytes),
+                    None => decode_gif_frames(&path),
+                };
+                if let Some(frames) = frames {
                     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                     crate::logger::log(format!(
                         "  fs load anim-gif: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
@@ -42186,8 +42293,12 @@ impl App {
             }
 
             // PNG: APNG アニメーション試行 (通常パスのみ, ZIP は未対応)
-            if ext == "png" && zip_bytes.is_none() {
-                if let Some(frames) = decode_apng_frames(&path) {
+            if ext == "png" && zip_entry.is_none() {
+                let frames = match source_bytes.as_deref() {
+                    Some(bytes) => decode_apng_frames_from_bytes(bytes),
+                    None => decode_apng_frames(&path),
+                };
+                if let Some(frames) = frames {
                     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                     crate::logger::log(format!(
                         "  fs load anim-png: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
@@ -42214,7 +42325,7 @@ impl App {
 
             // WebP: アニメーション試行。通常ファイルと ZIP 内 bytes の両方に対応する。
             if ext == "webp" {
-                let frames = match zip_bytes.as_deref() {
+                let frames = match source_bytes.as_deref() {
                     Some(bytes) => decode_webp_frames_from_bytes(bytes),
                     None => decode_webp_frames(&path),
                 };
@@ -42234,7 +42345,7 @@ impl App {
                                 ("ms", serde_json::Value::from(elapsed)),
                                 ("format", serde_json::Value::from("webp_anim")),
                                 ("frames", serde_json::Value::from(frames.len())),
-                                ("is_zip", serde_json::Value::from(zip_bytes.is_some())),
+                                ("is_zip", serde_json::Value::from(zip_entry.is_some())),
                             ],
                         );
                     }
@@ -42247,8 +42358,11 @@ impl App {
             // 静止画フォールバック
             // image クレート → WIC → Susie プラグインの順で試す
             // ZIP エントリは SHCreateMemStream + CreateDecoderFromStream 経由で WIC へフォールバック
-            let open_result = if let Some(bytes) = zip_bytes.as_deref() {
-                let hint = zip_entry.as_deref().unwrap_or("");
+            let open_result = if let Some(bytes) = source_bytes.as_deref() {
+                let hint = zip_entry
+                    .as_deref()
+                    .or_else(|| path.file_name().and_then(|name| name.to_str()))
+                    .unwrap_or("");
                 match image::load_from_memory(bytes) {
                     Ok(img) => Ok(img),
                     Err(e) => {
@@ -42280,7 +42394,7 @@ impl App {
             match open_result {
                 Ok(img) => {
                     // EXIF Orientation 自動回転。ZIP はエントリのバイト列から読む。
-                    let img = match zip_bytes.as_deref() {
+                    let img = match source_bytes.as_deref() {
                         Some(bytes) => {
                             crate::thumb_loader::apply_exif_orientation_from_bytes(img, bytes)
                         }
@@ -57898,6 +58012,7 @@ fn apply_folder_thumb_pin(
         // pinned_key 下に書き戻してしまい、video frame が消える。
         return LoadRequest {
             path: container.to_path_buf(),
+            relative_page_provenance: None,
             zip_entry: None,
             zip_dir_prefix: None,
             pdf_page: None,
@@ -57957,6 +58072,7 @@ fn apply_folder_thumb_pin(
 
     LoadRequest {
         path: resolved.abs_path,
+        relative_page_provenance: None,
         zip_entry,
         zip_dir_prefix,
         pdf_page,

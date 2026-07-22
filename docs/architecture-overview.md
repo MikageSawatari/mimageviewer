@@ -323,6 +323,9 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 `mimageviewer.dat` と独立した versioned JSON を実フォルダ直下へ作る。評価、タグ、
 動画・音声ブックマーク、本ブックマークを対象にし、再帰 export でも sidecar は root の
 1 個だけ。import は manifest に記載された物理項目だけを上書きし、未記載項目を保持する。
+manifest 由来の画像本の相対ページは provenance と canonical container を一覧から
+metadata / thumbnail / fullscreen worker まで保持し、実 I/O では開いた同一ハンドルの
+final path を再検証してから、そのハンドル由来の metadata / bytes だけを利用する。
 実装と境界条件は `metadata_transfer.rs`、モーダルと writer drain は
 `ui_dialogs/metadata_transfer.rs` が所有する。
 

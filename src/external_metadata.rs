@@ -155,6 +155,45 @@ pub fn read_for_display(image_path: &Path) -> Option<SidecarDisplay> {
     }
 }
 
+/// manifest relative page 用。sidecar candidate も画像と同じ trust root の下で開き、
+/// containment を確認した同一ハンドルからだけ読む。
+#[allow(dead_code)] // lib target does not compile the App metadata consumer
+pub(crate) fn read_for_display_verified(
+    provenance: &crate::book_bookmarks::RelativePageProvenance,
+) -> Option<SidecarDisplay> {
+    for path in candidate_paths(&provenance.candidate_path()) {
+        let Some(candidate) = provenance.for_candidate(&path) else {
+            continue;
+        };
+        let Ok(opened) = candidate.open_verified() else {
+            continue;
+        };
+        let Ok(metadata) = opened.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_SIDECAR_BYTES {
+            continue;
+        }
+        let Ok(raw) = opened.read_to_end() else {
+            continue;
+        };
+        let bytes = strip_utf8_bom(&raw);
+        let display = if is_json_ext(&path) {
+            serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .map(SidecarDisplay::Json)
+        } else {
+            let text = String::from_utf8_lossy(bytes);
+            let capped = truncate_on_char_boundary(&text, MAX_TEXT_BYTES).to_string();
+            (!capped.trim().is_empty()).then_some(SidecarDisplay::Text(capped))
+        };
+        if display.is_some() {
+            return display;
+        }
+    }
+    None
+}
+
 /// 監視 (notify) でサイドカー (`*.json` / `*.txt`) の変更イベントが届いたとき、
 /// 再 ingest すべき兄弟画像を逆引きする (docs §14-2)。
 /// - `<full>` 形式 (`foo.jpg.json`): 拡張子を剥がすと既存画像 `foo.jpg` → それを返す。

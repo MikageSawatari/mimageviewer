@@ -611,7 +611,7 @@ impl App {
             return None;
         }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
-        let req = make_load_request(
+        let mut req = make_load_request(
             item,
             idx,
             mtime,
@@ -628,6 +628,7 @@ impl App {
             self.video_pin_db.as_ref(),
             self.use_full_path_cache_keys(),
         )?;
+        req.relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         Some((item.perf_key(), req))
     }
 

@@ -6366,10 +6366,109 @@ fn bookmark_grid_test_row(id: i64) -> crate::bookmark_browser::BookmarkBrowserRo
             is_audio: false,
         },
         item: GridItem::Video(path),
+        relative_page_provenance: None,
         image_meta: None,
         marker_thumbnail: None,
         created_at_ms: id,
         missing: false,
+    }
+}
+
+#[cfg(test)]
+mod relative_page_io_boundary_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::path::Path;
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    fn write_png(path: &Path, color: [u8; 4]) {
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 2, image::Rgba(color)))
+            .save(path)
+            .unwrap();
+    }
+
+    #[test]
+    fn fullscreen_boundary_does_not_call_decoder_after_relative_page_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let chapter = album.join("chapter");
+        let parked = album.join("chapter-safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        write_png(&chapter.join("page.png"), [1, 2, 3, 255]);
+        write_png(&outside.join("page.png"), [240, 10, 10, 255]);
+        let crate::book_bookmarks::RelativePagePathResolution::Existing(provenance) =
+            crate::book_bookmarks::resolve_relative_page_path(&album, "chapter/page.png")
+        else {
+            panic!("safe page should materialize");
+        };
+
+        std::fs::rename(&chapter, &parked).unwrap();
+        if !create_dir_link(&outside, &chapter) {
+            return;
+        }
+        let decoder_called = std::sync::atomic::AtomicBool::new(false);
+        let result = App::with_verified_fullscreen_relative_page_bytes(&provenance, |_| {
+            decoder_called.store(true, Ordering::Relaxed);
+        });
+        assert!(result.is_err());
+        assert!(!decoder_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn current_list_bookmark_jump_revalidates_relative_page_at_fullscreen_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        let chapter = album.join("chapter");
+        let parked = album.join("chapter-safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let page = chapter.join("page.png");
+        write_png(&page, [1, 2, 3, 255]);
+        write_png(&outside.join("page.png"), [240, 10, 10, 255]);
+
+        let mut app = setup_app();
+        app.current_folder = Some(album.clone());
+        app.items.push(GridItem::Image(page.clone()));
+        app.image_metas.push(Some((1, 1)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.visible_indices.push(0);
+        let bookmark = crate::book_bookmarks::BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&album),
+            container_path: album.clone(),
+            container_kind: crate::book_bookmarks::BookContainerKind::ImageFolder,
+            page_identity: crate::book_bookmarks::PageIdentity::RelativePath(
+                "chapter/page.png".to_string(),
+            ),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+        assert_eq!(app.book_bookmark_item_idx(&bookmark), Some(0));
+
+        std::fs::rename(&chapter, &parked).unwrap();
+        if !create_dir_link(&outside, &chapter) {
+            return;
+        }
+        app.jump_to_current_book_bookmark(&egui::Context::default(), &bookmark);
+
+        let (_, rx, _) = app.fs_pending.get(&0).expect("fullscreen load pending");
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fullscreen worker result");
+        assert!(matches!(result, FsLoadResult::Failed));
     }
 }
 
@@ -6610,6 +6709,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
             created_at_ms: 1,
             title: None,
         },
+        relative_page_provenance: None,
         started_at: std::time::Instant::now(),
         entered_archive_prefix: false,
     });
@@ -19458,6 +19558,7 @@ mod native_video_rating_key_tests {
                 },
             ),
             item: GridItem::Image(path),
+            relative_page_provenance: None,
             image_meta: None,
             marker_thumbnail: None,
             created_at_ms: 71,
