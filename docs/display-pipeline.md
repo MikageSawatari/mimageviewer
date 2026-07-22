@@ -123,6 +123,11 @@ load 時に失効する。削除／全消去通知を受けた UI も、メモ�
 保存完了通知を受けた UI は該当セルを `Evicted` に戻して読み直し、同時進行して
 いた raw decode が後着しても `from_edit_preview` が立つまで再試行する。
 
+閲覧だけで viewer を閉じた場合は、永続 preview 行が実在して削除されたときだけ UI へ失効を通知する。
+行が存在しない通常サムネイルまで `Evicted` に戻すと、開閉したセルだけが灰色へ戻って再 decode される
+ためである。一方、編集データの明示的な更新では、preview 行が未生成でもメモリ上の派生表示を破棄する
+必要があるため、従来どおり必ず失効を通知する。この二つの削除契約は service command で区別する。
+
 親コンテナの代表サムネイルを手動 pin した場合も、cascade 解決後の leaf が固定の
 Image / ZipEntry / PdfPage なら同じ preview を通常 catalog より優先する。直接ページは
 page mtime + size、ZIP/PDF の親代表は保存 worker が記録した container size と thumbnail

@@ -543,10 +543,15 @@ impl EditPreviewCacheDb {
         Ok(())
     }
 
-    pub fn delete(&self, item_key: &str) {
+    /// Returns `true` only when an existing preview row was removed.
+    ///
+    /// Callers use this distinction to avoid publishing a cache invalidation for a read-only
+    /// viewer close when there was no cached preview in the first place. Explicit edit mutations
+    /// may still choose to publish an invalidation even when this returns `false`.
+    pub fn delete(&self, item_key: &str) -> bool {
         let paths: Vec<String> = {
             let Ok(conn) = self.conn.lock() else {
-                return;
+                return false;
             };
             let row: Option<(String, String)> = conn
                 .query_row(
@@ -558,18 +563,24 @@ impl EditPreviewCacheDb {
                 .optional()
                 .ok()
                 .flatten();
-            row.map(|(path, layers)| cache_paths(&path, &layers))
-                .unwrap_or_default()
-        };
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
+            let Some((path, layers)) = row else {
+                return false;
+            };
+            let Ok(deleted) = conn.execute(
                 "DELETE FROM edit_previews WHERE item_key = ?1",
                 params![item_key],
-            );
-        }
+            ) else {
+                return false;
+            };
+            if deleted == 0 {
+                return false;
+            }
+            cache_paths(&path, &layers)
+        };
         for path in paths {
             remove_file_and_empty_parents(&self.root, Path::new(&path));
         }
+        true
     }
 
     fn delete_if_row_matches(
@@ -966,11 +977,18 @@ enum EditPreviewCommand {
     },
     Delete {
         item_key: String,
+        /// Explicit edit mutations must refresh a materialized thumbnail even when no persistent
+        /// preview existed. A read-only viewer close only refreshes when it actually removed one.
+        notify_if_missing: bool,
     },
     Prune {
         max_bytes: u64,
     },
     Clear,
+}
+
+fn publish_delete_invalidation(removed: bool, notify_if_missing: bool) -> bool {
+    removed || notify_if_missing
 }
 
 pub struct EditPreviewCacheService {
@@ -1041,9 +1059,14 @@ impl EditPreviewCacheService {
                                 )),
                             }
                         }
-                        EditPreviewCommand::Delete { item_key } => {
-                            worker_db.delete(&item_key);
-                            let _ = event_tx.send(EditPreviewEvent::Invalidated { item_key });
+                        EditPreviewCommand::Delete {
+                            item_key,
+                            notify_if_missing,
+                        } => {
+                            let removed = worker_db.delete(&item_key);
+                            if publish_delete_invalidation(removed, notify_if_missing) {
+                                let _ = event_tx.send(EditPreviewEvent::Invalidated { item_key });
+                            }
                         }
                         EditPreviewCommand::Prune { max_bytes } => worker_db.prune(max_bytes),
                         EditPreviewCommand::Clear => {
@@ -1087,7 +1110,19 @@ impl EditPreviewCacheService {
     }
 
     pub fn delete(&self, item_key: String) {
-        let _ = self.tx.send(EditPreviewCommand::Delete { item_key });
+        let _ = self.tx.send(EditPreviewCommand::Delete {
+            item_key,
+            notify_if_missing: true,
+        });
+    }
+
+    /// Removes a stale preview at a viewer-close boundary without invalidating an unchanged raw
+    /// thumbnail when no preview row existed.
+    pub fn delete_if_present(&self, item_key: String) {
+        let _ = self.tx.send(EditPreviewCommand::Delete {
+            item_key,
+            notify_if_missing: false,
+        });
     }
 
     pub fn prune(&self, max_bytes: u64) {
@@ -1161,6 +1196,31 @@ mod tests {
         assert_eq!(hit.image.size, [8, 4]);
         assert!(db.load("page-a", 11, 20, 2048).is_none());
         assert_eq!(db.total_bytes(), 0);
+    }
+
+    #[test]
+    fn delete_reports_whether_a_persistent_preview_was_removed() {
+        let (_temp, db) = test_db();
+        assert!(!db.delete("missing"));
+
+        let webp = encode_preview(&egui::ColorImage::filled(
+            [8, 4],
+            egui::Color32::from_rgb(20, 80, 140),
+        ))
+        .unwrap();
+        db.save_encoded("page-delete", 10, 20, None, (8, 4), &webp, &[])
+            .unwrap();
+
+        assert!(db.delete("page-delete"));
+        assert!(!db.delete("page-delete"));
+        assert_eq!(db.total_bytes(), 0);
+    }
+
+    #[test]
+    fn read_only_close_does_not_publish_missing_preview_invalidation() {
+        assert!(!publish_delete_invalidation(false, false));
+        assert!(publish_delete_invalidation(true, false));
+        assert!(publish_delete_invalidation(false, true));
     }
 
     #[test]

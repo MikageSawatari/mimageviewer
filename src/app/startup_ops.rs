@@ -242,6 +242,18 @@ impl App {
         {
             return opened;
         }
+        #[cfg(windows)]
+        if matches!(source, StartupOpenPathSource::Bookmark)
+            && !self.settings.detached_viewer_open_images_in_window
+            && self
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+                .is_some()
+            && !self.park_detached_media_before_fullfeature_bookmark_book_open(ctx)
+        {
+            return false;
+        }
         let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
             || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
         let outcome =
@@ -348,6 +360,29 @@ impl App {
             placement_seed,
             Some(pending),
         ))
+    }
+
+    /// Full-feature book opens continue through the mounted/main context so editing and linked
+    /// viewer semantics stay unchanged. If a detached media context currently owns the active
+    /// session, park that media first through the standard `ParkedLive` handoff. Loading the book
+    /// while the media context remains active lets both paths compete for the single mounted
+    /// `active_detached_session`, which can re-show the media window and suppress the book open.
+    #[cfg(windows)]
+    pub(super) fn park_detached_media_before_fullfeature_bookmark_book_open(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        let active_media = self.active_detached_viewer_context_contains_video();
+        let mounted_media =
+            self.viewer_session_is_detached() && self.current_viewer_context_contains_video();
+        if !active_media && !mounted_media {
+            return true;
+        }
+
+        crate::logger::log(format!(
+            "[bookmark-open] park detached media before full-feature book open active_context={active_media} mounted={mounted_media}"
+        ));
+        self.park_and_close_current_active_detached_viewer(ctx)
     }
 
     /// 「フル機能ウィンドウ + 動画・音声を別ウィンドウ」でブックマークを開く。

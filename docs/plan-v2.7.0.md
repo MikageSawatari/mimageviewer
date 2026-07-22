@@ -40,6 +40,9 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   同じ終了経路を通り、1 回の操作で再生を終了する。対象から移動していた場合だけ、detached context の
   最終フォルダと選択ファイルをメインへ反映する。終了時の DB 再照合で一覧内容が同一なら、
   メイン一覧を再構築せず現在の表示を維持する。
+  同モードで detached 動画・音声の再生中に本ブックマークを開く場合は、先にメディア context を
+  共通 handoff で `ParkedLive` へ退避してから、本を従来のフル機能 container open へ渡す。
+  active media session を残したまま book session を開始せず、動画窓の再表示と本 open の競合を防ぐ。
   「画像を別ウィンドウで開く」複数ウィンドウモードでは、本のブックマークも通常の本を開く経路と
   同じ independent detached viewer context を使う。PDF / ZIP / 画像フォルダ / 製本 / 変換済み
   対応アーカイブのページ列挙と対象ページ解決は detached context が所有し、メインウィンドウは

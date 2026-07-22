@@ -7320,6 +7320,89 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
     assert!(app.bookmark_view_state.is_none());
 }
 
+#[cfg(windows)]
+#[test]
+fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let video = PathBuf::from(r"C:\Media\bookmark.mp4");
+    let book = PathBuf::from(r"C:\Books\volume.pdf");
+    let window_id = 73;
+
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.fullfeature_media_window = true;
+    app.current_folder = Some(super::bookmark_view_synthetic_path());
+    app.items_are_bookmark_view = true;
+    app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(book.clone()),
+        grid: super::BookmarkViewReturnGridState {
+            row_keys: vec![(1, 73)],
+            selected_key: Some((1, 73)),
+            opened_key: (1, 73),
+            scroll_offset_y: 360.0,
+        },
+    });
+    app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+        crate::bookmark_browser::PendingBookOpen {
+            bookmark: crate::book_bookmarks::BookBookmark {
+                id: 73,
+                container_key: crate::adjustment_db::normalize_path(&book),
+                container_path: book.clone(),
+                container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+                page_identity: crate::book_bookmarks::PageIdentity::PdfPage(4),
+                page_index_hint: 4,
+                created_at_ms: 1,
+                title: None,
+            },
+            relative_page_provenance: None,
+            stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+        },
+    ));
+
+    let mut media_bundle = super::ViewerContextBundle::empty();
+    media_bundle.items = vec![GridItem::Video(video.clone())];
+    media_bundle.fullscreen_idx = Some(0);
+    media_bundle.viewer_session.presentation = super::ViewerPresentation::DetachedWindow;
+    media_bundle.viewer_session.detached_window_id = Some(window_id);
+    media_bundle.viewer_session.independent_active = true;
+    app.active_detached_viewer_context = Some(super::ActiveDetachedViewerContext {
+        bundle: media_bundle,
+    });
+    app.begin_active_detached_session(window_id, super::DetachedSource::Video);
+
+    assert!(app.park_detached_media_before_fullfeature_bookmark_book_open(&ctx));
+
+    assert!(app.active_detached_viewer_context.is_none());
+    assert!(app.active_detached_session.is_none());
+    assert!(app.items_are_bookmark_view);
+    assert_eq!(
+        app.current_folder.as_deref(),
+        Some(super::bookmark_view_synthetic_path().as_path())
+    );
+    assert!(matches!(
+        app.bookmark_open_pending,
+        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+    ));
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(super::BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(ref path),
+            ..
+        }) if crate::path_key::eq_keep_drive(path, &book)
+    ));
+    assert_eq!(app.detached_image_windows.len(), 1);
+    let parked = &app.detached_image_windows[0];
+    assert_eq!(parked.id, window_id);
+    assert_eq!(
+        app.detached_window_state(window_id),
+        Some(super::DetachedWindowState::ParkedLive)
+    );
+    assert!(parked.paused_bundle.as_deref().is_some_and(|bundle| {
+        bundle.fullscreen_idx == Some(0)
+            && matches!(bundle.items.first(), Some(GridItem::Video(path)) if path == &video)
+    }));
+}
+
 // =======================================================================
 // Phase C - Ctrl+G drill view アドレスバー表示テスト (2026-04 報告)
 //

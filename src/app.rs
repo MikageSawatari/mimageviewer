@@ -4191,7 +4191,7 @@ enum EditPreviewCloseUpdate {
         annotations: Option<crate::edit_preview_cache::EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
     },
-    Delete {
+    DeleteIfPresent {
         item_key: String,
     },
 }
@@ -44923,14 +44923,14 @@ impl App {
             .cloned();
         let has_annotations = annotation_objects.is_some();
         if !has_source_edits && !has_annotations && !has_crop {
-            return Some(EditPreviewCloseUpdate::Delete { item_key });
+            return Some(EditPreviewCloseUpdate::DeleteIfPresent { item_key });
         }
 
         let edit_key = self.current_edit_result_key(idx);
         let Some(entry) = self.edit_result_cache.get(&edit_key) else {
             // 最新世代がまだ完成していない場合、古いプレビューを表示する方が危険。
             // 今回は削除し、次に完成結果を表示して閉じた時に再生成する。
-            return Some(EditPreviewCloseUpdate::Delete { item_key });
+            return Some(EditPreviewCloseUpdate::DeleteIfPresent { item_key });
         };
         let pixels = Arc::clone(&entry.pixels);
         let crop = self.export_crop_rect_for_pixels(idx, pixels.size);
@@ -44939,7 +44939,7 @@ impl App {
             // navigation 境界で新しいフォント列挙やファイル読み込みを同期実行しない。
             let Some(fonts) = self.comic_fonts.clone() else {
                 // 注釈を欠いたプレビューで旧結果を上書きしない。
-                return Some(EditPreviewCloseUpdate::Delete { item_key });
+                return Some(EditPreviewCloseUpdate::DeleteIfPresent { item_key });
             };
             let (source_w, source_h) = self
                 .source_dims_for_idx(idx)
@@ -44991,7 +44991,9 @@ impl App {
                 self.settings.edit_preview_cache_max_bytes.max(1_000_000),
                 self.edit_preview_repaint_ctx.clone(),
             ),
-            EditPreviewCloseUpdate::Delete { item_key } => service.delete(item_key),
+            EditPreviewCloseUpdate::DeleteIfPresent { item_key } => {
+                service.delete_if_present(item_key)
+            }
         }
     }
 

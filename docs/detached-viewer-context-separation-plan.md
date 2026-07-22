@@ -192,11 +192,18 @@ active detached bundle へロードし、player とブックマーク時刻へ�
 メイン一覧、タグバッジ、選択、スクロールを載せたままにする。名称変更・追加・削除・missing 状態など
 表示内容が変わった場合だけ一覧を再構築する。
 
-本ブックマークも同じ境界を使う。path resolve 後に main の汎用 startup loader へ流してページ一覧へ
-遷移させず、PDF / ZIP / 画像フォルダ / 製本は `ViewerContextDescriptor` から active detached book
-context を開始する。RAR / 7z / LZH は direct-read probe または変換完了までは要求を `Resolving` として
-保持し、readable backing archive が確定した時点で同じ context 開始関数へ渡す。active context が
-ページ列挙と stable page identity の解決を所有し、main は一覧 bundle を mount したままにする。
+本ブックマークはビューワモードごとの既存契約を維持する。複数ウィンドウモードでは、path resolve 後に
+main の汎用 startup loader へ流してページ一覧へ遷移させず、PDF / ZIP / 画像フォルダ / 製本を
+`ViewerContextDescriptor` から active detached book context として開始する。RAR / 7z / LZH は
+direct-read probe または変換完了までは要求を `Resolving` として保持し、readable backing archive が
+確定した時点で同じ context 開始関数へ渡す。active context がページ列挙と stable page identity の
+解決を所有し、main は一覧 bundle を mount したままにする。
+
+フル機能モードでは編集機能と linked viewer の意味論を保つため、本は従来どおり mounted/main context
+の container open へ渡す。ただし「動画・音声は別ウィンドウ」で active media context が存在する場合、
+container load より先に共通 handoff でその media bundle を `ParkedLive` へ移す。active media session を
+残したまま main 側で book session を開始してはならない。両者が App-global の active session を競合し、
+動画窓の再表示や本 open の消失を招くためである。ParkedLive の再生は継続し、本側はフル機能経路を使う。
 
 ブックマーク起点の状態は `PendingBookmarkOpen::{Media, Book}` と
 `BookmarkViewState::{Opening, Restoring, Detached}` に集約する。media/book の pending を別々に持つこと、
