@@ -4,31 +4,139 @@
 コード比較基準: `v2.6.0` (`0d504f6d`) .. `a963317b`
 レビュー計画: [systemic-review-plan.md](systemic-review-plan.md)
 
-## 状態
+## 結論
 
-レビュー計画の固定前。コードレビューは本書と計画文書のコミット後に開始する。
+コード対象を `0d504f6d..a963317b` に固定し、最新のbookmark detached修正を起点に、
+context ownership、非同期request、cache invalidation、入力経路、同型のtop-level viewを
+横断して再レビューした。
 
-## 進捗
+**未解決はP2が1件。** slow pathのbookmark openを通常navigationまたはactivationが置き換える場合、
+path resolverとbookmark requestの解消が一体化されていない。手動navigation後に古いbookmarkが
+遅れて開く、またはactivation後にold pendingが残る可能性があるため、コード出荷判定は保留とする。
 
-- [ ] commit分類とownership境界
-- [ ] bookmark open routing / return / close
-- [ ] detached session / context handoff
-- [ ] thumbnail / cache / worker ownership
-- [ ] input parity / request correlation / cancellation
-- [ ] top-level virtual viewの同型検索
-- [ ] metadata import / export
-- [ ] mipmap / GPU lifecycle
-- [ ] rating / details / music metadata / その他
-- [ ] 自動検証と最終判定
+それ以外の最新bookmark routing、detached handoff、main thumbnail/cache ownership、metadata
+import/export、mipmap、details/rating/music metadataでは追加指摘はない。既レビュー指摘の修正も維持され、
+focused test、全library test、全main binary test、check、format、UI文字検査はすべて成功した。
 
 ## 指摘一覧
 
-レビュー開始後、重要度順に記録する。
+### [P2] bookmark path resolverとopen requestが別々に置換・cancelされる
+
+- 場所: `src/app/startup_ops.rs:25-38`, `src/app/startup_ops.rs:90-176`,
+  `src/app.rs:14452-14484`, `src/app.rs:24254-24325`, `src/app.rs:24420-24586`
+- 破れている不変条件: 新しいnavigation / activationがopen要求を置き換えた後、古い要求は現在の
+  表示を変更せず、request、view state、resolver、repaint待ちを同じownership境界で終了する。
+- 根本原因: `PendingBookmarkOpen::{Media, Book}`はmedia/bookの同時保持を防ぐが、
+  `StartupOpenPathResolvePending`とは別のApp fieldであり、両者を結ぶrequest identityがない。
+  `start_startup_open_path_resolve`は旧resolverだけをdrop/cancelし、対応するbookmark pendingと
+  `BookmarkViewState`のdispositionを決めない。通常の`load_folder_with_scan`もview stateは照合するが、
+  in-flight resolverと`bookmark_open_pending`を終了しない。
+- 影響1: network path等のbookmark resolve中に通常navigationするとresolverは生存する。完了時には
+  detached bookmark用のtarget照合が外れてもgeneric Bookmark openへfall throughするため、ユーザーが
+  後から選んだ場所を古いbookmark containerで上書きし得る。
+- 影響2: bookmark resolve中にactivationが入ると旧resolverはcancelされるが、Book pendingは
+  `Resolving`のままtimeoutせず残る。`poll_bookmark_browser`は50ms repaintを継続する。Media pendingは
+  30秒後に無関係な失敗toastを出す。
+- 同型検索: bookmark A→Bは新resolverのstate-local receiverへ置き換わるため旧resultは適用されない。
+  archive変換も二重起動を拒否し、各`ArchiveConvertState`が固有receiverを所有するため、当初疑った
+  AのcompletionがBへ混線する経路は成立しない。metadata transfer、details lazy metadata、thumbnail
+  worker、top-level search/smart folderにもgenerationまたはstate-local receiverがあり、同型指摘なし。
+
+### 必要な修正
+
+1. bookmark open requestへ単調なrequest IDまたは同等のtyped ownerを持たせ、path resolverまで同じ
+   requestに含める。
+2. bookmark A→B、activation、通常navigation、cancel、disconnect、timeoutの各遷移で、旧IDに属する
+   resolver / pending / view stateだけを原子的に終了する。新しいBを旧Aのcancelで消さない。
+3. completionはrequest IDとtarget identityが現在のrequestに一致する場合だけ適用する。
+4. Bookの`Resolving`にも終了条件を持たせ、ownerのないpendingがrepaintを継続しないようにする。
+
+### 必須回帰テスト
+
+- slow bookmark resolve → 通常folder navigation → late resultでも現在folderが変わらない。
+- slow bookmark resolve → activation → 旧bookmark pending/view stateが残らずactivationだけが作用する。
+- bookmark A → bookmark BではBだけが開き、AのcancelがBを消さない。
+- Media / Bookそれぞれでcancel、worker disconnect、timeout後にpendingとrepaint理由が残らない。
+
+## 最新bookmark修正の確認
+
+### routing / input parity
+
+- `PendingBookmarkOpen::{Media, Book}`でmedia/book requestを排他化している。
+- mouse double-click、Enter、gamepad acceptはすべて`open_bookmark_browser_row`へ合流する。
+- PDF、ZIP、画像フォルダ、製本、変換アーカイブは既存のdetached book context seamを使用し、mainの
+  bookmark grid bundleを置き換えない。
+- full-feature bookを開く前のactive mediaは既存のParkedLive handoffで退避する。
+
+### context / cache ownership
+
+- `ViewerContextBundle`はitems、thumbnail state、request/result channel、queue、cancel token、generation、
+  fullscreen/edit cache、bookmark stateをcontext単位で所有する。detachedのDropやresult drainがmainの
+  thumbnail workerを直接cancel/drainする経路はない。
+- detached openはmain bundleを退避してempty bundleへloadし、active bundleを確定後にmainを戻す。
+  close時もmainの現在selection/scrollを優先してbookmark read modelだけを再照合する。
+- edit preview closeは、実在rowを削除した場合だけread-only closeのinvalidationを発行する。明示的編集は
+  cache missでもinvalidationを発行する。報告されたmain thumbnailの不要なPending化に対する修正方針は
+  適切である。
+- bookmark read modelの同一判定はstable key、source/title/position、provenance、metadata、marker thumbの
+  有無、created time、missingを比較する。marker thumb blobは既存blobを自動更新しない現行生成経路のため、
+  有無比較で表示上の変更を取りこぼさない。
+
+## 機能別再レビュー
+
+### metadata import / export
+
+- dialog workerは`MetadataTransferState`固有receiverとcancel tokenを持ち、別jobのcompletionを適用しない。
+- exportのatomic sidecar、importの部分commit/cancel仕様、scan depth/size制限、manifest path検証を維持する。
+- relative bookmark pageはprovenanceをmetadata、thumbnail、fullscreenまで運び、open済みfile handleのfinal
+  pathをcontainment検証した同じhandleから読む。前回のTOCTOU指摘は解消済み。
+- 追加指摘なし。
+
+### mipmap / GPU lifecycle
+
+- full mip chain、compare textureの現在組だけの保持、pin縮小texture、panorama seamのexplicit gradient、
+  crop sampler分離を維持する。`20627fb4`以降に対象実装の意味を変える差分はない。
+- 追加指摘なし。
+
+### details / rating / music metadata / その他
+
+- details best-fitはview kindと列別content revisionをjob keyへ含め、動的State列をall-row scanする。
+- filesystem journal phase/rollback保持、rating shared write generation、stable ring target、XMP undoの前回修正を
+  維持する。
+- 音楽metadata URLは既存HTTP(S) parser/rendererを再利用し、外部browser open前にplayerをpauseする。
+- top-level virtual viewは`TopLevelGridView`がsurface、return owner、generationを所有し、smart folder/search
+  workerもcancel/generation境界を持つ。bookmark resolverと同型の未相関completionは見つからない。
+- 追加指摘なし。
+
+## commit分類
+
+- bookmark / top-level view / detached routing: `8439c0b5`, `1ff18e91`〜`76f180df`,
+  `2814e6bb`, `a575b174`, `f8b8ff78`, `ae6dde0d`, `ee8ffe57`, `04b9ee37`,
+  `37b687ea`, `e5875e65`, `2d60663a`
+- metadata import / exportとpath安全性: `1c773b1d`, `6d457883`, `7f5c1ce2`, `0534955f`
+- mipmap / panorama / GPU resource: `d36a6005`, `0d42b62b`, `efb94303`, `20627fb4`
+- details / font / UI scale: `9e506d80`, `e89eec16`, `d7331b1b`, `61218736`,
+  `c25a26a3`, `1b8028ef`
+- rating / ring / undo: `04b9ee37`, `37b687ea`, `eec48ae4`
+- その他UI / release: `f4b2c663`, `1a13038a`, `e75c5504`, `a963317b`
 
 ## 検証結果
 
-レビュー開始後に記録する。
+- `cargo test -p mimageviewer --bin mimageviewer-core bookmark -- --test-threads=1`:
+  134 passed
+- `cargo test -p mimageviewer --lib metadata_transfer -- --test-threads=1`: 17 passed
+- `cargo test -p mimageviewer --bin mimageviewer-core details_best_fit -- --test-threads=1`:
+  14 passed
+- mipmap / panorama / music URL focused tests: 各1 passed
+- `cargo test -p mimageviewer --lib -- --test-threads=1`:
+  2,314 passed / 17 ignored
+- `cargo test -p mimageviewer --bin mimageviewer-core -- --test-threads=1`:
+  4,054 passed / 18 ignored
+- `cargo check -p mimageviewer --bin mimageviewer-core`: passed
+- `cargo fmt --all -- --check`: passed
+- `python scripts/check_ui_glyphs.py`: passed（dangerous glyph 0）
 
 ## 最終判定
 
-未判定。
+**コード出荷保留。** 上記P2をroot causeで修正し、通常navigation / activationを含むrequest lifecycle
+testを追加した後、この指摘と同型経路を再レビューする。P2以外のコード領域は本レビュー上readyである。
