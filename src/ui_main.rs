@@ -40,14 +40,15 @@ const BOOK_REORDER_MIN_WINDOW_H: f32 = 360.0;
 const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 const BOOK_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 64.0;
 const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
-// 詳細ヘッダ + 詳細行 + パネル内の最小余白。下部情報バーはこの 2 行を
-// CentralPanel より先に予約し、グリッドの仮想 viewport から確実に除外する。
-const SELECTION_INFO_BAR_HEIGHT: f32 = 58.0;
+// 詳細ヘッダ + 詳細行 + パネル内の最小余白。下部情報バーはこの 2 行に加えて
+// solid 横スクロールバー専用レーンを CentralPanel より先に予約する。
+const SELECTION_INFO_BAR_CONTENT_HEIGHT: f32 = 58.0;
 // 列境界のダブルクリックは UI thread 上で egui の font atlas を使って文字幅を測る。
 // 全行の exact max を維持したまま 1 frame の仕事量を一定にするため、分割 job で測る。
 const DETAILS_BEST_FIT_ROWS_PER_FRAME: usize = 192;
 const DETAILS_BEST_FIT_HORIZONTAL_PADDING: f32 = 14.0;
 const DETAILS_BEST_FIT_MAX_WIDTH: f32 = 800.0;
+const DETAILS_LAYOUT_DEBUG_ENV: &str = "MIV_DETAILS_LAYOUT_DEBUG";
 const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [86, 86, 86],
     [255, 255, 255],
@@ -361,6 +362,14 @@ fn sticky_facet_menu_config() -> egui::containers::menu::MenuConfig {
 fn prepare_facet_menu_popup(ui: &mut egui::Ui) {
     ui.set_min_width(180.0);
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+}
+
+fn ui_scale_menu_button(ui: &mut egui::Ui, checked: bool, percent: u32) -> egui::Response {
+    let prefix = if checked { "✓ " } else { "  " };
+    // The scaling submenu is only as wide as its unselected numeric labels. If the check mark
+    // makes the selected label slightly wider, the default wrap mode can split `✓ 100%` across
+    // two rows. Let this one menu row extend the popup width instead.
+    ui.add(egui::Button::new(format!("{prefix}{percent}%")).wrap_mode(egui::TextWrapMode::Extend))
 }
 
 fn draw_facet_calendar_date_row(
@@ -1424,15 +1433,306 @@ fn details_separator_y(rect: egui::Rect, pixels_per_point: f32) -> f32 {
     ((rect.bottom() * pixels_per_point).floor() - 0.5) / pixels_per_point
 }
 
+fn details_scroll_style() -> egui::style::ScrollStyle {
+    // floating style は前景色の濃いハンドルを内容の上へ重ねる。詳細一覧の縦横バーと
+    // 下部選択情報バーを同じ solid style に揃え、列テキストとは別領域に表示する。
+    egui::style::ScrollStyle::solid()
+}
+
+fn details_layout_right_guard(pixels_per_point: f32) -> f32 {
+    // 名前の自動幅では最低 1 physical px を空ける。高 DPI ではヘッダ右端の
+    // 1pt separator の半幅の方が大きくなるため、そちらも収まる余白にする。
+    (1.0 / normalized_pixels_per_point(pixels_per_point)).max(0.5)
+}
+
+fn selection_info_bar_height() -> f32 {
+    SELECTION_INFO_BAR_CONTENT_HEIGHT + details_scroll_style().allocated_width()
+}
+
 /// 詳細表示の水平レイアウト。縦スクロールバーの gutter を考慮して、ヘッダと行の列が
 /// ぴったり揃い、縦バー出現時に右端列が欠けたり不要な横スクロールバーが出たりしないようにする。
 struct DetailsLayout {
     /// 名前列の実効幅。
     name_w: f32,
+    /// 表示列の実幅合計。pane の空き背景は含めない。
+    columns_w: f32,
     /// 行 / ヘッダ背景の幅 (>= 全列合計。pane を埋める)。
     pane_w: f32,
     /// 外側 (水平) スクロールが扱う総コンテンツ幅 (= pane_w + gutter)。
     extent: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DetailsHorizontalScrollPolicy {
+    /// アプリが把握する描画範囲が viewport の物理ピクセル右端を越えるか。
+    overflow: bool,
+    /// offset=0 の ScrollArea が子 Ui に与える丸め後の開始座標。
+    content_origin_x: f32,
+    /// 背景・列・右端 separator をすべて含む必要幅。
+    required_extent: f32,
+    /// viewport の内向き物理 px 右端まで、描画開始位置から安全に使える幅。
+    viewport_capacity: f32,
+    /// overflow 時に右端まで確実に到達できるよう外向きに確保した幅。
+    scroll_extent: f32,
+    viewport_right_px: i64,
+    required_right_px: i64,
+}
+
+fn physical_pixel_floor(value: f32) -> i64 {
+    let value = value as f64;
+    let nearest = value.round();
+    // f32 の座標×pppで生じる数 ULP だけを整数へ吸着する。固定の大きい epsilon を
+    // 使うと実在する微小 overflow を隠すため、座標値に応じた上限 1/100 px の範囲にする。
+    let integer_epsilon = (f32::EPSILON as f64 * value.abs() * 4.0).clamp(1.0e-5, 1.0e-2);
+    if (value - nearest).abs() <= integer_epsilon {
+        nearest as i64
+    } else {
+        value.floor() as i64
+    }
+}
+
+fn physical_pixel_ceil(value: f32) -> i64 {
+    let value = value as f64;
+    let nearest = value.round();
+    let integer_epsilon = (f32::EPSILON as f64 * value.abs() * 4.0).clamp(1.0e-5, 1.0e-2);
+    if (value - nearest).abs() <= integer_epsilon {
+        nearest as i64
+    } else {
+        value.ceil() as i64
+    }
+}
+
+fn details_scroll_content_origin_x(viewport_left: f32, pixels_per_point: f32) -> f32 {
+    use egui::emath::GuiRounding as _;
+
+    viewport_left
+        .round_to_pixels(normalized_pixels_per_point(pixels_per_point))
+        .round_ui()
+}
+
+fn details_horizontal_viewport_capacity(viewport: egui::Rect, pixels_per_point: f32) -> f32 {
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
+    let content_origin_x =
+        details_scroll_content_origin_x(viewport.left(), pixels_per_point).max(viewport.left());
+    let viewport_right_px = physical_pixel_floor(viewport.right() * pixels_per_point);
+    (viewport_right_px as f32 / pixels_per_point - content_origin_x).max(0.0)
+}
+
+fn details_horizontal_scroll_policy(
+    viewport: egui::Rect,
+    layout_extent: f32,
+    columns_w: f32,
+    pixels_per_point: f32,
+) -> DetailsHorizontalScrollPolicy {
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
+    let content_origin_x = details_scroll_content_origin_x(viewport.left(), pixels_per_point);
+    // 背景 (layout_extent) と、最終列の中央に描く 1pt separator の右半分を両方含める。
+    let required_extent = layout_extent.max(columns_w + 0.5);
+    // 子 Ui の丸めが左へ寄った場合に得られる偶然の余白には依存しない。右へ寄る場合だけ
+    // 実際の描画開始位置として反映し、右端切れ判定を安全側へ倒す。
+    let required_origin_x = content_origin_x.max(viewport.left());
+    let viewport_right_px = physical_pixel_floor(viewport.right() * pixels_per_point);
+    let viewport_capacity =
+        (viewport_right_px as f32 / pixels_per_point - required_origin_x).max(0.0);
+    let required_right_px =
+        physical_pixel_ceil((required_origin_x + required_extent) * pixels_per_point);
+    let overflow = required_right_px > viewport_right_px;
+    let scroll_extent = if overflow {
+        // min_width 自体も egui で再丸めされる。必要右端のさらに 1 physical px 外まで
+        // 確保し、手動幅が境界をわずかに越えた場合も最終列まで確実にスクロールできるようにする。
+        (((required_right_px.saturating_add(1)) as f32 / pixels_per_point) - content_origin_x)
+            .max(layout_extent)
+            .max(required_extent)
+    } else {
+        layout_extent
+    };
+
+    DetailsHorizontalScrollPolicy {
+        overflow,
+        content_origin_x,
+        required_extent,
+        viewport_capacity,
+        scroll_extent,
+        viewport_right_px,
+        required_right_px,
+    }
+}
+
+fn configured_details_horizontal_scroll_area(
+    policy: DetailsHorizontalScrollPolicy,
+) -> egui::ScrollArea {
+    use egui::containers::scroll_area::{ScrollBarVisibility, ScrollSource};
+
+    let area = egui::ScrollArea::horizontal()
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(if policy.overflow {
+            ScrollBarVisibility::AlwaysVisible
+        } else {
+            ScrollBarVisibility::AlwaysHidden
+        })
+        .scroll_source(if policy.overflow {
+            ScrollSource::ALL
+        } else {
+            ScrollSource::NONE
+        });
+    if policy.overflow {
+        area
+    } else {
+        // 以前はみ出していた列をスクロールした後に自動幅へ戻しても、保持中 offset や
+        // その丸め位相が fit 判定へ混ざらないよう、非 overflow 状態では原点を所有する。
+        area.horizontal_scroll_offset(0.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DetailsVerticalScrollDebug {
+    inner_rect: egui::Rect,
+    content_size: egui::Vec2,
+    state: egui::scroll_area::State,
+}
+
+struct DetailsLayoutDebugSample<'a> {
+    surface: &'static str,
+    source_rect: egui::Rect,
+    avail_w: f32,
+    avail_h: f32,
+    row_count: usize,
+    natural_h: f32,
+    viewport_h_est: f32,
+    horizontal_policy: DetailsHorizontalScrollPolicy,
+    predicted_hbar: f32,
+    predicted_vscroll: bool,
+    gutter: f32,
+    fixed_columns_w: f32,
+    name_w: f32,
+    pane_w: f32,
+    layout_extent: f32,
+    requested_extent: f32,
+    column_set: DetailsColumnSet,
+    outer_inner_rect: egui::Rect,
+    outer_content_size: egui::Vec2,
+    outer_state: egui::scroll_area::State,
+    vertical: Option<DetailsVerticalScrollDebug>,
+    settings: &'a crate::settings::Settings,
+}
+
+fn details_layout_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var(DETAILS_LAYOUT_DEBUG_ENV).ok().as_deref() == Some("1"))
+}
+
+fn format_details_layout_debug_rect(rect: Option<egui::Rect>) -> String {
+    rect.map_or_else(
+        || "none".to_string(),
+        |rect| {
+            format!(
+                "({:.6},{:.6}) {:.6}x{:.6}",
+                rect.min.x,
+                rect.min.y,
+                rect.width(),
+                rect.height()
+            )
+        },
+    )
+}
+
+fn log_details_layout_debug(ctx: &egui::Context, sample: DetailsLayoutDebugSample<'_>) {
+    if !details_layout_debug_enabled() {
+        return;
+    }
+
+    let effective_ppp = ctx.pixels_per_point();
+    let native_ppp = ctx.native_pixels_per_point();
+    let zoom_factor = ctx.zoom_factor();
+    let (viewport_outer, viewport_inner, viewport_focused, viewport_maximized) =
+        ctx.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.outer_rect,
+                viewport.inner_rect,
+                viewport.focused,
+                viewport.maximized,
+            )
+        });
+    let outer_delta_x = sample.outer_content_size.x - sample.outer_inner_rect.width();
+    let columns = details_visible_columns(sample.settings, sample.column_set);
+    let viewport_id = ctx.viewport_id();
+    let rounding_slack = details_layout_right_guard(effective_ppp);
+    let columns_avail = (sample.horizontal_policy.viewport_capacity - sample.gutter).max(0.0);
+    let columns_w = sample.name_w + sample.fixed_columns_w;
+    let columns_debug = columns
+        .iter()
+        .map(|&column| {
+            let width = if column == DetailsColumn::Name {
+                sample.name_w
+            } else {
+                details_column_width(sample.settings, column)
+            };
+            format!("{column:?}:{width:.6}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let vertical_debug = sample.vertical.map_or_else(
+        || "none".to_string(),
+        |vertical| {
+            let delta_x = vertical.content_size.x - vertical.inner_rect.width();
+            format!(
+                "inner=({:.6},{:.6}) {:.6}x{:.6} content={:.6}x{:.6} delta_x={:.6}pt/{:.6}px state={:?}",
+                vertical.inner_rect.min.x,
+                vertical.inner_rect.min.y,
+                vertical.inner_rect.width(),
+                vertical.inner_rect.height(),
+                vertical.content_size.x,
+                vertical.content_size.y,
+                delta_x,
+                delta_x * effective_ppp,
+                vertical.state
+            )
+        },
+    );
+    crate::logger::log(format!(
+        "[DETAILS_LAYOUT] frame={} viewport={viewport_id:?} surface={} native_ppp={:.6?} zoom={zoom_factor:.6} effective_ppp={effective_ppp:.6} focused={viewport_focused:?} maximized={viewport_maximized:?} viewport_outer={} viewport_inner={} source=({:.6},{:.6}) {:.6}x{:.6} avail={:.6}x{:.6} rows={} natural_h={:.6} predicted={{h_overflow:{} hbar:{:.6} viewport_h:{:.6} vscroll:{} gutter:{:.6}}} layout={{name_auto:{} fixed:{:.6} columns_avail:{:.6} slack:{rounding_slack:.6} name:{:.6} columns:{columns_w:.6} pane:{:.6} extent:{:.6} requested:{:.6}}} physical={{origin:{:.6} capacity:{:.6} required_extent:{:.6} viewport_right_px:{} required_right_px:{} overflow:{} scroll_extent:{:.6}}} outer={{inner:({:.6},{:.6}) {:.6}x{:.6} content:{:.6}x{:.6} delta_x:{outer_delta_x:.6}pt/{:.6}px state:{:?}}} vertical={{{vertical_debug}}} columns=[{columns_debug}]",
+        ctx.cumulative_frame_nr(),
+        sample.surface,
+        native_ppp,
+        format_details_layout_debug_rect(viewport_outer),
+        format_details_layout_debug_rect(viewport_inner),
+        sample.source_rect.min.x,
+        sample.source_rect.min.y,
+        sample.source_rect.width(),
+        sample.source_rect.height(),
+        sample.avail_w,
+        sample.avail_h,
+        sample.row_count,
+        sample.natural_h,
+        sample.horizontal_policy.overflow,
+        sample.predicted_hbar,
+        sample.viewport_h_est,
+        sample.predicted_vscroll,
+        sample.gutter,
+        sample.settings.details_name_width_auto,
+        sample.fixed_columns_w,
+        columns_avail,
+        sample.name_w,
+        sample.pane_w,
+        sample.layout_extent,
+        sample.requested_extent,
+        sample.horizontal_policy.content_origin_x,
+        sample.horizontal_policy.viewport_capacity,
+        sample.horizontal_policy.required_extent,
+        sample.horizontal_policy.viewport_right_px,
+        sample.horizontal_policy.required_right_px,
+        sample.horizontal_policy.overflow,
+        sample.horizontal_policy.scroll_extent,
+        sample.outer_inner_rect.min.x,
+        sample.outer_inner_rect.min.y,
+        sample.outer_inner_rect.width(),
+        sample.outer_inner_rect.height(),
+        sample.outer_content_size.x,
+        sample.outer_content_size.y,
+        outer_delta_x * effective_ppp,
+        sample.outer_state,
+    ));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1467,7 +1767,7 @@ fn details_layout(
     let columns_avail = (avail_w - gutter).max(0.0);
     let auto_fits = settings.details_name_width_auto
         && columns_avail >= fixed + DetailsColumn::Name.default_width();
-    let rounding_slack = 1.0 / normalized_pixels_per_point(pixels_per_point);
+    let rounding_slack = details_layout_right_guard(pixels_per_point);
     let name_w = if auto_fits {
         (columns_avail - fixed - rounding_slack).max(DetailsColumn::Name.min_width())
     } else if settings.details_name_width_auto {
@@ -1491,6 +1791,7 @@ fn details_layout(
     let extent = pane_w + gutter;
     DetailsLayout {
         name_w,
+        columns_w,
         pane_w,
         extent,
     }
@@ -3411,12 +3712,8 @@ impl App {
                                     for scale in crate::settings::ui_scale_factor_steps() {
                                         let checked = (self.settings.ui_scale_factor - scale).abs()
                                             < f32::EPSILON;
-                                        let prefix = if checked { "✓ " } else { "  " };
                                         let percent = (scale * 100.0).round() as u32;
-                                        if ui
-                                            .button(format!("{prefix}{percent}%"))
-                                            .clicked()
-                                        {
+                                        if ui_scale_menu_button(ui, checked, percent).clicked() {
                                             self.set_ui_scale_factor(ctx, scale);
                                             settings_changed = true;
                                             ui.close();
@@ -10469,7 +10766,8 @@ impl App {
         scroll_to: bool,
         spread_pair_cursor_idx: Option<usize>,
     ) -> Option<PathBuf> {
-        let avail_w = ui.available_width().max(1.0);
+        let horizontal_source_rect = ui.available_rect_before_wrap();
+        let avail_w = horizontal_source_rect.width().max(1.0);
         let avail_h = ui.available_height().max(0.0);
 
         if self.details_order.len() != self.visible_indices.len() {
@@ -10483,32 +10781,49 @@ impl App {
         // 内側の縦スクロール (solid) が gutter ぶん外形を広げ、ヘッダ (縦バー外) と行 (縦バー内) が
         // ずれて右端列が欠け、不要な横スクロールバーまで出る。viewport はヘッダ + 行間を引いた概算で
         // 判定し、境界帯では「gutter を多めに確保」側へ倒す (= 列が欠けるより無害)。
-        // 横方向にあふれる (固定名前列 / 広い列) と外側に水平スクロールバーが出る。それが solid 設定だと
-        // 内側縦ビューポートの高さを削るので、その分も概算から引く (既定 floating では allocated=0 なので無影響)。
-        let fixed_cols_w = details_fixed_columns_width(&self.settings);
-        let name_w_unconstrained = if self.settings.details_name_width_auto {
-            (avail_w - fixed_cols_w).max(DetailsColumn::Name.default_width())
-        } else {
-            details_name_fixed_width(&self.settings)
-        };
-        let h_overflow = name_w_unconstrained + fixed_cols_w > avail_w + 0.5;
-        let details_scroll_style = egui::style::ScrollStyle::solid();
-        let hbar = if h_overflow {
-            details_scroll_style.allocated_width()
-        } else {
-            0.0
-        };
-        // 危険なのは「出ないと予測したのに egui が出す」側 (= 上記バグが再発) だけ。境界では gutter を
-        // 多めに確保する方へ倒す (余分に取っても右に空き帯が出るだけで無害) ため概算を少し小さめにする。
-        let viewport_h_est =
-            (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - hbar - 2.0).max(0.0);
-        let needs_vscroll = natural_h > viewport_h_est;
-        let gutter = if needs_vscroll {
-            egui::style::ScrollStyle::solid().allocated_width()
-        } else {
-            0.0
-        };
-        let layout = details_layout(avail_w, gutter, ui.ctx().pixels_per_point(), &self.settings);
+        // 横方向の要否は egui の丸め後 content_size に任せず、アプリが所有する全列幅を
+        // 物理ピクセル右端へ変換して決める。横バーが出ると縦 viewport が縮み、縦バー gutter が
+        // 新たに必要になる場合があるため、false -> true の単調な状態を最大 3 回で収束させる。
+        let details_scroll_style = details_scroll_style();
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let layout_avail_w =
+            details_horizontal_viewport_capacity(horizontal_source_rect, pixels_per_point)
+                .min(avail_w)
+                .max(1.0);
+        let mut h_overflow = false;
+        let mut settled = None;
+        for _ in 0..3 {
+            let hbar = if h_overflow {
+                details_scroll_style.allocated_width()
+            } else {
+                0.0
+            };
+            // 境界帯では gutter を多めに確保する方へ倒し、右端列の欠けを避ける。
+            let viewport_h_est =
+                (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - hbar - 2.0)
+                    .max(0.0);
+            let needs_vscroll = natural_h > viewport_h_est;
+            let gutter = if needs_vscroll {
+                details_scroll_style.allocated_width()
+            } else {
+                0.0
+            };
+            let layout = details_layout(layout_avail_w, gutter, pixels_per_point, &self.settings);
+            let policy = details_horizontal_scroll_policy(
+                horizontal_source_rect,
+                layout.extent,
+                layout.columns_w,
+                pixels_per_point,
+            );
+            let stable = policy.overflow == h_overflow;
+            h_overflow = policy.overflow;
+            settled = Some((layout, policy, hbar, viewport_h_est, needs_vscroll, gutter));
+            if stable {
+                break;
+            }
+        }
+        let (layout, horizontal_policy, hbar, viewport_h_est, needs_vscroll, gutter) =
+            settled.expect("details horizontal policy loop always runs");
         let content_w = layout.pane_w;
         self.last_details_name_width = layout.name_w;
 
@@ -10523,15 +10838,15 @@ impl App {
         let mut body_inner_rect = egui::Rect::NOTHING;
         let mut egui_offset_y = self.scroll_offset_y;
         let mut hovered_preview: Option<(usize, egui::Rect)> = None;
+        let mut vertical_scroll_debug = None;
         let previous_scroll_style = ui.spacing().scroll;
         ui.spacing_mut().scroll = details_scroll_style;
-        egui::ScrollArea::horizontal()
+        let horizontal_output = configured_details_horizontal_scroll_area(horizontal_policy)
             .id_salt("details_list_horizontal")
-            .auto_shrink([false, false])
             .show(ui, |ui| {
                 // 外側コンテンツ幅 = pane + gutter。pane より広くしておくことで内側縦スクロールの
                 // gutter が pane の右外に収まり、ヘッダ・行の列が揃う。
-                ui.set_min_width(layout.extent);
+                ui.set_min_width(horizontal_policy.scroll_extent);
                 let (header_rect, _) = ui.allocate_exact_size(
                     egui::vec2(content_w, Self::DETAILS_HEADER_H),
                     egui::Sense::hover(),
@@ -10627,8 +10942,40 @@ impl App {
                 ui.spacing_mut().scroll = old_scroll_style;
                 body_inner_rect = scroll_output.inner_rect;
                 egui_offset_y = scroll_output.state.offset.y;
+                vertical_scroll_debug = Some(DetailsVerticalScrollDebug {
+                    inner_rect: scroll_output.inner_rect,
+                    content_size: scroll_output.content_size,
+                    state: scroll_output.state,
+                });
             });
         ui.spacing_mut().scroll = previous_scroll_style;
+        log_details_layout_debug(
+            ctx,
+            DetailsLayoutDebugSample {
+                surface: "details_list",
+                source_rect: horizontal_source_rect,
+                avail_w,
+                avail_h,
+                row_count,
+                natural_h,
+                viewport_h_est,
+                horizontal_policy,
+                predicted_hbar: hbar,
+                predicted_vscroll: needs_vscroll,
+                gutter,
+                fixed_columns_w: layout.columns_w - layout.name_w,
+                name_w: layout.name_w,
+                pane_w: layout.pane_w,
+                layout_extent: layout.extent,
+                requested_extent: horizontal_policy.scroll_extent,
+                column_set: DetailsColumnSet::All,
+                outer_inner_rect: horizontal_output.inner_rect,
+                outer_content_size: horizontal_output.content_size,
+                outer_state: horizontal_output.state,
+                vertical: vertical_scroll_debug,
+                settings: &self.settings,
+            },
+        );
 
         self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
         self.update_grid_mouse_ring_flick(ctx);
@@ -12722,25 +13069,46 @@ impl App {
 
         let selected_idx = self.selected.filter(|&idx| self.items.get(idx).is_some());
         let available_before = ctx.available_rect();
+        let scroll_style = details_scroll_style();
         let panel = egui::TopBottomPanel::bottom("selection_info_bottom_bar")
-            .exact_height(SELECTION_INFO_BAR_HEIGHT)
+            .exact_height(selection_info_bar_height())
             .show_separator_line(true)
             .show(ctx, |ui| {
-                let avail_w = ui.available_width().max(1.0);
+                let source_rect = ui.available_rect_before_wrap();
+                let avail_w = source_rect.width().max(1.0);
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                let layout_avail_w =
+                    details_horizontal_viewport_capacity(source_rect, pixels_per_point)
+                        .min(avail_w)
+                        .max(1.0);
                 let full_layout =
-                    details_layout(avail_w, 0.0, ui.ctx().pixels_per_point(), &self.settings);
+                    details_layout(layout_avail_w, 0.0, pixels_per_point, &self.settings);
                 let content_w = details_content_width_for_column_set(
                     full_layout.pane_w,
                     &self.settings,
                     DetailsColumnSet::TextOnly,
                 );
-                egui::ScrollArea::horizontal()
+                let avail_h = ui.available_height().max(0.0);
+                let fixed_columns_w: f32 =
+                    details_visible_columns(&self.settings, DetailsColumnSet::TextOnly)
+                        .into_iter()
+                        .filter(|column| *column != DetailsColumn::Name)
+                        .map(|column| details_column_width(&self.settings, column))
+                        .sum();
+                let horizontal_policy = details_horizontal_scroll_policy(
+                    source_rect,
+                    content_w,
+                    full_layout.name_w + fixed_columns_w,
+                    pixels_per_point,
+                );
+                let previous_scroll_style = ui.spacing().scroll;
+                ui.spacing_mut().scroll = scroll_style;
+                let output = configured_details_horizontal_scroll_area(horizontal_policy)
                     .id_salt("selection_info_bottom_bar_horizontal")
-                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let old_spacing_y = ui.spacing().item_spacing.y;
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.set_min_width(content_w);
+                        ui.set_min_width(horizontal_policy.scroll_extent);
                         let (header_rect, _) = ui.allocate_exact_size(
                             egui::vec2(content_w, Self::DETAILS_HEADER_H),
                             egui::Sense::hover(),
@@ -12768,6 +13136,38 @@ impl App {
                         }
                         ui.spacing_mut().item_spacing.y = old_spacing_y;
                     });
+                ui.spacing_mut().scroll = previous_scroll_style;
+                log_details_layout_debug(
+                    ctx,
+                    DetailsLayoutDebugSample {
+                        surface: "selection_info_bar",
+                        source_rect,
+                        avail_w,
+                        avail_h,
+                        row_count: usize::from(selected_idx.is_some()),
+                        natural_h: Self::DETAILS_HEADER_H + Self::DETAILS_ROW_H,
+                        viewport_h_est: avail_h,
+                        horizontal_policy,
+                        predicted_hbar: if horizontal_policy.overflow {
+                            scroll_style.allocated_width()
+                        } else {
+                            0.0
+                        },
+                        predicted_vscroll: false,
+                        gutter: 0.0,
+                        fixed_columns_w,
+                        name_w: full_layout.name_w,
+                        pane_w: content_w,
+                        layout_extent: content_w,
+                        requested_extent: horizontal_policy.scroll_extent,
+                        column_set: DetailsColumnSet::TextOnly,
+                        outer_inner_rect: output.inner_rect,
+                        outer_content_size: output.content_size,
+                        outer_state: output.state,
+                        vertical: None,
+                        settings: &self.settings,
+                    },
+                );
             });
         self.selection_info_bar_rect = Some(panel.response.rect);
         let available_after = ctx.available_rect();
@@ -13213,8 +13613,19 @@ mod selection_info_tests {
         });
 
         let (before, after, central) = measured.unwrap();
-        assert!(before - after >= SELECTION_INFO_BAR_HEIGHT - 0.5);
+        assert!(before - after >= selection_info_bar_height() - 0.5);
         assert!(central <= after + 0.5);
+    }
+
+    #[test]
+    fn details_scrollbars_reserve_space_instead_of_covering_rows() {
+        let scroll = details_scroll_style();
+        assert!(!scroll.floating);
+        assert!(scroll.allocated_width() > 0.0);
+        assert_eq!(
+            selection_info_bar_height(),
+            SELECTION_INFO_BAR_CONTENT_HEIGHT + scroll.allocated_width()
+        );
     }
 
     #[test]
@@ -13741,6 +14152,40 @@ mod book_reorder_drag_tests {
 mod compute_cell_size_tests {
     use super::*;
 
+    #[test]
+    fn selected_ui_scale_menu_button_stays_on_one_row_in_a_narrow_popup() {
+        let ctx = egui::Context::default();
+        let mut measured = None;
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(120.0, 100.0),
+            )),
+            ..Default::default()
+        };
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Narrower than `✓ 100%`: the button must grow horizontally, not vertically.
+                ui.set_max_width(36.0);
+                let expected_row_height = ui.spacing().interact_size.y;
+                let response = ui_scale_menu_button(ui, true, 100);
+                measured = Some((
+                    response.rect.width(),
+                    response.rect.height(),
+                    expected_row_height,
+                ));
+            });
+        });
+
+        let (width, height, expected_row_height) = measured.expect("button measurement");
+        assert!(width > 36.0, "the popup row should extend horizontally");
+        assert!(
+            height <= expected_row_height + 0.01,
+            "the checked label wrapped: height={height}, row={expected_row_height}"
+        );
+    }
+
     fn minimal_details_settings() -> crate::settings::Settings {
         let mut settings = crate::settings::Settings::default();
         settings.details_show_preview = false;
@@ -13924,16 +14369,245 @@ mod compute_cell_size_tests {
     }
 
     #[test]
-    fn details_layout_rounding_slack_is_one_device_pixel_across_ui_scales() {
+    fn details_layout_rounding_slack_covers_pixel_and_header_stroke() {
         let settings = minimal_details_settings();
-        for pixels_per_point in [0.8, 0.9, 1.0, 1.25, 1.5] {
+        for pixels_per_point in [0.8_f32, 0.9, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
             let layout = details_layout(600.0, 10.0, pixels_per_point, &settings);
             let device_pixel_gap = (600.0 - layout.extent) * pixels_per_point;
+            let expected_gap = 1.0_f32.max(0.5 * pixels_per_point);
             assert!(
-                (device_pixel_gap - 1.0).abs() < 0.01,
-                "pixels_per_point={pixels_per_point}, gap={device_pixel_gap}"
+                (device_pixel_gap - expected_gap).abs() < 0.01,
+                "pixels_per_point={pixels_per_point}, gap={device_pixel_gap}, expected={expected_gap}"
             );
             assert!(layout.extent < 600.0);
+        }
+    }
+
+    #[test]
+    fn details_physical_scroll_policy_fits_logged_80_and_90_percent_cases() {
+        let settings = minimal_details_settings();
+        for (pixels_per_point, avail_w) in [(0.8_f32, 1880.25_f32), (0.9, 1669.5625)] {
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(8.0, 100.0), egui::vec2(avail_w, 600.0));
+            let layout_avail_w =
+                details_horizontal_viewport_capacity(viewport, pixels_per_point).min(avail_w);
+            let layout = details_layout(layout_avail_w, 10.0, pixels_per_point, &settings);
+            let policy = details_horizontal_scroll_policy(
+                viewport,
+                layout.extent,
+                layout.columns_w,
+                pixels_per_point,
+            );
+            assert!(
+                !policy.overflow,
+                "pixels_per_point={pixels_per_point}, policy={policy:?}"
+            );
+            assert!(policy.required_right_px <= policy.viewport_right_px);
+        }
+    }
+
+    #[test]
+    fn details_physical_scroll_policy_is_conservative_for_fractional_overflow() {
+        for native_ppp in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            for ui_scale_step in 5..=20 {
+                let pixels_per_point = native_ppp * ui_scale_step as f32 / 10.0;
+                for left in [0.0_f32, 0.125, 0.5, 8.0, 8.3] {
+                    for avail_w in [319.3_f32, 600.25, 1669.5625, 1880.25] {
+                        let viewport = egui::Rect::from_min_size(
+                            egui::pos2(left, 0.0),
+                            egui::vec2(avail_w, 100.0),
+                        );
+                        let content_origin =
+                            details_scroll_content_origin_x(left, pixels_per_point).max(left);
+                        let viewport_right_px =
+                            physical_pixel_floor(viewport.right() * pixels_per_point);
+                        let max_required_extent =
+                            viewport_right_px as f32 / pixels_per_point - content_origin;
+
+                        let fit = details_horizontal_scroll_policy(
+                            viewport,
+                            0.0,
+                            max_required_extent - 0.5,
+                            pixels_per_point,
+                        );
+                        assert!(
+                            !fit.overflow,
+                            "fit must stay visible: ppp={pixels_per_point} viewport={viewport:?} policy={fit:?}"
+                        );
+
+                        let overflow = details_horizontal_scroll_policy(
+                            viewport,
+                            0.0,
+                            max_required_extent - 0.5 + 0.1 / pixels_per_point,
+                            pixels_per_point,
+                        );
+                        assert!(
+                            overflow.overflow,
+                            "fractional physical overflow must scroll: ppp={pixels_per_point} viewport={viewport:?} policy={overflow:?}"
+                        );
+                        assert!(overflow.scroll_extent >= overflow.required_extent);
+                        assert!(
+                            physical_pixel_floor(
+                                (overflow.content_origin_x + overflow.scroll_extent)
+                                    * pixels_per_point
+                            ) > overflow.required_right_px,
+                            "scroll extent must reach past the required right edge: {overflow:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn details_manual_name_width_is_preserved_and_scrolls_when_needed() {
+        let avail_w = 600.25_f32;
+        let gutter = 10.0_f32;
+        for pixels_per_point in [0.8_f32, 0.9, 1.0, 1.25, 1.5, 2.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(8.0, 0.0), egui::vec2(avail_w, 400.0));
+            let mut settings = minimal_details_settings();
+            settings.details_name_width_auto = false;
+            let fixed = details_fixed_columns_width(&settings);
+            let layout_avail_w =
+                details_horizontal_viewport_capacity(viewport, pixels_per_point).min(avail_w);
+            let fitting_name =
+                layout_avail_w - gutter - details_layout_right_guard(pixels_per_point) - fixed;
+            settings.details_name_width = fitting_name;
+
+            let fitting_layout =
+                details_layout(layout_avail_w, gutter, pixels_per_point, &settings);
+            let fitting_policy = details_horizontal_scroll_policy(
+                viewport,
+                fitting_layout.extent,
+                fitting_layout.columns_w,
+                pixels_per_point,
+            );
+            assert!((fitting_layout.name_w - fitting_name).abs() < 0.001);
+            assert!(
+                !fitting_policy.overflow,
+                "manual fit ppp={pixels_per_point}: {fitting_policy:?}"
+            );
+
+            settings.details_name_width = fitting_name + 2.0 / pixels_per_point;
+            let overflow_layout =
+                details_layout(layout_avail_w, gutter, pixels_per_point, &settings);
+            let overflow_policy = details_horizontal_scroll_policy(
+                viewport,
+                overflow_layout.extent,
+                overflow_layout.columns_w,
+                pixels_per_point,
+            );
+            assert!((overflow_layout.name_w - settings.details_name_width).abs() < 0.001);
+            assert!(
+                overflow_policy.overflow,
+                "manual overflow ppp={pixels_per_point}: {overflow_policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn details_auto_width_never_overflows_the_inward_physical_viewport() {
+        let settings = minimal_details_settings();
+        for native_ppp in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            for ui_scale_step in 5..=20 {
+                let pixels_per_point = native_ppp * ui_scale_step as f32 / 10.0;
+                for left in [0.0_f32, 0.125, 0.5, 8.0, 8.3] {
+                    for avail_w in [319.3_f32, 600.25, 1669.5625, 1880.25] {
+                        for gutter in [0.0_f32, 10.0] {
+                            let viewport = egui::Rect::from_min_size(
+                                egui::pos2(left, 0.0),
+                                egui::vec2(avail_w, 100.0),
+                            );
+                            let layout_avail_w =
+                                details_horizontal_viewport_capacity(viewport, pixels_per_point)
+                                    .min(avail_w);
+                            let layout =
+                                details_layout(layout_avail_w, gutter, pixels_per_point, &settings);
+                            let policy = details_horizontal_scroll_policy(
+                                viewport,
+                                layout.extent,
+                                layout.columns_w,
+                                pixels_per_point,
+                            );
+                            assert!(
+                                !policy.overflow,
+                                "ppp={pixels_per_point} viewport={viewport:?} gutter={gutter} layout={{columns:{}, pane:{}, extent:{}}} policy={policy:?}",
+                                layout.columns_w, layout.pane_w, layout.extent
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn configured_scroll_area_hides_egui_fractional_baseline_overflow() {
+        let settings = minimal_details_settings();
+        for (pixels_per_point, avail_w) in [(0.8_f32, 1880.25_f32), (0.9, 1669.5625)] {
+            let ctx = egui::Context::default();
+            // set_zoom_factor は次 pass 冒頭で直前 viewport rect も拡縮する。ここでは
+            // ScrollArea の丸めだけを再現したいので、test context の option を先に確定する。
+            ctx.options_mut(|options| options.zoom_factor = pixels_per_point);
+            let mut raw_input = egui::RawInput::default();
+            let viewport_rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(avail_w + 16.0, 240.0));
+            raw_input.screen_rect = Some(viewport_rect);
+            let root_viewport = raw_input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .expect("root viewport");
+            root_viewport.native_pixels_per_point = Some(1.0);
+            root_viewport.inner_rect = Some(viewport_rect);
+            root_viewport.outer_rect = Some(viewport_rect);
+            let mut measured = None;
+
+            let _ = ctx.run(raw_input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let viewport = ui.available_rect_before_wrap();
+                    let effective_ppp = ui.ctx().pixels_per_point();
+                    let layout_avail_w =
+                        details_horizontal_viewport_capacity(viewport, effective_ppp)
+                            .min(viewport.width());
+                    let layout = details_layout(layout_avail_w, 10.0, effective_ppp, &settings);
+                    let policy = details_horizontal_scroll_policy(
+                        viewport,
+                        layout.extent,
+                        layout.columns_w,
+                        effective_ppp,
+                    );
+                    let output = configured_details_horizontal_scroll_area(policy)
+                        .id_salt(("fractional_baseline", pixels_per_point.to_bits()))
+                        .show(ui, |ui| {
+                            // egui の入れ子 ScrollArea が作った「実描画ではない 1pt 超過」を
+                            // 明示的に再現する。policy は列が収まると判定済みなので、この
+                            // synthetic content_size がバー表示や offset を発生させてはならない。
+                            ui.set_min_width(viewport.width() + 1.0);
+                            ui.allocate_exact_size(
+                                egui::vec2(layout.pane_w, 80.0),
+                                egui::Sense::hover(),
+                            );
+                        });
+                    measured = Some((
+                        policy,
+                        output.state.offset,
+                        output.content_size,
+                        output.inner_rect,
+                        viewport,
+                    ));
+                });
+            });
+
+            let (policy, offset, content_size, inner_rect, viewport) =
+                measured.expect("scroll area rendered");
+            assert!(!policy.overflow, "{policy:?}");
+            assert_eq!(offset.x, 0.0);
+            assert!((inner_rect.height() - viewport.height()).abs() < 0.01);
+            assert!(
+                content_size.x > inner_rect.width(),
+                "test must reproduce egui's synthetic fractional overflow: ppp={pixels_per_point}, content={content_size:?}, inner={inner_rect:?}"
+            );
         }
     }
 

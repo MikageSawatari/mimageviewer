@@ -125,8 +125,42 @@ ctx.send_viewport_cmd(egui::ViewportCommand::Close);         // 終了ボタン
 
 ## ログ全文
 
-デバッグログ（`mimageviewer.log`）は `target/debug/` ディレクトリに生成される。
+動作ログは `%APPDATA%\mimageviewer\logs\mimageviewer.log` に生成される。
 ログには `[viewport] rect updated` のプレフィックスで位置変化が記録されている。
+
+### 詳細表示の横スクロール調査
+
+OS / アプリ内スケーリング変更後に詳細表示へ不要な横スクロールバーが出る場合は、
+起動前に環境変数 `MIV_DETAILS_LAYOUT_DEBUG=1` を設定する。`mimageviewer.log` へ
+`[DETAILS_LAYOUT]` 行が出力され、次の値を同じフレーム単位で比較できる。
+
+- native / effective pixels-per-point とアプリ内 zoom factor
+- viewport の outer / inner rect、詳細 UI の開始座標と利用可能幅
+- 縦横スクロールバーの事前予測、gutter、列幅、右端線を含む丸め余白
+- `physical` 内の丸め後 content origin、内向き右端までの capacity、必要幅、viewport / 必要右端の物理 px、
+  アプリ判定の overflow、外向きに確保した scroll extent
+- 外側水平 / 内側垂直 `ScrollArea` の `inner_rect`、`content_size`、差分の pt / 物理 px
+- egui の `show_scroll` / `content_is_too_large` を含む ScrollArea state
+- 表示列と各列の実効幅
+
+調査モード中は各描画フレームを記録する。下部の選択情報バーは `surface=selection_info_bar`、
+詳細一覧本体は `surface=details_list` で区別する。調査後は環境変数を削除して通常起動へ戻す。
+
+横バーの表示可否は `physical.overflow` を正とする。`false` では egui 内部の
+`content_is_too_large.x` が端数丸めで `true` になっても横バー・横入力を無効化して offset を
+0 に保つ。`true` では手動名前幅を含む実描画の必要右端を物理 px で外向きに丸め、横バーと
+最終列までの scroll extent を必ず確保する。
+
+PowerShell からの起動例:
+
+```powershell
+$env:MIV_DETAILS_LAYOUT_DEBUG = '1'
+.\mimageviewer.exe
+Remove-Item Env:MIV_DETAILS_LAYOUT_DEBUG
+```
+
+次回起動時には直前のセッションが `mimageviewer.log.prev` へ移るため、再起動前に現行ログを
+回収するのが確実。
 
 ## 関連コード箇所
 
