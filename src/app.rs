@@ -39625,6 +39625,33 @@ impl App {
         Ok(())
     }
 
+    /// Atomic multi-row form of [`Self::write_user_rating_shared`]. Session
+    /// generations and context caches are published only after the SQLite
+    /// transaction commits, so callers can keep their UI/Undo state unchanged
+    /// on failure.
+    pub(crate) fn write_user_ratings_shared(
+        &mut self,
+        writes: &[(String, u8, Option<crate::rating_db::RatingMeta>)],
+    ) -> Result<(), String> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let db_writes = writes
+            .iter()
+            .map(|(key, stars, meta)| (key.as_str(), *stars, meta.as_ref()))
+            .collect::<Vec<_>>();
+        self.rating_db
+            .as_ref()
+            .ok_or_else(|| "レーティング DB を利用できません".to_string())?
+            .set_user_ratings(&db_writes)
+            .map_err(|error| format!("レーティング DB への保存に失敗しました: {error}"))?;
+        for (key, stars, _) in writes {
+            self.record_rating_session_write(key.clone(), *stars, true);
+        }
+        self.sync_current_context_rating_session_writes();
+        Ok(())
+    }
+
     pub(crate) fn report_rating_write_error(&mut self, error: &str) {
         crate::logger::log(format!("[RATING] user write failed: {error}"));
         self.show_feedback_toast(format!("レーティングを保存できませんでした: {error}"));
@@ -40337,7 +40364,12 @@ impl App {
     /// スキャン完了後 (`loaded=true`) なら old→new の delta で直下コンテナに増減を加える。
     /// スキャン進行中は、worker の batch と bump の加算順序で二重計上・取りこぼしが起きる
     /// (Codex レビュー P1) ので、局所 bump は諦めて worker を restart する。
-    fn apply_rating_delta_to_folder_counts(&mut self, key: &str, old_stars: u8, new_stars: u8) {
+    pub(crate) fn apply_rating_delta_to_folder_counts(
+        &mut self,
+        key: &str,
+        old_stars: u8,
+        new_stars: u8,
+    ) {
         if old_stars == new_stars {
             return;
         }

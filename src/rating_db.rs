@@ -268,6 +268,24 @@ impl RatingDb {
         self.set_with_timestamp(key, stars, meta, Some(now_ms()))
     }
 
+    /// Apply one user operation atomically. Undo/Redo and other multi-item
+    /// boundaries must not expose a partially-applied group when a later row
+    /// fails.
+    pub fn set_user_ratings(
+        &self,
+        writes: &[(&str, u8, Option<&RatingMeta>)],
+    ) -> Result<(), rusqlite::Error> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let timestamp = now_ms();
+        for &(key, stars, meta) in writes {
+            Self::set_with_timestamp_on(&transaction, key, stars, meta, Some(timestamp))?;
+        }
+        transaction.commit()
+    }
+
     /// XMP hydration など外部由来の取り込み。非ゼロ値でも rated_at_ms は NULL。
     pub fn set_imported_rating(
         &self,
@@ -285,10 +303,19 @@ impl RatingDb {
         meta: Option<&RatingMeta>,
         rated_at_ms: Option<i64>,
     ) -> Result<(), rusqlite::Error> {
+        Self::set_with_timestamp_on(&self.conn, key, stars, meta, rated_at_ms)
+    }
+
+    fn set_with_timestamp_on(
+        conn: &rusqlite::Connection,
+        key: &str,
+        stars: u8,
+        meta: Option<&RatingMeta>,
+        rated_at_ms: Option<i64>,
+    ) -> Result<(), rusqlite::Error> {
         let stars = stars.min(5);
         if stars == 0 {
-            self.conn
-                .execute("DELETE FROM ratings WHERE path = ?1", [key])?;
+            conn.execute("DELETE FROM ratings WHERE path = ?1", [key])?;
             return Ok(());
         }
 
@@ -302,7 +329,7 @@ impl RatingDb {
             meta.and_then(|m| m.zipdir_is_archive.map(|v| if v { 1_i64 } else { 0_i64 }));
         let zipdir_representative = meta.and_then(|m| m.zipdir_representative.as_deref());
 
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO ratings (
                 path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
                 dir_prefix, archive_format, zipdir_is_archive, zipdir_representative
@@ -550,6 +577,30 @@ mod tests {
         assert_eq!(row.stars, 3);
         assert_eq!(row.rated_at_ms, None);
         assert_eq!(row.kind, Some(RatingItemKind::Image));
+    }
+
+    #[test]
+    fn user_rating_batch_rolls_back_all_rows_when_one_write_fails() {
+        let db = empty_db();
+        db.set_user_rating("a.jpg", 1, None).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_rating_insert
+                 BEFORE INSERT ON ratings
+                 WHEN NEW.path = 'fail.jpg'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected batch failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = db
+            .set_user_ratings(&[("a.jpg", 4, None), ("fail.jpg", 5, None)])
+            .expect_err("the second row must abort the transaction");
+
+        assert!(error.to_string().contains("injected batch failure"));
+        assert_eq!(db.get("a.jpg"), 1, "the first update must roll back");
+        assert_eq!(db.get("fail.jpg"), 0);
     }
 
     #[test]

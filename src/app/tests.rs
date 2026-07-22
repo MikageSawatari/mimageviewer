@@ -36776,4 +36776,136 @@ mod rating_write_failure_tests {
         assert!(!app.rating_session_writes.contains_key(&key));
         assert_eq!(app.meta_undo.undo_len(), 0);
     }
+
+    #[test]
+    fn failed_rating_undo_keeps_entry_and_display_on_undo_side() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("undo.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.rating_cache.insert(0, 4);
+        let key = crate::adjustment_db::normalize_path(&path);
+        let meta = app.rating_meta_for_idx(0);
+        app.push_rating_undo_entry(
+            vec![crate::undo_stack::RatingChange {
+                path_key: key,
+                source_path: path,
+                meta,
+                before: 1,
+                after: 4,
+            }],
+            "評価変更".to_string(),
+        );
+        app.rating_db = None;
+        let generation = app.rating_session_write_generation;
+
+        app.apply_meta_undo();
+
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.meta_undo.redo_len(), 0);
+        assert_eq!(app.rating_cache.get(&0), Some(&4));
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("レーティングを保存できませんでした") && !toast.0.contains("元に戻す")
+        }));
+    }
+
+    #[test]
+    fn failed_rating_redo_keeps_entry_and_display_on_redo_side() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("redo.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.rating_cache.insert(0, 4);
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 4, app.rating_meta_for_idx(0).as_ref())
+            .unwrap();
+        let meta = app.rating_meta_for_idx(0);
+        app.push_rating_undo_entry(
+            vec![crate::undo_stack::RatingChange {
+                path_key: key,
+                source_path: path,
+                meta,
+                before: 1,
+                after: 4,
+            }],
+            "評価変更".to_string(),
+        );
+        app.apply_meta_undo();
+        assert_eq!(app.rating_cache.get(&0), Some(&1));
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        app.rating_db = None;
+        let generation = app.rating_session_write_generation;
+
+        app.apply_meta_redo();
+
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        assert_eq!(app.rating_cache.get(&0), Some(&1));
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("レーティングを保存できませんでした") && !toast.0.contains("やり直し")
+        }));
+    }
+
+    #[test]
+    fn ring_rating_registers_only_one_undo_after_durable_success() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("ring.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, app.rating_meta_for_idx(0).as_ref())
+            .unwrap();
+        app.rating_cache.insert(0, 1);
+        let mut picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        picker
+            .dirty_rows
+            .push(crate::ring_shortcut::RingPickerRowId::ItemRating);
+        picker.item_rating = 4;
+
+        // A successful live preview already writes 4. Finalization writes the
+        // same value again but must derive one original->durable transition.
+        assert!(app.set_rating(0, 4));
+        let (records, container) = app.finalize_live_picker_ratings(&picker);
+        assert_eq!(records, vec![(0, 1, 4)]);
+        app.commit_live_picker_undo(records, container);
+
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.meta_undo.redo_len(), 0);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+    }
+
+    #[test]
+    fn ring_rating_failure_does_not_register_phantom_undo() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("ring-fail.jpg");
+        app.items = vec![GridItem::Image(path)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.rating_cache.insert(0, 2);
+        let mut picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        picker
+            .dirty_rows
+            .push(crate::ring_shortcut::RingPickerRowId::ItemRating);
+        picker.item_rating = 5;
+        app.rating_db = None;
+
+        let (records, container) = app.finalize_live_picker_ratings(&picker);
+        app.commit_live_picker_undo(records, container);
+
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert_eq!(app.rating_cache.get(&0), Some(&2));
+    }
 }

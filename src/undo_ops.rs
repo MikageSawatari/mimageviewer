@@ -7,7 +7,7 @@
 //! # キー設計
 //!
 //! - **Rating**: rating_db のキー (lowercased path) で記録。Undo 時に
-//!   `apply_rating_change_to_app` が DB を直接書き換え、grid 内に該当 idx があれば
+//!   `apply_rating_changes_to_app` が DB をトランザクションで書き換え、grid 内に該当 idx があれば
 //!   `rating_cache` も同期する。
 //! - **Tag**: パスと mIV タグの完全リストで記録。Undo 時は
 //!   `TagJobKind::SetTags(target)` を worker に積むだけ。worker が単一スレッド + FIFO
@@ -157,8 +157,15 @@ impl App {
         crate::logger::log(format!("[UNDO] applying undo: {summary}"));
         match &entry {
             UndoEntry::Rating { changes, .. } => {
-                for c in changes {
-                    self.apply_rating_change_to_app(c, /* use_before */ true);
+                if let Err(error) =
+                    self.apply_rating_changes_to_app(changes, /* use_before */ true)
+                {
+                    crate::logger::log(format!("[UNDO] rating undo failed: {error}"));
+                    self.report_rating_write_error(&error);
+                    // The entry was only borrowed, not applied. Restore it to
+                    // the same side; Redo must remain untouched.
+                    self.meta_undo.push_undo_from_redo(entry);
+                    return;
                 }
                 if self.items_are_rating_view {
                     let view_changes: Vec<(String, u8)> = changes
@@ -203,8 +210,14 @@ impl App {
         crate::logger::log(format!("[UNDO] applying redo: {summary}"));
         match &entry {
             UndoEntry::Rating { changes, .. } => {
-                for c in changes {
-                    self.apply_rating_change_to_app(c, /* use_before */ false);
+                if let Err(error) =
+                    self.apply_rating_changes_to_app(changes, /* use_before */ false)
+                {
+                    crate::logger::log(format!("[UNDO] rating redo failed: {error}"));
+                    self.report_rating_write_error(&error);
+                    // Keep the failed operation retryable on the Redo side.
+                    self.meta_undo.push_redo(entry);
+                    return;
                 }
                 if self.items_are_rating_view {
                     let view_changes: Vec<(String, u8)> = changes
@@ -278,68 +291,69 @@ impl App {
 
     // ── 内部: 1 件適用 ──────────────────────────────────────────────
 
-    /// レーティング 1 件の Undo/Redo 適用。`use_before=true` なら `before` を、false なら
-    /// `after` を新しい値として書き戻す。
-    ///
-    /// 現在のグリッドに該当 path のアイテムがあれば、そのまま `App::set_rating(idx, ...)`
-    /// を呼ぶ — これで rating_db / rating_cache / App-global rating 世代台帳 /
-    /// folder_rating_counts / current_folder_rating_cache / XMP worker submit など
-    /// すべての副作用が一括で正しく走る (Undo 用に再実装するとフォルダ★件数バッジの
-    /// 更新が抜けやすい)。フォルダ移動で undo_stack はクリアされるので、
-    /// 「現在のグリッドに必ず該当 idx がある」前提は通常成立する。
-    ///
-    /// グリッドに該当 idx が無い (= search results 等) のレアケースは、最低限
-    /// rating_db だけ書き戻す (visible_indices 再計算で表示は追従する)。
-    fn apply_rating_change_to_app(&mut self, c: &RatingChange, use_before: bool) {
-        let target = if use_before { c.before } else { c.after };
-
-        // 該当 path のアイテムを idx で集める。`rating_path_key` は Image/ZipImage/
-        // PdfPage と Folder/ZipFile/PdfFile を統一的に扱うため、ここから 1 経路で済む。
-        let matching: Vec<usize> = (0..self.items.len())
-            .filter(|&i| self.rating_path_key(i).as_deref() == Some(c.path_key.as_str()))
-            .collect();
-
-        if matching.is_empty() {
-            // 現在のグリッドに無い (= 通常はコンテナレーティングの Undo: current_folder
-            // 自身は self.items に含まれないため、ここに来る)。永続化に加えて、現在表示中
-            // フォルダと一致する場合はアドレスバー側のキャッシュも同期する (Codex P2)。
-            let fallback_meta;
-            let meta = match c.meta.as_ref() {
-                Some(meta) => Some(meta),
-                None => {
-                    fallback_meta =
-                        self.rating_meta_for_key_and_source(&c.path_key, &c.source_path);
-                    fallback_meta.as_ref()
-                }
-            };
-            if let Err(error) = self.write_user_rating_shared(&c.path_key, target, meta) {
-                self.report_rating_write_error(&error);
-                return;
+    /// Apply a rating Undo/Redo entry as one SQLite transaction. Durable DB
+    /// success is the publication boundary for caches, generations, XMP jobs,
+    /// and the caller's stack transition.
+    fn apply_rating_changes_to_app(
+        &mut self,
+        changes: &[RatingChange],
+        use_before: bool,
+    ) -> Result<(), String> {
+        let mut writes = Vec::with_capacity(changes.len());
+        let mut seen = std::collections::HashSet::with_capacity(changes.len());
+        for change in changes {
+            if !seen.insert(change.path_key.clone()) {
+                continue;
             }
-            self.invalidate_rating_counts_cache();
-            if self
-                .current_container_rating_key_and_source()
-                .is_some_and(|(key, _)| key == c.path_key)
-            {
-                self.current_folder_rating_cache = Some(target);
+            let target = if use_before {
+                change.before
+            } else {
+                change.after
+            };
+            let meta = change.meta.clone().or_else(|| {
+                self.rating_meta_for_key_and_source(&change.path_key, &change.source_path)
+            });
+            writes.push((change.path_key.clone(), target, meta));
+        }
+        self.write_user_ratings_shared(&writes)?;
+
+        self.invalidate_rating_counts_cache();
+        for change in changes {
+            let old = if use_before {
+                change.after
+            } else {
+                change.before
+            };
+            let target = if use_before {
+                change.before
+            } else {
+                change.after
+            };
+            let is_leaf = (0..self.items.len()).any(|idx| {
+                self.rating_path_key(idx).as_deref() == Some(change.path_key.as_str())
+                    && self.items[idx].is_rating_leaf()
+            });
+            if is_leaf {
+                self.apply_rating_delta_to_folder_counts(&change.path_key, old, target);
             }
             if self.settings.write_rating_to_xmp
-                && crate::xmp_writer::is_writable_format(&c.source_path)
+                && crate::xmp_writer::is_writable_format(&change.source_path)
             {
                 self.ensure_rating_write_handle();
-                if let Some(h) = self.rating_write_handle.as_ref() {
-                    h.submit(crate::rating_write_worker::RatingWriteJob {
-                        path: c.source_path.clone(),
-                        rating: if target == 0 { None } else { Some(target) },
+                if let Some(handle) = self.rating_write_handle.as_ref() {
+                    handle.submit(crate::rating_write_worker::RatingWriteJob {
+                        path: change.source_path.clone(),
+                        rating: (target != 0).then_some(target),
                     });
                 }
             }
-            return;
         }
-
-        for idx in matching {
-            self.set_rating(idx, target);
+        if !changes.is_empty() {
+            self.schedule_current_smart_folder_metadata_refresh(
+                crate::app::smart_folder::SmartFolderMetadataDependency::Rating,
+            );
         }
+        Ok(())
     }
 
     /// 画像補正 Undo/Redo の 1 件適用。スコープに応じて対応する書き込みパス

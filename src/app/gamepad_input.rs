@@ -2226,7 +2226,10 @@ impl App {
         self.maybe_show_x_picker_hint(ctx, context);
     }
 
-    fn build_ring_picker_state(&mut self, context: RingShortcutContext) -> RingPickerState {
+    pub(crate) fn build_ring_picker_state(
+        &mut self,
+        context: RingShortcutContext,
+    ) -> RingPickerState {
         let fs_idx = self.fullscreen_idx;
         let params = fs_idx.map(|idx| self.effective_params(idx).clone());
         let item_rating_records = self.current_picker_item_rating_records(context);
@@ -3733,45 +3736,106 @@ impl App {
         }
         self.gamepad_state.cancel_west_ring();
         self.gamepad_state.require_directional_neutral();
-        self.commit_live_picker_undo(&picker);
+        let (item_rating_records, container_rating_record) =
+            self.finalize_live_picker_ratings(&picker);
+        self.commit_live_picker_undo(item_rating_records, container_rating_record);
         self.apply_ring_picker_state(ctx, picker);
         ctx.request_repaint();
     }
 
-    fn commit_live_picker_undo(&mut self, picker: &RingPickerState) {
+    /// Re-apply the selected final value, then return only durable changes from
+    /// the picker-open snapshot. Rating caches are updated strictly after DB
+    /// success, so they are the per-target publication record for both earlier
+    /// live previews and this final write; dirty state alone proves nothing.
+    pub(crate) fn finalize_live_picker_ratings(
+        &mut self,
+        picker: &RingPickerState,
+    ) -> (Vec<(usize, u8, u8)>, Option<(u8, u8)>) {
+        let mut item_records = Vec::new();
         if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
-            let records: Vec<(usize, u8, u8)> = picker
-                .original
-                .item_rating_records
-                .iter()
-                .filter_map(|&(idx, before)| {
-                    (before != picker.item_rating).then_some((idx, before, picker.item_rating))
-                })
-                .collect();
-            if !records.is_empty() {
-                let summary = if records.len() > 1 {
-                    if picker.item_rating == 0 {
-                        format!("★解除を {} 件に適用", records.len())
-                    } else {
-                        format!("★{} を {} 件に付与", picker.item_rating, records.len())
+            let mut first_error = None;
+            let mut touched = Vec::new();
+            for &(idx, _) in &picker.original.item_rating_records {
+                match self.set_rating_result(idx, picker.item_rating) {
+                    Ok(true) => touched.push(idx),
+                    Ok(false) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
                     }
-                } else if picker.item_rating == 0 {
-                    "★解除".to_string()
-                } else {
-                    format!("★{}", picker.item_rating)
-                };
-                self.capture_rating_undo(records, summary);
+                }
+            }
+            if let Some(error) = first_error {
+                self.report_rating_write_error(&error);
+            }
+
+            for &(idx, before) in &picker.original.item_rating_records {
+                let actual = self.rating_cache.get(&idx).copied().unwrap_or(before);
+                if before != actual {
+                    item_records.push((idx, before, actual));
+                }
+            }
+            if self.global_search.active {
+                self.refresh_global_search_hit_stars(&touched);
+            }
+            if self.items_are_rating_view {
+                let changes = item_records
+                    .iter()
+                    .filter_map(|&(idx, _, actual)| {
+                        self.rating_path_key(idx).map(|key| (key, actual))
+                    })
+                    .collect::<Vec<_>>();
+                self.refresh_rating_view_after_rating_changes(&changes);
+            } else if self.global_search.active && self.items_are_global_search_view {
+                self.rebuild_items_from_global_search();
+            } else {
+                self.rebuild_visible_indices();
+            }
+            if touched.len() > 1 {
+                self.checked.clear();
             }
         }
+
+        let mut container_record = None;
         if picker
             .dirty_rows
             .contains(&RingPickerRowId::ContainerRating)
-            && picker.original.container_rating != picker.container_rating
         {
-            self.capture_container_rating_undo(
-                picker.original.container_rating,
-                picker.container_rating,
-            );
+            if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+                self.report_rating_write_error(&error);
+            }
+            let actual = self
+                .current_folder_rating_cache
+                .unwrap_or(picker.original.container_rating);
+            if picker.original.container_rating != actual {
+                container_record = Some((picker.original.container_rating, actual));
+            }
+        }
+        (item_records, container_record)
+    }
+
+    pub(crate) fn commit_live_picker_undo(
+        &mut self,
+        item_records: Vec<(usize, u8, u8)>,
+        container_record: Option<(u8, u8)>,
+    ) {
+        if !item_records.is_empty() {
+            let actual = item_records[0].2;
+            let summary = if item_records.len() > 1 {
+                if actual == 0 {
+                    format!("★解除を {} 件に適用", item_records.len())
+                } else {
+                    format!("★{actual} を {} 件に付与", item_records.len())
+                }
+            } else if actual == 0 {
+                "★解除".to_string()
+            } else {
+                format!("★{actual}")
+            };
+            self.capture_rating_undo(item_records, summary);
+        }
+        if let Some((before, after)) = container_record {
+            self.capture_container_rating_undo(before, after);
+            self.show_container_rating_toast(after);
         }
     }
 
@@ -3821,20 +3885,6 @@ impl App {
         }
         if settings_changed {
             self.settings.save();
-        }
-        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
-            self.apply_rating_to_selection(picker.item_rating);
-        }
-        if picker
-            .dirty_rows
-            .contains(&RingPickerRowId::ContainerRating)
-            && self.current_folder_rating() != picker.container_rating
-        {
-            match self.set_current_folder_rating(picker.container_rating) {
-                Ok(true) => self.show_container_rating_toast(picker.container_rating),
-                Ok(false) => {}
-                Err(error) => self.report_rating_write_error(&error),
-            }
         }
     }
 
@@ -3907,20 +3957,6 @@ impl App {
                 self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, fit);
             }
         }
-        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
-            self.apply_fullscreen_picker_rating(fs_idx, picker.item_rating);
-        }
-        if picker
-            .dirty_rows
-            .contains(&RingPickerRowId::ContainerRating)
-            && self.current_folder_rating() != picker.container_rating
-        {
-            match self.set_current_folder_rating(picker.container_rating) {
-                Ok(true) => self.show_container_rating_toast(picker.container_rating),
-                Ok(false) => {}
-                Err(error) => self.report_rating_write_error(&error),
-            }
-        }
         if self.reading_flow.is_paged() {
             if picker.dirty_rows.contains(&RingPickerRowId::PostFilter) {
                 if self.effective_params(fs_idx).post_filter != picker.original.post_filter {
@@ -3973,42 +4009,6 @@ impl App {
             && self.video_continuous_mode != picker.video_continuous_mode
         {
             self.set_video_continuous_mode_common(ctx, fs_idx, picker.video_continuous_mode);
-        }
-        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
-            self.apply_fullscreen_picker_rating(fs_idx, picker.item_rating);
-        }
-        if picker
-            .dirty_rows
-            .contains(&RingPickerRowId::ContainerRating)
-            && self.current_folder_rating() != picker.container_rating
-        {
-            match self.set_current_folder_rating(picker.container_rating) {
-                Ok(true) => self.show_container_rating_toast(picker.container_rating),
-                Ok(false) => {}
-                Err(error) => self.report_rating_write_error(&error),
-            }
-        }
-    }
-
-    fn apply_fullscreen_picker_rating(&mut self, fs_idx: usize, stars: u8) {
-        let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
-        if before == stars {
-            return;
-        }
-        if !self.set_rating(fs_idx, stars) {
-            return;
-        }
-        let summary = if stars == 0 {
-            "★解除".to_string()
-        } else {
-            format!("★{stars}")
-        };
-        self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
-        self.rebuild_visible_indices();
-        if stars == 0 {
-            self.show_feedback_toast("[★解除]".to_string());
-        } else {
-            self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
         }
     }
 

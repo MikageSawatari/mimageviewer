@@ -22,6 +22,26 @@ impl BookFileIdentity {
     pub(crate) fn read(path: &Path) -> Result<Self, String> {
         RealBookFileOps.identity(path)
     }
+
+    fn from_reader(mut input: impl Read, path: &Path) -> Result<Self, String> {
+        let mut hasher = Sha256::new();
+        let mut len = 0u64;
+        let mut buffer = [0u8; 128 * 1024];
+        loop {
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            len = len.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Self {
+            len,
+            sha256: hasher.finalize().into(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,9 +237,24 @@ trait BookFileOps {
     fn publish_file_no_replace(&self, from: &Path, to: &Path) -> Result<(), std::io::Error>;
     fn copy_create_new(&self, from: &Path, to: &Path) -> Result<(), String>;
     fn remove_file(&self, path: &Path) -> Result<(), String>;
+    /// Remove only the exact file represented by `expected`. Implementations
+    /// must bind verification and deletion to the same file object; a second
+    /// path lookup after verification reintroduces a replacement race.
+    fn remove_file_if_identity(
+        &self,
+        path: &Path,
+        expected: &BookFileIdentity,
+    ) -> Result<IdentityRemoval, String>;
     fn remove_dir(&self, path: &Path) -> Result<(), String>;
     fn identity(&self, path: &Path) -> Result<BookFileIdentity, String>;
     fn sync_dir(&self, path: &Path) -> Result<(), String>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityRemoval {
+    Missing,
+    Removed,
+    Mismatch,
 }
 
 struct RealBookFileOps;
@@ -267,35 +302,102 @@ impl BookFileOps for RealBookFileOps {
         fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))
     }
 
+    fn remove_file_if_identity(
+        &self,
+        path: &Path,
+        expected: &BookFileIdentity,
+    ) -> Result<IdentityRemoval, String> {
+        remove_file_if_identity(path, expected)
+    }
+
     fn remove_dir(&self, path: &Path) -> Result<(), String> {
         fs::remove_dir(path).map_err(|error| format!("{}: {error}", path.display()))
     }
 
     fn identity(&self, path: &Path) -> Result<BookFileIdentity, String> {
-        let mut input =
-            fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let mut hasher = Sha256::new();
-        let mut len = 0u64;
-        let mut buffer = [0u8; 128 * 1024];
-        loop {
-            let read = input
-                .read(&mut buffer)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            if read == 0 {
-                break;
-            }
-            len = len.saturating_add(read as u64);
-            hasher.update(&buffer[..read]);
-        }
-        Ok(BookFileIdentity {
-            len,
-            sha256: hasher.finalize().into(),
-        })
+        let input = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        BookFileIdentity::from_reader(input, path)
     }
 
     fn sync_dir(&self, path: &Path) -> Result<(), String> {
         sync_directory(path).map_err(|error| format!("{}: {error}", path.display()))
     }
+}
+
+/// Open without sharing, hash through that handle, then mark that same handle
+/// for deletion. With sharing disabled, another process cannot replace the
+/// pathname between verification and `FileDispositionInfo`; closing the handle
+/// completes deletion of the verified file object.
+#[cfg(windows)]
+fn remove_file_if_identity(
+    path: &Path,
+    expected: &BookFileIdentity,
+) -> Result<IdentityRemoval, String> {
+    remove_file_if_identity_with_hook(path, expected, || {})
+}
+
+#[cfg(windows)]
+fn remove_file_if_identity_with_hook(
+    path: &Path,
+    expected: &BookFileIdentity,
+    before_delete: impl FnOnce(),
+) -> Result<IdentityRemoval, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FileDispositionInfo,
+        SetFileInformationByHandle,
+    };
+
+    let mut file = match OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ.0 | DELETE.0)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(IdentityRemoval::Missing);
+        }
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let actual = BookFileIdentity::from_reader(&mut file, path)?;
+    if &actual != expected {
+        return Ok(IdentityRemoval::Mismatch);
+    }
+
+    // Test hook deliberately runs at the old race point. The exclusive handle
+    // must make replacement fail before deletion is requested on this handle.
+    before_delete();
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            std::mem::size_of_val(&disposition) as u32,
+        )
+    }
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    drop(file);
+    Ok(IdentityRemoval::Removed)
+}
+
+#[cfg(not(windows))]
+fn remove_file_if_identity(
+    path: &Path,
+    expected: &BookFileIdentity,
+) -> Result<IdentityRemoval, String> {
+    let actual = match BookFileIdentity::read(path) {
+        Ok(actual) => actual,
+        Err(_) if !path.exists() => return Ok(IdentityRemoval::Missing),
+        Err(error) => return Err(error),
+    };
+    if &actual != expected {
+        return Ok(IdentityRemoval::Mismatch);
+    }
+    fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(IdentityRemoval::Removed)
 }
 
 /// Windows needs `FILE_FLAG_BACKUP_SEMANTICS` to open a directory. A write
@@ -615,14 +717,13 @@ fn remove_expected_file<O: BookFileOps>(
     identity: &BookFileIdentity,
     role: &str,
 ) -> Result<(), String> {
-    if !expected_file_present(ops, path, identity, role)? {
-        return sync_parent(ops, path);
+    match ops.remove_file_if_identity(path, identity)? {
+        IdentityRemoval::Missing | IdentityRemoval::Removed => sync_parent(ops, path),
+        IdentityRemoval::Mismatch => Err(format!(
+            "{role} identity differs; refusing to delete unrelated file: {}",
+            path.display()
+        )),
     }
-    // Recheck immediately before deletion so an already-visible external
-    // replacement is never classified as this journal's output.
-    require_identity(ops, path, identity)?;
-    ops.remove_file(path)?;
-    sync_parent(ops, path)
 }
 
 fn apply_copy<O: BookFileOps>(
@@ -851,6 +952,18 @@ mod tests {
             }
         }
 
+        fn remove_file_if_identity(
+            &self,
+            path: &Path,
+            expected: &BookFileIdentity,
+        ) -> Result<IdentityRemoval, String> {
+            if matches!(self.fault, Fault::Delete) {
+                Err(self.fail("injected delete failure"))
+            } else {
+                RealBookFileOps.remove_file_if_identity(path, expected)
+            }
+        }
+
         fn remove_dir(&self, path: &Path) -> Result<(), String> {
             RealBookFileOps.remove_dir(path)
         }
@@ -973,6 +1086,40 @@ mod tests {
             assert_eq!(std::fs::read(&to).unwrap(), b"external-after-crash");
             assert_eq!(from.exists(), !move_file);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_checked_delete_blocks_mock_replacement_at_delete_boundary() {
+        use std::cell::RefCell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("destination.jpg");
+        let displaced = temp.path().join("displaced.jpg");
+        std::fs::write(&path, b"journal-owned").unwrap();
+        let identity = BookFileIdentity::read(&path).unwrap();
+        let replacement_attempt = RefCell::new(None);
+
+        let outcome = remove_file_if_identity_with_hook(&path, &identity, || {
+            // This hook is exactly where the former implementation closed the
+            // checked handle and called path-based remove_file. Mock an external
+            // replacement there; the exclusive verified handle must reject it.
+            let result = std::fs::rename(&path, &displaced)
+                .and_then(|_| std::fs::write(&path, b"unrelated replacement"));
+            *replacement_attempt.borrow_mut() = Some(result);
+        })
+        .unwrap();
+
+        assert_eq!(outcome, IdentityRemoval::Removed);
+        assert!(
+            replacement_attempt
+                .into_inner()
+                .expect("replacement hook ran")
+                .is_err(),
+            "an external replacement must not pass the exclusive verified handle"
+        );
+        assert!(!path.exists());
+        assert!(!displaced.exists());
     }
 
     #[test]
