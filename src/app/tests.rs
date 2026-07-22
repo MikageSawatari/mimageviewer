@@ -31742,6 +31742,11 @@ mod still_window_mode_key_tests {
         }
         app.fullscreen_idx = Some(10);
         app.spread_mode = crate::settings::SpreadMode::Rtl;
+        app.reading_direction = crate::settings::ReadingDirection::Rtl;
+        app.settings.fullscreen_seek_direction =
+            crate::settings::FullscreenSeekDirection::LeftToRight;
+        app.settings.fullscreen_horizontal_cursor_direction =
+            crate::settings::FullscreenHorizontalCursorDirection::FollowSeekBar;
         app.settings.fullscreen_jump_mode = crate::settings::FullscreenJumpMode::Percent;
         app.settings.fullscreen_jump_percent = 10;
 
@@ -31760,6 +31765,43 @@ mod still_window_mode_key_tests {
             Some(7),
             "right-bound spread mode should treat Shift+Right as previous"
         );
+    }
+
+    #[test]
+    fn fullscreen_plain_right_can_follow_seek_bar_instead_of_rtl_page_direction() {
+        for (cursor_direction, expected_delta) in [
+            (
+                crate::settings::FullscreenHorizontalCursorDirection::FollowPage,
+                -1,
+            ),
+            (
+                crate::settings::FullscreenHorizontalCursorDirection::FollowSeekBar,
+                1,
+            ),
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            for i in 0..12 {
+                push_image(&mut app, &format!(r"C:\pics\{i:03}.jpg"));
+            }
+            app.fullscreen_idx = Some(4);
+            app.spread_mode = crate::settings::SpreadMode::Rtl;
+            app.reading_direction = crate::settings::ReadingDirection::Rtl;
+            app.settings.fullscreen_seek_direction =
+                crate::settings::FullscreenSeekDirection::LeftToRight;
+            app.settings.fullscreen_horizontal_cursor_direction = cursor_direction;
+            let expected = match app.spread_page_nav(expected_delta) {
+                crate::ui_fullscreen::FsPageNav::Target(idx) => idx,
+                other => panic!("middle spread must have a navigation target: {other:?}"),
+            };
+
+            begin_root_key_pass(&ctx, egui::Key::ArrowRight, false);
+            let handled = app.handle_fullscreen_root_key_input(&ctx);
+            let _ = ctx.end_pass();
+
+            assert!(handled);
+            assert_eq!(app.fullscreen_idx, Some(expected), "{cursor_direction:?}");
+        }
     }
 
     #[test]
@@ -32440,6 +32482,108 @@ mod rating_view_navigation_tests {
             "PageList must clear a previous direct-page one-shot"
         );
         assert_eq!(app.rating_view_nav_stack, vec![pdf]);
+    }
+
+    #[test]
+    fn multi_window_explicit_container_open_is_toast_only_without_side_effects() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let original_folder = app.tmp.path().join("main-grid");
+        let history_entry = app.tmp.path().join("history.zip");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.current_folder = Some(original_folder.clone());
+        app.pending_auto_fs_open = true;
+        app.rating_view_nav_stack.push(history_entry.clone());
+
+        for (item, mode) in [
+            (
+                GridItem::ZipFile(app.tmp.path().join("book.zip")),
+                GridContainerOpenMode::PageFullscreen,
+            ),
+            (
+                GridItem::PdfFile(app.tmp.path().join("book.pdf")),
+                GridContainerOpenMode::PageList,
+            ),
+            (
+                GridItem::ConvertibleArchive {
+                    path: app.tmp.path().join("book.rar"),
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                },
+                GridContainerOpenMode::PageFullscreen,
+            ),
+        ] {
+            app.items = vec![item];
+            app.selected = Some(0);
+            app.fs_feedback_toast = None;
+            app.fs_feedback_toast_surface = None;
+
+            assert!(
+                app.open_selected_grid_container_with_mode(&ctx, mode, "test")
+                    .is_none()
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&original_folder));
+            assert!(app.pending_auto_fs_open);
+            assert_eq!(app.rating_view_nav_stack, vec![history_entry.clone()]);
+            assert!(app.archive_convert.is_none());
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+                text.contains("フル機能ウィンドウで利用できます")
+            }));
+            assert_eq!(
+                app.fs_feedback_toast_surface,
+                Some(crate::app::ActionSurface::MainWindow)
+            );
+        }
+    }
+
+    #[test]
+    fn multi_window_ring_container_open_uses_the_common_noop_guard() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let original_folder = app.tmp.path().join("main-grid");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.current_folder = Some(original_folder.clone());
+        app.items = vec![GridItem::ZipFile(app.tmp.path().join("book.zip"))];
+        app.selected = Some(0);
+
+        for action in [
+            crate::ring_shortcut::RingActionId::GridOpenSelectedAsPage,
+            crate::ring_shortcut::RingActionId::GridOpenSelectedAsList,
+        ] {
+            app.fs_feedback_toast = None;
+            assert!(
+                app.apply_ring_action(
+                    &ctx,
+                    crate::ring_shortcut::RingShortcutContext::Grid,
+                    action,
+                    "test-ring",
+                )
+                .is_none()
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&original_folder));
+            assert_eq!(app.selected, Some(0));
+            assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+                text.contains("フル機能ウィンドウで利用できます")
+            }));
+        }
+    }
+
+    #[test]
+    fn archive_page_format_does_not_change_viewer_gesture_context() {
+        let mut app = setup_app();
+        for container in ["direct.rar", "converted-rar.zip", "book.zip"] {
+            app.items = vec![GridItem::ZipImage {
+                zip_path: app.tmp.path().join(container),
+                entry_name: "page01.jpg".to_string(),
+            }];
+            app.fullscreen_idx = Some(0);
+
+            assert_eq!(
+                app.current_right_drag_context(),
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                "viewer gesture dispatch must not depend on the archive container: {container}"
+            );
+        }
     }
 
     #[test]

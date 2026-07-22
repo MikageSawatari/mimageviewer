@@ -28372,13 +28372,29 @@ impl App {
         self.open_grid_container_with_mode(ctx, idx, mode, source)
     }
 
+    /// 明示的な「ページを開く / 一覧を開く」は、メイン一覧をそのページ一覧へ
+    /// 遷移させるフル機能ウィンドウ用コマンド。複数ウィンドウモードでは本を
+    /// independent viewer に直開きする契約なので、入口で副作用なしに無効化する。
+    pub(crate) fn explicit_grid_container_open_disabled_reason(&self) -> Option<&'static str> {
+        self.settings
+            .detached_viewer_open_images_in_window
+            .then_some("「ページを開く」「一覧を開く」はフル機能ウィンドウで利用できます")
+    }
+
     pub(crate) fn open_grid_container_with_mode(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
         mode: GridContainerOpenMode,
-        _source: &'static str,
+        source: &'static str,
     ) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(reason) = self.explicit_grid_container_open_disabled_reason() {
+            crate::logger::log(format!(
+                "[input-nav] source={source} ignored explicit container open mode={mode:?} in multi-window mode"
+            ));
+            self.show_feedback_toast_on(reason.to_string(), ActionSurface::MainWindow);
+            return None;
+        }
         let Some(item) = self.items.get(idx).cloned() else {
             self.show_feedback_toast("ZIP/PDF/対応アーカイブを選択してください".into());
             return None;

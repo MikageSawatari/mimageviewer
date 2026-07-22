@@ -11952,8 +11952,18 @@ impl App {
         }
 
         // ── ナビゲーション ──
-        // RTL モードでは左右キーの意味を反転
-        let rtl = self.spread_mode.is_rtl();
+        // 通常の左右キーによるページ移動だけは、ページ表示の綴じ方向かシークバーの
+        // 実効方向かを設定で選べる。Ctrl/Shift+左右などの明示コマンドは従来どおり
+        // ページ表示の綴じ方向を使い、この設定へ巻き込まない。
+        let page_rtl = self.spread_mode.is_rtl();
+        let seek_bar_rtl = self
+            .settings
+            .fullscreen_seek_direction
+            .is_rtl(self.reading_direction);
+        let horizontal_cursor_rtl = self
+            .settings
+            .fullscreen_horizontal_cursor_direction
+            .is_rtl(page_rtl, seek_bar_rtl);
         // 連続読みのスクロール/ナビ分岐は、レンダラが実際に連続描画している条件と一致させる。
         // これで縦/横読み中に解析(Z)・比較(X/C)・オーバーレイ編集・動画/非対応アイテムへ
         // 入ったとき、↑↓ がスクロールへ吸われてナビもスクロールもしない (デッド入力) のを防ぎ、
@@ -11995,18 +12005,22 @@ impl App {
             self.scroll_vertical_reading_by(ctx, scroll_delta);
         }
         let nav_next = if vertical_reading {
-            (arrow_right && !rtl) || (arrow_left && rtl)
+            (arrow_right && !horizontal_cursor_rtl) || (arrow_left && horizontal_cursor_rtl)
         } else if horizontal_reading {
             arrow_down
         } else {
-            (arrow_right && !rtl) || (arrow_left && rtl) || arrow_down
+            (arrow_right && !horizontal_cursor_rtl)
+                || (arrow_left && horizontal_cursor_rtl)
+                || arrow_down
         };
         let nav_prev = if vertical_reading {
-            (arrow_left && !rtl) || (arrow_right && rtl)
+            (arrow_left && !horizontal_cursor_rtl) || (arrow_right && horizontal_cursor_rtl)
         } else if horizontal_reading {
             arrow_up
         } else {
-            (arrow_left && !rtl) || (arrow_right && rtl) || arrow_up
+            (arrow_left && !horizontal_cursor_rtl)
+                || (arrow_right && horizontal_cursor_rtl)
+                || arrow_up
         };
 
         // 矢印キーでのフォルダ内移動はスライドショーを止めない (ホイール / クリックと統一)。
@@ -12029,8 +12043,8 @@ impl App {
         }
         // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在の表示ユニット先頭を
         // 1 ページぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
-        let ctrl_nudge_next = (ctrl_right && !rtl) || (ctrl_left && rtl);
-        let ctrl_nudge_prev = (ctrl_left && !rtl) || (ctrl_right && rtl);
+        let ctrl_nudge_next = (ctrl_right && !page_rtl) || (ctrl_left && page_rtl);
+        let ctrl_nudge_prev = (ctrl_left && !page_rtl) || (ctrl_right && page_rtl);
         if ctrl_nudge_next || ctrl_nudge_prev || spread_shift_prev || spread_shift_next {
             let dir = if spread_shift_next || ctrl_nudge_next {
                 1
@@ -12077,7 +12091,7 @@ impl App {
             action.page_nav = self.spread_page_nav(-1);
         }
         if fixed_jump_next || fixed_jump_prev {
-            let forward = if fixed_jump_next { !rtl } else { rtl };
+            let forward = if fixed_jump_next { !page_rtl } else { page_rtl };
             if let Some(new_idx) = self.fullscreen_large_jump_target(fs_idx, forward) {
                 action.jump_to = Some(new_idx);
             } else {

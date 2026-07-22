@@ -11,10 +11,11 @@ use crate::ring_shortcut::{
     format_mouse_gesture_pattern, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
-    self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
-    FullscreenSeekDirection, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
-    SortOrder, SpreadMode, StartupFolderMode, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX,
-    UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
+    self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
+    FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenSeekDirection,
+    GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
+    StartupFolderMode, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN,
+    UiFontSelection, UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -6889,7 +6890,19 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 );
             }
         });
-    ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグに適用されます。左右キーと画面端クリックは本の読み方向に従います。");
+    ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグに適用されます。");
+    egui::ComboBox::from_label("カーソルキー左右の方向")
+        .selected_text(s.fullscreen_horizontal_cursor_direction.label())
+        .show_ui(ui, |ui| {
+            for &direction in FullscreenHorizontalCursorDirection::all() {
+                ui.selectable_value(
+                    &mut s.fullscreen_horizontal_cursor_direction,
+                    direction,
+                    direction.label(),
+                );
+            }
+        });
+    ui.small("通常の左右キーによるページ移動だけに適用します。前／次コマンド、Shift+左右、Ctrl+左右、PageUp／PageDown、画面端クリック、ホイールの方向は変わりません。");
     ui.checkbox(&mut s.fullscreen_top_bar_locked, "上部情報バーを固定表示");
     ui.small("ON のときはフルスクリーン上端に情報バー領域を確保し、画像と重ならないようにフィットします。上部バーの鍵アイコンからも切り替えできます。");
     ui.checkbox(

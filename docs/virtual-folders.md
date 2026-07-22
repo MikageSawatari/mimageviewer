@@ -312,6 +312,10 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 同じくページ一覧をスキップして開く。MangaMeeya 風の「本棚 → 本を開く → 読む → 閉じて本棚」
 フロー。開く位置は `book_open_resume` (続きから / 先頭から) に従う。
 複数ウィンドウモードでは `auto_fullscreen_zip_pdf` の保存値は書き換えず、実効値だけを ON として扱う。
+このモードではメイン一覧をページ一覧へ切り替える明示コマンド「ページを開く」/「一覧を開く」は
+利用しない。キー、右クリックメニュー、リング、マウスジェスチャのいずれから発火しても、共通の
+`open_grid_container_with_mode` 入口で理由をトースト表示して no-op とし、RAR 変換開始や読書履歴更新を
+含む副作用を起こさない。通常 ZIP、直読み RAR、変換対象 RAR/7z/LZH でこの判定を分岐させない。
 
 - グリッド側の open (`ui_main` ダブルクリック / `handle_keyboard` Enter) で
   `pending_auto_fs_open` を立てる (ZipFile/PdfFile/ConvertibleArchive、追加設定 ON の

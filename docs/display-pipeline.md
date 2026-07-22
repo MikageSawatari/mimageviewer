@@ -777,6 +777,10 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して
 クリック先が逆になるような独立判定を置かない。
+通常の左右カーソルキーによるページ移動は
+`fullscreen_horizontal_cursor_direction` で、従来のページ表示方向か、このシークバー実効方向かを
+選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、
+`FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
 **描画は `draw_fs_image` を再利用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、

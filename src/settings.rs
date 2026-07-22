@@ -2497,6 +2497,47 @@ impl FullscreenSeekDirection {
     }
 }
 
+/// 静止画フルスクリーンの通常の左右カーソルキーで、左右のどちらを前方として扱うか。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenHorizontalCursorDirection {
+    /// ページ表示の綴じ方向に合わせる（従来動作）。
+    #[default]
+    FollowPage,
+    /// 下部ページシークバーの実効左右方向に合わせる。
+    FollowSeekBar,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenHorizontalCursorDirection {
+    pub fn all() -> &'static [Self] {
+        &[Self::FollowPage, Self::FollowSeekBar]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::FollowPage => "ページ表示 / 読み方向に合わせる",
+            Self::FollowSeekBar => "シークバー方向に合わせる",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::FollowPage,
+            value => value,
+        }
+    }
+
+    pub fn is_rtl(self, page_rtl: bool, seek_bar_rtl: bool) -> bool {
+        match self.normalized() {
+            Self::FollowPage => page_rtl,
+            Self::FollowSeekBar => seek_bar_rtl,
+            Self::Unknown => unreachable!(),
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // FullscreenFitMode (フルスクリーン倍率/フィット基準)
 // -----------------------------------------------------------------------
@@ -3215,6 +3256,9 @@ pub struct Settings {
     /// 静止画フルスクリーン下部のページシークバーの左右方向。
     #[serde(default)]
     pub fullscreen_seek_direction: FullscreenSeekDirection,
+    /// 静止画フルスクリーンの通常の左右カーソルキーの方向。
+    #[serde(default)]
+    pub fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection,
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
@@ -4540,6 +4584,7 @@ impl Default for Settings {
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
             fullscreen_seek_direction: FullscreenSeekDirection::default(),
+            fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection::default(),
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
             fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
@@ -7212,6 +7257,10 @@ mod tests {
             s.fullscreen_seek_direction,
             FullscreenSeekDirection::FollowReading
         );
+        assert_eq!(
+            s.fullscreen_horizontal_cursor_direction,
+            FullscreenHorizontalCursorDirection::FollowPage
+        );
         assert!(s.fullscreen_page_number_overlay);
         assert!(!s.fullscreen_keep_on_app_switch);
         assert_eq!(
@@ -7273,6 +7322,19 @@ mod tests {
         assert!(follow.is_rtl(ReadingDirection::Rtl));
         assert!(!FullscreenSeekDirection::LeftToRight.is_rtl(ReadingDirection::Rtl));
         assert!(FullscreenSeekDirection::Unknown.is_rtl(ReadingDirection::Rtl));
+    }
+
+    #[test]
+    fn fullscreen_horizontal_cursor_direction_selects_only_requested_axis() {
+        let page = FullscreenHorizontalCursorDirection::FollowPage;
+        let seek = FullscreenHorizontalCursorDirection::FollowSeekBar;
+        for page_rtl in [false, true] {
+            for seek_rtl in [false, true] {
+                assert_eq!(page.is_rtl(page_rtl, seek_rtl), page_rtl);
+                assert_eq!(seek.is_rtl(page_rtl, seek_rtl), seek_rtl);
+            }
+        }
+        assert!(FullscreenHorizontalCursorDirection::Unknown.is_rtl(true, false));
     }
 
     #[test]

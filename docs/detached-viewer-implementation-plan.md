@@ -531,6 +531,11 @@ enum NativeVideoPlacement {
   Stage SETTINGS 以後、複数ウィンドウモードでは `auto_fullscreen_zip_pdf` の保存値を変更せず、
   `effective_auto_fullscreen_zip_pdf()` を true として扱う。したがって ON×保存値 OFF でも
   ZIP/PDF/対応アーカイブは直開きになる。
+- 複数ウィンドウモードでフル機能ウィンドウ専用の `GridOpenSelectedAsPage` /
+  `GridOpenSelectedAsList` を実行した場合は、container open の共通入口で理由をトースト表示し、
+  履歴更新・RAR 変換開始・一覧遷移・viewer open のいずれも行わない。キー、右クリック、リング、
+  マウスジェスチャは同じ入口へ収束させる。これは入力コマンド境界の整理であり、detached の
+  lifecycle / viewport / session 所有権は変更しない。
 - 独立 detached 静止画 session かどうかは、open 時の one-shot フラグではなく
   `detached_viewer_independent_active` として session に保持する。これは現在の active viewer の状態であり、
   independent active viewer を passive window へ退避した時点で新しい active viewer へは引き継がない。

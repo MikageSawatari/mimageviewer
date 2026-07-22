@@ -308,6 +308,14 @@ impl App {
             .command_display_rows_for_active_scopes(help_context.active_scopes(), false)
             .into_iter()
             .filter(|row| help_context.includes_row(row))
+            .filter(|row| {
+                self.explicit_grid_container_open_disabled_reason()
+                    .is_none()
+                    || !matches!(
+                        row.spec.action,
+                        KeyAction::GridOpenSelectedAsPage | KeyAction::GridOpenSelectedAsList
+                    )
+            })
             .collect::<Vec<_>>();
         let mut close_clicked = false;
 

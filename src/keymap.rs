@@ -3638,8 +3638,12 @@ impl KeyAction {
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
             GridOpenSelected => "選択中の項目を開く",
-            GridOpenSelectedAsPage => "選択中の ZIP/PDF/対応アーカイブをページで開く",
-            GridOpenSelectedAsList => "選択中の ZIP/PDF/対応アーカイブを一覧で開く",
+            GridOpenSelectedAsPage => {
+                "選択中の ZIP/PDF/対応アーカイブをページで開く（フル機能ウィンドウ）"
+            }
+            GridOpenSelectedAsList => {
+                "選択中の ZIP/PDF/対応アーカイブを一覧で開く（フル機能ウィンドウ）"
+            }
             GridOpenExternalPlayer => "選択中の動画を外部プレイヤーで開く",
             GridParentFolder => "親フォルダへ移動する",
             GridHistoryBack => "フォルダ履歴を戻る",
