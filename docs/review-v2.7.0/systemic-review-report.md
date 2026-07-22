@@ -10,7 +10,7 @@
 context ownership、非同期request、cache invalidation、入力経路、同型のtop-level viewを
 横断して再レビューした。
 
-**未解決はP2が1件。** slow pathのbookmark openを通常navigationまたはactivationが置き換える場合、
+**レビュー時点の未解決はP2が1件。** slow pathのbookmark openを通常navigationまたはactivationが置き換える場合、
 path resolverとbookmark requestの解消が一体化されていない。手動navigation後に古いbookmarkが
 遅れて開く、またはactivation後にold pendingが残る可能性があるため、コード出荷判定は保留とする。
 
@@ -138,5 +138,25 @@ focused test、全library test、全main binary test、check、format、UI文字
 
 ## 最終判定
 
-**コード出荷保留。** 上記P2をroot causeで修正し、通常navigation / activationを含むrequest lifecycle
+**レビュー時点ではコード出荷保留。** 上記P2をroot causeで修正し、通常navigation / activationを含むrequest lifecycle
 testを追加した後、この指摘と同型経路を再レビューする。P2以外のコード領域は本レビュー上readyである。
+
+## 対応追補（2026-07-23）
+
+- bookmark open ごとに process-local の単調増加 request ID を発行し、media / book pending と path
+  resolver owner を同じ ID で結び付けた。resolver owner は target identity も保持し、完了時に ID と
+  target の両方が現在の request に一致する場合だけ結果を適用する。
+- bookmark A → B、activation、通常 folder navigation は置き換え対象の owner だけを cancel する。
+  resolver 完了後の page / player 待機中も、別 container への navigation で同じ pending と戻り先を
+  終了する。古い A の cancel / completion は新しい B を消さず、表示 folder も変更しない。
+- worker disconnect、media timeout、book page timeout に加え、従来無期限だった Book `Resolving` に
+  45 秒 timeout を追加した。終了時は request に属する resolver / pending / view state を同じ境界で
+  解消し、50ms repaint の理由を残さない。
+- slow resolve → navigation、slow resolve → activation、A → B、stale completion、media / book の
+  disconnect / timeout、resolver 完了後 navigation を回帰テストへ追加した。
+
+対応後の検証は request lifecycle focused 9件成功、bookmark focused 139件成功、main binary 全テスト
+4,065件成功・失敗0件・18件ignored、
+`cargo check -p mimageviewer --bin mimageviewer-core` と `cargo fmt --all -- --check` 成功。
+
+**追補判定: 上記P2は解消。本指摘によるコード出荷保留を解除する。**

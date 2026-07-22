@@ -65,7 +65,11 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   開く要求は media / book の独立した `Option` を併存させず、単一の型付き pending とする。戻り先も
   origin grid を所有する `Opening`、DB 再構築後に位置を戻す `Restoring`、別 viewer context 側の
   `Detached` を明示し、snapshot の有無を ownership 判定に流用しない。マウス、Enter、ゲームパッドは
-  すべて同じブックマーク open router を通す。
+  すべて同じブックマーク open router を通す。各 open には process 内で単調増加する request ID を
+  発行し、path resolver、media / book 待機、target identity を同じ owner に結び付ける。通常移動、
+  activation、後続ブックマーク、worker 切断、cancel、timeout は一致する旧 ID の resolver / pending /
+  戻り先だけを終了し、古い完了通知は request ID と target の両方が現在値に一致する場合だけ適用する。
+  Book の resolve 待機にも 45 秒の終了条件を設け、owner のない pending による継続再描画を残さない。
 - スマートフィルタの `状態` に `ブックマークあり / ブックマークなし` を追加する。動画・音声は
   対象ファイル、本はコンテナまたは表示中ページの安定 identity で判定し、スマートフォルダの
   保存条件にも含める。

@@ -1447,13 +1447,92 @@ mod startup_open_path_resolve_tests {
         mpsc,
     };
 
+    fn bookmark_grid_state() -> BookmarkViewReturnGridState {
+        BookmarkViewReturnGridState {
+            row_keys: vec![(0, 1)],
+            selected_key: Some((0, 1)),
+            opened_key: (0, 1),
+            scroll_offset_y: 120.0,
+        }
+    }
+
+    fn arm_media_bookmark(
+        app: &mut App,
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+        path: PathBuf,
+        started_at: std::time::Instant,
+    ) {
+        app.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone()),
+            grid: bookmark_grid_state(),
+        });
+        app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+            crate::bookmark_browser::PendingMediaOpen {
+                request_id,
+                path,
+                pts_secs: 12.0,
+                started_at,
+                last_wait: None,
+            },
+        ));
+    }
+
+    fn arm_book_bookmark(
+        app: &mut App,
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+        path: PathBuf,
+        started_at: std::time::Instant,
+    ) {
+        app.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path.clone()),
+            grid: bookmark_grid_state(),
+        });
+        app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+            crate::bookmark_browser::PendingBookOpen {
+                request_id,
+                bookmark: crate::book_bookmarks::BookBookmark {
+                    id: 1,
+                    container_key: crate::adjustment_db::normalize_path(&path),
+                    container_path: path,
+                    container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+                    page_identity: crate::book_bookmarks::PageIdentity::PdfPage(0),
+                    page_index_hint: 0,
+                    created_at_ms: 1,
+                    title: None,
+                },
+                relative_page_provenance: None,
+                started_at,
+                stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+            },
+        ));
+    }
+
+    fn install_bookmark_resolver(
+        app: &mut App,
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+        target: crate::bookmark_browser::BookmarkViewReturnTarget,
+        requested: PathBuf,
+    ) -> (mpsc::Sender<StartupOpenPathResolveResult>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested,
+            owner: StartupOpenPathOwner::Bookmark { request_id, target },
+            cancel: Arc::clone(&cancel),
+            rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+        });
+        (tx, cancel)
+    }
+
     #[test]
     fn startup_open_path_resolve_shows_delayed_toast() {
         let mut app = setup_app();
         let (_tx, rx) = mpsc::channel();
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
             requested: PathBuf::from(r"\\server\offline\book.zip"),
-            source: StartupOpenPathSource::Activation,
+            owner: StartupOpenPathOwner::Activation,
             cancel: Arc::new(AtomicBool::new(false)),
             rx,
             started_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
@@ -1482,7 +1561,7 @@ mod startup_open_path_resolve_tests {
         let old_cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
             requested: PathBuf::from(r"\\server\slow\old.zip"),
-            source: StartupOpenPathSource::Activation,
+            owner: StartupOpenPathOwner::Activation,
             cancel: Arc::clone(&old_cancel),
             rx,
             started_at: std::time::Instant::now(),
@@ -1495,6 +1574,271 @@ mod startup_open_path_resolve_tests {
 
         assert!(old_cancel.load(Ordering::Relaxed));
         assert!(app.startup_open_path_resolve_pending.is_some());
+    }
+
+    #[test]
+    fn normal_navigation_cancels_slow_bookmark_resolve_and_ignores_late_result() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(10);
+        let old_target = app.tmp.path().join("old.mp4");
+        arm_media_bookmark(
+            &mut app,
+            request_id,
+            old_target.clone(),
+            std::time::Instant::now(),
+        );
+        let (tx, cancel) = install_bookmark_resolver(
+            &mut app,
+            request_id,
+            crate::bookmark_browser::BookmarkViewReturnTarget::Media(old_target.clone()),
+            old_target,
+        );
+        let destination = app.tmp.path().join("manual-navigation");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        app.load_folder(destination.clone());
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &destination
+        ));
+        assert!(
+            tx.send(StartupOpenPathResolveResult {
+                requested: PathBuf::from("old.mp4"),
+                resolved: None,
+                bookmark_relative_page_openable: None,
+                elapsed_ms: 1.0,
+            })
+            .is_err(),
+            "late result receiver must be gone"
+        );
+    }
+
+    #[test]
+    fn activation_replaces_slow_bookmark_request_as_one_lifecycle() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(11);
+        let old_target = app.tmp.path().join("old.mp4");
+        arm_media_bookmark(
+            &mut app,
+            request_id,
+            old_target.clone(),
+            std::time::Instant::now(),
+        );
+        let (_tx, cancel) = install_bookmark_resolver(
+            &mut app,
+            request_id,
+            crate::bookmark_browser::BookmarkViewReturnTarget::Media(old_target.clone()),
+            old_target,
+        );
+        let activation = app.tmp.path().join("activation");
+        std::fs::create_dir_all(&activation).unwrap();
+        let ctx = egui::Context::default();
+
+        app.start_startup_open_path_resolve(
+            activation.clone(),
+            StartupOpenPathSource::Activation,
+            &ctx,
+        );
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.owner, StartupOpenPathOwner::Activation))
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.startup_open_path_resolve_pending.is_some()
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_startup_open_path_resolve(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &activation
+        ));
+    }
+
+    #[test]
+    fn replacing_bookmark_a_with_b_cannot_cancel_or_apply_over_b() {
+        let mut app = setup_app();
+        let request_a = crate::bookmark_browser::BookmarkOpenRequestId(20);
+        let request_b = crate::bookmark_browser::BookmarkOpenRequestId(21);
+        let target_a = app.tmp.path().join("a.mp4");
+        let target_b = app.tmp.path().join("b.mp4");
+        std::fs::write(&target_b, []).unwrap();
+        let (_tx, cancel_a) = install_bookmark_resolver(
+            &mut app,
+            request_a,
+            crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_a.clone()),
+            target_a.clone(),
+        );
+        arm_media_bookmark(
+            &mut app,
+            request_b,
+            target_b.clone(),
+            std::time::Instant::now(),
+        );
+        let ctx = egui::Context::default();
+
+        app.start_startup_open_path_resolve(
+            target_b.clone(),
+            StartupOpenPathSource::Bookmark,
+            &ctx,
+        );
+
+        assert!(cancel_a.load(Ordering::Relaxed));
+        assert_eq!(
+            app.bookmark_open_pending.as_ref().unwrap().request_id(),
+            request_b
+        );
+        assert!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .is_some_and(|pending| matches!(
+                    pending.owner,
+                    StartupOpenPathOwner::Bookmark { request_id, .. } if request_id == request_b
+                ))
+        );
+
+        let before = app.current_folder.clone();
+        let stale_resolved_folder = app.tmp.path().to_path_buf();
+        app.finish_startup_open_path_resolve(
+            StartupOpenPathOwner::Bookmark {
+                request_id: request_a,
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_a.clone()),
+            },
+            StartupOpenPathResolveResult {
+                requested: target_a,
+                resolved: Some(crate::folder_tree::OpenablePathResolution {
+                    path: stale_resolved_folder,
+                    kind: crate::folder_tree::OpenablePathKind::Directory,
+                    requested_is_file: true,
+                }),
+                bookmark_relative_page_openable: None,
+                elapsed_ms: 1.0,
+            },
+            &ctx,
+        );
+        assert_eq!(app.current_folder, before);
+        assert_eq!(
+            app.bookmark_open_pending.as_ref().unwrap().request_id(),
+            request_b
+        );
+    }
+
+    #[test]
+    fn disconnected_bookmark_resolver_clears_media_request_and_view() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(30);
+        let target = app.tmp.path().join("media.mp4");
+        arm_media_bookmark(
+            &mut app,
+            request_id,
+            target.clone(),
+            std::time::Instant::now(),
+        );
+        let (tx, _cancel) = install_bookmark_resolver(
+            &mut app,
+            request_id,
+            crate::bookmark_browser::BookmarkViewReturnTarget::Media(target.clone()),
+            target,
+        );
+        drop(tx);
+
+        app.poll_startup_open_path_resolve(&egui::Context::default());
+
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+    }
+
+    #[test]
+    fn disconnected_bookmark_resolver_clears_book_request_and_view() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(31);
+        let target = app.tmp.path().join("book.pdf");
+        arm_book_bookmark(
+            &mut app,
+            request_id,
+            target.clone(),
+            std::time::Instant::now(),
+        );
+        let (tx, _cancel) = install_bookmark_resolver(
+            &mut app,
+            request_id,
+            crate::bookmark_browser::BookmarkViewReturnTarget::Book(target.clone()),
+            target,
+        );
+        drop(tx);
+
+        app.poll_startup_open_path_resolve(&egui::Context::default());
+
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+    }
+
+    #[test]
+    fn navigation_cancels_book_request_after_resolver_completion() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(35);
+        let book = app.tmp.path().join("book.pdf");
+        arm_book_bookmark(&mut app, request_id, book, std::time::Instant::now());
+        app.bookmark_open_pending
+            .as_mut()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book_mut)
+            .unwrap()
+            .begin_page_wait();
+        let destination = app.tmp.path().join("other-folder");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        app.load_folder(destination.clone());
+
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &destination
+        ));
+    }
+
+    #[test]
+    fn media_and_resolving_book_timeouts_finish_their_lifecycle() {
+        let mut app = setup_app();
+        let media_id = crate::bookmark_browser::BookmarkOpenRequestId(40);
+        let media_path = app.tmp.path().join("media.mp4");
+        arm_media_bookmark(
+            &mut app,
+            media_id,
+            media_path,
+            std::time::Instant::now() - std::time::Duration::from_secs(31),
+        );
+        app.poll_bookmark_media_open(&egui::Context::default());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+
+        let book_id = crate::bookmark_browser::BookmarkOpenRequestId(41);
+        let book_path = app.tmp.path().join("book.pdf");
+        arm_book_bookmark(
+            &mut app,
+            book_id,
+            book_path,
+            std::time::Instant::now() - std::time::Duration::from_secs(46),
+        );
+        app.poll_bookmark_book_open(&egui::Context::default());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(app.startup_open_path_resolve_pending.is_none());
     }
 }
 
@@ -6339,6 +6683,7 @@ fn bookmark_media_open_waits_until_open_time_resume_has_settled() {
         );
         app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
             crate::bookmark_browser::PendingMediaOpen {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
                 path: bookmark_db_path,
                 pts_secs: 42.0,
                 started_at: std::time::Instant::now(),
@@ -6728,6 +7073,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     let return_target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone());
     app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
         crate::bookmark_browser::PendingMediaOpen {
+            request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
             path: path.clone(),
             pts_secs: 42.0,
             started_at: std::time::Instant::now(),
@@ -6871,6 +7217,7 @@ fn arm_detached_bookmark_book_open(
     });
     app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
         crate::bookmark_browser::PendingBookOpen {
+            request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
             bookmark: crate::book_bookmarks::BookBookmark {
                 id: 9,
                 container_key: crate::adjustment_db::normalize_path(&container),
@@ -6882,6 +7229,7 @@ fn arm_detached_bookmark_book_open(
                 title: None,
             },
             relative_page_provenance: None,
+            started_at: std::time::Instant::now(),
             stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
         },
     ));
@@ -7133,6 +7481,7 @@ fn begin_detached_bookmark_media_test(
     });
     app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
         crate::bookmark_browser::PendingMediaOpen {
+            request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
             path: target.clone(),
             pts_secs: 42.0,
             started_at: std::time::Instant::now(),
@@ -7344,6 +7693,7 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
     });
     app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
         crate::bookmark_browser::PendingBookOpen {
+            request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
             bookmark: crate::book_bookmarks::BookBookmark {
                 id: 73,
                 container_key: crate::adjustment_db::normalize_path(&book),
@@ -7355,6 +7705,7 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
                 title: None,
             },
             relative_page_provenance: None,
+            started_at: std::time::Instant::now(),
             stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
         },
     ));

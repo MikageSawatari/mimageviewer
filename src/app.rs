@@ -2480,6 +2480,34 @@ pub(crate) enum StartupOpenPathSource {
     Bookmark,
 }
 
+/// path resolver の結果を適用できる所有者。
+///
+/// Bookmark は request ID と target の両方を固定し、古い worker の完了や cancel が
+/// 後続の bookmark request を変更できないようにする。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StartupOpenPathOwner {
+    InitialStartup,
+    Activation,
+    Bookmark {
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+        target: crate::bookmark_browser::BookmarkViewReturnTarget,
+    },
+}
+
+impl StartupOpenPathOwner {
+    fn source(&self) -> StartupOpenPathSource {
+        match self {
+            Self::InitialStartup => StartupOpenPathSource::InitialStartup,
+            Self::Activation => StartupOpenPathSource::Activation,
+            Self::Bookmark { .. } => StartupOpenPathSource::Bookmark,
+        }
+    }
+
+    fn perf_tag(&self) -> &'static str {
+        self.source().perf_tag()
+    }
+}
+
 impl StartupOpenPathSource {
     fn perf_tag(self) -> &'static str {
         match self {
@@ -2506,7 +2534,7 @@ pub(crate) struct StartupOpenPathResolveResult {
 /// resolve だけ先に worker へ逃がし、完了後の実ロードだけ UI スレッドで行う。
 pub(crate) struct StartupOpenPathResolvePending {
     requested: PathBuf,
-    source: StartupOpenPathSource,
+    owner: StartupOpenPathOwner,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<StartupOpenPathResolveResult>,
     started_at: std::time::Instant,
@@ -7467,6 +7495,8 @@ pub struct App {
     pub(crate) bookmark_media_filter: crate::bookmark_browser::MediaFilter,
     pub(crate) bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter,
     pub(crate) bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort,
+    /// process 内で bookmark open request を一意にする単調増加 sequence。
+    pub(crate) bookmark_open_request_seq: u64,
     pub(crate) bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
     /// ブックマークから既存 items の relative page を開く1回だけの loader trust root。
     /// `open_fullscreen` が同期的に fs / metadata worker へ snapshot した直後に破棄する。
@@ -10173,6 +10203,7 @@ impl App {
             bookmark_media_filter: crate::bookmark_browser::MediaFilter::default(),
             bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
             bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
+            bookmark_open_request_seq: 0,
             bookmark_open_pending: None,
             bookmark_relative_page_open_once: None,
             bookmark_view_state: None,
@@ -14450,6 +14481,13 @@ impl App {
     /// をスキップできる。`path` が ZIP/PDF ファイルのときは仮想フォルダとして
     /// 別ルートに入るため `pre_scan` は無視される (None 相当で委譲)。
     pub fn load_folder_with_scan(&mut self, path: PathBuf, pre_scan: Option<ScannedDir>) {
+        // A direct navigation owns the next visible location. If an earlier startup,
+        // activation, or bookmark path is still resolving, dispose that request before the
+        // worker can overwrite this navigation with a late completion. Resolver-driven loads
+        // have already taken their pending receiver before reaching here, so they are not
+        // mistaken for a competing navigation.
+        self.cancel_unresolved_open_for_navigation();
+        self.cancel_conflicting_bookmark_open_for_navigation(&path);
         // 別経路の load が走ったら、in-flight のフォルダペイン open scan は stale なので
         // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
         // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
@@ -24304,6 +24342,12 @@ impl App {
             row.stable_key(),
             self.scroll_offset_y,
         );
+        self.bookmark_open_request_seq = self
+            .bookmark_open_request_seq
+            .checked_add(1)
+            .expect("bookmark open request sequence exhausted");
+        let request_id =
+            crate::bookmark_browser::BookmarkOpenRequestId(self.bookmark_open_request_seq);
         match &row.source {
             crate::bookmark_browser::BookmarkRowSource::Media { path, pts_secs, .. } => {
                 let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone());
@@ -24320,6 +24364,7 @@ impl App {
                 self.bookmark_open_pending =
                     Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
                         crate::bookmark_browser::PendingMediaOpen {
+                            request_id,
                             path: path.clone(),
                             pts_secs: *pts_secs,
                             started_at: std::time::Instant::now(),
@@ -24349,8 +24394,10 @@ impl App {
                 self.bookmark_open_pending =
                     Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
                         crate::bookmark_browser::PendingBookOpen {
+                            request_id,
                             bookmark: bookmark.clone(),
                             relative_page_provenance: row.relative_page_provenance.clone(),
+                            started_at: std::time::Instant::now(),
                             stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
                         },
                     ));
@@ -24540,7 +24587,7 @@ impl App {
                 self.fullscreen_idx,
                 current_item
             ));
-            self.bookmark_open_pending = None;
+            self.cancel_bookmark_open_request(pending.request_id, "media_timeout");
             self.show_feedback_toast("ブックマーク位置を開けませんでした".to_string());
             return;
         }
@@ -24601,7 +24648,13 @@ impl App {
             player.position(),
             player.current_seek_serial()
         ));
-        self.bookmark_open_pending = None;
+        if self
+            .bookmark_open_pending
+            .as_ref()
+            .is_some_and(|current| current.request_id() == pending.request_id)
+        {
+            self.bookmark_open_pending = None;
+        }
     }
 
     fn poll_bookmark_book_open(&mut self, ctx: &egui::Context) {
@@ -24618,10 +24671,16 @@ impl App {
                 started_at,
                 entered_archive_prefix,
             } => (*started_at, *entered_archive_prefix),
-            crate::bookmark_browser::PendingBookOpenStage::Resolving => return,
+            crate::bookmark_browser::PendingBookOpenStage::Resolving => {
+                if pending.started_at.elapsed() > std::time::Duration::from_secs(45) {
+                    self.cancel_bookmark_open_request(pending.request_id, "book_resolve_timeout");
+                    self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
+                }
+                return;
+            }
         };
         if started_at.elapsed() > std::time::Duration::from_secs(45) {
-            self.bookmark_open_pending = None;
+            self.cancel_bookmark_open_request(pending.request_id, "book_page_timeout");
             self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
             return;
         }
@@ -24632,7 +24691,13 @@ impl App {
             return;
         }
         if let Some(idx) = self.book_bookmark_item_idx(&pending.bookmark) {
-            self.bookmark_open_pending = None;
+            if self
+                .bookmark_open_pending
+                .as_ref()
+                .is_some_and(|current| current.request_id() == pending.request_id)
+            {
+                self.bookmark_open_pending = None;
+            }
             let provenance = pending.relative_page_provenance.clone().or_else(|| {
                 let crate::book_bookmarks::PageIdentity::RelativePath(relative) =
                     &pending.bookmark.page_identity
@@ -24663,7 +24728,7 @@ impl App {
             || self.pdf_enumerate_pending.is_some()
             || self.items.is_empty();
         if !enumeration_pending {
-            self.bookmark_open_pending = None;
+            self.cancel_bookmark_open_request(pending.request_id, "book_page_missing");
             self.show_feedback_toast(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );

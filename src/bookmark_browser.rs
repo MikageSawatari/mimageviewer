@@ -794,8 +794,16 @@ impl PendingMediaOpenWait {
     }
 }
 
+/// 横断ブックマーク一覧から発行された open request の process-local identity。
+///
+/// path resolver、viewer 待機、戻り先を同じ要求として照合するために使う。path は同じ対象を
+/// 続けて開けるため identity にはならず、単調増加 ID を別に持つ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BookmarkOpenRequestId(pub(crate) u64);
+
 #[derive(Clone, Debug)]
 pub struct PendingMediaOpen {
+    pub request_id: BookmarkOpenRequestId,
     pub path: PathBuf,
     pub pts_secs: f64,
     pub started_at: std::time::Instant,
@@ -816,8 +824,10 @@ pub enum PendingBookOpenStage {
 
 #[derive(Clone, Debug)]
 pub struct PendingBookOpen {
+    pub request_id: BookmarkOpenRequestId,
     pub bookmark: crate::book_bookmarks::BookBookmark,
     pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
+    pub started_at: std::time::Instant,
     pub stage: PendingBookOpenStage,
 }
 
@@ -840,6 +850,13 @@ pub enum PendingBookmarkOpen {
 }
 
 impl PendingBookmarkOpen {
+    pub fn request_id(&self) -> BookmarkOpenRequestId {
+        match self {
+            Self::Media(pending) => pending.request_id,
+            Self::Book(pending) => pending.request_id,
+        }
+    }
+
     pub fn media(&self) -> Option<&PendingMediaOpen> {
         match self {
             Self::Media(pending) => Some(pending),
