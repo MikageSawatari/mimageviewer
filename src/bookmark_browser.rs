@@ -461,11 +461,12 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
         });
     }
     let archive_cache = crate::archive_cache::ArchiveCacheDb::open().ok();
+    let mut book_missing_cache = HashMap::new();
     for bookmark in crate::book_bookmarks::load_all_from_disk()? {
         if cancel.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }
-        let missing = book_page_missing(&bookmark);
+        let missing = book_page_missing(&bookmark, &mut book_missing_cache);
         let item = book_grid_item(&bookmark, archive_cache.as_ref());
         let image_meta = match &item {
             GridItem::Image(path) => source_meta(path),
@@ -570,14 +571,57 @@ fn book_grid_item(
     }
 }
 
-fn book_page_missing(bookmark: &crate::book_bookmarks::BookBookmark) -> bool {
-    if !bookmark.container_path.try_exists().unwrap_or(false) {
-        return true;
-    }
-    match (&bookmark.container_kind, &bookmark.page_identity) {
-        (
+enum BookContainerMissingIndex {
+    Missing,
+    Filesystem,
+    ZipEntries(Option<HashSet<String>>),
+    PdfPageCount(Option<usize>),
+    Present,
+}
+
+/// 一覧 worker の1回の構築中は ZIP / PDF の列挙結果をコンテナ単位で共有する。
+/// 読み取りエラーは従来どおり missing と断定せず、記録を残して open 時の導線へ委ねる。
+fn book_page_missing(
+    bookmark: &crate::book_bookmarks::BookBookmark,
+    cache: &mut HashMap<String, BookContainerMissingIndex>,
+) -> bool {
+    let cache_key = crate::book_bookmarks::container_key(&bookmark.container_path);
+    let index = cache.entry(cache_key).or_insert_with(|| {
+        if !bookmark.container_path.try_exists().unwrap_or(false) {
+            return BookContainerMissingIndex::Missing;
+        }
+        match bookmark.container_kind {
             crate::book_bookmarks::BookContainerKind::CompiledBook
-            | crate::book_bookmarks::BookContainerKind::ImageFolder,
+            | crate::book_bookmarks::BookContainerKind::ImageFolder => {
+                BookContainerMissingIndex::Filesystem
+            }
+            crate::book_bookmarks::BookContainerKind::Zip => {
+                let entries = crate::zip_loader::enumerate_image_entries(&bookmark.container_path)
+                    .ok()
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| normalize_virtual_path(&entry.entry_name))
+                            .collect()
+                    });
+                BookContainerMissingIndex::ZipEntries(entries)
+            }
+            crate::book_bookmarks::BookContainerKind::Pdf => {
+                let count = crate::pdf_loader::enumerate_pages(&bookmark.container_path, None)
+                    .ok()
+                    .map(|pages| pages.len());
+                BookContainerMissingIndex::PdfPageCount(count)
+            }
+            crate::book_bookmarks::BookContainerKind::OtherArchive => {
+                BookContainerMissingIndex::Present
+            }
+        }
+    });
+
+    match (index, &bookmark.page_identity) {
+        (BookContainerMissingIndex::Missing, _) => true,
+        (
+            BookContainerMissingIndex::Filesystem,
             crate::book_bookmarks::PageIdentity::RelativePath(relative),
         ) => !bookmark
             .container_path
@@ -585,24 +629,16 @@ fn book_page_missing(bookmark: &crate::book_bookmarks::BookBookmark) -> bool {
             .try_exists()
             .unwrap_or(false),
         (
-            crate::book_bookmarks::BookContainerKind::Zip,
+            BookContainerMissingIndex::ZipEntries(entries),
             crate::book_bookmarks::PageIdentity::ArchiveEntry(wanted),
-        ) => crate::zip_loader::enumerate_image_entries(&bookmark.container_path)
-            .map(|entries| {
-                let wanted = wanted.replace('\\', "/").to_lowercase();
-                !entries
-                    .into_iter()
-                    .any(|entry| entry.entry_name.replace('\\', "/").to_lowercase() == wanted)
-            })
-            // 読み取りエラーや一時ロックは「missing」と断定しない。
+        ) => entries
+            .as_ref()
+            .map(|entries| !entries.contains(&normalize_virtual_path(wanted)))
             .unwrap_or(false),
         (
-            crate::book_bookmarks::BookContainerKind::Pdf,
+            BookContainerMissingIndex::PdfPageCount(count),
             crate::book_bookmarks::PageIdentity::PdfPage(page),
-        ) => crate::pdf_loader::enumerate_pages(&bookmark.container_path, None)
-            .map(|pages| *page as usize >= pages.len())
-            // パスワード付き PDF 等は open 時に既存導線で解決する。
-            .unwrap_or(false),
+        ) => count.map(|count| *page as usize >= count).unwrap_or(false),
         _ => false,
     }
 }
@@ -704,6 +740,7 @@ impl BookmarkViewReturnTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn media_row(id: i64, created_at_ms: i64, name: &str) -> BookmarkBrowserRow {
         let path = PathBuf::from(format!(r"C:\media\{name}.mp4"));
@@ -777,6 +814,47 @@ mod tests {
         ));
         assert!(presence.has_archive_prefix(&archive, "part/"));
         assert!(!presence.has_archive_prefix(&archive, "other/"));
+    }
+
+    #[test]
+    fn missing_check_reuses_zip_inventory_for_bookmarks_in_same_container() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let zip_path = temp.path().join("book.zip");
+        let file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("chapter/p001.jpg", options)
+            .expect("start entry");
+        writer.write_all(b"image").expect("write entry");
+        writer.finish().expect("finish zip");
+
+        let bookmark = |entry: &str| BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&zip_path),
+            container_path: zip_path.clone(),
+            container_kind: BookContainerKind::Zip,
+            page_identity: PageIdentity::ArchiveEntry(entry.to_string()),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+        let mut cache = HashMap::new();
+        assert!(!book_page_missing(
+            &bookmark("chapter/p001.jpg"),
+            &mut cache
+        ));
+
+        // 2件目で再列挙すれば読み取りエラーになり missing を断定できない。最初の
+        // inventory が再利用されるため、存在しない entry を正しく missing と判定できる。
+        std::fs::write(&zip_path, b"not a zip anymore").expect("replace zip");
+        assert!(book_page_missing(
+            &bookmark("chapter/missing.jpg"),
+            &mut cache
+        ));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

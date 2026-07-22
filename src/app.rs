@@ -22180,7 +22180,9 @@ impl App {
     /// sidecar ミラー書込) はさらに後のフレーム後半に走るため、is_busy だけだと移行開始後に
     /// 旧 path のサイドカーが書き直される (Sol rename-mig R2 P2)。
     /// ★の書込 worker (ファイル XMP / 動画サイドカー) も同様に待つ (DB は書かず、
-    /// sidecar 書込は worker 内で完結するので is_busy で足りる)。
+    /// sidecar 書込は worker 内で完結するので is_busy で足りる)。本ブックマークは
+    /// 専用 service の FIFO へ旧 path の追加が残った後で rename DB を先に動かさないよう、
+    /// request の結果を UI が消費し終えるまで待つ。
     pub(crate) fn rename_migration_writers_busy(&self) -> bool {
         let tag_busy = self
             .tag_write_handle
@@ -22190,7 +22192,7 @@ impl App {
             .rating_write_handle
             .as_ref()
             .is_some_and(|h| h.is_busy());
-        tag_busy || rating_busy
+        tag_busy || rating_busy || !self.book_bookmark_pending_requests.is_empty()
     }
 
     /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
@@ -22317,10 +22319,9 @@ impl App {
                     // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
                     // (角度⑦ P1、Sol/Terra/Luna 一致)。
                     self.rehydrate_contexts_after_rename_migration(&job.old_path, &job.new_path);
-                    if self.bookmark_presence.is_some() || self.bookmark_presence_pending.is_some()
-                    {
-                        self.refresh_bookmark_presence();
-                    }
+                    // 共通リネーム worker は book_bookmarks.db も更新する。現在の本の
+                    // 左パネルと横断一覧が旧 identity を保持し続けないよう再読込する。
+                    self.invalidate_book_bookmarks_after_path_migration();
                     self.refresh_smart_folders_after_rename();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -23456,8 +23457,34 @@ impl App {
                 crate::book_bookmarks::BookBookmarkEvent::AllListed { request_id, .. } => {
                     self.book_bookmark_pending_requests.remove(&request_id);
                 }
+                crate::book_bookmarks::BookBookmarkEvent::PathsMigrated { request_id, result } => {
+                    self.book_bookmark_pending_requests.remove(&request_id);
+                    match result {
+                        Ok(rows) => {
+                            if rows > 0 {
+                                self.invalidate_book_bookmarks_after_path_migration();
+                            }
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "book bookmark path migration failed: {error}"
+                            ));
+                            self.show_feedback_toast(
+                                "本ブックマークの引き継ぎに失敗しました".to_string(),
+                            );
+                        }
+                    }
+                }
             }
         }
+    }
+
+    fn invalidate_book_bookmarks_after_path_migration(&mut self) {
+        self.current_book_bookmarks.clear();
+        self.current_book_bookmarks_key = None;
+        self.current_book_bookmarks_request = None;
+        self.book_bookmark_title_edit = None;
+        self.notify_bookmarks_changed();
     }
 
     pub(crate) fn book_bookmark_item_idx(
@@ -23496,13 +23523,44 @@ impl App {
         ctx: &egui::Context,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) {
-        if let Some(idx) = self.book_bookmark_item_idx(bookmark) {
+        let mut item_idx = self.book_bookmark_item_idx(bookmark);
+        if item_idx.is_none() && self.enter_book_bookmark_archive_prefix(bookmark) {
+            item_idx = self.book_bookmark_item_idx(bookmark);
+        }
+        if let Some(idx) = item_idx {
             self.open_fullscreen_from_fs_navigation(ctx, idx);
         } else {
             self.show_feedback_toast(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
         }
+    }
+
+    /// ネスト ZIP の現在表示階層に無いページへ、ブックマークの entry prefix を使って移動する。
+    ///
+    /// 左パネルと横断一覧のどちらから開いても同じ階層解決を通すことで、現在
+    /// materialize 済みの `items` だけに到達可否を左右させない。
+    fn enter_book_bookmark_archive_prefix(
+        &mut self,
+        bookmark: &crate::book_bookmarks::BookBookmark,
+    ) -> bool {
+        let crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) = &bookmark.page_identity
+        else {
+            return false;
+        };
+        let normalized = entry_name.replace('\\', "/");
+        let Some((prefix, _)) = normalized.rsplit_once('/') else {
+            return false;
+        };
+        if prefix.is_empty() {
+            return false;
+        }
+        let Some(nav) = self.zip_nav.as_mut() else {
+            return false;
+        };
+        nav.enter(&format!("{prefix}/"));
+        self.zip_nav_show_current_level();
+        true
     }
 
     pub(crate) fn ensure_bookmark_panel_thumbnails(&mut self, indices: &[usize]) {
@@ -24165,20 +24223,11 @@ impl App {
         }
 
         if !pending.entered_archive_prefix
-            && let crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) =
-                &pending.bookmark.page_identity
+            && self.enter_book_bookmark_archive_prefix(&pending.bookmark)
         {
-            let normalized = entry_name.replace('\\', "/");
-            if let Some((prefix, _)) = normalized.rsplit_once('/')
-                && !prefix.is_empty()
-                && let Some(nav) = self.zip_nav.as_mut()
-            {
-                nav.enter(&format!("{prefix}/"));
-                pending.entered_archive_prefix = true;
-                self.bookmark_book_open_pending = Some(pending);
-                self.zip_nav_show_current_level();
-                return;
-            }
+            pending.entered_archive_prefix = true;
+            self.bookmark_book_open_pending = Some(pending);
+            return;
         }
 
         let enumeration_pending = self.zip_enumerate_pending.is_some()
@@ -24393,6 +24442,7 @@ impl App {
         &mut self,
         mappings: &[crate::books::BookPathMapping],
     ) {
+        self.migrate_book_page_bookmarks(mappings);
         let mappings = Self::normalized_book_page_edit_mappings(mappings);
         if mappings.is_empty() {
             return;
@@ -24422,6 +24472,24 @@ impl App {
             self.move_book_page_edit_key(temp, to, &mut errors);
         }
         self.finish_book_page_edit_mapping("move", errors);
+    }
+
+    fn migrate_book_page_bookmarks(&mut self, mappings: &[crate::books::BookPathMapping]) {
+        let mappings: Vec<_> = mappings
+            .iter()
+            .filter(|mapping| !crate::folder_tree::path_eq(&mapping.from, &mapping.to))
+            .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+            .collect();
+        if mappings.is_empty() {
+            return;
+        }
+        let request_id = self.next_book_bookmark_request_id();
+        let Some(service) = self.book_bookmark_service.as_ref() else {
+            self.show_feedback_toast("ブックマークDBを利用できません".to_string());
+            return;
+        };
+        service.migrate_paths(request_id, mappings);
+        self.book_bookmark_pending_requests.insert(request_id);
     }
 
     fn normalized_book_page_edit_mappings(

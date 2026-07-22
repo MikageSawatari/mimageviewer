@@ -2,7 +2,7 @@
 //!
 //! アプリ内リネーム (`ui_dialogs/rename_item.rs`) の成功後に、旧 path をキーにした
 //! ユーザーデータ (★ / タグ / 回転 / 補正 / マスク / 隠蔽 / ローカル調整 / テキスト注釈 /
-//! 出力範囲 / 動画ピン / 動画・音楽ブックマーク / 代表サムネピン / 本 resume / 見開き /
+//! 出力範囲 / 動画ピン / 動画・音楽ブックマーク / 本ページブックマーク / 代表サムネピン / 本 resume / 見開き /
 //! 読書履歴 / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
 //! (docs/next-release-backlog.md §1.8 の段階 1+2、review-v2.3.0 角度④ (C))。
 //!
@@ -331,13 +331,38 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
         );
     }
 
-    // 4. 読書履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
+    // 本ページブックマークは container_key だけでなく raw container_path と、画像本では
+    // container 相対 page identity も同時更新する必要があるため generic STORES へは載せない。
+    // また missing 行を保持する仕様上、STORES と共有される delete hard purge の対象にも
+    // してはならない。専用 transaction で case-only rename も含めて追従させる。
+    migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
+
+    // 5. 読書履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
     //    purge は exact + prefix で同じ行を削除する。
     if old_k != new_k {
         migrate_reading_history(data_dir, new_path, &old_k, &new_k, &mut report);
     }
 
     report
+}
+
+fn migrate_book_bookmarks(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    report: &mut RenameMigrationReport,
+) {
+    let db_path = data_dir.join("book_bookmarks.db");
+    if !db_path.exists() {
+        return;
+    }
+    match crate::book_bookmarks::migrate_paths_at(
+        &db_path,
+        &[(old_path.to_path_buf(), new_path.to_path_buf())],
+    ) {
+        Ok(rows) => report.rows += rows,
+        Err(error) => report.errors.push(format!("book_bookmarks: {error}")),
+    }
 }
 
 /// mIV 内削除の成功 path に対応する全 path-keyed メタストア hard purge 結果。
@@ -1137,6 +1162,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stranded, 180, "逆順実行では中間 path に取り残される");
+    }
+
+    #[test]
+    fn rename_migrates_book_bookmark_but_hard_purge_keeps_missing_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"D:\Books\old.cbz");
+        let new = PathBuf::from(r"D:\Books\new.cbz");
+        let db_path = dir.path().join("book_bookmarks.db");
+        crate::book_bookmarks::ensure_schema_at(&db_path).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO book_bookmarks
+                    (container_key, container_path, container_kind, page_kind, page_value,
+                     page_key, page_index_hint, created_at_ms, title)
+                 VALUES (?1, ?2, 'zip', 'archive_entry', 'chapter/001.jpg',
+                         'chapter/001.jpg', 0, 1, '表紙')",
+                rusqlite::params![
+                    crate::book_bookmarks::container_key(&old),
+                    old.to_string_lossy().as_ref()
+                ],
+            )
+            .unwrap();
+        }
+
+        let report = run_at(dir.path(), &old, &new);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (key, path, title): (String, String, String) = conn
+            .query_row(
+                "SELECT container_key, container_path, title FROM book_bookmarks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(key, crate::book_bookmarks::container_key(&new));
+        assert_eq!(PathBuf::from(path), new);
+        assert_eq!(title, "表紙");
+        drop(conn);
+
+        let purge = purge_removed_paths_at(dir.path(), &[new], &[]);
+        assert!(purge.errors.is_empty(), "{:?}", purge.errors);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM book_bookmarks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "missing bookmarks remain user-deletable");
     }
 
     /// view_trim.db の両テーブル (keep-drive の page / drive 除去の book) が移行される。

@@ -4,6 +4,7 @@
 //! [`PageIdentity`] で保持する。SQLite は [`BookBookmarkService`] の専用 worker
 //! だけが触り、UI スレッドは request / event の送受信だけを行う。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -134,6 +135,10 @@ pub enum BookBookmarkEvent {
         request_id: u64,
         result: Result<Vec<BookBookmark>, String>,
     },
+    PathsMigrated {
+        request_id: u64,
+        result: Result<usize, String>,
+    },
 }
 
 enum BookBookmarkRequest {
@@ -142,6 +147,7 @@ enum BookBookmarkRequest {
     SetTitle(u64, i64, String),
     ListContainer(u64, PathBuf),
     ListAll(u64),
+    MigratePaths(u64, Vec<(PathBuf, PathBuf)>),
 }
 
 /// SQLite を専用スレッドに閉じ込める本ブックマークサービス。
@@ -158,7 +164,7 @@ impl BookBookmarkService {
         let handle = std::thread::Builder::new()
             .name("book-bookmarks".to_string())
             .spawn(move || {
-                let db = match BookBookmarkDb::open() {
+                let mut db = match BookBookmarkDb::open() {
                     Ok(db) => db,
                     Err(err) => {
                         let message = format!("book bookmarks: DB open failed: {err}");
@@ -194,6 +200,12 @@ impl BookBookmarkService {
                                 }
                                 BookBookmarkRequest::ListAll(request_id) => {
                                     BookBookmarkEvent::AllListed {
+                                        request_id,
+                                        result: Err(message.clone()),
+                                    }
+                                }
+                                BookBookmarkRequest::MigratePaths(request_id, _) => {
+                                    BookBookmarkEvent::PathsMigrated {
                                         request_id,
                                         result: Err(message.clone()),
                                     }
@@ -237,6 +249,12 @@ impl BookBookmarkService {
                             request_id,
                             result: db.list_all().map_err(|err| err.to_string()),
                         },
+                        BookBookmarkRequest::MigratePaths(request_id, mappings) => {
+                            BookBookmarkEvent::PathsMigrated {
+                                request_id,
+                                result: db.migrate_paths(&mappings).map_err(|err| err.to_string()),
+                            }
+                        }
                     };
                     if event_tx.send(event).is_err() {
                         break;
@@ -278,6 +296,12 @@ impl BookBookmarkService {
     pub fn list_all(&self, request_id: u64) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(BookBookmarkRequest::ListAll(request_id));
+        }
+    }
+
+    pub fn migrate_paths(&self, request_id: u64, mappings: Vec<(PathBuf, PathBuf)>) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(BookBookmarkRequest::MigratePaths(request_id, mappings));
         }
     }
 
@@ -418,6 +442,196 @@ impl BookBookmarkDb {
         };
         rows.collect()
     }
+
+    /// 製本ページのリネーム・並べ替え・別の本への移動を、安定したページ identity へ反映する。
+    /// 全対象行を一度 internal key へ退避してから確定するため、ページ同士の入れ替えでも
+    /// UNIQUE(container_key, page_kind, page_key) の一時衝突を起こさない。
+    fn migrate_paths(&mut self, mappings: &[(PathBuf, PathBuf)]) -> Result<usize, rusqlite::Error> {
+        if mappings.is_empty() {
+            return Ok(0);
+        }
+        let mappings = PathMappingIndex::new(mappings);
+        let targets: Vec<_> = self
+            .list_all()?
+            .into_iter()
+            .filter_map(|bookmark| migration_target(&bookmark, &mappings))
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = self.conn.transaction()?;
+        for target in &targets {
+            tx.execute(
+                "UPDATE book_bookmarks SET container_key = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    format!("miv-internal://bookmark-migration/{}", target.id),
+                    target.id
+                ],
+            )?;
+        }
+        for target in &targets {
+            let conflict = tx.query_row(
+                "SELECT id FROM book_bookmarks
+                  WHERE container_key = ?1 AND page_kind = ?2 AND page_key = ?3 AND id <> ?4
+                  LIMIT 1",
+                rusqlite::params![
+                    target.container_key,
+                    target.page_kind,
+                    target.page_key,
+                    target.id
+                ],
+                |row| row.get::<_, i64>(0),
+            );
+            match conflict {
+                Ok(_) => {
+                    // 改名後の identity に既存行がある場合は、共通 rename migration と同様に
+                    // 新側を正本として旧ブックマークを捨てる。
+                    tx.execute("DELETE FROM book_bookmarks WHERE id = ?1", [target.id])?;
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    tx.execute(
+                        "UPDATE book_bookmarks
+                            SET container_key = ?1, container_path = ?2,
+                                page_kind = ?3, page_value = ?4, page_key = ?5,
+                                page_index_hint = ?6
+                          WHERE id = ?7",
+                        rusqlite::params![
+                            target.container_key,
+                            target.container_path.to_string_lossy().as_ref(),
+                            target.page_kind,
+                            target.page_value,
+                            target.page_key,
+                            target.page_index_hint.min(i64::MAX as usize) as i64,
+                            target.id,
+                        ],
+                    )?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        tx.commit()?;
+        Ok(targets.len())
+    }
+}
+
+#[derive(Debug)]
+struct BookmarkMigrationTarget {
+    id: i64,
+    container_key: String,
+    container_path: PathBuf,
+    page_kind: String,
+    page_value: String,
+    page_key: String,
+    page_index_hint: usize,
+}
+
+fn migration_target(
+    bookmark: &BookBookmark,
+    mappings: &PathMappingIndex,
+) -> Option<BookmarkMigrationTarget> {
+    let (mut container_path, container_changed) = mappings.map_path(&bookmark.container_path);
+    let mut page_identity = bookmark.page_identity.clone();
+    let mut page_index_hint = bookmark.page_index_hint;
+
+    if let PageIdentity::RelativePath(relative) = &bookmark.page_identity {
+        let source_page = bookmark
+            .container_path
+            .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let (mapped_page, page_changed) = mappings.map_path(&source_page);
+        if page_changed {
+            if bookmark.container_kind == BookContainerKind::CompiledBook
+                && !path_is_within(&mapped_page, &container_path)
+                && let Some(parent) = mapped_page.parent()
+            {
+                container_path = parent.to_path_buf();
+            }
+            if let Some(new_relative) = relative_to(&mapped_page, &container_path) {
+                page_identity =
+                    PageIdentity::RelativePath(new_relative.to_string_lossy().replace('\\', "/"));
+            }
+            if bookmark.container_kind == BookContainerKind::CompiledBook {
+                page_index_hint = compiled_page_index(&mapped_page).unwrap_or(page_index_hint);
+            }
+        }
+    }
+
+    let container_key = container_key(&container_path);
+    let (page_kind, page_value, page_key) = page_identity.storage_parts();
+    let raw_changed = container_path != bookmark.container_path || container_changed;
+    let identity_changed = page_identity != bookmark.page_identity;
+    let hint_changed = page_index_hint != bookmark.page_index_hint;
+    (raw_changed || container_key != bookmark.container_key || identity_changed || hint_changed)
+        .then_some(BookmarkMigrationTarget {
+            id: bookmark.id,
+            container_key,
+            container_path,
+            page_kind: page_kind.to_string(),
+            page_value,
+            page_key,
+            page_index_hint,
+        })
+}
+
+struct PathMappingIndex {
+    /// 製本の全ページ並べ替えでも bookmark × mapping の全走査をしない。exact は O(1)、
+    /// フォルダ rename は path の ancestor (通常は数段) だけを調べる。
+    by_from: HashMap<String, (usize, PathBuf)>,
+}
+
+impl PathMappingIndex {
+    fn new(mappings: &[(PathBuf, PathBuf)]) -> Self {
+        let mut by_from = HashMap::with_capacity(mappings.len());
+        for (from, to) in mappings {
+            by_from
+                .entry(crate::path_key::normalize_keep_drive(from))
+                .or_insert_with(|| (from.components().count(), to.clone()));
+        }
+        Self { by_from }
+    }
+
+    fn map_path(&self, path: &Path) -> (PathBuf, bool) {
+        for candidate in path.ancestors() {
+            let key = crate::path_key::normalize_keep_drive(candidate);
+            let Some((component_count, to)) = self.by_from.get(&key) else {
+                continue;
+            };
+            if candidate == path {
+                return (to.clone(), true);
+            }
+            let suffix = path
+                .components()
+                .skip(*component_count)
+                .collect::<PathBuf>();
+            return (to.join(suffix), true);
+        }
+        (path.to_path_buf(), false)
+    }
+}
+
+fn path_is_within(path: &Path, container: &Path) -> bool {
+    let path_key = crate::path_key::normalize_keep_drive(path);
+    let container_key = crate::path_key::normalize_keep_drive(container);
+    path_key.starts_with(&format!("{container_key}/"))
+}
+
+fn relative_to(path: &Path, container: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(container) {
+        return Some(relative.to_path_buf());
+    }
+    path_is_within(path, container).then(|| {
+        path.components()
+            .skip(container.components().count())
+            .collect()
+    })
+}
+
+fn compiled_page_index(path: &Path) -> Option<usize> {
+    let name = path.file_name()?.to_str()?;
+    let prefix = name.split_once('_')?.0;
+    (prefix.len() == 4)
+        .then(|| prefix.parse::<usize>().ok()?.checked_sub(1))
+        .flatten()
 }
 
 fn row_to_bookmark(row: &rusqlite::Row<'_>) -> Result<BookBookmark, rusqlite::Error> {
@@ -497,6 +711,16 @@ pub fn db_path() -> PathBuf {
 pub fn ensure_schema_at(path: &Path) -> Result<(), rusqlite::Error> {
     drop(BookBookmarkDb::open_at(path)?);
     Ok(())
+}
+
+/// アプリ内の共通リネーム worker 用。コンテナ path と画像フォルダ内ページ identity の
+/// 両方を同じ transaction で追従させる。削除時は missing 行を保持する仕様なので、
+/// `rename_key_migration::STORES` の hard-purge 対象には加えない。
+pub fn migrate_paths_at(
+    db_path: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+) -> Result<usize, rusqlite::Error> {
+    BookBookmarkDb::open_at(db_path)?.migrate_paths(mappings)
 }
 
 /// 横断一覧 worker 用の全件読み出し。UI スレッドから直接呼ばないこと。
@@ -618,6 +842,110 @@ mod tests {
 
         assert_eq!(db.set_title(saved.id, Some("   ")).unwrap(), None);
         assert_eq!(db.list_all().unwrap()[0].title, None);
+    }
+
+    #[test]
+    fn path_migration_tracks_container_and_relative_page_renames() {
+        let mut db = open_in_memory();
+        let old_container = PathBuf::from("C:/Books/Old");
+        let new_container = PathBuf::from("D:/Library/New");
+        let (saved, _) = db
+            .add(&NewBookBookmark {
+                container_path: old_container.clone(),
+                container_kind: BookContainerKind::ImageFolder,
+                page_identity: PageIdentity::RelativePath("chapter/001.jpg".to_string()),
+                page_index_hint: 4,
+            })
+            .unwrap();
+        db.set_title(saved.id, Some("keep me")).unwrap();
+
+        assert_eq!(
+            db.migrate_paths(&[(old_container.clone(), new_container.clone())])
+                .unwrap(),
+            1
+        );
+        let renamed_page = new_container.join("chapter").join("cover.jpg");
+        assert_eq!(
+            db.migrate_paths(&[(new_container.join("chapter").join("001.jpg"), renamed_page,)])
+                .unwrap(),
+            1
+        );
+
+        let row = db.list_all().unwrap().pop().expect("bookmark");
+        assert_eq!(row.container_path, new_container);
+        assert_eq!(
+            row.page_identity,
+            PageIdentity::RelativePath("chapter/cover.jpg".to_string())
+        );
+        assert_eq!(row.title.as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn path_migration_tracks_compiled_book_reorder_without_losing_titles() {
+        let mut db = open_in_memory();
+        let book = PathBuf::from("C:/Books/story");
+        for (name, title) in [("0001_alpha.jpg", "alpha"), ("0002_beta.jpg", "beta")] {
+            let (saved, _) = db
+                .add(&NewBookBookmark {
+                    container_path: book.clone(),
+                    container_kind: BookContainerKind::CompiledBook,
+                    page_identity: PageIdentity::RelativePath(name.to_string()),
+                    page_index_hint: if name.starts_with("0001") { 0 } else { 1 },
+                })
+                .unwrap();
+            db.set_title(saved.id, Some(title)).unwrap();
+        }
+
+        let mappings = [
+            (book.join("0001_alpha.jpg"), book.join("0002_alpha.jpg")),
+            (book.join("0002_beta.jpg"), book.join("0001_beta.jpg")),
+        ];
+        assert_eq!(db.migrate_paths(&mappings).unwrap(), 2);
+
+        let rows = db.list_all().unwrap();
+        let alpha = rows
+            .iter()
+            .find(|row| row.title.as_deref() == Some("alpha"))
+            .unwrap();
+        assert_eq!(
+            alpha.page_identity,
+            PageIdentity::RelativePath("0002_alpha.jpg".to_string())
+        );
+        assert_eq!(alpha.page_index_hint, 1);
+        let beta = rows
+            .iter()
+            .find(|row| row.title.as_deref() == Some("beta"))
+            .unwrap();
+        assert_eq!(
+            beta.page_identity,
+            PageIdentity::RelativePath("0001_beta.jpg".to_string())
+        );
+        assert_eq!(beta.page_index_hint, 0);
+    }
+
+    #[test]
+    fn path_migration_moves_compiled_page_to_its_new_book() {
+        let mut db = open_in_memory();
+        let source = PathBuf::from("C:/Books/source");
+        let target = PathBuf::from("C:/Books/target");
+        let source_page = source.join("0002_scene.jpg");
+        let target_page = target.join("0003_scene.jpg");
+        db.add(&NewBookBookmark {
+            container_path: source,
+            container_kind: BookContainerKind::CompiledBook,
+            page_identity: PageIdentity::RelativePath("0002_scene.jpg".to_string()),
+            page_index_hint: 1,
+        })
+        .unwrap();
+
+        assert_eq!(db.migrate_paths(&[(source_page, target_page)]).unwrap(), 1);
+        let row = db.list_all().unwrap().pop().expect("bookmark");
+        assert_eq!(row.container_path, target);
+        assert_eq!(
+            row.page_identity,
+            PageIdentity::RelativePath("0003_scene.jpg".to_string())
+        );
+        assert_eq!(row.page_index_hint, 2);
     }
 
     #[test]

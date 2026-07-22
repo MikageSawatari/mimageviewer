@@ -9629,6 +9629,39 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn book_bookmark_enters_another_zip_prefix_before_resolving_page() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&[
+            "book-a/p001.jpg",
+            "book-b/chapter/p010.jpg",
+        ]));
+        app.zip_nav.as_mut().expect("zip nav").enter("book-a/");
+        app.zip_nav_show_current_level();
+
+        let bookmark = BookBookmark {
+            id: 1,
+            container_key: crate::book_bookmarks::container_key(&zip_path),
+            container_path: zip_path,
+            container_kind: BookContainerKind::Zip,
+            page_identity: PageIdentity::ArchiveEntry("book-b/chapter/p010.jpg".to_string()),
+            page_index_hint: 0,
+            created_at_ms: 1,
+            title: None,
+        };
+
+        assert!(app.book_bookmark_item_idx(&bookmark).is_none());
+        assert!(app.enter_book_bookmark_archive_prefix(&bookmark));
+        assert!(
+            app.book_bookmark_item_idx(&bookmark).is_some(),
+            "the target page must be materialized after entering its absolute ZIP prefix"
+        );
+    }
+
+    #[test]
     fn aggregate_image_view_is_not_a_bookmarkable_book() {
         let mut app = setup_app();
         enable_auto_image_folder_book(&mut app);
@@ -23130,6 +23163,21 @@ mod still_window_mode_key_tests {
                 .any(|k| k.starts_with(&format!("{old_k}/"))),
             "旧キーは残らない"
         );
+    }
+
+    #[test]
+    fn rename_migration_waits_for_book_bookmark_service_fifo() {
+        let mut app = setup_app();
+        assert!(!app.rename_migration_writers_busy());
+
+        app.book_bookmark_pending_requests.insert(42);
+        assert!(
+            app.rename_migration_writers_busy(),
+            "a rename must not overtake an old-path bookmark write"
+        );
+
+        app.book_bookmark_pending_requests.clear();
+        assert!(!app.rename_migration_writers_busy());
     }
 
     #[test]
