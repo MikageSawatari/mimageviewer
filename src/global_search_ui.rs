@@ -1260,7 +1260,7 @@ impl App {
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         // Ctrl+F フィルタの残留を解除 (Ctrl+G と共存させない)
         self.search_filter = None;
         self.search_query.clear();

@@ -244,7 +244,7 @@ impl App {
         self.tag_maintenance_rx = None;
         match result {
             Ok(message) => {
-                self.tags_cache.clear();
+                self.clear_tags_cache();
                 self.prewarm_grid_tags();
                 if self.settings.facet_filter.uses_tag_state() {
                     self.rebuild_visible_indices();

@@ -1779,6 +1779,7 @@ struct ViewerContextBundle {
     visible_indices: Vec<usize>,
     details_order: Vec<usize>,
     details_order_revision: u64,
+    details_cell_content_revisions: DetailsCellContentRevisions,
     details_tag_prewarm_indices: Vec<usize>,
     details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
     details_meta_pending: Option<DetailsMetaPending>,
@@ -2066,6 +2067,7 @@ impl ViewerContextBundle {
             visible_indices: Vec::new(),
             details_order: Vec::new(),
             details_order_revision: 0,
+            details_cell_content_revisions: DetailsCellContentRevisions::default(),
             details_tag_prewarm_indices: Vec::new(),
             details_lazy_meta: std::collections::HashMap::new(),
             details_meta_pending: None,
@@ -3355,8 +3357,9 @@ impl DetailsLazyMeta {
         self.source_mtime == mtime && self.source_size == size
     }
 
-    fn apply_patch(&mut self, patch: Self, loaded: DetailsLazyFieldFlags) {
-        if !self.matches_source(Some((patch.source_mtime, patch.source_size))) {
+    fn apply_patch(&mut self, patch: Self, loaded: DetailsLazyFieldFlags) -> bool {
+        let source_changed = !self.matches_source(Some((patch.source_mtime, patch.source_size)));
+        if source_changed {
             *self = Self::default();
         }
         self.source_mtime = patch.source_mtime;
@@ -3386,6 +3389,7 @@ impl DetailsLazyMeta {
             self.video_codec = patch.video_codec;
             self.video_meta_failed = patch.video_meta_failed;
         }
+        source_changed
     }
 }
 
@@ -3396,6 +3400,47 @@ struct DetailsLazyFieldFlags {
     ai_metadata: bool,
     image_dims: bool,
     video_meta: bool,
+}
+
+/// 詳細列の表示文字列が変化した世代。
+///
+/// best-fit は対象列の世代だけを監視する。全列共通の世代にすると、タグの連続到着中に
+/// 動画列まで再走査されるなど、無関係な background load で完了できなくなるため分離する。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DetailsCellContentRevisions {
+    pub(crate) tags: u64,
+    pub(crate) page_count: u64,
+    pub(crate) created_at: u64,
+    pub(crate) image_dims: u64,
+    pub(crate) video_meta: u64,
+}
+
+impl DetailsCellContentRevisions {
+    fn bump(value: &mut u64) {
+        *value = value.wrapping_add(1);
+    }
+
+    fn bump_lazy_fields(&mut self, loaded: DetailsLazyFieldFlags) {
+        if loaded.page_count {
+            Self::bump(&mut self.page_count);
+        }
+        if loaded.created_at {
+            Self::bump(&mut self.created_at);
+        }
+        if loaded.image_dims {
+            Self::bump(&mut self.image_dims);
+        }
+        if loaded.video_meta {
+            Self::bump(&mut self.video_meta);
+        }
+    }
+
+    fn bump_all_lazy_fields(&mut self) {
+        Self::bump(&mut self.page_count);
+        Self::bump(&mut self.created_at);
+        Self::bump(&mut self.image_dims);
+        Self::bump(&mut self.video_meta);
+    }
 }
 
 struct DetailsMetaPending {
@@ -7063,6 +7108,8 @@ pub struct App {
     /// 詳細一覧の表示集合またはソート順を再構築した世代。分割 UI job は開始時の
     /// 一覧と一致する間だけ結果を適用し、filter / sort 変更後の古い測定を破棄する。
     pub(crate) details_order_revision: u64,
+    /// best-fit が単一の表示内容世代だけを測るための列別 revision。
+    pub(crate) details_cell_content_revisions: DetailsCellContentRevisions,
     /// 詳細表示で現在画面付近にある idx。サムネ用 `keep_set` を空にしても、
     /// XMP rating hydration はこの集合で可視行だけ進める。
     pub(crate) details_tag_prewarm_indices: Vec<usize>,
@@ -9982,6 +10029,7 @@ impl App {
             visible_indices: Vec::new(),
             details_order: Vec::new(),
             details_order_revision: 0,
+            details_cell_content_revisions: DetailsCellContentRevisions::default(),
             details_tag_prewarm_indices: Vec::new(),
             details_lazy_meta: std::collections::HashMap::new(),
             details_meta_pending: None,
@@ -11704,6 +11752,7 @@ impl App {
             visible_indices,
             details_order,
             details_order_revision,
+            details_cell_content_revisions,
             details_tag_prewarm_indices,
             details_lazy_meta,
             details_meta_pending,
@@ -11906,6 +11955,7 @@ impl App {
         swap_field!(visible_indices);
         swap_field!(details_order);
         swap_field!(details_order_revision);
+        swap_field!(details_cell_content_revisions);
         swap_field!(details_tag_prewarm_indices);
         swap_field!(details_lazy_meta);
         swap_field!(details_meta_pending);
@@ -14120,7 +14170,7 @@ impl App {
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.xmp_panorama_info.clear();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         self.rotation_cache.clear();
         self.rating_cache.clear();
         self.reset_folder_rating_counts();
@@ -17611,7 +17661,7 @@ impl App {
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         // Ctrl+F フィルタの残留を解除 (旧レベルの entry 向けなので新レベルでは無効)。
         self.search_filter = None;
         self.search_query.clear();
@@ -19067,7 +19117,7 @@ impl App {
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.xmp_panorama_info.clear();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         self.checked.clear();
         self.rotation_cache.clear();
         self.rating_cache.clear();
@@ -19129,7 +19179,7 @@ impl App {
             if let Some(pending) = self.tag_legacy_seed_pending.take() {
                 pending.cancel();
             }
-            self.tags_cache = std::mem::take(&mut prepared.tags_cache);
+            self.replace_tags_cache(std::mem::take(&mut prepared.tags_cache));
             if self.settings.write_rating_to_xmp {
                 self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
             }
@@ -22092,7 +22142,7 @@ impl App {
         self.current_folder_rating_cache = None;
         self.invalidate_rating_counts_cache();
         self.reset_folder_rating_counts();
-        self.tags_cache.retain(|key, _| !matches_key(key));
+        self.retain_tags_cache(|key| !matches_key(key));
         self.rating_session_writes
             .retain(|key, _| !matches_key(key));
         self.folder_pin_map.retain(|key, _| !matches_key(key));
@@ -22194,7 +22244,7 @@ impl App {
         self.invalidate_rating_counts_cache();
         self.reset_folder_rating_counts();
 
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         self.prewarm_grid_tags();
         self.invalidate_tag_apply_suggestions();
 
@@ -22462,7 +22512,7 @@ impl App {
                     // ★ / タグの path-keyed 表示キャッシュはグローバルに引き直す (安全)。
                     self.rating_cache.clear();
                     self.invalidate_rating_counts_cache();
-                    self.tags_cache.clear();
+                    self.clear_tags_cache();
                     // idx キーのページ編集 state は「リネームに関係する文脈」だけ再構築する。
                     // 旧実装の全文脈 clear_page_edit_state は、無関係な画像の編集中ドラッグ値
                     // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
@@ -22597,7 +22647,7 @@ impl App {
         self.rehydrate_page_edit_state_for_current_items(&folder);
         self.rating_cache.clear();
         self.current_folder_rating_cache = None;
-        self.tags_cache.clear();
+        self.clear_tags_cache();
     }
 
     /// リネームに合わせて、編集済みバッジ用の presence set (起動時に全 DB キーを読み込む
@@ -24856,7 +24906,7 @@ impl App {
     fn finish_book_page_semantic_mapping(&mut self, errors: Vec<String>) {
         self.rating_cache.clear();
         self.invalidate_rating_counts_cache();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         if errors.is_empty() {
             return;
         }
@@ -24880,7 +24930,7 @@ impl App {
         self.clear_page_edit_state();
         self.rating_cache.clear();
         self.invalidate_rating_counts_cache();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         if errors.is_empty() {
             return;
         }
@@ -33748,6 +33798,7 @@ impl App {
             visible_indices,
             details_order,
             details_order_revision,
+            details_cell_content_revisions,
             details_tag_prewarm_indices,
             details_lazy_meta,
             details_meta_pending,
@@ -33945,6 +33996,7 @@ impl App {
             visible_indices,
             details_order,
             details_order_revision,
+            details_cell_content_revisions,
             search_filter,
             search_filter_origin_folder,
             checked,
@@ -36463,6 +36515,30 @@ impl App {
         }
     }
 
+    fn apply_details_lazy_meta_patch(
+        &mut self,
+        key: String,
+        meta: DetailsLazyMeta,
+        loaded: DetailsLazyFieldFlags,
+    ) {
+        let replaced_existing_source = match self.details_lazy_meta.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut value = DetailsLazyMeta::default();
+                value.apply_patch(meta, loaded);
+                entry.insert(value);
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().apply_patch(meta, loaded)
+            }
+        };
+        if replaced_existing_source {
+            self.details_cell_content_revisions.bump_all_lazy_fields();
+        } else {
+            self.details_cell_content_revisions.bump_lazy_fields(loaded);
+        }
+    }
+
     pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
         if !self.details_lazy_columns_visible() {
             if let Some(pending) = self.details_meta_pending.take() {
@@ -36609,10 +36685,7 @@ impl App {
                     meta,
                     loaded,
                 } if generation == self.items_generation => {
-                    self.details_lazy_meta
-                        .entry(key)
-                        .or_default()
-                        .apply_patch(meta, loaded);
+                    self.apply_details_lazy_meta_patch(key, meta, loaded);
                     self.facet_ai_model_counts_cache = None;
                     self.facet_ai_tool_counts_cache = None;
                     ctx.request_repaint();
@@ -37373,8 +37446,13 @@ impl App {
     /// 一覧のメタデータ取得が並行中の場合は、変更前の認証状態で完了した結果が
     /// 再挿入されないようジョブ全体をキャンセルし、必要な列だけ次フレームで再開する。
     fn invalidate_details_pdf_page_count(&mut self, pdf_path: &Path) {
-        self.details_lazy_meta
-            .remove(&crate::adjustment_db::normalize_path(pdf_path));
+        if self
+            .details_lazy_meta
+            .remove(&crate::adjustment_db::normalize_path(pdf_path))
+            .is_some()
+        {
+            DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.page_count);
+        }
         self.invalidate_details_meta_requirements();
     }
 
@@ -40465,6 +40543,42 @@ impl App {
         true
     }
 
+    pub(crate) fn set_tags_cache_entry(&mut self, key: String, tags: Vec<String>) -> bool {
+        if self.tags_cache.get(&key) == Some(&tags) {
+            return false;
+        }
+        self.tags_cache.insert(key, tags);
+        DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
+        true
+    }
+
+    pub(crate) fn clear_tags_cache(&mut self) -> bool {
+        if self.tags_cache.is_empty() {
+            return false;
+        }
+        self.tags_cache.clear();
+        DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
+        true
+    }
+
+    pub(crate) fn replace_tags_cache(
+        &mut self,
+        replacement: std::collections::HashMap<String, Vec<String>>,
+    ) {
+        self.tags_cache = replacement;
+        DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
+    }
+
+    pub(crate) fn retain_tags_cache(&mut self, mut keep: impl FnMut(&String) -> bool) -> bool {
+        let before = self.tags_cache.len();
+        self.tags_cache.retain(|key, _| keep(key));
+        if self.tags_cache.len() == before {
+            return false;
+        }
+        DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
+        true
+    }
+
     /// グリッドのタグバッジ表示用キャッシュを埋める。フォルダ切替時に 1 回呼ぶ。
     ///
     /// タグ正本は `tags.db`。フォルダ切替時に表示中の実パス item だけを一括取得し、
@@ -40493,12 +40607,12 @@ impl App {
         if let Some(db) = self.tags_db.as_ref() {
             let mut loaded = db.get_many_display_tags(&keys);
             for key in keys {
-                self.tags_cache
-                    .insert(key.clone(), loaded.remove(&key).unwrap_or_default());
+                let tags = loaded.remove(&key).unwrap_or_default();
+                self.set_tags_cache_entry(key, tags);
             }
         } else {
             for key in keys {
-                self.tags_cache.entry(key).or_default();
+                self.set_tags_cache_entry(key, Vec::new());
             }
         }
 
@@ -40672,7 +40786,7 @@ impl App {
         let mut changed = false;
         for (path, tags) in result.cache_updates {
             let key = crate::tags_db::item_key_for_path(&path);
-            self.tags_cache.insert(key, tags.clone());
+            self.set_tags_cache_entry(key, tags.clone());
             if let Some(target) = crate::tag_write_worker::sidecar_target_for_real_file(&path) {
                 self.mirror_tag_sidecar_update(&target, &tags);
             }

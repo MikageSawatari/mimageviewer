@@ -36622,3 +36622,105 @@ fn saving_pdf_password_invalidates_cached_page_count_result() {
     assert!(!app.details_lazy_meta.contains_key(&key));
     assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
 }
+
+#[test]
+fn details_cell_content_revisions_follow_only_changed_cache_columns() {
+    let mut app = phase_c_support::setup_app();
+    let initial = app.details_cell_content_revisions;
+
+    assert!(app.set_tags_cache_entry("tag-key".to_string(), vec!["long-tag".to_string()]));
+    assert_eq!(
+        app.details_cell_content_revisions.tags,
+        initial.tags.wrapping_add(1)
+    );
+    assert!(!app.set_tags_cache_entry("tag-key".to_string(), vec!["long-tag".to_string()]));
+    assert_eq!(
+        app.details_cell_content_revisions.video_meta,
+        initial.video_meta
+    );
+
+    app.apply_details_lazy_meta_patch(
+        "lazy-key".to_string(),
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 2,
+            page_count: Some(123_456),
+            page_count_checked: true,
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            page_count: true,
+            created_at: false,
+            ai_metadata: false,
+            image_dims: false,
+            video_meta: false,
+        },
+    );
+
+    // A newly inserted page-count result must not invalidate unrelated lazy columns.
+    let after_source = app.details_cell_content_revisions;
+    assert_eq!(after_source.page_count, initial.page_count.wrapping_add(1));
+    assert_eq!(after_source.created_at, initial.created_at);
+    assert_eq!(after_source.image_dims, initial.image_dims);
+    assert_eq!(after_source.video_meta, initial.video_meta);
+
+    app.apply_details_lazy_meta_patch(
+        "lazy-key".to_string(),
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 2,
+            video_codec: Some("AV1".to_string()),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            page_count: false,
+            created_at: false,
+            ai_metadata: false,
+            image_dims: false,
+            video_meta: true,
+        },
+    );
+
+    assert_eq!(
+        app.details_cell_content_revisions.page_count,
+        after_source.page_count
+    );
+    assert_eq!(
+        app.details_cell_content_revisions.video_meta,
+        after_source.video_meta.wrapping_add(1)
+    );
+
+    let before_replacement = app.details_cell_content_revisions;
+    app.apply_details_lazy_meta_patch(
+        "lazy-key".to_string(),
+        DetailsLazyMeta {
+            source_mtime: 3,
+            source_size: 4,
+            ai_metadata_checked: true,
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            page_count: false,
+            created_at: false,
+            ai_metadata: true,
+            image_dims: false,
+            video_meta: false,
+        },
+    );
+    assert_eq!(
+        app.details_cell_content_revisions.page_count,
+        before_replacement.page_count.wrapping_add(1)
+    );
+    assert_eq!(
+        app.details_cell_content_revisions.created_at,
+        before_replacement.created_at.wrapping_add(1)
+    );
+    assert_eq!(
+        app.details_cell_content_revisions.image_dims,
+        before_replacement.image_dims.wrapping_add(1)
+    );
+    assert_eq!(
+        app.details_cell_content_revisions.video_meta,
+        before_replacement.video_meta.wrapping_add(1)
+    );
+}

@@ -606,12 +606,12 @@ impl App {
         if let Some(db) = self.tags_db.as_ref() {
             let mut loaded = db.get_many_display_tags(&missing);
             for key in missing {
-                self.tags_cache
-                    .insert(key.clone(), loaded.remove(&key).unwrap_or_default());
+                let tags = loaded.remove(&key).unwrap_or_default();
+                self.set_tags_cache_entry(key, tags);
             }
         } else {
             for key in missing {
-                self.tags_cache.insert(key, Vec::new());
+                self.set_tags_cache_entry(key, Vec::new());
             }
         }
     }
@@ -713,7 +713,7 @@ impl App {
         let tags_cache_changed = !cache_updates.is_empty();
         for (path, tags) in cache_updates {
             let key = crate::tags_db::item_key_for_path(&path);
-            self.tags_cache.insert(key, tags);
+            self.set_tags_cache_entry(key, tags);
         }
         if tags_cache_changed {
             self.invalidate_tag_apply_suggestions();
@@ -803,7 +803,7 @@ impl App {
                 let mut changed = false;
                 for (path, tags) in result.cache_updates {
                     let key = crate::tags_db::item_key_for_path(&path);
-                    self.tags_cache.insert(key, tags.clone());
+                    self.set_tags_cache_entry(key, tags.clone());
                     if let Some(target) =
                         crate::tag_write_worker::sidecar_target_for_real_file(&path)
                     {

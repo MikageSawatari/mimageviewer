@@ -939,14 +939,43 @@ pub(crate) enum DetailsColumnSet {
 struct DetailsBestFitJobKey {
     items_generation: u64,
     order_revision: u64,
+    content_revision: u64,
     total_rows: usize,
     column: DetailsColumn,
+    view_kind: DetailsBestFitViewKind,
     book_sort_locked: bool,
     header_title: String,
     button_font: egui::FontId,
     body_font: egui::FontId,
     pixels_per_point_bits: u32,
     ui_font: crate::settings::UiFontSettings,
+}
+
+impl DetailsBestFitJobKey {
+    fn has_restartable_content_update(&self, other: &Self) -> bool {
+        if self.content_revision == other.content_revision
+            && self.header_title == other.header_title
+        {
+            return false;
+        }
+        let mut started = self.clone();
+        let mut current = other.clone();
+        started.content_revision = 0;
+        current.content_revision = 0;
+        // Lazy columns append/remove `...` as the same worker delivers cell values. Treat that
+        // header transition as part of the restartable content update instead of losing the
+        // user's best-fit request at worker completion.
+        started.header_title.clear();
+        current.header_title.clear();
+        started == current
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsBestFitViewKind {
+    Normal,
+    Bookmark,
+    ReadingHistory,
 }
 
 #[derive(Clone, Debug)]
@@ -11091,11 +11120,31 @@ impl App {
         column: DetailsColumn,
         book_sort_locked: bool,
     ) -> DetailsBestFitJobKey {
+        let view_kind = if self.items_are_bookmark_view {
+            DetailsBestFitViewKind::Bookmark
+        } else if self.items_are_reading_history_view {
+            DetailsBestFitViewKind::ReadingHistory
+        } else {
+            DetailsBestFitViewKind::Normal
+        };
+        let revisions = self.details_cell_content_revisions;
+        let content_revision = match column {
+            DetailsColumn::Tags => revisions.tags,
+            DetailsColumn::PageCount => revisions.page_count,
+            DetailsColumn::Created => revisions.created_at,
+            DetailsColumn::ImageDimensions => revisions.image_dims,
+            DetailsColumn::VideoDuration
+            | DetailsColumn::VideoDimensions
+            | DetailsColumn::VideoCodec => revisions.video_meta,
+            _ => 0,
+        };
         DetailsBestFitJobKey {
             items_generation: self.items_generation,
             order_revision: self.details_order_revision,
+            content_revision,
             total_rows: self.current_grid_order().len(),
             column,
+            view_kind,
             book_sort_locked,
             header_title: self.details_header_title(column, book_sort_locked, true),
             button_font: egui::TextStyle::Button.resolve(ui.style()),
@@ -11135,7 +11184,7 @@ impl App {
                         key.body_font.clone(),
                     ));
                 }
-                false
+                !matches!(key.view_kind, DetailsBestFitViewKind::Normal)
             }
             _ => true,
         };
@@ -11215,6 +11264,8 @@ impl App {
         let batch = job.next_batch(&current_key);
         match batch {
             DetailsBestFitBatch::Stale => {
+                let restart_for_content_change =
+                    job.key.has_restartable_content_update(&current_key);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "details",
@@ -11234,8 +11285,33 @@ impl App {
                                 "current_order_revision",
                                 serde_json::Value::from(self.details_order_revision),
                             ),
+                            (
+                                "started_content_revision",
+                                serde_json::Value::from(job.key.content_revision),
+                            ),
+                            (
+                                "current_content_revision",
+                                serde_json::Value::from(current_key.content_revision),
+                            ),
                         ],
                     );
+                }
+                if restart_for_content_change {
+                    let (widest, needs_dynamic_rows) =
+                        self.details_best_fit_seed_width(ui, &current_key);
+                    if needs_dynamic_rows {
+                        let restarted = DetailsBestFitJob {
+                            key: current_key,
+                            next_row: 0,
+                            widest,
+                            started: std::time::Instant::now(),
+                            measured_rows: 0,
+                            batches: 0,
+                        };
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(job_id, Some(restarted)));
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
             DetailsBestFitBatch::Complete => {
@@ -13682,8 +13758,10 @@ mod compute_cell_size_tests {
         DetailsBestFitJobKey {
             items_generation: 7,
             order_revision: 11,
+            content_revision: 13,
             total_rows,
             column: DetailsColumn::Name,
+            view_kind: DetailsBestFitViewKind::Normal,
             book_sort_locked: false,
             header_title: "名前".to_owned(),
             button_font: egui::FontId::proportional(14.0),
@@ -14046,10 +14124,304 @@ mod compute_cell_size_tests {
                 let tags_key = app.details_best_fit_job_key(ui, DetailsColumn::Tags, false);
                 let (_, tags_dynamic) = app.details_best_fit_seed_width(ui, &tags_key);
                 assert!(tags_dynamic, "タグは現在一覧の動的値を全行測る");
+
+                app.items_are_bookmark_view = true;
+                let bookmark_state_key =
+                    app.details_best_fit_job_key(ui, DetailsColumn::State, false);
+                let (_, bookmark_state_dynamic) =
+                    app.details_best_fit_seed_width(ui, &bookmark_state_key);
+                assert!(
+                    bookmark_state_dynamic,
+                    "ブックマークの位置は固定語彙でないため全行測る"
+                );
+
+                app.items_are_bookmark_view = false;
+                app.items_are_reading_history_view = true;
+                let history_state_key =
+                    app.details_best_fit_job_key(ui, DetailsColumn::State, false);
+                let (_, history_state_dynamic) =
+                    app.details_best_fit_seed_width(ui, &history_state_key);
+                assert!(
+                    history_state_dynamic,
+                    "読書履歴の既読位置は固定語彙でないため全行測る"
+                );
                 checked = true;
             });
         });
         assert!(checked);
+    }
+
+    #[test]
+    fn details_best_fit_restarts_tags_scan_when_measured_content_changes() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_tags = true;
+        let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
+        let first_path = PathBuf::from(r"C:\Pictures\tag-0.png");
+        app.items = (0..row_count)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\Pictures\tag-{idx}.png"))))
+            .collect();
+        app.image_metas = vec![None; row_count];
+        app.visible_indices = (0..row_count).collect();
+        app.details_order = app.visible_indices.clone();
+        app.details_order_revision = 1;
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.start_details_best_fit_job(ui, DetailsColumn::Tags, false);
+            });
+        });
+
+        let long_tag = "first-batch-row-received-a-long-tag-after-measurement".to_string();
+        let key = crate::tags_db::item_key_for_path(&first_path);
+        app.set_tags_cache_entry(key, vec![long_tag.clone()]);
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+        let restarted = ctx
+            .data(|data| {
+                data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
+                    .flatten()
+            })
+            .expect("内容世代変更後は先頭から再走査する");
+        assert_eq!(restarted.next_row, 0);
+        assert_eq!(
+            restarted.key.content_revision,
+            app.details_cell_content_revisions.tags
+        );
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+        let mut expected = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                expected = (App::details_best_fit_measure(
+                    ui,
+                    long_tag.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                    .ceil()
+                    .clamp(DetailsColumn::Tags.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+
+        assert!(
+            (details_column_width(&app.settings, DetailsColumn::Tags) - expected).abs() < 0.01,
+            "再走査後は1 batch目へ遅れて届いたタグも収める"
+        );
+    }
+
+    #[test]
+    fn details_best_fit_restarts_lazy_scan_when_video_codec_arrives() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_video_codec = true;
+        let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
+        app.items = (0..row_count)
+            .map(|idx| GridItem::Video(PathBuf::from(format!(r"C:\Videos\clip-{idx}.mkv"))))
+            .collect();
+        app.image_metas = vec![Some((1_700_000_000, 4096)); row_count];
+        app.visible_indices = (0..row_count).collect();
+        app.details_order = app.visible_indices.clone();
+        app.details_order_revision = 1;
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.start_details_best_fit_job(ui, DetailsColumn::VideoCodec, false);
+            });
+        });
+
+        let codec = "AV1 / unusually-long-worker-result-codec-profile".to_string();
+        let key = app.metadata_cache_key(0).unwrap();
+        app.details_lazy_meta.insert(
+            key,
+            crate::app::DetailsLazyMeta {
+                source_mtime: 1_700_000_000,
+                source_size: 4096,
+                video_codec: Some(codec.clone()),
+                ..Default::default()
+            },
+        );
+        app.details_cell_content_revisions.video_meta = app
+            .details_cell_content_revisions
+            .video_meta
+            .wrapping_add(1);
+
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.advance_details_best_fit_job(ui, false);
+                });
+            });
+        }
+        let mut expected = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                expected = (App::details_best_fit_measure(
+                    ui,
+                    codec.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                    .ceil()
+                    .clamp(
+                        DetailsColumn::VideoCodec.min_width(),
+                        DETAILS_BEST_FIT_MAX_WIDTH,
+                    );
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+
+        assert!(
+            (details_column_width(&app.settings, DetailsColumn::VideoCodec) - expected).abs()
+                < 0.01,
+            "遅延メタ到着前後の幅を混ぜず、安定世代を全行再走査する"
+        );
+    }
+
+    #[test]
+    fn details_best_fit_ignores_unrelated_column_content_revision() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_tags = true;
+        let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
+        app.items = (0..row_count)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\Pictures\tag-{idx}.png"))))
+            .collect();
+        app.image_metas = vec![None; row_count];
+        app.visible_indices = (0..row_count).collect();
+        app.details_order = app.visible_indices.clone();
+        app.details_order_revision = 1;
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.start_details_best_fit_job(ui, DetailsColumn::Tags, false);
+            });
+        });
+        app.details_cell_content_revisions.video_meta = app
+            .details_cell_content_revisions
+            .video_meta
+            .wrapping_add(1);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.advance_details_best_fit_job(ui, false);
+            });
+        });
+
+        assert!(ctx.data(|data| {
+            data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
+                .flatten()
+                .is_none()
+        }));
+    }
+
+    #[test]
+    fn details_best_fit_bookmark_state_measures_long_missing_page_position() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_state = true;
+        app.items_are_bookmark_view = true;
+        let path = PathBuf::from(r"C:\Books\many-pages");
+        let row = crate::bookmark_browser::BookmarkBrowserRow {
+            source: crate::bookmark_browser::BookmarkRowSource::Book(
+                crate::book_bookmarks::BookBookmark {
+                    id: 1,
+                    container_key: crate::adjustment_db::normalize_path(&path),
+                    container_path: path.clone(),
+                    container_kind: crate::book_bookmarks::BookContainerKind::ImageFolder,
+                    page_identity: crate::book_bookmarks::PageIdentity::RelativePath(
+                        "12345.png".to_string(),
+                    ),
+                    page_index_hint: 12_344,
+                    created_at_ms: 1_700_000_000_000,
+                    title: None,
+                },
+            ),
+            item: GridItem::Folder(path),
+            relative_page_provenance: None,
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 1_700_000_000_000,
+            missing: true,
+        };
+        let state = row.position_label();
+        app.items = vec![row.item.clone()];
+        app.bookmark_browser_rows = vec![row];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.details_order = vec![0];
+        let ctx = egui::Context::default();
+        let mut measured = 0.0;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                measured = App::details_best_fit_measure(
+                    ui,
+                    state.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                );
+                app.start_details_best_fit_job(ui, DetailsColumn::State, false);
+            });
+        });
+
+        assert!(state.contains("12345 ページ"));
+        assert!(state.ends_with("見つかりません"));
+        assert!(
+            details_column_width(&app.settings, DetailsColumn::State)
+                >= (measured + DETAILS_BEST_FIT_HORIZONTAL_PADDING).ceil()
+        );
+    }
+
+    #[test]
+    fn details_best_fit_reading_history_state_measures_large_progress() {
+        let mut app = App::default();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_state = true;
+        app.items_are_reading_history_view = true;
+        let path = PathBuf::from(r"C:\Books\long.pdf");
+        let item = GridItem::PdfFile(path.clone());
+        let entry = crate::reading_history_db::ReadingHistoryEntry::new(
+            path,
+            crate::reading_history_db::ReadingHistoryKind::Pdf,
+            None,
+            "long".to_string(),
+            Some(12_345),
+            Some(123_456),
+        );
+        app.reading_history_rows.insert(entry.key.clone(), entry);
+        app.items = vec![item];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.details_order = vec![0];
+        let ctx = egui::Context::default();
+        let state = "12345 / 123456".to_string();
+        let mut measured = 0.0;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                measured = App::details_best_fit_measure(
+                    ui,
+                    state.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                );
+                app.start_details_best_fit_job(ui, DetailsColumn::State, false);
+            });
+        });
+
+        assert_eq!(app.details_state_text(0), state);
+        assert!(
+            details_column_width(&app.settings, DetailsColumn::State)
+                >= (measured + DETAILS_BEST_FIT_HORIZONTAL_PADDING).ceil()
+        );
     }
 
     #[test]
@@ -14143,7 +14515,7 @@ mod compute_cell_size_tests {
     }
 
     #[test]
-    fn details_best_fit_large_list_visits_every_row_with_a_per_frame_cap() {
+    fn details_best_fit_stable_content_generation_visits_every_row_once_with_a_per_frame_cap() {
         let key = best_fit_test_key(1_003);
         let mut job = best_fit_test_job(1_003);
         let mut visited = Vec::new();
@@ -14187,6 +14559,22 @@ mod compute_cell_size_tests {
         changed = base.clone();
         changed.order_revision += 1;
         assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
+
+        changed = base.clone();
+        changed.content_revision += 1;
+        assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
+        assert!(base.has_restartable_content_update(&changed));
+
+        changed.header_title.push_str(" ...");
+        assert!(
+            base.has_restartable_content_update(&changed),
+            "lazy worker completion may change content revision and loading suffix together"
+        );
+
+        changed = base.clone();
+        changed.view_kind = DetailsBestFitViewKind::Bookmark;
+        assert_eq!(job.next_batch(&changed), DetailsBestFitBatch::Stale);
+        assert!(!base.has_restartable_content_update(&changed));
 
         changed = base.clone();
         changed.column = DetailsColumn::Tags;

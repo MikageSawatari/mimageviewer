@@ -545,7 +545,7 @@ impl App {
         for c in changes {
             let target = if use_before { &c.before } else { &c.after };
             let key = crate::adjustment_db::normalize_path(&c.path);
-            self.tags_cache.insert(key, target.clone());
+            self.set_tags_cache_entry(key, target.clone());
         }
     }
 }
@@ -636,7 +636,7 @@ impl App {
                 continue;
             };
             let after = after_for(&before);
-            self.tags_cache.insert(key, after);
+            self.set_tags_cache_entry(key, after);
         }
     }
 

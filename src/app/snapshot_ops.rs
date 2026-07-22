@@ -291,7 +291,7 @@ impl App {
         // 既存の load_folder 経路 (= self.start_loading_items) と同様に invalidate する。
         self.rating_cache.clear();
         self.rotation_cache.clear();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         self.mark_color_filter_scope_dirty();
 
         self.snapshot = Some(SnapshotState {
@@ -323,7 +323,7 @@ impl App {
         self.invalidate_idx_state_and_queues();
         // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
         // 残しておく方が安全、二重 clear は no-op)
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         // ★items を subset へ差し替えたので、idx-keyed なページ編集状態 (補正 / ローカル
         // 調整 / crop / マスク / 隠蔽) を新 idx に合わせ直す (Codex P1)。これをやらないと、
         // 差し替え前 idx に紐付いた補正・マスクが subset の別 idx に乗って表示 / エクスポート /
@@ -548,7 +548,7 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.items_generation = self.items_generation.wrapping_add(1);
             self.invalidate_idx_state_and_queues();
-            self.tags_cache.clear();
+            self.clear_tags_cache();
             // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
             // し直す (= activate の subset hydrate と対称、Codex P1)。snapshot 中に編集した分は
             // set_page_params 等が DB に同期保存済みなので、DB から読み直せば反映される。
@@ -638,7 +638,7 @@ impl App {
         // items_generation bump + invalidate (= Codex P1-1)
         self.items_generation = self.items_generation.wrapping_add(1);
         self.invalidate_idx_state_and_queues();
-        self.tags_cache.clear();
+        self.clear_tags_cache();
         // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す
         // (= activate と同じ、Codex P1)。通常フォルダ由来は origin の DB から hydrate
         // (child folder で編集した分は DB に同期保存済みなので subset 該当ページに反映される)。
