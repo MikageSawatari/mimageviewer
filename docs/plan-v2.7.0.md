@@ -71,8 +71,10 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   通常移動、activation、後続ブックマーク、worker 切断、cancel、timeout は一致する旧 ID の resolver /
   変換 / pending / 戻り先だけを終了し、古い完了通知は request ID と target の両方が現在値に一致する
   場合だけ適用する。Book の resolve 待機は通常 45 秒を終了条件とするが、変換状態が同じ request を
-  所有している間は確認・パスワード入力・変換完了を待ち、別 navigation 時は変換 cancel token と
-  completion receiver を request と一緒に破棄する。
+  所有している間は確認・パスワード入力・変換完了を待つ。`ArchiveConvertState` が事前 scan、
+  パスワード再 scan、変換本体を通した単一 cancel token を所有し、RAR / 7z / LZH / ZIP の列挙は
+  entry 境界で協調的に確認する。別 navigation、activation、後続 bookmark、Esc / cancel 時は token を
+  立てて completion receiver を request と一緒に破棄し、古い scan を背景で走らせ続けない。
 - スマートフィルタの `状態` に `ブックマークあり / ブックマークなし` を追加する。動画・音声は
   対象ファイル、本はコンテナまたは表示中ページの安定 identity で判定し、スマートフォルダの
   保存条件にも含める。

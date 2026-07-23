@@ -281,11 +281,32 @@ pub fn scan_summary_with_password(
     format: ArchiveFormat,
     password: Option<&str>,
 ) -> Result<ArchiveImageSummary, ConvertError> {
+    let cancel = AtomicBool::new(false);
+    scan_summary_with_password_cancelable(path, format, password, &cancel)
+}
+
+/// Cancellable variant used by the archive-open lifecycle. Archive libraries may perform a
+/// bounded amount of work while opening headers, then every enumeration step checks `cancel`.
+pub fn scan_summary_with_password_cancelable(
+    path: &Path,
+    format: ArchiveFormat,
+    password: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<ArchiveImageSummary, ConvertError> {
+    check_scan_cancel(cancel)?;
     match format {
-        ArchiveFormat::Rar => scan_summary_rar(path, password),
-        ArchiveFormat::SevenZ => scan_summary_7z(path),
-        ArchiveFormat::Lzh => scan_summary_lzh(path),
-        ArchiveFormat::Zip => scan_summary_zip(path),
+        ArchiveFormat::Rar => scan_summary_rar(path, password, cancel),
+        ArchiveFormat::SevenZ => scan_summary_7z(path, cancel),
+        ArchiveFormat::Lzh => scan_summary_lzh(path, cancel),
+        ArchiveFormat::Zip => scan_summary_zip(path, cancel),
+    }
+}
+
+fn check_scan_cancel(cancel: &AtomicBool) -> Result<(), ConvertError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(ConvertError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -356,12 +377,18 @@ fn open_rar_processing(
 fn scan_summary_rar(
     path: &Path,
     password: Option<&str>,
+    cancel: &AtomicBool,
 ) -> Result<ArchiveImageSummary, ConvertError> {
+    check_scan_cancel(cancel)?;
     let mut archive = open_rar_listing(path, password)?;
     let mut count = 0u32;
     let mut bytes = 0u64;
     let mut nested = 0u32;
-    for entry in archive.by_ref() {
+    loop {
+        check_scan_cancel(cancel)?;
+        let Some(entry) = archive.next() else {
+            break;
+        };
         let entry = entry.map_err(rar_error)?;
         let name = entry.filename.to_string_lossy();
         if !entry.is_file() || should_ignore_entry(&name.replace('\\', "/")) {
@@ -374,6 +401,7 @@ fn scan_summary_rar(
             nested += 1;
         }
     }
+    check_scan_cancel(cancel)?;
     Ok(ArchiveImageSummary {
         image_count: count,
         total_uncompressed_bytes: bytes,
@@ -381,13 +409,15 @@ fn scan_summary_rar(
     })
 }
 
-fn scan_summary_7z(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
+fn scan_summary_7z(path: &Path, cancel: &AtomicBool) -> Result<ArchiveImageSummary, ConvertError> {
+    check_scan_cancel(cancel)?;
     let reader = sevenz_rust2::ArchiveReader::open(path, Default::default())
         .map_err(|e| ConvertError::Archive(e.to_string()))?;
     let mut count = 0u32;
     let mut bytes = 0u64;
     let mut nested = 0u32;
     for entry in &reader.archive().files {
+        check_scan_cancel(cancel)?;
         if entry.is_directory || should_ignore_entry(&entry.name.replace('\\', "/")) {
             continue;
         }
@@ -398,6 +428,7 @@ fn scan_summary_7z(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
             nested += 1;
         }
     }
+    check_scan_cancel(cancel)?;
     Ok(ArchiveImageSummary {
         image_count: count,
         total_uncompressed_bytes: bytes,
@@ -405,12 +436,14 @@ fn scan_summary_7z(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
     })
 }
 
-fn scan_summary_lzh(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
+fn scan_summary_lzh(path: &Path, cancel: &AtomicBool) -> Result<ArchiveImageSummary, ConvertError> {
+    check_scan_cancel(cancel)?;
     let mut reader = delharc::parse_file(path).map_err(|e| ConvertError::Archive(e.to_string()))?;
     let mut count = 0u32;
     let mut bytes = 0u64;
     let mut nested = 0u32;
     loop {
+        check_scan_cancel(cancel)?;
         let header = reader.header();
         let pathname = header.parse_pathname();
         let name = pathname.to_string_lossy();
@@ -422,6 +455,7 @@ fn scan_summary_lzh(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
                 nested += 1;
             }
         }
+        check_scan_cancel(cancel)?;
         if !reader
             .next_file()
             .map_err(|e| ConvertError::Archive(e.to_string()))?
@@ -429,6 +463,7 @@ fn scan_summary_lzh(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
             break;
         }
     }
+    check_scan_cancel(cancel)?;
     Ok(ArchiveImageSummary {
         image_count: count,
         total_uncompressed_bytes: bytes,
@@ -439,7 +474,8 @@ fn scan_summary_lzh(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
 /// ZIP (入れ子に非 ZIP アーカイブを含むもの) の事前スキャン。トップレベルの
 /// central directory だけを見る (入れ子は展開しない = 安価)。`image_count` は
 /// 直下 (ネスト ZIP の外) の画像数、`nested_archive_count` は入れ子アーカイブ数。
-fn scan_summary_zip(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
+fn scan_summary_zip(path: &Path, cancel: &AtomicBool) -> Result<ArchiveImageSummary, ConvertError> {
+    check_scan_cancel(cancel)?;
     let file = std::fs::File::open(path)?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|e| ConvertError::Archive(e.to_string()))?;
@@ -447,6 +483,7 @@ fn scan_summary_zip(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
     let mut bytes = 0u64;
     let mut nested = 0u32;
     for i in 0..archive.len() {
+        check_scan_cancel(cancel)?;
         // by_index_raw は伸長しない (central directory のメタ読みだけで安価)。
         let Ok(entry) = archive.by_index_raw(i) else {
             continue;
@@ -468,6 +505,7 @@ fn scan_summary_zip(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
             bytes = bytes.saturating_add(entry.size());
         }
     }
+    check_scan_cancel(cancel)?;
     Ok(ArchiveImageSummary {
         image_count: count,
         total_uncompressed_bytes: bytes,
@@ -1402,6 +1440,27 @@ fn expand_lzh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_summary_scan_short_circuits_every_supported_format() {
+        let cancel = AtomicBool::new(true);
+        for format in [
+            ArchiveFormat::Rar,
+            ArchiveFormat::SevenZ,
+            ArchiveFormat::Lzh,
+            ArchiveFormat::Zip,
+        ] {
+            assert!(matches!(
+                scan_summary_with_password_cancelable(
+                    Path::new("cancel-before-archive-open"),
+                    format,
+                    None,
+                    &cancel,
+                ),
+                Err(ConvertError::Cancelled)
+            ));
+        }
+    }
 
     #[test]
     fn copy_capped_passes_input_within_limit() {

@@ -24,7 +24,7 @@ use crate::app::App;
 use crate::archive_cache::ArchiveCacheDb;
 use crate::archive_converter::{
     ArchiveFormat, ArchiveImageSummary, ConvertError, ConvertOptions, ConvertProgress,
-    convert_to_zip_with_password, scan_summary_with_password,
+    convert_to_zip_with_password, scan_summary_with_password_cancelable,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -104,7 +104,6 @@ pub(crate) enum ArchiveConvertPhase {
     /// 変換実行中
     Converting {
         progress: Arc<ArchiveConvertProgressShared>,
-        cancel: Arc<AtomicBool>,
     },
     /// エラー (ユーザーが閉じるまで表示)
     Error { message: String },
@@ -128,6 +127,8 @@ pub(crate) struct ArchiveConvertState {
     pub password: Option<String>,
     pub password_input: String,
     pub phase: ArchiveConvertPhase,
+    /// One cancellation owner for the entire scan / password retry / conversion lifecycle.
+    pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<ArchiveConvertMsg>,
     /// 変換完了後にメイン UI がナビゲーションに使うキャッシュ ZIP パス。
     /// `update()` が毎フレーム見に行き、Some なら `load_folder` を呼んでクリアする。
@@ -157,31 +158,54 @@ pub(crate) struct ArchiveConvertState {
     pub suppress_confirm_next_time: bool,
 }
 
+impl Drop for ArchiveConvertState {
+    fn drop(&mut self) {
+        // The state owns every worker in this archive-open lifecycle. Dropping the receiver makes
+        // late results inert; setting the same token first also stops scan/convert work itself.
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 fn spawn_archive_scan(
     src: PathBuf,
     format: ArchiveFormat,
     password: Option<String>,
     allow_direct_read: bool,
+    cancel: Arc<AtomicBool>,
 ) -> mpsc::Receiver<ArchiveConvertMsg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = if allow_direct_read && format == ArchiveFormat::Rar && password.is_none() {
-            match crate::rar_loader::inspect_for_direct_read(&src) {
+    spawn_archive_scan_task(cancel, move |cancel| {
+        if allow_direct_read && format == ArchiveFormat::Rar && password.is_none() {
+            match crate::rar_loader::inspect_for_direct_read_cancelable(&src, cancel) {
                 Ok(inspection) => Ok((
                     inspection.summary,
                     inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct,
                     inspection.resolved_path,
                 )),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    Err(ConvertError::Cancelled)
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    scan_summary_with_password(&src, format, None)
+                    scan_summary_with_password_cancelable(&src, format, None, cancel)
                         .map(|summary| (summary, false, src.clone()))
                 }
                 Err(error) => Err(ConvertError::Archive(error.to_string())),
             }
         } else {
-            scan_summary_with_password(&src, format, password.as_deref())
+            scan_summary_with_password_cancelable(&src, format, password.as_deref(), cancel)
                 .map(|summary| (summary, false, src.clone()))
-        };
+        }
+    })
+}
+
+fn spawn_archive_scan_task<F>(cancel: Arc<AtomicBool>, task: F) -> mpsc::Receiver<ArchiveConvertMsg>
+where
+    F: FnOnce(&AtomicBool) -> Result<(ArchiveImageSummary, bool, PathBuf), ConvertError>
+        + Send
+        + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = task(&cancel);
         let _ = tx.send(ArchiveConvertMsg::ScanDone(result));
     });
     rx
@@ -349,7 +373,8 @@ impl App {
         if self.archive_convert.is_some() || self.batch_convert.is_some() {
             return false;
         }
-        let rx = spawn_archive_scan(src.clone(), format, None, false);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = spawn_archive_scan(src.clone(), format, None, false, Arc::clone(&cancel));
         let suppress_confirm = self.settings.archive_convert_suppresses_confirm();
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
@@ -357,6 +382,7 @@ impl App {
             password: None,
             password_input: String::new(),
             phase: ArchiveConvertPhase::Scanning,
+            cancel,
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -395,13 +421,21 @@ impl App {
         {
             return false;
         }
-        let rx = spawn_archive_scan(src.clone(), ArchiveFormat::Rar, None, true);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = spawn_archive_scan(
+            src.clone(),
+            ArchiveFormat::Rar,
+            None,
+            true,
+            Arc::clone(&cancel),
+        );
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
             format: ArchiveFormat::Rar,
             password: None,
             password_input: String::new(),
             phase: ArchiveConvertPhase::Scanning,
+            cancel,
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -433,13 +467,15 @@ impl App {
         if self.archive_convert.is_some() || format == ArchiveFormat::Zip {
             return false;
         }
-        let rx = spawn_archive_scan(src.clone(), format, None, false);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = spawn_archive_scan(src.clone(), format, None, false, Arc::clone(&cancel));
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
             format,
             password: None,
             password_input: String::new(),
             phase: ArchiveConvertPhase::Scanning,
+            cancel,
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -534,13 +570,46 @@ impl App {
             .archive_convert
             .take()
             .expect("matching archive conversion must still exist");
-        if let ArchiveConvertPhase::Converting { cancel, .. } = &state.phase {
-            cancel.store(true, Ordering::Relaxed);
-        }
+        state.cancel.store(true, Ordering::Relaxed);
         let had_deferred = state.deferred_fullscreen.take().is_some();
         crate::logger::log(format!(
             "[bookmark-open] cancel archive transition id={} source={}",
             request_id.0,
+            state.src_path.display()
+        ));
+        drop(state);
+        if had_deferred {
+            self.release_fs_nav_lock();
+        }
+        true
+    }
+
+    /// A new navigation owns the visible context and supersedes any archive dialog/worker.
+    /// Same-folder refreshes are not navigation and intentionally keep the dialog alive.
+    pub(crate) fn cancel_archive_convert_for_navigation_to(
+        &mut self,
+        path: &std::path::Path,
+        reason: &'static str,
+    ) -> bool {
+        if self.archive_convert.is_none()
+            || self
+                .current_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, path))
+        {
+            return false;
+        }
+        self.cancel_archive_convert_for_navigation(reason)
+    }
+
+    pub(crate) fn cancel_archive_convert_for_navigation(&mut self, reason: &'static str) -> bool {
+        let Some(mut state) = self.archive_convert.take() else {
+            return false;
+        };
+        state.cancel.store(true, Ordering::Relaxed);
+        let had_deferred = state.deferred_fullscreen.take().is_some();
+        crate::logger::log(format!(
+            "archive transition cancelled reason={reason} source={}",
             state.src_path.display()
         ));
         drop(state);
@@ -1106,9 +1175,7 @@ impl App {
 
         if cancel_convert {
             if let Some(state) = self.archive_convert.as_ref() {
-                if let ArchiveConvertPhase::Converting { cancel, .. } = &state.phase {
-                    cancel.store(true, Ordering::Relaxed);
-                }
+                state.cancel.store(true, Ordering::Relaxed);
             }
         }
         if start_convert {
@@ -1127,11 +1194,9 @@ impl App {
             self.apply_archive_password();
         }
         if should_close {
-            // 変換中ならキャンセル信号も立てておく (ワーカーは後で気付いて停止)
+            // Scan / password retry / conversion all share this lifecycle token.
             if let Some(state) = self.archive_convert.as_ref() {
-                if let ArchiveConvertPhase::Converting { cancel, .. } = &state.phase {
-                    cancel.store(true, Ordering::Relaxed);
-                }
+                state.cancel.store(true, Ordering::Relaxed);
             }
             let nav_history_rollback = self
                 .archive_convert
@@ -1218,6 +1283,28 @@ impl App {
                     };
                     clear_deferred_fullscreen = true;
                 }
+                ArchiveConvertMsg::ScanDone(Err(ConvertError::Cancelled))
+                | ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled))
+                | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::Cancelled)) => {
+                    // User cancellation closes every phase of the shared archive lifecycle.
+                    let nav_history_rollback = state.nav_history_rollback.clone();
+                    let had_deferred = state.deferred_fullscreen.is_some();
+                    let bookmark_owner = state.completion.bookmark_owner().cloned();
+                    self.archive_convert = None;
+                    if let Some(owner) = bookmark_owner {
+                        self.cancel_bookmark_open_request(
+                            owner.request_id,
+                            "archive_conversion_cancelled",
+                        );
+                    }
+                    if let Some(snapshot) = nav_history_rollback {
+                        self.restore_folder_nav_history(snapshot);
+                    }
+                    if had_deferred {
+                        self.release_fs_nav_lock();
+                    }
+                    return;
+                }
                 ArchiveConvertMsg::ScanDone(Err(e)) => {
                     state.phase = ArchiveConvertPhase::Error {
                         message: format!("スキャン失敗: {e}"),
@@ -1245,27 +1332,6 @@ impl App {
                 }
                 ArchiveConvertMsg::SiblingConvertDone(Ok((_summary, output, _size))) => {
                     state.pending_sibling_output = Some(output);
-                }
-                ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled))
-                | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::Cancelled)) => {
-                    // ユーザーキャンセルならダイアログを即閉じる
-                    let nav_history_rollback = state.nav_history_rollback.clone();
-                    let had_deferred = state.deferred_fullscreen.is_some();
-                    let bookmark_owner = state.completion.bookmark_owner().cloned();
-                    self.archive_convert = None;
-                    if let Some(owner) = bookmark_owner {
-                        self.cancel_bookmark_open_request(
-                            owner.request_id,
-                            "archive_conversion_cancelled",
-                        );
-                    }
-                    if let Some(snapshot) = nav_history_rollback {
-                        self.restore_folder_nav_history(snapshot);
-                    }
-                    if had_deferred {
-                        self.release_fs_nav_lock();
-                    }
-                    return;
                 }
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::PasswordRequired))
                 | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::PasswordRequired)) => {
@@ -1317,7 +1383,13 @@ impl App {
         match resume {
             ArchivePasswordResume::Scan => {
                 if let Some(state) = self.archive_convert.as_mut() {
-                    state.rx = spawn_archive_scan(src, format, Some(password), false);
+                    state.rx = spawn_archive_scan(
+                        src,
+                        format,
+                        Some(password),
+                        false,
+                        Arc::clone(&state.cancel),
+                    );
                     state.allow_direct_read = false;
                     state.phase = ArchiveConvertPhase::Scanning;
                 }
@@ -1363,13 +1435,12 @@ impl App {
                 return;
             }
         };
-        let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(ArchiveConvertProgressShared::new());
         let (tx, rx) = mpsc::channel();
         let src = state.src_path.clone();
         let format = state.format;
         let password = state.password.clone();
-        let cancel_worker = cancel.clone();
+        let cancel_worker = Arc::clone(&state.cancel);
         let progress_worker = progress.clone();
         let db_worker = Arc::clone(&db);
         let archive_cache_max_bytes = self.settings.archive_cache_max_bytes;
@@ -1451,7 +1522,7 @@ impl App {
             drop(_convert_guard);
             let _ = tx.send(msg);
         });
-        state.phase = ArchiveConvertPhase::Converting { progress, cancel };
+        state.phase = ArchiveConvertPhase::Converting { progress };
         state.rx = rx;
     }
 
@@ -1460,13 +1531,12 @@ impl App {
             return;
         };
         let dst = sibling_zip_path(&state.src_path);
-        let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(ArchiveConvertProgressShared::new());
         let (tx, rx) = mpsc::channel();
         let src = state.src_path.clone();
         let format = state.format;
         let password = state.password.clone();
-        let cancel_worker = Arc::clone(&cancel);
+        let cancel_worker = Arc::clone(&state.cancel);
         let progress_worker = Arc::clone(&progress);
         thread::spawn(move || {
             let cb = |p: ConvertProgress| {
@@ -1498,7 +1568,7 @@ impl App {
             });
             let _ = tx.send(ArchiveConvertMsg::SiblingConvertDone(result));
         });
-        state.phase = ArchiveConvertPhase::Converting { progress, cancel };
+        state.phase = ArchiveConvertPhase::Converting { progress };
         state.rx = rx;
     }
 }
@@ -1506,6 +1576,61 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_scan_test_zip(path: &std::path::Path) {
+        use std::io::Write as _;
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("page-001.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"image").unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn cancelled_scan_worker_stops_and_followup_scan_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("scan.zip");
+        write_scan_test_zip(&source);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let started_worker = Arc::clone(&started);
+        let stopped_worker = Arc::clone(&stopped);
+        let cancelled_rx = spawn_archive_scan_task(Arc::clone(&cancelled), move |cancel| {
+            started_worker.store(true, Ordering::Relaxed);
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            stopped_worker.store(true, Ordering::Relaxed);
+            Err(ConvertError::Cancelled)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(started.load(Ordering::Relaxed));
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            cancelled_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(ArchiveConvertMsg::ScanDone(Err(ConvertError::Cancelled)))
+        ));
+        assert!(stopped.load(Ordering::Relaxed));
+
+        let followup = Arc::new(AtomicBool::new(false));
+        let followup_rx = spawn_archive_scan(source, ArchiveFormat::Zip, None, false, followup);
+        match followup_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("follow-up scan result")
+        {
+            ArchiveConvertMsg::ScanDone(Ok((summary, false, _))) => {
+                assert_eq!(summary.image_count, 1);
+            }
+            _ => panic!("follow-up scan should complete normally"),
+        }
+    }
 
     fn state_for_password_resume(resume: ArchivePasswordResume) -> ArchiveConvertState {
         let (_tx, rx) = mpsc::channel();
@@ -1518,6 +1643,7 @@ mod tests {
                 message: None,
                 resume,
             },
+            cancel: Arc::new(AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -1565,7 +1691,6 @@ mod tests {
         assert!(!archive_convert_window_suppressed(
             &ArchiveConvertPhase::Converting {
                 progress: Arc::new(ArchiveConvertProgressShared::new()),
-                cancel: Arc::new(AtomicBool::new(false)),
             },
             true,
             false

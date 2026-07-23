@@ -50,6 +50,9 @@
 - **判定タイミング**: フォルダスキャン時には **やらない**（各 RAR を開くと UI が固まる。`docs/ui-responsiveness.md` §4）。
   open / サムネ生成の **worker 内** で 1 回 list して判定する。
 - 判定結果は `(path, mtime, size)` をキーにキャッシュし、再 list を避ける（メモリ保持で十分。catalog 併用は未決 §11）。
+- 判定 worker は `ArchiveConvertState` が所有する scan / convert 共通 cancel token を受け取り、
+  RAR listing の各 entry 境界で確認する。通常 navigation、activation、後続 bookmark、変換ダイアログの
+  Esc / cancel、state drop は token と receiver を同時に終了し、古い listing を背景で継続しない。
 - 分岐:
   - `!is_solid() && 入れ子なし` → **直読み**。
   - それ以外 → **従来 convert**。

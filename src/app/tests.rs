@@ -1555,14 +1555,19 @@ mod startup_open_path_resolve_tests {
         format: ArchiveFormat,
         owner: crate::bookmark_browser::BookmarkOpenRequestOwner,
         phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase,
-    ) -> mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg> {
+    ) -> (
+        mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg>,
+        Arc<AtomicBool>,
+    ) {
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: source,
             format,
             password: None,
             password_input: String::new(),
             phase,
+            cancel: Arc::clone(&cancel),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -1577,7 +1582,40 @@ mod startup_open_path_resolve_tests {
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
-        tx
+        (tx, cancel)
+    }
+
+    fn install_normal_archive_scan_transition(
+        app: &mut App,
+        source: PathBuf,
+    ) -> (
+        mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg>,
+        Arc<AtomicBool>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: source,
+            format: ArchiveFormat::SevenZ,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: Arc::clone(&cancel),
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        (tx, cancel)
     }
 
     fn assert_bookmark_is_awaiting_page(app: &App) {
@@ -1588,6 +1626,183 @@ mod startup_open_path_resolve_tests {
                 .map(|pending| &pending.stage),
             Some(crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { .. })
         ));
+    }
+
+    #[test]
+    fn replacing_scanning_archive_bookmark_cancels_old_scan() {
+        let mut app = setup_app();
+        let request_a = crate::bookmark_browser::BookmarkOpenRequestId(48);
+        let source_a = app.tmp.path().join("replaced-book.7z");
+        let owner_a = arm_archive_bookmark(
+            &mut app,
+            request_a,
+            source_a.clone(),
+            std::time::Instant::now(),
+        );
+        let (tx_a, cancel_a) = install_bookmark_archive_transition(
+            &mut app,
+            source_a,
+            ArchiveFormat::SevenZ,
+            owner_a,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+        );
+        let row_b = super::bookmark_grid_test_row(49);
+        app.bookmark_browser_rows = vec![row_b.clone()];
+        app.selected = Some(0);
+
+        app.open_bookmark_browser_row(&egui::Context::default(), &row_b);
+
+        assert!(cancel_a.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert_ne!(
+            app.bookmark_open_pending.as_ref().unwrap().request_id(),
+            request_a
+        );
+        assert!(
+            tx_a.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Err(
+                    crate::archive_converter::ConvertError::Cancelled,
+                ))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normal_navigation_cancels_normal_archive_scan() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("normal-scan.7z");
+        let (tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
+        let destination = app.tmp.path().join("normal-scan-destination");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        app.load_folder(destination.clone());
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &destination
+        ));
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
+                    crate::archive_converter::ArchiveImageSummary {
+                        image_count: 1,
+                        total_uncompressed_bytes: 1,
+                        nested_archive_count: 0,
+                    },
+                    false,
+                    PathBuf::from("late.7z"),
+                )))
+            )
+            .is_err(),
+            "late scan result must not recreate the cancelled dialog"
+        );
+        assert!(app.archive_convert.is_none());
+    }
+
+    #[test]
+    fn activation_cancels_normal_archive_scan_before_path_resolution() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("activation-normal-scan.7z");
+        let (tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
+        let activation = app.tmp.path().join("activation-after-normal-scan");
+        std::fs::create_dir_all(&activation).unwrap();
+
+        app.start_startup_open_path_resolve(
+            activation,
+            StartupOpenPathSource::Activation,
+            &egui::Context::default(),
+        );
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Err(
+                    crate::archive_converter::ConvertError::Cancelled,
+                ))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn escape_closes_normal_archive_scan_and_cancels_worker() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("escape-normal-scan.7z");
+        let (tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.show_archive_convert_dialog(ctx),
+        );
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
+                    crate::archive_converter::ArchiveImageSummary {
+                        image_count: 1,
+                        total_uncompressed_bytes: 1,
+                        nested_archive_count: 0,
+                    },
+                    false,
+                    PathBuf::from("late.7z"),
+                )))
+            )
+            .is_err()
+        );
+        assert!(app.archive_convert.is_none());
+    }
+
+    #[test]
+    fn cancel_button_closes_normal_archive_scan_and_cancels_worker() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let app = Rc::new(RefCell::new(setup_app()));
+        let source = app.borrow().tmp.path().join("button-normal-scan.7z");
+        let (tx, cancel) = install_normal_archive_scan_transition(&mut app.borrow_mut(), source);
+        let app_for_ui = Rc::clone(&app);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(640.0, 360.0))
+            .build(move |ctx| {
+                app_for_ui.borrow_mut().show_archive_convert_dialog(ctx);
+            });
+
+        harness.step();
+        harness.get_by_label("キャンセル").click();
+        harness.step();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.borrow().archive_convert.is_none());
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
+                    crate::archive_converter::ArchiveImageSummary {
+                        image_count: 1,
+                        total_uncompressed_bytes: 1,
+                        nested_archive_count: 0,
+                    },
+                    false,
+                    PathBuf::from("late.7z"),
+                )))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1660,7 +1875,7 @@ mod startup_open_path_resolve_tests {
             source.clone(),
             std::time::Instant::now(),
         );
-        let _tx = install_bookmark_archive_transition(
+        let (_tx, _cancel) = install_bookmark_archive_transition(
             &mut app,
             source.clone(),
             ArchiveFormat::Rar,
@@ -1697,7 +1912,7 @@ mod startup_open_path_resolve_tests {
             source.clone(),
             std::time::Instant::now(),
         );
-        let _tx = install_bookmark_archive_transition(
+        let (_tx, _cancel) = install_bookmark_archive_transition(
             &mut app,
             source.clone(),
             ArchiveFormat::SevenZ,
@@ -1734,7 +1949,7 @@ mod startup_open_path_resolve_tests {
             source.clone(),
             std::time::Instant::now() - std::time::Duration::from_secs(60),
         );
-        let _tx = install_bookmark_archive_transition(
+        let (_tx, _cancel) = install_bookmark_archive_transition(
             &mut app,
             source,
             ArchiveFormat::SevenZ,
@@ -1758,7 +1973,7 @@ mod startup_open_path_resolve_tests {
     }
 
     #[test]
-    fn navigation_cancels_archive_owned_bookmark_and_drops_late_completion() {
+    fn navigation_cancels_archive_bookmark_scan_and_drops_late_result() {
         let mut app = setup_app();
         let request_id = crate::bookmark_browser::BookmarkOpenRequestId(54);
         let source = app.tmp.path().join("cancelled-book.7z");
@@ -1768,18 +1983,12 @@ mod startup_open_path_resolve_tests {
             source.clone(),
             std::time::Instant::now(),
         );
-        let cancel = Arc::new(AtomicBool::new(false));
-        let tx = install_bookmark_archive_transition(
+        let (tx, cancel) = install_bookmark_archive_transition(
             &mut app,
             source,
             ArchiveFormat::SevenZ,
             owner,
-            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
-                progress: Arc::new(
-                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
-                ),
-                cancel: Arc::clone(&cancel),
-            },
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
         );
         let destination = app.tmp.path().join("manual-navigation-after-convert");
         std::fs::create_dir_all(&destination).unwrap();
@@ -1796,7 +2005,7 @@ mod startup_open_path_resolve_tests {
         ));
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Err(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Err(
                     crate::archive_converter::ConvertError::Cancelled,
                 ))
             )
@@ -1806,7 +2015,7 @@ mod startup_open_path_resolve_tests {
     }
 
     #[test]
-    fn activation_immediately_cancels_archive_owned_bookmark() {
+    fn activation_immediately_cancels_archive_bookmark_scan() {
         let mut app = setup_app();
         let request_id = crate::bookmark_browser::BookmarkOpenRequestId(55);
         let source = app.tmp.path().join("activation-cancelled-book.7z");
@@ -1816,18 +2025,12 @@ mod startup_open_path_resolve_tests {
             source.clone(),
             std::time::Instant::now(),
         );
-        let cancel = Arc::new(AtomicBool::new(false));
-        let tx = install_bookmark_archive_transition(
+        let (tx, cancel) = install_bookmark_archive_transition(
             &mut app,
             source,
             ArchiveFormat::SevenZ,
             owner,
-            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
-                progress: Arc::new(
-                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
-                ),
-                cancel: Arc::clone(&cancel),
-            },
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
         );
         let activation = app.tmp.path().join("activation-destination");
         std::fs::create_dir_all(&activation).unwrap();
@@ -1844,7 +2047,7 @@ mod startup_open_path_resolve_tests {
         assert!(app.bookmark_view_state.is_none());
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Err(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Err(
                     crate::archive_converter::ConvertError::Cancelled,
                 ))
             )
@@ -1864,8 +2067,7 @@ mod startup_open_path_resolve_tests {
             target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(source_a.clone()),
         };
         arm_archive_bookmark(&mut app, request_b, source_b, std::time::Instant::now());
-        let cancel = Arc::new(AtomicBool::new(false));
-        let tx = install_bookmark_archive_transition(
+        let (tx, cancel) = install_bookmark_archive_transition(
             &mut app,
             source_a,
             ArchiveFormat::SevenZ,
@@ -1874,7 +2076,6 @@ mod startup_open_path_resolve_tests {
                 progress: Arc::new(
                     crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
                 ),
-                cancel: Arc::clone(&cancel),
             },
         );
         let before = app.current_folder.clone();
@@ -1905,7 +2106,7 @@ mod startup_open_path_resolve_tests {
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
             requested: PathBuf::from(r"\\server\offline\book.zip"),
             owner: StartupOpenPathOwner::Activation,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             started_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
             toast_shown: false,
@@ -3083,7 +3284,7 @@ mod folder_pane_open_nav_tests {
         tx.send(empty_scan()).expect("send scan");
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
             path: target.clone(),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
         });
 
@@ -3699,6 +3900,7 @@ mod phase_c_folder_nav_history_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -3760,6 +3962,7 @@ mod phase_c_folder_nav_history_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -3799,6 +4002,7 @@ mod phase_c_folder_nav_history_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -3843,6 +4047,7 @@ mod phase_c_folder_nav_history_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -15286,6 +15491,7 @@ mod favorite_adjustment_defaults_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -15322,6 +15528,7 @@ mod favorite_adjustment_defaults_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -15350,6 +15557,7 @@ mod favorite_adjustment_defaults_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -15405,6 +15613,7 @@ mod favorite_adjustment_defaults_tests {
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
@@ -15463,8 +15672,8 @@ mod favorite_adjustment_defaults_tests {
                 progress: std::sync::Arc::new(
                     crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
                 ),
-                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             pending_nav: None,
             pending_direct_nav: None,

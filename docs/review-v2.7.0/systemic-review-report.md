@@ -178,3 +178,20 @@ testを追加した後、この指摘と同型経路を再レビューする。P
 `cargo check -p mimageviewer --bin mimageviewer-core` と `cargo fmt --all -- --check` 成功。
 
 **追補判定: 変換アーカイブで途切れていた bookmark request ownership は解消。**
+
+## 変換前 scan cancel 追補（2026-07-23）
+
+- `ArchiveConvertState` に scan / password retry / convert 共通の `Arc<AtomicBool>` を持たせ、state の
+  Drop、Esc / cancel、通常 navigation、activation、後続 bookmark から同じ token を停止する。
+- `spawn_archive_scan` から RAR direct-read 判定と RAR / 7z / LZH / ZIP summary scan へ token を渡し、
+  各 entry 列挙境界で `Cancelled` を返す。receiver も state と同時に drop するため、cancel と競合した
+  late result は表示状態へ到達しない。
+- scan 中 bookmark A → B、通常 navigation、activation、通常 scan ダイアログの Esc、late result、
+  cancel 後の後続 scan 成功を focused test で固定した。
+
+対応後の検証は startup open-path lifecycle focused 21件成功、archive convert focused 43件成功、
+ライブラリテスト2,323件成功・失敗0件・17件ignored、バイナリテスト直列実行4,082件成功・失敗0件・
+18件ignored、`cargo check -p mimageviewer --bin mimageviewer-core` と
+`cargo fmt --all -- --check` 成功。
+
+**追補判定: 事前 scan worker が取消後も並行継続する経路は解消。**

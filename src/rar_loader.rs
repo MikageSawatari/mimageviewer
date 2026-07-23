@@ -254,12 +254,25 @@ pub fn is_subsequent_volume(path: &Path) -> io::Result<bool> {
 
 /// Inspect a RAR once per `(path, mtime, size)` identity.
 pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
+    let cancel = AtomicBool::new(false);
+    inspect_for_direct_read_cancelable(path, &cancel)
+}
+
+/// Cancellable direct-read inspection for archive-open requests. Header open itself is delegated
+/// to unrar, then every entry boundary observes the request's shared cancellation token.
+pub fn inspect_for_direct_read_cancelable(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> io::Result<RarInspection> {
+    check_inspection_cancel(cancel)?;
     let key = cache_key(path)?;
     if let Ok(cache) = DECISION_CACHE.lock()
         && let Some((_, inspection)) = cache.iter().find(|(cached, _)| cached == &key)
     {
+        check_inspection_cancel(cancel)?;
         return Ok(inspection.clone());
     }
+    check_inspection_cancel(cancel)?;
     let (mut archive, volume_kind, resolved_path) =
         open_listing_from_volume_with_key(path, Some(&key))?;
     let is_solid = archive.is_solid();
@@ -267,7 +280,11 @@ pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
     let mut image_count = 0u32;
     let mut total_uncompressed_bytes = 0u64;
     let mut nested_archive_count = 0u32;
-    for entry in archive.by_ref() {
+    loop {
+        check_inspection_cancel(cancel)?;
+        let Some(entry) = archive.next() else {
+            break;
+        };
         let entry = entry.map_err(unrar_io)?;
         // Encryption is an archive eligibility property, including entries hidden from the UI.
         has_encrypted |= entry.is_encrypted();
@@ -285,6 +302,7 @@ pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
             nested_archive_count = nested_archive_count.saturating_add(1);
         }
     }
+    check_inspection_cancel(cancel)?;
     let inspection = RarInspection {
         decision: classify_direct_read(is_solid, nested_archive_count > 0, has_encrypted),
         summary: ArchiveImageSummary {
@@ -303,6 +321,17 @@ pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
         cache.push((key, inspection.clone()));
     }
     Ok(inspection)
+}
+
+fn check_inspection_cancel(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "RAR inspection cancelled",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn enumerate_image_entries_detailed(path: &Path) -> io::Result<ZipEnumeration> {

@@ -39,13 +39,15 @@ impl App {
         // A forwarded activation is a new navigation request as soon as it is received. Do not
         // let an archive conversion owned by the currently opening bookmark win the race while
         // the activation path is still being resolved on its worker.
-        if matches!(source, StartupOpenPathSource::Activation)
-            && let Some(request_id) = self
+        if matches!(source, StartupOpenPathSource::Activation) {
+            self.cancel_archive_convert_for_navigation("activation_navigation");
+            if let Some(request_id) = self
                 .bookmark_open_pending
                 .as_ref()
                 .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
-        {
-            self.cancel_bookmark_open_request(request_id, "activation_navigation");
+            {
+                self.cancel_bookmark_open_request(request_id, "activation_navigation");
+            }
         }
         if let Some(pending) = self.startup_open_path_resolve_pending.take() {
             crate::logger::log(format!(

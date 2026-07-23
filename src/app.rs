@@ -14538,6 +14538,7 @@ impl App {
                 // A direct navigation owns the next visible location. If an earlier startup,
                 // activation, or bookmark path is still resolving, dispose that request before
                 // the worker can overwrite this navigation with a late completion.
+                self.cancel_archive_convert_for_navigation_to(&path, "normal_navigation");
                 self.cancel_unresolved_open_for_navigation();
                 self.cancel_conflicting_bookmark_open_for_navigation(&path);
             }

@@ -191,7 +191,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF + XMP ツイート情報) |
 | `ui_erase.rs` | 消しゴムモード (筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円 → MI-GAN で inpaint) |
 | `ui_conceal.rs` | 隠蔽加工モード (同じマスク編集 UI でモザイク / 塗りつぶし / ぼかしを合成) |
-| `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定等。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
+| `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定等。アーカイブ変換は `ArchiveConvertState` が scan / password retry / convert 共通の cancel token と completion policy を所有し、state drop と競合 navigation で worker と receiver を同時に終了する。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
 | `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch |
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「ファイル処理 → Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
