@@ -26,6 +26,81 @@ fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
 }
 
 #[test]
+fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
+    let mut app = phase_c_support::setup_app();
+    let first = PathBuf::from("C:/Pictures/a.jpg");
+    let second = PathBuf::from("C:/Pictures/b.jpg");
+    app.items = vec![
+        GridItem::Image(first.clone()),
+        GridItem::Image(second.clone()),
+    ];
+    app.image_metas = vec![None, None];
+    app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+    app.rating_cache = std::collections::HashMap::from([(0, 1), (1, 2)]);
+    let first_key = crate::adjustment_db::normalize_path(&first);
+    let second_key = crate::adjustment_db::normalize_path(&second);
+    app.tags_cache = std::collections::HashMap::from([
+        (first_key.clone(), vec!["old".to_string()]),
+        (second_key.clone(), vec!["keep".to_string()]),
+    ]);
+    // Any accidental UI-thread fallback would now be unable to query SQLite.
+    app.rating_db = None;
+    app.tags_db = None;
+
+    app.refresh_after_metadata_transfer_import(&crate::metadata_transfer::ImportRefreshDelta {
+        physical_ratings: vec![crate::metadata_transfer::ImportedRatingValue {
+            key: first_key.clone(),
+            stars: 5,
+        }],
+        page_state_families: vec![crate::metadata_transfer::ImportedPageStateFamily {
+            base_key: first_key.clone(),
+            items: vec![crate::metadata_transfer::ImportedPageStatePresence {
+                key: first_key.clone(),
+                adjusted: true,
+                rotated: true,
+                ..Default::default()
+            }],
+        }],
+        visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
+            base_key: first_key.clone(),
+            ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
+                key: first_key.clone(),
+                stars: 5,
+            }]),
+            tags: Some(vec![crate::metadata_transfer::ImportedTagsValue {
+                key: first_key.clone(),
+                tags: vec!["new".to_string()],
+            }]),
+            page_states: Some(vec![crate::metadata_transfer::ImportedPageState {
+                key: first_key.clone(),
+                rotation_degrees: Some(90),
+                adjustment: Some(crate::adjustment::AdjustParams::default()),
+                adjusted: true,
+                rotated: true,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }],
+    });
+
+    assert_eq!(app.rating_cache.get(&0), Some(&5));
+    assert_eq!(app.rating_cache.get(&1), Some(&2));
+    assert_eq!(
+        app.tags_cache.get(&first_key),
+        Some(&vec!["new".to_string()])
+    );
+    assert_eq!(
+        app.tags_cache.get(&second_key),
+        Some(&vec!["keep".to_string()])
+    );
+    assert!(app.adjustment_page_params.contains_key(&0));
+    assert_eq!(
+        app.rotation_cache.get(&0),
+        Some(&crate::rotation_db::Rotation::Cw90)
+    );
+}
+
+#[test]
 fn main_window_title_hides_internal_synthetic_paths() {
     let internal = PathBuf::from(r"C:\data\__reading_history__");
     assert_eq!(

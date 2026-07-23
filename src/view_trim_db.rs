@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 
 use crate::view_trim::{ViewTrimBookState, ViewTrimPageOverride};
 
+#[derive(Clone, Debug, Default)]
+pub struct ViewTrimWriteBatch {
+    pub book: Option<(PathBuf, ViewTrimBookState)>,
+    pub pages: Vec<(String, ViewTrimPageOverride)>,
+}
+
 pub struct ViewTrimDb {
     conn: rusqlite::Connection,
 }
@@ -98,6 +104,45 @@ impl ViewTrimDb {
             [page_key],
         )?;
         Ok(())
+    }
+
+    /// 明示メタ情報転送前に UI から引き渡された未保存値を、worker 接続で一括保存する。
+    /// 同一 batch は 1 transaction なので、export が途中状態を読むことはない。
+    pub fn apply_write_batch(&mut self, batch: &ViewTrimWriteBatch) -> Result<(), rusqlite::Error> {
+        if batch.book.is_none() && batch.pages.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        if let Some((book_path, state)) = &batch.book {
+            let key = book_key(book_path);
+            if state.is_removable() {
+                tx.execute("DELETE FROM view_trim_books WHERE book_key = ?1", [&key])?;
+            } else {
+                let json = serde_json::to_string(state)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute(
+                    "INSERT INTO view_trim_books (book_key, state_json, updated_at)
+                     VALUES (?1, ?2, unixepoch())
+                     ON CONFLICT(book_key) DO UPDATE SET
+                        state_json = ?2,
+                        updated_at = unixepoch()",
+                    rusqlite::params![key, json],
+                )?;
+            }
+        }
+        for (page_key, page_override) in &batch.pages {
+            let json = serde_json::to_string(page_override)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            tx.execute(
+                "INSERT INTO view_trim_pages (page_path, override_json, updated_at)
+                 VALUES (?1, ?2, unixepoch())
+                 ON CONFLICT(page_path) DO UPDATE SET
+                    override_json = ?2,
+                    updated_at = unixepoch()",
+                rusqlite::params![page_key, json],
+            )?;
+        }
+        tx.commit()
     }
 
     pub fn load_page_overrides_by_prefix(
@@ -244,5 +289,38 @@ mod tests {
         let loaded = db.load_page_overrides_many(&["c:/b.jpg", "c:/missing.jpg"]);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get("c:/b.jpg"), Some(&page_override));
+    }
+
+    #[test]
+    fn write_batch_persists_book_and_pages_together() {
+        let (_temp, mut db) = open_temp_db();
+        let book = PathBuf::from(r"C:\Books\Vol2");
+        let book_state = ViewTrimBookState {
+            apply_mode: ViewTrimApplyMode::Book,
+            book_settings: ViewTrimBookSettings {
+                enabled: true,
+                single: ViewTrimMargins {
+                    right: 0.08,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let page_state = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            bottom: 0.06,
+            ..Default::default()
+        });
+        db.apply_write_batch(&ViewTrimWriteBatch {
+            book: Some((book.clone(), book_state)),
+            pages: vec![("c:/books/vol2/page.jpg".to_string(), page_state)],
+        })
+        .unwrap();
+
+        assert_eq!(db.get_book_state(&book), Some(book_state));
+        assert_eq!(
+            db.load_page_overrides_many(&["c:/books/vol2/page.jpg"])
+                .get("c:/books/vol2/page.jpg"),
+            Some(&page_state)
+        );
     }
 }

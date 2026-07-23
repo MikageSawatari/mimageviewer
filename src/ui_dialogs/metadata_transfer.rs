@@ -40,10 +40,14 @@ enum ResultState {
 enum WorkerMessage {
     Progress(TransferProgress),
     Preview(Result<ImportPreview, String>),
-    Export(Result<ExportSummary, String>),
+    Export {
+        result: Result<ExportSummary, String>,
+        view_trim_saved: bool,
+    },
     Import {
         result: Result<ImportSummary, String>,
         resource_error: Option<String>,
+        view_trim_saved: bool,
     },
 }
 
@@ -91,6 +95,7 @@ pub(crate) struct MetadataTransferState {
     rx: Option<Receiver<WorkerMessage>>,
     handle: Option<std::thread::JoinHandle<()>>,
     import_resources: Option<Arc<Mutex<ImportWorkerResources>>>,
+    pending_view_trim: Option<crate::ui_view_trim::PendingViewTrimTransfer>,
 }
 
 impl MetadataTransferState {
@@ -105,6 +110,7 @@ impl MetadataTransferState {
             rx: None,
             handle: None,
             import_resources: None,
+            pending_view_trim: None,
         }
     }
 
@@ -119,6 +125,7 @@ impl MetadataTransferState {
             rx: None,
             handle: None,
             import_resources: None,
+            pending_view_trim: None,
         }
     }
 }
@@ -228,27 +235,46 @@ impl App {
                 .as_ref()
                 .map(|state| state.operation)
                 .expect("state checked above");
-            // writer の結果反映で view-trim が再び dirty になり得るため、
-            // WaitingForWriters を抜ける実行直前にも確定する。
-            self.persist_pending_view_trim_state();
+            // writer の結果反映で view-trim が再び dirty になり得るため、実行直前の
+            // UI 状態をメモリ snapshot する。SQLite write は transfer worker に渡す。
+            let pending_view_trim = self.take_pending_view_trim_transfer();
+            let mut restore_view_trim = None;
             match operation {
                 Operation::Export => {
                     if let Some(state) = self.metadata_transfer.as_mut() {
-                        start_export_worker(state);
+                        state.pending_view_trim = pending_view_trim;
+                        let batch = state
+                            .pending_view_trim
+                            .as_ref()
+                            .map(|pending| pending.batch.clone());
+                        if !start_export_worker(state, batch) {
+                            restore_view_trim = state.pending_view_trim.take();
+                        }
                     }
                 }
                 Operation::Import => {
                     // JSON serialize / temp write / rename and tags.db journal-mode
                     // handoff are part of the worker preparation stage.  Move their
                     // ownership instead of doing file I/O on the UI thread.
+                    let refresh_scope = self.metadata_import_refresh_scope();
                     let resources = ImportWorkerResources {
                         sidecars: std::mem::take(&mut self.sidecars),
                         tags_db: self.tags_db.take(),
                     };
                     if let Some(state) = self.metadata_transfer.as_mut() {
-                        start_import_worker(state, resources);
+                        state.pending_view_trim = pending_view_trim;
+                        let batch = state
+                            .pending_view_trim
+                            .as_ref()
+                            .map(|pending| pending.batch.clone());
+                        if !start_import_worker(state, resources, batch, refresh_scope) {
+                            restore_view_trim = state.pending_view_trim.take();
+                        }
                     }
                 }
+            }
+            if let Some(pending) = restore_view_trim {
+                self.restore_pending_view_trim_transfer(pending);
             }
         }
         // Thread creation failure reaches Result without a receiver message, so
@@ -263,18 +289,12 @@ impl App {
         match action {
             DialogAction::None => {}
             DialogAction::StartExport => {
-                // 表示トリムは操作中に debounce 保存されるため、worker が DB snapshot を
-                // 読む前に現在の編集を確定する。モーダル中は以後の入力が発生しない。
-                self.persist_pending_view_trim_state();
                 if let Some(state) = self.metadata_transfer.as_mut() {
                     state.stage = Stage::WaitingForWriters;
                     state.progress = None;
                 }
             }
             DialogAction::StartImport => {
-                // import 後の再 hydrate が、未保存の旧 UI 状態を DB へ書き戻さないよう
-                // 適用開始前に dirty state を排出する。
-                self.persist_pending_view_trim_state();
                 if let Some(state) = self.metadata_transfer.as_mut() {
                     state.stage = Stage::WaitingForWriters;
                     state.progress = None;
@@ -328,8 +348,8 @@ impl App {
                 }
             }
         }
-        let mut imported_rating_keys = Vec::new();
-        let mut imported_page_state_families = Vec::new();
+        let mut imported_refresh = None;
+        let mut restore_view_trim = None;
         for message in messages {
             let Some(state) = self.metadata_transfer.as_mut() else {
                 break;
@@ -343,20 +363,32 @@ impl App {
                         Err(error) => Stage::Result(ResultState::Import(Err(error))),
                     };
                 }
-                WorkerMessage::Export(result) => {
+                WorkerMessage::Export {
+                    result,
+                    view_trim_saved,
+                } => {
+                    if view_trim_saved {
+                        state.pending_view_trim = None;
+                    } else {
+                        restore_view_trim = state.pending_view_trim.take();
+                    }
                     state.rx = None;
                     state.stage = Stage::Result(ResultState::Export(result));
                 }
                 WorkerMessage::Import {
                     mut result,
                     resource_error,
+                    view_trim_saved,
                 } => {
                     if let Ok(summary) = &mut result
                         && summary.applied_entries > 0
                     {
-                        imported_rating_keys = std::mem::take(&mut summary.applied_rating_keys);
-                        imported_page_state_families =
-                            std::mem::take(&mut summary.applied_page_state_families);
+                        imported_refresh = Some(std::mem::take(&mut summary.refresh));
+                    }
+                    if view_trim_saved {
+                        state.pending_view_trim = None;
+                    } else {
+                        restore_view_trim = state.pending_view_trim.take();
                     }
                     if let Some(error) = resource_error {
                         result = Err(match result {
@@ -375,6 +407,7 @@ impl App {
             })
             && let Some(state) = self.metadata_transfer.as_mut()
         {
+            restore_view_trim = state.pending_view_trim.take();
             state.rx = None;
             state.stage = match state.operation {
                 Operation::Export => Stage::Result(ResultState::Export(Err(
@@ -385,12 +418,12 @@ impl App {
                 ))),
             };
         }
+        if let Some(pending) = restore_view_trim {
+            self.restore_pending_view_trim_transfer(pending);
+        }
         self.restore_metadata_import_resources();
-        if !imported_rating_keys.is_empty() {
-            self.refresh_after_metadata_transfer_import(
-                &imported_rating_keys,
-                &imported_page_state_families,
-            );
+        if let Some(refresh) = imported_refresh {
+            self.refresh_after_metadata_transfer_import(&refresh);
         }
     }
 
@@ -639,7 +672,10 @@ fn start_preview_worker(state: &mut MetadataTransferState) {
     }
 }
 
-fn start_export_worker(state: &mut MetadataTransferState) {
+fn start_export_worker(
+    state: &mut MetadataTransferState,
+    view_trim_batch: Option<crate::view_trim_db::ViewTrimWriteBatch>,
+) -> bool {
     let root = state.root.clone();
     let recursive = state.recursive;
     let data_dir = crate::data_dir::get();
@@ -652,28 +688,44 @@ fn start_export_worker(state: &mut MetadataTransferState) {
         .name("metadata-export".to_string())
         .spawn(move || {
             let mut progress_relay = ProgressRelay::new(tx.clone());
-            let result = crate::metadata_transfer::export_at(
-                &data_dir,
-                &root,
-                recursive,
-                &cancel,
-                move |value| {
-                    progress_relay.send(value);
-                },
-            )
-            .map_err(|error| error.to_string());
-            let _ = tx.send(WorkerMessage::Export(result));
+            let preparation = flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "export");
+            let view_trim_saved = preparation.is_ok();
+            let result = preparation.and_then(|()| {
+                crate::metadata_transfer::export_at(
+                    &data_dir,
+                    &root,
+                    recursive,
+                    &cancel,
+                    move |value| {
+                        progress_relay.send(value);
+                    },
+                )
+                .map_err(|error| error.to_string())
+            });
+            let _ = tx.send(WorkerMessage::Export {
+                result,
+                view_trim_saved,
+            });
         });
     match spawn {
-        Ok(handle) => state.handle = Some(handle),
+        Ok(handle) => {
+            state.handle = Some(handle);
+            true
+        }
         Err(error) => {
             state.rx = None;
             state.stage = Stage::Result(ResultState::Export(Err(error.to_string())));
+            false
         }
     }
 }
 
-fn start_import_worker(state: &mut MetadataTransferState, resources: ImportWorkerResources) {
+fn start_import_worker(
+    state: &mut MetadataTransferState,
+    resources: ImportWorkerResources,
+    view_trim_batch: Option<crate::view_trim_db::ViewTrimWriteBatch>,
+    refresh_scope: crate::metadata_transfer::ImportRefreshScope,
+) -> bool {
     if let Some(preview_handle) = state.handle.take() {
         let _ = preview_handle.join();
     }
@@ -702,14 +754,21 @@ fn start_import_worker(state: &mut MetadataTransferState, resources: ImportWorke
             drop(tags_db);
 
             let mut progress_relay = ProgressRelay::new(tx.clone());
-            let flush_result = flush_import_sidecars(&resources);
+            let view_trim_result =
+                flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import");
+            let view_trim_saved = view_trim_result.is_ok();
+            let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
             let result = match flush_result {
-                Ok(()) => {
-                    crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
+                Ok(()) => crate::metadata_transfer::import_at_with_refresh_scope(
+                    &data_dir,
+                    &root,
+                    &cancel,
+                    Some(&refresh_scope),
+                    move |value| {
                         progress_relay.send(value);
-                    })
-                    .map_err(|error| error.to_string())
-                }
+                    },
+                )
+                .map_err(|error| error.to_string()),
                 Err(error) => Err(error),
             };
 
@@ -731,15 +790,36 @@ fn start_import_worker(state: &mut MetadataTransferState, resources: ImportWorke
             let _ = tx.send(WorkerMessage::Import {
                 result,
                 resource_error,
+                view_trim_saved,
             });
         });
     match spawn {
-        Ok(handle) => state.handle = Some(handle),
+        Ok(handle) => {
+            state.handle = Some(handle);
+            true
+        }
         Err(error) => {
             state.rx = None;
             state.stage = Stage::Result(ResultState::Import(Err(error.to_string())));
+            false
         }
     }
+}
+
+fn flush_view_trim_batch(
+    data_dir: &std::path::Path,
+    batch: Option<&crate::view_trim_db::ViewTrimWriteBatch>,
+    operation: &str,
+) -> Result<(), String> {
+    let Some(batch) = batch else {
+        return Ok(());
+    };
+    let mut db = crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).map_err(
+        |error| format!("表示トリムDBを開けないため、{operation}を開始しませんでした: {error}"),
+    )?;
+    db.apply_write_batch(batch).map_err(|error| {
+        format!("未保存の表示トリムを保存できないため、{operation}を開始しませんでした: {error}")
+    })
 }
 
 fn flush_import_sidecars(resources: &Arc<Mutex<ImportWorkerResources>>) -> Result<(), String> {
@@ -815,5 +895,34 @@ mod tests {
 
         let error = flush_import_sidecars(&resources).unwrap_err();
         assert!(error.contains("importを開始しませんでした"));
+    }
+
+    #[test]
+    fn transfer_preparation_flushes_pending_view_trim_on_worker() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let book = temp.path().join("book");
+        let state = crate::view_trim::ViewTrimBookState {
+            apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+            book_settings: crate::view_trim::ViewTrimBookSettings {
+                enabled: true,
+                ..Default::default()
+            },
+        };
+        let batch = crate::view_trim_db::ViewTrimWriteBatch {
+            book: Some((book.clone(), state)),
+            pages: Vec::new(),
+        };
+        let data_dir = temp.path().to_path_buf();
+        std::thread::Builder::new()
+            .name("metadata-view-trim-flush-test".to_string())
+            .spawn(move || flush_view_trim_batch(&data_dir, Some(&batch), "test"))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+
+        let db =
+            crate::view_trim_db::ViewTrimDb::open_at(&temp.path().join("view_trim.db")).unwrap();
+        assert_eq!(db.get_book_state(&book), Some(state));
     }
 }

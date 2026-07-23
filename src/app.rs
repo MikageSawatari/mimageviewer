@@ -22411,37 +22411,117 @@ impl App {
         self.invalidate_tag_apply_suggestions();
     }
 
-    /// 明示メタ情報インポート完了後、DB を正本にして表示用キャッシュを再構築する。
-    /// worker は別接続で複数 DB を更新するため、既存接続そのものは再生成せず、
-    /// path-keyed な派生キャッシュだけを捨てる。
+    pub(crate) fn metadata_import_refresh_scope(
+        &self,
+    ) -> crate::metadata_transfer::ImportRefreshScope {
+        let mut base_keys = std::collections::HashSet::new();
+        if let Some(folder) = self.current_folder.as_ref() {
+            base_keys.insert(crate::path_key::normalize_keep_drive(folder));
+        }
+        for idx in 0..self.items.len() {
+            if let Some(key) = self
+                .rating_path_key(idx)
+                .or_else(|| self.page_path_key(idx))
+            {
+                base_keys.insert(
+                    key.split_once("::")
+                        .map_or(key.as_str(), |(base, _)| base)
+                        .to_string(),
+                );
+            }
+            if let Some(path) = self.items[idx].container_path() {
+                base_keys.insert(crate::path_key::normalize_keep_drive(path));
+            }
+        }
+        crate::metadata_transfer::ImportRefreshScope { base_keys }
+    }
+
+    /// 明示メタ情報インポート完了後、worker が返した commit 済み差分だけで表示を更新する。
+    /// SQLite の point read / prewarm / folder reload は UI thread で行わない。
     pub(crate) fn refresh_after_metadata_transfer_import(
         &mut self,
-        applied_rating_keys: &[String],
-        applied_page_state_families: &[crate::metadata_transfer::ImportedPageStateFamily],
+        refresh: &crate::metadata_transfer::ImportRefreshDelta,
     ) {
-        let imported_ratings = self
-            .rating_db
-            .as_ref()
-            .map(|db| {
-                applied_rating_keys
-                    .iter()
-                    .map(|key| (key.clone(), db.get(key)))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for (key, stars) in imported_ratings {
-            self.record_rating_session_write(key, stars, true);
-        }
-        self.rating_cache.clear();
-        self.prewarm_rating_cache();
-        self.sync_current_context_rating_session_writes();
-        self.current_folder_rating_cache = None;
-        self.invalidate_rating_counts_cache();
-        self.reset_folder_rating_counts();
+        use std::collections::{HashMap, HashSet};
 
-        self.clear_tags_cache();
-        self.prewarm_grid_tags();
-        self.invalidate_tag_apply_suggestions();
+        fn family_base_for_item(key: &str) -> &str {
+            key.split_once("::").map_or(key, |(base, _)| base)
+        }
+        fn container_in_family(key: &str, base: &str, include_nested: bool) -> bool {
+            key == base
+                || (include_nested
+                    && key
+                        .strip_prefix(base)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        }
+
+        let imported = &refresh.visible_entries;
+        for value in &refresh.physical_ratings {
+            self.record_rating_session_write(value.key.clone(), value.stars, true);
+        }
+        let mut rating_families = HashSet::new();
+        let mut rating_values = HashMap::new();
+        for entry in imported {
+            let Some(values) = entry.ratings.as_ref() else {
+                continue;
+            };
+            rating_families.insert(entry.base_key.clone());
+            for value in values {
+                rating_values.insert(value.key.clone(), value.stars);
+            }
+        }
+        if !rating_families.is_empty() {
+            let rating_updates = (0..self.items.len())
+                .filter_map(|idx| {
+                    let key = self.rating_path_key(idx)?;
+                    rating_families
+                        .contains(family_base_for_item(&key))
+                        .then_some((idx, rating_values.get(&key).copied().unwrap_or(0)))
+                })
+                .collect::<Vec<_>>();
+            for (idx, stars) in rating_updates {
+                self.rating_cache.insert(idx, stars);
+            }
+            if let Some((key, _)) = self.current_container_rating_key_and_source()
+                && rating_families.contains(family_base_for_item(&key))
+            {
+                self.current_folder_rating_cache =
+                    Some(rating_values.get(&key).copied().unwrap_or(0));
+            }
+            self.rating_session_write_seen_generation = self.rating_session_write_generation;
+            self.invalidate_rating_counts_cache();
+            self.reset_folder_rating_counts();
+        }
+
+        let mut tag_families = HashSet::new();
+        let mut tag_values = HashMap::new();
+        for entry in imported {
+            let Some(values) = entry.tags.as_ref() else {
+                continue;
+            };
+            tag_families.insert(entry.base_key.clone());
+            for value in values {
+                tag_values.insert(value.key.clone(), value.tags.clone());
+            }
+        }
+        if !tag_families.is_empty() {
+            if let Some(pending) = self.tag_prewarm_pending.take() {
+                pending.cancel();
+            }
+            self.tag_prewarm_queued.clear();
+            if let Some(pending) = self.tag_legacy_seed_pending.take() {
+                pending.cancel();
+            }
+            let mut replacement = std::mem::take(&mut self.tags_cache);
+            replacement.retain(|key, _| !tag_families.contains(family_base_for_item(key)));
+            replacement.extend(tag_values);
+            self.replace_tags_cache(replacement);
+            if self.settings.write_rating_to_xmp {
+                self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+            }
+            self.start_tag_legacy_seed_for_current_items();
+            self.invalidate_tag_apply_suggestions();
+        }
 
         self.current_book_bookmarks.clear();
         self.current_book_bookmarks_key = None;
@@ -22452,17 +22532,34 @@ impl App {
         self.music_bookmarks.clear();
         self.music_bookmarks_loaded_for = None;
 
-        // v2 で上書きした page-key family だけを差分更新する。各 DB の全件走査を
-        // UI thread へ持ち込まず、manifest にない family の既存 rollup は保持する。
-        for family in applied_page_state_families {
-            let virtual_prefix = format!("{}::", family.base_key);
-            let keep = |key: &String| key != &family.base_key && !key.starts_with(&virtual_prefix);
+        let mut page_families = HashSet::new();
+        let mut page_values = HashMap::new();
+        for entry in imported {
+            let Some(items) = entry.page_states.as_ref() else {
+                continue;
+            };
+            page_families.insert(entry.base_key.clone());
+            for item in items {
+                page_values.insert(item.key.clone(), item);
+            }
+        }
+        // v2 で上書きした page-key family だけを差分更新する。manifest にない family の
+        // 既存 rollup / idx cache は保持する。
+        let all_page_families = refresh
+            .page_state_families
+            .iter()
+            .map(|family| family.base_key.as_str())
+            .collect::<HashSet<_>>();
+        if !all_page_families.is_empty() {
+            let keep = |key: &String| !all_page_families.contains(family_base_for_item(key));
             self.adjusted_page_keys.retain(keep);
             self.local_adjust_page_keys.retain(keep);
             self.mask_page_keys.retain(keep);
             self.conceal_page_keys.retain(keep);
             self.comic_page_keys.retain(keep);
             self.rotation_page_keys.retain(keep);
+        }
+        for family in &refresh.page_state_families {
             for item in &family.items {
                 Self::set_page_key_presence(&mut self.adjusted_page_keys, &item.key, item.adjusted);
                 Self::set_page_key_presence(
@@ -22476,8 +22573,225 @@ impl App {
                 Self::set_page_key_presence(&mut self.rotation_page_keys, &item.key, item.rotated);
             }
         }
-        self.rotation_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        if !page_families.is_empty() {
+            self.comic_docs
+                .retain(|key, _| !page_families.contains(family_base_for_item(key)));
+            let affected_pages = (0..self.items.len())
+                .filter_map(|idx| {
+                    let key = self.page_path_key(idx)?;
+                    page_families
+                        .contains(family_base_for_item(&key))
+                        .then_some((idx, key))
+                })
+                .collect::<Vec<_>>();
+            for (idx, key) in affected_pages {
+                let state = page_values.get(&key).copied();
+                if let Some(params) = state.and_then(|state| state.adjustment.as_ref()) {
+                    self.adjustment_page_params.insert(idx, params.clone());
+                } else {
+                    self.adjustment_page_params.remove(&idx);
+                }
+                self.local_adjust_page_layers.remove(&idx);
+                self.local_adjust_selected_layers.remove(&idx);
+                Self::set_page_presence(
+                    &mut self.local_adjust_pages,
+                    idx,
+                    state.is_some_and(|state| state.local_adjusted),
+                );
+                if let Some(settings) = state.and_then(|state| state.export_crop) {
+                    self.export_crop_page_settings.insert(idx, settings);
+                    self.export_crop_pages.insert(idx);
+                } else {
+                    self.export_crop_page_settings.remove(&idx);
+                    self.export_crop_pages.remove(&idx);
+                }
+                if let Some(page_override) = state.and_then(|state| state.view_trim) {
+                    self.view_trim_page_overrides.insert(idx, page_override);
+                } else {
+                    self.view_trim_page_overrides.remove(&idx);
+                }
+                Self::set_page_presence(
+                    &mut self.mask_pages,
+                    idx,
+                    state.is_some_and(|state| state.masked),
+                );
+                Self::set_page_presence(
+                    &mut self.conceal_pages,
+                    idx,
+                    state.is_some_and(|state| state.concealed),
+                );
+                Self::set_page_presence(
+                    &mut self.comic_pages,
+                    idx,
+                    state.is_some_and(|state| state.comic),
+                );
+                self.rotation_cache.insert(
+                    idx,
+                    crate::rotation_db::Rotation::from_degrees(
+                        state.and_then(|state| state.rotation_degrees).unwrap_or(0),
+                    ),
+                );
+                self.comic_docs.remove(&key);
+            }
+            // 項目ごとの retain/cancel は大量 import で二乗コストになる。現在 context の
+            // edit pipeline 派生物を一度だけ破棄し、上で差し替えた sparse state から再生成する。
+            self.adjustment_cache.clear();
+            self.thumb_adjust_tex.clear();
+            self.erase_result_cache.clear();
+            self.local_adjust_cache.clear();
+            self.local_adjust_layer_bypass_cache.clear();
+            self.local_adjust_prefix_preview_cache.clear();
+            self.edit_result_cache.clear();
+            self.conceal_base_cache.clear();
+            self.conceal_cache.clear();
+            self.cancel_all_local_adjust_pending();
+            self.cancel_all_erase_inpaint_pending();
+            self.bump_all_adjustment_generations();
+            self.clear_all_final_pipeline_caches();
+        }
+
+        let current_spread_key = self
+            .spread_container_key()
+            .map(|path| crate::path_key::normalize(&path));
+        if let Some(current_key) = current_spread_key.as_deref() {
+            let mut imported_state = None;
+            for entry in imported {
+                let Some(family) = entry.container_states.as_ref() else {
+                    continue;
+                };
+                if container_in_family(current_key, &family.base_key, family.include_nested) {
+                    imported_state = Some(family.items.iter().find(|item| item.key == current_key));
+                }
+            }
+            if let Some(state) = imported_state {
+                let stored_spread = state
+                    .and_then(|state| state.spread)
+                    .map(|state| crate::settings::SpreadMode::from_int(state.mode))
+                    .unwrap_or(self.settings.default_spread_mode);
+                self.reading_flow = state
+                    .and_then(|state| state.spread)
+                    .map(|state| crate::settings::ReadingFlow::from_int(state.flow))
+                    .unwrap_or(self.settings.default_reading_flow);
+                self.reading_direction = state
+                    .and_then(|state| state.spread)
+                    .map(|state| crate::settings::ReadingDirection::from_int(state.direction))
+                    .unwrap_or(self.settings.default_reading_direction);
+                if stored_spread == crate::settings::SpreadMode::Vertical {
+                    self.spread_mode = crate::settings::SpreadMode::Single;
+                    self.reading_flow = crate::settings::ReadingFlow::Vertical;
+                } else {
+                    self.spread_mode = stored_spread;
+                }
+                if self.spread_mode.is_rtl() {
+                    self.reading_direction = crate::settings::ReadingDirection::Rtl;
+                } else if matches!(
+                    self.spread_mode,
+                    crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
+                ) {
+                    self.reading_direction = crate::settings::ReadingDirection::Ltr;
+                }
+                self.spread_shift_anchor_idx = None;
+
+                let trim = state.and_then(|state| state.view_trim).unwrap_or_default();
+                self.view_trim_apply_mode = match trim.apply_mode {
+                    crate::view_trim::ViewTrimApplyMode::Page => {
+                        crate::view_trim::ViewTrimApplyMode::None
+                    }
+                    mode => mode,
+                };
+                self.view_trim_book_settings = trim.book_settings;
+                self.view_trim_page_apply_root_idx = None;
+                self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
+            }
+        }
+
+        let pin_families = imported
+            .iter()
+            .filter_map(|entry| entry.folder_pins.as_ref())
+            .collect::<Vec<_>>();
+        if !pin_families.is_empty() {
+            let exact_pin_families = pin_families
+                .iter()
+                .map(|family| family.base_key.as_str())
+                .collect::<HashSet<_>>();
+            let nested_pin_families = pin_families
+                .iter()
+                .filter(|family| family.include_nested)
+                .map(|family| family.base_key.as_str())
+                .collect::<Vec<_>>();
+            self.folder_pin_map.retain(|key, _| {
+                !exact_pin_families.contains(key.as_str())
+                    && !nested_pin_families
+                        .iter()
+                        .any(|base| container_in_family(key, base, true))
+            });
+            for family in &pin_families {
+                self.folder_pin_map.extend(
+                    family
+                        .items
+                        .iter()
+                        .map(|item| (item.key.clone(), item.source.clone())),
+                );
+            }
+            let affected = self
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let key = crate::path_key::normalize_keep_drive(item.container_path()?);
+                    exact_pin_families.contains(key.as_str()).then_some(idx)
+                })
+                .collect::<Vec<_>>();
+            for idx in affected {
+                if let Some(thumbnail) = self.thumbnails.get_mut(idx) {
+                    *thumbnail = ThumbnailState::Pending;
+                }
+                self.requested.remove(&idx);
+                self.pending_finalize.remove(&idx);
+            }
+            self.folder_thumb_pin_dirty = false;
+        }
+
+        let video_changes = imported
+            .iter()
+            .filter_map(|entry| entry.video_pin.as_ref())
+            .map(|change| (change.key.as_str(), change))
+            .collect::<HashMap<_, _>>();
+        if !video_changes.is_empty() {
+            let mut video_items = Vec::new();
+            let mut pin_blobs = HashMap::new();
+            for (idx, item) in self.items.iter().enumerate() {
+                let GridItem::Video(path) = item else {
+                    continue;
+                };
+                let key = crate::path_key::normalize_keep_drive(path);
+                let Some(change) = video_changes.get(key.as_str()) else {
+                    continue;
+                };
+                if let Some(webp) = change.thumb_webp.as_ref().filter(|webp| !webp.is_empty()) {
+                    pin_blobs.insert(path.clone(), webp.clone());
+                }
+                let size = self
+                    .image_metas
+                    .get(idx)
+                    .and_then(|metadata| *metadata)
+                    .map(|(_, size)| size.max(0) as u64)
+                    .unwrap_or(0);
+                video_items.push((idx, path.clone(), size));
+                if let Some(thumbnail) = self.thumbnails.get_mut(idx) {
+                    *thumbnail = ThumbnailState::Pending;
+                }
+            }
+            if !video_items.is_empty() {
+                self.spawn_video_thread(
+                    self.tx.clone(),
+                    Arc::clone(&self.cancel_token),
+                    video_items,
+                    self.video_thumb_overrides.clone(),
+                    pin_blobs,
+                );
+            }
+        }
 
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Rating,
@@ -22488,14 +22802,6 @@ impl App {
         self.notify_bookmarks_changed();
         if self.settings.facet_filter.is_active() {
             self.rebuild_visible_indices();
-        }
-
-        // 代表サムネ / 動画ピンの WebP はフォルダ準備 worker が snapshot する。
-        // 明示 import のモーダル中は current_folder が変化しないため、一度だけ同じ
-        // 実フォルダを再ロードすれば、見開き・表示トリムを含む全キャッシュが揃う。
-        if let Some(current_folder) = self.current_folder.clone() {
-            self.folder_history.remove(&current_folder);
-            self.load_folder(current_folder);
         }
     }
 
@@ -50584,6 +50890,14 @@ impl App {
             keys.insert(key.to_owned());
         } else {
             keys.remove(key);
+        }
+    }
+
+    fn set_page_presence(pages: &mut std::collections::HashSet<usize>, idx: usize, present: bool) {
+        if present {
+            pages.insert(idx);
+        } else {
+            pages.remove(&idx);
         }
     }
 

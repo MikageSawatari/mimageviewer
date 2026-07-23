@@ -15,6 +15,11 @@ const PANEL_TOP: f32 = 72.0;
 const PANEL_MIN_H: f32 = 250.0;
 const PANEL_MAX_H: f32 = 560.0;
 
+pub(crate) struct PendingViewTrimTransfer {
+    pub(crate) batch: crate::view_trim_db::ViewTrimWriteBatch,
+    pub(crate) dirty_page_indices: Vec<usize>,
+}
+
 fn panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
     (full_rect.bottom() - panel_pos.y - PANEL_MARGIN).clamp(PANEL_MIN_H, PANEL_MAX_H)
 }
@@ -547,6 +552,53 @@ impl App {
             }
         }
         self.view_trim_save_pending = false;
+    }
+
+    /// 明示メタ情報転送用に未保存値をメモリだけで切り離す。SQLite への書き込みは
+    /// transfer worker が行う。spawn / worker preparation が失敗した場合は
+    /// [`Self::restore_pending_view_trim_transfer`] で dirty 状態を戻す。
+    pub(crate) fn take_pending_view_trim_transfer(&mut self) -> Option<PendingViewTrimTransfer> {
+        if !self.view_trim_save_pending {
+            return None;
+        }
+        let book = self.spread_container_key().map(|key| {
+            let state = crate::view_trim::ViewTrimBookState {
+                apply_mode: match self.view_trim_apply_mode {
+                    ViewTrimApplyMode::Page => ViewTrimApplyMode::None,
+                    mode => mode,
+                },
+                book_settings: self.view_trim_book_settings,
+            };
+            (key, state)
+        });
+        let mut dirty_page_indices = self
+            .view_trim_dirty_page_overrides
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        dirty_page_indices.sort_unstable();
+        let pages = dirty_page_indices
+            .iter()
+            .filter_map(|&idx| {
+                Some((
+                    self.page_path_key(idx)?,
+                    *self.view_trim_page_overrides.get(&idx)?,
+                ))
+            })
+            .collect();
+
+        self.view_trim_dirty_page_overrides.clear();
+        self.view_trim_save_pending = false;
+        Some(PendingViewTrimTransfer {
+            batch: crate::view_trim_db::ViewTrimWriteBatch { book, pages },
+            dirty_page_indices,
+        })
+    }
+
+    pub(crate) fn restore_pending_view_trim_transfer(&mut self, pending: PendingViewTrimTransfer) {
+        self.view_trim_dirty_page_overrides
+            .extend(pending.dirty_page_indices);
+        self.view_trim_save_pending = true;
     }
 
     #[allow(clippy::too_many_lines)]

@@ -71,7 +71,7 @@ pub struct ImportPreview {
     pub exported_at_ms: i64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct ImportSummary {
     pub total_entries: usize,
     pub applied_entries: usize,
@@ -79,22 +79,63 @@ pub struct ImportSummary {
     pub skipped_changed: usize,
     pub failed_entries: usize,
     pub cancelled: bool,
-    /// XMP rating hydration が明示 import の「評価なし」を直後に復活させないための
-    /// session-local suppression key。UI 表示には使わない。
-    pub applied_rating_keys: Vec<String>,
-    /// import で上書きした page-key family。UI 側の編集有無 rollup を DB 全走査せず
-    /// 差分更新するための session-local 情報。
-    pub applied_page_state_families: Vec<ImportedPageStateFamily>,
+    /// UI thread が SQLite を再読込せず、現在の表示キャッシュだけを差分更新するための
+    /// worker-produced payload。項目 transaction の commit 後にだけ追加される。
+    pub refresh: ImportRefreshDelta,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportRefreshDelta {
+    /// XMP hydration の session-local suppression 用。従来同様、commit 済み物理項目を保持する。
+    pub physical_ratings: Vec<ImportedRatingValue>,
+    /// 全体の編集有無 rollup 用。実データ本体は持たない。
+    pub page_state_families: Vec<ImportedPageStateFamily>,
+    /// import 開始時に表示中だった項目だけの、UI cache 更新用実値。
+    pub visible_entries: Vec<ImportedEntryMetadata>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportRefreshScope {
+    pub base_keys: HashSet<String>,
+}
+
+impl ImportRefreshScope {
+    pub fn contains(&self, base_key: &str) -> bool {
+        self.base_keys.contains(base_key)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportedEntryMetadata {
+    pub base_key: String,
+    pub ratings: Option<Vec<ImportedRatingValue>>,
+    pub tags: Option<Vec<ImportedTagsValue>>,
+    pub page_states: Option<Vec<ImportedPageState>>,
+    pub container_states: Option<ImportedContainerStateFamily>,
+    pub folder_pins: Option<ImportedFolderPinFamily>,
+    pub video_pin: Option<ImportedVideoPinChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedRatingValue {
+    pub key: String,
+    pub stars: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedTagsValue {
+    pub key: String,
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportedPageStateFamily {
     pub base_key: String,
-    pub items: Vec<ImportedPageState>,
+    pub items: Vec<ImportedPageStatePresence>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImportedPageState {
+pub struct ImportedPageStatePresence {
     pub key: String,
     pub adjusted: bool,
     pub local_adjusted: bool,
@@ -102,6 +143,64 @@ pub struct ImportedPageState {
     pub concealed: bool,
     pub comic: bool,
     pub rotated: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportedPageState {
+    pub key: String,
+    pub rotation_degrees: Option<i32>,
+    pub adjustment: Option<crate::adjustment::AdjustParams>,
+    pub export_crop: Option<crate::export_crop::CropSettings>,
+    pub view_trim: Option<crate::view_trim::ViewTrimPageOverride>,
+    pub adjusted: bool,
+    pub local_adjusted: bool,
+    pub masked: bool,
+    pub concealed: bool,
+    pub comic: bool,
+    pub rotated: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportedContainerStateFamily {
+    /// spread / view-trim DB と同じ drive-stripped key。
+    pub base_key: String,
+    pub include_nested: bool,
+    pub items: Vec<ImportedContainerState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportedContainerState {
+    pub key: String,
+    pub spread: Option<ImportedSpreadState>,
+    pub view_trim: Option<crate::view_trim::ViewTrimBookState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedSpreadState {
+    pub mode: i32,
+    pub flow: i32,
+    pub direction: i32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportedFolderPinFamily {
+    /// folder-pin DB と同じ drive-preserving key。
+    pub base_key: String,
+    pub include_nested: bool,
+    pub items: Vec<ImportedFolderPinValue>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportedFolderPinValue {
+    pub key: String,
+    pub source: crate::folder_thumb_pins::FolderPinSource,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportedVideoPinChange {
+    pub key: String,
+    /// `None` は pin 削除、または pin に保存済み WebP がない状態を表す。
+    pub thumb_webp: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -430,6 +529,21 @@ pub fn import_at<F>(
     data_dir: &Path,
     root: &Path,
     cancel: &AtomicBool,
+    progress: F,
+) -> Result<ImportSummary, TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    import_at_with_refresh_scope(data_dir, root, cancel, None, progress)
+}
+
+/// UI 表示中の物理項目だけ実値を返す import 入口。全項目分は評価値と編集有無だけを
+/// lightweight に保持し、再帰 import の worker result が manifest 本体相当に膨らむのを防ぐ。
+pub fn import_at_with_refresh_scope<F>(
+    data_dir: &Path,
+    root: &Path,
+    cancel: &AtomicBool,
+    refresh_scope: Option<&ImportRefreshScope>,
     mut progress: F,
 ) -> Result<ImportSummary, TransferError>
 where
@@ -505,13 +619,24 @@ where
         ) {
             Ok(()) => {
                 summary.applied_entries += 1;
-                summary
-                    .applied_rating_keys
-                    .push(crate::path_key::normalize_keep_drive(path));
+                let base_key = crate::path_key::normalize_keep_drive(path);
+                if manifest.sections.ratings {
+                    summary.refresh.physical_ratings.push(ImportedRatingValue {
+                        key: base_key.clone(),
+                        stars: entry.rating.as_ref().map_or(0, |rating| rating.stars),
+                    });
+                }
                 if manifest.sections.page_state {
                     summary
-                        .applied_page_state_families
+                        .refresh
+                        .page_state_families
                         .push(imported_page_state_family(path, entry));
+                }
+                if refresh_scope.is_some_and(|scope| scope.contains(&base_key)) {
+                    summary
+                        .refresh
+                        .visible_entries
+                        .push(imported_entry_metadata(path, entry, manifest.sections));
                 }
             }
             Err(error) => {
@@ -535,9 +660,9 @@ where
 fn imported_page_state_family(path: &Path, entry: &PortableEntry) -> ImportedPageStateFamily {
     let base_key = crate::path_key::normalize_keep_drive(path);
     let mut items = Vec::with_capacity(entry.virtual_items.len() + 1);
-    items.push(imported_page_state(&base_key, &entry.page_state));
+    items.push(imported_page_state_presence(&base_key, &entry.page_state));
     items.extend(entry.virtual_items.iter().map(|item| {
-        imported_page_state(
+        imported_page_state_presence(
             &format!("{base_key}::{}", item.member_key.to_lowercase()),
             &item.page_state,
         )
@@ -545,8 +670,8 @@ fn imported_page_state_family(path: &Path, entry: &PortableEntry) -> ImportedPag
     ImportedPageStateFamily { base_key, items }
 }
 
-fn imported_page_state(key: &str, state: &PortablePageState) -> ImportedPageState {
-    ImportedPageState {
+fn imported_page_state_presence(key: &str, state: &PortablePageState) -> ImportedPageStatePresence {
+    ImportedPageStatePresence {
         key: key.to_string(),
         adjusted: state.adjustment.is_some(),
         local_adjusted: state.local_adjust_layers.is_some(),
@@ -554,6 +679,161 @@ fn imported_page_state(key: &str, state: &PortablePageState) -> ImportedPageStat
         concealed: state.conceal.is_some(),
         comic: state.comic.is_some(),
         rotated: state.rotation_degrees.is_some(),
+    }
+}
+
+fn imported_entry_metadata(
+    path: &Path,
+    entry: &PortableEntry,
+    sections: ManifestSections,
+) -> ImportedEntryMetadata {
+    let base_key = crate::path_key::normalize_keep_drive(path);
+    let item_key = |member: &str| format!("{base_key}::{}", member.to_lowercase());
+
+    let ratings = sections.ratings.then(|| {
+        let mut values = Vec::with_capacity(entry.virtual_items.len() + 1);
+        values.push(ImportedRatingValue {
+            key: base_key.clone(),
+            stars: entry.rating.as_ref().map_or(0, |rating| rating.stars),
+        });
+        values.extend(entry.virtual_items.iter().map(|item| ImportedRatingValue {
+            key: item_key(&item.member_key),
+            stars: item.rating.as_ref().map_or(0, |rating| rating.stars),
+        }));
+        values
+    });
+    let tags = sections.tags.then(|| {
+        let mut values = Vec::with_capacity(entry.virtual_items.len() + 1);
+        values.push(ImportedTagsValue {
+            key: base_key.clone(),
+            tags: entry.tags.clone(),
+        });
+        values.extend(entry.virtual_items.iter().map(|item| ImportedTagsValue {
+            key: item_key(&item.member_key),
+            tags: item.tags.clone(),
+        }));
+        values
+    });
+    let page_states = sections.page_state.then(|| {
+        let mut items = Vec::with_capacity(entry.virtual_items.len() + 1);
+        items.push(imported_page_state(&base_key, &entry.page_state));
+        items.extend(
+            entry
+                .virtual_items
+                .iter()
+                .map(|item| imported_page_state(&item_key(&item.member_key), &item.page_state)),
+        );
+        items
+    });
+
+    let include_nested = entry.kind == PortableEntryKind::File;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let can_have_container_state = entry.kind == PortableEntryKind::Directory
+        || crate::folder_tree::is_zip_extension(&extension)
+        || extension == "pdf"
+        || crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some();
+    let container_states = (sections.container_state && can_have_container_state).then(|| {
+        let stripped_base = crate::path_key::normalize(path);
+        let mut items = Vec::with_capacity(entry.nested_containers.len() + 1);
+        items.push(imported_container_state(
+            stripped_base.clone(),
+            &entry.container_state,
+        ));
+        items.extend(entry.nested_containers.iter().map(|container| {
+            imported_container_state(
+                join_container_key(&stripped_base, &container.member_key),
+                &container.state,
+            )
+        }));
+        ImportedContainerStateFamily {
+            base_key: stripped_base,
+            include_nested,
+            items,
+        }
+    });
+    let folder_pins = (sections.thumbnail_pins && can_have_container_state).then(|| {
+        let mut items = Vec::with_capacity(entry.nested_containers.len() + 1);
+        if let Some(source) = entry
+            .container_state
+            .folder_thumb_pin
+            .as_ref()
+            .and_then(portable_folder_pin_source)
+        {
+            items.push(ImportedFolderPinValue {
+                key: base_key.clone(),
+                source,
+            });
+        }
+        items.extend(entry.nested_containers.iter().filter_map(|container| {
+            let source = container
+                .state
+                .folder_thumb_pin
+                .as_ref()
+                .and_then(portable_folder_pin_source)?;
+            Some(ImportedFolderPinValue {
+                key: join_container_key(&base_key, &container.member_key),
+                source,
+            })
+        }));
+        ImportedFolderPinFamily {
+            base_key: base_key.clone(),
+            include_nested,
+            items,
+        }
+    });
+    let video_pin = (sections.thumbnail_pins
+        && crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()))
+    .then(|| ImportedVideoPinChange {
+        key: base_key.clone(),
+        thumb_webp: entry.video_pin.as_ref().and_then(|pin| {
+            pin.thumb_webp_base64.as_ref().and_then(|encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_bytes())
+                    .ok()
+            })
+        }),
+    });
+
+    ImportedEntryMetadata {
+        base_key,
+        ratings,
+        tags,
+        page_states,
+        container_states,
+        folder_pins,
+        video_pin,
+    }
+}
+
+fn imported_page_state(key: &str, state: &PortablePageState) -> ImportedPageState {
+    ImportedPageState {
+        key: key.to_string(),
+        rotation_degrees: state.rotation_degrees,
+        adjustment: state.adjustment.clone(),
+        export_crop: state.export_crop,
+        view_trim: state.view_trim,
+        adjusted: state.adjustment.is_some(),
+        local_adjusted: state.local_adjust_layers.is_some(),
+        masked: state.mask.is_some(),
+        concealed: state.conceal.is_some(),
+        comic: state.comic.is_some(),
+        rotated: state.rotation_degrees.is_some(),
+    }
+}
+
+fn imported_container_state(key: String, state: &PortableContainerState) -> ImportedContainerState {
+    ImportedContainerState {
+        key,
+        spread: state.spread.map(|spread| ImportedSpreadState {
+            mode: spread.mode,
+            flow: spread.flow,
+            direction: spread.direction,
+        }),
+        view_trim: state.view_trim,
     }
 }
 
@@ -3702,7 +3982,30 @@ mod tests {
             destination.join(SIDECAR_FILENAME),
         )
         .unwrap();
-        import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        let listed_key = crate::path_key::normalize_keep_drive(&destination.join("listed.jpg"));
+        let refresh_scope = ImportRefreshScope {
+            base_keys: HashSet::from([listed_key.clone()]),
+        };
+        let summary = import_at_with_refresh_scope(
+            &destination_data,
+            &destination,
+            &cancel,
+            Some(&refresh_scope),
+            no_progress,
+        )
+        .unwrap();
+        assert_eq!(summary.refresh.visible_entries.len(), 1);
+        assert_eq!(summary.refresh.visible_entries[0].base_key, listed_key);
+        assert_eq!(
+            summary
+                .refresh
+                .visible_entries
+                .first()
+                .and_then(|entry| entry.ratings.as_ref())
+                .and_then(|ratings| ratings.first())
+                .map(|rating| rating.stars),
+            Some(0)
+        );
 
         assert_eq!(
             rating(&destination_data, &destination.join("listed.jpg")),
