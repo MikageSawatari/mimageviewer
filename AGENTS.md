@@ -105,6 +105,17 @@ always-active guidance.
   when practical. See the UI snapshot test section in `CLAUDE.md`.
 - Run the narrowest relevant tests first, then broaden when the change touches
   shared behavior.
+- Allow enough command time for this repository's Rust builds and tests. A
+  build or initial test compile can take five minutes or more. For agent-run
+  commands, use at least a 10-minute timeout for `cargo check`, `cargo build`,
+  and release builds, and at least a 15-minute timeout for broad or full
+  `cargo test` runs; increase these further for cold or clean builds. Use a
+  shorter timeout only for a genuinely narrow test after its dependencies are
+  already built.
+- Do not classify `BrokenPipe`, channel-send, or test-harness errors produced
+  after the command runner timed out as product test failures. Confirm whether
+  the timeout interrupted the process, then rerun once with a sufficient
+  timeout instead of repeatedly retrying with the same limit.
 
 ## Verification Builds (Windows native features)
 
