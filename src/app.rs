@@ -22630,6 +22630,7 @@ impl App {
             let rating_key = self.rating_path_key(item_index);
             let page_key = self.page_path_key(item_index);
             let item = &self.items[item_index];
+            let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
             let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
             let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
             if let Some(target) = folder_pin_target {
@@ -22650,23 +22651,32 @@ impl App {
             };
 
             if rating_key.is_some()
+                || tag_key.is_some()
                 || page_key.is_some()
                 || container_path.is_some()
                 || video_path.is_some()
             {
-                let (key, rating, page, alternate_page_key) = match (rating_key, page_key) {
-                    (Some(rating_key), Some(page_key)) if rating_key == page_key => {
-                        (rating_key, true, true, None)
-                    }
-                    (Some(rating_key), Some(page_key)) => (rating_key, true, false, Some(page_key)),
-                    (Some(rating_key), None) => (rating_key, true, false, None),
-                    (None, Some(page_key)) => (page_key, false, true, None),
-                    (None, None) => (String::new(), false, false, None),
+                let key = rating_key
+                    .as_ref()
+                    .or(tag_key.as_ref())
+                    .or(page_key.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+                let rating = rating_key.as_deref() == Some(key.as_str());
+                let tags = tag_key.as_deref() == Some(key.as_str());
+                // rating/tagは重なる物理itemでは同じnormalize_path identityを使う。
+                debug_assert!(rating_key.is_none() || rating);
+                debug_assert!(tag_key.is_none() || tags);
+                let (page, alternate_page_key) = match page_key {
+                    Some(page_key) if page_key == key => (true, None),
+                    Some(page_key) => (false, Some(page_key)),
+                    None => (false, None),
                 };
                 index.items.push(metadata_import_refresh::ItemKey {
                     index: item_index,
                     key,
                     rating,
+                    tags,
                     page,
                     alternate_page_key,
                     container_path,
@@ -22893,9 +22903,10 @@ impl App {
         if result.items_generation != self.items_generation {
             return false;
         }
-        let rebuild_display = result.rating_cache.is_some()
-            || result.tags_cache.is_some()
-            || result.page_state.is_some();
+        let rating_cache_replaced = result.rating_cache.is_some();
+        let tags_cache_replaced = result.tags_cache.is_some();
+        let rebuild_display =
+            rating_cache_replaced || tags_cache_replaced || result.page_state.is_some();
         if let Some(ratings) = result.rating_cache.take() {
             self.rating_cache = ratings;
             self.current_folder_rating_cache = result.current_rating;
@@ -23035,6 +23046,15 @@ impl App {
             self.cancel_fullscreen_video_marker_thumb_decode();
             self.music_bookmarks.clear();
             self.music_bookmarks_loaded_for = None;
+        }
+        // 古いDB snapshotの結果を防ぐため上で取消したcontext所有workerを、
+        // 完成cacheの適用後に同じcontextへ再生成する。これをmount中に行うことで
+        // main / active detached / paused detached がそれぞれ自分のhandleを持つ。
+        if (rating_cache_replaced || tags_cache_replaced) && self.settings.write_rating_to_xmp {
+            self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+        }
+        if tags_cache_replaced {
+            self.start_tag_legacy_seed_for_current_items();
         }
         // visible_indices / facet / details order / selectionはViewerContextBundle所有。
         // cacheを適用したcontextをmountしている間に一体で再計算する。
@@ -24652,7 +24672,7 @@ impl App {
                 Ok(presence) => {
                     self.bookmark_presence = Some(presence);
                     if self.settings.facet_filter.uses_bookmark_state() {
-                        self.rebuild_visible_indices();
+                        self.rebuild_all_viewer_context_visible_indices();
                     }
                 }
                 Err(error) if error == "cancelled" => {}
@@ -24661,7 +24681,7 @@ impl App {
                     // 「なし」は全件となり、フィルタ結果が未確定のまま残らない。
                     self.bookmark_presence = Some(Default::default());
                     if self.settings.facet_filter.uses_bookmark_state() {
-                        self.rebuild_visible_indices();
+                        self.rebuild_all_viewer_context_visible_indices();
                     }
                     self.show_feedback_toast(format!(
                         "ブックマーク状態を読み込めませんでした: {error}"
@@ -24671,6 +24691,34 @@ impl App {
         }
         if self.bookmark_presence_pending.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// App-globalなbookmark snapshotの更新を、保持中の全viewer contextの
+    /// context-owned表示集合へ反映する。DB I/Oは行わず、各bundleをmountして
+    /// `visible_indices` / facet / details order / selectionを一体で再計算する。
+    fn rebuild_all_viewer_context_visible_indices(&mut self) {
+        self.rebuild_visible_indices();
+        #[cfg(windows)]
+        {
+            if let Some(mut active) = self.active_detached_viewer_context.take() {
+                self.swap_viewer_context_bundle(&mut active.bundle);
+                self.rebuild_visible_indices();
+                self.swap_viewer_context_bundle(&mut active.bundle);
+                self.active_detached_viewer_context = Some(active);
+            }
+            for window_index in 0..self.detached_image_windows.len() {
+                let Some(mut bundle) = self.detached_image_windows[window_index]
+                    .paused_bundle
+                    .take()
+                else {
+                    continue;
+                };
+                self.swap_viewer_context_bundle(&mut bundle);
+                self.rebuild_visible_indices();
+                self.swap_viewer_context_bundle(&mut bundle);
+                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+            }
         }
     }
 

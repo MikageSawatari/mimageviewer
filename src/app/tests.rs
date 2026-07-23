@@ -3,6 +3,39 @@ use crate::archive_converter::ArchiveFormat;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[cfg(windows)]
+fn paused_test_window(
+    ctx: &egui::Context,
+    id: u64,
+    bundle: ViewerContextBundle,
+) -> DetachedImageWindowSnapshot {
+    let texture = ctx.load_texture(
+        format!("paused_test_window_{id}"),
+        egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+        egui::TextureOptions::LINEAR,
+    );
+    DetachedImageWindowSnapshot {
+        id,
+        texture,
+        title: format!("paused-{id}"),
+        location_display: format!("paused-{id}"),
+        image_dims: None,
+        rotation: crate::rotation_db::Rotation::None,
+        zoom_pan: None,
+        free_rotation: 0.0,
+        image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        image_content_bbox: None,
+        frozen_continuous_pages: Vec::new(),
+        reopen_descriptor: None,
+        reopen_sync_stamp: None,
+        activation_ready_frame: 0,
+        activation_armed: true,
+        focused_last_frame: false,
+        initial_placement_applied: true,
+        paused_bundle: Some(Box::new(bundle)),
+    }
+}
+
 #[test]
 fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
     use crate::settings_db::BootSource;
@@ -62,6 +95,10 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
             .iter()
             .all(|item| item.alternate_page_key.is_none()),
         "ordinary images keep one shared rating/page key"
+    );
+    assert!(
+        requests[0].items.iter().all(|item| item.tags),
+        "ordinary images are explicit tag refresh targets"
     );
 }
 
@@ -179,6 +216,184 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
     assert!(stale);
     assert_eq!(app.rating_cache.get(&0), Some(&2));
 }
+
+#[cfg(windows)]
+#[test]
+fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_workers() {
+    use crate::settings::FacetEditFlag;
+
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let tagged_path = PathBuf::from(r"C:\Pictures\tagged.jpg");
+    let untagged_path = PathBuf::from(r"C:\Pictures\untagged.jpg");
+    let tagged_key = crate::tags_db::item_key_for_path(&tagged_path);
+    let untagged_key = crate::tags_db::item_key_for_path(&untagged_path);
+    let items = vec![GridItem::Image(tagged_path), GridItem::Image(untagged_path)];
+    app.items = items.clone();
+    app.image_metas = vec![None; items.len()];
+    app.thumbnails = vec![ThumbnailState::Pending; items.len()];
+    app.visible_indices = vec![0, 1];
+    app.details_order = vec![0, 1];
+    app.settings.write_rating_to_xmp = true;
+    app.settings
+        .facet_filter
+        .edits
+        .insert(FacetEditFlag::Tagged);
+
+    let items_generation = app.items_generation;
+    let make_bundle = || {
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = items.clone();
+        bundle.image_metas = vec![None; items.len()];
+        bundle.thumbnails = vec![ThumbnailState::Pending; items.len()];
+        bundle.visible_indices = vec![0, 1];
+        bundle.details_order = vec![0, 1];
+        bundle.items_generation = items_generation;
+        bundle
+    };
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+        bundle: make_bundle(),
+    });
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, 73, make_bundle()));
+
+    let context = |slot| crate::app::metadata_import_refresh::ContextResult {
+        slot,
+        items_generation: app.items_generation,
+        rating_cache: None,
+        tags_cache: Some(std::collections::HashMap::from([
+            (tagged_key.clone(), vec!["#imported".to_string()]),
+            (untagged_key.clone(), Vec::new()),
+        ])),
+        current_rating: None,
+        page_state: None,
+        folder_pin_map: None,
+        folder_pin_reset_indices: None,
+        video_pin_blobs: None,
+        video_items: None,
+        container_state: None,
+    };
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![
+            context(crate::app::metadata_import_refresh::ContextSlot::Main),
+            context(crate::app::metadata_import_refresh::ContextSlot::ActiveDetached(None)),
+            context(
+                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                    index: 0,
+                    window_id: 73,
+                },
+            ),
+        ],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (errors, stale) = app.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            tags: true,
+            ..Default::default()
+        },
+    );
+    assert!(errors.is_empty());
+    assert!(!stale);
+
+    let assert_context =
+        |tags_cache: &std::collections::HashMap<String, Vec<String>>,
+         visible_indices: &[usize],
+         xmp_worker: &Option<crate::tag_prewarm::TagPrewarmPending>,
+         legacy_worker: &Option<crate::tag_legacy_seed_worker::LegacySeedPending>| {
+            assert_eq!(
+                tags_cache.get(&untagged_key),
+                Some(&Vec::new()),
+                "未タグitemも読込済みsentinelを維持する"
+            );
+            assert_eq!(visible_indices, &[0], "Tagged filterは未タグitemを除外する");
+            assert!(xmp_worker.is_some(), "XMP rating hydrationを再生成する");
+            assert!(legacy_worker.is_some(), "legacy XMP tag seedを再生成する");
+        };
+    assert_context(
+        &app.tags_cache,
+        &app.visible_indices,
+        &app.tag_prewarm_pending,
+        &app.tag_legacy_seed_pending,
+    );
+    let active = app.active_detached_viewer_context.as_ref().unwrap();
+    assert_context(
+        &active.bundle.tags_cache,
+        &active.bundle.visible_indices,
+        &active.bundle.tag_prewarm_pending,
+        &active.bundle.tag_legacy_seed_pending,
+    );
+    let paused = app.detached_image_windows[0]
+        .paused_bundle
+        .as_ref()
+        .unwrap();
+    assert_context(
+        &paused.tags_cache,
+        &paused.visible_indices,
+        &paused.tag_prewarm_pending,
+        &paused.tag_legacy_seed_pending,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
+    use crate::settings::FacetEditFlag;
+
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let saved = PathBuf::from(r"C:\Media\saved.mp4");
+    let plain = PathBuf::from(r"C:\Media\plain.flac");
+    let items = vec![GridItem::Video(saved.clone()), GridItem::Audio(plain)];
+    app.items = items.clone();
+    app.image_metas = vec![None; items.len()];
+    app.thumbnails = vec![ThumbnailState::Pending; items.len()];
+    app.visible_indices = vec![0, 1];
+    app.settings
+        .facet_filter
+        .edits
+        .insert(FacetEditFlag::Bookmarked);
+    app.bookmark_presence = Some(crate::bookmark_browser::BookmarkPresence::from_rows(
+        std::collections::HashSet::from([crate::path_key::normalize_keep_drive(&saved)]),
+        Vec::new(),
+    ));
+
+    let make_bundle = || {
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = items.clone();
+        bundle.image_metas = vec![None; items.len()];
+        bundle.thumbnails = vec![ThumbnailState::Pending; items.len()];
+        bundle.visible_indices = vec![0, 1];
+        bundle
+    };
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+        bundle: make_bundle(),
+    });
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, 91, make_bundle()));
+
+    app.rebuild_all_viewer_context_visible_indices();
+
+    assert_eq!(app.visible_indices, vec![0]);
+    assert_eq!(
+        app.active_detached_viewer_context
+            .as_ref()
+            .unwrap()
+            .bundle
+            .visible_indices,
+        vec![0]
+    );
+    assert_eq!(
+        app.detached_image_windows[0]
+            .paused_bundle
+            .as_ref()
+            .unwrap()
+            .visible_indices,
+        vec![0]
+    );
+}
+
 #[test]
 fn main_window_title_hides_internal_synthetic_paths() {
     let internal = PathBuf::from(r"C:\data\__reading_history__");

@@ -16,11 +16,12 @@ const DB_KEY_CHUNK: usize = 500;
 #[derive(Debug)]
 pub(crate) struct ItemKey {
     pub(crate) index: usize,
-    /// rating/tag と page-state が同じidentityならこの1本を共用する。
+    /// rating / tag / page-state が同じidentityならこの1本を共用する。
     pub(crate) key: String,
     pub(crate) rating: bool,
+    pub(crate) tags: bool,
     pub(crate) page: bool,
-    /// 両identityが異なる稀な項目だけ追加保持する。
+    /// page identityだけが共有キーと異なる稀な項目で追加保持する。
     pub(crate) alternate_page_key: Option<String>,
     pub(crate) container_path: Option<PathBuf>,
     pub(crate) video_path: Option<PathBuf>,
@@ -304,6 +305,11 @@ fn build_context_result(
             .filter(|item| item.rating)
             .map(|item| item.key.clone())
             .collect::<Vec<_>>();
+        let tag_keys = chunk
+            .iter()
+            .filter(|item| item.tags)
+            .map(|item| item.key.clone())
+            .collect::<Vec<_>>();
         if let (Some(cache), Some(db)) = (rating_cache.as_mut(), rating_db) {
             let loaded = db.get_many(&rating_keys);
             for item in chunk.iter().filter(|item| item.rating) {
@@ -311,10 +317,14 @@ fn build_context_result(
             }
         }
         if let (Some(cache), Some(db)) = (tags_cache.as_mut(), tags_db) {
-            for (key, tags) in db.get_many_display_tags(&rating_keys) {
-                if !tags.is_empty() {
-                    cache.insert(key, tags);
-                }
+            // `tags_cache` の空 Vec は「DB読込済みだがタグなし」を表す sentinel。
+            // 行があるキーだけを載せると facet の Tagged 判定が未ロード扱いで
+            // permissive になるため、対象キーを先に空で初期化してから実値で上書きする。
+            for key in &tag_keys {
+                cache.entry(key.clone()).or_default();
+            }
+            for (key, tags) in db.get_many_display_tags(&tag_keys) {
+                cache.insert(key, tags);
             }
         }
 
@@ -540,6 +550,8 @@ mod tests {
         let data_dir = temp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let key = "c:/pictures/a.jpg".to_string();
+        let untagged_key = "c:/pictures/b.jpg".to_string();
+        let tag_only_key = "c:/pictures/search-container".to_string();
         crate::rating_db::RatingDb::open_at(data_dir.join("rating.db"))
             .unwrap()
             .set(&key, 4)
@@ -554,16 +566,41 @@ mod tests {
             vec![ContextRequest {
                 slot: ContextSlot::Main,
                 items_generation: 7,
-                items: vec![ItemKey {
-                    index: 3,
-                    key: key.clone(),
-                    rating: true,
-                    page: true,
-                    alternate_page_key: None,
-                    container_path: None,
-                    video_path: None,
-                    video_size: 0,
-                }],
+                items: vec![
+                    ItemKey {
+                        index: 3,
+                        key: key.clone(),
+                        rating: true,
+                        tags: true,
+                        page: true,
+                        alternate_page_key: None,
+                        container_path: None,
+                        video_path: None,
+                        video_size: 0,
+                    },
+                    ItemKey {
+                        index: 4,
+                        key: untagged_key.clone(),
+                        rating: true,
+                        tags: true,
+                        page: true,
+                        alternate_page_key: None,
+                        container_path: None,
+                        video_path: None,
+                        video_size: 0,
+                    },
+                    ItemKey {
+                        index: 5,
+                        key: tag_only_key.clone(),
+                        rating: false,
+                        tags: true,
+                        page: false,
+                        alternate_page_key: None,
+                        container_path: None,
+                        video_path: None,
+                        video_size: 0,
+                    },
+                ],
                 current_rating_key: Some(key.clone()),
                 spread_container_path: None,
                 old_folder_pin_keys: HashSet::new(),
@@ -586,6 +623,17 @@ mod tests {
             context.tags_cache.as_ref().unwrap().get(&key),
             Some(&vec!["#portable".to_string()])
         );
+        assert_eq!(
+            context.tags_cache.as_ref().unwrap().get(&untagged_key),
+            Some(&Vec::new()),
+            "DB行がない対象も、読込済みの空タグsentinelとして返す"
+        );
+        assert_eq!(
+            context.tags_cache.as_ref().unwrap().get(&tag_only_key),
+            Some(&Vec::new()),
+            "rating対象外でもtag対象なら空sentinelを返す"
+        );
+        assert!(!context.rating_cache.as_ref().unwrap().contains_key(&5));
         assert_eq!(context.current_rating, Some(4));
     }
 
@@ -601,6 +649,7 @@ mod tests {
                     index: 0,
                     key: "c:/missing.jpg".to_string(),
                     rating: true,
+                    tags: true,
                     page: false,
                     alternate_page_key: None,
                     container_path: None,
@@ -670,6 +719,7 @@ mod tests {
                     index: 4,
                     key: crate::path_key::normalize_keep_drive(&video),
                     rating: true,
+                    tags: true,
                     page: false,
                     alternate_page_key: None,
                     container_path: None,
