@@ -7372,6 +7372,8 @@ mod tests {
                 MenuCommandId::FileQuit,
                 MenuCommandId::FileOpenFolder,
                 MenuCommandId::FileLocalSearch,
+                MenuCommandId::FileMetadataExport,
+                MenuCommandId::FileMetadataImport,
                 MenuCommandId::FileOpenCaptureFolder,
                 MenuCommandId::FileOpenRecycleBin,
             ]
@@ -7390,15 +7392,15 @@ mod tests {
     }
 
     #[test]
-    fn metadata_transfer_commands_are_hidden_from_v2_7_release_menus() {
-        assert!(!crate::metadata_transfer::UI_ENABLED);
+    fn metadata_transfer_commands_are_available_in_v2_8_development_menus() {
+        assert!(crate::metadata_transfer::UI_ENABLED);
         let file_commands = menu_commands_for_parent(TopMenuId::File)
             .map(|spec| spec.id)
             .collect::<Vec<_>>();
-        assert!(!file_commands.contains(&MenuCommandId::FileMetadataExport));
-        assert!(!file_commands.contains(&MenuCommandId::FileMetadataImport));
+        assert!(file_commands.contains(&MenuCommandId::FileMetadataExport));
+        assert!(file_commands.contains(&MenuCommandId::FileMetadataImport));
 
-        // 旧設定に明示順序が残っていても、release-disabled commandを復活させない。
+        // v2.7.0の非公開中も保持した明示順序を、再公開後にそのまま復元する。
         let settings = MenuLayoutSettings {
             top_menu_order: vec!["File".to_string()],
             command_order: vec![MenuCommandOrderSettings {
@@ -7416,8 +7418,14 @@ mod tests {
             .into_iter()
             .find(|menu| menu.id == TopMenuId::File)
             .expect("File menu must remain available");
-        assert!(!file.commands.contains(&MenuCommandId::FileMetadataExport));
-        assert!(!file.commands.contains(&MenuCommandId::FileMetadataImport));
+        assert_eq!(
+            &file.commands[..3],
+            &[
+                MenuCommandId::FileMetadataExport,
+                MenuCommandId::FileMetadataImport,
+                MenuCommandId::FileOpenFolder,
+            ]
+        );
         assert!(file.commands.contains(&MenuCommandId::FileOpenFolder));
     }
 

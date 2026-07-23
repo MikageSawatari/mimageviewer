@@ -322,8 +322,8 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 ### 明示メタ情報転送 (`mimageviewer.meta.miv`)
 
-v2.7.0では安定化を継続するためメニュー入口を一時非表示にする。実装とbundle形式は保持し、
-`metadata_transfer::UI_ENABLED`を再び有効化してリリース後の開発・検証を継続する。
+v2.7.0では安定化のためメニュー入口を一時非表示にしたが、v2.8.0の継続開発では
+`metadata_transfer::UI_ENABLED`を有効化して再公開する。
 
 `ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
 `mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v3 は評価、

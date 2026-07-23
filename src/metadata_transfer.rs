@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME;
-/// v2.7.0では安定化を継続するため、ユーザー向けメニュー入口を一時的に公開しない。
-/// 実装とbundle形式は保持し、リリース後の開発再開時にこの1か所をtrueへ戻す。
-pub(crate) const UI_ENABLED: bool = false;
+/// v2.7.0では安定化のため非公開にしたが、v2.8.0の継続開発で再び有効化する。
+/// 未リリース機能を緊急にrelease buildから外す場合だけ、このgateをfalseへ戻す。
+pub(crate) const UI_ENABLED: bool = true;
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
 const FORMAT_VERSION: u32 = 3;
@@ -4620,40 +4620,91 @@ mod tests {
         let destination = temp.path().join("destination");
         let source_data = temp.path().join("source-data");
         let destination_data = temp.path().join("destination-data");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        for name in ["a.jpg", "book.zip", "clip.mp4"] {
+        let edited_image = "ChatGPT Image 2026年6月7日 15_49_45 (1).png";
+        let image_book = Path::new("原神").join("ヨォーヨ");
+        let image_book_page = "001.png";
+        fs::create_dir_all(source.join(&image_book)).unwrap();
+        fs::create_dir_all(destination.join(&image_book)).unwrap();
+        for name in [edited_image, "book.zip", "clip.mp4"] {
             fs::write(source.join(name), name.as_bytes()).unwrap();
             fs::write(destination.join(name), name.as_bytes()).unwrap();
         }
+        fs::write(
+            source.join(&image_book).join(image_book_page),
+            image_book_page.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            destination.join(&image_book).join(image_book_page),
+            image_book_page.as_bytes(),
+        )
+        .unwrap();
         init_data_dir(&source_data);
         init_data_dir(&destination_data);
         assert!(!source.join(crate::sidecar::SIDECAR_FILENAME).exists());
+        set_rating(&source_data, &source.join(edited_image), 3);
+        set_tags(
+            &source_data,
+            &source.join(edited_image),
+            &["AI", "テキスト注釈"],
+        );
 
         let source_root = crate::path_key::normalize(&source);
         let source_root_keep = crate::path_key::normalize_keep_drive(&source);
+        let source_image_book = crate::path_key::normalize(&source.join(&image_book));
+        let source_image_book_keep =
+            crate::path_key::normalize_keep_drive(&source.join(&image_book));
         let source_nested_book = join_container_key(
             &crate::path_key::normalize(&source.join("book.zip")),
-            "chapter",
+            "特典用",
         );
         let source_nested_book_keep = join_container_key(
             &crate::path_key::normalize_keep_drive(&source.join("book.zip")),
-            "chapter",
+            "特典用",
         );
-        let image_key = crate::path_key::normalize_keep_drive(&source.join("a.jpg"));
+        let image_key = crate::path_key::normalize_keep_drive(&source.join(edited_image));
         let virtual_key = format!(
-            "{}::page/001.jpg",
+            "{}::特典用/001.jpg",
             crate::path_key::normalize_keep_drive(&source.join("book.zip"))
         );
-        Connection::open(source_data.join("spread.db"))
+        Connection::open(source_data.join("video_bookmarks.db"))
             .unwrap()
-            .execute_batch(&format!(
-                "INSERT INTO spreads (path, mode, flow, direction)
-                    VALUES ('{}', 2, 1, 1), ('{}', 3, 2, 0)",
-                source_root.replace('\'', "''"),
-                source_nested_book.replace('\'', "''")
-            ))
+            .execute(
+                "INSERT INTO video_bookmarks (path, pts_secs, title, created_at)
+                 VALUES (?1, 8.25, '虹色の場面', 99)",
+                [crate::path_key::normalize_keep_drive(
+                    &source.join("clip.mp4"),
+                )],
+            )
             .unwrap();
+        Connection::open(source_data.join("book_bookmarks.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO book_bookmarks
+                    (container_key, container_path, container_kind, page_kind, page_value,
+                     page_key, page_index_hint, created_at_ms, title)
+                 VALUES (?1, ?2, 'zip', 'archive_entry', '特典用/001.jpg',
+                         '特典用/001.jpg', 0, 777, '表紙')",
+                params![
+                    crate::path_key::normalize_keep_drive(&source.join("book.zip")),
+                    source.join("book.zip").to_string_lossy().as_ref()
+                ],
+            )
+            .unwrap();
+        let spread = Connection::open(source_data.join("spread.db")).unwrap();
+        for (path, mode, flow, direction) in [
+            (&source_root, 2, 1, 1),
+            (&source_image_book, 4, 2, 0),
+            (&source_nested_book, 3, 2, 0),
+        ] {
+            spread
+                .execute(
+                    "INSERT INTO spreads (path, mode, flow, direction)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![path, mode, flow, direction],
+                )
+                .unwrap();
+        }
         let book_trim = crate::view_trim::ViewTrimBookState {
             apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
             book_settings: crate::view_trim::ViewTrimBookSettings {
@@ -4695,42 +4746,50 @@ mod tests {
                 params![image_key, virtual_key],
             )
             .unwrap();
+        let mut adjustment = crate::adjustment::AdjustParams::default();
+        adjustment.brightness = 12.0;
+        adjustment.contrast = -8.0;
+        adjustment.gamma = 1.2;
+        adjustment.saturation = 15.0;
+        adjustment.smart_sharpen = 24;
+        let adjustment_json = serde_json::to_string(&adjustment).unwrap();
         Connection::open(source_data.join("adjustment.db"))
             .unwrap()
             .execute(
                 "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)",
-                params![
-                    image_key,
-                    serde_json::to_string(&crate::adjustment::AdjustParams::default()).unwrap()
-                ],
+                params![image_key, adjustment_json],
             )
             .unwrap();
-        let compressed = crate::mask_db::compress_mask(&[true, false, false, true]);
+        let erase_mask = crate::mask_db::compress_mask(&[true, false, false, true]);
         Connection::open(source_data.join("mask.db"))
             .unwrap()
             .execute(
                 "INSERT INTO masks (path, mask_data, width, height, vectors)
                  VALUES (?1, ?2, 2, 2, '[]')",
-                params![image_key, compressed],
+                params![image_key, erase_mask],
             )
             .unwrap();
+        let conceal_mask = crate::mask_db::compress_mask(&[false, true, true, false]);
         Connection::open(source_data.join("conceal.db"))
             .unwrap()
             .execute(
                 "INSERT INTO conceal_entries
                     (page_path, bitmap_w, bitmap_h, bitmap_data, shapes)
                  VALUES (?1, 2, 2, ?2, '[]')",
-                params![
-                    image_key,
-                    crate::mask_db::compress_mask(&[false, true, true, false])
-                ],
+                params![image_key, conceal_mask],
             )
             .unwrap();
+        let local_layers = vec![local_adjust_core::LocalAdjustmentLayer::new(
+            "修復／塗り",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        )];
+        let local_layers_json = serde_json::to_string(&local_layers).unwrap();
         Connection::open(source_data.join("local_adjust.db"))
             .unwrap()
             .execute(
-                "INSERT INTO local_adjust_pages (page_path, layers_json) VALUES (?1, '[]')",
-                [&image_key],
+                "INSERT INTO local_adjust_pages (page_path, layers_json) VALUES (?1, ?2)",
+                params![image_key, local_layers_json],
             )
             .unwrap();
         Connection::open(source_data.join("export_crop.db"))
@@ -4738,16 +4797,28 @@ mod tests {
             .execute(
                 "INSERT INTO export_crop_pages
                     (page_path, min_x, min_y, max_x, max_y, aspect_mode)
-                 VALUES (?1, 10.0, 20.0, 800.0, 900.0, '4x3')",
+                 VALUES (?1, 63.3854256, 33.5276108, 1024.0, 1024.0, 'free')",
                 [&image_key],
             )
             .unwrap();
+        let mut text = comic_core::TextBlock {
+            text: "ガーン".to_string(),
+            size_px: 157.0,
+            ..Default::default()
+        };
+        text.bold = true;
+        let annotations = vec![comic_core::AnnotationObject::new_text(
+            1,
+            (701.0, 344.0),
+            text,
+        )];
+        let annotations_json = serde_json::to_string(&annotations).unwrap();
         Connection::open(source_data.join("comic.db"))
             .unwrap()
             .execute(
                 "INSERT INTO comic_entries (page_path, doc_version, doc_json)
-                 VALUES (?1, 1, '[]')",
-                [&image_key],
+                 VALUES (?1, 1, ?2)",
+                params![image_key, annotations_json],
             )
             .unwrap();
         Connection::open(source_data.join("folder_thumb_pins.db"))
@@ -4755,8 +4826,8 @@ mod tests {
             .execute(
                 "INSERT INTO folder_thumb_pins
                     (container_key, source_kind, source_rel, source_entry, source_page)
-                 VALUES (?1, 'image', 'a.jpg', NULL, NULL)",
-                [&source_root_keep],
+                 VALUES (?1, 'image', ?2, NULL, NULL)",
+                params![source_root_keep, edited_image],
             )
             .unwrap();
         Connection::open(source_data.join("folder_thumb_pins.db"))
@@ -4764,7 +4835,16 @@ mod tests {
             .execute(
                 "INSERT INTO folder_thumb_pins
                     (container_key, source_kind, source_rel, source_entry, source_page)
-                 VALUES (?1, 'zipentry', '', 'page/001.jpg', NULL)",
+                 VALUES (?1, 'image', ?2, NULL, NULL)",
+                params![source_image_book_keep, image_book_page],
+            )
+            .unwrap();
+        Connection::open(source_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO folder_thumb_pins
+                    (container_key, source_kind, source_rel, source_entry, source_page)
+                 VALUES (?1, 'zipentry', '', '特典用/001.jpg', NULL)",
                 [&source_nested_book_keep],
             )
             .unwrap();
@@ -4781,20 +4861,67 @@ mod tests {
             .unwrap();
 
         let cancel = AtomicBool::new(false);
-        let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let exported = export_at(&source_data, &source, true, &cancel, no_progress).unwrap();
         assert!(exported.page_states >= 2);
-        assert!(exported.container_states >= 1);
-        assert_eq!(exported.thumbnail_pins, 3);
+        assert!(exported.container_states >= 3);
+        assert_eq!(exported.thumbnail_pins, 4);
         copy_sidecar_bundle(&source, &destination);
         let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
         assert_eq!(imported.failed_entries, 0);
 
         let destination_root = crate::path_key::normalize(&destination);
         let destination_root_keep = crate::path_key::normalize_keep_drive(&destination);
-        let destination_image = crate::path_key::normalize_keep_drive(&destination.join("a.jpg"));
+        let destination_image =
+            crate::path_key::normalize_keep_drive(&destination.join(edited_image));
         let destination_virtual = format!(
-            "{}::page/001.jpg",
+            "{}::特典用/001.jpg",
             crate::path_key::normalize_keep_drive(&destination.join("book.zip"))
+        );
+        assert_eq!(
+            rating(&destination_data, &destination.join(edited_image)),
+            Some(3)
+        );
+        assert_eq!(
+            tags(&destination_data, &destination.join(edited_image)),
+            vec!["AI", "テキスト注釈"]
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("video_bookmarks.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT path, pts_secs, title FROM video_bookmarks",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, String>(2)?
+                    ))
+                )
+                .unwrap(),
+            (
+                crate::path_key::normalize_keep_drive(&destination.join("clip.mp4")),
+                8.25,
+                "虹色の場面".to_string()
+            )
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("book_bookmarks.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT container_key, page_value, title FROM book_bookmarks",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?
+                    ))
+                )
+                .unwrap(),
+            (
+                crate::path_key::normalize_keep_drive(&destination.join("book.zip")),
+                "特典用/001.jpg".to_string(),
+                "表紙".to_string()
+            )
         );
         assert_eq!(
             Connection::open(destination_data.join("spread.db"))
@@ -4811,9 +4938,25 @@ mod tests {
                 .unwrap(),
             (2, 1, 1)
         );
+        let destination_image_book = crate::path_key::normalize(&destination.join(&image_book));
+        assert_eq!(
+            Connection::open(destination_data.join("spread.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT mode, flow, direction FROM spreads WHERE path = ?1",
+                    [&destination_image_book],
+                    |row| Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?
+                    ))
+                )
+                .unwrap(),
+            (4, 2, 0)
+        );
         let destination_nested_book = join_container_key(
             &crate::path_key::normalize(&destination.join("book.zip")),
-            "chapter",
+            "特典用",
         );
         assert_eq!(
             Connection::open(destination_data.join("spread.db"))
@@ -4892,6 +5035,72 @@ mod tests {
             assert_eq!(count, 1, "missing imported state in {db}");
         }
         assert_eq!(
+            Connection::open(destination_data.join("adjustment.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT params_json FROM page_params WHERE page_path = ?1",
+                    [&destination_image],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            adjustment_json
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("mask.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT mask_data, width, height, vectors FROM masks WHERE path = ?1",
+                    [&destination_image],
+                    |row| Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                )
+                .unwrap(),
+            (erase_mask, 2, 2, None)
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("conceal.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT bitmap_data, bitmap_w, bitmap_h, shapes
+                       FROM conceal_entries WHERE page_path = ?1",
+                    [&destination_image],
+                    |row| Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                )
+                .unwrap(),
+            (conceal_mask, 2, 2, None)
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("local_adjust.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT layers_json FROM local_adjust_pages WHERE page_path = ?1",
+                    [&destination_image],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            local_layers_json
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("comic.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT doc_version, doc_json FROM comic_entries WHERE page_path = ?1",
+                    [&destination_image],
+                    |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            (1, annotations_json)
+        );
+        assert_eq!(
             Connection::open(destination_data.join("export_crop.db"))
                 .unwrap()
                 .query_row(
@@ -4907,7 +5116,7 @@ mod tests {
                     ))
                 )
                 .unwrap(),
-            (10.0, 20.0, 800.0, 900.0, "4x3".to_string()),
+            (63.3854256, 33.5276108, 1024.0, 1024.0, "free".to_string()),
             "source-image pixel crop coordinates must round-trip without normalization"
         );
         assert_eq!(
@@ -4919,7 +5128,20 @@ mod tests {
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 )
                 .unwrap(),
-            ("image".to_string(), "a.jpg".to_string())
+            ("image".to_string(), edited_image.to_string())
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("folder_thumb_pins.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT source_kind, source_rel FROM folder_thumb_pins WHERE container_key = ?1",
+                    [crate::path_key::normalize_keep_drive(
+                        &destination.join(&image_book)
+                    )],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            ("image".to_string(), image_book_page.to_string())
         );
         assert_eq!(
             Connection::open(destination_data.join("folder_thumb_pins.db"))
@@ -4928,12 +5150,12 @@ mod tests {
                     "SELECT source_kind, source_entry FROM folder_thumb_pins WHERE container_key = ?1",
                     [join_container_key(
                         &crate::path_key::normalize_keep_drive(&destination.join("book.zip")),
-                        "chapter"
+                        "特典用"
                     )],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 )
                 .unwrap(),
-            ("zipentry".to_string(), "page/001.jpg".to_string())
+            ("zipentry".to_string(), "特典用/001.jpg".to_string())
         );
         assert_eq!(
             Connection::open(destination_data.join("video_pins.db"))
