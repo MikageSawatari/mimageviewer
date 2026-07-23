@@ -3,8 +3,10 @@
 //! ダイアログが存在する間は [`App::common_modal_dialog_open`] が背面入力を止める。
 //! ファイル列挙・JSON・SQLite はすべて worker で行い、UI スレッドは進捗だけを受け取る。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 
@@ -39,7 +41,15 @@ enum WorkerMessage {
     Progress(TransferProgress),
     Preview(Result<ImportPreview, String>),
     Export(Result<ExportSummary, String>),
-    Import(Result<ImportSummary, String>),
+    Import {
+        result: Result<ImportSummary, String>,
+        resource_error: Option<String>,
+    },
+}
+
+struct ImportWorkerResources {
+    sidecars: HashMap<PathBuf, crate::sidecar::SidecarFile>,
+    tags_db: Option<crate::tags_db::TagsDb>,
 }
 
 struct ProgressRelay {
@@ -80,6 +90,7 @@ pub(crate) struct MetadataTransferState {
     cancel: Arc<AtomicBool>,
     rx: Option<Receiver<WorkerMessage>>,
     handle: Option<std::thread::JoinHandle<()>>,
+    import_resources: Option<Arc<Mutex<ImportWorkerResources>>>,
 }
 
 impl MetadataTransferState {
@@ -93,6 +104,7 @@ impl MetadataTransferState {
             cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
             handle: None,
+            import_resources: None,
         }
     }
 
@@ -106,6 +118,7 @@ impl MetadataTransferState {
             cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
             handle: None,
+            import_resources: None,
         }
     }
 }
@@ -215,19 +228,32 @@ impl App {
                 .as_ref()
                 .map(|state| state.operation)
                 .expect("state checked above");
-            // writer の結果反映で sidecar / view-trim が再び dirty になり得るため、
+            // writer の結果反映で view-trim が再び dirty になり得るため、
             // WaitingForWriters を抜ける実行直前にも確定する。
             self.persist_pending_view_trim_state();
-            if operation == Operation::Import {
-                self.flush_all_sidecars();
-            }
-            if let Some(state) = self.metadata_transfer.as_mut() {
-                match operation {
-                    Operation::Export => start_export_worker(state),
-                    Operation::Import => start_import_worker(state),
+            match operation {
+                Operation::Export => {
+                    if let Some(state) = self.metadata_transfer.as_mut() {
+                        start_export_worker(state);
+                    }
+                }
+                Operation::Import => {
+                    // JSON serialize / temp write / rename and tags.db journal-mode
+                    // handoff are part of the worker preparation stage.  Move their
+                    // ownership instead of doing file I/O on the UI thread.
+                    let resources = ImportWorkerResources {
+                        sidecars: std::mem::take(&mut self.sidecars),
+                        tags_db: self.tags_db.take(),
+                    };
+                    if let Some(state) = self.metadata_transfer.as_mut() {
+                        start_import_worker(state, resources);
+                    }
                 }
             }
         }
+        // Thread creation failure reaches Result without a receiver message, so
+        // return the moved DB/sidecar ownership in the same frame as well.
+        self.restore_metadata_import_resources();
 
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let action = {
@@ -321,13 +347,22 @@ impl App {
                     state.rx = None;
                     state.stage = Stage::Result(ResultState::Export(result));
                 }
-                WorkerMessage::Import(mut result) => {
+                WorkerMessage::Import {
+                    mut result,
+                    resource_error,
+                } => {
                     if let Ok(summary) = &mut result
                         && summary.applied_entries > 0
                     {
                         imported_rating_keys = std::mem::take(&mut summary.applied_rating_keys);
                         imported_page_state_families =
                             std::mem::take(&mut summary.applied_page_state_families);
+                    }
+                    if let Some(error) = resource_error {
+                        result = Err(match result {
+                            Ok(_) => error,
+                            Err(import_error) => format!("{import_error}\n{error}"),
+                        });
                     }
                     state.rx = None;
                     state.stage = Stage::Result(ResultState::Import(result));
@@ -350,12 +385,36 @@ impl App {
                 ))),
             };
         }
+        self.restore_metadata_import_resources();
         if !imported_rating_keys.is_empty() {
             self.refresh_after_metadata_transfer_import(
                 &imported_rating_keys,
                 &imported_page_state_families,
             );
         }
+    }
+
+    fn restore_metadata_import_resources(&mut self) {
+        let should_restore = self.metadata_transfer.as_ref().is_some_and(|state| {
+            state.import_resources.is_some()
+                && matches!(state.stage, Stage::Result(ResultState::Import(_)))
+        });
+        if !should_restore {
+            return;
+        }
+        let Some(resources) = self
+            .metadata_transfer
+            .as_mut()
+            .and_then(|state| state.import_resources.take())
+        else {
+            return;
+        };
+        let mut resources = match resources.lock() {
+            Ok(resources) => resources,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.sidecars = std::mem::take(&mut resources.sidecars);
+        self.tags_db = resources.tags_db.take();
     }
 }
 
@@ -614,7 +673,7 @@ fn start_export_worker(state: &mut MetadataTransferState) {
     }
 }
 
-fn start_import_worker(state: &mut MetadataTransferState) {
+fn start_import_worker(state: &mut MetadataTransferState, resources: ImportWorkerResources) {
     if let Some(preview_handle) = state.handle.take() {
         let _ = preview_handle.join();
     }
@@ -625,16 +684,54 @@ fn start_import_worker(state: &mut MetadataTransferState) {
     let (tx, rx) = mpsc::channel();
     state.rx = Some(rx);
     state.stage = Stage::Running;
+    let resources = Arc::new(Mutex::new(resources));
+    state.import_resources = Some(Arc::clone(&resources));
     let spawn = std::thread::Builder::new()
         .name("metadata-import".to_string())
         .spawn(move || {
+            // tags.db is normally held open in WAL mode by App.  Drop that idle
+            // connection on this worker before metadata_transfer switches it to
+            // DELETE journal mode for a crash-atomic attached transaction.
+            let tags_db = {
+                let mut resources = match resources.lock() {
+                    Ok(resources) => resources,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                resources.tags_db.take()
+            };
+            drop(tags_db);
+
             let mut progress_relay = ProgressRelay::new(tx.clone());
-            let result =
-                crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
-                    progress_relay.send(value);
-                })
-                .map_err(|error| error.to_string());
-            let _ = tx.send(WorkerMessage::Import(result));
+            let flush_result = flush_import_sidecars(&resources);
+            let result = match flush_result {
+                Ok(()) => {
+                    crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
+                        progress_relay.send(value);
+                    })
+                    .map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error),
+            };
+
+            // Reopening restores tags.db to its normal WAL mode before the UI
+            // regains ownership.  Report a reopen failure even when DB import
+            // itself succeeded; the caller still extracts the applied-key delta.
+            let (tags_db, resource_error) =
+                match crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")) {
+                    Ok(tags_db) => (Some(tags_db), None),
+                    Err(error) => (None, Some(format!("タグDBを再開できませんでした: {error}"))),
+                };
+            {
+                let mut resources = match resources.lock() {
+                    Ok(resources) => resources,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                resources.tags_db = tags_db;
+            }
+            let _ = tx.send(WorkerMessage::Import {
+                result,
+                resource_error,
+            });
         });
     match spawn {
         Ok(handle) => state.handle = Some(handle),
@@ -642,5 +739,81 @@ fn start_import_worker(state: &mut MetadataTransferState) {
             state.rx = None;
             state.stage = Stage::Result(ResultState::Import(Err(error.to_string())));
         }
+    }
+}
+
+fn flush_import_sidecars(resources: &Arc<Mutex<ImportWorkerResources>>) -> Result<(), String> {
+    let mut resources = match resources.lock() {
+        Ok(resources) => resources,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut failed = Vec::new();
+    for sidecar in resources.sidecars.values_mut() {
+        if !sidecar.flush() {
+            failed.push(sidecar.folder().display().to_string());
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        const MAX_REPORTED: usize = 3;
+        let omitted = failed.len().saturating_sub(MAX_REPORTED);
+        let mut detail = failed
+            .iter()
+            .take(MAX_REPORTED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、");
+        if omitted > 0 {
+            detail.push_str(&format!("、ほか {omitted} フォルダ"));
+        }
+        Err(format!(
+            "既存の自動バックアップを保存できなかったため、importを開始しませんでした: {detail}"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_preparation_flushes_dirty_sidecars_off_thread() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = temp.path().join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut sidecar = crate::sidecar::SidecarFile::new(folder.clone());
+        sidecar.set_adjust("page.jpg", crate::adjustment::AdjustParams::default());
+        let resources = Arc::new(Mutex::new(ImportWorkerResources {
+            sidecars: HashMap::from([(folder.clone(), sidecar)]),
+            tags_db: None,
+        }));
+        let worker_resources = Arc::clone(&resources);
+        std::thread::Builder::new()
+            .name("metadata-sidecar-flush-test".to_string())
+            .spawn(move || flush_import_sidecars(&worker_resources))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+
+        let resources = resources.lock().unwrap();
+        assert!(!resources.sidecars[&folder].is_dirty());
+        assert!(folder.join(crate::sidecar::SIDECAR_FILENAME).is_file());
+    }
+
+    #[test]
+    fn import_preparation_reports_sidecar_failure_before_db_work() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let missing_folder = temp.path().join("missing");
+        let mut sidecar = crate::sidecar::SidecarFile::new(missing_folder.clone());
+        sidecar.set_adjust("page.jpg", crate::adjustment::AdjustParams::default());
+        let resources = Arc::new(Mutex::new(ImportWorkerResources {
+            sidecars: HashMap::from([(missing_folder, sidecar)]),
+            tags_db: None,
+        }));
+
+        let error = flush_import_sidecars(&resources).unwrap_err();
+        assert!(error.contains("importを開始しませんでした"));
     }
 }

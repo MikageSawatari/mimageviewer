@@ -18,3 +18,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # `relative = true` で manifest dir 起点に解決される。
 [env]
 FFMPEG_DIR = { value = "vendor/ffmpeg", relative = true }
+# Portable metadata import updates 15 existing SQLite stores as one attached-
+# database transaction.  The bundled SQLite default (10 attached databases) is
+# too small for that crash-atomic ownership boundary; SQLite supports up to 125.
+LIBSQLITE3_FLAGS = "SQLITE_MAX_ATTACHED=20"

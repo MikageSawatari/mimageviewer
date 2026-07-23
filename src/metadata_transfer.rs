@@ -452,7 +452,6 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     ensure_database_schemas(data_dir)?;
     let mut conn = open_import_connection(data_dir)?;
-    let mut auxiliary_conn = open_auxiliary_import_connection(data_dir)?;
     let mut summary = ImportSummary {
         total_entries: manifest.entries.len(),
         ..ImportSummary::default()
@@ -499,7 +498,6 @@ where
         }
         match apply_entry(
             &mut conn,
-            &mut auxiliary_conn,
             path,
             entry,
             manifest.sections,
@@ -2218,21 +2216,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         ("crop", "export_crop.db"),
         ("comic", "comic.db"),
         ("view_trim", "view_trim.db"),
-    ] {
-        conn.execute(
-            &format!("ATTACH DATABASE ?1 AS {schema}"),
-            [data_dir.join(filename).to_string_lossy().as_ref()],
-        )
-        .map_err(db_error)?;
-    }
-    Ok(conn)
-}
-
-fn open_auxiliary_import_connection(data_dir: &Path) -> Result<Connection, TransferError> {
-    let conn = Connection::open(data_dir.join("rotation.db")).map_err(db_error)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(db_error)?;
-    for (schema, filename) in [
+        ("rotation", "rotation.db"),
         ("spread", "spread.db"),
         ("folder_pin", "folder_thumb_pins.db"),
         ("video_pin", "video_pins.db"),
@@ -2243,12 +2227,60 @@ fn open_auxiliary_import_connection(data_dir: &Path) -> Result<Connection, Trans
         )
         .map_err(db_error)?;
     }
+
+    // TagsDb normally uses WAL for concurrent UI reads.  A transaction spanning
+    // WAL and rollback-journal databases has no SQLite super-journal and is not
+    // crash-atomic.  The UI transfers ownership of its idle TagsDb connection to
+    // the import worker before this point, so it is safe to switch tags.db to a
+    // rollback journal for the duration of import.  TagsDb::open restores WAL
+    // after the import connection has been dropped.
+    let tag_mode: String = conn
+        .query_row("PRAGMA tags.journal_mode = DELETE", [], |row| row.get(0))
+        .map_err(db_error)?;
+    if !tag_mode.eq_ignore_ascii_case("delete") {
+        return Err(TransferError::Database(format!(
+            "tags.db を安全なjournal modeへ切り替えられませんでした: {tag_mode}"
+        )));
+    }
+
+    // Same invariant as edit_bundle::apply_atomic: every participant must use a
+    // disk rollback journal so SQLite can coordinate them with a super-journal.
+    for schema in [
+        "main",
+        "tags",
+        "video",
+        "book",
+        "adjustment",
+        "mask",
+        "conceal",
+        "local_adjust",
+        "crop",
+        "comic",
+        "view_trim",
+        "rotation",
+        "spread",
+        "folder_pin",
+        "video_pin",
+    ] {
+        let mode: String = conn
+            .query_row(&format!("PRAGMA {schema}.journal_mode"), [], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)?;
+        if ["wal", "memory", "off"]
+            .iter()
+            .any(|unsafe_mode| mode.eq_ignore_ascii_case(unsafe_mode))
+        {
+            return Err(TransferError::Database(format!(
+                "{schema} DBが{mode}モードのため、安全なメタ情報importを実行できません"
+            )));
+        }
+    }
     Ok(conn)
 }
 
 fn apply_entry(
     conn: &mut Connection,
-    auxiliary_conn: &mut Connection,
     path: &Path,
     entry: &PortableEntry,
     sections: ManifestSections,
@@ -2257,9 +2289,6 @@ fn apply_entry(
     let base_key = crate::path_key::normalize_keep_drive(path);
     let automatic_sidecar_sync = automatic_sidecar_sync(path, entry.kind);
     let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error)?;
-    let auxiliary_tx = auxiliary_conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
     if sections.ratings {
@@ -2386,12 +2415,11 @@ fn apply_entry(
         delete_key_family(&tx, "crop.export_crop_pages", "page_path", &base_key)?;
         delete_key_family(&tx, "comic.comic_entries", "page_path", &base_key)?;
         delete_key_family(&tx, "view_trim.view_trim_pages", "page_path", &base_key)?;
-        delete_key_family(&auxiliary_tx, "rotations", "path", &base_key)?;
-        insert_page_state(&tx, &auxiliary_tx, &base_key, &entry.page_state)?;
+        delete_key_family(&tx, "rotation.rotations", "path", &base_key)?;
+        insert_page_state(&tx, &base_key, &entry.page_state)?;
         for item in &entry.virtual_items {
             insert_page_state(
                 &tx,
-                &auxiliary_tx,
                 &format!("{base_key}::{}", item.member_key.to_lowercase()),
                 &item.page_state,
             )?;
@@ -2401,7 +2429,7 @@ fn apply_entry(
         let container_key = crate::path_key::normalize(path);
         let include_nested = entry.kind == PortableEntryKind::File;
         delete_container_family(
-            &auxiliary_tx,
+            &tx,
             "spread.spreads",
             "path",
             &container_key,
@@ -2414,11 +2442,10 @@ fn apply_entry(
             &container_key,
             include_nested,
         )?;
-        insert_container_state(&tx, &auxiliary_tx, &container_key, &entry.container_state)?;
+        insert_container_state(&tx, &container_key, &entry.container_state)?;
         for container in &entry.nested_containers {
             insert_container_state(
                 &tx,
-                &auxiliary_tx,
                 &join_container_key(&container_key, &container.member_key),
                 &container.state,
             )?;
@@ -2427,26 +2454,25 @@ fn apply_entry(
     if sections.thumbnail_pins {
         let include_nested = entry.kind == PortableEntryKind::File;
         delete_container_family(
-            &auxiliary_tx,
+            &tx,
             "folder_pin.folder_thumb_pins",
             "container_key",
             &base_key,
             include_nested,
         )?;
-        auxiliary_tx
-            .execute(
-                "DELETE FROM video_pin.video_pins WHERE path = ?1",
-                [&base_key],
-            )
-            .map_err(db_error)?;
+        tx.execute(
+            "DELETE FROM video_pin.video_pins WHERE path = ?1",
+            [&base_key],
+        )
+        .map_err(db_error)?;
         insert_folder_pin(
-            &auxiliary_tx,
+            &tx,
             &base_key,
             entry.container_state.folder_thumb_pin.as_ref(),
         )?;
         for container in &entry.nested_containers {
             insert_folder_pin(
-                &auxiliary_tx,
+                &tx,
                 &join_container_key(&base_key, &container.member_key),
                 container.state.folder_thumb_pin.as_ref(),
             )?;
@@ -2458,18 +2484,16 @@ fn apply_entry(
                 .map(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()))
                 .transpose()
                 .map_err(|_| TransferError::Invalid("動画サムネの base64 が不正です".into()))?;
-            auxiliary_tx
-                .execute(
-                    "INSERT INTO video_pin.video_pins
+            tx.execute(
+                "INSERT INTO video_pin.video_pins
                         (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![base_key, pin.pin_pts_secs, webp, pin.thumb_pts_secs],
-                )
-                .map_err(db_error)?;
+                params![base_key, pin.pin_pts_secs, webp, pin.thumb_pts_secs],
+            )
+            .map_err(db_error)?;
         }
     }
-    tx.commit().map_err(db_error)?;
-    auxiliary_tx.commit().map_err(db_error)
+    tx.commit().map_err(db_error)
 }
 
 fn automatic_sidecar_sync(path: &Path, kind: PortableEntryKind) -> Option<(String, i64)> {
@@ -2490,17 +2514,15 @@ fn automatic_sidecar_sync(path: &Path, kind: PortableEntryKind) -> Option<(Strin
 
 fn insert_page_state(
     tx: &rusqlite::Transaction<'_>,
-    auxiliary_tx: &rusqlite::Transaction<'_>,
     key: &str,
     state: &PortablePageState,
 ) -> Result<(), TransferError> {
     if let Some(angle) = state.rotation_degrees {
-        auxiliary_tx
-            .execute(
-                "INSERT INTO rotations (path, angle) VALUES (?1, ?2)",
-                params![key, angle],
-            )
-            .map_err(db_error)?;
+        tx.execute(
+            "INSERT INTO rotation.rotations (path, angle) VALUES (?1, ?2)",
+            params![key, angle],
+        )
+        .map_err(db_error)?;
     }
     if let Some(adjustment) = &state.adjustment {
         let json = serde_json::to_string(adjustment)
@@ -2600,18 +2622,16 @@ fn insert_mask(
 
 fn insert_container_state(
     tx: &rusqlite::Transaction<'_>,
-    auxiliary_tx: &rusqlite::Transaction<'_>,
     stripped_key: &str,
     state: &PortableContainerState,
 ) -> Result<(), TransferError> {
     if let Some(spread) = state.spread {
-        auxiliary_tx
-            .execute(
-                "INSERT INTO spread.spreads (path, mode, flow, direction)
+        tx.execute(
+            "INSERT INTO spread.spreads (path, mode, flow, direction)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![stripped_key, spread.mode, spread.flow, spread.direction],
-            )
-            .map_err(db_error)?;
+            params![stripped_key, spread.mode, spread.flow, spread.direction],
+        )
+        .map_err(db_error)?;
     }
     if let Some(view_trim) = state.view_trim {
         let json = serde_json::to_string(&view_trim)
@@ -2627,7 +2647,7 @@ fn insert_container_state(
 }
 
 fn insert_folder_pin(
-    auxiliary_tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Transaction<'_>,
     key: &str,
     pin: Option<&PortableFolderThumbPin>,
 ) -> Result<(), TransferError> {
@@ -2636,20 +2656,19 @@ fn insert_folder_pin(
     };
     portable_folder_pin_source(pin)
         .ok_or_else(|| TransferError::Invalid("代表サムネ設定が不正です".into()))?;
-    auxiliary_tx
-        .execute(
-            "INSERT INTO folder_pin.folder_thumb_pins
+    tx.execute(
+        "INSERT INTO folder_pin.folder_thumb_pins
                 (container_key, source_kind, source_rel, source_entry, source_page)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                key,
-                pin.source_kind,
-                pin.source_rel,
-                pin.source_entry,
-                pin.source_page,
-            ],
-        )
-        .map_err(db_error)?;
+        params![
+            key,
+            pin.source_kind,
+            pin.source_rel,
+            pin.source_entry,
+            pin.source_page,
+        ],
+    )
+    .map_err(db_error)?;
     Ok(())
 }
 
@@ -3138,12 +3157,11 @@ mod tests {
             destination.join(SIDECAR_FILENAME),
         )
         .unwrap();
-        // 実アプリと同様、各 DB のアイドル接続が開いたままでも別 worker 接続から
-        // attached transaction を実行できることを確認する。
+        // 実アプリと同様、rollback-journal DB のアイドル接続が開いたままでも別 worker
+        // 接続から attached transaction を実行できることを確認する。WAL の tags.db
+        // connection は UI から worker へ移して閉じた後に import_at を呼ぶ。
         let _open_rating =
             crate::rating_db::RatingDb::open_at(destination_data.join("rating.db")).unwrap();
-        let _open_tags =
-            crate::tags_db::TagsDb::open_at(&destination_data.join("tags.db")).unwrap();
         let _open_video = crate::video_bookmarks::VideoBookmarkDb::open_at(
             &destination_data.join("video_bookmarks.db"),
         )
@@ -3232,6 +3250,85 @@ mod tests {
                 "表紙".to_string(),
             )
         );
+    }
+
+    #[test]
+    fn item_import_rolls_back_all_stores_on_late_write_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("clip.mp4"), b"same-video").unwrap();
+        fs::write(destination.join("clip.mp4"), b"same-video").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_path = source.join("clip.mp4");
+        set_rating(&source_data, &source_path, 5);
+        Connection::open(source_data.join("video_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
+                 VALUES (?1, 9.0, ?2, 9.0)",
+                params![
+                    crate::path_key::normalize_keep_drive(&source_path),
+                    b"new-thumb".as_slice()
+                ],
+            )
+            .unwrap();
+
+        let destination_path = destination.join("clip.mp4");
+        set_rating(&destination_data, &destination_path, 2);
+        let video_pins = Connection::open(destination_data.join("video_pins.db")).unwrap();
+        video_pins
+            .execute(
+                "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
+                 VALUES (?1, 1.0, ?2, 1.0)",
+                params![
+                    crate::path_key::normalize_keep_drive(&destination_path),
+                    b"old-thumb".as_slice()
+                ],
+            )
+            .unwrap();
+        // video_pin is written after rating and all page/container stores.  A late
+        // failure here must roll the main rating DB back through the same attached
+        // transaction, not leave a partially imported physical item.
+        video_pins
+            .execute_batch(
+                "CREATE TRIGGER fail_metadata_import_video_pin
+                 BEFORE INSERT ON video_pins
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected late import failure');
+                 END;",
+            )
+            .unwrap();
+        drop(video_pins);
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        fs::copy(
+            source.join(SIDECAR_FILENAME),
+            destination.join(SIDECAR_FILENAME),
+        )
+        .unwrap();
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        // The manifest also contains the root directory entry; only clip.mp4 is
+        // fault-injected and must remain wholly at its previous state.
+        assert_eq!(imported.applied_entries, 1);
+        assert_eq!(imported.failed_entries, 1);
+        assert_eq!(rating(&destination_data, &destination_path), Some(2));
+        let video_pins = Connection::open(destination_data.join("video_pins.db")).unwrap();
+        let old_pin = video_pins
+            .query_row(
+                "SELECT pin_pts_secs, thumb_webp FROM video_pins WHERE path = ?1",
+                [crate::path_key::normalize_keep_drive(&destination_path)],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old_pin, (1.0, b"old-thumb".to_vec()));
     }
 
     #[test]

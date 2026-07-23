@@ -72,6 +72,10 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   同期済みとして記録し、明示 import で消した項目を古い自動バックアップから復活させない。
 - 両処理は完全モーダルで背面操作を止めるが、列挙、JSON、SQLite は worker thread で行う。
   開始前から実行中のメタ情報書き込みとリネーム移行が着地するまで待ってから処理する。
+  dirty な自動 sidecar の JSON 化・temp 書き込み・rename も import worker の前処理とし、
+  保存に失敗した場合は DB 反映を開始しない。評価から動画ピンまでの全15ストアは、WAL等の
+  非対応 journal mode がないことを検査した単一の SQLite attached transaction で物理項目ごとに
+  commitし、途中の書き込み失敗・commit失敗・異常終了で一部ストアだけ新しくならないようにする。
   キャンセル可能で、エクスポートは sibling temp を破棄して既存 sidecar を保持する。
   インポートは物理項目ごとの transaction 完了境界で停止し、反映済み項目は rollback しない。
 - 製本の「この本を並べ替え」は常にメニューへ表示し、本フォルダ以外では disabled にする。

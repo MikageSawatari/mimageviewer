@@ -140,7 +140,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_music_timeline.rs` | 音楽ビュー中央の行分割波形タイムライン。row raster worker + 行テクスチャキャッシュ (`TimelineTextureCache`、解析の版数 = `music_analysis_version` で再ラスタ判定)。行数は `TIMELINE_MAX_ROWS` でキャップ |
 | `ui_music_spectrum.rs` | 下段 108band スペクトラム + 鍵盤。専用 worker が共有 `MusicPcm` の窓を FFT (in-flight 1 件 coalesce) |
 | `ui_music_panels.rs` | 音楽ビューの左右ホバーパネル (ブックマーク / ループ / 行秒数) と下 HUD (動画 native HUD とレイアウト一致) |
-| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` の versioned JSON、root-relative path 検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンの収集と項目単位 import を worker で実行する。UI は完全モーダルの確認・進捗・キャンセル、開始前の pending view-trim flush、完了後の表示 snapshot 再構築を担当する |
+| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` の versioned JSON、root-relative path 検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンの収集と項目単位 import を worker で実行する。import は15ストアを1つのSQLite attached-database transactionへまとめ、rollback journal / super-journalを検査して物理項目単位のcrash atomicityを保証する。UI は完全モーダルの確認・進捗・キャンセル、開始前の pending view-trim flush、dirty自動sidecarとTagsDb connectionのworkerへの所有権移譲、完了後の表示 snapshot 再構築を担当する |
 | App の `music_*` 状態 | 解析ワーカー / `MusicPcm` / spectrum / timeline cache は **ViewerContextBundle に入れず global** (stage-audio §3.5: ParkedLive 音楽窓も同じ global を消費する)。表示ゲートの中央述語は `fs_music_view_active`、動画→音声モードの transient は `video_audio_mode` / `video_audio_vst` |
 
 ### マルチウィンドウ / detached viewer (F12)
@@ -331,6 +331,11 @@ import は manifest に記載された物理項目だけを上書きし、未記
 section は「指定なし」として既存の v2 state を保持する。v2 適用時は既存
 `mimageviewer.dat` の mtime を編集 / タグ sidecar sync table に記録し、明示 import 後の
 フォルダ再ロードで古い自動バックアップが欠落行を復活させないようにする。
+dirty な自動 sidecar のserialize / temp書き込み / renameはimport workerの前処理で行い、
+失敗時はDB更新を開始しない。項目の全15ストアはbundled SQLiteのATTACH上限を20へ拡張して
+単一transactionへ参加させる。通常WALの`tags.db`はAppのidle connectionをworkerへ移して閉じ、
+import中だけDELETE journalへ切り替える。他の参加DBを含めWAL / MEMORY / OFFを検出した場合は
+適用前に拒否し、SQLite super-journalによる項目単位のcrash atomicityを維持する。
 manifest 由来の画像本の相対ページは provenance と canonical container を一覧から
 metadata / thumbnail / fullscreen worker まで保持し、実 I/O では開いた同一ハンドルの
 final path を再検証してから、そのハンドル由来の metadata / bytes だけを利用する。
