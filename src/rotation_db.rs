@@ -113,6 +113,47 @@ impl RotationDb {
         .ok()
     }
 
+    /// 正規化済みページキーをchunked IN queryで一括取得する。
+    pub fn get_many<'a, I>(&self, keys: I) -> std::collections::HashMap<String, Rotation>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        use std::collections::{HashMap, HashSet};
+
+        let keys = keys
+            .into_iter()
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut result = HashMap::new();
+        for chunk in keys.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT path, angle FROM rotations WHERE path IN ({placeholders})");
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let params = chunk
+                .iter()
+                .map(|key| key as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>();
+            let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Rotation::from_degrees(row.get::<_, i32>(1)?),
+                ))
+            }) else {
+                continue;
+            };
+            result.extend(rows.flatten());
+        }
+        result
+    }
+
     /// 回転角度を設定する。None (0°) の場合はレコードを削除する。
     pub fn set(&self, path: &Path, rotation: Rotation) -> Result<(), rusqlite::Error> {
         let key = normalize_path(path);
@@ -231,5 +272,17 @@ mod tests {
         // None で削除
         db.set(p, Rotation::None).unwrap();
         assert!(db.get(p).is_none());
+    }
+
+    #[test]
+    fn get_many_returns_only_stored_keys() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = RotationDb::open_at(&temp.path().join("rotation.db")).unwrap();
+        db.set_key("a", Rotation::Cw90).unwrap();
+        db.set_key("b", Rotation::Cw180).unwrap();
+        let values = db.get_many(["a", "missing", "b"]);
+        assert_eq!(values.get("a"), Some(&Rotation::Cw90));
+        assert_eq!(values.get("b"), Some(&Rotation::Cw180));
+        assert!(!values.contains_key("missing"));
     }
 }

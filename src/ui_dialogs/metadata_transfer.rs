@@ -14,8 +14,7 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::metadata_transfer::{
-    ExportSummary, ImportPreview, ImportRefreshDelta, ImportRefreshScope, ImportSummary,
-    TransferError, TransferPhase, TransferProgress,
+    ExportSummary, ImportPreview, ImportSummary, TransferError, TransferPhase, TransferProgress,
 };
 
 const WORKER_CHANNEL_CAPACITY: usize = 1;
@@ -33,6 +32,8 @@ enum Stage {
     ImportConfirm(ImportPreview),
     WaitingForWriters,
     Running,
+    RefreshPreparing,
+    Refreshing,
     Result(ResultState),
 }
 
@@ -43,7 +44,6 @@ enum ResultState {
 
 enum WorkerMessage {
     Progress(TransferProgress),
-    ImportRefresh(ImportRefreshDelta),
     Preview(Result<ImportPreview, String>),
     Export {
         result: Result<ExportSummary, String>,
@@ -52,9 +52,9 @@ enum WorkerMessage {
     Import {
         result: Result<ImportSummary, String>,
         resource_error: Option<String>,
-        page_state_snapshot: Option<crate::metadata_transfer::ImportPageStateSnapshot>,
         view_trim_saved: bool,
     },
+    Refresh(crate::app::metadata_import_refresh::RefreshResult),
 }
 
 struct ImportWorkerResources {
@@ -102,8 +102,8 @@ pub(crate) struct MetadataTransferState {
     handle: Option<std::thread::JoinHandle<()>>,
     import_resources: Option<Arc<Mutex<ImportWorkerResources>>>,
     pending_view_trim: Option<crate::ui_view_trim::PendingViewTrimTransfer>,
-    import_refresh_scope: ImportRefreshScope,
-    import_refresh_preparing: bool,
+    pending_import_result: Option<Result<ImportSummary, String>>,
+    import_refresh_errors: Vec<String>,
 }
 
 impl MetadataTransferState {
@@ -119,8 +119,8 @@ impl MetadataTransferState {
             handle: None,
             import_resources: None,
             pending_view_trim: None,
-            import_refresh_scope: ImportRefreshScope::default(),
-            import_refresh_preparing: false,
+            pending_import_result: None,
+            import_refresh_errors: Vec::new(),
         }
     }
 
@@ -136,8 +136,8 @@ impl MetadataTransferState {
             handle: None,
             import_resources: None,
             pending_view_trim: None,
-            import_refresh_scope: ImportRefreshScope::default(),
-            import_refresh_preparing: false,
+            pending_import_result: None,
+            import_refresh_errors: Vec::new(),
         }
     }
 }
@@ -243,39 +243,7 @@ impl App {
             matches!(state.stage, Stage::WaitingForWriters)
                 && !self.metadata_transfer_writers_busy()
         });
-        if writers_ready
-            && self.metadata_transfer.as_ref().is_some_and(|state| {
-                state.operation == Operation::Import && !state.import_refresh_preparing
-            })
-        {
-            self.begin_metadata_import_refresh_scope();
-            if let Some(state) = self.metadata_transfer.as_mut() {
-                state.import_refresh_preparing = true;
-                state.import_refresh_scope = ImportRefreshScope::default();
-            }
-        }
-        let import_refresh_ready = if writers_ready
-            && self.metadata_transfer.as_ref().is_some_and(|state| {
-                state.operation == Operation::Import && state.import_refresh_preparing
-            }) {
-            let mut scope = self
-                .metadata_transfer
-                .as_mut()
-                .map(|state| std::mem::take(&mut state.import_refresh_scope))
-                .unwrap_or_default();
-            let ready = self.advance_metadata_import_refresh_scope(&mut scope);
-            if let Some(state) = self.metadata_transfer.as_mut() {
-                state.import_refresh_scope = scope;
-            }
-            ready
-        } else {
-            false
-        };
-        let should_start_worker = writers_ready
-            && self.metadata_transfer.as_ref().is_some_and(|state| {
-                state.operation == Operation::Export
-                    || (state.operation == Operation::Import && import_refresh_ready)
-            });
+        let should_start_worker = writers_ready;
         if should_start_worker {
             let operation = self
                 .metadata_transfer
@@ -304,11 +272,6 @@ impl App {
                     // JSON serialize / temp write / rename and tags.db journal-mode
                     // handoff are part of the worker preparation stage.  Move their
                     // ownership instead of doing file I/O on the UI thread.
-                    let refresh_scope = self
-                        .metadata_transfer
-                        .as_mut()
-                        .map(|state| std::mem::take(&mut state.import_refresh_scope))
-                        .unwrap_or_default();
                     let resources = ImportWorkerResources {
                         sidecars: std::mem::take(&mut self.sidecars),
                         tags_db: self.tags_db.take(),
@@ -319,7 +282,7 @@ impl App {
                             .pending_view_trim
                             .as_ref()
                             .map(|pending| pending.batch.clone());
-                        if !start_import_worker(state, resources, batch, refresh_scope) {
+                        if !start_import_worker(state, resources, batch) {
                             restore_view_trim = state.pending_view_trim.take();
                             import_start_failed = true;
                         }
@@ -330,7 +293,20 @@ impl App {
                 self.restore_pending_view_trim_transfer(pending);
             }
             if import_start_failed {
-                self.finish_metadata_transfer_import_refresh();
+                self.abort_metadata_import_terminal_refresh();
+            }
+        }
+        let refresh_target = self.metadata_transfer.as_ref().and_then(|state| {
+            matches!(state.stage, Stage::RefreshPreparing)
+                .then(|| (state.root.clone(), state.recursive))
+        });
+        let refresh_ready = refresh_target.as_ref().is_some_and(|(root, recursive)| {
+            self.advance_metadata_import_terminal_refresh(root, *recursive)
+        });
+        if refresh_ready {
+            let requests = self.take_metadata_import_refresh_requests();
+            if let Some(state) = self.metadata_transfer.as_mut() {
+                start_metadata_import_refresh_worker(state, requests);
             }
         }
         // Thread creation failure reaches Result without a receiver message, so
@@ -378,7 +354,11 @@ impl App {
         if self.metadata_transfer.as_ref().is_some_and(|state| {
             matches!(
                 state.stage,
-                Stage::LoadingPreview | Stage::WaitingForWriters | Stage::Running
+                Stage::LoadingPreview
+                    | Stage::WaitingForWriters
+                    | Stage::Running
+                    | Stage::RefreshPreparing
+                    | Stage::Refreshing
             )
         }) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -395,13 +375,7 @@ impl App {
         {
             for _ in 0..MAX_MESSAGES_PER_FRAME {
                 match rx.try_recv() {
-                    Ok(message) => {
-                        let is_refresh = matches!(message, WorkerMessage::ImportRefresh(_));
-                        messages.push(message);
-                        if is_refresh {
-                            break;
-                        }
-                    }
+                    Ok(message) => messages.push(message),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -410,19 +384,16 @@ impl App {
                 }
             }
         }
-        let mut imported_refresh = None;
-        let mut import_finished = false;
-        let mut page_state_snapshot = None;
         let mut restore_view_trim = None;
+        let mut terminal_refresh = None;
+        let mut begin_terminal_refresh = false;
+        let mut restart_terminal_refresh = false;
         for message in messages {
             let Some(state) = self.metadata_transfer.as_mut() else {
                 break;
             };
             match message {
                 WorkerMessage::Progress(progress) => state.progress = Some(progress),
-                WorkerMessage::ImportRefresh(refresh) => {
-                    imported_refresh = Some(refresh);
-                }
                 WorkerMessage::Preview(result) => {
                     state.rx = None;
                     state.stage = match result {
@@ -445,10 +416,8 @@ impl App {
                 WorkerMessage::Import {
                     mut result,
                     resource_error,
-                    page_state_snapshot: snapshot,
                     view_trim_saved,
                 } => {
-                    page_state_snapshot = snapshot;
                     if view_trim_saved {
                         state.pending_view_trim = None;
                     } else {
@@ -470,50 +439,123 @@ impl App {
                         };
                     }
                     state.rx = None;
-                    state.stage = Stage::Result(ResultState::Import(result));
-                    import_finished = true;
+                    let needs_refresh = result
+                        .as_ref()
+                        .is_ok_and(|summary| summary.applied_entries > 0);
+                    if needs_refresh {
+                        state.pending_import_result = Some(result);
+                        state.stage = Stage::RefreshPreparing;
+                        begin_terminal_refresh = true;
+                    } else {
+                        state.stage = Stage::Result(ResultState::Import(result));
+                    }
+                }
+                WorkerMessage::Refresh(result) => {
+                    state.rx = None;
+                    terminal_refresh = Some(result);
                 }
             }
         }
         if disconnected
             && self.metadata_transfer.as_ref().is_some_and(|state| {
-                state.rx.is_some() && matches!(state.stage, Stage::LoadingPreview | Stage::Running)
+                state.rx.is_some()
+                    && matches!(
+                        state.stage,
+                        Stage::LoadingPreview | Stage::Running | Stage::Refreshing
+                    )
             })
             && let Some(state) = self.metadata_transfer.as_mut()
         {
             restore_view_trim = state.pending_view_trim.take();
             state.rx = None;
+            let worker_error = "worker が予期せず終了しました".to_string();
             state.stage = match state.operation {
-                Operation::Export => Stage::Result(ResultState::Export(Err(
-                    "worker が予期せず終了しました".to_string(),
-                ))),
+                Operation::Export => Stage::Result(ResultState::Export(Err(worker_error))),
                 Operation::Import => {
-                    import_finished = true;
-                    Stage::Result(ResultState::Import(Err(
-                        "worker が予期せず終了しました".to_string()
-                    )))
+                    let result = state.pending_import_result.take().map_or_else(
+                        || Err(worker_error.clone()),
+                        |result| match result {
+                            Ok(mut summary) => {
+                                summary.incomplete_error = Some(
+                                    summary
+                                        .incomplete_error
+                                        .map_or(worker_error.clone(), |existing| {
+                                            format!("{existing}\n{worker_error}")
+                                        }),
+                                );
+                                Ok(summary)
+                            }
+                            Err(existing) => Err(format!("{existing}\n{worker_error}")),
+                        },
+                    );
+                    Stage::Result(ResultState::Import(result))
                 }
             };
         }
         if let Some(pending) = restore_view_trim {
             self.restore_pending_view_trim_transfer(pending);
         }
+        if begin_terminal_refresh {
+            self.begin_metadata_import_terminal_refresh();
+        }
         self.restore_metadata_import_resources();
-        if let Some(refresh) = imported_refresh {
-            self.refresh_after_metadata_transfer_import(refresh);
+        if let Some(refresh) = terminal_refresh {
+            let changed = self
+                .metadata_transfer
+                .as_ref()
+                .and_then(|state| state.pending_import_result.as_ref())
+                .and_then(|result| result.as_ref().ok())
+                .map(|summary| summary.changed)
+                .unwrap_or_default();
+            let (errors, stale_context) =
+                self.apply_metadata_import_terminal_refresh(refresh, changed);
+            if let Some(state) = self.metadata_transfer.as_mut() {
+                state.import_refresh_errors.extend(errors);
+                if stale_context {
+                    state.stage = Stage::RefreshPreparing;
+                    restart_terminal_refresh = true;
+                } else {
+                    let mut result = state
+                        .pending_import_result
+                        .take()
+                        .unwrap_or_else(|| Err("import結果を復元できませんでした".to_string()));
+                    if !state.import_refresh_errors.is_empty() {
+                        state.import_refresh_errors.sort();
+                        state.import_refresh_errors.dedup();
+                        let refresh_error = state.import_refresh_errors.join("\n");
+                        state.import_refresh_errors.clear();
+                        result = match result {
+                            Ok(mut summary) => {
+                                summary.incomplete_error = Some(
+                                    summary
+                                        .incomplete_error
+                                        .map_or(refresh_error.clone(), |error| {
+                                            format!("{error}\n{refresh_error}")
+                                        }),
+                                );
+                                Ok(summary)
+                            }
+                            Err(error) => Err(format!("{error}\n{refresh_error}")),
+                        };
+                    }
+                    state.stage = Stage::Result(ResultState::Import(result));
+                }
+            }
         }
-        if let Some(snapshot) = page_state_snapshot {
-            self.replace_metadata_import_page_state_snapshot(snapshot);
-        }
-        if import_finished {
-            self.finish_metadata_transfer_import_refresh();
+        if restart_terminal_refresh {
+            self.begin_metadata_import_terminal_refresh();
         }
     }
 
     fn restore_metadata_import_resources(&mut self) {
         let should_restore = self.metadata_transfer.as_ref().is_some_and(|state| {
             state.import_resources.is_some()
-                && matches!(state.stage, Stage::Result(ResultState::Import(_)))
+                && matches!(
+                    state.stage,
+                    Stage::RefreshPreparing
+                        | Stage::Refreshing
+                        | Stage::Result(ResultState::Import(_))
+                )
         });
         if !should_restore {
             return;
@@ -612,6 +654,7 @@ fn draw_dialog(
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("インポート").clicked() {
+                        state.recursive = preview.recursive;
                         action = DialogAction::StartImport;
                     }
                     if ui.button("キャンセル").clicked() {
@@ -623,11 +666,7 @@ fn draw_dialog(
                 }
             }
             Stage::WaitingForWriters => {
-                ui.label(if state.import_refresh_preparing {
-                    "表示更新の準備をしています…"
-                } else {
-                    "実行中のメタ情報書き込みが完了するのを待っています…"
-                });
+                ui.label("実行中のメタ情報書き込みが完了するのを待っています…");
                 ui.spinner();
                 ui.small("待機中も安全にキャンセルできます。");
                 if ui.button("キャンセル").clicked() || escape_pressed {
@@ -645,6 +684,11 @@ fn draw_dialog(
                 if state.operation == Operation::Import {
                     ui.small("キャンセル時も、反映済みの項目はそのまま保持されます。");
                 }
+            }
+            Stage::RefreshPreparing | Stage::Refreshing => {
+                ui.label("表示用メタ情報を更新しています…");
+                ui.spinner();
+                ui.small("データベースへの反映は完了しています。");
             }
             Stage::Result(result) => {
                 draw_result(ui, result);
@@ -872,7 +916,6 @@ fn start_import_worker(
     state: &mut MetadataTransferState,
     resources: ImportWorkerResources,
     view_trim_batch: Option<crate::view_trim_db::ViewTrimWriteBatch>,
-    refresh_scope: crate::metadata_transfer::ImportRefreshScope,
 ) -> bool {
     if let Some(preview_handle) = state.handle.take() {
         let _ = preview_handle.join();
@@ -906,30 +949,20 @@ fn start_import_worker(
                 flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import");
             let view_trim_saved = view_trim_result.is_ok();
             let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
-            let refresh_tx = tx.clone();
             let result = match flush_result {
-                Ok(()) => crate::metadata_transfer::import_at_with_refresh_scope(
-                    &data_dir,
-                    &root,
-                    &cancel,
-                    Some(&refresh_scope),
-                    move |value| {
+                Ok(()) => {
+                    crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
                         progress_relay.send(value);
-                    },
-                    move |refresh| {
-                        refresh_tx
-                            .send(WorkerMessage::ImportRefresh(refresh))
-                            .map_err(|_| TransferError::Cancelled)
-                    },
-                )
-                .map_err(|error| error.to_string()),
+                    })
+                    .map_err(|error| error.to_string())
+                }
                 Err(error) => Err(error),
             };
 
             // Reopening restores tags.db to its normal WAL mode before the UI
             // regains ownership.  Report a reopen failure even when DB import
             // itself succeeded; the caller still extracts the applied-key delta.
-            let (tags_db, mut resource_error) =
+            let (tags_db, resource_error) =
                 match crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")) {
                     Ok(tags_db) => (Some(tags_db), None),
                     Err(error) => (None, Some(format!("タグDBを再開できませんでした: {error}"))),
@@ -941,23 +974,9 @@ fn start_import_worker(
                 };
                 resources.tags_db = tags_db;
             }
-            let page_state_snapshot =
-                match crate::metadata_transfer::load_import_page_state_snapshot(&data_dir) {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(error) => {
-                        let error = format!("編集状態索引を再構築できませんでした: {error}");
-                        crate::logger::log(format!("metadata import: {error}"));
-                        resource_error = Some(
-                            resource_error
-                                .map_or(error.clone(), |existing| format!("{existing}\n{error}")),
-                        );
-                        None
-                    }
-                };
             let _ = tx.send(WorkerMessage::Import {
                 result,
                 resource_error,
-                page_state_snapshot,
                 view_trim_saved,
             });
         });
@@ -970,6 +989,52 @@ fn start_import_worker(
             state.rx = None;
             state.stage = Stage::Result(ResultState::Import(Err(error.to_string())));
             false
+        }
+    }
+}
+
+fn start_metadata_import_refresh_worker(
+    state: &mut MetadataTransferState,
+    requests: Vec<crate::app::metadata_import_refresh::ContextRequest>,
+) {
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+    let changed = state
+        .pending_import_result
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|summary| summary.changed)
+        .unwrap_or_default();
+    let data_dir = crate::data_dir::get();
+    let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+    state.rx = Some(rx);
+    state.stage = Stage::Refreshing;
+    match std::thread::Builder::new()
+        .name("metadata-import-refresh".to_string())
+        .spawn(move || {
+            let result = crate::app::metadata_import_refresh::run(data_dir, requests, changed);
+            let _ = tx.send(WorkerMessage::Refresh(result));
+        }) {
+        Ok(handle) => state.handle = Some(handle),
+        Err(error) => {
+            state.rx = None;
+            let error = format!("表示用メタ情報を更新できませんでした: {error}");
+            let result = state
+                .pending_import_result
+                .take()
+                .unwrap_or_else(|| Err(error.clone()));
+            state.stage = Stage::Result(ResultState::Import(match result {
+                Ok(mut summary) => {
+                    summary.incomplete_error = Some(
+                        summary
+                            .incomplete_error
+                            .map_or(error.clone(), |existing| format!("{existing}\n{error}")),
+                    );
+                    Ok(summary)
+                }
+                Err(existing) => Err(format!("{existing}\n{error}")),
+            }));
         }
     }
 }

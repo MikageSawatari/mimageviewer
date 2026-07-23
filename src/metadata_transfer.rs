@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -27,9 +27,14 @@ const GENERATIONS_DIRNAME: &str = "generations";
 const SHARDS_DIRNAME: &str = "shards";
 const SHARD_EXTENSION: &str = "jsonl";
 const EXPORT_BATCH_ENTRIES: usize = 4_096;
-const IMPORT_REFRESH_BATCH_VALUES: usize = 256;
-const IMPORT_REFRESH_BATCH_BYTES: usize = 512 * 1024;
-const IMPORT_REFRESH_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(2);
+/// Importはこのいずれかへ達した時点でdurable commitする。item内はSAVEPOINTで
+/// 隔離するため、1件の不正値は同じbatchの他itemを巻き戻さない。
+///
+/// プロセス異常終了時は現在batch（最大この予算）だけがrollbackされ、完了済みbatchは
+/// 保持される。明示キャンセルと通常の走査エラーでは現在batchもcommitしてから終端へ進む。
+const IMPORT_TRANSACTION_BATCH_ENTRIES: usize = 256;
+const IMPORT_TRANSACTION_BATCH_BYTES: usize = 64 * 1024 * 1024;
+const IMPORT_TRANSACTION_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// 総exportサイズではなく、単一の物理項目recordにだけ適用する防御上限。
 const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
@@ -92,9 +97,37 @@ pub struct ImportSummary {
     pub skipped_changed: usize,
     pub failed_entries: usize,
     pub cancelled: bool,
-    /// preflight後の2回目の走査でI/O・parse・検証に失敗した場合の終端エラー。
-    /// それ以前にcommitした項目は保持され、対応するrefresh差分もすでに通知済み。
+    /// preflight後の2回目の走査、または終端cache再取得で失敗した場合の終端エラー。
+    /// それ以前にcommitしたbatchは保持される。
     pub incomplete_error: Option<String>,
+    pub changed: ImportChangedSections,
+    #[cfg(test)]
+    pub transaction_batches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportChangedSections {
+    pub ratings: bool,
+    pub tags: bool,
+    pub timed_bookmarks: bool,
+    pub book_bookmarks: bool,
+    pub page_state: bool,
+    pub container_state: bool,
+    pub thumbnail_pins: bool,
+}
+
+impl ManifestSections {
+    fn changed(self) -> ImportChangedSections {
+        ImportChangedSections {
+            ratings: self.ratings,
+            tags: self.tags,
+            timed_bookmarks: self.timed_bookmarks,
+            book_bookmarks: self.book_bookmarks,
+            page_state: self.page_state,
+            container_state: self.container_state,
+            thumbnail_pins: self.thumbnail_pins,
+        }
+    }
 }
 
 pub struct ImportPageStateSnapshot {
@@ -138,129 +171,6 @@ pub fn load_import_page_state_snapshot(
         comic,
         rotated,
     })
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ImportRefreshDelta {
-    /// 実値を返す表示scope外を含め、このbatchにcommit済み項目がある。
-    pub any_entry_applied: bool,
-    pub committed_entries: usize,
-    /// 表示scope外の項目も含むsection変更通知。全件key/valueは保持しない。
-    pub ratings_changed: bool,
-    pub tags_changed: bool,
-    pub page_states_changed: bool,
-    /// import 開始時に表示中だった項目だけの、UI cache 更新用実値。
-    pub visible_entries: Vec<ImportedEntryMetadata>,
-}
-
-impl ImportRefreshDelta {
-    #[allow(dead_code)] // binary Appで使用。library-only buildにはconsumerがない。
-    pub(crate) fn is_empty(&self) -> bool {
-        !self.any_entry_applied
-            && !self.ratings_changed
-            && !self.tags_changed
-            && !self.page_states_changed
-            && self.visible_entries.is_empty()
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ImportRefreshScope {
-    pub base_keys: HashSet<String>,
-    /// UIに実在する安定item key。manifestに記載がないvirtual memberも、file単位
-    /// 上書きで既定値へ戻す差分をworker側から明示送信するために使う。
-    pub visible_keys: HashMap<String, HashSet<String>>,
-}
-
-impl ImportRefreshScope {
-    pub fn contains(&self, base_key: &str) -> bool {
-        self.base_keys.contains(base_key)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ImportedEntryMetadata {
-    pub base_key: String,
-    pub ratings: Option<Vec<ImportedRatingValue>>,
-    pub tags: Option<Vec<ImportedTagsValue>>,
-    pub page_states: Option<Vec<ImportedPageState>>,
-    pub container_states: Option<ImportedContainerStateFamily>,
-    pub folder_pins: Option<ImportedFolderPinFamily>,
-    pub video_pin: Option<ImportedVideoPinChange>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImportedRatingValue {
-    pub key: String,
-    pub stars: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImportedTagsValue {
-    pub key: String,
-    pub tags: Vec<String>,
-    /// trueは既存値を置換、falseは同じkeyの直前chunkへ追記。
-    pub replace: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ImportedPageState {
-    pub key: String,
-    pub rotation_degrees: Option<i32>,
-    pub adjustment: Option<crate::adjustment::AdjustParams>,
-    pub export_crop: Option<crate::export_crop::CropSettings>,
-    pub view_trim: Option<crate::view_trim::ViewTrimPageOverride>,
-    pub adjusted: bool,
-    pub local_adjusted: bool,
-    pub masked: bool,
-    pub concealed: bool,
-    pub comic: bool,
-    pub rotated: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ImportedContainerStateFamily {
-    /// spread / view-trim DB と同じ drive-stripped key。
-    pub base_key: String,
-    pub include_nested: bool,
-    pub replace: bool,
-    pub items: Vec<ImportedContainerState>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ImportedContainerState {
-    pub key: String,
-    pub spread: Option<ImportedSpreadState>,
-    pub view_trim: Option<crate::view_trim::ViewTrimBookState>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImportedSpreadState {
-    pub mode: i32,
-    pub flow: i32,
-    pub direction: i32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ImportedFolderPinFamily {
-    /// folder-pin DB と同じ drive-preserving key。
-    pub base_key: String,
-    pub include_nested: bool,
-    pub replace: bool,
-    pub items: Vec<ImportedFolderPinValue>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ImportedFolderPinValue {
-    pub key: String,
-    pub source: crate::folder_thumb_pins::FolderPinSource,
-}
-
-#[derive(Clone, Debug)]
-pub struct ImportedVideoPinChange {
-    pub key: String,
-    /// `None` は pin 削除、または pin に保存済み WebP がない状態を表す。
-    pub thumb_webp: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -662,88 +572,23 @@ pub fn import_at<F>(
 where
     F: FnMut(TransferProgress),
 {
-    import_at_with_refresh_scope(data_dir, root, cancel, None, progress, |_| Ok(()))
+    import_at_batched(data_dir, root, cancel, progress)
 }
 
-struct ImportRefreshBatcher<'a, R> {
-    callback: &'a mut R,
-    batch: ImportRefreshDelta,
-    values: usize,
-    bytes: usize,
-    started: std::time::Instant,
-}
-
-impl<R> ImportRefreshBatcher<'_, R>
-where
-    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
-{
-    fn push(
-        &mut self,
-        mut fragment: ImportRefreshDelta,
-        values: usize,
-        bytes: usize,
-    ) -> Result<(), TransferError> {
-        if !self.batch.is_empty()
-            && (self.values.saturating_add(values) > IMPORT_REFRESH_BATCH_VALUES
-                || self.bytes.saturating_add(bytes) > IMPORT_REFRESH_BATCH_BYTES
-                || self.started.elapsed() >= IMPORT_REFRESH_BATCH_TIME)
-        {
-            self.flush()?;
-        }
-        self.batch.any_entry_applied |= fragment.any_entry_applied;
-        self.batch.committed_entries = self
-            .batch
-            .committed_entries
-            .saturating_add(fragment.committed_entries);
-        self.batch.ratings_changed |= fragment.ratings_changed;
-        self.batch.tags_changed |= fragment.tags_changed;
-        self.batch.page_states_changed |= fragment.page_states_changed;
-        self.batch
-            .visible_entries
-            .append(&mut fragment.visible_entries);
-        self.values = self.values.saturating_add(values);
-        self.bytes = self.bytes.saturating_add(bytes);
-        if self.values >= IMPORT_REFRESH_BATCH_VALUES
-            || self.bytes >= IMPORT_REFRESH_BATCH_BYTES
-            || self.started.elapsed() >= IMPORT_REFRESH_BATCH_TIME
-        {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), TransferError> {
-        if !self.batch.is_empty() {
-            (self.callback)(std::mem::take(&mut self.batch))?;
-        }
-        self.values = 0;
-        self.bytes = 0;
-        self.started = std::time::Instant::now();
-        Ok(())
-    }
-}
-
-/// UI 表示中の項目だけ実値をcommit後の小さいbatchとして通知するimport入口。
-/// refreshは最終resultへ蓄積せず、呼び出し側の有界channelにbackpressureを掛ける。
-pub fn import_at_with_refresh_scope<F, R>(
+fn import_at_batched<F>(
     data_dir: &Path,
     root: &Path,
     cancel: &AtomicBool,
-    refresh_scope: Option<&ImportRefreshScope>,
     mut progress: F,
-    mut refresh: R,
 ) -> Result<ImportSummary, TransferError>
 where
     F: FnMut(TransferProgress),
-    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
 {
     validate_root(root)?;
     let manifest = read_bundle_manifest(root, cancel)?;
     let total = usize_from_count(manifest.entry_count, "項目数")?;
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| TransferError::Io(format!("{}: {error}", root.display())))?;
-    // Sidecar は信頼しない。全shardをstreaming preflightし、1件でもroot外を指す
-    // 既存reparse pathがあればDBを触る前にgeneration全体を拒否する。
     visit_bundle_entries(root, &manifest, cancel, |entry, index| {
         let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
         validate_bookmark_page_targets(&path, entry)?;
@@ -757,18 +602,17 @@ where
     })?;
 
     ensure_database_schemas(data_dir)?;
-    let mut conn = open_import_connection(data_dir)?;
+    let conn = open_import_connection(data_dir)?;
     let mut summary = ImportSummary {
         total_entries: total,
+        changed: manifest.sections.changed(),
         ..ImportSummary::default()
     };
-    let mut refresh_batcher = ImportRefreshBatcher {
-        callback: &mut refresh,
-        batch: ImportRefreshDelta::default(),
-        values: 0,
-        bytes: 0,
-        started: std::time::Instant::now(),
-    };
+    let mut batch_entries = 0usize;
+    let mut batch_bytes = 0usize;
+    let mut batch_applied = 0usize;
+    let mut batch_started = std::time::Instant::now();
+    let mut batch_active = false;
 
     let apply_result = visit_bundle_entries(root, &manifest, cancel, |entry, index| {
         progress(TransferProgress {
@@ -777,58 +621,63 @@ where
             total,
             current_path: Some(entry.path.clone()),
         });
-        // preflight後のreparse差し替えも、各itemのwrite直前に再検証する。
         let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
         validate_bookmark_page_targets(&path, entry)?;
         match verify_target(&path, entry) {
-            TargetState::Missing => {
-                summary.skipped_missing += 1;
-                progress(TransferProgress {
-                    phase: TransferPhase::Importing,
-                    processed: index + 1,
-                    total,
-                    current_path: Some(entry.path.clone()),
-                });
-                return Ok(());
-            }
-            TargetState::Changed => {
-                summary.skipped_changed += 1;
-                progress(TransferProgress {
-                    phase: TransferPhase::Importing,
-                    processed: index + 1,
-                    total,
-                    current_path: Some(entry.path.clone()),
-                });
-                return Ok(());
-            }
-            TargetState::Ready => {}
-        }
-        match apply_entry(
-            &mut conn,
-            &path,
-            entry,
-            manifest.sections,
-            manifest.exported_at_ms,
-        ) {
-            Ok(()) => {
-                summary.applied_entries += 1;
-                let base_key = crate::path_key::normalize_keep_drive(&path);
-                emit_import_refresh_fragments(
+            TargetState::Missing => summary.skipped_missing += 1,
+            TargetState::Changed => summary.skipped_changed += 1,
+            TargetState::Ready => {
+                if !batch_active {
+                    begin_import_batch(&conn)?;
+                    batch_active = true;
+                    batch_started = std::time::Instant::now();
+                }
+                conn.execute_batch("SAVEPOINT metadata_import_item")
+                    .map_err(db_error)?;
+                match apply_entry(
+                    &conn,
                     &path,
                     entry,
                     manifest.sections,
-                    refresh_scope.is_some_and(|scope| scope.contains(&base_key)),
-                    refresh_scope.and_then(|scope| scope.visible_keys.get(&base_key)),
-                    &mut refresh_batcher,
-                )?;
+                    manifest.exported_at_ms,
+                ) {
+                    Ok(()) => {
+                        conn.execute_batch("RELEASE metadata_import_item")
+                            .map_err(db_error)?;
+                        batch_applied = batch_applied.saturating_add(1);
+                    }
+                    Err(error) => {
+                        conn.execute_batch(
+                            "ROLLBACK TO metadata_import_item; RELEASE metadata_import_item",
+                        )
+                        .map_err(db_error)?;
+                        crate::logger::log(format!(
+                            "metadata import: failed to apply {}: {error}",
+                            entry.path
+                        ));
+                        summary.failed_entries = summary.failed_entries.saturating_add(1);
+                    }
+                }
+                batch_entries = batch_entries.saturating_add(1);
+                batch_bytes = batch_bytes.saturating_add(estimated_json_bytes(entry));
             }
-            Err(error) => {
-                crate::logger::log(format!(
-                    "metadata import: failed to apply {}: {error}",
-                    entry.path
-                ));
-                summary.failed_entries += 1;
+        }
+        if batch_entries > 0
+            && (batch_entries >= IMPORT_TRANSACTION_BATCH_ENTRIES
+                || batch_bytes >= IMPORT_TRANSACTION_BATCH_BYTES
+                || batch_started.elapsed() >= IMPORT_TRANSACTION_BATCH_TIME)
+        {
+            commit_import_batch(&conn)?;
+            summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+            #[cfg(test)]
+            {
+                summary.transaction_batches += 1;
             }
+            batch_active = false;
+            batch_entries = 0;
+            batch_bytes = 0;
+            batch_applied = 0;
+            batch_started = std::time::Instant::now();
         }
         progress(TransferProgress {
             phase: TransferPhase::Importing,
@@ -838,357 +687,36 @@ where
         });
         Ok(())
     });
-    let trailing_refresh_result = refresh_batcher.flush();
-    let terminal_result = match apply_result {
-        Err(error) => Err(error),
-        Ok(()) => trailing_refresh_result,
+
+    // cancel / shard I/O errorでも、仕様どおり完了済みitemは保持する。異常終了だけは
+    // SQLiteが現在batchを一括rollbackする。
+    let commit_result = if batch_active {
+        commit_import_batch(&conn)
+    } else {
+        Ok(())
     };
-    match terminal_result {
+    if commit_result.is_ok() {
+        summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+        #[cfg(test)]
+        if batch_active {
+            summary.transaction_batches += 1;
+        }
+    }
+    let terminal = apply_result.and(commit_result);
+    match terminal {
         Ok(()) => {}
         Err(TransferError::Cancelled) => summary.cancelled = true,
-        Err(error) => {
-            // preflight後は項目単位commitで進む。2回目走査の終端エラーをsummaryに載せ、
-            // それ以前のcommit済み件数と、すでに送信したrefresh差分を失わない。
-            summary.incomplete_error = Some(error.to_string());
-        }
+        Err(error) => summary.incomplete_error = Some(error.to_string()),
     }
     Ok(summary)
 }
 
-fn emit_import_refresh_fragments<R>(
-    path: &Path,
-    entry: &PortableEntry,
-    sections: ManifestSections,
-    visible: bool,
-    visible_keys: Option<&HashSet<String>>,
-    batcher: &mut ImportRefreshBatcher<'_, R>,
-) -> Result<(), TransferError>
-where
-    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
-{
-    let mut virtual_cursor = 0;
-    let mut nested_cursor = if visible {
-        0
-    } else {
-        entry.nested_containers.len()
-    };
-    let mut first = true;
-    loop {
-        let started = std::time::Instant::now();
-        let virtual_start = virtual_cursor;
-        let nested_start = nested_cursor;
-        let mut values = usize::from(first);
-        let mut bytes = if first {
-            estimated_physical_refresh_bytes(path, entry)
-        } else {
-            path.as_os_str().to_string_lossy().len()
-        };
-
-        while values < IMPORT_REFRESH_BATCH_VALUES {
-            let next_bytes = if virtual_cursor < entry.virtual_items.len() {
-                let item = &entry.virtual_items[virtual_cursor];
-                virtual_cursor += 1;
-                estimated_json_bytes(item)
-            } else if nested_cursor < entry.nested_containers.len() {
-                let item = &entry.nested_containers[nested_cursor];
-                nested_cursor += 1;
-                estimated_json_bytes(item)
-            } else {
-                break;
-            };
-            // 単一値は分割不能だが、2値目以降はbyte予算を越える前に次messageへ送る。
-            if values > 0 && bytes.saturating_add(next_bytes) > IMPORT_REFRESH_BATCH_BYTES {
-                if virtual_cursor > virtual_start
-                    && virtual_cursor <= entry.virtual_items.len()
-                    && nested_cursor == nested_start
-                {
-                    virtual_cursor -= 1;
-                } else if nested_cursor > nested_start {
-                    nested_cursor -= 1;
-                }
-                break;
-            }
-            values += 1;
-            bytes = bytes.saturating_add(next_bytes);
-            if started.elapsed() >= IMPORT_REFRESH_BATCH_TIME {
-                break;
-            }
-        }
-
-        let virtual_range = virtual_start..virtual_cursor;
-        let nested_range = nested_start..nested_cursor;
-        let mut fragment = ImportRefreshDelta {
-            any_entry_applied: true,
-            committed_entries: usize::from(first),
-            ratings_changed: sections.ratings,
-            tags_changed: sections.tags,
-            page_states_changed: sections.page_state,
-            ..ImportRefreshDelta::default()
-        };
-        if visible {
-            fragment.visible_entries.push(imported_entry_metadata(
-                path,
-                entry,
-                sections,
-                virtual_range,
-                nested_range,
-                first,
-            ));
-        }
-        push_refresh_fragment(fragment, values.max(1), bytes, batcher)?;
-
-        first = false;
-        if virtual_cursor >= entry.virtual_items.len()
-            && nested_cursor >= entry.nested_containers.len()
-        {
-            break;
-        }
-    }
-    if visible {
-        emit_missing_visible_defaults(path, entry, sections, visible_keys, batcher)?;
-    }
-    Ok(())
+fn begin_import_batch(conn: &Connection) -> Result<(), TransferError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(db_error)
 }
 
-fn emit_missing_visible_defaults<R>(
-    path: &Path,
-    entry: &PortableEntry,
-    sections: ManifestSections,
-    visible_keys: Option<&HashSet<String>>,
-    batcher: &mut ImportRefreshBatcher<'_, R>,
-) -> Result<(), TransferError>
-where
-    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
-{
-    let Some(visible_keys) = visible_keys else {
-        return Ok(());
-    };
-    let base_key = crate::path_key::normalize_keep_drive(path);
-    let mut present = HashSet::with_capacity(entry.virtual_items.len().saturating_add(1));
-    present.insert(base_key.clone());
-    present.extend(
-        entry
-            .virtual_items
-            .iter()
-            .map(|item| canonical_virtual_item_key(&base_key, &item.member_key)),
-    );
-    let mut keys = Vec::with_capacity(IMPORT_REFRESH_BATCH_VALUES);
-    let mut bytes = 0_usize;
-    let mut started = std::time::Instant::now();
-    for key in visible_keys.iter().filter(|key| !present.contains(*key)) {
-        let key_bytes = key.len();
-        if !keys.is_empty()
-            && (keys.len() >= IMPORT_REFRESH_BATCH_VALUES
-                || bytes.saturating_add(key_bytes) > IMPORT_REFRESH_BATCH_BYTES
-                || started.elapsed() >= IMPORT_REFRESH_BATCH_TIME)
-        {
-            push_missing_visible_defaults(&base_key, sections, &mut keys, bytes, batcher)?;
-            bytes = 0;
-            started = std::time::Instant::now();
-        }
-        bytes = bytes.saturating_add(key_bytes);
-        keys.push(key.clone());
-    }
-    if !keys.is_empty() {
-        push_missing_visible_defaults(&base_key, sections, &mut keys, bytes, batcher)?;
-    }
-    Ok(())
-}
-
-fn push_missing_visible_defaults<R>(
-    base_key: &str,
-    sections: ManifestSections,
-    keys: &mut Vec<String>,
-    bytes: usize,
-    batcher: &mut ImportRefreshBatcher<'_, R>,
-) -> Result<(), TransferError>
-where
-    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
-{
-    let values = keys.len();
-    let keys = std::mem::take(keys);
-    let ratings = sections.ratings.then(|| {
-        keys.iter()
-            .map(|key| ImportedRatingValue {
-                key: key.clone(),
-                stars: 0,
-            })
-            .collect()
-    });
-    let tags = sections.tags.then(|| {
-        keys.iter()
-            .map(|key| ImportedTagsValue {
-                key: key.clone(),
-                tags: Vec::new(),
-                replace: true,
-            })
-            .collect()
-    });
-    let page_states = sections.page_state.then(|| {
-        keys.iter()
-            .map(|key| ImportedPageState {
-                key: key.clone(),
-                ..ImportedPageState::default()
-            })
-            .collect()
-    });
-    push_refresh_fragment(
-        ImportRefreshDelta {
-            any_entry_applied: true,
-            ratings_changed: sections.ratings,
-            tags_changed: sections.tags,
-            page_states_changed: sections.page_state,
-            visible_entries: vec![ImportedEntryMetadata {
-                base_key: base_key.to_string(),
-                ratings,
-                tags,
-                page_states,
-                ..ImportedEntryMetadata::default()
-            }],
-            ..ImportRefreshDelta::default()
-        },
-        values,
-        bytes,
-        batcher,
-    )
-}
-
-fn push_refresh_fragment<R>(
-    mut fragment: ImportRefreshDelta,
-    values: usize,
-    bytes: usize,
-    batcher: &mut ImportRefreshBatcher<'_, R>,
-) -> Result<(), TransferError>
-where
-    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
-{
-    let oversized = fragment
-        .visible_entries
-        .iter()
-        .enumerate()
-        .find_map(|(entry_index, entry)| {
-            entry
-                .tags
-                .as_ref()?
-                .iter()
-                .enumerate()
-                .find_map(|(value_index, value)| {
-                    (estimated_tags_value_bytes(value) > IMPORT_REFRESH_BATCH_BYTES)
-                        .then_some((entry_index, value_index))
-                })
-        });
-    let Some((entry_index, value_index)) = oversized else {
-        return batcher.push(fragment, values, bytes);
-    };
-
-    let value = fragment.visible_entries[entry_index]
-        .tags
-        .as_mut()
-        .expect("located above")
-        .remove(value_index);
-    let ImportedTagsValue { key, tags, .. } = value;
-    let mut tag_chunks = Vec::new();
-    let mut chunk_bytes = key.len();
-    let mut first_chunk = true;
-    for tag in tags {
-        let tag_bytes = tag.len();
-        if !tag_chunks.is_empty()
-            && (tag_chunks.len() >= IMPORT_REFRESH_BATCH_VALUES
-                || chunk_bytes.saturating_add(tag_bytes) > IMPORT_REFRESH_BATCH_BYTES)
-        {
-            push_tag_value_chunk(
-                &mut fragment,
-                entry_index,
-                value_index,
-                &key,
-                std::mem::take(&mut tag_chunks),
-                first_chunk,
-                chunk_bytes,
-                values,
-                batcher,
-            )?;
-            first_chunk = false;
-            chunk_bytes = key.len();
-        }
-        chunk_bytes = chunk_bytes.saturating_add(tag_bytes);
-        tag_chunks.push(tag);
-    }
-    // 空tagsも「置換してclear」という意味がある。
-    push_tag_value_chunk(
-        &mut fragment,
-        entry_index,
-        value_index,
-        &key,
-        tag_chunks,
-        first_chunk,
-        chunk_bytes,
-        values,
-        batcher,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_tag_value_chunk<R>(
-    original: &mut ImportRefreshDelta,
-    entry_index: usize,
-    value_index: usize,
-    key: &str,
-    tags: Vec<String>,
-    replace: bool,
-    bytes: usize,
-    original_values: usize,
-    batcher: &mut ImportRefreshBatcher<'_, R>,
-) -> Result<(), TransferError>
-where
-    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
-{
-    if replace {
-        original.visible_entries[entry_index]
-            .tags
-            .get_or_insert_with(Vec::new)
-            .insert(
-                value_index,
-                ImportedTagsValue {
-                    key: key.to_string(),
-                    tags,
-                    replace: true,
-                },
-            );
-        batcher.push(
-            std::mem::take(original),
-            original_values.max(1),
-            bytes.min(IMPORT_REFRESH_BATCH_BYTES),
-        )
-    } else {
-        batcher.push(
-            ImportRefreshDelta {
-                any_entry_applied: true,
-                tags_changed: true,
-                visible_entries: vec![ImportedEntryMetadata {
-                    base_key: key
-                        .split_once("::")
-                        .map_or(key, |(base_key, _)| base_key)
-                        .to_string(),
-                    tags: Some(vec![ImportedTagsValue {
-                        key: key.to_string(),
-                        tags,
-                        replace: false,
-                    }]),
-                    ..ImportedEntryMetadata::default()
-                }],
-                ..ImportRefreshDelta::default()
-            },
-            1,
-            bytes.min(IMPORT_REFRESH_BATCH_BYTES),
-        )
-    }
-}
-
-fn estimated_tags_value_bytes(value: &ImportedTagsValue) -> usize {
-    value
-        .key
-        .len()
-        .saturating_add(value.tags.iter().map(|tag| tag.len()).sum::<usize>())
+fn commit_import_batch(conn: &Connection) -> Result<(), TransferError> {
+    conn.execute_batch("COMMIT").map_err(db_error)
 }
 
 fn estimated_json_bytes<T: Serialize>(value: &T) -> usize {
@@ -1208,17 +736,6 @@ fn estimated_json_bytes<T: Serialize>(value: &T) -> usize {
         .unwrap_or(MAX_RECORD_BYTES as usize)
 }
 
-fn estimated_physical_refresh_bytes(path: &Path, entry: &PortableEntry) -> usize {
-    path.as_os_str()
-        .to_string_lossy()
-        .len()
-        .saturating_add(estimated_json_bytes(&entry.rating))
-        .saturating_add(estimated_json_bytes(&entry.tags))
-        .saturating_add(estimated_json_bytes(&entry.page_state))
-        .saturating_add(estimated_json_bytes(&entry.container_state))
-        .saturating_add(estimated_json_bytes(&entry.video_pin))
-}
-
 /// 仮想項目のDB identity。ZIP member名は表示・manifestではcaseを保持するが、
 /// mIVのpage keyはcase-insensitiveなので全store・refresh経路で同じ形に揃える。
 fn canonical_virtual_item_key(base_key: &str, member_key: &str) -> String {
@@ -1229,197 +746,6 @@ fn canonical_virtual_item_key(base_key: &str, member_key: &str) -> String {
 /// 有効な区切りとして受理するため、重複検査と全DB key生成の前に`/`へ統一する。
 fn canonical_member_key(member_key: &str) -> String {
     member_key.replace('\\', "/").to_lowercase()
-}
-
-fn imported_entry_metadata(
-    path: &Path,
-    entry: &PortableEntry,
-    sections: ManifestSections,
-    virtual_range: std::ops::Range<usize>,
-    nested_range: std::ops::Range<usize>,
-    replace: bool,
-) -> ImportedEntryMetadata {
-    let base_key = crate::path_key::normalize_keep_drive(path);
-    let item_key = |member: &str| canonical_virtual_item_key(&base_key, member);
-
-    let ratings = sections.ratings.then(|| {
-        let mut values =
-            Vec::with_capacity(virtual_range.len().saturating_add(usize::from(replace)));
-        if replace {
-            values.push(ImportedRatingValue {
-                key: base_key.clone(),
-                stars: entry.rating.as_ref().map_or(0, |rating| rating.stars),
-            });
-        }
-        values.extend(
-            entry.virtual_items[virtual_range.clone()]
-                .iter()
-                .map(|item| ImportedRatingValue {
-                    key: item_key(&item.member_key),
-                    stars: item.rating.as_ref().map_or(0, |rating| rating.stars),
-                }),
-        );
-        values
-    });
-    let tags = sections.tags.then(|| {
-        let mut values =
-            Vec::with_capacity(virtual_range.len().saturating_add(usize::from(replace)));
-        if replace {
-            values.push(ImportedTagsValue {
-                key: base_key.clone(),
-                tags: entry.tags.clone(),
-                replace: true,
-            });
-        }
-        values.extend(
-            entry.virtual_items[virtual_range.clone()]
-                .iter()
-                .map(|item| ImportedTagsValue {
-                    key: item_key(&item.member_key),
-                    tags: item.tags.clone(),
-                    replace: true,
-                }),
-        );
-        values
-    });
-    let page_states = sections.page_state.then(|| {
-        let mut items =
-            Vec::with_capacity(virtual_range.len().saturating_add(usize::from(replace)));
-        if replace {
-            items.push(imported_page_state(&base_key, &entry.page_state));
-        }
-        items.extend(
-            entry.virtual_items[virtual_range.clone()]
-                .iter()
-                .map(|item| imported_page_state(&item_key(&item.member_key), &item.page_state)),
-        );
-        items
-    });
-
-    let include_nested = entry.kind == PortableEntryKind::File;
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let can_have_container_state = entry.kind == PortableEntryKind::Directory
-        || crate::folder_tree::is_zip_extension(&extension)
-        || extension == "pdf"
-        || crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some();
-    let container_states = (sections.container_state && can_have_container_state).then(|| {
-        let stripped_base = crate::path_key::normalize(path);
-        let mut items = Vec::with_capacity(nested_range.len().saturating_add(usize::from(replace)));
-        if replace {
-            items.push(imported_container_state(
-                stripped_base.clone(),
-                &entry.container_state,
-            ));
-        }
-        items.extend(
-            entry.nested_containers[nested_range.clone()]
-                .iter()
-                .map(|container| {
-                    imported_container_state(
-                        join_container_key(&stripped_base, &container.member_key),
-                        &container.state,
-                    )
-                }),
-        );
-        ImportedContainerStateFamily {
-            base_key: stripped_base,
-            include_nested,
-            replace,
-            items,
-        }
-    });
-    let folder_pins = (sections.thumbnail_pins && can_have_container_state).then(|| {
-        let mut items = Vec::with_capacity(nested_range.len().saturating_add(usize::from(replace)));
-        if replace {
-            if let Some(source) = entry
-                .container_state
-                .folder_thumb_pin
-                .as_ref()
-                .and_then(portable_folder_pin_source)
-            {
-                items.push(ImportedFolderPinValue {
-                    key: base_key.clone(),
-                    source,
-                });
-            }
-        }
-        items.extend(
-            entry.nested_containers[nested_range]
-                .iter()
-                .filter_map(|container| {
-                    let source = container
-                        .state
-                        .folder_thumb_pin
-                        .as_ref()
-                        .and_then(portable_folder_pin_source)?;
-                    Some(ImportedFolderPinValue {
-                        key: join_container_key(&base_key, &container.member_key),
-                        source,
-                    })
-                }),
-        );
-        ImportedFolderPinFamily {
-            base_key: base_key.clone(),
-            include_nested,
-            replace,
-            items,
-        }
-    });
-    let video_pin = (sections.thumbnail_pins
-        && replace
-        && crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()))
-    .then(|| ImportedVideoPinChange {
-        key: base_key.clone(),
-        thumb_webp: entry.video_pin.as_ref().and_then(|pin| {
-            pin.thumb_webp_base64.as_ref().and_then(|encoded| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded.as_bytes())
-                    .ok()
-            })
-        }),
-    });
-
-    ImportedEntryMetadata {
-        base_key,
-        ratings,
-        tags,
-        page_states,
-        container_states,
-        folder_pins,
-        video_pin,
-    }
-}
-
-fn imported_page_state(key: &str, state: &PortablePageState) -> ImportedPageState {
-    ImportedPageState {
-        key: key.to_string(),
-        rotation_degrees: state.rotation_degrees,
-        adjustment: state.adjustment.clone(),
-        export_crop: state.export_crop,
-        view_trim: state.view_trim,
-        adjusted: state.adjustment.is_some(),
-        local_adjusted: state.local_adjust_layers.is_some(),
-        masked: state.mask.is_some(),
-        concealed: state.conceal.is_some(),
-        comic: state.comic.is_some(),
-        rotated: state.rotation_degrees.is_some(),
-    }
-}
-
-fn imported_container_state(key: String, state: &PortableContainerState) -> ImportedContainerState {
-    ImportedContainerState {
-        key,
-        spread: state.spread.map(|spread| ImportedSpreadState {
-            mode: spread.mode,
-            flow: spread.flow,
-            direction: spread.direction,
-        }),
-        view_trim: state.view_trim,
-    }
 }
 
 fn validate_root(root: &Path) -> Result<(), TransferError> {
@@ -3526,7 +2852,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
 }
 
 fn apply_entry(
-    conn: &mut Connection,
+    tx: &Connection,
     path: &Path,
     entry: &PortableEntry,
     sections: ManifestSections,
@@ -3534,18 +2860,15 @@ fn apply_entry(
 ) -> Result<(), TransferError> {
     let base_key = crate::path_key::normalize_keep_drive(path);
     let automatic_sidecar_sync = automatic_sidecar_sync(path, entry.kind);
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error)?;
     if sections.ratings {
-        delete_key_family(&tx, "ratings", "path", &base_key)?;
+        delete_key_family(tx, "ratings", "path", &base_key)?;
         if let Some(rating) = &entry.rating {
-            insert_rating(&tx, &base_key, path, rating)?;
+            insert_rating(tx, &base_key, path, rating)?;
         }
         for item in &entry.virtual_items {
             if let Some(rating) = &item.rating {
                 insert_rating(
-                    &tx,
+                    tx,
                     &canonical_virtual_item_key(&base_key, &item.member_key),
                     path,
                     rating,
@@ -3554,12 +2877,12 @@ fn apply_entry(
         }
     }
     if sections.tags {
-        delete_key_family(&tx, "tags.item_tags", "item_key", &base_key)?;
-        delete_key_family(&tx, "tags.tag_item_state", "item_key", &base_key)?;
-        insert_tags(&tx, &base_key, &entry.tags, fallback_time_ms)?;
+        delete_key_family(tx, "tags.item_tags", "item_key", &base_key)?;
+        delete_key_family(tx, "tags.tag_item_state", "item_key", &base_key)?;
+        insert_tags(tx, &base_key, &entry.tags, fallback_time_ms)?;
         for item in &entry.virtual_items {
             insert_tags(
-                &tx,
+                tx,
                 &canonical_virtual_item_key(&base_key, &item.member_key),
                 &item.tags,
                 fallback_time_ms,
@@ -3647,23 +2970,23 @@ fn apply_entry(
         }
     }
     if sections.page_state {
-        delete_key_family(&tx, "adjustment.page_params", "page_path", &base_key)?;
-        delete_key_family(&tx, "mask.masks", "path", &base_key)?;
-        delete_key_family(&tx, "conceal.conceal_entries", "page_path", &base_key)?;
+        delete_key_family(tx, "adjustment.page_params", "page_path", &base_key)?;
+        delete_key_family(tx, "mask.masks", "path", &base_key)?;
+        delete_key_family(tx, "conceal.conceal_entries", "page_path", &base_key)?;
         delete_key_family(
-            &tx,
+            tx,
             "local_adjust.local_adjust_pages",
             "page_path",
             &base_key,
         )?;
-        delete_key_family(&tx, "crop.export_crop_pages", "page_path", &base_key)?;
-        delete_key_family(&tx, "comic.comic_entries", "page_path", &base_key)?;
-        delete_key_family(&tx, "view_trim.view_trim_pages", "page_path", &base_key)?;
-        delete_key_family(&tx, "rotation.rotations", "path", &base_key)?;
-        insert_page_state(&tx, &base_key, &entry.page_state)?;
+        delete_key_family(tx, "crop.export_crop_pages", "page_path", &base_key)?;
+        delete_key_family(tx, "comic.comic_entries", "page_path", &base_key)?;
+        delete_key_family(tx, "view_trim.view_trim_pages", "page_path", &base_key)?;
+        delete_key_family(tx, "rotation.rotations", "path", &base_key)?;
+        insert_page_state(tx, &base_key, &entry.page_state)?;
         for item in &entry.virtual_items {
             insert_page_state(
-                &tx,
+                tx,
                 &canonical_virtual_item_key(&base_key, &item.member_key),
                 &item.page_state,
             )?;
@@ -3672,24 +2995,18 @@ fn apply_entry(
     if sections.container_state {
         let container_key = crate::path_key::normalize(path);
         let include_nested = entry.kind == PortableEntryKind::File;
+        delete_container_family(tx, "spread.spreads", "path", &container_key, include_nested)?;
         delete_container_family(
-            &tx,
-            "spread.spreads",
-            "path",
-            &container_key,
-            include_nested,
-        )?;
-        delete_container_family(
-            &tx,
+            tx,
             "view_trim.view_trim_books",
             "book_key",
             &container_key,
             include_nested,
         )?;
-        insert_container_state(&tx, &container_key, &entry.container_state)?;
+        insert_container_state(tx, &container_key, &entry.container_state)?;
         for container in &entry.nested_containers {
             insert_container_state(
-                &tx,
+                tx,
                 &join_container_key(&container_key, &container.member_key),
                 &container.state,
             )?;
@@ -3698,7 +3015,7 @@ fn apply_entry(
     if sections.thumbnail_pins {
         let include_nested = entry.kind == PortableEntryKind::File;
         delete_container_family(
-            &tx,
+            tx,
             "folder_pin.folder_thumb_pins",
             "container_key",
             &base_key,
@@ -3710,13 +3027,13 @@ fn apply_entry(
         )
         .map_err(db_error)?;
         insert_folder_pin(
-            &tx,
+            tx,
             &base_key,
             entry.container_state.folder_thumb_pin.as_ref(),
         )?;
         for container in &entry.nested_containers {
             insert_folder_pin(
-                &tx,
+                tx,
                 &join_container_key(&base_key, &container.member_key),
                 container.state.folder_thumb_pin.as_ref(),
             )?;
@@ -3737,7 +3054,7 @@ fn apply_entry(
             .map_err(db_error)?;
         }
     }
-    tx.commit().map_err(db_error)
+    Ok(())
 }
 
 fn automatic_sidecar_sync(path: &Path, kind: PortableEntryKind) -> Option<(String, i64)> {
@@ -3757,7 +3074,7 @@ fn automatic_sidecar_sync(path: &Path, kind: PortableEntryKind) -> Option<(Strin
 }
 
 fn insert_page_state(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     key: &str,
     state: &PortablePageState,
 ) -> Result<(), TransferError> {
@@ -3835,7 +3152,7 @@ fn insert_page_state(
 }
 
 fn insert_mask(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     table: &str,
     key_column: &str,
     key: &str,
@@ -3865,7 +3182,7 @@ fn insert_mask(
 }
 
 fn insert_container_state(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     stripped_key: &str,
     state: &PortableContainerState,
 ) -> Result<(), TransferError> {
@@ -3891,7 +3208,7 @@ fn insert_container_state(
 }
 
 fn insert_folder_pin(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     key: &str,
     pin: Option<&PortableFolderThumbPin>,
 ) -> Result<(), TransferError> {
@@ -3917,7 +3234,7 @@ fn insert_folder_pin(
 }
 
 fn delete_container_family(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     table: &str,
     column: &str,
     base_key: &str,
@@ -3944,7 +3261,7 @@ fn join_container_key(base: &str, member: &str) -> String {
 }
 
 fn delete_key_family(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     table: &str,
     column: &str,
     base_key: &str,
@@ -3959,7 +3276,7 @@ fn delete_key_family(
 }
 
 fn insert_rating(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     key: &str,
     source_path: &Path,
     rating: &PortableRating,
@@ -3988,7 +3305,7 @@ fn insert_rating(
 }
 
 fn insert_tags(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     key: &str,
     tags: &[String],
     fallback_time_ms: i64,
@@ -4931,7 +4248,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_case_virtual_member_uses_one_canonical_key_for_db_and_refresh() {
+    fn mixed_case_virtual_member_uses_one_canonical_key_for_all_databases() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("library");
         let data_dir = temp.path().join("data");
@@ -4999,23 +4316,7 @@ mod tests {
         let base_key = crate::path_key::normalize_keep_drive(&root.join("book.zip"));
         let canonical_key = canonical_virtual_item_key(&base_key, mixed_member);
         let raw_key = format!("{base_key}::{mixed_member}");
-        let refresh_scope = ImportRefreshScope {
-            base_keys: HashSet::from([base_key.clone()]),
-            ..ImportRefreshScope::default()
-        };
-        let mut refreshes = Vec::new();
-        let summary = import_at_with_refresh_scope(
-            &data_dir,
-            &root,
-            &cancel,
-            Some(&refresh_scope),
-            no_progress,
-            |refresh| {
-                refreshes.push(refresh);
-                Ok(())
-            },
-        )
-        .unwrap();
+        let summary = import_at(&data_dir, &root, &cancel, no_progress).unwrap();
         assert_eq!(summary.failed_entries, 0);
 
         let rating_db = Connection::open(data_dir.join("rating.db")).unwrap();
@@ -5088,17 +4389,6 @@ mod tests {
                 .unwrap(),
             0
         );
-        let refreshed = &refreshes[0].visible_entries[0];
-        assert_eq!(refreshed.ratings.as_ref().unwrap()[1].key, canonical_key);
-        assert_eq!(refreshed.tags.as_ref().unwrap()[1].key, canonical_key);
-        assert_eq!(
-            refreshed.page_states.as_ref().unwrap()[1].key,
-            canonical_key
-        );
-        assert_eq!(
-            refreshed.container_states.as_ref().unwrap().items[1].key,
-            canonical_container_key
-        );
     }
 
     #[test]
@@ -5151,154 +4441,6 @@ mod tests {
             Err(TransferError::Invalid(message))
                 if message.contains("仮想コンテナキーが不正または重複")
         ));
-    }
-
-    #[test]
-    fn refresh_fragments_bound_virtual_items_and_emit_missing_visible_defaults() {
-        let path = PathBuf::from("C:/Pictures/book.zip");
-        let base_key = crate::path_key::normalize_keep_drive(&path);
-        let virtual_items = (0..700)
-            .map(|index| PortableVirtualItem {
-                member_key: format!("pages/{index:04}.jpg"),
-                rating: Some(PortableRating {
-                    stars: 4,
-                    rated_at_ms: None,
-                    kind: Some("zip_image".to_string()),
-                    entry_name: None,
-                    page_num: None,
-                    dir_prefix: None,
-                    archive_format: None,
-                    zipdir_is_archive: None,
-                    zipdir_representative: None,
-                }),
-                tags: vec!["tag".to_string()],
-                page_state: PortablePageState::default(),
-            })
-            .collect();
-        let entry = PortableEntry {
-            path: "book.zip".to_string(),
-            kind: PortableEntryKind::File,
-            fingerprint: None,
-            rating: None,
-            tags: Vec::new(),
-            timed_bookmarks: Vec::new(),
-            book_bookmarks: Vec::new(),
-            page_state: PortablePageState::default(),
-            container_state: PortableContainerState::default(),
-            nested_containers: Vec::new(),
-            video_pin: None,
-            virtual_items,
-        };
-        let missing_key = canonical_virtual_item_key(&base_key, "pages/missing.jpg");
-        let visible_keys = HashSet::from([base_key.clone(), missing_key.clone()]);
-        let mut refreshes = Vec::new();
-        {
-            let mut callback = |refresh| {
-                refreshes.push(refresh);
-                Ok(())
-            };
-            let mut batcher = ImportRefreshBatcher {
-                callback: &mut callback,
-                batch: ImportRefreshDelta::default(),
-                values: 0,
-                bytes: 0,
-                started: std::time::Instant::now(),
-            };
-            emit_import_refresh_fragments(
-                &path,
-                &entry,
-                ManifestSections::default(),
-                true,
-                Some(&visible_keys),
-                &mut batcher,
-            )
-            .unwrap();
-            batcher.flush().unwrap();
-        }
-
-        assert!(refreshes.len() >= 3);
-        assert!(refreshes.iter().all(|refresh| {
-            refresh
-                .visible_entries
-                .iter()
-                .map(|entry| entry.page_states.as_ref().map_or(0, Vec::len))
-                .sum::<usize>()
-                <= IMPORT_REFRESH_BATCH_VALUES
-        }));
-        let missing = refreshes
-            .iter()
-            .flat_map(|refresh| &refresh.visible_entries)
-            .flat_map(|entry| entry.ratings.as_deref().unwrap_or_default())
-            .find(|value| value.key == missing_key)
-            .expect("visible member absent from manifest receives an explicit reset");
-        assert_eq!(missing.stars, 0);
-    }
-
-    #[test]
-    fn refresh_fragments_split_one_items_large_tag_list_for_incremental_replace() {
-        let path = PathBuf::from("C:/Pictures/image.jpg");
-        let expected = (0..1_000)
-            .map(|index| format!("tag-{index:04}-{}", "x".repeat(600)))
-            .collect::<Vec<_>>();
-        let entry = PortableEntry {
-            path: "image.jpg".to_string(),
-            kind: PortableEntryKind::File,
-            fingerprint: None,
-            rating: None,
-            tags: expected.clone(),
-            timed_bookmarks: Vec::new(),
-            book_bookmarks: Vec::new(),
-            page_state: PortablePageState::default(),
-            container_state: PortableContainerState::default(),
-            nested_containers: Vec::new(),
-            video_pin: None,
-            virtual_items: Vec::new(),
-        };
-        let mut refreshes = Vec::new();
-        {
-            let mut callback = |refresh| {
-                refreshes.push(refresh);
-                Ok(())
-            };
-            let mut batcher = ImportRefreshBatcher {
-                callback: &mut callback,
-                batch: ImportRefreshDelta::default(),
-                values: 0,
-                bytes: 0,
-                started: std::time::Instant::now(),
-            };
-            emit_import_refresh_fragments(
-                &path,
-                &entry,
-                ManifestSections::default(),
-                true,
-                None,
-                &mut batcher,
-            )
-            .unwrap();
-            batcher.flush().unwrap();
-        }
-
-        let tag_values = refreshes
-            .iter()
-            .flat_map(|refresh| &refresh.visible_entries)
-            .flat_map(|entry| entry.tags.as_deref().unwrap_or_default())
-            .collect::<Vec<_>>();
-        assert!(tag_values.len() > 1);
-        assert!(tag_values[0].replace);
-        assert!(tag_values.iter().skip(1).all(|value| !value.replace));
-        assert_eq!(
-            tag_values
-                .iter()
-                .flat_map(|value| value.tags.iter().cloned())
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert!(
-            tag_values
-                .iter()
-                .all(|value| estimated_tags_value_bytes(value) <= IMPORT_REFRESH_BATCH_BYTES)
-        );
     }
 
     #[test]
@@ -5739,38 +4881,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
         copy_sidecar_bundle(&source, &destination);
-        let listed_key = crate::path_key::normalize_keep_drive(&destination.join("listed.jpg"));
-        let refresh_scope = ImportRefreshScope {
-            base_keys: HashSet::from([listed_key.clone()]),
-            ..ImportRefreshScope::default()
-        };
-        let mut refreshes = Vec::new();
-        let _summary = import_at_with_refresh_scope(
-            &destination_data,
-            &destination,
-            &cancel,
-            Some(&refresh_scope),
-            no_progress,
-            |refresh| {
-                refreshes.push(refresh);
-                Ok(())
-            },
-        )
-        .unwrap();
-        let visible_entries = refreshes
-            .iter()
-            .flat_map(|refresh| &refresh.visible_entries)
-            .collect::<Vec<_>>();
-        assert_eq!(visible_entries.len(), 1);
-        assert_eq!(visible_entries[0].base_key, listed_key);
-        assert_eq!(
-            visible_entries[0]
-                .ratings
-                .as_ref()
-                .and_then(|ratings| ratings.first())
-                .map(|rating| rating.stars),
-            Some(0)
-        );
+        let _summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
 
         assert_eq!(
             rating(&destination_data, &destination.join("listed.jpg")),
@@ -5951,56 +5062,7 @@ mod tests {
     }
 
     #[test]
-    fn import_refresh_is_emitted_in_bounded_batches() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        let source_data = temp.path().join("source-data");
-        let destination_data = temp.path().join("destination-data");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        for index in 0..600 {
-            let name = format!("{index:04}.jpg");
-            fs::write(source.join(&name), b"x").unwrap();
-            fs::write(destination.join(&name), b"x").unwrap();
-        }
-        init_data_dir(&source_data);
-        init_data_dir(&destination_data);
-        let cancel = AtomicBool::new(false);
-        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
-        copy_sidecar_bundle(&source, &destination);
-
-        let mut batch_sizes = Vec::new();
-        let mut saw_rating_change = false;
-        let mut saw_tag_change = false;
-        let summary = import_at_with_refresh_scope(
-            &destination_data,
-            &destination,
-            &cancel,
-            None,
-            no_progress,
-            |refresh| {
-                saw_rating_change |= refresh.ratings_changed;
-                saw_tag_change |= refresh.tags_changed;
-                batch_sizes.push(refresh.committed_entries);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(summary.incomplete_error.is_none());
-        assert_eq!(batch_sizes.iter().sum::<usize>(), summary.applied_entries);
-        assert!(
-            batch_sizes
-                .iter()
-                .all(|size| *size <= IMPORT_REFRESH_BATCH_VALUES)
-        );
-        assert!(batch_sizes.len() >= 3);
-        assert!(saw_rating_change);
-        assert!(saw_tag_change);
-    }
-
-    #[test]
-    fn second_pass_parse_failure_returns_committed_summary_and_refresh() {
+    fn second_pass_parse_failure_returns_committed_summary() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -6041,36 +5103,21 @@ mod tests {
         fs::write(&shard, padded).unwrap();
 
         let mut truncated = false;
-        let mut refreshed = 0_usize;
-        let summary = import_at_with_refresh_scope(
-            &destination_data,
-            &destination,
-            &cancel,
-            None,
-            |progress| {
-                if !truncated
-                    && progress.phase == TransferPhase::Importing
-                    && progress.processed == 1
-                {
-                    File::options()
-                        .write(true)
-                        .truncate(true)
-                        .open(&shard)
-                        .unwrap();
-                    truncated = true;
-                }
-            },
-            |refresh| {
-                refreshed += refresh.committed_entries;
-                Ok(())
-            },
-        )
+        let summary = import_at(&destination_data, &destination, &cancel, |progress| {
+            if !truncated && progress.phase == TransferPhase::Importing && progress.processed == 1 {
+                File::options()
+                    .write(true)
+                    .truncate(true)
+                    .open(&shard)
+                    .unwrap();
+                truncated = true;
+            }
+        })
         .unwrap();
 
         assert!(truncated);
         assert!(summary.incomplete_error.is_some());
         assert!(summary.applied_entries >= 1);
-        assert_eq!(refreshed, summary.applied_entries);
     }
 
     #[test]
@@ -6095,6 +5142,31 @@ mod tests {
             read_manifest(&root, &cancel).unwrap().entries.len(),
             expected
         );
+    }
+
+    #[test]
+    fn import_uses_bounded_outer_transactions_instead_of_per_item_commits() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for index in 0..600 {
+            let name = format!("{index:04}.jpg");
+            fs::write(source.join(&name), b"x").unwrap();
+            fs::write(destination.join(&name), b"x").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.applied_entries, 601);
+        assert_eq!(summary.transaction_batches, 3);
     }
 
     #[test]

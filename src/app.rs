@@ -52,6 +52,7 @@ mod detached_window_manager;
 mod folder_scan;
 mod gamepad_input;
 mod grid_paint;
+pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
 #[cfg(windows)]
 mod native_video;
@@ -1802,27 +1803,33 @@ pub(crate) struct RatingSessionWrite {
     explicit_user: bool,
 }
 
-#[derive(Clone, Debug)]
-struct MetadataImportIndexedItem {
-    index: usize,
-    /// index 構築時の安定identity。items世代が変わった場合は適用直前に再照合する。
-    key: String,
-}
-
 #[derive(Default)]
 struct MetadataImportRefreshIndex {
     items_generation: u64,
     next_item: usize,
     complete: bool,
-    rating_indices: HashMap<String, Vec<MetadataImportIndexedItem>>,
-    page_indices: HashMap<String, Vec<MetadataImportIndexedItem>>,
-    container_indices: HashMap<String, Vec<MetadataImportIndexedItem>>,
-    video_indices: HashMap<String, Vec<MetadataImportIndexedItem>>,
-    edit_pipeline_invalidated: bool,
-    ratings_changed: bool,
-    tags_changed: bool,
-    page_state_changed: bool,
-    any_refresh: bool,
+    affected: bool,
+    items: Vec<metadata_import_refresh::ItemKey>,
+    current_rating_key: Option<String>,
+}
+
+fn metadata_import_context_path_is_affected(
+    path: &Path,
+    import_root: &Path,
+    recursive: bool,
+) -> bool {
+    let key = crate::path_key::normalize_keep_drive(path);
+    let root = crate::path_key::normalize_keep_drive(import_root);
+    if key == root {
+        return true;
+    }
+    if recursive {
+        return key
+            .strip_prefix(&root)
+            .is_some_and(|suffix| suffix.starts_with('/'));
+    }
+    path.parent()
+        .is_some_and(|parent| crate::path_key::normalize_keep_drive(parent) == root)
 }
 
 #[cfg(windows)]
@@ -22460,9 +22467,8 @@ impl App {
         self.invalidate_tag_apply_suggestions();
     }
 
-    /// import開始前の表示scope/index構築を開始する。items全件の走査は
-    /// [`advance_metadata_import_refresh_scope`] がフレーム予算内で段階実行する。
-    pub(crate) fn begin_metadata_import_refresh_scope(&mut self) {
+    /// 終端refreshのcompact indexを全viewer contextから破棄する。
+    fn clear_metadata_import_refresh_indexes(&mut self) {
         self.metadata_import_refresh_index = None;
         #[cfg(windows)]
         {
@@ -22485,19 +22491,27 @@ impl App {
         }
     }
 
-    /// main / detached / parked contextの索引を、合計件数とwall-clockの双方で
-    /// 区切って構築する。trueなら全contextが同一items世代で完成した。
-    pub(crate) fn advance_metadata_import_refresh_scope(
+    /// DB更新終端後の表示cache再取得準備を開始する。
+    pub(crate) fn begin_metadata_import_terminal_refresh(&mut self) {
+        self.clear_metadata_import_refresh_indexes();
+    }
+
+    pub(crate) fn advance_metadata_import_terminal_refresh(
         &mut self,
-        scope: &mut crate::metadata_transfer::ImportRefreshScope,
+        import_root: &Path,
+        recursive: bool,
     ) -> bool {
         const MAX_ITEMS_PER_FRAME: usize = 2_048;
         const MAX_TIME_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(3);
 
         let deadline = std::time::Instant::now() + MAX_TIME_PER_FRAME;
         let mut remaining = MAX_ITEMS_PER_FRAME;
-        let mut complete =
-            self.advance_current_metadata_import_refresh_index(scope, &mut remaining, deadline);
+        let mut complete = self.advance_current_metadata_import_terminal_index(
+            import_root,
+            recursive,
+            &mut remaining,
+            deadline,
+        );
         #[cfg(windows)]
         {
             if complete
@@ -22506,8 +22520,9 @@ impl App {
                 && let Some(mut active) = self.active_detached_viewer_context.take()
             {
                 self.swap_viewer_context_bundle(&mut active.bundle);
-                complete = self.advance_current_metadata_import_refresh_index(
-                    scope,
+                complete = self.advance_current_metadata_import_terminal_index(
+                    import_root,
+                    recursive,
                     &mut remaining,
                     deadline,
                 );
@@ -22525,8 +22540,9 @@ impl App {
                         continue;
                     };
                     self.swap_viewer_context_bundle(&mut bundle);
-                    complete = self.advance_current_metadata_import_refresh_index(
-                        scope,
+                    complete = self.advance_current_metadata_import_terminal_index(
+                        import_root,
+                        recursive,
                         &mut remaining,
                         deadline,
                     );
@@ -22541,336 +22557,319 @@ impl App {
         complete
     }
 
-    fn advance_current_metadata_import_refresh_index(
+    fn advance_current_metadata_import_terminal_index(
         &mut self,
-        scope: &mut crate::metadata_transfer::ImportRefreshScope,
+        import_root: &Path,
+        recursive: bool,
         remaining: &mut usize,
         deadline: std::time::Instant,
     ) -> bool {
-        fn physical_path(item: &GridItem) -> Option<&std::path::Path> {
-            match item {
-                GridItem::Folder(path)
-                | GridItem::Image(path)
-                | GridItem::Video(path)
-                | GridItem::Audio(path)
-                | GridItem::ZipFile(path)
-                | GridItem::PdfFile(path)
-                | GridItem::ConvertibleArchive { path, .. }
-                | GridItem::SearchContainer { path, .. } => Some(path.as_path()),
-                GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
-                    Some(zip_path.as_path())
-                }
-                GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.as_path()),
-                GridItem::Stack { representative, .. } => Some(representative.as_path()),
-            }
-        }
-        fn family(key: &str) -> &str {
-            key.split_once("::").map_or(key, |(base, _)| base)
-        }
-
-        let needs_restart = self
+        let restart = self
             .metadata_import_refresh_index
             .as_ref()
             .is_none_or(|index| index.items_generation != self.items_generation);
-        if needs_restart {
-            let mut index = MetadataImportRefreshIndex {
+        if restart {
+            let affected = self.current_folder.as_deref().is_some_and(|path| {
+                metadata_import_context_path_is_affected(path, import_root, recursive)
+            }) || self.archive_source_override.as_deref().is_some_and(|path| {
+                metadata_import_context_path_is_affected(path, import_root, recursive)
+            });
+            let current_rating_key = self
+                .current_container_rating_key_and_source()
+                .map(|(key, _)| key);
+            self.metadata_import_refresh_index = Some(MetadataImportRefreshIndex {
                 items_generation: self.items_generation,
+                current_rating_key,
+                affected,
+                complete: !affected || self.items.is_empty(),
                 ..MetadataImportRefreshIndex::default()
-            };
-            if self.items.is_empty() {
-                index.complete = true;
-            }
-            self.metadata_import_refresh_index = Some(index);
-            if let Some(path) = self.current_folder.as_deref() {
-                scope
-                    .base_keys
-                    .insert(crate::path_key::normalize_keep_drive(path));
-            }
-            if let Some(path) = self.archive_source_override.as_deref() {
-                scope
-                    .base_keys
-                    .insert(crate::path_key::normalize_keep_drive(path));
-            }
+            });
         }
+
         let mut index = self
             .metadata_import_refresh_index
             .take()
-            .expect("initialized above");
-        while index.next_item < self.items.len()
+            .expect("terminal metadata refresh index initialized");
+        while index.affected
+            && index.next_item < self.items.len()
             && *remaining > 0
             && std::time::Instant::now() < deadline
         {
             let item_index = index.next_item;
+            let rating_key = self.rating_path_key(item_index);
+            let page_key = self.page_path_key(item_index);
             let item = &self.items[item_index];
-            if let Some(path) = physical_path(item) {
-                scope
-                    .base_keys
-                    .insert(crate::path_key::normalize_keep_drive(path));
-            }
-            if let Some(key) = self.rating_path_key(item_index) {
-                scope
-                    .visible_keys
-                    .entry(family(&key).to_string())
-                    .or_default()
-                    .insert(key.clone());
-                index.rating_indices.entry(key.clone()).or_default().push(
-                    MetadataImportIndexedItem {
-                        index: item_index,
-                        key,
-                    },
-                );
-            }
-            if let Some(key) = self.page_path_key(item_index) {
-                scope
-                    .visible_keys
-                    .entry(family(&key).to_string())
-                    .or_default()
-                    .insert(key.clone());
-                index.page_indices.entry(key.clone()).or_default().push(
-                    MetadataImportIndexedItem {
-                        index: item_index,
-                        key,
-                    },
-                );
-            }
-            if let Some(path) = item.container_path() {
-                let key = crate::path_key::normalize_keep_drive(path);
-                index
-                    .container_indices
-                    .entry(key.clone())
-                    .or_default()
-                    .push(MetadataImportIndexedItem {
-                        index: item_index,
-                        key,
-                    });
-            }
-            if let GridItem::Video(path) = item {
-                let key = crate::path_key::normalize_keep_drive(path);
-                index.video_indices.entry(key.clone()).or_default().push(
-                    MetadataImportIndexedItem {
-                        index: item_index,
-                        key,
-                    },
-                );
+            let container_path = item.container_path().map(Path::to_path_buf);
+            let (video_path, video_size) = if let GridItem::Video(path) = item {
+                let size = self
+                    .image_metas
+                    .get(item_index)
+                    .and_then(|metadata| *metadata)
+                    .map(|(_, size)| size.max(0) as u64)
+                    .unwrap_or(0);
+                (Some(path.clone()), size)
+            } else {
+                (None, 0)
+            };
+
+            if rating_key.is_some()
+                || page_key.is_some()
+                || container_path.is_some()
+                || video_path.is_some()
+            {
+                let (key, rating, page, alternate_page_key) = match (rating_key, page_key) {
+                    (Some(rating_key), Some(page_key)) if rating_key == page_key => {
+                        (rating_key, true, true, None)
+                    }
+                    (Some(rating_key), Some(page_key)) => (rating_key, true, false, Some(page_key)),
+                    (Some(rating_key), None) => (rating_key, true, false, None),
+                    (None, Some(page_key)) => (page_key, false, true, None),
+                    (None, None) => (String::new(), false, false, None),
+                };
+                index.items.push(metadata_import_refresh::ItemKey {
+                    index: item_index,
+                    key,
+                    rating,
+                    page,
+                    alternate_page_key,
+                    container_path,
+                    video_path,
+                    video_size,
+                });
             }
             index.next_item += 1;
             *remaining -= 1;
         }
-        index.complete =
-            index.items_generation == self.items_generation && index.next_item >= self.items.len();
+        index.complete = !index.affected
+            || (index.items_generation == self.items_generation
+                && index.next_item >= self.items.len());
         let complete = index.complete;
         self.metadata_import_refresh_index = Some(index);
         complete
     }
 
-    #[cfg(test)]
-    pub(crate) fn metadata_import_refresh_scope(
+    pub(crate) fn take_metadata_import_refresh_requests(
         &mut self,
-    ) -> crate::metadata_transfer::ImportRefreshScope {
-        let mut scope = crate::metadata_transfer::ImportRefreshScope::default();
-        self.begin_metadata_import_refresh_scope();
-        while !self.advance_metadata_import_refresh_scope(&mut scope) {}
-        scope
-    }
+    ) -> Vec<metadata_import_refresh::ContextRequest> {
+        fn take_current(
+            index: &mut Option<MetadataImportRefreshIndex>,
+            slot: metadata_import_refresh::ContextSlot,
+            spread_container_path: Option<PathBuf>,
+            old_folder_pin_keys: std::collections::HashSet<String>,
+        ) -> Option<metadata_import_refresh::ContextRequest> {
+            let index = index.take()?;
+            (index.complete && index.affected).then_some(metadata_import_refresh::ContextRequest {
+                slot,
+                items_generation: index.items_generation,
+                items: index.items,
+                current_rating_key: index.current_rating_key,
+                spread_container_path,
+                old_folder_pin_keys,
+            })
+        }
 
-    pub(crate) fn finish_metadata_transfer_import_refresh(&mut self) {
-        let any_refresh = self.finish_current_metadata_transfer_import_refresh();
+        let mut requests = Vec::new();
+        let spread_path = self.spread_container_key();
+        let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+        if let Some(request) = take_current(
+            &mut self.metadata_import_refresh_index,
+            metadata_import_refresh::ContextSlot::Main,
+            spread_path,
+            old_folder_pin_keys,
+        ) {
+            requests.push(request);
+        }
         #[cfg(windows)]
         {
             if let Some(mut active) = self.active_detached_viewer_context.take() {
+                let window_id = self.active_detached_window_id();
                 self.swap_viewer_context_bundle(&mut active.bundle);
-                self.finish_current_metadata_transfer_import_refresh();
+                let spread_path = self.spread_container_key();
+                let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+                if let Some(request) = take_current(
+                    &mut self.metadata_import_refresh_index,
+                    metadata_import_refresh::ContextSlot::ActiveDetached(window_id),
+                    spread_path,
+                    old_folder_pin_keys,
+                ) {
+                    requests.push(request);
+                }
                 self.swap_viewer_context_bundle(&mut active.bundle);
                 self.active_detached_viewer_context = Some(active);
             }
-            for index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
+            for window_index in 0..self.detached_image_windows.len() {
+                let window_id = self.detached_image_windows[window_index].id;
+                let Some(mut bundle) = self.detached_image_windows[window_index]
+                    .paused_bundle
+                    .take()
                 else {
                     continue;
                 };
                 self.swap_viewer_context_bundle(&mut bundle);
-                self.finish_current_metadata_transfer_import_refresh();
+                let spread_path = self.spread_container_key();
+                let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+                if let Some(request) = take_current(
+                    &mut self.metadata_import_refresh_index,
+                    metadata_import_refresh::ContextSlot::PausedDetached {
+                        index: window_index,
+                        window_id,
+                    },
+                    spread_path,
+                    old_folder_pin_keys,
+                ) {
+                    requests.push(request);
+                }
                 self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[index].paused_bundle = Some(bundle);
+                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
             }
         }
-        if any_refresh {
-            self.notify_bookmarks_changed();
-        }
+        requests
     }
 
-    fn finish_current_metadata_transfer_import_refresh(&mut self) -> bool {
-        let Some(index) = self.metadata_import_refresh_index.take() else {
-            return false;
-        };
-        if index.ratings_changed {
+    pub(crate) fn abort_metadata_import_terminal_refresh(&mut self) {
+        self.clear_metadata_import_refresh_indexes();
+    }
+
+    pub(crate) fn apply_metadata_import_terminal_refresh(
+        &mut self,
+        result: metadata_import_refresh::RefreshResult,
+        changed: crate::metadata_transfer::ImportChangedSections,
+    ) -> (Vec<String>, bool) {
+        let stale_before_apply = result.contexts.iter().any(|context| match context.slot {
+            metadata_import_refresh::ContextSlot::Main => {
+                context.items_generation != self.items_generation
+            }
+            #[cfg(windows)]
+            metadata_import_refresh::ContextSlot::ActiveDetached(expected_window_id) => {
+                self.active_detached_window_id() != expected_window_id
+                    || self
+                        .active_detached_viewer_context
+                        .as_ref()
+                        .is_some_and(|active| {
+                            active.bundle.items_generation != context.items_generation
+                        })
+            }
+            #[cfg(windows)]
+            metadata_import_refresh::ContextSlot::PausedDetached {
+                index: window_index,
+                window_id,
+            } => self
+                .detached_image_windows
+                .get(window_index)
+                .is_some_and(|window| {
+                    window.id != window_id
+                        || window.paused_bundle.as_ref().is_some_and(|bundle| {
+                            bundle.items_generation != context.items_generation
+                        })
+                }),
+            #[cfg(not(windows))]
+            _ => false,
+        });
+        if stale_before_apply {
+            return (result.errors, true);
+        }
+        let mut stale_context = false;
+        if let Some(snapshot) = result.page_snapshot {
+            self.replace_metadata_import_page_state_snapshot(snapshot);
+        }
+        for context in result.contexts {
+            match context.slot {
+                metadata_import_refresh::ContextSlot::Main => {
+                    stale_context |=
+                        !self.apply_current_metadata_import_terminal_result(context, changed);
+                }
+                #[cfg(windows)]
+                metadata_import_refresh::ContextSlot::ActiveDetached(expected_window_id) => {
+                    if self.active_detached_window_id() != expected_window_id {
+                        stale_context = true;
+                    } else if let Some(mut active) = self.active_detached_viewer_context.take() {
+                        self.swap_viewer_context_bundle(&mut active.bundle);
+                        stale_context |=
+                            !self.apply_current_metadata_import_terminal_result(context, changed);
+                        self.swap_viewer_context_bundle(&mut active.bundle);
+                        self.active_detached_viewer_context = Some(active);
+                    }
+                }
+                #[cfg(windows)]
+                metadata_import_refresh::ContextSlot::PausedDetached {
+                    index: window_index,
+                    window_id,
+                } => {
+                    if self
+                        .detached_image_windows
+                        .get(window_index)
+                        .is_some_and(|window| window.id != window_id)
+                    {
+                        stale_context = true;
+                        continue;
+                    }
+                    if let Some(mut bundle) = self
+                        .detached_image_windows
+                        .get_mut(window_index)
+                        .and_then(|window| window.paused_bundle.take())
+                    {
+                        self.swap_viewer_context_bundle(&mut bundle);
+                        stale_context |=
+                            !self.apply_current_metadata_import_terminal_result(context, changed);
+                        self.swap_viewer_context_bundle(&mut bundle);
+                        if let Some(window) = self.detached_image_windows.get_mut(window_index) {
+                            window.paused_bundle = Some(bundle);
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                _ => {}
+            }
+        }
+
+        if changed.ratings {
             self.invalidate_rating_counts_cache();
             self.reset_folder_rating_counts();
             self.schedule_current_smart_folder_metadata_refresh(
                 smart_folder::SmartFolderMetadataDependency::Rating,
             );
         }
-        if (index.ratings_changed || index.tags_changed) && self.settings.write_rating_to_xmp {
-            self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
-        }
-        if index.tags_changed {
-            self.start_tag_legacy_seed_for_current_items();
+        if changed.tags {
             self.schedule_current_smart_folder_metadata_refresh(
                 smart_folder::SmartFolderMetadataDependency::Tags,
             );
+            self.invalidate_tag_apply_suggestions();
         }
-        if index.page_state_changed {
+        if changed.page_state {
             self.schedule_current_smart_folder_metadata_refresh(
                 smart_folder::SmartFolderMetadataDependency::Edits,
             );
         }
-        if (index.ratings_changed || index.tags_changed || index.page_state_changed)
+        if (changed.ratings || changed.tags || changed.page_state)
             && self.settings.facet_filter.is_active()
         {
             self.rebuild_visible_indices();
         }
-        index.any_refresh
+        if changed.book_bookmarks || changed.timed_bookmarks {
+            self.notify_bookmarks_changed();
+        }
+        (result.errors, stale_context)
     }
 
-    /// 明示メタ情報インポートのcommit済み差分を、所有中の各viewer contextへ適用する。
-    /// SQLite のpoint read / prewarm / folder reloadはUI threadで行わない。
-    pub(crate) fn refresh_after_metadata_transfer_import(
+    fn apply_current_metadata_import_terminal_result(
         &mut self,
-        refresh: crate::metadata_transfer::ImportRefreshDelta,
-    ) {
-        if refresh.is_empty() {
-            return;
+        mut result: metadata_import_refresh::ContextResult,
+        changed: crate::metadata_transfer::ImportChangedSections,
+    ) -> bool {
+        if result.items_generation != self.items_generation {
+            return false;
         }
-        self.apply_metadata_transfer_import_refresh(&refresh);
-        // 差分を最終resultへ蓄積せず、受信したbounded batchを所有contextごとに
-        // その場で適用する。main / detached / parkedのどれもmount待ちpayloadを持たない。
-        #[cfg(windows)]
-        {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.apply_metadata_transfer_import_refresh(&refresh);
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            for index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
-                else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.apply_metadata_transfer_import_refresh(&refresh);
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[index].paused_bundle = Some(bundle);
-            }
-        }
-    }
-
-    fn apply_metadata_transfer_import_refresh(
-        &mut self,
-        refresh: &crate::metadata_transfer::ImportRefreshDelta,
-    ) {
-        use std::collections::{HashMap, HashSet};
-
-        fn family_base_for_item(key: &str) -> &str {
-            key.split_once("::").map_or(key, |(base, _)| base)
-        }
-        fn container_in_family(key: &str, base: &str, include_nested: bool) -> bool {
-            key == base
-                || (include_nested
-                    && key
-                        .strip_prefix(base)
-                        .is_some_and(|suffix| suffix.starts_with('/')))
-        }
-
-        let mut refresh_index = self
-            .metadata_import_refresh_index
-            .take()
-            .unwrap_or_default();
-        let index_generation_changed =
-            refresh_index.items_generation != self.items_generation || !refresh_index.complete;
-        let imported = &refresh.visible_entries;
-        refresh_index.any_refresh |= refresh.any_entry_applied || !imported.is_empty();
-        let mut any_rating = refresh.ratings_changed;
-        for entry in imported {
-            let Some(values) = entry.ratings.as_ref() else {
-                continue;
-            };
-            any_rating = true;
-            let values = values
-                .iter()
-                .map(|value| (value.key.as_str(), value.stars))
-                .collect::<HashMap<_, _>>();
-            for (key, stars) in &values {
-                if let Some(indices) = refresh_index.rating_indices.get(*key) {
-                    for indexed in indices {
-                        let Some(current_key) = self.rating_path_key(indexed.index) else {
-                            continue;
-                        };
-                        // async import中に一覧世代が交換されても、同じraw indexの別項目へ
-                        // 適用しない。identityが一致する項目だけは安全に継続できる。
-                        if current_key == indexed.key {
-                            self.rating_cache.insert(indexed.index, *stars);
-                        }
-                    }
-                }
-            }
-            if let Some((key, _)) = self.current_container_rating_key_and_source()
-                && family_base_for_item(&key) == entry.base_key
-            {
-                if let Some(stars) = values.get(key.as_str()).copied() {
-                    self.current_folder_rating_cache = Some(stars);
-                }
-            }
-        }
-        if any_rating {
-            refresh_index.ratings_changed = true;
+        if let Some(ratings) = result.rating_cache.take() {
+            self.rating_cache = ratings;
+            self.current_folder_rating_cache = result.current_rating;
             self.rating_session_write_seen_generation = self.rating_session_write_generation;
-            // import前に開始済みのXMP読込が、commit後の0評価を古いXMP値で
-            // 上書きしないよう、最初のrating batchでcontext所有workerを停止する。
             if let Some(pending) = self.tag_prewarm_pending.take() {
                 pending.cancel();
             }
             self.tag_prewarm_queued.clear();
         }
-
-        let mut any_tags = refresh.tags_changed;
-        let mut tags_changed = false;
-        for entry in imported {
-            let Some(values) = entry.tags.as_ref() else {
-                continue;
-            };
-            any_tags = true;
-            let values = values
-                .iter()
-                .map(|value| (value.key.as_str(), (&value.tags, value.replace)))
-                .collect::<HashMap<_, _>>();
-            for (key, (tags, replace)) in values {
-                if let Some(indices) = refresh_index.rating_indices.get(key) {
-                    for indexed in indices {
-                        let Some(current_key) = self.rating_path_key(indexed.index) else {
-                            continue;
-                        };
-                        if current_key != indexed.key {
-                            continue;
-                        }
-                        if replace {
-                            if self.tags_cache.get(&current_key) != Some(tags) {
-                                self.tags_cache.insert(current_key, tags.clone());
-                                tags_changed = true;
-                            }
-                        } else if !tags.is_empty() {
-                            self.tags_cache
-                                .entry(current_key)
-                                .or_default()
-                                .extend(tags.iter().cloned());
-                            tags_changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        if any_tags {
-            refresh_index.tags_changed = true;
+        if let Some(tags) = result.tags_cache.take() {
+            self.tags_cache = tags;
             if let Some(pending) = self.tag_prewarm_pending.take() {
                 pending.cancel();
             }
@@ -22878,287 +22877,115 @@ impl App {
             if let Some(pending) = self.tag_legacy_seed_pending.take() {
                 pending.cancel();
             }
-            if tags_changed {
-                DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
-            }
-            self.invalidate_tag_apply_suggestions();
+            DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
         }
-
-        self.current_book_bookmarks.clear();
-        self.current_book_bookmarks_key = None;
-        self.current_book_bookmarks_request = None;
-        self.book_bookmark_title_edit = None;
-        self.fullscreen_video_marker_cache = None;
-        self.cancel_fullscreen_video_marker_thumb_decode();
-        self.music_bookmarks.clear();
-        self.music_bookmarks_loaded_for = None;
-
-        let mut page_families = HashSet::new();
-        let mut page_values = HashMap::new();
-        for entry in imported {
-            let Some(items) = entry.page_states.as_ref() else {
-                continue;
+        if let Some(page) = result.page_state.take() {
+            self.adjustment_page_params = page.adjustment_page_params;
+            self.local_adjust_pages = page.local_adjust_pages;
+            self.local_adjust_page_layers.clear();
+            self.local_adjust_selected_layers.clear();
+            self.export_crop_pages = page.export_crop_page_settings.keys().copied().collect();
+            self.export_crop_page_settings = page.export_crop_page_settings;
+            self.view_trim_page_overrides = page.view_trim_page_overrides;
+            self.mask_pages = page.mask_pages;
+            self.conceal_pages = page.conceal_pages;
+            self.comic_pages = page.comic_pages;
+            self.rotation_cache = page.rotation_cache;
+            self.adjustment_cache.clear();
+            self.thumb_adjust_tex.clear();
+            self.erase_result_cache.clear();
+            self.local_adjust_cache.clear();
+            self.local_adjust_layer_bypass_cache.clear();
+            self.local_adjust_prefix_preview_cache.clear();
+            self.edit_result_cache.clear();
+            self.conceal_base_cache.clear();
+            self.conceal_cache.clear();
+            self.comic_docs.clear();
+            self.cancel_all_local_adjust_pending();
+            self.cancel_all_erase_inpaint_pending();
+            self.bump_all_adjustment_generations();
+            self.clear_all_final_pipeline_caches();
+        }
+        if let Some(container) = result.container_state.take() {
+            let stored_spread = container
+                .spread_mode
+                .unwrap_or(self.settings.default_spread_mode);
+            self.reading_flow = container
+                .reading_flow
+                .unwrap_or(self.settings.default_reading_flow);
+            self.reading_direction = container
+                .reading_direction
+                .unwrap_or(self.settings.default_reading_direction);
+            if stored_spread == crate::settings::SpreadMode::Vertical {
+                self.spread_mode = crate::settings::SpreadMode::Single;
+                self.reading_flow = crate::settings::ReadingFlow::Vertical;
+            } else {
+                self.spread_mode = stored_spread;
+            }
+            if self.spread_mode.is_rtl() {
+                self.reading_direction = crate::settings::ReadingDirection::Rtl;
+            } else if matches!(
+                self.spread_mode,
+                crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
+            ) {
+                self.reading_direction = crate::settings::ReadingDirection::Ltr;
+            }
+            self.spread_shift_anchor_idx = None;
+            let trim = container.view_trim.unwrap_or_default();
+            self.view_trim_apply_mode = match trim.apply_mode {
+                crate::view_trim::ViewTrimApplyMode::Page => {
+                    crate::view_trim::ViewTrimApplyMode::None
+                }
+                mode => mode,
             };
-            page_families.insert(entry.base_key.clone());
-            for item in items {
-                page_values.insert(item.key.clone(), item);
-            }
+            self.view_trim_book_settings = trim.book_settings;
+            self.view_trim_page_apply_root_idx = None;
+            self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         }
-        if refresh.page_states_changed {
-            refresh_index.page_state_changed = true;
-        }
-        if !page_families.is_empty() {
-            refresh_index.page_state_changed = true;
-            let mut affected_pages = Vec::new();
-            for key in page_values.keys() {
-                let Some(indices) = refresh_index.page_indices.get(key) else {
-                    continue;
-                };
-                for indexed in indices {
-                    let Some(current_key) = self.page_path_key(indexed.index) else {
-                        continue;
-                    };
-                    if current_key == indexed.key {
-                        affected_pages.push((indexed.index, key.clone()));
-                    }
-                }
-            }
-            for (idx, key) in affected_pages {
-                let state = page_values.get(&key).copied();
-                if let Some(params) = state.and_then(|state| state.adjustment.as_ref()) {
-                    self.adjustment_page_params.insert(idx, params.clone());
-                } else {
-                    self.adjustment_page_params.remove(&idx);
-                }
-                self.local_adjust_page_layers.remove(&idx);
-                self.local_adjust_selected_layers.remove(&idx);
-                Self::set_page_presence(
-                    &mut self.local_adjust_pages,
-                    idx,
-                    state.is_some_and(|state| state.local_adjusted),
-                );
-                if let Some(settings) = state.and_then(|state| state.export_crop) {
-                    self.export_crop_page_settings.insert(idx, settings);
-                    self.export_crop_pages.insert(idx);
-                } else {
-                    self.export_crop_page_settings.remove(&idx);
-                    self.export_crop_pages.remove(&idx);
-                }
-                if let Some(page_override) = state.and_then(|state| state.view_trim) {
-                    self.view_trim_page_overrides.insert(idx, page_override);
-                } else {
-                    self.view_trim_page_overrides.remove(&idx);
-                }
-                Self::set_page_presence(
-                    &mut self.mask_pages,
-                    idx,
-                    state.is_some_and(|state| state.masked),
-                );
-                Self::set_page_presence(
-                    &mut self.conceal_pages,
-                    idx,
-                    state.is_some_and(|state| state.concealed),
-                );
-                Self::set_page_presence(
-                    &mut self.comic_pages,
-                    idx,
-                    state.is_some_and(|state| state.comic),
-                );
-                self.rotation_cache.insert(
-                    idx,
-                    crate::rotation_db::Rotation::from_degrees(
-                        state.and_then(|state| state.rotation_degrees).unwrap_or(0),
-                    ),
-                );
-                self.comic_docs.remove(&key);
-            }
-            if !refresh_index.edit_pipeline_invalidated {
-                // modal中は表示pipelineが再生成されないため、最初のpage batchで1回だけ
-                // context派生cacheを破棄すれば、後続batchも同じclean stateへ収束する。
-                self.adjustment_cache.clear();
-                self.thumb_adjust_tex.clear();
-                self.erase_result_cache.clear();
-                self.local_adjust_cache.clear();
-                self.local_adjust_layer_bypass_cache.clear();
-                self.local_adjust_prefix_preview_cache.clear();
-                self.edit_result_cache.clear();
-                self.conceal_base_cache.clear();
-                self.conceal_cache.clear();
-                self.cancel_all_local_adjust_pending();
-                self.cancel_all_erase_inpaint_pending();
-                self.bump_all_adjustment_generations();
-                self.clear_all_final_pipeline_caches();
-                refresh_index.edit_pipeline_invalidated = true;
-            }
-        }
-
-        let current_spread_key = self
-            .spread_container_key()
-            .map(|path| crate::path_key::normalize(&path));
-        if let Some(current_key) = current_spread_key.as_deref() {
-            let mut imported_state = None;
-            for entry in imported {
-                let Some(family) = entry.container_states.as_ref() else {
-                    continue;
-                };
-                if container_in_family(current_key, &family.base_key, family.include_nested) {
-                    let state = family.items.iter().find(|item| item.key == current_key);
-                    if state.is_some() || family.replace {
-                        imported_state = Some(state);
-                    }
-                }
-            }
-            if let Some(state) = imported_state {
-                let stored_spread = state
-                    .and_then(|state| state.spread)
-                    .map(|state| crate::settings::SpreadMode::from_int(state.mode))
-                    .unwrap_or(self.settings.default_spread_mode);
-                self.reading_flow = state
-                    .and_then(|state| state.spread)
-                    .map(|state| crate::settings::ReadingFlow::from_int(state.flow))
-                    .unwrap_or(self.settings.default_reading_flow);
-                self.reading_direction = state
-                    .and_then(|state| state.spread)
-                    .map(|state| crate::settings::ReadingDirection::from_int(state.direction))
-                    .unwrap_or(self.settings.default_reading_direction);
-                if stored_spread == crate::settings::SpreadMode::Vertical {
-                    self.spread_mode = crate::settings::SpreadMode::Single;
-                    self.reading_flow = crate::settings::ReadingFlow::Vertical;
-                } else {
-                    self.spread_mode = stored_spread;
-                }
-                if self.spread_mode.is_rtl() {
-                    self.reading_direction = crate::settings::ReadingDirection::Rtl;
-                } else if matches!(
-                    self.spread_mode,
-                    crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
-                ) {
-                    self.reading_direction = crate::settings::ReadingDirection::Ltr;
-                }
-                self.spread_shift_anchor_idx = None;
-
-                let trim = state.and_then(|state| state.view_trim).unwrap_or_default();
-                self.view_trim_apply_mode = match trim.apply_mode {
-                    crate::view_trim::ViewTrimApplyMode::Page => {
-                        crate::view_trim::ViewTrimApplyMode::None
-                    }
-                    mode => mode,
-                };
-                self.view_trim_book_settings = trim.book_settings;
-                self.view_trim_page_apply_root_idx = None;
-                self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
-            }
-        }
-
-        let pin_families = imported
-            .iter()
-            .filter_map(|entry| entry.folder_pins.as_ref())
-            .collect::<Vec<_>>();
-        if !pin_families.is_empty() {
-            let exact_pin_families = pin_families
-                .iter()
-                .filter(|family| family.replace)
-                .map(|family| family.base_key.as_str())
-                .collect::<HashSet<_>>();
-            let nested_pin_families = pin_families
-                .iter()
-                .filter(|family| family.replace && family.include_nested)
-                .map(|family| family.base_key.as_str())
-                .collect::<Vec<_>>();
-            self.folder_pin_map.retain(|key, _| {
-                !exact_pin_families.contains(key.as_str())
-                    && !nested_pin_families
-                        .iter()
-                        .any(|base| container_in_family(key, base, true))
-            });
-            for family in &pin_families {
-                self.folder_pin_map.extend(
-                    family
-                        .items
-                        .iter()
-                        .map(|item| (item.key.clone(), item.source.clone())),
-                );
-            }
-            let affected = exact_pin_families
-                .iter()
-                .filter_map(|family| refresh_index.container_indices.get(*family))
-                .flatten()
-                .filter_map(|indexed| {
-                    let key = self
-                        .items
-                        .get(indexed.index)?
-                        .container_path()
-                        .map(crate::path_key::normalize_keep_drive)?;
-                    (key == indexed.key).then_some(indexed.index)
-                })
-                .collect::<Vec<_>>();
-            for idx in affected {
-                if let Some(thumbnail) = self.thumbnails.get_mut(idx) {
-                    *thumbnail = ThumbnailState::Pending;
-                }
-                self.requested.remove(&idx);
-                self.pending_finalize.remove(&idx);
-            }
+        if let Some(folder_pins) = result.folder_pin_map.take() {
+            self.folder_pin_map = folder_pins;
             self.folder_thumb_pin_dirty = false;
         }
-
-        let video_changes = imported
-            .iter()
-            .filter_map(|entry| entry.video_pin.as_ref())
-            .map(|change| (change.key.as_str(), change))
-            .collect::<HashMap<_, _>>();
-        if !video_changes.is_empty() {
-            let mut video_items = Vec::new();
-            let mut pin_blobs = HashMap::new();
-            for (key, change) in video_changes {
-                let Some(indices) = refresh_index.video_indices.get(key) else {
-                    continue;
-                };
-                for indexed in indices {
-                    let Some(GridItem::Video(path)) = self.items.get(indexed.index) else {
-                        continue;
-                    };
-                    if crate::path_key::normalize_keep_drive(path) != indexed.key {
-                        continue;
-                    }
-                    if let Some(webp) = change.thumb_webp.as_ref().filter(|webp| !webp.is_empty()) {
-                        pin_blobs.insert(path.clone(), webp.clone());
-                    }
-                    let size = self
-                        .image_metas
-                        .get(indexed.index)
-                        .and_then(|metadata| *metadata)
-                        .map(|(_, size)| size.max(0) as u64)
-                        .unwrap_or(0);
-                    video_items.push((indexed.index, path.clone(), size));
-                    if let Some(thumbnail) = self.thumbnails.get_mut(indexed.index) {
-                        *thumbnail = ThumbnailState::Pending;
-                    }
+        if let Some(indices) = result.folder_pin_reset_indices.take() {
+            for index in indices {
+                if let Some(thumbnail) = self.thumbnails.get_mut(index) {
+                    *thumbnail = ThumbnailState::Pending;
+                }
+                self.requested.remove(&index);
+                self.pending_finalize.remove(&index);
+            }
+        }
+        if let (Some(video_items), Some(pin_blobs)) =
+            (result.video_items.take(), result.video_pin_blobs.take())
+            && !video_items.is_empty()
+        {
+            for (index, _, _) in &video_items {
+                if let Some(thumbnail) = self.thumbnails.get_mut(*index) {
+                    *thumbnail = ThumbnailState::Pending;
                 }
             }
-            if !video_items.is_empty() {
-                self.spawn_video_thread(
-                    self.tx.clone(),
-                    Arc::clone(&self.cancel_token),
-                    video_items,
-                    self.video_thumb_overrides.clone(),
-                    pin_blobs,
-                );
-            }
+            self.spawn_video_thread(
+                self.tx.clone(),
+                Arc::clone(&self.cancel_token),
+                video_items,
+                self.video_thumb_overrides.clone(),
+                pin_blobs,
+            );
         }
 
-        // 世代変更後はstable identityで安全に適用できた項目だけを反映した。次のbatchで
-        // stale raw indexを再利用しないよう索引自体は破棄する（DBが正本）。
-        if index_generation_changed {
-            refresh_index.rating_indices.clear();
-            refresh_index.page_indices.clear();
-            refresh_index.container_indices.clear();
-            refresh_index.video_indices.clear();
-            refresh_index.items_generation = self.items_generation;
-            refresh_index.next_item = 0;
-            refresh_index.complete = false;
+        if changed.book_bookmarks {
+            self.current_book_bookmarks.clear();
+            self.current_book_bookmarks_key = None;
+            self.current_book_bookmarks_request = None;
+            self.book_bookmark_title_edit = None;
         }
-        self.metadata_import_refresh_index = Some(refresh_index);
+        if changed.timed_bookmarks {
+            self.fullscreen_video_marker_cache = None;
+            self.cancel_fullscreen_video_marker_thumb_decode();
+            self.music_bookmarks.clear();
+            self.music_bookmarks_loaded_for = None;
+        }
+        true
     }
 
     pub(crate) fn replace_metadata_import_page_state_snapshot(
@@ -51260,14 +51087,6 @@ impl App {
             keys.insert(key.to_owned());
         } else {
             keys.remove(key);
-        }
-    }
-
-    fn set_page_presence(pages: &mut std::collections::HashSet<usize>, idx: usize, present: bool) {
-        if present {
-            pages.insert(idx);
-        } else {
-            pages.remove(&idx);
         }
     }
 

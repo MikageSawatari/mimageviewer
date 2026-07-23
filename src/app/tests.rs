@@ -26,249 +26,24 @@ fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
 }
 
 #[test]
-fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
+fn metadata_import_terminal_index_build_is_split_and_compact() {
     let mut app = phase_c_support::setup_app();
-    let first = PathBuf::from("C:/Pictures/a.jpg");
-    let second = PathBuf::from("C:/Pictures/b.jpg");
-    app.items = vec![
-        GridItem::Image(first.clone()),
-        GridItem::Image(second.clone()),
-    ];
-    app.image_metas = vec![None, None];
-    app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
-    app.rating_cache = std::collections::HashMap::from([(0, 1), (1, 2)]);
-    let first_key = crate::adjustment_db::normalize_path(&first);
-    let second_key = crate::adjustment_db::normalize_path(&second);
-    app.tags_cache = std::collections::HashMap::from([
-        (first_key.clone(), vec!["old".to_string()]),
-        (second_key.clone(), vec!["keep".to_string()]),
-    ]);
-    let _scope = app.metadata_import_refresh_scope();
-    // Any accidental UI-thread fallback would now be unable to query SQLite.
-    app.rating_db = None;
-    app.tags_db = None;
-
-    app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
-        any_entry_applied: true,
-        ratings_changed: true,
-        tags_changed: true,
-        visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
-            base_key: first_key.clone(),
-            ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
-                key: first_key.clone(),
-                stars: 5,
-            }]),
-            tags: Some(vec![crate::metadata_transfer::ImportedTagsValue {
-                key: first_key.clone(),
-                tags: vec!["new".to_string()],
-                replace: true,
-            }]),
-            page_states: Some(vec![crate::metadata_transfer::ImportedPageState {
-                key: first_key.clone(),
-                rotation_degrees: Some(90),
-                adjustment: Some(crate::adjustment::AdjustParams::default()),
-                adjusted: true,
-                rotated: true,
-                ..Default::default()
-            }]),
-            ..Default::default()
-        }],
-        ..Default::default()
-    });
-
-    assert_eq!(app.rating_cache.get(&0), Some(&5));
-    assert_eq!(app.rating_cache.get(&1), Some(&2));
-    assert_eq!(
-        app.tags_cache.get(&first_key),
-        Some(&vec!["new".to_string()])
-    );
-    assert_eq!(
-        app.tags_cache.get(&second_key),
-        Some(&vec!["keep".to_string()])
-    );
-    assert!(app.adjustment_page_params.contains_key(&0));
-    assert_eq!(
-        app.rotation_cache.get(&0),
-        Some(&crate::rotation_db::Rotation::Cw90)
-    );
-}
-
-#[test]
-fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
-    let mut app = phase_c_support::setup_app();
-    let book = PathBuf::from("C:/Pictures/Book.ZIP");
-    let member = "Pages/Cover.JPG";
-    let base_key = crate::path_key::normalize_keep_drive(&book);
-    let page_key = crate::adjustment_db::zip_entry_key(&book, member);
-    let old_pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-        zip_rel: String::new(),
-        entry: "old.jpg".to_string(),
-    };
-    let new_pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-        zip_rel: String::new(),
-        entry: member.to_string(),
-    };
-
-    app.current_folder = Some(book.clone());
-    app.items = vec![GridItem::ZipImage {
-        zip_path: book.clone(),
-        entry_name: member.to_string(),
-    }];
-    app.image_metas = vec![None];
-    app.thumbnails = vec![ThumbnailState::Pending];
-    app.rating_cache = std::collections::HashMap::from([(0, 1)]);
-    app.tags_cache =
-        std::collections::HashMap::from([(page_key.clone(), vec!["old-main".to_string()])]);
-    app.rotation_cache = std::collections::HashMap::from([(0, crate::rotation_db::Rotation::None)]);
-    app.folder_pin_map = std::collections::HashMap::from([(base_key.clone(), old_pin.clone())]);
-
-    let mut detached = ViewerContextBundle::empty();
-    detached.current_folder = Some(book.clone());
-    detached.items = app.items.clone();
-    detached.image_metas = vec![None];
-    detached.thumbnails = vec![ThumbnailState::Pending];
-    detached.rating_cache = std::collections::HashMap::from([(0, 2)]);
-    detached.tags_cache =
-        std::collections::HashMap::from([(page_key.clone(), vec!["old-detached".to_string()])]);
-    detached.rotation_cache =
-        std::collections::HashMap::from([(0, crate::rotation_db::Rotation::None)]);
-    detached.folder_pin_map =
-        std::collections::HashMap::from([(base_key.clone(), old_pin.clone())]);
-    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
-    let _scope = app.metadata_import_refresh_scope();
-
-    // UI-thread DB fallbackがなくても両contextを更新できることを固定する。
-    app.rating_db = None;
-    app.tags_db = None;
-    let refresh = crate::metadata_transfer::ImportRefreshDelta {
-        visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
-            base_key: base_key.clone(),
-            ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
-                key: page_key.clone(),
-                stars: 4,
-            }]),
-            tags: Some(vec![crate::metadata_transfer::ImportedTagsValue {
-                key: page_key.clone(),
-                tags: vec!["imported".to_string()],
-                replace: true,
-            }]),
-            page_states: Some(vec![crate::metadata_transfer::ImportedPageState {
-                key: page_key.clone(),
-                rotation_degrees: Some(90),
-                rotated: true,
-                ..Default::default()
-            }]),
-            folder_pins: Some(crate::metadata_transfer::ImportedFolderPinFamily {
-                base_key: base_key.clone(),
-                include_nested: true,
-                replace: true,
-                items: vec![crate::metadata_transfer::ImportedFolderPinValue {
-                    key: base_key.clone(),
-                    source: new_pin.clone(),
-                }],
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
-    app.refresh_after_metadata_transfer_import(refresh);
-    // detachedが退避中でもbounded batchを直ちに所有contextへ適用し、
-    // 後続section-only batchが先のtag/page stateを失わない。
-    app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
-        visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
-            base_key: base_key.clone(),
-            ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
-                key: page_key.clone(),
-                stars: 5,
-            }]),
-            ..Default::default()
-        }],
-        ..Default::default()
-    });
-    assert_eq!(app.rating_cache.get(&0), Some(&5));
-    assert_eq!(
-        app.tags_cache.get(&page_key),
-        Some(&vec!["imported".to_string()])
-    );
-    assert_eq!(
-        app.rotation_cache.get(&0),
-        Some(&crate::rotation_db::Rotation::Cw90)
-    );
-    assert_eq!(app.folder_pin_map.get(&base_key), Some(&new_pin));
-
-    let parked = app
-        .active_detached_viewer_context
-        .as_ref()
-        .expect("detached context remains parked");
-    assert_eq!(parked.bundle.rating_cache.get(&0), Some(&5));
-    assert_eq!(
-        parked.bundle.tags_cache.get(&page_key),
-        Some(&vec!["imported".to_string()])
-    );
-    assert_eq!(
-        parked.bundle.rotation_cache.get(&0),
-        Some(&crate::rotation_db::Rotation::Cw90)
-    );
-    assert_eq!(parked.bundle.folder_pin_map.get(&base_key), Some(&new_pin));
-
-    app.with_active_detached_viewer_context(|mounted| {
-        assert_eq!(mounted.rating_cache.get(&0), Some(&5));
-        assert_eq!(
-            mounted.tags_cache.get(&page_key),
-            Some(&vec!["imported".to_string()])
-        );
-        assert_eq!(
-            mounted.rotation_cache.get(&0),
-            Some(&crate::rotation_db::Rotation::Cw90)
-        );
-        assert_eq!(mounted.folder_pin_map.get(&base_key), Some(&new_pin));
-    })
-    .expect("detached context mounts");
-
-    assert_eq!(app.rating_cache.get(&0), Some(&5));
-    assert_eq!(
-        app.tags_cache.get(&page_key),
-        Some(&vec!["imported".to_string()])
-    );
-}
-
-#[test]
-fn metadata_import_refresh_scope_includes_unmounted_detached_context() {
-    let mut app = phase_c_support::setup_app();
-    let main_image = PathBuf::from("C:/Pictures/main.jpg");
-    let detached_book = PathBuf::from("C:/Archive/Detached.ZIP");
-    app.items = vec![GridItem::Image(main_image.clone())];
-
-    let mut detached = ViewerContextBundle::empty();
-    detached.current_folder = Some(detached_book.clone());
-    detached.items = vec![GridItem::ZipImage {
-        zip_path: detached_book.clone(),
-        entry_name: "Page/One.JPG".to_string(),
-    }];
-    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
-
-    let scope = app.metadata_import_refresh_scope();
-    assert!(
-        scope.contains(&crate::path_key::normalize_keep_drive(&main_image)),
-        "mounted main context remains in scope"
-    );
-    assert!(
-        scope.contains(&crate::path_key::normalize_keep_drive(&detached_book)),
-        "unmounted detached context must receive a worker-produced refresh delta"
-    );
-}
-
-#[test]
-fn metadata_import_refresh_index_build_is_split_across_frames() {
-    let mut app = phase_c_support::setup_app();
+    let root = PathBuf::from("C:/Pictures");
+    app.current_folder = Some(root.clone());
     app.items = (0..5_000)
         .map(|index| GridItem::Image(PathBuf::from(format!("C:/Pictures/{index:05}.jpg"))))
         .collect();
-    app.begin_metadata_import_refresh_scope();
-    let mut scope = crate::metadata_transfer::ImportRefreshScope::default();
+    app.image_metas = vec![None; app.items.len()];
+    app.thumbnails = (0..app.items.len())
+        .map(|_| ThumbnailState::Pending)
+        .collect();
+    let mut unrelated = ViewerContextBundle::empty();
+    unrelated.current_folder = Some(PathBuf::from("C:/Other"));
+    unrelated.items = vec![GridItem::Image(PathBuf::from("C:/Other/keep.jpg"))];
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: unrelated });
 
-    assert!(!app.advance_metadata_import_refresh_scope(&mut scope));
+    app.begin_metadata_import_terminal_refresh();
+    assert!(!app.advance_metadata_import_terminal_refresh(&root, false));
     let first_frame_items = app
         .metadata_import_refresh_index
         .as_ref()
@@ -276,48 +51,123 @@ fn metadata_import_refresh_index_build_is_split_across_frames() {
         .next_item;
     assert!((1..=2_048).contains(&first_frame_items));
 
-    while !app.advance_metadata_import_refresh_scope(&mut scope) {}
-    assert_eq!(
-        app.metadata_import_refresh_index
-            .as_ref()
-            .expect("index completed")
-            .next_item,
-        5_000
+    while !app.advance_metadata_import_terminal_refresh(&root, false) {}
+    let requests = app.take_metadata_import_refresh_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].items.len(), 5_000);
+    assert!(
+        requests[0]
+            .items
+            .iter()
+            .all(|item| item.alternate_page_key.is_none()),
+        "ordinary images keep one shared rating/page key"
     );
 }
 
 #[test]
-fn metadata_import_refresh_rejects_stale_raw_index_after_items_generation_change() {
+fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_book() {
     let mut app = phase_c_support::setup_app();
-    let old = PathBuf::from("C:/Pictures/old.jpg");
-    let replacement = PathBuf::from("C:/Pictures/replacement.jpg");
-    let old_key = crate::path_key::normalize_keep_drive(&old);
-    app.items = vec![GridItem::Image(old)];
-    app.rating_cache = std::collections::HashMap::from([(0, 2)]);
-    let _scope = app.metadata_import_refresh_scope();
+    let book = PathBuf::from("C:/Pictures/Book.ZIP");
+    let member = "Pages/Cover.JPG";
+    let page_key = crate::adjustment_db::zip_entry_key(&book, member);
 
-    app.items = vec![GridItem::Image(replacement)];
-    app.items_generation = app.items_generation.wrapping_add(1);
-    app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
-        any_entry_applied: true,
-        visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
-            base_key: old_key.clone(),
-            ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
-                key: old_key,
-                stars: 5,
-            }]),
-            ..Default::default()
-        }],
+    app.items = vec![GridItem::ZipImage {
+        zip_path: book.clone(),
+        entry_name: member.to_string(),
+    }];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.rating_cache = std::collections::HashMap::from([(0, 1)]);
+
+    let mut detached = ViewerContextBundle::empty();
+    detached.items = app.items.clone();
+    detached.image_metas = vec![None];
+    detached.thumbnails = vec![ThumbnailState::Pending];
+    detached.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
+
+    let context = |slot| crate::app::metadata_import_refresh::ContextResult {
+        slot,
+        items_generation: app.items_generation,
+        rating_cache: Some(std::collections::HashMap::from([(0, 5)])),
+        tags_cache: Some(std::collections::HashMap::from([(
+            page_key.clone(),
+            vec!["imported".to_string()],
+        )])),
+        current_rating: Some(5),
+        page_state: None,
+        folder_pin_map: None,
+        folder_pin_reset_indices: None,
+        video_pin_blobs: None,
+        video_items: None,
+        container_state: None,
+    };
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![
+            context(crate::app::metadata_import_refresh::ContextSlot::Main),
+            context(crate::app::metadata_import_refresh::ContextSlot::ActiveDetached(None)),
+        ],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let changed = crate::metadata_transfer::ImportChangedSections {
+        ratings: true,
+        tags: true,
         ..Default::default()
-    });
+    };
+    let (errors, stale) = app.apply_metadata_import_terminal_refresh(result, changed);
+    assert!(errors.is_empty());
+    assert!(!stale);
 
+    assert_eq!(app.rating_cache.get(&0), Some(&5));
     assert_eq!(
-        app.rating_cache.get(&0),
-        Some(&2),
-        "same raw index in a newer list must not receive the old item's delta"
+        app.tags_cache.get(&page_key),
+        Some(&vec!["imported".to_string()])
+    );
+    let detached = app
+        .active_detached_viewer_context
+        .as_ref()
+        .expect("detached context remains parked");
+    assert_eq!(detached.bundle.rating_cache.get(&0), Some(&5));
+    assert_eq!(
+        detached.bundle.tags_cache.get(&page_key),
+        Some(&vec!["imported".to_string()])
     );
 }
 
+#[test]
+fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
+    let mut app = phase_c_support::setup_app();
+    app.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    let stale_generation = app.items_generation;
+    app.items_generation = app.items_generation.wrapping_add(1);
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![crate::app::metadata_import_refresh::ContextResult {
+            slot: crate::app::metadata_import_refresh::ContextSlot::Main,
+            items_generation: stale_generation,
+            rating_cache: Some(std::collections::HashMap::from([(0, 5)])),
+            tags_cache: None,
+            current_rating: Some(5),
+            page_state: None,
+            folder_pin_map: None,
+            folder_pin_reset_indices: None,
+            video_pin_blobs: None,
+            video_items: None,
+            container_state: None,
+        }],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, stale) = app.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    assert!(stale);
+    assert_eq!(app.rating_cache.get(&0), Some(&2));
+}
 #[test]
 fn main_window_title_hides_internal_synthetic_paths() {
     let internal = PathBuf::from(r"C:\data\__reading_history__");

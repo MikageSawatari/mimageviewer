@@ -1,0 +1,579 @@
+//! 明示メタ情報 import 完了後の viewer-context cache 再構築。
+//!
+//! import worker は DB 更新だけを担当し、途中の値を UI へ配信しない。各 context の
+//! 現在項目キーを compact な snapshot として受け取り、DB の一括読込結果を所有権ごと
+//! UI へ返す。UI は `items_generation` が一致する結果だけを swap する。
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use crate::metadata_transfer::{ImportChangedSections, ImportPageStateSnapshot};
+
+const DB_KEY_CHUNK: usize = 10_000;
+
+#[derive(Debug)]
+pub(crate) struct ItemKey {
+    pub(crate) index: usize,
+    /// rating/tag と page-state が同じidentityならこの1本を共用する。
+    pub(crate) key: String,
+    pub(crate) rating: bool,
+    pub(crate) page: bool,
+    /// 両identityが異なる稀な項目だけ追加保持する。
+    pub(crate) alternate_page_key: Option<String>,
+    pub(crate) container_path: Option<PathBuf>,
+    pub(crate) video_path: Option<PathBuf>,
+    pub(crate) video_size: u64,
+}
+
+impl ItemKey {
+    fn page_key(&self) -> Option<&str> {
+        if let Some(key) = self.alternate_page_key.as_deref() {
+            Some(key)
+        } else if self.page {
+            Some(&self.key)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContextRequest {
+    pub(crate) slot: ContextSlot,
+    pub(crate) items_generation: u64,
+    pub(crate) items: Vec<ItemKey>,
+    pub(crate) current_rating_key: Option<String>,
+    pub(crate) spread_container_path: Option<PathBuf>,
+    pub(crate) old_folder_pin_keys: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContextSlot {
+    Main,
+    ActiveDetached(Option<u64>),
+    PausedDetached { index: usize, window_id: u64 },
+}
+
+pub(crate) struct ContextResult {
+    pub(crate) slot: ContextSlot,
+    pub(crate) items_generation: u64,
+    pub(crate) rating_cache: Option<HashMap<usize, u8>>,
+    pub(crate) tags_cache: Option<HashMap<String, Vec<String>>>,
+    pub(crate) current_rating: Option<u8>,
+    pub(crate) page_state: Option<PageStateResult>,
+    pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
+    pub(crate) folder_pin_reset_indices: Option<Vec<usize>>,
+    pub(crate) video_pin_blobs: Option<HashMap<PathBuf, Vec<u8>>>,
+    pub(crate) video_items: Option<Vec<(usize, PathBuf, u64)>>,
+    pub(crate) container_state: Option<ContainerStateResult>,
+}
+
+pub(crate) struct ContainerStateResult {
+    pub(crate) spread_mode: Option<crate::settings::SpreadMode>,
+    pub(crate) reading_flow: Option<crate::settings::ReadingFlow>,
+    pub(crate) reading_direction: Option<crate::settings::ReadingDirection>,
+    pub(crate) view_trim: Option<crate::view_trim::ViewTrimBookState>,
+}
+
+pub(crate) struct PageStateResult {
+    pub(crate) adjustment_page_params: HashMap<usize, crate::adjustment::AdjustParams>,
+    pub(crate) local_adjust_pages: HashSet<usize>,
+    pub(crate) export_crop_page_settings: HashMap<usize, crate::export_crop::CropSettings>,
+    pub(crate) view_trim_page_overrides: HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
+    pub(crate) mask_pages: HashSet<usize>,
+    pub(crate) conceal_pages: HashSet<usize>,
+    pub(crate) comic_pages: HashSet<usize>,
+    pub(crate) rotation_cache: HashMap<usize, crate::rotation_db::Rotation>,
+}
+
+pub(crate) struct RefreshResult {
+    pub(crate) contexts: Vec<ContextResult>,
+    pub(crate) page_snapshot: Option<ImportPageStateSnapshot>,
+    pub(crate) errors: Vec<String>,
+}
+
+pub(crate) fn run(
+    data_dir: PathBuf,
+    requests: Vec<ContextRequest>,
+    changed: ImportChangedSections,
+) -> RefreshResult {
+    let mut errors = Vec::new();
+    let page_snapshot = if changed.page_state {
+        match crate::metadata_transfer::load_import_page_state_snapshot(&data_dir) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                errors.push(format!("編集状態索引を再構築できませんでした: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let rating_db = changed.ratings.then(|| {
+        crate::rating_db::RatingDb::open_readonly(data_dir.join("rating.db"))
+            .map_err(|error| format!("評価DBを再読込できませんでした: {error}"))
+    });
+    let tags_db = changed.tags.then(|| {
+        crate::tags_db::TagsDb::open_readonly(&data_dir.join("tags.db"))
+            .map_err(|error| format!("タグDBを再読込できませんでした: {error}"))
+    });
+    let adjustment_db = changed.page_state.then(|| {
+        crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db"))
+            .map_err(|error| format!("画像補正DBを再読込できませんでした: {error}"))
+    });
+    let local_adjust_db = changed.page_state.then(|| {
+        crate::local_adjust_db::LocalAdjustDb::open_readonly(&data_dir.join("local_adjust.db"))
+            .map_err(|error| format!("ローカル補正DBを再読込できませんでした: {error}"))
+    });
+    let crop_db = changed.page_state.then(|| {
+        crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db"))
+            .map_err(|error| format!("クロップDBを再読込できませんでした: {error}"))
+    });
+    let view_trim_db = changed.page_state.then(|| {
+        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
+            .map_err(|error| format!("表示トリムDBを再読込できませんでした: {error}"))
+    });
+    let mask_db = changed.page_state.then(|| {
+        crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db"))
+            .map_err(|error| format!("マスクDBを再読込できませんでした: {error}"))
+    });
+    let conceal_db = changed.page_state.then(|| {
+        crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db"))
+            .map_err(|error| format!("隠蔽DBを再読込できませんでした: {error}"))
+    });
+    let comic_db = changed.page_state.then(|| {
+        crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db"))
+            .map_err(|error| format!("注釈DBを再読込できませんでした: {error}"))
+    });
+    let rotation_db = changed.page_state.then(|| {
+        crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db"))
+            .map_err(|error| format!("回転DBを再読込できませんでした: {error}"))
+    });
+    let folder_pin_db = changed.thumbnail_pins.then(|| {
+        crate::folder_thumb_pins::FolderThumbPinDb::open_at(&data_dir.join("folder_thumb_pins.db"))
+            .map_err(|error| format!("フォルダピンDBを再読込できませんでした: {error}"))
+    });
+    let video_pin_db = changed.thumbnail_pins.then(|| {
+        crate::video_pins::VideoPinDb::open_readonly(&data_dir.join("video_pins.db"))
+            .map_err(|error| format!("動画ピンDBを再読込できませんでした: {error}"))
+    });
+    let spread_db = changed.container_state.then(|| {
+        crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db"))
+            .map_err(|error| format!("見開きDBを再読込できませんでした: {error}"))
+    });
+    let container_trim_db = changed.container_state.then(|| {
+        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
+            .map_err(|error| format!("本の表示トリムDBを再読込できませんでした: {error}"))
+    });
+
+    for result in [
+        rating_db.as_ref().and_then(|result| result.as_ref().err()),
+        tags_db.as_ref().and_then(|result| result.as_ref().err()),
+        adjustment_db
+            .as_ref()
+            .and_then(|result| result.as_ref().err()),
+        local_adjust_db
+            .as_ref()
+            .and_then(|result| result.as_ref().err()),
+        crop_db.as_ref().and_then(|result| result.as_ref().err()),
+        view_trim_db
+            .as_ref()
+            .and_then(|result| result.as_ref().err()),
+        mask_db.as_ref().and_then(|result| result.as_ref().err()),
+        conceal_db.as_ref().and_then(|result| result.as_ref().err()),
+        comic_db.as_ref().and_then(|result| result.as_ref().err()),
+        rotation_db
+            .as_ref()
+            .and_then(|result| result.as_ref().err()),
+        folder_pin_db
+            .as_ref()
+            .and_then(|result| result.as_ref().err()),
+        video_pin_db
+            .as_ref()
+            .and_then(|result| result.as_ref().err()),
+        spread_db.as_ref().and_then(|result| result.as_ref().err()),
+        container_trim_db
+            .as_ref()
+            .and_then(|result| result.as_ref().err()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        errors.push(result.clone());
+    }
+
+    let contexts = requests
+        .into_iter()
+        .map(|request| {
+            build_context_result(
+                request,
+                changed,
+                rating_db.as_ref().and_then(|result| result.as_ref().ok()),
+                tags_db.as_ref().and_then(|result| result.as_ref().ok()),
+                adjustment_db
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok()),
+                local_adjust_db
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok()),
+                crop_db.as_ref().and_then(|result| result.as_ref().ok()),
+                view_trim_db
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok()),
+                mask_db.as_ref().and_then(|result| result.as_ref().ok()),
+                conceal_db.as_ref().and_then(|result| result.as_ref().ok()),
+                comic_db.as_ref().and_then(|result| result.as_ref().ok()),
+                rotation_db.as_ref().and_then(|result| result.as_ref().ok()),
+                folder_pin_db
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok()),
+                video_pin_db
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok()),
+                spread_db.as_ref().and_then(|result| result.as_ref().ok()),
+                container_trim_db
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok()),
+            )
+        })
+        .collect();
+
+    RefreshResult {
+        contexts,
+        page_snapshot,
+        errors,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_context_result(
+    request: ContextRequest,
+    changed: ImportChangedSections,
+    rating_db: Option<&crate::rating_db::RatingDb>,
+    tags_db: Option<&crate::tags_db::TagsDb>,
+    adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
+    local_adjust_db: Option<&crate::local_adjust_db::LocalAdjustDb>,
+    crop_db: Option<&crate::export_crop::CropDb>,
+    view_trim_db: Option<&crate::view_trim_db::ViewTrimDb>,
+    mask_db: Option<&crate::mask_db::MaskDb>,
+    conceal_db: Option<&crate::conceal_db::ConcealDb>,
+    comic_db: Option<&crate::comic_db::ComicDb>,
+    rotation_db: Option<&crate::rotation_db::RotationDb>,
+    folder_pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    video_pin_db: Option<&crate::video_pins::VideoPinDb>,
+    spread_db: Option<&crate::spread_db::SpreadDb>,
+    container_trim_db: Option<&crate::view_trim_db::ViewTrimDb>,
+) -> ContextResult {
+    let mut rating_cache = (changed.ratings && rating_db.is_some()).then(HashMap::new);
+    let mut tags_cache = (changed.tags && tags_db.is_some()).then(HashMap::new);
+    let all_page_databases_available = [
+        adjustment_db.is_some(),
+        local_adjust_db.is_some(),
+        crop_db.is_some(),
+        view_trim_db.is_some(),
+        mask_db.is_some(),
+        conceal_db.is_some(),
+        comic_db.is_some(),
+        rotation_db.is_some(),
+    ]
+    .into_iter()
+    .all(|available| available);
+    let mut page_state =
+        (changed.page_state && all_page_databases_available).then(PageStateResult::default);
+
+    for chunk in request.items.chunks(DB_KEY_CHUNK) {
+        let rating_keys = chunk
+            .iter()
+            .filter(|item| item.rating)
+            .map(|item| item.key.clone())
+            .collect::<Vec<_>>();
+        if let (Some(cache), Some(db)) = (rating_cache.as_mut(), rating_db) {
+            let loaded = db.get_many(&rating_keys);
+            for item in chunk.iter().filter(|item| item.rating) {
+                cache.insert(item.index, loaded.get(&item.key).copied().unwrap_or(0));
+            }
+        }
+        if let (Some(cache), Some(db)) = (tags_cache.as_mut(), tags_db) {
+            for (key, tags) in db.get_many_display_tags(&rating_keys) {
+                if !tags.is_empty() {
+                    cache.insert(key, tags);
+                }
+            }
+        }
+
+        let page_items = chunk
+            .iter()
+            .filter_map(|item| item.page_key().map(|key| (item.index, key)))
+            .collect::<Vec<_>>();
+        let page_keys = page_items.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+        if let Some(state) = page_state.as_mut() {
+            if let Some(db) = adjustment_db {
+                let loaded = db.load_page_params_many(&page_keys);
+                for (index, key) in &page_items {
+                    if let Some(value) = loaded.get(*key) {
+                        state.adjustment_page_params.insert(*index, value.clone());
+                    }
+                }
+            }
+            if let Some(db) = local_adjust_db {
+                let owned = page_keys
+                    .iter()
+                    .map(|key| (*key).to_string())
+                    .collect::<Vec<_>>();
+                let loaded = db.load_existing_layer_keys(&owned);
+                for (index, key) in &page_items {
+                    if loaded.contains(*key) {
+                        state.local_adjust_pages.insert(*index);
+                    }
+                }
+            }
+            if let Some(db) = crop_db {
+                let loaded = db.load_many(&page_keys);
+                for (index, key) in &page_items {
+                    if let Some(value) = loaded.get(*key) {
+                        state.export_crop_page_settings.insert(*index, *value);
+                    }
+                }
+            }
+            if let Some(db) = view_trim_db {
+                let loaded = db.load_page_overrides_many(&page_keys);
+                for (index, key) in &page_items {
+                    if let Some(value) = loaded.get(*key) {
+                        state.view_trim_page_overrides.insert(*index, *value);
+                    }
+                }
+            }
+            if let Some(db) = mask_db {
+                let loaded = db.load_existing_mask_keys(&page_keys);
+                collect_indices(&mut state.mask_pages, &page_items, &loaded);
+            }
+            if let Some(db) = conceal_db {
+                let loaded = db.load_existing_conceal_keys(&page_keys);
+                collect_indices(&mut state.conceal_pages, &page_items, &loaded);
+            }
+            if let Some(db) = comic_db {
+                let loaded = db.load_existing_comic_keys(&page_keys);
+                collect_indices(&mut state.comic_pages, &page_items, &loaded);
+            }
+            if let Some(db) = rotation_db {
+                let loaded = db.get_many(page_keys.iter().copied());
+                for (index, key) in &page_items {
+                    if let Some(rotation) = loaded.get(*key) {
+                        state.rotation_cache.insert(*index, *rotation);
+                    }
+                }
+            }
+        }
+    }
+
+    let current_rating = request
+        .current_rating_key
+        .as_deref()
+        .and_then(|key| rating_db.map(|db| db.get(key)));
+    let folder_pin_map = if changed.thumbnail_pins {
+        folder_pin_db.map(|db| {
+            let mut pins = HashMap::new();
+            for chunk in request.items.chunks(DB_KEY_CHUNK) {
+                pins.extend(
+                    db.lookup_many(
+                        chunk
+                            .iter()
+                            .filter_map(|item| item.container_path.as_deref()),
+                    ),
+                );
+            }
+            pins
+        })
+    } else {
+        None
+    };
+    let folder_pin_reset_indices = folder_pin_map.as_ref().map(|pins| {
+        let affected = request
+            .old_folder_pin_keys
+            .iter()
+            .chain(pins.keys())
+            .collect::<HashSet<_>>();
+        request
+            .items
+            .iter()
+            .filter_map(|item| {
+                let path = item.container_path.as_deref()?;
+                affected
+                    .contains(&crate::path_key::normalize_keep_drive(path))
+                    .then_some(item.index)
+            })
+            .collect()
+    });
+    let video_pin_blobs =
+        if changed.thumbnail_pins {
+            video_pin_db.map(|db| {
+                let mut blobs = HashMap::new();
+                for chunk in request.items.chunks(DB_KEY_CHUNK) {
+                    blobs.extend(db.lookup_webps_many(
+                        chunk.iter().filter_map(|item| item.video_path.as_deref()),
+                    ));
+                }
+                blobs
+            })
+        } else {
+            None
+        };
+    let video_items = video_pin_blobs.as_ref().map(|blobs| {
+        request
+            .items
+            .iter()
+            .filter_map(|item| {
+                let path = item.video_path.as_ref()?;
+                blobs
+                    .contains_key(path)
+                    .then(|| (item.index, path.clone(), item.video_size))
+            })
+            .collect()
+    });
+    let container_state =
+        if changed.container_state && spread_db.is_some() && container_trim_db.is_some() {
+            request.spread_container_path.as_deref().map(|path| {
+                let spread_mode = spread_db.and_then(|db| db.get(path));
+                let reading_flow = spread_db.and_then(|db| db.get_flow(path));
+                let reading_direction = spread_db.and_then(|db| db.get_direction(path));
+                let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
+                ContainerStateResult {
+                    spread_mode,
+                    reading_flow,
+                    reading_direction,
+                    view_trim,
+                }
+            })
+        } else {
+            None
+        };
+
+    ContextResult {
+        slot: request.slot,
+        items_generation: request.items_generation,
+        rating_cache,
+        tags_cache,
+        current_rating,
+        page_state,
+        folder_pin_map,
+        folder_pin_reset_indices,
+        video_pin_blobs,
+        video_items,
+        container_state,
+    }
+}
+
+fn collect_indices(
+    destination: &mut HashSet<usize>,
+    page_items: &[(usize, &str)],
+    loaded: &HashSet<String>,
+) {
+    for (index, key) in page_items {
+        if loaded.contains(*key) {
+            destination.insert(*index);
+        }
+    }
+}
+
+impl Default for PageStateResult {
+    fn default() -> Self {
+        Self {
+            adjustment_page_params: HashMap::new(),
+            local_adjust_pages: HashSet::new(),
+            export_crop_page_settings: HashMap::new(),
+            view_trim_page_overrides: HashMap::new(),
+            mask_pages: HashSet::new(),
+            conceal_pages: HashSet::new(),
+            comic_pages: HashSet::new(),
+            rotation_cache: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_reloads_rating_and_tags_for_compact_context_keys() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let key = "c:/pictures/a.jpg".to_string();
+        crate::rating_db::RatingDb::open_at(data_dir.join("rating.db"))
+            .unwrap()
+            .set(&key, 4)
+            .unwrap();
+        crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db"))
+            .unwrap()
+            .set_item_tags(&key, ["portable"], crate::tags_db::source::METADATA_IMPORT)
+            .unwrap();
+
+        let result = run(
+            data_dir,
+            vec![ContextRequest {
+                slot: ContextSlot::Main,
+                items_generation: 7,
+                items: vec![ItemKey {
+                    index: 3,
+                    key: key.clone(),
+                    rating: true,
+                    page: true,
+                    alternate_page_key: None,
+                    container_path: None,
+                    video_path: None,
+                    video_size: 0,
+                }],
+                current_rating_key: Some(key.clone()),
+                spread_container_path: None,
+                old_folder_pin_keys: HashSet::new(),
+            }],
+            ImportChangedSections {
+                ratings: true,
+                tags: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.errors.is_empty());
+        let context = &result.contexts[0];
+        assert_eq!(context.rating_cache.as_ref().unwrap().get(&3), Some(&4));
+        assert_eq!(
+            context.tags_cache.as_ref().unwrap().get(&key),
+            Some(&vec!["#portable".to_string()])
+        );
+        assert_eq!(context.current_rating, Some(4));
+    }
+
+    #[test]
+    fn worker_error_does_not_publish_empty_replacement_cache() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let result = run(
+            temp.path().join("missing"),
+            vec![ContextRequest {
+                slot: ContextSlot::Main,
+                items_generation: 1,
+                items: vec![ItemKey {
+                    index: 0,
+                    key: "c:/missing.jpg".to_string(),
+                    rating: true,
+                    page: false,
+                    alternate_page_key: None,
+                    container_path: None,
+                    video_path: None,
+                    video_size: 0,
+                }],
+                current_rating_key: None,
+                spread_container_path: None,
+                old_folder_pin_keys: HashSet::new(),
+            }],
+            ImportChangedSections {
+                ratings: true,
+                ..Default::default()
+            },
+        );
+        assert!(!result.errors.is_empty());
+        assert!(result.contexts[0].rating_cache.is_none());
+    }
+}
