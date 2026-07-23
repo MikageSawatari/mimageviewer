@@ -294,6 +294,9 @@ pub fn collect_index_entries(
                 continue;
             }
         };
+        if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
+            continue;
+        }
         let p = entry.path();
         if is_apple_double(&p) {
             continue;

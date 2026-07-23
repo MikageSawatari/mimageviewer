@@ -18,7 +18,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const SIDECAR_FILENAME: &str = "mimageviewer.meta.miv";
+pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME;
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
 const FORMAT_VERSION: u32 = 3;
@@ -27,6 +27,7 @@ const GENERATIONS_DIRNAME: &str = "generations";
 const SHARDS_DIRNAME: &str = "shards";
 const SHARD_EXTENSION: &str = "jsonl";
 const EXPORT_BATCH_ENTRIES: usize = 4_096;
+const IMPORT_REFRESH_BATCH_ENTRIES: usize = 256;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// 総exportサイズではなく、単一の物理項目recordにだけ適用する防御上限。
 const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
@@ -67,6 +68,8 @@ pub struct ExportSummary {
     pub page_states: usize,
     pub container_states: usize,
     pub thumbnail_pins: usize,
+    #[cfg(test)]
+    pub metadata_batches: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -87,15 +90,18 @@ pub struct ImportSummary {
     pub skipped_changed: usize,
     pub failed_entries: usize,
     pub cancelled: bool,
-    /// UI thread が SQLite を再読込せず、現在の表示キャッシュだけを差分更新するための
-    /// worker-produced payload。項目 transaction の commit 後にだけ追加される。
-    pub refresh: ImportRefreshDelta,
+    /// preflight後の2回目の走査でI/O・parse・検証に失敗した場合の終端エラー。
+    /// それ以前にcommitした項目は保持され、対応するrefresh差分もすでに通知済み。
+    pub incomplete_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ImportRefreshDelta {
-    /// XMP hydration の session-local suppression 用。従来同様、commit 済み物理項目を保持する。
-    pub physical_ratings: Vec<ImportedRatingValue>,
+    /// 実値を返す表示scope外を含め、このbatchにcommit済み項目がある。
+    pub any_entry_applied: bool,
+    /// 表示scope外の項目も含むsection変更通知。全件key/valueは保持しない。
+    pub ratings_changed: bool,
+    pub tags_changed: bool,
     /// 全体の編集有無 rollup 用。実データ本体は持たない。
     pub page_state_families: Vec<ImportedPageStateFamily>,
     /// import 開始時に表示中だった項目だけの、UI cache 更新用実値。
@@ -103,57 +109,11 @@ pub struct ImportRefreshDelta {
 }
 
 impl ImportRefreshDelta {
-    /// 未マウントの viewer context が複数回の import を後から取り込めるよう、同じ
-    /// visible physical family の最新値を section 単位で畳み込む。`None` はその
-    /// import で section が対象外だったことを表すため、既存の差分を消さない。
-    #[allow(dead_code)] // binary Appで使用。library-only buildにはconsumerがない。
-    pub(crate) fn merge_visible_entries_from(&mut self, mut newer: Vec<ImportedEntryMetadata>) {
-        if newer.is_empty() {
-            return;
-        }
-        // 最初のimportはworker resultのallocationをそのまま所有し、全件走査もしない。
-        if self.visible_entries.is_empty() {
-            self.visible_entries = newer;
-            return;
-        }
-
-        let mut indices = HashMap::with_capacity(self.visible_entries.len() + newer.len());
-        for (index, entry) in self.visible_entries.iter().enumerate() {
-            indices.insert(entry.base_key.clone(), index);
-        }
-        self.visible_entries.reserve(newer.len());
-        for mut entry in newer.drain(..) {
-            let Some(index) = indices.get(&entry.base_key).copied() else {
-                let index = self.visible_entries.len();
-                indices.insert(entry.base_key.clone(), index);
-                self.visible_entries.push(entry);
-                continue;
-            };
-            let current = &mut self.visible_entries[index];
-            if entry.ratings.is_some() {
-                current.ratings = entry.ratings.take();
-            }
-            if entry.tags.is_some() {
-                current.tags = entry.tags.take();
-            }
-            if entry.page_states.is_some() {
-                current.page_states = entry.page_states.take();
-            }
-            if entry.container_states.is_some() {
-                current.container_states = entry.container_states.take();
-            }
-            if entry.folder_pins.is_some() {
-                current.folder_pins = entry.folder_pins.take();
-            }
-            if entry.video_pin.is_some() {
-                current.video_pin = entry.video_pin.take();
-            }
-        }
-    }
-
     #[allow(dead_code)] // binary Appで使用。library-only buildにはconsumerがない。
     pub(crate) fn is_empty(&self) -> bool {
-        self.physical_ratings.is_empty()
+        !self.any_entry_applied
+            && !self.ratings_changed
+            && !self.tags_changed
             && self.page_state_families.is_empty()
             && self.visible_entries.is_empty()
     }
@@ -514,6 +474,11 @@ struct EnumeratedEntry {
     portable: PortableEntry,
 }
 
+struct ShardedEnumeratedEntry {
+    shard_path: PathBuf,
+    entry: EnumeratedEntry,
+}
+
 #[derive(Default)]
 struct BundleCounts {
     shards: u64,
@@ -545,8 +510,9 @@ where
     let mut staging = BundleStaging::create(root, &generation)?;
     let mut summary = ExportSummary::default();
     let mut counts = BundleCounts::default();
-    let mut visited = HashSet::new();
-    crate::fs_entry::mark_directory_visited(root, &mut visited);
+    let mut batch = Vec::with_capacity(EXPORT_BATCH_ENTRIES);
+    let mut visited = DiskDuplicateGuard::new()?;
+    let _ = visited.insert(&crate::fs_entry::directory_visit_key(root))?;
     let shards_dir = staging.shards_dir();
     let export_result = export_directory_shard(
         data_dir,
@@ -559,6 +525,7 @@ where
         cancel,
         &mut progress,
         &mut visited,
+        &mut batch,
         &mut counts,
         &mut summary,
     );
@@ -566,6 +533,14 @@ where
         staging.abort();
         return Err(error);
     }
+    flush_export_batch(
+        data_dir,
+        &mut batch,
+        cancel,
+        &mut progress,
+        &mut counts,
+        &mut summary,
+    )?;
     check_cancel(cancel)?;
 
     let manifest = BundleManifest {
@@ -652,20 +627,22 @@ pub fn import_at<F>(
 where
     F: FnMut(TransferProgress),
 {
-    import_at_with_refresh_scope(data_dir, root, cancel, None, progress)
+    import_at_with_refresh_scope(data_dir, root, cancel, None, progress, |_| Ok(()))
 }
 
-/// UI 表示中の物理項目だけ実値を返す import 入口。全項目分は評価値と編集有無だけを
-/// lightweight に保持し、再帰 import の worker result が manifest 本体相当に膨らむのを防ぐ。
-pub fn import_at_with_refresh_scope<F>(
+/// UI 表示中の物理項目だけ実値をcommit後の小さいbatchとして通知するimport入口。
+/// refreshは最終resultへ蓄積せず、呼び出し側の有界channelにbackpressureを掛ける。
+pub fn import_at_with_refresh_scope<F, R>(
     data_dir: &Path,
     root: &Path,
     cancel: &AtomicBool,
     refresh_scope: Option<&ImportRefreshScope>,
     mut progress: F,
+    mut refresh: R,
 ) -> Result<ImportSummary, TransferError>
 where
     F: FnMut(TransferProgress),
+    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
 {
     validate_root(root)?;
     let manifest = read_bundle_manifest(root, cancel)?;
@@ -692,6 +669,8 @@ where
         total_entries: total,
         ..ImportSummary::default()
     };
+    let mut refresh_batch = ImportRefreshDelta::default();
+    let mut refresh_batch_entries = 0_usize;
 
     let apply_result = visit_bundle_entries(root, &manifest, cancel, |entry, index| {
         progress(TransferProgress {
@@ -736,23 +715,27 @@ where
             Ok(()) => {
                 summary.applied_entries += 1;
                 let base_key = crate::path_key::normalize_keep_drive(&path);
-                if manifest.sections.ratings {
-                    summary.refresh.physical_ratings.push(ImportedRatingValue {
-                        key: base_key.clone(),
-                        stars: entry.rating.as_ref().map_or(0, |rating| rating.stars),
-                    });
-                }
+                refresh_batch.any_entry_applied = true;
+                refresh_batch.ratings_changed |= manifest.sections.ratings;
+                refresh_batch.tags_changed |= manifest.sections.tags;
                 if manifest.sections.page_state {
-                    summary
-                        .refresh
+                    refresh_batch
                         .page_state_families
                         .push(imported_page_state_family(&path, entry));
                 }
                 if refresh_scope.is_some_and(|scope| scope.contains(&base_key)) {
-                    summary
-                        .refresh
-                        .visible_entries
-                        .push(imported_entry_metadata(&path, entry, manifest.sections));
+                    refresh_batch.visible_entries.push(imported_entry_metadata(
+                        &path,
+                        entry,
+                        manifest.sections,
+                    ));
+                }
+                refresh_batch_entries += 1;
+                if refresh_batch_entries >= IMPORT_REFRESH_BATCH_ENTRIES {
+                    if !refresh_batch.is_empty() {
+                        refresh(std::mem::take(&mut refresh_batch))?;
+                    }
+                    refresh_batch_entries = 0;
                 }
             }
             Err(error) => {
@@ -771,10 +754,23 @@ where
         });
         Ok(())
     });
-    match apply_result {
+    let trailing_refresh_result = if refresh_batch.is_empty() {
+        Ok(())
+    } else {
+        refresh(std::mem::take(&mut refresh_batch))
+    };
+    let terminal_result = match apply_result {
+        Err(error) => Err(error),
+        Ok(()) => trailing_refresh_result,
+    };
+    match terminal_result {
         Ok(()) => {}
         Err(TransferError::Cancelled) => summary.cancelled = true,
-        Err(error) => return Err(error),
+        Err(error) => {
+            // preflight後は項目単位commitで進む。2回目走査の終端エラーをsummaryに載せ、
+            // それ以前のcommit済み件数と、すでに送信したrefresh差分を失わない。
+            summary.incomplete_error = Some(error.to_string());
+        }
     }
     Ok(summary)
 }
@@ -992,7 +988,8 @@ fn export_directory_shard<F>(
     shards_dir: &Path,
     cancel: &AtomicBool,
     progress: &mut F,
-    visited: &mut HashSet<String>,
+    visited: &mut DiskDuplicateGuard,
+    batch: &mut Vec<ShardedEnumeratedEntry>,
     counts: &mut BundleCounts,
     summary: &mut ExportSummary,
 ) -> Result<(), TransferError>
@@ -1037,15 +1034,20 @@ where
         .shards
         .checked_add(1)
         .ok_or_else(|| TransferError::Invalid("shard数が表現範囲を超えています".into()))?;
+    writer
+        .flush()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", shard_path.display())))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", shard_path.display())))?;
+    drop(writer);
 
-    let mut batch = Vec::with_capacity(EXPORT_BATCH_ENTRIES);
-    let mut recurse_after_batch = Vec::new();
     if dir == root {
-        batch.push(make_enumerated(
-            root,
-            ".".to_string(),
-            PortableEntryKind::Directory,
-        )?);
+        batch.push(ShardedEnumeratedEntry {
+            shard_path: shard_path.clone(),
+            entry: make_enumerated(root, ".".to_string(), PortableEntryKind::Directory)?,
+        });
     }
     let children = fs::read_dir(dir)
         .map_err(|error| TransferError::Io(format!("{}: {error}", dir.display())))?;
@@ -1070,13 +1072,10 @@ where
         };
         let path = child.path();
         let rel = relative_string(root, &path)?;
-        batch.push(make_enumerated(&path, rel.clone(), portable_kind)?);
-        if recursive
-            && kind == crate::fs_entry::DirEntryKind::Directory
-            && crate::fs_entry::mark_directory_visited(&path, visited)
-        {
-            recurse_after_batch.push(path);
-        }
+        batch.push(ShardedEnumeratedEntry {
+            shard_path: shard_path.clone(),
+            entry: make_enumerated(&path, rel.clone(), portable_kind)?,
+        });
         progress(TransferProgress {
             phase: TransferPhase::Scanning,
             processed: usize_from_count(
@@ -1087,73 +1086,36 @@ where
             current_path: Some(rel),
         });
         if batch.len() >= EXPORT_BATCH_ENTRIES {
-            flush_export_batch(
+            flush_export_batch(data_dir, batch, cancel, progress, counts, summary)?;
+        }
+        if recursive
+            && kind == crate::fs_entry::DirEntryKind::Directory
+            && visited.insert(&crate::fs_entry::directory_visit_key(&path))?
+        {
+            export_directory_shard(
                 data_dir,
-                &mut writer,
-                &mut batch,
+                root,
+                &path,
+                true,
+                depth + 1,
+                generation,
+                shards_dir,
                 cancel,
                 progress,
+                visited,
+                batch,
                 counts,
                 summary,
             )?;
-            for child_dir in recurse_after_batch.drain(..) {
-                export_directory_shard(
-                    data_dir,
-                    root,
-                    &child_dir,
-                    true,
-                    depth + 1,
-                    generation,
-                    shards_dir,
-                    cancel,
-                    progress,
-                    visited,
-                    counts,
-                    summary,
-                )?;
-            }
         }
     }
-    flush_export_batch(
-        data_dir,
-        &mut writer,
-        &mut batch,
-        cancel,
-        progress,
-        counts,
-        summary,
-    )?;
-    for child_dir in recurse_after_batch {
-        export_directory_shard(
-            data_dir,
-            root,
-            &child_dir,
-            true,
-            depth + 1,
-            generation,
-            shards_dir,
-            cancel,
-            progress,
-            visited,
-            counts,
-            summary,
-        )?;
-    }
-    writer
-        .flush()
-        .map_err(|error| TransferError::Io(format!("{}: {error}", shard_path.display())))?;
-    writer
-        .get_ref()
-        .sync_all()
-        .map_err(|error| TransferError::Io(format!("{}: {error}", shard_path.display())))?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn flush_export_batch<F>(
     data_dir: &Path,
-    writer: &mut BufWriter<File>,
-    batch: &mut Vec<EnumeratedEntry>,
+    batch: &mut Vec<ShardedEnumeratedEntry>,
     cancel: &AtomicBool,
     progress: &mut F,
     counts: &mut BundleCounts,
@@ -1165,18 +1127,65 @@ where
     if batch.is_empty() {
         return Ok(());
     }
-    attach_metadata(data_dir, batch, cancel, progress)?;
-    for entry in batch.drain(..) {
+    #[cfg(test)]
+    {
+        summary.metadata_batches += 1;
+    }
+    let drained = std::mem::replace(batch, Vec::with_capacity(EXPORT_BATCH_ENTRIES));
+    let mut destinations = drained
+        .iter()
+        .map(|entry| entry.shard_path.clone())
+        .collect::<Vec<_>>();
+    let mut entries = drained
+        .into_iter()
+        .map(|entry| entry.entry)
+        .collect::<Vec<_>>();
+    attach_metadata(data_dir, &mut entries, cancel, progress)?;
+    let mut entries = entries.into_iter();
+    debug_assert_eq!(entries.len(), destinations.len());
+    let mut current_writer: Option<(PathBuf, BufWriter<File>)> = None;
+    for (entry, shard_path) in entries.by_ref().zip(destinations.drain(..)) {
         check_cancel(cancel)?;
         validate_portable_entry(&entry.portable)?;
-        write_json_line(writer, &entry.portable, cancel, MAX_RECORD_BYTES)?;
+        if current_writer
+            .as_ref()
+            .is_none_or(|(current, _)| current != &shard_path)
+        {
+            if let Some((path, mut writer)) = current_writer.take() {
+                flush_and_sync_shard(&path, &mut writer)?;
+            }
+            let file = File::options()
+                .append(true)
+                .open(&shard_path)
+                .map_err(|error| TransferError::Io(format!("{}: {error}", shard_path.display())))?;
+            current_writer = Some((shard_path.clone(), BufWriter::new(file)));
+        }
+        write_json_line(
+            &mut current_writer.as_mut().expect("opened above").1,
+            &entry.portable,
+            cancel,
+            MAX_RECORD_BYTES,
+        )?;
         summarize_entry(summary, &entry.portable);
         counts.entries = counts
             .entries
             .checked_add(1)
             .ok_or_else(|| TransferError::Invalid("項目数が表現範囲を超えています".into()))?;
     }
+    if let Some((path, mut writer)) = current_writer.take() {
+        flush_and_sync_shard(&path, &mut writer)?;
+    }
     Ok(())
+}
+
+fn flush_and_sync_shard(path: &Path, writer: &mut BufWriter<File>) -> Result<(), TransferError> {
+    writer
+        .flush()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))
 }
 
 fn make_enumerated(
@@ -2120,6 +2129,7 @@ where
     let mut shard_count = 0_u64;
     let mut entry_count = 0_u64;
     let mut saw_root_shard = false;
+    let mut duplicate_guard = DiskDuplicateGuard::new()?;
     let shards = fs::read_dir(&shards_dir)
         .map_err(|error| TransferError::Io(format!("{}: {error}", shards_dir.display())))?;
     for shard in shards {
@@ -2159,7 +2169,6 @@ where
             .checked_add(1)
             .ok_or_else(|| TransferError::Invalid("shard数が表現範囲を超えています".into()))?;
 
-        let mut shard_paths = HashSet::new();
         let mut line_number = 1_usize;
         while read_bounded_line(&mut reader, &mut line, MAX_RECORD_BYTES, cancel, &path)? {
             line_number += 1;
@@ -2167,9 +2176,9 @@ where
             validate_portable_entry(&entry)?;
             validate_shard_entry_path(&header.folder, &entry.path)?;
             let identity = entry.path.to_lowercase();
-            if !shard_paths.insert(identity) {
+            if !duplicate_guard.insert(&identity)? {
                 return Err(TransferError::Invalid(format!(
-                    "shard内のパスが重複しています: {}",
+                    "bundle内のパスが重複しています: {}",
                     entry.path
                 )));
             }
@@ -2192,6 +2201,51 @@ where
         )));
     }
     Ok(())
+}
+
+/// 件数に比例するHashSetをRAMへ保持せず、OSの一時領域に置いたSQLite indexで
+/// 完全な重複検査を行う。import pathとexport済みdirectoryの双方で使い、
+/// cacheを4MiBへ制限して巨大な単一フォルダでも検証メモリを抑える。
+struct DiskDuplicateGuard {
+    conn: Connection,
+    // Connectionを先にdropしてからWindows上の一時DBを削除するため、この順序を保つ。
+    _temp_dir: tempfile::TempDir,
+}
+
+impl DiskDuplicateGuard {
+    fn new() -> Result<Self, TransferError> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("miv-metadata-duplicates-")
+            .tempdir()
+            .map_err(|error| TransferError::Io(format!("重複検査用一時領域: {error}")))?;
+        let path = temp_dir.path().join("seen.db");
+        let conn = Connection::open(&path).map_err(db_error)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=OFF;
+             PRAGMA synchronous=OFF;
+             PRAGMA temp_store=FILE;
+             PRAGMA cache_size=-4096;
+             CREATE TABLE seen_paths (
+                 path TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             BEGIN;",
+        )
+        .map_err(db_error)?;
+        Ok(Self {
+            conn,
+            _temp_dir: temp_dir,
+        })
+    }
+
+    fn insert(&mut self, path: &str) -> Result<bool, TransferError> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO seen_paths(path) VALUES (?1)",
+                params![path],
+            )
+            .map(|changed| changed == 1)
+            .map_err(db_error)
+    }
 }
 
 fn read_bounded_line<R: BufRead>(
@@ -3525,7 +3579,6 @@ struct BundleStaging {
     destination: PathBuf,
     bundle_dir: PathBuf,
     generation_dir: PathBuf,
-    old_generation: Option<String>,
     mode: BundlePublishMode,
     published: bool,
 }
@@ -3594,6 +3647,7 @@ impl BundleStaging {
                 }
             }
         }
+        crate::sidecar::mark_hidden_system(&bundle_dir);
         let generations_dir = bundle_dir.join(GENERATIONS_DIRNAME);
         match fs::symlink_metadata(&generations_dir) {
             Ok(_) => ensure_plain_directory(&generations_dir)?,
@@ -3609,6 +3663,13 @@ impl BundleStaging {
                 )));
             }
         }
+        // 前回crashでpointer公開前に残ったgenerationは、現在のmanifestが指す
+        // generationだけを保護して次回export開始時にbest-effort回収する。
+        if matches!(mode, BundlePublishMode::ExistingDirectory)
+            && let Some(active) = old_generation.as_deref()
+        {
+            cleanup_bundle_generations(&bundle_dir, active);
+        }
         let generation_dir = bundle_generation_dir(&bundle_dir, generation);
         fs::create_dir(&generation_dir)
             .map_err(|error| TransferError::Io(format!("{}: {error}", generation_dir.display())))?;
@@ -3619,7 +3680,6 @@ impl BundleStaging {
             destination,
             bundle_dir,
             generation_dir,
-            old_generation,
             mode,
             published: false,
         })
@@ -3665,32 +3725,8 @@ impl BundleStaging {
                 }
             }
         }
-        self.cleanup_old_generation();
+        cleanup_bundle_generations(&self.destination, self.generation_name());
         Ok(())
-    }
-
-    fn cleanup_old_generation(&self) {
-        let Some(old_generation) = self
-            .old_generation
-            .as_deref()
-            .filter(|old| *old != self.generation_name())
-        else {
-            return;
-        };
-        if validate_generation(old_generation).is_err() {
-            return;
-        }
-        let path = bundle_generation_dir(&self.destination, old_generation);
-        if fs::symlink_metadata(&path)
-            .ok()
-            .is_some_and(|metadata| metadata.is_dir() && !metadata_is_reparse(&metadata))
-            && let Err(error) = fs::remove_dir_all(&path)
-        {
-            crate::logger::log(format!(
-                "metadata export: old generation cleanup failed {}: {error}",
-                path.display()
-            ));
-        }
     }
 
     fn generation_name(&self) -> &str {
@@ -3710,6 +3746,34 @@ impl BundleStaging {
         };
         let _ = fs::remove_dir_all(target);
         self.published = true;
+    }
+}
+
+fn cleanup_bundle_generations(bundle_dir: &Path, keep: &str) {
+    if validate_generation(keep).is_err() {
+        return;
+    }
+    let generations_dir = bundle_dir.join(GENERATIONS_DIRNAME);
+    let Ok(entries) = fs::read_dir(&generations_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == keep || validate_generation(&name).is_err() {
+            continue;
+        }
+        let path = entry.path();
+        let removable = fs::symlink_metadata(&path)
+            .ok()
+            .is_some_and(|metadata| metadata.is_dir() && !metadata_is_reparse(&metadata));
+        if removable && let Err(error) = fs::remove_dir_all(&path) {
+            crate::logger::log(format!(
+                "metadata export: unpublished generation cleanup failed {}: {error}",
+                path.display()
+            ));
+        }
     }
 }
 
@@ -4483,12 +4547,17 @@ mod tests {
         let refresh_scope = ImportRefreshScope {
             base_keys: HashSet::from([base_key.clone()]),
         };
+        let mut refreshes = Vec::new();
         let summary = import_at_with_refresh_scope(
             &data_dir,
             &root,
             &cancel,
             Some(&refresh_scope),
             no_progress,
+            |refresh| {
+                refreshes.push(refresh);
+                Ok(())
+            },
         )
         .unwrap();
         assert_eq!(summary.failed_entries, 0);
@@ -4562,10 +4631,10 @@ mod tests {
             0
         );
         assert_eq!(
-            summary.refresh.page_state_families[0].items[1].key,
+            refreshes[0].page_state_families[0].items[1].key,
             canonical_key
         );
-        let refreshed = &summary.refresh.visible_entries[0];
+        let refreshed = &refreshes[0].visible_entries[0];
         assert_eq!(refreshed.ratings.as_ref().unwrap()[1].key, canonical_key);
         assert_eq!(refreshed.tags.as_ref().unwrap()[1].key, canonical_key);
         assert_eq!(
@@ -4628,67 +4697,6 @@ mod tests {
             Err(TransferError::Invalid(message))
                 if message.contains("仮想コンテナキーが不正または重複")
         ));
-    }
-
-    #[test]
-    fn pending_refresh_merge_moves_large_payloads_and_preserves_other_sections() {
-        let first_webp = vec![7_u8; 1024];
-        let first_ptr = first_webp.as_ptr();
-        let mut pending = ImportRefreshDelta::default();
-        pending.merge_visible_entries_from(vec![ImportedEntryMetadata {
-            base_key: "c:/book.zip".to_string(),
-            tags: Some(vec![ImportedTagsValue {
-                key: "c:/book.zip::page.jpg".to_string(),
-                tags: vec!["keep".to_string()],
-            }]),
-            video_pin: Some(ImportedVideoPinChange {
-                key: "c:/book.zip".to_string(),
-                thumb_webp: Some(first_webp),
-            }),
-            ..Default::default()
-        }]);
-        assert_eq!(
-            pending.visible_entries[0]
-                .video_pin
-                .as_ref()
-                .unwrap()
-                .thumb_webp
-                .as_ref()
-                .unwrap()
-                .as_ptr(),
-            first_ptr,
-            "first worker payload allocation must be adopted without a deep clone"
-        );
-
-        let newer_webp = vec![9_u8; 2048];
-        let newer_ptr = newer_webp.as_ptr();
-        pending.merge_visible_entries_from(vec![ImportedEntryMetadata {
-            base_key: "c:/book.zip".to_string(),
-            ratings: Some(vec![ImportedRatingValue {
-                key: "c:/book.zip::page.jpg".to_string(),
-                stars: 5,
-            }]),
-            video_pin: Some(ImportedVideoPinChange {
-                key: "c:/book.zip".to_string(),
-                thumb_webp: Some(newer_webp),
-            }),
-            ..Default::default()
-        }]);
-        let entry = &pending.visible_entries[0];
-        assert_eq!(
-            entry
-                .video_pin
-                .as_ref()
-                .unwrap()
-                .thumb_webp
-                .as_ref()
-                .unwrap()
-                .as_ptr(),
-            newer_ptr,
-            "replacement payload allocation must also move without a deep clone"
-        );
-        assert_eq!(entry.tags.as_ref().unwrap()[0].tags, vec!["keep"]);
-        assert_eq!(entry.ratings.as_ref().unwrap()[0].stars, 5);
     }
 
     #[test]
@@ -5133,19 +5141,25 @@ mod tests {
         let refresh_scope = ImportRefreshScope {
             base_keys: HashSet::from([listed_key.clone()]),
         };
-        let summary = import_at_with_refresh_scope(
+        let mut refreshes = Vec::new();
+        let _summary = import_at_with_refresh_scope(
             &destination_data,
             &destination,
             &cancel,
             Some(&refresh_scope),
             no_progress,
+            |refresh| {
+                refreshes.push(refresh);
+                Ok(())
+            },
         )
         .unwrap();
-        assert_eq!(summary.refresh.visible_entries.len(), 1);
-        assert_eq!(summary.refresh.visible_entries[0].base_key, listed_key);
+        assert_eq!(refreshes[0].visible_entries.len(), 1);
+        assert_eq!(refreshes[0].visible_entries[0].base_key, listed_key);
         assert_eq!(
-            summary
-                .refresh
+            refreshes
+                .first()
+                .unwrap()
                 .visible_entries
                 .first()
                 .and_then(|entry| entry.ratings.as_ref())
@@ -5309,6 +5323,150 @@ mod tests {
                 "header + direct entries for {folder}"
             );
         }
+    }
+
+    #[test]
+    fn export_metadata_batch_spans_many_small_folders() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..100 {
+            let folder = root.join(format!("d{index:03}"));
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("page.jpg"), b"x").unwrap();
+        }
+        init_data_dir(&data);
+
+        let summary = export_at(&data, &root, true, &AtomicBool::new(false), no_progress).unwrap();
+        assert_eq!(summary.entries, 201);
+        assert_eq!(
+            summary.metadata_batches, 1,
+            "small folders must share one bounded metadata DB scope"
+        );
+    }
+
+    #[test]
+    fn import_refresh_is_emitted_in_bounded_batches() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for index in 0..600 {
+            let name = format!("{index:04}.jpg");
+            fs::write(source.join(&name), b"x").unwrap();
+            fs::write(destination.join(&name), b"x").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+
+        let mut batch_sizes = Vec::new();
+        let mut saw_rating_change = false;
+        let mut saw_tag_change = false;
+        let summary = import_at_with_refresh_scope(
+            &destination_data,
+            &destination,
+            &cancel,
+            None,
+            no_progress,
+            |refresh| {
+                saw_rating_change |= refresh.ratings_changed;
+                saw_tag_change |= refresh.tags_changed;
+                batch_sizes.push(refresh.page_state_families.len());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(summary.incomplete_error.is_none());
+        assert_eq!(batch_sizes.iter().sum::<usize>(), summary.applied_entries);
+        assert!(
+            batch_sizes
+                .iter()
+                .all(|size| *size <= IMPORT_REFRESH_BATCH_ENTRIES)
+        );
+        assert!(batch_sizes.len() >= 3);
+        assert!(saw_rating_change);
+        assert!(saw_tag_change);
+    }
+
+    #[test]
+    fn second_pass_parse_failure_returns_committed_summary_and_refresh() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            fs::write(source.join(name), b"x").unwrap();
+            fs::write(destination.join(name), b"x").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+
+        let manifest = read_bundle_manifest(&destination, &cancel).unwrap();
+        let shard =
+            bundle_generation_dir(&destination.join(SIDECAR_FILENAME), &manifest.generation)
+                .join(SHARDS_DIRNAME)
+                .join(shard_filename("."));
+        let lines = fs::read_to_string(&shard).unwrap();
+        let mut padded = String::new();
+        for (index, line) in lines.lines().enumerate() {
+            if index == 0 {
+                padded.push_str(line);
+            } else {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("test_padding".to_string(), "x".repeat(64 * 1024).into());
+                padded.push_str(&serde_json::to_string(&value).unwrap());
+            }
+            padded.push('\n');
+        }
+        fs::write(&shard, padded).unwrap();
+
+        let mut truncated = false;
+        let mut refreshed = 0_usize;
+        let summary = import_at_with_refresh_scope(
+            &destination_data,
+            &destination,
+            &cancel,
+            None,
+            |progress| {
+                if !truncated
+                    && progress.phase == TransferPhase::Importing
+                    && progress.processed == 1
+                {
+                    File::options()
+                        .write(true)
+                        .truncate(true)
+                        .open(&shard)
+                        .unwrap();
+                    truncated = true;
+                }
+            },
+            |refresh| {
+                refreshed += refresh.page_state_families.len();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(truncated);
+        assert!(summary.incomplete_error.is_some());
+        assert!(summary.applied_entries >= 1);
+        assert_eq!(refreshed, summary.applied_entries);
     }
 
     #[test]
@@ -5569,6 +5727,33 @@ mod tests {
         let bundle = root.join(SIDECAR_FILENAME);
         assert!(!bundle_generation_dir(&bundle, &first.generation).exists());
         assert!(bundle_generation_dir(&bundle, &second.generation).is_dir());
+    }
+
+    #[test]
+    fn successful_reexport_collects_unpublished_generations() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.jpg"), b"a").unwrap();
+        init_data_dir(&data);
+        let cancel = AtomicBool::new(false);
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+
+        let bundle = root.join(SIDECAR_FILENAME);
+        let stale = uuid::Uuid::new_v4().simple().to_string();
+        let stale_dir = bundle_generation_dir(&bundle, &stale);
+        fs::create_dir_all(stale_dir.join(SHARDS_DIRNAME)).unwrap();
+        fs::write(stale_dir.join("orphan.bin"), vec![1_u8; 1024]).unwrap();
+
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        assert!(!stale_dir.exists());
+        let active = read_bundle_manifest(&root, &cancel).unwrap().generation;
+        let generations = fs::read_dir(bundle.join(GENERATIONS_DIRNAME))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(generations, vec![active]);
     }
 
     #[test]

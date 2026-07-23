@@ -48,10 +48,9 @@ fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
     app.tags_db = None;
 
     app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
-        physical_ratings: vec![crate::metadata_transfer::ImportedRatingValue {
-            key: first_key.clone(),
-            stars: 5,
-        }],
+        any_entry_applied: true,
+        ratings_changed: true,
+        tags_changed: true,
         page_state_families: vec![crate::metadata_transfer::ImportedPageStateFamily {
             base_key: first_key.clone(),
             items: vec![crate::metadata_transfer::ImportedPageStatePresence {
@@ -81,6 +80,7 @@ fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
             }]),
             ..Default::default()
         }],
+        ..Default::default()
     });
 
     assert_eq!(app.rating_cache.get(&0), Some(&5));
@@ -185,8 +185,8 @@ fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
     };
 
     app.refresh_after_metadata_transfer_import(refresh);
-    // detachedが退避中のまま別sectionだけを再importしても、未mount差分はsection単位で
-    // 合成され、先のtag/page stateを失わない。
+    // detachedが退避中でもbounded batchを直ちに所有contextへ適用し、
+    // 後続section-only batchが先のtag/page stateを失わない。
     app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
         visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
             base_key: base_key.clone(),
@@ -213,11 +213,16 @@ fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
         .active_detached_viewer_context
         .as_ref()
         .expect("detached context remains parked");
-    assert_eq!(parked.bundle.rating_cache.get(&0), Some(&2));
+    assert_eq!(parked.bundle.rating_cache.get(&0), Some(&5));
     assert_eq!(
         parked.bundle.tags_cache.get(&page_key),
-        Some(&vec!["old-detached".to_string()])
+        Some(&vec!["imported".to_string()])
     );
+    assert_eq!(
+        parked.bundle.rotation_cache.get(&0),
+        Some(&crate::rotation_db::Rotation::Cw90)
+    );
+    assert_eq!(parked.bundle.folder_pin_map.get(&base_key), Some(&new_pin));
 
     app.with_active_detached_viewer_context(|mounted| {
         assert_eq!(mounted.rating_cache.get(&0), Some(&5));
@@ -238,7 +243,6 @@ fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
         app.tags_cache.get(&page_key),
         Some(&vec!["imported".to_string()])
     );
-    assert!(app.metadata_import_refresh_pending.is_empty());
 }
 
 #[test]
@@ -400,6 +404,24 @@ fn scan_convertible_archive_names(dir: &std::path::Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+#[test]
+fn scan_directory_never_lists_portable_metadata_bundle() {
+    let temp = TempDir::new().unwrap();
+    std::fs::create_dir(temp.path().join("visible")).unwrap();
+    std::fs::create_dir(
+        temp.path()
+            .join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME),
+    )
+    .unwrap();
+    assert_eq!(scan_folder_names(temp.path()), vec!["visible"]);
+    let shown_hidden = scan_directory_with_convertible_archives(temp.path(), true, true);
+    assert!(shown_hidden.folders.iter().all(|(item, _)| {
+        item.container_path().map_or(true, |path| {
+            !crate::fs_entry::is_internal_app_entry_name(path.file_name().unwrap_or_default())
+        })
+    }));
 }
 
 #[test]

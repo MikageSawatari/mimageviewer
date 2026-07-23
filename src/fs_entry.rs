@@ -6,8 +6,18 @@
 //! step before the UI/search walkers can treat them as folders.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::{DirEntry, FileType};
 use std::path::Path;
+
+pub const PORTABLE_METADATA_BUNDLE_DIRNAME: &str = "mimageviewer.meta.miv";
+
+/// mIV自身が作る持ち運び用bundleは、Hidden属性や「隠しファイルを表示」の設定に
+/// 依存せず、通常一覧・再帰ビュー・フォルダナビから常に除外する。
+pub fn is_internal_app_entry_name(name: &OsStr) -> bool {
+    name.to_string_lossy()
+        .eq_ignore_ascii_case(PORTABLE_METADATA_BUNDLE_DIRNAME)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirEntryKind {
@@ -127,6 +137,17 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn portable_metadata_bundle_name_is_always_internal() {
+        assert!(is_internal_app_entry_name(OsStr::new(
+            "mimageviewer.meta.miv"
+        )));
+        assert!(is_internal_app_entry_name(OsStr::new(
+            "MIMAGEVIEWER.META.MIV"
+        )));
+        assert!(!is_internal_app_entry_name(OsStr::new("photos")));
     }
 
     #[test]

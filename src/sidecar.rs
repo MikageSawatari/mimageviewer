@@ -739,7 +739,7 @@ pub fn import_to_dbs(
 // ── Windows 隠し+システム属性 ─────────────────────────────────────────
 
 #[cfg(windows)]
-fn mark_hidden_system(path: &Path) {
+pub(crate) fn mark_hidden_system(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW,

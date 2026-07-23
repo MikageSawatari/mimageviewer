@@ -266,6 +266,9 @@ fn walk_dir_recursive(
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
+        if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
+            continue;
+        }
         // ★ file_type() は entry がキャッシュしているので syscall なし
         let file_type = match entry.file_type() {
             Ok(ft) => ft,

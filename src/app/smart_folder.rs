@@ -568,6 +568,9 @@ fn scan_one_directory(
                 continue;
             }
         };
+        if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
+            continue;
+        }
         entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
         if crate::fs_entry::should_hide_fs_entry(&entry, options.show_hidden_files) {
             continue;
@@ -3688,6 +3691,36 @@ mod tests {
         let activity_gate = crate::activity_gate::ActivityGate::new(0);
         let (tx, _rx) = mpsc::channel();
         scan_smart_folder(definition, options, &cancel, &io_sem, &activity_gate, &tx).unwrap()
+    }
+
+    #[test]
+    fn smart_folder_never_descends_into_portable_metadata_bundle() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let bundle = root.join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(root.join("visible.jpg"), b"v").unwrap();
+        std::fs::write(bundle.join("internal.jpg"), b"i").unwrap();
+
+        let mut definition = crate::settings::SmartFolderDefinition::new("internal-filter");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root.clone(),
+            true,
+            true,
+            Default::default(),
+        ));
+        let result = run_test_scan(definition, unfiltered_scan_options());
+        assert!(
+            result
+                .snapshot
+                .entries
+                .iter()
+                .all(|entry| !entry.path.starts_with(&bundle))
+        );
+        assert!(result.snapshot.entries.iter().any(|entry| {
+            entry.path.file_name().and_then(|name| name.to_str()) == Some("visible.jpg")
+        }));
     }
 
     #[test]

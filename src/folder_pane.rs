@@ -663,6 +663,9 @@ fn scan_real_subfolders_inner(
                 continue;
             }
         };
+        if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
+            continue;
+        }
         if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
             continue;
         }
@@ -997,6 +1000,20 @@ mod tests {
         let dirs = scan_real_subfolders(tmp.path(), SortOrder::FileName, false, None).unwrap();
         let labels: Vec<_> = dirs.iter().map(|path| folder_label(path)).collect();
         assert_eq!(labels, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn scan_real_subfolders_excludes_portable_metadata_bundle_even_when_showing_hidden() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("visible")).unwrap();
+        std::fs::create_dir(
+            tmp.path()
+                .join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME),
+        )
+        .unwrap();
+        let dirs = scan_real_subfolders(tmp.path(), SortOrder::FileName, true, None).unwrap();
+        let labels: Vec<_> = dirs.iter().map(|path| folder_label(path)).collect();
+        assert_eq!(labels, vec!["visible"]);
     }
 
     #[cfg(windows)]

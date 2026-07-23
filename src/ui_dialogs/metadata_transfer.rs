@@ -14,8 +14,12 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::metadata_transfer::{
-    ExportSummary, ImportPreview, ImportSummary, TransferError, TransferPhase, TransferProgress,
+    ExportSummary, ImportPreview, ImportRefreshDelta, ImportSummary, TransferError, TransferPhase,
+    TransferProgress,
 };
+
+const WORKER_CHANNEL_CAPACITY: usize = 1;
+const MAX_MESSAGES_PER_FRAME: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation {
@@ -39,6 +43,7 @@ enum ResultState {
 
 enum WorkerMessage {
     Progress(TransferProgress),
+    ImportRefresh(ImportRefreshDelta),
     Preview(Result<ImportPreview, String>),
     Export {
         result: Result<ExportSummary, String>,
@@ -57,13 +62,13 @@ struct ImportWorkerResources {
 }
 
 struct ProgressRelay {
-    tx: mpsc::Sender<WorkerMessage>,
+    tx: mpsc::SyncSender<WorkerMessage>,
     last_phase: Option<TransferPhase>,
     last_sent: std::time::Instant,
 }
 
 impl ProgressRelay {
-    fn new(tx: mpsc::Sender<WorkerMessage>) -> Self {
+    fn new(tx: mpsc::SyncSender<WorkerMessage>) -> Self {
         Self {
             tx,
             last_phase: None,
@@ -133,6 +138,8 @@ impl MetadataTransferState {
 impl Drop for MetadataTransferState {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        // bounded channelでworkerがrefresh送信待ちの場合、receiverを先にdropして解除する。
+        self.rx.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -239,6 +246,7 @@ impl App {
             // UI 状態をメモリ snapshot する。SQLite write は transfer worker に渡す。
             let pending_view_trim = self.take_pending_view_trim_transfer();
             let mut restore_view_trim = None;
+            let mut import_start_failed = false;
             match operation {
                 Operation::Export => {
                     if let Some(state) = self.metadata_transfer.as_mut() {
@@ -269,12 +277,16 @@ impl App {
                             .map(|pending| pending.batch.clone());
                         if !start_import_worker(state, resources, batch, refresh_scope) {
                             restore_view_trim = state.pending_view_trim.take();
+                            import_start_failed = true;
                         }
                     }
                 }
             }
             if let Some(pending) = restore_view_trim {
                 self.restore_pending_view_trim_transfer(pending);
+            }
+            if import_start_failed {
+                self.finish_metadata_transfer_import_refresh();
             }
         }
         // Thread creation failure reaches Result without a receiver message, so
@@ -325,7 +337,7 @@ impl App {
                 Stage::LoadingPreview | Stage::WaitingForWriters | Stage::Running
             )
         }) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 
@@ -337,9 +349,15 @@ impl App {
             .as_ref()
             .and_then(|state| state.rx.as_ref())
         {
-            loop {
+            for _ in 0..MAX_MESSAGES_PER_FRAME {
                 match rx.try_recv() {
-                    Ok(message) => messages.push(message),
+                    Ok(message) => {
+                        let is_refresh = matches!(message, WorkerMessage::ImportRefresh(_));
+                        messages.push(message);
+                        if is_refresh {
+                            break;
+                        }
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -349,6 +367,7 @@ impl App {
             }
         }
         let mut imported_refresh = None;
+        let mut import_finished = false;
         let mut restore_view_trim = None;
         for message in messages {
             let Some(state) = self.metadata_transfer.as_mut() else {
@@ -356,6 +375,9 @@ impl App {
             };
             match message {
                 WorkerMessage::Progress(progress) => state.progress = Some(progress),
+                WorkerMessage::ImportRefresh(refresh) => {
+                    imported_refresh = Some(refresh);
+                }
                 WorkerMessage::Preview(result) => {
                     state.rx = None;
                     state.stage = match result {
@@ -380,24 +402,29 @@ impl App {
                     resource_error,
                     view_trim_saved,
                 } => {
-                    if let Ok(summary) = &mut result
-                        && summary.applied_entries > 0
-                    {
-                        imported_refresh = Some(std::mem::take(&mut summary.refresh));
-                    }
                     if view_trim_saved {
                         state.pending_view_trim = None;
                     } else {
                         restore_view_trim = state.pending_view_trim.take();
                     }
                     if let Some(error) = resource_error {
-                        result = Err(match result {
-                            Ok(_) => error,
-                            Err(import_error) => format!("{import_error}\n{error}"),
-                        });
+                        result = match result {
+                            Ok(mut summary) => {
+                                summary.incomplete_error = Some(
+                                    summary
+                                        .incomplete_error
+                                        .map_or(error.clone(), |import_error| {
+                                            format!("{import_error}\n{error}")
+                                        }),
+                                );
+                                Ok(summary)
+                            }
+                            Err(import_error) => Err(format!("{import_error}\n{error}")),
+                        };
                     }
                     state.rx = None;
                     state.stage = Stage::Result(ResultState::Import(result));
+                    import_finished = true;
                 }
             }
         }
@@ -413,9 +440,12 @@ impl App {
                 Operation::Export => Stage::Result(ResultState::Export(Err(
                     "worker が予期せず終了しました".to_string(),
                 ))),
-                Operation::Import => Stage::Result(ResultState::Import(Err(
-                    "worker が予期せず終了しました".to_string(),
-                ))),
+                Operation::Import => {
+                    import_finished = true;
+                    Stage::Result(ResultState::Import(Err(
+                        "worker が予期せず終了しました".to_string()
+                    )))
+                }
             };
         }
         if let Some(pending) = restore_view_trim {
@@ -424,6 +454,9 @@ impl App {
         self.restore_metadata_import_resources();
         if let Some(refresh) = imported_refresh {
             self.refresh_after_metadata_transfer_import(refresh);
+        }
+        if import_finished {
+            self.finish_metadata_transfer_import_refresh();
         }
     }
 
@@ -676,6 +709,11 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
         ResultState::Import(Ok(summary)) => {
             if summary.cancelled {
                 ui.label("インポートをキャンセルしました。反映済みの項目は保持されています。");
+            } else if summary.incomplete_error.is_some() {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    "途中でエラーが発生しました。反映済みの項目は保持されています。",
+                );
             } else {
                 ui.label("インポートが完了しました。");
             }
@@ -687,6 +725,9 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
                 summary.failed_entries,
                 summary.total_entries
             ));
+            if let Some(error) = summary.incomplete_error.as_deref() {
+                ui.label(error);
+            }
         }
         ResultState::Export(Err(error)) | ResultState::Import(Err(error)) => {
             if error == &TransferError::Cancelled.to_string() {
@@ -702,7 +743,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
 fn start_preview_worker(state: &mut MetadataTransferState) {
     let root = state.root.clone();
     let cancel = Arc::clone(&state.cancel);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
     state.rx = Some(rx);
     state.stage = Stage::LoadingPreview;
     let spawn = std::thread::Builder::new()
@@ -734,7 +775,7 @@ fn start_export_worker(
     let data_dir = crate::data_dir::get();
     let cancel = Arc::clone(&state.cancel);
     cancel.store(false, Ordering::Relaxed);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
     state.rx = Some(rx);
     state.stage = Stage::Running;
     let spawn = std::thread::Builder::new()
@@ -786,7 +827,7 @@ fn start_import_worker(
     let data_dir = crate::data_dir::get();
     let cancel = Arc::clone(&state.cancel);
     cancel.store(false, Ordering::Relaxed);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
     state.rx = Some(rx);
     state.stage = Stage::Running;
     let resources = Arc::new(Mutex::new(resources));
@@ -811,6 +852,7 @@ fn start_import_worker(
                 flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import");
             let view_trim_saved = view_trim_result.is_ok();
             let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
+            let refresh_tx = tx.clone();
             let result = match flush_result {
                 Ok(()) => crate::metadata_transfer::import_at_with_refresh_scope(
                     &data_dir,
@@ -819,6 +861,11 @@ fn start_import_worker(
                     Some(&refresh_scope),
                     move |value| {
                         progress_relay.send(value);
+                    },
+                    move |refresh| {
+                        refresh_tx
+                            .send(WorkerMessage::ImportRefresh(refresh))
+                            .map_err(|_| TransferError::Cancelled)
                     },
                 )
                 .map_err(|error| error.to_string()),

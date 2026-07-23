@@ -603,6 +603,9 @@ fn walk_dirs_recursive_with_progress_inner(
                     }
                 }
                 processed += 1;
+                if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
+                    continue;
+                }
                 // file_type() で GetFileAttributes syscall を避ける (scan_directory と同様)
                 let is_dir = entry
                     .file_type()
@@ -652,6 +655,9 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
 
     if let Ok(entries) = std::fs::read_dir(path) {
         for e in entries.flatten() {
+            if crate::fs_entry::is_internal_app_entry_name(&e.file_name()) {
+                continue;
+            }
             // Windows: `DirEntry::file_type()` は FindFirstFile のキャッシュ読み
             // (追加 syscall なし)。`Path::is_dir()` / `is_file()` は都度
             // `GetFileAttributes` を呼ぶので、数百ファイルのフォルダで
@@ -823,6 +829,22 @@ pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sorted_subdirs_excludes_portable_metadata_bundle() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("visible")).unwrap();
+        std::fs::create_dir(
+            temp.path()
+                .join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME),
+        )
+        .unwrap();
+        let names = sorted_subdirs(temp.path(), FolderTreeOptions::default())
+            .into_iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["visible"]);
+    }
 
     #[test]
     fn path_eq_same() {

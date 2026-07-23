@@ -422,6 +422,9 @@ fn scan_one_directory(
                 continue;
             }
         };
+        if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(_) => {
@@ -2128,6 +2131,27 @@ mod tests {
 
         settings.auto_fullscreen_zip_pdf = false;
         assert!(!SubfolderExpansionOptions::from(&settings).image_folder_books);
+    }
+
+    #[test]
+    fn scan_never_descends_into_portable_metadata_bundle() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let bundle = root.join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(root.join("visible.jpg"), b"v").unwrap();
+        std::fs::write(bundle.join("internal.jpg"), b"i").unwrap();
+
+        let result = scan_test_root(&root, test_scan_options(false));
+        assert!(result.entries.iter().any(|entry| {
+            entry.path.file_name().and_then(|name| name.to_str()) == Some("visible.jpg")
+        }));
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|entry| !entry.path.starts_with(&bundle))
+        );
     }
 
     #[test]

@@ -172,6 +172,9 @@ fn scan_directory_entries(
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for entry in entries.flatten() {
+        if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
+            continue;
+        }
         // file_type() は FindFirstFile のキャッシュ読み (syscall なし)。
         // metadata() も同様にキャッシュから返るが、失敗しても fallback 0 で続行する。
         let kind = entry

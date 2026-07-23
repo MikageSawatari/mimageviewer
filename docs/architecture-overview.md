@@ -140,7 +140,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_music_timeline.rs` | 音楽ビュー中央の行分割波形タイムライン。row raster worker + 行テクスチャキャッシュ (`TimelineTextureCache`、解析の版数 = `music_analysis_version` で再ラスタ判定)。行数は `TIMELINE_MAX_ROWS` でキャップ |
 | `ui_music_spectrum.rs` | 下段 108band スペクトラム + 鍵盤。専用 worker が共有 `MusicPcm` の窓を FFT (in-flight 1 件 coalesce) |
 | `ui_music_panels.rs` | 音楽ビューの左右ホバーパネル (ブックマーク / ループ / 行秒数) と下 HUD (動画 native HUD とレイアウト一致) |
-| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` directory の原子的generation pointer + フォルダ単位JSON Lines shard、root-relative path検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンの収集と項目単位importをworkerで実行する。export / preview / importはshardを逐次処理し、総項目数・総sidecarサイズの固定上限を持たない。importは15ストアを1つのSQLite attached-database transactionへまとめ、rollback journal / super-journalを検査して物理項目単位のcrash atomicityを保証する。UIは完全モーダルの確認・固定高進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当し、view-trim flush、dirty自動sidecar flush、TagsDb connectionのjournal-mode handoff / 再openはworker側で行う。完了時はworkerが返すcommit済み表示差分を在メモリcacheへ適用し、SQLite再読込や同期フォルダreloadを行わない。差分の実値はimport開始時に所有中のmain / detached / parked contextをscopeに含め、App-global世代とsection単位の累積差分を各`ViewerContextBundle`のmount時に適用する |
+| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` directory の原子的generation pointer + フォルダ単位JSON Lines shard、root-relative path検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンの収集と項目単位importをworkerで実行する。export / preview / importはshardを逐次処理し、総項目数・総sidecarサイズの固定上限を持たない。importは15ストアを1つのSQLite attached-database transactionへまとめ、rollback journal / super-journalを検査して物理項目単位のcrash atomicityを保証する。UIは完全モーダルの確認・固定高進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当し、view-trim flush、dirty自動sidecar flush、TagsDb connectionのjournal-mode handoff / 再openはworker側で行う。commit済み表示差分はbounded channelで小分けに渡し、main / detached / parked contextへ逐次適用するため、全import結果をメモリへ累積せず、SQLite再読込や同期フォルダreloadも行わない |
 | App の `music_*` 状態 | 解析ワーカー / `MusicPcm` / spectrum / timeline cache は **ViewerContextBundle に入れず global** (stage-audio §3.5: ParkedLive 音楽窓も同じ global を消費する)。表示ゲートの中央述語は `fs_music_view_active`、動画→音声モードの transient は `video_audio_mode` / `video_audio_vst` |
 
 ### マルチウィンドウ / detached viewer (F12)
@@ -330,15 +330,22 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
 `generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ
-保存する。再帰exportは4096物理項目ごとにDB scopeを作って逐次serializeするため、全項目を
-1つの`Vec`やJSONへ集めず、総項目数と総bundleサイズに固定上限を設けない。防御上限は
+保存する。bundle directoryにはWindowsのHidden + System属性を付け、属性表示設定にかかわらず
+通常一覧、サブフォルダ展開、スマートフォルダ、フォルダペイン、検索・名前索引の走査対象から
+除外する。再帰exportはフォルダ境界をまたぐ4096物理項目ごとにDB scopeを作り、深さ優先で
+逐次serializeするため、全項目や単一フォルダの全子要素を1つの`Vec`やJSONへ集めず、
+総項目数と総bundleサイズに固定上限を設けない。防御上限は
 manifest 1 MiB、shard header 256 KiB、単一物理項目record 256 MiBに限定する。
 完成前generationはpointerから参照されず、全shardのflush / sync後に`manifest.json`だけを
 原子的に置換する。キャンセル・書込失敗では既存pointerを維持し、公開済み内容を壊さない。
+crashで残った未公開generationは、次回exportの開始時と公開成功後に現pointerのgenerationを
+保護しながらbest-effortで回収する。
 
 preview / importは各shardをbounded line readerで逐次読み、folder hash、direct-child配置、
-shard / entry総数、record単位validationを検証する。importはDBを触る前に全generationを
-streaming preflightし、2回目の走査で対象pathを再検証して項目単位transactionを適用する。
+shard / entry総数、record単位validationを検証する。importはDBを触る前に現generationの全shardを
+streaming preflightし、重複pathはRAM上の全件`HashSet`ではなく一時SQLite indexで検出する。
+2回目の走査では対象pathを再検証して項目単位transactionを適用する。走査途中のI/O・parse・
+validationエラーは、それ以前のcommit済み件数と表示差分を含む部分完了結果としてUIへ返す。
 manifestに記載された物理項目だけを上書きし、未記載項目を保持する。適用時は既存
 `mimageviewer.dat` の mtime を編集 / タグ sidecar sync table に記録し、明示 import 後の
 フォルダ再ロードで古い自動バックアップが欠落行を復活させないようにする。
@@ -351,9 +358,10 @@ manifest 由来の画像本の相対ページは provenance と canonical contai
 metadata / thumbnail / fullscreen worker まで保持し、実 I/O では開いた同一ハンドルの
 final path を再検証してから、そのハンドル由来の metadata / bytes だけを利用する。
 archive member / nested container の identity は大小文字を区別せず、`\`を`/`へ統一してから
-重複検査・DB書込・完了差分へ共用する。完了差分はworker resultのownershipをUI上で複製せず、
-非active viewer contextがある場合だけkey indexで線形集成する。進捗path欄は3行分を固定確保し、
-折り返しによってキャンセルbuttonの位置を動かさない。
+重複検査・DB書込・完了差分へ共用する。commit済み差分は256項目以下のbatchに分け、容量制限付き
+channelへ送る。UIは1 frameにつき最大1 batchを、import開始時に構築したkey indexでmain /
+detached / parkedの各所有contextへ直接適用し、完了結果やmount待ちpayloadへ全件を蓄積しない。
+進捗path欄は3行分を固定確保し、折り返しによってキャンセルbuttonの位置を動かさない。
 実装と境界条件は `metadata_transfer.rs`、モーダルと writer drain は
 `ui_dialogs/metadata_transfer.rs` が所有する。
 
