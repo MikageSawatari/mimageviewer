@@ -74,8 +74,9 @@
 ## 2. 常に別ウィンドウモード (設定「画像を別ウィンドウで開く」= ON) ⚠️ 未検証重点
 
 > 画像を開くたびに新しいウィンドウ。古い窓は passive (frozen) として残る。
-> このモードの detached 窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown のフォルダ移動は行わない。
-> 入力は detached 窓側で消費し、短い案内だけ出す。静止画系の F12 detached 切替も無効。
+> active な静止画窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown が、その窓自身の物理フォルダ順で
+> 通常画像フォルダ / ZIP / CBZ / PDF へ移動する。main の検索・絞り込み・★固定は無視し、
+> 変更しない。動画窓のフォルダ移動と静止画系の F12 detached 切替は無効。
 
 ### 2.1 複数ウィンドウ展開
 
@@ -88,8 +89,12 @@
 
 - [ ] passive 窓をクリック (アクティブ化) → その窓が active になり送り / V / Shift+Z の対象に
 - [ ] active を切り替えても、他の窓の内容が**別画像へ化けない**
+- [ ] active 静止画窓で Ctrl+↓ / Ctrl+PageDown → 窓自身だけが次の画像フォルダ / ZIP / PDF へ移動する
+- [ ] main で Ctrl+F / Ctrl+G / ★固定 / rating / facet を有効にしても detached の物理順と main の条件が変わらない
+- [ ] folder-nav 直後に別の passive 窓をクリック、または元窓を閉じても、遅延結果が main / 別窓へ出ない
 - [ ] active 窓でページ送り → その窓だけ切替、passive は不変
-- [ ] active 窓で F12 / Ctrl+↓ / Ctrl+PageDown → 無効 toast。メイン一覧は動かない
+- [ ] active 静止画窓で F12 → 無効 toast。メイン一覧は動かない
+- [ ] active 動画 / 音声窓で Ctrl+↓ / Ctrl+PageDown → 無効 toast。メイン一覧は動かない
 
 ### 2.3 メイン操作との干渉
 

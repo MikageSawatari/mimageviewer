@@ -265,6 +265,10 @@ Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaW
 - **音声ファイルの detached 対応** (stage-audio): Phase S 検収合格後、Phase I で実装。
   音声も単一メディアウィンドウへ合流し、F12 / always-new open を動画と対称に扱う。
   `music_*` は bundle 化せず global のまま維持し、メディア窓 1 本規則で main 側との混線を排除する。
+- **独立静止画窓の物理フォルダ移動** (stage-folder-nav、v2.8.0):
+  [指示書](detached-rework-stage-folder-nav.md) に従い、folder-nav pending を
+  `ViewerContextBundle` 所有へ移して active context 内で poll / apply する。main の検索・
+  絞り込みを継承せず、通常画像フォルダ、ZIP/CBZ、PDF の物理順だけを初期対象とする。
 | R2 | 未着手 | — | |
 | R3 | 未着手 | — | |
 | R4 | 実施判断待ち (ゲート C) | — | |

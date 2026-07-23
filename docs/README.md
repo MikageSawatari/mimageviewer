@@ -46,6 +46,7 @@
 | [detached-rework-stage-r0-report.md](detached-rework-stage-r0-report.md) | **Stage R0 レポート**。egui/eframe public API 調査結果、`EnumThreadWindows` before/after 差分ログの実装内容、R1 推奨方式と実機 smoke 手順 |
 | detached-rework-stage-r1/r1b/r1c/r2a〜r2d.md | 各ステージの指示書 + 検収記録 (R1 = HWND を生成イベントで 1 回だけ確定、R2 = `DetachedWindowRuntime` + reducer + placement 一本化)。進捗の現在地は plan §9 の表を見る |
 | [detached-rework-stage-audio.md](detached-rework-stage-audio.md) | **音声メディア窓 (detached の音声ファイル / ParkedLive 音楽窓) の正本**。music_* global 方針 (§3.5)、メディア窓 1 本規則、動画→音声モードとの接続 |
+| [detached-rework-stage-folder-nav.md](detached-rework-stage-folder-nav.md) | **v2.8.0 独立静止画窓の物理フォルダ移動ステージ**。main の検索・絞り込みを継承せず、folder-nav request / pending / result を active detached bundle に閉じる仕様、実装結果、実機 smoke |
 | [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | リワーク出荷前の実機 smoke マトリクス (F/W/V/P/R 系)。V9 = detached×音声モードは v2.3.0 レビューで追加 |
 | detached-rework-findings-4〜19.md | 実機検証で見つかった問題の調査・修正記録シリーズ (findings-19 は fix1〜15 まで) |
 | [review-v2.3.0/final-report.md](review-v2.3.0/final-report.md) | **v2.3.0 出荷前 品質レビュー統合レポート** (Codex×Claude 二重レビュー + 検収)。確定 P2 一覧・修正記録・追加バグハント結果・残課題。素材 (brief / codex-* / claude-*) と実機確認チェックリストも同ディレクトリ |

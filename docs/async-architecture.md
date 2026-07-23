@@ -200,13 +200,20 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
 
 - `FolderNavPending { cancel, rx, forward, mode }` が進行中 DFS の状態を持ち、
   `poll_folder_nav` が `FolderNavResult { path, forward, mode }` を返す。
+- Windows の `ViewerContextBundle` は `FolderNavPending`、`pending_folder_nav_steps`、
+  `pending_folder_nav_mode`、`ViewerNavigationScope` を一式で所有する。main と
+  `DetachedPhysical` の active independent 静止画窓は bundle swap で完全に分離され、
+  active detached の結果はその bundle を mount 中の
+  `update_active_detached_viewer_context` だけが poll / apply する。pause / Drop は
+  cancel token を立て、遅延結果を sibling context へ持ち越さない。
 - `apply_folder_nav_result` がモードに応じて分岐。Fullscreen ブランチで
   `close_fullscreen` を呼ぶが、そこは既に `folder_nav_pending = None` なので
   再帰的な自己キャンセルは起きない。
 - DFS の結果が変換アーカイブファイルの場合は `load_folder_nav_target` が
   `load_folder_or_convert_archive` に振り分ける。変換確認ダイアログや無視結果では pending を解除し、
   その時点ではフルスクリーン再オープンや検索 nav_stack 更新を行わない。
-- 連鎖ステップでも同じモードを引き継ぐ。`pending_folder_nav_mode` を App 側に保持し、
+- 連鎖ステップでも同じモードを引き継ぐ。`pending_folder_nav_mode` を現在 mount 中の
+  viewer context に保持し、
   `chain_folder_nav_if_pending` がそれを参照して次の `spawn_folder_nav` に渡す。
 - Favsearch モードでは起点フォルダが `nav_stack.last()` なので、連鎖時には
   `current_folder` ではなくスタックトップを使う。

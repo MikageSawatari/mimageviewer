@@ -324,6 +324,14 @@ active viewer 内のキーは active context へ作用する。
   `BookmarkViewState` で明示し、メイン一覧を一度実フォルダへ遷移させて戻す処理は行わない。
 - active context の PDF / ZIP enumerate、fullscreen work、AI 先読み、local adjustment 起動、
   fullscreen viewport 描画は `update_active_detached_viewer_context` 内で mount して処理する。
+- v2.8.0 stage-folder-nav では、`folder_nav_pending`、連打量、mode も同じ
+  `ViewerContextBundle` 所有へ移す。active detached の結果は
+  `update_active_detached_viewer_context` の mount 中だけ poll / apply / chain し、
+  root/main poll が detached request を受け取らないようにする。pause / Drop は
+  cancel token を立てて pending と連打を破棄する。
+- independent still context は物理ナビゲーションスコープを持つ。main の検索、絞り込み、
+  ★固定、smart/subfolder view は detached load と先頭ページ選定へ適用せず、main 側の
+  filter scope や pending open も変更しない。linked viewer と media window は従来スコープを維持する。
 - active context を mount して `load_pdf_as_folder` / `load_zip_as_folder` /
   `start_loading_items` を再利用している間は、メイン一覧用の永続履歴を更新しない。
   具体的には `settings.last_folder`、quick folder target / recent、folder nav back/forward は

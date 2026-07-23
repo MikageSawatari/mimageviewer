@@ -13649,6 +13649,18 @@ impl App {
         // 確実にカバーするため、Ctrl+↑↓ ハンドラの入口で一括で消す
         // (Codex 第 8/9 P2 指摘)。
         #[cfg(windows)]
+        if self.detached_physical_folder_nav_available() {
+            // Independent detached still viewers deliberately ignore main-window
+            // search, snapshot, smart-folder and filter state. Their request is
+            // owned by the mounted ViewerContextBundle and follows filesystem DFS.
+            if let Some(cur) = self.effective_folder() {
+                self.capture_fs_nav_holdover(fs_idx);
+                self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
+            }
+            return;
+        }
+
+        #[cfg(windows)]
         {
             self.native_video_deferred_nav_delta = None;
         }
@@ -13750,6 +13762,15 @@ impl App {
         self.slideshow_anchor_idx = None;
         self.slideshow_scroll_anim = None;
         self.slideshow_scroll_range_cache = None;
+        #[cfg(windows)]
+        if self.detached_physical_folder_nav_available() {
+            if let Some(cur) = self.effective_folder() {
+                self.capture_fs_nav_holdover(fs_idx);
+                self.start_folder_nav(cur, forward, crate::app::FolderNavMode::SiblingFullscreen);
+            }
+            return;
+        }
+
         #[cfg(windows)]
         {
             self.native_video_deferred_nav_delta = None;

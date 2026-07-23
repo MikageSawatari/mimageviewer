@@ -149,18 +149,18 @@
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
 
-### 1.22 独立 detached 静止画窓の物理フォルダ移動
+### 1.22 独立 detached 静止画窓の物理フォルダ移動 — 対応中 (実装済み・実機確認待ち)
 
 - 出典: mImageViewer スレの要望 (2026-07-23、レス 100〜102)。「画像フルスクリーン中の
   戻る / 進むボタン」に兄弟フォルダ前後を割り当て、同じ場所の `1巻.zip` から
   `2巻.zip` へ移りたいが、複数ウィンドウモードでは
   「切り離した別ウィンドウではフォルダ移動しません」となり実行できない。
-- 現状: independent / always-new detached では Ctrl+↑↓ と Ctrl+PageUp/PageDown を
-  意図的に no-op にしている。フォルダ移動の `folder_nav_pending`、
-  `pending_folder_nav_steps`、`pending_folder_nav_mode` が App-global のため、ガードだけを
+- 旧状: independent / always-new detached では Ctrl+↑↓ と Ctrl+PageUp/PageDown を
+  意図的に no-op にしていた。フォルダ移動の `folder_nav_pending`、
+  `pending_folder_nav_steps`、`pending_folder_nav_mode` が App-global だったため、ガードだけを
   外すと detached で開始した非同期結果を main context が poll / apply し、メイン一覧の
   移動、別窓への誤適用、close / activate 後の遅延適用を再発させ得る。
-- 検討方針:
+- 実装:
   1. **独立窓は物理スコープ固定**: detached 窓自身の `effective_folder()` を起点に、
      現行 `folder_tree` のファイルシステム走査と設定上のソート順で移動する。
      Ctrl+↑↓ はツリー順、Ctrl+PageUp/PageDown は同じ親直下の兄弟順とする。
@@ -169,8 +169,7 @@
      しない。移動先の先頭ページ選定も main 側の絞り込みに左右されない。並び順、
      隠しファイル、対応アーカイブ設定など物理探索に必要な一般設定だけを使う。
   3. **所有権を先に分離**: ガード削除を先行せず、フォルダ移動要求 / pending / 連打量 /
-     結果に main または `{window_id, context_generation, request_id}` の owner を持たせるか、
-     一式を `ViewerContextBundle` 所有へ移す。active detached context を mount している間に
+     結果一式を `ViewerContextBundle` 所有へ移した。active detached context を mount している間に
      poll / apply し、main 側の poll は main owner だけを処理する。
   4. active→passive、別窓 activate、close、モード切替、新規 load / nav で旧要求を cancel
      し、遅延結果は owner / generation 不一致なら破棄する。既存の同一 detached window ID・
@@ -187,7 +186,7 @@
   - ZIP / PDF enumerate 完了が要求元の同じ窓へ戻り、window ID・位置・サイズを維持し、
     新窓生成や main への focus steal を起こさない。
   - 連打アキュームレータが owner 単位で閉じ、main と detached の要求を混在させない。
-- 着手条件: detached リワーク凍結ルールに従い、症状パッチではなく明示的な新ステージとして
+- 実装条件: detached リワーク凍結ルールに従い、症状パッチではなく明示的な新ステージとして
   `docs/detached-rework-plan.md` / `docs/detached-viewer-context-separation-plan.md` に
   ownership と lifecycle を追記してから実装する。
 - 規模 / 優先度: 初期スコープは Medium / P2 candidate。変換アーカイブ・メディア・

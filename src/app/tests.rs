@@ -24552,6 +24552,246 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn mounted_detached_physical_context_owns_sibling_nav_without_touching_main_state() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = temp.path().join("01");
+        let second = temp.path().join("02");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("a.jpg"), b"fixture").unwrap();
+        std::fs::write(second.join("b.jpg"), b"fixture").unwrap();
+
+        app.current_folder = Some(PathBuf::from(r"C:\main"));
+        app.pending_folder_nav_steps = -2;
+        app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
+        app.native_video_deferred_nav_delta = Some(-1);
+        app.show_search_bar = true;
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(first.clone());
+        bundle.items = vec![GridItem::Image(first.join("a.jpg"))];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(12);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        app.with_active_detached_viewer_context(|mounted| {
+            assert!(mounted.detached_physical_folder_nav_available());
+            mounted.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+            assert!(
+                mounted.folder_nav_pending.is_some(),
+                "the async request must stay in the mounted detached bundle"
+            );
+            assert_eq!(
+                mounted.pending_folder_nav_mode.perf_tag(),
+                "fullscreen_sibling"
+            );
+            assert!(
+                mounted.fs_boundary_hint.is_none(),
+                "physical detached navigation must not use the legacy detached no-op"
+            );
+        })
+        .expect("active detached context should mount");
+
+        assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\main")));
+        assert_eq!(app.pending_folder_nav_steps, -2);
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
+        assert!(app.show_search_bar);
+
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("detached context must be restored after mounting");
+        assert_eq!(
+            active.bundle.navigation_scope,
+            ViewerNavigationScope::DetachedPhysical
+        );
+        assert!(active.bundle.folder_nav_pending.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_physical_visible_set_ignores_main_local_filter() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\main"));
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\main\keep.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\main\hidden.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.visible_indices = vec![0];
+        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.show_search_bar = true;
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(PathBuf::from(r"C:\detached"));
+        bundle.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\detached\a.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\detached\b.jpg")),
+        ];
+        bundle.thumbnails = vec![ThumbnailState::Pending; 2];
+        bundle.search_filter = Some(std::collections::HashSet::from([0]));
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        app.with_active_detached_viewer_context(|mounted| {
+            mounted.rebuild_visible_indices();
+            assert_eq!(mounted.visible_indices, vec![0, 1]);
+            assert_eq!(
+                mounted.search_filter,
+                Some(std::collections::HashSet::from([0])),
+                "the context may retain a stale local-filter snapshot, but physical policy ignores it"
+            );
+        })
+        .expect("active detached context should mount");
+
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(
+            app.search_filter,
+            Some(std::collections::HashSet::from([0]))
+        );
+        assert!(app.show_search_bar);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_physical_reopen_skips_video_and_lands_on_still_image() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        app.items = vec![
+            GridItem::Video(PathBuf::from(r"C:\detached\a.mp4")),
+            GridItem::Image(PathBuf::from(r"C:\detached\b.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.visible_indices = vec![0, 1];
+
+        let mut reason = "";
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            reason = app.reopen_fullscreen_after_folder_nav_load(ctx, false, false);
+        });
+
+        assert_eq!(reason, "done");
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(1),
+            "physical detached navigation must keep a still viewer on a still target"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_folder_nav_pending_is_cancelled_on_pause_and_drop() {
+        fn pending(cancel: Arc<AtomicBool>) -> FolderNavPending {
+            let (_tx, rx) = mpsc::channel::<FolderNavThreadResult>();
+            FolderNavPending {
+                cancel,
+                rx,
+                forward: true,
+                mode: FolderNavMode::Fullscreen,
+            }
+        }
+
+        let pause_cancel = Arc::new(AtomicBool::new(false));
+        let mut paused = ViewerContextBundle::empty();
+        paused.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        paused.folder_nav_pending = Some(pending(Arc::clone(&pause_cancel)));
+        paused.pending_folder_nav_steps = 3;
+        paused.pending_folder_nav_mode = FolderNavMode::Fullscreen;
+
+        paused.pause_background_work_keep_current_frame();
+
+        assert!(pause_cancel.load(Ordering::Relaxed));
+        assert!(paused.folder_nav_pending.is_none());
+        assert_eq!(paused.pending_folder_nav_steps, 0);
+        assert_eq!(paused.pending_folder_nav_mode.perf_tag(), "grid");
+
+        let drop_cancel = Arc::new(AtomicBool::new(false));
+        let mut dropped = ViewerContextBundle::empty();
+        dropped.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        dropped.folder_nav_pending = Some(pending(Arc::clone(&drop_cancel)));
+        drop(dropped);
+        assert!(drop_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn active_detached_update_polls_only_its_bundle_folder_nav_result() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = PathBuf::from(r"C:\main\keep.jpg");
+        app.items = vec![GridItem::Image(image)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+
+        let main_cancel = Arc::new(AtomicBool::new(false));
+        let (_main_tx, main_rx) = mpsc::channel::<FolderNavThreadResult>();
+        app.folder_nav_pending = Some(FolderNavPending {
+            cancel: Arc::clone(&main_cancel),
+            rx: main_rx,
+            forward: false,
+            mode: FolderNavMode::Grid,
+        });
+
+        let detached_cancel = Arc::new(AtomicBool::new(false));
+        let (detached_tx, detached_rx) = mpsc::channel::<FolderNavThreadResult>();
+        detached_tx
+            .send(FolderNavThreadResult {
+                outcome: None,
+                scanned: None,
+            })
+            .unwrap();
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(PathBuf::from(r"C:\detached"));
+        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\detached\a.jpg"))];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        bundle.folder_nav_pending = Some(FolderNavPending {
+            cancel: Arc::clone(&detached_cancel),
+            rx: detached_rx,
+            forward: true,
+            mode: FolderNavMode::Fullscreen,
+        });
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(13);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        let mut updated = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            updated = app.update_active_detached_viewer_context(ctx);
+        });
+        assert!(updated);
+
+        assert!(
+            app.folder_nav_pending.is_some(),
+            "the main context's pending request must not be polled while the detached bundle is mounted"
+        );
+        assert!(!main_cancel.load(Ordering::Relaxed));
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("a boundary result keeps the active viewer open");
+        assert!(active.bundle.folder_nav_pending.is_none());
+        assert!(!detached_cancel.load(Ordering::Relaxed));
+        assert!(matches!(
+            active.bundle.fs_boundary_hint,
+            Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn independent_still_video_navigation_uses_detached_hint_not_global_toast() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

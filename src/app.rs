@@ -195,6 +195,25 @@ pub(crate) enum FolderOpenOutcome {
     Ignored,
 }
 
+/// The navigation domain owned by the currently mounted viewer context.
+///
+/// Detached independent still viewers intentionally use only the physical
+/// filesystem order.  Keeping this as typed context state (rather than
+/// consulting App-global search/filter flags) makes bundle swaps preserve the
+/// request's meaning and prevents a detached result from inheriting main state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ViewerNavigationScope {
+    #[default]
+    Main,
+    DetachedPhysical,
+}
+
+impl ViewerNavigationScope {
+    fn is_detached_physical(self) -> bool {
+        matches!(self, Self::DetachedPhysical)
+    }
+}
+
 /// Ownership of a visible folder/container load.
 ///
 /// Normal navigation supersedes pending opens. Bookmark-owned internal transitions (for
@@ -1853,6 +1872,7 @@ struct FolderPinLookupTarget {
 struct ViewerContextBundle {
     address: String,
     current_folder: Option<PathBuf>,
+    navigation_scope: ViewerNavigationScope,
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
     stack_mode_requested: bool,
@@ -1926,6 +1946,9 @@ struct ViewerContextBundle {
     vis_settle_at: Option<std::time::Instant>,
     vis_first_logged: bool,
     vis_all_logged: bool,
+    folder_nav_pending: Option<FolderNavPending>,
+    pending_folder_nav_steps: i32,
+    pending_folder_nav_mode: FolderNavMode,
     search_filter: Option<std::collections::HashSet<usize>>,
     search_filter_origin_folder: Option<PathBuf>,
     checked: std::collections::HashSet<usize>,
@@ -2047,6 +2070,7 @@ struct ViewerContextBundle {
     cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
     fs_nav_locked_gen: Option<u64>,
     fs_holdover_tex: Option<egui::TextureHandle>,
+    fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
     virtual_folder_writeback: Option<VirtualFolderWriteback>,
     pdf_prefetch_grace_until: Option<std::time::Instant>,
     thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
@@ -2127,6 +2151,9 @@ impl Drop for ViewerContextBundle {
         if let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+        if let Some(pending) = self.folder_nav_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2140,6 +2167,7 @@ impl ViewerContextBundle {
         Self {
             address: String::new(),
             current_folder: None,
+            navigation_scope: ViewerNavigationScope::Main,
             archive_source_override: None,
             zip_nav: None,
             stack_mode_requested: false,
@@ -2198,6 +2226,9 @@ impl ViewerContextBundle {
             vis_settle_at: None,
             vis_first_logged: false,
             vis_all_logged: false,
+            folder_nav_pending: None,
+            pending_folder_nav_steps: 0,
+            pending_folder_nav_mode: FolderNavMode::Grid,
             search_filter: None,
             search_filter_origin_folder: None,
             checked: std::collections::HashSet::new(),
@@ -2298,6 +2329,7 @@ impl ViewerContextBundle {
             cached_fs_seek_info: None,
             fs_nav_locked_gen: None,
             fs_holdover_tex: None,
+            fs_boundary_hint: None,
             virtual_folder_writeback: None,
             pdf_prefetch_grace_until: None,
             thumb_pixels: std::collections::HashMap::new(),
@@ -2354,6 +2386,11 @@ impl ViewerContextBundle {
         self.fs_holdover_tex = None;
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
+        if let Some(pending) = self.folder_nav_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pending_folder_nav_steps = 0;
+        self.pending_folder_nav_mode = FolderNavMode::Grid;
         for (_, (cancel, _, _)) in self.fs_pending.drain() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -6195,6 +6232,7 @@ pub(crate) enum GridScrollIntent {
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
+    pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
@@ -9771,6 +9809,7 @@ impl App {
         let mut app = Self {
             address: String::new(),
             current_folder: None,
+            navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
             thumbnails: Vec::new(),
             selected: None,
@@ -11860,6 +11899,7 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            navigation_scope,
             archive_source_override,
             zip_nav,
             stack_mode_requested,
@@ -11918,6 +11958,9 @@ impl App {
             vis_settle_at,
             vis_first_logged,
             vis_all_logged,
+            folder_nav_pending,
+            pending_folder_nav_steps,
+            pending_folder_nav_mode,
             search_filter,
             search_filter_origin_folder,
             checked,
@@ -12018,6 +12061,7 @@ impl App {
             cached_fs_seek_info,
             fs_nav_locked_gen,
             fs_holdover_tex,
+            fs_boundary_hint,
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
             thumb_pixels,
@@ -12062,6 +12106,7 @@ impl App {
 
         swap_field!(address);
         swap_field!(current_folder);
+        swap_field!(navigation_scope);
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
         swap_field!(stack_mode_requested);
@@ -12123,6 +12168,9 @@ impl App {
         swap_field!(vis_settle_at);
         swap_field!(vis_first_logged);
         swap_field!(vis_all_logged);
+        swap_field!(folder_nav_pending);
+        swap_field!(pending_folder_nav_steps);
+        swap_field!(pending_folder_nav_mode);
         swap_field!(search_filter);
         swap_field!(search_filter_origin_folder);
         swap_field!(checked);
@@ -12231,6 +12279,7 @@ impl App {
         swap_field!(cached_fs_seek_info);
         swap_field!(fs_nav_locked_gen);
         swap_field!(fs_holdover_tex);
+        swap_field!(fs_boundary_hint);
         swap_field!(virtual_folder_writeback);
         swap_field!(pdf_prefetch_grace_until);
         swap_field!(thumb_pixels);
@@ -14600,6 +14649,12 @@ impl App {
     fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
         match owner {
             OpenRequestOwner::Navigation => {
+                if self.navigation_scope.is_detached_physical() {
+                    // Archive conversion, unresolved startup opens, and bookmark
+                    // opens are App-global main requests. A detached context can
+                    // own its load without cancelling any of them.
+                    return true;
+                }
                 // A direct navigation owns the next visible location. If an earlier startup,
                 // activation, or bookmark path is still resolving, dispose that request before
                 // the worker can overwrite this navigation with a late completion.
@@ -14629,19 +14684,22 @@ impl App {
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
     ) {
+        let detached_physical = self.navigation_scope.is_detached_physical();
         // 別経路の load が走ったら、in-flight のフォルダペイン open scan は stale なので
         // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
         // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
-        self.cancel_folder_pane_open();
-        if self.restore_smart_folder_for_synthetic_path(&path) {
-            self.suppress_nav_record_for_search_restore = false;
-            return;
+        if !detached_physical {
+            self.cancel_folder_pane_open();
+            if self.restore_smart_folder_for_synthetic_path(&path) {
+                self.suppress_nav_record_for_search_restore = false;
+                return;
+            }
+            if self.restore_subfolder_expansion_for_synthetic_path(&path) {
+                self.suppress_nav_record_for_search_restore = false;
+                return;
+            }
+            self.reconcile_smart_folder_scoped_real_folder_load(&path);
         }
-        if self.restore_subfolder_expansion_for_synthetic_path(&path) {
-            self.suppress_nav_record_for_search_restore = false;
-            return;
-        }
-        self.reconcile_smart_folder_scoped_real_folder_load(&path);
         if matches!(
             self.top_level_grid_view.surface(),
             top_level_grid_view::TopLevelGridSurface::DriveList
@@ -14660,7 +14718,7 @@ impl App {
         {
             self.reading_history_return_from = None;
         }
-        if matches!(owner, OpenRequestOwner::Navigation) {
+        if !detached_physical && matches!(owner, OpenRequestOwner::Navigation) {
             self.reconcile_bookmark_return_target_for_folder_load(&path);
         }
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
@@ -14669,7 +14727,8 @@ impl App {
         // で path 完全一致または prefix 一致を見る。
         // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
         // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
-        if self.is_snapshot_active()
+        if !detached_physical
+            && self.is_snapshot_active()
             && !self.snapshot_internal_nav
             && self.snapshot_owner_entry(&path).is_none()
         {
@@ -14718,7 +14777,9 @@ impl App {
             // ナビゲートしたら自動解除する (plan §3.5)。同一フォルダ再読込 (ソート変更・外部更新・
             // メンバーグリッドからの戻り) では folder_changes=false なので維持される。
             self.stack_mode_requested = false;
-            self.clear_archive_convert_nav_history_rollback();
+            if !detached_physical {
+                self.clear_archive_convert_nav_history_rollback();
+            }
             // **review #11/#13 対応**: 前フォルダ向けの catch-up / neighbor-prefetch
             // ジョブをまとめてキャンセル & queue から破棄する。これにより:
             //   - 未処理 job が即 drop され、握っていた `Arc<CatalogDb>` が解放される
@@ -14727,13 +14788,15 @@ impl App {
             //     Interrupted で抜け、PDF worker Normal 枠を即解放する
             //   - 新フォルダ向けの enqueue は新しい cancel flag で焼き付くので、
             //     混ざらない
-            crate::thumb_loader::bump_catchup_epoch();
-            // PDF render pool の context epoch も bump し、前フォルダの page-grid
-            // render ジョブを stale prune する。`load_pdf_as_folder` の async enumerate
-            // 待ちの間も保護されるよう、`start_loading_items` (= helper 経由) より早い
-            // load_folder の入口で先に bump する (二重 bump は fetch_add で別 epoch
-            // になるだけで無害)。
-            let _ = crate::pdf_loader::bump_render_context_epoch();
+            if !detached_physical {
+                crate::thumb_loader::bump_catchup_epoch();
+                // PDF render pool の context epoch も bump し、前フォルダの page-grid
+                // render ジョブを stale prune する。`load_pdf_as_folder` の async enumerate
+                // 待ちの間も保護されるよう、`start_loading_items` (= helper 経由) より早い
+                // load_folder の入口で先に bump する (二重 bump は fetch_add で別 epoch
+                // になるだけで無害)。
+                let _ = crate::pdf_loader::bump_render_context_epoch();
+            }
         }
         self.record_folder_nav_transition(&path);
         // パスが .zip / .cbz / .pdf ファイルなら仮想フォルダとして開く
@@ -14789,7 +14852,9 @@ impl App {
 
         // フォルダ移動でメタ操作の Undo/Redo スタックを破棄する (移動先で過去の
         // レーティング操作を巻き戻すと UX が混乱するため)。
-        self.clear_meta_undo();
+        if !detached_physical {
+            self.clear_meta_undo();
+        }
 
         // 外側の ZIP/PDF/フォルダを切り替えたので、ネスト ZIP バイト列キャッシュを破棄する。
         // これで古い外側アーカイブのバイト列が RAM に居残るのを防ぐ。
@@ -15084,7 +15149,9 @@ impl App {
                 ],
             );
         }
-        self.update_smart_folder_scoped_address();
+        if !detached_physical {
+            self.update_smart_folder_scoped_address();
+        }
     }
 
     /// 名前索引フラグ (`auto_index_structure`) の OFF→ON / ON→OFF 遷移を即時反映する。
@@ -19093,9 +19160,12 @@ impl App {
         folder_signature: Option<u64>,
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
     ) {
+        let detached_physical = self.navigation_scope.is_detached_physical();
         self.cancel_media_navigation_pending_for_current_context("start_loading_items");
-        self.clear_color_filter_for_new_items();
-        self.color_filter_scope_refresh_pending = false;
+        if !detached_physical {
+            self.clear_color_filter_for_new_items();
+            self.color_filter_scope_refresh_pending = false;
+        }
         self.current_color_cache_map = None;
         self.current_color_catalog = None;
 
@@ -19117,7 +19187,9 @@ impl App {
         self.stack_showing_flat = false;
         // 進行中のスタックスクリプトワーカーも破棄 (旧フォルダ向けの結果を適用しない)。
         self.cancel_stack_script_pending();
-        if !crate::folder_tree::path_eq(&source_path, &subfolder_expansion_synthetic_path()) {
+        if !detached_physical
+            && !crate::folder_tree::path_eq(&source_path, &subfolder_expansion_synthetic_path())
+        {
             if self.items_are_subfolder_expansion_view {
                 // Search/rating/synthetic views own their dedicated restore state. Taking it again
                 // here after their first transfer leaves a root-only duplicate. Real-folder
@@ -19132,14 +19204,18 @@ impl App {
             self.cancel_subfolder_expansion_pending();
             self.clear_subfolder_expansion_view_state();
         }
-        if !smart_folder::is_smart_folder_synthetic_path(&source_path) {
+        if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&source_path) {
             self.cancel_smart_folder_pending();
             if self.items_are_smart_folder_view {
                 self.clear_smart_folder_view_state();
             }
         }
-        self.gamepad_location_picker = None;
-        if !crate::folder_tree::path_eq(&source_path, &rating_view_synthetic_path()) {
+        if !detached_physical {
+            self.gamepad_location_picker = None;
+        }
+        if !detached_physical
+            && !crate::folder_tree::path_eq(&source_path, &rating_view_synthetic_path())
+        {
             if let Some(pending) = self.rating_view_pending.take() {
                 pending.cancel();
             }
@@ -19187,13 +19263,15 @@ impl App {
         // 初フレームから prefetch が pool に流れる。新コンテキストでも visible を優先したいので
         // `Some(now)` で 100ms idle 待ちを生み出す (= 同 1 フレーム内の Ctrl+↑↓ 多段 nav にも効く)。
         // docs/prefetch-suppression-during-scroll-plan.md 1.3 参照。
-        self.last_prefetch_scroll_at = Some(std::time::Instant::now());
-        // **Codex P3-2 (2026-05)**: suppression event の transition tracker も新フォルダで
-        // リセット。前フォルダ末で allow 状態のまま終わると、新フォルダ初回の Block 遷移が
-        // `start` ではなく次の continue tick まで遅れたり、逆も起きる。新コンテキストでは
-        // 「未観測」スタートにして初回 frame で確実に start を emit させる。
-        self.prev_prefetch_allowed = None;
-        self.last_prefetch_suppressed_emit_at = None;
+        if !detached_physical {
+            self.last_prefetch_scroll_at = Some(std::time::Instant::now());
+            // **Codex P3-2 (2026-05)**: suppression event の transition tracker も新フォルダで
+            // リセット。前フォルダ末で allow 状態のまま終わると、新フォルダ初回の Block 遷移が
+            // `start` ではなく次の continue tick まで遅れたり、逆も起きる。新コンテキストでは
+            // 「未観測」スタートにして初回 frame で確実に start を emit させる。
+            self.prev_prefetch_allowed = None;
+            self.last_prefetch_suppressed_emit_at = None;
+        }
 
         // perf: start_loading_items 全体 + 内訳 (sidecar_flush / close_fullscreen /
         // state_reset / prewarm_rating / prewarm_tags / rebuild_visible_indices /
@@ -19217,8 +19295,10 @@ impl App {
         // フォルダ切替前に dirty なサイドカーをディスクに書き出す。メモリ上の表現は
         // 破棄して再読み込みに任せる (長時間稼働時のメモリリーク防止)。
         let sidecar_t0 = std::time::Instant::now();
-        self.flush_all_sidecars();
-        self.sidecars.clear();
+        if !detached_physical {
+            self.flush_all_sidecars();
+            self.sidecars.clear();
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -19237,7 +19317,7 @@ impl App {
         // folder_history (スクロール位置復元用) へ保存しない。Ctrl+G は current_folder を
         // 検索前フォルダのまま保つため、検索ビューの scroll_offset_y をそのフォルダの
         // スクロール状態として記録すると、後で戻ったとき誤った位置に復元される。
-        if let Some(cur) = self.current_folder.clone() {
+        if !detached_physical && let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
                 || self.items_are_reading_history_view
@@ -19287,13 +19367,17 @@ impl App {
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
         self.current_folder_rating_cache = None;
-        self.reset_folder_rating_counts();
+        if !detached_physical {
+            self.reset_folder_rating_counts();
+        }
         // ★フィルタ suppression scope の判定: anchor の subtree 外に出たら復元する。
         // 判定は current_folder 反映直後に行うため、`effective_folder()` が最新値を返す。
         // RAR/7z/LZH キャッシュ ZIP の async enumerate 完了時は、呼び出し元が設定した
         // archive_source_override がまだ生きているため、ユーザー視点の元アーカイブ
         // パスを基準に判定できる。
-        self.maybe_restore_rating_filter_if_out_of_scope();
+        if !detached_physical {
+            self.maybe_restore_rating_filter_if_out_of_scope();
+        }
         // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
         // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
         self.current_folder_last_mtime = source_path
@@ -19323,7 +19407,9 @@ impl App {
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
         // no-op: Ctrl+G 非アクティブ / Aggregated 時は何もしない。
-        self.update_global_search_address();
+        if !detached_physical {
+            self.update_global_search_address();
+        }
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
@@ -19506,11 +19592,13 @@ impl App {
         self.slideshow_scroll_range_cache = None;
         self.search_filter = None;
         self.search_filter_origin_folder = None;
-        self.search_query.clear();
-        // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
-        // 検索結果インデックスが意味を失う)
-        if let Some(pending) = self.search_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
+        if !detached_physical {
+            self.search_query.clear();
+            // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
+            // 検索結果インデックスが意味を失う)
+            if let Some(pending) = self.search_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
         }
         // メタデータ読み込みも idx ベースなのでフォルダ切替時にキャンセル
         if let Some(pending) = self.metadata_pending.take() {
@@ -19980,8 +20068,10 @@ impl App {
         // ときは履歴より優先する: 深い階層から BS で戻ったとき、最初にフォルダへ入った位置
         // ではなく「今いる位置」にカーソルを合わせるため。指定アイテムが items に見つから
         // なかった場合 (削除等) のみ履歴へフォールバック。
-        let history_state = self.folder_history.get(&source_path).copied();
-        let restored = self.try_select_after_load();
+        let history_state = (!detached_physical)
+            .then(|| self.folder_history.get(&source_path).copied())
+            .flatten();
+        let restored = !detached_physical && self.try_select_after_load();
         if restored && let Some((scroll, _)) = history_state {
             // BS / direct-page close は select_after_load で選択対象を更新するが、
             // 視点は戻り先リストでユーザーが見ていたスクロール位置を先に復元する。
@@ -20019,8 +20109,10 @@ impl App {
         // A freshly loaded grid must not inherit stale idle-upgrade timing from
         // the previous grid. Scroll history has been restored by this point, so
         // restart the quiet window from the restored position.
-        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
-        self.last_scroll_change_time = std::time::Instant::now();
+        if !detached_physical {
+            self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+            self.last_scroll_change_time = std::time::Instant::now();
+        }
         // 検索結果 / 読書履歴 / レーティング一覧用の合成パスは last_folder に記録しない (次回起動時に復元しないため)。
         // active detached viewer の PDF / ZIP ページ文脈も、メイン一覧とは独立した一時 context
         // なので last_folder / quick folder settings へ永続化しない。
@@ -29358,7 +29450,12 @@ impl App {
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        self.cancel_folder_pane_open();
+        // Folder-pane pending belongs to the main grid, not to a mounted detached
+        // physical viewer.  Cancelling it from the detached window would let an
+        // unrelated Ctrl+↑↓ race and discard the user's main-window click.
+        if !self.navigation_scope.is_detached_physical() {
+            self.cancel_folder_pane_open();
+        }
         self.clear_pending_folder_nav_steps();
         self.release_fs_nav_lock();
     }
@@ -29419,7 +29516,13 @@ impl App {
         // Phase 4 (spec §8): `folder_tree::*_dfs` は内部で `Settings::load()` を呼ばず
         // 呼び出し側から `FolderTreeOptions` を受ける形に変更済み。ここで一度だけ
         // 値をスナップショットして worker thread に move する。
-        let tree_opts = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
+        let detached_physical = self.navigation_scope.is_detached_physical();
+        let mut tree_opts = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
+        if detached_physical {
+            // A detached physical viewer must not open a conversion dialog owned
+            // by the main window. Native still containers remain eligible.
+            tree_opts.include_convertible_archives = false;
+        }
         let show_hidden_files = self.settings.show_hidden_files;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -29435,9 +29538,10 @@ impl App {
             FolderNavMode::SmartFolder { state, .. } => Some(state.clone()),
             _ => None,
         };
-        // スライドショー NextFolder だけは判定述語を「静止画あり」にして、動画のみ /
-        // 画像なしフォルダを skip-walk で飛ばす。手動 Ctrl+↑↓ 等は従来どおり動画込み。
-        let still_only = matches!(mode, FolderNavMode::SlideshowNext);
+        // Detached physical navigation is a still-viewer operation. It shares
+        // SlideshowNext's still predicate so media-only folders never promote
+        // the independent still window into an unowned media session.
+        let still_only = matches!(mode, FolderNavMode::SlideshowNext) || detached_physical;
         let start_path_disp = if crate::perf::is_enabled() {
             current.display().to_string()
         } else {
@@ -29934,8 +30038,11 @@ impl App {
             });
             return "enumerate_defer";
         }
-        // SlideshowNext の再開は動画を開かず静止画のみに着地する (Codex P2)。
-        let target_idx = self.find_fullscreen_nav_target_filtered(!resume_slideshow);
+        // SlideshowNext と切り離し静止画ビューアの物理順ナビは、動画を開かず
+        // 静止画のみに着地する。後者は移動先フォルダに動画が先に並んでいても
+        // detached still session を media session へ昇格させない。
+        let include_video = !resume_slideshow && !self.navigation_scope.is_detached_physical();
+        let target_idx = self.find_fullscreen_nav_target_filtered(include_video);
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             // find_fullscreen_nav_target_filtered が loose 画像なしフォルダで先頭 ZIP/PDF を
             // 仮想展開した場合もここに来る (current_folder が ZIP/PDF になっている)。
@@ -29987,7 +30094,9 @@ impl App {
             // close_fullscreen で既に false なので再開しないだけでよい。)
             // fullscreen は close 済みなので、メインビューポートに
             // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if !self.navigation_scope.is_detached_physical() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             // フルスクリーン再オープン無しなら nav ロックを使う相手がいないので
             // 明示 release (Codex P1)。次の Ctrl+↑↓ がブロックされない。
             self.release_fs_nav_lock();
@@ -30200,6 +30309,8 @@ impl App {
         // フォルダへ飛ばしてフルスクリーンが解除されるのを避けるため、現状維持で
         // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
         if (matches!(result.mode, FolderNavMode::Fullscreen)
+            || (self.navigation_scope.is_detached_physical()
+                && matches!(result.mode, FolderNavMode::SiblingFullscreen))
             || matches!(
                 result.mode,
                 FolderNavMode::SmartFolder {
@@ -33749,6 +33860,10 @@ impl App {
     ) -> bool {
         let target = Self::detached_book_context_target(&descriptor);
         let mut main_context = self.take_current_viewer_context_bundle();
+        // From this point until the bundle is captured, all loads belong to the
+        // independent detached still viewer.  The scope travels with the bundle
+        // and is restored whenever that viewer is mounted.
+        self.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         if let Some(pending) = bookmark_pending.as_mut() {
             pending.begin_page_wait();
             self.bookmark_view_state = Some(BookmarkViewState::Detached {
@@ -34222,32 +34337,9 @@ impl App {
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            // ★固定 (Snapshot Lock) 中は範囲外フォルダの `load_folder` が早期 return し、
-            // 窓を閉じた後に items が空のまま = 窓が無言で失われる (レビュー P2)。
-            // snapshot は bundle 非対象の App-global なので、load_folder と同じ判定で
-            // ここで先に弾き、parked のまま残す。
-            if self.is_snapshot_active()
-                && !self.snapshot_internal_nav
-                && path
-                    .parent()
-                    .is_some_and(|p| self.snapshot_owner_entry(p).is_none())
-            {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_reopen_descriptor_aborted id={} reason=snapshot_lock_out_of_range",
-                    snapshot.id
-                ));
-                self.show_feedback_toast(
-                    "スナップショット中は範囲外の別ウィンドウを復帰できません (★固定を解除してください)"
-                        .to_string(),
-                );
-                self.transition_detached_window_state(
-                    snapshot.id,
-                    DetachedWindowState::Parked,
-                    "passive_activate_reopen_descriptor_aborted",
-                );
-                self.detached_image_windows.insert(pos, snapshot);
-                return false;
-            }
+            // Descriptor fallback creates a DetachedPhysical bundle below.
+            // App-global snapshot lock belongs to the main grid and therefore
+            // must not prevent this independent viewer from restoring its file.
         }
         self.log_detached_image_window_debug(format!(
             "passive_activate_reopen_descriptor id={} descriptor={} title={:?}",
@@ -34406,6 +34498,10 @@ impl App {
                         app.detached_image_windows.len()
                     ));
                 }
+                if let Some(result) = app.poll_folder_nav() {
+                    app.apply_folder_nav_result(ctx, result);
+                    app.chain_folder_nav_if_pending();
+                }
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
@@ -34433,7 +34529,8 @@ impl App {
                 app.poll_local_adjust_lut_load(ctx);
                 app.poll_local_adjust_segmentation(ctx);
 
-                if app.pdf_enumerate_pending.is_some()
+                if app.folder_nav_pending.is_some()
+                    || app.pdf_enumerate_pending.is_some()
                     || app.zip_enumerate_pending.is_some()
                     || app.fs_nav_deferred_reopen_wait_active()
                     || matches!(
@@ -34898,6 +34995,7 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            navigation_scope,
             archive_source_override,
             zip_nav,
             stack_mode_requested,
@@ -34957,6 +35055,9 @@ impl App {
             vis_settle_at,
             vis_first_logged,
             vis_all_logged,
+            folder_nav_pending,
+            pending_folder_nav_steps,
+            pending_folder_nav_mode,
             search_filter,
             search_filter_origin_folder,
             checked,
@@ -35056,6 +35157,7 @@ impl App {
             cached_fs_seek_info,
             fs_nav_locked_gen,
             fs_holdover_tex,
+            fs_boundary_hint,
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
             thumb_pixels,
@@ -35203,6 +35305,7 @@ impl App {
             cached_fs_seek_info,
             fs_nav_locked_gen,
             fs_holdover_tex,
+            fs_boundary_hint,
             normalize_ui_states,
             normalize_auto_scan_suppressed,
             music_bookmarks,
@@ -35222,6 +35325,7 @@ impl App {
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
+            navigation_scope,
             requested,
             metadata_import_refresh_index,
             idle_upgrade_cache_bypass_ineligible,
@@ -35257,6 +35361,9 @@ impl App {
             vis_settle_at,
             vis_first_logged,
             vis_all_logged,
+            folder_nav_pending,
+            pending_folder_nav_steps,
+            pending_folder_nav_mode,
             folder_pin_map,
             converted_archive_cache_paths,
             converted_archive_cache_paths_pending,
@@ -35614,6 +35721,12 @@ impl App {
             && self
                 .fullscreen_idx
                 .is_some_and(|idx| self.viewer_item_supports_detached_still(idx))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_physical_folder_nav_available(&self) -> bool {
+        self.navigation_scope.is_detached_physical()
+            && self.detached_viewer_independent_still_session()
     }
 
     #[cfg(windows)]
@@ -38924,6 +39037,22 @@ impl App {
     }
 
     fn rebuild_visible_indices_impl(&mut self, sync_facet_scope: bool) {
+        if self.navigation_scope.is_detached_physical() {
+            // Detached physical viewers intentionally ignore every App-global
+            // display filter.  Their list is the filesystem/container list that
+            // was loaded into this bundle, in raw order.
+            self.visible_indices = (0..self.items.len()).collect();
+            self.details_thumb_suppression_applied = false;
+            self.details_order.clear();
+            self.cached_nav_indices = None;
+            self.cached_fs_seek_info = None;
+            if !self.checked.is_empty() {
+                let vi = &self.visible_indices;
+                self.checked.retain(|idx| vi.binary_search(idx).is_ok());
+            }
+            self.ensure_selected_visible_or_first();
+            return;
+        }
         self.ensure_bookmark_presence_loaded();
         let color_filter_t0 = if self.color_filter.enabled && crate::perf::is_enabled() {
             Some(std::time::Instant::now())

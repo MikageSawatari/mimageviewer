@@ -148,10 +148,12 @@ Passive frozen still 駆動ノート（R2d）:
 - ⑤ を実装で守るため、active detached window が OS foreground のときはメイン側のグリッドキー
   (Ctrl+↑↓ 等) を処理しない。キー入力は foreground の active detached context にだけ渡し、
   independent 窓の操作でメイン bundle が同時に移動する経路を作らない。
-- independent 窓 / always-new 窓での Ctrl+↑↓ / Ctrl+PageUp/PageDown は、フォルダ横断
-  ナビゲーションを開始せず、入力をその窓側で消費して案内だけ出す。同じフォルダ / 同じ本の中の
-  前後移動は従来どおり許可する。独自 bundle とメイン bundle の境界をまたぐ操作を禁止し、
-  連動事故を防ぐための仕様。
+- independent / always-new の静止画窓で Ctrl+↑↓ / Ctrl+PageUp/PageDown を押すと、
+  窓自身の `DetachedPhysical` bundle で物理フォルダ移動を行う。main のローカル絞り込み、
+  Ctrl+G / Ctrl+S、★固定、スマートフォルダ、facet / rating / 色フィルタは参照も変更もしない。
+  通常画像フォルダ / ZIP / CBZ / PDF だけを対象とし、変換ダイアログを要する
+  RAR/7z/LZH と動画 / 音声への昇格は行わない。pending と連打量も bundle 所有なので、
+  独自 bundle と main bundle の境界はまたがない。
 - independent 窓のスライドショーは、末尾動作が「次のフォルダへ進む」でもフォルダ横断を
   開始せず、現一覧内ループとして扱う。スライドショー自動送りも Ctrl+↑↓ と同じく bundle 境界を
   またがせない。
@@ -175,7 +177,7 @@ R2c 時点の入力処理は「表示状態」だけでなく「所有してい�
 | 状態 | 主要入力経路 | 有効な入力 | 無効 / no-op | 実装メモ |
 |---|---|---|---|---|
 | Active・連動（静止画 / ZIP / PDF） | detached fullscreen viewport の egui `ctx` → `handle_fs_key_input` / wheel / mouse | 同一フォルダ・同一本内の前後移動、V、Shift+Z、全体補正、通常 linked で許可される編集 | 特になし。Ctrl+↑↓ は linked としてメイン bundle と同じ文脈を動かす | root/main 側の fullscreen key fallback は detached 中 `handle_fullscreen_root_key_input` が false で返すため、foreground detached viewport 側が本線 |
-| Active・連動なし（always-new 静止画） | detached fullscreen viewport の egui `ctx` | 同一フォルダ・同一本内の前後移動、V、Shift+Z、全体補正 | Ctrl+↑↓ / Ctrl+PageUp/Down は no-op toast。E / Ctrl+M / Ctrl+T / F7-F10 など編集系は案内して no-op | `detached_independent_session_blocks_folder_nav` と `detached_viewer_image_edit_tools_disabled_reason` で bundle 境界を越える操作を止める |
+| Active・連動なし（always-new 静止画） | detached fullscreen viewport の egui `ctx` | 同一フォルダ・同一本内の前後移動、物理 scope の Ctrl+↑↓ / Ctrl+PageUp/Down、V、Shift+Z、全体補正 | RAR/7z/LZH・動画/音声への folder-nav、E / Ctrl+M / Ctrl+T / F7-F10 など編集系は案内して no-op | `ViewerNavigationScope::DetachedPhysical` と bundle 所有の folder-nav pending で main の検索・絞り込みから分離。scope を持たない legacy independent / detached media は `detached_independent_session_blocks_folder_nav` で止める |
 | Active detached 動画 | native presenter HWND → `handle_native_video_output_event` / `handle_native_video_window_event` | 再生、シーク、音量、ホイール前後移動、F12 host migration、F11 仮想 fullscreen | always-new でも Ctrl+↑↓ / Ctrl+PageUp/Down は detached 側では folder-nav しない。別動画の明示 open だけ既存動画 window を差し替える | egui 親 viewport へ漏れる wheel は `should_suppress_egui_wheel_for_native_detached_video` で消費し、native presenter を唯一の動画入力経路にする |
 | Passive・連動なし（静止画 frozen） | `render_detached_image_windows` の passive egui viewport | 左クリック（pointer press）で Active 化、× / バー close | キー、ホイール、スクロールは表示だけで no-op。focus edge だけでは Active 化しない | CUT 後、linked passive は存在しない。focus ping-pong 対策で `detached_passive_window_should_activate` は pointer activation のみ |
 | ParkedLive（動画 / 音声 live-park） | native presenter HWND を tick するため毎フレーム短時間 mount | 左クリック down→up の組だけ Active 復帰要求に変換。Geometry / DPI / PlacementSwitched は lifecycle として通す | キー、ホイール、右/中クリック、ダブルクリックは no-op。復帰前にシークや HUD 操作へ貫通しない | `native_video_parked_live_input_window_id` 中の filter で左クリックだけ activation queue。復帰後は通常 native 入力に戻る |

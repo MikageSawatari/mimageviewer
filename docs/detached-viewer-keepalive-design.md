@@ -303,8 +303,9 @@ active_detached_viewport_rendered_this_frame()      // rendered_frame == frame_c
 
 - **K0 を最優先**: backstop は既存構造を壊さずに不変条件を「事後保証」するので、まず
   ちらつきを止めて切り分けできる。K1 以降で構造を本来の単一入口へ寄せる。
-- always-new (常に別ウィンドウ) モードの Ctrl+↑↓ は当面無効でよい (ユーザー許容済み)。
-  まず通常モード (OFF) の PDF/画像 folder-nav を壊さないことを最優先。
+- K0 当時は always-new (常に別ウィンドウ) モードの Ctrl+↑↓ を無効とした。
+  v2.8.0 の `detached-rework-stage-folder-nav.md` で、独立静止画窓に限り bundle 所有の
+  物理フォルダ移動へ更新済み。detached 動画 / 音声とスライドショー自動送りは従来どおり。
 
 ---
 

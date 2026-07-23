@@ -46,8 +46,8 @@ Ctrl+↑↓ でフォルダ横断しない。
 | --- | --- |
 | ホイール / ↑↓ / 画像の ←→ | `visible_indices` 内の前後アイテムへ移動。通常の←→によるページ移動は、環境設定でページ表示 / 読み方向（既定）またはページシークバーの実効方向に合わせられる。縦連結ではホイール / ↑↓ / PageUp/PageDown は縦スクロールし、←→はこの設定に従う前後アイテム移動。横連結ではホイール / ←→ / PageUp/PageDown は横スクロールし、↑↓ は従来どおり前後アイテムへ移動 |
 | 同一一覧の先頭 / 末尾 | `FsBoundaryHint::Edge` を中央表示し、Home / End と Ctrl+↑↓ を案内。文言は「項目」表現 |
-| Ctrl+↑↓ | `FolderNavMode::Fullscreen` で DFS。現在は前後どちらの方向でも移動先フォルダの先頭 image-like に着地する。切り離した detached / always-new 窓ではメイン bundle のフォルダ移動へは入らず no-op 案内 |
-| Ctrl+PageUp/PageDown | `FolderNavMode::SiblingFullscreen` で同じ親の前後兄弟へ移動する。移動先に image-like があれば先頭 image-like に着地し、なければ一覧へ戻る。切り離した detached / always-new 窓では no-op |
+| Ctrl+↑↓ | `FolderNavMode::Fullscreen` で DFS。現在は前後どちらの方向でも移動先フォルダの先頭 image-like に着地する。独立 detached 静止画窓では、その窓の `DetachedPhysical` bundle を起点に通常画像フォルダ / ZIP / CBZ / PDF だけを物理 DFS 順で移動し、main の検索・絞り込み・★固定を参照しない |
+| Ctrl+PageUp/PageDown | `FolderNavMode::SiblingFullscreen` で同じ親の前後兄弟へ移動する。独立 detached 静止画窓でも同じ物理兄弟順を使うが、静止画を持たない兄弟と RAR/7z/LZH は開かず境界案内を出す |
 | スライドショー「次のフォルダへ進む」 | 通常 linked viewer では `FolderNavMode::SlideshowNext` で次の静止画フォルダへ進む。切り離した detached / always-new 窓ではフォルダ横断せず、現一覧内ループ扱い |
 | 移動先に画像 / 動画が見つからない | `FsBoundaryHint::NoImageFolder` を表示 |
 | 兄弟が無い | `FsBoundaryHint::NoSiblingFolder` を表示 |
@@ -130,7 +130,8 @@ Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を
   画像または動画を含む通常フォルダ、画像入り ZIP、PDF、RAR/7z/LZH などの変換アーカイブ。
   分割 RAR は先頭パートのみを対象にし、後続パートは重複として飛ばす。
 - フルスクリーンを維持して移動した場合、方向に関わらず移動先の先頭 image-like
-  (`Image` / `Video` / `ZipImage` / `PdfPage`) を開く。
+  (`Image` / `Video` / `ZipImage` / `PdfPage`) を開く。独立 detached 静止画窓の
+  物理順ナビだけは動画を除外し、先頭の静止画 / ZIP ページ / PDF ページへ着地する。
 - これにより、`Ctrl+↑` で「前フォルダの末尾」へ行きたいケースは `Ctrl+↑` → `End`
   の 2 操作になる。一方で、連打中に前後方向が混ざっても着地点が安定し、
   「フォルダへジャンプしたら冒頭から見る」という mental model に統一できるため、
@@ -151,7 +152,8 @@ Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を
 | Ctrl+G の検索結果末端 | 「最後/最初の検索結果です」 + 検索を閉じると通常移動に戻る案内 |
 | Ctrl+F active 中の Ctrl+↑↓ | 「Ctrl+F 検索中はフォルダ移動しません」などの no-op 案内 |
 | Ctrl+S / Ctrl+G の結果一覧で Ctrl+↑↓ | 「検索結果を開いてから Ctrl+↑↓ で移動できます」などの no-op 案内 |
-| 切り離した detached / always-new 窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | 「切り離した別ウィンドウではフォルダ移動しません」などの no-op 案内 |
+| 独立 detached 静止画窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | main の検索・絞り込みを無視し、その窓自身の物理順で移動。端では物理スコープの境界案内 |
+| detached 動画 / 音声窓、legacy unbundled 窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | 「切り離した別ウィンドウではフォルダ移動しません」などの no-op 案内 |
 
 見開きでは 2 ページを 1 つの表示単位として扱う。最後の見開きから次へ、または最初の見開きから
 前へ進む入力は、内部ページ index を同じ見開き内で動かさず、その 1 回目で境界ヒントを表示する。
@@ -215,7 +217,7 @@ no-op 案内は段階を分ける:
 - [x] スマートフォルダで、グリッド / リング / ゲームパッド / フルスクリーン / native 動画の Ctrl+↑↓ が同じ entry scope と root 表示順を使う。
 - [x] Ctrl+G Aggregated / Ctrl+S 結果一覧では no-op でもよいが、必要なら案内を出す。
 - [x] Ctrl+PageUp/PageDown は通常フォルダで兄弟だけを移動し、空フォルダも skip せず、子や祖先の兄弟へ入らない。検索中は no-op。
-- [x] 切り離した detached / always-new 窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown が main bundle を動かさず no-op になる。
+- [x] 独立 detached 静止画窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown が窓自身の物理 scope を移動し、main bundle と main の検索・絞り込みを変更しない。独立 detached 動画と bundle 未分離の legacy 経路は no-op を維持する。
 - [x] 検索バー / フルスクリーン / タイルなど scope が変わる操作では pending folder navigation を flush する。
 - [x] 境界文言は画像だけでなく動画も含む表現にする。
 - [x] native overlay はまず toast MVP とし、構造的な中央表示は別段階にする。
