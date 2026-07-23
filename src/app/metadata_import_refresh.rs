@@ -45,6 +45,8 @@ pub(crate) struct ContextRequest {
     pub(crate) slot: ContextSlot,
     pub(crate) items_generation: u64,
     pub(crate) items: Vec<ItemKey>,
+    /// UIの段階snapshot中に収集済みのlegacy XMP tag seed対象。
+    pub(crate) legacy_seed_paths: Vec<PathBuf>,
     pub(crate) current_rating_key: Option<String>,
     pub(crate) spread_container_path: Option<PathBuf>,
     pub(crate) old_folder_pin_keys: HashSet<String>,
@@ -71,6 +73,8 @@ pub(crate) struct ContextResult {
     pub(crate) video_pin_blobs: Option<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) video_items: Option<Vec<(usize, PathBuf, u64)>>,
     pub(crate) container_state: Option<ContainerStateResult>,
+    /// `ContextRequest`からcloneせず所有権を返し、UIで再走査せずworkerを再生成する。
+    pub(crate) legacy_seed_paths: Vec<PathBuf>,
 }
 
 pub(crate) struct ContainerStateResult {
@@ -510,6 +514,7 @@ fn build_context_result(
         video_pin_blobs,
         video_items,
         container_state,
+        legacy_seed_paths: request.legacy_seed_paths,
     })
 }
 
@@ -552,6 +557,7 @@ mod tests {
         let key = "c:/pictures/a.jpg".to_string();
         let untagged_key = "c:/pictures/b.jpg".to_string();
         let tag_only_key = "c:/pictures/search-container".to_string();
+        let legacy_seed_path = PathBuf::from("c:/pictures/a.jpg");
         crate::rating_db::RatingDb::open_at(data_dir.join("rating.db"))
             .unwrap()
             .set(&key, 4)
@@ -601,6 +607,7 @@ mod tests {
                         video_size: 0,
                     },
                 ],
+                legacy_seed_paths: vec![legacy_seed_path.clone()],
                 current_rating_key: Some(key.clone()),
                 spread_container_path: None,
                 old_folder_pin_keys: HashSet::new(),
@@ -635,6 +642,11 @@ mod tests {
         );
         assert!(!context.rating_cache.as_ref().unwrap().contains_key(&5));
         assert_eq!(context.current_rating, Some(4));
+        assert_eq!(
+            context.legacy_seed_paths,
+            vec![legacy_seed_path],
+            "legacy seed path ownership must round-trip through the refresh worker"
+        );
     }
 
     #[test]
@@ -656,6 +668,7 @@ mod tests {
                     video_path: None,
                     video_size: 0,
                 }],
+                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
                 old_folder_pin_keys: HashSet::new(),
@@ -726,6 +739,7 @@ mod tests {
                     video_path: Some(video.clone()),
                     video_size: 123,
                 }],
+                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
                 old_folder_pin_keys: HashSet::new(),

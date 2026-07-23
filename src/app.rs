@@ -1809,7 +1809,9 @@ struct MetadataImportRefreshIndex {
     next_item: usize,
     complete: bool,
     affected: bool,
+    collect_legacy_seed_paths: bool,
     items: Vec<metadata_import_refresh::ItemKey>,
+    legacy_seed_paths: Vec<PathBuf>,
     current_rating_key: Option<String>,
     folder_pin_paths: Vec<PathBuf>,
     folder_pin_aliases: Vec<(String, String)>,
@@ -22527,6 +22529,7 @@ impl App {
         &mut self,
         import_root: &Path,
         recursive: bool,
+        collect_legacy_seed_paths: bool,
     ) -> bool {
         const MAX_ITEMS_PER_FRAME: usize = 2_048;
         const MAX_TIME_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(3);
@@ -22536,6 +22539,7 @@ impl App {
         let mut complete = self.advance_current_metadata_import_terminal_index(
             import_root,
             recursive,
+            collect_legacy_seed_paths,
             &mut remaining,
             deadline,
         );
@@ -22550,6 +22554,7 @@ impl App {
                 complete = self.advance_current_metadata_import_terminal_index(
                     import_root,
                     recursive,
+                    collect_legacy_seed_paths,
                     &mut remaining,
                     deadline,
                 );
@@ -22570,6 +22575,7 @@ impl App {
                     complete = self.advance_current_metadata_import_terminal_index(
                         import_root,
                         recursive,
+                        collect_legacy_seed_paths,
                         &mut remaining,
                         deadline,
                     );
@@ -22588,13 +22594,17 @@ impl App {
         &mut self,
         import_root: &Path,
         recursive: bool,
+        collect_legacy_seed_paths: bool,
         remaining: &mut usize,
         deadline: std::time::Instant,
     ) -> bool {
         let restart = self
             .metadata_import_refresh_index
             .as_ref()
-            .is_none_or(|index| index.items_generation != self.items_generation);
+            .is_none_or(|index| {
+                index.items_generation != self.items_generation
+                    || index.collect_legacy_seed_paths != collect_legacy_seed_paths
+            });
         if restart {
             let affected = self.current_folder.as_deref().is_some_and(|path| {
                 metadata_import_context_path_is_affected(path, import_root, recursive)
@@ -22612,7 +22622,9 @@ impl App {
                 current_rating_key,
                 affected,
                 complete: !affected || self.items.is_empty(),
+                collect_legacy_seed_paths,
                 folder_pin_paths,
+                legacy_seed_paths: Vec::new(),
                 ..MetadataImportRefreshIndex::default()
             });
         }
@@ -22631,6 +22643,14 @@ impl App {
             let page_key = self.page_path_key(item_index);
             let item = &self.items[item_index];
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
+            if index.collect_legacy_seed_paths
+                && !self.items_are_global_search_view
+                && !self.items_are_tag_view
+                && !self.idx_is_compiled_book_page(item_index)
+                && let GridItem::Image(path) | GridItem::Video(path) = item
+            {
+                index.legacy_seed_paths.push(path.clone());
+            }
             let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
             let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
             if let Some(target) = folder_pin_target {
@@ -22709,6 +22729,7 @@ impl App {
                 slot,
                 items_generation: index.items_generation,
                 items: index.items,
+                legacy_seed_paths: index.legacy_seed_paths,
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
                 old_folder_pin_keys,
@@ -22777,6 +22798,76 @@ impl App {
 
     pub(crate) fn abort_metadata_import_terminal_refresh(&mut self) {
         self.clear_metadata_import_refresh_indexes();
+    }
+
+    /// 転送開始前に、現在mount中のcontextが持つmetadata writerを静止させる。
+    ///
+    /// XMP rating prewarmはファイルread結果をUI pollでDBへ反映するため、handleを取消・破棄
+    /// すれば以後書込みを生成しない。legacy seedはworker自身がtags.dbへ書くので取消による
+    /// 中途半端な打切りはせず、完了結果をcontextへ適用してhandleが消えるまで待つ。
+    fn quiesce_current_metadata_transfer_context_writers(&mut self) -> bool {
+        if let Some(pending) = self.tag_prewarm_pending.take() {
+            pending.cancel();
+        }
+        self.tag_prewarm_queued.clear();
+        self.poll_tag_legacy_seed_results();
+        self.tag_legacy_seed_pending.is_some()
+    }
+
+    /// main / active detached / paused detachedの全context writerを静止させる。
+    /// 戻り値trueの間はlegacy seedがDBを書き得るため、転送workerを開始しない。
+    pub(crate) fn quiesce_metadata_transfer_context_writers(&mut self) -> bool {
+        let mut busy = self.quiesce_current_metadata_transfer_context_writers();
+        #[cfg(windows)]
+        {
+            if let Some(mut active) = self.active_detached_viewer_context.take() {
+                self.swap_viewer_context_bundle(&mut active.bundle);
+                busy |= self.quiesce_current_metadata_transfer_context_writers();
+                self.swap_viewer_context_bundle(&mut active.bundle);
+                self.active_detached_viewer_context = Some(active);
+            }
+            for window_index in 0..self.detached_image_windows.len() {
+                let Some(mut bundle) = self.detached_image_windows[window_index]
+                    .paused_bundle
+                    .take()
+                else {
+                    continue;
+                };
+                self.swap_viewer_context_bundle(&mut bundle);
+                busy |= self.quiesce_current_metadata_transfer_context_writers();
+                self.swap_viewer_context_bundle(&mut bundle);
+                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+            }
+        }
+        busy
+    }
+
+    /// 転送待機で取消したXMP rating readerを、完了・開始失敗・待機キャンセル後に
+    /// contextごとへ戻す。legacy seedは安全に完走させているため再生成しない。
+    pub(crate) fn resume_metadata_transfer_context_readers(&mut self) {
+        if !self.settings.write_rating_to_xmp {
+            return;
+        }
+        if !self.items.is_empty() && self.tag_prewarm_pending.is_none() {
+            self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+        }
+        #[cfg(windows)]
+        {
+            if let Some(active) = self.active_detached_viewer_context.as_mut()
+                && !active.bundle.items.is_empty()
+                && active.bundle.tag_prewarm_pending.is_none()
+            {
+                active.bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+            }
+            for window in &mut self.detached_image_windows {
+                if let Some(bundle) = window.paused_bundle.as_mut()
+                    && !bundle.items.is_empty()
+                    && bundle.tag_prewarm_pending.is_none()
+                {
+                    bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+                }
+            }
+        }
     }
 
     pub(crate) fn apply_metadata_import_terminal_refresh(
@@ -22905,6 +22996,7 @@ impl App {
         }
         let rating_cache_replaced = result.rating_cache.is_some();
         let tags_cache_replaced = result.tags_cache.is_some();
+        let legacy_seed_paths = std::mem::take(&mut result.legacy_seed_paths);
         let rebuild_display =
             rating_cache_replaced || tags_cache_replaced || result.page_state.is_some();
         if let Some(ratings) = result.rating_cache.take() {
@@ -23054,12 +23146,12 @@ impl App {
             self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
         }
         if tags_cache_replaced {
-            self.start_tag_legacy_seed_for_current_items();
+            self.start_tag_legacy_seed(legacy_seed_paths);
         }
         // visible_indices / facet / details order / selectionはViewerContextBundle所有。
         // cacheを適用したcontextをmountしている間に一体で再計算する。
         if rebuild_display {
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_preserving_facet_scope();
         }
         true
     }
@@ -24698,12 +24790,12 @@ impl App {
     /// context-owned表示集合へ反映する。DB I/Oは行わず、各bundleをmountして
     /// `visible_indices` / facet / details order / selectionを一体で再計算する。
     fn rebuild_all_viewer_context_visible_indices(&mut self) {
-        self.rebuild_visible_indices();
+        self.rebuild_visible_indices_preserving_facet_scope();
         #[cfg(windows)]
         {
             if let Some(mut active) = self.active_detached_viewer_context.take() {
                 self.swap_viewer_context_bundle(&mut active.bundle);
-                self.rebuild_visible_indices();
+                self.rebuild_visible_indices_preserving_facet_scope();
                 self.swap_viewer_context_bundle(&mut active.bundle);
                 self.active_detached_viewer_context = Some(active);
             }
@@ -24715,7 +24807,7 @@ impl App {
                     continue;
                 };
                 self.swap_viewer_context_bundle(&mut bundle);
-                self.rebuild_visible_indices();
+                self.rebuild_visible_indices_preserving_facet_scope();
                 self.swap_viewer_context_bundle(&mut bundle);
                 self.detached_image_windows[window_index].paused_bundle = Some(bundle);
             }
@@ -38819,6 +38911,17 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
+        self.rebuild_visible_indices_impl(true);
+    }
+
+    /// DB / bookmarkなど外部snapshotの更新で、現在mount中のcontext-owned表示集合だけを
+    /// 再計算する。`facet_filter_scope`とsuppressionはApp-globalなので、detached/pausedを
+    /// 一時mountする経路ではnavigation扱いのscope同期を行わない。
+    fn rebuild_visible_indices_preserving_facet_scope(&mut self) {
+        self.rebuild_visible_indices_impl(false);
+    }
+
+    fn rebuild_visible_indices_impl(&mut self, sync_facet_scope: bool) {
         self.ensure_bookmark_presence_loaded();
         let color_filter_t0 = if self.color_filter.enabled && crate::perf::is_enabled() {
             Some(std::time::Instant::now())
@@ -38830,7 +38933,9 @@ impl App {
         self.facet_place_counts_cache = None;
         self.facet_ai_model_counts_cache = None;
         self.facet_ai_tool_counts_cache = None;
-        self.sync_facet_filter_scope();
+        if sync_facet_scope {
+            self.sync_facet_filter_scope();
+        }
         let search_filter = self.search_filter.clone();
         // Codex P1-2 fix: effective_rating_filter() で ★一時解除中は [true;6] が返るので
         // 表示は全 ON 相当になる。旧版は settings.rating_filter を書き換えて同じ効果を
@@ -41731,7 +41836,7 @@ impl App {
     }
 
     fn start_tag_legacy_seed_for_current_items(&mut self) {
-        if self.tags_db.is_none() || self.items_are_global_search_view || self.items_are_tag_view {
+        if self.items_are_global_search_view || self.items_are_tag_view {
             return;
         }
         let paths = self
@@ -41744,6 +41849,13 @@ impl App {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        self.start_tag_legacy_seed(paths);
+    }
+
+    fn start_tag_legacy_seed(&mut self, paths: Vec<PathBuf>) {
+        if self.tags_db.is_none() {
+            return;
+        }
         if paths.is_empty() {
             return;
         }
@@ -41906,7 +42018,7 @@ impl App {
             );
         }
         if changed && self.settings.facet_filter.uses_tag_state() {
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_preserving_facet_scope();
         }
         if report.imported_items > 0
             || report.marked_empty_items > 0
@@ -42010,7 +42122,7 @@ impl App {
             self.apply_rating_delta_to_folder_counts(key, 0, *stars);
         }
         // 実際に rating_cache が更新されたのでフィルタ影響あり
-        self.rebuild_visible_indices();
+        self.rebuild_visible_indices_preserving_facet_scope();
     }
 
     /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。

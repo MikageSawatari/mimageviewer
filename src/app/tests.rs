@@ -76,7 +76,7 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: unrelated });
 
     app.begin_metadata_import_terminal_refresh();
-    assert!(!app.advance_metadata_import_terminal_refresh(&root, false));
+    assert!(!app.advance_metadata_import_terminal_refresh(&root, false, true));
     let first_frame_items = app
         .metadata_import_refresh_index
         .as_ref()
@@ -84,7 +84,7 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
         .next_item;
     assert!((1..=2_048).contains(&first_frame_items));
 
-    while !app.advance_metadata_import_terminal_refresh(&root, false) {}
+    while !app.advance_metadata_import_terminal_refresh(&root, false, true) {}
     let requests = app.take_metadata_import_refresh_requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].items.len(), 5_000);
@@ -99,6 +99,11 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     assert!(
         requests[0].items.iter().all(|item| item.tags),
         "ordinary images are explicit tag refresh targets"
+    );
+    assert_eq!(
+        requests[0].legacy_seed_paths.len(),
+        5_000,
+        "legacy seed paths are collected inside the frame-budgeted snapshot"
     );
 }
 
@@ -145,6 +150,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        legacy_seed_paths: Vec::new(),
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![
@@ -202,6 +208,7 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
             video_pin_blobs: None,
             video_items: None,
             container_state: None,
+            legacy_seed_paths: Vec::new(),
         }],
         page_snapshot: None,
         errors: Vec::new(),
@@ -228,7 +235,13 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
     let untagged_path = PathBuf::from(r"C:\Pictures\untagged.jpg");
     let tagged_key = crate::tags_db::item_key_for_path(&tagged_path);
     let untagged_key = crate::tags_db::item_key_for_path(&untagged_path);
-    let items = vec![GridItem::Image(tagged_path), GridItem::Image(untagged_path)];
+    let items = vec![
+        GridItem::Image(tagged_path.clone()),
+        GridItem::Image(untagged_path.clone()),
+    ];
+    let main_scope = PathBuf::from(r"C:\Pictures");
+    app.current_folder = Some(main_scope.clone());
+    app.facet_filter_scope = Some(main_scope.clone());
     app.items = items.clone();
     app.image_metas = vec![None; items.len()];
     app.thumbnails = vec![ThumbnailState::Pending; items.len()];
@@ -241,8 +254,9 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         .insert(FacetEditFlag::Tagged);
 
     let items_generation = app.items_generation;
-    let make_bundle = || {
+    let make_bundle = |folder: &str| {
         let mut bundle = ViewerContextBundle::empty();
+        bundle.current_folder = Some(PathBuf::from(folder));
         bundle.items = items.clone();
         bundle.image_metas = vec![None; items.len()];
         bundle.thumbnails = vec![ThumbnailState::Pending; items.len()];
@@ -252,10 +266,13 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         bundle
     };
     app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-        bundle: make_bundle(),
+        bundle: make_bundle(r"C:\Pictures\Child"),
     });
-    app.detached_image_windows
-        .push(paused_test_window(&ctx, 73, make_bundle()));
+    app.detached_image_windows.push(paused_test_window(
+        &ctx,
+        73,
+        make_bundle(r"C:\Pictures\Child\Paused"),
+    ));
 
     let context = |slot| crate::app::metadata_import_refresh::ContextResult {
         slot,
@@ -272,6 +289,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        legacy_seed_paths: vec![tagged_path.clone(), untagged_path.clone()],
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![
@@ -296,6 +314,22 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
     );
     assert!(errors.is_empty());
     assert!(!stale);
+    assert_eq!(
+        app.facet_filter_scope,
+        Some(main_scope),
+        "terminal refresh must not replace the App-global main facet scope"
+    );
+    assert!(
+        app.facet_filter_suppression_stack.is_empty(),
+        "temporary detached mounts must not create facet suppression"
+    );
+    assert!(
+        app.settings
+            .facet_filter
+            .edits
+            .contains(&FacetEditFlag::Tagged),
+        "terminal refresh must preserve the user's facet filter"
+    );
 
     let assert_context =
         |tags_cache: &std::collections::HashMap<String, Vec<String>>,
@@ -346,6 +380,9 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
     let saved = PathBuf::from(r"C:\Media\saved.mp4");
     let plain = PathBuf::from(r"C:\Media\plain.flac");
     let items = vec![GridItem::Video(saved.clone()), GridItem::Audio(plain)];
+    let main_scope = PathBuf::from(r"C:\Media");
+    app.current_folder = Some(main_scope.clone());
+    app.facet_filter_scope = Some(main_scope.clone());
     app.items = items.clone();
     app.image_metas = vec![None; items.len()];
     app.thumbnails = vec![ThumbnailState::Pending; items.len()];
@@ -359,8 +396,9 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
         Vec::new(),
     ));
 
-    let make_bundle = || {
+    let make_bundle = |folder: &str| {
         let mut bundle = ViewerContextBundle::empty();
+        bundle.current_folder = Some(PathBuf::from(folder));
         bundle.items = items.clone();
         bundle.image_metas = vec![None; items.len()];
         bundle.thumbnails = vec![ThumbnailState::Pending; items.len()];
@@ -368,10 +406,13 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
         bundle
     };
     app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-        bundle: make_bundle(),
+        bundle: make_bundle(r"C:\Media\Active"),
     });
-    app.detached_image_windows
-        .push(paused_test_window(&ctx, 91, make_bundle()));
+    app.detached_image_windows.push(paused_test_window(
+        &ctx,
+        91,
+        make_bundle(r"C:\Media\Active\Paused"),
+    ));
 
     app.rebuild_all_viewer_context_visible_indices();
 
@@ -391,6 +432,90 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
             .unwrap()
             .visible_indices,
         vec![0]
+    );
+    assert_eq!(
+        app.facet_filter_scope,
+        Some(main_scope),
+        "bookmark snapshot refresh must preserve the main facet scope"
+    );
+    assert!(app.facet_filter_suppression_stack.is_empty());
+    assert!(
+        app.settings
+            .facet_filter
+            .edits
+            .contains(&FacetEditFlag::Bookmarked)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let temp = tempfile::TempDir::new().unwrap();
+    let items = vec![GridItem::Image(PathBuf::from(r"C:\Pictures\a.jpg"))];
+    app.items = items.clone();
+    app.settings.write_rating_to_xmp = true;
+    app.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+    app.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
+        temp.path().join("main"),
+        Vec::new(),
+    ));
+
+    let make_bundle = |name: &str| {
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = items.clone();
+        bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+        bundle.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
+            temp.path().join(name),
+            Vec::new(),
+        ));
+        bundle
+    };
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+        bundle: make_bundle("active"),
+    });
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, 113, make_bundle("paused")));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.quiesce_metadata_transfer_context_writers() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "legacy writers must finish after the transfer drain starts"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert!(app.tag_prewarm_pending.is_none());
+    assert!(app.tag_legacy_seed_pending.is_none());
+    let active = app.active_detached_viewer_context.as_ref().unwrap();
+    assert!(active.bundle.tag_prewarm_pending.is_none());
+    assert!(active.bundle.tag_legacy_seed_pending.is_none());
+    let paused = app.detached_image_windows[0]
+        .paused_bundle
+        .as_ref()
+        .unwrap();
+    assert!(paused.tag_prewarm_pending.is_none());
+    assert!(paused.tag_legacy_seed_pending.is_none());
+
+    app.resume_metadata_transfer_context_readers();
+    assert!(app.tag_prewarm_pending.is_some());
+    assert!(
+        app.active_detached_viewer_context
+            .as_ref()
+            .unwrap()
+            .bundle
+            .tag_prewarm_pending
+            .is_some()
+    );
+    assert!(
+        app.detached_image_windows[0]
+            .paused_bundle
+            .as_ref()
+            .unwrap()
+            .tag_prewarm_pending
+            .is_some()
     );
 }
 
@@ -14229,7 +14354,7 @@ mod favorite_adjustment_defaults_tests {
         app.install_new_items(items, metas);
 
         app.begin_metadata_import_terminal_refresh();
-        while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false) {}
+        while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false, false) {}
         let requests = app.take_metadata_import_refresh_requests();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];

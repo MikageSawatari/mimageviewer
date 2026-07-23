@@ -213,14 +213,10 @@ impl App {
     /// 転送 worker と同じ DB を書き換え得る既存処理が完全に着地したか。
     /// モーダルはユーザー入力を止めるが、開始前から走っていた worker までは止めないため、
     /// この drain 待ちを必ず通してから export/import を開始する。
-    fn metadata_transfer_writers_busy(&self) -> bool {
-        self.rename_migration_writers_busy()
+    fn metadata_transfer_writers_busy(&mut self) -> bool {
+        self.quiesce_metadata_transfer_context_writers()
+            || self.rename_migration_writers_busy()
             || self.tag_maintenance_rx.is_some()
-            || self
-                .tag_prewarm_pending
-                .as_ref()
-                .is_some_and(|pending| pending.is_busy())
-            || self.tag_legacy_seed_pending.is_some()
             || self.tag_legacy_xmp_pending.is_some()
             || self.rename_migration_in_flight.is_some()
             || !self.rename_migration_queue.is_empty()
@@ -244,10 +240,11 @@ impl App {
         }
         self.poll_metadata_transfer_worker();
 
-        let writers_ready = self.metadata_transfer.as_ref().is_some_and(|state| {
-            matches!(state.stage, Stage::WaitingForWriters)
-                && !self.metadata_transfer_writers_busy()
-        });
+        let waiting_for_writers = self
+            .metadata_transfer
+            .as_ref()
+            .is_some_and(|state| matches!(state.stage, Stage::WaitingForWriters));
+        let writers_ready = waiting_for_writers && !self.metadata_transfer_writers_busy();
         let should_start_worker = writers_ready;
         if should_start_worker {
             let operation = self
@@ -302,12 +299,21 @@ impl App {
             }
         }
         let refresh_target = self.metadata_transfer.as_ref().and_then(|state| {
-            matches!(state.stage, Stage::RefreshPreparing)
-                .then(|| (state.root.clone(), state.recursive))
+            matches!(state.stage, Stage::RefreshPreparing).then(|| {
+                let changed_tags = state
+                    .pending_import_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .is_some_and(|summary| summary.changed.tags);
+                (state.root.clone(), state.recursive, changed_tags)
+            })
         });
-        let refresh_ready = refresh_target.as_ref().is_some_and(|(root, recursive)| {
-            self.advance_metadata_import_terminal_refresh(root, *recursive)
-        });
+        let refresh_ready =
+            refresh_target
+                .as_ref()
+                .is_some_and(|(root, recursive, changed_tags)| {
+                    self.advance_metadata_import_terminal_refresh(root, *recursive, *changed_tags)
+                });
         if refresh_ready {
             let requests = self.take_metadata_import_refresh_requests();
             if let Some(state) = self.metadata_transfer.as_mut() {
@@ -354,6 +360,20 @@ impl App {
                 }
             }
             DialogAction::Close => self.metadata_transfer = None,
+        }
+
+        // WaitingForWritersで止めたcontext所有XMP readerは、転送の結果表示・開始失敗・
+        // 待機キャンセルでmodalを離れる時に全contextへ戻す。Running/Refreshing中は
+        // DB writerを新たに生成しない。
+        let resume_context_readers = self.metadata_transfer.is_none()
+            || self.metadata_transfer.as_ref().is_some_and(|state| {
+                matches!(
+                    state.stage,
+                    Stage::ExportOptions | Stage::ImportConfirm(_) | Stage::Result(_)
+                )
+            });
+        if resume_context_readers {
+            self.resume_metadata_transfer_context_readers();
         }
 
         if self.metadata_transfer.as_ref().is_some_and(|state| {
