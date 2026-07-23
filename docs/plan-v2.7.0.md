@@ -66,10 +66,13 @@ v2.7.0 では、既存の動画・音声ブックマークに加え、製本、�
   origin grid を所有する `Opening`、DB 再構築後に位置を戻す `Restoring`、別 viewer context 側の
   `Detached` を明示し、snapshot の有無を ownership 判定に流用しない。マウス、Enter、ゲームパッドは
   すべて同じブックマーク open router を通す。各 open には process 内で単調増加する request ID を
-  発行し、path resolver、media / book 待機、target identity を同じ owner に結び付ける。通常移動、
-  activation、後続ブックマーク、worker 切断、cancel、timeout は一致する旧 ID の resolver / pending /
-  戻り先だけを終了し、古い完了通知は request ID と target の両方が現在値に一致する場合だけ適用する。
-  Book の resolve 待機にも 45 秒の終了条件を設け、owner のない pending による継続再描画を残さない。
+  発行し、path resolver、RAR / 7z / LZH の変換状態、media / book 待機、target identity を同じ owner に
+  結び付ける。元アーカイブから変換キャッシュ ZIP への mount は同一 request 内部の遷移として扱う。
+  通常移動、activation、後続ブックマーク、worker 切断、cancel、timeout は一致する旧 ID の resolver /
+  変換 / pending / 戻り先だけを終了し、古い完了通知は request ID と target の両方が現在値に一致する
+  場合だけ適用する。Book の resolve 待機は通常 45 秒を終了条件とするが、変換状態が同じ request を
+  所有している間は確認・パスワード入力・変換完了を待ち、別 navigation 時は変換 cancel token と
+  completion receiver を request と一緒に破棄する。
 - スマートフィルタの `状態` に `ブックマークあり / ブックマークなし` を追加する。動画・音声は
   対象ファイル、本はコンテナまたは表示中ページの安定 identity で判定し、スマートフォルダの
   保存条件にも含める。

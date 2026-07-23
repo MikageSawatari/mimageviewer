@@ -160,3 +160,21 @@ testを追加した後、この指摘と同型経路を再レビューする。P
 `cargo check -p mimageviewer --bin mimageviewer-core` と `cargo fmt --all -- --check` 成功。
 
 **追補判定: 上記P2は解消。本指摘によるコード出荷保留を解除する。**
+
+## 変換アーカイブ追補（2026-07-23）
+
+- bookmark path resolver の完了後に RAR / 7z / LZH のスキャン・確認・パスワード入力・変換へ
+  移る場合も、`ArchiveConvertState` の型付き completion policy に同じ request ID と target identity を
+  引き継ぐ。直接 RAR と元アーカイブ → キャッシュ ZIP の load は通常 navigation ではなく、同一
+  request の内部遷移として適用する。
+- 変換 state が request を所有している間は Book `Resolving` の 45 秒 timeout を停止する。通常
+  navigation、activation、後続 bookmark、ダイアログ close / cancel は一致する request の変換
+  cancel token と receiver を破棄し、遅延 completion は現在表示を変更できない。
+- cache hit、direct RAR、new conversion completion、60 秒を超える確認待ち、通常 navigation / activation
+  cancel、stale A completion 対 B request を focused test で固定した。
+
+対応後の検証は startup / bookmark archive lifecycle focused 16件成功、ライブラリテスト
+2,321件成功・失敗0件・17件ignored、バイナリテスト直列実行4,072件成功・失敗0件・18件ignored、
+`cargo check -p mimageviewer --bin mimageviewer-core` と `cargo fmt --all -- --check` 成功。
+
+**追補判定: 変換アーカイブで途切れていた bookmark request ownership は解消。**

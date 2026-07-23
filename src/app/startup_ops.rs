@@ -36,6 +36,17 @@ impl App {
             ));
             return;
         };
+        // A forwarded activation is a new navigation request as soon as it is received. Do not
+        // let an archive conversion owned by the currently opening bookmark win the race while
+        // the activation path is still being resolved on its worker.
+        if matches!(source, StartupOpenPathSource::Activation)
+            && let Some(request_id) = self
+                .bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
+        {
+            self.cancel_bookmark_open_request(request_id, "activation_navigation");
+        }
         if let Some(pending) = self.startup_open_path_resolve_pending.take() {
             crate::logger::log(format!(
                 "startup open: cancel pending resolve source={} requested={}",
@@ -51,7 +62,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let worker_requested = requested.clone();
-        let bookmark = matches!(owner, StartupOpenPathOwner::Bookmark { .. })
+        let bookmark = matches!(owner, StartupOpenPathOwner::Bookmark(_))
             .then(|| {
                 self.bookmark_open_pending
                     .as_ref()
@@ -142,8 +153,8 @@ impl App {
                 if matches!(source, StartupOpenPathSource::InitialStartup) {
                     self.open_default_startup_target();
                 } else {
-                    if let StartupOpenPathOwner::Bookmark { request_id, .. } = owner {
-                        self.cancel_bookmark_open_request(request_id, "resolve_disconnected");
+                    if let StartupOpenPathOwner::Bookmark(owner) = owner {
+                        self.cancel_bookmark_open_request(owner.request_id, "resolve_disconnected");
                     }
                     self.show_feedback_toast("パスの確認を完了できませんでした".to_string());
                 }
@@ -167,44 +178,36 @@ impl App {
             return;
         }
         let source = owner.source();
-        if let StartupOpenPathOwner::Bookmark { request_id, .. } = &owner
+        if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner
             && result.bookmark_relative_page_openable == Some(false)
         {
             crate::logger::log(
                 "[bookmark-open] relative page rejected by usage-time containment check",
             );
-            self.cancel_bookmark_open_request(*request_id, "relative_page_missing_or_unsafe");
+            self.cancel_bookmark_open_request(
+                bookmark_owner.request_id,
+                "relative_page_missing_or_unsafe",
+            );
             self.show_feedback_toast(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
             return;
         }
         let requested_display = result.requested.display().to_string();
-        if self.apply_startup_open_path_resolve_result(source, result, ctx) {
+        if self.apply_startup_open_path_resolve_result(&owner, result, ctx) {
             return;
         }
         if matches!(source, StartupOpenPathSource::InitialStartup) {
             self.open_default_startup_target();
         } else {
-            if let StartupOpenPathOwner::Bookmark { request_id, .. } = owner {
-                self.cancel_bookmark_open_request(request_id, "not_openable");
+            if let StartupOpenPathOwner::Bookmark(bookmark_owner) = owner {
+                self.cancel_bookmark_open_request(bookmark_owner.request_id, "not_openable");
             }
             crate::logger::log(format!(
                 "startup open: activation open failed for {requested_display}"
             ));
             self.show_feedback_toast("開けるパスが見つかりませんでした".to_string());
         }
-    }
-
-    pub(crate) fn abandon_bookmark_open_after_path_failure(&mut self, reason: &'static str) {
-        let Some(request_id) = self
-            .bookmark_open_pending
-            .as_ref()
-            .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
-        else {
-            return;
-        };
-        self.cancel_bookmark_open_request(request_id, reason);
     }
 
     fn startup_open_path_owner(
@@ -217,19 +220,46 @@ impl App {
             StartupOpenPathSource::Bookmark => {
                 let request_id = self.bookmark_open_pending.as_ref()?.request_id();
                 let target = self.bookmark_view_target()?.clone();
-                Some(StartupOpenPathOwner::Bookmark { request_id, target })
+                Some(StartupOpenPathOwner::Bookmark(
+                    crate::bookmark_browser::BookmarkOpenRequestOwner { request_id, target },
+                ))
             }
         }
     }
 
     fn startup_open_path_owner_is_current(&self, owner: &StartupOpenPathOwner) -> bool {
-        let StartupOpenPathOwner::Bookmark { request_id, target } = owner else {
+        let StartupOpenPathOwner::Bookmark(bookmark_owner) = owner else {
             return true;
         };
+        self.bookmark_open_owner_is_current(bookmark_owner)
+    }
+
+    pub(crate) fn bookmark_open_owner_is_current(
+        &self,
+        owner: &crate::bookmark_browser::BookmarkOpenRequestOwner,
+    ) -> bool {
         self.bookmark_open_pending
             .as_ref()
-            .is_some_and(|pending| pending.request_id() == *request_id)
-            && self.bookmark_view_target() == Some(target)
+            .is_some_and(|pending| pending.request_id() == owner.request_id)
+            && self.bookmark_view_target() == Some(&owner.target)
+    }
+
+    pub(crate) fn begin_bookmark_page_wait(
+        &mut self,
+        owner: &crate::bookmark_browser::BookmarkOpenRequestOwner,
+    ) -> bool {
+        if !self.bookmark_open_owner_is_current(owner) {
+            return false;
+        }
+        let Some(pending) = self
+            .bookmark_open_pending
+            .as_mut()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book_mut)
+        else {
+            return false;
+        };
+        pending.begin_page_wait();
+        true
     }
 
     fn finish_replaced_startup_open_owner(
@@ -237,8 +267,8 @@ impl App {
         owner: StartupOpenPathOwner,
         reason: &'static str,
     ) {
-        if let StartupOpenPathOwner::Bookmark { request_id, .. } = owner {
-            self.cancel_bookmark_open_request(request_id, reason);
+        if let StartupOpenPathOwner::Bookmark(bookmark_owner) = owner {
+            self.cancel_bookmark_open_request(bookmark_owner.request_id, reason);
         }
     }
 
@@ -290,21 +320,24 @@ impl App {
                 .is_some_and(|pending| {
                     matches!(
                         pending.owner,
-                        StartupOpenPathOwner::Bookmark {
-                            request_id: current,
-                            ..
-                        } if current == request_id
+                        StartupOpenPathOwner::Bookmark(
+                            crate::bookmark_browser::BookmarkOpenRequestOwner {
+                                request_id: current,
+                                ..
+                            }
+                        ) if current == request_id
                     )
                 });
         if resolver_matches {
             drop(self.startup_open_path_resolve_pending.take());
         }
+        let archive_matches = self.cancel_archive_convert_for_bookmark_request(request_id);
         let pending_matches = self
             .bookmark_open_pending
             .as_ref()
             .is_some_and(|pending| pending.request_id() == request_id);
         if !pending_matches {
-            return resolver_matches;
+            return resolver_matches || archive_matches;
         }
         crate::logger::log(format!(
             "[bookmark-open] finish request id={} reason={reason}",
@@ -317,10 +350,11 @@ impl App {
 
     fn apply_startup_open_path_resolve_result(
         &mut self,
-        source: StartupOpenPathSource,
+        owner: &StartupOpenPathOwner,
         result: StartupOpenPathResolveResult,
         ctx: &egui::Context,
     ) -> bool {
+        let source = owner.source();
         let Some(resolution) = result.resolved else {
             crate::logger::log(format!(
                 "startup open: no openable path for {}",
@@ -387,19 +421,19 @@ impl App {
         }
         let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
             || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
-        let outcome =
-            self.load_folder_or_convert_archive_with_auto_fullscreen(openable, auto_fullscreen);
+        let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            openable,
+            auto_fullscreen,
+            owner.open_request_owner(),
+        );
         if matches!(outcome, FolderOpenOutcome::Ignored) {
             return false;
         }
         if matches!(source, StartupOpenPathSource::Bookmark)
             && matches!(outcome, FolderOpenOutcome::Loaded)
-            && let Some(pending) = self
-                .bookmark_open_pending
-                .as_mut()
-                .and_then(crate::bookmark_browser::PendingBookmarkOpen::book_mut)
+            && let StartupOpenPathOwner::Bookmark(bookmark_owner) = owner
         {
-            pending.begin_page_wait();
+            self.begin_bookmark_page_wait(bookmark_owner);
         }
         if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
             self.open_startup_file_if_visible(&result.requested);

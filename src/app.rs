@@ -194,6 +194,17 @@ pub(crate) enum FolderOpenOutcome {
     Ignored,
 }
 
+/// Ownership of a visible folder/container load.
+///
+/// Normal navigation supersedes pending opens. Bookmark-owned internal transitions (for
+/// example source 7z -> cached ZIP) retain the same request and may load only while that owner
+/// is still current.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpenRequestOwner {
+    Navigation,
+    Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GridContainerOpenMode {
     PageFullscreen,
@@ -2488,10 +2499,7 @@ pub(crate) enum StartupOpenPathSource {
 pub(crate) enum StartupOpenPathOwner {
     InitialStartup,
     Activation,
-    Bookmark {
-        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
-        target: crate::bookmark_browser::BookmarkViewReturnTarget,
-    },
+    Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
 }
 
 impl StartupOpenPathOwner {
@@ -2499,12 +2507,19 @@ impl StartupOpenPathOwner {
         match self {
             Self::InitialStartup => StartupOpenPathSource::InitialStartup,
             Self::Activation => StartupOpenPathSource::Activation,
-            Self::Bookmark { .. } => StartupOpenPathSource::Bookmark,
+            Self::Bookmark(_) => StartupOpenPathSource::Bookmark,
         }
     }
 
     fn perf_tag(&self) -> &'static str {
         self.source().perf_tag()
+    }
+
+    fn open_request_owner(&self) -> OpenRequestOwner {
+        match self {
+            Self::Bookmark(owner) => OpenRequestOwner::Bookmark(owner.clone()),
+            Self::InitialStartup | Self::Activation => OpenRequestOwner::Navigation,
+        }
     }
 }
 
@@ -14419,6 +14434,29 @@ impl App {
         path: PathBuf,
         auto_fullscreen: bool,
     ) -> FolderOpenOutcome {
+        self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            path,
+            auto_fullscreen,
+            OpenRequestOwner::Navigation,
+        )
+    }
+
+    pub(crate) fn load_folder_or_convert_archive_with_auto_fullscreen_owned(
+        &mut self,
+        path: PathBuf,
+        auto_fullscreen: bool,
+        owner: OpenRequestOwner,
+    ) -> FolderOpenOutcome {
+        if let OpenRequestOwner::Bookmark(bookmark_owner) = &owner
+            && !self.bookmark_open_owner_is_current(bookmark_owner)
+        {
+            crate::logger::log(format!(
+                "[bookmark-open] reject stale container transition id={} path={}",
+                bookmark_owner.request_id.0,
+                path.display()
+            ));
+            return FolderOpenOutcome::Ignored;
+        }
         let format = path
             .extension()
             .and_then(|e| e.to_str())
@@ -14435,7 +14473,12 @@ impl App {
             }
             if format == crate::archive_converter::ArchiveFormat::Rar {
                 let fallback_cached_zip = self.try_archive_cache_lookup(&path);
-                return if self.request_rar_open(path, auto_fullscreen, fallback_cached_zip) {
+                return if self.request_rar_open_owned(
+                    path,
+                    auto_fullscreen,
+                    fallback_cached_zip,
+                    owner,
+                ) {
                     FolderOpenOutcome::ConversionDialogOpened
                 } else {
                     FolderOpenOutcome::Ignored
@@ -14450,13 +14493,13 @@ impl App {
                 }
                 // ★固定 ガード等でブロックされたら Ignored を返し、後続の drill 進行に
                 // 流さない (Codex P1)。
-                return if self.open_archive_via_cache(path, cached, auto_fullscreen) {
+                return if self.open_archive_via_cache_owned(path, cached, auto_fullscreen, owner) {
                     FolderOpenOutcome::Loaded
                 } else {
                     FolderOpenOutcome::Ignored
                 };
             } else {
-                return if self.request_archive_convert(path, format, auto_fullscreen) {
+                return if self.request_archive_convert_owned(path, format, auto_fullscreen, owner) {
                     FolderOpenOutcome::ConversionDialogOpened
                 } else {
                     FolderOpenOutcome::Ignored
@@ -14471,7 +14514,7 @@ impl App {
         {
             self.pending_auto_fs_open = true;
         }
-        self.load_folder(path);
+        self.load_folder_with_scan_owned(path, None, owner);
         FolderOpenOutcome::Loaded
     }
 
@@ -14481,13 +14524,35 @@ impl App {
     /// をスキップできる。`path` が ZIP/PDF ファイルのときは仮想フォルダとして
     /// 別ルートに入るため `pre_scan` は無視される (None 相当で委譲)。
     pub fn load_folder_with_scan(&mut self, path: PathBuf, pre_scan: Option<ScannedDir>) {
-        // A direct navigation owns the next visible location. If an earlier startup,
-        // activation, or bookmark path is still resolving, dispose that request before the
-        // worker can overwrite this navigation with a late completion. Resolver-driven loads
-        // have already taken their pending receiver before reaching here, so they are not
-        // mistaken for a competing navigation.
-        self.cancel_unresolved_open_for_navigation();
-        self.cancel_conflicting_bookmark_open_for_navigation(&path);
+        self.load_folder_with_scan_owned(path, pre_scan, OpenRequestOwner::Navigation);
+    }
+
+    pub(crate) fn load_folder_with_scan_owned(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+    ) {
+        match &owner {
+            OpenRequestOwner::Navigation => {
+                // A direct navigation owns the next visible location. If an earlier startup,
+                // activation, or bookmark path is still resolving, dispose that request before
+                // the worker can overwrite this navigation with a late completion.
+                self.cancel_unresolved_open_for_navigation();
+                self.cancel_conflicting_bookmark_open_for_navigation(&path);
+            }
+            OpenRequestOwner::Bookmark(bookmark_owner) => {
+                if !self.bookmark_open_owner_is_current(bookmark_owner) {
+                    crate::logger::log(format!(
+                        "[bookmark-open] ignore stale folder load id={} path={}",
+                        bookmark_owner.request_id.0,
+                        path.display()
+                    ));
+                    self.pending_auto_fs_open = false;
+                    return;
+                }
+            }
+        }
         // 別経路の load が走ったら、in-flight のフォルダペイン open scan は stale なので
         // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
         // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
@@ -14519,7 +14584,9 @@ impl App {
         {
             self.reading_history_return_from = None;
         }
-        self.reconcile_bookmark_return_target_for_folder_load(&path);
+        if matches!(owner, OpenRequestOwner::Navigation) {
+            self.reconcile_bookmark_return_target_for_folder_load(&path);
+        }
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
         // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
         // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
@@ -24336,6 +24403,13 @@ impl App {
             );
             return;
         }
+        if let Some(previous_request_id) = self
+            .bookmark_open_pending
+            .as_ref()
+            .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
+        {
+            self.cancel_bookmark_open_request(previous_request_id, "bookmark_replaced");
+        }
         let return_grid = BookmarkViewReturnGridState::capture(
             &self.bookmark_browser_rows,
             self.selected,
@@ -24672,6 +24746,13 @@ impl App {
                 entered_archive_prefix,
             } => (*started_at, *entered_archive_prefix),
             crate::bookmark_browser::PendingBookOpenStage::Resolving => {
+                // ArchiveConvertState is the active owner while a RAR/7z/LZH is being probed,
+                // confirmed, unlocked, or converted. User interaction and real conversions can
+                // legitimately exceed the path-resolver timeout; activation/navigation cancel
+                // the shared request (and worker) through its ID instead.
+                if self.archive_convert_owns_bookmark_request(pending.request_id) {
+                    return;
+                }
                 if pending.started_at.elapsed() > std::time::Duration::from_secs(45) {
                     self.cancel_bookmark_open_request(pending.request_id, "book_resolve_timeout");
                     self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
@@ -33186,14 +33267,21 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         backing_archive: PathBuf,
+        owner: &crate::bookmark_browser::BookmarkOpenRequestOwner,
     ) -> Option<bool> {
         if !self.settings.detached_viewer_open_images_in_window {
             return None;
+        }
+        if !self.bookmark_open_owner_is_current(owner) {
+            return Some(false);
         }
         let pending = self
             .bookmark_open_pending
             .as_ref()
             .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)?;
+        if pending.request_id != owner.request_id {
+            return Some(false);
+        }
         if pending.bookmark.container_kind != crate::book_bookmarks::BookContainerKind::OtherArchive
             || !matches!(
                 self.bookmark_view_state.as_ref(),

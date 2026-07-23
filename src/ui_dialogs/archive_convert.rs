@@ -39,10 +39,38 @@ pub(crate) enum ArchiveConvertMsg {
     SiblingConvertDone(Result<(ArchiveImageSummary, PathBuf, i64), ConvertError>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ArchiveConvertDestination {
-    CacheAndOpen,
+/// What may happen after this archive state reaches a readable backing archive.
+///
+/// Bookmark carries the same request owner used by path resolution. Keeping this as one typed
+/// policy prevents a conversion result from falling back to unowned navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveConvertCompletionPolicy {
+    Navigation,
+    Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     SiblingZip,
+}
+
+impl ArchiveConvertCompletionPolicy {
+    fn is_sibling_zip(&self) -> bool {
+        matches!(self, Self::SiblingZip)
+    }
+
+    pub(crate) fn bookmark_owner(
+        &self,
+    ) -> Option<&crate::bookmark_browser::BookmarkOpenRequestOwner> {
+        match self {
+            Self::Bookmark(owner) => Some(owner),
+            Self::Navigation | Self::SiblingZip => None,
+        }
+    }
+
+    fn open_owner(&self) -> Option<crate::app::OpenRequestOwner> {
+        match self {
+            Self::Navigation => Some(crate::app::OpenRequestOwner::Navigation),
+            Self::Bookmark(owner) => Some(crate::app::OpenRequestOwner::Bookmark(owner.clone())),
+            Self::SiblingZip => None,
+        }
+    }
 }
 
 /// 進捗の共有ハンドル。変換ワーカーが書き、UI スレッドが読む。
@@ -110,7 +138,7 @@ pub(crate) struct ArchiveConvertState {
     pub allow_direct_read: bool,
     /// Existing conversion cache, used only when the direct-read probe rejects the RAR.
     pub fallback_cached_zip: Option<PathBuf>,
-    pub destination: ArchiveConvertDestination,
+    pub completion: ArchiveConvertCompletionPolicy,
     pub pending_sibling_output: Option<PathBuf>,
     /// 履歴の戻る/進むから未変換アーカイブに入ろうとしてダイアログが出た場合、
     /// キャンセル時に戻る/進むスタックをクリック前へ戻すためのスナップショット。
@@ -222,6 +250,26 @@ impl App {
         cached_zip: PathBuf,
         auto_fullscreen: bool,
     ) -> bool {
+        self.open_archive_via_cache_owned(
+            src,
+            cached_zip,
+            auto_fullscreen,
+            crate::app::OpenRequestOwner::Navigation,
+        )
+    }
+
+    pub(crate) fn open_archive_via_cache_owned(
+        &mut self,
+        src: PathBuf,
+        cached_zip: PathBuf,
+        auto_fullscreen: bool,
+        owner: crate::app::OpenRequestOwner,
+    ) -> bool {
+        if let crate::app::OpenRequestOwner::Bookmark(bookmark_owner) = &owner
+            && !self.bookmark_open_owner_is_current(bookmark_owner)
+        {
+            return false;
+        }
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
         }
@@ -241,7 +289,7 @@ impl App {
                     .is_some_and(|target| target.matches_loaded_container(&src))
             })
             .cloned();
-        self.load_folder(cached_zip.clone());
+        self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
         // 変わらない (load_zip_as_folder が current_folder = cache_zip を同期セットする前に
         // return するため)。その場合は override / address / recent を更新しない
@@ -280,6 +328,21 @@ impl App {
         format: ArchiveFormat,
         auto_fullscreen: bool,
     ) -> bool {
+        self.request_archive_convert_owned(
+            src,
+            format,
+            auto_fullscreen,
+            crate::app::OpenRequestOwner::Navigation,
+        )
+    }
+
+    pub(crate) fn request_archive_convert_owned(
+        &mut self,
+        src: PathBuf,
+        format: ArchiveFormat,
+        auto_fullscreen: bool,
+        owner: crate::app::OpenRequestOwner,
+    ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible() {
             return false;
         }
@@ -299,7 +362,14 @@ impl App {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination: ArchiveConvertDestination::CacheAndOpen,
+            completion: match owner {
+                crate::app::OpenRequestOwner::Navigation => {
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::Bookmark(owner) => {
+                    ArchiveConvertCompletionPolicy::Bookmark(owner)
+                }
+            },
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen,
@@ -312,11 +382,12 @@ impl App {
 
     /// Probe a RAR on the scan worker and open it directly when eligible.
     /// Rejected RARs continue through the unchanged conversion-cache flow.
-    pub(crate) fn request_rar_open(
+    pub(crate) fn request_rar_open_owned(
         &mut self,
         src: PathBuf,
         auto_fullscreen: bool,
         fallback_cached_zip: Option<PathBuf>,
+        owner: crate::app::OpenRequestOwner,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible()
             || self.archive_convert.is_some()
@@ -336,7 +407,14 @@ impl App {
             pending_direct_nav: None,
             allow_direct_read: true,
             fallback_cached_zip,
-            destination: ArchiveConvertDestination::CacheAndOpen,
+            completion: match owner {
+                crate::app::OpenRequestOwner::Navigation => {
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::Bookmark(owner) => {
+                    ArchiveConvertCompletionPolicy::Bookmark(owner)
+                }
+            },
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen,
@@ -367,7 +445,7 @@ impl App {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination: ArchiveConvertDestination::SiblingZip,
+            completion: ArchiveConvertCompletionPolicy::SiblingZip,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -435,39 +513,133 @@ impl App {
         }
     }
 
+    pub(crate) fn archive_convert_owns_bookmark_request(
+        &self,
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+    ) -> bool {
+        self.archive_convert
+            .as_ref()
+            .and_then(|state| state.completion.bookmark_owner())
+            .is_some_and(|owner| owner.request_id == request_id)
+    }
+
+    pub(crate) fn cancel_archive_convert_for_bookmark_request(
+        &mut self,
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+    ) -> bool {
+        if !self.archive_convert_owns_bookmark_request(request_id) {
+            return false;
+        }
+        let mut state = self
+            .archive_convert
+            .take()
+            .expect("matching archive conversion must still exist");
+        if let ArchiveConvertPhase::Converting { cancel, .. } = &state.phase {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let had_deferred = state.deferred_fullscreen.take().is_some();
+        crate::logger::log(format!(
+            "[bookmark-open] cancel archive transition id={} source={}",
+            request_id.0,
+            state.src_path.display()
+        ));
+        drop(state);
+        if had_deferred {
+            self.release_fs_nav_lock();
+        }
+        true
+    }
+
+    fn discard_stale_archive_bookmark_request(&mut self) -> bool {
+        let owner = self
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.completion.bookmark_owner())
+            .cloned();
+        let Some(owner) = owner else {
+            return false;
+        };
+        if self.bookmark_open_owner_is_current(&owner) {
+            return false;
+        }
+        self.cancel_bookmark_open_request(owner.request_id, "archive_owner_stale")
+    }
+
     /// 毎フレーム呼ばれるダイアログ描画・メッセージ処理のエントリポイント。
     pub(crate) fn show_archive_convert_dialog(&mut self, ctx: &egui::Context) {
+        if self.discard_stale_archive_bookmark_request() {
+            return;
+        }
         // 先にメッセージ処理 (ステート遷移)
         self.poll_archive_convert_messages();
 
-        if let Some(src) = self
+        if self.discard_stale_archive_bookmark_request() {
+            return;
+        }
+
+        if self
             .archive_convert
-            .as_mut()
-            .and_then(|state| state.pending_direct_nav.take())
+            .as_ref()
+            .is_some_and(|state| state.pending_direct_nav.is_some())
         {
-            let auto_fs = self
+            let mut state = self
                 .archive_convert
-                .as_ref()
-                .is_some_and(|state| state.auto_fullscreen);
-            let deferred = self
-                .archive_convert
-                .as_mut()
-                .and_then(|state| state.deferred_fullscreen.take());
-            self.archive_convert = None;
-            #[cfg(windows)]
-            if let Some(opened) = self.open_converted_bookmark_in_detached_context(ctx, src.clone())
-            {
-                if !opened {
-                    self.show_feedback_toast(
-                        "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
+                .take()
+                .expect("direct archive navigation state must exist");
+            let src = state
+                .pending_direct_nav
+                .take()
+                .expect("direct archive path must exist");
+            let auto_fs = state.auto_fullscreen;
+            let deferred = state.deferred_fullscreen.take();
+            let completion = state.completion.clone();
+            drop(state);
+            if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
+                if !self.bookmark_open_owner_is_current(owner) {
+                    self.cancel_bookmark_open_request(
+                        owner.request_id,
+                        "archive_direct_completion_stale",
                     );
+                    return;
                 }
-                return;
+                #[cfg(windows)]
+                if let Some(opened) =
+                    self.open_converted_bookmark_in_detached_context(ctx, src.clone(), owner)
+                {
+                    if !opened {
+                        self.cancel_bookmark_open_request(
+                            owner.request_id,
+                            "archive_detached_direct_open_failed",
+                        );
+                        self.show_feedback_toast(
+                            "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
+                        );
+                    }
+                    return;
+                }
             }
             if auto_fs {
                 self.pending_auto_fs_open = true;
             }
             self.load_zip_as_folder(src.clone());
+            let loaded = self
+                .current_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &src));
+            if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
+                if loaded {
+                    self.begin_bookmark_page_wait(owner);
+                } else {
+                    self.cancel_bookmark_open_request(
+                        owner.request_id,
+                        "archive_direct_navigation_blocked",
+                    );
+                    if deferred.is_some() {
+                        self.release_fs_nav_lock();
+                    }
+                    return;
+                }
+            }
             self.advance_drilled_current_path(&src);
             if self.favsearch.active {
                 self.update_favsearch_address();
@@ -558,6 +730,20 @@ impl App {
                     .as_ref()
                     .map(|s| s.auto_fullscreen)
                     .unwrap_or(false);
+                let completion = self
+                    .archive_convert
+                    .as_ref()
+                    .map(|s| s.completion.clone())
+                    .unwrap_or(ArchiveConvertCompletionPolicy::Navigation);
+                if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion
+                    && !self.bookmark_open_owner_is_current(owner)
+                {
+                    self.cancel_bookmark_open_request(
+                        owner.request_id,
+                        "archive_cache_completion_stale",
+                    );
+                    return;
+                }
                 let deferred_fullscreen = self
                     .archive_convert
                     .as_mut()
@@ -569,23 +755,32 @@ impl App {
                     .and_then(|s| s.nav_history_rollback.clone());
                 self.archive_convert = None;
                 #[cfg(windows)]
-                if let Some(opened) =
-                    self.open_converted_bookmark_in_detached_context(ctx, nav.clone())
-                {
-                    if deferred_fullscreen.is_some() {
-                        self.release_fs_nav_lock();
+                if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
+                    if let Some(opened) =
+                        self.open_converted_bookmark_in_detached_context(ctx, nav.clone(), owner)
+                    {
+                        if deferred_fullscreen.is_some() {
+                            self.release_fs_nav_lock();
+                        }
+                        if !opened {
+                            self.cancel_bookmark_open_request(
+                                owner.request_id,
+                                "archive_detached_converted_open_failed",
+                            );
+                            self.show_feedback_toast(
+                                "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
+                            );
+                        }
+                        return;
                     }
-                    if !opened {
-                        self.show_feedback_toast(
-                            "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
-                        );
-                    }
-                    return;
                 }
                 if auto_fs {
                     self.pending_auto_fs_open = true;
                 }
-                self.load_folder(nav.clone());
+                let open_owner = completion
+                    .open_owner()
+                    .expect("pending cache navigation must have an open policy");
+                self.load_folder_with_scan_owned(nav.clone(), None, open_owner);
                 // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
                 // current_folder は変わらない。その場合は override / address / recent を
                 // 更新せず、変換ダイアログを開いたときに変えた履歴スタックも巻き戻す
@@ -595,6 +790,12 @@ impl App {
                     .as_ref()
                     .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
                 if !loaded {
+                    if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
+                        self.cancel_bookmark_open_request(
+                            owner.request_id,
+                            "archive_cache_navigation_blocked",
+                        );
+                    }
                     if let Some(snapshot) = nav_history_rollback {
                         self.restore_folder_nav_history(snapshot);
                     }
@@ -618,6 +819,9 @@ impl App {
                         self.bookmark_view_state = Some(state);
                     }
                     self.archive_source_override = Some(src);
+                }
+                if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
+                    self.begin_bookmark_page_wait(owner);
                 }
                 if self.favsearch.active {
                     self.update_favsearch_address();
@@ -664,7 +868,7 @@ impl App {
         // ZIP (入れ子アーカイブ展開、v1.3.0) は「ZIP を ZIP に変換」だと意味が通らない
         // ので展開系の文言にする。
         let is_zip_expand = state.format == ArchiveFormat::Zip;
-        let is_sibling_zip = state.destination == ArchiveConvertDestination::SiblingZip;
+        let is_sibling_zip = state.completion.is_sibling_zip();
         let title = match &state.phase {
             ArchiveConvertPhase::Scanning => format!("{fmt_label} を読み込み中..."),
             ArchiveConvertPhase::PasswordRequired { .. } => {
@@ -933,19 +1137,19 @@ impl App {
                 .archive_convert
                 .as_ref()
                 .and_then(|state| state.nav_history_rollback.clone());
+            let bookmark_owner = self
+                .archive_convert
+                .as_ref()
+                .and_then(|state| state.completion.bookmark_owner())
+                .cloned();
             let had_deferred_fullscreen = self
                 .archive_convert
                 .as_mut()
                 .and_then(|state| state.deferred_fullscreen.take())
                 .is_some();
             self.archive_convert = None;
-            if self.bookmark_open_pending.as_ref().is_some_and(|pending| {
-                matches!(
-                    pending,
-                    crate::bookmark_browser::PendingBookmarkOpen::Book(_)
-                )
-            }) {
-                self.abandon_bookmark_open_after_path_failure("archive_dialog_closed");
+            if let Some(owner) = bookmark_owner {
+                self.cancel_bookmark_open_request(owner.request_id, "archive_dialog_closed");
             }
             if let Some(snapshot) = nav_history_rollback {
                 self.restore_folder_nav_history(snapshot);
@@ -1047,14 +1251,11 @@ impl App {
                     // ユーザーキャンセルならダイアログを即閉じる
                     let nav_history_rollback = state.nav_history_rollback.clone();
                     let had_deferred = state.deferred_fullscreen.is_some();
+                    let bookmark_owner = state.completion.bookmark_owner().cloned();
                     self.archive_convert = None;
-                    if self.bookmark_open_pending.as_ref().is_some_and(|pending| {
-                        matches!(
-                            pending,
-                            crate::bookmark_browser::PendingBookmarkOpen::Book(_)
-                        )
-                    }) {
-                        self.abandon_bookmark_open_after_path_failure(
+                    if let Some(owner) = bookmark_owner {
+                        self.cancel_bookmark_open_request(
+                            owner.request_id,
                             "archive_conversion_cancelled",
                         );
                     }
@@ -1132,7 +1333,7 @@ impl App {
         if self
             .archive_convert
             .as_ref()
-            .is_some_and(|state| state.destination == ArchiveConvertDestination::SiblingZip)
+            .is_some_and(|state| state.completion.is_sibling_zip())
         {
             self.start_sibling_zip_convert();
             return;
@@ -1322,7 +1523,7 @@ mod tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination: ArchiveConvertDestination::CacheAndOpen,
+            completion: ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,

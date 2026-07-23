@@ -1517,13 +1517,385 @@ mod startup_open_path_resolve_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
             requested,
-            owner: StartupOpenPathOwner::Bookmark { request_id, target },
+            owner: StartupOpenPathOwner::Bookmark(
+                crate::bookmark_browser::BookmarkOpenRequestOwner { request_id, target },
+            ),
             cancel: Arc::clone(&cancel),
             rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
         });
         (tx, cancel)
+    }
+
+    fn arm_archive_bookmark(
+        app: &mut App,
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+        path: PathBuf,
+        started_at: std::time::Instant,
+    ) -> crate::bookmark_browser::BookmarkOpenRequestOwner {
+        arm_book_bookmark(app, request_id, path.clone(), started_at);
+        let pending = app
+            .bookmark_open_pending
+            .as_mut()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book_mut)
+            .expect("archive bookmark should be armed");
+        pending.bookmark.container_kind = crate::book_bookmarks::BookContainerKind::OtherArchive;
+        pending.bookmark.page_identity =
+            crate::book_bookmarks::PageIdentity::ArchiveEntry("page-001.jpg".to_string());
+        crate::bookmark_browser::BookmarkOpenRequestOwner {
+            request_id,
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path),
+        }
+    }
+
+    fn install_bookmark_archive_transition(
+        app: &mut App,
+        source: PathBuf,
+        format: ArchiveFormat,
+        owner: crate::bookmark_browser::BookmarkOpenRequestOwner,
+        phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase,
+    ) -> mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg> {
+        let (tx, rx) = mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: source,
+            format,
+            password: None,
+            password_input: String::new(),
+            phase,
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Bookmark(owner),
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen: true,
+            deferred_fullscreen: None,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        tx
+    }
+
+    fn assert_bookmark_is_awaiting_page(app: &App) {
+        assert!(matches!(
+            app.bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+                .map(|pending| &pending.stage),
+            Some(crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { .. })
+        ));
+    }
+
+    #[test]
+    fn cached_converted_archive_keeps_bookmark_owner_through_cache_zip_load() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = false;
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(50);
+        let source = app.tmp.path().join("cached-book.7z");
+        let cached = app.tmp.path().join("cached-book.zip");
+        std::fs::write(&source, b"7z").unwrap();
+        std::fs::write(&cached, []).unwrap();
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
+        );
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .expect("archive cache DB")
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                &cached,
+                0,
+                1,
+                false,
+            )
+            .unwrap();
+
+        app.finish_startup_open_path_resolve(
+            StartupOpenPathOwner::Bookmark(owner),
+            StartupOpenPathResolveResult {
+                requested: source.clone(),
+                resolved: Some(crate::folder_tree::OpenablePathResolution {
+                    path: source.clone(),
+                    kind: crate::folder_tree::OpenablePathKind::File,
+                    requested_is_file: true,
+                }),
+                bookmark_relative_page_openable: None,
+                elapsed_ms: 1.0,
+            },
+            &egui::Context::default(),
+        );
+
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &cached
+        ));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert_bookmark_is_awaiting_page(&app);
+    }
+
+    #[test]
+    fn direct_rar_completion_begins_bookmark_page_wait() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = false;
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(51);
+        let source = app.tmp.path().join("direct-book.rar");
+        std::fs::write(&source, []).unwrap();
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
+        );
+        let _tx = install_bookmark_archive_transition(
+            &mut app,
+            source.clone(),
+            ArchiveFormat::Rar,
+            owner,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+        );
+        app.archive_convert.as_mut().unwrap().pending_direct_nav = Some(source.clone());
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &source
+        ));
+        assert_bookmark_is_awaiting_page(&app);
+    }
+
+    #[test]
+    fn new_archive_conversion_completion_begins_bookmark_page_wait() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = false;
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(52);
+        let source = app.tmp.path().join("converted-book.7z");
+        let cached = app.tmp.path().join("converted-book.zip");
+        std::fs::write(&source, b"7z").unwrap();
+        std::fs::write(&cached, []).unwrap();
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
+        );
+        let _tx = install_bookmark_archive_transition(
+            &mut app,
+            source.clone(),
+            ArchiveFormat::SevenZ,
+            owner,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+        );
+        app.archive_convert.as_mut().unwrap().pending_nav = Some(cached.clone());
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &cached
+        ));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert_bookmark_is_awaiting_page(&app);
+    }
+
+    #[test]
+    fn archive_owned_bookmark_does_not_timeout_during_user_or_conversion_wait() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(53);
+        let source = app.tmp.path().join("slow-book.7z");
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        );
+        let _tx = install_bookmark_archive_transition(
+            &mut app,
+            source,
+            ArchiveFormat::SevenZ,
+            owner,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Confirm {
+                summary: crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 1,
+                    nested_archive_count: 0,
+                },
+            },
+        );
+
+        app.poll_bookmark_book_open(&egui::Context::default());
+
+        assert_eq!(
+            app.bookmark_open_pending.as_ref().unwrap().request_id(),
+            request_id
+        );
+        assert!(app.archive_convert_owns_bookmark_request(request_id));
+    }
+
+    #[test]
+    fn navigation_cancels_archive_owned_bookmark_and_drops_late_completion() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(54);
+        let source = app.tmp.path().join("cancelled-book.7z");
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tx = install_bookmark_archive_transition(
+            &mut app,
+            source,
+            ArchiveFormat::SevenZ,
+            owner,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                progress: Arc::new(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                ),
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        let destination = app.tmp.path().join("manual-navigation-after-convert");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        app.load_folder(destination.clone());
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &destination
+        ));
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Err(
+                    crate::archive_converter::ConvertError::Cancelled,
+                ))
+            )
+            .is_err(),
+            "late conversion completion must have no navigation receiver"
+        );
+    }
+
+    #[test]
+    fn activation_immediately_cancels_archive_owned_bookmark() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(55);
+        let source = app.tmp.path().join("activation-cancelled-book.7z");
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tx = install_bookmark_archive_transition(
+            &mut app,
+            source,
+            ArchiveFormat::SevenZ,
+            owner,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                progress: Arc::new(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                ),
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        let activation = app.tmp.path().join("activation-destination");
+        std::fs::create_dir_all(&activation).unwrap();
+
+        app.start_startup_open_path_resolve(
+            activation,
+            StartupOpenPathSource::Activation,
+            &egui::Context::default(),
+        );
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Err(
+                    crate::archive_converter::ConvertError::Cancelled,
+                ))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_archive_owner_cannot_overwrite_a_newer_bookmark_request() {
+        let mut app = setup_app();
+        let request_a = crate::bookmark_browser::BookmarkOpenRequestId(56);
+        let request_b = crate::bookmark_browser::BookmarkOpenRequestId(57);
+        let source_a = app.tmp.path().join("old-book.7z");
+        let source_b = app.tmp.path().join("new-book.7z");
+        let owner_a = crate::bookmark_browser::BookmarkOpenRequestOwner {
+            request_id: request_a,
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(source_a.clone()),
+        };
+        arm_archive_bookmark(&mut app, request_b, source_b, std::time::Instant::now());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tx = install_bookmark_archive_transition(
+            &mut app,
+            source_a,
+            ArchiveFormat::SevenZ,
+            owner_a,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                progress: Arc::new(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                ),
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        let before = app.current_folder.clone();
+
+        app.show_archive_convert_dialog(&egui::Context::default());
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder, before);
+        assert_eq!(
+            app.bookmark_open_pending.as_ref().unwrap().request_id(),
+            request_b
+        );
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Err(
+                    crate::archive_converter::ConvertError::Cancelled,
+                ))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1706,17 +2078,17 @@ mod startup_open_path_resolve_tests {
                 .as_ref()
                 .is_some_and(|pending| matches!(
                     pending.owner,
-                    StartupOpenPathOwner::Bookmark { request_id, .. } if request_id == request_b
+                    StartupOpenPathOwner::Bookmark(ref owner) if owner.request_id == request_b
                 ))
         );
 
         let before = app.current_folder.clone();
         let stale_resolved_folder = app.tmp.path().to_path_buf();
         app.finish_startup_open_path_resolve(
-            StartupOpenPathOwner::Bookmark {
+            StartupOpenPathOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
                 request_id: request_a,
                 target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_a.clone()),
-            },
+            }),
             StartupOpenPathResolveResult {
                 requested: target_a,
                 resolved: Some(crate::folder_tree::OpenablePathResolution {
@@ -3332,8 +3704,8 @@ mod phase_c_folder_nav_history_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -3393,8 +3765,8 @@ mod phase_c_folder_nav_history_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -3432,8 +3804,8 @@ mod phase_c_folder_nav_history_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
@@ -3476,8 +3848,8 @@ mod phase_c_folder_nav_history_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
@@ -7353,6 +7725,10 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         app.open_converted_bookmark_in_detached_context(
             &egui::Context::default(),
             backing.clone(),
+            &crate::bookmark_browser::BookmarkOpenRequestOwner {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(source.clone()),
+            },
         ),
         Some(true)
     );
@@ -14915,8 +15291,8 @@ mod favorite_adjustment_defaults_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -14951,8 +15327,8 @@ mod favorite_adjustment_defaults_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -14979,8 +15355,8 @@ mod favorite_adjustment_defaults_tests {
             pending_direct_nav: None,
             allow_direct_read: true,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -15034,8 +15410,8 @@ mod favorite_adjustment_defaults_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -15094,8 +15470,8 @@ mod favorite_adjustment_defaults_tests {
             pending_direct_nav: None,
             allow_direct_read: false,
             fallback_cached_zip: None,
-            destination:
-                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,

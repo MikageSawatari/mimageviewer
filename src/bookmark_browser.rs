@@ -801,6 +801,14 @@ impl PendingMediaOpenWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BookmarkOpenRequestId(pub(crate) u64);
 
+/// A bookmark open request's stable owner, shared by every asynchronous stage from path
+/// resolution through archive conversion and viewer initialization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookmarkOpenRequestOwner {
+    pub request_id: BookmarkOpenRequestId,
+    pub target: BookmarkViewReturnTarget,
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingMediaOpen {
     pub request_id: BookmarkOpenRequestId,
