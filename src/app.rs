@@ -1886,6 +1886,8 @@ struct ViewerContextBundle {
     rating_cache: std::collections::HashMap<usize, u8>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
     rating_session_write_seen_generation: u64,
+    /// App-global metadata import 差分をこの context の各表示cacheへ反映済みの世代。
+    metadata_import_refresh_seen_generation: u64,
     current_folder_rating_cache: Option<u8>,
     current_folder_last_mtime: Option<std::time::SystemTime>,
     current_folder_signature: Option<u64>,
@@ -2156,6 +2158,7 @@ impl ViewerContextBundle {
             rotation_cache: std::collections::HashMap::new(),
             rating_cache: std::collections::HashMap::new(),
             rating_session_write_seen_generation: 0,
+            metadata_import_refresh_seen_generation: 0,
             current_folder_rating_cache: None,
             current_folder_last_mtime: None,
             current_folder_signature: None,
@@ -7446,6 +7449,12 @@ pub struct App {
     /// 現在 mount 中の context が `rating_session_writes` を反映済みの世代。
     /// idx cache と同じ context ownership なので `ViewerContextBundle` と交換する。
     pub(crate) rating_session_write_seen_generation: u64,
+    /// import worker が返した差分のApp-global世代。DBを再読込せず、退避中bundleは
+    /// mount時に `metadata_import_refresh_pending` の未反映分を取り込む。
+    pub(crate) metadata_import_refresh_generation: u64,
+    pub(crate) metadata_import_refresh_pending: crate::metadata_transfer::ImportRefreshDelta,
+    /// 現在mount中contextがmetadata import差分を反映済みの世代。bundle ownership。
+    pub(crate) metadata_import_refresh_seen_generation: u64,
     /// `current_folder` (コンテナ) 自身のレーティングキャッシュ。アドレスバー描画で
     /// 毎フレーム参照されるので SQLite を叩かない。`None` は未計算を意味する。
     /// `load_folder` / `set_current_folder_rating` / `set_rating` (コンテナ変更時) で
@@ -10195,6 +10204,10 @@ impl App {
             rating_session_write_generation: 0,
             rating_session_writes: std::collections::HashMap::new(),
             rating_session_write_seen_generation: 0,
+            metadata_import_refresh_generation: 0,
+            metadata_import_refresh_pending: crate::metadata_transfer::ImportRefreshDelta::default(
+            ),
+            metadata_import_refresh_seen_generation: 0,
             current_folder_rating_cache: None,
             rating_counts_cache: None,
             folder_rating_counts: std::collections::HashMap::new(),
@@ -11796,6 +11809,7 @@ impl App {
         if self.sync_current_context_rating_session_writes() {
             self.rebuild_visible_indices();
         }
+        self.sync_current_context_metadata_import_refresh();
         macro_rules! swap_field {
             ($field:ident) => {
                 std::mem::swap(&mut self.$field, $field);
@@ -11869,6 +11883,7 @@ impl App {
             rotation_cache,
             rating_cache,
             rating_session_write_seen_generation,
+            metadata_import_refresh_seen_generation,
             current_folder_rating_cache,
             current_folder_last_mtime,
             current_folder_signature,
@@ -12073,6 +12088,7 @@ impl App {
         swap_field!(rotation_cache);
         swap_field!(rating_cache);
         swap_field!(rating_session_write_seen_generation);
+        swap_field!(metadata_import_refresh_seen_generation);
         swap_field!(current_folder_rating_cache);
         swap_field!(current_folder_last_mtime);
         swap_field!(current_folder_signature);
@@ -12224,6 +12240,8 @@ impl App {
         if self.sync_current_context_rating_session_writes() {
             self.rebuild_visible_indices();
         }
+        self.sync_current_context_metadata_import_refresh();
+        self.prune_metadata_import_refresh_if_fully_seen();
     }
 
     #[cfg(windows)]
@@ -22432,33 +22450,101 @@ impl App {
     pub(crate) fn metadata_import_refresh_scope(
         &self,
     ) -> crate::metadata_transfer::ImportRefreshScope {
-        let mut base_keys = std::collections::HashSet::new();
-        if let Some(folder) = self.current_folder.as_ref() {
-            base_keys.insert(crate::path_key::normalize_keep_drive(folder));
+        fn collect_context(
+            base_keys: &mut std::collections::HashSet<String>,
+            current_folder: Option<&std::path::Path>,
+            archive_source_override: Option<&std::path::Path>,
+            items: &[GridItem],
+        ) {
+            if let Some(path) = current_folder {
+                base_keys.insert(crate::path_key::normalize_keep_drive(path));
+            }
+            if let Some(path) = archive_source_override {
+                base_keys.insert(crate::path_key::normalize_keep_drive(path));
+            }
+            for item in items {
+                let path = match item {
+                    GridItem::Folder(path)
+                    | GridItem::Image(path)
+                    | GridItem::Video(path)
+                    | GridItem::Audio(path)
+                    | GridItem::ZipFile(path)
+                    | GridItem::PdfFile(path) => Some(path.as_path()),
+                    GridItem::ConvertibleArchive { path, .. }
+                    | GridItem::SearchContainer { path, .. } => Some(path.as_path()),
+                    GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
+                        Some(zip_path.as_path())
+                    }
+                    GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.as_path()),
+                    GridItem::Stack { representative, .. } => Some(representative.as_path()),
+                };
+                if let Some(path) = path {
+                    base_keys.insert(crate::path_key::normalize_keep_drive(path));
+                }
+            }
         }
-        for idx in 0..self.items.len() {
-            if let Some(key) = self
-                .rating_path_key(idx)
-                .or_else(|| self.page_path_key(idx))
-            {
-                base_keys.insert(
-                    key.split_once("::")
-                        .map_or(key.as_str(), |(base, _)| base)
-                        .to_string(),
+
+        let mut base_keys = std::collections::HashSet::new();
+        collect_context(
+            &mut base_keys,
+            self.current_folder.as_deref(),
+            self.archive_source_override.as_deref(),
+            &self.items,
+        );
+        #[cfg(windows)]
+        {
+            if let Some(active) = self.active_detached_viewer_context.as_ref() {
+                collect_context(
+                    &mut base_keys,
+                    active.bundle.current_folder.as_deref(),
+                    active.bundle.archive_source_override.as_deref(),
+                    &active.bundle.items,
                 );
             }
-            if let Some(path) = self.items[idx].container_path() {
-                base_keys.insert(crate::path_key::normalize_keep_drive(path));
+            for window in &self.detached_image_windows {
+                if let Some(bundle) = window.paused_bundle.as_deref() {
+                    collect_context(
+                        &mut base_keys,
+                        bundle.current_folder.as_deref(),
+                        bundle.archive_source_override.as_deref(),
+                        &bundle.items,
+                    );
+                }
             }
         }
         crate::metadata_transfer::ImportRefreshScope { base_keys }
     }
 
-    /// 明示メタ情報インポート完了後、worker が返した commit 済み差分だけで表示を更新する。
-    /// SQLite の point read / prewarm / folder reload は UI thread で行わない。
+    /// 明示メタ情報インポートのcommit済み差分をApp-globalにpublishし、現在contextへ適用する。
+    /// 退避中のmain / detached / parked contextはbundle mount時に同じ差分を取り込む。
+    /// SQLite のpoint read / prewarm / folder reloadはUI threadで行わない。
     pub(crate) fn refresh_after_metadata_transfer_import(
         &mut self,
         refresh: &crate::metadata_transfer::ImportRefreshDelta,
+    ) {
+        if refresh.is_empty() {
+            return;
+        }
+        self.metadata_import_refresh_generation =
+            self.metadata_import_refresh_generation.saturating_add(1);
+        // physical rating台帳とpage-key rollupはApp-globalなので現在ここで1回だけ反映する。
+        // bundle mount時に必要なのはscope済み実値だけに絞り、大規模再帰importの全familyを
+        // parked contextの寿命中ずっと複製保持しない。
+        self.metadata_import_refresh_pending.merge_from(
+            &crate::metadata_transfer::ImportRefreshDelta {
+                visible_entries: refresh.visible_entries.clone(),
+                ..Default::default()
+            },
+        );
+        self.apply_metadata_transfer_import_refresh(refresh, true);
+        self.metadata_import_refresh_seen_generation = self.metadata_import_refresh_generation;
+        self.prune_metadata_import_refresh_if_fully_seen();
+    }
+
+    fn apply_metadata_transfer_import_refresh(
+        &mut self,
+        refresh: &crate::metadata_transfer::ImportRefreshDelta,
+        publish_global: bool,
     ) {
         use std::collections::{HashMap, HashSet};
 
@@ -22474,8 +22560,10 @@ impl App {
         }
 
         let imported = &refresh.visible_entries;
-        for value in &refresh.physical_ratings {
-            self.record_rating_session_write(value.key.clone(), value.stars, true);
+        if publish_global {
+            for value in &refresh.physical_ratings {
+                self.record_rating_session_write(value.key.clone(), value.stars, true);
+            }
         }
         let mut rating_families = HashSet::new();
         let mut rating_values = HashMap::new();
@@ -22507,8 +22595,10 @@ impl App {
                     Some(rating_values.get(&key).copied().unwrap_or(0));
             }
             self.rating_session_write_seen_generation = self.rating_session_write_generation;
-            self.invalidate_rating_counts_cache();
-            self.reset_folder_rating_counts();
+            if publish_global {
+                self.invalidate_rating_counts_cache();
+                self.reset_folder_rating_counts();
+            }
         }
 
         let mut tag_families = HashSet::new();
@@ -22568,7 +22658,7 @@ impl App {
             .iter()
             .map(|family| family.base_key.as_str())
             .collect::<HashSet<_>>();
-        if !all_page_families.is_empty() {
+        if publish_global && !all_page_families.is_empty() {
             let keep = |key: &String| !all_page_families.contains(family_base_for_item(key));
             self.adjusted_page_keys.retain(keep);
             self.local_adjust_page_keys.retain(keep);
@@ -22577,18 +22667,32 @@ impl App {
             self.comic_page_keys.retain(keep);
             self.rotation_page_keys.retain(keep);
         }
-        for family in &refresh.page_state_families {
-            for item in &family.items {
-                Self::set_page_key_presence(&mut self.adjusted_page_keys, &item.key, item.adjusted);
-                Self::set_page_key_presence(
-                    &mut self.local_adjust_page_keys,
-                    &item.key,
-                    item.local_adjusted,
-                );
-                Self::set_page_key_presence(&mut self.mask_page_keys, &item.key, item.masked);
-                Self::set_page_key_presence(&mut self.conceal_page_keys, &item.key, item.concealed);
-                Self::set_page_key_presence(&mut self.comic_page_keys, &item.key, item.comic);
-                Self::set_page_key_presence(&mut self.rotation_page_keys, &item.key, item.rotated);
+        if publish_global {
+            for family in &refresh.page_state_families {
+                for item in &family.items {
+                    Self::set_page_key_presence(
+                        &mut self.adjusted_page_keys,
+                        &item.key,
+                        item.adjusted,
+                    );
+                    Self::set_page_key_presence(
+                        &mut self.local_adjust_page_keys,
+                        &item.key,
+                        item.local_adjusted,
+                    );
+                    Self::set_page_key_presence(&mut self.mask_page_keys, &item.key, item.masked);
+                    Self::set_page_key_presence(
+                        &mut self.conceal_page_keys,
+                        &item.key,
+                        item.concealed,
+                    );
+                    Self::set_page_key_presence(&mut self.comic_page_keys, &item.key, item.comic);
+                    Self::set_page_key_presence(
+                        &mut self.rotation_page_keys,
+                        &item.key,
+                        item.rotated,
+                    );
+                }
             }
         }
         if !page_families.is_empty() {
@@ -22817,10 +22921,60 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Tags,
         );
-        self.notify_bookmarks_changed();
+        if publish_global {
+            self.notify_bookmarks_changed();
+        }
         if self.settings.facet_filter.is_active() {
             self.rebuild_visible_indices();
         }
+    }
+
+    /// App-global import差分のうち、現在mount中のviewer contextがまだ見ていない分だけを
+    /// 在メモリcacheへ適用する。bundle swap境界からだけ呼び、DB I/Oは行わない。
+    #[cfg(windows)]
+    fn sync_current_context_metadata_import_refresh(&mut self) -> bool {
+        if self.metadata_import_refresh_seen_generation == self.metadata_import_refresh_generation {
+            return false;
+        }
+        let refresh = self.metadata_import_refresh_pending.clone();
+        if !refresh.is_empty() {
+            self.apply_metadata_transfer_import_refresh(&refresh, false);
+        }
+        self.metadata_import_refresh_seen_generation = self.metadata_import_refresh_generation;
+        true
+    }
+
+    #[cfg(windows)]
+    fn prune_metadata_import_refresh_if_fully_seen(&mut self) {
+        let generation = self.metadata_import_refresh_generation;
+        if self.metadata_import_refresh_seen_generation != generation {
+            return;
+        }
+        if self
+            .active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| {
+                active.bundle.metadata_import_refresh_seen_generation != generation
+            })
+        {
+            return;
+        }
+        if self.detached_image_windows.iter().any(|window| {
+            window
+                .paused_bundle
+                .as_deref()
+                .is_some_and(|bundle| bundle.metadata_import_refresh_seen_generation != generation)
+        }) {
+            return;
+        }
+        self.metadata_import_refresh_pending =
+            crate::metadata_transfer::ImportRefreshDelta::default();
+    }
+
+    #[cfg(not(windows))]
+    fn prune_metadata_import_refresh_if_fully_seen(&mut self) {
+        self.metadata_import_refresh_pending =
+            crate::metadata_transfer::ImportRefreshDelta::default();
     }
 
     /// リネーム移行が使う data_dir (テストでは tempdir に差し替え可能)。
@@ -34587,6 +34741,7 @@ impl App {
             rotation_cache,
             rating_cache,
             rating_session_write_seen_generation,
+            metadata_import_refresh_seen_generation,
             current_folder_rating_cache,
             current_folder_last_mtime,
             current_folder_signature,
@@ -34755,6 +34910,7 @@ impl App {
             rotation_cache,
             rating_cache,
             rating_session_write_seen_generation,
+            metadata_import_refresh_seen_generation,
             current_folder_rating_cache,
             tags_cache,
             current_folder_last_mtime,

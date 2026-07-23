@@ -94,6 +94,72 @@ pub struct ImportRefreshDelta {
     pub visible_entries: Vec<ImportedEntryMetadata>,
 }
 
+impl ImportRefreshDelta {
+    /// 未マウントの viewer context が複数回の import を後から取り込めるよう、同じ
+    /// physical family の最新値を section 単位で畳み込む。`None` はその import で
+    /// section が対象外だったことを表すため、既存の差分を消さない。
+    #[allow(dead_code)] // binary Appで使用。library-only buildにはconsumerがない。
+    pub(crate) fn merge_from(&mut self, newer: &Self) {
+        for value in &newer.physical_ratings {
+            if let Some(current) = self
+                .physical_ratings
+                .iter_mut()
+                .find(|current| current.key == value.key)
+            {
+                *current = value.clone();
+            } else {
+                self.physical_ratings.push(value.clone());
+            }
+        }
+        for family in &newer.page_state_families {
+            if let Some(current) = self
+                .page_state_families
+                .iter_mut()
+                .find(|current| current.base_key == family.base_key)
+            {
+                *current = family.clone();
+            } else {
+                self.page_state_families.push(family.clone());
+            }
+        }
+        for entry in &newer.visible_entries {
+            let Some(current) = self
+                .visible_entries
+                .iter_mut()
+                .find(|current| current.base_key == entry.base_key)
+            else {
+                self.visible_entries.push(entry.clone());
+                continue;
+            };
+            if entry.ratings.is_some() {
+                current.ratings.clone_from(&entry.ratings);
+            }
+            if entry.tags.is_some() {
+                current.tags.clone_from(&entry.tags);
+            }
+            if entry.page_states.is_some() {
+                current.page_states.clone_from(&entry.page_states);
+            }
+            if entry.container_states.is_some() {
+                current.container_states.clone_from(&entry.container_states);
+            }
+            if entry.folder_pins.is_some() {
+                current.folder_pins.clone_from(&entry.folder_pins);
+            }
+            if entry.video_pin.is_some() {
+                current.video_pin.clone_from(&entry.video_pin);
+            }
+        }
+    }
+
+    #[allow(dead_code)] // binary Appで使用。library-only buildにはconsumerがない。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.physical_ratings.is_empty()
+            && self.page_state_families.is_empty()
+            && self.visible_entries.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ImportRefreshScope {
     pub base_keys: HashSet<String>,
@@ -663,11 +729,17 @@ fn imported_page_state_family(path: &Path, entry: &PortableEntry) -> ImportedPag
     items.push(imported_page_state_presence(&base_key, &entry.page_state));
     items.extend(entry.virtual_items.iter().map(|item| {
         imported_page_state_presence(
-            &format!("{base_key}::{}", item.member_key.to_lowercase()),
+            &canonical_virtual_item_key(&base_key, &item.member_key),
             &item.page_state,
         )
     }));
     ImportedPageStateFamily { base_key, items }
+}
+
+/// 仮想項目のDB identity。ZIP member名は表示・manifestではcaseを保持するが、
+/// mIVのpage keyはcase-insensitiveなので全store・refresh経路で同じ形に揃える。
+fn canonical_virtual_item_key(base_key: &str, member_key: &str) -> String {
+    format!("{base_key}::{}", member_key.to_lowercase())
 }
 
 fn imported_page_state_presence(key: &str, state: &PortablePageState) -> ImportedPageStatePresence {
@@ -688,7 +760,7 @@ fn imported_entry_metadata(
     sections: ManifestSections,
 ) -> ImportedEntryMetadata {
     let base_key = crate::path_key::normalize_keep_drive(path);
-    let item_key = |member: &str| format!("{base_key}::{}", member.to_lowercase());
+    let item_key = |member: &str| canonical_virtual_item_key(&base_key, member);
 
     let ratings = sections.ratings.then(|| {
         let mut values = Vec::with_capacity(entry.virtual_items.len() + 1);
@@ -2580,7 +2652,7 @@ fn apply_entry(
             if let Some(rating) = &item.rating {
                 insert_rating(
                     &tx,
-                    &format!("{base_key}::{}", item.member_key),
+                    &canonical_virtual_item_key(&base_key, &item.member_key),
                     path,
                     rating,
                 )?;
@@ -2594,7 +2666,7 @@ fn apply_entry(
         for item in &entry.virtual_items {
             insert_tags(
                 &tx,
-                &format!("{base_key}::{}", item.member_key),
+                &canonical_virtual_item_key(&base_key, &item.member_key),
                 &item.tags,
                 fallback_time_ms,
             )?;
@@ -2700,7 +2772,7 @@ fn apply_entry(
         for item in &entry.virtual_items {
             insert_page_state(
                 &tx,
-                &format!("{base_key}::{}", item.member_key.to_lowercase()),
+                &canonical_virtual_item_key(&base_key, &item.member_key),
                 &item.page_state,
             )?;
         }
@@ -3529,6 +3601,134 @@ mod tests {
                 "page/001.jpg".to_string(),
                 "表紙".to_string(),
             )
+        );
+    }
+
+    #[test]
+    fn mixed_case_virtual_member_uses_one_canonical_key_for_db_and_refresh() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("library");
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("book.zip"), b"zip").unwrap();
+        init_data_dir(&data_dir);
+
+        let mixed_member = "Pages/Cover.JPG";
+        let manifest = Manifest {
+            format: FORMAT_NAME.to_string(),
+            version: FORMAT_VERSION,
+            exported_at_ms: 123_000,
+            recursive: false,
+            sections: ManifestSections::default(),
+            entries: vec![PortableEntry {
+                path: "book.zip".to_string(),
+                kind: PortableEntryKind::File,
+                fingerprint: Some(FileFingerprint {
+                    size: 3,
+                    modified_ms: None,
+                }),
+                rating: None,
+                tags: Vec::new(),
+                timed_bookmarks: Vec::new(),
+                book_bookmarks: Vec::new(),
+                page_state: PortablePageState::default(),
+                container_state: PortableContainerState::default(),
+                nested_containers: Vec::new(),
+                video_pin: None,
+                virtual_items: vec![PortableVirtualItem {
+                    member_key: mixed_member.to_string(),
+                    rating: Some(PortableRating {
+                        stars: 4,
+                        rated_at_ms: Some(456),
+                        kind: Some("zip_image".to_string()),
+                        entry_name: Some(mixed_member.to_string()),
+                        page_num: None,
+                        dir_prefix: None,
+                        archive_format: None,
+                        zipdir_is_archive: None,
+                        zipdir_representative: None,
+                    }),
+                    tags: vec!["MixedCase".to_string()],
+                    page_state: PortablePageState {
+                        rotation_degrees: Some(90),
+                        ..PortablePageState::default()
+                    },
+                }],
+            }],
+        };
+        let cancel = AtomicBool::new(false);
+        write_manifest_atomic(&root, &manifest, &cancel).unwrap();
+
+        let base_key = crate::path_key::normalize_keep_drive(&root.join("book.zip"));
+        let canonical_key = canonical_virtual_item_key(&base_key, mixed_member);
+        let raw_key = format!("{base_key}::{mixed_member}");
+        let refresh_scope = ImportRefreshScope {
+            base_keys: HashSet::from([base_key.clone()]),
+        };
+        let summary = import_at_with_refresh_scope(
+            &data_dir,
+            &root,
+            &cancel,
+            Some(&refresh_scope),
+            no_progress,
+        )
+        .unwrap();
+        assert_eq!(summary.failed_entries, 0);
+
+        let rating_db = Connection::open(data_dir.join("rating.db")).unwrap();
+        assert_eq!(
+            rating_db
+                .query_row(
+                    "SELECT stars FROM ratings WHERE path = ?1",
+                    [&canonical_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            rating_db
+                .query_row(
+                    "SELECT COUNT(*) FROM ratings WHERE path = ?1",
+                    [&raw_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+
+        let tags_db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
+        assert_eq!(
+            tags_db
+                .get_item_tags(&canonical_key)
+                .into_iter()
+                .map(|tag| tag.tag)
+                .collect::<Vec<_>>(),
+            vec!["MixedCase"]
+        );
+        assert!(tags_db.get_item_tags(&raw_key).is_empty());
+
+        let rotation_db = Connection::open(data_dir.join("rotation.db")).unwrap();
+        assert_eq!(
+            rotation_db
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&canonical_key],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            90
+        );
+        assert_eq!(
+            summary.refresh.page_state_families[0].items[1].key,
+            canonical_key
+        );
+        let refreshed = &summary.refresh.visible_entries[0];
+        assert_eq!(refreshed.ratings.as_ref().unwrap()[1].key, canonical_key);
+        assert_eq!(refreshed.tags.as_ref().unwrap()[1].key, canonical_key);
+        assert_eq!(
+            refreshed.page_states.as_ref().unwrap()[1].key,
+            canonical_key
         );
     }
 
