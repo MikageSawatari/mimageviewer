@@ -140,7 +140,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_music_timeline.rs` | 音楽ビュー中央の行分割波形タイムライン。row raster worker + 行テクスチャキャッシュ (`TimelineTextureCache`、解析の版数 = `music_analysis_version` で再ラスタ判定)。行数は `TIMELINE_MAX_ROWS` でキャップ |
 | `ui_music_spectrum.rs` | 下段 108band スペクトラム + 鍵盤。専用 worker が共有 `MusicPcm` の窓を FFT (in-flight 1 件 coalesce) |
 | `ui_music_panels.rs` | 音楽ビューの左右ホバーパネル (ブックマーク / ループ / 行秒数) と下 HUD (動画 native HUD とレイアウト一致) |
-| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` の versioned JSON、root-relative path 検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンの収集と項目単位 import を worker で実行する。import は15ストアを1つのSQLite attached-database transactionへまとめ、rollback journal / super-journalを検査して物理項目単位のcrash atomicityを保証する。UI は完全モーダルの確認・進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当し、view-trim flush、dirty自動sidecar flush、TagsDb connectionのjournal-mode handoff / 再openはworker側で行う。完了時はworkerが返すcommit済み表示差分を在メモリcacheへ適用し、SQLite再読込や同期フォルダreloadを行わない。差分の実値はimport開始時に所有中のmain / detached / parked contextをscopeに含め、App-global世代とsection単位の累積差分を各`ViewerContextBundle`のmount時に適用する |
+| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` directory の原子的generation pointer + フォルダ単位JSON Lines shard、root-relative path検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンの収集と項目単位importをworkerで実行する。export / preview / importはshardを逐次処理し、総項目数・総sidecarサイズの固定上限を持たない。importは15ストアを1つのSQLite attached-database transactionへまとめ、rollback journal / super-journalを検査して物理項目単位のcrash atomicityを保証する。UIは完全モーダルの確認・固定高進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当し、view-trim flush、dirty自動sidecar flush、TagsDb connectionのjournal-mode handoff / 再openはworker側で行う。完了時はworkerが返すcommit済み表示差分を在メモリcacheへ適用し、SQLite再読込や同期フォルダreloadを行わない。差分の実値はimport開始時に所有中のmain / detached / parked contextをscopeに含め、App-global世代とsection単位の累積差分を各`ViewerContextBundle`のmount時に適用する |
 | App の `music_*` 状態 | 解析ワーカー / `MusicPcm` / spectrum / timeline cache は **ViewerContextBundle に入れず global** (stage-audio §3.5: ParkedLive 音楽窓も同じ global を消費する)。表示ゲートの中央述語は `fs_music_view_active`、動画→音声モードの transient は `video_audio_mode` / `video_audio_vst` |
 
 ### マルチウィンドウ / detached viewer (F12)
@@ -323,12 +323,23 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 ### 明示メタ情報転送 (`mimageviewer.meta.miv`)
 
 `ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
-`mimageviewer.dat` と独立した versioned JSON を実フォルダ直下へ作る。v2 は評価、タグ、
-動画・音声 / 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク / 部分補正 /
-crop / 注釈、フォルダ代表サムネ・動画ピンを対象にし、再帰 export でも sidecar は root の
-1 個だけ。ZIP / PDF のページ state と ZIP 内の本 state は物理コンテナ配下の相対キーで持つ。
-import は manifest に記載された物理項目だけを上書きし、未記載項目を保持する。v1 の不足
-section は「指定なし」として既存の v2 state を保持する。v2 適用時は既存
+`mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v3 は評価、
+タグ、動画・音声 / 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
+部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。ZIP / PDF のページ state
+と ZIP 内の本 state は物理コンテナ配下の相対キーで持つ。
+
+bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
+`generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ
+保存する。再帰exportは4096物理項目ごとにDB scopeを作って逐次serializeするため、全項目を
+1つの`Vec`やJSONへ集めず、総項目数と総bundleサイズに固定上限を設けない。防御上限は
+manifest 1 MiB、shard header 256 KiB、単一物理項目record 256 MiBに限定する。
+完成前generationはpointerから参照されず、全shardのflush / sync後に`manifest.json`だけを
+原子的に置換する。キャンセル・書込失敗では既存pointerを維持し、公開済み内容を壊さない。
+
+preview / importは各shardをbounded line readerで逐次読み、folder hash、direct-child配置、
+shard / entry総数、record単位validationを検証する。importはDBを触る前に全generationを
+streaming preflightし、2回目の走査で対象pathを再検証して項目単位transactionを適用する。
+manifestに記載された物理項目だけを上書きし、未記載項目を保持する。適用時は既存
 `mimageviewer.dat` の mtime を編集 / タグ sidecar sync table に記録し、明示 import 後の
 フォルダ再ロードで古い自動バックアップが欠落行を復活させないようにする。
 dirty な自動 sidecar のserialize / temp書き込み / renameはimport workerの前処理で行い、

@@ -1,14 +1,14 @@
 //! 明示操作によるポータブル・メタ情報のエクスポート / インポート。
 //!
 //! 既存の `mimageviewer.dat`（編集情報の自動 sidecar）とは責務を分離し、
-//! `mimageviewer.meta.miv` 1 個に、フォルダ配下のユーザー作成メタ情報をまとめる。
+//! `mimageviewer.meta.miv` directory に、フォルダ単位で分割したユーザー作成メタ情報をまとめる。
 //! 自動 sidecar の設定が OFF でも、この manifest 単体で別環境へ復元できる。
 //! このモジュールの公開 API は worker スレッドから呼ぶこと。
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,13 +16,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const SIDECAR_FILENAME: &str = "mimageviewer.meta.miv";
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
-const FORMAT_VERSION: u32 = 2;
-const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
-const MAX_SIDECAR_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_ENTRIES: usize = 500_000;
+const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
+const FORMAT_VERSION: u32 = 3;
+const BUNDLE_MANIFEST_FILENAME: &str = "manifest.json";
+const GENERATIONS_DIRNAME: &str = "generations";
+const SHARDS_DIRNAME: &str = "shards";
+const SHARD_EXTENSION: &str = "jsonl";
+const EXPORT_BATCH_ENTRIES: usize = 4_096;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// 総exportサイズではなく、単一の物理項目recordにだけ適用する防御上限。
+const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SHARD_HEADER_BYTES: u64 = 256 * 1024;
 const MAX_PATH_CHARS: usize = 32_768;
 const MAX_MEMBER_KEY_CHARS: usize = 65_536;
 const MAX_TITLE_CHARS: usize = 1_024;
@@ -281,6 +289,7 @@ impl fmt::Display for TransferError {
 
 impl std::error::Error for TransferError {}
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Manifest {
     format: String,
@@ -289,6 +298,26 @@ struct Manifest {
     recursive: bool,
     sections: ManifestSections,
     entries: Vec<PortableEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BundleManifest {
+    format: String,
+    version: u32,
+    generation: String,
+    exported_at_ms: i64,
+    recursive: bool,
+    sections: ManifestSections,
+    shard_count: u64,
+    entry_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ShardHeader {
+    format: String,
+    version: u32,
+    generation: String,
+    folder: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -485,8 +514,14 @@ struct EnumeratedEntry {
     portable: PortableEntry,
 }
 
-/// `root` と同じフォルダの固定 sidecar へエクスポートする。
-/// 完成するまで sibling temp に書き、成功時だけ既存 sidecar と原子的に置換する。
+#[derive(Default)]
+struct BundleCounts {
+    shards: u64,
+    entries: u64,
+}
+
+/// `root` と同じフォルダの固定 sidecar directory へエクスポートする。
+/// folder shardをbatch単位で逐次生成し、完成したgenerationだけをpointerで公開する。
 pub fn export_at<F>(
     data_dir: &Path,
     root: &Path,
@@ -498,39 +533,63 @@ where
     F: FnMut(TransferProgress),
 {
     validate_root(root)?;
-    let mut entries = enumerate_entries(root, recursive, cancel, &mut progress)?;
-    check_cancel(cancel)?;
     progress(TransferProgress {
-        phase: TransferPhase::ReadingMetadata,
+        phase: TransferPhase::Scanning,
         processed: 0,
         total: 0,
         current_path: None,
     });
-    attach_metadata(data_dir, &mut entries, cancel, &mut progress)?;
-    check_cancel(cancel)?;
 
     let exported_at_ms = now_ms();
-    let manifest = Manifest {
+    let generation = uuid::Uuid::new_v4().simple().to_string();
+    let mut staging = BundleStaging::create(root, &generation)?;
+    let mut summary = ExportSummary::default();
+    let mut counts = BundleCounts::default();
+    let mut visited = HashSet::new();
+    crate::fs_entry::mark_directory_visited(root, &mut visited);
+    let shards_dir = staging.shards_dir();
+    let export_result = export_directory_shard(
+        data_dir,
+        root,
+        root,
+        recursive,
+        0,
+        &generation,
+        &shards_dir,
+        cancel,
+        &mut progress,
+        &mut visited,
+        &mut counts,
+        &mut summary,
+    );
+    if let Err(error) = export_result {
+        staging.abort();
+        return Err(error);
+    }
+    check_cancel(cancel)?;
+
+    let manifest = BundleManifest {
         format: FORMAT_NAME.to_string(),
         version: FORMAT_VERSION,
+        generation,
         exported_at_ms,
         recursive,
         sections: ManifestSections::default(),
-        entries: entries.into_iter().map(|entry| entry.portable).collect(),
+        shard_count: counts.shards,
+        entry_count: counts.entries,
     };
-    validate_manifest(&manifest)?;
-    let summary = summarize_export(&manifest);
+    validate_bundle_manifest(&manifest)?;
     progress(TransferProgress {
         phase: TransferPhase::WritingSidecar,
         processed: 0,
-        total: manifest.entries.len(),
+        total: usize_from_count(manifest.entry_count, "項目数")?,
         current_path: Some(SIDECAR_FILENAME.to_string()),
     });
-    write_manifest_atomic(root, &manifest, cancel)?;
+    staging.publish(&manifest, cancel)?;
     progress(TransferProgress {
         phase: TransferPhase::WritingSidecar,
-        processed: manifest.entries.len(),
-        total: manifest.entries.len(),
+        processed: usize_from_count(manifest.entry_count, "項目数")?,
+        total: usize_from_count(manifest.entry_count, "項目数")?,
         current_path: Some(SIDECAR_FILENAME.to_string()),
     });
     Ok(summary)
@@ -552,16 +611,17 @@ where
         total: 0,
         current_path: Some(SIDECAR_FILENAME.to_string()),
     });
-    let manifest = read_manifest(root, cancel)?;
+    let manifest = read_bundle_manifest(root, cancel)?;
+    let total = usize_from_count(manifest.entry_count, "項目数")?;
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| TransferError::Io(format!("{}: {error}", root.display())))?;
     let mut preview = ImportPreview {
-        entries: manifest.entries.len(),
+        entries: total,
         recursive: manifest.recursive,
         exported_at_ms: manifest.exported_at_ms,
         ..ImportPreview::default()
     };
-    for (index, entry) in manifest.entries.iter().enumerate() {
+    visit_bundle_entries(root, &manifest, cancel, |entry, index| {
         check_cancel(cancel)?;
         let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
         validate_bookmark_page_targets(&path, entry)?;
@@ -573,10 +633,11 @@ where
         progress(TransferProgress {
             phase: TransferPhase::ReadingSidecar,
             processed: index + 1,
-            total: manifest.entries.len(),
+            total,
             current_path: Some(entry.path.clone()),
         });
-    }
+        Ok(())
+    })?;
     Ok(preview)
 }
 
@@ -607,76 +668,74 @@ where
     F: FnMut(TransferProgress),
 {
     validate_root(root)?;
-    let manifest = read_manifest(root, cancel)?;
+    let manifest = read_bundle_manifest(root, cancel)?;
+    let total = usize_from_count(manifest.entry_count, "項目数")?;
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| TransferError::Io(format!("{}: {error}", root.display())))?;
-    // Sidecar は信頼しない。1 件でも root 外を指す既存 reparse path があれば、
-    // DB を触る前にファイル全体を拒否する。
-    let resolved_paths = manifest
-        .entries
-        .iter()
-        .map(|entry| {
-            let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
-            validate_bookmark_page_targets(&path, entry)?;
-            Ok(path)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Sidecar は信頼しない。全shardをstreaming preflightし、1件でもroot外を指す
+    // 既存reparse pathがあればDBを触る前にgeneration全体を拒否する。
+    visit_bundle_entries(root, &manifest, cancel, |entry, index| {
+        let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
+        validate_bookmark_page_targets(&path, entry)?;
+        progress(TransferProgress {
+            phase: TransferPhase::ReadingSidecar,
+            processed: index + 1,
+            total,
+            current_path: Some(entry.path.clone()),
+        });
+        Ok(())
+    })?;
+
     ensure_database_schemas(data_dir)?;
     let mut conn = open_import_connection(data_dir)?;
     let mut summary = ImportSummary {
-        total_entries: manifest.entries.len(),
+        total_entries: total,
         ..ImportSummary::default()
     };
 
-    for (index, (entry, path)) in manifest
-        .entries
-        .iter()
-        .zip(resolved_paths.iter())
-        .enumerate()
-    {
-        if cancel.load(Ordering::Relaxed) {
-            summary.cancelled = true;
-            break;
-        }
+    let apply_result = visit_bundle_entries(root, &manifest, cancel, |entry, index| {
         progress(TransferProgress {
             phase: TransferPhase::Importing,
             processed: index,
-            total: manifest.entries.len(),
+            total,
             current_path: Some(entry.path.clone()),
         });
+        // preflight後のreparse差し替えも、各itemのwrite直前に再検証する。
+        let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
+        validate_bookmark_page_targets(&path, entry)?;
         match verify_target(&path, entry) {
             TargetState::Missing => {
                 summary.skipped_missing += 1;
                 progress(TransferProgress {
                     phase: TransferPhase::Importing,
                     processed: index + 1,
-                    total: manifest.entries.len(),
+                    total,
                     current_path: Some(entry.path.clone()),
                 });
-                continue;
+                return Ok(());
             }
             TargetState::Changed => {
                 summary.skipped_changed += 1;
                 progress(TransferProgress {
                     phase: TransferPhase::Importing,
                     processed: index + 1,
-                    total: manifest.entries.len(),
+                    total,
                     current_path: Some(entry.path.clone()),
                 });
-                continue;
+                return Ok(());
             }
             TargetState::Ready => {}
         }
         match apply_entry(
             &mut conn,
-            path,
+            &path,
             entry,
             manifest.sections,
             manifest.exported_at_ms,
         ) {
             Ok(()) => {
                 summary.applied_entries += 1;
-                let base_key = crate::path_key::normalize_keep_drive(path);
+                let base_key = crate::path_key::normalize_keep_drive(&path);
                 if manifest.sections.ratings {
                     summary.refresh.physical_ratings.push(ImportedRatingValue {
                         key: base_key.clone(),
@@ -687,13 +746,13 @@ where
                     summary
                         .refresh
                         .page_state_families
-                        .push(imported_page_state_family(path, entry));
+                        .push(imported_page_state_family(&path, entry));
                 }
                 if refresh_scope.is_some_and(|scope| scope.contains(&base_key)) {
                     summary
                         .refresh
                         .visible_entries
-                        .push(imported_entry_metadata(path, entry, manifest.sections));
+                        .push(imported_entry_metadata(&path, entry, manifest.sections));
                 }
             }
             Err(error) => {
@@ -707,9 +766,15 @@ where
         progress(TransferProgress {
             phase: TransferPhase::Importing,
             processed: index + 1,
-            total: manifest.entries.len(),
+            total,
             current_path: Some(entry.path.clone()),
         });
+        Ok(())
+    });
+    match apply_result {
+        Ok(()) => {}
+        Err(TransferError::Cancelled) => summary.cancelled = true,
+        Err(error) => return Err(error),
     }
     Ok(summary)
 }
@@ -916,47 +981,20 @@ fn validate_root(root: &Path) -> Result<(), TransferError> {
     Ok(())
 }
 
-fn enumerate_entries<F>(
-    root: &Path,
-    recursive: bool,
-    cancel: &AtomicBool,
-    progress: &mut F,
-) -> Result<Vec<EnumeratedEntry>, TransferError>
-where
-    F: FnMut(TransferProgress),
-{
-    let mut out = Vec::new();
-    out.push(make_enumerated(
-        root,
-        ".".to_string(),
-        PortableEntryKind::Directory,
-    )?);
-    let mut visited = HashSet::new();
-    crate::fs_entry::mark_directory_visited(root, &mut visited);
-    enumerate_directory(
-        root,
-        root,
-        recursive,
-        0,
-        cancel,
-        progress,
-        &mut visited,
-        &mut out,
-    )?;
-    out.sort_by(|a, b| a.portable.path.cmp(&b.portable.path));
-    Ok(out)
-}
-
 #[allow(clippy::too_many_arguments)]
-fn enumerate_directory<F>(
+fn export_directory_shard<F>(
+    data_dir: &Path,
     root: &Path,
     dir: &Path,
     recursive: bool,
     depth: usize,
+    generation: &str,
+    shards_dir: &Path,
     cancel: &AtomicBool,
     progress: &mut F,
     visited: &mut HashSet<String>,
-    out: &mut Vec<EnumeratedEntry>,
+    counts: &mut BundleCounts,
+    summary: &mut ExportSummary,
 ) -> Result<(), TransferError>
 where
     F: FnMut(TransferProgress),
@@ -965,6 +1003,49 @@ where
         return Err(TransferError::Invalid(format!(
             "フォルダ階層が深すぎます（上限 {MAX_RECURSION_DEPTH} 階層）"
         )));
+    }
+    check_cancel(cancel)?;
+    let folder = if dir == root {
+        ".".to_string()
+    } else {
+        relative_string(root, dir)?
+    };
+    let shard_path = shards_dir.join(shard_filename(&folder));
+    let file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&shard_path)
+        .map_err(|error| {
+            TransferError::Io(format!(
+                "{}: {error}（大小文字だけが異なるフォルダがないか確認してください）",
+                shard_path.display()
+            ))
+        })?;
+    let mut writer = BufWriter::new(file);
+    write_json_line(
+        &mut writer,
+        &ShardHeader {
+            format: SHARD_FORMAT_NAME.to_string(),
+            version: FORMAT_VERSION,
+            generation: generation.to_string(),
+            folder: folder.clone(),
+        },
+        cancel,
+        MAX_SHARD_HEADER_BYTES,
+    )?;
+    counts.shards = counts
+        .shards
+        .checked_add(1)
+        .ok_or_else(|| TransferError::Invalid("shard数が表現範囲を超えています".into()))?;
+
+    let mut batch = Vec::with_capacity(EXPORT_BATCH_ENTRIES);
+    let mut recurse_after_batch = Vec::new();
+    if dir == root {
+        batch.push(make_enumerated(
+            root,
+            ".".to_string(),
+            PortableEntryKind::Directory,
+        )?);
     }
     let children = fs::read_dir(dir)
         .map_err(|error| TransferError::Io(format!("{}: {error}", dir.display())))?;
@@ -989,24 +1070,111 @@ where
         };
         let path = child.path();
         let rel = relative_string(root, &path)?;
-        if out.len() >= MAX_ENTRIES {
-            return Err(TransferError::Invalid(format!(
-                "対象が多すぎます（上限 {MAX_ENTRIES} 件）"
-            )));
-        }
-        out.push(make_enumerated(&path, rel.clone(), portable_kind)?);
-        progress(TransferProgress {
-            phase: TransferPhase::Scanning,
-            processed: out.len(),
-            total: 0,
-            current_path: Some(rel),
-        });
+        batch.push(make_enumerated(&path, rel.clone(), portable_kind)?);
         if recursive
             && kind == crate::fs_entry::DirEntryKind::Directory
             && crate::fs_entry::mark_directory_visited(&path, visited)
         {
-            enumerate_directory(root, &path, true, depth + 1, cancel, progress, visited, out)?;
+            recurse_after_batch.push(path);
         }
+        progress(TransferProgress {
+            phase: TransferPhase::Scanning,
+            processed: usize_from_count(
+                counts.entries.saturating_add(batch.len() as u64),
+                "項目数",
+            )?,
+            total: 0,
+            current_path: Some(rel),
+        });
+        if batch.len() >= EXPORT_BATCH_ENTRIES {
+            flush_export_batch(
+                data_dir,
+                &mut writer,
+                &mut batch,
+                cancel,
+                progress,
+                counts,
+                summary,
+            )?;
+            for child_dir in recurse_after_batch.drain(..) {
+                export_directory_shard(
+                    data_dir,
+                    root,
+                    &child_dir,
+                    true,
+                    depth + 1,
+                    generation,
+                    shards_dir,
+                    cancel,
+                    progress,
+                    visited,
+                    counts,
+                    summary,
+                )?;
+            }
+        }
+    }
+    flush_export_batch(
+        data_dir,
+        &mut writer,
+        &mut batch,
+        cancel,
+        progress,
+        counts,
+        summary,
+    )?;
+    for child_dir in recurse_after_batch {
+        export_directory_shard(
+            data_dir,
+            root,
+            &child_dir,
+            true,
+            depth + 1,
+            generation,
+            shards_dir,
+            cancel,
+            progress,
+            visited,
+            counts,
+            summary,
+        )?;
+    }
+    writer
+        .flush()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", shard_path.display())))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", shard_path.display())))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_export_batch<F>(
+    data_dir: &Path,
+    writer: &mut BufWriter<File>,
+    batch: &mut Vec<EnumeratedEntry>,
+    cancel: &AtomicBool,
+    progress: &mut F,
+    counts: &mut BundleCounts,
+    summary: &mut ExportSummary,
+) -> Result<(), TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    if batch.is_empty() {
+        return Ok(());
+    }
+    attach_metadata(data_dir, batch, cancel, progress)?;
+    for entry in batch.drain(..) {
+        check_cancel(cancel)?;
+        validate_portable_entry(&entry.portable)?;
+        write_json_line(writer, &entry.portable, cancel, MAX_RECORD_BYTES)?;
+        summarize_entry(summary, &entry.portable);
+        counts.entries = counts
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| TransferError::Invalid("項目数が表現範囲を超えています".into()))?;
     }
     Ok(())
 }
@@ -1873,157 +2041,377 @@ fn locate_item_key(
         .map(|index| (index, Some(member.to_string())))
 }
 
-fn summarize_export(manifest: &Manifest) -> ExportSummary {
-    let mut summary = ExportSummary {
-        entries: manifest.entries.len(),
-        ..ExportSummary::default()
-    };
-    for entry in &manifest.entries {
-        summary.ratings += usize::from(entry.rating.is_some());
-        summary.tagged_items += usize::from(!entry.tags.is_empty());
-        summary.timed_bookmarks += entry.timed_bookmarks.len();
-        summary.book_bookmarks += entry.book_bookmarks.len();
-        summary.page_states += usize::from(!entry.page_state.is_empty());
-        summary.container_states += usize::from(entry.container_state.has_view_state());
-        summary.container_states += entry
-            .nested_containers
-            .iter()
-            .filter(|container| container.state.has_view_state())
-            .count();
-        summary.thumbnail_pins += usize::from(entry.video_pin.is_some());
-        summary.thumbnail_pins += usize::from(entry.container_state.folder_thumb_pin.is_some());
-        summary.thumbnail_pins += entry
-            .nested_containers
-            .iter()
-            .filter(|container| container.state.folder_thumb_pin.is_some())
-            .count();
-        for virtual_item in &entry.virtual_items {
-            summary.ratings += usize::from(virtual_item.rating.is_some());
-            summary.tagged_items += usize::from(!virtual_item.tags.is_empty());
-            summary.page_states += usize::from(!virtual_item.page_state.is_empty());
-        }
+fn summarize_entry(summary: &mut ExportSummary, entry: &PortableEntry) {
+    summary.entries += 1;
+    summary.ratings += usize::from(entry.rating.is_some());
+    summary.tagged_items += usize::from(!entry.tags.is_empty());
+    summary.timed_bookmarks += entry.timed_bookmarks.len();
+    summary.book_bookmarks += entry.book_bookmarks.len();
+    summary.page_states += usize::from(!entry.page_state.is_empty());
+    summary.container_states += usize::from(entry.container_state.has_view_state());
+    summary.container_states += entry
+        .nested_containers
+        .iter()
+        .filter(|container| container.state.has_view_state())
+        .count();
+    summary.thumbnail_pins += usize::from(entry.video_pin.is_some());
+    summary.thumbnail_pins += usize::from(entry.container_state.folder_thumb_pin.is_some());
+    summary.thumbnail_pins += entry
+        .nested_containers
+        .iter()
+        .filter(|container| container.state.folder_thumb_pin.is_some())
+        .count();
+    for virtual_item in &entry.virtual_items {
+        summary.ratings += usize::from(virtual_item.rating.is_some());
+        summary.tagged_items += usize::from(!virtual_item.tags.is_empty());
+        summary.page_states += usize::from(!virtual_item.page_state.is_empty());
     }
-    summary
 }
 
-fn read_manifest(root: &Path, cancel: &AtomicBool) -> Result<Manifest, TransferError> {
+fn read_bundle_manifest(root: &Path, cancel: &AtomicBool) -> Result<BundleManifest, TransferError> {
     check_cancel(cancel)?;
-    let path = root.join(SIDECAR_FILENAME);
+    let bundle_dir = root.join(SIDECAR_FILENAME);
+    ensure_plain_directory(&bundle_dir)?;
+    let path = bundle_dir.join(BUNDLE_MANIFEST_FILENAME);
+    ensure_plain_file(&path)?;
     let metadata = fs::metadata(&path)
         .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
-    if metadata.len() > MAX_SIDECAR_BYTES {
+    if metadata.len() > MAX_MANIFEST_BYTES {
         return Err(TransferError::Invalid(format!(
-            "ファイルサイズが上限 {} MiB を超えています",
-            MAX_SIDECAR_BYTES / 1024 / 1024
+            "manifestサイズが上限 {} KiB を超えています",
+            MAX_MANIFEST_BYTES / 1024
         )));
     }
     let file = File::open(&path)
         .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
-    let reader = BufReader::new(file.take(MAX_SIDECAR_BYTES + 1));
+    let reader = BufReader::new(file.take(MAX_MANIFEST_BYTES + 1));
     let reader = CancelReader {
         inner: reader,
         cancel,
     };
-    let manifest: Manifest = serde_json::from_reader(reader).map_err(|error| {
+    let manifest: BundleManifest = serde_json::from_reader(reader).map_err(|error| {
         if cancel.load(Ordering::Relaxed) {
             TransferError::Cancelled
         } else {
             TransferError::Invalid(format!("JSON: {error}"))
         }
     })?;
-    validate_manifest(&manifest)?;
+    validate_bundle_manifest(&manifest)?;
+    let generation_dir = bundle_generation_dir(&bundle_dir, &manifest.generation);
+    ensure_plain_directory(&generation_dir)?;
+    ensure_plain_directory(&generation_dir.join(SHARDS_DIRNAME))?;
     check_cancel(cancel)?;
     Ok(manifest)
 }
 
+fn visit_bundle_entries<F>(
+    root: &Path,
+    manifest: &BundleManifest,
+    cancel: &AtomicBool,
+    mut visit: F,
+) -> Result<(), TransferError>
+where
+    F: FnMut(&PortableEntry, usize) -> Result<(), TransferError>,
+{
+    let bundle_dir = root.join(SIDECAR_FILENAME);
+    let shards_dir = bundle_generation_dir(&bundle_dir, &manifest.generation).join(SHARDS_DIRNAME);
+    ensure_plain_directory(&shards_dir)?;
+
+    let mut shard_count = 0_u64;
+    let mut entry_count = 0_u64;
+    let mut saw_root_shard = false;
+    let shards = fs::read_dir(&shards_dir)
+        .map_err(|error| TransferError::Io(format!("{}: {error}", shards_dir.display())))?;
+    for shard in shards {
+        check_cancel(cancel)?;
+        let shard = shard.map_err(|error| TransferError::Io(error.to_string()))?;
+        let path = shard.path();
+        ensure_plain_file(&path)?;
+        let name = shard.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| TransferError::Invalid("Unicodeでないshard名があります".into()))?;
+        if !name.ends_with(&format!(".{SHARD_EXTENSION}")) {
+            return Err(TransferError::Invalid(format!(
+                "不明なshardファイルがあります: {name}"
+            )));
+        }
+
+        let file = File::open(&path)
+            .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        if !read_bounded_line(
+            &mut reader,
+            &mut line,
+            MAX_SHARD_HEADER_BYTES,
+            cancel,
+            &path,
+        )? {
+            return Err(TransferError::Invalid(format!(
+                "shard headerがありません: {name}"
+            )));
+        }
+        let header: ShardHeader = parse_json_record(&line, &path, 1)?;
+        validate_shard_header(&header, manifest, name)?;
+        saw_root_shard |= header.folder == ".";
+        shard_count = shard_count
+            .checked_add(1)
+            .ok_or_else(|| TransferError::Invalid("shard数が表現範囲を超えています".into()))?;
+
+        let mut shard_paths = HashSet::new();
+        let mut line_number = 1_usize;
+        while read_bounded_line(&mut reader, &mut line, MAX_RECORD_BYTES, cancel, &path)? {
+            line_number += 1;
+            let entry: PortableEntry = parse_json_record(&line, &path, line_number)?;
+            validate_portable_entry(&entry)?;
+            validate_shard_entry_path(&header.folder, &entry.path)?;
+            let identity = entry.path.to_lowercase();
+            if !shard_paths.insert(identity) {
+                return Err(TransferError::Invalid(format!(
+                    "shard内のパスが重複しています: {}",
+                    entry.path
+                )));
+            }
+            let index = usize_from_count(entry_count, "項目数")?;
+            visit(&entry, index)?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| TransferError::Invalid("項目数が表現範囲を超えています".into()))?;
+        }
+    }
+    if !saw_root_shard {
+        return Err(TransferError::Invalid(
+            "root folderのshardがありません".into(),
+        ));
+    }
+    if shard_count != manifest.shard_count || entry_count != manifest.entry_count {
+        return Err(TransferError::Invalid(format!(
+            "manifest件数とshard内容が一致しません（shard {shard_count}/{}, 項目 {entry_count}/{}）",
+            manifest.shard_count, manifest.entry_count
+        )));
+    }
+    Ok(())
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    max_bytes: u64,
+    cancel: &AtomicBool,
+    path: &Path,
+) -> Result<bool, TransferError> {
+    output.clear();
+    loop {
+        check_cancel(cancel)?;
+        let available = reader
+            .fill_buf()
+            .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
+        if available.is_empty() {
+            return Ok(!output.is_empty());
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        let new_len = (output.len() as u64)
+            .checked_add(take as u64)
+            .ok_or_else(|| TransferError::Invalid("recordサイズが表現範囲を超えています".into()))?;
+        if new_len > max_bytes {
+            return Err(TransferError::Invalid(format!(
+                "単一recordが上限 {} MiBを超えています: {}",
+                max_bytes / 1024 / 1024,
+                path.display()
+            )));
+        }
+        output.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            while output
+                .last()
+                .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+            {
+                output.pop();
+            }
+            if output.is_empty() {
+                return Err(TransferError::Invalid(format!(
+                    "空のJSON recordがあります: {}",
+                    path.display()
+                )));
+            }
+            return Ok(true);
+        }
+    }
+}
+
+fn parse_json_record<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    path: &Path,
+    line: usize,
+) -> Result<T, TransferError> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        TransferError::Invalid(format!("{}:{line}: JSON: {error}", path.display()))
+    })
+}
+
+fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferError> {
+    if manifest.format != FORMAT_NAME {
+        return Err(TransferError::Invalid(
+            "形式識別子が一致しません".to_string(),
+        ));
+    }
+    if manifest.version != FORMAT_VERSION {
+        return Err(TransferError::Invalid(format!(
+            "未対応のバージョンです: {}",
+            manifest.version
+        )));
+    }
+    validate_generation(&manifest.generation)?;
+    if manifest.shard_count == 0 || manifest.entry_count == 0 {
+        return Err(TransferError::Invalid(
+            "shard数または項目数が0です".to_string(),
+        ));
+    }
+    if !manifest.recursive && manifest.shard_count != 1 {
+        return Err(TransferError::Invalid(
+            "非再帰manifestにはroot shard以外を含められません".to_string(),
+        ));
+    }
+    usize_from_count(manifest.entry_count, "項目数")?;
+    Ok(())
+}
+
+fn validate_shard_header(
+    header: &ShardHeader,
+    manifest: &BundleManifest,
+    filename: &str,
+) -> Result<(), TransferError> {
+    if header.format != SHARD_FORMAT_NAME
+        || header.version != FORMAT_VERSION
+        || header.generation != manifest.generation
+    {
+        return Err(TransferError::Invalid(format!(
+            "shard headerがmanifestと一致しません: {filename}"
+        )));
+    }
+    validate_relative_path(&header.folder)?;
+    if filename != shard_filename(&header.folder) {
+        return Err(TransferError::Invalid(format!(
+            "folderとshard名が一致しません: {filename}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_shard_entry_path(folder: &str, entry_path: &str) -> Result<(), TransferError> {
+    let valid = if folder == "." {
+        entry_path == "." || !entry_path.contains('/')
+    } else {
+        entry_path.rsplit_once('/').is_some_and(|(parent, child)| {
+            !child.is_empty() && parent.to_lowercase() == folder.to_lowercase()
+        })
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(TransferError::Invalid(format!(
+            "項目がfolder shardの直下ではありません: {folder} -> {entry_path}"
+        )))
+    }
+}
+
+fn usize_from_count(value: u64, label: &str) -> Result<usize, TransferError> {
+    usize::try_from(value)
+        .map_err(|_| TransferError::Invalid(format!("{label}がこの環境の表現範囲を超えています")))
+}
+
+#[cfg(test)]
 fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
     if manifest.format != FORMAT_NAME {
         return Err(TransferError::Invalid(
             "形式識別子が一致しません".to_string(),
         ));
     }
-    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&manifest.version) {
+    if manifest.version != FORMAT_VERSION {
         return Err(TransferError::Invalid(format!(
             "未対応のバージョンです: {}",
             manifest.version
         )));
     }
-    if manifest.entries.len() > MAX_ENTRIES {
-        return Err(TransferError::Invalid(format!(
-            "項目数が上限 {MAX_ENTRIES} 件を超えています"
-        )));
-    }
     let mut paths = HashSet::new();
     for entry in &manifest.entries {
-        validate_relative_path(&entry.path)?;
-        let normalized = entry.path.replace('\\', "/").to_lowercase();
+        let normalized = entry.path.to_lowercase();
         if !paths.insert(normalized) {
             return Err(TransferError::Invalid(format!(
                 "パスが重複しています: {}",
                 entry.path
             )));
         }
-        if entry.kind == PortableEntryKind::File && entry.fingerprint.is_none() {
+        validate_portable_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
+    validate_relative_path(&entry.path)?;
+    if entry.kind == PortableEntryKind::File && entry.fingerprint.is_none() {
+        return Err(TransferError::Invalid(format!(
+            "ファイルの照合情報がありません: {}",
+            entry.path
+        )));
+    }
+    validate_rating(entry.rating.as_ref())?;
+    validate_tags(&entry.tags)?;
+    if entry.timed_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
+        || entry.book_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
+        || entry.virtual_items.len() > MAX_BOOKMARKS_PER_ENTRY
+        || entry.nested_containers.len() > MAX_BOOKMARKS_PER_ENTRY
+    {
+        return Err(TransferError::Invalid(format!(
+            "1項目あたりのメタ情報が多すぎます: {}",
+            entry.path
+        )));
+    }
+    for bookmark in &entry.timed_bookmarks {
+        if !bookmark.pts_secs.is_finite() || bookmark.pts_secs < 0.0 {
             return Err(TransferError::Invalid(format!(
-                "ファイルの照合情報がありません: {}",
+                "ブックマーク位置が不正です: {}",
                 entry.path
             )));
         }
-        validate_rating(entry.rating.as_ref())?;
-        validate_tags(&entry.tags)?;
-        if entry.timed_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
-            || entry.book_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
-            || entry.virtual_items.len() > MAX_BOOKMARKS_PER_ENTRY
-            || entry.nested_containers.len() > MAX_BOOKMARKS_PER_ENTRY
+        validate_title(bookmark.title.as_deref())?;
+    }
+    for bookmark in &entry.book_bookmarks {
+        validate_book_bookmark(bookmark, entry.kind, &entry.path)?;
+        validate_title(bookmark.title.as_deref())?;
+    }
+    validate_page_state(&entry.page_state, &entry.path)?;
+    validate_container_state(&entry.container_state, &entry.path)?;
+    validate_video_pin(entry.video_pin.as_ref(), &entry.path)?;
+    let mut member_keys = HashSet::new();
+    for item in &entry.virtual_items {
+        if validate_member_key(&item.member_key).is_err()
+            || !member_keys.insert(canonical_member_key(&item.member_key))
         {
             return Err(TransferError::Invalid(format!(
-                "1項目あたりのメタ情報が多すぎます: {}",
+                "仮想項目キーが不正または重複しています: {}",
                 entry.path
             )));
         }
-        for bookmark in &entry.timed_bookmarks {
-            if !bookmark.pts_secs.is_finite() || bookmark.pts_secs < 0.0 {
-                return Err(TransferError::Invalid(format!(
-                    "ブックマーク位置が不正です: {}",
-                    entry.path
-                )));
-            }
-            validate_title(bookmark.title.as_deref())?;
+        validate_rating(item.rating.as_ref())?;
+        validate_tags(&item.tags)?;
+        validate_page_state(&item.page_state, &entry.path)?;
+    }
+    let mut container_keys = HashSet::new();
+    for container in &entry.nested_containers {
+        if entry.kind != PortableEntryKind::File
+            || validate_member_key(&container.member_key).is_err()
+            || !container_keys.insert(canonical_member_key(&container.member_key))
+        {
+            return Err(TransferError::Invalid(format!(
+                "仮想コンテナキーが不正または重複しています: {}",
+                entry.path
+            )));
         }
-        for bookmark in &entry.book_bookmarks {
-            validate_book_bookmark(bookmark, entry.kind, &entry.path)?;
-            validate_title(bookmark.title.as_deref())?;
-        }
-        validate_page_state(&entry.page_state, &entry.path)?;
-        validate_container_state(&entry.container_state, &entry.path)?;
-        validate_video_pin(entry.video_pin.as_ref(), &entry.path)?;
-        let mut member_keys = HashSet::new();
-        for item in &entry.virtual_items {
-            if validate_member_key(&item.member_key).is_err()
-                || !member_keys.insert(canonical_member_key(&item.member_key))
-            {
-                return Err(TransferError::Invalid(format!(
-                    "仮想項目キーが不正または重複しています: {}",
-                    entry.path
-                )));
-            }
-            validate_rating(item.rating.as_ref())?;
-            validate_tags(&item.tags)?;
-            validate_page_state(&item.page_state, &entry.path)?;
-        }
-        let mut container_keys = HashSet::new();
-        for container in &entry.nested_containers {
-            if entry.kind != PortableEntryKind::File
-                || validate_member_key(&container.member_key).is_err()
-                || !container_keys.insert(canonical_member_key(&container.member_key))
-            {
-                return Err(TransferError::Invalid(format!(
-                    "仮想コンテナキーが不正または重複しています: {}",
-                    entry.path
-                )));
-            }
-            validate_container_state(&container.state, &entry.path)?;
-        }
+        validate_container_state(&container.state, &entry.path)?;
     }
     Ok(())
 }
@@ -2728,8 +3116,8 @@ fn apply_entry(
     }
     if let Some((folder_key, modified_secs)) = automatic_sidecar_sync {
         // 明示 import が正本になった後、同じ場所へ残っている自動 backup の旧値を
-        // 「DB に行が無い」項目へ再 import して復活させない。v1 は新しい page_state
-        // section を持たないため、従来どおり編集 sidecar を利用できる。
+        // 「DB に行が無い」項目へ再 import して復活させない。明示bundleのsectionが
+        // 対象外なら、その種類の自動sidecar同期状態には触れない。
         if sections.page_state {
             tx.execute(
                 "INSERT INTO adjustment.sidecar_sync (folder_key, sidecar_mtime)
@@ -3128,13 +3516,219 @@ fn open_readonly(path: &Path) -> Result<Connection, TransferError> {
     Ok(conn)
 }
 
-fn write_manifest_atomic(
-    root: &Path,
-    manifest: &Manifest,
+enum BundlePublishMode {
+    ExistingDirectory,
+    NewBundle,
+}
+
+struct BundleStaging {
+    destination: PathBuf,
+    bundle_dir: PathBuf,
+    generation_dir: PathBuf,
+    old_generation: Option<String>,
+    mode: BundlePublishMode,
+    published: bool,
+}
+
+impl BundleStaging {
+    fn create(root: &Path, generation: &str) -> Result<Self, TransferError> {
+        validate_generation(generation)?;
+        let destination = root.join(SIDECAR_FILENAME);
+        let existing = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(TransferError::Io(format!(
+                    "{}: {error}",
+                    destination.display()
+                )));
+            }
+        };
+        let (bundle_dir, mode, old_generation) = match existing {
+            Some(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                let old_generation = read_existing_generation(&destination);
+                (
+                    destination.clone(),
+                    BundlePublishMode::ExistingDirectory,
+                    old_generation,
+                )
+            }
+            Some(metadata) if metadata.is_file() && !metadata_is_reparse(&metadata) => (
+                root.join(format!(
+                    ".{SIDECAR_FILENAME}.{}.tmp",
+                    uuid::Uuid::new_v4().simple()
+                )),
+                BundlePublishMode::NewBundle,
+                None,
+            ),
+            Some(_) => {
+                return Err(TransferError::Invalid(format!(
+                    "sidecarが通常のファイルまたはフォルダではありません: {}",
+                    destination.display()
+                )));
+            }
+            None => (
+                root.join(format!(
+                    ".{SIDECAR_FILENAME}.{}.tmp",
+                    uuid::Uuid::new_v4().simple()
+                )),
+                BundlePublishMode::NewBundle,
+                None,
+            ),
+        };
+
+        if matches!(mode, BundlePublishMode::NewBundle) {
+            fs::create_dir(&bundle_dir)
+                .map_err(|error| TransferError::Io(format!("{}: {error}", bundle_dir.display())))?;
+        } else {
+            ensure_plain_directory(&bundle_dir)?;
+            let manifest_path = bundle_dir.join(BUNDLE_MANIFEST_FILENAME);
+            match fs::symlink_metadata(&manifest_path) {
+                Ok(_) => ensure_plain_file(&manifest_path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(TransferError::Io(format!(
+                        "{}: {error}",
+                        manifest_path.display()
+                    )));
+                }
+            }
+        }
+        let generations_dir = bundle_dir.join(GENERATIONS_DIRNAME);
+        match fs::symlink_metadata(&generations_dir) {
+            Ok(_) => ensure_plain_directory(&generations_dir)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&generations_dir).map_err(|error| {
+                    TransferError::Io(format!("{}: {error}", generations_dir.display()))
+                })?;
+            }
+            Err(error) => {
+                return Err(TransferError::Io(format!(
+                    "{}: {error}",
+                    generations_dir.display()
+                )));
+            }
+        }
+        let generation_dir = bundle_generation_dir(&bundle_dir, generation);
+        fs::create_dir(&generation_dir)
+            .map_err(|error| TransferError::Io(format!("{}: {error}", generation_dir.display())))?;
+        let shards_dir = generation_dir.join(SHARDS_DIRNAME);
+        fs::create_dir(&shards_dir)
+            .map_err(|error| TransferError::Io(format!("{}: {error}", shards_dir.display())))?;
+        Ok(Self {
+            destination,
+            bundle_dir,
+            generation_dir,
+            old_generation,
+            mode,
+            published: false,
+        })
+    }
+
+    fn shards_dir(&self) -> PathBuf {
+        self.generation_dir.join(SHARDS_DIRNAME)
+    }
+
+    fn publish(
+        &mut self,
+        manifest: &BundleManifest,
+        cancel: &AtomicBool,
+    ) -> Result<(), TransferError> {
+        write_bundle_manifest_atomic(&self.bundle_dir, manifest, cancel)?;
+        match self.mode {
+            BundlePublishMode::ExistingDirectory => {
+                self.published = true;
+            }
+            BundlePublishMode::NewBundle => {
+                let backup = self.destination.with_file_name(format!(
+                    ".{SIDECAR_FILENAME}.{}.old.tmp",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                let had_previous = self.destination.exists();
+                if had_previous {
+                    fs::rename(&self.destination, &backup).map_err(|error| {
+                        TransferError::Io(format!("{}: {error}", self.destination.display()))
+                    })?;
+                }
+                if let Err(error) = fs::rename(&self.bundle_dir, &self.destination) {
+                    if had_previous {
+                        let _ = fs::rename(&backup, &self.destination);
+                    }
+                    return Err(TransferError::Io(format!(
+                        "{}: {error}",
+                        self.destination.display()
+                    )));
+                }
+                self.published = true;
+                if had_previous {
+                    let _ = fs::remove_file(&backup);
+                }
+            }
+        }
+        self.cleanup_old_generation();
+        Ok(())
+    }
+
+    fn cleanup_old_generation(&self) {
+        let Some(old_generation) = self
+            .old_generation
+            .as_deref()
+            .filter(|old| *old != self.generation_name())
+        else {
+            return;
+        };
+        if validate_generation(old_generation).is_err() {
+            return;
+        }
+        let path = bundle_generation_dir(&self.destination, old_generation);
+        if fs::symlink_metadata(&path)
+            .ok()
+            .is_some_and(|metadata| metadata.is_dir() && !metadata_is_reparse(&metadata))
+            && let Err(error) = fs::remove_dir_all(&path)
+        {
+            crate::logger::log(format!(
+                "metadata export: old generation cleanup failed {}: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    fn generation_name(&self) -> &str {
+        self.generation_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+    }
+
+    fn abort(&mut self) {
+        if self.published {
+            return;
+        }
+        let target = match self.mode {
+            BundlePublishMode::ExistingDirectory => &self.generation_dir,
+            BundlePublishMode::NewBundle => &self.bundle_dir,
+        };
+        let _ = fs::remove_dir_all(target);
+        self.published = true;
+    }
+}
+
+impl Drop for BundleStaging {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+fn write_bundle_manifest_atomic(
+    bundle_dir: &Path,
+    manifest: &BundleManifest,
     cancel: &AtomicBool,
 ) -> Result<(), TransferError> {
-    let destination = root.join(SIDECAR_FILENAME);
-    let temp = root.join(format!(".{SIDECAR_FILENAME}.{}.tmp", uuid::Uuid::new_v4()));
+    let destination = bundle_dir.join(BUNDLE_MANIFEST_FILENAME);
+    let temp = bundle_dir.join(format!(
+        ".{BUNDLE_MANIFEST_FILENAME}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
     let result = (|| {
         let file = File::create(&temp)
             .map_err(|error| TransferError::Io(format!("{}: {error}", temp.display())))?;
@@ -3144,7 +3738,7 @@ fn write_manifest_atomic(
                 inner: &mut writer,
                 cancel,
                 written: 0,
-                max_bytes: MAX_SIDECAR_BYTES,
+                max_bytes: MAX_MANIFEST_BYTES,
             };
             serde_json::to_writer_pretty(&mut cancel_writer, manifest).map_err(|error| {
                 if cancel.load(Ordering::Relaxed) {
@@ -3169,6 +3763,203 @@ fn write_manifest_atomic(
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn write_json_line<T: Serialize, W: Write>(
+    writer: &mut W,
+    value: &T,
+    cancel: &AtomicBool,
+    max_bytes: u64,
+) -> Result<(), TransferError> {
+    let mut cancel_writer = CancelWriter {
+        inner: writer,
+        cancel,
+        written: 0,
+        max_bytes,
+    };
+    serde_json::to_writer(&mut cancel_writer, value).map_err(|error| {
+        if cancel.load(Ordering::Relaxed) {
+            TransferError::Cancelled
+        } else {
+            TransferError::Io(error.to_string())
+        }
+    })?;
+    cancel_writer.write_all(b"\n").map_err(|error| {
+        if cancel.load(Ordering::Relaxed) {
+            TransferError::Cancelled
+        } else {
+            TransferError::Io(error.to_string())
+        }
+    })
+}
+
+fn bundle_generation_dir(bundle_dir: &Path, generation: &str) -> PathBuf {
+    bundle_dir.join(GENERATIONS_DIRNAME).join(generation)
+}
+
+fn shard_filename(folder: &str) -> String {
+    let identity = folder.to_lowercase();
+    format!(
+        "{:x}.{SHARD_EXTENSION}",
+        Sha256::digest(identity.as_bytes())
+    )
+}
+
+fn validate_generation(value: &str) -> Result<(), TransferError> {
+    if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(TransferError::Invalid(
+            "generation識別子が不正です".to_string(),
+        ))
+    }
+}
+
+fn read_existing_generation(bundle_dir: &Path) -> Option<String> {
+    let path = bundle_dir.join(BUNDLE_MANIFEST_FILENAME);
+    ensure_plain_file(&path).ok()?;
+    let metadata = fs::metadata(&path).ok()?;
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    let manifest: BundleManifest =
+        serde_json::from_reader(BufReader::new(File::open(path).ok()?)).ok()?;
+    validate_bundle_manifest(&manifest).ok()?;
+    Some(manifest.generation)
+}
+
+fn ensure_plain_directory(path: &Path) -> Result<(), TransferError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
+    if metadata.is_dir() && !metadata_is_reparse(&metadata) {
+        Ok(())
+    } else {
+        Err(TransferError::Invalid(format!(
+            "通常のフォルダではありません: {}",
+            path.display()
+        )))
+    }
+}
+
+fn ensure_plain_file(path: &Path) -> Result<(), TransferError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
+    if metadata.is_file() && !metadata_is_reparse(&metadata) {
+        Ok(())
+    } else {
+        Err(TransferError::Invalid(format!(
+            "通常のファイルではありません: {}",
+            path.display()
+        )))
+    }
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+fn write_manifest_atomic(
+    root: &Path,
+    manifest: &Manifest,
+    cancel: &AtomicBool,
+) -> Result<(), TransferError> {
+    validate_manifest(manifest)?;
+    let generation = uuid::Uuid::new_v4().simple().to_string();
+    let mut staging = BundleStaging::create(root, &generation)?;
+    let shards_dir = staging.shards_dir();
+    let mut by_folder: HashMap<String, Vec<&PortableEntry>> = HashMap::new();
+    for entry in &manifest.entries {
+        let folder = if entry.path == "." {
+            ".".to_string()
+        } else {
+            entry
+                .path
+                .rsplit_once('/')
+                .map_or_else(|| ".".to_string(), |(parent, _)| parent.to_string())
+        };
+        by_folder.entry(folder).or_default().push(entry);
+    }
+    by_folder.entry(".".to_string()).or_default();
+    let mut folders = by_folder.into_iter().collect::<Vec<_>>();
+    folders.sort_by(|a, b| a.0.cmp(&b.0));
+    for (folder, mut entries) in folders {
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let path = shards_dir.join(shard_filename(&folder));
+        let mut writer = BufWriter::new(
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?,
+        );
+        write_json_line(
+            &mut writer,
+            &ShardHeader {
+                format: SHARD_FORMAT_NAME.to_string(),
+                version: FORMAT_VERSION,
+                generation: generation.clone(),
+                folder,
+            },
+            cancel,
+            MAX_SHARD_HEADER_BYTES,
+        )?;
+        for entry in entries {
+            write_json_line(&mut writer, entry, cancel, MAX_RECORD_BYTES)?;
+        }
+        writer
+            .flush()
+            .map_err(|error| TransferError::Io(error.to_string()))?;
+    }
+    let bundle_manifest = BundleManifest {
+        format: FORMAT_NAME.to_string(),
+        version: FORMAT_VERSION,
+        generation,
+        exported_at_ms: manifest.exported_at_ms,
+        recursive: manifest.recursive,
+        sections: manifest.sections,
+        shard_count: folders_len_for_manifest(&manifest.entries),
+        entry_count: manifest.entries.len() as u64,
+    };
+    staging.publish(&bundle_manifest, cancel)
+}
+
+#[cfg(test)]
+fn folders_len_for_manifest(entries: &[PortableEntry]) -> u64 {
+    let mut folders = HashSet::from([".".to_string()]);
+    for entry in entries {
+        if let Some((parent, _)) = entry.path.rsplit_once('/') {
+            folders.insert(parent.to_lowercase());
+        }
+    }
+    folders.len() as u64
+}
+
+#[cfg(test)]
+fn read_manifest(root: &Path, cancel: &AtomicBool) -> Result<Manifest, TransferError> {
+    let bundle = read_bundle_manifest(root, cancel)?;
+    let mut entries = Vec::new();
+    visit_bundle_entries(root, &bundle, cancel, |entry, _| {
+        entries.push(entry.clone());
+        Ok(())
+    })?;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Manifest {
+        format: bundle.format,
+        version: bundle.version,
+        exported_at_ms: bundle.exported_at_ms,
+        recursive: bundle.recursive,
+        sections: bundle.sections,
+        entries,
+    })
 }
 
 #[cfg(windows)]
@@ -3351,6 +4142,27 @@ mod tests {
 
     fn no_progress(_: TransferProgress) {}
 
+    fn copy_sidecar_bundle(source_root: &Path, destination_root: &Path) {
+        fn copy_directory(source: &Path, destination: &Path) {
+            fs::create_dir(destination).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let source_path = entry.path();
+                let destination_path = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_directory(&source_path, &destination_path);
+                } else {
+                    fs::copy(source_path, destination_path).unwrap();
+                }
+            }
+        }
+
+        copy_directory(
+            &source_root.join(SIDECAR_FILENAME),
+            &destination_root.join(SIDECAR_FILENAME),
+        );
+    }
+
     fn init_data_dir(path: &Path) {
         ensure_database_schemas(path).unwrap();
     }
@@ -3503,11 +4315,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let exported = export_at(&source_data, &source, true, &cancel, no_progress).unwrap();
         assert_eq!(exported.ratings, 2);
-        fs::copy(
-            source.join(SIDECAR_FILENAME),
-            destination.join(SIDECAR_FILENAME),
-        )
-        .unwrap();
+        copy_sidecar_bundle(&source, &destination);
         // 実アプリと同様、rollback-journal DB のアイドル接続が開いたままでも別 worker
         // 接続から attached transaction を実行できることを確認する。WAL の tags.db
         // connection は UI から worker へ移して閉じた後に import_at を呼ぶ。
@@ -3940,11 +4748,7 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
-        fs::copy(
-            source.join(SIDECAR_FILENAME),
-            destination.join(SIDECAR_FILENAME),
-        )
-        .unwrap();
+        copy_sidecar_bundle(&source, &destination);
         let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
         // The manifest also contains the root directory entry; only clip.mp4 is
         // fault-injected and must remain wholly at its previous state.
@@ -3963,7 +4767,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_round_trip_is_self_contained_without_automatic_sidecar() {
+    fn v3_round_trip_is_self_contained_without_automatic_sidecar() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -4134,11 +4938,7 @@ mod tests {
         assert!(exported.page_states >= 2);
         assert!(exported.container_states >= 1);
         assert_eq!(exported.thumbnail_pins, 3);
-        fs::copy(
-            source.join(SIDECAR_FILENAME),
-            destination.join(SIDECAR_FILENAME),
-        )
-        .unwrap();
+        copy_sidecar_bundle(&source, &destination);
         let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
         assert_eq!(imported.failed_entries, 0);
 
@@ -4328,11 +5128,7 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
-        fs::copy(
-            source.join(SIDECAR_FILENAME),
-            destination.join(SIDECAR_FILENAME),
-        )
-        .unwrap();
+        copy_sidecar_bundle(&source, &destination);
         let listed_key = crate::path_key::normalize_keep_drive(&destination.join("listed.jpg"));
         let refresh_scope = ImportRefreshScope {
             base_keys: HashSet::from([listed_key.clone()]),
@@ -4387,77 +5183,30 @@ mod tests {
     }
 
     #[test]
-    fn v1_manifest_does_not_clear_v2_metadata_sections() {
+    fn older_bundle_version_is_rejected_before_import() {
         let temp = tempfile::TempDir::new().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        let source_data = temp.path().join("source-data");
-        let destination_data = temp.path().join("destination-data");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        fs::write(source.join("a.jpg"), b"x").unwrap();
-        fs::write(destination.join("a.jpg"), b"x").unwrap();
-        init_data_dir(&source_data);
-        init_data_dir(&destination_data);
-        let destination_key = crate::path_key::normalize_keep_drive(&destination.join("a.jpg"));
-        Connection::open(destination_data.join("rotation.db"))
-            .unwrap()
-            .execute(
-                "INSERT INTO rotations (path, angle) VALUES (?1, 180)",
-                [&destination_key],
-            )
-            .unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.jpg"), b"x").unwrap();
+        init_data_dir(&data);
 
         let cancel = AtomicBool::new(false);
-        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        let path = root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME);
         let mut json: serde_json::Value =
-            serde_json::from_slice(&fs::read(source.join(SIDECAR_FILENAME)).unwrap()).unwrap();
-        json["version"] = serde_json::Value::from(1);
-        let sections = json["sections"].as_object_mut().unwrap();
-        for field in ["page_state", "container_state", "thumbnail_pins"] {
-            sections.remove(field);
-        }
-        for entry in json["entries"].as_array_mut().unwrap() {
-            let entry = entry.as_object_mut().unwrap();
-            for field in [
-                "page_state",
-                "container_state",
-                "nested_containers",
-                "video_pin",
-            ] {
-                entry.remove(field);
-            }
-            for item in entry
-                .get_mut("virtual_items")
-                .and_then(serde_json::Value::as_array_mut)
-                .into_iter()
-                .flatten()
-            {
-                item.as_object_mut().unwrap().remove("page_state");
-            }
-        }
-        fs::write(
-            destination.join(SIDECAR_FILENAME),
-            serde_json::to_vec_pretty(&json).unwrap(),
-        )
-        .unwrap();
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["version"] = serde_json::Value::from(FORMAT_VERSION - 1);
+        fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 
-        import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
-        assert_eq!(
-            Connection::open(destination_data.join("rotation.db"))
-                .unwrap()
-                .query_row(
-                    "SELECT angle FROM rotations WHERE path = ?1",
-                    [&destination_key],
-                    |row| row.get::<_, i32>(0)
-                )
-                .unwrap(),
-            180
-        );
+        assert!(matches!(
+            inspect_import_at(&root, &cancel, no_progress),
+            Err(TransferError::Invalid(message)) if message.contains("未対応のバージョン")
+        ));
     }
 
     #[test]
-    fn v2_import_marks_existing_automatic_sidecar_as_consumed() {
+    fn v3_import_marks_existing_automatic_sidecar_as_consumed() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -4472,11 +5221,7 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
-        fs::copy(
-            source.join(SIDECAR_FILENAME),
-            destination.join(SIDECAR_FILENAME),
-        )
-        .unwrap();
+        copy_sidecar_bundle(&source, &destination);
         let automatic_sidecar = destination.join(crate::sidecar::SIDECAR_FILENAME);
         fs::write(&automatic_sidecar, br#"{"version":1,"items":{}}"#).unwrap();
         let modified_secs = fs::metadata(&automatic_sidecar)
@@ -4531,6 +5276,104 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.path == "nested/deep.jpg")
+        );
+    }
+
+    #[test]
+    fn recursive_export_writes_one_streaming_shard_per_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::write(root.join("root.jpg"), b"r").unwrap();
+        fs::write(root.join("a/a.jpg"), b"a").unwrap();
+        fs::write(root.join("a/b/b.jpg"), b"b").unwrap();
+        init_data_dir(&data);
+
+        let cancel = AtomicBool::new(false);
+        let summary = export_at(&data, &root, true, &cancel, no_progress).unwrap();
+        let manifest = read_bundle_manifest(&root, &cancel).unwrap();
+        assert_eq!(summary.entries, 7);
+        assert_eq!(manifest.entry_count, 7);
+        assert_eq!(manifest.shard_count, 4);
+
+        let shards = bundle_generation_dir(&root.join(SIDECAR_FILENAME), &manifest.generation)
+            .join(SHARDS_DIRNAME);
+        for (folder, records) in [(".", 4), ("a", 2), ("a/b", 1), ("empty", 0)] {
+            let shard = shards.join(shard_filename(folder));
+            assert!(shard.is_file(), "missing shard for {folder}");
+            assert_eq!(
+                fs::read_to_string(shard).unwrap().lines().count(),
+                records + 1,
+                "header + direct entries for {folder}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_crosses_streaming_batch_boundary_without_a_total_entry_cap() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..=EXPORT_BATCH_ENTRIES {
+            fs::write(root.join(format!("{index:05}.jpg")), b"x").unwrap();
+        }
+        init_data_dir(&data);
+
+        let cancel = AtomicBool::new(false);
+        let summary = export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        let manifest = read_bundle_manifest(&root, &cancel).unwrap();
+        let expected = EXPORT_BATCH_ENTRIES + 2; // root + batch boundaryを越えるfile群
+        assert_eq!(summary.entries, expected);
+        assert_eq!(manifest.entry_count, expected as u64);
+        assert_eq!(manifest.shard_count, 1);
+        assert_eq!(
+            read_manifest(&root, &cancel).unwrap().entries.len(),
+            expected
+        );
+    }
+
+    #[test]
+    fn manifest_count_mismatch_is_rejected_before_any_database_write() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("a.jpg"), b"x").unwrap();
+        fs::write(destination.join("a.jpg"), b"x").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_rating(&source_data, &source.join("a.jpg"), 1);
+        set_rating(&destination_data, &destination.join("a.jpg"), 5);
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let manifest_path = destination
+            .join(SIDECAR_FILENAME)
+            .join(BUNDLE_MANIFEST_FILENAME);
+        let mut manifest: BundleManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.entry_count += 1;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        assert!(matches!(
+            import_at(
+                &destination_data,
+                &destination,
+                &cancel,
+                no_progress
+            ),
+            Err(TransferError::Invalid(message)) if message.contains("manifest件数")
+        ));
+        assert_eq!(
+            rating(&destination_data, &destination.join("a.jpg")),
+            Some(5)
         );
     }
 
@@ -4675,6 +5518,60 @@ mod tests {
     }
 
     #[test]
+    fn export_cancel_preserves_published_bundle_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.jpg"), b"x").unwrap();
+        init_data_dir(&data);
+        let cancel = AtomicBool::new(false);
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        let manifest_path = root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME);
+        let before = fs::read(&manifest_path).unwrap();
+        let before_manifest: BundleManifest = serde_json::from_slice(&before).unwrap();
+
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, |progress| {
+                if progress.phase == TransferPhase::Scanning {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }),
+            Err(TransferError::Cancelled)
+        ));
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        assert!(inspect_import_at(&root, &AtomicBool::new(false), no_progress).is_ok());
+        let generations = fs::read_dir(root.join(SIDECAR_FILENAME).join(GENERATIONS_DIRNAME))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].to_string_lossy(), before_manifest.generation);
+    }
+
+    #[test]
+    fn successful_reexport_atomically_switches_to_the_new_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.jpg"), b"a").unwrap();
+        init_data_dir(&data);
+        let cancel = AtomicBool::new(false);
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        let first = read_bundle_manifest(&root, &cancel).unwrap();
+
+        fs::write(root.join("b.jpg"), b"b").unwrap();
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        let second = read_bundle_manifest(&root, &cancel).unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(second.entry_count, 3);
+        let bundle = root.join(SIDECAR_FILENAME);
+        assert!(!bundle_generation_dir(&bundle, &first.generation).exists());
+        assert!(bundle_generation_dir(&bundle, &second.generation).is_dir());
+    }
+
+    #[test]
     fn import_cancel_keeps_completed_entries_without_touching_remaining_entries() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -4696,20 +5593,18 @@ mod tests {
 
         let export_cancel = AtomicBool::new(false);
         export_at(&source_data, &source, false, &export_cancel, no_progress).unwrap();
-        fs::copy(
-            source.join(SIDECAR_FILENAME),
-            destination.join(SIDECAR_FILENAME),
-        )
-        .unwrap();
+        copy_sidecar_bundle(&source, &destination);
 
         let import_cancel = AtomicBool::new(false);
+        let mut completed_file = None;
         let summary = import_at(
             &destination_data,
             &destination,
             &import_cancel,
             |progress| {
-                // 並びは root, a.jpg, b.jpg。a.jpg の transaction 完了後に止める。
+                // rootに続く最初のfile transaction完了後に止める。read_dir順には依存しない。
                 if progress.phase == TransferPhase::Importing && progress.processed == 2 {
+                    completed_file = progress.current_path.clone();
                     import_cancel.store(true, Ordering::Relaxed);
                 }
             },
@@ -4717,13 +5612,25 @@ mod tests {
         .unwrap();
         assert!(summary.cancelled);
         assert_eq!(summary.applied_entries, 2);
+        let completed_file = completed_file.unwrap();
+        let (completed_rating, untouched_rating) = if completed_file == "a.jpg" {
+            (1, 5)
+        } else {
+            assert_eq!(completed_file, "b.jpg");
+            (2, 4)
+        };
         assert_eq!(
-            rating(&destination_data, &destination.join("a.jpg")),
-            Some(1)
+            rating(&destination_data, &destination.join(&completed_file)),
+            Some(completed_rating)
         );
+        let untouched = if completed_file == "a.jpg" {
+            "b.jpg"
+        } else {
+            "a.jpg"
+        };
         assert_eq!(
-            rating(&destination_data, &destination.join("b.jpg")),
-            Some(5)
+            rating(&destination_data, &destination.join(untouched)),
+            Some(untouched_rating)
         );
     }
 
@@ -4745,11 +5652,7 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
-        fs::copy(
-            source.join(SIDECAR_FILENAME),
-            destination.join(SIDECAR_FILENAME),
-        )
-        .unwrap();
+        copy_sidecar_bundle(&source, &destination);
         let preview = inspect_import_at(&destination, &cancel, no_progress).unwrap();
         assert_eq!(preview.changed_files, 1);
         let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
@@ -4869,7 +5772,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsafe_or_malformed_v2_state_before_import() {
+    fn rejects_unsafe_or_malformed_v3_state_before_import() {
         let mut base =
             manifest_with_bookmark(PortableEntryKind::File, "zip", "archive_entry", "page.jpg");
         base.entries[0].book_bookmarks.clear();
@@ -4964,12 +5867,8 @@ mod tests {
                 virtual_items: Vec::new(),
             }],
         };
-        fs::write(
-            root.join(SIDECAR_FILENAME),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
         let cancel = AtomicBool::new(false);
+        write_manifest_atomic(&root, &manifest, &cancel).unwrap();
         assert!(matches!(
             inspect_import_at(&root, &cancel, no_progress),
             Err(TransferError::Invalid(message)) if message.contains("フォルダ外")
@@ -5000,12 +5899,8 @@ mod tests {
             "link/secret.jpg",
         );
         manifest.entries[0].path = "album".to_string();
-        fs::write(
-            root.join(SIDECAR_FILENAME),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
         let cancel = AtomicBool::new(false);
+        write_manifest_atomic(&root, &manifest, &cancel).unwrap();
         assert!(matches!(
             inspect_import_at(&root, &cancel, no_progress),
             Err(TransferError::Invalid(message)) if message.contains("コンテナ外")
@@ -5035,13 +5930,8 @@ mod tests {
             "link/future.jpg",
         );
         manifest.entries[0].path = "album".to_string();
-        fs::write(
-            root.join(SIDECAR_FILENAME),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-
         let cancel = AtomicBool::new(false);
+        write_manifest_atomic(&root, &manifest, &cancel).unwrap();
         assert!(matches!(
             inspect_import_at(&root, &cancel, no_progress),
             Err(TransferError::Invalid(message)) if message.contains("コンテナ外")
@@ -5064,13 +5954,8 @@ mod tests {
             "chapter/future.jpg",
         );
         manifest.entries[0].path = "album".to_string();
-        fs::write(
-            root.join(SIDECAR_FILENAME),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-
         let cancel = AtomicBool::new(false);
+        write_manifest_atomic(&root, &manifest, &cancel).unwrap();
         let preview = inspect_import_at(&root, &cancel, no_progress).unwrap();
         assert_eq!(preview.existing_entries, 1);
         let summary = import_at(&data, &root, &cancel, no_progress).unwrap();

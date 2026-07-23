@@ -476,10 +476,10 @@ fn draw_dialog(
                 ui.checkbox(&mut state.recursive, "サブフォルダも含める（再帰）");
                 ui.add_space(6.0);
                 ui.label(format!(
-                    "同じフォルダの {} に保存します。",
+                    "同じフォルダの {} フォルダに保存します。",
                     crate::metadata_transfer::SIDECAR_FILENAME
                 ));
-                ui.small("既存ファイルは、エクスポートが完了した時点で置き換えます。");
+                ui.small("既存のメタ情報は、完了時に新しい世代へ切り替えます。");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("エクスポート").clicked() {
@@ -494,7 +494,7 @@ fn draw_dialog(
                 }
             }
             Stage::LoadingPreview => {
-                ui.label("メタ情報ファイルを確認しています…");
+                ui.label("メタ情報を確認しています…");
                 ui.spinner();
                 if ui.button("キャンセル").clicked() || escape_pressed {
                     action = DialogAction::Cancel;
@@ -525,7 +525,7 @@ fn draw_dialog(
                 ui.small(
                     "評価・タグ・ブックマーク・見開き・表示トリム・回転・ページ編集・代表サムネを含みます。",
                 );
-                ui.small("このファイルに記載がない項目の既存メタ情報は保持します。");
+                ui.small("このメタ情報に記載がない項目の既存メタ情報は保持します。");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("インポート").clicked() {
@@ -581,8 +581,8 @@ fn draw_progress(ui: &mut egui::Ui, progress: Option<&TransferProgress>) {
     let label = match progress.phase {
         TransferPhase::Scanning => "ファイルを列挙中",
         TransferPhase::ReadingMetadata => "メタ情報を読み取り中",
-        TransferPhase::WritingSidecar => "メタ情報ファイルを書き込み中",
-        TransferPhase::ReadingSidecar => "メタ情報ファイルを確認中",
+        TransferPhase::WritingSidecar => "メタ情報を書き込み中",
+        TransferPhase::ReadingSidecar => "メタ情報を確認中",
         TransferPhase::Importing => "メタ情報を反映中",
     };
     ui.label(label);
