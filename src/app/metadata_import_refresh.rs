@@ -6,10 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::metadata_transfer::{ImportChangedSections, ImportPageStateSnapshot};
 
-const DB_KEY_CHUNK: usize = 10_000;
+/// SQLiteのbind上限回避と終了時cancel応答を兼ねるworker work unit。
+const DB_KEY_CHUNK: usize = 500;
 
 #[derive(Debug)]
 pub(crate) struct ItemKey {
@@ -45,6 +47,8 @@ pub(crate) struct ContextRequest {
     pub(crate) current_rating_key: Option<String>,
     pub(crate) spread_container_path: Option<PathBuf>,
     pub(crate) old_folder_pin_keys: HashSet<String>,
+    pub(crate) folder_pin_paths: Vec<PathBuf>,
+    pub(crate) folder_pin_aliases: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,11 +100,18 @@ pub(crate) fn run(
     data_dir: PathBuf,
     requests: Vec<ContextRequest>,
     changed: ImportChangedSections,
-) -> RefreshResult {
+    cancel: &AtomicBool,
+) -> Option<RefreshResult> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let mut errors = Vec::new();
     let page_snapshot = if changed.page_state {
-        match crate::metadata_transfer::load_import_page_state_snapshot(&data_dir) {
+        match crate::metadata_transfer::load_import_page_state_snapshot_cancellable(
+            &data_dir, cancel,
+        ) {
             Ok(snapshot) => Some(snapshot),
+            Err(crate::metadata_transfer::TransferError::Cancelled) => return None,
             Err(error) => {
                 errors.push(format!("編集状態索引を再構築できませんでした: {error}"));
                 None
@@ -203,52 +214,53 @@ pub(crate) fn run(
         errors.push(result.clone());
     }
 
-    let contexts = requests
-        .into_iter()
-        .map(|request| {
-            build_context_result(
-                request,
-                changed,
-                rating_db.as_ref().and_then(|result| result.as_ref().ok()),
-                tags_db.as_ref().and_then(|result| result.as_ref().ok()),
-                adjustment_db
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok()),
-                local_adjust_db
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok()),
-                crop_db.as_ref().and_then(|result| result.as_ref().ok()),
-                view_trim_db
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok()),
-                mask_db.as_ref().and_then(|result| result.as_ref().ok()),
-                conceal_db.as_ref().and_then(|result| result.as_ref().ok()),
-                comic_db.as_ref().and_then(|result| result.as_ref().ok()),
-                rotation_db.as_ref().and_then(|result| result.as_ref().ok()),
-                folder_pin_db
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok()),
-                video_pin_db
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok()),
-                spread_db.as_ref().and_then(|result| result.as_ref().ok()),
-                container_trim_db
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok()),
-            )
-        })
-        .collect();
-
-    RefreshResult {
+    let mut contexts = Vec::with_capacity(requests.len());
+    for request in requests {
+        contexts.push(build_context_result(
+            request,
+            changed,
+            rating_db.as_ref().and_then(|result| result.as_ref().ok()),
+            tags_db.as_ref().and_then(|result| result.as_ref().ok()),
+            adjustment_db
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+            local_adjust_db
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+            crop_db.as_ref().and_then(|result| result.as_ref().ok()),
+            view_trim_db
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+            mask_db.as_ref().and_then(|result| result.as_ref().ok()),
+            conceal_db.as_ref().and_then(|result| result.as_ref().ok()),
+            comic_db.as_ref().and_then(|result| result.as_ref().ok()),
+            rotation_db.as_ref().and_then(|result| result.as_ref().ok()),
+            folder_pin_db
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+            video_pin_db
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+            spread_db.as_ref().and_then(|result| result.as_ref().ok()),
+            container_trim_db
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+            cancel,
+        )?);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(RefreshResult {
         contexts,
         page_snapshot,
         errors,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_context_result(
-    request: ContextRequest,
+    mut request: ContextRequest,
     changed: ImportChangedSections,
     rating_db: Option<&crate::rating_db::RatingDb>,
     tags_db: Option<&crate::tags_db::TagsDb>,
@@ -264,7 +276,8 @@ fn build_context_result(
     video_pin_db: Option<&crate::video_pins::VideoPinDb>,
     spread_db: Option<&crate::spread_db::SpreadDb>,
     container_trim_db: Option<&crate::view_trim_db::ViewTrimDb>,
-) -> ContextResult {
+    cancel: &AtomicBool,
+) -> Option<ContextResult> {
     let mut rating_cache = (changed.ratings && rating_db.is_some()).then(HashMap::new);
     let mut tags_cache = (changed.tags && tags_db.is_some()).then(HashMap::new);
     let all_page_databases_available = [
@@ -283,6 +296,9 @@ fn build_context_result(
         (changed.page_state && all_page_databases_available).then(PageStateResult::default);
 
     for chunk in request.items.chunks(DB_KEY_CHUNK) {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let rating_keys = chunk
             .iter()
             .filter(|item| item.rating)
@@ -371,10 +387,16 @@ fn build_context_result(
         .current_rating_key
         .as_deref()
         .and_then(|key| rating_db.map(|db| db.get(key)));
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let folder_pin_map = if changed.thumbnail_pins {
         folder_pin_db.map(|db| {
             let mut pins = HashMap::new();
             for chunk in request.items.chunks(DB_KEY_CHUNK) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 pins.extend(
                     db.lookup_many(
                         chunk
@@ -382,6 +404,15 @@ fn build_context_result(
                             .filter_map(|item| item.container_path.as_deref()),
                     ),
                 );
+            }
+            for chunk in request.folder_pin_paths.chunks(DB_KEY_CHUNK) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                pins.extend(db.lookup_many(chunk));
+            }
+            if !cancel.load(Ordering::Relaxed) {
+                crate::app::App::apply_folder_pin_aliases(&mut pins, &request.folder_pin_aliases);
             }
             pins
         })
@@ -405,11 +436,18 @@ fn build_context_result(
             })
             .collect()
     });
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let video_pin_blobs =
         if changed.thumbnail_pins {
             video_pin_db.map(|db| {
                 let mut blobs = HashMap::new();
+                // VideoPinDb側も500件ずつqueryするため、同じ境界でcancelを確認する。
                 for chunk in request.items.chunks(DB_KEY_CHUNK) {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
                     blobs.extend(db.lookup_webps_many(
                         chunk.iter().filter_map(|item| item.video_path.as_deref()),
                     ));
@@ -419,15 +457,13 @@ fn build_context_result(
         } else {
             None
         };
-    let video_items = video_pin_blobs.as_ref().map(|blobs| {
+    let video_items = video_pin_blobs.as_ref().map(|_| {
         request
             .items
-            .iter()
+            .iter_mut()
             .filter_map(|item| {
-                let path = item.video_path.as_ref()?;
-                blobs
-                    .contains_key(path)
-                    .then(|| (item.index, path.clone(), item.video_size))
+                let path = item.video_path.take()?;
+                Some((item.index, path, item.video_size))
             })
             .collect()
     });
@@ -449,7 +485,10 @@ fn build_context_result(
             None
         };
 
-    ContextResult {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(ContextResult {
         slot: request.slot,
         items_generation: request.items_generation,
         rating_cache,
@@ -461,7 +500,7 @@ fn build_context_result(
         video_pin_blobs,
         video_items,
         container_state,
-    }
+    })
 }
 
 fn collect_indices(
@@ -528,13 +567,17 @@ mod tests {
                 current_rating_key: Some(key.clone()),
                 spread_container_path: None,
                 old_folder_pin_keys: HashSet::new(),
+                folder_pin_paths: Vec::new(),
+                folder_pin_aliases: Vec::new(),
             }],
             ImportChangedSections {
                 ratings: true,
                 tags: true,
                 ..Default::default()
             },
-        );
+            &AtomicBool::new(false),
+        )
+        .expect("refresh should complete");
 
         assert!(result.errors.is_empty());
         let context = &result.contexts[0];
@@ -567,13 +610,99 @@ mod tests {
                 current_rating_key: None,
                 spread_container_path: None,
                 old_folder_pin_keys: HashSet::new(),
+                folder_pin_paths: Vec::new(),
+                folder_pin_aliases: Vec::new(),
             }],
             ImportChangedSections {
                 ratings: true,
                 ..Default::default()
             },
-        );
+            &AtomicBool::new(false),
+        )
+        .expect("refresh should report DB errors");
         assert!(!result.errors.is_empty());
         assert!(result.contexts[0].rating_cache.is_none());
+    }
+
+    #[test]
+    fn worker_honors_terminal_refresh_cancel_before_database_work() {
+        let cancel = AtomicBool::new(true);
+        let result = run(
+            PathBuf::from("unused"),
+            Vec::new(),
+            ImportChangedSections {
+                ratings: true,
+                page_state: true,
+                ..Default::default()
+            },
+            &cancel,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn worker_restores_folder_aliases_and_reports_video_without_a_remaining_pin() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let effective = PathBuf::from("c:/books/outer.zip/book/inner");
+        let literal = PathBuf::from("c:/books/outer.zip/book");
+        let source = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "book/inner/cover.jpg".to_string(),
+        };
+        crate::folder_thumb_pins::FolderThumbPinDb::open_at(&data_dir.join("folder_thumb_pins.db"))
+            .unwrap()
+            .set(&effective, &source)
+            .unwrap();
+        // DBは存在するが対象動画の行はない。これはimportでpinが削除された状態と同じ。
+        crate::video_pins::VideoPinDb::open_at(&data_dir.join("video_pins.db")).unwrap();
+        let video = PathBuf::from("c:/books/movie.mp4");
+        let effective_key = crate::path_key::normalize_keep_drive(&effective);
+        let literal_key = crate::path_key::normalize_keep_drive(&literal);
+
+        let result = run(
+            data_dir,
+            vec![ContextRequest {
+                slot: ContextSlot::Main,
+                items_generation: 9,
+                items: vec![ItemKey {
+                    index: 4,
+                    key: crate::path_key::normalize_keep_drive(&video),
+                    rating: true,
+                    page: false,
+                    alternate_page_key: None,
+                    container_path: None,
+                    video_path: Some(video.clone()),
+                    video_size: 123,
+                }],
+                current_rating_key: None,
+                spread_container_path: None,
+                old_folder_pin_keys: HashSet::new(),
+                folder_pin_paths: vec![effective],
+                folder_pin_aliases: vec![(literal_key.clone(), effective_key)],
+            }],
+            ImportChangedSections {
+                thumbnail_pins: true,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("refresh should complete");
+
+        let context = &result.contexts[0];
+        assert_eq!(
+            context
+                .folder_pin_map
+                .as_ref()
+                .and_then(|pins| pins.get(&literal_key)),
+            Some(&source)
+        );
+        assert!(context.video_pin_blobs.as_ref().unwrap().is_empty());
+        assert_eq!(
+            context.video_items.as_ref().unwrap(),
+            &vec![(4, video, 123)],
+            "pin削除でも通常サムネ再生成対象に残す"
+        );
     }
 }

@@ -1811,6 +1811,8 @@ struct MetadataImportRefreshIndex {
     affected: bool,
     items: Vec<metadata_import_refresh::ItemKey>,
     current_rating_key: Option<String>,
+    folder_pin_paths: Vec<PathBuf>,
+    folder_pin_aliases: Vec<(String, String)>,
 }
 
 fn metadata_import_context_path_is_affected(
@@ -1823,6 +1825,13 @@ fn metadata_import_context_path_is_affected(
     if key == root {
         return true;
     }
+    // import root自身のrating / 代表サムネpinは、親フォルダcontextのroot tileにも現れる。
+    if import_root
+        .parent()
+        .is_some_and(|parent| crate::path_key::normalize_keep_drive(parent) == key)
+    {
+        return true;
+    }
     if recursive {
         return key
             .strip_prefix(&root)
@@ -1830,6 +1839,12 @@ fn metadata_import_context_path_is_affected(
     }
     path.parent()
         .is_some_and(|parent| crate::path_key::normalize_keep_drive(parent) == root)
+}
+
+struct FolderPinLookupTarget {
+    path: PathBuf,
+    /// `ZipDir` cellのliteral keyからDB保存先のeffective keyへのalias。
+    alias: Option<(String, String)>,
 }
 
 #[cfg(windows)]
@@ -20691,17 +20706,90 @@ impl App {
         }
     }
 
-    /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive/ZipDir) 分のピン + `current_folder`
-    /// 自身のピンを DB から一括取得して `folder_pin_map` に格納する。pin DB が未開なら no-op。
+    /// 通常ロードとmetadata import終端refreshで共用する、item単位のfolder-pin identity。
     ///
-    /// `current_folder` 自身を含めるのは、アドレスバー 📌 ボタンの `folder_thumb_pin_for
-    /// (current_folder)` が「現在表示中のコンテナがピン留め済みか」を判定するため
-    /// (Codex 最終レビュー P2 指摘)。reload 後に map に入っていないと、トグル / アイコン
-    /// 強調 / tooltip が「未ピン」固定になってしまう。
+    /// `ZipDir`はDB保存先のeffective prefixとcell参照側のliteral prefixが異なり得るため、
+    /// lookup pathに加えてaliasも返す。
+    fn folder_pin_lookup_target_for_item(&self, item: &GridItem) -> Option<FolderPinLookupTarget> {
+        let direct = match item {
+            GridItem::Folder(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        if let Some(path) = direct {
+            return Some(FolderPinLookupTarget { path, alias: None });
+        }
+        let GridItem::ZipDir {
+            zip_path,
+            dir_prefix,
+            ..
+        } = item
+        else {
+            return None;
+        };
+        let book_root = zip_pin_root_path(
+            zip_path,
+            self.archive_source_override.as_deref(),
+            self.current_folder.as_deref(),
+        );
+        let literal = book_container_key(book_root, dir_prefix);
+        let effective_key = if let Some(nav) = self.zip_nav.as_ref() {
+            let segments = dir_prefix
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let effective = nav.tree.collapse_redundant(&segments);
+            book_container_key_from_segs(book_root, &effective)
+        } else {
+            literal.clone()
+        };
+        let literal_key = crate::path_key::normalize_keep_drive(&literal);
+        let effective_key_normalized = crate::path_key::normalize_keep_drive(&effective_key);
+        Some(FolderPinLookupTarget {
+            path: effective_key,
+            alias: (literal_key != effective_key_normalized)
+                .then_some((literal_key, effective_key_normalized)),
+        })
+    }
+
+    /// item以外にfolder-pin mapが必要とするcontext固有identity。
+    fn folder_pin_context_lookup_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(2);
+        // current_folder自身はアドレスバーの📌状態で参照する。
+        if let Some(current) = self.current_folder.as_ref()
+            && !is_synthetic_view_path(current)
+            && !self.items_are_global_search_view
+            && !self.items_are_tag_view
+        {
+            paths.push(current.clone());
+        }
+        // ZIP本を開いている場合は、現在の本そのもののpin keyも必要。
+        if self.zip_nav.is_some()
+            && let Some(book_key) = self.pin_container_key()
+        {
+            paths.push(book_key);
+        }
+        paths
+    }
+
+    fn apply_folder_pin_aliases(
+        pins: &mut HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        aliases: &[(String, String)],
+    ) {
+        for (literal_key, effective_key) in aliases {
+            if let Some(pin) = pins.get(effective_key).cloned() {
+                pins.insert(literal_key.clone(), pin);
+            }
+        }
+    }
+
+    /// 現在items中の親コンテナとcontext固有identityをDBから一括取得する。
     fn refresh_folder_pin_map(&mut self) {
         self.folder_pin_map.clear();
-        // サブ展開の Folder / ZIP / PDF ピンは prepare worker がコンテナだけを一括照会して
-        // install する。ここで数百万件を UI thread 上で再走査・DB lookup しない。
+        // サブ展開はprepare workerが全対象を照会済み。
         if self.current_folder.as_ref().is_some_and(|folder| {
             crate::folder_tree::path_eq(folder, &subfolder_expansion_synthetic_path())
         }) {
@@ -20710,83 +20798,22 @@ impl App {
         let Some(db) = self.folder_thumb_pin_db.as_ref() else {
             return;
         };
-        // 所有権付き PathBuf で集める (ZipDir の本キーは合成パスで借用できないため)。
-        // lookup_many が内部で重複除去するので manual dedup は不要。
-        let mut container_paths: Vec<PathBuf> = Vec::with_capacity(self.items.len() + 2);
-        // ZipDir セルのピンは「本の中で set した実効 prefix キー」(`pin_container_key`)
-        // に保存されるが、`make_load_request` は cell の literal prefix から作った
-        // book key で folder_pin_map を引く。単一ラッパー本では両者がずれる
-        // (literal "bookB/" vs 実効 "bookB/inner/") ので、実効キーで DB を引いた結果を
-        // literal キーへ **alias 登録**して一致させる (レビュー P2: set/lookup キー不一致の根治)。
-        let mut zipdir_aliases: Vec<(String, String)> = Vec::new(); // (literal, effective) 正規化済み
-        for it in self.items.iter() {
-            match it {
-                GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
-                    container_paths.push(p.clone());
+        let mut paths = Vec::with_capacity(self.items.len() + 2);
+        let mut aliases = Vec::new();
+        for item in &self.items {
+            if let Some(target) = self.folder_pin_lookup_target_for_item(item) {
+                paths.push(target.path);
+                if let Some(alias) = target.alias {
+                    aliases.push(alias);
                 }
-                GridItem::ConvertibleArchive { path, .. } => {
-                    container_paths.push(path.clone());
-                }
-                GridItem::ZipDir {
-                    zip_path,
-                    dir_prefix,
-                    ..
-                } => {
-                    let book_root = zip_pin_root_path(
-                        zip_path,
-                        self.archive_source_override.as_deref(),
-                        self.current_folder.as_deref(),
-                    );
-                    let literal = book_container_key(book_root, dir_prefix);
-                    let effective_key = if let Some(nav) = self.zip_nav.as_ref() {
-                        let segs: Vec<String> = dir_prefix
-                            .split('/')
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string())
-                            .collect();
-                        let effective = nav.tree.collapse_redundant(&segs);
-                        book_container_key_from_segs(book_root, &effective)
-                    } else {
-                        literal.clone()
-                    };
-                    let lit_norm = crate::path_key::normalize_keep_drive(&literal);
-                    let eff_norm = crate::path_key::normalize_keep_drive(&effective_key);
-                    if lit_norm != eff_norm {
-                        zipdir_aliases.push((lit_norm, eff_norm));
-                    }
-                    container_paths.push(effective_key);
-                }
-                _ => {}
             }
         }
-        // current_folder 自身も lookup 対象に含める (合成パス / 検索ビューは除外)。
-        if let Some(cur) = self.current_folder.as_ref() {
-            if !is_synthetic_view_path(cur)
-                && !self.items_are_global_search_view
-                && !self.items_are_tag_view
-            {
-                container_paths.push(cur.clone());
-            }
-        }
-        // ネスト ZIP 閲覧中は「現在の本」のピンキーも含める (P トグル / 📌 ボタン /
-        // 「ピ」バッジの folder_thumb_pin_for 判定用)。ルート表示では zip_path
-        // (= 外側 ZIP の代表キー、v1.2.x 互換)。
-        if self.zip_nav.is_some() {
-            if let Some(book_key) = self.pin_container_key() {
-                container_paths.push(book_key);
-            }
-        }
-        if container_paths.is_empty() {
+        paths.extend(self.folder_pin_context_lookup_paths());
+        if paths.is_empty() {
             return;
         }
-        self.folder_pin_map = db.lookup_many(container_paths);
-        // 実効キーで見つかったピンを literal キーでも引けるように alias を張る
-        // (make_load_request 側は literal キーで get する)。
-        for (lit_norm, eff_norm) in zipdir_aliases {
-            if let Some(pin) = self.folder_pin_map.get(&eff_norm).cloned() {
-                self.folder_pin_map.insert(lit_norm, pin);
-            }
-        }
+        self.folder_pin_map = db.lookup_many(paths);
+        Self::apply_folder_pin_aliases(&mut self.folder_pin_map, &aliases);
     }
 
     fn should_force_cache_for_drive_list_pin(&self, item: &GridItem) -> bool {
@@ -22577,11 +22604,15 @@ impl App {
             let current_rating_key = self
                 .current_container_rating_key_and_source()
                 .map(|(key, _)| key);
+            let folder_pin_paths = affected
+                .then(|| self.folder_pin_context_lookup_paths())
+                .unwrap_or_default();
             self.metadata_import_refresh_index = Some(MetadataImportRefreshIndex {
                 items_generation: self.items_generation,
                 current_rating_key,
                 affected,
                 complete: !affected || self.items.is_empty(),
+                folder_pin_paths,
                 ..MetadataImportRefreshIndex::default()
             });
         }
@@ -22599,7 +22630,13 @@ impl App {
             let rating_key = self.rating_path_key(item_index);
             let page_key = self.page_path_key(item_index);
             let item = &self.items[item_index];
-            let container_path = item.container_path().map(Path::to_path_buf);
+            let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
+            let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
+            if let Some(target) = folder_pin_target {
+                if let Some(alias) = target.alias {
+                    index.folder_pin_aliases.push(alias);
+                }
+            }
             let (video_path, video_size) = if let GridItem::Video(path) = item {
                 let size = self
                     .image_metas
@@ -22665,6 +22702,8 @@ impl App {
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
                 old_folder_pin_keys,
+                folder_pin_paths: index.folder_pin_paths,
+                folder_pin_aliases: index.folder_pin_aliases,
             })
         }
 
@@ -22840,11 +22879,6 @@ impl App {
                 smart_folder::SmartFolderMetadataDependency::Edits,
             );
         }
-        if (changed.ratings || changed.tags || changed.page_state)
-            && self.settings.facet_filter.is_active()
-        {
-            self.rebuild_visible_indices();
-        }
         if changed.book_bookmarks || changed.timed_bookmarks {
             self.notify_bookmarks_changed();
         }
@@ -22859,6 +22893,9 @@ impl App {
         if result.items_generation != self.items_generation {
             return false;
         }
+        let rebuild_display = result.rating_cache.is_some()
+            || result.tags_cache.is_some()
+            || result.page_state.is_some();
         if let Some(ratings) = result.rating_cache.take() {
             self.rating_cache = ratings;
             self.current_folder_rating_cache = result.current_rating;
@@ -22942,9 +22979,12 @@ impl App {
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         }
+        let folder_thumbnails_changed = result
+            .folder_pin_reset_indices
+            .as_ref()
+            .is_some_and(|indices| !indices.is_empty());
         if let Some(folder_pins) = result.folder_pin_map.take() {
             self.folder_pin_map = folder_pins;
-            self.folder_thumb_pin_dirty = false;
         }
         if let Some(indices) = result.folder_pin_reset_indices.take() {
             for index in indices {
@@ -22963,6 +23003,8 @@ impl App {
                 if let Some(thumbnail) = self.thumbnails.get_mut(*index) {
                     *thumbnail = ThumbnailState::Pending;
                 }
+                self.requested.remove(index);
+                self.pending_finalize.remove(index);
             }
             self.spawn_video_thread(
                 self.tx.clone(),
@@ -22971,6 +23013,15 @@ impl App {
                 self.video_thumb_overrides.clone(),
                 pin_blobs,
             );
+        }
+        // folder pin自体、またはそのleafとなるvideo pinの変更時はcontextを一度だけ
+        // 再materializeし、catalogへseed済みの代表WebPも更新・削除する。
+        if folder_thumbnails_changed {
+            self.folder_thumb_pin_dirty = true;
+            // dirty flag自体はApp-globalなので、detached/parked bundleをswap backする前に
+            // 現在mount中のcontextで消費する。video pinをleafに持つ代表サムネの
+            // catalog seed更新・削除も、通常ロードと同じ経路でcontextごとに一度だけ行う。
+            self.consume_folder_thumb_pin_dirty();
         }
 
         if changed.book_bookmarks {
@@ -22984,6 +23035,11 @@ impl App {
             self.cancel_fullscreen_video_marker_thumb_decode();
             self.music_bookmarks.clear();
             self.music_bookmarks_loaded_for = None;
+        }
+        // visible_indices / facet / details order / selectionはViewerContextBundle所有。
+        // cacheを適用したcontextをmountしている間に一体で再計算する。
+        if rebuild_display {
+            self.rebuild_visible_indices();
         }
         true
     }

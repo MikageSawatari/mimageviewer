@@ -367,7 +367,11 @@ detached / parked contextの現在項目キーを3 ms / 2048項目のフレー�
 専用refresh workerがrating / tag / page state / container state / pinをSQLiteからbatch取得し、
 UIはitems generationとdetached window identityが一致する完成cacheだけをswapする。不一致時は
 モーダルを維持して再snapshot・再取得する。bookmark / media cacheは影響contextごとに1回だけ
-無効化し、全体page badge集合もworker生成snapshotへ置換する。
+無効化し、全体page badge集合もworker生成snapshotへ置換する。folder pinのlookup identityは
+通常ロードと共通化し、current folder / 現在のZIP本 / ZipDirのliteral-effective aliasを含める。
+cache swap後のvisible/facet/details/selection再計算と代表サムネ再materializeは各contextをmount
+している間に行う。video pinは現DBにWebPがない項目も再生成対象へ含め、削除を通常フレーム抽出へ
+戻す。終端refreshはimport本体と別のcancel tokenを持ち、App終了時はDB chunk間で中断する。
 進捗path欄は3行分を固定確保し、折り返しによってキャンセルbuttonの位置を動かさない。
 実装と境界条件は `metadata_transfer.rs`、モーダルと writer drain は
 `ui_dialogs/metadata_transfer.rs` が所有する。

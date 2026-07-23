@@ -98,6 +98,8 @@ pub(crate) struct MetadataTransferState {
     stage: Stage,
     progress: Option<TransferProgress>,
     cancel: Arc<AtomicBool>,
+    /// import本体の明示cancelとは分離した、終端refreshの終了・破棄専用cancel。
+    refresh_cancel: Arc<AtomicBool>,
     rx: Option<Receiver<WorkerMessage>>,
     handle: Option<std::thread::JoinHandle<()>>,
     import_resources: Option<Arc<Mutex<ImportWorkerResources>>>,
@@ -115,6 +117,7 @@ impl MetadataTransferState {
             stage: Stage::ExportOptions,
             progress: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            refresh_cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
             handle: None,
             import_resources: None,
@@ -132,6 +135,7 @@ impl MetadataTransferState {
             stage: Stage::LoadingPreview,
             progress: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            refresh_cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
             handle: None,
             import_resources: None,
@@ -145,6 +149,7 @@ impl MetadataTransferState {
 impl Drop for MetadataTransferState {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.refresh_cancel.store(true, Ordering::Relaxed);
         // bounded channelでworkerがrefresh送信待ちの場合、receiverを先にdropして解除する。
         self.rx.take();
         if let Some(handle) = self.handle.take() {
@@ -997,6 +1002,7 @@ fn start_metadata_import_refresh_worker(
     state: &mut MetadataTransferState,
     requests: Vec<crate::app::metadata_import_refresh::ContextRequest>,
 ) {
+    state.refresh_cancel.store(true, Ordering::Relaxed);
     if let Some(handle) = state.handle.take() {
         let _ = handle.join();
     }
@@ -1007,14 +1013,22 @@ fn start_metadata_import_refresh_worker(
         .map(|summary| summary.changed)
         .unwrap_or_default();
     let data_dir = crate::data_dir::get();
+    let refresh_cancel = Arc::new(AtomicBool::new(false));
+    state.refresh_cancel = Arc::clone(&refresh_cancel);
     let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
     state.rx = Some(rx);
     state.stage = Stage::Refreshing;
     match std::thread::Builder::new()
         .name("metadata-import-refresh".to_string())
         .spawn(move || {
-            let result = crate::app::metadata_import_refresh::run(data_dir, requests, changed);
-            let _ = tx.send(WorkerMessage::Refresh(result));
+            if let Some(result) = crate::app::metadata_import_refresh::run(
+                data_dir,
+                requests,
+                changed,
+                &refresh_cancel,
+            ) {
+                let _ = tx.send(WorkerMessage::Refresh(result));
+            }
         }) {
         Ok(handle) => state.handle = Some(handle),
         Err(error) => {
@@ -1171,5 +1185,17 @@ mod tests {
             (short - long).abs() < f32::EPSILON,
             "progress widget height changed: short={short}, long={long}"
         );
+    }
+
+    #[test]
+    fn dropping_transfer_state_cancels_import_and_terminal_refresh_workers() {
+        let state = MetadataTransferState::import(PathBuf::from("C:/Pictures"));
+        let import_cancel = Arc::clone(&state.cancel);
+        let refresh_cancel = Arc::clone(&state.refresh_cancel);
+
+        drop(state);
+
+        assert!(import_cancel.load(Ordering::Relaxed));
+        assert!(refresh_cancel.load(Ordering::Relaxed));
     }
 }

@@ -55,6 +55,7 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     let requests = app.take_metadata_import_refresh_requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].items.len(), 5_000);
+    assert_eq!(requests[0].folder_pin_paths, vec![root]);
     assert!(
         requests[0]
             .items
@@ -78,12 +79,18 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
     app.image_metas = vec![None];
     app.thumbnails = vec![ThumbnailState::Pending];
     app.rating_cache = std::collections::HashMap::from([(0, 1)]);
+    app.settings.rating_filter = [false, false, false, false, false, true];
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.visible_indices.clear();
+    app.details_order.clear();
 
     let mut detached = ViewerContextBundle::empty();
     detached.items = app.items.clone();
     detached.image_metas = vec![None];
     detached.thumbnails = vec![ThumbnailState::Pending];
     detached.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    detached.visible_indices.clear();
+    detached.details_order.clear();
     app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
 
     let context = |slot| crate::app::metadata_import_refresh::ContextResult {
@@ -124,6 +131,8 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         app.tags_cache.get(&page_key),
         Some(&vec!["imported".to_string()])
     );
+    assert_eq!(app.visible_indices, vec![0]);
+    assert_eq!(app.details_order, vec![0]);
     let detached = app
         .active_detached_viewer_context
         .as_ref()
@@ -133,6 +142,8 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         detached.bundle.tags_cache.get(&page_key),
         Some(&vec!["imported".to_string()])
     );
+    assert_eq!(detached.bundle.visible_indices, vec![0]);
+    assert_eq!(detached.bundle.details_order, vec![0]);
 }
 
 #[test]
@@ -13987,6 +13998,46 @@ mod favorite_adjustment_defaults_tests {
             app.folder_pin_map.contains_key(&literal_norm),
             "実効キーのピンが literal キーへ alias 登録される: {:?}",
             app.folder_pin_map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn metadata_terminal_folder_pin_targets_share_current_book_and_zipdir_alias_rules() {
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&["bookA/p1.jpg", "bookB/only/p1.jpg"]));
+        let (items, metas) = {
+            let nav = app.zip_nav.as_ref().unwrap();
+            nav.materialize_current(crate::settings::SortOrder::FileName)
+        };
+        app.install_new_items(items, metas);
+
+        app.begin_metadata_import_terminal_refresh();
+        while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false) {}
+        let requests = app.take_metadata_import_refresh_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let effective = crate::path_key::normalize_keep_drive(&zip_path.join("bookB").join("only"));
+        let literal = crate::path_key::normalize_keep_drive(&zip_path.join("bookB"));
+
+        assert!(
+            request.folder_pin_paths.iter().any(|path| {
+                crate::path_key::normalize_keep_drive(path)
+                    == crate::path_key::normalize_keep_drive(&zip_path)
+            }),
+            "current ZIP book itself must be included"
+        );
+        assert!(
+            request
+                .items
+                .iter()
+                .filter_map(|item| item.container_path.as_deref())
+                .any(|path| crate::path_key::normalize_keep_drive(path) == effective)
+        );
+        assert!(
+            request.folder_pin_aliases.contains(&(literal, effective)),
+            "terminal refresh must use the same literal/effective ZipDir alias"
         );
     }
 

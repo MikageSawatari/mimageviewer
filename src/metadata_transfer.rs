@@ -144,25 +144,45 @@ pub struct ImportPageStateSnapshot {
 pub fn load_import_page_state_snapshot(
     data_dir: &Path,
 ) -> Result<ImportPageStateSnapshot, TransferError> {
-    let adjusted = crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db"))
-        .map_err(db_error)?
-        .load_page_param_keys();
-    let local_adjusted =
-        crate::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db"))
-            .map_err(db_error)?
-            .load_all_layer_keys();
-    let masked = crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db"))
-        .map_err(db_error)?
-        .load_all_mask_keys();
-    let concealed = crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db"))
-        .map_err(db_error)?
-        .load_all_conceal_keys();
-    let comic = crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db"))
-        .map_err(db_error)?
-        .load_all_comic_keys();
-    let rotated = crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db"))
-        .map_err(db_error)?
-        .load_rotated_keys();
+    load_import_page_state_snapshot_cancellable(data_dir, &AtomicBool::new(false))
+}
+
+/// 終端refresh worker向け。各DBの全体索引取得間で終了専用cancelを確認する。
+pub fn load_import_page_state_snapshot_cancellable(
+    data_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<ImportPageStateSnapshot, TransferError> {
+    let adjusted = load_import_key_set(
+        &data_dir.join("adjustment.db"),
+        "SELECT page_path FROM page_params",
+        cancel,
+    )?;
+    let local_adjusted = load_import_key_set(
+        &data_dir.join("local_adjust.db"),
+        "SELECT page_path FROM local_adjust_pages",
+        cancel,
+    )?;
+    let masked = load_import_key_set(
+        &data_dir.join("mask.db"),
+        "SELECT path FROM masks WHERE path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'",
+        cancel,
+    )?;
+    let concealed = load_import_key_set(
+        &data_dir.join("conceal.db"),
+        "SELECT page_path FROM conceal_entries
+         WHERE page_path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'",
+        cancel,
+    )?;
+    let comic = load_import_key_set(
+        &data_dir.join("comic.db"),
+        "SELECT page_path FROM comic_entries",
+        cancel,
+    )?;
+    let rotated = load_import_key_set(
+        &data_dir.join("rotation.db"),
+        "SELECT path FROM rotations WHERE angle != 0",
+        cancel,
+    )?;
     Ok(ImportPageStateSnapshot {
         adjusted,
         local_adjusted,
@@ -171,6 +191,28 @@ pub fn load_import_page_state_snapshot(
         comic,
         rotated,
     })
+}
+
+fn load_import_key_set(
+    path: &Path,
+    sql: &str,
+    cancel: &AtomicBool,
+) -> Result<std::collections::BTreeSet<String>, TransferError> {
+    check_cancel(cancel)?;
+    let conn = open_readonly(path)?;
+    let mut statement = conn.prepare(sql).map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let mut keys = std::collections::BTreeSet::new();
+    let mut processed = 0usize;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        if processed % 512 == 0 {
+            check_cancel(cancel)?;
+        }
+        keys.insert(row.get::<_, String>(0).map_err(db_error)?);
+        processed = processed.saturating_add(1);
+    }
+    check_cancel(cancel)?;
+    Ok(keys)
 }
 
 #[derive(Debug)]
