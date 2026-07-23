@@ -326,8 +326,8 @@ v2.7.0では安定化のためメニュー入口を一時非表示にしたが�
 `metadata_transfer::UI_ENABLED`を有効化して再公開する。
 
 `ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
-`mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v3 は評価、
-タグ、動画・音声 / 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
+`mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v4 は評価、
+タグ（名前と適用時刻）、動画・音声 / 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
 部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。crop矩形は通常DB /
 sidecarと同じ元画像ピクセル座標を保持する。ZIP / PDF のページ stateと ZIP 内の本 state は
 物理コンテナ配下の相対キーで持つ。

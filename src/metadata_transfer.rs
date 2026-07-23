@@ -24,7 +24,7 @@ pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIR
 pub(crate) const UI_ENABLED: bool = true;
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 const BUNDLE_MANIFEST_FILENAME: &str = "manifest.json";
 const GENERATIONS_DIRNAME: &str = "generations";
 const SHARDS_DIRNAME: &str = "shards";
@@ -318,7 +318,7 @@ struct PortableEntry {
     fingerprint: Option<FileFingerprint>,
     rating: Option<PortableRating>,
     #[serde(default)]
-    tags: Vec<String>,
+    tags: Vec<PortableTag>,
     #[serde(default)]
     timed_bookmarks: Vec<PortableTimedBookmark>,
     #[serde(default)]
@@ -340,9 +340,16 @@ struct PortableVirtualItem {
     member_key: String,
     rating: Option<PortableRating>,
     #[serde(default)]
-    tags: Vec<String>,
+    tags: Vec<PortableTag>,
     #[serde(default, skip_serializing_if = "PortablePageState::is_empty")]
     page_state: PortablePageState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PortableTag {
+    name: String,
+    /// `tags.db.item_tags.applied_at` と同じUnix秒。
+    applied_at: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1166,7 +1173,7 @@ where
     if tags_path.is_file() {
         let mut conn = open_readonly(&tags_path)?;
         prepare_metadata_scope(&mut conn, &index, cancel)?;
-        let mut tags_by_key: HashMap<String, Vec<String>> = HashMap::new();
+        let mut tags_by_key: HashMap<String, Vec<PortableTag>> = HashMap::new();
         {
             let mut stmt = conn
                 .prepare(
@@ -1185,7 +1192,13 @@ where
                 .map_err(db_error)?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        PortableTag {
+                            name: row.get(1)?,
+                            applied_at: row.get(2)?,
+                        },
+                    ))
                 })
                 .map_err(db_error)?;
             for row in rows {
@@ -2552,15 +2565,19 @@ fn validate_rating(rating: Option<&PortableRating>) -> Result<(), TransferError>
     Ok(())
 }
 
-fn validate_tags(tags: &[String]) -> Result<(), TransferError> {
+fn validate_tags(tags: &[PortableTag]) -> Result<(), TransferError> {
     if tags.len() > MAX_BOOKMARKS_PER_ENTRY {
         return Err(TransferError::Invalid("タグ数が多すぎます".to_string()));
     }
-    if tags
-        .iter()
-        .any(|tag| !crate::tags_db::is_valid_tag_display_name(tag))
-    {
-        return Err(TransferError::Invalid("不正なタグ名があります".to_string()));
+    let mut keys = HashSet::with_capacity(tags.len());
+    for tag in tags {
+        if !crate::tags_db::is_valid_tag_display_name(&tag.name)
+            || !keys.insert(crate::tags_db::normalize_tag_key(&tag.name))
+        {
+            return Err(TransferError::Invalid(
+                "不正または重複したタグ名があります".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3350,23 +3367,24 @@ fn insert_rating(
 fn insert_tags(
     tx: &Connection,
     key: &str,
-    tags: &[String],
+    tags: &[PortableTag],
     fallback_time_ms: i64,
 ) -> Result<(), TransferError> {
-    let applied_at = fallback_time_ms.div_euclid(1000);
-    let collapsed = crate::tags_db::collapse_tags(tags, applied_at);
-    for tag in collapsed {
+    for tag in tags {
+        let display = crate::tags_db::normalize_tag_display_name(&tag.name);
+        let tag_key = crate::tags_db::normalize_tag_key(&display);
         tx.execute(
             "INSERT INTO tags.item_tags (item_key, tag, tag_key, applied_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![key, tag.tag, tag.tag_key, tag.applied_at],
+            params![key, display, tag_key, tag.applied_at],
         )
         .map_err(db_error)?;
     }
+    let decided_at = fallback_time_ms.div_euclid(1000);
     tx.execute(
         "INSERT INTO tags.tag_item_state (item_key, decided_at, source)
          VALUES (?1, ?2, ?3)",
-        params![key, applied_at, crate::tags_db::source::METADATA_IMPORT],
+        params![key, decided_at, crate::tags_db::source::METADATA_IMPORT],
     )
     .map_err(db_error)?;
     Ok(())
@@ -4132,6 +4150,54 @@ mod tests {
         .unwrap();
     }
 
+    fn set_tags_with_applied_at(data_dir: &Path, item_key: &str, tags: &[(&str, i64)]) {
+        let conn = Connection::open(data_dir.join("tags.db")).unwrap();
+        for (name, applied_at) in tags {
+            let display = crate::tags_db::normalize_tag_display_name(name);
+            conn.execute(
+                "INSERT INTO item_tags (item_key, tag, tag_key, applied_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    item_key,
+                    display,
+                    crate::tags_db::normalize_tag_key(name),
+                    applied_at
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tag_item_state (item_key, decided_at, source)
+             VALUES (?1, ?2, ?3)",
+            params![
+                item_key,
+                tags.iter()
+                    .map(|(_, applied_at)| *applied_at)
+                    .max()
+                    .unwrap_or(0),
+                crate::tags_db::source::EDIT
+            ],
+        )
+        .unwrap();
+    }
+
+    fn tags_with_applied_at(data_dir: &Path, item_key: &str) -> Vec<(String, i64)> {
+        let conn = Connection::open(data_dir.join("tags.db")).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT tag, applied_at
+                   FROM item_tags
+                  WHERE item_key = ?1
+                  ORDER BY applied_at ASC, tag COLLATE NOCASE ASC",
+            )
+            .unwrap();
+        statement
+            .query_map([item_key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     fn tags(data_dir: &Path, path: &Path) -> Vec<String> {
         crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db"))
             .unwrap()
@@ -4197,7 +4263,13 @@ mod tests {
         init_data_dir(&destination_data);
 
         set_rating(&source_data, &source.join("a.jpg"), 4);
-        set_tags(&source_data, &source.join("a.jpg"), &["旅行", "青"]);
+        let physical_source_key = crate::path_key::normalize_keep_drive(&source.join("a.jpg"));
+        // 辞書順とは逆の古い→新しい順を作り、表示順と候補時刻の双方を検証する。
+        set_tags_with_applied_at(
+            &source_data,
+            &physical_source_key,
+            &[("Zulu", 100), ("Alpha", 300)],
+        );
         let virtual_source_key = format!(
             "{}::page/001.jpg",
             crate::path_key::normalize_keep_drive(&source.join("nested/book.zip"))
@@ -4212,14 +4284,11 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut tags_db = crate::tags_db::TagsDb::open_at(&source_data.join("tags.db")).unwrap();
-        tags_db
-            .set_item_tags(
-                &virtual_source_key,
-                ["お気に入り"],
-                crate::tags_db::source::EDIT,
-            )
-            .unwrap();
+        set_tags_with_applied_at(
+            &source_data,
+            &virtual_source_key,
+            &[("VirtualZulu", 200), ("VirtualAlpha", 500)],
+        );
         let video = Connection::open(source_data.join("video_bookmarks.db")).unwrap();
         video
             .execute(
@@ -4265,7 +4334,13 @@ mod tests {
         );
         assert_eq!(
             tags(&destination_data, &destination.join("a.jpg")),
-            vec!["旅行", "青"]
+            vec!["Zulu", "Alpha"]
+        );
+        let physical_destination_key =
+            crate::path_key::normalize_keep_drive(&destination.join("a.jpg"));
+        assert_eq!(
+            tags_with_applied_at(&destination_data, &physical_destination_key),
+            vec![("Zulu".to_string(), 100), ("Alpha".to_string(), 300)]
         );
 
         let virtual_destination_key = format!(
@@ -4282,13 +4357,43 @@ mod tests {
             .unwrap(),
             5
         );
-        let virtual_tags = crate::tags_db::TagsDb::open_at(&destination_data.join("tags.db"))
-            .unwrap()
-            .get_item_tags(&virtual_destination_key)
-            .into_iter()
-            .map(|tag| tag.tag)
-            .collect::<Vec<_>>();
-        assert_eq!(virtual_tags, vec!["お気に入り"]);
+        assert_eq!(
+            tags_with_applied_at(&destination_data, &virtual_destination_key),
+            vec![
+                ("VirtualZulu".to_string(), 200),
+                ("VirtualAlpha".to_string(), 500),
+            ]
+        );
+        let destination_tags =
+            crate::tags_db::TagsDb::open_at(&destination_data.join("tags.db")).unwrap();
+        assert_eq!(
+            destination_tags
+                .find_exact("Alpha")
+                .expect("physical tag summary")
+                .last_applied_at,
+            300
+        );
+        assert_eq!(
+            destination_tags
+                .find_exact("VirtualAlpha")
+                .expect("virtual tag summary")
+                .last_applied_at,
+            500
+        );
+        assert_eq!(
+            destination_tags
+                .find_by_prefix("", 10)
+                .into_iter()
+                .map(|summary| (summary.tag, summary.last_applied_at))
+                .collect::<Vec<_>>(),
+            vec![
+                ("VirtualAlpha".to_string(), 500),
+                ("Alpha".to_string(), 300),
+                ("VirtualZulu".to_string(), 200),
+                ("Zulu".to_string(), 100),
+            ],
+            "recent-tag candidates must retain their pre-transfer ordering"
+        );
         let video = Connection::open(destination_data.join("video_bookmarks.db")).unwrap();
         let video_row = video
             .query_row(
@@ -4397,7 +4502,10 @@ mod tests {
                         zipdir_is_archive: None,
                         zipdir_representative: None,
                     }),
-                    tags: vec!["MixedCase".to_string()],
+                    tags: vec![PortableTag {
+                        name: "MixedCase".to_string(),
+                        applied_at: 456,
+                    }],
                     page_state: PortablePageState {
                         rotation_degrees: Some(90),
                         ..PortablePageState::default()
@@ -4614,7 +4722,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_round_trip_is_self_contained_without_automatic_sidecar() {
+    fn v4_round_trip_is_self_contained_without_automatic_sidecar() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -5271,7 +5379,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_import_marks_existing_automatic_sidecar_as_consumed() {
+    fn v4_import_marks_existing_automatic_sidecar_as_consumed() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -5969,7 +6077,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsafe_or_malformed_v3_state_before_import() {
+    fn rejects_unsafe_or_malformed_v4_state_before_import() {
         let mut base =
             manifest_with_bookmark(PortableEntryKind::File, "zip", "archive_entry", "page.jpg");
         base.entries[0].book_bookmarks.clear();
