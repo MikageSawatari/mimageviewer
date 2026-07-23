@@ -15,8 +15,13 @@ pub const PORTABLE_METADATA_BUNDLE_DIRNAME: &str = "mimageviewer.meta.miv";
 /// mIV自身が作る持ち運び用bundleは、Hidden属性や「隠しファイルを表示」の設定に
 /// 依存せず、通常一覧・再帰ビュー・フォルダナビから常に除外する。
 pub fn is_internal_app_entry_name(name: &OsStr) -> bool {
-    name.to_string_lossy()
-        .eq_ignore_ascii_case(PORTABLE_METADATA_BUNDLE_DIRNAME)
+    let name = name.to_string_lossy();
+    if name.eq_ignore_ascii_case(PORTABLE_METADATA_BUNDLE_DIRNAME) {
+        return true;
+    }
+
+    let name = name.to_ascii_lowercase();
+    name.starts_with(&format!(".{PORTABLE_METADATA_BUNDLE_DIRNAME}.")) && name.ends_with(".tmp")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +151,15 @@ mod tests {
         )));
         assert!(is_internal_app_entry_name(OsStr::new(
             "MIMAGEVIEWER.META.MIV"
+        )));
+        assert!(is_internal_app_entry_name(OsStr::new(
+            ".mimageviewer.meta.miv.1234.tmp"
+        )));
+        assert!(is_internal_app_entry_name(OsStr::new(
+            ".MIMAGEVIEWER.META.MIV.1234.old.tmp"
+        )));
+        assert!(!is_internal_app_entry_name(OsStr::new(
+            ".mimageviewer.meta.miv.tmp.jpg"
         )));
         assert!(!is_internal_app_entry_name(OsStr::new("photos")));
     }

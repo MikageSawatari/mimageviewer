@@ -27,7 +27,9 @@ const GENERATIONS_DIRNAME: &str = "generations";
 const SHARDS_DIRNAME: &str = "shards";
 const SHARD_EXTENSION: &str = "jsonl";
 const EXPORT_BATCH_ENTRIES: usize = 4_096;
-const IMPORT_REFRESH_BATCH_ENTRIES: usize = 256;
+const IMPORT_REFRESH_BATCH_VALUES: usize = 256;
+const IMPORT_REFRESH_BATCH_BYTES: usize = 512 * 1024;
+const IMPORT_REFRESH_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(2);
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// 総exportサイズではなく、単一の物理項目recordにだけ適用する防御上限。
 const MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
@@ -95,15 +97,58 @@ pub struct ImportSummary {
     pub incomplete_error: Option<String>,
 }
 
+pub struct ImportPageStateSnapshot {
+    pub adjusted: std::collections::BTreeSet<String>,
+    pub local_adjusted: std::collections::BTreeSet<String>,
+    pub masked: std::collections::BTreeSet<String>,
+    pub concealed: std::collections::BTreeSet<String>,
+    pub comic: std::collections::BTreeSet<String>,
+    pub rotated: std::collections::BTreeSet<String>,
+}
+
+/// import完了後の全体編集badge索引をworker上で再構築する。UI側は各Setの所有権を
+/// swapするだけなので、巨大familyの削除走査をUI frameへ持ち込まない。
+pub fn load_import_page_state_snapshot(
+    data_dir: &Path,
+) -> Result<ImportPageStateSnapshot, TransferError> {
+    let adjusted = crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db"))
+        .map_err(db_error)?
+        .load_page_param_keys();
+    let local_adjusted =
+        crate::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db"))
+            .map_err(db_error)?
+            .load_all_layer_keys();
+    let masked = crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db"))
+        .map_err(db_error)?
+        .load_all_mask_keys();
+    let concealed = crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db"))
+        .map_err(db_error)?
+        .load_all_conceal_keys();
+    let comic = crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db"))
+        .map_err(db_error)?
+        .load_all_comic_keys();
+    let rotated = crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db"))
+        .map_err(db_error)?
+        .load_rotated_keys();
+    Ok(ImportPageStateSnapshot {
+        adjusted,
+        local_adjusted,
+        masked,
+        concealed,
+        comic,
+        rotated,
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ImportRefreshDelta {
     /// 実値を返す表示scope外を含め、このbatchにcommit済み項目がある。
     pub any_entry_applied: bool,
+    pub committed_entries: usize,
     /// 表示scope外の項目も含むsection変更通知。全件key/valueは保持しない。
     pub ratings_changed: bool,
     pub tags_changed: bool,
-    /// 全体の編集有無 rollup 用。実データ本体は持たない。
-    pub page_state_families: Vec<ImportedPageStateFamily>,
+    pub page_states_changed: bool,
     /// import 開始時に表示中だった項目だけの、UI cache 更新用実値。
     pub visible_entries: Vec<ImportedEntryMetadata>,
 }
@@ -114,7 +159,7 @@ impl ImportRefreshDelta {
         !self.any_entry_applied
             && !self.ratings_changed
             && !self.tags_changed
-            && self.page_state_families.is_empty()
+            && !self.page_states_changed
             && self.visible_entries.is_empty()
     }
 }
@@ -122,6 +167,9 @@ impl ImportRefreshDelta {
 #[derive(Clone, Debug, Default)]
 pub struct ImportRefreshScope {
     pub base_keys: HashSet<String>,
+    /// UIに実在する安定item key。manifestに記載がないvirtual memberも、file単位
+    /// 上書きで既定値へ戻す差分をworker側から明示送信するために使う。
+    pub visible_keys: HashMap<String, HashSet<String>>,
 }
 
 impl ImportRefreshScope {
@@ -151,23 +199,8 @@ pub struct ImportedRatingValue {
 pub struct ImportedTagsValue {
     pub key: String,
     pub tags: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImportedPageStateFamily {
-    pub base_key: String,
-    pub items: Vec<ImportedPageStatePresence>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImportedPageStatePresence {
-    pub key: String,
-    pub adjusted: bool,
-    pub local_adjusted: bool,
-    pub masked: bool,
-    pub concealed: bool,
-    pub comic: bool,
-    pub rotated: bool,
+    /// trueは既存値を置換、falseは同じkeyの直前chunkへ追記。
+    pub replace: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -190,6 +223,7 @@ pub struct ImportedContainerStateFamily {
     /// spread / view-trim DB と同じ drive-stripped key。
     pub base_key: String,
     pub include_nested: bool,
+    pub replace: bool,
     pub items: Vec<ImportedContainerState>,
 }
 
@@ -212,6 +246,7 @@ pub struct ImportedFolderPinFamily {
     /// folder-pin DB と同じ drive-preserving key。
     pub base_key: String,
     pub include_nested: bool,
+    pub replace: bool,
     pub items: Vec<ImportedFolderPinValue>,
 }
 
@@ -630,7 +665,65 @@ where
     import_at_with_refresh_scope(data_dir, root, cancel, None, progress, |_| Ok(()))
 }
 
-/// UI 表示中の物理項目だけ実値をcommit後の小さいbatchとして通知するimport入口。
+struct ImportRefreshBatcher<'a, R> {
+    callback: &'a mut R,
+    batch: ImportRefreshDelta,
+    values: usize,
+    bytes: usize,
+    started: std::time::Instant,
+}
+
+impl<R> ImportRefreshBatcher<'_, R>
+where
+    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
+{
+    fn push(
+        &mut self,
+        mut fragment: ImportRefreshDelta,
+        values: usize,
+        bytes: usize,
+    ) -> Result<(), TransferError> {
+        if !self.batch.is_empty()
+            && (self.values.saturating_add(values) > IMPORT_REFRESH_BATCH_VALUES
+                || self.bytes.saturating_add(bytes) > IMPORT_REFRESH_BATCH_BYTES
+                || self.started.elapsed() >= IMPORT_REFRESH_BATCH_TIME)
+        {
+            self.flush()?;
+        }
+        self.batch.any_entry_applied |= fragment.any_entry_applied;
+        self.batch.committed_entries = self
+            .batch
+            .committed_entries
+            .saturating_add(fragment.committed_entries);
+        self.batch.ratings_changed |= fragment.ratings_changed;
+        self.batch.tags_changed |= fragment.tags_changed;
+        self.batch.page_states_changed |= fragment.page_states_changed;
+        self.batch
+            .visible_entries
+            .append(&mut fragment.visible_entries);
+        self.values = self.values.saturating_add(values);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.values >= IMPORT_REFRESH_BATCH_VALUES
+            || self.bytes >= IMPORT_REFRESH_BATCH_BYTES
+            || self.started.elapsed() >= IMPORT_REFRESH_BATCH_TIME
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), TransferError> {
+        if !self.batch.is_empty() {
+            (self.callback)(std::mem::take(&mut self.batch))?;
+        }
+        self.values = 0;
+        self.bytes = 0;
+        self.started = std::time::Instant::now();
+        Ok(())
+    }
+}
+
+/// UI 表示中の項目だけ実値をcommit後の小さいbatchとして通知するimport入口。
 /// refreshは最終resultへ蓄積せず、呼び出し側の有界channelにbackpressureを掛ける。
 pub fn import_at_with_refresh_scope<F, R>(
     data_dir: &Path,
@@ -669,8 +762,13 @@ where
         total_entries: total,
         ..ImportSummary::default()
     };
-    let mut refresh_batch = ImportRefreshDelta::default();
-    let mut refresh_batch_entries = 0_usize;
+    let mut refresh_batcher = ImportRefreshBatcher {
+        callback: &mut refresh,
+        batch: ImportRefreshDelta::default(),
+        values: 0,
+        bytes: 0,
+        started: std::time::Instant::now(),
+    };
 
     let apply_result = visit_bundle_entries(root, &manifest, cancel, |entry, index| {
         progress(TransferProgress {
@@ -715,28 +813,14 @@ where
             Ok(()) => {
                 summary.applied_entries += 1;
                 let base_key = crate::path_key::normalize_keep_drive(&path);
-                refresh_batch.any_entry_applied = true;
-                refresh_batch.ratings_changed |= manifest.sections.ratings;
-                refresh_batch.tags_changed |= manifest.sections.tags;
-                if manifest.sections.page_state {
-                    refresh_batch
-                        .page_state_families
-                        .push(imported_page_state_family(&path, entry));
-                }
-                if refresh_scope.is_some_and(|scope| scope.contains(&base_key)) {
-                    refresh_batch.visible_entries.push(imported_entry_metadata(
-                        &path,
-                        entry,
-                        manifest.sections,
-                    ));
-                }
-                refresh_batch_entries += 1;
-                if refresh_batch_entries >= IMPORT_REFRESH_BATCH_ENTRIES {
-                    if !refresh_batch.is_empty() {
-                        refresh(std::mem::take(&mut refresh_batch))?;
-                    }
-                    refresh_batch_entries = 0;
-                }
+                emit_import_refresh_fragments(
+                    &path,
+                    entry,
+                    manifest.sections,
+                    refresh_scope.is_some_and(|scope| scope.contains(&base_key)),
+                    refresh_scope.and_then(|scope| scope.visible_keys.get(&base_key)),
+                    &mut refresh_batcher,
+                )?;
             }
             Err(error) => {
                 crate::logger::log(format!(
@@ -754,11 +838,7 @@ where
         });
         Ok(())
     });
-    let trailing_refresh_result = if refresh_batch.is_empty() {
-        Ok(())
-    } else {
-        refresh(std::mem::take(&mut refresh_batch))
-    };
+    let trailing_refresh_result = refresh_batcher.flush();
     let terminal_result = match apply_result {
         Err(error) => Err(error),
         Ok(()) => trailing_refresh_result,
@@ -775,17 +855,368 @@ where
     Ok(summary)
 }
 
-fn imported_page_state_family(path: &Path, entry: &PortableEntry) -> ImportedPageStateFamily {
+fn emit_import_refresh_fragments<R>(
+    path: &Path,
+    entry: &PortableEntry,
+    sections: ManifestSections,
+    visible: bool,
+    visible_keys: Option<&HashSet<String>>,
+    batcher: &mut ImportRefreshBatcher<'_, R>,
+) -> Result<(), TransferError>
+where
+    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
+{
+    let mut virtual_cursor = 0;
+    let mut nested_cursor = if visible {
+        0
+    } else {
+        entry.nested_containers.len()
+    };
+    let mut first = true;
+    loop {
+        let started = std::time::Instant::now();
+        let virtual_start = virtual_cursor;
+        let nested_start = nested_cursor;
+        let mut values = usize::from(first);
+        let mut bytes = if first {
+            estimated_physical_refresh_bytes(path, entry)
+        } else {
+            path.as_os_str().to_string_lossy().len()
+        };
+
+        while values < IMPORT_REFRESH_BATCH_VALUES {
+            let next_bytes = if virtual_cursor < entry.virtual_items.len() {
+                let item = &entry.virtual_items[virtual_cursor];
+                virtual_cursor += 1;
+                estimated_json_bytes(item)
+            } else if nested_cursor < entry.nested_containers.len() {
+                let item = &entry.nested_containers[nested_cursor];
+                nested_cursor += 1;
+                estimated_json_bytes(item)
+            } else {
+                break;
+            };
+            // 単一値は分割不能だが、2値目以降はbyte予算を越える前に次messageへ送る。
+            if values > 0 && bytes.saturating_add(next_bytes) > IMPORT_REFRESH_BATCH_BYTES {
+                if virtual_cursor > virtual_start
+                    && virtual_cursor <= entry.virtual_items.len()
+                    && nested_cursor == nested_start
+                {
+                    virtual_cursor -= 1;
+                } else if nested_cursor > nested_start {
+                    nested_cursor -= 1;
+                }
+                break;
+            }
+            values += 1;
+            bytes = bytes.saturating_add(next_bytes);
+            if started.elapsed() >= IMPORT_REFRESH_BATCH_TIME {
+                break;
+            }
+        }
+
+        let virtual_range = virtual_start..virtual_cursor;
+        let nested_range = nested_start..nested_cursor;
+        let mut fragment = ImportRefreshDelta {
+            any_entry_applied: true,
+            committed_entries: usize::from(first),
+            ratings_changed: sections.ratings,
+            tags_changed: sections.tags,
+            page_states_changed: sections.page_state,
+            ..ImportRefreshDelta::default()
+        };
+        if visible {
+            fragment.visible_entries.push(imported_entry_metadata(
+                path,
+                entry,
+                sections,
+                virtual_range,
+                nested_range,
+                first,
+            ));
+        }
+        push_refresh_fragment(fragment, values.max(1), bytes, batcher)?;
+
+        first = false;
+        if virtual_cursor >= entry.virtual_items.len()
+            && nested_cursor >= entry.nested_containers.len()
+        {
+            break;
+        }
+    }
+    if visible {
+        emit_missing_visible_defaults(path, entry, sections, visible_keys, batcher)?;
+    }
+    Ok(())
+}
+
+fn emit_missing_visible_defaults<R>(
+    path: &Path,
+    entry: &PortableEntry,
+    sections: ManifestSections,
+    visible_keys: Option<&HashSet<String>>,
+    batcher: &mut ImportRefreshBatcher<'_, R>,
+) -> Result<(), TransferError>
+where
+    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
+{
+    let Some(visible_keys) = visible_keys else {
+        return Ok(());
+    };
     let base_key = crate::path_key::normalize_keep_drive(path);
-    let mut items = Vec::with_capacity(entry.virtual_items.len() + 1);
-    items.push(imported_page_state_presence(&base_key, &entry.page_state));
-    items.extend(entry.virtual_items.iter().map(|item| {
-        imported_page_state_presence(
-            &canonical_virtual_item_key(&base_key, &item.member_key),
-            &item.page_state,
+    let mut present = HashSet::with_capacity(entry.virtual_items.len().saturating_add(1));
+    present.insert(base_key.clone());
+    present.extend(
+        entry
+            .virtual_items
+            .iter()
+            .map(|item| canonical_virtual_item_key(&base_key, &item.member_key)),
+    );
+    let mut keys = Vec::with_capacity(IMPORT_REFRESH_BATCH_VALUES);
+    let mut bytes = 0_usize;
+    let mut started = std::time::Instant::now();
+    for key in visible_keys.iter().filter(|key| !present.contains(*key)) {
+        let key_bytes = key.len();
+        if !keys.is_empty()
+            && (keys.len() >= IMPORT_REFRESH_BATCH_VALUES
+                || bytes.saturating_add(key_bytes) > IMPORT_REFRESH_BATCH_BYTES
+                || started.elapsed() >= IMPORT_REFRESH_BATCH_TIME)
+        {
+            push_missing_visible_defaults(&base_key, sections, &mut keys, bytes, batcher)?;
+            bytes = 0;
+            started = std::time::Instant::now();
+        }
+        bytes = bytes.saturating_add(key_bytes);
+        keys.push(key.clone());
+    }
+    if !keys.is_empty() {
+        push_missing_visible_defaults(&base_key, sections, &mut keys, bytes, batcher)?;
+    }
+    Ok(())
+}
+
+fn push_missing_visible_defaults<R>(
+    base_key: &str,
+    sections: ManifestSections,
+    keys: &mut Vec<String>,
+    bytes: usize,
+    batcher: &mut ImportRefreshBatcher<'_, R>,
+) -> Result<(), TransferError>
+where
+    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
+{
+    let values = keys.len();
+    let keys = std::mem::take(keys);
+    let ratings = sections.ratings.then(|| {
+        keys.iter()
+            .map(|key| ImportedRatingValue {
+                key: key.clone(),
+                stars: 0,
+            })
+            .collect()
+    });
+    let tags = sections.tags.then(|| {
+        keys.iter()
+            .map(|key| ImportedTagsValue {
+                key: key.clone(),
+                tags: Vec::new(),
+                replace: true,
+            })
+            .collect()
+    });
+    let page_states = sections.page_state.then(|| {
+        keys.iter()
+            .map(|key| ImportedPageState {
+                key: key.clone(),
+                ..ImportedPageState::default()
+            })
+            .collect()
+    });
+    push_refresh_fragment(
+        ImportRefreshDelta {
+            any_entry_applied: true,
+            ratings_changed: sections.ratings,
+            tags_changed: sections.tags,
+            page_states_changed: sections.page_state,
+            visible_entries: vec![ImportedEntryMetadata {
+                base_key: base_key.to_string(),
+                ratings,
+                tags,
+                page_states,
+                ..ImportedEntryMetadata::default()
+            }],
+            ..ImportRefreshDelta::default()
+        },
+        values,
+        bytes,
+        batcher,
+    )
+}
+
+fn push_refresh_fragment<R>(
+    mut fragment: ImportRefreshDelta,
+    values: usize,
+    bytes: usize,
+    batcher: &mut ImportRefreshBatcher<'_, R>,
+) -> Result<(), TransferError>
+where
+    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
+{
+    let oversized = fragment
+        .visible_entries
+        .iter()
+        .enumerate()
+        .find_map(|(entry_index, entry)| {
+            entry
+                .tags
+                .as_ref()?
+                .iter()
+                .enumerate()
+                .find_map(|(value_index, value)| {
+                    (estimated_tags_value_bytes(value) > IMPORT_REFRESH_BATCH_BYTES)
+                        .then_some((entry_index, value_index))
+                })
+        });
+    let Some((entry_index, value_index)) = oversized else {
+        return batcher.push(fragment, values, bytes);
+    };
+
+    let value = fragment.visible_entries[entry_index]
+        .tags
+        .as_mut()
+        .expect("located above")
+        .remove(value_index);
+    let ImportedTagsValue { key, tags, .. } = value;
+    let mut tag_chunks = Vec::new();
+    let mut chunk_bytes = key.len();
+    let mut first_chunk = true;
+    for tag in tags {
+        let tag_bytes = tag.len();
+        if !tag_chunks.is_empty()
+            && (tag_chunks.len() >= IMPORT_REFRESH_BATCH_VALUES
+                || chunk_bytes.saturating_add(tag_bytes) > IMPORT_REFRESH_BATCH_BYTES)
+        {
+            push_tag_value_chunk(
+                &mut fragment,
+                entry_index,
+                value_index,
+                &key,
+                std::mem::take(&mut tag_chunks),
+                first_chunk,
+                chunk_bytes,
+                values,
+                batcher,
+            )?;
+            first_chunk = false;
+            chunk_bytes = key.len();
+        }
+        chunk_bytes = chunk_bytes.saturating_add(tag_bytes);
+        tag_chunks.push(tag);
+    }
+    // 空tagsも「置換してclear」という意味がある。
+    push_tag_value_chunk(
+        &mut fragment,
+        entry_index,
+        value_index,
+        &key,
+        tag_chunks,
+        first_chunk,
+        chunk_bytes,
+        values,
+        batcher,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_tag_value_chunk<R>(
+    original: &mut ImportRefreshDelta,
+    entry_index: usize,
+    value_index: usize,
+    key: &str,
+    tags: Vec<String>,
+    replace: bool,
+    bytes: usize,
+    original_values: usize,
+    batcher: &mut ImportRefreshBatcher<'_, R>,
+) -> Result<(), TransferError>
+where
+    R: FnMut(ImportRefreshDelta) -> Result<(), TransferError>,
+{
+    if replace {
+        original.visible_entries[entry_index]
+            .tags
+            .get_or_insert_with(Vec::new)
+            .insert(
+                value_index,
+                ImportedTagsValue {
+                    key: key.to_string(),
+                    tags,
+                    replace: true,
+                },
+            );
+        batcher.push(
+            std::mem::take(original),
+            original_values.max(1),
+            bytes.min(IMPORT_REFRESH_BATCH_BYTES),
         )
-    }));
-    ImportedPageStateFamily { base_key, items }
+    } else {
+        batcher.push(
+            ImportRefreshDelta {
+                any_entry_applied: true,
+                tags_changed: true,
+                visible_entries: vec![ImportedEntryMetadata {
+                    base_key: key
+                        .split_once("::")
+                        .map_or(key, |(base_key, _)| base_key)
+                        .to_string(),
+                    tags: Some(vec![ImportedTagsValue {
+                        key: key.to_string(),
+                        tags,
+                        replace: false,
+                    }]),
+                    ..ImportedEntryMetadata::default()
+                }],
+                ..ImportRefreshDelta::default()
+            },
+            1,
+            bytes.min(IMPORT_REFRESH_BATCH_BYTES),
+        )
+    }
+}
+
+fn estimated_tags_value_bytes(value: &ImportedTagsValue) -> usize {
+    value
+        .key
+        .len()
+        .saturating_add(value.tags.iter().map(|tag| tag.len()).sum::<usize>())
+}
+
+fn estimated_json_bytes<T: Serialize>(value: &T) -> usize {
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buffer.len());
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map(|()| counter.0)
+        .unwrap_or(MAX_RECORD_BYTES as usize)
+}
+
+fn estimated_physical_refresh_bytes(path: &Path, entry: &PortableEntry) -> usize {
+    path.as_os_str()
+        .to_string_lossy()
+        .len()
+        .saturating_add(estimated_json_bytes(&entry.rating))
+        .saturating_add(estimated_json_bytes(&entry.tags))
+        .saturating_add(estimated_json_bytes(&entry.page_state))
+        .saturating_add(estimated_json_bytes(&entry.container_state))
+        .saturating_add(estimated_json_bytes(&entry.video_pin))
 }
 
 /// 仮想項目のDB identity。ZIP member名は表示・manifestではcaseを保持するが、
@@ -800,56 +1231,65 @@ fn canonical_member_key(member_key: &str) -> String {
     member_key.replace('\\', "/").to_lowercase()
 }
 
-fn imported_page_state_presence(key: &str, state: &PortablePageState) -> ImportedPageStatePresence {
-    ImportedPageStatePresence {
-        key: key.to_string(),
-        adjusted: state.adjustment.is_some(),
-        local_adjusted: state.local_adjust_layers.is_some(),
-        masked: state.mask.is_some(),
-        concealed: state.conceal.is_some(),
-        comic: state.comic.is_some(),
-        rotated: state.rotation_degrees.is_some(),
-    }
-}
-
 fn imported_entry_metadata(
     path: &Path,
     entry: &PortableEntry,
     sections: ManifestSections,
+    virtual_range: std::ops::Range<usize>,
+    nested_range: std::ops::Range<usize>,
+    replace: bool,
 ) -> ImportedEntryMetadata {
     let base_key = crate::path_key::normalize_keep_drive(path);
     let item_key = |member: &str| canonical_virtual_item_key(&base_key, member);
 
     let ratings = sections.ratings.then(|| {
-        let mut values = Vec::with_capacity(entry.virtual_items.len() + 1);
-        values.push(ImportedRatingValue {
-            key: base_key.clone(),
-            stars: entry.rating.as_ref().map_or(0, |rating| rating.stars),
-        });
-        values.extend(entry.virtual_items.iter().map(|item| ImportedRatingValue {
-            key: item_key(&item.member_key),
-            stars: item.rating.as_ref().map_or(0, |rating| rating.stars),
-        }));
+        let mut values =
+            Vec::with_capacity(virtual_range.len().saturating_add(usize::from(replace)));
+        if replace {
+            values.push(ImportedRatingValue {
+                key: base_key.clone(),
+                stars: entry.rating.as_ref().map_or(0, |rating| rating.stars),
+            });
+        }
+        values.extend(
+            entry.virtual_items[virtual_range.clone()]
+                .iter()
+                .map(|item| ImportedRatingValue {
+                    key: item_key(&item.member_key),
+                    stars: item.rating.as_ref().map_or(0, |rating| rating.stars),
+                }),
+        );
         values
     });
     let tags = sections.tags.then(|| {
-        let mut values = Vec::with_capacity(entry.virtual_items.len() + 1);
-        values.push(ImportedTagsValue {
-            key: base_key.clone(),
-            tags: entry.tags.clone(),
-        });
-        values.extend(entry.virtual_items.iter().map(|item| ImportedTagsValue {
-            key: item_key(&item.member_key),
-            tags: item.tags.clone(),
-        }));
+        let mut values =
+            Vec::with_capacity(virtual_range.len().saturating_add(usize::from(replace)));
+        if replace {
+            values.push(ImportedTagsValue {
+                key: base_key.clone(),
+                tags: entry.tags.clone(),
+                replace: true,
+            });
+        }
+        values.extend(
+            entry.virtual_items[virtual_range.clone()]
+                .iter()
+                .map(|item| ImportedTagsValue {
+                    key: item_key(&item.member_key),
+                    tags: item.tags.clone(),
+                    replace: true,
+                }),
+        );
         values
     });
     let page_states = sections.page_state.then(|| {
-        let mut items = Vec::with_capacity(entry.virtual_items.len() + 1);
-        items.push(imported_page_state(&base_key, &entry.page_state));
+        let mut items =
+            Vec::with_capacity(virtual_range.len().saturating_add(usize::from(replace)));
+        if replace {
+            items.push(imported_page_state(&base_key, &entry.page_state));
+        }
         items.extend(
-            entry
-                .virtual_items
+            entry.virtual_items[virtual_range.clone()]
                 .iter()
                 .map(|item| imported_page_state(&item_key(&item.member_key), &item.page_state)),
         );
@@ -868,54 +1308,69 @@ fn imported_entry_metadata(
         || crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some();
     let container_states = (sections.container_state && can_have_container_state).then(|| {
         let stripped_base = crate::path_key::normalize(path);
-        let mut items = Vec::with_capacity(entry.nested_containers.len() + 1);
-        items.push(imported_container_state(
-            stripped_base.clone(),
-            &entry.container_state,
-        ));
-        items.extend(entry.nested_containers.iter().map(|container| {
-            imported_container_state(
-                join_container_key(&stripped_base, &container.member_key),
-                &container.state,
-            )
-        }));
+        let mut items = Vec::with_capacity(nested_range.len().saturating_add(usize::from(replace)));
+        if replace {
+            items.push(imported_container_state(
+                stripped_base.clone(),
+                &entry.container_state,
+            ));
+        }
+        items.extend(
+            entry.nested_containers[nested_range.clone()]
+                .iter()
+                .map(|container| {
+                    imported_container_state(
+                        join_container_key(&stripped_base, &container.member_key),
+                        &container.state,
+                    )
+                }),
+        );
         ImportedContainerStateFamily {
             base_key: stripped_base,
             include_nested,
+            replace,
             items,
         }
     });
     let folder_pins = (sections.thumbnail_pins && can_have_container_state).then(|| {
-        let mut items = Vec::with_capacity(entry.nested_containers.len() + 1);
-        if let Some(source) = entry
-            .container_state
-            .folder_thumb_pin
-            .as_ref()
-            .and_then(portable_folder_pin_source)
-        {
-            items.push(ImportedFolderPinValue {
-                key: base_key.clone(),
-                source,
-            });
-        }
-        items.extend(entry.nested_containers.iter().filter_map(|container| {
-            let source = container
-                .state
+        let mut items = Vec::with_capacity(nested_range.len().saturating_add(usize::from(replace)));
+        if replace {
+            if let Some(source) = entry
+                .container_state
                 .folder_thumb_pin
                 .as_ref()
-                .and_then(portable_folder_pin_source)?;
-            Some(ImportedFolderPinValue {
-                key: join_container_key(&base_key, &container.member_key),
-                source,
-            })
-        }));
+                .and_then(portable_folder_pin_source)
+            {
+                items.push(ImportedFolderPinValue {
+                    key: base_key.clone(),
+                    source,
+                });
+            }
+        }
+        items.extend(
+            entry.nested_containers[nested_range]
+                .iter()
+                .filter_map(|container| {
+                    let source = container
+                        .state
+                        .folder_thumb_pin
+                        .as_ref()
+                        .and_then(portable_folder_pin_source)?;
+                    Some(ImportedFolderPinValue {
+                        key: join_container_key(&base_key, &container.member_key),
+                        source,
+                    })
+                }),
+        );
         ImportedFolderPinFamily {
             base_key: base_key.clone(),
             include_nested,
+            replace,
             items,
         }
     });
     let video_pin = (sections.thumbnail_pins
+        && replace
         && crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()))
     .then(|| ImportedVideoPinChange {
         key: base_key.clone(),
@@ -4075,10 +4530,10 @@ fn relative_string(root: &Path, path: &Path) -> Result<String, TransferError> {
 }
 
 fn is_temp_sidecar_name(name: &std::ffi::OsStr) -> bool {
-    name.to_str().is_some_and(|name| {
-        let name = name.to_ascii_lowercase();
-        name.starts_with(&format!(".{SIDECAR_FILENAME}.")) && name.ends_with(".tmp")
-    })
+    crate::fs_entry::is_internal_app_entry_name(name)
+        && !name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(SIDECAR_FILENAME)
 }
 
 fn is_sidecar_name(name: &std::ffi::OsStr) -> bool {
@@ -4546,6 +5001,7 @@ mod tests {
         let raw_key = format!("{base_key}::{mixed_member}");
         let refresh_scope = ImportRefreshScope {
             base_keys: HashSet::from([base_key.clone()]),
+            ..ImportRefreshScope::default()
         };
         let mut refreshes = Vec::new();
         let summary = import_at_with_refresh_scope(
@@ -4606,6 +5062,8 @@ mod tests {
                 .unwrap(),
             90
         );
+        let snapshot = load_import_page_state_snapshot(&data_dir).unwrap();
+        assert!(snapshot.rotated.contains(&canonical_key));
         let stripped_base = crate::path_key::normalize(&root.join("book.zip"));
         let canonical_container_key = join_container_key(&stripped_base, mixed_container);
         let raw_container_key = format!("{stripped_base}/{mixed_container}");
@@ -4629,10 +5087,6 @@ mod tests {
                 )
                 .unwrap(),
             0
-        );
-        assert_eq!(
-            refreshes[0].page_state_families[0].items[1].key,
-            canonical_key
         );
         let refreshed = &refreshes[0].visible_entries[0];
         assert_eq!(refreshed.ratings.as_ref().unwrap()[1].key, canonical_key);
@@ -4697,6 +5151,154 @@ mod tests {
             Err(TransferError::Invalid(message))
                 if message.contains("仮想コンテナキーが不正または重複")
         ));
+    }
+
+    #[test]
+    fn refresh_fragments_bound_virtual_items_and_emit_missing_visible_defaults() {
+        let path = PathBuf::from("C:/Pictures/book.zip");
+        let base_key = crate::path_key::normalize_keep_drive(&path);
+        let virtual_items = (0..700)
+            .map(|index| PortableVirtualItem {
+                member_key: format!("pages/{index:04}.jpg"),
+                rating: Some(PortableRating {
+                    stars: 4,
+                    rated_at_ms: None,
+                    kind: Some("zip_image".to_string()),
+                    entry_name: None,
+                    page_num: None,
+                    dir_prefix: None,
+                    archive_format: None,
+                    zipdir_is_archive: None,
+                    zipdir_representative: None,
+                }),
+                tags: vec!["tag".to_string()],
+                page_state: PortablePageState::default(),
+            })
+            .collect();
+        let entry = PortableEntry {
+            path: "book.zip".to_string(),
+            kind: PortableEntryKind::File,
+            fingerprint: None,
+            rating: None,
+            tags: Vec::new(),
+            timed_bookmarks: Vec::new(),
+            book_bookmarks: Vec::new(),
+            page_state: PortablePageState::default(),
+            container_state: PortableContainerState::default(),
+            nested_containers: Vec::new(),
+            video_pin: None,
+            virtual_items,
+        };
+        let missing_key = canonical_virtual_item_key(&base_key, "pages/missing.jpg");
+        let visible_keys = HashSet::from([base_key.clone(), missing_key.clone()]);
+        let mut refreshes = Vec::new();
+        {
+            let mut callback = |refresh| {
+                refreshes.push(refresh);
+                Ok(())
+            };
+            let mut batcher = ImportRefreshBatcher {
+                callback: &mut callback,
+                batch: ImportRefreshDelta::default(),
+                values: 0,
+                bytes: 0,
+                started: std::time::Instant::now(),
+            };
+            emit_import_refresh_fragments(
+                &path,
+                &entry,
+                ManifestSections::default(),
+                true,
+                Some(&visible_keys),
+                &mut batcher,
+            )
+            .unwrap();
+            batcher.flush().unwrap();
+        }
+
+        assert!(refreshes.len() >= 3);
+        assert!(refreshes.iter().all(|refresh| {
+            refresh
+                .visible_entries
+                .iter()
+                .map(|entry| entry.page_states.as_ref().map_or(0, Vec::len))
+                .sum::<usize>()
+                <= IMPORT_REFRESH_BATCH_VALUES
+        }));
+        let missing = refreshes
+            .iter()
+            .flat_map(|refresh| &refresh.visible_entries)
+            .flat_map(|entry| entry.ratings.as_deref().unwrap_or_default())
+            .find(|value| value.key == missing_key)
+            .expect("visible member absent from manifest receives an explicit reset");
+        assert_eq!(missing.stars, 0);
+    }
+
+    #[test]
+    fn refresh_fragments_split_one_items_large_tag_list_for_incremental_replace() {
+        let path = PathBuf::from("C:/Pictures/image.jpg");
+        let expected = (0..1_000)
+            .map(|index| format!("tag-{index:04}-{}", "x".repeat(600)))
+            .collect::<Vec<_>>();
+        let entry = PortableEntry {
+            path: "image.jpg".to_string(),
+            kind: PortableEntryKind::File,
+            fingerprint: None,
+            rating: None,
+            tags: expected.clone(),
+            timed_bookmarks: Vec::new(),
+            book_bookmarks: Vec::new(),
+            page_state: PortablePageState::default(),
+            container_state: PortableContainerState::default(),
+            nested_containers: Vec::new(),
+            video_pin: None,
+            virtual_items: Vec::new(),
+        };
+        let mut refreshes = Vec::new();
+        {
+            let mut callback = |refresh| {
+                refreshes.push(refresh);
+                Ok(())
+            };
+            let mut batcher = ImportRefreshBatcher {
+                callback: &mut callback,
+                batch: ImportRefreshDelta::default(),
+                values: 0,
+                bytes: 0,
+                started: std::time::Instant::now(),
+            };
+            emit_import_refresh_fragments(
+                &path,
+                &entry,
+                ManifestSections::default(),
+                true,
+                None,
+                &mut batcher,
+            )
+            .unwrap();
+            batcher.flush().unwrap();
+        }
+
+        let tag_values = refreshes
+            .iter()
+            .flat_map(|refresh| &refresh.visible_entries)
+            .flat_map(|entry| entry.tags.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(tag_values.len() > 1);
+        assert!(tag_values[0].replace);
+        assert!(tag_values.iter().skip(1).all(|value| !value.replace));
+        assert_eq!(
+            tag_values
+                .iter()
+                .flat_map(|value| value.tags.iter().cloned())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            tag_values
+                .iter()
+                .all(|value| estimated_tags_value_bytes(value) <= IMPORT_REFRESH_BATCH_BYTES)
+        );
     }
 
     #[test]
@@ -5140,6 +5742,7 @@ mod tests {
         let listed_key = crate::path_key::normalize_keep_drive(&destination.join("listed.jpg"));
         let refresh_scope = ImportRefreshScope {
             base_keys: HashSet::from([listed_key.clone()]),
+            ..ImportRefreshScope::default()
         };
         let mut refreshes = Vec::new();
         let _summary = import_at_with_refresh_scope(
@@ -5154,15 +5757,16 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(refreshes[0].visible_entries.len(), 1);
-        assert_eq!(refreshes[0].visible_entries[0].base_key, listed_key);
+        let visible_entries = refreshes
+            .iter()
+            .flat_map(|refresh| &refresh.visible_entries)
+            .collect::<Vec<_>>();
+        assert_eq!(visible_entries.len(), 1);
+        assert_eq!(visible_entries[0].base_key, listed_key);
         assert_eq!(
-            refreshes
-                .first()
-                .unwrap()
-                .visible_entries
-                .first()
-                .and_then(|entry| entry.ratings.as_ref())
+            visible_entries[0]
+                .ratings
+                .as_ref()
                 .and_then(|ratings| ratings.first())
                 .map(|rating| rating.stars),
             Some(0)
@@ -5378,7 +5982,7 @@ mod tests {
             |refresh| {
                 saw_rating_change |= refresh.ratings_changed;
                 saw_tag_change |= refresh.tags_changed;
-                batch_sizes.push(refresh.page_state_families.len());
+                batch_sizes.push(refresh.committed_entries);
                 Ok(())
             },
         )
@@ -5388,7 +5992,7 @@ mod tests {
         assert!(
             batch_sizes
                 .iter()
-                .all(|size| *size <= IMPORT_REFRESH_BATCH_ENTRIES)
+                .all(|size| *size <= IMPORT_REFRESH_BATCH_VALUES)
         );
         assert!(batch_sizes.len() >= 3);
         assert!(saw_rating_change);
@@ -5457,7 +6061,7 @@ mod tests {
                 }
             },
             |refresh| {
-                refreshed += refresh.page_state_families.len();
+                refreshed += refresh.committed_entries;
                 Ok(())
             },
         )

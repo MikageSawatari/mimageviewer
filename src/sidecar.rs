@@ -754,6 +754,9 @@ pub(crate) fn mark_hidden_system(path: &Path) {
     }
 }
 
+#[cfg(not(windows))]
+pub(crate) fn mark_hidden_system(_path: &Path) {}
+
 #[cfg(windows)]
 fn clear_hidden_system(path: &Path) {
     use std::os::windows::ffi::OsStrExt;

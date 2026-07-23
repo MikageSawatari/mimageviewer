@@ -14,8 +14,8 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::metadata_transfer::{
-    ExportSummary, ImportPreview, ImportRefreshDelta, ImportSummary, TransferError, TransferPhase,
-    TransferProgress,
+    ExportSummary, ImportPreview, ImportRefreshDelta, ImportRefreshScope, ImportSummary,
+    TransferError, TransferPhase, TransferProgress,
 };
 
 const WORKER_CHANNEL_CAPACITY: usize = 1;
@@ -52,6 +52,7 @@ enum WorkerMessage {
     Import {
         result: Result<ImportSummary, String>,
         resource_error: Option<String>,
+        page_state_snapshot: Option<crate::metadata_transfer::ImportPageStateSnapshot>,
         view_trim_saved: bool,
     },
 }
@@ -101,6 +102,8 @@ pub(crate) struct MetadataTransferState {
     handle: Option<std::thread::JoinHandle<()>>,
     import_resources: Option<Arc<Mutex<ImportWorkerResources>>>,
     pending_view_trim: Option<crate::ui_view_trim::PendingViewTrimTransfer>,
+    import_refresh_scope: ImportRefreshScope,
+    import_refresh_preparing: bool,
 }
 
 impl MetadataTransferState {
@@ -116,6 +119,8 @@ impl MetadataTransferState {
             handle: None,
             import_resources: None,
             pending_view_trim: None,
+            import_refresh_scope: ImportRefreshScope::default(),
+            import_refresh_preparing: false,
         }
     }
 
@@ -131,6 +136,8 @@ impl MetadataTransferState {
             handle: None,
             import_resources: None,
             pending_view_trim: None,
+            import_refresh_scope: ImportRefreshScope::default(),
+            import_refresh_preparing: false,
         }
     }
 }
@@ -232,11 +239,44 @@ impl App {
         }
         self.poll_metadata_transfer_worker();
 
-        let should_start = self.metadata_transfer.as_ref().is_some_and(|state| {
+        let writers_ready = self.metadata_transfer.as_ref().is_some_and(|state| {
             matches!(state.stage, Stage::WaitingForWriters)
                 && !self.metadata_transfer_writers_busy()
         });
-        if should_start {
+        if writers_ready
+            && self.metadata_transfer.as_ref().is_some_and(|state| {
+                state.operation == Operation::Import && !state.import_refresh_preparing
+            })
+        {
+            self.begin_metadata_import_refresh_scope();
+            if let Some(state) = self.metadata_transfer.as_mut() {
+                state.import_refresh_preparing = true;
+                state.import_refresh_scope = ImportRefreshScope::default();
+            }
+        }
+        let import_refresh_ready = if writers_ready
+            && self.metadata_transfer.as_ref().is_some_and(|state| {
+                state.operation == Operation::Import && state.import_refresh_preparing
+            }) {
+            let mut scope = self
+                .metadata_transfer
+                .as_mut()
+                .map(|state| std::mem::take(&mut state.import_refresh_scope))
+                .unwrap_or_default();
+            let ready = self.advance_metadata_import_refresh_scope(&mut scope);
+            if let Some(state) = self.metadata_transfer.as_mut() {
+                state.import_refresh_scope = scope;
+            }
+            ready
+        } else {
+            false
+        };
+        let should_start_worker = writers_ready
+            && self.metadata_transfer.as_ref().is_some_and(|state| {
+                state.operation == Operation::Export
+                    || (state.operation == Operation::Import && import_refresh_ready)
+            });
+        if should_start_worker {
             let operation = self
                 .metadata_transfer
                 .as_ref()
@@ -264,7 +304,11 @@ impl App {
                     // JSON serialize / temp write / rename and tags.db journal-mode
                     // handoff are part of the worker preparation stage.  Move their
                     // ownership instead of doing file I/O on the UI thread.
-                    let refresh_scope = self.metadata_import_refresh_scope();
+                    let refresh_scope = self
+                        .metadata_transfer
+                        .as_mut()
+                        .map(|state| std::mem::take(&mut state.import_refresh_scope))
+                        .unwrap_or_default();
                     let resources = ImportWorkerResources {
                         sidecars: std::mem::take(&mut self.sidecars),
                         tags_db: self.tags_db.take(),
@@ -368,6 +412,7 @@ impl App {
         }
         let mut imported_refresh = None;
         let mut import_finished = false;
+        let mut page_state_snapshot = None;
         let mut restore_view_trim = None;
         for message in messages {
             let Some(state) = self.metadata_transfer.as_mut() else {
@@ -400,8 +445,10 @@ impl App {
                 WorkerMessage::Import {
                     mut result,
                     resource_error,
+                    page_state_snapshot: snapshot,
                     view_trim_saved,
                 } => {
+                    page_state_snapshot = snapshot;
                     if view_trim_saved {
                         state.pending_view_trim = None;
                     } else {
@@ -454,6 +501,9 @@ impl App {
         self.restore_metadata_import_resources();
         if let Some(refresh) = imported_refresh {
             self.refresh_after_metadata_transfer_import(refresh);
+        }
+        if let Some(snapshot) = page_state_snapshot {
+            self.replace_metadata_import_page_state_snapshot(snapshot);
         }
         if import_finished {
             self.finish_metadata_transfer_import_refresh();
@@ -573,7 +623,11 @@ fn draw_dialog(
                 }
             }
             Stage::WaitingForWriters => {
-                ui.label("実行中のメタ情報書き込みが完了するのを待っています…");
+                ui.label(if state.import_refresh_preparing {
+                    "表示更新の準備をしています…"
+                } else {
+                    "実行中のメタ情報書き込みが完了するのを待っています…"
+                });
                 ui.spinner();
                 ui.small("待機中も安全にキャンセルできます。");
                 if ui.button("キャンセル").clicked() || escape_pressed {
@@ -875,7 +929,7 @@ fn start_import_worker(
             // Reopening restores tags.db to its normal WAL mode before the UI
             // regains ownership.  Report a reopen failure even when DB import
             // itself succeeded; the caller still extracts the applied-key delta.
-            let (tags_db, resource_error) =
+            let (tags_db, mut resource_error) =
                 match crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")) {
                     Ok(tags_db) => (Some(tags_db), None),
                     Err(error) => (None, Some(format!("タグDBを再開できませんでした: {error}"))),
@@ -887,9 +941,23 @@ fn start_import_worker(
                 };
                 resources.tags_db = tags_db;
             }
+            let page_state_snapshot =
+                match crate::metadata_transfer::load_import_page_state_snapshot(&data_dir) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        let error = format!("編集状態索引を再構築できませんでした: {error}");
+                        crate::logger::log(format!("metadata import: {error}"));
+                        resource_error = Some(
+                            resource_error
+                                .map_or(error.clone(), |existing| format!("{existing}\n{error}")),
+                        );
+                        None
+                    }
+                };
             let _ = tx.send(WorkerMessage::Import {
                 result,
                 resource_error,
+                page_state_snapshot,
                 view_trim_saved,
             });
         });

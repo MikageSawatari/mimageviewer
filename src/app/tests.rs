@@ -43,6 +43,7 @@ fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
         (first_key.clone(), vec!["old".to_string()]),
         (second_key.clone(), vec!["keep".to_string()]),
     ]);
+    let _scope = app.metadata_import_refresh_scope();
     // Any accidental UI-thread fallback would now be unable to query SQLite.
     app.rating_db = None;
     app.tags_db = None;
@@ -51,15 +52,6 @@ fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
         any_entry_applied: true,
         ratings_changed: true,
         tags_changed: true,
-        page_state_families: vec![crate::metadata_transfer::ImportedPageStateFamily {
-            base_key: first_key.clone(),
-            items: vec![crate::metadata_transfer::ImportedPageStatePresence {
-                key: first_key.clone(),
-                adjusted: true,
-                rotated: true,
-                ..Default::default()
-            }],
-        }],
         visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
             base_key: first_key.clone(),
             ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
@@ -69,6 +61,7 @@ fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
             tags: Some(vec![crate::metadata_transfer::ImportedTagsValue {
                 key: first_key.clone(),
                 tags: vec!["new".to_string()],
+                replace: true,
             }]),
             page_states: Some(vec![crate::metadata_transfer::ImportedPageState {
                 key: first_key.clone(),
@@ -142,19 +135,12 @@ fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
     detached.folder_pin_map =
         std::collections::HashMap::from([(base_key.clone(), old_pin.clone())]);
     app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
+    let _scope = app.metadata_import_refresh_scope();
 
     // UI-thread DB fallbackがなくても両contextを更新できることを固定する。
     app.rating_db = None;
     app.tags_db = None;
     let refresh = crate::metadata_transfer::ImportRefreshDelta {
-        page_state_families: vec![crate::metadata_transfer::ImportedPageStateFamily {
-            base_key: base_key.clone(),
-            items: vec![crate::metadata_transfer::ImportedPageStatePresence {
-                key: page_key.clone(),
-                rotated: true,
-                ..Default::default()
-            }],
-        }],
         visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
             base_key: base_key.clone(),
             ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
@@ -164,6 +150,7 @@ fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
             tags: Some(vec![crate::metadata_transfer::ImportedTagsValue {
                 key: page_key.clone(),
                 tags: vec!["imported".to_string()],
+                replace: true,
             }]),
             page_states: Some(vec![crate::metadata_transfer::ImportedPageState {
                 key: page_key.clone(),
@@ -174,6 +161,7 @@ fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
             folder_pins: Some(crate::metadata_transfer::ImportedFolderPinFamily {
                 base_key: base_key.clone(),
                 include_nested: true,
+                replace: true,
                 items: vec![crate::metadata_transfer::ImportedFolderPinValue {
                     key: base_key.clone(),
                     source: new_pin.clone(),
@@ -268,6 +256,65 @@ fn metadata_import_refresh_scope_includes_unmounted_detached_context() {
     assert!(
         scope.contains(&crate::path_key::normalize_keep_drive(&detached_book)),
         "unmounted detached context must receive a worker-produced refresh delta"
+    );
+}
+
+#[test]
+fn metadata_import_refresh_index_build_is_split_across_frames() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..5_000)
+        .map(|index| GridItem::Image(PathBuf::from(format!("C:/Pictures/{index:05}.jpg"))))
+        .collect();
+    app.begin_metadata_import_refresh_scope();
+    let mut scope = crate::metadata_transfer::ImportRefreshScope::default();
+
+    assert!(!app.advance_metadata_import_refresh_scope(&mut scope));
+    let first_frame_items = app
+        .metadata_import_refresh_index
+        .as_ref()
+        .expect("index preparation started")
+        .next_item;
+    assert!((1..=2_048).contains(&first_frame_items));
+
+    while !app.advance_metadata_import_refresh_scope(&mut scope) {}
+    assert_eq!(
+        app.metadata_import_refresh_index
+            .as_ref()
+            .expect("index completed")
+            .next_item,
+        5_000
+    );
+}
+
+#[test]
+fn metadata_import_refresh_rejects_stale_raw_index_after_items_generation_change() {
+    let mut app = phase_c_support::setup_app();
+    let old = PathBuf::from("C:/Pictures/old.jpg");
+    let replacement = PathBuf::from("C:/Pictures/replacement.jpg");
+    let old_key = crate::path_key::normalize_keep_drive(&old);
+    app.items = vec![GridItem::Image(old)];
+    app.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    let _scope = app.metadata_import_refresh_scope();
+
+    app.items = vec![GridItem::Image(replacement)];
+    app.items_generation = app.items_generation.wrapping_add(1);
+    app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
+        any_entry_applied: true,
+        visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
+            base_key: old_key.clone(),
+            ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {
+                key: old_key,
+                stars: 5,
+            }]),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    assert_eq!(
+        app.rating_cache.get(&0),
+        Some(&2),
+        "same raw index in a newer list must not receive the old item's delta"
     );
 }
 
