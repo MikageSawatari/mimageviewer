@@ -176,10 +176,12 @@ detached independent open では使わない。
 cancel / epoch / password / archive conversion などのコアは共有し、結果の sink だけを
 main `start_loading_items` または active viewer context へ分岐する。
 
-通常画像 (`Image` / 既に main context に存在する `ZipImage` / `PdfPage`) を開く経路は、
-元々 main `items` を差し替えないため detached 専用 container open の対象外にする。
-既存の passive snapshot + active viewer 退避モデルを使う。新規 detached pending は、
-main がページ一覧へ遷移してしまうコンテナ open 問題に絞る。
+通常画像 (`Image` / 既に main context に存在する `ZipImage` / `PdfPage`) は detached 専用の
+container 列挙 pending を作らない。ただし always-new detached として grid から新規 open する
+場合は、main 一覧 snapshot から独立 `ActiveViewerContext` を作って、その context 内で
+`open_fullscreen` する。これにより main `items` を差し替えず、通常画像の folder-nav / close /
+非同期画像 load も main から分離する。物理起点は開いた Image の実親、または ZIP / PDF
+container path とし、main が検索・絞り込み surface でも同期再 scan は行わない。
 
 横断ブックマーク一覧から動画・音声を別ウィンドウで開く場合も、同じ context ownership 境界を使う。
 前後ファイル移動のために実フォルダの `items` が必要でも、main を実フォルダへ遷移させてから
@@ -329,6 +331,11 @@ active viewer 内のキーは active context へ作用する。
   `update_active_detached_viewer_context` の mount 中だけ poll / apply / chain し、
   root/main poll が detached request を受け取らないようにする。pause / Drop は
   cancel token を立てて pending と連打を破棄する。
+- 同 stage の実機フィードバックで、通常画像だけ legacy/unbundled のまま open されて
+  `active_context=false` となる経路を確認した。通常画像の新規 always-new grid open は、
+  main 一覧 identity と描画 read model を複製した `DetachedPhysical` bundle へ open 前に
+  ルーティングする。main の worker 複合体・dirty/pending は移さず、detached 側には別
+  items generation を割り当てる。
 - independent still context は物理ナビゲーションスコープを持つ。main の検索、絞り込み、
   ★固定、smart/subfolder view は detached load と先頭ページ選定へ適用せず、main 側の
   filter scope や pending open も変更しない。linked viewer と media window は従来スコープを維持する。

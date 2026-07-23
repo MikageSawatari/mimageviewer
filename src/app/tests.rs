@@ -1078,18 +1078,33 @@ fn auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detach
     app.load_folder(folder.clone());
 
     assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
-    assert_eq!(app.fullscreen_idx, Some(0));
-    assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    assert_eq!(
+        app.fullscreen_idx, None,
+        "the auto-opened image viewer must not remain bundled with main"
+    );
+    let active = app
+        .active_detached_viewer_context
+        .as_ref()
+        .expect("the auto-opened image folder must own an active context");
+    assert_eq!(active.bundle.fullscreen_idx, Some(0));
+    assert_eq!(
+        active.bundle.viewer_session.presentation,
+        ViewerPresentation::DetachedWindow
+    );
+    assert_eq!(
+        active.bundle.navigation_scope,
+        ViewerNavigationScope::DetachedPhysical
+    );
     assert!(
         app.detached_viewer_focus_requested,
         "image-only folder auto fullscreen happens after enumeration, but it is still an explicit grid/open request and must focus the new detached window"
     );
     assert!(
-        app.detached_viewer_window_id.is_some(),
+        active.bundle.viewer_session.detached_window_id.is_some(),
         "always-new detached image folders should allocate a detached viewport instead of treating the open as continuation navigation"
     );
     assert!(
-        !app.fs_open_intent_from_grid,
+        !app.fs_open_intent_from_grid && !active.bundle.fs_open_intent_from_grid,
         "open_fullscreen consumes the restored grid intent"
     );
 }
@@ -24471,7 +24486,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn always_new_detached_ctrl_nav_handler_consumes_without_folder_nav() {
+    fn legacy_unbundled_detached_ctrl_nav_handler_consumes_without_folder_nav() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let image = push_image(&mut app, r"C:\pics\a.jpg");
@@ -24507,6 +24522,124 @@ mod still_window_mode_key_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normal_image_grid_open_promotes_to_physical_context_before_ctrl_nav() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = temp.path().join("01");
+        let second = temp.path().join("02");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let hidden = first.join("a.jpg");
+        let opened = first.join("b.jpg");
+        let main_surface = temp.path().join("search-results");
+        std::fs::write(&hidden, b"fixture").unwrap();
+        std::fs::write(&opened, b"fixture").unwrap();
+        std::fs::write(second.join("c.jpg"), b"fixture").unwrap();
+
+        app.current_folder = Some(main_surface.clone());
+        let hidden_idx = push_image(&mut app, hidden.to_str().unwrap());
+        let opened_idx = push_image(&mut app, opened.to_str().unwrap());
+        insert_static_fs_entry(&mut app, &ctx, opened_idx, "promoted_normal_image");
+        app.visible_indices = vec![opened_idx];
+        app.search_filter = Some(std::collections::HashSet::from([opened_idx]));
+        app.show_search_bar = true;
+        app.selected = Some(opened_idx);
+        app.scroll_offset_y = 321.0;
+        app.pending_folder_nav_steps = -2;
+        app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fs_open_intent_from_grid = true;
+        let main_items_generation = app.items_generation;
+        let mut passive_bundle = ViewerContextBundle::empty();
+        passive_bundle.items = vec![GridItem::Image(temp.path().join("parked.jpg"))];
+        passive_bundle.fullscreen_idx = Some(0);
+        passive_bundle
+            .viewer_session
+            .activate_independent_detached(77);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 77, passive_bundle));
+
+        app.open_fullscreen(opened_idx);
+
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "the main grid must not retain an unbundled fullscreen owner"
+        );
+        assert_eq!(app.navigation_scope, ViewerNavigationScope::Main);
+        assert_eq!(app.current_folder, Some(main_surface.clone()));
+        assert_eq!(app.items_generation, main_items_generation);
+        assert_eq!(app.visible_indices, vec![opened_idx]);
+        assert_eq!(
+            app.search_filter,
+            Some(std::collections::HashSet::from([opened_idx]))
+        );
+        assert!(app.show_search_bar);
+        assert_eq!(app.selected, Some(opened_idx));
+        assert_eq!(app.scroll_offset_y, 321.0);
+        assert_eq!(app.pending_folder_nav_steps, -2);
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
+        assert_eq!(
+            app.detached_image_windows.len(),
+            1,
+            "opening the active physical context must not close an existing passive viewer"
+        );
+
+        app.with_active_detached_viewer_context(|mounted| {
+            assert_eq!(
+                mounted.navigation_scope,
+                ViewerNavigationScope::DetachedPhysical
+            );
+            assert_eq!(mounted.current_folder, Some(first.clone()));
+            assert_ne!(
+                mounted.items_generation, main_items_generation,
+                "detached worker results need a context generation distinct from main"
+            );
+            assert_eq!(mounted.visible_indices, vec![hidden_idx, opened_idx]);
+            assert_eq!(mounted.fullscreen_idx, Some(opened_idx));
+            assert!(mounted.detached_viewer_independent_still_session());
+            assert!(mounted.detached_physical_folder_nav_available());
+
+            mounted.handle_fullscreen_ctrl_nav_context(&ctx, opened_idx, true, false);
+
+            assert!(
+                mounted.folder_nav_pending.is_some(),
+                "Ctrl+Down must create the request in the detached bundle"
+            );
+            assert_eq!(mounted.pending_folder_nav_mode.perf_tag(), "fullscreen");
+            assert!(
+                mounted.fs_boundary_hint.is_none(),
+                "the promoted normal-image route must not fall back to the legacy detached no-op"
+            );
+        })
+        .expect("normal image open must create an active detached context");
+
+        assert_eq!(app.current_folder, Some(main_surface));
+        assert_eq!(app.visible_indices, vec![opened_idx]);
+        assert_eq!(
+            app.search_filter,
+            Some(std::collections::HashSet::from([opened_idx]))
+        );
+        assert!(app.show_search_bar);
+        assert_eq!(app.selected, Some(opened_idx));
+        assert_eq!(app.scroll_offset_y, 321.0);
+        assert_eq!(app.pending_folder_nav_steps, -2);
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(
+            app.detached_image_windows.len(),
+            1,
+            "Ctrl+Down in the active context must not close a sibling image window"
+        );
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.folder_nav_pending.is_some())
+        );
     }
 
     #[test]
@@ -27133,9 +27266,24 @@ mod still_window_mode_key_tests {
         app.load_folder(folder.clone());
 
         assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
-        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "the auto-opened image viewer must not remain bundled with main"
+        );
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("the auto-opened image folder must own an active context");
+        assert_eq!(active.bundle.fullscreen_idx, Some(0));
+        assert_eq!(
+            active.bundle.viewer_session.presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert_eq!(
+            active.bundle.navigation_scope,
+            ViewerNavigationScope::DetachedPhysical
+        );
         assert!(
             app.detached_viewer_focus_requested,
             "image-only folder auto-open is still an explicit grid open and should focus the newly active detached window"
@@ -27151,16 +27299,16 @@ mod still_window_mode_key_tests {
             "existing.jpg"
         );
         assert_ne!(
-            app.detached_viewer_window_id,
+            active.bundle.viewer_session.detached_window_id,
             Some(41),
             "always-new auto-open must not reuse the previous detached viewport as continuation navigation"
         );
         assert!(
-            app.detached_viewer_window_id.is_some(),
+            active.bundle.viewer_session.detached_window_id.is_some(),
             "a new active detached viewport should be allocated for the image-only folder"
         );
         assert!(
-            !app.fs_open_intent_from_grid,
+            !app.fs_open_intent_from_grid && !active.bundle.fs_open_intent_from_grid,
             "open_fullscreen consumes the restored grid intent"
         );
     }
@@ -27403,14 +27551,26 @@ mod still_window_mode_key_tests {
             preserve_after_password_prompt: true,
         });
 
-        assert_eq!(app.fullscreen_idx, Some(0));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert_eq!(app.fullscreen_idx, None);
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("an explicit detached PDF page open must own an active context");
+        assert_eq!(active.bundle.fullscreen_idx, Some(0));
+        assert_eq!(
+            active.bundle.viewer_session.presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert_eq!(
+            active.bundle.navigation_scope,
+            ViewerNavigationScope::DetachedPhysical
+        );
         assert!(
             app.detached_viewer_focus_requested,
             "explicit PDF auto-fullscreen should focus the detached viewer after async enumerate"
         );
         assert!(
-            app.detached_viewer_independent_active,
+            active.bundle.viewer_session.independent_active,
             "always-new image window mode must still make the PDF page detached session independent"
         );
     }

@@ -153,7 +153,7 @@ Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を
 | Ctrl+F active 中の Ctrl+↑↓ | 「Ctrl+F 検索中はフォルダ移動しません」などの no-op 案内 |
 | Ctrl+S / Ctrl+G の結果一覧で Ctrl+↑↓ | 「検索結果を開いてから Ctrl+↑↓ で移動できます」などの no-op 案内 |
 | 独立 detached 静止画窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | main の検索・絞り込みを無視し、その窓自身の物理順で移動。端では物理スコープの境界案内 |
-| detached 動画 / 音声窓、legacy unbundled 窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | 「切り離した別ウィンドウではフォルダ移動しません」などの no-op 案内 |
+| detached 動画 / 音声窓、bundle 化されていない旧経路の窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | 「切り離した別ウィンドウではフォルダ移動しません」などの no-op 案内。通常画像の新規 always-new open は active physical bundle へ昇格するため、この旧経路には残らない |
 
 見開きでは 2 ページを 1 つの表示単位として扱う。最後の見開きから次へ、または最初の見開きから
 前へ進む入力は、内部ページ index を同じ見開き内で動かさず、その 1 回目で境界ヒントを表示する。

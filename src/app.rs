@@ -31779,14 +31779,21 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn assign_next_detached_viewer_context_generation(&mut self) -> u64 {
+    fn allocate_detached_viewer_context_generation(&mut self) -> (u64, u64) {
         let context_serial = self.next_detached_viewer_context_serial.max(1);
         self.next_detached_viewer_context_serial = self
             .next_detached_viewer_context_serial
             .wrapping_add(1)
             .max(1);
-        self.items_generation = DETACHED_VIEWER_CONTEXT_GENERATION_BASE
+        let items_generation = DETACHED_VIEWER_CONTEXT_GENERATION_BASE
             | context_serial.wrapping_mul(DETACHED_VIEWER_CONTEXT_GENERATION_STRIDE);
+        (context_serial, items_generation)
+    }
+
+    #[cfg(windows)]
+    fn assign_next_detached_viewer_context_generation(&mut self) -> u64 {
+        let (context_serial, items_generation) = self.allocate_detached_viewer_context_generation();
+        self.items_generation = items_generation;
         context_serial
     }
 
@@ -34936,7 +34943,7 @@ impl App {
         };
         let snapshot_id = snapshot.id;
         let mut parked_bundle = if preserve_main_context {
-            self.split_current_context_for_live_media_park()
+            self.split_current_context_preserving_main_grid()
         } else {
             Box::new(self.take_current_viewer_context_bundle())
         };
@@ -34969,12 +34976,17 @@ impl App {
         true
     }
 
-    /// legacy/unbundled live-media park 用に、現在 context を main と ParkedLive に分割する。
+    /// legacy/unbundled viewer 用に、現在 context を main と独立 viewer に分割する。
+    ///
+    /// main grid が使う一覧 identity / worker 複合体は main に残し、viewer の一時状態だけを
+    /// 戻り値へ移す。ParkedLive media と、通常画像を grid から always-new detached viewer
+    /// として開く境界の両方がこの primitive を使う。
+    ///
     /// `ViewerContextBundle` の全 field を destructure して 3 分類するため、field 追加時は
     /// コンパイルエラーになり、空 bundle + allowlist 方式の状態喪失を再発させない。
     /// (review-v2.3.0 追補4: live-park main 文脈保持)
     #[cfg(windows)]
-    fn split_current_context_for_live_media_park(&mut self) -> Box<ViewerContextBundle> {
+    fn split_current_context_preserving_main_grid(&mut self) -> Box<ViewerContextBundle> {
         macro_rules! duplicate_for_parked {
             ($($field:ident),+ $(,)?) => {
                 $(*$field = self.$field.clone();)+
@@ -35425,6 +35437,111 @@ impl App {
             ai_classify_cache,
         );
         parked
+    }
+
+    /// main の通常画像一覧を変えずに independent still viewer を開始するための snapshot。
+    ///
+    /// `split_current_context_preserving_main_grid` は ParkedLive media も使うため、編集・見開き・
+    /// view-trim の read model を main に残す。一方、独立静止画は同じ見た目で開く必要があるので、
+    /// worker / dirty / pending ownership は複製せず、描画に必要な安定 read model と完成 cache
+    /// だけを追加で複製する。
+    #[cfg(windows)]
+    fn split_current_context_for_independent_still_open(&mut self) -> Box<ViewerContextBundle> {
+        let mut detached = self.split_current_context_preserving_main_grid();
+
+        detached.view_trim_mode = self.view_trim_mode;
+        detached.view_trim_apply_mode = self.view_trim_apply_mode;
+        detached.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx;
+        detached.view_trim_page_spread_separate = self.view_trim_page_spread_separate;
+        detached.view_trim_book_settings = self.view_trim_book_settings.clone();
+        detached.view_trim_page_overrides = self.view_trim_page_overrides.clone();
+        detached.spread_mode = self.spread_mode;
+        detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
+        detached.reading_flow = self.reading_flow;
+        detached.reading_direction = self.reading_direction;
+
+        detached.thumb_pixels = self.thumb_pixels.clone();
+        detached.thumb_edit_preview_layers = self.thumb_edit_preview_layers.clone();
+        detached.thumb_edit_preview_keys = self.thumb_edit_preview_keys.clone();
+        detached.thumb_adjust_tex = self.thumb_adjust_tex.clone();
+        detached.adjustment_page_params = self.adjustment_page_params.clone();
+        detached.local_adjust_page_layers = self.local_adjust_page_layers.clone();
+        detached.local_adjust_pages = self.local_adjust_pages.clone();
+        detached.local_adjust_selected_layers = self.local_adjust_selected_layers.clone();
+        detached.local_adjust_generation = self.local_adjust_generation.clone();
+        detached.export_crop_page_settings = self.export_crop_page_settings.clone();
+        detached.export_crop_pages = self.export_crop_pages.clone();
+        detached.mask_pages = self.mask_pages.clone();
+        detached.comic_pages = self.comic_pages.clone();
+        detached.conceal_pages = self.conceal_pages.clone();
+        detached.erase_mask_generation = self.erase_mask_generation.clone();
+        detached.conceal_mask_generation = self.conceal_mask_generation.clone();
+        detached.final_ai_cache = self.final_ai_cache.clone();
+        detached.final_ai_failed = self.final_ai_failed.clone();
+        detached.erase_base_cache = self.erase_base_cache.clone();
+        detached.conceal_base_cache = self.conceal_base_cache.clone();
+        detached.ai_classify_cache = self.ai_classify_cache.clone();
+
+        detached
+    }
+
+    /// grid の通常画像 open を、main と共有された legacy viewer にせず active bundle へ移す。
+    ///
+    /// PDF / ZIP container open は `start_active_detached_book_context` が最初から独立 context を
+    /// 作る一方、既に main items に存在する Image / ZipImage / PdfPage は従来 main context 上で
+    /// `open_fullscreen` していた。この非対称が、always-new の通常画像だけ Ctrl+folder-nav と
+    /// close を main へ漏らす原因だった。I/O を伴う再 scan はせず、現在の一覧 snapshot を複製して
+    /// active context 内で通常の open 処理を完結させる。
+    #[cfg(windows)]
+    fn route_new_independent_still_open_to_active_context(&mut self, idx: usize) -> bool {
+        if self.active_detached_viewer_context.is_some()
+            || !matches!(self.navigation_scope, ViewerNavigationScope::Main)
+            || self.detached_viewer_main_history_suppression_depth != 0
+            || self.fullscreen_idx.is_some()
+            || self.detached_viewer_folder_nav_reuse_window_once
+            || !self.fs_open_intent_from_grid
+            || !self.detached_still_open_is_independent(idx)
+            || !matches!(
+                self.effective_viewer_presentation_for_open(idx),
+                ViewerPresentation::DetachedWindow
+            )
+        {
+            return false;
+        }
+
+        let physical_context = match self.items.get(idx) {
+            Some(GridItem::Image(path)) => path.parent().map(Path::to_path_buf),
+            Some(GridItem::ZipImage { zip_path, .. }) => Some(zip_path.clone()),
+            Some(GridItem::PdfPage { pdf_path, .. }) => Some(pdf_path.clone()),
+            _ => None,
+        };
+        let (_context_serial, items_generation) =
+            self.allocate_detached_viewer_context_generation();
+        let mut bundle = self.split_current_context_for_independent_still_open();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.items_generation = items_generation;
+        if let Some(physical_context) = physical_context {
+            bundle.address = physical_context.display().to_string();
+            bundle.current_folder = Some(physical_context);
+        }
+        bundle.visible_indices = (0..bundle.items.len()).collect();
+        bundle.details_thumb_suppression_applied = false;
+        bundle.details_order.clear();
+        bundle.cached_nav_indices = None;
+        bundle.cached_fs_seek_info = None;
+        bundle.selected = Some(idx);
+
+        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: *bundle });
+        self.log_detached_image_window_debug(format!(
+            "independent_still_context_promoted idx={idx} main_items={} active_context=true",
+            self.items.len()
+        ));
+
+        self.with_active_detached_viewer_context(|detached| {
+            detached.open_fullscreen(idx);
+        })
+        .expect("independent still context must remain present while opening");
+        true
     }
 
     #[cfg(windows)]
@@ -37274,6 +37391,11 @@ impl App {
     /// 見開き正規化のような内部起動は bump しないので、fs load は現在の
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
+        #[cfg(windows)]
+        if self.route_new_independent_still_open_to_active_context(idx) {
+            return;
+        }
+
         // viewer 内ページ送りでも、idx を差し替える前に前ページの完成済み編集結果を
         // 派生キャッシュへ渡す。grid からの新規入場では fullscreen_idx=None なので no-op。
         if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {

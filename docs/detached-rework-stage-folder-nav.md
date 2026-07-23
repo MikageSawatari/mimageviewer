@@ -71,13 +71,18 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - detached physical load は main の folder pane pending、snapshot lock、検索 pending、
   folder history、rating / facet / color filter、main history persistence を参照・変更しない。
 - 動画のみのフォルダを探索対象から外し、動画・静止画混在時も先頭の静止画へ着地する。
+- 通常画像を grid から always-new detached で開く経路も、open 前に main 一覧 snapshot から
+  独立 active bundle を作る。開いた画像の実親フォルダと detached 専用 items generation を
+  bundle に設定し、同期再 scan を行わず、main の検索条件・選択・スクロールを保持する。
 - `src/app/tests.rs` で request ownership、main filter preservation、pause / Drop cancel を固定した。
+- 実際の通常画像 grid-open 経路から Ctrl+↓ を発行し、request が detached bundle にだけ入り、
+  main の検索条件・選択・スクロール・既存 folder-nav state が変わらない回帰テストを追加した。
 
 ## 7. 検証結果
 
 - `cargo fmt --check`: 成功
 - `python scripts/check_ui_glyphs.py`: 成功
-- `cargo test`: 全体成功（lib: 4,125 passed / 18 ignored、integration / doctest も成功）
+- `cargo test`: 全体成功（main: 4,126 passed / 18 ignored、lib / integration / doctest も成功）
 - `cargo build`: 成功
 - `scripts/build-release.ps1`: 成功。`target/release/mimageviewer.exe` と
   `target/release/mimageviewer-core.exe` を生成し、agent は起動していない。
