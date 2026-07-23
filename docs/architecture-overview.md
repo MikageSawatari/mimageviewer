@@ -151,7 +151,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 
 | モジュール / 概念 | 役割 |
 | --- | --- |
-| `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / ピン / Book) と parked live 窓は bundle swap で mount/unmount する。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む) |
+| `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / ピン / Book) と parked live 窓は bundle swap で mount/unmount する。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む)。swap前後のApp-global rating session差分は各context cacheへ同期するが、ownership交換自体はnavigationではないためfacet scope / suppressionを変更しない |
 | `ViewerSession` (`app/viewer_session.rs`) | 退避中 bundle の表示先・同期 stamp・独立 detached 状態・window ID を一括所有する。現在表示中の session は当面 `App` の既存フィールドへマウントし、`swap_with_mounted` で5項目を同時交換する |
 | `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (Active/Passive/Parked/ParkedLive/Resuming/Closing) と activation watcher を一元管理する。`ViewerSession` の意味状態とは分離する |
 | `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
@@ -322,11 +322,15 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 ### 明示メタ情報転送 (`mimageviewer.meta.miv`)
 
+v2.7.0では安定化を継続するためメニュー入口を一時非表示にする。実装とbundle形式は保持し、
+`metadata_transfer::UI_ENABLED`を再び有効化してリリース後の開発・検証を継続する。
+
 `ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
 `mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v3 は評価、
 タグ、動画・音声 / 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
-部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。ZIP / PDF のページ state
-と ZIP 内の本 state は物理コンテナ配下の相対キーで持つ。
+部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。crop矩形は通常DB /
+sidecarと同じ元画像ピクセル座標を保持する。ZIP / PDF のページ stateと ZIP 内の本 state は
+物理コンテナ配下の相対キーで持つ。
 
 bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
 `generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ

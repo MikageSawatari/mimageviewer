@@ -11845,9 +11845,11 @@ impl App {
     #[cfg(windows)]
     fn swap_viewer_context_bundle(&mut self, bundle: &mut ViewerContextBundle) {
         // path-keyed DB 更新は context-global。退避する側も復元する側も、idx-keyed cache を
-        // その時点の最新世代へ揃えてから ownership を渡す。
+        // その時点の最新世代へ揃えてから ownership を渡す。この関数はnavigationではなく
+        // ownership交換のプリミティブなので、同期に伴う表示再構築でApp-globalなfacet
+        // scope / suppressionを変更してはならない。
         if self.sync_current_context_rating_session_writes() {
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_preserving_facet_scope();
         }
         macro_rules! swap_field {
             ($field:ident) => {
@@ -12277,7 +12279,7 @@ impl App {
         // churn になっていた (review-v2.3.0 P2-8)。channel/token/キューを bundle 化した現在は
         // bookkeeping がコンテキストと一緒に移動するため clear 不要。
         if self.sync_current_context_rating_session_writes() {
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_preserving_facet_scope();
         }
     }
 

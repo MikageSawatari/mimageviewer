@@ -2454,11 +2454,18 @@ pub fn menu_command_catalog() -> &'static [MenuCommandSpec] {
     MENU_COMMAND_SPECS
 }
 
+fn menu_command_is_available_in_build(id: MenuCommandId) -> bool {
+    !matches!(
+        id,
+        MenuCommandId::FileMetadataExport | MenuCommandId::FileMetadataImport
+    ) || crate::metadata_transfer::UI_ENABLED
+}
+
 pub fn menu_commands_for_parent(parent: TopMenuId) -> impl Iterator<Item = MenuCommandSpec> {
     MENU_COMMAND_SPECS
         .iter()
         .copied()
-        .filter(move |spec| spec.parent == parent)
+        .filter(move |spec| spec.parent == parent && menu_command_is_available_in_build(spec.id))
 }
 
 pub fn menu_command_can_be_hidden(id: MenuCommandId) -> bool {
@@ -2577,7 +2584,9 @@ fn resolve_menu_commands_for_parent(
             if hidden.contains(&id) || out.contains(&id) {
                 continue;
             }
-            if menu_command_spec(id).is_some_and(|spec| spec.parent == parent) {
+            if menu_command_is_available_in_build(id)
+                && menu_command_spec(id).is_some_and(|spec| spec.parent == parent)
+            {
                 out.push(id);
             }
         }
@@ -7270,7 +7279,11 @@ mod tests {
             }
         }
 
-        let catalog_ids: Vec<_> = menu_command_catalog().iter().map(|spec| spec.id).collect();
+        let catalog_ids: Vec<_> = menu_command_catalog()
+            .iter()
+            .map(|spec| spec.id)
+            .filter(|id| menu_command_is_available_in_build(*id))
+            .collect();
         assert_eq!(flattened_ids, catalog_ids);
     }
 
@@ -7359,8 +7372,6 @@ mod tests {
                 MenuCommandId::FileQuit,
                 MenuCommandId::FileOpenFolder,
                 MenuCommandId::FileLocalSearch,
-                MenuCommandId::FileMetadataExport,
-                MenuCommandId::FileMetadataImport,
                 MenuCommandId::FileOpenCaptureFolder,
                 MenuCommandId::FileOpenRecycleBin,
             ]
@@ -7376,6 +7387,38 @@ mod tests {
                 .commands
                 .contains(&MenuCommandId::SettingsPreferences)
         );
+    }
+
+    #[test]
+    fn metadata_transfer_commands_are_hidden_from_v2_7_release_menus() {
+        assert!(!crate::metadata_transfer::UI_ENABLED);
+        let file_commands = menu_commands_for_parent(TopMenuId::File)
+            .map(|spec| spec.id)
+            .collect::<Vec<_>>();
+        assert!(!file_commands.contains(&MenuCommandId::FileMetadataExport));
+        assert!(!file_commands.contains(&MenuCommandId::FileMetadataImport));
+
+        // 旧設定に明示順序が残っていても、release-disabled commandを復活させない。
+        let settings = MenuLayoutSettings {
+            top_menu_order: vec!["File".to_string()],
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "File".to_string(),
+                commands: vec![
+                    "FileMetadataExport".to_string(),
+                    "FileMetadataImport".to_string(),
+                    "FileOpenFolder".to_string(),
+                ],
+            }],
+            hidden_commands: Vec::new(),
+        };
+        let file = resolve_menu_layout(&settings)
+            .menus
+            .into_iter()
+            .find(|menu| menu.id == TopMenuId::File)
+            .expect("File menu must remain available");
+        assert!(!file.commands.contains(&MenuCommandId::FileMetadataExport));
+        assert!(!file.commands.contains(&MenuCommandId::FileMetadataImport));
+        assert!(file.commands.contains(&MenuCommandId::FileOpenFolder));
     }
 
     #[test]

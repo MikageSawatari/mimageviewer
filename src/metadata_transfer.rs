@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME;
+/// v2.7.0では安定化を継続するため、ユーザー向けメニュー入口を一時的に公開しない。
+/// 実装とbundle形式は保持し、リリース後の開発再開時にこの1か所をtrueへ戻す。
+pub(crate) const UI_ENABLED: bool = false;
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
 const FORMAT_VERSION: u32 = 3;
@@ -2331,8 +2334,6 @@ fn validate_page_state(state: &PortablePageState, entry_path: &str) -> Result<()
         if values.iter().any(|value| !value.is_finite())
             || rect.min_x < 0.0
             || rect.min_y < 0.0
-            || rect.max_x > 1.0
-            || rect.max_y > 1.0
             || rect.min_x >= rect.max_x
             || rect.min_y >= rect.max_y
         {
@@ -4020,6 +4021,58 @@ mod tests {
 
     fn no_progress(_: TransferProgress) {}
 
+    #[test]
+    fn page_state_validation_accepts_source_pixel_crop_coordinates() {
+        let state = PortablePageState {
+            export_crop: Some(crate::export_crop::CropSettings {
+                rect: crate::export_crop::CropRect {
+                    min_x: 25.0,
+                    min_y: 40.0,
+                    max_x: 1_600.0,
+                    max_y: 900.0,
+                },
+                aspect_mode: crate::export_crop::CropAspectMode::Ratio16x9,
+            }),
+            ..PortablePageState::default()
+        };
+
+        validate_page_state(&state, "image.png")
+            .expect("crop coordinates are stored in source-image pixels, not normalized 0..=1");
+    }
+
+    #[test]
+    fn page_state_validation_rejects_unsafe_crop_coordinates() {
+        for rect in [
+            crate::export_crop::CropRect {
+                min_x: f32::INFINITY,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: -1.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 100.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+            },
+        ] {
+            let state = PortablePageState {
+                export_crop: Some(crate::export_crop::CropSettings {
+                    rect,
+                    aspect_mode: crate::export_crop::CropAspectMode::Free,
+                }),
+                ..PortablePageState::default()
+            };
+            assert!(validate_page_state(&state, "image.png").is_err());
+        }
+    }
+
     fn copy_sidecar_bundle(source_root: &Path, destination_root: &Path) {
         fn copy_directory(source: &Path, destination: &Path) {
             fs::create_dir(destination).unwrap();
@@ -4685,7 +4738,7 @@ mod tests {
             .execute(
                 "INSERT INTO export_crop_pages
                     (page_path, min_x, min_y, max_x, max_y, aspect_mode)
-                 VALUES (?1, 0.1, 0.2, 0.8, 0.9, '4x3')",
+                 VALUES (?1, 10.0, 20.0, 800.0, 900.0, '4x3')",
                 [&image_key],
             )
             .unwrap();
@@ -4838,6 +4891,25 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "missing imported state in {db}");
         }
+        assert_eq!(
+            Connection::open(destination_data.join("export_crop.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT min_x, min_y, max_x, max_y, aspect_mode
+                       FROM export_crop_pages WHERE page_path = ?1",
+                    [&destination_image],
+                    |row| Ok((
+                        row.get::<_, f32>(0)?,
+                        row.get::<_, f32>(1)?,
+                        row.get::<_, f32>(2)?,
+                        row.get::<_, f32>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                )
+                .unwrap(),
+            (10.0, 20.0, 800.0, 900.0, "4x3".to_string()),
+            "source-image pixel crop coordinates must round-trip without normalization"
+        );
         assert_eq!(
             Connection::open(destination_data.join("folder_thumb_pins.db"))
                 .unwrap()

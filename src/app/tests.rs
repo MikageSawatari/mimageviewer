@@ -450,10 +450,21 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
 #[cfg(windows)]
 #[test]
 fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
+    use crate::settings::FacetEditFlag;
+
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let temp = tempfile::TempDir::new().unwrap();
-    let items = vec![GridItem::Image(PathBuf::from(r"C:\Pictures\a.jpg"))];
+    let image_path = PathBuf::from(r"C:\Pictures\a.jpg");
+    let rating_key = crate::adjustment_db::normalize_path(&image_path);
+    let items = vec![GridItem::Image(image_path)];
+    let main_scope = PathBuf::from(r"C:\Pictures");
+    app.current_folder = Some(main_scope.clone());
+    app.facet_filter_scope = Some(main_scope.clone());
+    app.settings
+        .facet_filter
+        .edits
+        .insert(FacetEditFlag::Tagged);
     app.items = items.clone();
     app.settings.write_rating_to_xmp = true;
     app.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
@@ -462,8 +473,9 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
         Vec::new(),
     ));
 
-    let make_bundle = |name: &str| {
+    let make_bundle = |name: &str, folder: &str| {
         let mut bundle = ViewerContextBundle::empty();
+        bundle.current_folder = Some(PathBuf::from(folder));
         bundle.items = items.clone();
         bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
         bundle.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
@@ -473,10 +485,17 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
         bundle
     };
     app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-        bundle: make_bundle("active"),
+        bundle: make_bundle("active", r"C:\Pictures\Child"),
     });
-    app.detached_image_windows
-        .push(paused_test_window(&ctx, 113, make_bundle("paused")));
+    app.detached_image_windows.push(paused_test_window(
+        &ctx,
+        113,
+        make_bundle("paused", r"C:\Pictures\Child\Paused"),
+    ));
+
+    // bundle退避後に別contextでratingが更新された状態を作る。quiesceの一時mountで
+    // 各context cacheへ反映されるが、navigationではないのでfacet scopeは不変でなければならない。
+    app.record_rating_session_write(rating_key, 4, true);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while app.quiesce_metadata_transfer_context_writers() {
@@ -487,17 +506,36 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
+    assert_eq!(app.rating_cache.get(&0), Some(&4));
     assert!(app.tag_prewarm_pending.is_none());
     assert!(app.tag_legacy_seed_pending.is_none());
     let active = app.active_detached_viewer_context.as_ref().unwrap();
+    assert_eq!(active.bundle.rating_cache.get(&0), Some(&4));
     assert!(active.bundle.tag_prewarm_pending.is_none());
     assert!(active.bundle.tag_legacy_seed_pending.is_none());
     let paused = app.detached_image_windows[0]
         .paused_bundle
         .as_ref()
         .unwrap();
+    assert_eq!(paused.rating_cache.get(&0), Some(&4));
     assert!(paused.tag_prewarm_pending.is_none());
     assert!(paused.tag_legacy_seed_pending.is_none());
+    assert_eq!(
+        app.facet_filter_scope,
+        Some(main_scope),
+        "rating同期を伴う一時mountでもmainのfacet scopeを保持する"
+    );
+    assert!(
+        app.facet_filter_suppression_stack.is_empty(),
+        "一時mountを子フォルダnavigationとしてsuppressionへ積んではならない"
+    );
+    assert!(
+        app.settings
+            .facet_filter
+            .edits
+            .contains(&FacetEditFlag::Tagged),
+        "一時mount中のrating同期でfacet filterを解除してはならない"
+    );
 
     app.resume_metadata_transfer_context_readers();
     assert!(app.tag_prewarm_pending.is_some());
