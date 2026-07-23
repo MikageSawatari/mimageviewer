@@ -466,6 +466,46 @@ fn music_right_panel_visible_from_inputs(
     }
 }
 
+/// 音楽ビューがこのフレームで実際に描く操作 UI のうち、カーソル自動非表示を
+/// 止めるもの。App に永続させず、描画結果から同じフレームの cursor 判定へ渡す。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MusicViewFrameUiState {
+    left_panel_visible: bool,
+    right_panel_visible: bool,
+    modal_open: bool,
+}
+
+impl MusicViewFrameUiState {
+    fn from_panel_inputs(
+        mode: crate::settings::FsSidePanelMode,
+        left_hover_active: bool,
+        right_hover_active: bool,
+        left_session_open: bool,
+        right_click_info_open: bool,
+        modal_open: bool,
+    ) -> Self {
+        Self {
+            left_panel_visible: music_left_panel_visible_from_inputs(
+                mode,
+                left_hover_active,
+                left_session_open,
+                modal_open,
+            ),
+            right_panel_visible: music_right_panel_visible_from_inputs(
+                mode,
+                right_hover_active,
+                right_click_info_open,
+                modal_open,
+            ),
+            modal_open,
+        }
+    }
+
+    fn blocks_cursor_auto_hide(self) -> bool {
+        self.left_panel_visible || self.right_panel_visible || self.modal_open
+    }
+}
+
 const MUSIC_TOP_BAR_HEIGHT: f32 = 54.0;
 
 fn music_side_panel_contains_pointer(
@@ -7623,6 +7663,7 @@ impl App {
                 fs_setup_ms = setup_t0.elapsed().as_secs_f64() * 1000.0;
 
                 let central_t0 = std::time::Instant::now();
+                let mut music_view_frame_ui = MusicViewFrameUiState::default();
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
@@ -7831,7 +7872,8 @@ impl App {
                                     if self.fs_music_view_active(fs_idx) {
                                         // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
                                         // 比較/回転経路はスキップする。
-                                        self.draw_fs_music_view(ui, ctx, image_rect, fs_idx);
+                                        music_view_frame_ui =
+                                            self.draw_fs_music_view(ui, ctx, image_rect, fs_idx);
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
                                         // ここで close_fs に合流させる (動画の close_requested と同じ)。
                                         if std::mem::take(&mut self.music_view_close_requested) {
@@ -8930,7 +8972,7 @@ impl App {
                 {
                     let full_rect = ctx.content_rect();
                     let is_video = state.is_video;
-                    let clean = self.fs_ui_is_clean(ctx, full_rect, is_video);
+                    let clean = self.fs_ui_is_clean(ctx, full_rect, is_video, music_view_frame_ui);
                     if !clean {
                         // UI が出ている間はタイマを today に戻して countdown を停止。
                         self.cursor_last_activity = Some(std::time::Instant::now());
@@ -17779,7 +17821,13 @@ impl App {
     /// フルスクリーン UI が「クリーンな状態」(= 上部バー / 左右パネル / HUD / モーダルが
     /// 何も出ていない) か判定する。`true` かつアイドル時間が設定秒数を超えたら
     /// マウスカーソルを `CursorIcon::None` で非表示にする。
-    fn fs_ui_is_clean(&self, ctx: &egui::Context, full_rect: egui::Rect, _is_video: bool) -> bool {
+    fn fs_ui_is_clean(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        _is_video: bool,
+        music_view_frame_ui: MusicViewFrameUiState,
+    ) -> bool {
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         // Once the cursor is hidden, the last hover position is stale until a real input
         // event arrives. Do not let that passive position keep hover UI "visible" and
@@ -17813,6 +17861,7 @@ impl App {
             && !self.view_trim_mode
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
+            && !music_view_frame_ui.blocks_cursor_auto_hide()
             && !self.spread_popup_open
             && !self.fit_popup_open
             && !self.slideshow_popup_open
@@ -22756,7 +22805,7 @@ impl App {
         ctx: &egui::Context,
         rect: egui::Rect,
         fs_idx: usize,
-    ) {
+    ) -> MusicViewFrameUiState {
         // 音楽ビューは動画フルスクリーンと同じく黒背景ベースで統一する。App テーマが Light でも
         // ここは常にダーク配色にする (CLAUDE.md「フルスクリーン内は黒背景ベース統一」、実機 FB:
         // 上下バーが Light 基調で中央のダーク波形と食い違っていた)。
@@ -22830,7 +22879,7 @@ impl App {
                 egui::FontId::proportional(20.0),
                 egui::Color32::from_rgb(255, 120, 120),
             );
-            return;
+            return MusicViewFrameUiState::default();
         }
 
         // ── レイアウト (Inc 5 FB: 動画に合わせる) ──
@@ -22948,18 +22997,16 @@ impl App {
             self.music_left_panel_active = false;
             self.music_right_panel_active = false;
         }
-        let left_hover = music_left_panel_visible_from_inputs(
+        let frame_ui = MusicViewFrameUiState::from_panel_inputs(
             side_panel_mode,
             self.music_left_panel_active,
-            self.music_left_click_open,
-            music_modal_open,
-        );
-        let right_hover = music_right_panel_visible_from_inputs(
-            side_panel_mode,
             self.music_right_panel_active,
+            self.music_left_click_open,
             self.fs_click_info_open,
             music_modal_open,
         );
+        let left_hover = frame_ui.left_panel_visible;
+        let right_hover = frame_ui.right_panel_visible;
         let pointer_over_panel = left_hover || right_hover || music_modal_open;
 
         let show_timeline = !music_shell_active
@@ -23276,6 +23323,7 @@ impl App {
         if playing {
             ctx.request_repaint();
         }
+        frame_ui
     }
 }
 
@@ -23403,6 +23451,55 @@ mod tests {
             true,
             true,
         ));
+    }
+
+    #[test]
+    fn music_view_interactive_ui_blocks_cursor_auto_hide() {
+        use crate::settings::FsSidePanelMode;
+
+        let idle = MusicViewFrameUiState::from_panel_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(!idle.blocks_cursor_auto_hide());
+
+        let hover_left = MusicViewFrameUiState::from_panel_inputs(
+            FsSidePanelMode::Hover,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(hover_left.left_panel_visible);
+        assert!(hover_left.blocks_cursor_auto_hide());
+
+        let click_right = MusicViewFrameUiState::from_panel_inputs(
+            FsSidePanelMode::ClickToShow,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(click_right.right_panel_visible);
+        assert!(click_right.blocks_cursor_auto_hide());
+
+        let modal = MusicViewFrameUiState::from_panel_inputs(
+            FsSidePanelMode::Hover,
+            true,
+            true,
+            false,
+            false,
+            true,
+        );
+        assert!(!modal.left_panel_visible);
+        assert!(!modal.right_panel_visible);
+        assert!(modal.blocks_cursor_auto_hide());
     }
 
     #[test]
