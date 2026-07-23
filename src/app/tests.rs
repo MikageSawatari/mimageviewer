@@ -47,7 +47,7 @@ fn metadata_import_refresh_uses_worker_delta_without_database_connections() {
     app.rating_db = None;
     app.tags_db = None;
 
-    app.refresh_after_metadata_transfer_import(&crate::metadata_transfer::ImportRefreshDelta {
+    app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
         physical_ratings: vec![crate::metadata_transfer::ImportedRatingValue {
             key: first_key.clone(),
             stars: 5,
@@ -184,10 +184,10 @@ fn metadata_import_refresh_reaches_main_and_detached_context_for_same_book() {
         ..Default::default()
     };
 
-    app.refresh_after_metadata_transfer_import(&refresh);
+    app.refresh_after_metadata_transfer_import(refresh);
     // detachedが退避中のまま別sectionだけを再importしても、未mount差分はsection単位で
     // 合成され、先のtag/page stateを失わない。
-    app.refresh_after_metadata_transfer_import(&crate::metadata_transfer::ImportRefreshDelta {
+    app.refresh_after_metadata_transfer_import(crate::metadata_transfer::ImportRefreshDelta {
         visible_entries: vec![crate::metadata_transfer::ImportedEntryMetadata {
             base_key: base_key.clone(),
             ratings: Some(vec![crate::metadata_transfer::ImportedRatingValue {

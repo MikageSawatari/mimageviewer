@@ -96,58 +96,49 @@ pub struct ImportRefreshDelta {
 
 impl ImportRefreshDelta {
     /// 未マウントの viewer context が複数回の import を後から取り込めるよう、同じ
-    /// physical family の最新値を section 単位で畳み込む。`None` はその import で
-    /// section が対象外だったことを表すため、既存の差分を消さない。
+    /// visible physical family の最新値を section 単位で畳み込む。`None` はその
+    /// import で section が対象外だったことを表すため、既存の差分を消さない。
     #[allow(dead_code)] // binary Appで使用。library-only buildにはconsumerがない。
-    pub(crate) fn merge_from(&mut self, newer: &Self) {
-        for value in &newer.physical_ratings {
-            if let Some(current) = self
-                .physical_ratings
-                .iter_mut()
-                .find(|current| current.key == value.key)
-            {
-                *current = value.clone();
-            } else {
-                self.physical_ratings.push(value.clone());
-            }
+    pub(crate) fn merge_visible_entries_from(&mut self, mut newer: Vec<ImportedEntryMetadata>) {
+        if newer.is_empty() {
+            return;
         }
-        for family in &newer.page_state_families {
-            if let Some(current) = self
-                .page_state_families
-                .iter_mut()
-                .find(|current| current.base_key == family.base_key)
-            {
-                *current = family.clone();
-            } else {
-                self.page_state_families.push(family.clone());
-            }
+        // 最初のimportはworker resultのallocationをそのまま所有し、全件走査もしない。
+        if self.visible_entries.is_empty() {
+            self.visible_entries = newer;
+            return;
         }
-        for entry in &newer.visible_entries {
-            let Some(current) = self
-                .visible_entries
-                .iter_mut()
-                .find(|current| current.base_key == entry.base_key)
-            else {
-                self.visible_entries.push(entry.clone());
+
+        let mut indices = HashMap::with_capacity(self.visible_entries.len() + newer.len());
+        for (index, entry) in self.visible_entries.iter().enumerate() {
+            indices.insert(entry.base_key.clone(), index);
+        }
+        self.visible_entries.reserve(newer.len());
+        for mut entry in newer.drain(..) {
+            let Some(index) = indices.get(&entry.base_key).copied() else {
+                let index = self.visible_entries.len();
+                indices.insert(entry.base_key.clone(), index);
+                self.visible_entries.push(entry);
                 continue;
             };
+            let current = &mut self.visible_entries[index];
             if entry.ratings.is_some() {
-                current.ratings.clone_from(&entry.ratings);
+                current.ratings = entry.ratings.take();
             }
             if entry.tags.is_some() {
-                current.tags.clone_from(&entry.tags);
+                current.tags = entry.tags.take();
             }
             if entry.page_states.is_some() {
-                current.page_states.clone_from(&entry.page_states);
+                current.page_states = entry.page_states.take();
             }
             if entry.container_states.is_some() {
-                current.container_states.clone_from(&entry.container_states);
+                current.container_states = entry.container_states.take();
             }
             if entry.folder_pins.is_some() {
-                current.folder_pins.clone_from(&entry.folder_pins);
+                current.folder_pins = entry.folder_pins.take();
             }
             if entry.video_pin.is_some() {
-                current.video_pin.clone_from(&entry.video_pin);
+                current.video_pin = entry.video_pin.take();
             }
         }
     }
@@ -739,7 +730,13 @@ fn imported_page_state_family(path: &Path, entry: &PortableEntry) -> ImportedPag
 /// 仮想項目のDB identity。ZIP member名は表示・manifestではcaseを保持するが、
 /// mIVのpage keyはcase-insensitiveなので全store・refresh経路で同じ形に揃える。
 fn canonical_virtual_item_key(base_key: &str, member_key: &str) -> String {
-    format!("{base_key}::{}", member_key.to_lowercase())
+    format!("{base_key}::{}", canonical_member_key(member_key))
+}
+
+/// archive member / 仮想containerの共通identity。manifestではWindows由来の`\`も
+/// 有効な区切りとして受理するため、重複検査と全DB key生成の前に`/`へ統一する。
+fn canonical_member_key(member_key: &str) -> String {
+    member_key.replace('\\', "/").to_lowercase()
 }
 
 fn imported_page_state_presence(key: &str, state: &PortablePageState) -> ImportedPageStatePresence {
@@ -2003,7 +2000,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
         let mut member_keys = HashSet::new();
         for item in &entry.virtual_items {
             if validate_member_key(&item.member_key).is_err()
-                || !member_keys.insert(item.member_key.to_lowercase())
+                || !member_keys.insert(canonical_member_key(&item.member_key))
             {
                 return Err(TransferError::Invalid(format!(
                     "仮想項目キーが不正または重複しています: {}",
@@ -2018,7 +2015,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
         for container in &entry.nested_containers {
             if entry.kind != PortableEntryKind::File
                 || validate_member_key(&container.member_key).is_err()
-                || !container_keys.insert(container.member_key.to_lowercase())
+                || !container_keys.insert(canonical_member_key(&container.member_key))
             {
                 return Err(TransferError::Invalid(format!(
                     "仮想コンテナキーが不正または重複しています: {}",
@@ -2701,9 +2698,7 @@ fn apply_entry(
         .map_err(db_error)?;
         for bookmark in &entry.book_bookmarks {
             let page_key = match bookmark.page_kind.as_str() {
-                "relative_path" | "archive_entry" => {
-                    bookmark.page_value.replace('\\', "/").to_lowercase()
-                }
+                "relative_path" | "archive_entry" => canonical_member_key(&bookmark.page_value),
                 "pdf_page" => bookmark.page_value.clone(),
                 _ => {
                     return Err(TransferError::Invalid(
@@ -3044,7 +3039,11 @@ fn delete_container_family(
 }
 
 fn join_container_key(base: &str, member: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), member.to_lowercase())
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        canonical_member_key(member)
+    )
 }
 
 fn delete_key_family(
@@ -3613,7 +3612,8 @@ mod tests {
         fs::write(root.join("book.zip"), b"zip").unwrap();
         init_data_dir(&data_dir);
 
-        let mixed_member = "Pages/Cover.JPG";
+        let mixed_member = r"Pages\Cover.JPG";
+        let mixed_container = r"Chapters\Volume.ONE";
         let manifest = Manifest {
             format: FORMAT_NAME.to_string(),
             version: FORMAT_VERSION,
@@ -3633,7 +3633,17 @@ mod tests {
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
                 container_state: PortableContainerState::default(),
-                nested_containers: Vec::new(),
+                nested_containers: vec![PortableNestedContainer {
+                    member_key: mixed_container.to_string(),
+                    state: PortableContainerState {
+                        spread: Some(PortableSpreadState {
+                            mode: 2,
+                            flow: 0,
+                            direction: 1,
+                        }),
+                        ..PortableContainerState::default()
+                    },
+                }],
                 video_pin: None,
                 virtual_items: vec![PortableVirtualItem {
                     member_key: mixed_member.to_string(),
@@ -3719,6 +3729,30 @@ mod tests {
                 .unwrap(),
             90
         );
+        let stripped_base = crate::path_key::normalize(&root.join("book.zip"));
+        let canonical_container_key = join_container_key(&stripped_base, mixed_container);
+        let raw_container_key = format!("{stripped_base}/{mixed_container}");
+        let spread_db = Connection::open(data_dir.join("spread.db")).unwrap();
+        assert_eq!(
+            spread_db
+                .query_row(
+                    "SELECT mode FROM spreads WHERE path = ?1",
+                    [&canonical_container_key],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            spread_db
+                .query_row(
+                    "SELECT COUNT(*) FROM spreads WHERE path = ?1",
+                    [&raw_container_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
         assert_eq!(
             summary.refresh.page_state_families[0].items[1].key,
             canonical_key
@@ -3730,6 +3764,123 @@ mod tests {
             refreshed.page_states.as_ref().unwrap()[1].key,
             canonical_key
         );
+        assert_eq!(
+            refreshed.container_states.as_ref().unwrap().items[1].key,
+            canonical_container_key
+        );
+    }
+
+    #[test]
+    fn slash_variants_are_duplicate_virtual_and_nested_member_keys() {
+        let virtual_item = |member_key: &str| PortableVirtualItem {
+            member_key: member_key.to_string(),
+            rating: None,
+            tags: Vec::new(),
+            page_state: PortablePageState::default(),
+        };
+        let nested_container = |member_key: &str| PortableNestedContainer {
+            member_key: member_key.to_string(),
+            state: PortableContainerState::default(),
+        };
+        let mut manifest = Manifest {
+            format: FORMAT_NAME.to_string(),
+            version: FORMAT_VERSION,
+            exported_at_ms: 0,
+            recursive: false,
+            sections: ManifestSections::default(),
+            entries: vec![PortableEntry {
+                path: "book.zip".to_string(),
+                kind: PortableEntryKind::File,
+                fingerprint: Some(FileFingerprint {
+                    size: 1,
+                    modified_ms: None,
+                }),
+                rating: None,
+                tags: Vec::new(),
+                timed_bookmarks: Vec::new(),
+                book_bookmarks: Vec::new(),
+                page_state: PortablePageState::default(),
+                container_state: PortableContainerState::default(),
+                nested_containers: Vec::new(),
+                video_pin: None,
+                virtual_items: vec![virtual_item("A/B"), virtual_item(r"A\B")],
+            }],
+        };
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(TransferError::Invalid(message))
+                if message.contains("仮想項目キーが不正または重複")
+        ));
+
+        manifest.entries[0].virtual_items.clear();
+        manifest.entries[0].nested_containers =
+            vec![nested_container("A/B"), nested_container(r"A\B")];
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(TransferError::Invalid(message))
+                if message.contains("仮想コンテナキーが不正または重複")
+        ));
+    }
+
+    #[test]
+    fn pending_refresh_merge_moves_large_payloads_and_preserves_other_sections() {
+        let first_webp = vec![7_u8; 1024];
+        let first_ptr = first_webp.as_ptr();
+        let mut pending = ImportRefreshDelta::default();
+        pending.merge_visible_entries_from(vec![ImportedEntryMetadata {
+            base_key: "c:/book.zip".to_string(),
+            tags: Some(vec![ImportedTagsValue {
+                key: "c:/book.zip::page.jpg".to_string(),
+                tags: vec!["keep".to_string()],
+            }]),
+            video_pin: Some(ImportedVideoPinChange {
+                key: "c:/book.zip".to_string(),
+                thumb_webp: Some(first_webp),
+            }),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            pending.visible_entries[0]
+                .video_pin
+                .as_ref()
+                .unwrap()
+                .thumb_webp
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            first_ptr,
+            "first worker payload allocation must be adopted without a deep clone"
+        );
+
+        let newer_webp = vec![9_u8; 2048];
+        let newer_ptr = newer_webp.as_ptr();
+        pending.merge_visible_entries_from(vec![ImportedEntryMetadata {
+            base_key: "c:/book.zip".to_string(),
+            ratings: Some(vec![ImportedRatingValue {
+                key: "c:/book.zip::page.jpg".to_string(),
+                stars: 5,
+            }]),
+            video_pin: Some(ImportedVideoPinChange {
+                key: "c:/book.zip".to_string(),
+                thumb_webp: Some(newer_webp),
+            }),
+            ..Default::default()
+        }]);
+        let entry = &pending.visible_entries[0];
+        assert_eq!(
+            entry
+                .video_pin
+                .as_ref()
+                .unwrap()
+                .thumb_webp
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            newer_ptr,
+            "replacement payload allocation must also move without a deep clone"
+        );
+        assert_eq!(entry.tags.as_ref().unwrap()[0].tags, vec!["keep"]);
+        assert_eq!(entry.ratings.as_ref().unwrap()[0].stars, 5);
     }
 
     #[test]

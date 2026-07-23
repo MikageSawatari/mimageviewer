@@ -22520,25 +22520,38 @@ impl App {
     /// SQLite のpoint read / prewarm / folder reloadはUI threadで行わない。
     pub(crate) fn refresh_after_metadata_transfer_import(
         &mut self,
-        refresh: &crate::metadata_transfer::ImportRefreshDelta,
+        mut refresh: crate::metadata_transfer::ImportRefreshDelta,
     ) {
         if refresh.is_empty() {
             return;
         }
+        let retain_for_unmounted_contexts = self.has_unmounted_metadata_import_contexts();
         self.metadata_import_refresh_generation =
             self.metadata_import_refresh_generation.saturating_add(1);
-        // physical rating台帳とpage-key rollupはApp-globalなので現在ここで1回だけ反映する。
-        // bundle mount時に必要なのはscope済み実値だけに絞り、大規模再帰importの全familyを
-        // parked contextの寿命中ずっと複製保持しない。
-        self.metadata_import_refresh_pending.merge_from(
-            &crate::metadata_transfer::ImportRefreshDelta {
-                visible_entries: refresh.visible_entries.clone(),
-                ..Default::default()
-            },
-        );
-        self.apply_metadata_transfer_import_refresh(refresh, true);
+        self.apply_metadata_transfer_import_refresh(&refresh, true);
         self.metadata_import_refresh_seen_generation = self.metadata_import_refresh_generation;
+        // physical rating台帳とpage-key rollupはApp-globalなので上で1回だけ反映済み。
+        // inactive bundleがある場合だけscope済み実値のVec ownershipをpendingへ移す。
+        // 初回はO(1)、複数import時だけkey indexで線形統合する。
+        if retain_for_unmounted_contexts {
+            self.metadata_import_refresh_pending
+                .merge_visible_entries_from(std::mem::take(&mut refresh.visible_entries));
+        }
         self.prune_metadata_import_refresh_if_fully_seen();
+    }
+
+    #[cfg(windows)]
+    fn has_unmounted_metadata_import_contexts(&self) -> bool {
+        self.active_detached_viewer_context.is_some()
+            || self
+                .detached_image_windows
+                .iter()
+                .any(|window| window.paused_bundle.is_some())
+    }
+
+    #[cfg(not(windows))]
+    fn has_unmounted_metadata_import_contexts(&self) -> bool {
+        false
     }
 
     fn apply_metadata_transfer_import_refresh(

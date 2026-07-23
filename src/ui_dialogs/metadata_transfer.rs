@@ -423,7 +423,7 @@ impl App {
         }
         self.restore_metadata_import_resources();
         if let Some(refresh) = imported_refresh {
-            self.refresh_after_metadata_transfer_import(&refresh);
+            self.refresh_after_metadata_transfer_import(refresh);
         }
     }
 
@@ -575,6 +575,7 @@ fn draw_progress(ui: &mut egui::Ui, progress: Option<&TransferProgress>) {
     let Some(progress) = progress else {
         ui.spinner();
         ui.label("準備中…");
+        draw_progress_path(ui, None);
         return;
     };
     let label = match progress.phase {
@@ -595,12 +596,64 @@ fn draw_progress(ui: &mut egui::Ui, progress: Option<&TransferProgress>) {
         ui.spinner();
         ui.label(format!("{} 件", progress.processed));
     }
-    if let Some(path) = &progress.current_path {
-        ui.label(
-            egui::RichText::new(path)
-                .small()
-                .color(ui.visuals().weak_text_color()),
-        );
+    draw_progress_path(ui, progress.current_path.as_deref());
+}
+
+const PROGRESS_PATH_ROWS: f32 = 3.0;
+
+/// 現在処理中のpathが1〜3行へ折り返されても、後続buttonの位置を動かさない。
+/// 3行を超える部分はclipし、hover時に全文を確認できるようにする。
+fn draw_progress_path(ui: &mut egui::Ui, path: Option<&str>) {
+    let row_height = ui.text_style_height(&egui::TextStyle::Small);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height * PROGRESS_PATH_ROWS),
+        egui::Sense::hover(),
+    );
+    let Some(path) = path else {
+        return;
+    };
+    let text_color = ui.visuals().weak_text_color();
+    let mut path_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    path_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+    path_ui.add(
+        egui::Label::new(egui::RichText::new(path).small().color(text_color))
+            .wrap()
+            .selectable(false),
+    );
+    response.on_hover_text(path);
+}
+
+#[cfg(test)]
+fn progress_widget_height(progress: TransferProgress) -> f32 {
+    use std::sync::{Arc, Mutex};
+
+    let height = Arc::new(Mutex::new(None));
+    let captured_height = Arc::clone(&height);
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(430.0, 240.0))
+        .build(move |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let top = ui.cursor().top();
+                draw_progress(ui, Some(&progress));
+                *captured_height.lock().unwrap() = Some(ui.cursor().top() - top);
+            });
+        });
+    harness.run();
+    let result = height.lock().unwrap().unwrap();
+    result
+}
+
+#[cfg(test)]
+fn test_progress(path: &str) -> TransferProgress {
+    TransferProgress {
+        phase: TransferPhase::ReadingMetadata,
+        processed: 10,
+        total: 100,
+        current_path: Some(path.to_string()),
     }
 }
 
@@ -924,5 +977,19 @@ mod tests {
         let db =
             crate::view_trim_db::ViewTrimDb::open_at(&temp.path().join("view_trim.db")).unwrap();
         assert_eq!(db.get_book_state(&book), Some(state));
+    }
+
+    #[test]
+    fn progress_height_does_not_change_when_current_path_wraps() {
+        let short = progress_widget_height(test_progress("C:/images/page.jpg"));
+        let long = progress_widget_height(test_progress(
+            "C:/very-long-folder-name/another-very-long-folder-name/\
+             third-very-long-folder-name/fourth-very-long-folder-name/page.jpg",
+        ));
+
+        assert!(
+            (short - long).abs() < f32::EPSILON,
+            "progress widget height changed: short={short}, long={long}"
+        );
     }
 }

@@ -339,6 +339,10 @@ import中だけDELETE journalへ切り替える。他の参加DBを含めWAL / M
 manifest 由来の画像本の相対ページは provenance と canonical container を一覧から
 metadata / thumbnail / fullscreen worker まで保持し、実 I/O では開いた同一ハンドルの
 final path を再検証してから、そのハンドル由来の metadata / bytes だけを利用する。
+archive member / nested container の identity は大小文字を区別せず、`\`を`/`へ統一してから
+重複検査・DB書込・完了差分へ共用する。完了差分はworker resultのownershipをUI上で複製せず、
+非active viewer contextがある場合だけkey indexで線形集成する。進捗path欄は3行分を固定確保し、
+折り返しによってキャンセルbuttonの位置を動かさない。
 実装と境界条件は `metadata_transfer.rs`、モーダルと writer drain は
 `ui_dialogs/metadata_transfer.rs` が所有する。
 
