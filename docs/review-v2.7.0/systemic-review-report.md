@@ -195,3 +195,20 @@ testを追加した後、この指摘と同型経路を再レビューする。P
 `cargo fmt --all -- --check` 成功。
 
 **追補判定: 事前 scan worker が取消後も並行継続する経路は解消。**
+
+## 通常 navigation の archive 置換境界追補（2026-07-23）
+
+- `OpenRequestOwner::Navigation` は container 種別判定より前に visible-open lifecycle を取得する。
+  archive A の scan 中に archive B を開いた場合、A の token と receiver を終了してから B の
+  `ArchiveConvertState` を作るため、B が `archive_convert.is_some()` で拒否されない。
+- 所有権判定は通常 folder load と共通の `claim_open_request_owner` に集約し、Bookmark owner の
+  request ID / target 検証と same-folder reload の例外は維持する。
+- App レベルで A scan → B open、A token cancel、B state ownership、A late completion の receiver
+  drop を固定する。
+
+対応後の検証は startup open-path lifecycle focused 22件成功、same-folder reload 回帰テスト成功、
+ライブラリテスト2,324件成功・失敗0件・17件ignored、バイナリテスト直列実行4,086件成功・失敗0件・
+18件ignored、`cargo check -p mimageviewer --bin mimageviewer-core` と
+`cargo fmt --all -- --check` 成功。
+
+**追補判定: 通常 navigation の archive A → archive B 置換で所有権が途切れる経路は解消。**

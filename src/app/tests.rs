@@ -1778,6 +1778,55 @@ mod startup_open_path_resolve_tests {
     }
 
     #[test]
+    fn navigation_archive_b_replaces_scanning_archive_a_before_dispatch() {
+        let mut app = setup_app();
+        let archive_a = app.tmp.path().join("archive-a.7z");
+        let (tx_a, cancel_a) = install_normal_archive_scan_transition(&mut app, archive_a.clone());
+        let archive_b = app.tmp.path().join("archive-b.7z");
+        std::fs::write(&archive_b, b"7z").unwrap();
+
+        let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            archive_b.clone(),
+            false,
+            OpenRequestOwner::Navigation,
+        );
+
+        assert_eq!(outcome, FolderOpenOutcome::ConversionDialogOpened);
+        assert!(cancel_a.load(Ordering::Relaxed));
+        let state_b = app
+            .archive_convert
+            .as_ref()
+            .expect("archive B must own the replacement transition");
+        assert!(crate::folder_tree::path_eq(&state_b.src_path, &archive_b));
+        assert!(matches!(
+            state_b.completion,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation
+        ));
+        assert!(!state_b.cancel.load(Ordering::Relaxed));
+        assert!(
+            tx_a.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
+                    crate::archive_converter::ArchiveImageSummary {
+                        image_count: 1,
+                        total_uncompressed_bytes: 1,
+                        nested_archive_count: 0,
+                    },
+                    false,
+                    archive_a,
+                )))
+            )
+            .is_err(),
+            "archive A receiver must be dropped before its late completion"
+        );
+        assert!(
+            app.archive_convert
+                .as_ref()
+                .is_some_and(|state| crate::folder_tree::path_eq(&state.src_path, &archive_b)),
+            "archive A late completion must not replace archive B"
+        );
+    }
+
+    #[test]
     fn activation_cancels_normal_archive_scan_before_path_resolution() {
         let mut app = setup_app();
         let source = app.tmp.path().join("activation-normal-scan.7z");

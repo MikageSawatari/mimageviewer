@@ -14447,14 +14447,9 @@ impl App {
         auto_fullscreen: bool,
         owner: OpenRequestOwner,
     ) -> FolderOpenOutcome {
-        if let OpenRequestOwner::Bookmark(bookmark_owner) = &owner
-            && !self.bookmark_open_owner_is_current(bookmark_owner)
-        {
-            crate::logger::log(format!(
-                "[bookmark-open] reject stale container transition id={} path={}",
-                bookmark_owner.request_id.0,
-                path.display()
-            ));
+        // Claim the visible-open lifecycle before dispatching by container type. In particular,
+        // archive B must replace an in-flight archive A before request_* observes the old state.
+        if !self.claim_open_request_owner(&path, &owner) {
             return FolderOpenOutcome::Ignored;
         }
         let format = path
@@ -14514,7 +14509,7 @@ impl App {
         {
             self.pending_auto_fs_open = true;
         }
-        self.load_folder_with_scan_owned(path, None, owner);
+        self.load_folder_with_scan_claimed(path, None, owner);
         FolderOpenOutcome::Loaded
     }
 
@@ -14533,27 +14528,50 @@ impl App {
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
     ) {
-        match &owner {
+        if !self.claim_open_request_owner(&path, &owner) {
+            return;
+        }
+        self.load_folder_with_scan_claimed(path, pre_scan, owner);
+    }
+
+    /// Acquire the right to perform a visible load before any format-specific dispatch.
+    ///
+    /// This is intentionally idempotent: the container dispatcher enforces the boundary before
+    /// archive recognition, while direct folder loaders enforce it for callers that bypass that
+    /// dispatcher. Same-folder reloads remain exempt in
+    /// `cancel_archive_convert_for_navigation_to`.
+    fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
+        match owner {
             OpenRequestOwner::Navigation => {
                 // A direct navigation owns the next visible location. If an earlier startup,
                 // activation, or bookmark path is still resolving, dispose that request before
                 // the worker can overwrite this navigation with a late completion.
-                self.cancel_archive_convert_for_navigation_to(&path, "normal_navigation");
+                self.cancel_archive_convert_for_navigation_to(path, "normal_navigation");
                 self.cancel_unresolved_open_for_navigation();
-                self.cancel_conflicting_bookmark_open_for_navigation(&path);
+                self.cancel_conflicting_bookmark_open_for_navigation(path);
+                true
             }
             OpenRequestOwner::Bookmark(bookmark_owner) => {
                 if !self.bookmark_open_owner_is_current(bookmark_owner) {
                     crate::logger::log(format!(
-                        "[bookmark-open] ignore stale folder load id={} path={}",
+                        "[bookmark-open] reject stale visible load id={} path={}",
                         bookmark_owner.request_id.0,
                         path.display()
                     ));
                     self.pending_auto_fs_open = false;
-                    return;
+                    return false;
                 }
+                true
             }
         }
+    }
+
+    fn load_folder_with_scan_claimed(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+    ) {
         // 別経路の load が走ったら、in-flight のフォルダペイン open scan は stale なので
         // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
         // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
