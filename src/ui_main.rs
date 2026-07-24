@@ -10,7 +10,8 @@ use std::sync::atomic::Ordering;
 use eframe::egui;
 
 use crate::app::{
-    App, FacetField, GridScrollIntent, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget,
+    App, FacetField, GridClickSelectionAnchor, GridScrollIntent, LazyColumnState,
+    QuickFolderSlotId, QuickFolderSwitchTarget,
 };
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
@@ -2796,12 +2797,14 @@ fn grid_selection_item_is_checkable(items: &[GridItem], allow_folders: bool, idx
 }
 
 fn grid_selection_anchor(
-    anchor: Option<usize>,
+    anchor: Option<GridClickSelectionAnchor>,
+    items_generation: u64,
     selected: Option<usize>,
     display_order: &[usize],
     clicked_idx: usize,
 ) -> usize {
     anchor
+        .and_then(|anchor| anchor.index_for_generation(items_generation))
         .filter(|idx| display_order.contains(idx))
         .or_else(|| selected.filter(|idx| display_order.contains(idx)))
         .unwrap_or(clicked_idx)
@@ -2841,7 +2844,8 @@ fn add_grid_selection_range(
 fn apply_grid_click_selection(
     mode: GridClickSelectionMode,
     selected: &mut Option<usize>,
-    anchor: &mut Option<usize>,
+    anchor: &mut Option<GridClickSelectionAnchor>,
+    items_generation: u64,
     checked: &mut HashSet<usize>,
     display_order: &[usize],
     items: &[GridItem],
@@ -2852,8 +2856,16 @@ fn apply_grid_click_selection(
 ) {
     let mode = mode.normalized();
     if shift {
-        let previous_anchor_is_valid = anchor.is_some_and(|idx| display_order.contains(&idx));
-        let range_anchor = grid_selection_anchor(*anchor, *selected, display_order, clicked_idx);
+        let previous_anchor_is_valid = anchor
+            .and_then(|anchor| anchor.index_for_generation(items_generation))
+            .is_some_and(|idx| display_order.contains(&idx));
+        let range_anchor = grid_selection_anchor(
+            *anchor,
+            items_generation,
+            *selected,
+            display_order,
+            clicked_idx,
+        );
         if mode == GridClickSelectionMode::Explorer {
             checked.clear();
         }
@@ -2867,7 +2879,10 @@ fn apply_grid_click_selection(
         );
         *selected = Some(clicked_idx);
         if !previous_anchor_is_valid {
-            *anchor = Some(range_anchor);
+            *anchor = Some(GridClickSelectionAnchor::new(
+                range_anchor,
+                items_generation,
+            ));
         }
         return;
     }
@@ -2877,7 +2892,7 @@ fn apply_grid_click_selection(
             checked.clear();
         }
         *selected = Some(clicked_idx);
-        *anchor = Some(clicked_idx);
+        *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
         return;
     }
 
@@ -2896,7 +2911,7 @@ fn apply_grid_click_selection(
             checked.insert(clicked_idx);
         }
         *selected = Some(clicked_idx);
-        *anchor = Some(clicked_idx);
+        *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
         return;
     }
 
@@ -2909,7 +2924,7 @@ fn apply_grid_click_selection(
         } else {
             checked.clear();
             *selected = Some(clicked_idx);
-            *anchor = Some(clicked_idx);
+            *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
         }
         return;
     }
@@ -2930,7 +2945,7 @@ fn apply_grid_click_selection(
             }
             _ => {
                 *selected = Some(clicked_idx);
-                *anchor = Some(clicked_idx);
+                *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
                 return;
             }
         }
@@ -2938,7 +2953,7 @@ fn apply_grid_click_selection(
         checked.insert(clicked_idx);
     }
 
-    *anchor = Some(clicked_idx);
+    *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
     match checked.len() {
         0 => {
             *selected = None;
@@ -2963,7 +2978,8 @@ fn apply_grid_click_selection(
 fn apply_grid_secondary_selection(
     mode: GridClickSelectionMode,
     selected: &mut Option<usize>,
-    anchor: &mut Option<usize>,
+    anchor: &mut Option<GridClickSelectionAnchor>,
+    items_generation: u64,
     checked: &mut HashSet<usize>,
     clicked_idx: usize,
 ) {
@@ -2971,13 +2987,13 @@ fn apply_grid_secondary_selection(
         checked.clear();
     }
     *selected = Some(clicked_idx);
-    *anchor = Some(clicked_idx);
+    *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
 }
 
 fn clear_grid_selection_for_background_click(
     mode: GridClickSelectionMode,
     selected: &mut Option<usize>,
-    anchor: &mut Option<usize>,
+    anchor: &mut Option<GridClickSelectionAnchor>,
     checked: &mut HashSet<usize>,
 ) -> bool {
     if mode.normalized() != GridClickSelectionMode::Explorer {
@@ -10510,7 +10526,8 @@ impl App {
                 &mode,
                 Some(idx),
             ) {
-                self.grid_click_selection_anchor = Some(idx);
+                self.grid_click_selection_anchor =
+                    Some(GridClickSelectionAnchor::new(idx, self.items_generation));
                 self.update_last_selected_image();
             }
             match mode {
@@ -10569,6 +10586,7 @@ impl App {
                 self.settings.grid_click_selection_mode,
                 &mut self.selected,
                 &mut self.grid_click_selection_anchor,
+                self.items_generation,
                 &mut self.checked,
                 &display_order,
                 &self.items,
@@ -10758,6 +10776,7 @@ impl App {
                 self.settings.grid_click_selection_mode,
                 &mut self.selected,
                 &mut self.grid_click_selection_anchor,
+                self.items_generation,
                 &mut self.checked,
                 idx,
             );
@@ -10960,6 +10979,7 @@ impl App {
                 self.settings.grid_click_selection_mode,
                 &mut self.selected,
                 &mut self.grid_click_selection_anchor,
+                self.items_generation,
                 &mut self.checked,
                 idx,
             );
@@ -15803,10 +15823,20 @@ mod toolbar_reorder_tests {
 mod grid_click_selection_tests {
     use super::*;
 
+    const ITEMS_GENERATION: u64 = 7;
+
     fn items(count: usize) -> Vec<GridItem> {
         (0..count)
             .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\{idx}.png"))))
             .collect()
+    }
+
+    fn test_anchor(index: usize) -> Option<GridClickSelectionAnchor> {
+        Some(GridClickSelectionAnchor::new(index, ITEMS_GENERATION))
+    }
+
+    fn anchor_index(anchor: Option<GridClickSelectionAnchor>) -> Option<usize> {
+        anchor.and_then(|anchor| anchor.index_for_generation(ITEMS_GENERATION))
     }
 
     #[test]
@@ -15814,13 +15844,14 @@ mod grid_click_selection_tests {
         let items = items(6);
         let order: Vec<_> = (0..items.len()).collect();
         let mut selected = Some(1);
-        let mut anchor = Some(1);
+        let mut anchor = test_anchor(1);
         let mut checked = HashSet::from([0]);
 
         apply_grid_click_selection(
             GridClickSelectionMode::Check,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &[],
             &items,
@@ -15830,13 +15861,14 @@ mod grid_click_selection_tests {
             false,
         );
         assert_eq!(selected, Some(2));
-        assert_eq!(anchor, Some(2));
+        assert_eq!(anchor_index(anchor), Some(2));
         assert_eq!(checked, HashSet::from([0]));
 
         apply_grid_click_selection(
             GridClickSelectionMode::Check,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &order,
             &items,
@@ -15846,7 +15878,7 @@ mod grid_click_selection_tests {
             true,
         );
         assert_eq!(selected, Some(4));
-        assert_eq!(anchor, Some(2));
+        assert_eq!(anchor_index(anchor), Some(2));
         assert_eq!(checked, HashSet::from([0, 2, 3, 4]));
     }
 
@@ -15854,13 +15886,14 @@ mod grid_click_selection_tests {
     fn explorer_normal_and_background_click_replace_then_clear_selection() {
         let items = items(4);
         let mut selected = Some(1);
-        let mut anchor = Some(1);
+        let mut anchor = test_anchor(1);
         let mut checked = HashSet::from([0, 1]);
 
         apply_grid_click_selection(
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &[],
             &items,
@@ -15870,7 +15903,7 @@ mod grid_click_selection_tests {
             false,
         );
         assert_eq!(selected, Some(3));
-        assert_eq!(anchor, Some(3));
+        assert_eq!(anchor_index(anchor), Some(3));
         assert!(checked.is_empty());
 
         assert!(clear_grid_selection_for_background_click(
@@ -15887,7 +15920,7 @@ mod grid_click_selection_tests {
     #[test]
     fn check_mode_background_click_preserves_selection() {
         let mut selected = Some(2);
-        let mut anchor = Some(2);
+        let mut anchor = test_anchor(2);
         let mut checked = HashSet::from([1, 2]);
         assert!(!clear_grid_selection_for_background_click(
             GridClickSelectionMode::Check,
@@ -15896,7 +15929,7 @@ mod grid_click_selection_tests {
             &mut checked,
         ));
         assert_eq!(selected, Some(2));
-        assert_eq!(anchor, Some(2));
+        assert_eq!(anchor_index(anchor), Some(2));
         assert_eq!(checked, HashSet::from([1, 2]));
     }
 
@@ -15905,13 +15938,14 @@ mod grid_click_selection_tests {
         let items = items(6);
         let order: Vec<_> = (0..items.len()).collect();
         let mut selected = Some(1);
-        let mut anchor = Some(1);
+        let mut anchor = test_anchor(1);
         let mut checked = HashSet::from([5]);
 
         apply_grid_click_selection(
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &order,
             &items,
@@ -15922,12 +15956,13 @@ mod grid_click_selection_tests {
         );
         assert_eq!(checked, HashSet::from([1, 2, 3]));
         assert_eq!(selected, Some(3));
-        assert_eq!(anchor, Some(1));
+        assert_eq!(anchor_index(anchor), Some(1));
 
         apply_grid_click_selection(
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &order,
             &items,
@@ -15937,7 +15972,7 @@ mod grid_click_selection_tests {
             true,
         );
         assert_eq!(checked, HashSet::from([1, 2, 3, 4]));
-        assert_eq!(anchor, Some(1));
+        assert_eq!(anchor_index(anchor), Some(1));
     }
 
     #[test]
@@ -15945,13 +15980,14 @@ mod grid_click_selection_tests {
         let items = items(5);
         let order: Vec<_> = (0..items.len()).collect();
         let mut selected = Some(1);
-        let mut anchor = Some(1);
+        let mut anchor = test_anchor(1);
         let mut checked = HashSet::new();
 
         apply_grid_click_selection(
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &order,
             &items,
@@ -15967,6 +16003,7 @@ mod grid_click_selection_tests {
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &order,
             &items,
@@ -15982,6 +16019,7 @@ mod grid_click_selection_tests {
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &order,
             &items,
@@ -15998,13 +16036,14 @@ mod grid_click_selection_tests {
     #[test]
     fn explorer_right_click_preserves_only_a_multi_selection_member() {
         let mut selected = Some(1);
-        let mut anchor = Some(1);
+        let mut anchor = test_anchor(1);
         let mut checked = HashSet::from([1, 2]);
 
         apply_grid_secondary_selection(
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             2,
         );
@@ -16015,26 +16054,29 @@ mod grid_click_selection_tests {
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             4,
         );
         assert!(checked.is_empty());
         assert_eq!(selected, Some(4));
-        assert_eq!(anchor, Some(4));
+        assert_eq!(anchor_index(anchor), Some(4));
     }
 
     #[test]
-    fn stale_anchor_falls_back_to_current_selection() {
+    fn previous_list_generation_anchor_falls_back_to_current_selection() {
         let items = items(5);
         let order: Vec<_> = (0..items.len()).collect();
         let mut selected = Some(2);
-        let mut anchor = Some(99);
+        // index=0 は現一覧にも存在するが、前世代の別アイテムなのでアンカーに使わない。
+        let mut anchor = Some(GridClickSelectionAnchor::new(0, ITEMS_GENERATION - 1));
         let mut checked = HashSet::new();
 
         apply_grid_click_selection(
             GridClickSelectionMode::Explorer,
             &mut selected,
             &mut anchor,
+            ITEMS_GENERATION,
             &mut checked,
             &order,
             &items,
@@ -16044,7 +16086,7 @@ mod grid_click_selection_tests {
             true,
         );
         assert_eq!(checked, HashSet::from([2, 3, 4]));
-        assert_eq!(anchor, Some(2));
+        assert_eq!(anchor_index(anchor), Some(2));
     }
 }
 

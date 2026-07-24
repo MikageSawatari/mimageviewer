@@ -6545,6 +6545,11 @@ mod phase_c_drill_nav_tests {
         app.replace_search_view_items(initial, vec![None, None, None]);
         // B (idx=1) を選択、A と C をチェック
         app.selected = Some(1);
+        // Shift 範囲の起点は A (idx=0)。selected と別にして、内容キーによる独立追従を確認。
+        app.grid_click_selection_anchor = Some(crate::app::GridClickSelectionAnchor::new(
+            0,
+            app.items_generation,
+        ));
         app.checked.insert(0);
         app.checked.insert(2);
 
@@ -6568,6 +6573,43 @@ mod phase_c_drill_nav_tests {
         assert!(
             !app.checked.contains(&2),
             "B は selected のみ、checked ではない"
+        );
+        assert_eq!(
+            app.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
+            Some(1),
+            "Shift アンカーは同じ A を指す新 idx=1 と新 items 世代へ追従"
+        );
+    }
+
+    #[test]
+    fn install_new_items_invalidates_click_selection_anchor_even_when_index_still_exists() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.install_new_items(
+            vec![
+                GridItem::Image(std::path::PathBuf::from("c:/old-a.jpg")),
+                GridItem::Image(std::path::PathBuf::from("c:/old-b.jpg")),
+            ],
+            vec![None, None],
+        );
+        app.selected = Some(1);
+        app.grid_click_selection_anchor = Some(crate::app::GridClickSelectionAnchor::new(
+            0,
+            app.items_generation,
+        ));
+
+        app.install_new_items(
+            vec![
+                GridItem::Image(std::path::PathBuf::from("c:/new-a.jpg")),
+                GridItem::Image(std::path::PathBuf::from("c:/new-b.jpg")),
+            ],
+            vec![None, None],
+        );
+
+        assert!(
+            app.grid_click_selection_anchor.is_none(),
+            "同じ index 数の別一覧へ旧 Shift アンカーを持ち込まない"
         );
     }
 
@@ -17201,6 +17243,34 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             app.thumb_adjust_tex.is_empty(),
             "補正済み TextureHandle は stale なので削除後に再生成させる"
+        );
+    }
+
+    #[test]
+    fn remove_items_batch_remaps_surviving_click_anchor_and_drops_removed_anchor() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/p/a.jpg");
+        let b = push_image(&mut app, "C:/p/b.jpg");
+        let c = push_image(&mut app, "C:/p/c.jpg");
+        let d = push_image(&mut app, "C:/p/d.jpg");
+        assert_eq!((a, b, c, d), (0, 1, 2, 3));
+
+        app.grid_click_selection_anchor = Some(crate::app::GridClickSelectionAnchor::new(
+            d,
+            app.items_generation,
+        ));
+        app.remove_items_batch(&[b]);
+        assert_eq!(
+            app.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
+            Some(2),
+            "削除位置より後ろで残存した D のアンカーは idx 3→2 へ追従"
+        );
+
+        app.remove_items_batch(&[2]);
+        assert!(
+            app.grid_click_selection_anchor.is_none(),
+            "アンカー対象 D 自体を削除したら失効する"
         );
     }
 

@@ -1192,6 +1192,11 @@ impl App {
             .selected
             .and_then(|i| self.items.get(i))
             .and_then(thumb_reuse_key);
+        let anchor_key = self
+            .grid_click_selection_anchor
+            .and_then(|anchor| anchor.index_for_generation(self.items_generation))
+            .and_then(|i| self.items.get(i))
+            .and_then(thumb_reuse_key);
         let checked_keys: HashSet<ThumbReuseKey> = self
             .checked
             .iter()
@@ -1219,7 +1224,12 @@ impl App {
         // 補正用 source pixels も同じ content-key で移し、補正済み tex は再生成させる。
         // 同時に選択 / チェックも content-key で新 idx に再マップする。
         let mut restored_selected: Option<usize> = None;
-        if !preserved.is_empty() || selected_key.is_some() || !checked_keys.is_empty() {
+        let mut restored_anchor: Option<usize> = None;
+        if !preserved.is_empty()
+            || selected_key.is_some()
+            || anchor_key.is_some()
+            || !checked_keys.is_empty()
+        {
             for (i, item) in self.items.iter().enumerate() {
                 let Some(key) = thumb_reuse_key(item) else {
                     continue;
@@ -1238,12 +1248,17 @@ impl App {
                 if selected_key.as_ref() == Some(&key) {
                     restored_selected = Some(i);
                 }
+                if anchor_key.as_ref() == Some(&key) {
+                    restored_anchor = Some(i);
+                }
                 if checked_keys.contains(&key) {
                     self.checked.insert(i);
                 }
             }
         }
         self.selected = restored_selected;
+        self.grid_click_selection_anchor = restored_anchor
+            .map(|index| crate::app::GridClickSelectionAnchor::new(index, self.items_generation));
         // 補正・マスク・crop・隠蔽・選択レイヤーはすべて idx ベース。Ctrl+G は items が
         // 総入れ替わりするので旧フォルダの個別設定は意味を失う。`clear_page_edit_state()` で
         // idx-keyed ページ編集状態を一括 clear する (Codex P2: 旧実装は

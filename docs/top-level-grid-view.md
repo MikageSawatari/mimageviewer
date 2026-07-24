@@ -53,6 +53,12 @@ root 再準備では新しい実フォルダ表示順を state へ反映する�
 scope として保持せず root へ戻す。定義削除、worker cancel、別最上位ビューへの遷移は既存の
 smart generation / cancel 境界と `TopLevelGridView` の ownership を両方確認する。
 
+グリッドの Shift+クリック起点は `GridClickSelectionAnchor { index, items_generation }` として
+現在の item 配列世代に所属する。一覧全体を差し替える通常経路では失効させ、Ctrl+G の
+streaming rebuild では同じ内容キーが残る場合だけ新 index / 新世代へ再マップする。一覧内削除は
+アンカー対象が残る場合だけ old→new index へ追従し、対象自体が消えた場合は失効させる。
+これにより、別一覧に同じ数値 index が存在しても前の一覧から範囲選択しない。
+
 ## 4. 回帰確認
 
 - root → 実フォルダ → 子フォルダ → Backspace → root

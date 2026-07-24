@@ -273,6 +273,9 @@ impl App {
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
         let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
         let saved_selected = std::mem::replace(&mut self.selected, new_selected);
+        // snapshot は別の item 配列なので、元一覧の index アンカーを持ち込まない。
+        // 次の Shift+クリックは snapshot 側の selected を起点に再確立する。
+        self.grid_click_selection_anchor = None;
         // ネスト ZIP ツリーナビ状態は必ず take して退避する。snapshot は items を
         // start_loading_items を通さず差し替えるので、残したままだと snapshot 表示中の
         // BS が zip_nav_back() に落ちて stale な ZIP 階層を snapshot ビューへ上書き
@@ -538,6 +541,7 @@ impl App {
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
             self.selected = snap.saved_selected;
+            self.grid_click_selection_anchor = None;
             // ネスト ZIP 由来の snapshot: saved_items (= ZIP 階層の items) と対で
             // ナビ状態も復元する。これをしないと「ZIP items なのに nav なし」になり、
             // BS が階層を戻らず ZIP ごと抜ける / ZipDir セルの Enter が無反応になる。
@@ -635,6 +639,7 @@ impl App {
         self.scroll_offset_y = 0.0;
         self.pending_grid_scroll = None;
         self.selected = None;
+        self.grid_click_selection_anchor = None;
         // items_generation bump + invalidate (= Codex P1-1)
         self.items_generation = self.items_generation.wrapping_add(1);
         self.invalidate_idx_state_and_queues();

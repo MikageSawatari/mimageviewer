@@ -1916,7 +1916,7 @@ struct ViewerContextBundle {
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     auto_aspect: crate::auto_aspect::AutoAspectState,
     selected: Option<usize>,
-    grid_click_selection_anchor: Option<usize>,
+    grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
     scroll_offset_y: f32,
     scroll_to_selected: bool,
     pending_grid_scroll: Option<GridScrollIntent>,
@@ -6255,6 +6255,25 @@ fn detached_window_references_removed(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridClickSelectionAnchor {
+    index: usize,
+    items_generation: u64,
+}
+
+impl GridClickSelectionAnchor {
+    pub(crate) fn new(index: usize, items_generation: u64) -> Self {
+        Self {
+            index,
+            items_generation,
+        }
+    }
+
+    pub(crate) fn index_for_generation(self, items_generation: u64) -> Option<usize> {
+        (self.items_generation == items_generation).then_some(self.index)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridScrollIntent {
     Top,
     Bottom,
@@ -6267,8 +6286,9 @@ pub struct App {
     pub(crate) items: Vec<GridItem>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
-    /// Shift+クリックの起点。表示中の一覧コンテキストと一緒に所有・交換する。
-    pub(crate) grid_click_selection_anchor: Option<usize>,
+    /// Shift+クリックの起点。index と items 世代を一体で保持し、別一覧の同じ index を
+    /// 誤って起点にしない。表示中の一覧コンテキストと一緒に所有・交換する。
+    pub(crate) grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
     pub(crate) settings: crate::settings::Settings,
     pub(crate) keymap: crate::keymap::Keymap,
     pub(crate) gamepad: crate::gamepad::GamepadRuntime,
@@ -17543,6 +17563,7 @@ impl App {
         }
         self.details_image_dims_state = LazyColumnState::Disabled;
         self.selected = None;
+        self.grid_click_selection_anchor = None;
         self.scroll_offset_y = 0.0;
         self.pending_grid_scroll = None;
         // 変換キャッシュの override は「current_folder == そのキャッシュ ZIP」の間だけ
@@ -20234,6 +20255,10 @@ impl App {
             })
             .collect();
         self.items_generation = self.items_generation.wrapping_add(1);
+        // 一覧全体の差し替えでは同じ index が別アイテムを指し得るため、クリック範囲選択の
+        // 起点を失効させる。Ctrl+G streaming のように内容 identity で追従できる経路だけ、
+        // 呼び出し側が旧 key を保存して新世代へ明示的に再マップする。
+        self.grid_click_selection_anchor = None;
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
@@ -21954,6 +21979,7 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
+        let previous_items_generation = self.items_generation;
         let removed_snapshot_paths: Vec<std::path::PathBuf> = sorted_desc_idxs
             .iter()
             .filter_map(|&i| {
@@ -21993,6 +22019,11 @@ impl App {
             }
             Some(old - p)
         };
+        self.grid_click_selection_anchor = self
+            .grid_click_selection_anchor
+            .and_then(|anchor| anchor.index_for_generation(previous_items_generation))
+            .and_then(shift)
+            .map(|index| GridClickSelectionAnchor::new(index, self.items_generation));
 
         if let Some(ref mut filter) = self.search_filter {
             let new_filter: std::collections::HashSet<usize> =
