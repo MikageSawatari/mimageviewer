@@ -708,13 +708,28 @@ pub fn draw_cell_filename(
     painter.galley(text_pos, galley, text_color);
 }
 
+const FILE_BADGE_SCALE: f32 = 0.70;
+const FILE_BADGE_MIN_FONT_SIZE: f32 = 7.0;
+
+/// ZIP / PDF / RAR 等の形式バッジに使う文字サイズ。
+///
+/// 従来のバッジに対して約 70% とし、小さいセルでは可読性を保つため 7pt を下限にする。
+/// フォルダ名バッジは対象外で、従来どおりのサイズを維持する。
+fn file_badge_font_size(cell_rect: egui::Rect) -> f32 {
+    ((cell_rect.height() * 0.10).clamp(9.0, 16.0) * FILE_BADGE_SCALE).max(FILE_BADGE_MIN_FONT_SIZE)
+}
+
+fn folder_badge_font_size(cell_rect: egui::Rect) -> f32 {
+    (cell_rect.height() * 0.10).clamp(9.0, 16.0)
+}
+
 /// `draw_zip_badge` / `draw_pdf_badge` / `draw_archive_badge` が左下に描く ASCII 3 文字
 /// バッジの幅を pessimistic に見積もって、`draw_cell_filename` の `reserve_left_w`
-/// に渡す値を返す。`draw_file_badge` の font_size = `clamp(h*0.10, 9, 16)` に合わせて
+/// に渡す値を返す。`draw_file_badge` と同じ縮小後の文字サイズに合わせて
 /// `badge_w ≈ font_size * 2.65` (3 文字 ASCII 大文字 + pad_h*2) を `font_size * 3.0`
 /// に余裕を持たせ、左マージン 3.0 と視覚的隙間 4.0 を加算する。
 pub fn estimated_file_badge_width(inner: egui::Rect) -> f32 {
-    let font_size = (inner.height() * 0.10).clamp(9.0, 16.0);
+    let font_size = file_badge_font_size(inner);
     3.0 + font_size * 3.0 + 4.0
 }
 
@@ -896,7 +911,7 @@ pub fn draw_rating_stars(ui: &mut egui::Ui, current: u8) -> Option<u8> {
 
 /// サムネイル左下にファイル種別バッジを描画する共通関数。
 fn draw_file_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str, bg: egui::Color32) {
-    let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);
+    let font_size = file_badge_font_size(cell_rect);
     let pad_h = font_size * 0.35;
     let pad_v = font_size * 0.2;
     let galley = painter.layout_no_wrap(
@@ -950,10 +965,11 @@ pub fn draw_archive_badge(painter: &egui::Painter, cell_rect: egui::Rect, label:
     );
 }
 
-/// 左下に描くコンテナバッジ (folder/zip/pdf/archive) の標準的な高さ。
-/// 各 `draw_*_badge` 関数と同じ `font_size = (cell.height * 0.10).clamp(9.0, 16.0)` +
-/// `pad_v = font_size * 0.2` の計算に追従し、`galley.size().y` を `font_size * 1.4` で
-/// 安全側に近似する (= painter を持たない呼び出し元から呼べるよう text metric を見ない)。
+/// 左下に描く ZIP / PDF / RAR 等の形式バッジの標準的な高さ。
+///
+/// `draw_file_badge` と同じ縮小後の文字サイズ・余白に追従し、`galley.size().y` を
+/// `font_size * 1.4` で安全側に近似する (= painter を持たない呼び出し元から呼べるよう
+/// text metric を見ない)。
 ///
 /// 用途: レーティング ★ バッジなど **左下に並ぶ別オーバーレイ** を、コンテナバッジに
 /// 重ねず縦に積むときの y オフセット計算。1 バッジぶん分の高さを取りたいときに使う。
@@ -962,15 +978,25 @@ pub fn draw_archive_badge(painter: &egui::Painter, cell_rect: egui::Rect, label:
 /// 内側 rect) を渡すこと**。outer rect を渡すと `cell.height` がわずかに大きく見えて
 /// `font_size` が `draw_*_badge` 側と乖離し、レーティング配置に 1-2 px の食い込みが
 /// 発生する (実機フィードバックで判明)。
-pub fn container_badge_height(cell_rect: egui::Rect) -> f32 {
-    let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);
+pub fn file_badge_height(cell_rect: egui::Rect) -> f32 {
+    let font_size = file_badge_font_size(cell_rect);
+    let pad_v = font_size * 0.2;
+    font_size * 1.4 + pad_v * 2.0
+}
+
+/// 左下に描くフォルダ名バッジの標準的な高さ。
+///
+/// 形式バッジだけを縮小しても、フォルダ名バッジとその上の評価表示の間隔は従来どおり
+/// 維持するため、専用の高さ計算として分けている。
+pub fn folder_badge_height(cell_rect: egui::Rect) -> f32 {
+    let font_size = folder_badge_font_size(cell_rect);
     let pad_v = font_size * 0.2;
     font_size * 1.4 + pad_v * 2.0
 }
 
 /// フォルダサムネイルに表示するバッジ（左下、緑系、フォルダ名表示）。
 pub fn draw_folder_badge(painter: &egui::Painter, cell_rect: egui::Rect, folder_name: &str) {
-    let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);
+    let font_size = folder_badge_font_size(cell_rect);
     let pad_h = font_size * 0.35;
     let pad_v = font_size * 0.2;
     let max_badge_w = cell_rect.width() * 0.80;
@@ -1591,6 +1617,21 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
+    }
+
+    #[test]
+    fn file_badge_geometry_is_compact_without_shrinking_folder_badges() {
+        let large = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 180.0));
+        let small = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 40.0));
+
+        assert!((file_badge_font_size(large) - 11.2).abs() < f32::EPSILON);
+        assert!((file_badge_font_size(small) - FILE_BADGE_MIN_FONT_SIZE).abs() < f32::EPSILON);
+        assert!((folder_badge_font_size(large) - 16.0).abs() < f32::EPSILON);
+        assert!(
+            (file_badge_height(large) / folder_badge_height(large) - FILE_BADGE_SCALE).abs()
+                < 0.001
+        );
+        assert!(estimated_file_badge_width(large) < 3.0 + 16.0 * 3.0 + 4.0);
     }
 
     #[test]

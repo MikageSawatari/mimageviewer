@@ -428,6 +428,53 @@ fn cell_filename_mixed_glyphs_dark() {
     );
 }
 
+/// ZIP / PDF / RAR 等の形式バッジが、中央の代替アイコンを変えずに左下へコンパクトに
+/// 収まり、ファイル名プレートとも重ならないことを確認する。
+#[test]
+fn compact_file_format_badges_light() {
+    snapshot_with_theme(
+        "compact_file_format_badges_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            ui.horizontal(|ui| {
+                for (icon, name, kind) in [
+                    ("📦", "comic.zip", "ZIP"),
+                    ("📄", "document.pdf", "PDF"),
+                    ("🗜", "archive.rar", "RAR"),
+                ] {
+                    let (response, painter) =
+                        ui.allocate_painter(egui::vec2(138.0, 180.0), egui::Sense::hover());
+                    let inner = response.rect.shrink(4.0);
+                    painter.rect_filled(inner, 3.0, egui::Color32::from_gray(228));
+                    painter.text(
+                        inner.center() - egui::vec2(0.0, 10.0),
+                        egui::Align2::CENTER_CENTER,
+                        icon,
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(70),
+                    );
+                    mimageviewer::ui_helpers::draw_cell_filename(
+                        &painter,
+                        inner,
+                        name,
+                        egui::Color32::from_gray(35),
+                        false,
+                        mimageviewer::ui_helpers::estimated_file_badge_width(inner),
+                    );
+                    match kind {
+                        "ZIP" => mimageviewer::ui_helpers::draw_zip_badge(&painter, inner),
+                        "PDF" => mimageviewer::ui_helpers::draw_pdf_badge(&painter, inner),
+                        _ => {
+                            mimageviewer::ui_helpers::draw_archive_badge(&painter, inner, kind);
+                        }
+                    }
+                }
+            });
+        },
+    );
+}
+
 #[test]
 fn stats_histogram_compact_columns_light() {
     snapshot_with_theme(

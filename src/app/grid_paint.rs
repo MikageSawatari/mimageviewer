@@ -149,6 +149,27 @@ pub(crate) fn cell_has_lower_left_container_badge(item: &GridItem, thumb: &Thumb
     }
 }
 
+/// 実際に描画される左下コンテナバッジの高さを返す。
+///
+/// ZIP / PDF / RAR 等の形式バッジだけを縮小しているため、フォルダ名バッジとは
+/// 高さを分けて評価表示の積み上げ位置を計算する。
+fn lower_left_container_badge_height(item: &GridItem, inner: egui::Rect) -> f32 {
+    match item {
+        GridItem::Folder(_) => crate::ui_helpers::folder_badge_height(inner),
+        GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. } => {
+            crate::ui_helpers::file_badge_height(inner)
+        }
+        GridItem::ZipDir { is_archive, .. } => {
+            if *is_archive {
+                crate::ui_helpers::file_badge_height(inner)
+            } else {
+                crate::ui_helpers::folder_badge_height(inner)
+            }
+        }
+        _ => 0.0,
+    }
+}
+
 fn draw_drive_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
     let side = inner.width().min(inner.height());
     let w = (side * 0.48).clamp(36.0, 72.0);
@@ -735,10 +756,10 @@ pub(crate) fn draw_cell(
         //   - x: `inner.min.x + 3.0` で folder badge と左端が揃う (rect ベースだと 4px 左にはみ出る)
         //   - y: `inner.max.y - bg_h - 3.0 - lift` で同じ anchor から計算
         // lift には gap 4px を追加して、folder badge との間に視覚的に余裕を出す
-        // (実機フィードバック: container_badge_height の galley 近似 + anchor 差で
+        // (実機フィードバック: badge height の galley 近似 + anchor 差で
         // 単純な `+ 2.0` だと 1-2 px 重なるため、`+ 4.0` で安全側に倒す)。
         let star_y_lift = if cell_has_lower_left_container_badge(item, thumb) {
-            crate::ui_helpers::container_badge_height(inner) + 4.0
+            lower_left_container_badge_height(item, inner) + 4.0
         } else {
             0.0
         };

@@ -172,7 +172,9 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
    `archivethumb:{format}:{identity}` キーで読む。キャッシュ未作成/失効時は要求を出さず
    アイコンに戻す。
 3. **フォルダ / ZIP / PDF / アーカイブアイコン fallback** — 中身が空 / 全部エラーで上 2 段が失敗
-   したときの最終フォールバック。`grid_item.rs` の draw_cell でアイコン表示。
+   したときの最終フォールバック。`grid_item.rs` の draw_cell でアイコン表示。ZIP / PDF /
+   RAR 等の形式は中央アイコンと独立した左下バッジでも示す。形式バッジは従来サイズの約
+   70%（小さいセルでは可読性のため 7pt を下限）で、フォルダ名バッジは従来サイズを保つ。
 
 **Video ピンの特殊経路**: pin source が動画の場合は `seed_folder_video_pin_thumbs`
 が起動時に `video_pins` DB の抽出済み WebP を pinned cache key として catalog にミラー
