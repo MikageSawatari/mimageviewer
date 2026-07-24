@@ -60253,3 +60253,13 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+/// Crate-wide `App` test fixture.
+///
+/// Unit tests outside `app::tests` must use this instead of `App::default()` so
+/// `Settings::load()` and every App-owned worker stay inside the same serialized
+/// data-dir override lease as settings/settings-restore tests.
+#[cfg(test)]
+pub(crate) use tests::phase_c_support::{
+    AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
+};

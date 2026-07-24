@@ -1342,14 +1342,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{AppTestEnvForTest, setup_app_for_test};
     use crate::grid_item::{GridItem, ThumbnailState};
     use crate::snapshot::SnapshotSourceLabel;
     use std::path::PathBuf;
 
     /// テスト用の App 構築。
-    fn test_app_with_items(items: Vec<GridItem>) -> App {
-        let mut app = App::default();
+    fn test_app_with_items(items: Vec<GridItem>) -> AppTestEnvForTest {
+        let mut app = setup_app_for_test();
         app.items = items;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
         app.visible_indices = (0..app.items.len()).collect();
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn snapshot_inactive_by_default() {
-        let app = App::default();
+        let app = setup_app_for_test();
         assert!(!app.is_snapshot_active());
         assert_eq!(app.snapshot_count(), None);
         assert!(app.snapshot_origin().is_none());
@@ -1601,20 +1601,20 @@ mod tests {
 
     #[test]
     fn owner_entry_returns_none_when_inactive() {
-        let app = App::default();
+        let app = setup_app_for_test();
         assert_eq!(app.snapshot_owner_entry(Path::new(r"E:\a.png")), None);
     }
 
     #[test]
     fn button_disabled_when_inactive_and_clean() {
         // 何も検索していない通常状態では enabled
-        let app = App::default();
+        let app = setup_app_for_test();
         assert!(app.snapshot_button_disabled_reason().is_none());
     }
 
     #[test]
     fn infer_source_label_defaults_to_mixed_for_default_state() {
-        let app = App::default();
+        let app = setup_app_for_test();
         // Default state: rating_filter=[true; 6] (= 全部許可) なので Mixed
         let label = app.infer_snapshot_source_label();
         assert_eq!(label, SnapshotSourceLabel::Mixed);
@@ -1622,7 +1622,7 @@ mod tests {
 
     #[test]
     fn infer_source_label_returns_rating_filter_when_filtering() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         // ★5 + 未評価 のみ
         app.settings.rating_filter = [true, false, false, false, false, true];
         let label = app.infer_snapshot_source_label();
@@ -1713,7 +1713,7 @@ mod tests {
 
     #[test]
     fn next_arrow_entry_inactive_returns_none() {
-        let app = App::default();
+        let app = setup_app_for_test();
         assert_eq!(app.snapshot_next_arrow_entry(None, true), None);
         assert_eq!(app.snapshot_next_playable_entry(None, true), None);
     }

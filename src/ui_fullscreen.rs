@@ -23366,7 +23366,7 @@ mod tests {
 
     #[test]
     fn viewer_short_right_click_action_applies_close_none_and_shared_menu_state() {
-        let mut app = App::default();
+        let mut app = crate::app::setup_app_for_test();
         let pos = egui::pos2(123.0, 456.0);
 
         assert!(app.apply_viewer_short_right_click_action(
@@ -25382,7 +25382,7 @@ mod tests {
     #[test]
     fn vertical_reading_texel_estimate_includes_edit_intermediate_textures() {
         let ctx = egui::Context::default();
-        let mut app = App::default();
+        let mut app = crate::app::setup_app_for_test();
         let idx = 7;
         let make_texture = |name: &str| {
             let image = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
@@ -25427,12 +25427,13 @@ mod tests {
         );
 
         let (pixels, texture) = make_texture("estimate_conceal");
+        let conceal_generation = app.conceal_generation;
         app.conceal_cache.insert(
             idx,
             crate::app::ConcealCacheEntry {
                 pixels,
                 texture,
-                generation: app.conceal_generation,
+                generation: conceal_generation,
             },
         );
 

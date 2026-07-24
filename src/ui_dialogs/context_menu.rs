@@ -2674,7 +2674,7 @@ mod delete_confirm_tests {
 
     #[test]
     fn fullscreen_video_menu_uses_frame_thumbnail_action_without_image_only_actions() {
-        let app = crate::app::App::default();
+        let app = crate::app::setup_app_for_test();
         let commands = menu_commands(
             &app,
             GridItem::Video(PathBuf::from("movie.mp4")),
@@ -2705,7 +2705,7 @@ mod delete_confirm_tests {
 
     #[test]
     fn context_menu_surface_keeps_grid_video_and_fullscreen_image_rotation_actions() {
-        let app = crate::app::App::default();
+        let app = crate::app::setup_app_for_test();
         let grid_video = menu_commands(
             &app,
             GridItem::Video(PathBuf::from("movie.mp4")),

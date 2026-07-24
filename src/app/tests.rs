@@ -1815,7 +1815,7 @@ fn clamp_color_image_for_gpu_preserves_premultiplied_alpha() {
 /// 統合した (settings.rs / settings_db.rs と共通)。これで全モジュールの set_test_override
 /// 使用者が単一の Mutex で直列化される。
 #[cfg(test)]
-mod phase_c_support {
+pub(crate) mod phase_c_support {
     use super::{App, AppTestConfig};
     use tempfile::TempDir;
 
@@ -1853,7 +1853,7 @@ mod phase_c_support {
     /// temp → APPDATA に変わった」と検知して本番 settings.db を defaults で上書きする事故が
     /// 起きた。`with_db` 側にも fail-fast ガード ([crate::settings_db]) を入れてあるが、
     /// 二重防御として drop 順自体を fix している。
-    pub(super) struct AppTestEnv {
+    pub(crate) struct AppTestEnv {
         pub app: App,
         _guard: OverrideGuard,
         /// Test 本体から `app.tmp.path()` の形でアクセスできるよう公開している
@@ -1877,7 +1877,7 @@ mod phase_c_support {
         }
     }
 
-    pub(super) fn setup_app() -> AppTestEnv {
+    pub(crate) fn setup_app() -> AppTestEnv {
         let lock = crate::data_dir::test_override_lock();
         let tmp = TempDir::new().expect("tempdir");
         crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));

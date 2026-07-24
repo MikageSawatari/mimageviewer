@@ -13538,10 +13538,10 @@ impl App {
 #[cfg(test)]
 mod selection_info_tests {
     use super::*;
-    use crate::app::DetailsLazyMeta;
+    use crate::app::{AppTestEnvForTest, DetailsLazyMeta, setup_app_for_test};
 
-    fn app_with_item(item: GridItem, meta: Option<(i64, i64)>) -> App {
-        let mut app = App::default();
+    fn app_with_item(item: GridItem, meta: Option<(i64, i64)>) -> AppTestEnvForTest {
+        let mut app = setup_app_for_test();
         app.items = vec![item];
         app.image_metas = vec![meta];
         app.thumbnails = vec![ThumbnailState::Pending];
@@ -13774,6 +13774,7 @@ mod selection_info_tests {
                 .text(DetailsColumn::PageCount),
             "42"
         );
+        drop(zip);
 
         let mut pdf = app_with_item(
             GridItem::PdfFile(PathBuf::from(r"C:\books\book.pdf")),
@@ -13799,7 +13800,7 @@ mod selection_info_tests {
 
     #[test]
     fn shared_builder_formats_multi_selection_and_cached_total_size() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.items = vec![
             GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")),
             GridItem::Image(PathBuf::from(r"C:\pics\b.jpg")),
@@ -13816,7 +13817,7 @@ mod selection_info_tests {
 
     #[test]
     fn multi_selection_omits_total_until_every_size_is_cached() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.items = vec![
             GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")),
             GridItem::Image(PathBuf::from(r"C:\pics\b.jpg")),
@@ -13834,7 +13835,7 @@ mod selection_info_tests {
 
     #[test]
     fn bottom_bar_reserves_height_from_grid_central_panel() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.selection_info_display_mode =
             crate::settings::SelectionInfoDisplayMode::BottomBar;
         let ctx = egui::Context::default();
@@ -13873,7 +13874,7 @@ mod selection_info_tests {
 
     #[test]
     fn details_lazy_status_reserves_bottom_without_moving_list_origin() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_page_count = true;
         app.settings.details_show_created = false;
@@ -14394,6 +14395,7 @@ mod book_reorder_drag_tests {
 #[cfg(test)]
 mod compute_cell_size_tests {
     use super::*;
+    use crate::app::setup_app_for_test;
 
     #[test]
     fn selected_ui_scale_menu_button_stays_on_one_row_in_a_narrow_popup() {
@@ -14856,7 +14858,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_name_width_measures_current_rows() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         app.items = vec![GridItem::Image(PathBuf::from(format!(
             r"C:\Pictures\{}.png",
@@ -14885,7 +14887,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_exact_width_reaches_longest_row_after_first_batch() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
         let longest_name = format!("{}tail.png", "outside-first-batch-".repeat(4));
@@ -14938,7 +14940,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_uses_current_filtered_and_sorted_order_exactly() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         let item_count = 221;
         let filtered_longest = format!("{}tail.png", "filtered-long-".repeat(4));
@@ -14987,7 +14989,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_discards_job_when_items_generation_changes_mid_scan() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 10;
         app.items = (0..row_count)
@@ -15024,7 +15026,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_keeps_fixed_samples_and_dynamic_column_scans() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         let ctx = egui::Context::default();
         let mut checked = false;
@@ -15074,7 +15076,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_restarts_tags_scan_when_measured_content_changes() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_tags = true;
         let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
@@ -15142,7 +15144,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_restarts_lazy_scan_when_video_codec_arrives() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_video_codec = true;
         let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
@@ -15210,7 +15212,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_ignores_unrelated_column_content_revision() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_tags = true;
         let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME + 1;
@@ -15247,7 +15249,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_bookmark_state_measures_long_missing_page_position() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_state = true;
         app.items_are_bookmark_view = true;
@@ -15304,7 +15306,7 @@ mod compute_cell_size_tests {
 
     #[test]
     fn details_best_fit_reading_history_state_measures_large_progress() {
-        let mut app = App::default();
+        let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_state = true;
         app.items_are_reading_history_view = true;
