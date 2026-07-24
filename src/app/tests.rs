@@ -24756,6 +24756,7 @@ mod still_window_mode_key_tests {
         std::fs::write(&a, b"fixture").unwrap();
         std::fs::write(&b, b"fixture").unwrap();
         std::fs::write(&c, b"fixture").unwrap();
+        let physical_scan = scan_directory(&first);
 
         app.current_folder = Some(main_surface.clone());
         let c_virtual_idx = push_image(&mut app, c.to_str().unwrap());
@@ -24831,14 +24832,64 @@ mod still_window_mode_key_tests {
             "the detached context must not clone the virtual c/a backing items while scanning"
         );
 
+        // 実 worker の速度に依存せず「次フレームでも scan 未完了」を再現する。直接 poll
+        // ではなく production の update を通し、pending 自体が active context の生存条件に
+        // 含まれていることを検証する。
+        let window_id = app
+            .active_detached_session
+            .expect("image open must create a detached session")
+            .window_id;
+        let (scan_tx, scan_rx) = mpsc::channel();
+        app.with_active_detached_viewer_context(|mounted| {
+            let real_pending = mounted
+                .folder_pane_open_pending
+                .take()
+                .expect("real physical scan must have started");
+            real_pending.cancel.store(true, Ordering::Relaxed);
+            mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: first.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::DetachedImage {
+                    image_path: a.clone(),
+                },
+            });
+        })
+        .expect("active detached context must mount");
+
+        let mut updated = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            updated = app.update_active_detached_viewer_context(ctx);
+        });
+        assert!(updated);
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.folder_pane_open_pending.is_some()),
+            "an unfinished image scan must keep the active detached context alive"
+        );
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(window_id),
+            "the slow scan frame must retain its detached session"
+        );
+        assert!(
+            app.detached_window_state(window_id).is_some(),
+            "the slow scan frame must retain its window runtime"
+        );
+
+        scan_tx
+            .send(physical_scan)
+            .expect("release controlled physical scan");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                updated = app.update_active_detached_viewer_context(ctx);
+            });
             let opened = app
-                .with_active_detached_viewer_context(|mounted| {
-                    mounted.poll_detached_physical_folder_open(&ctx);
-                    mounted.fullscreen_idx.is_some()
-                })
-                .expect("active detached context must remain mounted");
+                .active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.fullscreen_idx.is_some());
             if opened {
                 break;
             }
@@ -24944,6 +24995,143 @@ mod still_window_mode_key_tests {
             app.active_detached_viewer_context
                 .as_ref()
                 .is_some_and(|active| active.bundle.folder_nav_pending.is_some())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_image_open_missing_strict_target_closes_session_and_runtime() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = temp.path().join("physical");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("a.jpg");
+        let missing = folder.join("missing.jpg");
+        std::fs::write(&first, b"fixture").unwrap();
+        let physical_scan = scan_directory(&folder);
+
+        let main_surface = temp.path().join("search-results");
+        app.current_folder = Some(main_surface.clone());
+        let missing_virtual_idx = push_image(&mut app, missing.to_str().unwrap());
+        app.visible_indices = vec![missing_virtual_idx];
+        app.items_are_global_search_view = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, missing_virtual_idx));
+        let window_id = app
+            .active_detached_session
+            .expect("image request must create a detached session")
+            .window_id;
+
+        let (scan_tx, scan_rx) = mpsc::channel();
+        scan_tx.send(physical_scan).unwrap();
+        app.with_active_detached_viewer_context(|mounted| {
+            let real_pending = mounted
+                .folder_pane_open_pending
+                .take()
+                .expect("real physical scan must have started");
+            real_pending.cancel.store(true, Ordering::Relaxed);
+            mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: folder.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::DetachedImage {
+                    image_path: missing.clone(),
+                },
+            });
+        })
+        .expect("active detached context must mount");
+
+        let mut updated = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            updated = app.update_active_detached_viewer_context(ctx);
+        });
+        assert!(updated);
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "a missing explicit target must close the failed detached context"
+        );
+        assert!(
+            app.active_detached_session.is_none(),
+            "a failed explicit image open must finish its detached session"
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            None,
+            "a failed explicit image open must remove its window runtime"
+        );
+        assert_eq!(
+            app.current_folder,
+            Some(main_surface),
+            "closing the failed detached request must restore the main virtual surface"
+        );
+        assert!(
+            matches!(
+                app.items.as_slice(),
+                [GridItem::Image(path)] if path == &missing
+            ),
+            "the first physical image must never replace the explicitly requested missing image"
+        );
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_image_open_resolves_windows_path_case_without_fallback() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = temp.path().join("physical");
+        std::fs::create_dir_all(&folder).unwrap();
+        let actual = folder.join("Selected.JPG");
+        let requested = folder.join("selected.jpg");
+        std::fs::write(&actual, b"fixture").unwrap();
+        let physical_scan = scan_directory(&folder);
+
+        app.current_folder = Some(temp.path().join("search-results"));
+        let requested_idx = push_image(&mut app, requested.to_str().unwrap());
+        app.visible_indices = vec![requested_idx];
+        app.items_are_global_search_view = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, requested_idx));
+        let (scan_tx, scan_rx) = mpsc::channel();
+        scan_tx.send(physical_scan).unwrap();
+        app.with_active_detached_viewer_context(|mounted| {
+            let real_pending = mounted
+                .folder_pane_open_pending
+                .take()
+                .expect("real physical scan must have started");
+            real_pending.cancel.store(true, Ordering::Relaxed);
+            mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: folder.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::DetachedImage {
+                    image_path: requested,
+                },
+            });
+        })
+        .expect("active detached context must mount");
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_active_detached_viewer_context(ctx);
+        });
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("case-only path differences must still open the requested image");
+        let fullscreen_item = active
+            .bundle
+            .fullscreen_idx
+            .and_then(|idx| active.bundle.items.get(idx));
+        assert!(
+            matches!(
+                fullscreen_item,
+                Some(GridItem::Image(path)) if crate::folder_tree::path_eq(path, &actual)
+            ),
+            "the strict resolver must select the requested filesystem image"
         );
     }
 

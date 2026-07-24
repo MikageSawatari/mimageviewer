@@ -210,7 +210,10 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
 - 仮想一覧から通常画像を detached open するときは、親フォルダの `read_dir` / metadata scan を
   `FolderOpenScanPurpose::DetachedImage { image_path }` として worker へ出す。完了後に
   pre-scan 付き `load_folder_with_scan` で完全な物理一覧を materialize し、保持した path を
-  新しい index へ解決するため、main の検索部分集合や並び順を再利用しない。
+  新しい index へ解決するため、main の検索部分集合や並び順を再利用しない。pending は
+  active detached context の生存条件でもあり、遅いディスクやネットワークフォルダで scan が
+  複数フレームにまたがっても session / runtime とともに保持する。明示 target は Windows の
+  path identity で厳密に解決し、一覧に存在しなければ先頭へ fallback せず request を正常終了する。
 - `apply_folder_nav_result` がモードに応じて分岐。Fullscreen ブランチで
   `close_fullscreen` を呼ぶが、そこは既に `folder_nav_pending = None` なので
   再帰的な自己キャンセルは起きない。

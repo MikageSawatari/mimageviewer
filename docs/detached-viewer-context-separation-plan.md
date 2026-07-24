@@ -343,6 +343,9 @@ active viewer 内のキーは active context へ作用する。
   detached の `items` / `visible_indices` は開いた実親 / ZIP / PDF を非同期に完全列挙した
   物理順となり、検索で欠落した同一フォルダ画像や検索固有順を持ち込まない。
   linked viewer と media window は従来スコープを維持する。
+- 通常画像の初回 folder scan pending は active context のライフタイムに含める。scan 完了時は
+  request が保持した画像 path を Windows の path identity で厳密に解決し、削除や hidden 設定で
+  target が一覧に存在しなければ別画像へ fallback せず、その session / window runtime を閉じる。
 - active context を mount して `load_pdf_as_folder` / `load_zip_as_folder` /
   `start_loading_items` を再利用している間は、メイン一覧用の永続履歴を更新しない。
   具体的には `settings.last_folder`、quick folder target / recent、folder nav back/forward は

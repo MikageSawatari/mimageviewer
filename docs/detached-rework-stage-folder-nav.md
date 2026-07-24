@@ -47,7 +47,8 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 
 1. `folder_nav_pending`、通常画像の `folder_pane_open_pending`、
    `pending_folder_nav_steps`、`pending_folder_nav_mode` が
-   `ViewerContextBundle` の swap / pause / Drop 対象である。
+   `ViewerContextBundle` の swap / pause / Drop 対象であり、初回 scan 中は
+   `folder_pane_open_pending` 自体が active context の生存条件になる。
 2. `update_active_detached_viewer_context` が、active bundle を mount 中にだけ
    folder-nav を poll / apply / chain する。
 3. independent still の両ハンドラが main の検索・絞り込み分岐より先に
@@ -82,6 +83,10 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - scan 完了後だけ detached bundle を mount して `load_folder_with_scan` を適用し、
   対象 path を完全な物理 `items` 上の index へ解決して開く。仮想一覧の backing
   `items` / `visible_indices` と検索固有順は detached へ複製しない。
+- 初回 scan が複数フレームにまたがっても active context / session / window runtime を
+  保持する。明示した画像 path は Windows の filesystem identity で厳密に解決し、
+  削除・hidden 設定などで完全一覧に存在しない場合は先頭画像へ fallback せず、
+  失敗した detached session と runtime を正常終了する。
 - ZIP/PDF page は従来どおり container enumerate worker の完全な結果から対象 entry/page を
   解決する。通常画像 scan と ZIP/PDF enumerate の pending / cancel / result はいずれも
   `ViewerContextBundle` 所有で、main の検索条件・選択・スクロールを保持する。
@@ -90,16 +95,18 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
   非同期完了後が物理順 `a/b/c`、`a` の次が検索で欠落していた `b` になる回帰テストを追加した。
   同時に main の `c/a` 順、検索条件、選択、スクロール、既存 folder-nav state が変わらず、
   Ctrl+↓ request が detached bundle にだけ入ることを固定した。
+- 同テストは scan 完了まで production の `update_active_detached_viewer_context` を通し、
+  未完了フレームで context / session / runtime が生存することも固定する。さらに対象消失時の
+  session / runtime 終了と、大文字小文字だけ異なる Windows path の正しい解決を固定する。
 
 ## 7. 検証結果
 
 - `cargo fmt --check`: 成功
 - `python scripts/check_ui_glyphs.py`: 成功
-- `cargo test -p mimageviewer --lib still_window_mode_key_tests`: 324 passed
+- `cargo test -p mimageviewer --lib still_window_mode_key_tests`: 326 passed
 - `scripts/test-full.ps1`: PASS（workspace / integration / doctest を含む）
 - `cargo build`: 成功
 - `scripts/build-dev.ps1`: 成功。`target/dev-runtime/mimageviewer-core.exe` を生成し、
   agent は起動していない。
-- `scripts/build-release.ps1`: 成功。`target/release/mimageviewer.exe` と
-  `target/release/mimageviewer-core.exe` を生成し、agent は起動していない。
+- `scripts/build-release.ps1`: 今回の追修正では未実施（通常確認用 `build-dev.ps1` を使用）。
 - Windows 実機 smoke: 未実施

@@ -3438,6 +3438,13 @@ pub(crate) struct FolderPaneOpenReady {
     purpose: FolderOpenScanPurpose,
 }
 
+#[cfg(windows)]
+enum DetachedPhysicalFolderOpenPoll {
+    Waiting,
+    Applied,
+    ImageTargetMissing(PathBuf),
+}
+
 /// 親フォルダ上の `ConvertibleArchive` タイル用に、変換済み cache ZIP の対応表を
 /// UI スレッド外で解決している状態。
 pub(crate) struct ConvertedArchiveCachePathsPending {
@@ -29938,34 +29945,57 @@ impl App {
     /// `FolderOpenScanPurpose::DetachedImage` が対象画像を request と一体で所有するため、
     /// scan 待ちの間に main の検索結果・選択・並び順が変わっても参照しない。
     #[cfg(windows)]
-    fn poll_detached_physical_folder_open(&mut self, ctx: &egui::Context) -> bool {
+    fn poll_detached_physical_folder_open(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> DetachedPhysicalFolderOpenPoll {
         let Some(ready) = self.poll_folder_pane_open(ctx) else {
-            return false;
+            return DetachedPhysicalFolderOpenPoll::Waiting;
         };
         match ready.purpose {
             FolderOpenScanPurpose::DetachedImage { image_path } => {
                 self.with_detached_viewer_main_history_suppressed(|app| {
                     app.load_folder_with_scan(ready.path, Some(ready.scan));
                 });
+                // 明示された画像 request は厳密に解決する。snapshot / folder-nav 用 helper は
+                // target miss 時に先頭へ fallback するため、ここでは使用しない。Windows の
+                // filesystem identity に合わせ、path の大文字小文字差は path_eq で吸収する。
+                let Some(image_idx) = self.items.iter().position(|item| {
+                    matches!(
+                        item,
+                        GridItem::Image(candidate)
+                            if crate::folder_tree::path_eq(candidate, &image_path)
+                    )
+                }) else {
+                    self.log_detached_image_window_debug(format!(
+                        "detached_image_open_target_missing path={} folder={}",
+                        image_path.display(),
+                        self.current_folder.as_deref().map_or_else(
+                            || "<none>".to_string(),
+                            |path| path.display().to_string()
+                        )
+                    ));
+                    return DetachedPhysicalFolderOpenPoll::ImageTargetMissing(image_path);
+                };
+
                 // parked still の再開と同じく、既に割り当てた detached window_id を
-                // 保ったまま対象画像を物理一覧上の index へ解決して開く。
+                // 保ったまま物理一覧上の対象 index を開く。
                 self.detached_viewer_independent_active = true;
                 self.detached_viewer_open_next_still_detached_once = true;
-                self.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
-                    resume_slideshow: false,
-                    target: Some(crate::snapshot::SnapshotTarget::Fs(image_path)),
-                    resume_to_last_page: false,
-                    from_explicit_open: true,
-                    preserve_after_password_prompt: false,
-                });
+                self.fs_open_intent_from_grid = true;
+                self.open_fullscreen(image_idx);
+                self.selected = Some(image_idx);
+                self.scroll_to_selected = true;
+                self.update_last_selected_image();
+                DetachedPhysicalFolderOpenPoll::Applied
             }
             FolderOpenScanPurpose::PaneNavigation => {
                 // active detached viewport はフォルダペインを持たないため通常は到達しない。
                 // 将来ペインを共有しても結果を捨てず、その bundle の物理ナビとして適用する。
                 self.load_folder_with_scan(ready.path, Some(ready.scan));
+                DetachedPhysicalFolderOpenPoll::Applied
             }
         }
-        true
     }
 
     fn poll_folder_nav(&mut self) -> Option<FolderNavResult> {
@@ -33844,8 +33874,9 @@ impl App {
         self.fs_viewport_recreate_after_hide = false;
         self.clear_detached_viewer_host_hwnd();
         // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
-        // ここは should_drop (fullscreen_idx None + 列挙なし + !shown) 経路でのみ呼ばれ、
-        // folder-nav reopen 中 (shown=true / 列挙中) は呼ばれないので session を畳んでよい。
+        // ここは should_drop (fullscreen_idx None + folder/image scan・列挙なし + !shown)
+        // 経路でのみ呼ばれる。folder-nav reopen や初回 image scan 中は呼ばれないので
+        // session を畳んでよい。
         self.finish_active_detached_session_close("active_close_finalize");
         if let Some(window_id) = closing_window_id {
             self.remove_detached_window_runtime(window_id, "active_close_finalize");
@@ -34579,7 +34610,7 @@ impl App {
             return false;
         }
 
-        let should_drop = self
+        let (should_drop, image_target_missing) = self
             .with_active_detached_viewer_context(|app| {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
@@ -34611,7 +34642,11 @@ impl App {
                     app.apply_folder_nav_result(ctx, result);
                     app.chain_folder_nav_if_pending();
                 }
-                app.poll_detached_physical_folder_open(ctx);
+                let image_target_missing = match app.poll_detached_physical_folder_open(ctx) {
+                    DetachedPhysicalFolderOpenPoll::ImageTargetMissing(path) => Some(path),
+                    DetachedPhysicalFolderOpenPoll::Waiting
+                    | DetachedPhysicalFolderOpenPoll::Applied => None,
+                };
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
@@ -34713,6 +34748,7 @@ impl App {
                     false
                 };
                 let should_drop = app.fullscreen_idx.is_none()
+                    && app.folder_pane_open_pending.is_none()
                     && app.pdf_enumerate_pending.is_none()
                     && app.zip_enumerate_pending.is_none()
                     && !matches!(
@@ -34726,10 +34762,25 @@ impl App {
                 {
                     app.finalize_closed_active_detached_viewport(ctx, viewport_id);
                 }
-                should_drop
+                (should_drop, image_target_missing)
             })
-            .unwrap_or(false);
+            .unwrap_or((false, None));
 
+        if let Some(path) = image_target_missing {
+            self.log_detached_image_window_debug(format!(
+                "detached_image_open_aborted_missing_target path={}",
+                path.display()
+            ));
+            let closed = self.close_current_active_detached_viewer_context(ctx);
+            debug_assert!(
+                closed,
+                "missing detached image target must still own an active context"
+            );
+            self.request_detached_cleanup_font_atlas_resync(
+                "detached_image_open_aborted_missing_target",
+            );
+            return true;
+        }
         if should_drop && let Some(closed) = self.active_detached_viewer_context.take() {
             self.reconcile_closed_bookmark_detached_context(&closed.bundle);
         }
