@@ -444,6 +444,14 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
       + 不在 presenter を触るのを防ぐ）(b)`poll_video`: `is_music_mode`（loop 境界 / bookmark / resume
       位置＝音声クロック `position()`）と raw `is_audio_file`（連続再生 EOF）を分離 (c)`~41796` loop 境界
       dispatch を `tick_music_loop_boundary` へ (d)`fullscreen_video_marker_path` で動画マーカー cache 抑止。
+    - **動画マーカー同期の ownership gate（2026-07-24 回帰修正）**:
+      `sync_native_video_timeline_markers` 自体の入口を `fs_music_view_active(fs_idx)` で止める。
+      path helper だけを `None` にしていた旧実装は cache を破棄した後も `player.path()` から fallback
+      snapshot を再構築でき、worker cache の各ブックマーク画像を毎フレーム WebP encode +
+      SQLite `UPDATE` していた（実機 19 件で約 18fps）。音声ファイルと動画→音声モードを同じ
+      表示所有境界で除外し、VST host 表示中は predicate が false になるため native 同期を維持する。
+      回帰テストは `music_views_do_not_enter_native_video_marker_sync` と
+      `video_audio_vst_host_keeps_native_video_marker_sync_enabled`。
     - （`fullscreen_embedded_still_active` は 7b で一般化済み。）
     - **⚠️ 7d/7e へ持ち越す設計事項（Codex 7c 指摘）**:
       - **exit の seek は「音声も再同期する seek」= 短い音切れが起き得る**（`VideoPlayer::seek()` が

@@ -23900,6 +23900,103 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn music_views_do_not_enter_native_video_marker_sync() {
+        // 2026-07-24 実機: 動画→音声モードで video marker cache が意図どおり無効になる一方、
+        // 毎フレームの sync_native_video_timeline_markers が fallback snapshot を作り、19 件の
+        // bookmark thumbnail を WebP encode + SQLite UPDATE し続けて UI が約 18fps まで低下した。
+        // 音声ファイルも同じ music-view ownership なので、両方を method boundary で固定する。
+        for is_audio_file in [true, false] {
+            let mut app = setup_app();
+            let path = if is_audio_file {
+                PathBuf::from(r"C:\music\marker.flac")
+            } else {
+                PathBuf::from(r"C:\clips\marker.mp4")
+            };
+            let fs_idx = if is_audio_file {
+                push_audio(&mut app, path.to_str().unwrap())
+            } else {
+                push_video(&mut app, path.to_str().unwrap())
+            };
+            app.fullscreen_idx = Some(fs_idx);
+            if !is_audio_file {
+                app.video_audio_mode = Some(fs_idx);
+                app.video_audio_vst = None;
+            }
+
+            let thumbnail = VideoMarkerCachedThumbnail {
+                target_secs: 12.0,
+                width: 1,
+                height: 1,
+                rgba: std::sync::Arc::new(vec![0, 0, 0, 255]),
+            };
+            app.fullscreen_video_marker_cache = Some(FullscreenVideoMarkerCache {
+                fs_idx,
+                path: path.clone(),
+                pin_pts: None,
+                pin_thumbnail: None,
+                pin_thumb_current: false,
+                bookmarks: vec![crate::video_bookmarks::VideoBookmarkMeta {
+                    id: 7,
+                    pts_secs: 12.0,
+                    title: Some("marker".to_string()),
+                }],
+                bookmark_thumbnails: std::collections::HashMap::from([(7, thumbnail)]),
+                chapter_thumbnails: std::collections::HashMap::new(),
+            });
+
+            app.sync_native_video_timeline_markers(fs_idx);
+
+            let cache = app
+                .fullscreen_video_marker_cache
+                .as_ref()
+                .expect("music-view marker sync must not clear or rebuild native marker cache");
+            assert_eq!(cache.fs_idx, fs_idx);
+            assert_eq!(cache.path, path);
+            assert!(
+                cache.bookmark_thumbnails.contains_key(&7),
+                "music-view marker sync must not consume the cached thumbnail"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_vst_host_keeps_native_video_marker_sync_enabled() {
+        // VST GUI 表示中は hidden presenter 方式の音楽ビューではなく、native presenter が
+        // 表示所有者へ戻る。music-view guard を video_audio_mode の生判定へ広げてしまうと、
+        // この経路のマーカー同期まで止まるため、共有 predicate の例外を固定する。
+        let mut app = setup_app();
+        let path = PathBuf::from(r"C:\clips\vst-marker.mp4");
+        let fs_idx = push_video(&mut app, path.to_str().unwrap());
+        app.fullscreen_idx = Some(fs_idx);
+        app.video_audio_mode = Some(fs_idx);
+        app.video_audio_vst = Some(VideoAudioVstState {
+            fs_idx,
+            phase: VideoAudioVstPhase::Active,
+        });
+        app.fullscreen_video_marker_cache = Some(FullscreenVideoMarkerCache {
+            fs_idx,
+            path: PathBuf::from(r"C:\clips\stale.mp4"),
+            pin_pts: None,
+            pin_thumbnail: None,
+            pin_thumb_current: false,
+            bookmarks: Vec::new(),
+            bookmark_thumbnails: std::collections::HashMap::new(),
+            chapter_thumbnails: std::collections::HashMap::new(),
+        });
+
+        app.sync_native_video_timeline_markers(fs_idx);
+
+        let cache = app
+            .fullscreen_video_marker_cache
+            .as_ref()
+            .expect("VST-host marker sync must refresh the native marker cache");
+        assert_eq!(cache.fs_idx, fs_idx);
+        assert_eq!(cache.path, path);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_video_audio_mode_blocks_direct_presenter_rect_sync() {
         // Stage AUDIO fix2b: detached borderless settle は直接
         // sync_detached_video_child_presenter_rect() を呼ぶ。poll 経由の resync だけ止めても、

@@ -4600,6 +4600,19 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn sync_native_video_timeline_markers(&mut self, fs_idx: usize) {
+        // 音声ファイルと動画→音声モードは egui の音楽ビューが表示を所有し、native
+        // presenter の jump panel / marker thumbnail cache は使わない。ここを呼び出し元
+        // だけで gate すると、毎フレーム同期や mouse-move、bookmark 更新などの sibling
+        // entry point から再侵入できるため、ownership boundary で一括して止める。
+        //
+        // `fullscreen_video_marker_path` も同じ述語で None を返すが、guard が無かった旧実装は
+        // ensure で cache を破棄した後、player.path から fallback snapshot を毎フレーム構築した。
+        // その結果、worker cache に残った marker frame を WebP 再 encode → SQLite UPDATE し続け、
+        // bookmark 数に比例して UI thread を塞いでいた。VST host 表示中の動画→音声モードは
+        // `fs_music_view_active` が false (= native presenter が表示所有者) なので従来どおり同期する。
+        if self.fs_music_view_active(fs_idx) {
+            return;
+        }
         self.ensure_fullscreen_video_marker_cache(fs_idx);
         let (path, chapters) = {
             let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
