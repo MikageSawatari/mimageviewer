@@ -16,7 +16,8 @@ use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSortKey, FacetCalendarDate,
-    FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
+    FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode,
+    GridClickSelectionMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -2786,6 +2787,207 @@ fn reading_history_progress_text(
         Some(count) if count > 0 => Some(format!("{page} / {count}")),
         _ => Some(format!("{page} ページ目")),
     }
+}
+
+fn grid_selection_item_is_checkable(items: &[GridItem], allow_folders: bool, idx: usize) -> bool {
+    items.get(idx).is_some_and(|item| {
+        item.is_checkable() || (allow_folders && matches!(item, GridItem::Folder(_)))
+    })
+}
+
+fn grid_selection_anchor(
+    anchor: Option<usize>,
+    selected: Option<usize>,
+    display_order: &[usize],
+    clicked_idx: usize,
+) -> usize {
+    anchor
+        .filter(|idx| display_order.contains(idx))
+        .or_else(|| selected.filter(|idx| display_order.contains(idx)))
+        .unwrap_or(clicked_idx)
+}
+
+fn add_grid_selection_range(
+    checked: &mut HashSet<usize>,
+    display_order: &[usize],
+    anchor_idx: usize,
+    clicked_idx: usize,
+    items: &[GridItem],
+    allow_folders: bool,
+) {
+    let Some(anchor_pos) = display_order.iter().position(|&idx| idx == anchor_idx) else {
+        return;
+    };
+    let Some(clicked_pos) = display_order.iter().position(|&idx| idx == clicked_idx) else {
+        return;
+    };
+    let (start, end) = if anchor_pos <= clicked_pos {
+        (anchor_pos, clicked_pos)
+    } else {
+        (clicked_pos, anchor_pos)
+    };
+    for &idx in &display_order[start..=end] {
+        if grid_selection_item_is_checkable(items, allow_folders, idx) {
+            checked.insert(idx);
+        }
+    }
+}
+
+/// サムネイル / 詳細表示に共通のクリック選択状態遷移。
+///
+/// 単一選択は `selected`、複数選択は `checked` で表す既存モデルを維持する。
+/// `anchor` は Shift+クリックの起点で、通常 / Ctrl クリック時だけ更新する。
+#[allow(clippy::too_many_arguments)]
+fn apply_grid_click_selection(
+    mode: GridClickSelectionMode,
+    selected: &mut Option<usize>,
+    anchor: &mut Option<usize>,
+    checked: &mut HashSet<usize>,
+    display_order: &[usize],
+    items: &[GridItem],
+    allow_folders: bool,
+    clicked_idx: usize,
+    ctrl: bool,
+    shift: bool,
+) {
+    let mode = mode.normalized();
+    if shift {
+        let previous_anchor_is_valid = anchor.is_some_and(|idx| display_order.contains(&idx));
+        let range_anchor = grid_selection_anchor(*anchor, *selected, display_order, clicked_idx);
+        if mode == GridClickSelectionMode::Explorer {
+            checked.clear();
+        }
+        add_grid_selection_range(
+            checked,
+            display_order,
+            range_anchor,
+            clicked_idx,
+            items,
+            allow_folders,
+        );
+        *selected = Some(clicked_idx);
+        if !previous_anchor_is_valid {
+            *anchor = Some(range_anchor);
+        }
+        return;
+    }
+
+    if !ctrl {
+        if mode == GridClickSelectionMode::Explorer {
+            checked.clear();
+        }
+        *selected = Some(clicked_idx);
+        *anchor = Some(clicked_idx);
+        return;
+    }
+
+    if mode == GridClickSelectionMode::Check {
+        if checked.is_empty()
+            && let Some(previous) = *selected
+            && previous != clicked_idx
+            && display_order.contains(&previous)
+            && grid_selection_item_is_checkable(items, allow_folders, previous)
+        {
+            checked.insert(previous);
+        }
+        if grid_selection_item_is_checkable(items, allow_folders, clicked_idx)
+            && !checked.remove(&clicked_idx)
+        {
+            checked.insert(clicked_idx);
+        }
+        *selected = Some(clicked_idx);
+        *anchor = Some(clicked_idx);
+        return;
+    }
+
+    // エクスプローラー方式の Ctrl+クリック。チェック不可のセルは複数選択へ
+    // 混在できないため、そのセルだけの単一選択として扱う。
+    if !grid_selection_item_is_checkable(items, allow_folders, clicked_idx) {
+        if checked.is_empty() && *selected == Some(clicked_idx) {
+            *selected = None;
+            *anchor = None;
+        } else {
+            checked.clear();
+            *selected = Some(clicked_idx);
+            *anchor = Some(clicked_idx);
+        }
+        return;
+    }
+
+    if checked.is_empty() {
+        match *selected {
+            Some(previous) if previous == clicked_idx => {
+                *selected = None;
+                *anchor = None;
+                return;
+            }
+            Some(previous)
+                if display_order.contains(&previous)
+                    && grid_selection_item_is_checkable(items, allow_folders, previous) =>
+            {
+                checked.insert(previous);
+                checked.insert(clicked_idx);
+            }
+            _ => {
+                *selected = Some(clicked_idx);
+                *anchor = Some(clicked_idx);
+                return;
+            }
+        }
+    } else if !checked.remove(&clicked_idx) {
+        checked.insert(clicked_idx);
+    }
+
+    *anchor = Some(clicked_idx);
+    match checked.len() {
+        0 => {
+            *selected = None;
+        }
+        1 => {
+            *selected = checked.iter().copied().next();
+            checked.clear();
+        }
+        _ => {
+            *selected = if checked.contains(&clicked_idx) {
+                Some(clicked_idx)
+            } else {
+                display_order
+                    .iter()
+                    .copied()
+                    .find(|idx| checked.contains(idx))
+            };
+        }
+    }
+}
+
+fn apply_grid_secondary_selection(
+    mode: GridClickSelectionMode,
+    selected: &mut Option<usize>,
+    anchor: &mut Option<usize>,
+    checked: &mut HashSet<usize>,
+    clicked_idx: usize,
+) {
+    if mode.normalized() == GridClickSelectionMode::Explorer && !checked.contains(&clicked_idx) {
+        checked.clear();
+    }
+    *selected = Some(clicked_idx);
+    *anchor = Some(clicked_idx);
+}
+
+fn clear_grid_selection_for_background_click(
+    mode: GridClickSelectionMode,
+    selected: &mut Option<usize>,
+    anchor: &mut Option<usize>,
+    checked: &mut HashSet<usize>,
+) -> bool {
+    if mode.normalized() != GridClickSelectionMode::Explorer {
+        return false;
+    }
+    let changed = selected.is_some() || anchor.is_some() || !checked.is_empty();
+    *selected = None;
+    *anchor = None;
+    checked.clear();
+    changed
 }
 
 /// Applies the optional grid-selection change at the right-button press
@@ -10308,6 +10510,7 @@ impl App {
                 &mode,
                 Some(idx),
             ) {
+                self.grid_click_selection_anchor = Some(idx);
                 self.update_last_selected_image();
             }
             match mode {
@@ -10356,51 +10559,24 @@ impl App {
         if response.clicked() {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
             let shift = ctx.input(|i| i.modifiers.shift);
-            if shift {
-                // Shift+クリック: 前回選択位置から現在位置までを範囲チェック
-                if let Some(prev_sel) = self.selected {
-                    let display_order = self.current_grid_order().to_vec();
-                    let prev_pos = display_order
-                        .iter()
-                        .position(|&i| i == prev_sel)
-                        .unwrap_or(0);
-                    let cur_pos = display_order.iter().position(|&i| i == idx).unwrap_or(0);
-                    let (start, end) = if prev_pos <= cur_pos {
-                        (prev_pos, cur_pos)
-                    } else {
-                        (cur_pos, prev_pos)
-                    };
-                    for vp in start..=end {
-                        if let Some(&vidx) = display_order.get(vp) {
-                            if self.grid_item_can_be_checked(vidx) {
-                                self.checked.insert(vidx);
-                            }
-                        }
-                    }
-                }
-            } else if ctrl {
-                // Ctrl+クリック: チェック ON/OFF トグル + 選択移動。
-                // 初回 Ctrl+クリック (checked が空) のときは直前のカーソル位置も checked に
-                // 入れる (エクスプローラ流「A 通常クリック → B Ctrl+クリックで A+B が選択」)。
-                if self.checked.is_empty() {
-                    if let Some(prev_sel) = self.selected {
-                        if prev_sel != idx
-                            && self.idx_visible(prev_sel)
-                            && self.grid_item_can_be_checked(prev_sel)
-                        {
-                            self.checked.insert(prev_sel);
-                        }
-                    }
-                }
-                if self.grid_item_can_be_checked(idx) {
-                    if self.checked.contains(&idx) {
-                        self.checked.remove(&idx);
-                    } else {
-                        self.checked.insert(idx);
-                    }
-                }
-            }
-            self.selected = Some(idx);
+            let display_order = if ctrl || shift {
+                self.current_grid_order().to_vec()
+            } else {
+                Vec::new()
+            };
+            let allow_folders = self.subfolder_expansion_available();
+            apply_grid_click_selection(
+                self.settings.grid_click_selection_mode,
+                &mut self.selected,
+                &mut self.grid_click_selection_anchor,
+                &mut self.checked,
+                &display_order,
+                &self.items,
+                allow_folders,
+                idx,
+                ctrl,
+                shift,
+            );
             self.update_last_selected_image();
         }
         if response.double_clicked() && self.items_are_bookmark_view {
@@ -10578,7 +10754,13 @@ impl App {
             && !self.selection_info_bar_contains_pointer(ctx)
             && !self.mouse_ring_context_menu_suppressed(ctx)
         {
-            self.selected = Some(idx);
+            apply_grid_secondary_selection(
+                self.settings.grid_click_selection_mode,
+                &mut self.selected,
+                &mut self.grid_click_selection_anchor,
+                &mut self.checked,
+                idx,
+            );
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
@@ -10658,6 +10840,35 @@ impl App {
             self.context_menu_pos = pos;
             ctx.request_repaint();
         }
+    }
+
+    fn handle_grid_background_primary_click(
+        &mut self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        hit_cell: bool,
+    ) {
+        if self.settings.grid_click_selection_mode.normalized() != GridClickSelectionMode::Explorer
+            || hit_cell
+            || self.any_dialog_open()
+            || self.selection_info_bar_contains_pointer(ctx)
+            || !ctx.input(|i| {
+                i.pointer.primary_clicked()
+                    && i.pointer
+                        .interact_pos()
+                        .or_else(|| i.pointer.latest_pos())
+                        .is_some_and(|pos| rect.contains(pos))
+            })
+        {
+            return;
+        }
+        self.folder_pane.set_focus_grid();
+        clear_grid_selection_for_background_click(
+            self.settings.grid_click_selection_mode,
+            &mut self.selected,
+            &mut self.grid_click_selection_anchor,
+            &mut self.checked,
+        );
     }
 
     fn start_grid_background_mouse_ring_flick_if_pressed(
@@ -10745,7 +10956,13 @@ impl App {
             && idx < self.items.len()
             && !self.items_are_drive_list
         {
-            self.selected = Some(idx);
+            apply_grid_secondary_selection(
+                self.settings.grid_click_selection_mode,
+                &mut self.selected,
+                &mut self.grid_click_selection_anchor,
+                &mut self.checked,
+                idx,
+            );
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
             self.context_menu_pos = pos;
@@ -10839,6 +11056,13 @@ impl App {
         let mut egui_offset_y = self.scroll_offset_y;
         let mut hovered_preview: Option<(usize, egui::Rect)> = None;
         let mut vertical_scroll_debug = None;
+        let primary_click_pos = ctx.input(|i| {
+            i.pointer
+                .primary_clicked()
+                .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                .flatten()
+        });
+        let mut primary_click_hit_cell = false;
         let previous_scroll_style = ui.spacing().scroll;
         ui.spacing_mut().scroll = details_scroll_style;
         let horizontal_output = configured_details_horizontal_scroll_area(horizontal_policy)
@@ -10915,6 +11139,8 @@ impl App {
                                 egui::vec2(content_w, Self::DETAILS_ROW_H),
                             );
 
+                            primary_click_hit_cell |=
+                                primary_click_pos.is_some_and(|pos| row_rect.contains(pos));
                             if let Some(n) = self.handle_cell_interaction(ui, ctx, row_rect, idx) {
                                 nav = Some(n);
                             }
@@ -10979,6 +11205,7 @@ impl App {
 
         self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
         self.update_grid_mouse_ring_flick(ctx);
+        self.handle_grid_background_primary_click(ctx, body_inner_rect, primary_click_hit_cell);
 
         let bg_right_clicked = ui.rect_contains_pointer(body_inner_rect)
             && ctx.input(|i| i.pointer.secondary_clicked());
@@ -12469,6 +12696,7 @@ impl App {
                     // 空フォルダでも右クリックでフォルダ操作可能にする
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
+                    self.handle_grid_background_primary_click(ctx, ui.max_rect(), false);
                     if !self.items_are_bookmark_view
                         && ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
@@ -12530,6 +12758,7 @@ impl App {
                     });
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
+                    self.handle_grid_background_primary_click(ctx, ui.max_rect(), false);
                     if !self.items_are_bookmark_view
                         && ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
@@ -12623,6 +12852,13 @@ impl App {
                     resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
 
                 let mut nav: Option<PathBuf> = None;
+                let primary_click_pos = ctx.input(|i| {
+                    i.pointer
+                        .primary_clicked()
+                        .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                        .flatten()
+                });
+                let mut primary_click_hit_cell = false;
 
                 // egui にスクロールを管理させず、自前の offset を毎フレーム注入する。
                 // ただしスクロールバードラッグ時は egui 側のオフセットを読み戻す。
@@ -12678,6 +12914,8 @@ impl App {
                                     egui::vec2(cell_w, cell_h),
                                 );
 
+                                primary_click_hit_cell |=
+                                    primary_click_pos.is_some_and(|pos| cell_rect.contains(pos));
                                 if let Some(n) =
                                     self.handle_cell_interaction(ui, ctx, cell_rect, idx)
                                 {
@@ -12801,6 +13039,11 @@ impl App {
                     scroll_output.inner_rect,
                 );
                 self.update_grid_mouse_ring_flick(ctx);
+                self.handle_grid_background_primary_click(
+                    ctx,
+                    scroll_output.inner_rect,
+                    primary_click_hit_cell,
+                );
                 let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
                     && ctx.input(|i| i.pointer.secondary_clicked());
                 if bg_right_clicked
@@ -15551,6 +15794,255 @@ mod toolbar_reorder_tests {
         let order = vec![TS::Cols, TS::Aspect, TS::Sort, TS::Tags];
         let got = reorder_toolbar_section(&order, TS::Sort, Some(TS::Cols), None).unwrap();
         assert_eq!(got, vec![TS::Sort, TS::Cols, TS::Aspect, TS::Tags]);
+    }
+}
+
+#[cfg(test)]
+mod grid_click_selection_tests {
+    use super::*;
+
+    fn items(count: usize) -> Vec<GridItem> {
+        (0..count)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\{idx}.png"))))
+            .collect()
+    }
+
+    #[test]
+    fn check_mode_keeps_existing_checks_and_adds_shift_range() {
+        let items = items(6);
+        let order: Vec<_> = (0..items.len()).collect();
+        let mut selected = Some(1);
+        let mut anchor = Some(1);
+        let mut checked = HashSet::from([0]);
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Check,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &[],
+            &items,
+            false,
+            2,
+            false,
+            false,
+        );
+        assert_eq!(selected, Some(2));
+        assert_eq!(anchor, Some(2));
+        assert_eq!(checked, HashSet::from([0]));
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Check,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &order,
+            &items,
+            false,
+            4,
+            false,
+            true,
+        );
+        assert_eq!(selected, Some(4));
+        assert_eq!(anchor, Some(2));
+        assert_eq!(checked, HashSet::from([0, 2, 3, 4]));
+    }
+
+    #[test]
+    fn explorer_normal_and_background_click_replace_then_clear_selection() {
+        let items = items(4);
+        let mut selected = Some(1);
+        let mut anchor = Some(1);
+        let mut checked = HashSet::from([0, 1]);
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &[],
+            &items,
+            false,
+            3,
+            false,
+            false,
+        );
+        assert_eq!(selected, Some(3));
+        assert_eq!(anchor, Some(3));
+        assert!(checked.is_empty());
+
+        assert!(clear_grid_selection_for_background_click(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+        ));
+        assert_eq!(selected, None);
+        assert_eq!(anchor, None);
+        assert!(checked.is_empty());
+    }
+
+    #[test]
+    fn check_mode_background_click_preserves_selection() {
+        let mut selected = Some(2);
+        let mut anchor = Some(2);
+        let mut checked = HashSet::from([1, 2]);
+        assert!(!clear_grid_selection_for_background_click(
+            GridClickSelectionMode::Check,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+        ));
+        assert_eq!(selected, Some(2));
+        assert_eq!(anchor, Some(2));
+        assert_eq!(checked, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn explorer_shift_replaces_checks_and_keeps_original_anchor() {
+        let items = items(6);
+        let order: Vec<_> = (0..items.len()).collect();
+        let mut selected = Some(1);
+        let mut anchor = Some(1);
+        let mut checked = HashSet::from([5]);
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &order,
+            &items,
+            false,
+            3,
+            false,
+            true,
+        );
+        assert_eq!(checked, HashSet::from([1, 2, 3]));
+        assert_eq!(selected, Some(3));
+        assert_eq!(anchor, Some(1));
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &order,
+            &items,
+            false,
+            4,
+            false,
+            true,
+        );
+        assert_eq!(checked, HashSet::from([1, 2, 3, 4]));
+        assert_eq!(anchor, Some(1));
+    }
+
+    #[test]
+    fn explorer_ctrl_click_toggles_and_collapses_back_to_single_selection() {
+        let items = items(5);
+        let order: Vec<_> = (0..items.len()).collect();
+        let mut selected = Some(1);
+        let mut anchor = Some(1);
+        let mut checked = HashSet::new();
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &order,
+            &items,
+            false,
+            3,
+            true,
+            false,
+        );
+        assert_eq!(selected, Some(3));
+        assert_eq!(checked, HashSet::from([1, 3]));
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &order,
+            &items,
+            false,
+            3,
+            true,
+            false,
+        );
+        assert_eq!(selected, Some(1));
+        assert!(checked.is_empty());
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &order,
+            &items,
+            false,
+            1,
+            true,
+            false,
+        );
+        assert_eq!(selected, None);
+        assert_eq!(anchor, None);
+        assert!(checked.is_empty());
+    }
+
+    #[test]
+    fn explorer_right_click_preserves_only_a_multi_selection_member() {
+        let mut selected = Some(1);
+        let mut anchor = Some(1);
+        let mut checked = HashSet::from([1, 2]);
+
+        apply_grid_secondary_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            2,
+        );
+        assert_eq!(checked, HashSet::from([1, 2]));
+        assert_eq!(selected, Some(2));
+
+        apply_grid_secondary_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            4,
+        );
+        assert!(checked.is_empty());
+        assert_eq!(selected, Some(4));
+        assert_eq!(anchor, Some(4));
+    }
+
+    #[test]
+    fn stale_anchor_falls_back_to_current_selection() {
+        let items = items(5);
+        let order: Vec<_> = (0..items.len()).collect();
+        let mut selected = Some(2);
+        let mut anchor = Some(99);
+        let mut checked = HashSet::new();
+
+        apply_grid_click_selection(
+            GridClickSelectionMode::Explorer,
+            &mut selected,
+            &mut anchor,
+            &mut checked,
+            &order,
+            &items,
+            false,
+            4,
+            false,
+            true,
+        );
+        assert_eq!(checked, HashSet::from([2, 3, 4]));
+        assert_eq!(anchor, Some(2));
     }
 }
 

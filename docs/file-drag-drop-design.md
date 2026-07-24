@@ -9,6 +9,9 @@
 
 **改訂履歴**:
 
+- 2026-07-24: 一覧のクリック選択方式 (チェック方式 / エクスプローラー方式) を追加。
+  `handle_cell_interaction` の選択状態遷移だけを共通 helper 化し、
+  `drag_started_by(Primary)` と `decide_drag_payload()` の D&D 経路は変更しない。
 - 2026-05-23: ultrareview + Codex re-review (P2/P3) を反映して受け取り側 (§11) を
   再設計。`handle_external_file_drop` の検証ループを `file-drop-validate` worker
   thread へ移し、UI スレッドから `fs::canonicalize` × N (SMB で 10s+) を撤去
@@ -389,8 +392,9 @@ pub(crate) struct PendingNativeDrag {
 コンテキストメニュー (`secondary_clicked()`)、中ドラッグはスクロール等と紛れるため、
 **左ボタンのドラッグだけを native D&D の起点にする**。
 
-既存の複数選択は `if response.clicked()` 内で Ctrl+クリック (トグル) / Shift+クリック
-(範囲) を処理している ([ui_main.rs:1483-1529](../src/ui_main.rs))。egui では
+複数選択は `if response.clicked()` 内の共通選択 helper で、設定したチェック方式 /
+エクスプローラー方式に応じて Ctrl+クリック (トグル) / Shift+クリック (範囲) を
+処理している。egui では
 **`clicked()` と `drag_started()` は相互排他** — ポインタが閾値以上動けば `drag_started()`、
 動かなければ `clicked()` のどちらか一方しか発火しない。したがって:
 

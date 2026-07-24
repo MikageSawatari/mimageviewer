@@ -1887,6 +1887,7 @@ struct ViewerContextBundle {
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     auto_aspect: crate::auto_aspect::AutoAspectState,
     selected: Option<usize>,
+    grid_click_selection_anchor: Option<usize>,
     scroll_offset_y: f32,
     scroll_to_selected: bool,
     pending_grid_scroll: Option<GridScrollIntent>,
@@ -2182,6 +2183,7 @@ impl ViewerContextBundle {
             video_thumb_overrides: std::collections::HashMap::new(),
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             selected: None,
+            grid_click_selection_anchor: None,
             scroll_offset_y: 0.0,
             scroll_to_selected: false,
             pending_grid_scroll: None,
@@ -6236,6 +6238,8 @@ pub struct App {
     pub(crate) items: Vec<GridItem>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
+    /// Shift+クリックの起点。表示中の一覧コンテキストと一緒に所有・交換する。
+    pub(crate) grid_click_selection_anchor: Option<usize>,
     pub(crate) settings: crate::settings::Settings,
     pub(crate) keymap: crate::keymap::Keymap,
     pub(crate) gamepad: crate::gamepad::GamepadRuntime,
@@ -9813,6 +9817,7 @@ impl App {
             items: Vec::new(),
             thumbnails: Vec::new(),
             selected: None,
+            grid_click_selection_anchor: None,
             settings,
             keymap,
             gamepad: crate::gamepad::GamepadRuntime::new(),
@@ -11914,6 +11919,7 @@ impl App {
             video_thumb_overrides,
             auto_aspect,
             selected,
+            grid_click_selection_anchor,
             scroll_offset_y,
             scroll_to_selected,
             pending_grid_scroll,
@@ -12121,6 +12127,7 @@ impl App {
         swap_field!(video_thumb_overrides);
         swap_field!(auto_aspect);
         swap_field!(selected);
+        swap_field!(grid_click_selection_anchor);
         swap_field!(scroll_offset_y);
         swap_field!(scroll_to_selected);
         swap_field!(pending_grid_scroll);
@@ -35022,6 +35029,7 @@ impl App {
             video_thumb_overrides,
             auto_aspect,
             selected,
+            grid_click_selection_anchor,
             scroll_offset_y,
             scroll_to_selected,
             pending_grid_scroll,
@@ -35229,6 +35237,7 @@ impl App {
             image_metas,
             auto_aspect,
             selected,
+            grid_click_selection_anchor,
             scroll_offset_y,
             scroll_to_selected,
             pending_grid_scroll,

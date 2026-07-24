@@ -468,6 +468,44 @@ impl GridViewMode {
 }
 
 // -----------------------------------------------------------------------
+// 一覧のクリック選択方式
+// -----------------------------------------------------------------------
+
+/// サムネイル表示と詳細表示に共通のマウスクリック選択方式。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に
+/// 既存動作の `Check` へ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GridClickSelectionMode {
+    #[default]
+    Check,
+    Explorer,
+    #[serde(other)]
+    Unknown,
+}
+
+impl GridClickSelectionMode {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::Check => "チェック方式",
+            Self::Explorer => "エクスプローラー方式",
+            Self::Unknown => unreachable!("normalized grid click selection mode"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Check, Self::Explorer]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Check,
+            mode => mode,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // 選択情報の表示方法
 // -----------------------------------------------------------------------
 
@@ -2711,6 +2749,8 @@ pub struct Settings {
     #[serde(default)]
     pub grid_view_mode: GridViewMode,
     #[serde(default)]
+    pub grid_click_selection_mode: GridClickSelectionMode,
+    #[serde(default)]
     pub details_sort_key: DetailsSortKey,
     /// v2.5.0 が知らない `DetailsSortKey::PageCount` の保存用キャリア。
     /// 保存時だけ旧版が読める `Toolbar` へ退避し、読み込み後に戻す。
@@ -4470,6 +4510,7 @@ impl Default for Settings {
         Self {
             grid_cols: default_grid_cols(),
             grid_view_mode: GridViewMode::default(),
+            grid_click_selection_mode: GridClickSelectionMode::default(),
             details_sort_key: DetailsSortKey::default(),
             details_page_count_sort_stash: false,
             details_sort_ascending: default_details_sort_ascending(),
@@ -6004,6 +6045,7 @@ impl Settings {
         sanitize_details_column_widths(&mut self.details_column_widths);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
+        self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         self.selection_info_display_mode = self.selection_info_display_mode.normalized();
         self.fullscreen_side_panel_mode = self.fullscreen_side_panel_mode.normalized();
         // 手編集や移行で非有限 / 範囲外の名前列幅が混入しても安全にする
@@ -6683,6 +6725,35 @@ mod tests {
             loaded.selection_info_display_mode,
             SelectionInfoDisplayMode::Tooltip,
             "旧設定でフィールドが欠けていても従来のツールチップ表示を維持する"
+        );
+    }
+
+    #[test]
+    fn grid_click_selection_mode_defaults_to_check() {
+        assert_eq!(
+            Settings::default().grid_click_selection_mode,
+            GridClickSelectionMode::Check
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.grid_click_selection_mode,
+            GridClickSelectionMode::Check,
+            "旧設定でフィールドが欠けていても従来のチェック方式を維持する"
+        );
+    }
+
+    #[test]
+    fn grid_click_selection_mode_normalizes_unknown_to_check() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"grid_click_selection_mode":"FutureMode"}"#).unwrap();
+        assert_eq!(
+            loaded.grid_click_selection_mode,
+            GridClickSelectionMode::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.grid_click_selection_mode,
+            GridClickSelectionMode::Check
         );
     }
 

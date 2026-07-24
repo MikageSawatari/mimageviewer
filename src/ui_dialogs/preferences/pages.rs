@@ -593,6 +593,23 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 
     ui.add_space(12.0);
+    ui.label(egui::RichText::new("一覧のクリック選択").strong());
+    ui.horizontal(|ui| {
+        ui.label("選択方式:");
+        egui::ComboBox::from_id_salt("grid_click_selection_mode")
+            .selected_text(s.grid_click_selection_mode.label())
+            .show_ui(ui, |ui| {
+                for &mode in crate::settings::GridClickSelectionMode::all() {
+                    ui.selectable_value(&mut s.grid_click_selection_mode, mode, mode.label());
+                }
+            });
+    });
+    ui.label(
+        "チェック方式は通常クリックや空白クリックで既存チェックを維持します。\n\
+         エクスプローラー方式は通常クリックや空白クリックで選択を置き換え、Ctrl / Shift クリックで複数選択します。",
+    );
+
+    ui.add_space(12.0);
     ui.label(egui::RichText::new("選択情報の表示").strong());
     ui.horizontal(|ui| {
         ui.label("表示方法:");

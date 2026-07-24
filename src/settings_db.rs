@@ -2876,6 +2876,7 @@ mod tests {
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;
+        s.grid_click_selection_mode = crate::settings::GridClickSelectionMode::Explorer;
         s.ui_scale_factor = 1.5;
         s.thumb_quality = 88;
         s.last_folder = Some(PathBuf::from(r"C:\Users\test\Pictures"));
@@ -2997,6 +2998,10 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
         assert_eq!(loaded.ui_scale_factor, 1.5);
+        assert_eq!(
+            loaded.grid_click_selection_mode,
+            crate::settings::GridClickSelectionMode::Explorer
+        );
     }
 
     #[test]
