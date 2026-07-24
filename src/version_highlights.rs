@@ -387,6 +387,27 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "2.8.0",
+        must_read: &[],
+        highlights: &[
+            HighlightItem {
+                title: "メタ情報を別環境へ持ち運び",
+                body: "実フォルダーの評価、タグ、ブックマーク、画像補正や注釈などをまとめて\
+                       書き出し、別の PC やポータブル版へ取り込めます。",
+            },
+            HighlightItem {
+                title: "一覧のクリック選択方法を選択",
+                body: "環境設定の「表示 → サムネイル」から、従来のチェック方式と\
+                       エクスプローラー方式を選べます。",
+            },
+            HighlightItem {
+                title: "別ウィンドウから前後の場所へ移動",
+                body: "複数ウィンドウモードの画像や本でも、Ctrl+↑／Ctrl+↓などで\
+                       前後の画像フォルダー、ZIP／CBZ、PDFへ移動できます。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]

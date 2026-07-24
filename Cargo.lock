@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "ab_glyph",
  "base64",
@@ -3947,7 +3947,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "sha2",
  "windows 0.61.3",
