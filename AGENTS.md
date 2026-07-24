@@ -124,6 +124,26 @@ always-active guidance.
   the timeout interrupted the process, then rerun once with a sufficient
   timeout instead of repeatedly retrying with the same limit.
 
+## Verification Build Handoff
+
+- After completing a user-requested application or runtime behavior change,
+  run the relevant automated checks, then build a user-runnable verification
+  binary with `.\scripts\build-dev.ps1` before the final handoff. Do not stop
+  at `cargo check` or tests when the user could reasonably confirm the result
+  in the application.
+- Do not launch `target\dev-runtime\mimageviewer-core.exe` yourself. In the
+  final response, give the user the exact PowerShell launch command:
+  `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`.
+  State that its isolated data directory is `target\dev-runtime\data`, and list
+  the concrete scenario to verify.
+- A verification binary is not required for documentation-only, test-only,
+  build-script-only, or other non-runnable changes, when the user explicitly
+  asks not to build one, or when prerequisites are unavailable. Report the
+  reason when a normally expected verification build could not be produced.
+- Release-only behavior and the Windows-native cases below override the normal
+  `build-dev.ps1` handoff: build the release launcher/core and give the user
+  its exact launch command and any real-settings warning instead.
+
 ## Verification Builds (Windows native features)
 
 - **Never launch** `target\release\mimageviewer.exe`,
@@ -147,8 +167,11 @@ always-active guidance.
   owner/focus/z-order, real IME behavior, multi-monitor DPI), do not merely ask
   the user to verify on real hardware. First run `.\scripts\build-release.ps1`
   yourself to produce the verification binary (`target\release\mimageviewer.exe`
-  launcher + `target\release\mimageviewer-core.exe`), then ask with concrete
-  steps to run.
+  launcher + `target\release\mimageviewer-core.exe`), then give the exact
+  PowerShell launch command:
+  `Start-Process -FilePath .\target\release\mimageviewer.exe`.
+  Include concrete verification steps and warn that this build uses the user's
+  real `%APPDATA%\mimageviewer` data.
 - Prerequisite: `cargo build` / `cargo test` green, `cargo fmt --check` clean,
   and (for UI string changes) `python scripts/check_ui_glyphs.py` reporting zero.
   Do not build a verification binary on top of a non-compiling tree.

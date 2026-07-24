@@ -42,6 +42,25 @@ C++ bridge 自体を変更した場合は、従来どおり先に CMake で brid
 これは実装確認用であり、配布判定や Windows native 機能の最終確認には
 `scripts\build-release.ps1` を使う。配布物は必ず `scripts\build-dist.ps1` で作る。
 
+### 修正完了後のユーザー実機確認
+
+アプリ機能・実行時挙動の修正が完了して関連テストが通ったら、原則として
+`build-dev.ps1` まで実行し、ユーザーへ次の起動コマンドと具体的な確認手順を渡す。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+エージェント自身はこの成果物を起動しない。データは `target\dev-runtime\data` に隔離される。
+release固有・Windows native固有の確認では `build-release.ps1` の成果物を使い、通常設定を
+使用することを明記したうえで次のコマンドを渡す。
+
+```powershell
+Start-Process -FilePath .\target\release\mimageviewer.exe
+```
+
+ドキュメント、テスト、build scriptだけの変更には実機確認用バイナリは不要。
+
 ### 補助 bin
 
 `src/bin` のベンチマーク、probe、パック生成ツールは `dev-tools` feature の対象で、通常の

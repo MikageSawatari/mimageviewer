@@ -1101,6 +1101,31 @@ cargo test -p mimageviewer --test <integration-test-name>
 場合に実行する。機能追加中の試行錯誤ごとには実行しない。詳細と判断表は
 [docs/development-build-and-test.md](docs/development-build-and-test.md) を参照。
 
+### 修正完了時の実機確認用バイナリ
+
+ユーザーから指示されたアプリ機能・実行時挙動の修正が完了し、関連する自動テストが通ったら、
+最終回答の前に原則として次を実行する。
+
+```powershell
+.\scripts\build-dev.ps1
+```
+
+エージェントは成果物を起動しない。最終回答には、リポジトリルートからユーザーが実行する
+次のコマンドと、今回確認してほしい具体的な操作シナリオを記載する。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+このバイナリは `target\dev-runtime\data` を使う隔離portable構成であり、通常利用中の
+`%APPDATA%\mimageviewer` を変更しない。ドキュメントのみ、テストのみ、build scriptのみなど
+実行アプリへ影響しない変更、ユーザーがbuild不要と明示した場合、必要な依存物が無い場合は
+省略できる。通常なら必要なbuildを作れなかった場合は、その理由を最終回答に明記する。
+
+launcher、埋め込みasset、設定migration、Windows native挙動などrelease構成そのものを確認する
+変更では `build-dev.ps1` ではなく、後述の「実機検証用バイナリの準備」に従って
+`build-release.ps1` を使う。
+
 ## タグ書き込みの互換性検証 (ExifTool)
 
 mIV は JPEG / PNG / WebP のタグを XMP `dc:subject` にだけ書く (IPTC Keywords は書かない)。
@@ -1901,8 +1926,10 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
   ([docs/release-operations.md](docs/release-operations.md) §2.2)。PowerShell ツールは stderr を自前で拾うので、素の
   `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → launcher の 2 段 cargo build を
   直接叩く。
-- **依頼のしかた**: ビルド完了後に「`target\release\mimageviewer.exe` を起動して <具体的な手順>
-  を確認してください」と、検証すべきシナリオを具体的に添える。
+- **依頼のしかた**: ビルド完了後に、リポジトリルートから
+  `Start-Process -FilePath .\target\release\mimageviewer.exe` を実行してもらい、
+  検証すべきシナリオを具体的に添える。この通常release buildは実利用中の
+  `%APPDATA%\mimageviewer` を使うことも明記する。
 - **コミットのタイミング**: この種のネイティブ機能はユーザーが実機で確認してからコミットする
   運用 (ユーザーが「OK、コミットして」と言ってから)。検証で不具合が出たら修正 → 再ビルド →
   再依頼を繰り返す。
