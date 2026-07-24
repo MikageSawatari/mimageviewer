@@ -134,13 +134,16 @@ pub(super) fn is_image_only_book_contents(
 /// 方針は [docs/ui-responsiveness.md §1.1](../../docs/ui-responsiveness.md) にまとめてある。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
-    scan_directory_with_convertible_archives(path, true, false)
+    scan_directory_with_convertible_archives(path, true, false).unwrap_or_else(|_| ScannedDir {
+        folders: Vec::new(),
+        all_media: Vec::new(),
+    })
 }
 
 pub(crate) fn scan_directory_with_settings(
     path: &std::path::Path,
     settings: &crate::settings::Settings,
-) -> ScannedDir {
+) -> std::io::Result<ScannedDir> {
     scan_directory_with_convertible_archives(
         path,
         !settings.archive_file_handling_ignores_convertible(),
@@ -152,14 +155,13 @@ pub(crate) fn scan_directory_with_convertible_archives(
     path: &std::path::Path,
     include_convertible_archives: bool,
     show_hidden_files: bool,
-) -> ScannedDir {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return ScannedDir {
-            folders: Vec::new(),
-            all_media: Vec::new(),
-        };
-    };
-    scan_directory_entries(entries, include_convertible_archives, show_hidden_files)
+) -> std::io::Result<ScannedDir> {
+    let entries = std::fs::read_dir(path)?;
+    Ok(scan_directory_entries(
+        entries,
+        include_convertible_archives,
+        show_hidden_files,
+    ))
 }
 
 fn scan_directory_entries(

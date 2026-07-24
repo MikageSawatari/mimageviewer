@@ -351,6 +351,13 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
   画像のみ判定を行い、`book_open_resume` に従って保存済みページまたは先頭画像を開く。
 - パスワード付き PDF では、grid / 起動パス / SendTo 由来の明示オープン予約だけを
   入力ダイアログ後まで維持する。Ctrl+↑↓ 由来の deferred reopen は従来どおり破棄する。
+  detached open のパスワード要求と再試行用パスワードは owner `ViewerContextBundle` に保持し、
+  ダイアログ確定時もその context 内で `load_pdf_as_folder` を再開する。
+- detached のグリッドから明示された ZIP entry / PDF page は `Required` target として扱う。
+  列挙中の差し替え・削除で target が消えた場合、保存ページ／先頭ページへは fallback せず、
+  viewport 作成前の detached session を正常終了する。
+- 画像のみ通常Folderを複数ウィンドウモードで直開きする場合は、main を先に子フォルダへ
+  navigationせず、detached bundleが非同期scanと自動fullscreenを所有する。
 
 ### 退出ルーティング = 「設定で固定分岐」(一時フラグなし)
 

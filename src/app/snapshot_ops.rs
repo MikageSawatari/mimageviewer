@@ -982,7 +982,10 @@ impl App {
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
                 resume_slideshow,
-                target,
+                target: target.map_or(
+                    crate::app::DeferredFsTarget::None,
+                    crate::app::DeferredFsTarget::Preferred,
+                ),
                 resume_to_last_page: false,
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
@@ -1821,33 +1824,29 @@ mod tests {
     /// verify する。
     #[test]
     fn deactivate_at_origin_with_pre_search_origin_takes_restore_path() {
-        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
-        app.current_folder = Some(PathBuf::from(r"E:\drilled\container"));
+        let temp = tempfile::TempDir::new().unwrap();
+        let origin = temp.path().join("drilled").join("container");
+        let before_search = temp.path().join("before_search");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&before_search).unwrap();
+        let mut app = test_app_with_items(vec![GridItem::Image(origin.join("a.png"))]);
+        app.current_folder = Some(origin.clone());
         app.global_search.active = true;
-        app.global_search.saved_folder = Some(PathBuf::from(r"E:\before_search"));
+        app.global_search.saved_folder = Some(before_search.clone());
         app.activate_snapshot(SnapshotSourceLabel::GlobalSearch {
             query: "test".into(),
         });
         // current_folder は origin のまま (= drilled view で固定したケース)
-        assert_eq!(
-            app.current_folder,
-            Some(PathBuf::from(r"E:\drilled\container"))
-        );
+        assert_eq!(app.current_folder, Some(origin));
         let before_cf = app.current_folder.clone();
         // 解除: at_origin = true + pre_search_origin Some → load_folder(restore_to)
         app.deactivate_snapshot();
         // 重要な不変条件: snapshot は解除された
         assert!(app.snapshot.is_none());
-        // current_folder は load_folder で restore_to に変わる試行が走る
-        // (= test fixture では実 path 無くても load_folder 冒頭で current_folder が
-        //  restore_to に向かって更新される、または save 経路を通る)
-        // → 少なくとも before_cf と異なる、または restore_to に到達する
+        // current_folder は実在する restore_to の load 成功後に更新される。
         let after_cf = app.current_folder.clone();
-        assert!(
-            after_cf != before_cf || after_cf == Some(PathBuf::from(r"E:\before_search")),
-            "deactivate で current_folder が変化する (= restore path に入った証拠) \
-             before={before_cf:?}, after={after_cf:?}"
-        );
+        assert_ne!(after_cf, before_cf);
+        assert_eq!(after_cf, Some(before_search));
     }
 
     /// snapshot_open_entry が現在 items 内に同 path の image leaf を直接 fullscreen で

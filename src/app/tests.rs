@@ -702,7 +702,7 @@ fn scan_directory_never_lists_portable_metadata_bundle() {
     )
     .unwrap();
     assert_eq!(scan_folder_names(temp.path()), vec!["visible"]);
-    let shown_hidden = scan_directory_with_convertible_archives(temp.path(), true, true);
+    let shown_hidden = scan_directory_with_convertible_archives(temp.path(), true, true).unwrap();
     assert!(shown_hidden.folders.iter().all(|(item, _)| {
         item.container_path().map_or(true, |path| {
             !crate::fs_entry::is_internal_app_entry_name(path.file_name().unwrap_or_default())
@@ -783,7 +783,7 @@ fn scan_directory_can_ignore_convertible_archives() {
     std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
     std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
 
-    let scan = scan_directory_with_convertible_archives(tmp.path(), false, false);
+    let scan = scan_directory_with_convertible_archives(tmp.path(), false, false).unwrap();
 
     assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
     assert!(
@@ -792,6 +792,17 @@ fn scan_directory_can_ignore_convertible_archives() {
             .iter()
             .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
         "convertible archives should be hidden from the folder list"
+    );
+}
+
+#[test]
+fn scan_directory_with_convertible_archives_reports_read_dir_failure() {
+    let tmp = TempDir::new().expect("tempdir");
+    let missing = tmp.path().join("missing");
+
+    assert!(
+        scan_directory_with_convertible_archives(&missing, true, false).is_err(),
+        "read_dir failure must not be converted into an empty ScannedDir"
     );
 }
 
@@ -3895,7 +3906,7 @@ mod folder_pane_open_nav_tests {
         app.current_folder = Some(current);
 
         let (tx, rx) = mpsc::channel();
-        tx.send(empty_scan()).expect("send scan");
+        tx.send(Ok(empty_scan())).expect("send scan");
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
             path: target.clone(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3909,8 +3920,9 @@ mod folder_pane_open_nav_tests {
             .expect("completed pane scan should be returned as a nav candidate");
 
         assert_eq!(ready.path, target);
-        assert!(ready.scan.folders.is_empty());
-        assert!(ready.scan.all_media.is_empty());
+        let scan = ready.scan.expect("successful scan");
+        assert!(scan.folders.is_empty());
+        assert!(scan.all_media.is_empty());
         assert!(matches!(
             ready.purpose,
             FolderOpenScanPurpose::PaneNavigation
@@ -8621,6 +8633,7 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
 #[test]
 fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() {
     let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
     let folder = app.tmp.path().join("image-book");
     std::fs::create_dir_all(&folder).expect("create image book");
     std::fs::write(folder.join("page-001.jpg"), []).expect("create page");
@@ -8633,13 +8646,36 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
 
     assert_eq!(
         app.open_bookmark_book_in_detached_context(
-            &egui::Context::default(),
+            &ctx,
             folder.clone(),
             crate::folder_tree::OpenablePathKind::Directory,
         ),
         Some(true)
     );
     assert!(app.items_are_bookmark_view);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let materialized = app
+            .active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| {
+                active.bundle.current_folder.as_deref() == Some(folder.as_path())
+                    && active.bundle.items.iter().any(
+                        |item| matches!(item, GridItem::Image(path) if path.ends_with("page-001.jpg")),
+                    )
+            });
+        if materialized {
+            break;
+        }
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_active_detached_viewer_context(ctx);
+        });
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached image-folder bookmark scan did not complete"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let active = app
         .active_detached_viewer_context
         .as_ref()
@@ -11652,7 +11688,7 @@ mod favorite_adjustment_defaults_tests {
         let mut app = setup_app();
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
-            target: None,
+            target: DeferredFsTarget::None,
             resume_to_last_page: true,
             from_explicit_open: true,
             preserve_after_password_prompt: true,
@@ -11665,7 +11701,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
-            target: None,
+            target: DeferredFsTarget::None,
             resume_to_last_page: false,
             from_explicit_open: false,
             preserve_after_password_prompt: false,
@@ -16166,7 +16202,7 @@ mod favorite_adjustment_defaults_tests {
         app.items_generation = locked_gen + 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
-            target: None,
+            target: DeferredFsTarget::None,
             resume_to_last_page: false,
             from_explicit_open: false,
             preserve_after_password_prompt: false,
@@ -16736,7 +16772,7 @@ mod favorite_adjustment_defaults_tests {
         app.items_generation += 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
-            target: None,
+            target: DeferredFsTarget::None,
             resume_to_last_page: false,
             from_explicit_open: false,
             preserve_after_password_prompt: false,
@@ -24879,7 +24915,7 @@ mod still_window_mode_key_tests {
         );
 
         scan_tx
-            .send(physical_scan)
+            .send(Ok(physical_scan))
             .expect("release controlled physical scan");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -25025,7 +25061,7 @@ mod still_window_mode_key_tests {
             .window_id;
 
         let (scan_tx, scan_rx) = mpsc::channel();
-        scan_tx.send(physical_scan).unwrap();
+        scan_tx.send(Ok(physical_scan)).unwrap();
         app.with_active_detached_viewer_context(|mounted| {
             let real_pending = mounted
                 .folder_pane_open_pending
@@ -25078,6 +25114,271 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_pdf_password_request_survives_opening_gap_and_retries_in_owner_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let pdf = temp.path().join("protected.pdf");
+        std::fs::write(&pdf, b"not-a-real-pdf").unwrap();
+        let main_folder = temp.path().join("search-results");
+        let main_image = main_folder.join("result.jpg");
+        app.current_folder = Some(main_folder.clone());
+        app.items = vec![GridItem::Image(main_image.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.items_are_global_search_view = true;
+
+        let window_id = 501;
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.pdf_password_request = Some(PdfPasswordRequest { path: pdf.clone() });
+        bundle
+            .viewer_session
+            .activate_independent_detached(window_id);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.begin_active_detached_session(window_id, DetachedSource::Book);
+        app.show_pdf_password_dialog = true;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_active_detached_viewer_context(ctx);
+        });
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.pdf_password_request.is_some()),
+            "a password request must keep the pre-viewport detached context alive"
+        );
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(window_id)
+        );
+        assert_eq!(
+            app.pdf_password_dialog_path().as_deref(),
+            Some(pdf.as_path())
+        );
+
+        assert!(app.retry_pdf_password_dialog_request("secret".to_string(), false));
+
+        assert_eq!(
+            app.current_folder,
+            Some(main_folder),
+            "retrying a detached password request must not navigate main"
+        );
+        assert!(
+            matches!(app.items.as_slice(), [GridItem::Image(path)] if path == &main_image),
+            "retrying a detached password request must preserve the main search list"
+        );
+        assert!(app.items_are_global_search_view);
+        assert!(
+            app.pdf_enumerate_pending.is_none(),
+            "the PDF enumerate worker must not be attached to main"
+        );
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("the detached password owner must remain active while retrying");
+        assert!(active.bundle.pdf_password_request.is_none());
+        assert!(
+            active.bundle.pdf_enumerate_pending.is_some(),
+            "password retry must resume enumeration in the detached bundle"
+        );
+        assert_eq!(
+            active.bundle.pdf_current_password.as_deref(),
+            Some("secret")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_terminal_before_viewport_finalizes_session_and_runtime() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 502;
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle
+            .viewer_session
+            .activate_independent_detached(window_id);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.begin_active_detached_session(window_id, DetachedSource::Book);
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_active_detached_viewer_context(ctx);
+        });
+
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "an empty/error terminal result must drop its unmaterialized context"
+        );
+        assert!(
+            app.active_detached_session.is_none(),
+            "terminal close before viewport creation must finish the detached session"
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            None,
+            "terminal close before viewport creation must remove the window runtime"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn image_folder_container_open_starts_detached_scan_without_navigating_main() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let parent = temp.path().join("library");
+        let child = parent.join("book");
+        std::fs::create_dir_all(&child).unwrap();
+        let page_a = child.join("a.jpg");
+        let page_b = child.join("b.jpg");
+        std::fs::write(&page_a, b"fixture").unwrap();
+        std::fs::write(&page_b, b"fixture").unwrap();
+        let physical_scan = scan_directory(&child);
+
+        app.current_folder = Some(parent.clone());
+        app.address = parent.to_string_lossy().to_string();
+        app.items = vec![GridItem::Folder(child.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.scroll_offset_y = 246.0;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+
+        assert!(
+            app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, true),
+            "an auto-fullscreen Folder tile must be claimed before ordinary main navigation"
+        );
+        assert_eq!(app.current_folder, Some(parent.clone()));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::Folder(path)] if path == &child
+        ));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 246.0);
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.folder_pane_open_pending.is_some()),
+            "the child folder scan must be owned by the detached bundle"
+        );
+
+        let (scan_tx, scan_rx) = mpsc::channel();
+        scan_tx.send(Ok(physical_scan)).unwrap();
+        app.with_active_detached_viewer_context(|mounted| {
+            let real_pending = mounted
+                .folder_pane_open_pending
+                .take()
+                .expect("real detached folder scan must have started");
+            real_pending.cancel.store(true, Ordering::Relaxed);
+            mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: child.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::DetachedFolder,
+            });
+        })
+        .expect("active detached folder context must mount");
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_active_detached_viewer_context(ctx);
+        });
+
+        assert_eq!(app.current_folder, Some(parent));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::Folder(path)] if path == &child
+        ));
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("the materialized image folder must stay in its detached context");
+        assert_eq!(active.bundle.current_folder, Some(child));
+        assert_eq!(active.bundle.fullscreen_idx, Some(0));
+        assert_eq!(
+            active
+                .bundle
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    GridItem::Image(path) => Some(path.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![page_a, page_b]
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_scan_error_does_not_apply_empty_result_or_delete_catalog_rows() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = temp.path().join("network-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let image = folder.join("keep.jpg");
+        std::fs::write(&image, b"fixture").unwrap();
+        let catalog = app
+            .get_or_open_catalog(&folder)
+            .expect("open folder catalog");
+        catalog
+            .save("keep.jpg", 1, 1, 1, 1, None, b"cached-thumbnail")
+            .unwrap();
+        assert!(catalog.load_one("keep.jpg").unwrap().is_some());
+
+        app.current_folder = Some(temp.path().join("search-results"));
+        app.items = vec![GridItem::Image(image.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.items_are_global_search_view = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        let window_id = app.active_detached_session.unwrap().window_id;
+
+        let (scan_tx, scan_rx) = mpsc::channel();
+        scan_tx
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated listing failure",
+            )))
+            .unwrap();
+        app.with_active_detached_viewer_context(|mounted| {
+            let real_pending = mounted
+                .folder_pane_open_pending
+                .take()
+                .expect("real detached image scan must have started");
+            real_pending.cancel.store(true, Ordering::Relaxed);
+            mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: folder,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::DetachedImage { image_path: image },
+            });
+        })
+        .unwrap();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_active_detached_viewer_context(ctx);
+        });
+
+        assert!(app.active_detached_viewer_context.is_none());
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert!(
+            catalog.load_one("keep.jpg").unwrap().is_some(),
+            "a failed read_dir must not be materialized as an empty folder and delete cached rows"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_image_open_resolves_windows_path_case_without_fallback() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -25097,7 +25398,7 @@ mod still_window_mode_key_tests {
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, requested_idx));
         let (scan_tx, scan_rx) = mpsc::channel();
-        scan_tx.send(physical_scan).unwrap();
+        scan_tx.send(Ok(physical_scan)).unwrap();
         app.with_active_detached_viewer_context(|mounted| {
             let real_pending = mounted
                 .folder_pane_open_pending
@@ -25326,7 +25627,7 @@ mod still_window_mode_key_tests {
             }
         }
         fn scan_pending(cancel: Arc<AtomicBool>) -> FolderPaneOpenPending {
-            let (_tx, rx) = mpsc::channel::<ScannedDir>();
+            let (_tx, rx) = mpsc::channel::<std::io::Result<ScannedDir>>();
             FolderPaneOpenPending {
                 path: PathBuf::from(r"C:\detached"),
                 cancel,
@@ -25390,7 +25691,7 @@ mod still_window_mode_key_tests {
         detached_tx
             .send(FolderNavThreadResult {
                 outcome: None,
-                scanned: None,
+                scanned: FolderNavScanResult::NotNeeded,
             })
             .unwrap();
         let mut bundle = ViewerContextBundle::empty();
@@ -28057,7 +28358,7 @@ mod still_window_mode_key_tests {
 
         app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
             resume_slideshow: false,
-            target: None,
+            target: DeferredFsTarget::None,
             resume_to_last_page: false,
             from_explicit_open: true,
             preserve_after_password_prompt: true,
@@ -28084,6 +28385,38 @@ mod still_window_mode_key_tests {
         assert!(
             active.bundle.viewer_session.independent_active,
             "always-new image window mode must still make the PDF page detached session independent"
+        );
+    }
+
+    #[test]
+    fn detached_required_pdf_target_missing_does_not_fallback_to_first_page() {
+        let mut app = setup_app();
+        let pdf = PathBuf::from(r"C:\books\a.pdf");
+        app.current_folder = Some(pdf.clone());
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: pdf.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+
+        let outcome = app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            resume_slideshow: false,
+            target: DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
+                pdf_path: pdf,
+                page_num: 9,
+            }),
+            resume_to_last_page: true,
+            from_explicit_open: true,
+            preserve_after_password_prompt: true,
+        });
+
+        assert_eq!(outcome, DeferredFsOpenOutcome::RequiredTargetMissing);
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "an explicit detached page request must not open the first/saved page when its target vanished"
         );
     }
 
@@ -28432,7 +28765,7 @@ mod still_window_mode_key_tests {
         app.visible_indices = vec![0];
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
-            target: None,
+            target: DeferredFsTarget::None,
             resume_to_last_page: false,
             from_explicit_open: true,
             preserve_after_password_prompt: true,
@@ -28585,7 +28918,7 @@ mod still_window_mode_key_tests {
         let deferred = active.bundle.fs_nav_after_pdf_enumerate.as_ref().unwrap();
         assert!(matches!(
             deferred.target,
-            Some(crate::snapshot::SnapshotTarget::PdfPage {
+            DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
                 ref pdf_path,
                 page_num: 5
             }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")
@@ -28701,7 +29034,7 @@ mod still_window_mode_key_tests {
         let deferred = active.bundle.fs_nav_after_pdf_enumerate.as_ref().unwrap();
         assert!(matches!(
             deferred.target,
-            Some(crate::snapshot::SnapshotTarget::PdfPage {
+            DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
                 ref pdf_path,
                 page_num: 5
             }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")

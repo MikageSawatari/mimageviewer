@@ -2087,6 +2087,9 @@ struct ViewerContextBundle {
     slideshow_anchor_idx: Option<usize>,
     slideshow_scroll_anim: Option<SlideshowContinuousScrollAnim>,
     slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
+    pdf_password_request: Option<PdfPasswordRequest>,
+    pdf_current_password: Option<String>,
+    pdf_password_pending_save: Option<(PathBuf, String)>,
     pdf_enumerate_pending: Option<(
         PathBuf,
         Option<String>,
@@ -2355,6 +2358,9 @@ impl ViewerContextBundle {
             slideshow_anchor_idx: None,
             slideshow_scroll_anim: None,
             slideshow_scroll_range_cache: None,
+            pdf_password_request: None,
+            pdf_current_password: None,
+            pdf_password_pending_save: None,
             pdf_enumerate_pending: None,
             zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
@@ -2550,19 +2556,16 @@ pub(crate) enum FolderNavMode {
 /// resume を deferred 経路でも引き継ぐため struct 化した。resume は自由 bool ではなく
 /// `FolderNavMode::SlideshowNext` 由来でセットされる。)
 ///
-/// `target` は ★固定 (snapshot) ナビで未展開 ZIP/PDF 内の特定 leaf を開きに行く場合に
-/// セットされる (Codex P2 fix)。`SnapshotTarget` は `PathBuf`/`String` を含み `Copy` 不可
-/// なので、本 struct も `Clone` のみ (旧来の `Copy` は外した)。
+/// `target` は未展開 ZIP/PDF 内の特定 leaf を開きに行く場合に使う。★固定 navigation は
+/// `Preferred`、detached の明示 leaf open は `Required` とし、後者だけ target 消失時に
+/// 別ページへ fallback しない。
 #[derive(Clone, Debug)]
 pub(crate) struct DeferredFsReopen {
     /// true なら reopen 後にスライドショーを再開する (SlideshowNext 由来のときだけ)。
     /// また true のときは先頭の **静止画のみ** (Video 除外) を開く。
     /// (DFS 方向 forward は deferred reopen では使わない: フォルダ先頭着地固定のため。)
     pub resume_slideshow: bool,
-    /// ★固定ナビで開きに行く特定 leaf (画像 / 動画 / ZipImage / PdfPage)。
-    /// `Some` なら列挙完了時にこの target を `items` から解決して開く。マッチしなければ
-    /// `find_fullscreen_nav_target_filtered` に fallback。フォルダナビ経路では常に `None`。
-    pub target: Option<crate::snapshot::SnapshotTarget>,
+    pub target: DeferredFsTarget,
     /// 列挙完了で開くページを「先頭」ではなく「保存済み読書位置 (続きから)」にするか。
     /// grid から本を開いた経路は設定 `book_open_resume`、Ctrl+↑↓ フォルダナビ経路は
     /// `book_nav_resume` で true/false を決める (位置復元マトリクス)。既定は grid=続き /
@@ -2577,14 +2580,39 @@ pub(crate) struct DeferredFsReopen {
     pub preserve_after_password_prompt: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredFsTarget {
+    None,
+    Preferred(crate::snapshot::SnapshotTarget),
+    Required(crate::snapshot::SnapshotTarget),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredFsOpenOutcome {
+    Opened,
+    NoPlayableItem,
+    RequiredTargetMissing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PdfPasswordRequest {
+    path: PathBuf,
+}
+
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
 /// ヒット先が通常ディレクトリだった場合の事前スキャン結果を載せる。
 /// 事前スキャンがあれば UI スレッドの `load_folder` は `read_dir` をスキップできる。
 pub(crate) struct FolderNavThreadResult {
     outcome: Option<crate::folder_tree::FolderNavOutcome>,
-    /// `outcome.path` がディレクトリのときのみ Some。ZIP/PDF ファイルは
-    /// 専用ローダーに委譲するので事前スキャンしない。
-    scanned: Option<ScannedDir>,
+    /// `outcome.path` がディレクトリなら scan 成否を保持する。ZIP/PDF ファイルは
+    /// 専用ローダーに委譲するため `NotNeeded`。
+    scanned: FolderNavScanResult,
+}
+
+pub(crate) enum FolderNavScanResult {
+    NotNeeded,
+    Ready(ScannedDir),
+    Failed(String),
 }
 
 /// ZIP 中央ディレクトリ列挙の非同期ハンドル。ネスト ZIP が多いと `enumerate_image_entries`
@@ -3419,7 +3447,7 @@ pub(crate) struct FolderPaneOpenPending {
     /// 旧 pending を上書き/別 nav 勝利時に立てるキャンセルトークン。
     cancel: Arc<AtomicBool>,
     /// scan worker からの結果チャネル。
-    rx: mpsc::Receiver<ScannedDir>,
+    rx: mpsc::Receiver<std::io::Result<ScannedDir>>,
     /// scan 完了後に誰が結果を適用するか。detached image open は対象画像まで
     /// この request に内包し、main の仮想一覧や別の deferred field に依存しない。
     purpose: FolderOpenScanPurpose,
@@ -3427,6 +3455,7 @@ pub(crate) struct FolderPaneOpenPending {
 
 pub(crate) enum FolderOpenScanPurpose {
     PaneNavigation,
+    DetachedFolder,
     DetachedImage { image_path: PathBuf },
 }
 
@@ -3434,7 +3463,7 @@ pub(crate) enum FolderOpenScanPurpose {
 /// mounted detached bundle 内で対象画像を開く。
 pub(crate) struct FolderPaneOpenReady {
     path: PathBuf,
-    scan: ScannedDir,
+    scan: std::io::Result<ScannedDir>,
     purpose: FolderOpenScanPurpose,
 }
 
@@ -3442,7 +3471,7 @@ pub(crate) struct FolderPaneOpenReady {
 enum DetachedPhysicalFolderOpenPoll {
     Waiting,
     Applied,
-    ImageTargetMissing(PathBuf),
+    Failed,
 }
 
 /// 親フォルダ上の `ConvertibleArchive` タイル用に、変換済み cache ZIP の対応表を
@@ -3487,9 +3516,9 @@ pub(crate) struct FolderNavResult {
     pub forward: bool,
     /// 起点モード。
     pub mode: FolderNavMode,
-    /// DFS スレッドで事前走査した `path` の中身。`path` がディレクトリのときのみ Some。
-    /// UI スレッドの `load_folder` で read_dir をスキップするために使う。
-    pub scanned: Option<ScannedDir>,
+    /// DFS スレッドで事前走査した `path` の中身、または走査失敗。
+    /// 失敗を空一覧として `load_folder` へ適用して catalog を削除しない。
+    pub scanned: FolderNavScanResult,
 }
 
 /// 非同期メタデータ読み込み (フルスクリーン表示対象画像の AI/EXIF/XMP) の状態。
@@ -8033,8 +8062,9 @@ pub struct App {
     /// 「パスワードを保存する」チェックボックス (デフォルト OFF)
     pub(crate) pdf_password_save: bool,
     pub(crate) pdf_password_error: Option<String>,
-    /// パスワード入力待ちの PDF パス
-    pub(crate) pdf_password_pending_path: Option<PathBuf>,
+    /// パスワード入力待ちの context-owned request。main / active detached の bundle swap
+    /// 対象で、ダイアログの OK / cancel は request を所有する context へ route する。
+    pub(crate) pdf_password_request: Option<PdfPasswordRequest>,
     /// 現在開いている PDF のパスワード (セッション中キャッシュ)
     pub(crate) pdf_current_password: Option<String>,
     /// 非同期 enumerate 成功時に DPAPI 保存するための一時記録 (path, password)。
@@ -10528,7 +10558,7 @@ impl App {
             pdf_password_input: String::new(),
             pdf_password_save: false,
             pdf_password_error: None,
-            pdf_password_pending_path: None,
+            pdf_password_request: None,
             pdf_password_pending_save: None,
             pdf_current_password: None,
             pdf_content_type_tx: pdf_ct_tx,
@@ -12131,6 +12161,9 @@ impl App {
             slideshow_anchor_idx,
             slideshow_scroll_anim,
             slideshow_scroll_range_cache,
+            pdf_password_request,
+            pdf_current_password,
+            pdf_password_pending_save,
             pdf_enumerate_pending,
             zip_enumerate_pending,
             fs_nav_after_pdf_enumerate,
@@ -12351,6 +12384,9 @@ impl App {
         swap_field!(slideshow_anchor_idx);
         swap_field!(slideshow_scroll_anim);
         swap_field!(slideshow_scroll_range_cache);
+        swap_field!(pdf_password_request);
+        swap_field!(pdf_current_password);
+        swap_field!(pdf_password_pending_save);
         swap_field!(pdf_enumerate_pending);
         swap_field!(zip_enumerate_pending);
         swap_field!(fs_nav_after_pdf_enumerate);
@@ -13763,7 +13799,7 @@ impl App {
             || self.pdf_enumerate_pending.is_some()
             || self.zip_enumerate_pending.is_some()
             || self.show_pdf_password_dialog
-            || self.pdf_password_pending_path.is_some()
+            || self.pdf_password_request_pending_in_any_context()
         {
             return None;
         }
@@ -14005,7 +14041,10 @@ impl App {
         // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
         // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
         // ウイルススキャン等が触っただけで mtime が更新されるケースを救済する。
-        let scan = scan_directory_with_settings(&folder, &self.settings);
+        let Ok(scan) = scan_directory_with_settings(&folder, &self.settings) else {
+            // 一時的なネットワーク切断や権限エラーを「空フォルダへの変更」として扱わない。
+            return;
+        };
         let new_sig = signature_from_scan(&scan);
         if self.current_folder_signature == Some(new_sig) {
             self.current_folder_last_mtime = Some(new_mtime);
@@ -14949,7 +14988,22 @@ impl App {
         // pre_scan が与えられていれば DFS スレッドで既に走査済み (UI 非ブロック)。
         // 無ければ UI スレッドで scan_directory を呼ぶ (従来挙動)。
         let scan_t0 = std::time::Instant::now();
-        let scan = pre_scan.unwrap_or_else(|| scan_directory_with_settings(&path, &self.settings));
+        let scan = match pre_scan {
+            Some(scan) => scan,
+            None => match scan_directory_with_settings(&path, &self.settings) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "load_folder scan failed path={} error={error}",
+                        path.display()
+                    ));
+                    self.pending_auto_fs_open = false;
+                    self.release_fs_nav_lock();
+                    self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                    return;
+                }
+            },
+        };
         // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
         // `start_loading_items` に引数として渡す。
         let folder_signature = signature_from_scan(&scan);
@@ -17552,7 +17606,7 @@ impl App {
         if std::mem::take(&mut self.pending_auto_fs_open) {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow: false,
-                target: None,
+                target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
                 from_explicit_open: true,
@@ -18387,7 +18441,7 @@ impl App {
         if std::mem::take(&mut self.pending_auto_fs_open) {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow: false,
-                target: None,
+                target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
                 from_explicit_open: true,
@@ -18513,14 +18567,25 @@ impl App {
         }
     }
 
-    fn open_deferred_fullscreen_after_enumerate(&mut self, deferred: DeferredFsReopen) {
-        // ★固定ナビ由来 (target Some) なら列挙完了した items から対象 leaf を解決する。
-        // マッチしなければ / フォルダナビ由来なら従来どおり先頭着地。スライドショー
-        // NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
-        let mut new_idx = deferred
-            .target
-            .as_ref()
-            .and_then(|t| self.resolve_snapshot_target_idx(t));
+    fn open_deferred_fullscreen_after_enumerate(
+        &mut self,
+        deferred: DeferredFsReopen,
+    ) -> DeferredFsOpenOutcome {
+        // ★固定 navigation の Preferred target は従来どおり miss 時に読書位置 / 先頭へ
+        // fallback する。一方、detached の明示 leaf open は Required で、対象が列挙結果に
+        // 無ければ別ページを開かず terminal close へ進める。
+        let mut new_idx = match &deferred.target {
+            DeferredFsTarget::None => None,
+            DeferredFsTarget::Preferred(target) => self.resolve_snapshot_target_idx(target),
+            DeferredFsTarget::Required(target) => {
+                let resolved = self.resolve_snapshot_target_idx(target);
+                if resolved.is_none() {
+                    crate::logger::log(format!("detached deferred target missing: {target:?}"));
+                    return DeferredFsOpenOutcome::RequiredTargetMissing;
+                }
+                resolved
+            }
+        };
         // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
         if new_idx.is_none() && deferred.resume_to_last_page {
             new_idx = self.resume_page_for_container();
@@ -18540,6 +18605,9 @@ impl App {
                 self.slideshow_playing = true;
                 self.schedule_next_slideshow_from_now();
             }
+            DeferredFsOpenOutcome::Opened
+        } else {
+            DeferredFsOpenOutcome::NoPlayableItem
         }
     }
 
@@ -18848,7 +18916,7 @@ impl App {
                             None,
                         );
                     }
-                    self.pdf_password_pending_path = Some(pdf_path);
+                    self.pdf_password_request = Some(PdfPasswordRequest { path: pdf_path });
                     self.show_pdf_password_dialog = true;
                     self.pdf_password_input.clear();
                     // password が渡されていた = 入力済みのパスワードが誤っていた
@@ -18893,6 +18961,97 @@ impl App {
         // (= holdover が居座る)。明示オープン由来の reopen は残す場合でも、
         // パスワード入力中の nav lock はここで解放する。
         self.release_fs_nav_lock();
+    }
+
+    pub(crate) fn pdf_password_dialog_path(&self) -> Option<PathBuf> {
+        #[cfg(windows)]
+        if let Some(path) = self
+            .active_detached_viewer_context
+            .as_ref()
+            .and_then(|active| active.bundle.pdf_password_request.as_ref())
+            .map(|request| request.path.clone())
+        {
+            return Some(path);
+        }
+        self.pdf_password_request
+            .as_ref()
+            .map(|request| request.path.clone())
+    }
+
+    pub(crate) fn pdf_password_request_pending_in_any_context(&self) -> bool {
+        if self.pdf_password_request.is_some() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            return self
+                .active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.pdf_password_request.is_some());
+        }
+        #[cfg(not(windows))]
+        false
+    }
+
+    fn retry_pdf_password_request_in_mounted_context(
+        &mut self,
+        password: String,
+        save: bool,
+    ) -> bool {
+        let Some(request) = self.pdf_password_request.take() else {
+            return false;
+        };
+        self.pdf_current_password = Some(password.clone());
+        self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
+        self.load_pdf_as_folder(request.path);
+        true
+    }
+
+    pub(crate) fn retry_pdf_password_dialog_request(
+        &mut self,
+        password: String,
+        save: bool,
+    ) -> bool {
+        #[cfg(windows)]
+        if self
+            .active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| active.bundle.pdf_password_request.is_some())
+        {
+            return self
+                .with_active_detached_viewer_context(|app| {
+                    app.retry_pdf_password_request_in_mounted_context(password, save)
+                })
+                .unwrap_or(false);
+        }
+        self.retry_pdf_password_request_in_mounted_context(password, save)
+    }
+
+    fn cancel_pdf_password_request_in_mounted_context(&mut self) -> bool {
+        if self.pdf_password_request.take().is_none() {
+            return false;
+        }
+        self.pdf_password_pending_save = None;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.release_fs_nav_lock();
+        self.restore_rating_filter_suppression();
+        true
+    }
+
+    pub(crate) fn cancel_pdf_password_dialog_request(&mut self) -> bool {
+        #[cfg(windows)]
+        if self
+            .active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| active.bundle.pdf_password_request.is_some())
+        {
+            return self
+                .with_active_detached_viewer_context(|app| {
+                    app.cancel_pdf_password_request_in_mounted_context()
+                })
+                .unwrap_or(false);
+        }
+        self.cancel_pdf_password_request_in_mounted_context()
     }
 
     /// load_folder と load_zip_as_folder の共通処理。
@@ -25692,7 +25851,8 @@ impl App {
 
         let enumeration_pending = self.zip_enumerate_pending.is_some()
             || self.pdf_enumerate_pending.is_some()
-            || self.items.is_empty();
+            || self.folder_pane_open_pending.is_some()
+            || self.pdf_password_request.is_some();
         if !enumeration_pending {
             self.cancel_bookmark_open_request(pending.request_id, "book_page_missing");
             self.show_feedback_toast(
@@ -29727,16 +29887,20 @@ impl App {
             // (HDD で 100-180ms 級) を除去する。ZIP/PDF ファイルは専用ローダーが
             // 別経路で処理するのでここではスキャンしない。
             let scanned = if cancel_w.load(Ordering::Relaxed) {
-                None
+                FolderNavScanResult::NotNeeded
             } else if let Some(o) = outcome.as_ref() {
                 if o.path.is_dir() {
                     let scan_t0 = std::time::Instant::now();
-                    let s = scan_directory_with_convertible_archives(
+                    let scan = scan_directory_with_convertible_archives(
                         &o.path,
                         tree_opts.include_convertible_archives,
                         show_hidden_files,
                     );
                     if crate::perf::is_enabled() {
+                        let (folders, media, failed) = match scan.as_ref() {
+                            Ok(scan) => (scan.folders.len(), scan.all_media.len(), false),
+                            Err(_) => (0, 0, true),
+                        };
                         crate::perf::event(
                             "nav",
                             "dfs_scan",
@@ -29749,17 +29913,21 @@ impl App {
                                         scan_t0.elapsed().as_secs_f64() * 1000.0,
                                     ),
                                 ),
-                                ("folders", serde_json::Value::from(s.folders.len())),
-                                ("media", serde_json::Value::from(s.all_media.len())),
+                                ("folders", serde_json::Value::from(folders)),
+                                ("media", serde_json::Value::from(media)),
+                                ("failed", serde_json::Value::from(failed)),
                             ],
                         );
                     }
-                    Some(s)
+                    match scan {
+                        Ok(scan) => FolderNavScanResult::Ready(scan),
+                        Err(error) => FolderNavScanResult::Failed(error.to_string()),
+                    }
                 } else {
-                    None
+                    FolderNavScanResult::NotNeeded
                 }
             } else {
-                None
+                FolderNavScanResult::NotNeeded
             };
 
             let cancelled = cancel_w.load(Ordering::Relaxed);
@@ -29792,7 +29960,13 @@ impl App {
                             serde_json::Value::from(hit_image_folder),
                         ),
                         ("hit_path", serde_json::Value::from(hit)),
-                        ("pre_scanned", serde_json::Value::from(scanned.is_some())),
+                        (
+                            "pre_scanned",
+                            serde_json::Value::from(matches!(
+                                &scanned,
+                                FolderNavScanResult::Ready(_)
+                            )),
+                        ),
                     ],
                 );
             }
@@ -29868,6 +30042,10 @@ impl App {
         };
         self.start_folder_open_scan(parent, FolderOpenScanPurpose::DetachedImage { image_path });
         true
+    }
+
+    fn start_detached_folder_open(&mut self, folder_path: PathBuf) {
+        self.start_folder_open_scan(folder_path, FolderOpenScanPurpose::DetachedFolder);
     }
 
     fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
@@ -29952,10 +30130,20 @@ impl App {
         let Some(ready) = self.poll_folder_pane_open(ctx) else {
             return DetachedPhysicalFolderOpenPoll::Waiting;
         };
+        let scan = match ready.scan {
+            Ok(scan) => scan,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "detached folder scan failed path={} error={error}",
+                    ready.path.display()
+                ));
+                return DetachedPhysicalFolderOpenPoll::Failed;
+            }
+        };
         match ready.purpose {
             FolderOpenScanPurpose::DetachedImage { image_path } => {
                 self.with_detached_viewer_main_history_suppressed(|app| {
-                    app.load_folder_with_scan(ready.path, Some(ready.scan));
+                    app.load_folder_with_scan(ready.path, Some(scan));
                 });
                 // 明示された画像 request は厳密に解決する。snapshot / folder-nav 用 helper は
                 // target miss 時に先頭へ fallback するため、ここでは使用しない。Windows の
@@ -29975,7 +30163,7 @@ impl App {
                             |path| path.display().to_string()
                         )
                     ));
-                    return DetachedPhysicalFolderOpenPoll::ImageTargetMissing(image_path);
+                    return DetachedPhysicalFolderOpenPoll::Failed;
                 };
 
                 // parked still の再開と同じく、既に割り当てた detached window_id を
@@ -29989,10 +30177,16 @@ impl App {
                 self.update_last_selected_image();
                 DetachedPhysicalFolderOpenPoll::Applied
             }
+            FolderOpenScanPurpose::DetachedFolder => {
+                self.with_detached_viewer_main_history_suppressed(|app| {
+                    app.load_folder_with_scan(ready.path, Some(scan));
+                });
+                DetachedPhysicalFolderOpenPoll::Applied
+            }
             FolderOpenScanPurpose::PaneNavigation => {
                 // active detached viewport はフォルダペインを持たないため通常は到達しない。
                 // 将来ペインを共有しても結果を捨てず、その bundle の物理ナビとして適用する。
-                self.load_folder_with_scan(ready.path, Some(ready.scan));
+                self.load_folder_with_scan(ready.path, Some(scan));
                 DetachedPhysicalFolderOpenPoll::Applied
             }
         }
@@ -30023,7 +30217,7 @@ impl App {
                     hit_image_folder: false,
                     forward: pending.forward,
                     mode: pending.mode,
-                    scanned: None,
+                    scanned: FolderNavScanResult::NotNeeded,
                 })
             }
         }
@@ -30196,7 +30390,7 @@ impl App {
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow,
-                target: None,
+                target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
                 from_explicit_open: false,
@@ -30214,7 +30408,7 @@ impl App {
             // 仮想展開した場合もここに来る (current_folder が ZIP/PDF になっている)。
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow,
-                target: None,
+                target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
                 from_explicit_open: false,
@@ -30503,7 +30697,21 @@ impl App {
             return;
         }
         // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける。
-        let scanned = result.scanned;
+        let scanned = match result.scanned {
+            FolderNavScanResult::NotNeeded => None,
+            FolderNavScanResult::Ready(scan) => Some(scan),
+            FolderNavScanResult::Failed(error) => {
+                crate::logger::log(format!(
+                    "folder navigation scan failed path={} error={error}",
+                    path.display()
+                ));
+                self.clear_pending_folder_nav_steps();
+                self.release_fs_nav_lock();
+                self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                emit_end(apply_t0, apply_seq, apply_mode_tag, "scan_failed");
+                return;
+            }
+        };
         match result.mode {
             FolderNavMode::Grid | FolderNavMode::SiblingGrid => {
                 if !matches!(
@@ -31899,6 +32107,9 @@ impl App {
         idx: usize,
     ) -> Option<ViewerContextDescriptor> {
         match self.items.get(idx)? {
+            GridItem::Folder(path) => {
+                Some(ViewerContextDescriptor::BookFolder { path: path.clone() })
+            }
             GridItem::PdfFile(path) => Some(ViewerContextDescriptor::Pdf {
                 path: path.clone(),
                 page_num: None,
@@ -32390,14 +32601,18 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn close_current_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+    fn take_and_close_current_active_detached_viewer_context(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+    ) -> Option<ViewerContextBundle> {
         let Some(mut active) = self.active_detached_viewer_context.take() else {
-            return false;
+            return None;
         };
 
         // book context の明示 close = detached セッション終了 (§3.7 closing)。Close 送信前に
         // closing を立て、teardown 後に finish して backstop が窓を復活させないようにする。
-        self.begin_active_detached_session_close("close_active_detached_viewer_context");
+        self.begin_active_detached_session_close(reason);
         let closing_window_id = self
             .active_detached_session
             .map(|session| session.window_id);
@@ -32407,13 +32622,30 @@ impl App {
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
         }
         self.close_fullscreen();
-        let _closed_context = self.take_current_viewer_context_bundle();
+        let closed_context = self.take_current_viewer_context_bundle();
         self.swap_viewer_context_bundle(&mut active.bundle);
-        self.finish_active_detached_session_close("close_active_detached_viewer_context");
+        self.finish_active_detached_session_close(reason);
         if let Some(window_id) = closing_window_id {
-            self.remove_detached_window_runtime(window_id, "close_active_detached_viewer_context");
+            self.remove_detached_window_runtime(window_id, reason);
         }
-        true
+        // PDF password dialog の UI state 自体は App-global だが、request owner は bundle。
+        // viewport 作成前の terminal close で owner を捨てた後に orphan dialog を残さない。
+        if closed_context.pdf_password_request.is_some() && self.pdf_password_request.is_none() {
+            self.show_pdf_password_dialog = false;
+            self.pdf_password_input.clear();
+            self.pdf_password_error = None;
+            self.pdf_password_save = false;
+        }
+        Some(closed_context)
+    }
+
+    #[cfg(windows)]
+    fn close_current_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+        self.take_and_close_current_active_detached_viewer_context(
+            ctx,
+            "close_active_detached_viewer_context",
+        )
+        .is_some()
     }
 
     #[cfg(windows)]
@@ -34095,7 +34327,7 @@ impl App {
                 app.load_pdf_as_folder(path);
             }
             ViewerContextDescriptor::BookFolder { path } => {
-                app.load_folder(path);
+                app.start_detached_folder_open(path);
             }
             ViewerContextDescriptor::Image { path } => {
                 // 仮想一覧の backing snapshot は使わず、親フォルダを worker で完全走査する。
@@ -34116,7 +34348,7 @@ impl App {
         {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow: false,
-                target: Some(target),
+                target: DeferredFsTarget::Required(target),
                 resume_to_last_page: false,
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
@@ -34610,7 +34842,7 @@ impl App {
             return false;
         }
 
-        let (should_drop, image_target_missing) = self
+        let (should_drop, detached_viewport_finalized) = self
             .with_active_detached_viewer_context(|app| {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
@@ -34642,11 +34874,7 @@ impl App {
                     app.apply_folder_nav_result(ctx, result);
                     app.chain_folder_nav_if_pending();
                 }
-                let image_target_missing = match app.poll_detached_physical_folder_open(ctx) {
-                    DetachedPhysicalFolderOpenPoll::ImageTargetMissing(path) => Some(path),
-                    DetachedPhysicalFolderOpenPoll::Waiting
-                    | DetachedPhysicalFolderOpenPoll::Applied => None,
-                };
+                let _ = app.poll_detached_physical_folder_open(ctx);
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
@@ -34679,6 +34907,7 @@ impl App {
                     || app.pdf_enumerate_pending.is_some()
                     || app.zip_enumerate_pending.is_some()
                     || app.fs_nav_deferred_reopen_wait_active()
+                    || app.pdf_password_request.is_some()
                     || matches!(
                         app.bookmark_open_pending,
                         Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
@@ -34748,41 +34977,35 @@ impl App {
                     false
                 };
                 let should_drop = app.fullscreen_idx.is_none()
+                    && app.folder_nav_pending.is_none()
                     && app.folder_pane_open_pending.is_none()
                     && app.pdf_enumerate_pending.is_none()
                     && app.zip_enumerate_pending.is_none()
+                    && !app.fs_nav_deferred_reopen_wait_active()
+                    && app.pdf_password_request.is_none()
                     && !matches!(
                         app.bookmark_open_pending,
                         Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
                     )
                     && !app.fs_viewport_shown;
-                if should_drop
-                    && !detached_viewport_finalized
-                    && let Some(viewport_id) = close_viewport_id
-                {
-                    app.finalize_closed_active_detached_viewport(ctx, viewport_id);
-                }
-                (should_drop, image_target_missing)
+                (should_drop, detached_viewport_finalized)
             })
-            .unwrap_or((false, None));
+            .unwrap_or((false, false));
 
-        if let Some(path) = image_target_missing {
-            self.log_detached_image_window_debug(format!(
-                "detached_image_open_aborted_missing_target path={}",
-                path.display()
-            ));
-            let closed = self.close_current_active_detached_viewer_context(ctx);
-            debug_assert!(
-                closed,
-                "missing detached image target must still own an active context"
-            );
-            self.request_detached_cleanup_font_atlas_resync(
-                "detached_image_open_aborted_missing_target",
-            );
-            return true;
-        }
-        if should_drop && let Some(closed) = self.active_detached_viewer_context.take() {
-            self.reconcile_closed_bookmark_detached_context(&closed.bundle);
+        if should_drop {
+            let closed = if detached_viewport_finalized {
+                self.active_detached_viewer_context
+                    .take()
+                    .map(|active| active.bundle)
+            } else {
+                self.take_and_close_current_active_detached_viewer_context(
+                    ctx,
+                    "active_terminal_before_viewport",
+                )
+            };
+            if let Some(closed) = closed {
+                self.reconcile_closed_bookmark_detached_context(&closed);
+            }
         }
         true
     }
@@ -35319,6 +35542,9 @@ impl App {
             pdf_enumerate_pending,
             zip_enumerate_pending,
             fs_nav_after_pdf_enumerate,
+            pdf_password_request,
+            pdf_current_password,
+            pdf_password_pending_save,
             pending_auto_fs_open,
             pending_return_to_parent,
             pdf_placeholder_count,
@@ -35476,6 +35702,9 @@ impl App {
             fs_nav_locked_gen,
             fs_holdover_tex,
             fs_boundary_hint,
+            pdf_password_request,
+            pdf_current_password,
+            pdf_password_pending_save,
             normalize_ui_states,
             normalize_auto_scan_suppressed,
             music_bookmarks,
@@ -58084,8 +58313,20 @@ impl eframe::App for App {
                 self.start_folder_pane_open(p);
                 None
             } else if let Some(ready) = folder_pane_open_ready.take() {
-                navigate_pre_scan = Some(ready.scan);
-                Some(ready.path)
+                match ready.scan {
+                    Ok(scan) => {
+                        navigate_pre_scan = Some(scan);
+                        Some(ready.path)
+                    }
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "folder pane scan failed path={} error={error}",
+                            ready.path.display()
+                        ));
+                        self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                        None
+                    }
+                }
             } else {
                 grid_nav
             };

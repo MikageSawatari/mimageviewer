@@ -233,6 +233,10 @@ TextureIdで重複排除して見積もり、補正レイヤーの比較preview�
 | D | Ctrl+F / Ctrl+S 検索が UI スレッドで XMP/PNG メタ + SQLite を同期実行 | 検索ごと worker thread、結果 merge | `SearchPending` / `FavSearchPending` | [src/app.rs `execute_search`, `execute_favsearch`](../src/app.rs) |
 | E | `ensure_metadata_loaded` が `open_fullscreen` のたびに AI/EXIF/XMP を UI スレッドで同期読み (20MP JPEG で 100ms+) | 1 worker で 3 パーサーを順次実行、結果をキャッシュ merge | `MetadataLoadPending` | [src/app.rs `start_metadata_load`, `run_metadata_load`](../src/app.rs) |
 
+`ScannedDir` のworker handoffは `Result` を保持する。ネットワーク切断や権限エラー時に
+`read_dir` 失敗を空フォルダへ変換してUIへinstallすると、表示が空になるだけでなく
+`catalog.delete_missing()` が有効なサムネイル行を削除するため、失敗結果はloadへ適用しない。
+
 ### 5.2 効果 (measurement)
 
 | 指標 | Original | 最終 | 改善率 |

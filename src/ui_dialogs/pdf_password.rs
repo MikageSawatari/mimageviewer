@@ -28,7 +28,7 @@ impl crate::app::App {
                 ui.set_min_width(380.0);
                 ui.label("このPDFファイルを開くにはパスワードが必要です:");
 
-                if let Some(ref path) = self.pdf_password_pending_path {
+                if let Some(path) = self.pdf_password_dialog_path() {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                     ui.label(
                         egui::RichText::new(name)
@@ -97,37 +97,20 @@ impl crate::app::App {
         if apply {
             let password = self.pdf_password_input.trim().to_string();
             if !password.is_empty() {
-                if let Some(pending_path) = self.pdf_password_pending_path.take() {
-                    // パスワード検証は非同期 enumerate に任せる。ここで sync enumerate すると
-                    // UI が止まり、しかも直後の load_pdf_as_folder が同じ PDF をもう一度
-                    // 非同期 enumerate するため二重走行になる。
-                    // 成功時に DPAPI 保存したい場合は pending_save に退避し、
-                    // poll_pdf_enumerate の成功経路でパスが一致した時に save する。
-                    self.pdf_current_password = Some(password.clone());
-                    self.pdf_password_pending_save = if self.pdf_password_save {
-                        Some((pending_path.clone(), password))
-                    } else {
-                        None
-                    };
+                // request owner (main / active detached bundle) を mount して retry する。
+                // パスワード検証は非同期 enumerate に任せ、成功時保存も同じ context の
+                // pending_save が所有する。
+                if self.retry_pdf_password_dialog_request(password, self.pdf_password_save) {
                     self.show_pdf_password_dialog = false;
                     self.pdf_password_input.clear();
                     self.pdf_password_error = None;
-                    self.load_pdf_as_folder(pending_path);
                 }
             }
         } else if cancel || !open {
+            self.cancel_pdf_password_dialog_request();
             self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
-            self.pdf_password_pending_path = None;
-            self.pdf_password_pending_save = None;
-            self.fs_nav_after_pdf_enumerate = None;
-            self.release_fs_nav_lock();
-            // Codex High 指摘: ★付き PDF を開こうとして suppression を立てた直後に
-            // パスワードダイアログをキャンセルすると、load_pdf_as_folder の start_loading_items
-            // に到達せず suppression が永続化する。実際にはファイルを開けていないので
-            // 元のフィルタに復元する (ユーザー視点: 「開かなかった」)。
-            self.restore_rating_filter_suppression();
         }
     }
 }

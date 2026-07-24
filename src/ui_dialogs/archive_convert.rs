@@ -529,7 +529,7 @@ impl App {
             restore_video_tile,
             reopen: crate::app::DeferredFsReopen {
                 resume_slideshow,
-                target: None,
+                target: crate::app::DeferredFsTarget::None,
                 resume_to_last_page,
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,

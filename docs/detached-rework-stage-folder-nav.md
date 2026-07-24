@@ -87,9 +87,23 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
   保持する。明示した画像 path は Windows の filesystem identity で厳密に解決し、
   削除・hidden 設定などで完全一覧に存在しない場合は先頭画像へ fallback せず、
   失敗した detached session と runtime を正常終了する。
+- 画像のみ通常フォルダのコンテナ open も Enter / ダブルクリック / gamepad 共通の
+  descriptor 入口で先に detached 側へ取り込み、main を子フォルダへ移してから複製する
+  経路を廃止した。物理 folder scan と自動 fullscreen は空の detached bundle 内で完了する。
 - ZIP/PDF page は従来どおり container enumerate worker の完全な結果から対象 entry/page を
-  解決する。通常画像 scan と ZIP/PDF enumerate の pending / cancel / result はいずれも
+  解決する。detached の明示 target は `Required` とし、entry 削除・archive 差し替え・
+  PDF ページ数減少で消失した場合は保存ページや先頭ページへ fallback せず session を閉じる。
+  通常画像 scan と ZIP/PDF enumerate の pending / cancel / result はいずれも
   `ViewerContextBundle` 所有で、main の検索条件・選択・スクロールを保持する。
+- protected PDF のパスワード要求、再試行用 session password、成功後の保存予約も
+  `ViewerContextBundle` 所有にした。ダイアログ確定／キャンセル時は request owner を mount
+  して処理し、列挙再開が main context へ脱落しない。パスワード待ちも active context の
+  生存条件とする。
+- viewport 作成前に空一覧・列挙失敗・必須 target 消失へ到達した場合も、通常の window close
+  と同じ共通終端で active session を finish し、`DetachedWindowManager` の runtime を削除する。
+- 実フォルダ scan は `Result<ScannedDir, io::Error>` を維持する。`read_dir` 失敗を空一覧として
+  `load_folder_with_scan` へ渡さず、detached の read-only open や Ctrl+↑↓ が catalog の
+  `delete_missing()` を誤って実行しない。
 - `src/app/tests.rs` で request ownership、main filter preservation、pause / Drop cancel を固定した。
 - ディスク上に `a/b/c`、仮想一覧に `c/a` だけがある状態から通常画像を開き、detached の
   非同期完了後が物理順 `a/b/c`、`a` の次が検索で欠落していた `b` になる回帰テストを追加した。
@@ -98,14 +112,18 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - 同テストは scan 完了まで production の `update_active_detached_viewer_context` を通し、
   未完了フレームで context / session / runtime が生存することも固定する。さらに対象消失時の
   session / runtime 終了と、大文字小文字だけ異なる Windows path の正しい解決を固定する。
+- 追加レビューの回帰として、detached PDF password request の owner 内再開、viewport 未生成の
+  terminal close、ZIP/PDF 必須 target 消失、Folder container open の main 無変更、
+  scan error 時の catalog row 保持を固定する。
 
 ## 7. 検証結果
 
 - `cargo fmt --check`: 成功
 - `python scripts/check_ui_glyphs.py`: 成功
-- `cargo test -p mimageviewer --lib still_window_mode_key_tests`: 326 passed
+- `cargo check -p mimageviewer --bin mimageviewer-core`: 成功
+- `cargo test -p mimageviewer --lib still_window_mode_key_tests::detached_`: 84 passed
+- `cargo test -p mimageviewer --lib image_folder_container_open_starts_detached_scan_without_navigating_main`: 成功
 - `scripts/test-full.ps1`: PASS（workspace / integration / doctest を含む）
-- `cargo build`: 成功
 - `scripts/build-dev.ps1`: 成功。`target/dev-runtime/mimageviewer-core.exe` を生成し、
   agent は起動していない。
 - `scripts/build-release.ps1`: 今回の追修正では未実施（通常確認用 `build-dev.ps1` を使用）。
