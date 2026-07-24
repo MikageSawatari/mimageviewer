@@ -96,7 +96,7 @@ pub(crate) fn image_folder_page_count(
         entries,
         options.include_convertible_archives,
         options.show_hidden_files,
-    );
+    )?;
     if !is_image_only_book_contents(!scan.folders.is_empty(), &scan.all_media) {
         return Ok(None);
     }
@@ -157,23 +157,27 @@ pub(crate) fn scan_directory_with_convertible_archives(
     show_hidden_files: bool,
 ) -> std::io::Result<ScannedDir> {
     let entries = std::fs::read_dir(path)?;
-    Ok(scan_directory_entries(
-        entries,
-        include_convertible_archives,
-        show_hidden_files,
-    ))
+    scan_directory_entries(entries, include_convertible_archives, show_hidden_files)
 }
 
-fn scan_directory_entries(
-    entries: std::fs::ReadDir,
+fn scan_directory_entries<I>(
+    entries: I,
     include_convertible_archives: bool,
     show_hidden_files: bool,
-) -> ScannedDir {
+) -> std::io::Result<ScannedDir>
+where
+    I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)> = Vec::new();
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        // A ReadDir can fail after yielding some entries (for example when a network share
+        // disconnects during FindNextFile). Treating that as a successful partial snapshot lets
+        // catalog delete_missing remove rows for every unseen tail entry, so discard the whole
+        // scan instead.
+        let entry = entry?;
         if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
             continue;
         }
@@ -233,7 +237,7 @@ fn scan_directory_entries(
         }
     }
     filter_upscaled_video_pairs_fast(&mut all_media, &entry_file_names_ci);
-    ScannedDir { folders, all_media }
+    Ok(ScannedDir { folders, all_media })
 }
 
 pub(super) fn filter_upscaled_video_pairs_fast(
@@ -598,6 +602,31 @@ mod page_count_tests {
         let temp = tempfile::TempDir::new().unwrap();
         let missing = temp.path().join("missing");
         assert!(image_folder_page_count(&missing, &options(false)).is_err());
+    }
+
+    #[test]
+    fn directory_scan_discards_partial_result_after_entry_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("001.jpg"), b"image").unwrap();
+        let first_entry = std::fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .expect("fixture entry")
+            .unwrap();
+        let entries = vec![
+            Ok(first_entry),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "simulated FindNextFile failure",
+            )),
+        ];
+
+        let error = match scan_directory_entries(entries, true, false) {
+            Ok(_) => panic!("a partial directory snapshot must not be published"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
     }
 
     #[test]
