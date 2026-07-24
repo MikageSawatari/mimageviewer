@@ -19,13 +19,14 @@
   → clean → core → launcher → ISCC (installer) → portable を 1 コマンドで実行し、
   テスト通過後に**ワークスペースパッケージを `cargo clean --release`**
   してから実コンパイルするので stale 出荷が構造的に起きない。署名は既定 ON。
-- **通常の開発反復は `scripts/build-dev.ps1`** (core のみ、軽量 profile、loose deps)。
-  Windows native 機能の最終実機確認だけ `scripts/build-release.ps1` 単体を使う
-  (clean なし・署名は `-Sign` 指定時のみ)。**どちらも配布物の生成には使わない**。
-- 実機検証用バイナリ (Windows ネイティブ挙動の確認依頼前) も `build-release.ps1` で足りる。
+- **通常の開発反復とcore内Windows native挙動の実機確認は
+  `scripts/build-dev.ps1`** (coreのみ、軽量Cargo profile、通常のAPPDATA profile、
+  launcher省略用FFmpeg DLLだけloose配置)。launcher／release最適化／埋め込みasset／
+  変更したVST3 bridgeなどrelease構成依存の確認だけ `scripts/build-release.ps1` 単体を使う
+  (cleanなし・署名は `-Sign` 指定時のみ)。**どちらも配布物の生成には使わない**。
 - ただし、エージェントは通常版の `target\release\mimageviewer*.exe` を起動しない。
-  通常版は `%APPDATA%\mimageviewer` の実設定を使うため、起動確認だけでも migration・
-  bak rotation・quarantine が発生し得る。自動 UI 検証は
+  `target\dev-runtime\mimageviewer-core.exe` も同じ実設定を使うため起動しない。通常profileは
+  起動確認だけでもmigration・bak rotation・quarantineが発生し得る。自動UI検証は
   `scripts\prepare-portable-smoke.ps1` が作る `target\portable-smoke\` の使い捨て
   ポータブル環境だけで行い、実設定が必要な確認はユーザーへ手順を渡す。
 

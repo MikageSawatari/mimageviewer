@@ -31,16 +31,22 @@
 `build-dev.ps1` は次の条件で本体 core だけをビルドする。
 
 - `dev-runtime` profile: `opt-level = 2`、LTO なし、codegen unit 64、incremental 有効
-- `portable` feature: DLL・worker・AI model を exe に埋め込まず隣に配置
+- 通常 feature set（`portable` は付けない）: 設定・キャッシュ・ログの既定保存先は
+  インストール版／release版と同じ `%APPDATA%\mimageviewer`
+- launcher を省略して直接起動できるよう、FFmpeg DLL だけを exe の隣へ配置。他の
+  DLL・worker・AI model は通常版と同じ埋め込み・展開経路を使う
 - 出力: `target\dev-runtime\mimageviewer-core.exe`
-- データ: `target\dev-runtime\data`
+- Cargo の `dev-runtime` はビルド時間短縮用の最適化profileであり、アプリのデータprofileを
+  切り替えるものではない
 
-スクリプトは必要な loose file を変更時だけ出力先へコピーし、成果物を起動しない。
-VST3 bridge が `vendor\vst3-host\mimageviewer-vst3-host.exe` にあれば開発出力にも配置する。
-C++ bridge 自体を変更した場合は、従来どおり先に CMake で bridge を再ビルドする。
+スクリプトは必要な FFmpeg DLL を変更時だけ出力先へコピーし、成果物を起動しない。
+通常profileを汚さない隔離確認が明示的に必要な場合は、同じバイナリへ
+`--data-dir .\target\dev-runtime\data` を渡す。build flavor自体をportableへ変えない。
+C++ VST3 bridge 自体を変更した場合は、従来どおり先にCMakeでbridgeを再ビルドする。
 
-これは実装確認用であり、配布判定や Windows native 機能の最終確認には
-`scripts\build-release.ps1` を使う。配布物は必ず `scripts\build-dist.ps1` で作る。
+これは通常profile上での実装確認用であり、launcher・release最適化・埋め込みasset展開・
+変更したVST3 bridge・署名・packagingまで含む確認には `scripts\build-release.ps1` を使う。
+配布物は必ず `scripts\build-dist.ps1` で作る。
 
 ### 修正完了後のユーザー実機確認
 
@@ -51,8 +57,13 @@ C++ bridge 自体を変更した場合は、従来どおり先に CMake で brid
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 ```
 
-エージェント自身はこの成果物を起動しない。データは `target\dev-runtime\data` に隔離される。
-release固有・Windows native固有の確認では `build-release.ps1` の成果物を使い、通常設定を
+エージェント自身はこの成果物を起動しない。引数なしでは実利用中の
+`%APPDATA%\mimageviewer` を使うため、設定・キャッシュ・ログを更新し得ることをユーザーへ
+明記する。single-instance mutexも共有するため、起動前にインストール版／常駐tray版を終了して
+もらう。Windows native coreの確認も原則この経路でよい。
+
+launcher・release設定・exact release performance・埋め込みasset・変更したVST3 bridge・
+署名・packagingに依存する確認では `build-release.ps1` の成果物を使い、同じく通常設定を
 使用することを明記したうえで次のコマンドを渡す。
 
 ```powershell

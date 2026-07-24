@@ -134,22 +134,31 @@ always-active guidance.
 - Do not launch `target\dev-runtime\mimageviewer-core.exe` yourself. In the
   final response, give the user the exact PowerShell launch command:
   `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`.
-  State that its isolated data directory is `target\dev-runtime\data`, and list
-  the concrete scenario to verify.
+  State that this fast core build uses the normal `%APPDATA%\mimageviewer`
+  profile by default, warn that it can update the user's real settings/data,
+  tell the user to close the installed/tray-resident mImageViewer first because
+  the single-instance mutex is shared, and list the concrete scenario to verify.
+  `dev-runtime` is only a Cargo optimization profile; `build-dev.ps1` must not
+  enable the `portable` feature.
+  If an isolated run is explicitly needed, pass
+  `--data-dir .\target\dev-runtime\data` rather than changing the build flavor.
 - A verification binary is not required for documentation-only, test-only,
   build-script-only, or other non-runnable changes, when the user explicitly
   asks not to build one, or when prerequisites are unavailable. Report the
   reason when a normally expected verification build could not be produced.
-- Release-only behavior and the Windows-native cases below override the normal
-  `build-dev.ps1` handoff: build the release launcher/core and give the user
-  its exact launch command and any real-settings warning instead.
+- Release-only, launcher, packaging, embedded-asset/extraction, code-signing,
+  or optimization-sensitive behavior overrides the normal `build-dev.ps1`
+  handoff: build the release launcher/core and give the user its exact launch
+  command and real-settings warning instead.
 
 ## Verification Builds (Windows native features)
 
-- **Never launch** `target\release\mimageviewer.exe`,
+- **Never launch** `target\dev-runtime\mimageviewer-core.exe`,
+  `target\release\mimageviewer.exe`,
   `target\release\mimageviewer-core.exe`, an installed mImageViewer, or an
   `%APPDATA%\mimageviewer\runtime\*` executable as part of agent-driven UI or
-  Computer Use verification. Normal builds use the user's real
+  Computer Use verification. The normal-profile development and release builds
+  use the user's real
   `%APPDATA%\mimageviewer` data and may migrate, rotate, quarantine, or rewrite
   `settings.db` merely by starting. Building these binaries and handing them to
   the user is allowed; launching them is not.
@@ -162,24 +171,27 @@ always-active guidance.
   building and give the user concrete manual steps. Only the user launches the
   normal verification binary. Do not reset, rename, restore, or otherwise
   manipulate the normal settings files for test setup.
-- When a change affects Windows-native behavior that unit tests cannot cover
-  (native video presenter, fullscreen, video->audio mode, VST, D3D11, HWND
-  owner/focus/z-order, real IME behavior, multi-monitor DPI), do not merely ask
-  the user to verify on real hardware. First run `.\scripts\build-release.ps1`
-  yourself to produce the verification binary (`target\release\mimageviewer.exe`
-  launcher + `target\release\mimageviewer-core.exe`), then give the exact
-  PowerShell launch command:
-  `Start-Process -FilePath .\target\release\mimageviewer.exe`.
-  Include concrete verification steps and warn that this build uses the user's
-  real `%APPDATA%\mimageviewer` data.
+- When a change affects Windows-native core behavior that unit tests cannot
+  cover (native video presenter, fullscreen, video->audio mode, unchanged-bridge
+  VST behavior, D3D11, HWND owner/focus/z-order, real IME behavior,
+  multi-monitor DPI), do not merely ask the user to verify on real hardware.
+  Build the normal-profile core with `.\scripts\build-dev.ps1`, give
+  `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`, and warn
+  that it uses the real `%APPDATA%\mimageviewer` profile.
+- Use `.\scripts\build-release.ps1` instead when the scenario depends on the
+  launcher, release-only cfg/optimization, exact release performance,
+  embedded-asset extraction, a changed VST3 bridge, signing, or packaging.
+  Give `Start-Process -FilePath .\target\release\mimageviewer.exe` and the same
+  real-profile warning.
 - Prerequisite: `cargo build` / `cargo test` green, `cargo fmt --check` clean,
   and (for UI string changes) `python scripts/check_ui_glyphs.py` reporting zero.
   Do not build a verification binary on top of a non-compiling tree.
-- Use `build-release.ps1` (fast, incremental; it auto-stops a resident mIV to
-  avoid LNK1104), not the distribution `build-dist.ps1`. Do not append `*>&1`
-  when invoking it from a tool: PowerShell `-ErrorAction Stop` turns cargo stderr
-  into a terminating error and fails instantly. Call the script plainly, or run
-  the two `cargo build` stages (core, then launcher) directly.
+- When release verification is required, use `build-release.ps1` (incremental;
+  it auto-stops a resident mIV to avoid LNK1104), not the distribution
+  `build-dist.ps1`. Do not append `*>&1` when invoking it from a tool:
+  PowerShell `-ErrorAction Stop` turns cargo stderr into a terminating error and
+  fails instantly. Call the script plainly, or run the two `cargo build` stages
+  (core, then launcher) directly.
 - For these native features, commit after the user confirms on real hardware,
   following the git rules below.
 

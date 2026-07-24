@@ -1,11 +1,18 @@
-# Build and stage a fast, portable development runtime.
+# Build and stage a fast development runtime with the normal application
+# feature set and data profile.
 #
 # Output:
 #   target\dev-runtime\mimageviewer-core.exe
-#   Native DLLs, workers, the optional VST3 bridge, and AI models are staged
-#   beside it so the core can run without the release launcher.
+#   FFmpeg DLLs are staged beside it so the core can run without the release
+#   launcher. Other native assets, workers, and models use the same embedded
+#   extraction path as the regular application.
 #
-# This script builds only the application core. It does not run the result.
+# The dev-runtime Cargo profile only changes optimization/build-time settings.
+# The portable feature is intentionally NOT enabled, so an ordinary launch uses
+# %APPDATA%\mimageviewer just like the installed/release application.
+#
+# This script builds only the application core. It does not run the result or
+# touch the normal application data.
 
 [CmdletBinding()]
 param()
@@ -14,6 +21,11 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $outputDir = Join-Path $repoRoot 'target\dev-runtime'
 $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'
+$normalDataDir = if ($env:APPDATA) {
+    Join-Path $env:APPDATA 'mimageviewer'
+} else {
+    Join-Path $repoRoot 'mimageviewer'
+}
 
 function Ensure-LibclangPath {
     if ($env:LIBCLANG_PATH -and
@@ -86,8 +98,8 @@ try {
     }
 
     Ensure-LibclangPath
-    Write-Host '[build-dev] building portable core with profile dev-runtime'
-    & cargo build --profile dev-runtime --bin mimageviewer-core --features portable
+    Write-Host '[build-dev] building normal-profile core with Cargo profile dev-runtime'
+    & cargo build --profile dev-runtime --bin mimageviewer-core
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -102,33 +114,7 @@ try {
         @{ src = 'vendor\ffmpeg\bin\avfilter-10.dll'; dst = 'avfilter-10.dll' }
         @{ src = 'vendor\ffmpeg\bin\swscale-8.dll'; dst = 'swscale-8.dll' }
         @{ src = 'vendor\ffmpeg\bin\swresample-5.dll'; dst = 'swresample-5.dll' }
-        @{ src = 'vendor\pdfium\bin\pdfium.dll'; dst = 'pdfium.dll' }
-        @{ src = 'vendor\ort\onnxruntime.dll'; dst = 'onnxruntime.dll' }
-        @{
-            src = 'vendor\ort\onnxruntime_providers_shared.dll'
-            dst = 'onnxruntime_providers_shared.dll'
-        }
-        @{
-            src = 'vendor\susie-worker\mimageviewer-susie32.exe'
-            dst = 'mimageviewer-susie32.exe'
-        }
     )
-
-    $models = @(
-        'realesrgan_x4plus.onnx',
-        'realesrgan_x4plus_anime_6b.onnx',
-        'realesr_general_x4v3.onnx',
-        'realcugan_4x_conservative.onnx',
-        '4x_NMKD-Siax_200k.onnx',
-        'dejpg_realplksr_otf.onnx',
-        'migan.onnx'
-    )
-    foreach ($model in $models) {
-        $copies += @{
-            src = "vendor\models\$model"
-            dst = "models\$model"
-        }
-    }
 
     foreach ($copy in $copies) {
         Copy-IfChanged `
@@ -136,21 +122,13 @@ try {
             -Destination (Join-Path $outputDir $copy.dst)
     }
 
-    # The portable distribution omits this unsigned helper, but a local
-    # development runtime may use the already-built bridge when available.
-    $vstBridge = Join-Path $repoRoot 'vendor\vst3-host\mimageviewer-vst3-host.exe'
-    if (Test-Path $vstBridge -PathType Leaf) {
-        Copy-IfChanged `
-            -Source $vstBridge `
-            -Destination (Join-Path $outputDir 'mimageviewer-vst3-host.exe')
-    } else {
-        Write-Warning '[build-dev] VST3 bridge is absent; VST3 will be unavailable'
-    }
-
     Write-Host ''
     Write-Host '[build-dev] DONE'
     Write-Host ("  core: {0}" -f $coreExe)
-    Write-Host ("  data: {0}" -f (Join-Path $outputDir 'data'))
+    Write-Host ("  data (default): {0}" -f $normalDataDir)
+    Write-Host ("  isolated override: --data-dir `"{0}`"" -f
+        (Join-Path $outputDir 'data'))
+    Write-Host '  launch note: close the installed/resident mImageViewer first (shared single-instance mutex)'
 } finally {
     Pop-Location
 }
