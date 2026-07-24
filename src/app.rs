@@ -1977,6 +1977,7 @@ struct ViewerContextBundle {
     vis_first_logged: bool,
     vis_all_logged: bool,
     folder_nav_pending: Option<FolderNavPending>,
+    folder_pane_open_pending: Option<FolderPaneOpenPending>,
     pending_folder_nav_steps: i32,
     pending_folder_nav_mode: FolderNavMode,
     search_filter: Option<std::collections::HashSet<usize>>,
@@ -2184,6 +2185,9 @@ impl Drop for ViewerContextBundle {
         if let Some(pending) = self.folder_nav_pending.as_ref() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+        if let Some(pending) = self.folder_pane_open_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2258,6 +2262,7 @@ impl ViewerContextBundle {
             vis_first_logged: false,
             vis_all_logged: false,
             folder_nav_pending: None,
+            folder_pane_open_pending: None,
             pending_folder_nav_steps: 0,
             pending_folder_nav_mode: FolderNavMode::Grid,
             search_filter: None,
@@ -2418,6 +2423,9 @@ impl ViewerContextBundle {
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
         if let Some(pending) = self.folder_nav_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.folder_pane_open_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.pending_folder_nav_steps = 0;
@@ -3401,10 +3409,10 @@ pub(crate) struct FolderNavPending {
     mode: FolderNavMode,
 }
 
-/// フォルダツリーペインのクリック/Enter ナビを **worker で事前 scan** してから開くための
-/// 保留状態。UI スレッドで `scan_directory` (大/遅/ネットワークフォルダで read_dir が
-/// 数百 ms〜秒) を直接走らせると、ツリーを次々クリックするたびに UI が固まるため
-/// (docs/ui-responsiveness.md §4)。`spawn_folder_nav` の DFS pre-scan と同じ方式。
+/// 実フォルダを **worker で事前 scan** してから開くための保留状態。
+/// folder pane ナビと detached image open が共有し、`purpose` が結果の適用先と対象 leaf を所有する。
+/// UI スレッドで `scan_directory` (大/遅/ネットワークフォルダで read_dir が数百 ms〜秒) を
+/// 直接走らせないための、`spawn_folder_nav` の DFS pre-scan と同じ方式。
 pub(crate) struct FolderPaneOpenPending {
     /// 開く候補 (= 完了後に通常 nav 優先順位で裁定する実ディレクトリ)。
     path: PathBuf,
@@ -3412,13 +3420,22 @@ pub(crate) struct FolderPaneOpenPending {
     cancel: Arc<AtomicBool>,
     /// scan worker からの結果チャネル。
     rx: mpsc::Receiver<ScannedDir>,
+    /// scan 完了後に誰が結果を適用するか。detached image open は対象画像まで
+    /// この request に内包し、main の仮想一覧や別の deferred field に依存しない。
+    purpose: FolderOpenScanPurpose,
 }
 
-/// フォルダツリーペインの open scan が完了し、通常 nav と同じ優先順位で
-/// 裁定できるようになった候補。
+pub(crate) enum FolderOpenScanPurpose {
+    PaneNavigation,
+    DetachedImage { image_path: PathBuf },
+}
+
+/// folder open scan の完了候補。`purpose` に応じて main nav の優先順位で裁定するか、
+/// mounted detached bundle 内で対象画像を開く。
 pub(crate) struct FolderPaneOpenReady {
     path: PathBuf,
     scan: ScannedDir,
+    purpose: FolderOpenScanPurpose,
 }
 
 /// 親フォルダ上の `ConvertibleArchive` タイル用に、変換済み cache ZIP の対応表を
@@ -6423,8 +6440,8 @@ pub struct App {
     /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
     folder_nav_pending: Option<FolderNavPending>,
-    /// フォルダツリーペインのクリック/Enter ナビの worker scan 待ち
-    /// ([`FolderPaneOpenPending`])。UI スレッドの `scan_directory` ブロックを回避する。
+    /// 実フォルダ open の worker scan 待ち ([`FolderPaneOpenPending`])。
+    /// folder pane と detached image open のどちらも bundle ownership で保持する。
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
     /// Ctrl+↑↓ 連打アキュームレータ。in-flight 中の追加プレスをここに貯め、
     /// 現 nav が完了するたびに 1 消費して次の nav を連鎖させる。
@@ -12014,6 +12031,7 @@ impl App {
             vis_first_logged,
             vis_all_logged,
             folder_nav_pending,
+            folder_pane_open_pending,
             pending_folder_nav_steps,
             pending_folder_nav_mode,
             search_filter,
@@ -12225,6 +12243,7 @@ impl App {
         swap_field!(vis_first_logged);
         swap_field!(vis_all_logged);
         swap_field!(folder_nav_pending);
+        swap_field!(folder_pane_open_pending);
         swap_field!(pending_folder_nav_steps);
         swap_field!(pending_folder_nav_mode);
         swap_field!(search_filter);
@@ -14741,11 +14760,11 @@ impl App {
         owner: OpenRequestOwner,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
-        // 別経路の load が走ったら、in-flight のフォルダペイン open scan は stale なので
-        // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
-        // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
+        // 別経路の load が走ったら、この bundle の in-flight folder open scan は stale なので
+        // 破棄する。poll_folder_pane_open は pending を take してから適用するため、自分自身の
+        // 完了結果を pre-scan 付きで load する場合は no-op。
+        self.cancel_folder_pane_open();
         if !detached_physical {
-            self.cancel_folder_pane_open();
             if self.restore_smart_folder_for_synthetic_path(&path) {
                 self.suppress_nav_record_for_search_restore = false;
                 return;
@@ -29517,12 +29536,9 @@ impl App {
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        // Folder-pane pending belongs to the main grid, not to a mounted detached
-        // physical viewer.  Cancelling it from the detached window would let an
-        // unrelated Ctrl+↑↓ race and discard the user's main-window click.
-        if !self.navigation_scope.is_detached_physical() {
-            self.cancel_folder_pane_open();
-        }
+        // folder scan pending も bundle-owned。mounted detached からキャンセルすると
+        // その detached の image open だけが止まり、unmounted main の request には触れない。
+        self.cancel_folder_pane_open();
         self.clear_pending_folder_nav_steps();
         self.release_fs_nav_lock();
     }
@@ -29836,6 +29852,18 @@ impl App {
     /// 優先順位で裁定してから開く。対象は実ディレクトリ前提
     /// (フォルダペインは実フォルダのみ表示する)。
     pub(crate) fn start_folder_pane_open(&mut self, path: PathBuf) {
+        self.start_folder_open_scan(path, FolderOpenScanPurpose::PaneNavigation);
+    }
+
+    fn start_detached_image_folder_open(&mut self, image_path: PathBuf) -> bool {
+        let Some(parent) = image_path.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        self.start_folder_open_scan(parent, FolderOpenScanPurpose::DetachedImage { image_path });
+        true
+    }
+
+    fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
         if let Some(prev) = self.folder_pane_open_pending.take() {
             prev.cancel.store(true, Ordering::Relaxed);
@@ -29860,7 +29888,12 @@ impl App {
                 let _ = tx.send(scan);
             }
         });
-        self.folder_pane_open_pending = Some(FolderPaneOpenPending { path, cancel, rx });
+        self.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path,
+            cancel,
+            rx,
+            purpose,
+        });
     }
 
     /// 進行中のフォルダペイン open scan をキャンセルして破棄する。
@@ -29885,6 +29918,7 @@ impl App {
                 Some(FolderPaneOpenReady {
                     path: pending.path,
                     scan,
+                    purpose: pending.purpose,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -29897,6 +29931,41 @@ impl App {
                 None
             }
         }
+    }
+
+    /// detached の通常画像 open 用 folder scan を、その detached bundle 内だけで完了する。
+    ///
+    /// `FolderOpenScanPurpose::DetachedImage` が対象画像を request と一体で所有するため、
+    /// scan 待ちの間に main の検索結果・選択・並び順が変わっても参照しない。
+    #[cfg(windows)]
+    fn poll_detached_physical_folder_open(&mut self, ctx: &egui::Context) -> bool {
+        let Some(ready) = self.poll_folder_pane_open(ctx) else {
+            return false;
+        };
+        match ready.purpose {
+            FolderOpenScanPurpose::DetachedImage { image_path } => {
+                self.with_detached_viewer_main_history_suppressed(|app| {
+                    app.load_folder_with_scan(ready.path, Some(ready.scan));
+                });
+                // parked still の再開と同じく、既に割り当てた detached window_id を
+                // 保ったまま対象画像を物理一覧上の index へ解決して開く。
+                self.detached_viewer_independent_active = true;
+                self.detached_viewer_open_next_still_detached_once = true;
+                self.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+                    resume_slideshow: false,
+                    target: Some(crate::snapshot::SnapshotTarget::Fs(image_path)),
+                    resume_to_last_page: false,
+                    from_explicit_open: true,
+                    preserve_after_password_prompt: false,
+                });
+            }
+            FolderOpenScanPurpose::PaneNavigation => {
+                // active detached viewport はフォルダペインを持たないため通常は到達しない。
+                // 将来ペインを共有しても結果を捨てず、その bundle の物理ナビとして適用する。
+                self.load_folder_with_scan(ready.path, Some(ready.scan));
+            }
+        }
+        true
     }
 
     fn poll_folder_nav(&mut self) -> Option<FolderNavResult> {
@@ -31764,6 +31833,7 @@ impl App {
         idx: usize,
     ) -> Option<ViewerContextDescriptor> {
         match self.items.get(idx)? {
+            GridItem::Image(path) => Some(ViewerContextDescriptor::Image { path: path.clone() }),
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => Some(ViewerContextDescriptor::Pdf {
@@ -31783,23 +31853,14 @@ impl App {
     }
 
     /// parked still snapshot に焼き付ける再オープン descriptor。
-    /// 通常画像は open ルーティング用の descriptor
-    /// (`detached_viewer_context_descriptor_for_idx`) を持たない (still 経路のまま) が、
-    /// parked snapshot にはフォールバック用 `Image` descriptor を焼き付ける。
-    /// 同期スタンプが main の一覧変更で解決不能になっても、親フォルダを窓内
-    /// コンテキストとして開き直せるようにする (findings-19 stamp_not_resolved)。
+    /// 通常画像も open ルーティングと parked fallback の双方で同じ `Image`
+    /// descriptor を使い、親フォルダの完全な物理一覧から開き直す。
     #[cfg(windows)]
     pub(crate) fn parked_still_reopen_descriptor_for_idx(
         &self,
         idx: usize,
     ) -> Option<ViewerContextDescriptor> {
         self.detached_viewer_context_descriptor_for_idx(idx)
-            .or_else(|| match self.items.get(idx) {
-                Some(GridItem::Image(path)) => {
-                    Some(ViewerContextDescriptor::Image { path: path.clone() })
-                }
-                _ => None,
-            })
     }
 
     #[cfg(windows)]
@@ -34006,48 +34067,22 @@ impl App {
                 app.load_folder(path);
             }
             ViewerContextDescriptor::Image { path } => {
-                // 親フォルダを窓内コンテキストとして同期スキャンし、対象画像を
-                // 開き直す (findings-19: 連動 park 画像窓のスタンプ解決不能フォールバック)。
-                //
-                // `load_folder` の同期スキャンはグリッドでフォルダをクリックした
-                // ときの標準経路と同一 (= 既存フォルダナビと同じレイテンシクラス) で、
-                // ユーザーのクリック 1 回につき 1 回だけ走る。巨大/ネットワーク
-                // フォルダで待たされる場合も既存のフォルダ open と同じ症状に収まる。
-                // 非同期 reopen 化はフォルダ open 全体の worker 化と同時に扱う
-                // (Codex P2 判断済み: 新種の UI 同期 I/O ではなく既存経路の流用)。
-                if let Some(parent) = path.parent().map(|p| p.to_path_buf()) {
-                    app.load_folder(parent);
-                }
-                let target_idx = app
-                    .items
-                    .iter()
-                    .position(|item| {
-                        matches!(item, GridItem::Image(p)
-                            if crate::folder_tree::path_eq(p, &path))
-                    })
-                    .or_else(|| {
-                        // 対象画像が消えていたらフォルダ先頭の画像で代替する
-                        // (Pdf/Zip の deferred open が先頭ページへ落ちるのと同じ寛容さ)。
-                        app.items
-                            .iter()
-                            .position(|item| matches!(item, GridItem::Image(_)))
-                    });
-                if let Some(idx) = target_idx {
-                    // still 経路の再開 (resume_still_snapshot) と同じ扱いで、既存の
-                    // window_id を持つ detached still として開く。多窓モードの
-                    // 「グリッド intent = 常に新窓」経路に流さない。
-                    app.detached_viewer_independent_active = true;
-                    app.detached_viewer_open_next_still_detached_once = true;
-                    app.open_fullscreen(idx);
-                } else {
-                    app.log_detached_image_window_debug(
-                        "image_reopen_no_target_after_folder_load".to_string(),
-                    );
+                // 仮想一覧の backing snapshot は使わず、親フォルダを worker で完全走査する。
+                // 対象画像は scan request 自身が所有し、結果を detached bundle 内で
+                // materialize した後に物理順の index へ解決する。
+                if !app.start_detached_image_folder_open(path.clone()) {
+                    app.log_detached_image_window_debug(format!(
+                        "image_reopen_no_parent_for_async_folder_scan path={}",
+                        path.display()
+                    ));
                 }
             }
         });
 
-        if !bookmark_open && let Some(target) = target {
+        if !bookmark_open
+            && !is_image_reopen
+            && let Some(target) = target
+        {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow: false,
                 target: Some(target),
@@ -34576,6 +34611,7 @@ impl App {
                     app.apply_folder_nav_result(ctx, result);
                     app.chain_folder_nav_if_pending();
                 }
+                app.poll_detached_physical_folder_open(ctx);
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
@@ -34604,6 +34640,7 @@ impl App {
                 app.poll_local_adjust_segmentation(ctx);
 
                 if app.folder_nav_pending.is_some()
+                    || app.folder_pane_open_pending.is_some()
                     || app.pdf_enumerate_pending.is_some()
                     || app.zip_enumerate_pending.is_some()
                     || app.fs_nav_deferred_reopen_wait_active()
@@ -35136,6 +35173,7 @@ impl App {
             vis_first_logged,
             vis_all_logged,
             folder_nav_pending,
+            folder_pane_open_pending,
             pending_folder_nav_steps,
             pending_folder_nav_mode,
             search_filter,
@@ -35443,6 +35481,7 @@ impl App {
             vis_first_logged,
             vis_all_logged,
             folder_nav_pending,
+            folder_pane_open_pending,
             pending_folder_nav_steps,
             pending_folder_nav_mode,
             folder_pin_map,
@@ -35508,14 +35547,13 @@ impl App {
         parked
     }
 
-    /// main の通常画像一覧を変えずに independent still viewer を開始するための snapshot。
-    ///
-    /// `split_current_context_preserving_main_grid` は ParkedLive media も使うため、編集・見開き・
-    /// view-trim の read model を main に残す。一方、独立静止画は同じ見た目で開く必要があるので、
-    /// worker / dirty / pending ownership は複製せず、描画に必要な安定 read model と完成 cache
-    /// だけを追加で複製する。
+    /// 完全な物理一覧を既に materialize 済みの main context から、auto-fullscreen の
+    /// detached read model を作る。通常の grid leaf open は descriptor 経路で非同期列挙するため、
+    /// この snapshot 経路は folder / ZIP / PDF の列挙完了後に限る。
     #[cfg(windows)]
-    fn split_current_context_for_independent_still_open(&mut self) -> Box<ViewerContextBundle> {
+    fn split_materialized_physical_context_for_independent_still_open(
+        &mut self,
+    ) -> Box<ViewerContextBundle> {
         let mut detached = self.split_current_context_preserving_main_grid();
 
         detached.view_trim_mode = self.view_trim_mode;
@@ -35554,15 +35592,30 @@ impl App {
         detached
     }
 
-    /// grid の通常画像 open を、main と共有された legacy viewer にせず active bundle へ移す。
-    ///
-    /// PDF / ZIP container open は `start_active_detached_book_context` が最初から独立 context を
-    /// 作る一方、既に main items に存在する Image / ZipImage / PdfPage は従来 main context 上で
-    /// `open_fullscreen` していた。この非対称が、always-new の通常画像だけ Ctrl+folder-nav と
-    /// close を main へ漏らす原因だった。I/O を伴う再 scan はせず、現在の一覧 snapshot を複製して
-    /// active context 内で通常の open 処理を完結させる。
     #[cfg(windows)]
-    fn route_new_independent_still_open_to_active_context(&mut self, idx: usize) -> bool {
+    fn current_context_is_materialized_physical_source(&self, physical_context: &Path) -> bool {
+        self.current_folder
+            .as_deref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, physical_context))
+            && !self.items_are_global_search_view
+            && !self.items_are_tag_view
+            && !self.items_are_reading_history_view
+            && !self.items_are_bookmark_view
+            && !self.items_are_rating_view
+            && !self.items_are_subfolder_expansion_view
+            && !self.items_are_smart_folder_view
+            && !self.items_are_drive_list
+            && !self.is_snapshot_active()
+    }
+
+    /// folder / ZIP / PDF の完全な物理一覧を main へ materialize した後に発火する
+    /// auto-fullscreen を、main と共有された legacy viewer ではなく active bundle へ移す。
+    ///
+    /// 仮想一覧の leaf open は `open_grid_item_in_detached_book_context_with_auto_fullscreen`
+    /// が先に descriptor 化して非同期列挙する。この fallback は `current_folder` と
+    /// materialized source が一致し、仮想 surface flag がすべて落ちた場合にだけ使う。
+    #[cfg(windows)]
+    fn route_materialized_physical_still_open_to_active_context(&mut self, idx: usize) -> bool {
         if self.active_detached_viewer_context.is_some()
             || !matches!(self.navigation_scope, ViewerNavigationScope::Main)
             || self.detached_viewer_main_history_suppression_depth != 0
@@ -35587,9 +35640,13 @@ impl App {
         let Some(physical_context) = physical_context else {
             return false;
         };
+        if !self.current_context_is_materialized_physical_source(&physical_context) {
+            return false;
+        }
+
         let (_context_serial, items_generation) =
             self.allocate_detached_viewer_context_generation();
-        let mut bundle = self.split_current_context_for_independent_still_open();
+        let mut bundle = self.split_materialized_physical_context_for_independent_still_open();
         bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         bundle.items_generation = items_generation;
         bundle.address = physical_context.display().to_string();
@@ -35603,14 +35660,6 @@ impl App {
             })
             .collect();
         bundle.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
-        bundle.items_are_global_search_view = false;
-        bundle.items_are_tag_view = false;
-        bundle.items_are_reading_history_view = false;
-        bundle.items_are_bookmark_view = false;
-        bundle.items_are_rating_view = false;
-        bundle.items_are_subfolder_expansion_view = false;
-        bundle.items_are_smart_folder_view = false;
-        bundle.items_are_drive_list = false;
         bundle.details_thumb_suppression_applied = false;
         bundle.details_order.clear();
         bundle.cached_nav_indices = None;
@@ -35619,14 +35668,14 @@ impl App {
 
         self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: *bundle });
         self.log_detached_image_window_debug(format!(
-            "independent_still_context_promoted idx={idx} main_items={} active_context=true",
+            "materialized_physical_context_promoted idx={idx} main_items={} active_context=true",
             self.items.len()
         ));
 
         self.with_active_detached_viewer_context(|detached| {
             detached.open_fullscreen(idx);
         })
-        .expect("independent still context must remain present while opening");
+        .expect("materialized physical context must remain present while opening");
         true
     }
 
@@ -37478,7 +37527,7 @@ impl App {
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
         #[cfg(windows)]
-        if self.route_new_independent_still_open_to_active_context(idx) {
+        if self.route_materialized_physical_still_open_to_active_context(idx) {
             return;
         }
 

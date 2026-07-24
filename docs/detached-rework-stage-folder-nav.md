@@ -24,8 +24,9 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
   サブフォルダ展開、レーティング / facet / 色フィルタを参照・変更しない。
   移動先の先頭ページ選定も main の表示フィルタに左右されない。
 - Ctrl+G / タグ / レーティング / ★固定など複数の実親を含む仮想一覧から開いた場合も、
-  plain 前後移動、見開き、シークバー、スライドショーが参照する `visible_indices` は
-  開いた通常画像と同じ実親、または同じ ZIP / PDF コンテナだけに固定する。
+  detached 側で開いた通常画像の実親、または ZIP / PDF コンテナを非同期に列挙し直す。
+  plain 前後移動、見開き、シークバー、スライドショーが参照する `items` /
+  `visible_indices` は検索結果の部分集合や固有順ではなく、その物理ソースの完全な一覧とする。
 - 初期スコープは通常画像フォルダ、ZIP/CBZ、PDF。変換確認が必要な
   RAR/7z/LZH、動画 / 音声への昇格、検索固有順、スライドショー NextFolder は含めない。
 - passive 化、別窓 activate、close、context drop、新しい load で in-flight request を
@@ -44,7 +45,8 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 
 ## 4. 完了条件
 
-1. `folder_nav_pending`、`pending_folder_nav_steps`、`pending_folder_nav_mode` が
+1. `folder_nav_pending`、通常画像の `folder_pane_open_pending`、
+   `pending_folder_nav_steps`、`pending_folder_nav_mode` が
    `ViewerContextBundle` の swap / pause / Drop 対象である。
 2. `update_active_detached_viewer_context` が、active bundle を mount 中にだけ
    folder-nav を poll / apply / chain する。
@@ -74,18 +76,20 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - detached physical load は main の folder pane pending、snapshot lock、検索 pending、
   folder history、rating / facet / color filter、main history persistence を参照・変更しない。
 - 動画のみのフォルダを探索対象から外し、動画・静止画混在時も先頭の静止画へ着地する。
-- 通常画像を grid から always-new detached で開く経路も、open 前に main 一覧 snapshot から
-  独立 active bundle を作る。開いた画像の実親フォルダと detached 専用 items generation を
-  bundle に設定し、同期再 scan を行わず、main の検索条件・選択・スクロールを保持する。
-- 仮想一覧由来の `items` は per-index cache / texture identity を保つ backing snapshot として
-  複製するが、detached 側の仮想一覧フラグは解除し、raw `visible_indices` は
-  `DetachedPhysical + current_folder` が示す同一実親 / 同一 ZIP / 同一 PDF に限定する。
-  評価・タグ変更などで表示集合を再構築しても別の実親を再流入させない。
+- 通常画像を grid から always-new detached で開く経路も、ZIP/PDF page と同じ
+  `ViewerContextDescriptor` 経路へ統合した。空の独立 active bundle で親フォルダの
+  worker scan を開始し、対象画像 path も typed scan request に保持する。
+- scan 完了後だけ detached bundle を mount して `load_folder_with_scan` を適用し、
+  対象 path を完全な物理 `items` 上の index へ解決して開く。仮想一覧の backing
+  `items` / `visible_indices` と検索固有順は detached へ複製しない。
+- ZIP/PDF page は従来どおり container enumerate worker の完全な結果から対象 entry/page を
+  解決する。通常画像 scan と ZIP/PDF enumerate の pending / cancel / result はいずれも
+  `ViewerContextBundle` 所有で、main の検索条件・選択・スクロールを保持する。
 - `src/app/tests.rs` で request ownership、main filter preservation、pause / Drop cancel を固定した。
-- 実際の通常画像 grid-open 経路から Ctrl+↓ を発行し、request が detached bundle にだけ入り、
-  main の検索条件・選択・スクロール・既存 folder-nav state が変わらない回帰テストを追加した。
-  同テストに別の実親の画像も混在させ、通常ページ送りと表示集合再構築が物理境界を越えないことを
-  固定した。
+- ディスク上に `a/b/c`、仮想一覧に `c/a` だけがある状態から通常画像を開き、detached の
+  非同期完了後が物理順 `a/b/c`、`a` の次が検索で欠落していた `b` になる回帰テストを追加した。
+  同時に main の `c/a` 順、検索条件、選択、スクロール、既存 folder-nav state が変わらず、
+  Ctrl+↓ request が detached bundle にだけ入ることを固定した。
 
 ## 7. 検証結果
 

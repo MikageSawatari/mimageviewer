@@ -3900,6 +3900,7 @@ mod folder_pane_open_nav_tests {
             path: target.clone(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
+            purpose: FolderOpenScanPurpose::PaneNavigation,
         });
 
         let ctx = egui::Context::default();
@@ -3910,6 +3911,10 @@ mod folder_pane_open_nav_tests {
         assert_eq!(ready.path, target);
         assert!(ready.scan.folders.is_empty());
         assert!(ready.scan.all_media.is_empty());
+        assert!(matches!(
+            ready.purpose,
+            FolderOpenScanPurpose::PaneNavigation
+        ));
         assert!(app.folder_pane_open_pending.is_none());
         assert_ne!(
             app.current_folder.as_deref(),
@@ -3929,6 +3934,7 @@ mod folder_pane_open_nav_tests {
             path: target,
             cancel: Arc::clone(&cancel),
             rx,
+            purpose: FolderOpenScanPurpose::PaneNavigation,
         });
 
         app.cancel_pending_folder_nav();
@@ -10051,12 +10057,11 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// parked still の再オープン descriptor (findings-19): 通常画像には Image
-    /// フォールバックを焼き付けるが、open ルーティング用 descriptor は従来どおり
-    /// (画像 = None = still 経路のまま) であることを固定する。
+    /// 通常画像の grid open と parked still fallback が同じ Image descriptor を使い、
+    /// detached 側の完全な親フォルダ走査へ合流することを固定する。
     #[test]
     #[cfg(windows)]
-    fn parked_still_reopen_descriptor_adds_image_fallback_without_touching_open_routing() {
+    fn image_descriptor_is_shared_by_grid_open_and_parked_reopen() {
         let mut app = setup_app();
         let img_idx = push_image(&mut app, r"D:\pics\a.jpg");
         app.items.push(GridItem::ZipImage {
@@ -10068,14 +10073,12 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Video(PathBuf::from(r"D:\v\m.mp4")));
         let vid_idx = app.items.len() - 1;
 
-        // open ルーティング用 descriptor は画像では従来どおり None (still 経路)。
-        assert!(
-            app.detached_viewer_context_descriptor_for_idx(img_idx)
-                .is_none(),
-            "adding the parked-snapshot fallback must not reroute grid opens of plain images"
-        );
+        assert!(matches!(
+            app.detached_viewer_context_descriptor_for_idx(img_idx),
+            Some(crate::app::ViewerContextDescriptor::Image { path })
+                if path == PathBuf::from(r"D:\pics\a.jpg")
+        ));
 
-        // parked snapshot 用は Image フォールバックが付く。
         assert!(matches!(
             app.parked_still_reopen_descriptor_for_idx(img_idx),
             Some(crate::app::ViewerContextDescriptor::Image { path })
@@ -24740,37 +24743,35 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn normal_image_grid_open_promotes_to_physical_context_before_ctrl_nav() {
+    fn virtual_c_a_image_open_builds_detached_physical_a_b_c_before_ctrl_nav() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let temp = tempfile::TempDir::new().unwrap();
         let first = temp.path().join("01");
-        let second = temp.path().join("02");
         std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        let hidden = first.join("a.jpg");
-        let opened = first.join("b.jpg");
-        let cross_scope = second.join("c.jpg");
+        let a = first.join("a.jpg");
+        let b = first.join("b.jpg");
+        let c = first.join("c.jpg");
         let main_surface = temp.path().join("search-results");
-        std::fs::write(&hidden, b"fixture").unwrap();
-        std::fs::write(&opened, b"fixture").unwrap();
-        std::fs::write(&cross_scope, b"fixture").unwrap();
+        std::fs::write(&a, b"fixture").unwrap();
+        std::fs::write(&b, b"fixture").unwrap();
+        std::fs::write(&c, b"fixture").unwrap();
 
         app.current_folder = Some(main_surface.clone());
-        let hidden_idx = push_image(&mut app, hidden.to_str().unwrap());
-        let opened_idx = push_image(&mut app, opened.to_str().unwrap());
-        let cross_scope_idx = push_image(&mut app, cross_scope.to_str().unwrap());
-        insert_static_fs_entry(&mut app, &ctx, opened_idx, "promoted_normal_image");
-        app.visible_indices = vec![opened_idx];
-        app.search_filter = Some(std::collections::HashSet::from([opened_idx]));
+        let c_virtual_idx = push_image(&mut app, c.to_str().unwrap());
+        let a_virtual_idx = push_image(&mut app, a.to_str().unwrap());
+        app.visible_indices = vec![c_virtual_idx, a_virtual_idx];
+        app.search_filter = Some(std::collections::HashSet::from([
+            c_virtual_idx,
+            a_virtual_idx,
+        ]));
         app.show_search_bar = true;
         app.items_are_global_search_view = true;
-        app.selected = Some(opened_idx);
+        app.selected = Some(a_virtual_idx);
         app.scroll_offset_y = 321.0;
         app.pending_folder_nav_steps = -2;
         app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
         app.settings.detached_viewer_open_images_in_window = true;
-        app.fs_open_intent_from_grid = true;
         let main_items_generation = app.items_generation;
         let mut passive_bundle = ViewerContextBundle::empty();
         passive_bundle.items = vec![GridItem::Image(temp.path().join("parked.jpg"))];
@@ -24781,7 +24782,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(parked_bundle_snapshot(&ctx, 77, passive_bundle));
 
-        app.open_fullscreen(opened_idx);
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, a_virtual_idx));
 
         assert_eq!(
             app.fullscreen_idx, None,
@@ -24790,17 +24791,24 @@ mod still_window_mode_key_tests {
         assert_eq!(app.navigation_scope, ViewerNavigationScope::Main);
         assert_eq!(app.current_folder, Some(main_surface.clone()));
         assert_eq!(app.items_generation, main_items_generation);
-        assert_eq!(app.visible_indices, vec![opened_idx]);
+        assert_eq!(
+            app.visible_indices,
+            vec![c_virtual_idx, a_virtual_idx],
+            "the main virtual c/a order must remain untouched"
+        );
         assert_eq!(
             app.search_filter,
-            Some(std::collections::HashSet::from([opened_idx]))
+            Some(std::collections::HashSet::from([
+                c_virtual_idx,
+                a_virtual_idx
+            ]))
         );
         assert!(app.show_search_bar);
         assert!(
             app.items_are_global_search_view,
             "the main Ctrl+G surface identity must remain intact"
         );
-        assert_eq!(app.selected, Some(opened_idx));
+        assert_eq!(app.selected, Some(a_virtual_idx));
         assert_eq!(app.scroll_offset_y, 321.0);
         assert_eq!(app.pending_folder_nav_steps, -2);
         assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
@@ -24809,6 +24817,37 @@ mod still_window_mode_key_tests {
             1,
             "opening the active physical context must not close an existing passive viewer"
         );
+
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("normal image open must create an active detached context");
+        assert!(
+            active.bundle.folder_pane_open_pending.is_some(),
+            "the complete physical folder scan must be owned by the detached bundle"
+        );
+        assert!(
+            active.bundle.items.is_empty(),
+            "the detached context must not clone the virtual c/a backing items while scanning"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let opened = app
+                .with_active_detached_viewer_context(|mounted| {
+                    mounted.poll_detached_physical_folder_open(&ctx);
+                    mounted.fullscreen_idx.is_some()
+                })
+                .expect("active detached context must remain mounted");
+            if opened {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached physical folder scan did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
 
         app.with_active_detached_viewer_context(|mounted| {
             assert_eq!(
@@ -24824,33 +24863,46 @@ mod still_window_mode_key_tests {
                 mounted.items_generation, main_items_generation,
                 "detached worker results need a context generation distinct from main"
             );
-            assert_eq!(mounted.visible_indices, vec![hidden_idx, opened_idx]);
-            assert!(
-                !mounted.visible_indices.contains(&cross_scope_idx),
-                "a virtual-list item from another parent must not enter the detached physical order"
+            let physical_paths: Vec<_> = mounted
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    GridItem::Image(path) => Some(path.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                physical_paths,
+                vec![a.clone(), b.clone(), c.clone()],
+                "disk a/b/c must replace the virtual c/a subset and its result-specific order"
             );
-            assert_eq!(mounted.fullscreen_idx, Some(opened_idx));
+            assert_eq!(mounted.visible_indices, vec![0, 1, 2]);
+            assert_eq!(
+                mounted.fullscreen_idx,
+                Some(0),
+                "the opened virtual a index must be remapped to physical a"
+            );
             assert!(mounted.detached_viewer_independent_still_session());
             assert!(mounted.detached_physical_folder_nav_available());
             assert_eq!(
                 crate::ui_helpers::adjacent_navigable_idx(
                     &mounted.items,
                     mounted.current_grid_order(),
-                    opened_idx,
+                    0,
                     1,
                 ),
-                None,
-                "ordinary next-page navigation must stop at the physical-scope boundary"
+                Some(1),
+                "ordinary next-page navigation must include b even though search results omitted it"
             );
 
             mounted.rebuild_visible_indices();
             assert_eq!(
                 mounted.visible_indices,
-                vec![hidden_idx, opened_idx],
-                "rebuilding after a rating/tag change must not reintroduce another parent"
+                vec![0, 1, 2],
+                "rebuilding after a rating/tag change must retain the complete physical list"
             );
 
-            mounted.handle_fullscreen_ctrl_nav_context(&ctx, opened_idx, true, false);
+            mounted.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
 
             assert!(
                 mounted.folder_nav_pending.is_some(),
@@ -24865,17 +24917,20 @@ mod still_window_mode_key_tests {
         .expect("normal image open must create an active detached context");
 
         assert_eq!(app.current_folder, Some(main_surface));
-        assert_eq!(app.visible_indices, vec![opened_idx]);
+        assert_eq!(app.visible_indices, vec![c_virtual_idx, a_virtual_idx]);
         assert_eq!(
             app.search_filter,
-            Some(std::collections::HashSet::from([opened_idx]))
+            Some(std::collections::HashSet::from([
+                c_virtual_idx,
+                a_virtual_idx
+            ]))
         );
         assert!(app.show_search_bar);
         assert!(
             app.items_are_global_search_view,
             "unmounting the detached context must restore the main Ctrl+G surface identity"
         );
-        assert_eq!(app.selected, Some(opened_idx));
+        assert_eq!(app.selected, Some(a_virtual_idx));
         assert_eq!(app.scroll_offset_y, 321.0);
         assert_eq!(app.pending_folder_nav_steps, -2);
         assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
@@ -25072,8 +25127,8 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_folder_nav_pending_is_cancelled_on_pause_and_drop() {
-        fn pending(cancel: Arc<AtomicBool>) -> FolderNavPending {
+    fn detached_folder_pending_requests_are_cancelled_on_pause_and_drop() {
+        fn nav_pending(cancel: Arc<AtomicBool>) -> FolderNavPending {
             let (_tx, rx) = mpsc::channel::<FolderNavThreadResult>();
             FolderNavPending {
                 cancel,
@@ -25082,27 +25137,45 @@ mod still_window_mode_key_tests {
                 mode: FolderNavMode::Fullscreen,
             }
         }
+        fn scan_pending(cancel: Arc<AtomicBool>) -> FolderPaneOpenPending {
+            let (_tx, rx) = mpsc::channel::<ScannedDir>();
+            FolderPaneOpenPending {
+                path: PathBuf::from(r"C:\detached"),
+                cancel,
+                rx,
+                purpose: FolderOpenScanPurpose::DetachedImage {
+                    image_path: PathBuf::from(r"C:\detached\a.jpg"),
+                },
+            }
+        }
 
-        let pause_cancel = Arc::new(AtomicBool::new(false));
+        let pause_nav_cancel = Arc::new(AtomicBool::new(false));
+        let pause_scan_cancel = Arc::new(AtomicBool::new(false));
         let mut paused = ViewerContextBundle::empty();
         paused.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        paused.folder_nav_pending = Some(pending(Arc::clone(&pause_cancel)));
+        paused.folder_nav_pending = Some(nav_pending(Arc::clone(&pause_nav_cancel)));
+        paused.folder_pane_open_pending = Some(scan_pending(Arc::clone(&pause_scan_cancel)));
         paused.pending_folder_nav_steps = 3;
         paused.pending_folder_nav_mode = FolderNavMode::Fullscreen;
 
         paused.pause_background_work_keep_current_frame();
 
-        assert!(pause_cancel.load(Ordering::Relaxed));
+        assert!(pause_nav_cancel.load(Ordering::Relaxed));
+        assert!(pause_scan_cancel.load(Ordering::Relaxed));
         assert!(paused.folder_nav_pending.is_none());
+        assert!(paused.folder_pane_open_pending.is_none());
         assert_eq!(paused.pending_folder_nav_steps, 0);
         assert_eq!(paused.pending_folder_nav_mode.perf_tag(), "grid");
 
-        let drop_cancel = Arc::new(AtomicBool::new(false));
+        let drop_nav_cancel = Arc::new(AtomicBool::new(false));
+        let drop_scan_cancel = Arc::new(AtomicBool::new(false));
         let mut dropped = ViewerContextBundle::empty();
         dropped.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        dropped.folder_nav_pending = Some(pending(Arc::clone(&drop_cancel)));
+        dropped.folder_nav_pending = Some(nav_pending(Arc::clone(&drop_nav_cancel)));
+        dropped.folder_pane_open_pending = Some(scan_pending(Arc::clone(&drop_scan_cancel)));
         drop(dropped);
-        assert!(drop_cancel.load(Ordering::Relaxed));
+        assert!(drop_nav_cancel.load(Ordering::Relaxed));
+        assert!(drop_scan_cancel.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -27785,6 +27858,7 @@ mod still_window_mode_key_tests {
     fn explicit_pdf_deferred_reopen_keeps_grid_open_intent_for_detached_viewer() {
         let mut app = setup_app();
         app.settings.detached_viewer_open_images_in_window = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
         app.items.push(GridItem::PdfPage {
             pdf_path: PathBuf::from(r"C:\books\a.pdf"),
             page_num: 0,

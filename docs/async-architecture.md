@@ -200,12 +200,17 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
 
 - `FolderNavPending { cancel, rx, forward, mode }` が進行中 DFS の状態を持ち、
   `poll_folder_nav` が `FolderNavResult { path, forward, mode }` を返す。
-- Windows の `ViewerContextBundle` は `FolderNavPending`、`pending_folder_nav_steps`、
-  `pending_folder_nav_mode`、`ViewerNavigationScope` を一式で所有する。main と
+- Windows の `ViewerContextBundle` は `FolderNavPending`、通常画像 open 用の typed
+  `FolderPaneOpenPending`、`pending_folder_nav_steps`、`pending_folder_nav_mode`、
+  `ViewerNavigationScope` を一式で所有する。main と
   `DetachedPhysical` の active independent 静止画窓は bundle swap で完全に分離され、
   active detached の結果はその bundle を mount 中の
   `update_active_detached_viewer_context` だけが poll / apply する。pause / Drop は
   cancel token を立て、遅延結果を sibling context へ持ち越さない。
+- 仮想一覧から通常画像を detached open するときは、親フォルダの `read_dir` / metadata scan を
+  `FolderOpenScanPurpose::DetachedImage { image_path }` として worker へ出す。完了後に
+  pre-scan 付き `load_folder_with_scan` で完全な物理一覧を materialize し、保持した path を
+  新しい index へ解決するため、main の検索部分集合や並び順を再利用しない。
 - `apply_folder_nav_result` がモードに応じて分岐。Fullscreen ブランチで
   `close_fullscreen` を呼ぶが、そこは既に `folder_nav_pending = None` なので
   再帰的な自己キャンセルは起きない。
