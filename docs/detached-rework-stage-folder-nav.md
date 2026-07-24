@@ -23,6 +23,9 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - main のローカル絞り込み、Ctrl+G / Ctrl+S 検索、★固定、スマートフォルダ、
   サブフォルダ展開、レーティング / facet / 色フィルタを参照・変更しない。
   移動先の先頭ページ選定も main の表示フィルタに左右されない。
+- Ctrl+G / タグ / レーティング / ★固定など複数の実親を含む仮想一覧から開いた場合も、
+  plain 前後移動、見開き、シークバー、スライドショーが参照する `visible_indices` は
+  開いた通常画像と同じ実親、または同じ ZIP / PDF コンテナだけに固定する。
 - 初期スコープは通常画像フォルダ、ZIP/CBZ、PDF。変換確認が必要な
   RAR/7z/LZH、動画 / 音声への昇格、検索固有順、スライドショー NextFolder は含めない。
 - passive 化、別窓 activate、close、context drop、新しい load で in-flight request を
@@ -74,16 +77,25 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - 通常画像を grid から always-new detached で開く経路も、open 前に main 一覧 snapshot から
   独立 active bundle を作る。開いた画像の実親フォルダと detached 専用 items generation を
   bundle に設定し、同期再 scan を行わず、main の検索条件・選択・スクロールを保持する。
+- 仮想一覧由来の `items` は per-index cache / texture identity を保つ backing snapshot として
+  複製するが、detached 側の仮想一覧フラグは解除し、raw `visible_indices` は
+  `DetachedPhysical + current_folder` が示す同一実親 / 同一 ZIP / 同一 PDF に限定する。
+  評価・タグ変更などで表示集合を再構築しても別の実親を再流入させない。
 - `src/app/tests.rs` で request ownership、main filter preservation、pause / Drop cancel を固定した。
 - 実際の通常画像 grid-open 経路から Ctrl+↓ を発行し、request が detached bundle にだけ入り、
   main の検索条件・選択・スクロール・既存 folder-nav state が変わらない回帰テストを追加した。
+  同テストに別の実親の画像も混在させ、通常ページ送りと表示集合再構築が物理境界を越えないことを
+  固定した。
 
 ## 7. 検証結果
 
 - `cargo fmt --check`: 成功
 - `python scripts/check_ui_glyphs.py`: 成功
-- `cargo test`: 全体成功（main: 4,126 passed / 18 ignored、lib / integration / doctest も成功）
+- `cargo test -p mimageviewer --lib still_window_mode_key_tests`: 324 passed
+- `scripts/test-full.ps1`: PASS（workspace / integration / doctest を含む）
 - `cargo build`: 成功
+- `scripts/build-dev.ps1`: 成功。`target/dev-runtime/mimageviewer-core.exe` を生成し、
+  agent は起動していない。
 - `scripts/build-release.ps1`: 成功。`target/release/mimageviewer.exe` と
   `target/release/mimageviewer-core.exe` を生成し、agent は起動していない。
 - Windows 実機 smoke: 未実施

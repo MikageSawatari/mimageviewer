@@ -182,6 +182,10 @@ container 列挙 pending を作らない。ただし always-new detached とし�
 `open_fullscreen` する。これにより main `items` を差し替えず、通常画像の folder-nav / close /
 非同期画像 load も main から分離する。物理起点は開いた Image の実親、または ZIP / PDF
 container path とし、main が検索・絞り込み surface でも同期再 scan は行わない。
+元の `items` は per-index cache / texture identity を維持する backing snapshot として保持してよいが、
+ページ送りの正本 `visible_indices` は、通常ファイルなら開いた画像と同じ実親、ZIP/PDF page なら
+同じ実コンテナだけに限定する。仮想一覧の派生フラグは detached 側へ継承せず、評価・タグ変更後の
+表示集合再構築でもこの物理境界を再適用する。
 
 横断ブックマーク一覧から動画・音声を別ウィンドウで開く場合も、同じ context ownership 境界を使う。
 前後ファイル移動のために実フォルダの `items` が必要でも、main を実フォルダへ遷移させてから
@@ -338,7 +342,10 @@ active viewer 内のキーは active context へ作用する。
   items generation を割り当てる。
 - independent still context は物理ナビゲーションスコープを持つ。main の検索、絞り込み、
   ★固定、smart/subfolder view は detached load と先頭ページ選定へ適用せず、main 側の
-  filter scope や pending open も変更しない。linked viewer と media window は従来スコープを維持する。
+  filter scope や pending open も変更しない。複数の実親を含む仮想一覧 snapshot 由来でも、
+  `visible_indices` は `DetachedPhysical + current_folder` と同じ実親 / ZIP / PDF だけへ絞り、
+  通常ページ送り・見開き・スライドショーが別の物理コンテナへ横断しない。
+  linked viewer と media window は従来スコープを維持する。
 - active context を mount して `load_pdf_as_folder` / `load_zip_as_folder` /
   `start_loading_items` を再利用している間は、メイン一覧用の永続履歴を更新しない。
   具体的には `settings.last_folder`、quick folder target / recent、folder nav back/forward は

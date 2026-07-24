@@ -24622,6 +24622,53 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_physical_scope_membership_distinguishes_parent_and_container() {
+        let folder = PathBuf::from(r"C:\library\book-a");
+        assert!(item_belongs_to_detached_physical_scope(
+            &GridItem::Image(folder.join("001.jpg")),
+            &folder,
+        ));
+        assert!(!item_belongs_to_detached_physical_scope(
+            &GridItem::Image(PathBuf::from(r"C:\library\book-b\001.jpg")),
+            &folder,
+        ));
+
+        let zip = PathBuf::from(r"C:\library\book-a.zip");
+        assert!(item_belongs_to_detached_physical_scope(
+            &GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "001.jpg".to_string(),
+            },
+            &zip,
+        ));
+        assert!(!item_belongs_to_detached_physical_scope(
+            &GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\library\book-b.zip"),
+                entry_name: "001.jpg".to_string(),
+            },
+            &zip,
+        ));
+
+        let pdf = PathBuf::from(r"C:\library\book-a.pdf");
+        assert!(item_belongs_to_detached_physical_scope(
+            &GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+            &pdf,
+        ));
+        assert!(!item_belongs_to_detached_physical_scope(
+            &GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\library\book-b.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+            &pdf,
+        ));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn normal_image_grid_open_promotes_to_physical_context_before_ctrl_nav() {
         let mut app = setup_app();
@@ -24633,18 +24680,21 @@ mod still_window_mode_key_tests {
         std::fs::create_dir_all(&second).unwrap();
         let hidden = first.join("a.jpg");
         let opened = first.join("b.jpg");
+        let cross_scope = second.join("c.jpg");
         let main_surface = temp.path().join("search-results");
         std::fs::write(&hidden, b"fixture").unwrap();
         std::fs::write(&opened, b"fixture").unwrap();
-        std::fs::write(second.join("c.jpg"), b"fixture").unwrap();
+        std::fs::write(&cross_scope, b"fixture").unwrap();
 
         app.current_folder = Some(main_surface.clone());
         let hidden_idx = push_image(&mut app, hidden.to_str().unwrap());
         let opened_idx = push_image(&mut app, opened.to_str().unwrap());
+        let cross_scope_idx = push_image(&mut app, cross_scope.to_str().unwrap());
         insert_static_fs_entry(&mut app, &ctx, opened_idx, "promoted_normal_image");
         app.visible_indices = vec![opened_idx];
         app.search_filter = Some(std::collections::HashSet::from([opened_idx]));
         app.show_search_bar = true;
+        app.items_are_global_search_view = true;
         app.selected = Some(opened_idx);
         app.scroll_offset_y = 321.0;
         app.pending_folder_nav_steps = -2;
@@ -24676,6 +24726,10 @@ mod still_window_mode_key_tests {
             Some(std::collections::HashSet::from([opened_idx]))
         );
         assert!(app.show_search_bar);
+        assert!(
+            app.items_are_global_search_view,
+            "the main Ctrl+G surface identity must remain intact"
+        );
         assert_eq!(app.selected, Some(opened_idx));
         assert_eq!(app.scroll_offset_y, 321.0);
         assert_eq!(app.pending_folder_nav_steps, -2);
@@ -24692,14 +24746,39 @@ mod still_window_mode_key_tests {
                 ViewerNavigationScope::DetachedPhysical
             );
             assert_eq!(mounted.current_folder, Some(first.clone()));
+            assert!(
+                !mounted.items_are_global_search_view,
+                "the detached physical context must not retain its Ctrl+G origin semantics"
+            );
             assert_ne!(
                 mounted.items_generation, main_items_generation,
                 "detached worker results need a context generation distinct from main"
             );
             assert_eq!(mounted.visible_indices, vec![hidden_idx, opened_idx]);
+            assert!(
+                !mounted.visible_indices.contains(&cross_scope_idx),
+                "a virtual-list item from another parent must not enter the detached physical order"
+            );
             assert_eq!(mounted.fullscreen_idx, Some(opened_idx));
             assert!(mounted.detached_viewer_independent_still_session());
             assert!(mounted.detached_physical_folder_nav_available());
+            assert_eq!(
+                crate::ui_helpers::adjacent_navigable_idx(
+                    &mounted.items,
+                    mounted.current_grid_order(),
+                    opened_idx,
+                    1,
+                ),
+                None,
+                "ordinary next-page navigation must stop at the physical-scope boundary"
+            );
+
+            mounted.rebuild_visible_indices();
+            assert_eq!(
+                mounted.visible_indices,
+                vec![hidden_idx, opened_idx],
+                "rebuilding after a rating/tag change must not reintroduce another parent"
+            );
 
             mounted.handle_fullscreen_ctrl_nav_context(&ctx, opened_idx, true, false);
 
@@ -24722,6 +24801,10 @@ mod still_window_mode_key_tests {
             Some(std::collections::HashSet::from([opened_idx]))
         );
         assert!(app.show_search_bar);
+        assert!(
+            app.items_are_global_search_view,
+            "unmounting the detached context must restore the main Ctrl+G surface identity"
+        );
         assert_eq!(app.selected, Some(opened_idx));
         assert_eq!(app.scroll_offset_y, 321.0);
         assert_eq!(app.pending_folder_nav_steps, -2);

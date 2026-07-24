@@ -214,6 +214,35 @@ impl ViewerNavigationScope {
     }
 }
 
+/// `DetachedPhysical` の raw 表示順に残せる item かを判定する。
+///
+/// 仮想一覧から独立 viewer を開く場合も、`items` 自体は per-index cache / texture の
+/// identity を維持する backing snapshot として保持する。一方、ページ送りの正本である
+/// `visible_indices` は、通常ファイルなら同じ実親、ZIP/PDF page なら同じ実コンテナだけに
+/// 限定する。これにより Ctrl+G / タグ / レーティング / ★固定など複数フォルダを含む
+/// snapshot から開いても `DetachedPhysical` の通常ページ送りが親を横断しない。
+fn item_belongs_to_detached_physical_scope(item: &GridItem, scope: &Path) -> bool {
+    let path_has_parent = |path: &Path| {
+        path.parent()
+            .is_some_and(|parent| crate::folder_tree::path_eq(parent, scope))
+    };
+    match item {
+        GridItem::Folder(path)
+        | GridItem::Image(path)
+        | GridItem::Video(path)
+        | GridItem::Audio(path)
+        | GridItem::ZipFile(path)
+        | GridItem::PdfFile(path)
+        | GridItem::ConvertibleArchive { path, .. } => path_has_parent(path),
+        GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
+            crate::folder_tree::path_eq(zip_path, scope)
+        }
+        GridItem::PdfPage { pdf_path, .. } => crate::folder_tree::path_eq(pdf_path, scope),
+        GridItem::Stack { representative, .. } => path_has_parent(representative),
+        GridItem::SearchContainer { .. } => false,
+    }
+}
+
 /// Ownership of a visible folder/container load.
 ///
 /// Normal navigation supersedes pending opens. Bookmark-owned internal transitions (for
@@ -35524,16 +35553,33 @@ impl App {
             Some(GridItem::PdfPage { pdf_path, .. }) => Some(pdf_path.clone()),
             _ => None,
         };
+        let Some(physical_context) = physical_context else {
+            return false;
+        };
         let (_context_serial, items_generation) =
             self.allocate_detached_viewer_context_generation();
         let mut bundle = self.split_current_context_for_independent_still_open();
         bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         bundle.items_generation = items_generation;
-        if let Some(physical_context) = physical_context {
-            bundle.address = physical_context.display().to_string();
-            bundle.current_folder = Some(physical_context);
-        }
-        bundle.visible_indices = (0..bundle.items.len()).collect();
+        bundle.address = physical_context.display().to_string();
+        bundle.current_folder = Some(physical_context.clone());
+        bundle.visible_indices = bundle
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(item_idx, item)| {
+                item_belongs_to_detached_physical_scope(item, &physical_context).then_some(item_idx)
+            })
+            .collect();
+        bundle.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
+        bundle.items_are_global_search_view = false;
+        bundle.items_are_tag_view = false;
+        bundle.items_are_reading_history_view = false;
+        bundle.items_are_bookmark_view = false;
+        bundle.items_are_rating_view = false;
+        bundle.items_are_subfolder_expansion_view = false;
+        bundle.items_are_smart_folder_view = false;
+        bundle.items_are_drive_list = false;
         bundle.details_thumb_suppression_applied = false;
         bundle.details_order.clear();
         bundle.cached_nav_indices = None;
@@ -39170,9 +39216,23 @@ impl App {
     fn rebuild_visible_indices_impl(&mut self, sync_facet_scope: bool) {
         if self.navigation_scope.is_detached_physical() {
             // Detached physical viewers intentionally ignore every App-global
-            // display filter.  Their list is the filesystem/container list that
-            // was loaded into this bundle, in raw order.
-            self.visible_indices = (0..self.items.len()).collect();
+            // display filter. Their raw order is still constrained to the
+            // physical folder/container identity owned by this bundle because
+            // a virtual-list backing snapshot may contain several parents.
+            self.visible_indices = self
+                .current_folder
+                .as_deref()
+                .map(|physical_scope| {
+                    self.items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            item_belongs_to_detached_physical_scope(item, physical_scope)
+                                .then_some(idx)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
             self.cached_nav_indices = None;
