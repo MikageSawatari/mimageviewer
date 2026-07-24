@@ -71,7 +71,7 @@ Apr 29 の v2 trim test (`scripts/trim_dlls_v2.sh` を使用、`session_run min 
 ## 4. Pack 生成 (build_trt_pack)
 
 ```bash
-cargo run --release --bin build_trt_pack
+cargo run --release --features dev-tools --bin build_trt_pack
 ```
 
 出力:
@@ -220,7 +220,7 @@ $env:MIV_TRT_PACK_BASE_URL = $null
 
 1. `setup-tensorrt-pack.ps1` 実行 → `%APPDATA%/mimageviewer/tensorrt/` を full に
 2. `mimageviewer.exe --tensorrt-build <kind>` で 6 モデル engine 全部 build
-3. `cargo build --release --bin bench_ai` (= 最新ビルドで bench_ai を作る)
+3. `cargo build --release --features dev-tools --bin bench_ai` (= 最新ビルドで bench_ai を作る)
 4. `bash scripts/trim_dlls_v2.sh` を実行 (= v2 系、`session_run min < 200ms`
    閾値で TRT 経路を保証する判定。`/tmp/trim_dlls_v2/result.txt` に結果)
 5. `result.txt` の REMOVABLE 一覧を `build_trt_pack.rs::REMOVABLE_DLLS` に反映。

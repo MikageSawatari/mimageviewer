@@ -33,9 +33,16 @@ name = "mimageviewer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+autobins = false
 
 [features]
 manual-e2e = []
+# ベンチマーク、配布パック生成、診断用の補助 bin は通常の build/test 対象から外す。
+# 必要なときだけ `--features dev-tools --bin <name>` で明示的に有効化する。
+dev-tools = ["pack-build-tools"]
+# pack builder 2 本だけを全体テスト時に有効化する内部 feature。dev-tools 全体を
+# 有効にせず、この 2 本の unit test を本体 lib と同じ feature graph で実行する。
+pack-build-tools = []
 
 # loose-deps ポータブルビルド。native 依存 (pdfium / onnxruntime / susie ワーカー /
 # vst3-host / AI モデル) を `include_bytes!` で埋め込まず、exe と同じディレクトリの
@@ -51,6 +58,112 @@ portable = []
 [[bin]]
 name = "mimageviewer-core"
 path = "src/main.rs"
+bench = false
+
+# Development-only helpers.  Keeping these behind one feature prevents normal
+# application builds and integration tests from compiling every helper binary.
+[[bin]]
+name = "bench_ai"
+path = "src/bin/bench_ai.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_scroll"
+path = "src/bin/bench_scroll.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_search"
+path = "src/bin/bench_search.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_zip"
+path = "src/bin/bench_zip.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "build_editing_pack"
+path = "src/bin/build_editing_pack.rs"
+bench = false
+required-features = ["pack-build-tools"]
+
+[[bin]]
+name = "build_trt_pack"
+path = "src/bin/build_trt_pack.rs"
+bench = false
+required-features = ["pack-build-tools"]
+
+[[bin]]
+name = "compare_alpha_upscale"
+path = "src/bin/compare_alpha_upscale.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "diff_images"
+path = "src/bin/diff_images.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "normalize_probe"
+path = "src/bin/normalize_probe.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "normalize_scan_bench"
+path = "src/bin/normalize_scan_bench.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "normalize_scan_test"
+path = "src/bin/normalize_scan_test.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "probe_birefnet"
+path = "src/bin/probe_birefnet.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "probe_d3d11va_decode"
+path = "src/bin/probe_d3d11va_decode.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "probe_pack_fetch"
+path = "src/bin/probe_pack_fetch.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "xmp_smoke"
+path = "src/bin/xmp_smoke.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
 
 # Manual TensorRT-pack E2E smoke helper.  It is intentionally runnable via
 # `cargo run --features manual-e2e --bin test_trt_install`, while the feature
@@ -238,6 +351,23 @@ egui_kittest = { version = "0.33", features = ["snapshot", "wgpu"] }
 
 [build-dependencies]
 winresource = "0.1"
+
+# 通常テストでは行番号付きバックトレースを保ちつつ、型情報を含む巨大な PDB を避ける。
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+
+# 開発中に実アプリを試すための中間プロファイル。release より最適化と LTO を軽くし、
+# core だけを別 target ディレクトリへ高速に差分ビルドする。
+[profile.dev-runtime]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 64
+incremental = true
+strip = false
+debug = "line-tables-only"
+split-debuginfo = "packed"
 
 [profile.release]
 opt-level = 3

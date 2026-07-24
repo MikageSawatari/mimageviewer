@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   - dist\trt-pack-v3\ must contain the 21 files produced by
-#     `cargo run --release --bin build_trt_pack`
+#     `cargo run --release --features dev-tools --bin build_trt_pack`
 #   - gh CLI must be on PATH and authenticated as MikageSawatari
 #     (run `gh auth status` to check)
 #

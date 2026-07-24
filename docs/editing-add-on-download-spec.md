@@ -67,7 +67,7 @@ TensorRT とは別の導線にする。
   CPU では 1024² が実用にならないため、`load_model` (DirectML EP) を使う。
 - v1.1.0 開発中に本体埋め込みの U²-Netp は廃止。被写体マスク生成は追加パック導入時のみ有効。
 - モデル差し替えは pack manifest のバージョン更新で扱う。保存済み被写体マスクはモデル無しでも使える。
-- 検証 probe: `cargo run --release --bin probe_birefnet -- <model.onnx> <image>`。
+- 検証 probe: `cargo run --release --features dev-tools --bin probe_birefnet -- <model.onnx> <image>`。
 
 ## 4. ダウンロード導線
 

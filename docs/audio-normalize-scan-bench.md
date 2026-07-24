@@ -33,9 +33,9 @@ $ffmpegBin = if (Test-Path vendor\ffmpeg\bin) {
 }
 $env:PATH = $ffmpegBin + ';' + $env:PATH
 $env:CARGO_TARGET_DIR = 'C:\home\mimageviewer\target' # 別 worktree で既存 build artifacts を再利用する場合
-cargo run --release --bin normalize_scan_bench -- D:\home\18\dms2 --sample 12 --jobs 1 --csv bench-j1.csv
-cargo run --release --bin normalize_scan_bench -- D:\home\18\dms2 --sample 12 --jobs 2 --seed 1 --csv bench-j2.csv
-cargo run --release --bin normalize_scan_bench -- D:\home\18\dms2 --sample 12 --jobs 4 --seed 1 --csv bench-j4.csv
+cargo run --release --features dev-tools --bin normalize_scan_bench -- D:\home\18\dms2 --sample 12 --jobs 1 --csv bench-j1.csv
+cargo run --release --features dev-tools --bin normalize_scan_bench -- D:\home\18\dms2 --sample 12 --jobs 2 --seed 1 --csv bench-j2.csv
+cargo run --release --features dev-tools --bin normalize_scan_bench -- D:\home\18\dms2 --sample 12 --jobs 4 --seed 1 --csv bench-j4.csv
 ```
 
 主なオプション:

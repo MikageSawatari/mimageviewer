@@ -15,11 +15,13 @@
 
 ## 1. 全体の位置づけ
 
-- **配布ビルドは `scripts/build-dist.ps1` 一発**。idle-health 解析テスト → clean → core → launcher → ISCC (installer)
-  → portable を 1 コマンドで実行し、**最初にワークスペースパッケージを `cargo clean --release`**
+- **配布ビルドは `scripts/build-dist.ps1` 一発**。Rust 全体テスト → idle-health 解析テスト
+  → clean → core → launcher → ISCC (installer) → portable を 1 コマンドで実行し、
+  テスト通過後に**ワークスペースパッケージを `cargo clean --release`**
   してから実コンパイルするので stale 出荷が構造的に起きない。署名は既定 ON。
-- **開発中の素早い反復だけ `scripts/build-release.ps1` 単体** (clean なし・速い・署名は
-  `-Sign` 指定時のみ)。**配布物の生成には使わない**。
+- **通常の開発反復は `scripts/build-dev.ps1`** (core のみ、軽量 profile、loose deps)。
+  Windows native 機能の最終実機確認だけ `scripts/build-release.ps1` 単体を使う
+  (clean なし・署名は `-Sign` 指定時のみ)。**どちらも配布物の生成には使わない**。
 - 実機検証用バイナリ (Windows ネイティブ挙動の確認依頼前) も `build-release.ps1` で足りる。
 - ただし、エージェントは通常版の `target\release\mimageviewer*.exe` を起動しない。
   通常版は `%APPDATA%\mimageviewer` の実設定を使うため、起動確認だけでも migration・
@@ -83,7 +85,11 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
 
 ## 3. テストゲート
 
-- **リリース直前に `cargo test` をフルで RUN する** (パイプ無し・real exit code を確認)。
+- **リリース直前に `scripts\test-full.ps1` を RUN する** (パイプ無し・real exit code を確認)。
+  通常 workspace test に加え、`pack-build-tools` feature で単体テストを持つ補助 bin 2本も
+  同じlib buildに含めて実行する。
+  `build-dist.ps1` は clean 前にこのゲートを自動実行するため、通常は別実行不要。
+  `-SkipRustTests` は同一ソースでテスト済みの署名・packaging 再試行にだけ使う。
   「コンパイルが通る」だけでは不十分 — **実行して初めて stale assertion が出る**
   (過去に統合テストの実行時 failure を push 直前に踏んだ)。
 - `cargo test --bin mimageviewer-core` は `tests/` 配下の統合テストを**実行しない**。

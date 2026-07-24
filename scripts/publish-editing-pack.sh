@@ -43,7 +43,7 @@ usage() {
 
 build_pack() {
     echo "[publish-editing-pack] building pack into $OUT_DIR ..."
-    cargo run --release --bin build_editing_pack -- --out "$OUT_DIR" "$@"
+    cargo run --release --features dev-tools --bin build_editing_pack -- --out "$OUT_DIR" "$@"
 }
 
 find_assets() {

@@ -100,7 +100,7 @@ flag は残しておいてもよい。
 3. 手動: PDF 沢山入ったフォルダで:
    - Ctrl+↑↓ で次々と PDF を開く → Enter で 1 つ開く → 即座にページ一覧に遷移する
    - perf-log を取って `pool_cancel_queued waited_ms` が 100ms 未満に下がっていることを確認
-4. (任意) bench: `cargo run --release --bin bench_scroll` で PDF 多いフォルダの初期 batch
+4. (任意) bench: `cargo run --release --features dev-tools --bin bench_scroll` で PDF 多いフォルダの初期 batch
    時間を測り、`+50%` 程度に収まっていることを確認 (3→2 並列なので理論上 +50%)。
 
 ## まとめ

@@ -115,7 +115,7 @@ Log "TensorRT pack: ready"
 # even when cargo exits 0. cmd-level > 2>&1 has none of those side effects.
 Log "Building bench_ai (release)..."
 $BuildLog = Join-Path $OutDir 'build.log'
-& cmd /c "cargo build --release --bin bench_ai > `"$BuildLog`" 2>&1"
+& cmd /c "cargo build --release --features dev-tools --bin bench_ai > `"$BuildLog`" 2>&1"
 if ($LASTEXITCODE -ne 0) {
     Log "ERROR: cargo build failed (exit $LASTEXITCODE)"
     Log "  see: $BuildLog"
@@ -146,7 +146,7 @@ function Run-Bench {
     # (e.g. "Sonic Melty _ TuneCore Japan_files"). Cmd-level redirection
     # avoids the PowerShell NativeCommandError wrapping issue.
     $argParts = @(
-        'cargo run --release --bin bench_ai --',
+        'cargo run --release --features dev-tools --bin bench_ai --',
         "--backend $Backend",
         "--models $models",
         "--warmup $Warmup",

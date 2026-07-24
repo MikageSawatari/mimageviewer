@@ -105,6 +105,13 @@ always-active guidance.
   when practical. See the UI snapshot test section in `CLAUDE.md`.
 - Run the narrowest relevant tests first, then broaden when the change touches
   shared behavior.
+- During ordinary edit/test iteration, do not default to
+  `cargo test --workspace`. Prefer `cargo check -p mimageviewer --bin
+  mimageviewer-core`, `cargo test -p mimageviewer --lib <filter>`, or a
+  specific `--test <name>`. Run `.\scripts\test-full.ps1` for cross-cutting
+  shared changes, final verification, release preparation, or when the user
+  explicitly requests the full gate. See
+  `docs/development-build-and-test.md` for the command matrix.
 - Allow enough command time for this repository's Rust builds and tests. A
   build or initial test compile can take five minutes or more. For agent-run
   commands, use at least a 10-minute timeout for `cargo check`, `cargo build`,

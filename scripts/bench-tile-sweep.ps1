@@ -41,7 +41,7 @@ Log "  image2: $img2"
 
 # Build once
 Log "Building bench_ai..."
-& cmd /c "cargo build --release --bin bench_ai > `"$OutDir\build.log`" 2>&1"
+& cmd /c "cargo build --release --features dev-tools --bin bench_ai > `"$OutDir\build.log`" 2>&1"
 if ($LASTEXITCODE -ne 0) { Log "ERROR: build failed"; exit 1 }
 Log "Build OK"
 
@@ -53,7 +53,7 @@ Log "Running tile sweep..."
 $tStart = Get-Date
 
 $argParts = @(
-    'cargo run --release --bin bench_ai --',
+    'cargo run --release --features dev-tools --bin bench_ai --',
     '--backend tensorrt',
     '--models realesrgan_anime6b,nmkd_siax_4x',
     '--warmup 1',

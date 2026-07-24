@@ -944,7 +944,7 @@ PEN 20MP JPEG (median 9.3MB) で:
 
 1. **既存 `bench_scroll.rs` を活用**:
    ```bash
-   cargo run --release --bin bench_scroll -- "D:\home\photo\2025PEN" --delete-cache
+   cargo run --release --features dev-tools --bin bench_scroll -- "D:\home\photo\2025PEN" --delete-cache
    ```
    実装前後で実行し、`Phase1 完了時間` / `全 thumb Loaded 時間` の差を比較。
 

@@ -129,7 +129,7 @@ Searcher snapshot はループ外で 1 回取得し固定 (§9.1)。
 ## 8. 再現手順
 
 ```bash
-cargo run --release --bin bench_search                  # 10 万件デフォルト
-cargo run --release --bin bench_search -- --docs 500000 # 50 万件
-cargo run --release --bin bench_search -- --docs 100000 --keep  # index を残す
+cargo run --release --features dev-tools --bin bench_search                  # 10 万件デフォルト
+cargo run --release --features dev-tools --bin bench_search -- --docs 500000 # 50 万件
+cargo run --release --features dev-tools --bin bench_search -- --docs 100000 --keep  # index を残す
 ```

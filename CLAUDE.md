@@ -120,7 +120,8 @@ mimageviewer/
 │   ├── index.html                  # mikage.to トップページ
 │   └── mimageviewer/index.html     # mImageViewer 製品ページ
 ├── src/
-│   ├── main.rs              # エントリポイント + フォント設定 + logger::init()
+│   ├── main.rs              # windows_subsystem + mimageviewer::run() の薄い入口
+│   ├── lib.rs               # 単一 crate root + 起動処理 + 全モジュール宣言
 │   ├── app.rs               # App 構造体 + eframe::App 実装
 │   ├── ai/                  # AI 機能モジュール
 │   │   ├── mod.rs           # ModelKind, ImageCategory, AiError 型定義
@@ -1083,6 +1084,23 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 同時にコミットすること。詳細な設計方針・新規テスト追加手順は
 [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) を参照。
 
+## 開発中のビルド・テスト選択
+
+通常の編集ループで毎回 `cargo test --workspace` を実行しない。まず変更範囲に応じて
+次の最小targetを使い、共有境界を変更したときや最終確認時だけ範囲を広げる。
+
+```powershell
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo test -p mimageviewer --lib <filter>
+cargo test -p mimageviewer --test <integration-test-name>
+.\scripts\build-dev.ps1
+```
+
+全workspace・統合・doc・pack builderテストは `.\scripts\test-full.ps1` に集約する。
+これは共有基盤を横断する変更の最終確認、リリース前、または明示的に全体確認を求められた
+場合に実行する。機能追加中の試行錯誤ごとには実行しない。詳細と判断表は
+[docs/development-build-and-test.md](docs/development-build-and-test.md) を参照。
+
 ## タグ書き込みの互換性検証 (ExifTool)
 
 mIV は JPEG / PNG / WebP のタグを XMP `dc:subject` にだけ書く (IPTC Keywords は書かない)。
@@ -1228,7 +1246,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **配布ビルド**: `.\scripts\build-dist.ps1` (clean → core → launcher → ISCC → portable を 1 コマンド、
+- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (clean/ガードなしなので配布物には使わない)。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
@@ -1449,7 +1467,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 9.5. **bench 回帰チェック** (検索周りに変更を入れたリリースで実施):
    ```bash
-   cargo run --release --bin bench_search -- --docs 50000 --json /tmp/bench_new.json
+   cargo run --release --features dev-tools --bin bench_search -- --docs 50000 --json /tmp/bench_new.json
    python scripts/check_bench_regression.py vendor/bench_baseline.json /tmp/bench_new.json
    ```
    - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
@@ -1484,10 +1502,21 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - ZIP / PDF / スマートフォルダ、AI、動画・音楽の非同期経路を変更した場合は、その処理が
      完了した静止状態も追加測定する。詳細は `docs/idle-health-check.md`。
 
+9.8. **Rust 全体テストゲート**:
+   ```powershell
+   .\scripts\test-full.ps1
+   ```
+   - `cargo test --workspace --features pack-build-tools --no-fail-fast` で、workspace全体と
+     単体テストを持つ補助bin 2本を同じlib buildとして実行する。
+   - `build-dist.ps1` が clean 前に自動実行するため、通常は配布ビルドとは別に実行不要。
+   - `build-dist.ps1 -SkipRustTests` は、同一ソースが既にこのゲートを通過し、署名や
+     packaging だけを再試行する場合に限る。ソース変更後の初回配布では使わない。
+
 ### Phase 3: ビルド・配布成果物
 
-10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで clean → core → launcher → ISCC → portable)。
-    - build-dist.ps1 は最初に `cargo clean --release -p mimageviewer -p mimageviewer-launcher` (+ `target-portable` の
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → launcher → ISCC → portable)。
+    - build-dist.ps1 は Rust 全体テストを通してから
+      `cargo clean --release -p mimageviewer -p mimageviewer-launcher` (+ `target-portable` の
       `-p mimageviewer`) してから実コンパイルするので、cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
       ([docs/release-operations.md](docs/release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
@@ -1503,9 +1532,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       で即停止)。署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
       `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
-    - **開発中の素早い反復は `.\scripts\build-release.ps1` 単体** (incremental・clean なし・速い)。
-      署名も既定 OFF (署名込みで作りたいときだけ `-Sign`)。
-      stale 検出ガードは持たないので**配布物の生成には使わない** (必ず build-dist.ps1)。
+    - **通常の開発反復は `.\scripts\build-dev.ps1`**。`dev-runtime` profile + portable feature で
+      core だけを `target\dev-runtime` へビルドし、loose DLL / model を変更時だけ配置する。
+      Windows native 機能の最終実機確認は `.\scripts\build-release.ps1` (incremental・clean なし、
+      署名は既定 OFF) を使う。どちらも stale 検出ガードは持たないので
+      **配布物の生成には使わない** (必ず build-dist.ps1)。
     - portable core は専用 target dir `target-portable` に分離して焼くので、非portable の
       `target\release\mimageviewer-core.exe` を上書きしない (フレーバー混入防止)。
     - Vector 申請用 zip は build-dist.ps1 では作らない (下記 11 の手順で別途 `Compress-Archive`)。

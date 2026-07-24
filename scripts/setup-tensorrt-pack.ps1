@@ -310,4 +310,4 @@ Write-Host "  Target: $TargetDir"
 Write-Host "  DLLs:   $dllCount files, total $totalMb MB"
 Write-Host '  Sentinel: INSTALL_OK'
 Write-Host ''
-Write-Host 'Next step: cargo run --release --bin bench_ai -- --backend tensorrt'
+Write-Host 'Next step: cargo run --release --features dev-tools --bin bench_ai -- --backend tensorrt'
