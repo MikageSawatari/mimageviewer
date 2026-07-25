@@ -733,6 +733,15 @@ fn draw_dialog(
                         preview.missing_entries
                     ));
                 }
+                if preview.kind_mismatch_entries > 0 {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "ファイル種別が異なるためスキップ: {} 件",
+                            preview.kind_mismatch_entries
+                        ),
+                    );
+                }
                 if preview.changed_files > 0 {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
@@ -930,13 +939,22 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
                 ui.label("インポートが完了しました。");
             }
             ui.label(format!(
-                "反映 {} / 見つからない {} / 種類・サイズ相違 {} / 失敗 {}（全 {} 項目）",
+                "反映 {} / 見つからない {} / サイズ相違 {} / 失敗 {}（全 {} 項目）",
                 summary.applied_entries,
                 summary.skipped_missing,
                 summary.skipped_changed,
                 summary.failed_entries,
                 summary.total_entries
             ));
+            if summary.skipped_kind_mismatch > 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "ファイル種別が異なるためスキップ: {} 件",
+                        summary.skipped_kind_mismatch
+                    ),
+                );
+            }
             if let Some(error) = summary.incomplete_error.as_deref() {
                 ui.label(error);
             }

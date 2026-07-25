@@ -24,7 +24,7 @@ pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIR
 pub(crate) const UI_ENABLED: bool = true;
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 5;
+const FORMAT_VERSION: u32 = 7;
 const BUNDLE_MANIFEST_FILENAME: &str = "manifest.json";
 const GENERATIONS_DIRNAME: &str = "generations";
 const SHARDS_DIRNAME: &str = "shards";
@@ -92,6 +92,7 @@ pub struct ImportPreview {
     pub entries: usize,
     pub existing_entries: usize,
     pub missing_entries: usize,
+    pub kind_mismatch_entries: usize,
     pub changed_files: usize,
     pub recursive: bool,
     pub exported_at_ms: i64,
@@ -102,6 +103,7 @@ pub struct ImportSummary {
     pub total_entries: usize,
     pub applied_entries: usize,
     pub skipped_missing: usize,
+    pub skipped_kind_mismatch: usize,
     pub skipped_changed: usize,
     pub failed_entries: usize,
     /// UIへ表示する項目単位失敗の先頭分。総数は`failed_entries`を参照する。
@@ -338,6 +340,12 @@ enum PortableVirtualKeyBase {
     ConvertedCache,
 }
 
+impl Default for PortableVirtualKeyBase {
+    fn default() -> Self {
+        Self::Source
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FileFingerprint {
     size: u64,
@@ -350,10 +358,12 @@ struct PortableEntry {
     kind: PortableEntryKind,
     media_kind: PortableMediaKind,
     virtual_key_base: PortableVirtualKeyBase,
+    container_key_base: PortableVirtualKeyBase,
     fingerprint: Option<FileFingerprint>,
     rating: Option<PortableRating>,
     #[serde(default)]
     tags: Vec<PortableTag>,
+    tags_decided: bool,
     #[serde(default)]
     timed_bookmarks: Vec<PortableTimedBookmark>,
     #[serde(default)]
@@ -376,6 +386,7 @@ struct PortableVirtualItem {
     rating: Option<PortableRating>,
     #[serde(default)]
     tags: Vec<PortableTag>,
+    tags_decided: bool,
     #[serde(default, skip_serializing_if = "PortablePageState::is_empty")]
     page_state: PortablePageState,
 }
@@ -488,6 +499,8 @@ struct PortableRating {
 struct PortableTimedBookmark {
     pts_secs: f64,
     title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumb_webp_base64: Option<String>,
     created_at_ms: i64,
 }
 
@@ -635,6 +648,7 @@ where
         match verify_target(&path, entry, cancel)? {
             TargetState::Ready => preview.existing_entries += 1,
             TargetState::Missing => preview.missing_entries += 1,
+            TargetState::KindMismatch => preview.kind_mismatch_entries += 1,
             TargetState::Changed => preview.changed_files += 1,
         }
         progress(TransferProgress {
@@ -767,6 +781,7 @@ where
             target_verify_ms += target_started.elapsed().as_secs_f64() * 1000.0;
             match target_state {
                 TargetState::Missing => summary.skipped_missing += 1,
+                TargetState::KindMismatch => summary.skipped_kind_mismatch += 1,
                 TargetState::Changed => summary.skipped_changed += 1,
                 TargetState::Ready => {
                     if !batch_active {
@@ -1285,9 +1300,11 @@ fn make_enumerated(
             kind,
             media_kind,
             virtual_key_base: PortableVirtualKeyBase::Source,
+            container_key_base: PortableVirtualKeyBase::Source,
             fingerprint,
             rating: None,
             tags: Vec::new(),
+            tags_decided: false,
             timed_bookmarks: Vec::new(),
             book_bookmarks: Vec::new(),
             page_state: PortablePageState::default(),
@@ -1506,7 +1523,7 @@ fn locate_export_page_key(
             && previous != origin
         {
             return Err(TransferError::Database(format!(
-                "変換ページのメタ情報がsource keyとcache keyの両方にあります: {}",
+                "変換ページのメタ情報がsource keyとcache keyの両方にあります: {}。同じアーカイブを直接閲覧と変換キャッシュの両方で編集した可能性があります",
                 entries[entry_index].path.display()
             )));
         }
@@ -1734,9 +1751,12 @@ where
                 });
             if let Some((entry_index, member)) = located {
                 if let Some(member) = member {
-                    get_virtual_item(entries, &mut virtual_index, entry_index, member).tags = tags;
+                    let item = get_virtual_item(entries, &mut virtual_index, entry_index, member);
+                    item.tags = tags;
+                    item.tags_decided = true;
                 } else {
                     entries[entry_index].portable.tags = tags;
+                    entries[entry_index].portable.tags_decided = true;
                 }
             }
         }
@@ -1748,7 +1768,7 @@ where
         prepare_metadata_scope(&mut conn, &index, &index, cancel)?;
         let mut stmt = conn
             .prepare(
-                "SELECT v.path, v.pts_secs, v.title, v.created_at
+                "SELECT v.path, v.pts_secs, v.title, v.thumb_webp, v.created_at
                    FROM metadata_transfer_physical_scope AS s
                   CROSS JOIN video_bookmarks AS v
                   WHERE v.path = s.item_key
@@ -1757,7 +1777,11 @@ where
             .map_err(db_error)?;
         let rows = stmt
             .query_map([], |row| {
-                let created_at: i64 = row.get(3)?;
+                let thumb_webp_base64 = row
+                    .get::<_, Option<Vec<u8>>>(3)?
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+                let created_at: i64 = row.get(4)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     PortableTimedBookmark {
@@ -1765,6 +1789,7 @@ where
                         title: row
                             .get::<_, Option<String>>(2)?
                             .filter(|value| !value.is_empty()),
+                        thumb_webp_base64,
                         created_at_ms: created_at.saturating_mul(1000),
                     },
                 ))
@@ -1962,6 +1987,89 @@ fn prepare_container_scope(
         }
     }
     tx.commit().map_err(db_error)
+}
+
+struct ExportContainerIndex {
+    keys: HashMap<String, usize>,
+    cache_bases: HashMap<String, usize>,
+}
+
+fn prepare_export_container_index(
+    data_dir: &Path,
+    entries: &[EnumeratedEntry],
+    source_index: &HashMap<String, usize>,
+) -> Result<ExportContainerIndex, TransferError> {
+    let mut container_index = ExportContainerIndex {
+        keys: source_index.clone(),
+        cache_bases: HashMap::new(),
+    };
+    for (entry_index, entry) in entries.iter().enumerate() {
+        if !matches!(
+            entry.portable.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+        ) {
+            continue;
+        }
+        let cache_base = crate::path_key::normalize(
+            &crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &entry.path),
+        );
+        if let Some(previous) = container_index.keys.insert(cache_base.clone(), entry_index)
+            && previous != entry_index
+        {
+            return Err(TransferError::Database(format!(
+                "変換cache keyが別項目と重複しています: {}",
+                entry.path.display()
+            )));
+        }
+        container_index.cache_bases.insert(cache_base, entry_index);
+    }
+    Ok(container_index)
+}
+
+fn locate_export_container_key(
+    key: &str,
+    container_index: &ExportContainerIndex,
+    container_origins: &mut [Option<PortableVirtualKeyBase>],
+    entries: &[EnumeratedEntry],
+) -> Result<Option<(usize, Option<String>)>, TransferError> {
+    let located = if let Some(&entry_index) = container_index.keys.get(key) {
+        Some((entry_index, None, key))
+    } else {
+        let mut located = None;
+        let mut end = key.len();
+        while let Some(offset) = key[..end].rfind('/') {
+            let base = &key[..offset];
+            if let Some(&entry_index) = container_index.keys.get(base)
+                && entries[entry_index].portable.kind == PortableEntryKind::File
+            {
+                let member = &key[offset + 1..];
+                if !member.is_empty() {
+                    located = Some((entry_index, Some(member.to_string()), base));
+                    break;
+                }
+            }
+            end = offset;
+        }
+        located
+    };
+    let Some((entry_index, member, base)) = located else {
+        return Ok(None);
+    };
+    let origin = if container_index.cache_bases.get(base) == Some(&entry_index) {
+        PortableVirtualKeyBase::ConvertedCache
+    } else {
+        PortableVirtualKeyBase::Source
+    };
+    if let Some(previous) = container_origins[entry_index]
+        && previous != origin
+    {
+        return Err(TransferError::Database(format!(
+            "変換コンテナのメタ情報がsource keyとcache keyの両方にあります: {}。同じアーカイブを直接閲覧と変換キャッシュの両方で編集した可能性があります",
+            entries[entry_index].path.display()
+        )));
+    }
+    container_origins[entry_index] = Some(origin);
+    Ok(Some((entry_index, member)))
 }
 
 fn attach_extended_metadata<F>(
@@ -2222,12 +2330,14 @@ where
         .enumerate()
         .map(|(index, entry)| (crate::path_key::normalize(&entry.path), index))
         .collect();
+    let container_index = prepare_export_container_index(data_dir, entries, &stripped_index)?;
+    let mut container_origins = vec![None; entries.len()];
     let mut nested_index = HashMap::new();
 
     let spread_path = data_dir.join("spread.db");
     if spread_path.is_file() {
         let mut conn = open_readonly(&spread_path)?;
-        prepare_container_scope(&mut conn, entries, &stripped_index, cancel)?;
+        prepare_container_scope(&mut conn, entries, &container_index.keys, cancel)?;
         let mut stmt = conn
             .prepare(
                 "SELECT p.path, p.mode, p.flow, p.direction
@@ -2252,9 +2362,12 @@ where
             check_cancel(cancel)?;
             let (key, spread) = row.map_err(db_error)?;
             report_metadata_progress(metadata_rows, &key, progress);
-            if let Some((entry_index, member)) =
-                locate_container_key(&key, &stripped_index, entries)
-            {
+            if let Some((entry_index, member)) = locate_export_container_key(
+                &key,
+                &container_index,
+                &mut container_origins,
+                entries,
+            )? {
                 if let Some(member) = member {
                     get_nested_container(entries, &mut nested_index, entry_index, member).spread =
                         Some(spread);
@@ -2268,7 +2381,7 @@ where
     let view_trim_path = data_dir.join("view_trim.db");
     if view_trim_path.is_file() {
         let mut conn = open_readonly(&view_trim_path)?;
-        prepare_container_scope(&mut conn, entries, &stripped_index, cancel)?;
+        prepare_container_scope(&mut conn, entries, &container_index.keys, cancel)?;
         let mut stmt = conn
             .prepare(
                 "SELECT p.book_key, p.state_json
@@ -2289,9 +2402,12 @@ where
             let state = serde_json::from_str(&json).map_err(|error| {
                 TransferError::Database(format!("view_trim.db state_json: {error}"))
             })?;
-            if let Some((entry_index, member)) =
-                locate_container_key(&key, &stripped_index, entries)
-            {
+            if let Some((entry_index, member)) = locate_export_container_key(
+                &key,
+                &container_index,
+                &mut container_origins,
+                entries,
+            )? {
                 if let Some(member) = member {
                     get_nested_container(entries, &mut nested_index, entry_index, member)
                         .view_trim = Some(state);
@@ -2300,6 +2416,11 @@ where
                 }
             }
         }
+    }
+
+    for (entry_index, entry) in entries.iter_mut().enumerate() {
+        entry.portable.container_key_base =
+            container_origins[entry_index].unwrap_or(PortableVirtualKeyBase::Source);
     }
 
     let folder_pin_path = data_dir.join("folder_thumb_pins.db");
@@ -2440,6 +2561,7 @@ fn get_virtual_item<'a>(
                 member_key: member,
                 rating: None,
                 tags: Vec::new(),
+                tags_decided: false,
                 page_state: PortablePageState::default(),
             });
         index.insert(key, new_index);
@@ -2726,8 +2848,8 @@ fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferErr
     }
     if manifest.version != FORMAT_VERSION {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}",
-            manifest.version
+            "未対応のバージョンです: {}（v{}だけを受け入れます）",
+            manifest.version, FORMAT_VERSION
         )));
     }
     validate_generation(&manifest.generation)?;
@@ -2798,8 +2920,8 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
     }
     if manifest.version != FORMAT_VERSION {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}",
-            manifest.version
+            "未対応のバージョンです: {}（v{}だけを受け入れます）",
+            manifest.version, FORMAT_VERSION
         )));
     }
     let mut paths = HashSet::new();
@@ -2838,7 +2960,11 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
                 entry.media_kind,
                 PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
             ))
-        || portable_media_kind(Path::new(&entry.path), entry.kind) != entry.media_kind
+        || (entry.container_key_base == PortableVirtualKeyBase::ConvertedCache
+            && !matches!(
+                entry.media_kind,
+                PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+            ))
     {
         return Err(TransferError::Invalid(format!(
             "ファイル種別が不正です: {}",
@@ -2932,6 +3058,12 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
             )));
         }
     }
+    if !entry.tags_decided && !entry.tags.is_empty() {
+        return Err(TransferError::Invalid(format!(
+            "タグ未決定の項目にタグがあります: {}",
+            entry.path
+        )));
+    }
     validate_tags(&entry.tags)?;
     if entry.timed_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
         || entry.book_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
@@ -2951,6 +3083,7 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
             )));
         }
         validate_title(bookmark.title.as_deref())?;
+        validate_timed_bookmark_thumb(bookmark, &entry.path)?;
     }
     for bookmark in &entry.book_bookmarks {
         validate_book_bookmark(bookmark, entry.media_kind, &entry.path)?;
@@ -3005,6 +3138,12 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
                     entry.path
                 )));
             }
+        }
+        if !item.tags_decided && !item.tags.is_empty() {
+            return Err(TransferError::Invalid(format!(
+                "タグ未決定の仮想項目にタグがあります: {} / {}",
+                entry.path, item.member_key
+            )));
         }
         validate_tags(&item.tags)?;
         validate_page_state(&item.page_state, &entry.path)?;
@@ -3188,6 +3327,28 @@ fn validate_container_state(
         crate::folder_thumb_pins::validate_source(&source).map_err(|error| {
             TransferError::Invalid(format!("代表サムネ設定が不正です: {entry_path}: {error}"))
         })?;
+    }
+    Ok(())
+}
+
+fn validate_timed_bookmark_thumb(
+    bookmark: &PortableTimedBookmark,
+    entry_path: &str,
+) -> Result<(), TransferError> {
+    let Some(encoded) = &bookmark.thumb_webp_base64 else {
+        return Ok(());
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .map_err(|_| {
+            TransferError::Invalid(format!(
+                "時刻ブックマークの動画サムネの base64 が不正です: {entry_path}"
+            ))
+        })?;
+    if decoded.len() > MAX_VIDEO_THUMB_BYTES {
+        return Err(TransferError::Invalid(format!(
+            "時刻ブックマークの動画サムネが大きすぎます: {entry_path}"
+        )));
     }
     Ok(())
 }
@@ -3476,7 +3637,16 @@ fn validate_bookmark_page_targets(
 enum TargetState {
     Ready,
     Missing,
+    KindMismatch,
     Changed,
+}
+
+fn image_other_file_pair(left: PortableMediaKind, right: PortableMediaKind) -> bool {
+    matches!(
+        (left, right),
+        (PortableMediaKind::Image, PortableMediaKind::OtherFile)
+            | (PortableMediaKind::OtherFile, PortableMediaKind::Image)
+    )
 }
 
 fn verify_target(
@@ -3488,6 +3658,12 @@ fn verify_target(
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(TargetState::Missing);
     };
+    let local_media_kind = portable_media_kind(path, entry.kind);
+    if local_media_kind != entry.media_kind
+        && !image_other_file_pair(local_media_kind, entry.media_kind)
+    {
+        return Ok(TargetState::KindMismatch);
+    }
     Ok(match entry.kind {
         PortableEntryKind::Directory if metadata.is_dir() => TargetState::Ready,
         PortableEntryKind::File if metadata.is_file() => {
@@ -3666,6 +3842,22 @@ fn apply_entry(
             .clone()
             .ok_or_else(|| TransferError::Invalid("変換cacheのファイル種別が不正です".into()))?,
     };
+    let container_source_key = crate::path_key::normalize(path);
+    let container_cache_key = matches!(
+        entry.media_kind,
+        PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+    )
+    .then(|| {
+        crate::path_key::normalize(&crate::archive_cache::cache_zip_path_for_data_dir(
+            data_dir, path,
+        ))
+    });
+    let container_target_key = match entry.container_key_base {
+        PortableVirtualKeyBase::Source => container_source_key.clone(),
+        PortableVirtualKeyBase::ConvertedCache => container_cache_key
+            .clone()
+            .ok_or_else(|| TransferError::Invalid("変換cacheのファイル種別が不正です".into()))?,
+    };
     let supports_timed_bookmarks = matches!(
         entry.media_kind,
         PortableMediaKind::Video | PortableMediaKind::Audio
@@ -3722,12 +3914,19 @@ fn apply_entry(
             &page_base_key,
             deterministic_cache_key.as_deref(),
         )?;
-        insert_tags(tx, &base_key, &entry.tags, fallback_time_ms)?;
+        insert_tags(
+            tx,
+            &base_key,
+            &entry.tags,
+            entry.tags_decided,
+            fallback_time_ms,
+        )?;
         for item in &entry.virtual_items {
             insert_tags(
                 tx,
                 &canonical_virtual_item_key(&page_base_key, &item.member_key),
                 &item.tags,
+                item.tags_decided,
                 fallback_time_ms,
             )?;
         }
@@ -3738,16 +3937,29 @@ fn apply_entry(
             .execute([&base_key])
             .map_err(db_error)?;
         for bookmark in &entry.timed_bookmarks {
+            let thumb_webp = bookmark
+                .thumb_webp_base64
+                .as_ref()
+                .map(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()))
+                .transpose()
+                .map_err(|_| {
+                    TransferError::Invalid(format!(
+                        "時刻ブックマークの動画サムネの base64 が不正です: {}",
+                        entry.path
+                    ))
+                })?
+                .filter(|bytes| !bytes.is_empty());
             tx.prepare_cached(
                 "INSERT INTO video.video_bookmarks
                     (path, pts_secs, title, thumb_webp, created_at)
-                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .map_err(db_error)?
             .execute(params![
                 base_key,
                 bookmark.pts_secs,
                 bookmark.title.as_deref(),
+                thumb_webp,
                 bookmark.created_at_ms.div_euclid(1000),
             ])
             .map_err(db_error)?;
@@ -3890,21 +4102,28 @@ fn apply_entry(
         }
     }
     if sections.container_state && supports_container {
-        let container_key = crate::path_key::normalize(path);
         let include_nested = entry.kind == PortableEntryKind::File;
-        delete_container_family(tx, "spread.spreads", "path", &container_key, include_nested)?;
-        delete_container_family(
+        delete_container_key_family(
+            tx,
+            "spread.spreads",
+            "path",
+            &container_source_key,
+            container_cache_key.as_deref(),
+            include_nested,
+        )?;
+        delete_container_key_family(
             tx,
             "view_trim.view_trim_books",
             "book_key",
-            &container_key,
+            &container_source_key,
+            container_cache_key.as_deref(),
             include_nested,
         )?;
-        insert_container_state(tx, &container_key, &entry.container_state)?;
+        insert_container_state(tx, &container_target_key, &entry.container_state)?;
         for container in &entry.nested_containers {
             insert_container_state(
                 tx,
-                &join_container_key(&container_key, &container.member_key),
+                &join_container_key(&container_target_key, &container.member_key),
                 &container.state,
             )?;
         }
@@ -4185,6 +4404,37 @@ fn delete_container_family(
     Ok(())
 }
 
+fn delete_container_key_family(
+    tx: &Connection,
+    table: &str,
+    column: &str,
+    source_key: &str,
+    deterministic_cache_key: Option<&str>,
+    include_nested: bool,
+) -> Result<(), TransferError> {
+    let alternate_key = deterministic_cache_key.filter(|cache_key| *cache_key != source_key);
+    if let Some(alternate_key) = alternate_key {
+        let sql = if include_nested {
+            format!(
+                "DELETE FROM {table}
+                  WHERE {column} = ?1
+                     OR ({column} >= ?1 || '/' AND {column} < ?1 || '0')
+                     OR {column} = ?2
+                     OR ({column} >= ?2 || '/' AND {column} < ?2 || '0')"
+            )
+        } else {
+            format!("DELETE FROM {table} WHERE {column} = ?1 OR {column} = ?2")
+        };
+        tx.prepare_cached(&sql)
+            .map_err(db_error)?
+            .execute(params![source_key, alternate_key])
+            .map_err(db_error)?;
+        Ok(())
+    } else {
+        delete_container_family(tx, table, column, source_key, include_nested)
+    }
+}
+
 fn join_container_key(base: &str, member: &str) -> String {
     format!(
         "{}/{}",
@@ -4282,6 +4532,7 @@ fn insert_tags(
     tx: &Connection,
     key: &str,
     tags: &[PortableTag],
+    tags_decided: bool,
     fallback_time_ms: i64,
 ) -> Result<(), TransferError> {
     for tag in tags {
@@ -4295,18 +4546,20 @@ fn insert_tags(
         .execute(params![key, display, tag_key, tag.applied_at])
         .map_err(db_error)?;
     }
-    let decided_at = fallback_time_ms.div_euclid(1000);
-    tx.prepare_cached(
-        "INSERT INTO tags.tag_item_state (item_key, decided_at, source)
-         VALUES (?1, ?2, ?3)",
-    )
-    .map_err(db_error)?
-    .execute(params![
-        key,
-        decided_at,
-        crate::tags_db::source::METADATA_IMPORT
-    ])
-    .map_err(db_error)?;
+    if tags_decided {
+        let decided_at = fallback_time_ms.div_euclid(1000);
+        tx.prepare_cached(
+            "INSERT INTO tags.tag_item_state (item_key, decided_at, source)
+             VALUES (?1, ?2, ?3)",
+        )
+        .map_err(db_error)?
+        .execute(params![
+            key,
+            decided_at,
+            crate::tags_db::source::METADATA_IMPORT
+        ])
+        .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -5047,8 +5300,77 @@ mod tests {
         );
     }
 
+    fn rewrite_root_shard_entries(
+        root: &Path,
+        cancel: &AtomicBool,
+        mut rewrite: impl FnMut(&mut PortableEntry),
+    ) {
+        let manifest = read_bundle_manifest(root, cancel).unwrap();
+        let shard = bundle_generation_dir(&root.join(SIDECAR_FILENAME), &manifest.generation)
+            .join(SHARDS_DIRNAME)
+            .join(shard_filename("."));
+        let contents = fs::read_to_string(&shard).unwrap();
+        let mut lines = contents.lines();
+        let mut rewritten = String::new();
+        rewritten.push_str(lines.next().unwrap());
+        rewritten.push('\n');
+        for line in lines {
+            let mut entry: PortableEntry = serde_json::from_str(line).unwrap();
+            rewrite(&mut entry);
+            rewritten.push_str(&serde_json::to_string(&entry).unwrap());
+            rewritten.push('\n');
+        }
+        fs::write(shard, rewritten).unwrap();
+    }
+
     fn init_data_dir(path: &Path) {
         ensure_database_schemas(path).unwrap();
+    }
+
+    fn plain_portable_entry(path: &str, media_kind: PortableMediaKind) -> PortableEntry {
+        PortableEntry {
+            path: path.to_string(),
+            kind: PortableEntryKind::File,
+            media_kind,
+            virtual_key_base: PortableVirtualKeyBase::Source,
+            container_key_base: PortableVirtualKeyBase::Source,
+            fingerprint: Some(FileFingerprint {
+                size: 1,
+                modified_ms: None,
+            }),
+            rating: None,
+            tags: Vec::new(),
+            tags_decided: false,
+            timed_bookmarks: Vec::new(),
+            book_bookmarks: Vec::new(),
+            page_state: PortablePageState::default(),
+            container_state: PortableContainerState::default(),
+            nested_containers: Vec::new(),
+            video_pin: None,
+            virtual_items: Vec::new(),
+        }
+    }
+
+    fn set_tag_state(data_dir: &Path, item_key: &str) {
+        Connection::open(data_dir.join("tags.db"))
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO tag_item_state (item_key, decided_at, source)
+                 VALUES (?1, 123, 'test')",
+                [item_key],
+            )
+            .unwrap();
+    }
+
+    fn tag_state_exists(data_dir: &Path, item_key: &str) -> bool {
+        Connection::open(data_dir.join("tags.db"))
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tag_item_state WHERE item_key = ?1)",
+                [item_key],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn set_rating(data_dir: &Path, path: &Path, stars: i64) {
@@ -5181,12 +5503,14 @@ mod tests {
                     _ => PortableMediaKind::Zip,
                 },
                 virtual_key_base: PortableVirtualKeyBase::Source,
+                container_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: (entry_kind == PortableEntryKind::File).then_some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
                 }),
                 rating: None,
                 tags: Vec::new(),
+                tags_decided: false,
                 timed_bookmarks: Vec::new(),
                 book_bookmarks: vec![PortableBookBookmark {
                     container_kind: container_kind.to_string(),
@@ -5411,6 +5735,240 @@ mod tests {
     }
 
     #[test]
+    fn timed_bookmark_thumbnails_round_trip_with_null_preserved() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_video = source.join("clip.mp4");
+        let destination_video = destination.join("clip.mp4");
+        fs::write(&source_video, b"same-video").unwrap();
+        fs::write(&destination_video, b"same-video").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_key = crate::path_key::normalize_keep_drive(&source_video);
+        Connection::open(source_data.join("video_bookmarks.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO video_bookmarks
+                    (path, pts_secs, title, thumb_webp, created_at)
+                 VALUES (?1, 1.5, 'thumb', ?2, 10),
+                        (?1, 3.0, 'null', NULL, 20)",
+                params![source_key, b"webp-bookmark-thumb".as_slice()],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        let bookmarks = &manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "clip.mp4")
+            .unwrap()
+            .timed_bookmarks;
+        assert_eq!(bookmarks.len(), 2);
+        assert!(bookmarks[0].thumb_webp_base64.is_some());
+        assert!(bookmarks[1].thumb_webp_base64.is_none());
+
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 0);
+        let destination_key = crate::path_key::normalize_keep_drive(&destination_video);
+        let conn = Connection::open(destination_data.join("video_bookmarks.db")).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT thumb_webp FROM video_bookmarks
+                  WHERE path = ?1 ORDER BY pts_secs",
+            )
+            .unwrap();
+        let thumbs = statement
+            .query_map([destination_key], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(thumbs, vec![Some(b"webp-bookmark-thumb".to_vec()), None]);
+    }
+
+    #[test]
+    fn physical_tag_decision_state_round_trips_without_suppressing_undecided_seed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for name in ["decided-empty.jpg", "undecided.jpg", "tagged.jpg"] {
+            fs::write(source.join(name), name.as_bytes()).unwrap();
+            fs::write(destination.join(name), name.as_bytes()).unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_decided =
+            crate::path_key::normalize_keep_drive(&source.join("decided-empty.jpg"));
+        let source_tagged = crate::path_key::normalize_keep_drive(&source.join("tagged.jpg"));
+        set_tag_state(&source_data, &source_decided);
+        set_tags_with_applied_at(&source_data, &source_tagged, &[("new-tag", 456)]);
+        for name in ["decided-empty.jpg", "undecided.jpg", "tagged.jpg"] {
+            let key = crate::path_key::normalize_keep_drive(&destination.join(name));
+            set_tags_with_applied_at(&destination_data, &key, &[("stale", 1)]);
+        }
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        for (path, decided) in [
+            ("decided-empty.jpg", true),
+            ("undecided.jpg", false),
+            ("tagged.jpg", true),
+        ] {
+            assert_eq!(
+                manifest
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .unwrap()
+                    .tags_decided,
+                decided,
+                "unexpected tag decision state for {path}"
+            );
+        }
+
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 0);
+        let destination_decided =
+            crate::path_key::normalize_keep_drive(&destination.join("decided-empty.jpg"));
+        let destination_undecided =
+            crate::path_key::normalize_keep_drive(&destination.join("undecided.jpg"));
+        let destination_tagged =
+            crate::path_key::normalize_keep_drive(&destination.join("tagged.jpg"));
+        assert!(tags(&destination_data, &destination.join("decided-empty.jpg")).is_empty());
+        assert!(tag_state_exists(&destination_data, &destination_decided));
+        assert!(tags(&destination_data, &destination.join("undecided.jpg")).is_empty());
+        assert!(!tag_state_exists(&destination_data, &destination_undecided));
+        assert_eq!(
+            tags(&destination_data, &destination.join("tagged.jpg")),
+            vec!["new-tag"]
+        );
+        assert!(tag_state_exists(&destination_data, &destination_tagged));
+    }
+
+    #[test]
+    fn zip_and_pdf_virtual_tag_decision_state_round_trips() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for name in ["book.zip", "book.pdf"] {
+            fs::write(source.join(name), name.as_bytes()).unwrap();
+            fs::write(destination.join(name), name.as_bytes()).unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let zip_members = ["decided.jpg", "undecided.jpg", "tagged.jpg"];
+        let pdf_members = ["page_0", "page_1", "page_2"];
+        let source_zip_base = crate::path_key::normalize_keep_drive(&source.join("book.zip"));
+        let source_pdf_base = crate::path_key::normalize_keep_drive(&source.join("book.pdf"));
+        let source_zip_keys =
+            zip_members.map(|member| canonical_virtual_item_key(&source_zip_base, member));
+        let source_pdf_keys =
+            pdf_members.map(|member| canonical_virtual_item_key(&source_pdf_base, member));
+        let ratings = Connection::open(source_data.join("rating.db")).unwrap();
+        for (key, member) in source_zip_keys.iter().zip(zip_members) {
+            ratings
+                .execute(
+                    "INSERT INTO ratings (path, stars, kind, entry_name)
+                     VALUES (?1, 4, 6, ?2)",
+                    params![key, member],
+                )
+                .unwrap();
+        }
+        for (page_num, key) in source_pdf_keys.iter().enumerate() {
+            ratings
+                .execute(
+                    "INSERT INTO ratings (path, stars, kind, page_num)
+                     VALUES (?1, 4, 7, ?2)",
+                    params![key, page_num as i64],
+                )
+                .unwrap();
+        }
+        set_tag_state(&source_data, &source_zip_keys[0]);
+        set_tag_state(&source_data, &source_pdf_keys[0]);
+        set_tags_with_applied_at(&source_data, &source_zip_keys[2], &[("zip-tag", 300)]);
+        set_tags_with_applied_at(&source_data, &source_pdf_keys[2], &[("pdf-tag", 400)]);
+
+        let destination_zip_base =
+            crate::path_key::normalize_keep_drive(&destination.join("book.zip"));
+        let destination_pdf_base =
+            crate::path_key::normalize_keep_drive(&destination.join("book.pdf"));
+        let destination_zip_keys =
+            zip_members.map(|member| canonical_virtual_item_key(&destination_zip_base, member));
+        let destination_pdf_keys =
+            pdf_members.map(|member| canonical_virtual_item_key(&destination_pdf_base, member));
+        for key in destination_zip_keys
+            .iter()
+            .chain(destination_pdf_keys.iter())
+        {
+            set_tags_with_applied_at(&destination_data, key, &[("stale", 1)]);
+        }
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        for (path, members) in [("book.zip", &zip_members), ("book.pdf", &pdf_members)] {
+            let entry = manifest
+                .entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap();
+            for (member, decided) in members.iter().zip([true, false, true]) {
+                assert_eq!(
+                    entry
+                        .virtual_items
+                        .iter()
+                        .find(|item| item.member_key == *member)
+                        .unwrap()
+                        .tags_decided,
+                    decided,
+                    "unexpected tag decision state for {path}::{member}"
+                );
+            }
+        }
+
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 0);
+        for (keys, expected_tag) in [
+            (&destination_zip_keys, "zip-tag"),
+            (&destination_pdf_keys, "pdf-tag"),
+        ] {
+            assert!(tags_with_applied_at(&destination_data, &keys[0]).is_empty());
+            assert!(tag_state_exists(&destination_data, &keys[0]));
+            assert!(tags_with_applied_at(&destination_data, &keys[1]).is_empty());
+            assert!(!tag_state_exists(&destination_data, &keys[1]));
+            assert_eq!(
+                tags_with_applied_at(&destination_data, &keys[2]),
+                vec![(
+                    expected_tag.to_string(),
+                    if expected_tag == "zip-tag" { 300 } else { 400 }
+                )]
+            );
+            assert!(tag_state_exists(&destination_data, &keys[2]));
+        }
+    }
+
+    #[test]
     fn converted_archive_pages_round_trip_via_environment_local_cache_key() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -5529,6 +6087,322 @@ mod tests {
                 )
                 .unwrap(),
             270
+        );
+    }
+
+    #[test]
+    fn converted_archive_container_states_round_trip_via_environment_local_cache_key() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_archive = source.join("book.rar");
+        let destination_archive = destination.join("book.rar");
+        fs::write(&source_archive, b"same-rar").unwrap();
+        fs::write(&destination_archive, b"same-rar").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_cache_key = crate::path_key::normalize(
+            &crate::archive_cache::cache_zip_path_for_data_dir(&source_data, &source_archive),
+        );
+        let source_nested_key = join_container_key(&source_cache_key, "vol01");
+        let trim = crate::view_trim::ViewTrimBookState {
+            apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+            book_settings: crate::view_trim::ViewTrimBookSettings {
+                enabled: true,
+                single: crate::view_trim::ViewTrimMargins {
+                    left: 0.01,
+                    top: 0.02,
+                    right: 0.03,
+                    bottom: 0.04,
+                },
+                ..Default::default()
+            },
+        };
+        let trim_json = serde_json::to_string(&trim).unwrap();
+        let spread = Connection::open(source_data.join("spread.db")).unwrap();
+        spread
+            .execute(
+                "INSERT INTO spreads (path, mode, flow, direction) VALUES (?1, 2, 1, 1), (?2, 3, 2, 0)",
+                params![source_cache_key, source_nested_key],
+            )
+            .unwrap();
+        let view_trim = Connection::open(source_data.join("view_trim.db")).unwrap();
+        view_trim
+            .execute(
+                "INSERT INTO view_trim_books (book_key, state_json) VALUES (?1, ?3), (?2, ?3)",
+                params![source_cache_key, source_nested_key, trim_json],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        assert_eq!(exported.container_states, 2);
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        let archive_entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "book.rar")
+            .unwrap();
+        assert_eq!(
+            archive_entry.container_key_base,
+            PortableVirtualKeyBase::ConvertedCache
+        );
+        assert!(archive_entry.container_state.spread.is_some());
+        assert!(archive_entry.container_state.view_trim.is_some());
+        assert_eq!(archive_entry.nested_containers.len(), 1);
+
+        let destination_source_key = crate::path_key::normalize(&destination_archive);
+        let destination_cache_key =
+            crate::path_key::normalize(&crate::archive_cache::cache_zip_path_for_data_dir(
+                &destination_data,
+                &destination_archive,
+            ));
+        let old_trim_json =
+            serde_json::to_string(&crate::view_trim::ViewTrimBookState::default()).unwrap();
+        let destination_spread = Connection::open(destination_data.join("spread.db")).unwrap();
+        for base in [&destination_source_key, &destination_cache_key] {
+            destination_spread
+                .execute(
+                    "INSERT INTO spreads (path, mode, flow, direction) VALUES (?1, 1, 1, 0), (?2, 1, 1, 0)",
+                    params![base, join_container_key(base, "vol01")],
+                )
+                .unwrap();
+        }
+        let destination_trim = Connection::open(destination_data.join("view_trim.db")).unwrap();
+        for base in [&destination_source_key, &destination_cache_key] {
+            destination_trim
+                .execute(
+                    "INSERT INTO view_trim_books (book_key, state_json) VALUES (?1, ?3), (?2, ?3)",
+                    params![base, join_container_key(base, "vol01"), old_trim_json],
+                )
+                .unwrap();
+        }
+
+        copy_sidecar_bundle(&source, &destination);
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        assert_eq!(imported.skipped_kind_mismatch, 0);
+        let destination_nested_key = join_container_key(&destination_cache_key, "vol01");
+        assert_eq!(
+            destination_spread
+                .query_row(
+                    "SELECT mode, flow, direction FROM spreads WHERE path = ?1",
+                    [&destination_cache_key],
+                    |row| Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?
+                    ))
+                )
+                .unwrap(),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            destination_spread
+                .query_row(
+                    "SELECT mode, flow, direction FROM spreads WHERE path = ?1",
+                    [&destination_nested_key],
+                    |row| Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?
+                    ))
+                )
+                .unwrap(),
+            (3, 2, 0)
+        );
+        assert_eq!(
+            destination_spread
+                .query_row(
+                    "SELECT COUNT(*) FROM spreads WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+                    [&destination_source_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            destination_trim
+                .query_row(
+                    "SELECT COUNT(*) FROM view_trim_books WHERE book_key = ?1 OR (book_key >= ?1 || '/' AND book_key < ?1 || '0')",
+                    [&destination_source_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        for key in [&destination_cache_key, &destination_nested_key] {
+            assert_eq!(
+                destination_trim
+                    .query_row(
+                        "SELECT state_json FROM view_trim_books WHERE book_key = ?1",
+                        [key],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                trim_json
+            );
+        }
+    }
+
+    #[test]
+    fn container_state_export_rejects_source_and_cache_origin_conflict() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("book.rar");
+        fs::write(&archive, b"rar").unwrap();
+        init_data_dir(&data);
+        let source_key = crate::path_key::normalize(&archive);
+        let cache_key = crate::path_key::normalize(
+            &crate::archive_cache::cache_zip_path_for_data_dir(&data, &archive),
+        );
+        Connection::open(data.join("spread.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO spreads (path, mode, flow, direction) VALUES (?1, 2, 1, 1)",
+                [&source_key],
+            )
+            .unwrap();
+        Connection::open(data.join("view_trim.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO view_trim_books (book_key, state_json) VALUES (?1, ?2)",
+                params![
+                    cache_key,
+                    serde_json::to_string(&crate::view_trim::ViewTrimBookState::default()).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let error =
+            export_at(&data, &root, false, &AtomicBool::new(false), no_progress).unwrap_err();
+        assert!(matches!(
+            error,
+            TransferError::Database(message)
+                if message.contains("source key")
+                    && message.contains("cache key")
+                    && message.contains("book.rar")
+                    && message.contains("直接閲覧と変換キャッシュの両方で編集")
+        ));
+    }
+
+    #[test]
+    fn zip_and_directory_container_states_round_trip_via_source_keys() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(source.join("folder-book")).unwrap();
+        fs::create_dir_all(destination.join("folder-book")).unwrap();
+        fs::write(source.join("folder-book/001.jpg"), b"page").unwrap();
+        fs::write(destination.join("folder-book/001.jpg"), b"page").unwrap();
+        fs::write(source.join("book.zip"), b"zip").unwrap();
+        fs::write(destination.join("book.zip"), b"zip").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_folder_key = crate::path_key::normalize(&source.join("folder-book"));
+        let source_zip_key = crate::path_key::normalize(&source.join("book.zip"));
+        Connection::open(source_data.join("spread.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO spreads (path, mode, flow, direction) VALUES (?1, 4, 2, 0), (?2, 2, 1, 1)",
+                params![source_folder_key, source_zip_key],
+            )
+            .unwrap();
+        let trim_json =
+            serde_json::to_string(&crate::view_trim::ViewTrimBookState::default()).unwrap();
+        Connection::open(source_data.join("view_trim.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO view_trim_books (book_key, state_json) VALUES (?1, ?2)",
+                params![source_zip_key, trim_json],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        assert_eq!(exported.container_states, 2);
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        for path in ["folder-book", "book.zip"] {
+            assert_eq!(
+                manifest
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .unwrap()
+                    .container_key_base,
+                PortableVirtualKeyBase::Source
+            );
+        }
+
+        copy_sidecar_bundle(&source, &destination);
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        let destination_folder_key = crate::path_key::normalize(&destination.join("folder-book"));
+        let destination_zip_key = crate::path_key::normalize(&destination.join("book.zip"));
+        let spread = Connection::open(destination_data.join("spread.db")).unwrap();
+        assert_eq!(
+            spread
+                .query_row(
+                    "SELECT mode, flow, direction FROM spreads WHERE path = ?1",
+                    [&destination_folder_key],
+                    |row| Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?
+                    ))
+                )
+                .unwrap(),
+            (4, 2, 0)
+        );
+        assert_eq!(
+            spread
+                .query_row(
+                    "SELECT mode, flow, direction FROM spreads WHERE path = ?1",
+                    [&destination_zip_key],
+                    |row| Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?
+                    ))
+                )
+                .unwrap(),
+            (2, 1, 1)
+        );
+        let destination_cache_key =
+            crate::path_key::normalize(&crate::archive_cache::cache_zip_path_for_data_dir(
+                &destination_data,
+                &destination.join("book.zip"),
+            ));
+        assert_eq!(
+            spread
+                .query_row(
+                    "SELECT COUNT(*) FROM spreads WHERE path = ?1",
+                    [&destination_cache_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("view_trim.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT state_json FROM view_trim_books WHERE book_key = ?1",
+                    [&destination_zip_key],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            trim_json
         );
     }
 
@@ -5895,6 +6769,7 @@ mod tests {
                 if message.contains("source key")
                     && message.contains("cache key")
                     && message.contains("book.7z")
+                    && message.contains("直接閲覧と変換キャッシュの両方で編集")
         ));
     }
 
@@ -5950,12 +6825,14 @@ mod tests {
                 kind: PortableEntryKind::File,
                 media_kind: PortableMediaKind::Zip,
                 virtual_key_base: PortableVirtualKeyBase::Source,
+                container_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 3,
                     modified_ms: None,
                 }),
                 rating: None,
                 tags: Vec::new(),
+                tags_decided: false,
                 timed_bookmarks: Vec::new(),
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
@@ -5989,6 +6866,7 @@ mod tests {
                         name: "MixedCase".to_string(),
                         applied_at: 456,
                     }],
+                    tags_decided: true,
                     page_state: PortablePageState {
                         rotation_degrees: Some(90),
                         ..PortablePageState::default()
@@ -6083,6 +6961,7 @@ mod tests {
             member_key: member_key.to_string(),
             rating: None,
             tags: Vec::new(),
+            tags_decided: false,
             page_state: PortablePageState::default(),
         };
         let nested_container = |member_key: &str| PortableNestedContainer {
@@ -6100,12 +6979,14 @@ mod tests {
                 kind: PortableEntryKind::File,
                 media_kind: PortableMediaKind::Zip,
                 virtual_key_base: PortableVirtualKeyBase::Source,
+                container_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
                 }),
                 rating: None,
                 tags: Vec::new(),
+                tags_decided: false,
                 timed_bookmarks: Vec::new(),
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
@@ -6214,7 +7095,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_round_trip_is_self_contained_without_automatic_sidecar() {
+    fn v7_round_trip_is_self_contained_without_automatic_sidecar() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -6848,7 +7729,7 @@ mod tests {
     }
 
     #[test]
-    fn older_bundle_version_is_rejected_before_import() {
+    fn v6_and_older_bundles_are_rejected_with_v7_only_message() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
         let data = temp.path().join("data");
@@ -6861,17 +7742,21 @@ mod tests {
         let path = root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME);
         let mut json: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        json["version"] = serde_json::Value::from(FORMAT_VERSION - 1);
-        fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
-
-        assert!(matches!(
-            inspect_import_at(&root, &cancel, no_progress),
-            Err(TransferError::Invalid(message)) if message.contains("未対応のバージョン")
-        ));
+        for version in [6, 5] {
+            json["version"] = serde_json::Value::from(version);
+            fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+            assert!(matches!(
+                inspect_import_at(&root, &cancel, no_progress),
+                Err(TransferError::Invalid(message))
+                    if message.contains("未対応のバージョン")
+                        && message.contains(&version.to_string())
+                        && message.contains("v7だけを受け入れます")
+            ));
+        }
     }
 
     #[test]
-    fn v5_import_marks_existing_automatic_sidecar_as_consumed() {
+    fn v7_import_marks_existing_automatic_sidecar_as_consumed() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -7544,6 +8429,110 @@ mod tests {
     }
 
     #[test]
+    fn image_other_file_environment_mismatch_is_applied() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for name in ["plugin.codex_unknown_image", "known.jpg"] {
+            fs::write(source.join(name), b"same").unwrap();
+            fs::write(destination.join(name), b"same").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_tags(
+            &source_data,
+            &source.join("plugin.codex_unknown_image"),
+            &["plugin-image"],
+        );
+        set_tags(&source_data, &source.join("known.jpg"), &["built-in-image"]);
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        rewrite_root_shard_entries(&source, &cancel, |entry| match entry.path.as_str() {
+            "plugin.codex_unknown_image" => entry.media_kind = PortableMediaKind::Image,
+            "known.jpg" => entry.media_kind = PortableMediaKind::OtherFile,
+            _ => {}
+        });
+        copy_sidecar_bundle(&source, &destination);
+
+        let preview = inspect_import_at(&destination, &cancel, no_progress).unwrap();
+        assert_eq!(preview.existing_entries, 3);
+        assert_eq!(preview.kind_mismatch_entries, 0);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.applied_entries, 3);
+        assert_eq!(summary.skipped_kind_mismatch, 0);
+        assert_eq!(
+            tags(
+                &destination_data,
+                &destination.join("plugin.codex_unknown_image")
+            ),
+            vec!["plugin-image"]
+        );
+        assert_eq!(
+            tags(&destination_data, &destination.join("known.jpg")),
+            vec!["built-in-image"]
+        );
+    }
+
+    #[test]
+    fn incompatible_media_kind_skips_only_that_entry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for name in ["good.png", "mismatch.jpg"] {
+            fs::write(source.join(name), b"same").unwrap();
+            fs::write(destination.join(name), b"same").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_tags(&source_data, &source.join("good.png"), &["new-good"]);
+        set_tags(
+            &source_data,
+            &source.join("mismatch.jpg"),
+            &["must-not-apply"],
+        );
+        set_tags(
+            &destination_data,
+            &destination.join("mismatch.jpg"),
+            &["old-value"],
+        );
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        rewrite_root_shard_entries(&source, &cancel, |entry| {
+            if entry.path == "mismatch.jpg" {
+                entry.media_kind = PortableMediaKind::Video;
+            }
+        });
+        copy_sidecar_bundle(&source, &destination);
+
+        let preview = inspect_import_at(&destination, &cancel, no_progress).unwrap();
+        assert_eq!(preview.existing_entries, 2);
+        assert_eq!(preview.kind_mismatch_entries, 1);
+        assert_eq!(preview.changed_files, 0);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.applied_entries, 2);
+        assert_eq!(summary.skipped_kind_mismatch, 1);
+        assert_eq!(summary.skipped_changed, 0);
+        assert_eq!(
+            tags(&destination_data, &destination.join("good.png")),
+            vec!["new-good"]
+        );
+        assert_eq!(
+            tags(&destination_data, &destination.join("mismatch.jpg")),
+            vec!["old-value"]
+        );
+    }
+
+    #[test]
     fn same_path_kind_and_size_are_applied_without_reading_file_content() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -7575,36 +8564,71 @@ mod tests {
     }
 
     #[test]
-    fn media_kind_rejects_incompatible_metadata_sections() {
-        let plain_entry = |path: &str, media_kind: PortableMediaKind| PortableEntry {
-            path: path.to_string(),
-            kind: PortableEntryKind::File,
-            media_kind,
-            virtual_key_base: PortableVirtualKeyBase::Source,
-            fingerprint: Some(FileFingerprint {
-                size: 1,
-                modified_ms: None,
-            }),
-            rating: None,
-            tags: Vec::new(),
-            timed_bookmarks: Vec::new(),
-            book_bookmarks: Vec::new(),
-            page_state: PortablePageState::default(),
-            container_state: PortableContainerState::default(),
-            nested_containers: Vec::new(),
-            video_pin: None,
-            virtual_items: Vec::new(),
-        };
+    fn timed_bookmark_thumbnail_validation_rejects_invalid_and_oversized_base64() {
+        let mut entry = plain_portable_entry("movie.mp4", PortableMediaKind::Video);
+        entry.timed_bookmarks.push(PortableTimedBookmark {
+            pts_secs: 1.0,
+            title: None,
+            thumb_webp_base64: Some("not-base64".to_string()),
+            created_at_ms: 0,
+        });
+        assert!(matches!(
+            validate_portable_entry(&entry),
+            Err(TransferError::Invalid(message))
+                if message.contains("時刻ブックマークの動画サムネの base64 が不正")
+        ));
 
-        let mut image = plain_entry("image.jpg", PortableMediaKind::Image);
+        entry.timed_bookmarks[0].thumb_webp_base64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_VIDEO_THUMB_BYTES + 1]),
+        );
+        assert!(matches!(
+            validate_portable_entry(&entry),
+            Err(TransferError::Invalid(message))
+                if message.contains("時刻ブックマークの動画サムネが大きすぎます")
+        ));
+    }
+
+    #[test]
+    fn undecided_tag_state_rejects_nonempty_physical_and_virtual_tags() {
+        let tag = PortableTag {
+            name: "invalid".to_string(),
+            applied_at: 1,
+        };
+        let mut physical = plain_portable_entry("image.jpg", PortableMediaKind::Image);
+        physical.tags.push(tag.clone());
+        assert!(matches!(
+            validate_portable_entry(&physical),
+            Err(TransferError::Invalid(message))
+                if message.contains("タグ未決定の項目にタグがあります")
+        ));
+
+        let mut archive = plain_portable_entry("book.zip", PortableMediaKind::Zip);
+        archive.virtual_items.push(PortableVirtualItem {
+            member_key: "page.jpg".to_string(),
+            rating: None,
+            tags: vec![tag],
+            tags_decided: false,
+            page_state: PortablePageState::default(),
+        });
+        assert!(matches!(
+            validate_portable_entry(&archive),
+            Err(TransferError::Invalid(message))
+                if message.contains("タグ未決定の仮想項目にタグがあります")
+        ));
+    }
+
+    #[test]
+    fn media_kind_rejects_incompatible_metadata_sections() {
+        let mut image = plain_portable_entry("image.jpg", PortableMediaKind::Image);
         image.timed_bookmarks.push(PortableTimedBookmark {
             pts_secs: 1.0,
             title: None,
+            thumb_webp_base64: None,
             created_at_ms: 0,
         });
         assert!(validate_portable_entry(&image).is_err());
 
-        let mut audio = plain_entry("song.mp3", PortableMediaKind::Audio);
+        let mut audio = plain_portable_entry("song.mp3", PortableMediaKind::Audio);
         audio.video_pin = Some(PortableVideoPin {
             pin_pts_secs: 1.0,
             thumb_webp_base64: None,
@@ -7612,15 +8636,16 @@ mod tests {
         });
         assert!(validate_portable_entry(&audio).is_err());
 
-        let mut video = plain_entry("movie.mp4", PortableMediaKind::Video);
+        let mut video = plain_portable_entry("movie.mp4", PortableMediaKind::Video);
         video.page_state.rotation_degrees = Some(90);
         assert!(validate_portable_entry(&video).is_err());
 
-        let mut other = plain_entry("notes.txt", PortableMediaKind::OtherFile);
+        let mut other = plain_portable_entry("notes.txt", PortableMediaKind::OtherFile);
         other.virtual_items.push(PortableVirtualItem {
             member_key: "page.jpg".to_string(),
             rating: None,
             tags: Vec::new(),
+            tags_decided: false,
             page_state: PortablePageState::default(),
         });
         assert!(validate_portable_entry(&other).is_err());
@@ -7636,11 +8661,12 @@ mod tests {
             zipdir_is_archive: None,
             zipdir_representative: None,
         };
-        let mut pdf = plain_entry("book.pdf", PortableMediaKind::Pdf);
+        let mut pdf = plain_portable_entry("book.pdf", PortableMediaKind::Pdf);
         pdf.virtual_items.push(PortableVirtualItem {
             member_key: "cover.jpg".to_string(),
             rating: None,
             tags: Vec::new(),
+            tags_decided: false,
             page_state: PortablePageState::default(),
         });
         assert!(validate_portable_entry(&pdf).is_err());
@@ -7654,6 +8680,15 @@ mod tests {
 
         pdf.virtual_items[0].rating = Some(pdf_rating(2));
         assert!(validate_portable_entry(&pdf).is_ok());
+
+        let mut invalid_container_origin =
+            plain_portable_entry("image.jpg", PortableMediaKind::Image);
+        invalid_container_origin.container_key_base = PortableVirtualKeyBase::ConvertedCache;
+        assert!(validate_portable_entry(&invalid_container_origin).is_err());
+
+        let mut valid_container_origin = plain_portable_entry("book.zip", PortableMediaKind::Zip);
+        valid_container_origin.container_key_base = PortableVirtualKeyBase::ConvertedCache;
+        assert!(validate_portable_entry(&valid_container_origin).is_ok());
     }
 
     #[test]
@@ -7749,12 +8784,14 @@ mod tests {
                 kind: PortableEntryKind::File,
                 media_kind: PortableMediaKind::Image,
                 virtual_key_base: PortableVirtualKeyBase::Source,
+                container_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
                 }),
                 rating: None,
                 tags: Vec::new(),
+                tags_decided: false,
                 timed_bookmarks: Vec::new(),
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
@@ -7847,7 +8884,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsafe_or_malformed_v5_state_before_import() {
+    fn rejects_unsafe_or_malformed_v7_state_before_import() {
         let mut base =
             manifest_with_bookmark(PortableEntryKind::File, "zip", "archive_entry", "page.jpg");
         base.entries[0].book_bookmarks.clear();
@@ -7929,12 +8966,14 @@ mod tests {
                 kind: PortableEntryKind::File,
                 media_kind: PortableMediaKind::Image,
                 virtual_key_base: PortableVirtualKeyBase::Source,
+                container_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
                 }),
                 rating: None,
                 tags: Vec::new(),
+                tags_decided: false,
                 timed_bookmarks: Vec::new(),
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),

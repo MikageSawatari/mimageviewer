@@ -327,19 +327,29 @@ v2.7.0では安定化のためメニュー入口を一時非表示にしたが�
 `metadata_transfer::UI_ENABLED`を有効化して再公開する。
 
 `ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
-`mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v5 は評価、
-タグ（名前と適用時刻）、動画・音声 / 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
+`mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v7 は評価、
+タグ（名前・適用時刻と旧XMP seedを制御する決定状態）、サムネイル付き動画・音声ブックマーク /
+本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
 部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。crop矩形は通常DB /
 sidecarと同じ元画像ピクセル座標を保持する。ZIP / PDF のページ stateと ZIP 内の本 state は
 物理コンテナ配下の相対キーで持つ。RAR / 7z / LZHと、入れ子非ZIPを含んで変換されたZIPは、
-export元のarchive cache DBで有効なsource/cache対応を確認してcache ZIP側のページkeyを相対化し、
-import先data directoryから決まるcache ZIP keyへ復元する。コンテナ側の本設定は元アーカイブkeyを維持する。
+ページ側とコンテナ側で独立したoriginをmanifestの`virtual_key_base` / `container_key_base`へ保存する。
+ページ情報はexport元のarchive cache DBで有効なsource/cache対応も確認し、cache ZIP側のページkeyを
+相対化してimport先data directoryから決まるcache ZIP keyへ復元する。見開き・連結方式・綴じ方向と
+本単位表示トリムは実行時の`nav.tree.zip_path`と同じく変換後cache ZIP基点なので、実際に検出した
+source/cache originを移送先の決定的cache keyへ対応付ける。一方、代表サムネピンは
+`zip_pin_root_path`由来の元アーカイブsource keyを維持する。この非対称は実行時DB key体系に合わせたものとする。
+未リリースの開発ビルドだけが作成したv1〜v6 bundleは移行せず、v7だけを受け入れる。
+前回の未コミット検証で作成されたv6も、必須fieldを黙って補わずversion gateで明示的に拒否する。
 archive cache DB自体がない場合と対象行がない場合だけを未変換扱いにし、open / query失敗は
 ページメタ情報を黙って欠落させないようexport全体のエラーにする。
 cache ZIPと`converted_archives`行を管理画面削除・容量pruneで失っても、cache pathはsource pathと
 data directoryから決定的に再生成できるため、source/cache両prefixを全ページメタ情報familyの
-scopeへ入れる。cache側だけに行が残る場合は`ConvertedCache`として移送し、source/cache双方に
-行がある場合はDB間の走査順で暗黙mergeせず対象アーカイブ付きの競合エラーにする。
+scope、および`spreads` / `view_trim_books`のコンテナscopeへ入れる。cache側だけに行が残る場合は
+`ConvertedCache`として移送し、source/cache双方に行がある場合はページ・コンテナそれぞれのorigin内で
+DB間の走査順による暗黙mergeをせず、対象アーカイブ付きの競合エラーにする。
+この競合は同じアーカイブを直接閲覧と変換cache経由の両方で編集した可能性を利用者へ示し、
+どちらかを推測して統合せずexport全体を中止する。
 一方、直接閲覧RAR / CBRは`ConvertibleArchive`として列挙されてもsource RAR keyを参照するため、
 いずれか一方でページ行を実際に検出した場合は、そのoriginを有効cache行や拡張子からの推測より
 優先してmanifestの`virtual_key_base`へ保存する。
@@ -365,6 +375,12 @@ importは相対path・entry kind・media kind・sizeが一致すれば同一項�
 コピーと、同一sizeで内容が変わったファイルのどちらにも適用する。media kindも明示し、
 画像への時刻bookmark、音声へのvideo pin、
 動画へのpage edit、通常fileへのvirtual pageなどの組み合わせをpreflightで拒否する。
+移送先環境で拡張子から再導出したmedia kindとの差は項目単位で判定し、Susieプラグイン構成だけで
+変動する`Image`と`OtherFile`間はそのまま適用する。それ以外の差はbundle全体を中断せず、該当項目だけを
+`KindMismatch`としてスキップし、previewと完了結果へ件数を表示する。
+Susieが静的テーブル上の動画 / 音声 / ZIP / PDF / 変換アーカイブ拡張子を画像として主張した場合は
+`Image`とその静的種別の差になるため免除せず、件数表示付きの項目スキップへ倒す。実在する主要Susie
+拡張子は静的テーブルと衝突せず、環境差だけで変動する通常形が`Image`と`OtherFile`間だからである。
 2回目の走査では対象pathを再検証し、256物理項目 / 実record 64 MiB / 500 msのいずれかで
 外側transactionをcommitする。各物理項目はSAVEPOINTで隔離し、1件の失敗が同じbatchの
 他項目を巻き戻さない。走査途中のI/O・parse・validationエラーと明示キャンセルでは現在batchも
@@ -376,6 +392,9 @@ manifestに記載された物理項目だけを上書きし、未記載項目を
 ZIP / `ConvertibleArchive`のrating / tag / page-state familyは、manifestで選択されたoriginに
 かかわらずsource pathと決定的cache pathの両prefixを同一DELETE文で消去してから、選択originへ
 復元する。これにより直読みRARへ戻した後も旧cache値を表示・再exportしない。
+`spreads` / `view_trim_books`も同様にsource/cache両コンテナprefixを消去してから
+`container_key_base`で選択したoriginへrootとnested bookを復元する。`folder_thumb_pins`はこの削除対象へ
+混ぜず、従来どおりsource keyだけを上書きする。
 同一フォルダのsync upsertはsectionごとに1回へ集約し、file種別上存在し得ないDB familyは
 削除・挿入処理自体を省く。family削除はpath indexを利用できるexact + range条件で行う。
 dirty な自動 sidecar のserialize / temp書き込み / renameはimport workerの前処理で行い、
