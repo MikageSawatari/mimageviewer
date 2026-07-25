@@ -3752,7 +3752,45 @@ fn attach_error(filename: &str, error: rusqlite::Error) -> TransferError {
     TransferError::Database(format!("{filename}をATTACHできませんでした: {error}"))
 }
 
-fn switch_tags_to_rollback_journal(conn: &Connection) -> Result<String, TransferError> {
+#[derive(Debug, PartialEq, Eq)]
+enum TagsRollbackJournalAttempt {
+    Success,
+    Retry(TagsRollbackJournalFailure),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TagsRollbackJournalFailure {
+    UnchangedMode(String),
+    QueryError(String),
+}
+
+fn classify_tags_rollback_journal_attempt(
+    result: Result<String, String>,
+) -> TagsRollbackJournalAttempt {
+    match result {
+        Ok(mode) if mode.eq_ignore_ascii_case("delete") => TagsRollbackJournalAttempt::Success,
+        Ok(mode) => {
+            TagsRollbackJournalAttempt::Retry(TagsRollbackJournalFailure::UnchangedMode(mode))
+        }
+        Err(error) => {
+            TagsRollbackJournalAttempt::Retry(TagsRollbackJournalFailure::QueryError(error))
+        }
+    }
+}
+
+fn tags_rollback_journal_failure_message(failure: &TagsRollbackJournalFailure) -> String {
+    match failure {
+        TagsRollbackJournalFailure::UnchangedMode(mode) => format!(
+            "他の接続がtags.dbを開いたままのため、tags.db を安全なjournal modeへ切り替えられませんでした: {mode}"
+        ),
+        TagsRollbackJournalFailure::QueryError(_) => {
+            "他の接続がtags.dbを開いたままのため、tags.dbをrollback journalへ切り替えられませんでした"
+                .to_string()
+        }
+    }
+}
+
+fn switch_tags_to_rollback_journal(conn: &Connection) -> Result<(), TransferError> {
     const ATTEMPTS: usize = 5;
     const ATTEMPT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(375);
@@ -3765,31 +3803,57 @@ fn switch_tags_to_rollback_journal(conn: &Connection) -> Result<String, Transfer
             "tags.dbのjournal mode切替待機を設定できませんでした: {error}"
         ))
     })?;
-    for attempt in 1..=ATTEMPTS {
-        match conn.query_row("PRAGMA tags.journal_mode = DELETE", [], |row| row.get(0)) {
-            Ok(mode) => {
-                conn.busy_timeout(IMPORT_BUSY_TIMEOUT).map_err(|error| {
-                    TransferError::Database(format!(
-                        "tags.dbのimport待機時間を復元できませんでした: {error}"
-                    ))
-                })?;
-                return Ok(mode);
-            }
-            Err(error) => {
-                crate::logger::log(format!(
-                    "metadata import: tags.db journal mode switch failed ({attempt}/{ATTEMPTS}): {error}"
-                ));
-                if attempt < ATTEMPTS {
-                    std::thread::sleep(RETRY_DELAY);
+
+    let switch_result: Result<(), TransferError> = (|| {
+        let mut last_failure = None;
+        for attempt in 1..=ATTEMPTS {
+            let query_result = conn
+                .query_row("PRAGMA tags.journal_mode = DELETE", [], |row| row.get(0))
+                .map_err(|error| error.to_string());
+            match classify_tags_rollback_journal_attempt(query_result) {
+                TagsRollbackJournalAttempt::Success => return Ok(()),
+                TagsRollbackJournalAttempt::Retry(failure) => {
+                    let detail = match &failure {
+                        TagsRollbackJournalFailure::UnchangedMode(mode) => {
+                            format!("journal mode remained {mode}")
+                        }
+                        TagsRollbackJournalFailure::QueryError(error) => error.clone(),
+                    };
+                    crate::logger::log(format!(
+                        "metadata import: tags.db journal mode switch failed ({attempt}/{ATTEMPTS}): {detail}"
+                    ));
+                    last_failure = Some(failure);
+                    if attempt < ATTEMPTS {
+                        std::thread::sleep(RETRY_DELAY);
+                    }
                 }
             }
         }
+        let failure = last_failure.expect("ATTEMPTS must be greater than zero");
+        Err(TransferError::Database(
+            tags_rollback_journal_failure_message(&failure),
+        ))
+    })();
+
+    // 成否に関係なく、journal mode切替専用の短いtimeoutからimport用の値へ戻す。
+    // 切替失敗と復元失敗が重なった場合は、最後に観測した切替結果を利用者へ返し、
+    // 復元失敗は診断ログへ残す。
+    let restore_result = conn.busy_timeout(IMPORT_BUSY_TIMEOUT).map_err(|error| {
+        TransferError::Database(format!(
+            "tags.dbのimport待機時間を復元できませんでした: {error}"
+        ))
+    });
+    match (switch_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(restore_error)) => Err(restore_error),
+        (Err(switch_error), Ok(())) => Err(switch_error),
+        (Err(switch_error), Err(restore_error)) => {
+            crate::logger::log(format!(
+                "metadata import: tags.db busy timeout restore failed after journal mode switch failure: {restore_error}"
+            ));
+            Err(switch_error)
+        }
     }
-    let _ = conn.busy_timeout(IMPORT_BUSY_TIMEOUT);
-    Err(TransferError::Database(
-        "他の接続がtags.dbを開いたままのため、tags.dbをrollback journalへ切り替えられませんでした"
-            .to_string(),
-    ))
 }
 
 fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> {
@@ -3847,12 +3911,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
     // the import worker before this point, so it is safe to switch tags.db to a
     // rollback journal for the duration of import.  TagsDb::open restores WAL
     // after the import connection has been dropped.
-    let tag_mode = switch_tags_to_rollback_journal(&conn)?;
-    if !tag_mode.eq_ignore_ascii_case("delete") {
-        return Err(TransferError::Database(format!(
-            "tags.db を安全なjournal modeへ切り替えられませんでした: {tag_mode}"
-        )));
-    }
+    switch_tags_to_rollback_journal(&conn)?;
 
     // Same invariant as edit_bundle::apply_atomic: every participant must use a
     // disk rollback journal so SQLite can coordinate them with a super-journal.
@@ -5453,6 +5512,73 @@ mod tests {
 
     fn init_data_dir(path: &Path) {
         ensure_database_schemas(path).unwrap();
+    }
+
+    #[test]
+    fn classify_tags_rollback_journal_attempt_accepts_delete() {
+        assert_eq!(
+            classify_tags_rollback_journal_attempt(Ok("delete".to_string())),
+            TagsRollbackJournalAttempt::Success
+        );
+    }
+
+    #[test]
+    fn classify_tags_rollback_journal_attempt_accepts_delete_case_insensitively() {
+        assert_eq!(
+            classify_tags_rollback_journal_attempt(Ok("DELETE".to_string())),
+            TagsRollbackJournalAttempt::Success
+        );
+    }
+
+    #[test]
+    fn classify_tags_rollback_journal_attempt_retries_unchanged_mode() {
+        assert_eq!(
+            classify_tags_rollback_journal_attempt(Ok("wal".to_string())),
+            TagsRollbackJournalAttempt::Retry(TagsRollbackJournalFailure::UnchangedMode(
+                "wal".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn classify_tags_rollback_journal_attempt_retries_query_error() {
+        assert_eq!(
+            classify_tags_rollback_journal_attempt(Err("database is locked".to_string())),
+            TagsRollbackJournalAttempt::Retry(TagsRollbackJournalFailure::QueryError(
+                "database is locked".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn tags_rollback_journal_failure_message_preserves_last_observation_kind() {
+        let unchanged_mode = tags_rollback_journal_failure_message(
+            &TagsRollbackJournalFailure::UnchangedMode("wal".to_string()),
+        );
+        assert!(
+            unchanged_mode.contains("wal"),
+            "変更されなかったmode名を示す: {unchanged_mode}"
+        );
+        assert!(
+            unchanged_mode.contains("他の接続"),
+            "保持接続が原因だと示す: {unchanged_mode}"
+        );
+
+        let query_error = tags_rollback_journal_failure_message(
+            &TagsRollbackJournalFailure::QueryError("database is locked".to_string()),
+        );
+        assert!(
+            query_error.contains("他の接続"),
+            "保持接続が原因だと示す: {query_error}"
+        );
+        assert!(
+            query_error.contains("rollback journal"),
+            "失敗した切替段階を示す: {query_error}"
+        );
+        assert!(
+            !query_error.contains("database is locked"),
+            "SQLiteの生エラーだけを利用者へ返さない: {query_error}"
+        );
     }
 
     #[test]
