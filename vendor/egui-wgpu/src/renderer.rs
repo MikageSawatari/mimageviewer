@@ -151,6 +151,10 @@ struct UniformBuffer {
     ///
     /// See also <https://github.com/emilk/egui/issues/5295>.
     predictable_texture_filtering: u32,
+    /// Positive values prefer a coarser mip level for image minification.
+    image_lod_bias: f32,
+    /// WGSL uniform structs round this layout up to the vec2 alignment.
+    _padding: f32,
 }
 
 struct SlicedBuffer {
@@ -255,6 +259,7 @@ pub struct Renderer {
     mipmap_generator: Option<crate::mipmap::MipmapGenerator>,
 
     options: RendererOptions,
+    image_lod_bias: f32,
 
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
     ///
@@ -289,6 +294,8 @@ impl Renderer {
                 screen_size_in_points: [0.0, 0.0],
                 dithering: u32::from(options.dithering),
                 predictable_texture_filtering: u32::from(options.predictable_texture_filtering),
+                image_lod_bias: 0.0,
+                _padding: 0.0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -460,8 +467,22 @@ impl Renderer {
             samplers: HashMap::default(),
             mipmap_generator: None,
             options,
+            image_lod_bias: 0.0,
             callback_resources: CallbackResources::default(),
         }
+    }
+
+    /// Bias the implicit mip level selected for managed image textures.
+    ///
+    /// Textures exposing only level 0 are unaffected because sampling clamps to
+    /// the available view. Positive values trade a little sharpness for more
+    /// stable minification of periodic patterns such as manga screentones.
+    pub fn set_image_lod_bias(&mut self, bias: f32) {
+        self.image_lod_bias = if bias.is_finite() {
+            bias.clamp(0.0, 1.5)
+        } else {
+            0.0
+        };
     }
 
     /// Executes the egui renderer onto an existing wgpu renderpass.
@@ -936,6 +957,8 @@ impl Renderer {
             screen_size_in_points,
             dithering: u32::from(self.options.dithering),
             predictable_texture_filtering: u32::from(self.options.predictable_texture_filtering),
+            image_lod_bias: self.image_lod_bias,
+            _padding: 0.0,
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1183,4 +1206,16 @@ impl ScissorRect {
 fn renderer_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
+}
+
+#[test]
+fn egui_shader_with_lod_bias_parses_and_validates() {
+    let module =
+        wgpu::naga::front::wgsl::parse_str(include_str!("egui.wgsl")).expect("parse egui WGSL");
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .expect("validate egui WGSL");
 }

@@ -7,7 +7,8 @@
 
 ## 1. スコープ (v0.8.1 で 3 層化)
 
-補正パラメータは **3 スコープ + 10 スロット** で構成される:
+補正パラメータは **3 スコープ + 10 個の全設定スロット + 4 個のカラー化専用スロット**
+で構成される:
 
 ```
 スコープ              保存先
@@ -17,6 +18,7 @@
 ページ個別            adjustment.db の page_params テーブル
 
 保存スロット 0〜9     settings.json の preset_slots  (独立)
+カラー化スロット 1〜4 settings.json の colorize_preset_slots (独立)
 ```
 
 旧 (v0.5.0〜v0.6.0 開発版) の「フォルダ単位 4 プリセット + ページ→プリセット idx」方式は廃止した。
@@ -116,6 +118,13 @@ rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの
 > Ctrl 修飾に変更した (JIS 配列の Shift+0 は文字を生成しないため特に致命的だった)。
 
 補正パネルの保存スロット欄 (`💾` ボタン) で現在のパラメータをスロットに保存できる。
+カラー化タブ内の 4 スロットは `ColorizeParams` だけを保存するため、呼び出しても色調・AI・
+ポストフィルタを上書きしない。
+
+補正パネルは、上から「見開き対象／適用中スコープ」「フォルダ・お気に入り・グローバル操作」
+「色調／AI／カラー化／フィルタのサブタブ」「すべてリセット」「全設定保存スロット」の順。
+サブタブは中央の設定部分だけを切り替え、スコープ表示と共通操作はどのタブでも残す。
+フィルタタブはグループ見出し付きの縦 Radio で全候補を表示する。
 
 ### 1.5 見開き表示中の左右独立補正 + コピー
 
@@ -172,9 +181,11 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 - `black_point`, `white_point`, `midtone` (トーンカーブのレベル補正)
 - `auto_mode`: `None` / `Auto` / `MangaCleanup` (自動補正モード)
 - AI 関連: `upscale_model`, `denoise_model` (`Option<String>`)
+- **カラー化**: `colorize: ColorizeParams` (近モノクロ判定、階調パレット、
+  スクリーントーン濃淡変換。final pipeline 専用)
 - **ポストフィルタ**: `post_filter: PostFilter` (レトロ系表示エフェクト、色調補正の後に適用)
 - **シャープ化**: `smart_sharpen: u8` (0 = OFF, 1..=100。最終表示段スマートシャープの強度。
-  final pipeline 専用でサムネイルには反映しない。§2.6 と
+  final pipeline 専用でサムネイルには反映しない。§2.7 と
   [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md) を参照)
 
 AI 関連フィールドは「ページ / お気に入り / グローバルに保存された希望設定」であり、
@@ -197,13 +208,63 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 - `temperature != 0` なら f32 パイプライン (やや遅い)
 - v1.1.0 以降のフルスクリーン通常表示では、source 解像度の edit 結果
   (`edit_result_cache`) に色調補正を掛け、その後に final AI、スマートシャープ
-  (`smart_sharpen`、§2.6)、最後に `post_filter::apply` を掛けて
+  (`smart_sharpen`、§2.7)、カラー化、最後に `post_filter::apply` を掛けて
   `final_composite_cache` に格納する。
 
-### 2.2 ポストフィルタ (PostFilter enum)
+### 2.2 カラー化
+
+`ColorizeParams` はモノクロ系画像の専用着色設定で、画像補正パネルの「カラー化」タブから編集する。
+ページ / お気に入り / グローバル / フォルダ一括適用は他の `AdjustParams` と同じスコープを使う。
+カラー化だけを保存・呼び出しできるユーザースロットを 4 個持ち、既存の補正スロット 10 個にも
+`AdjustParams` の一部として含まれる。カラー化自体の初期値は OFF。有効化したときは
+`MonochromeOnly` が初期選択となる。
+
+- 標準パレット: `Legacy4Color` / `LegacySkin`。旧疑似カラーフィルタと同じ 256-entry LUT。
+- カスタムパレット: 2〜10 個の「RGB 色 + 強さ」制御点。隣接点の平均強度から区間長を求め、
+  強度比を通る二次補間で 256-entry LUT を生成する。
+- 元画像の明るさを保持: LUT 色の BT.709 chroma を使い、入力輝度をどの程度再現するかを
+  0〜100% で指定する。新規設定の初期値は 100%。旧ポストフィルタから移行した設定は
+  見た目を維持するため 0% を明示する。
+- 近モノクロ判定: サンプル RGB の主成分軸に 95% 以上の画素が収まるかで判定する。
+  単純な RGB 差だけではないため、黒インクから黄ばんだ紙色へ伸びる一方向の色分布も許容する。
+  UI の「色味の許容量」は主軸からの距離閾値を調整する。
+
+スクリーントーン濃淡変換は着色前の輝度に対して行う。`検出スケール` は長辺 2048px を基準に
+0.1〜4.0 を 0.1 刻みで指定し、初期値は 1.0。実際の画素半径は処理画像の長辺に比例させるため、
+final AI のアップスケール結果へ処理する場合も、アップスケール前と同じ絵柄上の範囲を狙う。
+実効半径は最大 64px に制限する。1px 未満の実効半径は元輝度と半径 1px の結果を補間するため、
+0.1 から連続的に弱く掛けられる。周期判定や文字・線画保護の領域マスクは、トーンと線画の
+境界だけが未変換の縁として残るため使用しない。復元候補は画像全体へ「変換の強さ」で直接合成する。
+
+| 方式 | 処理 |
+| --- | --- |
+| `Off` | 元画素の輝度をそのまま LUT へ入力 |
+| `LocalMean` / UI「弱」 | 指定半径の局所平均を1回適用。網点を軽くなじませる |
+| `Gaussian` / UI「強」 | 局所平均を3回重ねてガウス分布を近似。より広く滑らかに濃淡化 |
+
+旧設定の `EdgePreserving` / `MultiScale` は読み込み時に `Gaussian` へ移行する。比較用素材は
+`samples/tone-algorithm-comparison/01_source.png` にあり、長辺 2048px、検出スケール 1.0、
+変換の強さ 100% で「弱」「強」を切り替えると差を確認できる。
+
+カラー化とトーン変換は大画像で重くなるため、`final_effect_pending` のページ／viewer context
+単位 worker で処理する。環境設定の「AI・カラー化の先読み」で指定した前後枚数について、
+非表示ページも `final_composite_cache` まで 1 枚ずつ背景生成する。先読み開始時は白黒の
+provisional texture を GPU upload せず、完成結果だけを upload するため、完成済みページへの
+移動では白黒→カラーの差し替えを挟まない。先読み中の同じページを表示した場合は worker を
+cancel / 再起動せず表示用へ昇格し、完成までは直前ページを holdover する。カラー化待ちのページは
+生画像やサムネイルへフォールバックしない。ページ入場そのものでは完成済み final composite や
+進行中 worker を無効化せず、設定変更、AI 結果到着、cache eviction のときだけ不要な背景 worker を
+cancel する。`FinalCompositeKey` と items 世代が一致する完了結果だけを採用する。
+サムネイル自体には適用しない。
+
+旧 JSON の `post_filter = pseudo_color4` / `pseudo_color_skin` は読み込み時に
+`ColorizeParams` へ変換し、旧挙動維持のため移行時だけ `AllImages` にする。旧キーマップ名と
+ゲームパッドリング入口は互換エイリアスとして新しい標準カラー化へルーティングする。
+
+### 2.3 ポストフィルタ (PostFilter enum)
 
 レトロ系 (CRT ブラウン管風・機種別減色・複合) と写真系 (カラーグレーディング・アナログ・絵画風・実用)、
-漫画 疑似カラーをまとめて扱う表示エフェクト。全 42 バリアント:
+を扱う表示エフェクト。疑似カラーは専用カラー化へ移動した:
 
 | グループ | バリアント | 内容 |
 | --- | --- | --- |
@@ -241,8 +302,6 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 | 絵画風 | `Halftone` | 6×6 セルの輝度平均 + 距離判定ドット、2 階調グレー |
 | 絵画風 | `OilPaint` | 7×7 Kuwahara フィルタ (4 象限の輝度分散最小領域の平均色) |
 | 絵画風 | `Sketch` | Sobel 3×3 + 強度反転グレー |
-| 疑似カラー | `PseudoColor4` | モノクロ原画の輝度 → クアッドトーン着色 (影=青 / 明部=橙)。GiCoCu `4color4.cur` 由来 |
-| 疑似カラー | `PseudoColorSkin` | モノクロ原画の輝度 → 肌色寄り暖色着色。再現実装 `c4.cur` 由来 |
 | 実用 | `Sharpen` | 5-tap 分離可能ブラーのアンシャープマスク (amount 0.6) |
 
 **複合プリセットの方針**: **非液晶機種 (CRT TV / モニタ接続が標準)** とブラウン管フィルタを
@@ -252,7 +311,7 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 透過 PNG / WebP / GIF を通しても透過部分が不透明化しない。CRT 系は bilinear で alpha も補間
 (`BilinearYCtx::sample_rgba`)、減色系・写真系は元ピクセルから単純継承。
 
-### 漫画 疑似カラーの設計方針 (`mod pseudocolor`)
+### 標準カラー化LUTの設計方針 (`post_filter::pseudocolor`)
 
 モノクロ漫画ビューア「マンガミーヤ」で使われていた **GiCoCu (AviSynth + GIMP トーンカーブ)
 由来の「疑似四色刷り」** を再現したもの。元データは GIMP `.cur` カーブファイル (5ch ×
@@ -260,9 +319,10 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 **輝度 (0..255) → RGB の最終 256-entry LUT** にオフラインで畳み込んだ定数 (`C4_*` / `SKIN_*`)
 を持ち、ピクセル輝度 (`pixel_lum_f32`) を index に LUT を引くだけ (`#[rustfmt::skip]` の固定表)。
 
-- `PseudoColor4` = `4color4.cur` (影=青 / 明部=橙のクアッドトーン)
-- `PseudoColorSkin` = `c4.cur` (中間〜明部を肌色寄りの暖色に着色)
-- 入力はモノクロ原画想定。カラー入力でも輝度を取って着色するので duotone 的に振る舞う。
+- `Legacy4Color` = `4color4.cur` (影=青 / 明部=橙のクアッドトーン)
+- `LegacySkin` = `c4.cur` (中間〜明部を肌色寄りの暖色に着色)
+- 専用カラー化は既定で近モノクロ画像だけへ適用する。「すべての画像」を選ぶと従来どおり
+  カラー入力も輝度化して duotone 的に着色する。
 - 退行ガード: `post_filter::tests::pseudocolor_maps_known_gray_values` が代表点の RGB を固定
   (LUT 破損・取り違えの検知用。下記「忠実度」のとおり GiCoCu 厳密出力との一致は主張しない)。
 
@@ -271,7 +331,7 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 当時のコミュニティ運用では、**「疑似四色刷り "旧形式" アルファ補正付き.cur」を `4color4.cur`
 にリネームして使う**のが定番だった ([MangaMeeya スレ](https://egg.5ch.net/test/read.cgi/software/1416397467/240-n))。
 **"新形式" / "新形式アルファ" は無色化・フリーズの不具合が報告され避けられていた**版である。
-したがって本実装の `PseudoColor4` = `4color4.cur` (= 旧形式アルファ補正付きのリネーム) が
+したがって本実装の `Legacy4Color` = `4color4.cur` (= 旧形式アルファ補正付きのリネーム) が
 **再現の正**であり、"新形式" の数値に寄せる修正は再現性をむしろ損なう。レビューで「新形式に
 合わせるべき / 別形式と値が違う」という指摘が来ても、上記理由で**意図的に旧形式を採用**している。
 
@@ -355,11 +415,11 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 
 **並列化**: `rayon::par_chunks_mut` で行単位に並列処理。4K 画像でも 4080ms 程度。
 
-### 2.3 ポストフィルタの一時バイパス
+### 2.4 カラー化・ポストフィルタの一時バイパス
 
 消しゴム / 隠蔽加工 / 分析モード中は `App::post_filter_bypassed: bool` が `true` になり、
-final composite の `params_hash` から `post_filter` を外す。モード解除時に false に戻し、
-該当 idx の final pipeline cache だけをクリアして post-filter 適用状態で再生成させる。
+final composite の `params_hash` から `colorize` と `post_filter` を外す。モード解除時に false に戻し、
+該当 idx の final pipeline cache だけをクリアして最終表示エフェクト適用状態で再生成させる。
 これは編集時の見やすさだけの切替なので、source 解像度の edit cache や
 `input_generation` は進めない。
 
@@ -370,10 +430,11 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 - **分析**: ヒストグラムは `fs_cache` の生ピクセルから計算されるため、表示だけを生に揃える
 
 `AdjustParams` には:
-- `is_identity()` = 色調 identity **かつ** `post_filter == None` **かつ** `smart_sharpen == 0`
+- `is_identity()` = 色調 identity **かつ** カラー化無効 **かつ**
+  `post_filter == None` **かつ** `smart_sharpen == 0`
 - `is_color_identity()` = 色調 identity のみ (バイパス中の早期 return 判定用)
 
-### 2.4 元画像プレビュー
+### 2.5 元画像プレビュー
 
 右 Ctrl を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
 消しゴム補完結果 / 隠蔽加工を表示選択から外し、元画像を一時表示する。これは「比較用の描画 override」
@@ -381,12 +442,12 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 行わない。表示元は常に raw 専用の `fs_cache` で、消しゴム補完済みページでも
 `erase_base_cache` は参照しない。
 
-### 2.5 Auto モード
+### 2.6 Auto モード
 
 - **Auto**: ヒストグラムの 0.5/99.5 パーセンタイルでレベル補正
 - **MangaCleanup**: 紙/インク検出 → グレースケール → S 字カーブ → γ=0.85 → コントラスト ≥15
 
-### 2.6 最終表示段スマートシャープ (`smart_sharpen`、v1.3.0)
+### 2.7 最終表示段スマートシャープ (`smart_sharpen`、v1.3.0)
 
 設計の出所は [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md)。
 
@@ -505,7 +566,7 @@ AI を無駄に再実行してしまう)。
 
 1. 色調補正 (`apply_adjustments_fast`)
 2. final AI アップスケール / デノイズ (`final_ai_pending` → `final_ai_cache`)
-3. スマートシャープ (`apply_final_smart_sharpen`、`smart_sharpen != 0` のときだけ。§2.6)
+3. スマートシャープ (`apply_final_smart_sharpen`、`smart_sharpen != 0` のときだけ。§2.7)
 4. post_filter (`post_filter::apply`)
 5. GPU upload (`final_composite_cache`)
 
@@ -920,7 +981,7 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
   (そうでないとサムネが常時再生成される)。
 - [ ] **final pipeline 専用の項目** (post_filter / smart_sharpen のようにサムネへ乗せない
   もの) は逆に `is_color_identity()` へ参加させず、`is_identity()` と
-  `hash_adjust_final_params` にだけ追加する (§2.6 のシャープ化が実例)。
+  `hash_adjust_final_params` にだけ追加する (§2.7 のシャープ化が実例)。
 
 ---
 

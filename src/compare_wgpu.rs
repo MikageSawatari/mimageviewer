@@ -42,8 +42,8 @@ struct Params {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let pinned = textureSample(pinned_tex, compare_sampler, in.uv);
-    let current = textureSample(current_tex, compare_sampler, in.uv);
+    let pinned = textureSampleBias(pinned_tex, compare_sampler, in.uv, params.mode_wipe.z);
+    let current = textureSampleBias(current_tex, compare_sampler, in.uv, params.mode_wipe.z);
     if (params.mode_wipe.x < 0.5) {
         if (in.uv.x <= params.mode_wipe.y) {
             return pinned;
@@ -70,6 +70,7 @@ pub struct CompareShaderCallback {
     pub current_rgba: Arc<Vec<u8>>,
     pub mode: CompareShaderMode,
     pub wipe_fraction: f32,
+    pub lod_bias: f32,
     pub target_format: wgpu::TextureFormat,
 }
 
@@ -279,7 +280,7 @@ impl CompareGpuResources {
             queue.write_buffer(
                 &pair.uniform,
                 0,
-                &uniform_bytes(callback.mode, callback.wipe_fraction),
+                &uniform_bytes(callback.mode, callback.wipe_fraction, callback.lod_bias),
             );
         }
     }
@@ -344,12 +345,17 @@ fn upload_rgba_texture(
     UploadedTexture { texture, view }
 }
 
-fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32) -> [u8; 16] {
+fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, lod_bias: f32) -> [u8; 16] {
     let mode = match mode {
         CompareShaderMode::Wipe => 0.0_f32,
         CompareShaderMode::Diff => 1.0_f32,
     };
-    let values = [mode, wipe_fraction.clamp(0.05, 0.95), 0.0, 0.0];
+    let values = [
+        mode,
+        wipe_fraction.clamp(0.05, 0.95),
+        lod_bias.clamp(0.0, 1.5),
+        0.0,
+    ];
     let mut bytes = [0_u8; 16];
     for (i, value) in values.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
@@ -396,5 +402,18 @@ impl egui_wgpu::CallbackTrait for CompareShaderCallback {
         render_pass.set_pipeline(&resources.pipeline);
         render_pass.set_bind_group(0, &pair.bind_group, &[]);
         render_pass.draw(0..6, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompareShaderMode, SHADER, uniform_bytes};
+
+    #[test]
+    fn compare_shader_and_uniform_apply_clamped_lod_bias() {
+        assert!(SHADER.contains("textureSampleBias"));
+        let bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5, 99.0);
+        let bias = f32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(bias, 1.5);
     }
 }

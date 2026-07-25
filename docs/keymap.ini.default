@@ -374,8 +374,8 @@
 # FsPostFilterHalftone = none ; ポストフィルタをハーフトーン（漫画風）にする
 # FsPostFilterOilPaint = none ; ポストフィルタをオイルペイント風にする
 # FsPostFilterSketch = none ; ポストフィルタをスケッチ風にする
-# FsPostFilterPseudoColor4 = none ; ポストフィルタを疑似カラー（4色刷り）にする
-# FsPostFilterPseudoColorSkin = none ; ポストフィルタを疑似カラー（肌色）にする
+# FsPostFilterPseudoColor4 = none ; カラー化を4色刷り（従来互換）にする
+# FsPostFilterPseudoColorSkin = none ; カラー化を肌色（従来互換）にする
 # FsPostFilterSharpen = none ; ポストフィルタをシャープ化にする
 # FsAdjustSlot1.1 = Ctrl+1 ; 補正プリセットスロット1を適用する
 # FsAdjustSlot1.2 = Ctrl+Numpad1 ; 補正プリセットスロット1を適用する

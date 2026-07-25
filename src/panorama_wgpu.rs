@@ -53,6 +53,9 @@ struct Params {
     // フル equirect なら (0, 0, 1, 1)。
     // 部分 FOV equirect (GPano CroppedArea*) は実画像 / フル球面比から計算 (Phase 1.5)。
     crop: vec4<f32>,
+    // sampling.x = mip LOD bias。textureSampleGrad では勾配を 2^bias 倍して
+    // 通常の textureSampleBias と同じく粗い level を選ぶ。
+    sampling: vec4<f32>,
 };
 
 @group(0) @binding(0) var pano_tex: texture_2d<f32>;
@@ -157,7 +160,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             v_crop,
         ),
     );
-    return textureSampleGrad(pano_tex, pano_samp, texture_uv, texture_dx, texture_dy);
+    let lod_scale = exp2(params.sampling.x);
+    return textureSampleGrad(
+        pano_tex,
+        pano_samp,
+        texture_uv,
+        texture_dx * lod_scale,
+        texture_dy * lod_scale,
+    );
 }
 "#;
 
@@ -182,6 +192,7 @@ pub struct PanoramaShaderCallback {
     /// `crate::panorama::PanoUvTransform::IDENTITY` ならフル equirect。
     /// GPano `CroppedArea*` 宣言から計算 (`App::compute_pano_uv_transform`)。
     pub uv_transform: crate::panorama::PanoUvTransform,
+    pub lod_bias: f32,
     pub target_format: wgpu::TextureFormat,
 }
 
@@ -387,10 +398,10 @@ impl PanoStaticGpu {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Uniform buffer は paint() の前 (prepare()) で毎フレーム write_buffer される。
-        // ここでは初期値 0 で作っておく (Params = 2 × vec4<f32> = 32 bytes)。
+        // ここでは初期値 0 で作っておく (Params = 3 × vec4<f32> = 48 bytes)。
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("miv_panorama_uniform"),
-            size: 32,
+            size: 48,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -470,6 +481,7 @@ impl egui_wgpu::CallbackTrait for PanoramaShaderCallback {
                     self.fov_y,
                     self.aspect,
                     self.uv_transform,
+                    self.lod_bias,
                 );
                 queue.write_buffer(&uploaded.0.uniform, 0, &bytes);
             }
@@ -845,30 +857,45 @@ impl egui_wgpu::CallbackTrait for SettleOverlayCallback {
 
 #[cfg(test)]
 mod tests {
-    use super::SHADER;
+    use super::{SHADER, pano_uniform_bytes};
 
     #[test]
     fn panorama_shader_uses_wrapped_explicit_gradients() {
         assert!(SHADER.contains("sphere_dx_raw.x - round(sphere_dx_raw.x)"));
         assert!(SHADER.contains("sphere_dy_raw.x - round(sphere_dy_raw.x)"));
-        assert!(SHADER.contains(
-            "textureSampleGrad(pano_tex, pano_samp, texture_uv, texture_dx, texture_dy)"
-        ));
+        assert!(SHADER.contains("texture_dx * lod_scale"));
+        assert!(SHADER.contains("texture_dy * lod_scale"));
+    }
+
+    #[test]
+    fn panorama_uniform_clamps_lod_bias() {
+        let bytes = pano_uniform_bytes(
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            crate::panorama::PanoUvTransform::IDENTITY,
+            99.0,
+        );
+        let bias = f32::from_ne_bytes(bytes[32..36].try_into().unwrap());
+        assert_eq!(bias, 1.5);
     }
 }
 
-/// `Params` uniform 用バイト列 (2 × vec4<f32> = 8 floats、32 bytes)。
+/// `Params` uniform 用バイト列 (3 × vec4<f32> = 12 floats、48 bytes)。
 ///
 /// レイアウト:
 /// - bytes[0..16]: pose = (yaw, pitch, fov_y, aspect)
 /// - bytes[16..32]: crop = (u_offset, v_offset, u_scale, v_scale)
+/// - bytes[32..48]: sampling = (lod_bias, 0, 0, 0)
 pub fn pano_uniform_bytes(
     yaw: f32,
     pitch: f32,
     fov_y: f32,
     aspect: f32,
     uv_transform: crate::panorama::PanoUvTransform,
-) -> [u8; 32] {
+    lod_bias: f32,
+) -> [u8; 48] {
     let values = [
         yaw,
         pitch,
@@ -878,8 +905,12 @@ pub fn pano_uniform_bytes(
         uv_transform.v_offset,
         uv_transform.u_scale,
         uv_transform.v_scale,
+        lod_bias.clamp(0.0, 1.5),
+        0.0,
+        0.0,
+        0.0,
     ];
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; 48];
     for (i, v) in values.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
     }

@@ -205,7 +205,7 @@ const POST_FILTER_GROUPS: &[PostFilterGroup] = &[
         filters: POST_FILTER_GROUP_DRAWING,
     },
     PostFilterGroup {
-        label: "漫画 疑似カラー",
+        label: "カラー化（互換）",
         filters: POST_FILTER_GROUP_PSEUDO_COLOR,
     },
     PostFilterGroup {
@@ -2254,10 +2254,23 @@ impl App {
             .settings
             .fullscreen_fit_mode
             .effective_for_flow(self.reading_flow);
-        let post_filter = params
+        let actual_post_filter = params
             .as_ref()
             .map(|p| p.post_filter)
             .unwrap_or(PostFilter::None);
+        let colorize = params
+            .as_ref()
+            .map(|p| p.colorize.clone())
+            .unwrap_or_default();
+        let post_filter = if actual_post_filter == PostFilter::None && colorize.is_enabled() {
+            match colorize.palette {
+                crate::colorize::ColorizePalette::Legacy4Color => PostFilter::PseudoColor4,
+                crate::colorize::ColorizePalette::LegacySkin => PostFilter::PseudoColorSkin,
+                crate::colorize::ColorizePalette::Custom => actual_post_filter,
+            }
+        } else {
+            actual_post_filter
+        };
         let upscale_model_key = params.and_then(|p| p.upscale_model);
         let video_volume = self.settings.video_volume;
         let video_playback_speed = self.video_playback_speed;
@@ -2273,7 +2286,8 @@ impl App {
             reading_flow,
             reading_direction,
             fit_mode,
-            post_filter,
+            post_filter: actual_post_filter,
+            colorize,
             upscale_model_key: upscale_model_key.clone(),
             video_volume,
             video_playback_speed,
@@ -3083,11 +3097,8 @@ impl App {
                     self.report_rating_write_error(&error);
                 }
             }
-            RingPickerRowId::PostFilter
-                if self.reading_flow.is_paged()
-                    && self.effective_params(fs_idx).post_filter != picker.post_filter =>
-            {
-                self.preview_picker_post_filter(fs_idx, picker.post_filter);
+            RingPickerRowId::PostFilter if self.reading_flow.is_paged() => {
+                self.preview_picker_post_filter(fs_idx, picker);
             }
             // UpscaleModel remains commit-only to avoid expensive redraws per repeat.
             _ => {}
@@ -4024,10 +4035,21 @@ impl App {
         }
         if self.reading_flow.is_paged() {
             if picker.dirty_rows.contains(&RingPickerRowId::PostFilter) {
-                if self.effective_params(fs_idx).post_filter != picker.original.post_filter {
-                    self.preview_picker_post_filter(fs_idx, picker.original.post_filter);
+                let current = self.effective_params(fs_idx);
+                if current.post_filter != picker.original.post_filter
+                    || current.colorize != picker.original.colorize
+                {
+                    self.preview_picker_post_filter_selection(
+                        fs_idx,
+                        picker.original.post_filter,
+                        &picker.original.colorize,
+                    );
                 }
-                self.apply_picker_post_filter(fs_idx, picker.post_filter);
+                self.apply_picker_post_filter(
+                    fs_idx,
+                    picker.post_filter,
+                    &picker.original.colorize,
+                );
             }
             if picker.dirty_rows.contains(&RingPickerRowId::UpscaleModel) {
                 self.apply_picker_upscale_model(fs_idx, picker.upscale_model_key);
@@ -4077,14 +4099,50 @@ impl App {
         }
     }
 
-    fn preview_picker_post_filter(&mut self, fs_idx: usize, next: PostFilter) {
+    fn picker_post_filter_params(
+        mut params: crate::adjustment::AdjustParams,
+        next: PostFilter,
+        original_colorize: &crate::colorize::ColorizeParams,
+    ) -> crate::adjustment::AdjustParams {
+        params.colorize = original_colorize.clone();
+        match next {
+            PostFilter::PseudoColor4 => {
+                params.post_filter = PostFilter::None;
+                params
+                    .colorize
+                    .enable_with_palette(crate::colorize::ColorizePalette::Legacy4Color);
+            }
+            PostFilter::PseudoColorSkin => {
+                params.post_filter = PostFilter::None;
+                params
+                    .colorize
+                    .enable_with_palette(crate::colorize::ColorizePalette::LegacySkin);
+            }
+            other => params.post_filter = other,
+        }
+        params
+    }
+
+    fn preview_picker_post_filter(&mut self, fs_idx: usize, picker: &RingPickerState) {
+        self.preview_picker_post_filter_selection(
+            fs_idx,
+            picker.post_filter,
+            &picker.original.colorize,
+        );
+    }
+
+    fn preview_picker_post_filter_selection(
+        &mut self,
+        fs_idx: usize,
+        next: PostFilter,
+        original_colorize: &crate::colorize::ColorizeParams,
+    ) {
         let scope = self.resolve_adjust_scope(fs_idx);
         let old_params = self.effective_params(fs_idx).clone();
-        if old_params.post_filter == next {
+        let params = Self::picker_post_filter_params(old_params.clone(), next, original_colorize);
+        if old_params == params {
             return;
         }
-        let mut params = old_params.clone();
-        params.post_filter = next;
         match scope {
             crate::ui_fullscreen::AdjustScope::PageOverride => {
                 self.adjustment_page_params.insert(fs_idx, params.clone());
@@ -4099,26 +4157,28 @@ impl App {
         self.clear_caches_for_param_change(fs_idx, &old_params, &params);
     }
 
-    fn apply_picker_post_filter(&mut self, fs_idx: usize, next: PostFilter) {
+    fn apply_picker_post_filter(
+        &mut self,
+        fs_idx: usize,
+        next: PostFilter,
+        original_colorize: &crate::colorize::ColorizeParams,
+    ) {
         let scope = self.resolve_adjust_scope(fs_idx);
         let old_params = self.effective_params(fs_idx).clone();
-        if old_params.post_filter == next {
+        let params = Self::picker_post_filter_params(old_params.clone(), next, original_colorize);
+        if old_params == params {
             return;
         }
-        let mut params = old_params.clone();
-        params.post_filter = next;
-        self.show_feedback_toast(format!(
-            "[Picker: {} / {}]",
-            scope.label(),
-            next.display_label()
-        ));
-        self.capture_adjust_full(
-            format!("ポストフィルタ: {}", next.display_label()),
-            |app| {
-                app.write_params_for_scope(fs_idx, scope, params.clone());
-                app.clear_caches_for_param_change(fs_idx, &old_params, &params);
-            },
-        );
+        let label = match next {
+            PostFilter::PseudoColor4 => "カラー化 4色刷り（従来互換）",
+            PostFilter::PseudoColorSkin => "カラー化 肌色（従来互換）",
+            _ => next.display_label(),
+        };
+        self.show_feedback_toast(format!("[Picker: {} / {}]", scope.label(), label));
+        self.capture_adjust_full(format!("表示エフェクト: {label}"), |app| {
+            app.write_params_for_scope(fs_idx, scope, params.clone());
+            app.clear_caches_for_param_change(fs_idx, &old_params, &params);
+        });
     }
 
     fn apply_picker_upscale_model(&mut self, fs_idx: usize, next: Option<String>) {
@@ -7299,9 +7359,14 @@ mod tests {
     #[test]
     fn post_filter_drill_groups_cover_all_filters_once() {
         let grouped_count: usize = POST_FILTER_GROUPS.iter().map(|g| g.filters.len()).sum();
-        assert_eq!(grouped_count, PostFilter::ALL.len());
+        // 専用カラー化へ移行した 2 項目は T キーの PostFilter::ALL から外す一方、
+        // 既存リング操作の互換入口としてグループ内に残す。
+        assert_eq!(grouped_count, PostFilter::ALL.len() + 2);
 
-        for &filter in PostFilter::ALL {
+        for &filter in PostFilter::ALL
+            .iter()
+            .chain([PostFilter::PseudoColor4, PostFilter::PseudoColorSkin].iter())
+        {
             let occurrences = POST_FILTER_GROUPS
                 .iter()
                 .flat_map(|g| g.filters.iter().copied())

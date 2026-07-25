@@ -2363,6 +2363,7 @@ pub struct RingPickerOriginalState {
     pub reading_direction: crate::settings::ReadingDirection,
     pub fit_mode: crate::settings::FullscreenFitMode,
     pub post_filter: crate::adjustment::PostFilter,
+    pub colorize: crate::colorize::ColorizeParams,
     pub upscale_model_key: Option<String>,
     pub video_volume: f64,
     pub video_playback_speed: f64,

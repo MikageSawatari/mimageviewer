@@ -2154,6 +2154,7 @@ struct ViewerContextBundle {
     final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
     final_ai_failed: std::collections::HashSet<FinalAiKey>,
     final_composite_cache: std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    final_effect_pending: std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
     adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
     erase_preview_cache: std::collections::HashMap<usize, ErasePreviewCacheEntry>,
@@ -2209,6 +2210,9 @@ impl Drop for ViewerContextBundle {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         if let Some(pending) = self.folder_pane_open_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for pending in self.final_effect_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -2417,6 +2421,7 @@ impl ViewerContextBundle {
             final_ai_pending: std::collections::HashMap::new(),
             final_ai_failed: std::collections::HashSet::new(),
             final_composite_cache: std::collections::HashMap::new(),
+            final_effect_pending: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
             erase_result_cache: std::collections::HashMap::new(),
             erase_preview_cache: std::collections::HashMap::new(),
@@ -3864,6 +3869,7 @@ fn hash_adjust_final_params(
         hash_adjust_color_ai_params(params, ai_feature_mode).hash(h);
         post_filter_bypassed.hash(h);
         if !post_filter_bypassed {
+            format!("{:?}", params.colorize).hash(h);
             format!("{:?}", params.post_filter).hash(h);
         }
         // 最終表示段スマートシャープ。post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も
@@ -4585,6 +4591,9 @@ pub(crate) struct AiJob {
     pub(crate) runtime: Arc<crate::ai::runtime::AiRuntime>,
     pub(crate) manager: Arc<crate::ai::model_manager::ModelManager>,
     pub(crate) source: Arc<egui::ColorImage>,
+    /// 先読み経路は UI スレッドで色調補正を焼かず、AI worker 上で適用する。
+    /// 表示経路の source は既に補正済みなので None。
+    pub(crate) adjust_before_ai: Option<crate::adjustment::AdjustParams>,
     pub(crate) denoise_kind: Option<crate::ai::ModelKind>,
     pub(crate) upscale_kind: Option<crate::ai::ModelKind>,
 }
@@ -4708,6 +4717,86 @@ pub(crate) struct FinalCompositeEntry {
     pub(crate) texture: egui::TextureHandle,
     /// false は AI 完了待ち中の暫定プレビュー。AI が届いたら同じ key を上書きする。
     pub(crate) complete: bool,
+}
+
+pub(crate) struct FinalEffectPending {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<FinalEffectResult>,
+    items_generation: u64,
+    output_complete: bool,
+    nearest_sampler: bool,
+    /// 非表示ページの先読みとして起動した worker。表示要求時は同じ job を昇格して再利用する。
+    prefetch: bool,
+}
+
+pub(crate) enum FinalEffectResult {
+    Ready {
+        pixels: Arc<egui::ColorImage>,
+        elapsed_ms: f64,
+    },
+    Cancelled,
+}
+
+struct FinalEffectJob {
+    source: Arc<egui::ColorImage>,
+    /// AI を使わない先読みでは、色調補正も worker 上で行って UI を止めない。
+    adjust_before_effect: Option<crate::adjustment::AdjustParams>,
+    smart_sharpen: u8,
+    colorize: crate::colorize::ColorizeParams,
+    post_filter: crate::adjustment::PostFilter,
+}
+
+fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffectResult {
+    let started = std::time::Instant::now();
+    if cancel.load(Ordering::Relaxed) {
+        return FinalEffectResult::Cancelled;
+    }
+    let adjusted = if let Some(params) = job.adjust_before_effect.as_ref() {
+        Arc::new(crate::adjustment::apply_adjustments_fast(
+            &job.source,
+            params,
+        ))
+    } else {
+        job.source
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return FinalEffectResult::Cancelled;
+    }
+    let sharpened = if job.smart_sharpen == 0 {
+        adjusted
+    } else {
+        Arc::new(crate::adjustment::apply_final_smart_sharpen(
+            &adjusted,
+            job.smart_sharpen,
+        ))
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return FinalEffectResult::Cancelled;
+    }
+    let colorized = if crate::colorize::should_apply(&sharpened, &job.colorize) {
+        match crate::colorize::apply_with_cancel(&sharpened, &job.colorize, cancel) {
+            Some(image) => Arc::new(image),
+            None => return FinalEffectResult::Cancelled,
+        }
+    } else {
+        sharpened
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return FinalEffectResult::Cancelled;
+    }
+    let pixels = if job.post_filter != crate::adjustment::PostFilter::None {
+        Arc::new(crate::post_filter::apply(&colorized, job.post_filter))
+    } else {
+        colorized
+    };
+    if cancel.load(Ordering::Relaxed) {
+        FinalEffectResult::Cancelled
+    } else {
+        FinalEffectResult::Ready {
+            pixels,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        }
+    }
 }
 
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
@@ -8495,6 +8584,9 @@ pub struct App {
     /// 最終 composite cache。AdjustParams 全項目 + AI + post_filter 適用後。
     pub(crate) final_composite_cache:
         std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    /// カラー化を含む最終表示エフェクト worker。viewer context ごとに所有する。
+    pub(crate) final_effect_pending:
+        std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
     /// 補正レイヤー合成 worker。idx ごとに最新 1 本だけ動かす。
     pub(crate) local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
     /// 選択中レイヤーだけを一時除外した補正レイヤー結果 cache。
@@ -10726,6 +10818,7 @@ impl App {
             final_ai_rx: None,
             final_ai_result_backlog: Vec::new(),
             final_composite_cache: std::collections::HashMap::new(),
+            final_effect_pending: std::collections::HashMap::new(),
             local_adjust_pending: std::collections::HashMap::new(),
             local_adjust_layer_bypass_cache: std::collections::HashMap::new(),
             local_adjust_layer_bypass_pending: None,
@@ -12226,6 +12319,7 @@ impl App {
             final_ai_pending,
             final_ai_failed,
             final_composite_cache,
+            final_effect_pending,
             adjustment_cache,
             erase_result_cache,
             erase_preview_cache,
@@ -12449,6 +12543,7 @@ impl App {
         swap_field!(final_ai_pending);
         swap_field!(final_ai_failed);
         swap_field!(final_composite_cache);
+        swap_field!(final_effect_pending);
         swap_field!(adjustment_cache);
         swap_field!(erase_result_cache);
         swap_field!(erase_preview_cache);
@@ -35799,6 +35894,7 @@ impl App {
             final_ai_pending,
             final_ai_failed,
             final_composite_cache,
+            final_effect_pending,
             adjustment_cache,
             erase_result_cache,
             erase_preview_cache,
@@ -36034,6 +36130,7 @@ impl App {
             final_ai_pending,
             final_ai_failed,
             final_composite_cache,
+            final_effect_pending,
             adjustment_cache,
             erase_result_cache,
             erase_preview_cache,
@@ -38032,8 +38129,12 @@ impl App {
             return;
         }
 
-        // viewer 内ページ送りでも、idx を差し替える前に前ページの完成済み編集結果を
-        // 派生キャッシュへ渡す。grid からの新規入場では fullscreen_idx=None なので no-op。
+        // viewer 内ページ送りでは idx を差し替える前に、カラー化待ち用の完成表示と
+        // 前ページの完成済み編集結果を退避する。grid からの新規入場では
+        // fullscreen_idx=None なので holdover は空になる。
+        if self.fullscreen_idx != Some(idx) {
+            self.capture_colorize_page_transition_holdover(idx);
+        }
         if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {
             self.cache_current_edit_preview_if_ready();
         }
@@ -38199,12 +38300,12 @@ impl App {
         if !pano_toast_fired && self.adjustment_page_params.contains_key(&idx) {
             self.show_feedback_toast("ページ補正適用".to_string());
         }
-        // ページ切替時に補正キャッシュをクリア（前ページの補正結果を残さない）
-        // ただし ai_upscale_cache は消さない（再処理が重いため）
+        // legacy の表示用補正 texture はページ入場時に作り直す。final pipeline は
+        // edit/source generation と AdjustParams hash で正当性を判定できるため、
+        // ここで adjustment generation を bump してはいけない。bump すると次ページの
+        // 完成済みカラー化先読みと進行中 worker を、表示直前に自分で破棄してしまう。
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
-        // 360 度パノラマビュー: cache 内容変化 → 世代 bump (§3.6.2.2)。
-        self.bump_adjustment_generation(idx);
         let grid_open_intent = std::mem::take(&mut self.fs_open_intent_from_grid);
         let video_ignore_resume_once = self.fs_video_open_ignore_resume_once;
 
@@ -45822,16 +45923,22 @@ impl App {
         include_post_filter: bool,
     ) -> Arc<egui::ColorImage> {
         let params = self.effective_params(idx).clone();
+        let apply_colorize = include_post_filter && params.colorize.is_enabled();
         let apply_pf =
             include_post_filter && params.post_filter != crate::adjustment::PostFilter::None;
-        if params.is_color_identity() && !apply_pf {
+        if params.is_color_identity() && !apply_colorize && !apply_pf {
             return pixels;
         }
         let adjusted = crate::adjustment::apply_adjustments_fast(&pixels, &params);
-        let post_filtered = if apply_pf {
-            crate::post_filter::apply(&adjusted, params.post_filter)
+        let colorized = if apply_colorize {
+            crate::colorize::apply(&adjusted, &params.colorize)
         } else {
             adjusted
+        };
+        let post_filtered = if apply_pf {
+            crate::post_filter::apply(&colorized, params.post_filter)
+        } else {
+            colorized
         };
         Arc::new(post_filtered)
     }
@@ -46601,6 +46708,70 @@ impl App {
         }
     }
 
+    /// カラー化を含む final composite の先読み。AI と同じ前後枚数を使い、
+    /// 非表示ページは CPU pixels だけを worker へ渡す。完了時の GPU upload は
+    /// `poll_final_effects` の 1 結果として行い、ページ移動時は完成 texture が即 hit する。
+    fn prefetch_final_effects(&mut self, ctx: &egui::Context, current_idx: usize) {
+        if self.post_filter_bypassed
+            || self
+                .final_effect_pending
+                .values()
+                .any(|pending| !pending.cancel.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        for idx in self.ai_prefetch_targets(current_idx) {
+            let params = self.effective_params(idx).clone();
+            if !params.colorize.is_enabled() {
+                continue;
+            }
+            let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
+                continue;
+            };
+            let final_key =
+                self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
+            if self
+                .final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete)
+                || self.final_effect_pending.contains_key(&final_key)
+            {
+                continue;
+            }
+
+            let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
+            let (source, used_upscale, adjust_before_effect) = match ai_key {
+                Some(key) => {
+                    if let Some(entry) = self.final_ai_cache.get(&key).cloned() {
+                        (entry.pixels, entry.used_upscale, None)
+                    } else if self.final_ai_failed.contains(&key) {
+                        let adjust = (!params.is_color_identity()).then_some(params.clone());
+                        (Arc::clone(&edit_pixels), false, adjust)
+                    } else {
+                        // AI 結果が到着してから final effect を作る。AI 前の完成 entry を
+                        // 同じ key へ入れると Ready 到着後も stale な白黒結果が残る。
+                        continue;
+                    }
+                }
+                None => {
+                    let adjust = (!params.is_color_identity()).then_some(params.clone());
+                    (Arc::clone(&edit_pixels), false, adjust)
+                }
+            };
+            let job = FinalEffectJob {
+                source,
+                adjust_before_effect,
+                smart_sharpen: params.effective_smart_sharpen(used_upscale),
+                colorize: params.colorize.clone(),
+                post_filter: params.post_filter,
+            };
+            if self.spawn_final_effect_job(ctx, final_key, job, true, true) {
+                // 背景 CPU / GPU と完成時 upload を一度に積み上げない。
+                return;
+            }
+        }
+    }
+
     /// 新パイプライン (v1.1.0+) の AI 先読み。表示中画像の前後について
     /// `final_ai_cache` を埋め、ページ送り時に AI 結果が即 hit する状態にする。
     ///
@@ -46619,6 +46790,11 @@ impl App {
     /// - `maybe_start_final_ai` 内の "active pending check" は cancel 済を除外
     ///   しないため、ここで `has_uncancelled_final_ai_pending` を別途 gate する。
     pub(crate) fn prefetch_final_ai(&mut self, ctx: &egui::Context, current_idx: usize) {
+        // 背景 final-effect は現在ページの ensure 経路に依存せず、fullscreen work
+        // セクション自体で回収する。ensure 側の poll はコピー / 書き出し等の入口用に残す。
+        self.poll_final_effects(ctx);
+        // AI を使わないページもあるため、カラー化先読みは AI pending gate の外で進める。
+        self.prefetch_final_effects(ctx, current_idx);
         // 現在ページの AI が走っている間 (= cancel されていない pending あり) は
         // 先読みしない。旧設計 `current_done && empty` 条件と同等。
         if self.has_uncancelled_final_ai_pending() {
@@ -46675,7 +46851,7 @@ impl App {
                 continue;
             }
             // prefetch 経路は戻り値不要 (composite を作らないので complete 判定がない)。
-            let _ = self.maybe_start_final_ai(idx, key, edit_pixels, params);
+            let _ = self.maybe_start_final_ai(idx, key, edit_pixels, params, false);
         }
     }
 
@@ -47776,6 +47952,7 @@ impl App {
 
     fn clear_final_pipeline_caches_for_idx_inner(&mut self, idx: usize, clear_retained: bool) {
         self.cancel_final_ai_for_idx(idx);
+        self.cancel_final_effects_for_idx(idx);
         self.final_ai_cache.retain(|key, _| key.edit_key.idx != idx);
         self.final_ai_failed.retain(|key| key.edit_key.idx != idx);
         self.final_composite_cache
@@ -47796,6 +47973,7 @@ impl App {
         self.final_ai_pending.clear();
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
+        self.cancel_all_final_effects();
         self.final_composite_cache.clear();
         self.comic_cache.clear();
         self.cancel_all_comic_bakes();
@@ -47808,6 +47986,7 @@ impl App {
         }
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
+        self.cancel_all_final_effects();
         self.final_composite_cache.clear();
         self.comic_cache.clear();
         self.cancel_all_comic_bakes();
@@ -49970,6 +50149,7 @@ impl App {
         key: FinalAiKey,
         source_image: Arc<egui::ColorImage>,
         params: crate::adjustment::AdjustParams,
+        source_is_color_adjusted: bool,
     ) -> bool {
         if self.final_ai_cache.contains_key(&key) || self.final_ai_pending.contains_key(&key) {
             return true;
@@ -50129,6 +50309,8 @@ impl App {
             },
         );
         if let Some(queue) = self.ai_job_queue.as_ref() {
+            let adjust_before_ai =
+                (!source_is_color_adjusted && !params.is_color_identity()).then_some(params);
             queue.enqueue(AiJob {
                 job_id,
                 key,
@@ -50139,6 +50321,7 @@ impl App {
                 runtime,
                 manager,
                 source: source_image,
+                adjust_before_ai,
                 denoise_kind: denoise_model,
                 upscale_kind: upscale_model,
             });
@@ -50150,20 +50333,237 @@ impl App {
         true
     }
 
+    fn cancel_final_effects_for_idx(&mut self, idx: usize) {
+        let keys: Vec<FinalCompositeKey> = self
+            .final_effect_pending
+            .keys()
+            .copied()
+            .filter(|key| key.edit_key.idx == idx)
+            .collect();
+        for key in keys {
+            if let Some(pending) = self.final_effect_pending.remove(&key) {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn cancel_all_final_effects(&mut self) {
+        for (_, pending) in self.final_effect_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cancel_prefetch_final_effects_except(&mut self, keep: Option<FinalCompositeKey>) {
+        let keys: Vec<FinalCompositeKey> = self
+            .final_effect_pending
+            .iter()
+            .filter_map(|(key, pending)| (pending.prefetch && Some(*key) != keep).then_some(*key))
+            .collect();
+        for key in keys {
+            if let Some(pending) = self.final_effect_pending.remove(&key) {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn poll_final_effects(&mut self, ctx: &egui::Context) {
+        if self.final_effect_pending.is_empty() {
+            return;
+        }
+        let mut completed = Vec::new();
+        let mut disconnected = Vec::new();
+        for (&key, pending) in &self.final_effect_pending {
+            match pending.rx.try_recv() {
+                Ok(result) => completed.push((key, result)),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
+            }
+        }
+        let had_updates = !completed.is_empty() || !disconnected.is_empty();
+        for key in disconnected {
+            self.final_effect_pending.remove(&key);
+            self.final_composite_cache.remove(&key);
+        }
+        for (key, result) in completed {
+            let Some(pending) = self.final_effect_pending.remove(&key) else {
+                continue;
+            };
+            if pending.items_generation != self.items_generation {
+                continue;
+            }
+            match result {
+                FinalEffectResult::Ready { pixels, elapsed_ms } => {
+                    let upload_started = std::time::Instant::now();
+                    let upload = clamp_for_gpu(&pixels).into_owned();
+                    let texture = ctx.load_texture(
+                        format!(
+                            "final_effect_{}_{}_{}_{}",
+                            key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
+                        ),
+                        upload,
+                        if pending.nearest_sampler {
+                            egui::TextureOptions::NEAREST
+                        } else {
+                            DISPLAY_IMAGE_TEXTURE_OPTIONS
+                        },
+                    );
+                    let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+                    let [width, height] = pixels.size;
+                    self.final_composite_cache.insert(
+                        key,
+                        FinalCompositeEntry {
+                            pixels,
+                            texture,
+                            complete: pending.output_complete,
+                        },
+                    );
+                    self.comic_cache.remove(&key.edit_key.idx);
+                    self.cancel_comic_bake_for_idx(key.edit_key.idx);
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "final_effect_worker",
+                            None,
+                            0,
+                            &[
+                                ("ms", (elapsed_ms + upload_ms).into()),
+                                ("worker_ms", elapsed_ms.into()),
+                                ("upload_ms", upload_ms.into()),
+                                ("w", (width as u64).into()),
+                                ("h", (height as u64).into()),
+                                ("idx", (key.edit_key.idx as u64).into()),
+                                ("worker", true.into()),
+                            ],
+                        );
+                    }
+                }
+                FinalEffectResult::Cancelled => {
+                    self.final_composite_cache.remove(&key);
+                }
+            }
+        }
+        if !self.final_effect_pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        if had_updates {
+            ctx.request_repaint();
+        }
+    }
+
+    fn start_final_effect_worker(
+        &mut self,
+        ctx: &egui::Context,
+        key: FinalCompositeKey,
+        params: &crate::adjustment::AdjustParams,
+        source: Arc<egui::ColorImage>,
+        output_complete: bool,
+    ) -> Option<egui::TextureHandle> {
+        let reuse_prefetch = self
+            .final_effect_pending
+            .get(&key)
+            .is_some_and(|pending| pending.output_complete == output_complete);
+        if let Some(entry) = self
+            .final_composite_cache
+            .get(&key)
+            .filter(|entry| entry.complete)
+        {
+            return Some(entry.texture.clone());
+        }
+
+        // 表示要求は背景先読みより優先する。同じ key の先読みは投資を捨てず、
+        // 白黒の provisional texture を公開せず、その worker を表示用へ昇格する。
+        // 完成までの描画は viewer 側が前ページの holdover を使う。
+        self.cancel_prefetch_final_effects_except(reuse_prefetch.then_some(key));
+        if !reuse_prefetch {
+            self.cancel_final_effects_for_idx(key.edit_key.idx);
+        }
+        if reuse_prefetch {
+            if let Some(pending) = self.final_effect_pending.get_mut(&key) {
+                pending.prefetch = false;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return None;
+        }
+
+        let job = FinalEffectJob {
+            source,
+            adjust_before_effect: None,
+            smart_sharpen: 0,
+            colorize: params.colorize.clone(),
+            post_filter: params.post_filter,
+        };
+        let _ = self.spawn_final_effect_job(ctx, key, job, output_complete, false);
+        None
+    }
+
+    fn spawn_final_effect_job(
+        &mut self,
+        ctx: &egui::Context,
+        key: FinalCompositeKey,
+        job: FinalEffectJob,
+        output_complete: bool,
+        prefetch: bool,
+    ) -> bool {
+        let nearest_sampler = job.post_filter.needs_nearest_sampler();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let thread_name = if prefetch {
+            format!("miv-final-effect-prefetch-{}", key.edit_key.idx)
+        } else {
+            format!("miv-final-effect-{}", key.edit_key.idx)
+        };
+        let spawn_result = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let _ = tx.send(run_final_effect_job(job, &worker_cancel));
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.final_effect_pending.insert(
+                    key,
+                    FinalEffectPending {
+                        cancel,
+                        rx,
+                        items_generation: self.items_generation,
+                        output_complete,
+                        nearest_sampler,
+                        prefetch,
+                    },
+                );
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                true
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "[final-effect] worker spawn failed idx={} error={error}",
+                    key.edit_key.idx
+                ));
+                self.final_composite_cache.remove(&key);
+                false
+            }
+        }
+    }
+
     fn apply_final_post_filter(
         &self,
         src: Arc<egui::ColorImage>,
         params: &crate::adjustment::AdjustParams,
     ) -> Arc<egui::ColorImage> {
+        let colorized = if !self.post_filter_bypassed && params.colorize.is_enabled() {
+            Arc::new(crate::colorize::apply(&src, &params.colorize))
+        } else {
+            src
+        };
         let apply_pf =
             !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
         if apply_pf {
-            Arc::new(crate::post_filter::apply(&src, params.post_filter))
+            Arc::new(crate::post_filter::apply(&colorized, params.post_filter))
         } else {
             // ポストフィルタ無効時は全画素コピー (~45MP で 50-96ms) を避けて Arc を素通し。
             // 無変換 (色補正/AI/シャープも無し) なら src は edit_pixels と同一 Arc のままなので、
             // 呼び出し側の `Arc::ptr_eq` 判定で二重 GPU アップロードも回避できる。
-            src
+            colorized
         }
     }
 
@@ -50178,7 +50578,7 @@ impl App {
         complete: bool,
         base_used_upscale: bool,
         reason: &str,
-    ) -> egui::TextureHandle {
+    ) -> Option<egui::TextureHandle> {
         let perf_on = crate::perf::is_enabled();
         let build_start = perf_on.then(std::time::Instant::now);
         let sharpen_strength = params.effective_smart_sharpen(base_used_upscale);
@@ -50192,6 +50592,10 @@ impl App {
             ))
         };
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+
+        if !self.post_filter_bypassed && params.colorize.is_enabled() {
+            return self.start_final_effect_worker(ctx, final_key, params, sharpened, complete);
+        }
 
         let t_post0 = perf_on.then(std::time::Instant::now);
         let post_filtered = self.apply_final_post_filter(sharpened, params);
@@ -50258,7 +50662,7 @@ impl App {
                 ],
             );
         }
-        texture
+        Some(texture)
     }
 
     fn restore_retained_pdf_final_ai_composite(
@@ -50280,7 +50684,7 @@ impl App {
         let (ai_key, entry, edit_size) =
             self.lookup_retained_pdf_final_ai(idx, "restore_final_composite")?;
         self.final_ai_cache.insert(ai_key, entry.clone());
-        Some(self.build_final_composite_texture_from_base(
+        self.build_final_composite_texture_from_base(
             ctx,
             idx,
             final_key,
@@ -50290,7 +50694,7 @@ impl App {
             true,
             entry.used_upscale,
             "retained_pdf_final_ai",
-        ))
+        )
     }
 
     pub(crate) fn ensure_final_composite_texture(
@@ -50298,6 +50702,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.poll_final_effects(ctx);
         if self.fs_entry_is_animated(idx) {
             return None;
         }
@@ -50380,7 +50785,7 @@ impl App {
                     // 暫定 entry を返し続け、コピー / 書き出しが永久に待つ
                     // (Codex P2 第 2 ラウンド: 同フレーム内の failed 直接 insert や、
                     // runtime 初期化失敗 / モデル不在で何も立てずに return する経路)。
-                    self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone())
+                    self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone(), true)
                 };
                 (Arc::clone(&adjusted), !ai_will_arrive, false)
             }
@@ -50404,6 +50809,10 @@ impl App {
             ))
         };
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+
+        if !self.post_filter_bypassed && params.colorize.is_enabled() {
+            return self.start_final_effect_worker(ctx, final_key, &params, sharpened, complete);
+        }
 
         let t_post0 = perf_on.then(std::time::Instant::now);
         let post_filtered = self.apply_final_post_filter(sharpened, &params);
@@ -51294,6 +51703,7 @@ impl App {
                     };
                     if live_pending {
                         self.final_ai_cache.insert(key, entry);
+                        self.cancel_final_effects_for_idx(key.edit_key.idx);
                         self.final_composite_cache.retain(|cache_key, entry| {
                             cache_key.edit_key != key.edit_key || entry.complete
                         });
@@ -51373,6 +51783,17 @@ impl App {
             .retain(|key| keep_set.contains(&key.edit_key.idx));
         self.final_composite_cache
             .retain(|key, _| keep_set.contains(&key.edit_key.idx));
+        let final_effect_evict: Vec<FinalCompositeKey> = self
+            .final_effect_pending
+            .keys()
+            .copied()
+            .filter(|key| !keep_set.contains(&key.edit_key.idx))
+            .collect();
+        for key in final_effect_evict {
+            if let Some(pending) = self.final_effect_pending.remove(&key) {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+        }
         // comic は final composite を下地にするので keep_set に追従させる (Codex P2:
         // フル解像度 comic を eviction で生き残らせない + 下地と整合)。
         self.comic_cache.retain(|idx, _| keep_set.contains(idx));
@@ -52814,6 +53235,7 @@ impl App {
         let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
         // final pipeline と違い、この legacy cache ではシャープ化を含めない。
         // upscaler 実行有無を保持しない中間 cache へ final-stage 判定を持ち込まないため。
+        // カラー化も final-effect worker が非同期で適用するので、この同期経路には乗せない。
         let post_filtered = if apply_pf {
             crate::post_filter::apply(&adjusted, params.post_filter)
         } else {
@@ -52922,6 +53344,7 @@ impl App {
     pub(crate) fn clear_final_stage_only_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
+        self.cancel_final_effects_for_idx(idx);
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
         self.final_composite_cache
@@ -53125,6 +53548,7 @@ impl App {
         // 毎回 AI を待たされる退行があった (= 「先読み進捗バーは出ているのに次画像で
         // 一瞬アップスケール前が見えて、AI 処理から再表示」のユーザー報告)。
         let Some(key) = self.metadata_cache_key(idx) else {
+            self.cancel_final_effects_for_idx(idx);
             self.final_composite_cache
                 .retain(|cache_key, _| cache_key.edit_key.idx != idx);
             self.comic_cache.remove(&idx);
@@ -53132,6 +53556,7 @@ impl App {
         };
         let slot = self.adjustment_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
+        self.cancel_final_effects_for_idx(idx);
         self.final_composite_cache
             .retain(|cache_key, _| cache_key.edit_key.idx != idx);
         // comic は final composite を下地にするので連動破棄 (Codex P2)。
@@ -56778,6 +57203,12 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
         self.edit_preview_repaint_ctx = Some(ctx.clone());
+        if let Some(render_state) = self.wgpu_render_state.as_ref() {
+            render_state
+                .renderer
+                .write()
+                .set_image_lod_bias(self.settings.image_mipmap_lod_bias);
+        }
         // prefetch suppression gate: 同フレーム内の scroll 入力を即時に拾う。
         // `scroll_offset_y` への反映 (= process_scroll / handle_keyboard) を待たないので、
         // `update_keep_range_and_requests` の gate 判定時点で last_prefetch_scroll_at が
@@ -60697,6 +61128,20 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
             error: "no usable AI model (load failed)".to_string(),
         };
     }
+    if cancel.load(Ordering::Relaxed) {
+        return FinalAiResult::Cancelled { job_id, key };
+    }
+    let source = if let Some(params) = job.adjust_before_ai.as_ref() {
+        Arc::new(crate::adjustment::apply_adjustments_fast(
+            &job.source,
+            params,
+        ))
+    } else {
+        Arc::clone(&job.source)
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return FinalAiResult::Cancelled { job_id, key };
+    }
 
     let bg_rgb: [u8; 3] = if key.bg == 1 {
         [255, 255, 255]
@@ -60705,9 +61150,9 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
     };
     let composite_first = upscale_model.is_some();
     let mut dynimg = if composite_first {
-        color_image_to_dynamic_composited(&job.source, bg_rgb)
+        color_image_to_dynamic_composited(&source, bg_rgb)
     } else {
-        color_image_to_dynamic(&job.source)
+        color_image_to_dynamic(&source)
     };
 
     if let Some(denoise_kind) = denoise_model {

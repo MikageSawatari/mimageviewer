@@ -2655,6 +2655,29 @@ impl FullscreenLeftPanelTab {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdjustmentSettingsTab {
+    #[default]
+    ColorTone,
+    Ai,
+    Colorize,
+    PostFilter,
+}
+
+impl AdjustmentSettingsTab {
+    pub const ALL: &'static [Self] = &[Self::ColorTone, Self::Ai, Self::Colorize, Self::PostFilter];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ColorTone => "色調",
+            Self::Ai => "AI",
+            Self::Colorize => "カラー化",
+            Self::PostFilter => "フィルタ",
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // FullscreenJumpMode (Shift+左右の大きめページジャンプ量)
 // -----------------------------------------------------------------------
@@ -3281,9 +3304,16 @@ pub struct Settings {
     /// 自動フィット時に 100% 未満へ縮小しない。
     #[serde(default)]
     pub fullscreen_fit_no_downscale: bool,
+    /// 完全 mip chain を使う静止画表示で、GPU の自動 LOD を粗い側へ寄せる量。
+    /// 0.0 は標準、0.5 / 1.0 はそれぞれ半段 / 1段ぶんモアレ抑制を優先する。
+    #[serde(default)]
+    pub image_mipmap_lod_bias: f32,
     /// フルスクリーン左ホバーパネルで最後に開いていたタブ。
     #[serde(default)]
     pub fullscreen_left_panel_tab: FullscreenLeftPanelTab,
+    /// 画像補正タブの中央設定領域で最後に開いていたサブタブ。
+    #[serde(default)]
+    pub adjustment_settings_tab: AdjustmentSettingsTab,
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
@@ -3488,11 +3518,11 @@ pub struct Settings {
     #[serde(default)]
     pub ai_upscale_model_override: Option<String>,
 
-    /// AI アップスケール: 先読み枚数（後方）
+    /// AI アップスケール / カラー化 final composite: 先読み枚数（後方）
     #[serde(default = "default_ai_upscale_prefetch_back")]
     pub ai_upscale_prefetch_back: usize,
 
-    /// AI アップスケール: 先読み枚数（前方）
+    /// AI アップスケール / カラー化 final composite: 先読み枚数（前方）
     #[serde(default = "default_ai_upscale_prefetch_forward")]
     pub ai_upscale_prefetch_forward: usize,
 
@@ -3549,6 +3579,9 @@ pub struct Settings {
     /// 保存スロット (10個)。名前付きで保存した補正設定。
     #[serde(default)]
     pub preset_slots: crate::adjustment::PresetSlots,
+    /// カラー化専用保存スロット (4個)。他の画像補正値を変更せずに呼び出す。
+    #[serde(default)]
+    pub colorize_preset_slots: crate::colorize::ColorizePresetSlots,
 
     // ── フォルダ側サイドカー ───────────────────────────────────
     /// 補正・消しゴムマスク設定をフォルダごとのサイドカーファイル
@@ -4620,7 +4653,9 @@ impl Default for Settings {
             fullscreen_fit_mode: FullscreenFitMode::default(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
+            image_mipmap_lod_bias: 0.0,
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
+            adjustment_settings_tab: AdjustmentSettingsTab::default(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
@@ -4728,6 +4763,7 @@ impl Default for Settings {
             ai_backend: None,
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
+            colorize_preset_slots: crate::colorize::ColorizePresetSlots::default(),
             sidecar_backup_enabled: true,
             tag_sidecar_backup_enabled: false,
             susie_enabled: true,
@@ -5949,6 +5985,11 @@ impl Settings {
         self.continuous_reading_gamepad_scroll_percent_per_sec = self
             .continuous_reading_gamepad_scroll_percent_per_sec
             .clamp(10, 300);
+        self.image_mipmap_lod_bias = if self.image_mipmap_lod_bias.is_finite() {
+            self.image_mipmap_lod_bias.clamp(0.0, 1.5)
+        } else {
+            0.0
+        };
         self.fullscreen_jump_percent = self
             .fullscreen_jump_percent
             .clamp(FULLSCREEN_JUMP_PERCENT_MIN, FULLSCREEN_JUMP_PERCENT_MAX);
@@ -6231,6 +6272,8 @@ impl Settings {
         // 全体差し替えで巻き戻らないよう live 値を引き継ぐ (Codex P3)。
         self.text_preview_scale = src.text_preview_scale;
         self.thumb_quality = src.thumb_quality;
+        // ── 静止画 mipmap LOD (画像補正→フィルタでライブ編集) ──
+        self.image_mipmap_lod_bias = src.image_mipmap_lod_bias;
         // ── キャッシュ系 (環境設定に出ていない項目) ──
         self.cache_videos_always = src.cache_videos_always;
         self.batch_cache_zip_contents = src.batch_cache_zip_contents;
@@ -6264,6 +6307,7 @@ impl Settings {
         // ── 補正プリセット (フルスクリーン `P` / スロットダイアログで編集) ──
         self.global_preset = std::mem::take(&mut src.global_preset);
         self.preset_slots = std::mem::take(&mut src.preset_slots);
+        self.colorize_preset_slots = std::mem::take(&mut src.colorize_preset_slots);
         // ── VST3 プラグイン (環境設定→VST3 プラグインページで編集) ──
         // ⚠️ `vst3_plugins` の **構造 (= path / 順序)** は preferences が source of truth
         // (= 旧設計では管理ウィンドウで編集していたが、現設計では preferences で編集する)。
@@ -7322,6 +7366,7 @@ mod tests {
         assert_eq!(s.slideshow_continuous_scroll_secs, 0.2);
         assert_eq!(s.slideshow_continuous_scroll_percent, 50);
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
+        assert_eq!(s.image_mipmap_lod_bias, 0.0);
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(!s.fullscreen_top_bar_locked);
         assert_eq!(
@@ -7783,6 +7828,7 @@ mod tests {
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
+        assert_eq!(loaded.image_mipmap_lod_bias, 0.0);
         assert!(!loaded.ring_shortcuts.mouse_flick_enabled);
         assert!(loaded.ring_shortcuts.gamepad_ring_enabled);
         assert_eq!(
@@ -8055,10 +8101,12 @@ mod tests {
         s.fullscreen_cursor_hide_delay_secs = 99.0;
         s.retained_final_ai_cache_max_entries = 999;
         s.retained_final_ai_cache_max_mib = 999_999;
+        s.image_mipmap_lod_bias = 99.0;
         s.sanitize();
         assert_eq!(s.spread_page_gap_px, 200);
         assert_eq!(s.continuous_reading_gap_px, 200);
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 1);
+        assert_eq!(s.image_mipmap_lod_bias, 1.5);
         assert_eq!(s.continuous_reading_key_scroll_percent, 100);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 300);
         assert_eq!(s.slideshow_interval_secs, 3.0);

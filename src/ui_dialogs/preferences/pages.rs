@@ -4813,9 +4813,9 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 
     ui.add_space(12.0);
-    ui.label(egui::RichText::new("AI アップスケールの先読み").strong());
+    ui.label(egui::RichText::new("AI・カラー化の先読み").strong());
     ui.add_space(4.0);
-    ui.label("フルスクリーン表示時に AI アップスケール結果を前後の画像に先読みする枚数。");
+    ui.label("フルスクリーン表示時に AI とカラー化の最終結果を前後の画像へ先読みする枚数。");
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {

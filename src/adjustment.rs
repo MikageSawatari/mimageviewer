@@ -172,9 +172,6 @@ impl PostFilter {
         Self::Halftone,
         Self::OilPaint,
         Self::Sketch,
-        // 漫画 疑似カラー
-        Self::PseudoColor4,
-        Self::PseudoColorSkin,
         // 実用
         Self::Sharpen,
     ];
@@ -280,6 +277,7 @@ pub fn upscale_model_label(key: Option<&str>) -> &'static str {
 
 /// 画像補正パラメータ。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "AdjustParamsWire")]
 pub struct AdjustParams {
     pub brightness: f32,  // -100..+100
     pub contrast: f32,    // -100..+100
@@ -298,6 +296,10 @@ pub struct AdjustParams {
     /// ポストフィルタ (レトロ系表示エフェクト)。デフォルト = None
     #[serde(default)]
     pub post_filter: PostFilter,
+    /// モノクロ系画像の専用カラー化。最終 AI / スマートシャープ後、
+    /// `post_filter` 前に適用する。サムネイルには反映しない。
+    #[serde(default)]
+    pub colorize: crate::colorize::ColorizeParams,
     /// 最終表示段スマートシャープの強度。0 = OFF, 1..=100。
     /// サムネイルには反映せず、フルスクリーン最終表示・コピー・書き出しの final pixels に
     /// だけ掛かる (docs/final-smart-sharpen-plan.md)。色調補正 → final AI の後、
@@ -330,7 +332,95 @@ impl Default for AdjustParams {
             upscale_model: None,
             denoise_model: None,
             post_filter: PostFilter::None,
+            colorize: crate::colorize::ColorizeParams::default(),
             smart_sharpen: 0,
+        }
+    }
+}
+
+/// `AdjustParams` の後方互換デコード用 wire 表現。
+///
+/// 旧 `post_filter = pseudo_color*` は新しいカラー化へ正規化する。旧設定の見た目を
+/// 変えないため、移行時だけ適用対象を「すべての画像」にする。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct AdjustParamsWire {
+    brightness: f32,
+    contrast: f32,
+    gamma: f32,
+    saturation: f32,
+    temperature: f32,
+    black_point: u8,
+    white_point: u8,
+    midtone: f32,
+    auto_mode: Option<AutoMode>,
+    upscale_model: Option<String>,
+    denoise_model: Option<String>,
+    post_filter: PostFilter,
+    colorize: crate::colorize::ColorizeParams,
+    smart_sharpen: u8,
+}
+
+impl Default for AdjustParamsWire {
+    fn default() -> Self {
+        let params = AdjustParams::default();
+        Self {
+            brightness: params.brightness,
+            contrast: params.contrast,
+            gamma: params.gamma,
+            saturation: params.saturation,
+            temperature: params.temperature,
+            black_point: params.black_point,
+            white_point: params.white_point,
+            midtone: params.midtone,
+            auto_mode: params.auto_mode,
+            upscale_model: params.upscale_model,
+            denoise_model: params.denoise_model,
+            post_filter: params.post_filter,
+            colorize: params.colorize,
+            smart_sharpen: params.smart_sharpen,
+        }
+    }
+}
+
+impl From<AdjustParamsWire> for AdjustParams {
+    fn from(wire: AdjustParamsWire) -> Self {
+        let mut colorize = wire.colorize;
+        let post_filter = match wire.post_filter {
+            PostFilter::PseudoColor4 => {
+                if !colorize.is_enabled() {
+                    colorize = crate::colorize::ColorizeParams::legacy_all_images(
+                        crate::colorize::ColorizePalette::Legacy4Color,
+                    );
+                }
+                PostFilter::None
+            }
+            PostFilter::PseudoColorSkin => {
+                if !colorize.is_enabled() {
+                    colorize = crate::colorize::ColorizeParams::legacy_all_images(
+                        crate::colorize::ColorizePalette::LegacySkin,
+                    );
+                }
+                PostFilter::None
+            }
+            other => other,
+        };
+        colorize.sanitize();
+        Self {
+            brightness: wire.brightness,
+            contrast: wire.contrast,
+            gamma: wire.gamma,
+            saturation: wire.saturation,
+            temperature: wire.temperature,
+            black_point: wire.black_point,
+            white_point: wire.white_point,
+            midtone: wire.midtone,
+            auto_mode: wire.auto_mode,
+            upscale_model: wire.upscale_model,
+            denoise_model: wire.denoise_model,
+            post_filter,
+            colorize,
+            smart_sharpen: wire.smart_sharpen.min(100),
         }
     }
 }
@@ -338,7 +428,10 @@ impl Default for AdjustParams {
 impl AdjustParams {
     /// すべてのパラメータがデフォルト値 (無補正かつ post-filter / シャープ化無し) か。
     pub fn is_identity(&self) -> bool {
-        self.is_color_identity() && self.post_filter == PostFilter::None && self.smart_sharpen == 0
+        self.is_color_identity()
+            && self.post_filter == PostFilter::None
+            && !self.colorize.is_enabled()
+            && self.smart_sharpen == 0
     }
 
     /// 色調パラメータのみ無補正か (post-filter は問わない)。
@@ -389,7 +482,7 @@ impl AdjustParams {
             && self.auto_mode == other.auto_mode
     }
 
-    /// other との差分が final 専用フィールド (`post_filter` / `smart_sharpen`)
+    /// other との差分が final 専用フィールド (`post_filter` / `colorize` / `smart_sharpen`)
     /// のみ (または差分なし) か。
     /// これらは final pipeline の final AI より後段にしか効かないので、変更時に
     /// final AI cache を保持したまま再合成だけで済ませられる
@@ -398,6 +491,7 @@ impl AdjustParams {
     pub fn differs_only_in_final_stage(&self, other: &Self) -> bool {
         let mut probe = self.clone();
         probe.post_filter = other.post_filter;
+        probe.colorize = other.colorize.clone();
         probe.smart_sharpen = other.smart_sharpen;
         probe == *other
     }
@@ -998,6 +1092,39 @@ mod tests {
         let mut with_ai = pf_only.clone();
         with_ai.upscale_model = Some("auto".into());
         assert!(!base.differs_only_in_final_stage(&with_ai));
+    }
+
+    #[test]
+    fn legacy_pseudocolor_deserializes_as_dedicated_colorize() {
+        let params: AdjustParams =
+            serde_json::from_str(r#"{"post_filter":"pseudo_color4"}"#).unwrap();
+        assert_eq!(params.post_filter, PostFilter::None);
+        assert_eq!(
+            params.colorize.mode,
+            crate::colorize::ColorizeMode::AllImages
+        );
+        assert_eq!(
+            params.colorize.palette,
+            crate::colorize::ColorizePalette::Legacy4Color
+        );
+
+        let skin: AdjustParams =
+            serde_json::from_str(r#"{"post_filter":"pseudo_color_skin"}"#).unwrap();
+        assert_eq!(skin.post_filter, PostFilter::None);
+        assert_eq!(
+            skin.colorize.palette,
+            crate::colorize::ColorizePalette::LegacySkin
+        );
+    }
+
+    #[test]
+    fn colorize_is_a_final_stage_only_difference() {
+        let base = AdjustParams::default();
+        let mut changed = base.clone();
+        changed.colorize.mode = crate::colorize::ColorizeMode::MonochromeOnly;
+        assert!(base.differs_only_in_final_stage(&changed));
+        assert!(base.color_settings_eq(&changed));
+        assert!(!changed.is_identity());
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod capture;
 pub mod catalog;
 pub mod changelog_markdown;
 pub mod color_search;
+pub mod colorize;
 pub mod comic_db;
 pub mod comic_overlay;
 pub mod comic_presets;

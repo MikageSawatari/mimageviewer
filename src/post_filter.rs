@@ -952,6 +952,22 @@ mod pseudocolor {
     pub fn apply_skin(src: &ColorImage) -> ColorImage {
         colorize(src, &SKIN_R, &SKIN_G, &SKIN_B)
     }
+
+    pub(super) fn sample_4color(index: usize) -> [u8; 3] {
+        [C4_R[index], C4_G[index], C4_B[index]]
+    }
+
+    pub(super) fn sample_skin(index: usize) -> [u8; 3] {
+        [SKIN_R[index], SKIN_G[index], SKIN_B[index]]
+    }
+}
+
+pub(crate) fn legacy_pseudocolor4_rgb(index: usize) -> [u8; 3] {
+    pseudocolor::sample_4color(index)
+}
+
+pub(crate) fn legacy_pseudocolor_skin_rgb(index: usize) -> [u8; 3] {
+    pseudocolor::sample_skin(index)
 }
 
 mod photo {

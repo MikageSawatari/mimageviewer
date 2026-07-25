@@ -813,12 +813,17 @@ fn run_pipeline_debug_export(
                     include_post_filter,
                 } => {
                     let adjusted = crate::adjustment::apply_adjustments_fast(&source, &params);
+                    let colorized = if include_post_filter && params.colorize.is_enabled() {
+                        crate::colorize::apply(&adjusted, &params.colorize)
+                    } else {
+                        adjusted
+                    };
                     let output = if include_post_filter
                         && params.post_filter != crate::adjustment::PostFilter::None
                     {
-                        crate::post_filter::apply(&adjusted, params.post_filter)
+                        crate::post_filter::apply(&colorized, params.post_filter)
                     } else {
-                        adjusted
+                        colorized
                     };
                     let file = format!("{name}.png");
                     save_color_image_png(&output, &page_dir.join(&file))?;
@@ -847,10 +852,15 @@ fn run_pipeline_debug_export(
                         source
                     };
                     let adjusted = crate::adjustment::apply_adjustments_fast(&source, &params);
-                    let output = if params.post_filter != crate::adjustment::PostFilter::None {
-                        crate::post_filter::apply(&adjusted, params.post_filter)
+                    let colorized = if params.colorize.is_enabled() {
+                        crate::colorize::apply(&adjusted, &params.colorize)
                     } else {
                         adjusted
+                    };
+                    let output = if params.post_filter != crate::adjustment::PostFilter::None {
+                        crate::post_filter::apply(&colorized, params.post_filter)
+                    } else {
+                        colorized
                     };
                     let file = format!("{name}.png");
                     save_color_image_png(&output, &page_dir.join(&file))?;

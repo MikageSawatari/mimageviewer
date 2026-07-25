@@ -1,0 +1,826 @@
+//! モノクロ系画像のカラー化とスクリーントーン濃度復元。
+//!
+//! 処理順は final pipeline のスマートシャープ後、ポストフィルタ前。
+//! カスタムパレットは NeeView の ColorizeEffect と同じ「色 + 強さ」の制御点から
+//! 256-entry LUT を生成する。スクリーントーン濃度復元は直接着色する前の輝度だけを
+//! 置き換える。
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use egui::{Color32, ColorImage};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+const MONO_SAMPLE_LIMIT: usize = 16_384;
+const MONO_INLIER_RATIO: f32 = 0.95;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorizeMode {
+    #[default]
+    Disabled,
+    MonochromeOnly,
+    AllImages,
+}
+
+impl ColorizeMode {
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorizePalette {
+    #[default]
+    Legacy4Color,
+    LegacySkin,
+    Custom,
+}
+
+impl ColorizePalette {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy4Color => "4色刷り（従来互換）",
+            Self::LegacySkin => "肌色（従来互換）",
+            Self::Custom => "カスタム",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColorizeControlPoint {
+    pub color: [u8; 3],
+    pub strength: f32,
+}
+
+impl ColorizeControlPoint {
+    pub fn new(color: [u8; 3], strength: f32) -> Self {
+        Self { color, strength }
+    }
+}
+
+fn default_control_points() -> Vec<ColorizeControlPoint> {
+    vec![
+        ColorizeControlPoint::new([0, 0, 0], 3.0),
+        ColorizeControlPoint::new([75, 0, 130], 1.0),
+        ColorizeControlPoint::new([205, 92, 92], 1.0),
+        ColorizeControlPoint::new([245, 222, 179], 1.0),
+        ColorizeControlPoint::new([240, 248, 255], 1.0),
+    ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToneDensityMethod {
+    #[default]
+    Off,
+    LocalMean,
+    #[serde(alias = "edge_preserving", alias = "multi_scale")]
+    Gaussian,
+}
+
+impl ToneDensityMethod {
+    pub const ALL: &'static [Self] = &[Self::Off, Self::LocalMean, Self::Gaussian];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF（画素の輝度をそのまま使用）",
+            Self::LocalMean => "弱（局所平均）",
+            Self::Gaussian => "強（ガウシアン）",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Off => "スクリーントーンの網点を濃淡へ変換しません。",
+            Self::LocalMean => {
+                "局所平均を1回適用します。網点を少しだけなじませたい場合に向きます。"
+            }
+            Self::Gaussian => {
+                "局所平均を3回重ねてガウスぼかしを近似します。より広く滑らかに濃淡化します。"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColorizeParams {
+    #[serde(default)]
+    pub mode: ColorizeMode,
+    #[serde(default = "default_mono_tolerance")]
+    pub mono_tolerance: u8,
+    #[serde(default)]
+    pub palette: ColorizePalette,
+    #[serde(default = "default_control_points")]
+    pub control_points: Vec<ColorizeControlPoint>,
+    /// LUT 色の輝度を元画像の輝度へ寄せる割合。0..=100。
+    #[serde(default = "default_luminance_weight")]
+    pub luminance_weight: u8,
+    #[serde(default)]
+    pub tone_method: ToneDensityMethod,
+    /// 長辺 2048px を基準にしたトーン密度の検出スケール。0.1..=4.0。
+    #[serde(default = "default_tone_radius")]
+    pub tone_radius: f32,
+    /// 元輝度から推定濃度へ寄せる割合。0..=100。
+    #[serde(default = "default_tone_strength")]
+    pub tone_strength: u8,
+}
+
+const fn default_mono_tolerance() -> u8 {
+    12
+}
+
+const fn default_luminance_weight() -> u8 {
+    100
+}
+
+const fn default_tone_radius() -> f32 {
+    1.0
+}
+
+const TONE_RADIUS_REFERENCE_LONG_EDGE: f32 = 2048.0;
+const MAX_EFFECTIVE_TONE_RADIUS: f32 = 64.0;
+
+const fn default_tone_strength() -> u8 {
+    100
+}
+
+impl Default for ColorizeParams {
+    fn default() -> Self {
+        Self {
+            mode: ColorizeMode::Disabled,
+            mono_tolerance: default_mono_tolerance(),
+            palette: ColorizePalette::Legacy4Color,
+            control_points: default_control_points(),
+            luminance_weight: default_luminance_weight(),
+            tone_method: ToneDensityMethod::Off,
+            tone_radius: default_tone_radius(),
+            tone_strength: default_tone_strength(),
+        }
+    }
+}
+
+impl ColorizeParams {
+    pub fn is_enabled(&self) -> bool {
+        self.mode.enabled()
+    }
+
+    pub fn enable_with_palette(&mut self, palette: ColorizePalette) {
+        self.palette = palette;
+        if !self.mode.enabled() {
+            self.mode = ColorizeMode::MonochromeOnly;
+        }
+    }
+
+    pub fn legacy_all_images(palette: ColorizePalette) -> Self {
+        Self {
+            mode: ColorizeMode::AllImages,
+            palette,
+            // 旧ポストフィルタは LUT の輝度をそのまま使う。設定移行と
+            // 従来互換プリセットだけは新規設定の既定 100% に追従させない。
+            luminance_weight: 0,
+            ..Self::default()
+        }
+    }
+
+    pub fn sanitize(&mut self) {
+        self.mono_tolerance = self.mono_tolerance.clamp(1, 64);
+        self.luminance_weight = self.luminance_weight.min(100);
+        self.tone_radius = if self.tone_radius.is_finite() {
+            self.tone_radius.clamp(0.1, 4.0)
+        } else {
+            default_tone_radius()
+        };
+        self.tone_strength = self.tone_strength.min(100);
+        self.control_points.truncate(10);
+        if self.control_points.len() < 2 {
+            self.control_points = default_control_points();
+        }
+        for point in &mut self.control_points {
+            if !point.strength.is_finite() {
+                point.strength = 1.0;
+            }
+            point.strength = point.strength.clamp(0.0, 10.0);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ColorizePresetSlots {
+    pub slots: [Option<ColorizeParams>; 4],
+}
+
+/// 黄ばみ・青みなど一方向の紙色を許容する近モノクロ判定。
+///
+/// サンプル RGB の主成分軸を power iteration で求め、軸からの直交距離が
+/// `tolerance` 以下の画素が 95% 以上ならモノクロ系とみなす。純グレーだけでなく、
+/// 黒インクから有色紙へ伸びる 1 次元の色分布を通す。
+pub fn is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
+    let total = src.pixels.len();
+    if total == 0 {
+        return true;
+    }
+    let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
+    let samples: Vec<[f32; 3]> = src
+        .pixels
+        .iter()
+        .step_by(stride)
+        .filter(|pixel| pixel.a() >= 16)
+        .take(MONO_SAMPLE_LIMIT)
+        .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32])
+        .collect();
+    if samples.len() < 8 {
+        return true;
+    }
+
+    let inv_n = 1.0 / samples.len() as f32;
+    let mut mean = [0.0_f32; 3];
+    for sample in &samples {
+        for channel in 0..3 {
+            mean[channel] += sample[channel] * inv_n;
+        }
+    }
+
+    let mut covariance = [[0.0_f32; 3]; 3];
+    for sample in &samples {
+        let d = [
+            sample[0] - mean[0],
+            sample[1] - mean[1],
+            sample[2] - mean[2],
+        ];
+        for row in 0..3 {
+            for col in 0..3 {
+                covariance[row][col] += d[row] * d[col] * inv_n;
+            }
+        }
+    }
+
+    let total_variance = covariance[0][0] + covariance[1][1] + covariance[2][2];
+    if total_variance <= 1.0 {
+        return true;
+    }
+    let mut axis = [0.577_350_26_f32; 3];
+    for _ in 0..12 {
+        let next = [
+            covariance[0][0] * axis[0] + covariance[0][1] * axis[1] + covariance[0][2] * axis[2],
+            covariance[1][0] * axis[0] + covariance[1][1] * axis[1] + covariance[1][2] * axis[2],
+            covariance[2][0] * axis[0] + covariance[2][1] * axis[1] + covariance[2][2] * axis[2],
+        ];
+        let length = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2]).sqrt();
+        if length <= 1e-5 {
+            return true;
+        }
+        axis = [next[0] / length, next[1] / length, next[2] / length];
+    }
+
+    let tolerance_sq = f32::from(tolerance).powi(2);
+    let inliers = samples
+        .iter()
+        .filter(|sample| {
+            let d = [
+                sample[0] - mean[0],
+                sample[1] - mean[1],
+                sample[2] - mean[2],
+            ];
+            let projection = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+            let residual_sq =
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
+            residual_sq <= tolerance_sq
+        })
+        .count();
+    inliers as f32 / samples.len() as f32 >= MONO_INLIER_RATIO
+}
+
+pub fn should_apply(src: &ColorImage, params: &ColorizeParams) -> bool {
+    match params.mode {
+        ColorizeMode::Disabled => false,
+        ColorizeMode::AllImages => true,
+        ColorizeMode::MonochromeOnly => is_near_monochrome(src, params.mono_tolerance),
+    }
+}
+
+pub fn apply(src: &ColorImage, params: &ColorizeParams) -> ColorImage {
+    let cancel = AtomicBool::new(false);
+    apply_with_cancel(src, params, &cancel).unwrap_or_else(|| src.clone())
+}
+
+pub fn apply_with_cancel(
+    src: &ColorImage,
+    params: &ColorizeParams,
+    cancel: &AtomicBool,
+) -> Option<ColorImage> {
+    if !should_apply(src, params) {
+        return Some(src.clone());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let [width, height] = src.size;
+    if width == 0 || height == 0 {
+        return Some(src.clone());
+    }
+    let effective_tone_radius = effective_tone_radius(params.tone_radius, src.size);
+    let lut = build_lut(params);
+    let luma: Vec<u8> = src
+        .pixels
+        .par_iter()
+        .map(|pixel| {
+            (crate::adjustment::pixel_lum_f32(*pixel) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    let tone = tone_density_luma(
+        &luma,
+        width,
+        height,
+        params.tone_method,
+        effective_tone_radius,
+        cancel,
+    )?;
+    let tone_strength = f32::from(params.tone_strength) / 100.0;
+    let luminance_weight = f32::from(params.luminance_weight) / 100.0;
+
+    let pixels: Vec<Color32> = src
+        .pixels
+        .par_iter()
+        .enumerate()
+        .map(|(index, pixel)| {
+            let original_y = f32::from(luma[index]) / 255.0;
+            let mapped_y = if let Some(candidate) = tone.as_ref() {
+                original_y * (1.0 - tone_strength)
+                    + f32::from(candidate[index]) / 255.0 * tone_strength
+            } else {
+                original_y
+            };
+            let lut_index = (mapped_y * 255.0).round().clamp(0.0, 255.0) as usize;
+            let color = lut[lut_index];
+            let result = preserve_luminance(color, mapped_y, luminance_weight);
+            Color32::from_rgba_unmultiplied(result[0], result[1], result[2], pixel.a())
+        })
+        .collect();
+    if cancel.load(Ordering::Relaxed) {
+        None
+    } else {
+        Some(ColorImage::new([width, height], pixels))
+    }
+}
+
+fn effective_tone_radius(configured_radius: f32, size: [usize; 2]) -> f32 {
+    let configured_radius = if configured_radius.is_finite() {
+        configured_radius.clamp(0.1, 4.0)
+    } else {
+        default_tone_radius()
+    };
+    let long_edge = size[0].max(size[1]) as f32;
+    (configured_radius * long_edge / TONE_RADIUS_REFERENCE_LONG_EDGE).min(MAX_EFFECTIVE_TONE_RADIUS)
+}
+
+fn build_lut(params: &ColorizeParams) -> [[u8; 3]; 256] {
+    match params.palette {
+        ColorizePalette::Legacy4Color => {
+            std::array::from_fn(crate::post_filter::legacy_pseudocolor4_rgb)
+        }
+        ColorizePalette::LegacySkin => {
+            std::array::from_fn(crate::post_filter::legacy_pseudocolor_skin_rgb)
+        }
+        ColorizePalette::Custom => build_custom_lut(&params.control_points),
+    }
+}
+
+fn build_custom_lut(points: &[ColorizeControlPoint]) -> [[u8; 3]; 256] {
+    let fallback;
+    let points = if points.len() >= 2 {
+        &points[..points.len().min(10)]
+    } else {
+        fallback = default_control_points();
+        &fallback
+    };
+    let mut lengths = Vec::with_capacity(points.len() - 1);
+    let mut total = 0.0_f32;
+    for pair in points.windows(2) {
+        let length = ((pair[0].strength + pair[1].strength) * 0.5)
+            .max(0.01)
+            .min(10.0);
+        lengths.push(length);
+        total += length;
+    }
+    let mut knots = vec![0.0_f32; points.len()];
+    for index in 0..lengths.len() {
+        knots[index + 1] = knots[index] + lengths[index] / total.max(0.01);
+    }
+    std::array::from_fn(|index| {
+        let luminance = index as f32 / 255.0;
+        let mut section = 0;
+        while section < points.len() - 2
+            && !(knots[section] <= luminance && luminance <= knots[section + 1])
+        {
+            section += 1;
+        }
+        let span = (knots[section + 1] - knots[section]).max(1e-6);
+        let v = ((luminance - knots[section]) / span).clamp(0.0, 1.0);
+        let s0 = points[section].strength.clamp(0.0, 10.0);
+        let s1 = points[section + 1].strength.clamp(0.0, 10.0);
+        let midpoint = if s0 + s1 > 0.0 { s1 / (s0 + s1) } else { 0.5 };
+        let a = 2.0 - 4.0 * midpoint;
+        let b = 4.0 * midpoint - 1.0;
+        let curved = (a * v * v + b * v).clamp(0.0, 1.0);
+        std::array::from_fn(|channel| {
+            (f32::from(points[section].color[channel]) * (1.0 - curved)
+                + f32::from(points[section + 1].color[channel]) * curved)
+                .clamp(0.0, 255.0) as u8
+        })
+    })
+}
+
+fn preserve_luminance(color: [u8; 3], y: f32, weight: f32) -> [u8; 3] {
+    if weight <= 0.0 {
+        return color;
+    }
+    let r = f32::from(color[0]) / 255.0;
+    let g = f32::from(color[1]) / 255.0;
+    let b = f32::from(color[2]) / 255.0;
+    let cb = -0.1146 * r - 0.3854 * g + 0.5 * b;
+    let cr = 0.5 * r - 0.4545 * g - 0.0455 * b;
+    let preserved = [
+        (y + 1.5748 * cr).clamp(0.0, 1.0),
+        (y - 0.1873 * cb - 0.4681 * cr).clamp(0.0, 1.0),
+        (y + 1.8556 * cb).clamp(0.0, 1.0),
+    ];
+    std::array::from_fn(|channel| {
+        (([r, g, b][channel] * (1.0 - weight) + preserved[channel] * weight) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    })
+}
+
+fn tone_density_luma(
+    luma: &[u8],
+    width: usize,
+    height: usize,
+    method: ToneDensityMethod,
+    radius: f32,
+    cancel: &AtomicBool,
+) -> Option<Option<Vec<u8>>> {
+    if method == ToneDensityMethod::Off {
+        return Some(None);
+    }
+    let radius = if radius.is_finite() {
+        radius.clamp(0.0, MAX_EFFECTIVE_TONE_RADIUS)
+    } else {
+        default_tone_radius()
+    };
+    let lower_radius = radius.floor() as usize;
+    let upper_radius = radius.ceil() as usize;
+    let lower = tone_density_luma_at_radius(luma, width, height, method, lower_radius, cancel)?;
+    if upper_radius == lower_radius {
+        return Some(Some(lower));
+    }
+    let upper = tone_density_luma_at_radius(luma, width, height, method, upper_radius, cancel)?;
+    let fraction = radius - lower_radius as f32;
+    let blended = lower
+        .into_par_iter()
+        .zip(upper.into_par_iter())
+        .map(|(a, b)| {
+            (f32::from(a) * (1.0 - fraction) + f32::from(b) * fraction)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    (!cancel.load(Ordering::Relaxed)).then_some(Some(blended))
+}
+
+fn tone_density_luma_at_radius(
+    luma: &[u8],
+    width: usize,
+    height: usize,
+    method: ToneDensityMethod,
+    radius: usize,
+    cancel: &AtomicBool,
+) -> Option<Vec<u8>> {
+    if radius == 0 {
+        return Some(luma.to_vec());
+    }
+    let result = match method {
+        ToneDensityMethod::Off => return Some(luma.to_vec()),
+        ToneDensityMethod::LocalMean => box_blur(luma, width, height, radius, cancel)?,
+        ToneDensityMethod::Gaussian => gaussian_approx(luma, width, height, radius, cancel)?,
+    };
+    Some(result)
+}
+
+fn horizontal_box_blur(
+    src: &[u8],
+    width: usize,
+    _height: usize,
+    radius: usize,
+    cancel: &AtomicBool,
+) -> Option<Vec<u8>> {
+    let mut out = vec![0_u8; src.len()];
+    out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let source = &src[y * width..(y + 1) * width];
+        let mut sum = 0_u32;
+        let mut right = radius.min(width - 1);
+        for value in &source[..=right] {
+            sum += u32::from(*value);
+        }
+        let mut left = 0_usize;
+        for x in 0..width {
+            row[x] = (sum / (right - left + 1) as u32) as u8;
+            let next_right = x.saturating_add(radius).saturating_add(1);
+            if next_right < width {
+                right = next_right;
+                sum += u32::from(source[right]);
+            }
+            if x >= radius {
+                sum -= u32::from(source[left]);
+                left += 1;
+            }
+        }
+    });
+    (!cancel.load(Ordering::Relaxed)).then_some(out)
+}
+
+fn transpose(src: &[u8], width: usize, height: usize, cancel: &AtomicBool) -> Option<Vec<u8>> {
+    let mut out = vec![0_u8; src.len()];
+    out.par_chunks_mut(height)
+        .enumerate()
+        .for_each(|(x, column)| {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            for y in 0..height {
+                column[y] = src[y * width + x];
+            }
+        });
+    (!cancel.load(Ordering::Relaxed)).then_some(out)
+}
+
+fn box_blur(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    cancel: &AtomicBool,
+) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Some(Vec::new());
+    }
+    let horizontal = horizontal_box_blur(src, width, height, radius.min(width - 1), cancel)?;
+    let transposed = transpose(&horizontal, width, height, cancel)?;
+    drop(horizontal);
+    let transposed_blurred =
+        horizontal_box_blur(&transposed, height, width, radius.min(height - 1), cancel)?;
+    drop(transposed);
+    transpose(&transposed_blurred, height, width, cancel)
+}
+
+fn gaussian_approx(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    cancel: &AtomicBool,
+) -> Option<Vec<u8>> {
+    let r0 = (radius / 2).max(1);
+    let r1 = ((radius + 1) / 2).max(1);
+    let pass0 = box_blur(src, width, height, r0, cancel)?;
+    let pass1 = box_blur(&pass0, width, height, r1, cancel)?;
+    drop(pass0);
+    box_blur(&pass1, width, height, r0, cancel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(width: usize, height: usize, f: impl Fn(usize, usize) -> Color32) -> ColorImage {
+        let f = &f;
+        ColorImage::new(
+            [width, height],
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| f(x, y)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn legacy_palette_matches_post_filter() {
+        let source = image(256, 1, |x, _| Color32::from_gray(x as u8));
+        for (palette, filter) in [
+            (
+                ColorizePalette::Legacy4Color,
+                crate::adjustment::PostFilter::PseudoColor4,
+            ),
+            (
+                ColorizePalette::LegacySkin,
+                crate::adjustment::PostFilter::PseudoColorSkin,
+            ),
+        ] {
+            let params = ColorizeParams::legacy_all_images(palette);
+            assert_eq!(
+                apply(&source, &params),
+                crate::post_filter::apply(&source, filter)
+            );
+        }
+    }
+
+    #[test]
+    fn tinted_grayscale_is_detected_but_color_grid_is_not() {
+        let tinted = image(64, 64, |x, y| {
+            let v = ((x + y) * 2) as u8;
+            Color32::from_rgb(v, v.saturating_add(18), v.saturating_add(28))
+        });
+        assert!(is_near_monochrome(&tinted, 12));
+
+        let colored = image(64, 64, |x, y| match (x / 16 + y / 16) % 4 {
+            0 => Color32::RED,
+            1 => Color32::GREEN,
+            2 => Color32::BLUE,
+            _ => Color32::YELLOW,
+        });
+        assert!(!is_near_monochrome(&colored, 12));
+    }
+
+    #[test]
+    fn weak_and_strong_tone_modes_have_ordered_smoothing() {
+        let width = 65;
+        let height = 65;
+        let mut luma = vec![255_u8; width * height];
+        luma[(height / 2) * width + width / 2] = 0;
+        let cancel = AtomicBool::new(false);
+        let weak = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::LocalMean,
+            1.0,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        let strong = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::Gaussian,
+            1.0,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        let center = (height / 2) * width + width / 2;
+        let two_pixels_away = center + 2;
+        assert!(weak[center] < strong[center]);
+        assert_eq!(weak[two_pixels_away], 255);
+        assert!(strong[two_pixels_away] < 255);
+    }
+
+    #[test]
+    fn fractional_tone_radius_interpolates_adjacent_results() {
+        let width = 48;
+        let height = 32;
+        let luma: Vec<u8> = (0..width * height)
+            .map(|index| {
+                let x = index % width;
+                let y = index / width;
+                if ((x / 3) + (y / 2)) % 2 == 0 {
+                    24
+                } else {
+                    236
+                }
+            })
+            .collect();
+        let cancel = AtomicBool::new(false);
+        let at_four = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::LocalMean,
+            4.0,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        let at_five = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::LocalMean,
+            5.0,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        let at_half = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::LocalMean,
+            4.5,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(at_four.iter().zip(&at_five).any(|(a, b)| a != b));
+        for ((a, b), middle) in at_four.iter().zip(&at_five).zip(&at_half) {
+            let expected = (f32::from(*a) * 0.5 + f32::from(*b) * 0.5).round() as i16;
+            assert!((i16::from(*middle) - expected).abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn subpixel_tone_radius_interpolates_from_the_original() {
+        let width = 17;
+        let height = 17;
+        let mut luma = vec![255_u8; width * height];
+        let center = (height / 2) * width + width / 2;
+        luma[center] = 0;
+        let cancel = AtomicBool::new(false);
+        let at_one = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::LocalMean,
+            1.0,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        let at_tenth = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::LocalMean,
+            0.1,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        let expected =
+            (f32::from(luma[center]) * 0.9 + f32::from(at_one[center]) * 0.1).round() as i16;
+        assert!((i16::from(at_tenth[center]) - expected).abs() <= 1);
+    }
+
+    #[test]
+    fn tone_radius_scales_with_image_long_edge() {
+        assert_eq!(effective_tone_radius(4.0, [2048, 1200]), 4.0);
+        assert_eq!(effective_tone_radius(4.0, [1024, 800]), 2.0);
+        assert_eq!(effective_tone_radius(4.0, [8192, 4000]), 16.0);
+        assert!((effective_tone_radius(0.1, [1024, 800]) - 0.05).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn older_tone_settings_load_without_removed_fields() {
+        let mut params: ColorizeParams = serde_json::from_str(
+            r#"{
+                    "tone_radius": 4,
+                    "tone_method": "edge_preserving",
+                    "tone_line_protection": 100,
+                    "tone_periodicity_gate": true,
+                    "tone_periodicity_threshold": 55
+                }"#,
+        )
+        .unwrap();
+        params.sanitize();
+        assert_eq!(params.tone_radius, 4.0);
+        assert_eq!(params.tone_method, ToneDensityMethod::Gaussian);
+        assert_eq!(params.luminance_weight, 100);
+        assert_eq!(
+            ColorizeParams::legacy_all_images(ColorizePalette::Legacy4Color).luminance_weight,
+            0
+        );
+
+        let multiscale: ColorizeParams =
+            serde_json::from_str(r#"{"tone_method":"multi_scale"}"#).unwrap();
+        assert_eq!(multiscale.tone_method, ToneDensityMethod::Gaussian);
+    }
+
+    #[test]
+    fn custom_lut_uses_endpoints() {
+        let params = ColorizeParams {
+            mode: ColorizeMode::AllImages,
+            palette: ColorizePalette::Custom,
+            luminance_weight: 0,
+            control_points: vec![
+                ColorizeControlPoint::new([10, 20, 30], 1.0),
+                ColorizeControlPoint::new([210, 220, 230], 1.0),
+            ],
+            ..ColorizeParams::default()
+        };
+        let source = image(2, 1, |x, _| {
+            if x == 0 {
+                Color32::BLACK
+            } else {
+                Color32::WHITE
+            }
+        });
+        let output = apply(&source, &params);
+        assert_eq!(output.pixels[0], Color32::from_rgb(10, 20, 30));
+        assert_eq!(output.pixels[1], Color32::from_rgb(210, 220, 230));
+    }
+}

@@ -15,6 +15,11 @@ struct Locals {
     /// 1 to do manual filtering for more predictable kittest snapshot images.
     /// See also https://github.com/emilk/egui/issues/5295
     predictable_texture_filtering: u32,
+
+    /// Positive values choose a coarser mip level. Single-level UI textures
+    /// remain clamped to level 0.
+    image_lod_bias: f32,
+    _padding: f32,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 
@@ -101,7 +106,12 @@ fn vs_main(
 fn sample_texture(in: VertexOutput) -> vec4<f32> {
     if r_locals.predictable_texture_filtering == 0 {
         // Hardware filtering: fast, but varies across GPUs and drivers.
-        return textureSample(r_tex_color, r_tex_sampler, in.tex_coord);
+        return textureSampleBias(
+            r_tex_color,
+            r_tex_sampler,
+            in.tex_coord,
+            r_locals.image_lod_bias,
+        );
     } else {
         // Manual bilinear filtering with four taps at pixel centers using textureLoad
         let texture_size = vec2<i32>(textureDimensions(r_tex_color, 0));

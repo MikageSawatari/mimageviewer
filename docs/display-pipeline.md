@@ -204,6 +204,7 @@ seed する。worker は通常の cache_hit で取り出すので、Shell API �
 | EXIF Orientation | **デコード時**に適用 | 通常画像はファイル path、ZIP 内画像はエントリ bytes から読む。PDF は対象外 |
 | 非破壊編集結果 | **編集プレビューキャッシュ** | 消しゴム・補正レイヤー・隠蔽加工・テキスト／スタンプ・切り取り。編集終了時に非同期生成し、次回一覧から利用 |
 | プリセット補正 (色調のみ) | **UI スレッド同期適用** | `thumb_adjust_tex[idx]` に保持、§1.5 参照 |
+| カラー化 | **適用されない** | 最終表示専用。トーン濃淡変換を含むため worker で処理 |
 | ポストフィルタ | **適用されない** | コスト/実装維持のためサムネは色調のみ |
 | AI アップスケール | **適用されない** | 1 枚 10 秒級のためサムネでは非現実的 |
 
@@ -659,6 +660,11 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
   `PostFilter::Nearest` も level 0 + nearest sampler のまま。
+- 画像補正パネルの「フィルタ」にある `LOD 補正` (`image_mipmap_lod_bias`) は 0.0〜1.5。
+  0.0 は GPU 標準選択、正値はより粗い mip level へ寄せて中間縮小率のモアレを抑える。
+  managed texture と wipe/diff 比較は `textureSampleBias`、360度パノラマは
+  `textureSampleGrad` に渡す微分を `2^bias` 倍して同じ補正を適用する。uniform だけを
+  ライブ更新するため texture 再生成は不要で、対象外 texture と `Nearest` には影響しない。
 - mip texture の partial update では全下位 level を再生成する。完全な chain の VRAM は level 0
   の約 1/3 増えるため、フルスクリーンの既存 prefetch / eviction 境界を越えて保持しない。
 
@@ -711,7 +717,7 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 2. final_composite_cache[edit_key, params_hash, bg]
    (= edit_result_cache + 色調補正 + final AI + スマートシャープ + post_filter。
     スマートシャープは AI アップスケール出力には掛からない —
-    preset-and-adjustment.md §2.6)
+    preset-and-adjustment.md §2.7)
 3. edit_result_cache[edit_key]
    (= raw -> erase -> local_adjust -> conceal -> crop。最終段待ちの fallback)
 4. fs_cache[idx] (生デコード結果、raw 専用)
@@ -979,7 +985,7 @@ final composite / comic composite は可視ページ単位で扱い、キャッ�
 
 ---
 
-## 3. 補正・AI・ポストフィルタキャッシュと再描画
+## 3. 補正・AI・カラー化・ポストフィルタキャッシュと再描画
 
 ### 3.0 処理順序 (= 最終表示への適用順)
 
@@ -1014,9 +1020,15 @@ final composite / comic composite は可視ページ単位で扱い、キャッ�
    ↓
 8. スマートシャープ (シャープ化スライダー 0..=100、輪郭中心の最終段シャープ)
    → AI アップスケール出力には掛からない (固定動作)。デノイズのみ / AI なしには掛かる。
-     詳細は preset-and-adjustment.md §2.6
+     詳細は preset-and-adjustment.md §2.7
    ↓
-9. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
+9. カラー化
+   → 近モノクロ判定、カスタム階調 LUT、必要ならスクリーントーン濃淡変換
+   → `final_effect_pending` worker。カラー化前の provisional texture は公開しない。
+     前後ページは final composite まで先読みし、完成済みならページ移動直後からカラー表示する。
+     先読みが未完了なら直前ページを holdover し、完成後にカラー化済み画像へ直接切り替える。
+   ↓
+10. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
    → final_composite_cache[FinalCompositeKey]
 ```
 
@@ -1037,14 +1049,21 @@ denoise は意図的に飛ばすため、grid / fullscreen / stack のどこか�
 - **補正 (adjustment)**: `ensure_final_composite_texture` が `edit_result_cache` のピクセルへ
   `apply_adjustments_fast` を適用する。色系パラメータ変更では `edit_result_cache` を保持し、
   `final_ai_cache` / `final_composite_cache` だけを落とす。
-- **スマートシャープ (シャープ化)**: final AI の後・ポストフィルタの前に
+- **スマートシャープ (シャープ化)**: final AI の後・カラー化の前に
   `apply_final_smart_sharpen` を適用する。AI アップスケール出力には掛からない
   (固定動作)。サムネイルには反映しない。詳細は
-  [preset-and-adjustment.md §2.6](preset-and-adjustment.md)。
+  [preset-and-adjustment.md §2.7](preset-and-adjustment.md)。
+- **カラー化**: スマートシャープ後・ポストフィルタ前に適用する。カスタム色、近モノクロ判定、
+  スクリーントーン濃淡変換を含む。重い画素処理は viewer context 所有の worker へ送り、
+  stale 結果を `FinalCompositeKey` と items 世代で拒否する。AI 先読みと同じ前後枚数の
+  `final_composite_cache` を背景で 1 枚ずつ作る。先読み中は provisional texture を upload
+  せず、同ページが表示対象になったときは進行中 job を昇格して再利用する。通常ページ送りでは
+  完成まで直前ページを保持し、生画像・サムネイルへフォールバックしない。`open_fullscreen` は
+  ページ入場だけでは final composite / worker を無効化しない。サムネイル自体には反映しない。
 - **ポストフィルタ**: AI の後段で CPU 処理 (CRT/減色/複合)。rayon 並列化済み。
   `PostFilter::Nearest` のみ NEAREST サンプラー、それ以外は LINEAR でアップロードする。
 - **消しゴム/隠蔽加工/分析モード中の一時バイパス**: `App::post_filter_bypassed = true` の間は
-  final composite の key から post-filter を外し、表示用最終段だけを切り替える。
+  final composite の key からカラー化と post-filter を外し、表示用最終段だけを切り替える。
   edit 系 generation は進めない。
 - **補正レイヤー**: `local-adjust-render` worker で `local-adjust-core` を適用し、
   `local_adjust_cache` に載せる。生成中は古い補正レイヤー結果を使わず、
@@ -1092,7 +1111,9 @@ denoise は意図的に飛ばすため、grid / fullscreen / stack のどこか�
 - **AI 先読み (新パイプライン)**: `App::prefetch_final_ai` がフルスクリーン更新ループ
   終盤で呼ばれ、現在ページの `final_ai_pending` (cancel フラグ除く) が空のときだけ
   隣接ページの `final_ai` 推論を 1 件 spawn する。`ai_prefetch_targets` で前後の
-  対象 idx を `ai_upscale_prefetch_forward / back` 件まで取得する。
+  対象 idx を `ai_upscale_prefetch_forward / back` 件まで取得する。同じ更新入口から
+  カラー化の final composite 先読みも行い、AI 使用ページは `final_ai_cache` 完成後、
+  AI 不使用ページは edit pixels 準備後に 1 件ずつ final-effect worker へ送る。
   ⚠️ **退行注意**: Pipeline P1 リファクタ (be05cfef) で旧 `prefetch_ai_upscale` が
   dead code 化され、新版が未実装のまま 1 リリース過ごした。`App::update` の
   「フルスクリーン work セクション」(= `// AI 先読み (新パイプライン)` コメント) を

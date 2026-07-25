@@ -20664,6 +20664,225 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    #[test]
+    fn colorize_prefetch_builds_complete_neighbor_composite_without_preview_upload() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.ai_upscale_prefetch_back = 0;
+        app.settings.ai_upscale_prefetch_forward = 1;
+        let current = push_image(&mut app, "C:/pics/page-001.jpg");
+        let target = push_image(&mut app, "C:/pics/page-002.jpg");
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(current);
+
+        let edit_key = dummy_edit_key(&app, target);
+        let source = Arc::new(egui::ColorImage::filled(
+            [8, 8],
+            egui::Color32::from_gray(128),
+        ));
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::clone(&source),
+                texture: None,
+            },
+        );
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+        app.adjustment_page_params.insert(target, params.clone());
+        let final_key = app.final_composite_key_for_pixels(edit_key, source.size, &params);
+
+        app.prefetch_final_effects(&ctx, current);
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "background prefetch must not upload a provisional monochrome texture"
+        );
+        let pending = app
+            .final_effect_pending
+            .remove(&final_key)
+            .expect("neighbor colorize prefetch must start");
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("colorize prefetch result");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(result).unwrap();
+        app.final_effect_pending.insert(
+            final_key,
+            FinalEffectPending {
+                cancel: pending.cancel,
+                rx,
+                items_generation: pending.items_generation,
+                output_complete: pending.output_complete,
+                nearest_sampler: pending.nearest_sampler,
+                prefetch: pending.prefetch,
+            },
+        );
+        app.poll_final_effects(&ctx);
+
+        let entry = app
+            .final_composite_cache
+            .get(&final_key)
+            .expect("completed prefetched composite");
+        assert!(entry.complete);
+        let color = entry.pixels.pixels[0];
+        assert!(
+            color.r() != color.g() || color.g() != color.b(),
+            "prefetched result must already be colorized"
+        );
+    }
+
+    #[test]
+    fn display_request_promotes_matching_colorize_prefetch_without_restart() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.ai_upscale_prefetch_back = 0;
+        app.settings.ai_upscale_prefetch_forward = 1;
+        let current = push_image(&mut app, "C:/pics/promote-001.jpg");
+        let target = push_image(&mut app, "C:/pics/promote-002.jpg");
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(current);
+
+        let edit_key = dummy_edit_key(&app, target);
+        let source = Arc::new(egui::ColorImage::filled(
+            [64, 64],
+            egui::Color32::from_gray(128),
+        ));
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::clone(&source),
+                texture: None,
+            },
+        );
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+        app.adjustment_page_params.insert(target, params.clone());
+        let final_key = app.final_composite_key_for_pixels(edit_key, source.size, &params);
+
+        app.prefetch_final_effects(&ctx, current);
+        let original_cancel = Arc::clone(
+            &app.final_effect_pending
+                .get(&final_key)
+                .expect("prefetch pending")
+                .cancel,
+        );
+        app.open_fullscreen(target);
+        let displayed =
+            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), true);
+
+        let promoted = app
+            .final_effect_pending
+            .get(&final_key)
+            .expect("same pending must remain");
+        assert!(Arc::ptr_eq(&original_cancel, &promoted.cancel));
+        assert!(!promoted.prefetch);
+        assert!(!original_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            displayed.is_none(),
+            "in-flight colorize must keep the previous page instead of returning monochrome"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "promoting a prefetch must not publish a monochrome provisional composite"
+        );
+    }
+
+    #[test]
+    fn opening_colorize_target_preserves_prefetched_composite_and_captures_holdover() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let current = push_image(&mut app, "C:/pics/open-prefetch-001.jpg");
+        let target = push_image(&mut app, "C:/pics/open-prefetch-002.jpg");
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(current);
+
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+        app.adjustment_page_params.insert(target, params.clone());
+
+        let current_edit_key = dummy_edit_key(&app, current);
+        let current_params = app.effective_params(current).clone();
+        let current_key =
+            app.final_composite_key_for_pixels(current_edit_key, [8, 8], &current_params);
+        let current_pixels = Arc::new(egui::ColorImage::filled(
+            [8, 8],
+            egui::Color32::from_rgb(130, 110, 90),
+        ));
+        let current_texture = ctx.load_texture(
+            "colorize_open_holdover",
+            (*current_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let current_texture_id = current_texture.id();
+        app.final_composite_cache.insert(
+            current_key,
+            FinalCompositeEntry {
+                pixels: current_pixels,
+                texture: current_texture,
+                complete: true,
+            },
+        );
+
+        let target_edit_key = dummy_edit_key(&app, target);
+        let target_pixels = Arc::new(egui::ColorImage::filled(
+            [8, 8],
+            egui::Color32::from_gray(128),
+        ));
+        let target_texture = ctx.load_texture(
+            "colorize_open_target_source",
+            (*target_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            target,
+            FsCacheEntry::Static {
+                tex: target_texture,
+                pixels: Arc::clone(&target_pixels),
+                source_dims: Some(target_pixels.size),
+                load_seq: 0,
+            },
+        );
+        app.edit_result_cache.insert(
+            target_edit_key,
+            EditResultEntry {
+                pixels: Arc::clone(&target_pixels),
+                texture: None,
+            },
+        );
+        let target_final_key =
+            app.final_composite_key_for_pixels(target_edit_key, target_pixels.size, &params);
+        let prefetched_pixels = Arc::new(egui::ColorImage::filled(
+            [8, 8],
+            egui::Color32::from_rgb(125, 105, 85),
+        ));
+        let prefetched_texture = ctx.load_texture(
+            "colorize_open_prefetched",
+            (*prefetched_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.final_composite_cache.insert(
+            target_final_key,
+            FinalCompositeEntry {
+                pixels: prefetched_pixels,
+                texture: prefetched_texture,
+                complete: true,
+            },
+        );
+
+        app.open_fullscreen(target);
+
+        assert!(
+            app.final_composite_cache.contains_key(&target_final_key),
+            "page open must not discard a completed colorize prefetch"
+        );
+        assert_eq!(
+            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            Some(current_texture_id),
+            "page navigation must retain the previous completed frame until target display resolves"
+        );
+    }
+
     /// シャープ化以外が既定のページで、強度を上げてから ↩ で 0 に戻すと
     /// 個別設定 (補バッジ / DB 行) が綺麗に消えること。AI 時スキップは固定動作で
     /// 保存フィールドを持たないため、no-op 設定が残る経路が存在しない

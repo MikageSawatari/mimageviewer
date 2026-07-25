@@ -210,14 +210,6 @@ const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
     (KeyAction::FsPostFilterHalftone, PostFilter::Halftone),
     (KeyAction::FsPostFilterOilPaint, PostFilter::OilPaint),
     (KeyAction::FsPostFilterSketch, PostFilter::Sketch),
-    (
-        KeyAction::FsPostFilterPseudoColor4,
-        PostFilter::PseudoColor4,
-    ),
-    (
-        KeyAction::FsPostFilterPseudoColorSkin,
-        PostFilter::PseudoColorSkin,
-    ),
     (KeyAction::FsPostFilterSharpen, PostFilter::Sharpen),
 ];
 
@@ -2059,6 +2051,12 @@ impl App {
         if let Some(tex) = self.current_final_composite_texture(idx) {
             return Some(tex);
         }
+        // カラー化が有効なページでは、raw / edit / thumbnail を「表示可能な代替」
+        // として返さない。final-effect worker の完成前にここへ落ちると、ページ切替時に
+        // 白黒が1フレームだけ露出する。通常ページ送りは別途、直前ページの holdover を使う。
+        if self.colorize_display_requires_final_effect(idx) {
+            return None;
+        }
         if let Some(tex) = self.current_edit_result_texture(idx) {
             return Some(tex);
         }
@@ -2090,6 +2088,35 @@ impl App {
             }
         }
         None
+    }
+
+    pub(crate) fn colorize_display_requires_final_effect(&self, idx: usize) -> bool {
+        !self.post_filter_bypassed
+            && !self.fs_entry_is_animated(idx)
+            && matches!(
+                self.items.get(idx),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+            && self.effective_params(idx).colorize.is_enabled()
+    }
+
+    /// 同一 viewer 内のページ送りで、次ページのカラー化が未完了だった場合にだけ使う
+    /// 直前ページの holdover を取得する。フォルダ移動用 nav lock が所有中の holdover は
+    /// 上書きしない。
+    pub(crate) fn capture_colorize_page_transition_holdover(&mut self, target_idx: usize) {
+        if self.fs_nav_locked_gen.is_some() {
+            return;
+        }
+        if !self.colorize_display_requires_final_effect(target_idx) {
+            self.fs_holdover_tex = None;
+            return;
+        }
+        self.fs_holdover_tex = self
+            .fullscreen_idx
+            .filter(|&current_idx| current_idx != target_idx)
+            .and_then(|current_idx| self.resolve_fs_display_tex(current_idx, true));
     }
 
     /// 現在 fullscreen 表示中の画像 (Static) が透過 (alpha<255) を含むか。
@@ -2288,8 +2315,21 @@ impl App {
         if let Some(comic) = self.ensure_comic_composite_texture(ctx, idx) {
             return Some(comic);
         }
-        self.ensure_final_composite_texture(ctx, idx)
-            .or_else(|| self.resolve_fs_pre_overlay_texture(idx))
+        if let Some(texture) = self.ensure_final_composite_texture(ctx, idx) {
+            // nav lock 無しの holdover は同一フォルダ内ページ送り専用。カラー化済み
+            // texture が届いた時点で解放する。フォルダ移動用 holdover は
+            // poll_fs_nav_lock が items generation と合わせて解放する。
+            if self.fs_nav_locked_gen.is_none() && self.fullscreen_idx == Some(idx) {
+                self.fs_holdover_tex = None;
+            }
+            return Some(texture);
+        }
+        if self.colorize_display_requires_final_effect(idx) {
+            return (self.fs_nav_locked_gen.is_none() && self.fullscreen_idx == Some(idx))
+                .then(|| self.fs_holdover_tex.clone())
+                .flatten();
+        }
+        self.resolve_fs_pre_overlay_texture(idx)
     }
 
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
@@ -9239,11 +9279,19 @@ impl App {
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
 
-        let thumb_tex = match self.thumbnails.get(fs_idx) {
-            Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-            _ => None,
-        }
-        .or_else(|| self.fs_nav_holdover_tex_for_draw());
+        let waiting_for_colorize = !original_preview_active
+            && tex.is_none()
+            && self.colorize_display_requires_final_effect(fs_idx);
+        let thumb_tex = if waiting_for_colorize {
+            // フォルダ移動用 holdover だけは維持する。生サムネイルは白黒なので使わない。
+            self.fs_nav_holdover_tex_for_draw()
+        } else {
+            match self.thumbnails.get(fs_idx) {
+                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+                _ => None,
+            }
+            .or_else(|| self.fs_nav_holdover_tex_for_draw())
+        };
 
         let mut location_display = self.location_display_for(fs_idx);
         // 動画の場合は decode 経路 (HW/SW) と GPU パスを末尾に追記。
@@ -10399,6 +10447,36 @@ impl App {
         );
     }
 
+    fn apply_fullscreen_colorize_selection(
+        &mut self,
+        fs_idx: usize,
+        palette: crate::colorize::ColorizePalette,
+        shortcut_label: &'static str,
+    ) {
+        if !self.reading_flow.is_paged() {
+            return;
+        }
+        let scope = self.resolve_adjust_scope(fs_idx);
+        let old_params = self.effective_params(fs_idx).clone();
+        let mut params = old_params.clone();
+        params.colorize.enable_with_palette(palette);
+        let label = palette.label();
+        self.show_feedback_toast(format!(
+            "[{shortcut_label}: {} / カラー化 {}]",
+            scope.label(),
+            label
+        ));
+        self.capture_adjust_full(format!("カラー化: {label}"), |app| {
+            app.write_params_for_scope(fs_idx, scope, params.clone());
+            match scope {
+                AdjustScope::PageOverride => {
+                    app.clear_caches_for_param_change(fs_idx, &old_params, &params)
+                }
+                AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
+            }
+        });
+    }
+
     /// フルスクリーンのキー入力を処理し、アクションを返す。
     pub(crate) fn handle_fs_key_input(
         &mut self,
@@ -11543,6 +11621,25 @@ impl App {
                     })
             })
             .flatten();
+        // 旧疑似カラー直指定アクション名は設定互換のため維持し、専用カラー化の
+        // 標準プリセットへルーティングする。
+        let colorize_direct = if !current_item_is_video
+            && !fs_music_view_active
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsPostFilterPseudoColor4)
+        {
+            Some(crate::colorize::ColorizePalette::Legacy4Color)
+        } else if !current_item_is_video
+            && !fs_music_view_active
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsPostFilterPseudoColorSkin)
+        {
+            Some(crate::colorize::ColorizePalette::LegacySkin)
+        } else {
+            None
+        };
         let key_t_alt = !current_item_is_video
             && !fs_music_view_active
             && self
@@ -11700,7 +11797,9 @@ impl App {
         // T / Shift+T / Alt+T: ポストフィルタの次/前/なしへ切替。
         // post_filter は final AI の後段なので、差分分類 (clear_caches_for_param_change)
         // 経由で final AI cache を保持したまま final composite だけ作り直す。
-        if let Some(filter) = post_filter_direct {
+        if let Some(palette) = colorize_direct {
+            self.apply_fullscreen_colorize_selection(fs_idx, palette, "カラー化");
+        } else if let Some(filter) = post_filter_direct {
             self.apply_fullscreen_post_filter_selection(fs_idx, filter, "PF");
         } else if (key_t || key_t_shift || key_t_alt) && self.reading_flow.is_paged() {
             let all = PostFilter::ALL;
@@ -15679,6 +15778,8 @@ impl App {
             if !self.fs_cache.contains_key(&page.idx) {
                 any_loading = true;
             }
+            let allow_thumbnail =
+                original_preview_active || !self.colorize_display_requires_final_effect(page.idx);
             Self::draw_fs_spread_page(
                 &painter,
                 page.rect,
@@ -15689,6 +15790,7 @@ impl App {
                 &location,
                 holdover_for_locked.as_ref(),
                 display_tex.as_ref(),
+                allow_thumbnail,
                 page.content_bbox,
             );
         }
@@ -16071,6 +16173,7 @@ impl App {
             current_rgba: Arc::clone(&pair.current_rgba),
             mode,
             wipe_fraction,
+            lod_bias: self.settings.image_mipmap_lod_bias,
             target_format,
         };
         Some((
@@ -16253,6 +16356,7 @@ impl App {
             fov_y: pano.fov_y,
             aspect,
             uv_transform,
+            lod_bias: self.settings.image_mipmap_lod_bias,
             target_format,
         };
         let shape = egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
@@ -17298,9 +17402,15 @@ impl App {
             let page_original_preview_active = self.original_preview_active(ctx, page_idx);
             let page_tex =
                 self.resolve_fs_processed_texture(ctx, page_idx, page_original_preview_active);
-            let page_thumb: Option<egui::TextureHandle> = match self.thumbnails.get(page_idx) {
-                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-                _ => None,
+            let page_thumb: Option<egui::TextureHandle> = if !page_original_preview_active
+                && self.colorize_display_requires_final_effect(page_idx)
+            {
+                None
+            } else {
+                match self.thumbnails.get(page_idx) {
+                    Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+                    _ => None,
+                }
             };
             let Some(handle) = page_tex.or(page_thumb) else {
                 return;
@@ -17634,13 +17744,18 @@ impl App {
             // fallback 描画しない。タイトル/パスだけ先に進み、画像だけ旧フォルダに
             // 残る状態を避けるため、描画可否は helper に集約する。
             let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
-            for (rect, idx, rot, location, display_tex, content_bbox) in [
+            let left_allow_thumbnail =
+                original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
+            let right_allow_thumbnail =
+                original_preview_active || !self.colorize_display_requires_final_effect(right_idx);
+            for (rect, idx, rot, location, display_tex, allow_thumbnail, content_bbox) in [
                 (
                     spread_rects.left_rect,
                     left_idx,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
+                    left_allow_thumbnail,
                     content_left,
                 ),
                 (
@@ -17649,6 +17764,7 @@ impl App {
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
+                    right_allow_thumbnail,
                     content_right,
                 ),
             ] {
@@ -17662,6 +17778,7 @@ impl App {
                     location,
                     holdover_for_locked.as_ref(),
                     display_tex,
+                    allow_thumbnail,
                     content_bbox,
                 );
             }
@@ -17703,13 +17820,18 @@ impl App {
             );
             // フォールバック分岐でも nav ロック中の holdover 可否は上のパスと同じ。
             let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
-            for (rect, idx, rot, location, display_tex, content_bbox) in [
+            let left_allow_thumbnail =
+                original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
+            let right_allow_thumbnail =
+                original_preview_active || !self.colorize_display_requires_final_effect(right_idx);
+            for (rect, idx, rot, location, display_tex, allow_thumbnail, content_bbox) in [
                 (
                     left_rect,
                     left_idx,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
+                    left_allow_thumbnail,
                     content_left,
                 ),
                 (
@@ -17718,6 +17840,7 @@ impl App {
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
+                    right_allow_thumbnail,
                     content_right,
                 ),
             ] {
@@ -17731,6 +17854,7 @@ impl App {
                     location,
                     holdover_for_locked.as_ref(),
                     display_tex,
+                    allow_thumbnail,
                     content_bbox,
                 );
             }
@@ -17787,11 +17911,16 @@ impl App {
         location_display: &str,
         holdover_tex: Option<&egui::TextureHandle>,
         display_tex: Option<&egui::TextureHandle>,
+        allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
     ) {
-        let thumb_tex = match thumbnails.get(idx) {
-            Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-            _ => None,
+        let thumb_tex = if allow_thumbnail {
+            match thumbnails.get(idx) {
+                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+                _ => None,
+            }
+        } else {
+            None
         };
         let display_tex = display_tex.or(thumb_tex.as_ref()).or(holdover_tex);
 
