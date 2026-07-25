@@ -58,7 +58,10 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   消しゴムマスク・隠蔽加工・部分補正・書き出しクロップ・テキスト注釈、フォルダ / 本の
   代表サムネピン、動画ピン（位置と WebP）を保存する。`mimageviewer.dat` の自動バックアップ
   設定が OFF でも、明示 export は中央 DB からこれらを読み、自己完結した manifest を作る。
-  エクスポート時は直下だけ、またはサブフォルダを含む再帰走査を選べる。再帰時も nested
+  エクスポート時は直下だけ、またはサブフォルダを含む再帰走査を選べる。既定は再帰走査で、
+  最後に選んだ走査範囲は設定へ保存して次回の初期値にする。非再帰ではrootとその直下の項目を
+  対象にするため、直下のサブフォルダ自身のメタ情報（評価・タグ・代表サムネ・見開き等）は
+  含まれるが、そのサブフォルダの中身は対象外になる。再帰時も nested
   sidecar は作らず、root相対パスを持つフォルダ単位shardへ分割する。ZIP / PDF 内ページの評価・
   タグ・ページ編集と、ZIP 内の本ごとの設定は、物理コンテナの項目に仮想項目として格納する。
   変換cache経由のRAR / 7z / LZH（および入れ子非ZIPを含むZIP）は、ページ情報とコンテナ情報で
@@ -111,6 +114,11 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   復活させない。
 - 両処理は完全モーダルで背面操作を止めるが、列挙、JSON、SQLite は worker thread で行う。
   開始前から実行中のメタ情報書き込みとリネーム移行が着地するまで待ってから処理する。
+  インポート時はタグ書き込みworkerの未処理jobも先にdrainし、workerが保持する`tags.db`
+  接続の解放ACKを上限つきで待つ。解放できなければDB更新を開始せず原因を表示する。
+  解放中に到着したタグjobは保留し、インポートの成功 / キャンセル / 失敗 / 開始失敗後に
+  解放要求を下ろして、次のタグjobで接続を遅延再openして処理する。読み取り専用DB接続だけを
+  使いjournal modeを切り替えないエクスポートでは、この接続解放を行わない。
   dirty な自動 sidecar の JSON 化・temp 書き込み・rename も import worker の前処理とし、
   保存に失敗した場合は DB 反映を開始しない。評価から動画ピンまでの全15ストアは、WAL等の
   非対応 journal mode がないことを検査した単一の SQLite attached transaction に参加させる。
@@ -1476,6 +1484,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |
 | `tag_sidecar_backup_enabled` | bool | false | タグをフォルダ直下の `mimageviewer.dat` にもバックアップする。`tags.db` が正本で、この設定は移動時復元用の opt-in。フォルダタグは対象外。OFF 時はタグバックアップの読み書きをスキップ |
+| `metadata_export_recursive` | bool | true | 明示メタ情報エクスポートでサブフォルダの中身も再帰走査する。ダイアログで最後に選んだ値を保存し、次回の初期値に使う |
 | `folder_tree_pane_visible` | bool | false | 左側の実フォルダツリーペインを表示 |
 | `folder_tree_pane_width_ratio` | f32 | 0.22 | フォルダツリーペインの左右境界位置 (ウィンドウ幅に対する比率)。復元時は最小/最大幅にクランプ |
 | `show_toolbar_favorites` | bool | true | ツールバーにお気に入りを表示 |

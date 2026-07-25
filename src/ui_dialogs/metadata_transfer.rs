@@ -128,11 +128,11 @@ pub(crate) struct MetadataTransferState {
 }
 
 impl MetadataTransferState {
-    fn export(root: PathBuf) -> Self {
+    fn export(root: PathBuf, settings: &crate::settings::Settings) -> Self {
         Self {
             root,
             operation: Operation::Export,
-            recursive: false,
+            recursive: settings.metadata_export_recursive,
             stage: Stage::ExportOptions,
             progress: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -163,6 +163,17 @@ impl MetadataTransferState {
             import_refresh_errors: Vec::new(),
         }
     }
+}
+
+fn update_metadata_export_recursive_setting(
+    settings: &mut crate::settings::Settings,
+    recursive: bool,
+) -> bool {
+    if settings.metadata_export_recursive == recursive {
+        return false;
+    }
+    settings.metadata_export_recursive = recursive;
+    true
 }
 
 impl Drop for MetadataTransferState {
@@ -216,7 +227,7 @@ impl App {
             self.show_feedback_toast("実フォルダを表示しているときに使用できます".to_string());
             return;
         };
-        self.metadata_transfer = Some(MetadataTransferState::export(root));
+        self.metadata_transfer = Some(MetadataTransferState::export(root, &self.settings));
     }
 
     pub(crate) fn open_metadata_import_dialog(&mut self) {
@@ -232,8 +243,13 @@ impl App {
     /// 転送 worker と同じ DB を書き換え得る既存処理が完全に着地したか。
     /// モーダルはユーザー入力を止めるが、開始前から走っていた worker までは止めないため、
     /// この drain 待ちを必ず通してから export/import を開始する。
-    fn metadata_transfer_writers_busy(&mut self) -> bool {
-        self.quiesce_metadata_transfer_context_writers()
+    fn metadata_transfer_writers_busy(
+        &mut self,
+        release_tag_db_for_import: bool,
+    ) -> Result<bool, String> {
+        let context_or_tag_writer_busy =
+            self.quiesce_metadata_transfer_context_writers(release_tag_db_for_import)?;
+        Ok(context_or_tag_writer_busy
             || self.rename_migration_writers_busy()
             || self.tag_maintenance_rx.is_some()
             || self.tag_legacy_xmp_pending.is_some()
@@ -250,7 +266,7 @@ impl App {
             || self.book_op_pending.is_some()
             || self.capture_pending.is_some()
             || self.export_pending.is_some()
-            || self.batch_convert.is_some()
+            || self.batch_convert.is_some())
     }
 
     pub(crate) fn show_metadata_transfer_dialog(&mut self, ctx: &egui::Context) {
@@ -263,14 +279,28 @@ impl App {
             .metadata_transfer
             .as_ref()
             .is_some_and(|state| matches!(state.stage, Stage::WaitingForWriters));
-        let writers_ready = waiting_for_writers && !self.metadata_transfer_writers_busy();
+        let operation = self
+            .metadata_transfer
+            .as_ref()
+            .map(|state| state.operation)
+            .expect("state checked above");
+        let writer_status = waiting_for_writers
+            .then(|| self.metadata_transfer_writers_busy(matches!(operation, Operation::Import)));
+        let writers_ready = match writer_status {
+            Some(Ok(false)) => true,
+            Some(Err(error)) => {
+                if let Some(state) = self.metadata_transfer.as_mut() {
+                    state.stage = Stage::Result(match operation {
+                        Operation::Export => ResultState::Export(Err(error)),
+                        Operation::Import => ResultState::Import(Err(error)),
+                    });
+                }
+                false
+            }
+            Some(Ok(true)) | None => false,
+        };
         let should_start_worker = writers_ready;
         if should_start_worker {
-            let operation = self
-                .metadata_transfer
-                .as_ref()
-                .map(|state| state.operation)
-                .expect("state checked above");
             // writer の結果反映で view-trim が再び dirty になり得るため、実行直前の
             // UI 状態をメモリ snapshot する。SQLite write は transfer worker に渡す。
             let pending_view_trim = self.take_pending_view_trim_transfer();
@@ -344,10 +374,15 @@ impl App {
         self.restore_metadata_import_resources();
 
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let action = {
+        let (action, export_recursive_changed) = {
             let state = self.metadata_transfer.as_mut().expect("checked above");
             draw_dialog(ctx, state, escape_pressed)
         };
+        if let Some(recursive) = export_recursive_changed
+            && update_metadata_export_recursive_setting(&mut self.settings, recursive)
+        {
+            self.settings.save();
+        }
         match action {
             DialogAction::None => {}
             DialogAction::StartExport => {
@@ -381,9 +416,9 @@ impl App {
             DialogAction::Close => self.metadata_transfer = None,
         }
 
-        // WaitingForWritersで止めたcontext所有XMP readerは、転送の結果表示・開始失敗・
-        // 待機キャンセルでmodalを離れる時に全contextへ戻す。Running/Refreshing中は
-        // DB writerを新たに生成しない。
+        // WaitingForWritersで止めたcontext所有XMP readerとtag write workerは、転送の
+        // 結果表示・開始失敗・待機キャンセルでmodalを離れる時に再開する。
+        // Running/Refreshing中はDB writerを新たに生成しない。
         let resume_context_readers = self.metadata_transfer.is_none()
             || self.metadata_transfer.as_ref().is_some_and(|state| {
                 matches!(
@@ -674,8 +709,10 @@ fn draw_dialog(
     ctx: &egui::Context,
     state: &mut MetadataTransferState,
     escape_pressed: bool,
-) -> DialogAction {
+) -> (DialogAction, Option<bool>) {
     let mut action = DialogAction::None;
+    let mut export_recursive_changed = None;
+    let recursive = state.recursive;
     egui::Modal::new(egui::Id::new("metadata_transfer_modal")).show(ctx, |ui| {
         ui.set_min_width(430.0);
         ui.heading(match state.operation {
@@ -692,7 +729,19 @@ fn draw_dialog(
 
         match &mut state.stage {
             Stage::ExportOptions => {
-                ui.checkbox(&mut state.recursive, "サブフォルダも含める（再帰）");
+                if ui
+                    .checkbox(&mut state.recursive, "サブフォルダも含める（再帰）")
+                    .changed()
+                {
+                    export_recursive_changed = Some(state.recursive);
+                }
+                if state.recursive {
+                    ui.small("サブフォルダの中身もエクスポート対象になります。");
+                } else {
+                    ui.small(
+                        "このフォルダ直下の項目だけが対象です。サブフォルダの中身は含まれません。",
+                    );
+                }
                 ui.add_space(6.0);
                 ui.label(format!(
                     "同じフォルダの {} フォルダに保存します。",
@@ -796,7 +845,7 @@ fn draw_dialog(
                 ui.small("データベースへの反映は完了しています。");
             }
             Stage::Result(result) => {
-                draw_result(ui, result);
+                draw_result(ui, result, recursive);
                 ui.add_space(8.0);
                 if ui.button("閉じる").clicked() || escape_pressed {
                     action = DialogAction::Close;
@@ -804,7 +853,7 @@ fn draw_dialog(
             }
         }
     });
-    action
+    (action, export_recursive_changed)
 }
 
 fn draw_progress(ui: &mut egui::Ui, progress: Option<&TransferProgress>) {
@@ -893,12 +942,17 @@ fn test_progress(path: &str) -> TransferProgress {
     }
 }
 
-fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
+fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
     match result {
         ResultState::Export(Ok(summary)) => {
             ui.label("エクスポートが完了しました。");
+            let scope = if recursive {
+                "サブフォルダを含む再帰"
+            } else {
+                "このフォルダ直下のみ"
+            };
             ui.label(format!(
-                "{} 項目 / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / サムネピン {}",
+                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / サムネピン {}",
                 summary.entries,
                 summary.ratings,
                 summary.tagged_items,
@@ -1259,6 +1313,37 @@ fn flush_import_sidecars(resources: &Arc<Mutex<ImportWorkerResources>>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_state_initializes_recursive_from_settings() {
+        for recursive in [true, false] {
+            let mut settings = crate::settings::Settings::default();
+            settings.metadata_export_recursive = recursive;
+
+            let state = MetadataTransferState::export(PathBuf::from("C:/Pictures"), &settings);
+
+            assert_eq!(state.recursive, recursive);
+        }
+    }
+
+    #[test]
+    fn export_recursive_setting_changes_only_when_value_differs() {
+        let mut settings = crate::settings::Settings::default();
+
+        assert!(!update_metadata_export_recursive_setting(
+            &mut settings,
+            true
+        ));
+        assert!(update_metadata_export_recursive_setting(
+            &mut settings,
+            false
+        ));
+        assert!(!settings.metadata_export_recursive);
+        assert!(!update_metadata_export_recursive_setting(
+            &mut settings,
+            false
+        ));
+    }
 
     #[test]
     fn import_preparation_flushes_dirty_sidecars_off_thread() {

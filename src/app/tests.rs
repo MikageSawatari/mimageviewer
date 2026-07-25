@@ -526,6 +526,7 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
     app.items = items.clone();
     app.settings.write_rating_to_xmp = true;
     app.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+    app.tag_write_handle = Some(crate::tag_write_worker::TagWriteHandle::spawn());
     app.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
         temp.path().join("main"),
         Vec::new(),
@@ -556,13 +557,36 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
     app.record_rating_session_write(rating_key, 4, true);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while app.quiesce_metadata_transfer_context_writers() {
+    let mut saw_tag_db_release_wait = false;
+    loop {
+        let busy = app
+            .quiesce_metadata_transfer_context_writers(true)
+            .expect("tag DB release handshake must not time out");
+        saw_tag_db_release_wait |= busy
+            && matches!(
+                app.metadata_transfer_tag_db_release_state,
+                MetadataTransferTagDbReleaseState::Requested { .. }
+            );
+        if !busy {
+            break;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "legacy writers must finish after the transfer drain starts"
+            "legacy writers and tag DB release must finish after transfer drain starts"
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+
+    assert!(
+        saw_tag_db_release_wait,
+        "import待機はtag write workerへ接続解放を要求したフレームもbusyを返す"
+    );
+    assert!(
+        app.tag_write_handle
+            .as_ref()
+            .is_some_and(|handle| handle.db_released()),
+        "import開始可能になる前にtag write workerの解放ACKを得る"
+    );
 
     assert_eq!(app.rating_cache.get(&0), Some(&4));
     assert!(app.tag_prewarm_pending.is_none());
@@ -596,6 +620,40 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
     );
 
     app.resume_metadata_transfer_context_readers();
+    assert!(
+        matches!(
+            app.metadata_transfer_tag_db_release_state,
+            MetadataTransferTagDbReleaseState::Idle
+        ),
+        "終了時にApp側の接続解放状態をidleへ戻す"
+    );
+
+    let resumed_tag_path = app.tmp.path().join("resumed-tag-write.jpg");
+    app.tag_write_handle
+        .as_ref()
+        .unwrap()
+        .submit(crate::tag_write_worker::TagWriteJob {
+            path: resumed_tag_path,
+            kind: crate::tag_write_worker::TagJobKind::Add("resumed".to_string()),
+            tag_sidecar: None,
+            tx_id: 0,
+        });
+    let resume_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(result) = app
+            .tag_write_handle
+            .as_ref()
+            .and_then(|handle| handle.try_recv_result())
+        {
+            assert!(result.result.is_ok(), "resume後のtag書き込みが成功する");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < resume_deadline,
+            "resume後に保留解除されたtag jobが完了する"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(app.tag_prewarm_pending.is_some());
     assert!(
         app.active_detached_viewer_context

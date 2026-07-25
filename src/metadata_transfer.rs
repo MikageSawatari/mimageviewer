@@ -3681,45 +3681,120 @@ fn verify_target(
 
 fn ensure_database_schemas(data_dir: &Path) -> Result<(), TransferError> {
     fs::create_dir_all(data_dir).map_err(|error| TransferError::Io(error.to_string()))?;
-    drop(crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).map_err(db_error)?);
-    drop(crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).map_err(db_error)?);
+    drop(
+        crate::rating_db::RatingDb::open_at(data_dir.join("rating.db"))
+            .map_err(|error| schema_open_error("rating.db", error))?,
+    );
+    drop(
+        crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db"))
+            .map_err(|error| schema_open_error("tags.db", error))?,
+    );
     drop(
         crate::video_bookmarks::VideoBookmarkDb::open_at(&data_dir.join("video_bookmarks.db"))
-            .map_err(db_error)?,
+            .map_err(|error| schema_open_error("video_bookmarks.db", error))?,
     );
     crate::book_bookmarks::ensure_schema_at(&data_dir.join("book_bookmarks.db"))
-        .map_err(db_error)?;
+        .map_err(|error| schema_open_error("book_bookmarks.db", error))?;
     drop(
         crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db"))
-            .map_err(db_error)?,
+            .map_err(|error| schema_open_error("adjustment.db", error))?,
     );
-    drop(crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db")).map_err(db_error)?);
-    drop(crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db")).map_err(db_error)?);
+    drop(
+        crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db"))
+            .map_err(|error| schema_open_error("mask.db", error))?,
+    );
+    drop(
+        crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db"))
+            .map_err(|error| schema_open_error("conceal.db", error))?,
+    );
     drop(
         crate::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db"))
-            .map_err(db_error)?,
+            .map_err(|error| schema_open_error("local_adjust.db", error))?,
     );
-    drop(crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db")).map_err(db_error)?);
-    drop(crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).map_err(db_error)?);
+    drop(
+        crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db"))
+            .map_err(|error| schema_open_error("export_crop.db", error))?,
+    );
+    drop(
+        crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db"))
+            .map_err(|error| schema_open_error("comic.db", error))?,
+    );
     drop(
         crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
-            .map_err(db_error)?,
+            .map_err(|error| schema_open_error("view_trim.db", error))?,
     );
-    drop(crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db")).map_err(db_error)?);
-    drop(crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).map_err(db_error)?);
+    drop(
+        crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db"))
+            .map_err(|error| schema_open_error("rotation.db", error))?,
+    );
+    drop(
+        crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db"))
+            .map_err(|error| schema_open_error("spread.db", error))?,
+    );
     drop(
         crate::folder_thumb_pins::FolderThumbPinDb::open_at(&data_dir.join("folder_thumb_pins.db"))
-            .map_err(db_error)?,
+            .map_err(|error| schema_open_error("folder_thumb_pins.db", error))?,
     );
     drop(
         crate::video_pins::VideoPinDb::open_at(&data_dir.join("video_pins.db"))
-            .map_err(db_error)?,
+            .map_err(|error| schema_open_error("video_pins.db", error))?,
     );
     Ok(())
 }
 
+fn schema_open_error(filename: &str, error: rusqlite::Error) -> TransferError {
+    TransferError::Database(format!(
+        "{filename}を開いてスキーマを確認できませんでした: {error}"
+    ))
+}
+
+fn attach_error(filename: &str, error: rusqlite::Error) -> TransferError {
+    TransferError::Database(format!("{filename}をATTACHできませんでした: {error}"))
+}
+
+fn switch_tags_to_rollback_journal(conn: &Connection) -> Result<String, TransferError> {
+    const ATTEMPTS: usize = 5;
+    const ATTEMPT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(375);
+    const IMPORT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // journal mode切替だけは短い上限で再試行する。5回のbusy待ちと4回の間隔を
+    // 合わせても約2秒で打ち切り、UI側で解放できなかった接続を無限に待たない。
+    conn.busy_timeout(ATTEMPT_BUSY_TIMEOUT).map_err(|error| {
+        TransferError::Database(format!(
+            "tags.dbのjournal mode切替待機を設定できませんでした: {error}"
+        ))
+    })?;
+    for attempt in 1..=ATTEMPTS {
+        match conn.query_row("PRAGMA tags.journal_mode = DELETE", [], |row| row.get(0)) {
+            Ok(mode) => {
+                conn.busy_timeout(IMPORT_BUSY_TIMEOUT).map_err(|error| {
+                    TransferError::Database(format!(
+                        "tags.dbのimport待機時間を復元できませんでした: {error}"
+                    ))
+                })?;
+                return Ok(mode);
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "metadata import: tags.db journal mode switch failed ({attempt}/{ATTEMPTS}): {error}"
+                ));
+                if attempt < ATTEMPTS {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let _ = conn.busy_timeout(IMPORT_BUSY_TIMEOUT);
+    Err(TransferError::Database(
+        "他の接続がtags.dbを開いたままのため、tags.dbをrollback journalへ切り替えられませんでした"
+            .to_string(),
+    ))
+}
+
 fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> {
-    let conn = Connection::open(data_dir.join("rating.db")).map_err(db_error)?;
+    let conn = Connection::open(data_dir.join("rating.db"))
+        .map_err(|error| schema_open_error("rating.db", error))?;
     // 15 storeのfamily delete / sparse insertを項目ごとに再利用する。既定16では
     // statement種類数を下回り、巨大importでprepare/finalizeが再発する。
     conn.set_prepared_statement_cache_capacity(64);
@@ -3729,7 +3804,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         "ATTACH DATABASE ?1 AS tags",
         [data_dir.join("tags.db").to_string_lossy().as_ref()],
     )
-    .map_err(db_error)?;
+    .map_err(|error| attach_error("tags.db", error))?;
     conn.execute(
         "ATTACH DATABASE ?1 AS video",
         [data_dir
@@ -3737,7 +3812,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
             .to_string_lossy()
             .as_ref()],
     )
-    .map_err(db_error)?;
+    .map_err(|error| attach_error("video_bookmarks.db", error))?;
     conn.execute(
         "ATTACH DATABASE ?1 AS book",
         [data_dir
@@ -3745,7 +3820,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
             .to_string_lossy()
             .as_ref()],
     )
-    .map_err(db_error)?;
+    .map_err(|error| attach_error("book_bookmarks.db", error))?;
     for (schema, filename) in [
         ("adjustment", "adjustment.db"),
         ("mask", "mask.db"),
@@ -3763,7 +3838,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
             &format!("ATTACH DATABASE ?1 AS {schema}"),
             [data_dir.join(filename).to_string_lossy().as_ref()],
         )
-        .map_err(db_error)?;
+        .map_err(|error| attach_error(filename, error))?;
     }
 
     // TagsDb normally uses WAL for concurrent UI reads.  A transaction spanning
@@ -3772,9 +3847,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
     // the import worker before this point, so it is safe to switch tags.db to a
     // rollback journal for the duration of import.  TagsDb::open restores WAL
     // after the import connection has been dropped.
-    let tag_mode: String = conn
-        .query_row("PRAGMA tags.journal_mode = DELETE", [], |row| row.get(0))
-        .map_err(db_error)?;
+    let tag_mode = switch_tags_to_rollback_journal(&conn)?;
     if !tag_mode.eq_ignore_ascii_case("delete") {
         return Err(TransferError::Database(format!(
             "tags.db を安全なjournal modeへ切り替えられませんでした: {tag_mode}"
@@ -5325,6 +5398,40 @@ mod tests {
 
     fn init_data_dir(path: &Path) {
         ensure_database_schemas(path).unwrap();
+    }
+
+    #[test]
+    fn open_import_connection_names_held_tags_db_instead_of_raw_locked_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_data_dir(temp.path());
+        let _held_tags = crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db")).unwrap();
+
+        let error = match open_import_connection(temp.path()) {
+            Ok(_) => panic!("別接続がtags.dbを保持中ならjournal mode切替を拒否する"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("tags.db"), "対象DB名を示す: {error}");
+        assert!(
+            error.contains("他の接続"),
+            "保持接続が原因だと示す: {error}"
+        );
+        assert!(
+            error.contains("rollback journal"),
+            "失敗した切替段階を示す: {error}"
+        );
+        assert!(
+            !error.contains("database is locked"),
+            "SQLiteの生エラーだけを利用者へ返さない: {error}"
+        );
+    }
+
+    #[test]
+    fn open_import_connection_succeeds_without_held_tags_db_connection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_data_dir(temp.path());
+        let connection = open_import_connection(temp.path())
+            .expect("他のtags.db接続が無い通常状態ならimport connectionを開ける");
+        drop(connection);
     }
 
     fn plain_portable_entry(path: &str, media_kind: PortableMediaKind) -> PortableEntry {

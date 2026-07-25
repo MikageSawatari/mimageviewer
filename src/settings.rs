@@ -3599,6 +3599,11 @@ pub struct Settings {
     #[serde(default)]
     pub tag_sidecar_backup_enabled: bool,
 
+    /// 明示メタ情報エクスポートでサブフォルダの中身も再帰走査する。
+    /// ダイアログで最後に選んだ値を保持し、次回エクスポートの初期値に使う。
+    #[serde(default = "default_true")]
+    pub metadata_export_recursive: bool,
+
     // ── Susie プラグイン (v0.7.0) ──────────────────────────────
     /// Susie 画像プラグイン機能全体の ON/OFF (デフォルト: true、ワーカー exe が無い環境では自動的に無効化される)。
     #[serde(default = "default_true")]
@@ -4775,6 +4780,7 @@ impl Default for Settings {
             colorize_preset_slots: crate::colorize::ColorizePresetSlots::default(),
             sidecar_backup_enabled: true,
             tag_sidecar_backup_enabled: false,
+            metadata_export_recursive: true,
             susie_enabled: true,
             susie_allow_parallel: true,
             minimize_to_tray_on_close: false,
@@ -7356,6 +7362,20 @@ mod tests {
             loaded.edit_preview_cache_max_bytes,
             crate::edit_preview_cache::DEFAULT_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn metadata_export_recursive_defaults_to_true() {
+        assert!(Settings::default().metadata_export_recursive);
+
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(loaded.metadata_export_recursive);
+
+        let mut selected = Settings::default();
+        selected.metadata_export_recursive = false;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+        assert!(!restored.metadata_export_recursive);
     }
 
     #[test]

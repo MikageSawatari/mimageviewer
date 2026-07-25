@@ -4,6 +4,7 @@
 //! シリアルに `tags.db` を更新する。メディア本体 / XMP サイドカー / Tantivy
 //! には通常タグ操作から書き込まない。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -100,6 +101,10 @@ pub struct TagWriteHandle {
     pub pending_in_writer: Arc<AtomicUsize>,
     _thread: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    /// 明示メタ情報importがWALからrollback journalへ切り替える間、接続を解放する要求。
+    release_db_requested: Arc<AtomicBool>,
+    /// workerが`TagsDb`をdropし、解放要求中のジョブ処理を停止したことを示すACK。
+    db_released: Arc<AtomicBool>,
 }
 
 impl TagWriteHandle {
@@ -112,11 +117,15 @@ impl TagWriteHandle {
         let failures = Arc::new(AtomicUsize::new(0));
         let pending_in_writer = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let release_db_requested = Arc::new(AtomicBool::new(false));
+        let db_released = Arc::new(AtomicBool::new(false));
 
         let w_done = done.clone();
         let w_failures = failures.clone();
         let w_pending = pending_in_writer.clone();
         let w_shutdown = shutdown.clone();
+        let w_release_db_requested = release_db_requested.clone();
+        let w_db_released = db_released.clone();
         let handle = std::thread::Builder::new()
             .name("tag-write-worker".into())
             .spawn(move || {
@@ -127,6 +136,8 @@ impl TagWriteHandle {
                     &w_failures,
                     &w_pending,
                     &w_shutdown,
+                    &w_release_db_requested,
+                    &w_db_released,
                 );
             })
             .expect("tag-write-worker spawn");
@@ -140,6 +151,8 @@ impl TagWriteHandle {
             pending_in_writer,
             _thread: Some(handle),
             shutdown,
+            release_db_requested,
+            db_released,
         }
     }
 
@@ -174,13 +187,29 @@ impl TagWriteHandle {
             self.failures.store(0, Ordering::Relaxed);
         }
     }
+
+    /// 明示メタ情報importに備えて、workerが保持する`tags.db`接続の解放を要求する。
+    pub fn request_db_release(&self) {
+        self.db_released.store(false, Ordering::Release);
+        self.release_db_requested.store(true, Ordering::Release);
+    }
+
+    /// 接続をdropし、解放要求中のジョブを保留していることをworkerがACKしたか。
+    pub fn db_released(&self) -> bool {
+        self.db_released.load(Ordering::Acquire)
+    }
+
+    /// import終了後にジョブ処理を再開する。DB接続は次のジョブ直前に遅延再openする。
+    pub fn resume_db(&self) {
+        self.release_db_requested.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for TagWriteHandle {
     fn drop(&mut self) {
         // on_exit → App::drop → ここの流れで、worker が在庫ジョブを drain し切るのを待つ。
         // 終了直前にキューされた tags.db 更新を失わないため、rating worker と同じく join する。
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown.store(true, Ordering::Release);
         if let Some(thread) = self._thread.take() {
             let _ = thread.join();
         }
@@ -195,6 +224,8 @@ fn run_worker(
     failures: &Arc<AtomicUsize>,
     pending_in_writer: &Arc<AtomicUsize>,
     shutdown: &Arc<AtomicBool>,
+    release_db_requested: &Arc<AtomicBool>,
+    db_released: &Arc<AtomicBool>,
 ) {
     let mut db = match crate::tags_db::TagsDb::open() {
         Ok(db) => Some(db),
@@ -203,16 +234,43 @@ fn run_worker(
             None
         }
     };
+    let mut paused_jobs = VecDeque::new();
 
     loop {
-        if shutdown.load(Ordering::Relaxed) && job_rx.is_empty() {
+        let shutting_down = shutdown.load(Ordering::Acquire);
+
+        // shutdown時は解放要求よりqueue drainを優先する。通常時の解放要求中は接続を
+        // dropしてACKし、到着したjobをローカルqueueへ退避するだけで処理も破棄もしない。
+        if !shutting_down && release_db_requested.load(Ordering::Acquire) {
+            if db.take().is_some() {
+                crate::logger::log("tag_write_worker: released tags.db for metadata import");
+            }
+            db_released.store(true, Ordering::Release);
+            match job_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(job) => paused_jobs.push_back(job),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+            continue;
+        }
+        db_released.store(false, Ordering::Release);
+        if shutting_down && paused_jobs.is_empty() && job_rx.is_empty() {
             break;
         }
-        let job = match job_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(j) => j,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        let job = match paused_jobs.pop_front() {
+            Some(job) => job,
+            None => match job_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(job) => job,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            },
         };
+        // 通常recv_timeout中に解放要求が立ち、その直後のjobで待機解除された場合も、
+        // 要求中の処理へ進めず元の順序位置へ戻す。次loopで接続drop + ACKへ入る。
+        if !shutdown.load(Ordering::Acquire) && release_db_requested.load(Ordering::Acquire) {
+            paused_jobs.push_front(job);
+            continue;
+        }
 
         // spawn 時の open が一時要因 (AV スキャン / 他プロセスのファイルロック) で
         // 失敗していても、セッション中ずっと全タグ操作を失敗させない —
@@ -408,6 +466,8 @@ mod tests {
             pending_in_writer: pending_in_writer.clone(),
             _thread: None,
             shutdown,
+            release_db_requested: Arc::new(AtomicBool::new(false)),
+            db_released: Arc::new(AtomicBool::new(false)),
         };
 
         // total == done でも、pending_in_writer > 0 なら busy。
@@ -416,5 +476,75 @@ mod tests {
         // pending クリア後に busy が下がる。
         pending_in_writer.store(0, Ordering::Relaxed);
         assert!(!handle.is_busy(), "pending クリア後は busy=false");
+    }
+
+    #[test]
+    fn db_release_pauses_queue_and_resume_reopens_without_losing_jobs() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let path = crate::data_dir::get().join("release-handshake.jpg");
+        let handle = TagWriteHandle::spawn();
+
+        handle.submit(TagWriteJob {
+            path: path.clone(),
+            kind: TagJobKind::Add("before-release".to_string()),
+            tag_sidecar: None,
+            tx_id: 1,
+        });
+        let first = wait_for_result(&handle, Duration::from_secs(5));
+        assert!(first.result.is_ok(), "release前のjobが成功する");
+
+        handle.request_db_release();
+        let done_before_pause = handle.done.load(Ordering::Relaxed);
+        handle.submit(TagWriteJob {
+            path: path.clone(),
+            kind: TagJobKind::Add("during-release".to_string()),
+            tag_sidecar: None,
+            tx_id: 2,
+        });
+        let release_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.db_released() {
+            assert!(
+                std::time::Instant::now() < release_deadline,
+                "workerが上限内にtags.dbを解放する"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(
+            handle.done.load(Ordering::Relaxed),
+            done_before_pause,
+            "解放要求中のjobを処理しない"
+        );
+        assert!(
+            handle.try_recv_result().is_none(),
+            "解放要求中のjobを失敗結果へ変換しない"
+        );
+
+        handle.resume_db();
+        let second = wait_for_result(&handle, Duration::from_secs(5));
+        assert!(second.result.is_ok(), "再開後の保留jobが成功する");
+
+        let db = crate::tags_db::TagsDb::open_at(&crate::data_dir::get().join("tags.db")).unwrap();
+        let tags = db.display_tags_for_item(&crate::tags_db::item_key_for_path(&path));
+        assert!(tags.contains(&"#before-release".to_string()));
+        assert!(
+            tags.contains(&"#during-release".to_string()),
+            "遅延再open後も解放中に投入したjobを失わない"
+        );
+    }
+
+    fn wait_for_result(handle: &TagWriteHandle, timeout: Duration) -> TagWriteResult {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(result) = handle.try_recv_result() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tag write result must arrive before timeout"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

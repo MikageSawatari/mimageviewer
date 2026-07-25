@@ -399,8 +399,12 @@ ZIP / `ConvertibleArchive`のrating / tag / page-state familyは、manifestで�
 削除・挿入処理自体を省く。family削除はpath indexを利用できるexact + range条件で行う。
 dirty な自動 sidecar のserialize / temp書き込み / renameはimport workerの前処理で行い、
 失敗時はDB更新を開始しない。項目の全15ストアはbundled SQLiteのATTACH上限を20へ拡張して
-単一transactionへ参加させる。通常WALの`tags.db`はAppのidle connectionをworkerへ移して閉じ、
-import中だけDELETE journalへ切り替える。他の参加DBを含めWAL / MEMORY / OFFを検出した場合は
+単一transactionへ参加させる。通常WALの`tags.db`はAppのidle connectionをworkerへ移して閉じる
+だけでなく、App-globalなtag write workerの既存jobをdrainして保持接続の解放ACKを待ってから、
+import中だけDELETE journalへ切り替える。解放要求中に到着したタグjobは捨てずにworker内へ保留し、
+importの成功 / キャンセル / 失敗 / 開始失敗後に要求を下ろして、次jobの直前にWAL接続を遅延再open
+して処理する。接続解放ACKには上限を設け、到達しなければimportを開始しない。他の参加DBを含め
+WAL / MEMORY / OFFを検出した場合は
 適用前に拒否し、SQLite super-journalによるbatch内の全参加DB atomicityを維持する。
 manifest 由来の画像本の相対ページは provenance と canonical container を一覧から
 metadata / thumbnail / fullscreen worker まで保持し、実 I/O では開いた同一ハンドルの

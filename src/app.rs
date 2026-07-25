@@ -6460,6 +6460,15 @@ pub(crate) enum GridScrollIntent {
     Bottom,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MetadataTransferTagDbReleaseState {
+    #[default]
+    Idle,
+    Requested {
+        started_at: std::time::Instant,
+    },
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -7222,6 +7231,8 @@ pub struct App {
     /// 明示メタ情報エクスポート / インポートの完全モーダル状態。
     pub(crate) metadata_transfer:
         Option<crate::ui_dialogs::metadata_transfer::MetadataTransferState>,
+    /// import開始前に行うApp-globalなtag write workerの接続解放状態。
+    pub(crate) metadata_transfer_tag_db_release_state: MetadataTransferTagDbReleaseState,
     /// キャッシュ管理の「◯日以上古い」入力値
     pub(crate) cache_manager_days: u32,
     /// 開いたときに取得するキャッシュ統計: (フォルダ数, 合計バイト)
@@ -10341,6 +10352,7 @@ impl App {
             metadata_cleanup_scan: None,
             metadata_cleanup_result: None,
             metadata_transfer: None,
+            metadata_transfer_tag_db_release_state: MetadataTransferTagDbReleaseState::Idle,
             cache_manager_days: 90,
             cache_manager_stats: None,
             cache_manager_tile_bytes: None,
@@ -23318,8 +23330,12 @@ impl App {
     }
 
     /// main / active detached / paused detachedの全context writerを静止させる。
-    /// 戻り値trueの間はlegacy seedがDBを書き得るため、転送workerを開始しない。
-    pub(crate) fn quiesce_metadata_transfer_context_writers(&mut self) -> bool {
+    /// importでは全contextのdrain後、App-globalなtag write workerの接続解放も待つ。
+    /// `Ok(true)`の間はDB writerまたは接続解放ACKを待つため、転送workerを開始しない。
+    pub(crate) fn quiesce_metadata_transfer_context_writers(
+        &mut self,
+        release_tag_db_for_import: bool,
+    ) -> Result<bool, String> {
         let mut busy = self.quiesce_current_metadata_transfer_context_writers();
         #[cfg(windows)]
         {
@@ -23342,12 +23358,60 @@ impl App {
                 self.detached_image_windows[window_index].paused_bundle = Some(bundle);
             }
         }
-        busy
+
+        if !release_tag_db_for_import {
+            return Ok(busy);
+        }
+        if busy {
+            return Ok(true);
+        }
+
+        let Some(handle) = self.tag_write_handle.as_ref() else {
+            // worker未spawnは、解放対象の接続が存在しないため解放済みと同義。
+            self.metadata_transfer_tag_db_release_state = MetadataTransferTagDbReleaseState::Idle;
+            return Ok(false);
+        };
+        if matches!(
+            self.metadata_transfer_tag_db_release_state,
+            MetadataTransferTagDbReleaseState::Idle
+        ) {
+            // 先に既存jobを完走させる。要求後に入ったjobはworker側の保留queueへ残り、
+            // import終了後のresumeで処理される。
+            if handle.is_busy() {
+                return Ok(true);
+            }
+            handle.request_db_release();
+            self.metadata_transfer_tag_db_release_state =
+                MetadataTransferTagDbReleaseState::Requested {
+                    started_at: std::time::Instant::now(),
+                };
+            return Ok(true);
+        }
+        if handle.db_released() {
+            return Ok(false);
+        }
+        let MetadataTransferTagDbReleaseState::Requested { started_at } =
+            self.metadata_transfer_tag_db_release_state
+        else {
+            unreachable!("idle release state returned above");
+        };
+        if started_at.elapsed() >= std::time::Duration::from_secs(5) {
+            return Err(
+                "タグ書き込みワーカーが5秒以内にtags.dbの接続を解放しなかったため、メタ情報インポートを開始できませんでした"
+                    .to_string(),
+            );
+        }
+        Ok(true)
     }
 
     /// 転送待機で取消したXMP rating readerを、完了・開始失敗・待機キャンセル後に
     /// contextごとへ戻す。legacy seedは安全に完走させているため再生成しない。
     pub(crate) fn resume_metadata_transfer_context_readers(&mut self) {
+        if let Some(handle) = self.tag_write_handle.as_ref() {
+            handle.resume_db();
+        }
+        self.metadata_transfer_tag_db_release_state = MetadataTransferTagDbReleaseState::Idle;
+
         if !self.settings.write_rating_to_xmp {
             return;
         }
