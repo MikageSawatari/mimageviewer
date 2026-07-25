@@ -334,6 +334,8 @@ sidecarと同じ元画像ピクセル座標を保持する。ZIP / PDF のペー
 物理コンテナ配下の相対キーで持つ。RAR / 7z / LZHと、入れ子非ZIPを含んで変換されたZIPは、
 export元のarchive cache DBで有効なsource/cache対応を確認してcache ZIP側のページkeyを相対化し、
 import先data directoryから決まるcache ZIP keyへ復元する。コンテナ側の本設定は元アーカイブkeyを維持する。
+archive cache DB自体がない場合と対象行がない場合だけを未変換扱いにし、open / query失敗は
+ページメタ情報を黙って欠落させないようexport全体のエラーにする。
 
 bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
 `generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ
@@ -393,6 +395,9 @@ paused detachedのmaterialized previewを失効させる。各contextではimpor
 項目SAVEPOINT失敗は「一部未反映」として先頭path・理由を表示し、全件は常時
 `mimageviewer.log`へ記録する。import本体はmanifest / preflight / DB open / target verify /
 SQL apply / commit（合計・最大）の時間、終端refreshはcontext / item数と時間を同ログへ記録する。
+PDFの仮想項目はruntime keyと同じ`page_<u32>`だけを許可し、評価のkind / page numberもkeyと
+一致させる。export元DBのJSON化されたマスク・隠蔽図形などを厳密にparseし、破損値は空の状態へ
+変換せずストア名と項目keyを伴うエラーにする。
 性能ログを有効にした場合は同じ境界を`logs/perf_events.jsonl`の`metadata_import`イベントにも残す。
 進捗path欄は3行分を固定確保し、折り返しによってキャンセルbuttonの位置を動かさない。
 実装と境界条件は `metadata_transfer.rs`、モーダルと writer drain は

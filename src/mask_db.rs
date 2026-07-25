@@ -643,7 +643,13 @@ pub fn shapes_to_json(shapes: &[Shape]) -> Option<String> {
 /// 混在配列いずれも受ける (個別要素の `Deserialize` で分岐)。
 /// パース失敗時は空 Vec (既存 `vectors_from_json` と同じ寛容な挙動)。
 pub fn shapes_from_json(s: &str) -> Vec<Shape> {
-    serde_json::from_str(s).unwrap_or_default()
+    try_shapes_from_json(s).unwrap_or_default()
+}
+
+/// 移行・exportなど、壊れた図形を「図形なし」と同一視してはならない経路用。
+/// 通常表示の寛容な [`shapes_from_json`] は互換性のため維持する。
+pub fn try_shapes_from_json(s: &str) -> Result<Vec<Shape>, serde_json::Error> {
+    serde_json::from_str(s)
 }
 
 /// 円形ブラシで from → to を 1bit マスクへ塗る/消す。
@@ -1446,11 +1452,12 @@ mod tests {
 
     #[test]
     fn shape_deser_lenient_fallback_on_corrupt() {
-        // `shapes_from_json` は寛容に空配列を返す (既存 vectors_from_json と同じ挙動)。
-        // 厳密エラーが必要な場合は `serde_json::from_str::<Vec<Shape>>` を直接使う。
+        // 通常読込の `shapes_from_json` は寛容に空配列を返す一方、
+        // export / 移行用APIは破損を明示する。
         let corrupt = r#"this is not json"#;
         let shapes = shapes_from_json(corrupt);
         assert!(shapes.is_empty());
+        assert!(try_shapes_from_json(corrupt).is_err());
     }
 
     #[test]

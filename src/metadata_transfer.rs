@@ -1375,14 +1375,35 @@ fn prepare_export_page_index(
     data_dir: &Path,
     entries: &mut [EnumeratedEntry],
     physical_index: &HashMap<String, usize>,
-) -> HashMap<String, usize> {
+) -> Result<HashMap<String, usize>, TransferError> {
     let mut page_index = physical_index.clone();
+    let has_convertible_pages = entries.iter().any(|entry| {
+        matches!(
+            entry.portable.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+        )
+    });
+    if !has_convertible_pages {
+        return Ok(page_index);
+    }
     let db_path = data_dir.join("archive_cache.db");
+    match db_path.try_exists() {
+        Ok(false) => return Ok(page_index),
+        Ok(true) => {}
+        Err(error) => {
+            return Err(TransferError::Io(format!(
+                "{}を確認できません: {error}",
+                db_path.display()
+            )));
+        }
+    }
     let connection = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .ok();
+    .map_err(|error| {
+        TransferError::Database(format!("{}を読み取れません: {error}", db_path.display()))
+    })?;
     for (entry_index, entry) in entries.iter_mut().enumerate() {
         if !matches!(
             entry.portable.media_kind,
@@ -1393,28 +1414,30 @@ fn prepare_export_page_index(
         let Some(fingerprint) = entry.portable.fingerprint.as_ref() else {
             continue;
         };
-        let Some(connection) = connection.as_ref() else {
-            continue;
-        };
         let source_key = crate::path_key::normalize(&entry.path);
-        let row = connection
-            .query_row(
-                "SELECT src_mtime, src_size, cached_zip_path
+        let row = match connection.query_row(
+            "SELECT src_mtime, src_size, cached_zip_path
                    FROM converted_archives
                   WHERE src_path_key = ?1",
-                [&source_key],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .ok();
-        let Some((source_mtime, source_size, cached_path)) = row else {
-            continue;
+            [&source_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        ) {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(error) => {
+                return Err(TransferError::Database(format!(
+                    "archive_cache.db: {}: {error}",
+                    entry.path.display()
+                )));
+            }
         };
+        let (source_mtime, source_size, cached_path) = row;
         let fingerprint_mtime = fingerprint.modified_ms.map(|value| value.div_euclid(1000));
         let cached_path = PathBuf::from(cached_path);
         let expected_cached_path =
@@ -1436,7 +1459,7 @@ fn prepare_export_page_index(
         );
         entry.portable.virtual_key_base = PortableVirtualKeyBase::ConvertedCache;
     }
-    page_index
+    Ok(page_index)
 }
 
 fn attach_metadata<F>(
@@ -1453,7 +1476,7 @@ where
         .enumerate()
         .map(|(index, entry)| (crate::path_key::normalize_keep_drive(&entry.path), index))
         .collect();
-    let page_index = prepare_export_page_index(data_dir, entries, &index);
+    let page_index = prepare_export_page_index(data_dir, entries, &index)?;
     let mut virtual_index: HashMap<(usize, String), usize> = HashMap::new();
     let mut metadata_rows = 0usize;
 
@@ -1966,7 +1989,15 @@ where
                 })?;
             let shapes = vectors
                 .as_deref()
-                .map(crate::mask_db::shapes_from_json)
+                .map(crate::mask_db::try_shapes_from_json)
+                .transpose()
+                .map_err(|error| {
+                    invalid_db_value(
+                        4,
+                        rusqlite::types::Type::Text,
+                        format!("mask.db: {key}: vectors JSON: {error}"),
+                    )
+                })?
                 .unwrap_or_default();
             state.mask = Some(crate::sidecar::SidecarMask::from_raw(
                 &raw, &shapes, width, height,
@@ -2010,7 +2041,15 @@ where
                 })?;
             let shapes = vectors
                 .as_deref()
-                .map(crate::mask_db::shapes_from_json)
+                .map(crate::mask_db::try_shapes_from_json)
+                .transpose()
+                .map_err(|error| {
+                    invalid_db_value(
+                        4,
+                        rusqlite::types::Type::Text,
+                        format!("conceal.db: {key}: shapes JSON: {error}"),
+                    )
+                })?
                 .unwrap_or_default();
             state.conceal = Some(crate::sidecar::SidecarMask::from_raw(
                 &raw, &shapes, width, height,
@@ -2832,8 +2871,9 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
     validate_video_pin(entry.video_pin.as_ref(), &entry.path)?;
     let mut member_keys = HashSet::new();
     for item in &entry.virtual_items {
+        let canonical_member = canonical_member_key(&item.member_key);
         if validate_member_key(&item.member_key).is_err()
-            || !member_keys.insert(canonical_member_key(&item.member_key))
+            || !member_keys.insert(canonical_member.clone())
         {
             return Err(TransferError::Invalid(format!(
                 "仮想項目キーが不正または重複しています: {}",
@@ -2841,6 +2881,22 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
             )));
         }
         validate_rating(item.rating.as_ref())?;
+        if entry.media_kind == PortableMediaKind::Pdf {
+            let page_num = portable_pdf_page_num(&canonical_member).ok_or_else(|| {
+                TransferError::Invalid(format!(
+                    "PDF仮想ページキーが不正です: {} / {}",
+                    entry.path, item.member_key
+                ))
+            })?;
+            if let Some(rating) = &item.rating
+                && (rating.kind.as_deref() != Some("pdf_page") || rating.page_num != Some(page_num))
+            {
+                return Err(TransferError::Invalid(format!(
+                    "PDF仮想ページの評価情報がキーと一致しません: {} / {}",
+                    entry.path, item.member_key
+                )));
+            }
+        }
         if let Some(kind) = item
             .rating
             .as_ref()
@@ -2881,6 +2937,12 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
 
 fn validate_member_key(value: &str) -> Result<(), TransferError> {
     validate_bookmark_page_path(value, "仮想項目")
+}
+
+fn portable_pdf_page_num(member_key: &str) -> Option<u32> {
+    let value = member_key.strip_prefix("page_")?;
+    let page_num = value.parse::<u32>().ok()?;
+    (format!("page_{page_num}") == member_key).then_some(page_num)
 }
 
 fn validate_page_state(state: &PortablePageState, entry_path: &str) -> Result<(), TransferError> {
@@ -5285,6 +5347,36 @@ mod tests {
     }
 
     #[test]
+    fn converted_archive_export_reports_archive_cache_open_and_query_failures() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("book.7z"), b"archive").unwrap();
+        init_data_dir(&data);
+        let cache_db = data.join("archive_cache.db");
+        let cancel = AtomicBool::new(false);
+
+        fs::create_dir(&cache_db).unwrap();
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, no_progress),
+            Err(TransferError::Database(message))
+                if message.contains("archive_cache.db")
+        ));
+        fs::remove_dir(&cache_db).unwrap();
+
+        Connection::open(&cache_db)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, no_progress),
+            Err(TransferError::Database(message))
+                if message.contains("archive_cache.db") && message.contains("book.7z")
+        ));
+    }
+
+    #[test]
     fn mixed_case_virtual_member_uses_one_canonical_key_for_all_databases() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("library");
@@ -6980,6 +7072,36 @@ mod tests {
             page_state: PortablePageState::default(),
         });
         assert!(validate_portable_entry(&other).is_err());
+
+        let pdf_rating = |page_num| PortableRating {
+            stars: 4,
+            rated_at_ms: Some(123),
+            kind: Some("pdf_page".to_string()),
+            entry_name: None,
+            page_num: Some(page_num),
+            dir_prefix: None,
+            archive_format: None,
+            zipdir_is_archive: None,
+            zipdir_representative: None,
+        };
+        let mut pdf = plain_entry("book.pdf", PortableMediaKind::Pdf);
+        pdf.virtual_items.push(PortableVirtualItem {
+            member_key: "cover.jpg".to_string(),
+            rating: None,
+            tags: Vec::new(),
+            page_state: PortablePageState::default(),
+        });
+        assert!(validate_portable_entry(&pdf).is_err());
+
+        pdf.virtual_items[0].member_key = "page_02".to_string();
+        assert!(validate_portable_entry(&pdf).is_err());
+
+        pdf.virtual_items[0].member_key = "page_2".to_string();
+        pdf.virtual_items[0].rating = Some(pdf_rating(3));
+        assert!(validate_portable_entry(&pdf).is_err());
+
+        pdf.virtual_items[0].rating = Some(pdf_rating(2));
+        assert!(validate_portable_entry(&pdf).is_ok());
     }
 
     #[test]
@@ -7022,6 +7144,43 @@ mod tests {
             export_at(&data, &root, false, &cancel, no_progress),
             Err(TransferError::Database(message))
                 if message.contains("rotation.db") && message.contains("angle=45")
+        ));
+
+        Connection::open(data.join("rotation.db"))
+            .unwrap()
+            .execute("DELETE FROM rotations", [])
+            .unwrap();
+        Connection::open(data.join("mask.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO masks (path, mask_data, width, height, vectors)
+                 VALUES (?1, ?2, 1, 1, 'not json')",
+                params![key, vec![0_u8]],
+            )
+            .unwrap();
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, no_progress),
+            Err(TransferError::Database(message))
+                if message.contains("mask.db") && message.contains("vectors JSON")
+        ));
+
+        Connection::open(data.join("mask.db"))
+            .unwrap()
+            .execute("DELETE FROM masks", [])
+            .unwrap();
+        Connection::open(data.join("conceal.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO conceal_entries
+                    (page_path, bitmap_w, bitmap_h, bitmap_data, shapes)
+                 VALUES (?1, 1, 1, ?2, 'not json')",
+                params![key, vec![0_u8]],
+            )
+            .unwrap();
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, no_progress),
+            Err(TransferError::Database(message))
+                if message.contains("conceal.db") && message.contains("shapes JSON")
         ));
     }
 
