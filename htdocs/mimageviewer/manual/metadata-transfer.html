@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>メタ情報の移行 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>メタ情報の移行</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="metadata-transfer.html" class="active">メタ情報の移行</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">メタ情報の移行</h1>
+    <p class="page-desc">評価やタグなど、自分で付けた情報をフォルダごと別の PC やドライブへ移す方法を説明します。</p>
+
+    <h2 id="overview">概要</h2>
+    <p>メタ情報の移行は、画像や動画に自分で付けた評価・タグ・編集内容などを、フォルダごと別の環境へ持ち運ぶための機能です。</p>
+    <p>画像や動画のファイル自体はコピーせず、mImageViewer が覚えている情報だけをまとめて保存します。元のファイルは、エクスプローラーなどで別途コピーまたは移動してください。</p>
+
+    <h2 id="open">開き方</h2>
+    <ul>
+      <li><strong>書き出す:</strong> メニュー「ファイル」→「メタ情報をエクスポート…」</li>
+      <li><strong>取り込む:</strong> メニュー「ファイル」→「メタ情報をインポート…」</li>
+    </ul>
+    <p>どちらも実フォルダを表示しているときだけ使えます。</p>
+
+    <h2 id="included">移行できる情報</h2>
+    <ul>
+      <li>評価（★）</li>
+      <li>タグ（付けた順序・最近使った順を保つため、付与した日時も含む）</li>
+      <li>動画・音声のブックマーク（一覧用のサムネイル画像を含む）</li>
+      <li>本のブックマーク</li>
+      <li>見開きモード / 連結方式 / 綴じ方向</li>
+      <li>表示トリム（本単位・ページ単位）</li>
+      <li>非破壊回転</li>
+      <li>ページごとの画像補正・消しゴム・隠蔽加工・補正レイヤー・書き出し範囲・テキスト注釈</li>
+      <li>フォルダや本の代表サムネイル指定</li>
+      <li>動画のピン（位置とサムネイル画像）</li>
+      <li>ZIP / PDF の中のページに付けた情報、および ZIP 内の本ごとの設定</li>
+      <li>RAR / 7z / LZH のように mImageViewer が内部で ZIP へ変換して読むアーカイブのページ情報</li>
+    </ul>
+
+    <h2 id="excluded">移行しない情報</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>移行しない情報</th><th>理由</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>読書 / 再生履歴、最後に開いたページや再生位置</td><td>利用状況であって、内容に付けた情報ではないため</td></tr>
+          <tr><td>サムネイルなどの自動生成データ</td><td>移行先で作り直せるため</td></tr>
+          <tr><td>環境設定やプリセットなど全体の設定</td><td>フォルダの内容ではなく、その PC の設定であるため</td></tr>
+          <tr><td>PDF のパスワード</td><td>ファイルを開くための資格情報であり、内容に付けた情報ではないため</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="export-steps">エクスポートの手順</h2>
+    <ol>
+      <li>移したいフォルダを開きます。</li>
+      <li>メニュー「ファイル」→「メタ情報をエクスポート…」を選びます。</li>
+      <li>「サブフォルダも含める（再帰）」を確認して実行します。</li>
+    </ol>
+
+    <h3>「サブフォルダも含める（再帰）」について</h3>
+    <ul>
+      <li>既定でオンになっています。最後に選んだ状態を覚えていて、次回の初期値になります。</li>
+      <li>オンのときは、開いているフォルダと、その下にあるサブフォルダの内容をまとめて対象にします。</li>
+      <li>オフのときは、開いているフォルダ直下の項目だけを対象にします。直下のサブフォルダ自身に付けた評価・タグ・代表サムネイル・見開き設定などは含まれますが、そのサブフォルダの中にあるファイルの情報は含まれません。</li>
+      <li>完了画面には、サブフォルダを含めたか、直下だけを対象にしたかが表示されます。</li>
+    </ul>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        別の PC やドライブへの移行が目的なら、基本はオンのままにするのが安全です。
+      </div>
+    </div>
+
+    <h2 id="location">保存先</h2>
+    <p>エクスポートすると、開いているフォルダの直下に <code>mimageviewer.meta.miv</code> というフォルダが作られます。</p>
+    <p>通常のフォルダとして見えるため、画像や動画が入ったフォルダごとコピーまたは移動すれば、メタ情報も一緒に運べます。<code>mimageviewer.meta.miv</code> は、mImageViewer の一覧・フォルダツリー・検索結果には表示されません。</p>
+
+    <h2 id="import-steps">インポートの手順</h2>
+    <ol>
+      <li>画像や動画といっしょに <code>mimageviewer.meta.miv</code> フォルダをコピーした先を開きます。</li>
+      <li>メニュー「ファイル」→「メタ情報をインポート…」を選びます。</li>
+      <li>確認画面で件数を確認して実行します。</li>
+    </ol>
+
+    <h3>確認画面に表示される件数</h3>
+    <ul>
+      <li>反映できる項目数</li>
+      <li>見つからないためスキップする件数</li>
+      <li>サイズが異なるためスキップする件数</li>
+      <li>ファイル種別が異なるためスキップする件数</li>
+    </ul>
+
+    <h2 id="overwrite">上書きの考え方</h2>
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        エクスポート時に記録された項目は、種類ごとに上書きされます。記録が空の種類もその状態が反映されるため、たとえば「タグなし」と記録された項目を取り込むと、移行先にあったその項目のタグは消えます。
+      </div>
+    </div>
+    <p>エクスポートに記録されていない項目には触れません。そのため、移行先にしかない情報はそのまま残ります。</p>
+
+    <h2 id="matching">同じファイルとみなす条件</h2>
+    <p>フォルダ内の相対パス・ファイル種別・ファイルサイズが一致すれば、同じファイルとして扱います。</p>
+    <p>更新日時やファイルの中身は見ないため、コピーによって更新日時が変わっていても問題なく反映されます。</p>
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        移行先で保存し直したり再圧縮したりしてサイズが変わったファイルはスキップされ、確認画面の「サイズが異なるためスキップ」に数えられます。
+      </div>
+    </div>
+
+    <h2 id="progress">処理中の表示</h2>
+    <p>実行中はほかの操作ができません。進み具合が表示され、途中でキャンセルできます。</p>
+    <ul>
+      <li><strong>エクスポートを中止した場合:</strong> 前回のメタ情報はそのまま残ります。</li>
+      <li><strong>インポートを中止した場合:</strong> 中止するまでに反映された分は残ります。</li>
+    </ul>
+
+    <h2 id="automatic-backup">自動バックアップとの違い</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>名前</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>mimageviewer.dat</code></td><td>編集情報を自動で控えておくためのものです。そのフォルダに置いたまま使います</td></tr>
+          <tr><td><code>mimageviewer.meta.miv</code></td><td>別の PC やドライブへ持ち運ぶため、メニュー操作で明示的に作るものです</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>自動バックアップの設定がオフでも、メタ情報の移行は使えます。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+</body>
+</html>
