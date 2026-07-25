@@ -86,6 +86,8 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   暗黙補正や空データ化をせず対象ストアと項目を示してexportを中止する。
   未リリース中に作成したv1〜v4 bundleとの互換は持たず、タグ適用時刻、
   media kind、file identity、変換cache page identityを含むv5だけを受け入れる。
+  ZIP / 変換アーカイブのページ区分を適用するときは、選択したsource/cache originへ書く前に
+  対象区分のsource/cache両prefixを削除し、過去の別閲覧方式の値を残さない。
   v5 import の適用後は、同じ場所に既存 `mimageviewer.dat` があれば
   現在の mtime を同期済みとして記録し、明示 import で消した項目を古い自動バックアップから
   復活させない。

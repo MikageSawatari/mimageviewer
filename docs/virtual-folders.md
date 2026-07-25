@@ -192,6 +192,8 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 は既存データの明示 migration が必要なので、ここでは追求しない。
 明示メタ情報exportでも、DB上で実際に見つかったsource/cache originを優先してbundleへ記録し、
 直接閲覧RARのsource keyを変換cache keyへ読み替えない。
+importは選択originへ復元する前に対象ページ区分のsource/cache両prefixを消去し、以前の変換閲覧で
+残ったcache側の評価・タグ・編集状態と直読みsource側の新値を併存させない。
 
 新しく「現在のフォルダ」を永続化・ナビゲーションに使う箇所を足すときは、`current_folder` を
 直接使わず **`effective_folder()` を使う** こと。過去に漏れた実例:

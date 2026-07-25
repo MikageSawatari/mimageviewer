@@ -373,6 +373,9 @@ commitして部分完了結果を返す。プロセス異常終了時は現在ba
 manifestに記載された物理項目だけを上書きし、未記載項目を保持する。適用時は既存
 `mimageviewer.dat` の mtime を編集 / タグ sidecar sync table に記録し、明示 import 後の
 フォルダ再ロードで古い自動バックアップが欠落行を復活させないようにする。
+ZIP / `ConvertibleArchive`のrating / tag / page-state familyは、manifestで選択されたoriginに
+かかわらずsource pathと決定的cache pathの両prefixを同一DELETE文で消去してから、選択originへ
+復元する。これにより直読みRARへ戻した後も旧cache値を表示・再exportしない。
 同一フォルダのsync upsertはsectionごとに1回へ集約し、file種別上存在し得ないDB familyは
 削除・挿入処理自体を省く。family削除はpath indexを利用できるexact + range条件で行う。
 dirty な自動 sidecar のserialize / temp書き込み / renameはimport workerの前処理で行い、

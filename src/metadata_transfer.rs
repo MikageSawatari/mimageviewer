@@ -3651,11 +3651,20 @@ fn apply_entry(
     automatic_sidecar_sync: Option<(String, i64, bool, bool)>,
 ) -> Result<(), TransferError> {
     let base_key = crate::path_key::normalize_keep_drive(path);
+    let deterministic_cache_key = matches!(
+        entry.media_kind,
+        PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+    )
+    .then(|| {
+        crate::path_key::normalize_keep_drive(&crate::archive_cache::cache_zip_path_for_data_dir(
+            data_dir, path,
+        ))
+    });
     let page_base_key = match entry.virtual_key_base {
         PortableVirtualKeyBase::Source => base_key.clone(),
-        PortableVirtualKeyBase::ConvertedCache => crate::path_key::normalize_keep_drive(
-            &crate::archive_cache::cache_zip_path_for_data_dir(data_dir, path),
-        ),
+        PortableVirtualKeyBase::ConvertedCache => deterministic_cache_key
+            .clone()
+            .ok_or_else(|| TransferError::Invalid("変換cacheのファイル種別が不正です".into()))?,
     };
     let supports_timed_bookmarks = matches!(
         entry.media_kind,
@@ -3674,10 +3683,14 @@ fn apply_entry(
             PortableMediaKind::Zip | PortableMediaKind::Pdf | PortableMediaKind::ConvertibleArchive
         );
     if sections.ratings {
-        delete_key_family(tx, "ratings", "path", &base_key)?;
-        if page_base_key != base_key {
-            delete_key_family(tx, "ratings", "path", &page_base_key)?;
-        }
+        delete_page_key_family(
+            tx,
+            "ratings",
+            "path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
         if let Some(rating) = &entry.rating {
             insert_rating(tx, &base_key, path, rating)?;
         }
@@ -3693,12 +3706,22 @@ fn apply_entry(
         }
     }
     if sections.tags {
-        delete_key_family(tx, "tags.item_tags", "item_key", &base_key)?;
-        delete_key_family(tx, "tags.tag_item_state", "item_key", &base_key)?;
-        if page_base_key != base_key {
-            delete_key_family(tx, "tags.item_tags", "item_key", &page_base_key)?;
-            delete_key_family(tx, "tags.tag_item_state", "item_key", &page_base_key)?;
-        }
+        delete_page_key_family(
+            tx,
+            "tags.item_tags",
+            "item_key",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        delete_page_key_family(
+            tx,
+            "tags.tag_item_state",
+            "item_key",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
         insert_tags(tx, &base_key, &entry.tags, fallback_time_ms)?;
         for item in &entry.virtual_items {
             insert_tags(
@@ -3793,34 +3816,70 @@ fn apply_entry(
         }
     }
     if sections.page_state && supports_page_state {
-        delete_key_family(tx, "adjustment.page_params", "page_path", &base_key)?;
-        delete_key_family(tx, "mask.masks", "path", &base_key)?;
-        delete_key_family(tx, "conceal.conceal_entries", "page_path", &base_key)?;
-        delete_key_family(
+        delete_page_key_family(
+            tx,
+            "adjustment.page_params",
+            "page_path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        delete_page_key_family(
+            tx,
+            "mask.masks",
+            "path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        delete_page_key_family(
+            tx,
+            "conceal.conceal_entries",
+            "page_path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        delete_page_key_family(
             tx,
             "local_adjust.local_adjust_pages",
             "page_path",
             &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
         )?;
-        delete_key_family(tx, "crop.export_crop_pages", "page_path", &base_key)?;
-        delete_key_family(tx, "comic.comic_entries", "page_path", &base_key)?;
-        delete_key_family(tx, "view_trim.view_trim_pages", "page_path", &base_key)?;
-        delete_key_family(tx, "rotation.rotations", "path", &base_key)?;
-        if page_base_key != base_key {
-            delete_key_family(tx, "adjustment.page_params", "page_path", &page_base_key)?;
-            delete_key_family(tx, "mask.masks", "path", &page_base_key)?;
-            delete_key_family(tx, "conceal.conceal_entries", "page_path", &page_base_key)?;
-            delete_key_family(
-                tx,
-                "local_adjust.local_adjust_pages",
-                "page_path",
-                &page_base_key,
-            )?;
-            delete_key_family(tx, "crop.export_crop_pages", "page_path", &page_base_key)?;
-            delete_key_family(tx, "comic.comic_entries", "page_path", &page_base_key)?;
-            delete_key_family(tx, "view_trim.view_trim_pages", "page_path", &page_base_key)?;
-            delete_key_family(tx, "rotation.rotations", "path", &page_base_key)?;
-        }
+        delete_page_key_family(
+            tx,
+            "crop.export_crop_pages",
+            "page_path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        delete_page_key_family(
+            tx,
+            "comic.comic_entries",
+            "page_path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        delete_page_key_family(
+            tx,
+            "view_trim.view_trim_pages",
+            "page_path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        delete_page_key_family(
+            tx,
+            "rotation.rotations",
+            "path",
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
         insert_page_state(tx, &base_key, &entry.page_state)?;
         for item in &entry.virtual_items {
             insert_page_state(
@@ -4132,6 +4191,43 @@ fn join_container_key(base: &str, member: &str) -> String {
         base.trim_end_matches('/'),
         canonical_member_key(member)
     )
+}
+
+fn delete_page_key_family(
+    tx: &Connection,
+    table: &str,
+    column: &str,
+    base_key: &str,
+    page_base_key: &str,
+    deterministic_cache_key: Option<&str>,
+) -> Result<(), TransferError> {
+    let alternate_key = if page_base_key != base_key {
+        Some(page_base_key)
+    } else {
+        deterministic_cache_key.filter(|cache_key| *cache_key != base_key)
+    };
+    debug_assert!(
+        deterministic_cache_key
+            .map(|cache_key| cache_key == base_key || Some(cache_key) == alternate_key)
+            .unwrap_or(true),
+        "page base must be either the source key or deterministic cache key"
+    );
+    if let Some(alternate_key) = alternate_key {
+        let sql = format!(
+            "DELETE FROM {table}
+              WHERE {column} = ?1
+                 OR ({column} >= ?1 || '::' AND {column} < ?1 || ':;')
+                 OR {column} = ?2
+                 OR ({column} >= ?2 || '::' AND {column} < ?2 || ':;')"
+        );
+        tx.prepare_cached(&sql)
+            .map_err(db_error)?
+            .execute(params![base_key, alternate_key])
+            .map_err(db_error)?;
+    } else {
+        delete_key_family(tx, table, column, base_key)?;
+    }
+    Ok(())
 }
 
 fn delete_key_family(
@@ -5656,6 +5752,39 @@ mod tests {
         );
         assert_eq!(archive_entry.virtual_items.len(), 1);
 
+        let destination_cache = crate::archive_cache::cache_zip_path_for_data_dir(
+            &destination_data,
+            &destination_archive,
+        );
+        let destination_cache_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&destination_cache),
+            "Pages/Cover.JPG",
+        );
+        Connection::open(destination_data.join("rating.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ratings
+                    (path, stars, rated_at_ms, source_path, kind, entry_name)
+                 VALUES (?1, 1, 1, ?2, 6, 'Pages/Cover.JPG')",
+                params![
+                    destination_cache_page,
+                    destination_archive.to_string_lossy().as_ref()
+                ],
+            )
+            .unwrap();
+        set_tags_with_applied_at(
+            &destination_data,
+            &destination_cache_page,
+            &[("旧cache", 1)],
+        );
+        Connection::open(destination_data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 270)",
+                [&destination_cache_page],
+            )
+            .unwrap();
+
         copy_sidecar_bundle(&source, &destination);
         let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
         assert_eq!(summary.failed_entries, 0);
@@ -5690,19 +5819,34 @@ mod tests {
             90
         );
 
-        let destination_cache = crate::archive_cache::cache_zip_path_for_data_dir(
-            &destination_data,
-            &destination_archive,
-        );
-        let destination_cache_page = canonical_virtual_item_key(
-            &crate::path_key::normalize_keep_drive(&destination_cache),
-            "Pages/Cover.JPG",
-        );
         assert_eq!(
             Connection::open(destination_data.join("rating.db"))
                 .unwrap()
                 .query_row(
                     "SELECT COUNT(*) FROM ratings WHERE path = ?1",
+                    [&destination_cache_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(tags_with_applied_at(&destination_data, &destination_cache_page).is_empty());
+        assert_eq!(
+            Connection::open(destination_data.join("tags.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM tag_item_state WHERE item_key = ?1",
+                    [&destination_cache_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rotation.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM rotations WHERE path = ?1",
                     [&destination_cache_page],
                     |row| row.get::<_, i64>(0)
                 )
