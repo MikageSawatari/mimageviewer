@@ -356,9 +356,13 @@ DB間の走査順による暗黙mergeをせず、対象アーカイブ付きの�
 
 bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
 `generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ
-保存する。bundle directoryにはWindowsのHidden + System属性を付け、属性表示設定にかかわらず
-通常一覧、サブフォルダ展開、スマートフォルダ、フォルダペイン、検索・名前索引の走査対象から
-除外する。再帰exportはフォルダ境界をまたぐ4096物理項目ごとにDB scopeを作り、深さ優先で
+保存する。bundleは別環境へコピーするための成果物なので、WindowsのHidden + System属性を付けず、
+旧ビルドが作成したbundleも再exportの公開時にこの2属性だけをbest-effortでクリアする。隠したままでは
+ExplorerのCtrl+Aコピーや`xcopy`（`/H`なし）等でbundleだけが漏れ得るためである。mIV自身の通常一覧、
+サブフォルダ展開、スマートフォルダ、フォルダペイン、検索・名前索引からの除外は
+`mimageviewer.meta.miv`と一時directoryの名前に基づき、Windows属性や隠しファイル表示設定に依存しない。
+日常バックアップの自動sidecar `mimageviewer.dat`は従来どおりHidden + System属性を維持する。
+再帰exportはフォルダ境界をまたぐ4096物理項目ごとにDB scopeを作り、深さ優先で
 逐次serializeするため、全項目や単一フォルダの全子要素を1つの`Vec`やJSONへ集めず、
 総項目数と総bundleサイズに固定上限を設けない。防御上限は
 manifest 1 MiB、shard header 256 KiB、単一物理項目record 256 MiBに限定する。

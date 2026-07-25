@@ -4726,7 +4726,6 @@ impl BundleStaging {
                 }
             }
         }
-        crate::sidecar::mark_hidden_system(&bundle_dir);
         let generations_dir = bundle_dir.join(GENERATIONS_DIRNAME);
         match fs::symlink_metadata(&generations_dir) {
             Ok(_) => ensure_plain_directory(&generations_dir)?,
@@ -4804,6 +4803,7 @@ impl BundleStaging {
                 }
             }
         }
+        crate::sidecar::clear_hidden_system_preserving_other_attributes(&self.destination);
         cleanup_bundle_generations(&self.destination, self.generation_name());
         Ok(())
     }
@@ -5299,6 +5299,61 @@ mod tests {
     use super::*;
 
     fn no_progress(_: TransferProgress) {}
+
+    #[cfg(windows)]
+    fn bundle_file_attributes(root: &Path) -> u32 {
+        use std::os::windows::fs::MetadataExt;
+        fs::metadata(root.join(SIDECAR_FILENAME))
+            .unwrap()
+            .file_attributes()
+    }
+
+    #[cfg(windows)]
+    fn hidden_system_attribute_mask() -> u32 {
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM};
+        FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_export_publishes_bundle_without_hidden_or_system_attributes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&data);
+
+        export_at(&data, &root, false, &AtomicBool::new(false), no_progress).unwrap();
+
+        assert_eq!(
+            bundle_file_attributes(&root) & hidden_system_attribute_mask(),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reexport_clears_hidden_and_system_from_existing_bundle() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&data);
+        let cancel = AtomicBool::new(false);
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        crate::sidecar::mark_hidden_system(&root.join(SIDECAR_FILENAME));
+        assert_eq!(
+            bundle_file_attributes(&root) & hidden_system_attribute_mask(),
+            hidden_system_attribute_mask()
+        );
+
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+
+        assert_eq!(
+            bundle_file_attributes(&root) & hidden_system_attribute_mask(),
+            0
+        );
+    }
 
     #[test]
     fn page_state_validation_accepts_source_pixel_crop_coordinates() {

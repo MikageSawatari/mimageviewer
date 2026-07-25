@@ -758,6 +758,47 @@ pub(crate) fn mark_hidden_system(path: &Path) {
 pub(crate) fn mark_hidden_system(_path: &Path) {}
 
 #[cfg(windows)]
+fn attributes_without_hidden_system(attributes: u32) -> u32 {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM};
+    attributes & !(FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0)
+}
+
+#[cfg(windows)]
+pub(crate) fn clear_hidden_system_preserving_other_attributes(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAGS_AND_ATTRIBUTES, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    };
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let attributes = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        crate::logger::log(format!(
+            "metadata bundle attribute read failed {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+        return;
+    }
+    let cleared = attributes_without_hidden_system(attributes);
+    if cleared == attributes {
+        return;
+    }
+    if let Err(error) =
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(cleared)) }
+    {
+        crate::logger::log(format!(
+            "metadata bundle attribute clear failed {}: {error}",
+            path.display()
+        ));
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn clear_hidden_system_preserving_other_attributes(_path: &Path) {}
+
+#[cfg(windows)]
 fn clear_hidden_system(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
@@ -786,6 +827,22 @@ fn current_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn attributes_without_hidden_system_preserves_unrelated_bits() {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+        };
+        let preserved = FILE_ATTRIBUTE_READONLY.0
+            | FILE_ATTRIBUTE_ARCHIVE.0
+            | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED.0
+            | FILE_ATTRIBUTE_COMPRESSED.0;
+        let attributes = preserved | FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0;
+
+        assert_eq!(attributes_without_hidden_system(attributes), preserved);
+    }
 
     #[test]
     fn purge_deleted_root_removes_exact_and_container_entries_only() {
