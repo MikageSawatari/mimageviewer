@@ -336,6 +336,10 @@ export元のarchive cache DBで有効なsource/cache対応を確認してcache Z
 import先data directoryから決まるcache ZIP keyへ復元する。コンテナ側の本設定は元アーカイブkeyを維持する。
 archive cache DB自体がない場合と対象行がない場合だけを未変換扱いにし、open / query失敗は
 ページメタ情報を黙って欠落させないようexport全体のエラーにする。
+cache ZIPと`converted_archives`行を管理画面削除・容量pruneで失っても、cache pathはsource pathと
+data directoryから決定的に再生成できるため、source/cache両prefixを全ページメタ情報familyの
+scopeへ入れる。cache側だけに行が残る場合は`ConvertedCache`として移送し、source/cache双方に
+行がある場合はDB間の走査順で暗黙mergeせず対象アーカイブ付きの競合エラーにする。
 
 bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
 `generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ

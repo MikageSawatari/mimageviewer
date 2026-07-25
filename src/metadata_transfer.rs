@@ -1371,12 +1371,22 @@ fn prepare_metadata_scope(
     tx.commit().map_err(db_error)
 }
 
+struct ExportPageIndex {
+    keys: HashMap<String, usize>,
+    cache_bases: HashMap<String, usize>,
+    active_cache_entries: HashSet<usize>,
+}
+
 fn prepare_export_page_index(
     data_dir: &Path,
-    entries: &mut [EnumeratedEntry],
+    entries: &[EnumeratedEntry],
     physical_index: &HashMap<String, usize>,
-) -> Result<HashMap<String, usize>, TransferError> {
-    let mut page_index = physical_index.clone();
+) -> Result<ExportPageIndex, TransferError> {
+    let mut page_index = ExportPageIndex {
+        keys: physical_index.clone(),
+        cache_bases: HashMap::new(),
+        active_cache_entries: HashSet::new(),
+    };
     let has_convertible_pages = entries.iter().any(|entry| {
         matches!(
             entry.portable.media_kind,
@@ -1385,6 +1395,26 @@ fn prepare_export_page_index(
     });
     if !has_convertible_pages {
         return Ok(page_index);
+    }
+    for (entry_index, entry) in entries.iter().enumerate() {
+        if !matches!(
+            entry.portable.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+        ) {
+            continue;
+        }
+        let cache_base = crate::path_key::normalize_keep_drive(
+            &crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &entry.path),
+        );
+        if let Some(previous) = page_index.keys.insert(cache_base.clone(), entry_index)
+            && previous != entry_index
+        {
+            return Err(TransferError::Database(format!(
+                "変換cache keyが別項目と重複しています: {}",
+                entry.path.display()
+            )));
+        }
+        page_index.cache_bases.insert(cache_base, entry_index);
     }
     let db_path = data_dir.join("archive_cache.db");
     match db_path.try_exists() {
@@ -1404,7 +1434,7 @@ fn prepare_export_page_index(
     .map_err(|error| {
         TransferError::Database(format!("{}を読み取れません: {error}", db_path.display()))
     })?;
-    for (entry_index, entry) in entries.iter_mut().enumerate() {
+    for (entry_index, entry) in entries.iter().enumerate() {
         if !matches!(
             entry.portable.media_kind,
             PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
@@ -1451,15 +1481,61 @@ fn prepare_export_page_index(
         {
             continue;
         }
-        let original_key = crate::path_key::normalize_keep_drive(&entry.path);
-        page_index.remove(&original_key);
-        page_index.insert(
-            crate::path_key::normalize_keep_drive(&expected_cached_path),
-            entry_index,
-        );
-        entry.portable.virtual_key_base = PortableVirtualKeyBase::ConvertedCache;
+        page_index.active_cache_entries.insert(entry_index);
     }
     Ok(page_index)
+}
+
+fn locate_export_page_key(
+    key: &str,
+    page_index: &ExportPageIndex,
+    page_origins: &mut [Option<PortableVirtualKeyBase>],
+    entries: &[EnumeratedEntry],
+) -> Result<Option<(usize, Option<String>)>, TransferError> {
+    let Some((entry_index, member)) = locate_item_key(key, &page_index.keys) else {
+        return Ok(None);
+    };
+    if member.is_some() {
+        let base = key.split_once("::").map(|(base, _)| base).unwrap_or(key);
+        let origin = if page_index.cache_bases.get(base) == Some(&entry_index) {
+            PortableVirtualKeyBase::ConvertedCache
+        } else {
+            PortableVirtualKeyBase::Source
+        };
+        if let Some(previous) = page_origins[entry_index]
+            && previous != origin
+        {
+            return Err(TransferError::Database(format!(
+                "変換ページのメタ情報がsource keyとcache keyの両方にあります: {}",
+                entries[entry_index].path.display()
+            )));
+        }
+        page_origins[entry_index] = Some(origin);
+    }
+    Ok(Some((entry_index, member)))
+}
+
+fn finalize_export_page_bases(
+    entries: &mut [EnumeratedEntry],
+    page_index: &ExportPageIndex,
+    page_origins: &[Option<PortableVirtualKeyBase>],
+) {
+    for (entry_index, entry) in entries.iter_mut().enumerate() {
+        if !matches!(
+            entry.portable.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+        ) {
+            continue;
+        }
+        let use_cache = page_origins[entry_index] == Some(PortableVirtualKeyBase::ConvertedCache)
+            || page_index.active_cache_entries.contains(&entry_index)
+            || entry.portable.media_kind == PortableMediaKind::ConvertibleArchive;
+        entry.portable.virtual_key_base = if use_cache {
+            PortableVirtualKeyBase::ConvertedCache
+        } else {
+            PortableVirtualKeyBase::Source
+        };
+    }
 }
 
 fn attach_metadata<F>(
@@ -1477,13 +1553,14 @@ where
         .map(|(index, entry)| (crate::path_key::normalize_keep_drive(&entry.path), index))
         .collect();
     let page_index = prepare_export_page_index(data_dir, entries, &index)?;
+    let mut page_origins = vec![None; entries.len()];
     let mut virtual_index: HashMap<(usize, String), usize> = HashMap::new();
     let mut metadata_rows = 0usize;
 
     let rating_path = data_dir.join("rating.db");
     if rating_path.is_file() {
         let mut conn = open_readonly(&rating_path)?;
-        prepare_metadata_scope(&mut conn, &index, &page_index, cancel)?;
+        prepare_metadata_scope(&mut conn, &index, &page_index.keys, cancel)?;
         let mut stmt = conn
             .prepare(
                 "SELECT r.path, r.stars, r.rated_at_ms, r.kind, r.entry_name, r.page_num,
@@ -1557,12 +1634,14 @@ where
             check_cancel(cancel)?;
             let (key, rating) = row.map_err(db_error)?;
             report_metadata_progress(&mut metadata_rows, &key, progress);
-            if let Some((entry_index, member)) = locate_item_key(&key, &page_index).or_else(|| {
-                index
-                    .get(&key)
-                    .copied()
-                    .map(|entry_index| (entry_index, None))
-            }) {
+            let located = locate_export_page_key(&key, &page_index, &mut page_origins, entries)?
+                .or_else(|| {
+                    index
+                        .get(&key)
+                        .copied()
+                        .map(|entry_index| (entry_index, None))
+                });
+            if let Some((entry_index, member)) = located {
                 if let Some(member) = member {
                     let virtual_item =
                         get_virtual_item(entries, &mut virtual_index, entry_index, member);
@@ -1577,7 +1656,7 @@ where
     let tags_path = data_dir.join("tags.db");
     if tags_path.is_file() {
         let mut conn = open_readonly(&tags_path)?;
-        prepare_metadata_scope(&mut conn, &index, &page_index, cancel)?;
+        prepare_metadata_scope(&mut conn, &index, &page_index.keys, cancel)?;
         let mut tags_by_key: HashMap<String, Vec<PortableTag>> = HashMap::new();
         {
             let mut stmt = conn
@@ -1643,12 +1722,14 @@ where
         for key in decided {
             check_cancel(cancel)?;
             let tags = tags_by_key.remove(&key).unwrap_or_default();
-            if let Some((entry_index, member)) = locate_item_key(&key, &page_index).or_else(|| {
-                index
-                    .get(&key)
-                    .copied()
-                    .map(|entry_index| (entry_index, None))
-            }) {
+            let located = locate_export_page_key(&key, &page_index, &mut page_origins, entries)?
+                .or_else(|| {
+                    index
+                        .get(&key)
+                        .copied()
+                        .map(|entry_index| (entry_index, None))
+                });
+            if let Some((entry_index, member)) = located {
                 if let Some(member) = member {
                     get_virtual_item(entries, &mut virtual_index, entry_index, member).tags = tags;
                 } else {
@@ -1751,12 +1832,14 @@ where
         entries,
         &index,
         &page_index,
+        &mut page_origins,
         &mut virtual_index,
         cancel,
         &mut metadata_rows,
         progress,
     )?;
 
+    finalize_export_page_bases(entries, &page_index, &page_origins);
     for entry in entries {
         entry
             .portable
@@ -1882,7 +1965,8 @@ fn attach_extended_metadata<F>(
     data_dir: &Path,
     entries: &mut [EnumeratedEntry],
     physical_index: &HashMap<String, usize>,
-    page_index: &HashMap<String, usize>,
+    page_index: &ExportPageIndex,
+    page_origins: &mut [Option<PortableVirtualKeyBase>],
     virtual_index: &mut HashMap<(usize, String), usize>,
     cancel: &AtomicBool,
     metadata_rows: &mut usize,
@@ -1902,14 +1986,17 @@ where
             return Ok(());
         }
         let mut conn = open_readonly(&path)?;
-        prepare_metadata_scope(&mut conn, physical_index, page_index, cancel)?;
+        prepare_metadata_scope(&mut conn, physical_index, &page_index.keys, cancel)?;
         let mut stmt = conn.prepare(sql).map_err(db_error)?;
         let mut rows = stmt.query([]).map_err(db_error)?;
         while let Some(row) = rows.next().map_err(db_error)? {
             check_cancel(cancel)?;
             let key: String = row.get(0).map_err(db_error)?;
             report_metadata_progress(metadata_rows, &key, progress);
-            if let Some(state) = page_state_for_key_mut(entries, virtual_index, page_index, &key) {
+            locate_export_page_key(&key, page_index, page_origins, entries)?;
+            if let Some(state) =
+                page_state_for_key_mut(entries, virtual_index, &page_index.keys, &key)
+            {
                 apply(row, &key, state).map_err(db_error)?;
             }
         }
@@ -5344,6 +5431,180 @@ mod tests {
                 .unwrap(),
             270
         );
+    }
+
+    #[test]
+    fn converted_archive_pages_survive_cache_prune_before_export() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_archive = source.join("book.7z");
+        let destination_archive = destination.join("book.7z");
+        fs::write(&source_archive, b"same-archive").unwrap();
+        fs::write(&destination_archive, b"same-archive").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_cache =
+            crate::archive_cache::cache_zip_path_for_data_dir(&source_data, &source_archive);
+        fs::create_dir_all(source_cache.parent().unwrap()).unwrap();
+        fs::write(&source_cache, b"converted-zip").unwrap();
+        let source_metadata = fs::metadata(&source_archive).unwrap();
+        let source_mtime = source_metadata
+            .modified()
+            .ok()
+            .and_then(system_time_ms)
+            .unwrap()
+            .div_euclid(1000);
+        let archive_cache = Connection::open(source_data.join("archive_cache.db")).unwrap();
+        archive_cache
+            .execute_batch(
+                "CREATE TABLE converted_archives (
+                    src_path_key TEXT PRIMARY KEY,
+                    src_mtime INTEGER NOT NULL,
+                    src_size INTEGER NOT NULL,
+                    cached_zip_path TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        archive_cache
+            .execute(
+                "INSERT INTO converted_archives
+                    (src_path_key, src_mtime, src_size, cached_zip_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    crate::path_key::normalize(&source_archive),
+                    source_mtime,
+                    source_metadata.len() as i64,
+                    source_cache.to_string_lossy().as_ref(),
+                ],
+            )
+            .unwrap();
+
+        let source_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&source_cache),
+            "Pages/Cover.JPG",
+        );
+        Connection::open(source_data.join("rating.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ratings
+                    (path, stars, rated_at_ms, source_path, kind, entry_name)
+                 VALUES (?1, 5, 123, ?2, 6, 'Pages/Cover.JPG')",
+                params![source_page, source_archive.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        Connection::open(source_data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 270)",
+                [&source_page],
+            )
+            .unwrap();
+
+        archive_cache
+            .execute(
+                "DELETE FROM converted_archives WHERE src_path_key = ?1",
+                [crate::path_key::normalize(&source_archive)],
+            )
+            .unwrap();
+        drop(archive_cache);
+        fs::remove_file(&source_cache).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let exported = read_manifest(&source, &cancel).unwrap();
+        let archive_entry = exported
+            .entries
+            .iter()
+            .find(|entry| entry.path == "book.7z")
+            .unwrap();
+        assert_eq!(
+            archive_entry.virtual_key_base,
+            PortableVirtualKeyBase::ConvertedCache
+        );
+        assert_eq!(archive_entry.virtual_items.len(), 1);
+
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 0);
+        let destination_cache = crate::archive_cache::cache_zip_path_for_data_dir(
+            &destination_data,
+            &destination_archive,
+        );
+        let destination_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&destination_cache),
+            "Pages/Cover.JPG",
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rating.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT stars FROM ratings WHERE path = ?1",
+                    [&destination_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rotation.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&destination_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            270
+        );
+    }
+
+    #[test]
+    fn converted_archive_source_and_cache_page_metadata_are_a_conflict() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("book.7z");
+        fs::write(&archive, b"archive").unwrap();
+        init_data_dir(&data);
+
+        let source_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&archive),
+            "page.jpg",
+        );
+        let cache = crate::archive_cache::cache_zip_path_for_data_dir(&data, &archive);
+        let cache_page =
+            canonical_virtual_item_key(&crate::path_key::normalize_keep_drive(&cache), "page.jpg");
+        Connection::open(data.join("rating.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ratings (path, stars, kind, entry_name)
+                 VALUES (?1, 5, 6, 'page.jpg')",
+                [&source_page],
+            )
+            .unwrap();
+        Connection::open(data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 90)",
+                [&cache_page],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, no_progress),
+            Err(TransferError::Database(message))
+                if message.contains("source key")
+                    && message.contains("cache key")
+                    && message.contains("book.7z")
+        ));
     }
 
     #[test]
