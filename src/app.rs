@@ -48606,6 +48606,11 @@ impl App {
     /// `retained_final_ai_cache` も捨てる。一方、fullscreen を閉じて再度開いたときの
     /// raw 再デコードは同じ item の同じ source pixels を戻しているだけなので、
     /// session またぎ保持用の final AI pixels は残す。
+    ///
+    /// PDF の Z ズーム再描画など、表示中ページの source が高解像度版へ差し替わる
+    /// 場合は、呼び出し元が `build_static_fs_cache_entry` より前に完成済みのカラー化
+    /// 表示を holdover へ退避する。`apply_sync_adjustment` は final cache を無効化し得る
+    /// ため、世代更新を行うこの関数まで退避を遅らせてはいけない。
     pub(crate) fn bump_input_generation_for_fs_cache_reload(&mut self, idx: usize) {
         let slot = self.input_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
@@ -48615,6 +48620,19 @@ impl App {
         self.clear_erase_preview(idx);
         self.conceal_cache.remove(&idx);
         self.clear_edit_result_caches_for_idx_preserving_retained_final_ai(idx);
+    }
+
+    /// 表示中ページの static source を差し替える直前に、完成済みのカラー化表示だけを
+    /// display-only holdover へ退避する。初回ロードでは `resolve_fs_display_tex` が
+    /// `None` を返すので、ページ遷移が所有している既存 holdover は上書きしない。
+    pub(crate) fn capture_colorize_source_reload_holdover(&mut self, idx: usize) {
+        if self.fullscreen_idx == Some(idx)
+            && self.fs_nav_locked_gen.is_none()
+            && self.colorize_display_requires_final_effect(idx)
+            && let Some(texture) = self.resolve_fs_display_tex(idx, false)
+        {
+            self.fs_holdover_tex = Some(texture);
+        }
     }
 
     /// 全 idx の表示入力世代を進める。バルク補正やフォルダ切替などの広域 clear 用。
@@ -50929,6 +50947,22 @@ impl App {
             .iter()
             .find(|(key, _)| key.edit_key.idx == idx)
             .map(|(_, entry)| entry.texture.clone())
+    }
+
+    pub(crate) fn final_composite_texture_is_complete(
+        &self,
+        idx: usize,
+        texture: &egui::TextureHandle,
+    ) -> bool {
+        self.final_composite_cache.iter().any(|(key, entry)| {
+            key.edit_key.idx == idx && entry.texture.id() == texture.id() && entry.complete
+        })
+    }
+
+    pub(crate) fn current_final_composite_is_complete(&self, idx: usize) -> bool {
+        self.final_composite_cache
+            .iter()
+            .any(|(key, entry)| key.edit_key.idx == idx && entry.complete)
     }
 
     // ── テキスト注釈 (comic) オーバーレイ (Inc 1、最前面 D1) ─────────────
@@ -55335,6 +55369,17 @@ impl App {
             self.fs_early_dims.remove(&key);
             let perf_key_str = self.perf_item_key(key);
             let upload_t0 = std::time::Instant::now();
+            // static source の差し替えでは、この後の `apply_sync_adjustment` が旧世代の
+            // final composite を破棄し得る。PDF Z ズーム再描画の完成表示を失わないよう、
+            // raw upload / 同期補正より前に display-only holdover を確保する。
+            if matches!(
+                &result,
+                FsLoadResult::Static { .. }
+                    | FsLoadResult::StaticCached { .. }
+                    | FsLoadResult::StaticPanorama { .. }
+            ) {
+                self.capture_colorize_source_reload_holdover(key);
+            }
             let entry = match result {
                 FsLoadResult::Static { ci, source_dims } => {
                     let pixels = std::sync::Arc::new(ci);

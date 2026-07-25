@@ -2,8 +2,8 @@
 //!
 //! 処理順は final pipeline のスマートシャープ後、ポストフィルタ前。
 //! カスタムパレットは NeeView の ColorizeEffect と同じ「色 + 強さ」の制御点から
-//! 256-entry LUT を生成する。スクリーントーン濃度復元は直接着色する前の輝度だけを
-//! 置き換える。
+//! 256-entry LUT を生成する。画像ごとの濃さを整える自動レベル補正と
+//! スクリーントーン濃度復元は、直接着色する前の輝度だけを置き換える。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 const MONO_SAMPLE_LIMIT: usize = 16_384;
 const MONO_INLIER_RATIO: f32 = 0.95;
+const DENSITY_SAMPLE_LIMIT: usize = 262_144;
+const DENSITY_CLIP_RATIO: f32 = 0.005;
+const DENSITY_MIN_RANGE: u8 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +120,9 @@ pub struct ColorizeParams {
     /// LUT 色の輝度を元画像の輝度へ寄せる割合。0..=100。
     #[serde(default = "default_luminance_weight")]
     pub luminance_weight: u8,
+    /// 画像ごとの輝度分布を自動レベル補正へ寄せる割合。0..=100。
+    #[serde(default)]
+    pub density_normalization_strength: u8,
     #[serde(default)]
     pub tone_method: ToneDensityMethod,
     /// 長辺 2048px を基準にしたトーン密度の検出スケール。0.1..=4.0。
@@ -154,6 +160,7 @@ impl Default for ColorizeParams {
             palette: ColorizePalette::Legacy4Color,
             control_points: default_control_points(),
             luminance_weight: default_luminance_weight(),
+            density_normalization_strength: 0,
             tone_method: ToneDensityMethod::Off,
             tone_radius: default_tone_radius(),
             tone_strength: default_tone_strength(),
@@ -187,6 +194,7 @@ impl ColorizeParams {
     pub fn sanitize(&mut self) {
         self.mono_tolerance = self.mono_tolerance.clamp(1, 64);
         self.luminance_weight = self.luminance_weight.min(100);
+        self.density_normalization_strength = self.density_normalization_strength.min(100);
         self.tone_radius = if self.tone_radius.is_finite() {
             self.tone_radius.clamp(0.1, 4.0)
         } else {
@@ -322,7 +330,7 @@ pub fn apply_with_cancel(
     }
     let effective_tone_radius = effective_tone_radius(params.tone_radius, src.size);
     let lut = build_lut(params);
-    let luma: Vec<u8> = src
+    let mut luma: Vec<u8> = src
         .pixels
         .par_iter()
         .map(|pixel| {
@@ -331,6 +339,12 @@ pub fn apply_with_cancel(
                 .clamp(0.0, 255.0) as u8
         })
         .collect();
+    normalize_density_luma(
+        src,
+        &mut luma,
+        params.density_normalization_strength,
+        cancel,
+    )?;
     let tone = tone_density_luma(
         &luma,
         width,
@@ -364,6 +378,98 @@ pub fn apply_with_cancel(
         None
     } else {
         Some(ColorImage::new([width, height], pixels))
+    }
+}
+
+fn normalize_density_luma(
+    src: &ColorImage,
+    luma: &mut [u8],
+    strength: u8,
+    cancel: &AtomicBool,
+) -> Option<()> {
+    let strength = strength.min(100);
+    if strength == 0 || luma.is_empty() {
+        return Some(());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let Some((black_point, white_point)) = density_normalization_bounds(src, luma) else {
+        return Some(());
+    };
+    let black_point = f32::from(black_point);
+    let range = f32::from(white_point) - black_point;
+    let mix = f32::from(strength) / 100.0;
+    luma.par_iter_mut().for_each(|value| {
+        let original = f32::from(*value);
+        let normalized = ((original - black_point) / range).clamp(0.0, 1.0) * 255.0;
+        *value = (original * (1.0 - mix) + normalized * mix)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    });
+    if cancel.load(Ordering::Relaxed) {
+        None
+    } else {
+        Some(())
+    }
+}
+
+fn density_normalization_bounds(src: &ColorImage, luma: &[u8]) -> Option<(u8, u8)> {
+    if src.pixels.len() != luma.len() || luma.is_empty() {
+        return None;
+    }
+    let mut histogram = [0_u32; 256];
+    let mut sample_count = 0_u32;
+    let mut add_sample = |index: usize| {
+        if src.pixels[index].a() < 16 {
+            return;
+        }
+        histogram[luma[index] as usize] += 1;
+        sample_count += 1;
+    };
+    if luma.len() <= DENSITY_SAMPLE_LIMIT {
+        for index in 0..luma.len() {
+            add_sample(index);
+        }
+    } else {
+        let modulus = luma.len() as u64;
+        let mut state = 42_u64;
+        for _ in 0..DENSITY_SAMPLE_LIMIT {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            add_sample((state % modulus) as usize);
+        }
+    }
+    if sample_count < 8 {
+        return None;
+    }
+
+    let clipped = (sample_count as f32 * DENSITY_CLIP_RATIO).floor() as u32;
+    let low_rank = clipped.min(sample_count - 1);
+    let high_rank = sample_count - 1 - low_rank;
+    let mut cumulative = 0_u32;
+    let mut black_point = 0_u8;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative > low_rank {
+            black_point = index as u8;
+            break;
+        }
+    }
+    cumulative = 0;
+    let mut white_point = 255_u8;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative > high_rank {
+            white_point = index as u8;
+            break;
+        }
+    }
+    if white_point.saturating_sub(black_point) < DENSITY_MIN_RANGE {
+        None
+    } else {
+        Some((black_point, white_point))
     }
 }
 
@@ -647,6 +753,91 @@ mod tests {
     }
 
     #[test]
+    fn density_normalization_interpolates_auto_levels() {
+        let source = image(200, 1, |x, _| {
+            Color32::from_gray(if x < 100 { 40 } else { 220 })
+        });
+        let cancel = AtomicBool::new(false);
+
+        let mut full = vec![40_u8; 100];
+        full.extend(std::iter::repeat_n(220_u8, 100));
+        normalize_density_luma(&source, &mut full, 100, &cancel).unwrap();
+        assert!(full[..100].iter().all(|value| *value == 0));
+        assert!(full[100..].iter().all(|value| *value == 255));
+
+        let mut half = vec![40_u8; 100];
+        half.extend(std::iter::repeat_n(220_u8, 100));
+        normalize_density_luma(&source, &mut half, 50, &cancel).unwrap();
+        assert!(half[..100].iter().all(|value| *value == 20));
+        assert!(half[100..].iter().all(|value| *value == 238));
+    }
+
+    #[test]
+    fn density_normalization_does_not_clip_small_samples() {
+        let values = [20_u8, 50, 80, 110, 140, 170, 200, 240];
+        let source = ColorImage::new(
+            [values.len(), 1],
+            values
+                .iter()
+                .map(|value| Color32::from_gray(*value))
+                .collect(),
+        );
+        let cancel = AtomicBool::new(false);
+        let mut luma = values.to_vec();
+        assert_eq!(
+            density_normalization_bounds(&source, &luma),
+            Some((20, 240))
+        );
+        normalize_density_luma(&source, &mut luma, 100, &cancel).unwrap();
+        assert_eq!(luma[0], 0);
+        assert_eq!(luma[luma.len() - 1], 255);
+    }
+
+    #[test]
+    fn density_normalization_ignores_transparent_samples() {
+        let mut pixels = vec![Color32::TRANSPARENT; 8];
+        pixels.extend(std::iter::repeat_n(Color32::from_gray(40), 4));
+        pixels.extend(std::iter::repeat_n(Color32::from_gray(220), 4));
+        let source = ColorImage::new([pixels.len(), 1], pixels);
+        let mut luma = vec![0_u8, 255, 0, 255, 0, 255, 0, 255];
+        luma.extend(std::iter::repeat_n(40_u8, 4));
+        luma.extend(std::iter::repeat_n(220_u8, 4));
+        assert_eq!(
+            density_normalization_bounds(&source, &luma),
+            Some((40, 220))
+        );
+    }
+
+    #[test]
+    fn density_normalization_skips_nearly_flat_images() {
+        let source = image(8, 1, |x, _| {
+            Color32::from_gray(if x % 2 == 0 { 100 } else { 110 })
+        });
+        let cancel = AtomicBool::new(false);
+        let mut luma = vec![100_u8, 110, 100, 110, 100, 110, 100, 110];
+        let original = luma.clone();
+        assert_eq!(density_normalization_bounds(&source, &luma), None);
+        normalize_density_luma(&source, &mut luma, 100, &cancel).unwrap();
+        assert_eq!(luma, original);
+    }
+
+    #[test]
+    fn monochrome_only_density_normalization_leaves_color_images_unchanged() {
+        let colored = image(64, 64, |x, y| match (x / 16 + y / 16) % 4 {
+            0 => Color32::RED,
+            1 => Color32::GREEN,
+            2 => Color32::BLUE,
+            _ => Color32::YELLOW,
+        });
+        let params = ColorizeParams {
+            mode: ColorizeMode::MonochromeOnly,
+            density_normalization_strength: 100,
+            ..ColorizeParams::default()
+        };
+        assert_eq!(apply(&colored, &params), colored);
+    }
+
+    #[test]
     fn weak_and_strong_tone_modes_have_ordered_smoothing() {
         let width = 65;
         let height = 65;
@@ -790,6 +981,7 @@ mod tests {
         assert_eq!(params.tone_radius, 4.0);
         assert_eq!(params.tone_method, ToneDensityMethod::Gaussian);
         assert_eq!(params.luminance_weight, 100);
+        assert_eq!(params.density_normalization_strength, 0);
         assert_eq!(
             ColorizeParams::legacy_all_images(ColorizePalette::Legacy4Color).luminance_weight,
             0

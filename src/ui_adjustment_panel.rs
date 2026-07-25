@@ -1205,6 +1205,34 @@ mod local_adjust_segmentation_tests {
         harness.snapshot("local_adjust_panel_empty_layer_list");
     }
 
+    #[test]
+    fn colorize_preset_slots_snapshot_single_row() {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(280.0, 90.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut params = crate::colorize::ColorizeParams::default();
+                    let mut slots = crate::colorize::ColorizePresetSlots {
+                        slots: std::array::from_fn(|_| Some(params.clone())),
+                    };
+                    super::draw_colorize_preset_slots(ui, &mut params, &mut slots);
+                });
+            });
+
+        harness.run();
+        harness.snapshot("colorize_preset_slots_single_row");
+    }
+
     /// Snapshot シナリオ用の helper: 名前 / マスク / effect だけを受けて
     /// `LocalAdjustmentLayer` を作る (= 各 snapshot test の fixture を 1 行で書ける)。
     fn snapshot_layer(
@@ -7305,6 +7333,61 @@ macro_rules! slider_log_with_reset {
     }};
 }
 
+fn draw_colorize_preset_slots(
+    ui: &mut egui::Ui,
+    params: &mut crate::colorize::ColorizeParams,
+    slots: &mut crate::colorize::ColorizePresetSlots,
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut settings_changed = false;
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("カラー化設定保存スロット")
+            .size(SECTION_FONT)
+            .color(ui.visuals().text_color()),
+    );
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for slot_index in 0..4 {
+            let load = ui
+                .add_enabled(
+                    slots.slots[slot_index].is_some(),
+                    egui::Button::new(format!("{}", slot_index + 1))
+                        .small()
+                        .min_size(egui::vec2(22.0, 22.0)),
+                )
+                .on_hover_text(format!("カラー化スロット{}を読み込む", slot_index + 1));
+            if load.clicked()
+                && let Some(saved) = slots.slots[slot_index].clone()
+            {
+                *params = saved;
+                changed = true;
+            }
+            if ui
+                .add(
+                    egui::Button::new("💾")
+                        .small()
+                        .min_size(egui::vec2(22.0, 22.0)),
+                )
+                .on_hover_text(format!(
+                    "現在のカラー化設定をスロット{}に保存",
+                    slot_index + 1
+                ))
+                .clicked()
+            {
+                slots.slots[slot_index] = Some(params.clone());
+                settings_changed = true;
+            }
+        }
+    });
+
+    (changed, settings_changed)
+}
+
 fn draw_colorize_settings(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
@@ -7373,6 +7456,38 @@ fn draw_colorize_settings(
             }
             dragging |= response.dragged();
         }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("濃さを整える");
+            if params.colorize.density_normalization_strength != 0
+                && ui
+                    .small_button("↩")
+                    .on_hover_text("補正なし（0%）に戻す")
+                    .clicked()
+            {
+                params.colorize.density_normalization_strength = 0;
+                changed = true;
+            }
+        });
+        let mut density_strength = params.colorize.density_normalization_strength as f32;
+        let response = ui
+            .add(
+                egui::Slider::new(&mut density_strength, 0.0..=100.0)
+                    .text("強度")
+                    .step_by(1.0)
+                    .suffix("%"),
+            )
+            .on_hover_text(
+                "着色前の輝度分布から黒点・白点を自動検出し、画像ごとの濃さと\n\
+                 コントラストを揃えます。0%では補正しません。\n\
+                 「モノクロ系画像だけに適用」がONなら、カラー画像には影響しません。",
+            );
+        if response.changed() {
+            params.colorize.density_normalization_strength = density_strength as u8;
+            changed = true;
+        }
+        dragging |= response.dragged();
     });
 
     ui.add_space(8.0);
@@ -7395,35 +7510,6 @@ fn draw_colorize_settings(
             changed = true;
         }
     }
-
-    ui.horizontal_wrapped(|ui| {
-        ui.label("ユーザー:");
-        for slot_index in 0..4 {
-            let load = ui
-                .add_enabled(
-                    slots.slots[slot_index].is_some(),
-                    egui::Button::new(format!("{}", slot_index + 1)).small(),
-                )
-                .on_hover_text(format!("カラー化スロット{}を読み込む", slot_index + 1));
-            if load.clicked()
-                && let Some(saved) = slots.slots[slot_index].clone()
-            {
-                params.colorize = saved;
-                changed = true;
-            }
-            if ui
-                .small_button("💾")
-                .on_hover_text(format!(
-                    "現在のカラー化設定をスロット{}に保存",
-                    slot_index + 1
-                ))
-                .clicked()
-            {
-                slots.slots[slot_index] = Some(params.colorize.clone());
-                settings_changed = true;
-            }
-        }
-    });
 
     if params.colorize.palette == ColorizePalette::Custom {
         ui.add_space(6.0);
@@ -7602,6 +7688,10 @@ fn draw_colorize_settings(
         }
         dragging |= response.dragged();
     }
+
+    let slot_result = draw_colorize_preset_slots(ui, &mut params.colorize, slots);
+    changed |= slot_result.0;
+    settings_changed |= slot_result.1;
 
     params.colorize.sanitize();
     (changed, dragging, settings_changed)
@@ -12844,7 +12934,7 @@ impl App {
                         ui.separator();
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("保存スロット")
+                            egui::RichText::new("画像補正保存スロット")
                                 .size(11.0)
                                 .color(ui.visuals().text_color()),
                         );
@@ -13070,7 +13160,7 @@ impl App {
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
-        egui::Window::new("保存スロット名")
+        egui::Window::new("画像補正保存スロット名")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))

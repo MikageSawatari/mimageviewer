@@ -17787,6 +17787,7 @@ mod favorite_adjustment_defaults_tests {
 #[cfg(test)]
 mod pipeline_cache_refactor_tests {
     use crate::adjustment::PostFilter;
+    use crate::colorize::ColorizeMode;
 
     use super::phase_c_support::setup_app;
     use super::*;
@@ -18436,6 +18437,260 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.has_retained_final_ai(idx, next_key, [1, 1]),
             "retained final AI survives raw fs_cache reload and can restore into the new live key"
+        );
+    }
+
+    /// PDF の Z ズーム再描画などで表示中ページの raw source が差し替わっても、
+    /// 旧世代の完成済みカラー化 texture は display-only holdover に退避する。
+    /// live final cache 自体は従来どおり破棄し、新 source から再構築すること。
+    #[test]
+    fn fs_cache_reload_generation_holds_current_colorized_texture_during_rebuild() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, "C:/pics/fs-colorize-rerender.pdf", 0);
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        app.settings.global_preset.brightness = 12.0;
+        let (_, _, _, final_key) =
+            populate_all_idx_caches(&mut app, &ctx, idx, "fs_colorize_rerender");
+        let expected_texture_id = app
+            .final_composite_cache
+            .get(&final_key)
+            .expect("fixture should populate final composite")
+            .texture
+            .id();
+
+        let rerendered_pixels = Arc::new(egui::ColorImage::filled(
+            [4, 4],
+            egui::Color32::from_gray(180),
+        ));
+        app.fs_upload_backlog.push((
+            idx,
+            FsLoadResult::StaticCached {
+                pixels: rerendered_pixels,
+                source_dims: [4, 4],
+            },
+            7,
+        ));
+
+        app.poll_prefetch(&ctx);
+
+        assert_eq!(
+            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            Some(expected_texture_id),
+            "capture must happen before sync adjustment invalidates the old final composite"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "old live final cache must still be invalidated after it is captured for display"
+        );
+    }
+
+    /// 初回ロードなど、表示中ページに完成済み final がまだ無い source reload は、
+    /// 既存 holdover を None / raw で上書きしない。ページ遷移 holdover の所有権を
+    /// raw decode completion が横取りすると、遷移中に白黒が露出する。
+    #[test]
+    fn fs_cache_reload_generation_without_final_preserves_existing_holdover() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, "C:/pics/fs-colorize-initial.pdf", 0);
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        let existing = ctx.load_texture(
+            "existing_page_transition_holdover",
+            egui::ColorImage::filled([1, 1], egui::Color32::from_rgb(70, 80, 90)),
+            egui::TextureOptions::LINEAR,
+        );
+        let existing_id = existing.id();
+        app.fs_holdover_tex = Some(existing);
+
+        app.capture_colorize_source_reload_holdover(idx);
+        app.bump_input_generation_for_fs_cache_reload(idx);
+
+        assert_eq!(
+            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            Some(existing_id),
+            "a reload without a completed current final must leave the existing holdover untouched"
+        );
+    }
+
+    /// 先読み中の非表示ページが raw source を更新しても、表示中ページが所有する
+    /// holdover を置き換えない。context-scoped cache reload の回帰ガード。
+    #[test]
+    fn fs_cache_reload_generation_for_non_current_page_does_not_replace_holdover() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let current_idx = push_image(&mut app, "C:/pics/current.jpg");
+        let prefetched_idx = push_pdf_page(&mut app, "C:/pics/prefetched.pdf", 0);
+        app.fullscreen_idx = Some(current_idx);
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        let existing = ctx.load_texture(
+            "current_page_owned_holdover",
+            egui::ColorImage::filled([1, 1], egui::Color32::from_rgb(20, 30, 40)),
+            egui::TextureOptions::LINEAR,
+        );
+        let existing_id = existing.id();
+        app.fs_holdover_tex = Some(existing);
+        populate_all_idx_caches(&mut app, &ctx, prefetched_idx, "prefetched_reload");
+
+        app.capture_colorize_source_reload_holdover(prefetched_idx);
+        app.bump_input_generation_for_fs_cache_reload(prefetched_idx);
+
+        assert_eq!(
+            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            Some(existing_id),
+            "a non-current page reload must not mutate the current viewer holdover"
+        );
+    }
+
+    /// AI 待ちの incomplete final は表示可能なカラー化結果だが、AI 完了時に一度
+    /// live cache から外れる。真の complete が届くまでは provisional texture 自体を
+    /// holdover に昇格し、再合成の谷間にも黒画面へ落ちないこと。
+    #[test]
+    fn colorize_holdover_survives_incomplete_final_ai_replacement() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/colorize-ai-pending.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+
+        let (edit_key, stale_final_key) =
+            insert_edit_and_final_cache(&mut app, &ctx, idx, "colorize_ai_pending");
+        app.final_composite_cache.remove(&stale_final_key);
+        let params = app.effective_params(idx).clone();
+        let final_key = app.final_composite_key_for_pixels(edit_key, [1, 1], &params);
+        let provisional_pixels = Arc::new(egui::ColorImage::filled(
+            [1, 1],
+            egui::Color32::from_rgb(120, 100, 80),
+        ));
+        let provisional = ctx.load_texture(
+            "colorize_ai_provisional",
+            (*provisional_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let provisional_id = provisional.id();
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::clone(&provisional_pixels),
+                texture: provisional,
+                complete: false,
+            },
+        );
+        let old_holdover = ctx.load_texture(
+            "colorize_ai_old_holdover",
+            egui::ColorImage::filled([1, 1], egui::Color32::from_rgb(40, 50, 60)),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_holdover_tex = Some(old_holdover);
+
+        let displayed = app
+            .resolve_fs_processed_texture(&ctx, idx, false)
+            .expect("incomplete colorized composite should be displayable");
+        assert_eq!(displayed.id(), provisional_id);
+        assert_eq!(
+            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            Some(provisional_id),
+            "incomplete replacement becomes the next holdover instead of releasing it"
+        );
+
+        app.final_composite_cache.remove(&final_key);
+        let during_rebuild = app
+            .resolve_fs_processed_texture(&ctx, idx, false)
+            .expect("provisional holdover should bridge the AI-driven final rebuild");
+        assert_eq!(during_rebuild.id(), provisional_id);
+
+        app.cancel_final_effects_for_idx(idx);
+        let complete_pixels = Arc::new(egui::ColorImage::filled(
+            [1, 1],
+            egui::Color32::from_rgb(130, 110, 90),
+        ));
+        let complete = ctx.load_texture(
+            "colorize_ai_complete",
+            (*complete_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let complete_id = complete.id();
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: complete_pixels,
+                texture: complete,
+                complete: true,
+            },
+        );
+
+        let displayed = app
+            .resolve_fs_processed_texture(&ctx, idx, false)
+            .expect("complete final should replace the holdover");
+        assert_eq!(displayed.id(), complete_id);
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "only a complete final composite releases the colorize holdover"
+        );
+    }
+
+    /// フォルダ横断 nav lock は raw / thumbnail の到着だけでは解除しない。
+    /// カラー化対象では final composite が表示可能になって初めて旧ページ holdover を解放する。
+    #[test]
+    fn colorize_nav_lock_waits_for_final_composite() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/colorize-nav-target.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        app.fs_nav_locked_gen = Some(10);
+        app.items_generation = 11;
+        let raw_pixels = Arc::new(egui::ColorImage::filled(
+            [1, 1],
+            egui::Color32::from_gray(160),
+        ));
+        let raw = ctx.load_texture(
+            "colorize_nav_raw",
+            (*raw_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw,
+                pixels: raw_pixels,
+                source_dims: Some([1, 1]),
+                load_seq: 1,
+            },
+        );
+        app.fs_holdover_tex = Some(ctx.load_texture(
+            "colorize_nav_holdover",
+            egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        ));
+
+        app.poll_fs_nav_lock();
+        assert!(
+            app.fs_nav_locked_gen.is_some() && app.fs_holdover_tex.is_some(),
+            "raw readiness must not release a colorized navigation target"
+        );
+
+        let (_, final_key) = insert_edit_and_final_cache(&mut app, &ctx, idx, "colorize_nav_final");
+        app.final_composite_cache
+            .get_mut(&final_key)
+            .expect("fixture should populate final composite")
+            .complete = false;
+        app.poll_fs_nav_lock();
+        assert!(
+            app.fs_nav_locked_gen.is_some() && app.fs_holdover_tex.is_some(),
+            "AI-incomplete final must not release the navigation holdover"
+        );
+
+        app.final_composite_cache
+            .get_mut(&final_key)
+            .expect("fixture should retain final composite")
+            .complete = true;
+        app.poll_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "completed final display releases nav lock and holdover"
         );
     }
 
@@ -21286,6 +21541,26 @@ mod pipeline_cache_refactor_tests {
         assert_ne!(
             hash_adjust_final_params(&base, mode, true),
             hash_adjust_final_params(&sharpened, mode, true),
+        );
+    }
+
+    #[test]
+    fn colorize_density_normalization_changes_final_hash_but_not_color_ai_hash() {
+        let mode = crate::settings::AiFeatureMode::HighQuality;
+        let mut base = crate::adjustment::AdjustParams::default();
+        base.colorize.mode = crate::colorize::ColorizeMode::MonochromeOnly;
+        let mut normalized = base.clone();
+        normalized.colorize.density_normalization_strength = 60;
+
+        assert_ne!(
+            hash_adjust_final_params(&base, mode, false),
+            hash_adjust_final_params(&normalized, mode, false),
+            "着色前補正の変更では final composite を再生成する"
+        );
+        assert_eq!(
+            hash_adjust_color_ai_params(&base, mode),
+            hash_adjust_color_ai_params(&normalized, mode),
+            "着色前補正の変更では final AI を再実行しない"
         );
     }
 

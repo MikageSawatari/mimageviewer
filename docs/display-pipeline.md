@@ -1023,10 +1023,15 @@ final composite / comic composite は可視ページ単位で扱い、キャッ�
      詳細は preset-and-adjustment.md §2.7
    ↓
 9. カラー化
-   → 近モノクロ判定、カスタム階調 LUT、必要ならスクリーントーン濃淡変換
+   → 近モノクロ判定、対象画像だけの濃度・コントラスト自動補正、必要なら
+     スクリーントーン濃淡変換、カスタム階調 LUT
    → `final_effect_pending` worker。カラー化前の provisional texture は公開しない。
      前後ページは final composite まで先読みし、完成済みならページ移動直後からカラー表示する。
      先読みが未完了なら直前ページを holdover し、完成後にカラー化済み画像へ直接切り替える。
+     PDF の Z ズーム再描画など、同じ表示ページの source 解像度が更新される場合は、旧世代の
+     完成済み texture を display-only holdover に退避してから live cache を無効化し、
+     新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
+     次の holdover として維持し、`complete=true` の final だけが holdover を解放する。
    ↓
 10. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
    → final_composite_cache[FinalCompositeKey]
@@ -1054,7 +1059,8 @@ denoise は意図的に飛ばすため、grid / fullscreen / stack のどこか�
   (固定動作)。サムネイルには反映しない。詳細は
   [preset-and-adjustment.md §2.7](preset-and-adjustment.md)。
 - **カラー化**: スマートシャープ後・ポストフィルタ前に適用する。カスタム色、近モノクロ判定、
-  スクリーントーン濃淡変換を含む。重い画素処理は viewer context 所有の worker へ送り、
+  対象画像だけの着色前自動レベル補正、スクリーントーン濃淡変換を含む。重い画素処理は
+  viewer context 所有の worker へ送り、
   stale 結果を `FinalCompositeKey` と items 世代で拒否する。AI 先読みと同じ前後枚数の
   `final_composite_cache` を背景で 1 枚ずつ作る。先読み中は provisional texture を upload
   せず、同ページが表示対象になったときは進行中 job を昇格して再利用する。通常ページ送りでは

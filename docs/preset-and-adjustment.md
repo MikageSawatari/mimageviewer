@@ -119,7 +119,9 @@ rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの
 
 補正パネルの保存スロット欄 (`💾` ボタン) で現在のパラメータをスロットに保存できる。
 カラー化タブ内の 4 スロットは `ColorizeParams` だけを保存するため、呼び出しても色調・AI・
-ポストフィルタを上書きしない。
+ポストフィルタを上書きしない。カラー化専用スロットはカラー化タブの末尾に置き、
+「カラー化設定保存スロット」の見出しと、1〜4 のロード／保存ボタン行を分けて表示する。
+全設定を扱う共通欄は、専用欄と区別して「画像補正保存スロット」と表示する。
 
 補正パネルは、上から「見開き対象／適用中スコープ」「フォルダ・お気に入り・グローバル操作」
 「色調／AI／カラー化／フィルタのサブタブ」「すべてリセット」「全設定保存スロット」の順。
@@ -228,8 +230,13 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 - 近モノクロ判定: サンプル RGB の主成分軸に 95% 以上の画素が収まるかで判定する。
   単純な RGB 差だけではないため、黒インクから黄ばんだ紙色へ伸びる一方向の色分布も許容する。
   UI の「色味の許容量」は主軸からの距離閾値を調整する。
+- 濃さを整える: 着色対象と判定した画像だけについて、輝度ヒストグラムの上下 0.5% 点を
+  黒点／白点とする自動レベル補正を行い、元輝度から補正後輝度へ寄せる強度を 0〜100% で指定する。
+  初期値は 0%（補正なし）。有効範囲が 16 階調未満のほぼ単色な画像ではノイズ増幅を避けて
+  補正しない。`MonochromeOnly` で対象外になったカラー画像には一切適用しない。
 
-スクリーントーン濃淡変換は着色前の輝度に対して行う。`検出スケール` は長辺 2048px を基準に
+処理順は近モノクロ判定 → 濃さを整える → スクリーントーン濃淡変換 → 階調 LUT 着色。
+スクリーントーン濃淡変換は補正後の輝度に対して行う。`検出スケール` は長辺 2048px を基準に
 0.1〜4.0 を 0.1 刻みで指定し、初期値は 1.0。実際の画素半径は処理画像の長辺に比例させるため、
 final AI のアップスケール結果へ処理する場合も、アップスケール前と同じ絵柄上の範囲を狙う。
 実効半径は最大 64px に制限する。1px 未満の実効半径は元輝度と半径 1px の結果を補間するため、
@@ -255,6 +262,12 @@ cancel / 再起動せず表示用へ昇格し、完成までは直前ページ�
 生画像やサムネイルへフォールバックしない。ページ入場そのものでは完成済み final composite や
 進行中 worker を無効化せず、設定変更、AI 結果到着、cache eviction のときだけ不要な背景 worker を
 cancel する。`FinalCompositeKey` と items 世代が一致する完了結果だけを採用する。
+PDF の Z ズーム再描画などで表示中ページの source が高解像度版へ差し替わる場合も、差し替え直前の
+完成済みカラー化 texture を display-only holdover として保持する。旧世代の live cache は通常どおり
+無効化し、新 source の final composite が完成した時点で holdover を解放して置き換える。
+AI 待ちの `complete=false` カラー化結果が先にできた場合は、その結果を次の holdover に昇格して
+AI 完了後の再合成まで維持する。フォルダ横断の nav lock も raw / thumbnail や
+`complete=false` の到着だけでは解放せず、`complete=true` の final composite を待つ。
 サムネイル自体には適用しない。
 
 旧 JSON の `post_filter = pseudo_color4` / `pseudo_color_skin` は読み込み時に
@@ -575,9 +588,11 @@ AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛�
 `final_ai_cache` が miss しても `retained_final_ai_cache` が hit した場合は、その entry を
 `final_ai_cache` に戻してから同じ合成経路に入る。保持 LRU は `close_fullscreen()` や
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
-や AI 機能モード / サイズ上限変更で破棄する。fullscreen close / reopen に伴う同じ item の
-`fs_cache` 再ロードは `bump_input_generation_for_fs_cache_reload` で live cache だけを
-無効化し、保持 LRU は残す。PDF ページは `retained_final_ai_cache` へ重複保存せず、PDF 専用の
+や AI 機能モード / サイズ上限変更で破棄する。fullscreen close / reopen や PDF の表示解像度更新に伴う
+同じ item の `fs_cache` 再ロードは `bump_input_generation_for_fs_cache_reload` で live cache だけを
+無効化し、保持 LRU は残す。表示中のカラー化済みページなら、無効化前の texture は新しい final
+composite が完成するまで display-only holdover として使う。PDF ページは
+`retained_final_ai_cache` へ重複保存せず、PDF 専用の
 ページ保持スロットで `Raster` と `FinalAi` を同じ容量枠として扱う。PDF レンダリング後は
 `Raster` を保持し、final AI 完了後は同じ item_key のスロットを `FinalAi` に昇格して
 ラスタ結果を解放する。PDF ページ保持スロットと通常の保持AIは、同じ設定値

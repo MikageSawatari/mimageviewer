@@ -2209,7 +2209,7 @@ impl App {
     /// 注意: 本関数は `prepare_fullscreen_state` 経由でメインビューポート ctx が
     /// 渡される経路がある。Modifier 状態は `ctx.input(|i| i.modifiers)` ではなく
     /// 必ず `*_held_via_os()` 系で取ること。
-    fn resolve_fs_processed_texture(
+    pub(crate) fn resolve_fs_processed_texture(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
@@ -2316,11 +2316,19 @@ impl App {
             return Some(comic);
         }
         if let Some(texture) = self.ensure_final_composite_texture(ctx, idx) {
-            // nav lock 無しの holdover は同一フォルダ内ページ送り専用。カラー化済み
-            // texture が届いた時点で解放する。フォルダ移動用 holdover は
-            // poll_fs_nav_lock が items generation と合わせて解放する。
+            // nav lock 無しの holdover は同一フォルダ内ページ送り / 同一ページの
+            // source 解像度更新用。AI 待ちの incomplete composite は後で一度破棄
+            // されるため、その texture を次の holdover として維持する。真の完成結果が
+            // 届いた時点だけ解放する。フォルダ移動用 holdover は poll_fs_nav_lock が
+            // items generation と合わせて解放する。
             if self.fs_nav_locked_gen.is_none() && self.fullscreen_idx == Some(idx) {
-                self.fs_holdover_tex = None;
+                if self.final_composite_texture_is_complete(idx, &texture) {
+                    self.fs_holdover_tex = None;
+                } else if self.colorize_display_requires_final_effect(idx)
+                    && self.fs_holdover_tex.is_some()
+                {
+                    self.fs_holdover_tex = Some(texture.clone());
+                }
             }
             return Some(texture);
         }
@@ -2460,7 +2468,13 @@ impl App {
         // 新 idx のデコードが失敗確定 (Failed) の場合も lock を解放する。さもないと
         // holdover (旧画像) が残り続け、以降の Ctrl+↑↓ が lock でブロックされる。
         let has_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
-        if has_full || has_thumb || has_failed {
+        let display_ready = if self.colorize_display_requires_final_effect(idx) {
+            self.resolve_fs_display_tex(idx, true).is_some()
+                && self.current_final_composite_is_complete(idx)
+        } else {
+            has_full || has_thumb
+        };
+        if display_ready || has_failed {
             self.fs_nav_locked_gen = None;
             self.fs_holdover_tex = None;
         }
