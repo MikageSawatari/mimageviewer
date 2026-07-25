@@ -38085,6 +38085,42 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn cancelling_cache_miss_with_self_origin_does_not_restart_smart_folder_scan() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let normal = app.tmp.path().join("normal-cancel-origin");
+        let source = app.tmp.path().join("smart-cancel-origin");
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::create_dir_all(source.join("book")).unwrap();
+        app.current_folder = Some(normal.clone());
+        let definition = definition("Smart", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+
+        // A history/search restore installs the target surface before discovering that its
+        // in-memory snapshot is missing. That target must not become a recursive cancel origin.
+        app.top_level_grid_view.replace_surface(
+            super::top_level_grid_view::TopLevelGridSurface::SmartFolder(
+                super::top_level_grid_view::SmartFolderViewState::root(id, Vec::new()),
+            ),
+        );
+        app.open_smart_folder(id, false);
+        assert!(app.smart_folder_pending.is_some());
+        assert!(matches!(
+            app.smart_folder_open_origin.as_ref(),
+            Some(super::top_level_grid_view::TopLevelGridRestore::SmartFolder(_))
+        ));
+
+        app.cancel_smart_folder_pending_and_restore_origin();
+
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert!(app.smart_folder_confirm_pending.is_none());
+        assert!(app.top_level_grid_view.smart_folder().is_none());
+        assert_eq!(app.current_folder.as_ref(), Some(&normal));
+    }
+
+    #[test]
     fn smart_folder_entry_releases_snapshot_lock() {
         let mut app = setup_app();
         let origin = app.tmp.path().join("origin");

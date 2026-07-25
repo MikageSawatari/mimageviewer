@@ -52,6 +52,10 @@ root 再準備では新しい実フォルダ表示順を state へ反映する�
 並び替え後の index へ追従できる。削除・リネームで entry が消えた場合は stale な実パスを
 scope として保持せず root へ戻す。定義削除、worker cancel、別最上位ビューへの遷移は既存の
 smart generation / cancel 境界と `TopLevelGridView` の ownership を両方確認する。
+未完成の cache-miss restore では、先に設定した SmartFolder target surface 自身を中止時の
+復元元にしない。中止時は、背面に完成済みスマートフォルダ一覧が残っていればそれをそのまま
+復元し、完成済み一覧も有効 snapshot もない自己参照 origin なら保存済み実フォルダへ戻る。
+汎用 restore を再帰的に呼んで同じ scan を開始し直してはならない。
 
 グリッドの Shift+クリック起点は `GridClickSelectionAnchor { index, items_generation }` として
 現在の item 配列世代に所属する。一覧全体を差し替える通常経路では失効させ、Ctrl+G の

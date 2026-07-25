@@ -148,7 +148,23 @@ impl SmartFolderPending {
 
 pub(crate) struct SmartFolderConfirmPending {
     snapshot: SmartFolderSnapshot,
+    /// Exact result count after saved rating/tag/edit filters were applied.  This is separate
+    /// from `snapshot.entries.len()`, which is only the cheap filesystem-candidate upper bound.
+    result_count: usize,
+    /// Membership metadata already loaded by the exact-count worker. Reuse it after confirmation
+    /// so a 700k-candidate rating query is not repeated just to materialize a small result.
+    membership: Option<EvaluatedSmartFolderMembership>,
+    membership_revision: Option<u64>,
     generation: u64,
+    refresh: bool,
+    tombstones_at_start: HashSet<String>,
+}
+
+struct CountedSmartFolder {
+    snapshot: SmartFolderSnapshot,
+    result_count: usize,
+    membership: EvaluatedSmartFolderMembership,
+    metadata_revision: u64,
     refresh: bool,
     tombstones_at_start: HashSet<String>,
 }
@@ -226,6 +242,7 @@ pub(crate) struct ReusedSmartFolderMetadata {
 
 enum SmartFolderPrepareEvent {
     Progress(SmartFolderProgress),
+    Counted(Box<CountedSmartFolder>),
     Done(Box<PreparedSmartFolder>),
     Cancelled,
     Error(String),
@@ -1249,24 +1266,28 @@ fn prepare_video_folder_pin_seeds(
         .collect()
 }
 
-fn prepare_smart_folder(
-    snapshot: SmartFolderSnapshot,
-    sort: crate::settings::SortOrder,
-    display_order: crate::settings::GridDisplayOrder,
-    refresh: bool,
-    authoritative_rescan: bool,
-    authoritative_ignored_tombstones: HashSet<String>,
-    removed_paths: HashSet<String>,
+struct EvaluatedSmartFolderMembership {
+    keys: Arc<Vec<String>>,
+    included: Vec<usize>,
+    ratings: HashMap<String, u8>,
+    tags: HashMap<String, Vec<String>>,
+    local_adjust: HashSet<String>,
+    converted_archive_paths: HashMap<String, PathBuf>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_smart_folder_membership(
+    snapshot: &SmartFolderSnapshot,
+    removed_paths: &HashSet<String>,
     load_ratings: bool,
     load_tags: bool,
     load_local_adjust: bool,
-    reused_metadata: Option<Arc<ReusedSmartFolderMetadata>>,
-    resources: SmartFolderPrepareResources,
+    reused_metadata: Option<&ReusedSmartFolderMetadata>,
+    archive_cache_db: Option<&crate::archive_cache::ArchiveCacheDb>,
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SmartFolderPrepareEvent>,
-) -> Result<Option<PreparedSmartFolder>, String> {
+) -> Result<Option<EvaluatedSmartFolderMembership>, String> {
     let reuse_metadata = reused_metadata.is_some();
-    let reuse_resort_metadata_unchanged = reuse_metadata && removed_paths.is_empty();
     let total = snapshot.entries.len();
     let report = |phase, completed| {
         let _ = tx.send(SmartFolderPrepareEvent::Progress(SmartFolderProgress {
@@ -1278,7 +1299,6 @@ fn prepare_smart_folder(
         }));
     };
     let keys: Arc<Vec<String>> = reused_metadata
-        .as_ref()
         .map(|metadata| Arc::clone(&metadata.normalized_keys))
         .unwrap_or_else(|| {
             Arc::new(
@@ -1367,11 +1387,10 @@ fn prepare_smart_folder(
         report(SmartFolderPhase::Bookmarks, 0);
         crate::bookmark_browser::load_presence()?
     };
-    let mut converted_archive_paths_for_filter = reused_metadata
-        .as_ref()
+    let mut converted_archive_paths = reused_metadata
         .map(|metadata| metadata.converted_archive_cache_paths.clone())
         .unwrap_or_default();
-    if !reuse_metadata && let Some(db) = resources.archive_cache_db.as_deref() {
+    if !reuse_metadata && let Some(db) = archive_cache_db {
         for (index, entry) in snapshot.entries.iter().enumerate() {
             if index.is_multiple_of(METADATA_CHUNK_SIZE) && cancel.load(Ordering::Relaxed) {
                 return Ok(None);
@@ -1382,7 +1401,7 @@ fn prepare_smart_folder(
             if let Some(cache_path) =
                 prepared_converted_archive_path(&entry.path, entry.mtime, entry.file_size, db)
             {
-                converted_archive_paths_for_filter.insert(
+                converted_archive_paths.insert(
                     crate::path_key::normalize_keep_drive(&entry.path),
                     cache_path,
                 );
@@ -1393,11 +1412,10 @@ fn prepare_smart_folder(
     report(SmartFolderPhase::Filtering, 0);
     let mut included = Vec::with_capacity(
         reused_metadata
-            .as_ref()
             .map(|metadata| metadata.included_entry_indices.len())
             .unwrap_or(total),
     );
-    if let Some(metadata) = reused_metadata.as_ref() {
+    if let Some(metadata) = reused_metadata {
         for (position, &entry_index) in metadata.included_entry_indices.iter().enumerate() {
             if position.is_multiple_of(METADATA_CHUNK_SIZE) {
                 if cancel.load(Ordering::Relaxed) {
@@ -1406,14 +1424,12 @@ fn prepare_smart_folder(
                 report(SmartFolderPhase::Filtering, position);
             }
             let Some(entry) = snapshot.entries.get(entry_index) else {
-                // Reuse is valid only for the same snapshot generation. Treat a mismatched cache
-                // as unusable rather than indexing a different entry.
                 return Err("スマートフォルダの再ソート用キャッシュが一致しません".into());
             };
             if !removed_paths.is_empty()
                 && smart_folder_path_is_removed(
                     &crate::path_key::normalize_keep_drive(&entry.path),
-                    &removed_paths,
+                    removed_paths,
                 )
             {
                 continue;
@@ -1432,7 +1448,7 @@ fn prepare_smart_folder(
             if !removed_paths.is_empty()
                 && smart_folder_path_is_removed(
                     &crate::path_key::normalize_keep_drive(&entry.path),
-                    &removed_paths,
+                    removed_paths,
                 )
             {
                 continue;
@@ -1451,7 +1467,7 @@ fn prepare_smart_folder(
                             &tags,
                             &edit_keys,
                             &bookmark_presence,
-                            &converted_archive_paths_for_filter,
+                            &converted_archive_paths,
                         )
                     })
             });
@@ -1460,6 +1476,83 @@ fn prepare_smart_folder(
             }
         }
     }
+
+    Ok(Some(EvaluatedSmartFolderMembership {
+        keys,
+        included,
+        ratings,
+        tags,
+        local_adjust,
+        converted_archive_paths,
+    }))
+}
+
+fn prepare_smart_folder(
+    snapshot: SmartFolderSnapshot,
+    sort: crate::settings::SortOrder,
+    display_order: crate::settings::GridDisplayOrder,
+    refresh: bool,
+    authoritative_rescan: bool,
+    authoritative_ignored_tombstones: HashSet<String>,
+    removed_paths: HashSet<String>,
+    load_ratings: bool,
+    load_tags: bool,
+    load_local_adjust: bool,
+    precounted_membership: Option<EvaluatedSmartFolderMembership>,
+    reused_metadata: Option<Arc<ReusedSmartFolderMetadata>>,
+    resources: SmartFolderPrepareResources,
+    cancel: &AtomicBool,
+    tx: &mpsc::Sender<SmartFolderPrepareEvent>,
+) -> Result<Option<PreparedSmartFolder>, String> {
+    let reuse_metadata = reused_metadata.is_some();
+    let reuse_resort_metadata_unchanged = reuse_metadata && removed_paths.is_empty();
+    let total = snapshot.entries.len();
+    let report = |phase, completed| {
+        let _ = tx.send(SmartFolderPrepareEvent::Progress(SmartFolderProgress {
+            phase,
+            completed,
+            total,
+            containers_found: total,
+            ..SmartFolderProgress::default()
+        }));
+    };
+    let membership = if let Some(mut membership) = precounted_membership {
+        if !removed_paths.is_empty() {
+            membership.included.retain(|&entry_index| {
+                snapshot.entries.get(entry_index).is_some_and(|entry| {
+                    !smart_folder_path_is_removed(
+                        &crate::path_key::normalize_keep_drive(&entry.path),
+                        &removed_paths,
+                    )
+                })
+            });
+        }
+        membership
+    } else {
+        let Some(membership) = evaluate_smart_folder_membership(
+            &snapshot,
+            &removed_paths,
+            load_ratings,
+            load_tags,
+            load_local_adjust,
+            reused_metadata.as_deref(),
+            resources.archive_cache_db.as_deref(),
+            cancel,
+            tx,
+        )?
+        else {
+            return Ok(None);
+        };
+        membership
+    };
+    let EvaluatedSmartFolderMembership {
+        keys,
+        included,
+        ratings,
+        tags,
+        local_adjust,
+        converted_archive_paths: converted_archive_paths_for_filter,
+    } = membership;
 
     // Aggregate views cannot hydrate per-item state from one folder prefix. Query only the
     // filtered exact keys on this worker; loading each entire metadata DB would duplicate all
@@ -1846,6 +1939,119 @@ fn prepare_smart_folder(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn count_smart_folder_results(
+    snapshot: SmartFolderSnapshot,
+    metadata_revision: u64,
+    refresh: bool,
+    tombstones_at_start: HashSet<String>,
+    removed_paths: HashSet<String>,
+    load_ratings: bool,
+    load_tags: bool,
+    load_local_adjust: bool,
+    archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
+    cancel: &AtomicBool,
+    tx: &mpsc::Sender<SmartFolderPrepareEvent>,
+) -> Result<Option<CountedSmartFolder>, String> {
+    let Some(membership) = evaluate_smart_folder_membership(
+        &snapshot,
+        &removed_paths,
+        load_ratings,
+        load_tags,
+        load_local_adjust,
+        None,
+        archive_cache_db.as_deref(),
+        cancel,
+        tx,
+    )?
+    else {
+        return Ok(None);
+    };
+    let result_count = membership.included.len();
+    Ok(Some(CountedSmartFolder {
+        snapshot,
+        result_count,
+        membership,
+        metadata_revision,
+        refresh,
+        tombstones_at_start,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_smart_folder_result_count(
+    snapshot: SmartFolderSnapshot,
+    generation: u64,
+    metadata_revision: u64,
+    refresh: bool,
+    tombstones_at_start: HashSet<String>,
+    removed_paths: HashSet<String>,
+    load_ratings: bool,
+    load_tags: bool,
+    load_local_adjust: bool,
+    archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
+) -> Result<SmartFolderPreparePending, String> {
+    let definition_id = snapshot.definition.id;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = Arc::clone(&cancel);
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("smart-folder-result-count".into())
+        .spawn(move || {
+            let started = Instant::now();
+            let event = match count_smart_folder_results(
+                snapshot,
+                metadata_revision,
+                refresh,
+                tombstones_at_start,
+                removed_paths,
+                load_ratings,
+                load_tags,
+                load_local_adjust,
+                archive_cache_db,
+                &cancel_worker,
+                &tx,
+            ) {
+                Ok(Some(counted)) if !cancel_worker.load(Ordering::Relaxed) => {
+                    SmartFolderPrepareEvent::Counted(Box::new(counted))
+                }
+                Ok(_) => SmartFolderPrepareEvent::Cancelled,
+                Err(message) => SmartFolderPrepareEvent::Error(message),
+            };
+            if crate::perf::is_enabled() {
+                let (status, items) = match &event {
+                    SmartFolderPrepareEvent::Counted(counted) => ("done", counted.result_count),
+                    SmartFolderPrepareEvent::Cancelled => ("cancelled", 0),
+                    SmartFolderPrepareEvent::Error(_) => ("error", 0),
+                    SmartFolderPrepareEvent::Progress(_) => ("progress", 0),
+                    SmartFolderPrepareEvent::Done(prepared) => ("prepared", prepared.items.len()),
+                };
+                crate::perf::event(
+                    "smart_folder",
+                    "result_count_end",
+                    None,
+                    generation,
+                    &[
+                        ("status", serde_json::Value::from(status)),
+                        ("items", serde_json::Value::from(items)),
+                        (
+                            "ms",
+                            serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                    ],
+                );
+            }
+            let _ = tx.send(event);
+        })
+        .map_err(|error| format!("スマートフォルダの件数確認を開始できませんでした: {error}"))?;
+    Ok(SmartFolderPreparePending {
+        definition_id,
+        generation,
+        cancel,
+        rx,
+    })
+}
+
 fn spawn_smart_folder_prepare(
     snapshot: SmartFolderSnapshot,
     sort: crate::settings::SortOrder,
@@ -1859,6 +2065,7 @@ fn spawn_smart_folder_prepare(
     load_ratings: bool,
     load_tags: bool,
     load_local_adjust: bool,
+    precounted_membership: Option<EvaluatedSmartFolderMembership>,
     reused_metadata: Option<Arc<ReusedSmartFolderMetadata>>,
     resources: SmartFolderPrepareResources,
 ) -> Result<SmartFolderPreparePending, String> {
@@ -1881,6 +2088,7 @@ fn spawn_smart_folder_prepare(
                 load_ratings,
                 load_tags,
                 load_local_adjust,
+                precounted_membership,
                 reused_metadata,
                 resources,
                 &cancel_worker,
@@ -1896,6 +2104,7 @@ fn spawn_smart_folder_prepare(
             if crate::perf::is_enabled() {
                 let (status, items) = match &event {
                     SmartFolderPrepareEvent::Done(prepared) => ("done", prepared.items.len()),
+                    SmartFolderPrepareEvent::Counted(counted) => ("counted", counted.result_count),
                     SmartFolderPrepareEvent::Cancelled => ("cancelled", 0),
                     SmartFolderPrepareEvent::Error(_) => ("error", 0),
                     SmartFolderPrepareEvent::Progress(_) => ("progress", 0),
@@ -2048,6 +2257,18 @@ fn smart_folder_definition_uses_metadata(
                     | crate::settings::FacetEditFlag::Unbookmarked
             )
         }),
+    })
+}
+
+fn smart_folder_definition_needs_result_count(
+    definition: &crate::settings::SmartFolderDefinition,
+) -> bool {
+    definition.rules.iter().any(|rule| {
+        rule.enabled
+            && (rule.filter.ratings != [true; 6]
+                || !rule.filter.tags.is_empty()
+                || rule.filter.include_untagged
+                || !rule.filter.edits.is_empty())
     })
 }
 
@@ -2341,7 +2562,7 @@ impl App {
         snapshot: SmartFolderSnapshot,
         refresh: bool,
     ) {
-        self.start_smart_folder_prepare_inner(snapshot, refresh, false, HashSet::new(), None);
+        self.start_smart_folder_prepare_inner(snapshot, refresh, false, HashSet::new(), None, None);
     }
 
     /// Start preparing a snapshot that has just been produced by a successful filesystem scan.
@@ -2354,7 +2575,75 @@ impl App {
         refresh: bool,
         tombstones_at_start: HashSet<String>,
     ) {
-        self.start_smart_folder_prepare_inner(snapshot, refresh, true, tombstones_at_start, None);
+        self.start_smart_folder_prepare_inner(
+            snapshot,
+            refresh,
+            true,
+            tombstones_at_start,
+            None,
+            None,
+        );
+    }
+
+    fn start_smart_folder_prepare_after_count(
+        &mut self,
+        snapshot: SmartFolderSnapshot,
+        refresh: bool,
+        tombstones_at_start: HashSet<String>,
+        membership: EvaluatedSmartFolderMembership,
+    ) {
+        self.start_smart_folder_prepare_inner(
+            snapshot,
+            refresh,
+            true,
+            tombstones_at_start,
+            Some(membership),
+            None,
+        );
+    }
+
+    fn start_smart_folder_result_count_after_scan(
+        &mut self,
+        snapshot: SmartFolderSnapshot,
+        refresh: bool,
+        tombstones_at_start: HashSet<String>,
+    ) {
+        let retired =
+            cancelled_smart_folder_payloads(None, self.smart_folder_prepare_pending.take(), None);
+        self.retire_smart_folder_payloads(retired);
+        let generation = self.smart_folder_generation;
+        let definition_id = snapshot.definition.id;
+        let current_tombstones = self
+            .smart_folder_removed_paths
+            .get(&definition_id)
+            .cloned()
+            .unwrap_or_default();
+        let removed_paths =
+            smart_folder_tombstones_after_scan_start(&current_tombstones, &tombstones_at_start);
+        match spawn_smart_folder_result_count(
+            snapshot,
+            generation,
+            self.smart_folder_metadata_revision,
+            refresh,
+            tombstones_at_start,
+            removed_paths,
+            self.rating_db.is_some(),
+            self.tags_db.is_some(),
+            self.local_adjust_db.is_some(),
+            self.archive_cache_db.clone(),
+        ) {
+            Ok(pending) => {
+                self.smart_folder_progress = Some(SmartFolderProgress {
+                    phase: SmartFolderPhase::Filtering,
+                    ..SmartFolderProgress::default()
+                });
+                self.smart_folder_prepare_pending = Some(pending);
+            }
+            Err(message) => {
+                self.show_feedback_toast(message);
+                self.restore_pending_smart_folder_origin();
+            }
+        }
     }
 
     fn start_smart_folder_prepare_inner(
@@ -2363,6 +2652,7 @@ impl App {
         refresh: bool,
         authoritative_rescan: bool,
         authoritative_ignored_tombstones: HashSet<String>,
+        precounted_membership: Option<EvaluatedSmartFolderMembership>,
         reused_metadata: Option<Arc<ReusedSmartFolderMetadata>>,
     ) {
         if self.items_are_smart_folder_view && self.show_search_bar {
@@ -2407,6 +2697,7 @@ impl App {
             self.rating_db.is_some(),
             self.tags_db.is_some(),
             self.local_adjust_db.is_some(),
+            precounted_membership,
             reused_metadata,
             SmartFolderPrepareResources {
                 prepare_catalog: !is_sort_only,
@@ -2466,18 +2757,69 @@ impl App {
         }
     }
 
-    fn cancel_smart_folder_pending_and_restore_origin(&mut self) {
+    pub(crate) fn cancel_smart_folder_pending_and_restore_origin(&mut self) {
         let origin = self.smart_folder_open_origin.take();
         self.cancel_smart_folder_pending();
-        if let Some(origin) = origin {
-            self.restore_view_return_context(origin);
-        }
+        self.restore_cancelled_smart_folder_origin(origin);
     }
 
     fn restore_pending_smart_folder_origin(&mut self) {
-        if let Some(origin) = self.smart_folder_open_origin.take() {
-            self.restore_view_return_context(origin);
+        let origin = self.smart_folder_open_origin.take();
+        self.restore_cancelled_smart_folder_origin(origin);
+    }
+
+    fn restore_cancelled_smart_folder_origin(
+        &mut self,
+        origin: Option<super::top_level_grid_view::TopLevelGridRestore>,
+    ) {
+        let Some(origin) = origin else {
+            return;
+        };
+        if let super::top_level_grid_view::TopLevelGridRestore::SmartFolder(state) = &origin {
+            // Direct switching and refresh leave the previous installed grid in memory until the
+            // replacement succeeds. Restore that owner without starting another prepare/scan.
+            if self.items_are_smart_folder_view
+                && self.current_smart_folder_id == Some(state.definition_id)
+            {
+                self.top_level_grid_view.replace_surface(
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state.clone()),
+                );
+                return;
+            }
+
+            // A history/search restore can set the target SmartFolder surface before a cache-miss
+            // scan starts. In that state the target itself can accidentally become its own cancel
+            // origin. Calling the generic restore path would immediately start the same scan
+            // again, making the modal impossible to escape.
+            let can_restore_without_scan = self
+                .settings
+                .smart_folders
+                .iter()
+                .find(|definition| definition.id == state.definition_id)
+                .and_then(|definition| {
+                    self.smart_folder_snapshots
+                        .get(&state.definition_id)
+                        .filter(|snapshot| {
+                            smart_folder_scan_rules_match(&snapshot.definition, definition)
+                        })
+                })
+                .is_some();
+            if !can_restore_without_scan {
+                let fallback = self
+                    .smart_folder_saved_folder
+                    .clone()
+                    .or_else(|| self.effective_folder())
+                    .filter(|path| !is_synthetic_view_path(path));
+                self.clear_smart_folder_view_state();
+                if let Some(path) = fallback {
+                    self.load_folder(path);
+                } else {
+                    self.enter_drive_list(None);
+                }
+                return;
+            }
         }
+        self.restore_view_return_context(origin);
     }
 
     /// 定義変更時に古い snapshot / 進行中 worker を無効化する。
@@ -2816,11 +3158,23 @@ impl App {
                             Box::new(pending) as RetiredSmartFolderPayload,
                             Box::new(result) as RetiredSmartFolderPayload,
                         ]);
+                    } else if result.snapshot.entries.len() >= SMART_FOLDER_CONFIRM_THRESHOLD
+                        && smart_folder_definition_needs_result_count(&result.snapshot.definition)
+                    {
+                        self.start_smart_folder_result_count_after_scan(
+                            result.snapshot,
+                            pending.refresh,
+                            pending.tombstones_at_start,
+                        );
                     } else if result.snapshot.entries.len() >= SMART_FOLDER_CONFIRM_THRESHOLD {
+                        let result_count = result.snapshot.entries.len();
                         let replaced =
                             self.smart_folder_confirm_pending
                                 .replace(SmartFolderConfirmPending {
                                     snapshot: result.snapshot,
+                                    result_count,
+                                    membership: None,
+                                    membership_revision: None,
                                     generation: pending.generation,
                                     refresh: pending.refresh,
                                     tombstones_at_start: pending.tombstones_at_start,
@@ -2872,6 +3226,79 @@ impl App {
             match event {
                 Ok(SmartFolderPrepareEvent::Progress(progress)) => {
                     self.smart_folder_progress = Some(progress);
+                }
+                Ok(SmartFolderPrepareEvent::Counted(counted)) => {
+                    let mut counted = *counted;
+                    let Some(pending) = self.smart_folder_prepare_pending.take() else {
+                        self.retire_smart_folder_payloads(std::iter::once(
+                            Box::new(counted) as RetiredSmartFolderPayload
+                        ));
+                        break;
+                    };
+                    let current_definition = self
+                        .settings
+                        .smart_folders
+                        .iter()
+                        .find(|definition| {
+                            definition.id == pending.definition_id
+                                && smart_folder_scan_rules_match(
+                                    definition,
+                                    &counted.snapshot.definition,
+                                )
+                        })
+                        .cloned();
+                    let Some(current_definition) = current_definition else {
+                        self.smart_folder_progress = None;
+                        self.retire_smart_folder_payloads([
+                            Box::new(pending) as RetiredSmartFolderPayload,
+                            Box::new(counted) as RetiredSmartFolderPayload,
+                        ]);
+                        break;
+                    };
+                    if pending.generation != self.smart_folder_generation
+                        || pending.definition_id != counted.snapshot.definition.id
+                    {
+                        self.smart_folder_progress = None;
+                        self.retire_smart_folder_payloads([
+                            Box::new(pending) as RetiredSmartFolderPayload,
+                            Box::new(counted) as RetiredSmartFolderPayload,
+                        ]);
+                        break;
+                    }
+                    adopt_smart_folder_presentation(
+                        &mut counted.snapshot.definition,
+                        &current_definition,
+                    );
+                    if counted.metadata_revision != self.smart_folder_metadata_revision {
+                        self.start_smart_folder_result_count_after_scan(
+                            counted.snapshot,
+                            counted.refresh,
+                            counted.tombstones_at_start,
+                        );
+                    } else if counted.result_count >= SMART_FOLDER_CONFIRM_THRESHOLD {
+                        let replaced =
+                            self.smart_folder_confirm_pending
+                                .replace(SmartFolderConfirmPending {
+                                    snapshot: counted.snapshot,
+                                    result_count: counted.result_count,
+                                    membership: Some(counted.membership),
+                                    membership_revision: Some(counted.metadata_revision),
+                                    generation: pending.generation,
+                                    refresh: counted.refresh,
+                                    tombstones_at_start: counted.tombstones_at_start,
+                                });
+                        self.retire_smart_folder_payloads(
+                            replaced.map(|confirm| Box::new(confirm) as RetiredSmartFolderPayload),
+                        );
+                    } else {
+                        self.start_smart_folder_prepare_after_count(
+                            counted.snapshot,
+                            counted.refresh,
+                            counted.tombstones_at_start,
+                            counted.membership,
+                        );
+                    }
+                    break;
                 }
                 Ok(SmartFolderPrepareEvent::Done(prepared)) => {
                     let prepared = *prepared;
@@ -2932,6 +3359,7 @@ impl App {
                             refresh,
                             authoritative_rescan,
                             authoritative_ignored_tombstones,
+                            None,
                             None,
                         );
                     } else {
@@ -3016,13 +3444,25 @@ impl App {
                 resort_metadata,
                 applied_tombstones,
             );
-            self.start_smart_folder_prepare_inner(
-                snapshot,
-                refresh,
-                authoritative_rescan,
-                authoritative_ignored_tombstones,
-                None,
-            );
+            if authoritative_rescan
+                && snapshot.entries.len() >= SMART_FOLDER_CONFIRM_THRESHOLD
+                && smart_folder_definition_needs_result_count(&snapshot.definition)
+            {
+                self.start_smart_folder_result_count_after_scan(
+                    snapshot,
+                    refresh,
+                    authoritative_ignored_tombstones,
+                );
+            } else {
+                self.start_smart_folder_prepare_inner(
+                    snapshot,
+                    refresh,
+                    authoritative_rescan,
+                    authoritative_ignored_tombstones,
+                    None,
+                    None,
+                );
+            }
             return false;
         }
         let definition_id = snapshot.definition.id;
@@ -3053,6 +3493,7 @@ impl App {
                     refresh,
                     true,
                     authoritative_ignored_tombstones,
+                    None,
                     None,
                 );
                 return false;
@@ -3230,6 +3671,7 @@ impl App {
                 false,
                 false,
                 HashSet::new(),
+                None,
                 reused_metadata,
             );
         }
@@ -3329,7 +3771,13 @@ impl App {
         if let Some(confirm) = self.smart_folder_confirm_pending.as_mut()
             && affected_ids.contains(&confirm.snapshot.definition.id)
         {
-            remove_paths_from_smart_folder_snapshot(&mut confirm.snapshot, &removed);
+            if remove_paths_from_smart_folder_snapshot(&mut confirm.snapshot, &removed) {
+                // Entry indices in the exact-count membership belong to the pre-removal snapshot.
+                // A confirmed continuation can safely re-evaluate the now-smaller candidate set.
+                confirm.membership = None;
+                confirm.membership_revision = None;
+            }
+            confirm.result_count = confirm.result_count.min(confirm.snapshot.entries.len());
         }
         let pending_affected = self
             .smart_folder_prepare_pending
@@ -3369,7 +3817,7 @@ impl App {
 
     pub(crate) fn render_smart_folder_overlay(&mut self, ctx: &egui::Context) {
         if let Some(confirm) = self.smart_folder_confirm_pending.as_ref() {
-            let count = confirm.snapshot.entries.len();
+            let count = confirm.result_count;
             let name = confirm.snapshot.definition.name.clone();
             let mut proceed = false;
             let mut cancel = false;
@@ -3389,11 +3837,24 @@ impl App {
             if proceed {
                 if let Some(confirm) = self.smart_folder_confirm_pending.take() {
                     if confirm.generation == self.smart_folder_generation {
-                        self.start_smart_folder_prepare_after_scan(
-                            confirm.snapshot,
-                            confirm.refresh,
-                            confirm.tombstones_at_start,
-                        );
+                        let membership = (confirm.membership_revision
+                            == Some(self.smart_folder_metadata_revision))
+                        .then_some(confirm.membership)
+                        .flatten();
+                        if let Some(membership) = membership {
+                            self.start_smart_folder_prepare_after_count(
+                                confirm.snapshot,
+                                confirm.refresh,
+                                confirm.tombstones_at_start,
+                                membership,
+                            );
+                        } else {
+                            self.start_smart_folder_prepare_after_scan(
+                                confirm.snapshot,
+                                confirm.refresh,
+                                confirm.tombstones_at_start,
+                            );
+                        }
                     } else {
                         self.retire_smart_folder_payloads(std::iter::once(
                             Box::new(confirm) as RetiredSmartFolderPayload
@@ -3401,14 +3862,7 @@ impl App {
                     }
                 }
             } else if cancel {
-                let retired = cancelled_smart_folder_payloads(
-                    None,
-                    None,
-                    self.smart_folder_confirm_pending.take(),
-                );
-                self.retire_smart_folder_payloads(retired);
-                self.smart_folder_progress = None;
-                self.restore_pending_smart_folder_origin();
+                self.cancel_smart_folder_pending_and_restore_origin();
             }
             return;
         }
@@ -3587,6 +4041,9 @@ mod tests {
                 video_thumb_overrides: HashMap::new(),
                 diag: SmartFolderDiag::default(),
             },
+            result_count: 1,
+            membership: None,
+            membership_revision: None,
             generation: 1,
             refresh: false,
             tombstones_at_start: HashSet::new(),
@@ -4257,6 +4714,56 @@ mod tests {
     }
 
     #[test]
+    fn large_result_count_applies_saved_rating_filter_before_confirmation() {
+        let mut filter = crate::settings::SmartFolderFilter {
+            ratings: [false; 6],
+            ..Default::default()
+        };
+        filter.ratings[5] = true;
+        let mut definition = crate::settings::SmartFolderDefinition::new("starred");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            PathBuf::from(r"C:\Books"),
+            true,
+            true,
+            filter,
+        ));
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(vec![
+                smart_entry(r"C:\Books\a.zip", 0, ""),
+                smart_entry(r"C:\Books\b.zip", 0, ""),
+                smart_entry(r"C:\Books\c.zip", 0, ""),
+            ]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let counted = count_smart_folder_results(
+            snapshot,
+            7,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            false,
+            false,
+            false,
+            None,
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(counted.snapshot.entries.len(), 3);
+        assert_eq!(
+            counted.result_count, 0,
+            "confirmation must use the metadata-filtered result, not scan candidates"
+        );
+        assert_eq!(counted.metadata_revision, 7);
+    }
+
+    #[test]
     fn metadata_tag_filter_keeps_folder_rows_navigable() {
         let key = "c:/books/series".to_string();
         let mut filter = crate::settings::SmartFolderFilter::default();
@@ -4353,6 +4860,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             SmartFolderPrepareResources::default(),
             &cancel,
             &tx,
@@ -4409,6 +4917,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
             SmartFolderPrepareResources::default(),
             &cancel,
@@ -4478,6 +4987,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             SmartFolderPrepareResources::default(),
             &cancel,
             &tx,
@@ -4501,6 +5011,7 @@ mod tests {
             true,
             true,
             true,
+            None,
             Some(resort_metadata),
             SmartFolderPrepareResources::default(),
             &cancel,
@@ -4569,6 +5080,7 @@ mod tests {
             true,
             true,
             true,
+            None,
             Some(reused),
             SmartFolderPrepareResources::default(),
             &AtomicBool::new(false),
@@ -4700,6 +5212,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
             SmartFolderPrepareResources::default(),
             &cancel,
