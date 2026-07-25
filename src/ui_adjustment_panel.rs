@@ -8123,32 +8123,7 @@ fn draw_sliders(
                 .size(SECTION_FONT - 1.0)
                 .weak(),
         );
-        let selected_name = params
-            .creative_lut
-            .id
-            .and_then(|id| creative_luts.iter().find(|entry| entry.id == id))
-            .map(|entry| entry.name.as_str())
-            .unwrap_or_else(|| {
-                if params.creative_lut.id.is_some() {
-                    "（未登録）"
-                } else {
-                    "なし"
-                }
-            });
-        let before_lut_id = params.creative_lut.id;
-        egui::ComboBox::from_id_salt("image_creative_lut")
-            .selected_text(selected_name)
-            .width(ui.available_width().max(120.0))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut params.creative_lut.id, None, "なし");
-                for entry in creative_luts {
-                    ui.selectable_value(&mut params.creative_lut.id, Some(entry.id), &entry.name)
-                        .on_hover_text(entry.path.display().to_string());
-                }
-            });
-        if params.creative_lut.id != before_lut_id {
-            changed = true;
-        }
+        changed |= draw_image_creative_lut_combo(ui, &mut params.creative_lut.id, creative_luts);
         if let Some(id) = params.creative_lut.id {
             ui.horizontal(|ui| {
                 ui.label("適用量");
@@ -8458,6 +8433,94 @@ fn draw_sliders(
     }
 
     (changed, dragging, settings_changed)
+}
+
+fn draw_image_creative_lut_combo(
+    ui: &mut egui::Ui,
+    selected_id: &mut Option<uuid::Uuid>,
+    creative_luts: &[crate::creative_lut::CreativeLutEntry],
+) -> bool {
+    let selected_name = selected_id
+        .and_then(|id| creative_luts.iter().find(|entry| entry.id == id))
+        .map(|entry| entry.name.as_str())
+        .unwrap_or_else(|| {
+            if selected_id.is_some() {
+                "（未登録）"
+            } else {
+                "なし"
+            }
+        });
+    let before = *selected_id;
+    egui::ComboBox::from_id_salt("image_creative_lut")
+        .selected_text(selected_name)
+        .width(ui.available_width().max(120.0))
+        .height(420.0)
+        .popup_style(crate::os_theme::dark_popup_style(ui.ctx()))
+        .show_ui(ui, |ui| {
+            crate::os_theme::apply_dark_ui(ui);
+            ui.selectable_value(selected_id, None, "なし");
+            for entry in creative_luts {
+                let label = if entry.is_builtin() {
+                    format!("プリセット: {}", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+                let hover = entry
+                    .builtin
+                    .map(|builtin| builtin.description().to_owned())
+                    .unwrap_or_else(|| entry.path.display().to_string());
+                ui.selectable_value(selected_id, Some(entry.id), label)
+                    .on_hover_text(hover);
+            }
+        });
+    *selected_id != before
+}
+
+#[cfg(test)]
+mod creative_lut_ui_tests {
+    use super::*;
+
+    #[test]
+    fn image_creative_lut_popup_is_dark_and_shows_builtin_presets_in_light_app() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut fonts_ready = false;
+        let mut selected_id = None;
+        let creative_luts = crate::creative_lut::builtin_creative_lut_entries();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(380.0, 520.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
+                    .show(ctx, |ui| {
+                        crate::os_theme::apply_dark_ui(ui);
+                        ui.set_max_width(320.0);
+                        ui.label("Creative LUT");
+                        draw_image_creative_lut_combo(ui, &mut selected_id, &creative_luts);
+                    });
+            });
+
+        harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("プリセット: モノクロフィルム")
+                .is_some()
+        );
+        harness.snapshot("image_creative_lut_popup_dark_on_light_app");
+        assert_eq!(
+            harness.ctx.options(|options| options.theme_preference),
+            egui::ThemePreference::Light
+        );
+        assert!(!harness.ctx.style().visuals.dark_mode);
+    }
 }
 
 fn bookmark_row_should_jump(

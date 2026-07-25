@@ -732,13 +732,19 @@ fn draw_native_video_adjustment_body(
                     egui::ComboBox::from_id_salt("native_video_creative_lut")
                         .selected_text(selected_name)
                         .width(ui.available_width())
+                        .height(420.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut adjustments.creative_lut.id, None, "なし");
                             for entry in creative_luts {
+                                let label = if entry.builtin {
+                                    format!("プリセット: {}", entry.name)
+                                } else {
+                                    entry.name.clone()
+                                };
                                 ui.selectable_value(
                                     &mut adjustments.creative_lut.id,
                                     Some(entry.id),
-                                    &entry.name,
+                                    label,
                                 )
                                 .on_hover_text(&entry.path);
                             }
@@ -6267,8 +6273,9 @@ mod tests {
             },
             vec![crate::creative_lut::CreativeLutChoice {
                 id: lut_id,
-                name: "Cinematic Warm".to_string(),
-                path: r"C:\LUT\Cinematic Warm.cube".to_string(),
+                name: "ウォームフィルム".to_string(),
+                path: "組み込みプリセット".to_string(),
+                builtin: true,
                 loaded: true,
                 error: None,
             }],

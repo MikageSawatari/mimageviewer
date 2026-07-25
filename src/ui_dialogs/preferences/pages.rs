@@ -5888,9 +5888,10 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
     state.poll_creative_lut_import();
 
     ui.label(
-        "静止画と動画のプレビューに使う Creative 3D LUT を登録します。\n\
-         対応形式は一般的な .cube（LUT_3D_SIZE）です。入力色空間の変換用ではなく、\
-         通常の表示結果へ好みのルックを加える用途です。",
+        "静止画と動画のプレビューに使う Creative 3D LUT を管理します。\n\
+         すぐに使える組み込みプリセットに加えて、一般的な .cube（LUT_3D_SIZE）を\
+         追加できます。入力色空間の変換用ではなく、通常の表示結果へ好みのルックを\
+         加える用途です。",
     );
     ui.add_space(6.0);
     ui.label(
@@ -5921,31 +5922,38 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
     ui.separator();
     ui.add_space(6.0);
 
-    if state.settings.creative_luts.is_empty() {
-        ui.label(egui::RichText::new("登録済みのLUTはありません。").weak());
-        return;
-    }
-
     let mut remove = None;
     for (index, entry) in state.settings.creative_luts.iter_mut().enumerate() {
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("表示名:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut entry.name)
-                        .desired_width(220.0)
-                        .hint_text("LUT名"),
-                );
-                if ui.button("登録解除").clicked() {
-                    remove = Some(index);
-                }
-            });
-            ui.label(
-                egui::RichText::new(entry.path.display().to_string())
-                    .small()
-                    .weak(),
-            )
-            .on_hover_text(entry.path.display().to_string());
+            if let Some(builtin) = entry.builtin {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&entry.name).strong());
+                    ui.label(
+                        egui::RichText::new("組み込みプリセット")
+                            .small()
+                            .color(ui.visuals().selection.bg_fill),
+                    );
+                });
+                ui.label(egui::RichText::new(builtin.description()).small().weak());
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("表示名:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut entry.name)
+                            .desired_width(220.0)
+                            .hint_text("LUT名"),
+                    );
+                    if ui.button("登録解除").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(entry.path.display().to_string())
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text(entry.path.display().to_string());
+            }
         });
         ui.add_space(5.0);
     }
