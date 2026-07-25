@@ -1527,13 +1527,16 @@ fn finalize_export_page_bases(
         ) {
             continue;
         }
-        let use_cache = page_origins[entry_index] == Some(PortableVirtualKeyBase::ConvertedCache)
-            || page_index.active_cache_entries.contains(&entry_index)
-            || entry.portable.media_kind == PortableMediaKind::ConvertibleArchive;
-        entry.portable.virtual_key_base = if use_cache {
-            PortableVirtualKeyBase::ConvertedCache
-        } else {
-            PortableVirtualKeyBase::Source
+        entry.portable.virtual_key_base = match page_origins[entry_index] {
+            // 実際にDBで見つかったoriginは、拡張子やcache管理行からの推測より強い。
+            // 直接閲覧RAR/CBRはConvertibleArchiveだがsource keyを参照する。
+            Some(origin) => origin,
+            None if page_index.active_cache_entries.contains(&entry_index)
+                || entry.portable.media_kind == PortableMediaKind::ConvertibleArchive =>
+            {
+                PortableVirtualKeyBase::ConvertedCache
+            }
+            None => PortableVirtualKeyBase::Source,
         };
     }
 }
@@ -5561,6 +5564,150 @@ mod tests {
                 )
                 .unwrap(),
             270
+        );
+    }
+
+    #[test]
+    fn direct_read_rar_source_page_metadata_round_trips_without_cache_remap() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_archive = source.join("book.rar");
+        let destination_archive = destination.join("book.rar");
+        fs::write(&source_archive, b"same-rar").unwrap();
+        fs::write(&destination_archive, b"same-rar").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        // 有効な変換cache行が残っていても、実際にsource keyで観測したページ情報を優先する。
+        let source_cache =
+            crate::archive_cache::cache_zip_path_for_data_dir(&source_data, &source_archive);
+        fs::create_dir_all(source_cache.parent().unwrap()).unwrap();
+        fs::write(&source_cache, b"converted-zip").unwrap();
+        let source_metadata = fs::metadata(&source_archive).unwrap();
+        let source_mtime = source_metadata
+            .modified()
+            .ok()
+            .and_then(system_time_ms)
+            .unwrap()
+            .div_euclid(1000);
+        let archive_cache = Connection::open(source_data.join("archive_cache.db")).unwrap();
+        archive_cache
+            .execute_batch(
+                "CREATE TABLE converted_archives (
+                    src_path_key TEXT PRIMARY KEY,
+                    src_mtime INTEGER NOT NULL,
+                    src_size INTEGER NOT NULL,
+                    cached_zip_path TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        archive_cache
+            .execute(
+                "INSERT INTO converted_archives
+                    (src_path_key, src_mtime, src_size, cached_zip_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    crate::path_key::normalize(&source_archive),
+                    source_mtime,
+                    source_metadata.len() as i64,
+                    source_cache.to_string_lossy().as_ref(),
+                ],
+            )
+            .unwrap();
+
+        let source_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&source_archive),
+            "Pages/Cover.JPG",
+        );
+        Connection::open(source_data.join("rating.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ratings
+                    (path, stars, rated_at_ms, source_path, kind, entry_name)
+                 VALUES (?1, 4, 123, ?2, 6, 'Pages/Cover.JPG')",
+                params![source_page, source_archive.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        set_tags_with_applied_at(&source_data, &source_page, &[("直読み", 456)]);
+        Connection::open(source_data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 90)",
+                [&source_page],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let exported = read_manifest(&source, &cancel).unwrap();
+        let archive_entry = exported
+            .entries
+            .iter()
+            .find(|entry| entry.path == "book.rar")
+            .unwrap();
+        assert_eq!(
+            archive_entry.virtual_key_base,
+            PortableVirtualKeyBase::Source
+        );
+        assert_eq!(archive_entry.virtual_items.len(), 1);
+
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 0);
+        let destination_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&destination_archive),
+            "Pages/Cover.JPG",
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rating.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT stars FROM ratings WHERE path = ?1",
+                    [&destination_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            tags_with_applied_at(&destination_data, &destination_page),
+            vec![("直読み".to_string(), 456)]
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rotation.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&destination_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            90
+        );
+
+        let destination_cache = crate::archive_cache::cache_zip_path_for_data_dir(
+            &destination_data,
+            &destination_archive,
+        );
+        let destination_cache_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&destination_cache),
+            "Pages/Cover.JPG",
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rating.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM ratings WHERE path = ?1",
+                    [&destination_cache_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
     }
 

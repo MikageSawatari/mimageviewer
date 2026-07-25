@@ -340,6 +340,9 @@ cache ZIPと`converted_archives`行を管理画面削除・容量pruneで失っ�
 data directoryから決定的に再生成できるため、source/cache両prefixを全ページメタ情報familyの
 scopeへ入れる。cache側だけに行が残る場合は`ConvertedCache`として移送し、source/cache双方に
 行がある場合はDB間の走査順で暗黙mergeせず対象アーカイブ付きの競合エラーにする。
+一方、直接閲覧RAR / CBRは`ConvertibleArchive`として列挙されてもsource RAR keyを参照するため、
+いずれか一方でページ行を実際に検出した場合は、そのoriginを有効cache行や拡張子からの推測より
+優先してmanifestの`virtual_key_base`へ保存する。
 
 bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
 `generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ

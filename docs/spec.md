@@ -62,6 +62,9 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   タグ・ページ編集と、ZIP 内の本ごとの設定は、物理コンテナの項目に仮想項目として格納する。
   変換cache経由のRAR / 7z / LZH（および入れ子非ZIPを含むZIP）は、元アーカイブのコンテナ情報と
   cache ZIP側のページ情報を対応付け、移動先環境のcache keyへページ情報を復元する。
+  直接閲覧RAR / CBRのページ情報は元アーカイブのsource keyを維持し、移動先でもsource keyへ
+  復元する。source/cacheのどちらで実データを検出したかを、拡張子やcache管理行による推測より
+  優先する。
   変換cache DBが存在しない、または対象行がない場合だけ未変換として扱い、DBを読めない場合は
   ページ情報を欠落させたまま成功させずexportを中止する。cache ZIP・管理行の削除後も、
   決定的なcache key配下に残るページ情報をexport対象にする。source keyとcache keyの両方に
