@@ -984,7 +984,9 @@ enum EditPreviewCommand {
     Prune {
         max_bytes: u64,
     },
-    Clear,
+    Clear {
+        completed: Option<mpsc::SyncSender<()>>,
+    },
 }
 
 fn publish_delete_invalidation(removed: bool, notify_if_missing: bool) -> bool {
@@ -1069,9 +1071,12 @@ impl EditPreviewCacheService {
                             }
                         }
                         EditPreviewCommand::Prune { max_bytes } => worker_db.prune(max_bytes),
-                        EditPreviewCommand::Clear => {
+                        EditPreviewCommand::Clear { completed } => {
                             worker_db.clear();
                             let _ = event_tx.send(EditPreviewEvent::Cleared);
+                            if let Some(completed) = completed {
+                                let _ = completed.send(());
+                            }
                         }
                     }
                 }
@@ -1130,7 +1135,19 @@ impl EditPreviewCacheService {
     }
 
     pub fn clear(&self) {
-        let _ = self.tx.send(EditPreviewCommand::Clear);
+        let _ = self.tx.send(EditPreviewCommand::Clear { completed: None });
+    }
+
+    /// importのterminal refreshが旧previewを再利用しないよう、worker queue上で
+    /// それ以前のsaveを着地させた後にclear完了を通知する。
+    pub fn clear_with_completion(&self) -> Result<mpsc::Receiver<()>, String> {
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(EditPreviewCommand::Clear {
+                completed: Some(completed_tx),
+            })
+            .map_err(|_| "編集プレビューキャッシュの消去workerが終了しています".to_string())?;
+        Ok(completed_rx)
     }
 
     pub fn try_recv(&self) -> Result<EditPreviewEvent, mpsc::TryRecvError> {

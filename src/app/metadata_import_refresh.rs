@@ -21,6 +21,9 @@ pub(crate) struct ItemKey {
     pub(crate) rating: bool,
     pub(crate) tags: bool,
     pub(crate) page: bool,
+    /// import前にこのpage identityへ編集状態が存在したか。DB再取得後の状態と
+    /// ORして、削除・追加のどちらでもmaterialized thumbnailを失効させる。
+    pub(crate) had_page_state: bool,
     /// page identityだけが共有キーと異なる稀な項目で追加保持する。
     pub(crate) alternate_page_key: Option<String>,
     pub(crate) container_path: Option<PathBuf>,
@@ -93,6 +96,7 @@ pub(crate) struct PageStateResult {
     pub(crate) conceal_pages: HashSet<usize>,
     pub(crate) comic_pages: HashSet<usize>,
     pub(crate) rotation_cache: HashMap<usize, crate::rotation_db::Rotation>,
+    pub(crate) thumbnail_reset_indices: Vec<usize>,
 }
 
 pub(crate) struct RefreshResult {
@@ -107,6 +111,12 @@ pub(crate) fn run(
     changed: ImportChangedSections,
     cancel: &AtomicBool,
 ) -> Option<RefreshResult> {
+    let started = std::time::Instant::now();
+    let context_count = requests.len();
+    let item_count = requests
+        .iter()
+        .map(|request| request.items.len())
+        .sum::<usize>();
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
@@ -256,11 +266,35 @@ pub(crate) fn run(
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
-    Some(RefreshResult {
+    let result = RefreshResult {
         contexts,
         page_snapshot,
         errors,
-    })
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    crate::logger::log(format!(
+        "metadata import refresh: contexts={context_count} items={item_count} \
+         errors={} elapsed_ms={elapsed_ms:.1}",
+        result.errors.len()
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "metadata_import",
+            "terminal_refresh",
+            None,
+            0,
+            &[
+                ("contexts", serde_json::Value::from(context_count as u64)),
+                ("items", serde_json::Value::from(item_count as u64)),
+                (
+                    "errors",
+                    serde_json::Value::from(result.errors.len() as u64),
+                ),
+                ("ms", serde_json::Value::from(elapsed_ms)),
+            ],
+        );
+    }
+    Some(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -338,6 +372,7 @@ fn build_context_result(
             .collect::<Vec<_>>();
         let page_keys = page_items.iter().map(|(_, key)| *key).collect::<Vec<_>>();
         if let Some(state) = page_state.as_mut() {
+            let reset_start = state.thumbnail_reset_indices.len();
             if let Some(db) = adjustment_db {
                 let loaded = db.load_page_params_many(&page_keys);
                 for (index, key) in &page_items {
@@ -394,6 +429,24 @@ fn build_context_result(
                     }
                 }
             }
+            for item in chunk.iter().filter(|item| item.page_key().is_some()) {
+                let has_new_state = state.adjustment_page_params.contains_key(&item.index)
+                    || state.local_adjust_pages.contains(&item.index)
+                    || state.export_crop_page_settings.contains_key(&item.index)
+                    || state.view_trim_page_overrides.contains_key(&item.index)
+                    || state.mask_pages.contains(&item.index)
+                    || state.conceal_pages.contains(&item.index)
+                    || state.comic_pages.contains(&item.index)
+                    || state.rotation_cache.contains_key(&item.index);
+                if item.had_page_state || has_new_state {
+                    state.thumbnail_reset_indices.push(item.index);
+                }
+            }
+            debug_assert!(
+                state.thumbnail_reset_indices[reset_start..]
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            );
         }
     }
 
@@ -541,6 +594,7 @@ impl Default for PageStateResult {
             conceal_pages: HashSet::new(),
             comic_pages: HashSet::new(),
             rotation_cache: HashMap::new(),
+            thumbnail_reset_indices: Vec::new(),
         }
     }
 }
@@ -579,6 +633,7 @@ mod tests {
                         rating: true,
                         tags: true,
                         page: true,
+                        had_page_state: false,
                         alternate_page_key: None,
                         container_path: None,
                         video_path: None,
@@ -590,6 +645,7 @@ mod tests {
                         rating: true,
                         tags: true,
                         page: true,
+                        had_page_state: false,
                         alternate_page_key: None,
                         container_path: None,
                         video_path: None,
@@ -601,6 +657,7 @@ mod tests {
                         rating: false,
                         tags: true,
                         page: false,
+                        had_page_state: false,
                         alternate_page_key: None,
                         container_path: None,
                         video_path: None,
@@ -663,6 +720,7 @@ mod tests {
                     rating: true,
                     tags: true,
                     page: false,
+                    had_page_state: false,
                     alternate_page_key: None,
                     container_path: None,
                     video_path: None,
@@ -703,6 +761,78 @@ mod tests {
     }
 
     #[test]
+    fn page_refresh_resets_thumbnails_for_added_and_removed_edit_state() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let added_key = "c:/pictures/added.jpg".to_string();
+        let removed_key = "c:/pictures/removed.jpg".to_string();
+        crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db")).unwrap();
+        crate::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db")).unwrap();
+        crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db")).unwrap();
+        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap();
+        crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db")).unwrap();
+        crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db")).unwrap();
+        crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).unwrap();
+        crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db"))
+            .unwrap()
+            .set_key(&added_key, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+
+        let result = run(
+            data_dir,
+            vec![ContextRequest {
+                slot: ContextSlot::Main,
+                items_generation: 4,
+                items: vec![
+                    ItemKey {
+                        index: 10,
+                        key: added_key,
+                        rating: false,
+                        tags: false,
+                        page: true,
+                        had_page_state: false,
+                        alternate_page_key: None,
+                        container_path: None,
+                        video_path: None,
+                        video_size: 0,
+                    },
+                    ItemKey {
+                        index: 20,
+                        key: removed_key,
+                        rating: false,
+                        tags: false,
+                        page: true,
+                        had_page_state: true,
+                        alternate_page_key: None,
+                        container_path: None,
+                        video_path: None,
+                        video_size: 0,
+                    },
+                ],
+                legacy_seed_paths: Vec::new(),
+                current_rating_key: None,
+                spread_container_path: None,
+                old_folder_pin_keys: HashSet::new(),
+                folder_pin_paths: Vec::new(),
+                folder_pin_aliases: Vec::new(),
+            }],
+            ImportChangedSections {
+                page_state: true,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("refresh should complete");
+        let page = result.contexts[0].page_state.as_ref().unwrap();
+        assert_eq!(page.thumbnail_reset_indices, vec![10, 20]);
+        assert_eq!(
+            page.rotation_cache.get(&10),
+            Some(&crate::rotation_db::Rotation::Cw90)
+        );
+    }
+
+    #[test]
     fn worker_restores_folder_aliases_and_reports_video_without_a_remaining_pin() {
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path().join("data");
@@ -734,6 +864,7 @@ mod tests {
                     rating: true,
                     tags: true,
                     page: false,
+                    had_page_state: false,
                     alternate_page_key: None,
                     container_path: None,
                     video_path: Some(video.clone()),

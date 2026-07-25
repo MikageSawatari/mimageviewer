@@ -57,12 +57,19 @@ fn path_hash(src: &Path) -> String {
 /// 元ファイルから変換済み ZIP の絶対パスを決定する。
 /// `<cache_root>/<hash前2文字>/<hash>/<basename>.zip`
 fn cache_zip_path_for(src: &Path) -> PathBuf {
+    cache_zip_path_for_data_dir(&crate::data_dir::get(), src)
+}
+
+/// ポータブルメタ情報のimportなど、通常profileとは別のdata directoryに対しても
+/// 変換cacheの安定keyを再現するための純粋なpath計算。
+pub(crate) fn cache_zip_path_for_data_dir(data_dir: &Path, src: &Path) -> PathBuf {
     let hash = path_hash(src);
     let basename = src
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("archive");
-    cache_root()
+    data_dir
+        .join("archive_cache")
         .join(&hash[..2])
         .join(&hash)
         .join(format!("{basename}.zip"))

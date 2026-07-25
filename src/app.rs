@@ -22987,6 +22987,21 @@ impl App {
             let item_index = index.next_item;
             let rating_key = self.rating_path_key(item_index);
             let page_key = self.page_path_key(item_index);
+            let had_page_state = page_key.as_deref().is_some_and(|key| {
+                self.adjusted_page_keys.contains(key)
+                    || self.local_adjust_page_keys.contains(key)
+                    || self.mask_page_keys.contains(key)
+                    || self.conceal_page_keys.contains(key)
+                    || self.comic_page_keys.contains(key)
+                    || self.rotation_page_keys.contains(key)
+            }) || self.adjustment_page_params.contains_key(&item_index)
+                || self.local_adjust_pages.contains(&item_index)
+                || self.export_crop_page_settings.contains_key(&item_index)
+                || self.view_trim_page_overrides.contains_key(&item_index)
+                || self.mask_pages.contains(&item_index)
+                || self.conceal_pages.contains(&item_index)
+                || self.comic_pages.contains(&item_index)
+                || self.rotation_cache.contains_key(&item_index);
             let item = &self.items[item_index];
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
             if index.collect_legacy_seed_paths
@@ -23044,6 +23059,7 @@ impl App {
                     rating,
                     tags,
                     page,
+                    had_page_state,
                     alternate_page_key,
                     container_path,
                     video_path,
@@ -23366,6 +23382,9 @@ impl App {
             DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
         }
         if let Some(page) = result.page_state.take() {
+            for index in &page.thumbnail_reset_indices {
+                self.evict_thumbnail_for_edit_preview_refresh(*index);
+            }
             self.adjustment_page_params = page.adjustment_page_params;
             self.local_adjust_pages = page.local_adjust_pages;
             self.local_adjust_page_layers.clear();
@@ -46630,6 +46649,56 @@ impl App {
             .collect()
     }
 
+    fn clear_current_edit_preview_materializations(&mut self) {
+        let mut invalidated: std::collections::HashSet<usize> =
+            self.thumb_edit_preview_keys.keys().copied().collect();
+        invalidated.extend(
+            self.thumbnails
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, state)| {
+                    matches!(
+                        state,
+                        ThumbnailState::Loaded {
+                            from_edit_preview: true,
+                            ..
+                        }
+                    )
+                    .then_some(idx)
+                }),
+        );
+        for idx in invalidated {
+            self.evict_thumbnail_for_edit_preview_refresh(idx);
+        }
+        self.thumb_edit_preview_keys.clear();
+        self.edit_preview_refresh_pending.clear();
+    }
+
+    /// 永続preview cacheはApp-globalなので、clear通知もmainだけでなく保持中の
+    /// detached / paused contextへ同じ所有権境界で適用する。
+    fn clear_all_edit_preview_materializations(&mut self) {
+        self.clear_current_edit_preview_materializations();
+        #[cfg(windows)]
+        {
+            if let Some(mut active) = self.active_detached_viewer_context.take() {
+                self.swap_viewer_context_bundle(&mut active.bundle);
+                self.clear_current_edit_preview_materializations();
+                self.swap_viewer_context_bundle(&mut active.bundle);
+                self.active_detached_viewer_context = Some(active);
+            }
+            for index in 0..self.detached_image_windows.len() {
+                let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
+                else {
+                    continue;
+                };
+                self.swap_viewer_context_bundle(&mut bundle);
+                self.clear_current_edit_preview_materializations();
+                self.swap_viewer_context_bundle(&mut bundle);
+                self.detached_image_windows[index].paused_bundle = Some(bundle);
+            }
+        }
+    }
+
     fn reconcile_pinned_adjustment_refreshes(&mut self) {
         if self.pinned_adjustment_refresh_keys.is_empty() {
             return;
@@ -46684,25 +46753,7 @@ impl App {
                     self.edit_preview_refresh_pending.remove(&item_key);
                 }
                 crate::edit_preview_cache::EditPreviewEvent::Cleared => {
-                    let loaded_previews: Vec<usize> = self
-                        .thumbnails
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, state)| {
-                            matches!(
-                                state,
-                                ThumbnailState::Loaded {
-                                    from_edit_preview: true,
-                                    ..
-                                }
-                            )
-                            .then_some(idx)
-                        })
-                        .collect();
-                    for idx in loaded_previews {
-                        self.evict_thumbnail_for_edit_preview_refresh(idx);
-                    }
-                    self.edit_preview_refresh_pending.clear();
+                    self.clear_all_edit_preview_materializations();
                 }
             }
         }

@@ -226,6 +226,64 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
 
 #[cfg(windows)]
 #[test]
+fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let texture = ctx.load_texture(
+        "metadata_import_preview_clear",
+        egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+        egui::TextureOptions::LINEAR,
+    );
+    let loaded = || ThumbnailState::Loaded {
+        tex: texture.clone(),
+        from_cache: true,
+        from_edit_preview: true,
+        rendered_at_px: 64,
+        source_dims: Some((1, 1)),
+    };
+    let prepare_bundle = |path: &str| {
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image(PathBuf::from(path))];
+        bundle.thumbnails = vec![loaded()];
+        bundle
+            .thumb_edit_preview_keys
+            .insert(0, format!("{path}::preview"));
+        bundle
+    };
+
+    app.items = vec![GridItem::Image(PathBuf::from(r"C:\Pictures\main.jpg"))];
+    app.thumbnails = vec![loaded()];
+    app.thumb_edit_preview_keys
+        .insert(0, "main::preview".to_string());
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+        bundle: prepare_bundle(r"C:\Pictures\active.jpg"),
+    });
+    app.detached_image_windows.push(paused_test_window(
+        &ctx,
+        91,
+        prepare_bundle(r"C:\Pictures\paused.jpg"),
+    ));
+
+    app.clear_all_edit_preview_materializations();
+
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+    assert!(app.thumb_edit_preview_keys.is_empty());
+    let active = app.active_detached_viewer_context.as_ref().unwrap();
+    assert!(matches!(
+        active.bundle.thumbnails[0],
+        ThumbnailState::Evicted
+    ));
+    assert!(active.bundle.thumb_edit_preview_keys.is_empty());
+    let paused = app.detached_image_windows[0]
+        .paused_bundle
+        .as_deref()
+        .unwrap();
+    assert!(matches!(paused.thumbnails[0], ThumbnailState::Evicted));
+    assert!(paused.thumb_edit_preview_keys.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
 fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_workers() {
     use crate::settings::FacetEditFlag;
 

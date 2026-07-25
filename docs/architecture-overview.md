@@ -140,7 +140,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_music_timeline.rs` | 音楽ビュー中央の行分割波形タイムライン。row raster worker + 行テクスチャキャッシュ (`TimelineTextureCache`、解析の版数 = `music_analysis_version` で再ラスタ判定)。行数は `TIMELINE_MAX_ROWS` でキャップ |
 | `ui_music_spectrum.rs` | 下段 108band スペクトラム + 鍵盤。専用 worker が共有 `MusicPcm` の窓を FFT (in-flight 1 件 coalesce) |
 | `ui_music_panels.rs` | 音楽ビューの左右ホバーパネル (ブックマーク / ループ / 行秒数) と下 HUD (動画 native HUD とレイアウト一致) |
-| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` / `app/metadata_import_refresh.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` directory の原子的generation pointer + フォルダ単位JSON Lines shard、root-relative path検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンをworkerで移送する。export / preview / importはshardを逐次処理し、総項目数・総sidecarサイズの固定上限を持たない。importは15ストアをattached connectionへまとめ、外側transactionを256項目 / 64 MiB / 500 msで区切り、項目内SAVEPOINTで失敗を隔離する。UIは完全モーダルの確認・固定高進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当する。開始前にはmain / active detached / paused detachedのmetadata writerを静止・drainし、終了時にXMP readerをcontextごと再開する。DB更新中は既存cacheを安定snapshotとして保ち、終端時に影響contextのcompact keyとlegacy seed path snapshotを専用workerへ渡す。一括再取得したcacheは未タグの読込済みsentinelも含め、items世代照合後にcontextごと所有権を置換して表示集合とcontext所有XMP workerを再構築する。外部snapshot反映はApp-globalなfacet scope / suppressionを変更せず、bookmark presence更新も保持中の全contextへ在メモリ反映する |
+| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` / `app/metadata_import_refresh.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` directory の原子的generation pointer + フォルダ単位JSON Lines shard、root-relative path・media kind・file size検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンをworkerで移送する。変換済みRAR / 7z / LZH / nested-archive ZIPはsource container keyと環境固有cache ZIP page keyを相互変換する。export / preview / importはshardを逐次処理し、総項目数・総sidecarサイズの固定上限を持たない。importは15ストアをattached connectionへまとめ、外側transactionを256項目 / 64 MiB / 500 msで区切り、項目内SAVEPOINTで失敗を隔離する。UIは完全モーダルの確認・固定高進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当する。開始前にはmain / active detached / paused detachedのmetadata writerを静止・drainし、終了時にXMP readerをcontextごと再開する。DB更新中は既存cacheを安定snapshotとして保ち、終端時に影響contextのcompact keyとlegacy seed path snapshotを専用workerへ渡す。一括再取得したcacheは未タグの読込済みsentinelも含め、items世代照合後にcontextごと所有権を置換して表示集合とcontext所有XMP workerを再構築する。外部snapshot反映はApp-globalなfacet scope / suppressionを変更せず、bookmark presence更新も保持中の全contextへ在メモリ反映する |
 | App の `music_*` 状態 | 解析ワーカー / `MusicPcm` / spectrum / timeline cache は **ViewerContextBundle に入れず global** (stage-audio §3.5: ParkedLive 音楽窓も同じ global を消費する)。表示ゲートの中央述語は `fs_music_view_active`、動画→音声モードの transient は `video_audio_mode` / `video_audio_vst` |
 
 ### マルチウィンドウ / detached viewer (F12)
@@ -327,11 +327,13 @@ v2.7.0では安定化のためメニュー入口を一時非表示にしたが�
 `metadata_transfer::UI_ENABLED`を有効化して再公開する。
 
 `ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
-`mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v4 は評価、
+`mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v5 は評価、
 タグ（名前と適用時刻）、動画・音声 / 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
 部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。crop矩形は通常DB /
 sidecarと同じ元画像ピクセル座標を保持する。ZIP / PDF のページ stateと ZIP 内の本 state は
-物理コンテナ配下の相対キーで持つ。
+物理コンテナ配下の相対キーで持つ。RAR / 7z / LZHと、入れ子非ZIPを含んで変換されたZIPは、
+export元のarchive cache DBで有効なsource/cache対応を確認してcache ZIP側のページkeyを相対化し、
+import先data directoryから決まるcache ZIP keyへ復元する。コンテナ側の本設定は元アーカイブkeyを維持する。
 
 bundle は `mimageviewer.meta.miv/manifest.json` を現在generationの小さいpointerとし、
 `generations/<id>/shards/<folder-hash>.jsonl` にrootと各サブフォルダの直下項目を1recordずつ
@@ -349,7 +351,12 @@ crashで残った未公開generationは、次回exportの開始時と公開成�
 preview / importは各shardをbounded line readerで逐次読み、folder hash、direct-child配置、
 shard / entry総数、record単位validationを検証する。importはDBを触る前に現generationの全shardを
 streaming preflightし、重複pathはRAM上の全件`HashSet`ではなく一時SQLite indexで検出する。
-2回目の走査では対象pathを再検証し、256物理項目 / 推定64 MiB / 500 msのいずれかで
+各file recordにはsize / mtimeを保存するが、移送性能を優先してファイル内容digestは作らない。
+importは相対path・entry kind・media kind・sizeが一致すれば同一項目として扱い、mtimeだけが変わる
+コピーと、同一sizeで内容が変わったファイルのどちらにも適用する。media kindも明示し、
+画像への時刻bookmark、音声へのvideo pin、
+動画へのpage edit、通常fileへのvirtual pageなどの組み合わせをpreflightで拒否する。
+2回目の走査では対象pathを再検証し、256物理項目 / 実record 64 MiB / 500 msのいずれかで
 外側transactionをcommitする。各物理項目はSAVEPOINTで隔離し、1件の失敗が同じbatchの
 他項目を巻き戻さない。走査途中のI/O・parse・validationエラーと明示キャンセルでは現在batchも
 commitして部分完了結果を返す。プロセス異常終了時は現在batchだけがrollbackされ、完了済みbatchは
@@ -357,6 +364,8 @@ commitして部分完了結果を返す。プロセス異常終了時は現在ba
 manifestに記載された物理項目だけを上書きし、未記載項目を保持する。適用時は既存
 `mimageviewer.dat` の mtime を編集 / タグ sidecar sync table に記録し、明示 import 後の
 フォルダ再ロードで古い自動バックアップが欠落行を復活させないようにする。
+同一フォルダのsync upsertはsectionごとに1回へ集約し、file種別上存在し得ないDB familyは
+削除・挿入処理自体を省く。family削除はpath indexを利用できるexact + range条件で行う。
 dirty な自動 sidecar のserialize / temp書き込み / renameはimport workerの前処理で行い、
 失敗時はDB更新を開始しない。項目の全15ストアはbundled SQLiteのATTACH上限を20へ拡張して
 単一transactionへ参加させる。通常WALの`tags.db`はAppのidle connectionをworkerへ移して閉じ、
@@ -377,6 +386,14 @@ UIはitems generationとdetached window identityが一致する完成cacheだけ
 cache swap後のvisible/facet/details/selection再計算と代表サムネ再materializeは各contextをmount
 している間に行う。video pinは現DBにWebPがない項目も再生成対象へ含め、削除を通常フレーム抽出へ
 戻す。終端refreshはimport本体と別のcancel tokenを持ち、App終了時はDB chunk間で中断する。
+page state import時は永続edit preview cacheの破棄完了を非同期ACKで待ち、main / active detached /
+paused detachedのmaterialized previewを失効させる。各contextではimport前後のどちらかに編集が
+あるthumbnailも再要求するため、編集削除後の旧WebPを残さない。
+再帰exportでjunction / symlink directoryを追わない場合は、除外数と先頭pathを完了画面へ表示する。
+項目SAVEPOINT失敗は「一部未反映」として先頭path・理由を表示し、全件は常時
+`mimageviewer.log`へ記録する。import本体はmanifest / preflight / DB open / target verify /
+SQL apply / commit（合計・最大）の時間、終端refreshはcontext / item数と時間を同ログへ記録する。
+性能ログを有効にした場合は同じ境界を`logs/perf_events.jsonl`の`metadata_import`イベントにも残す。
 進捗path欄は3行分を固定確保し、折り返しによってキャンセルbuttonの位置を動かさない。
 実装と境界条件は `metadata_transfer.rs`、モーダルと writer drain は
 `ui_dialogs/metadata_transfer.rs` が所有する。

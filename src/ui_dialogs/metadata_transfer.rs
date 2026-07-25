@@ -32,6 +32,7 @@ enum Stage {
     ImportConfirm(ImportPreview),
     WaitingForWriters,
     Running,
+    WaitingForEditPreviewClear(Receiver<()>),
     RefreshPreparing,
     Refreshing,
     Result(ResultState),
@@ -40,6 +41,24 @@ enum Stage {
 enum ResultState {
     Export(Result<ExportSummary, String>),
     Import(Result<ImportSummary, String>),
+}
+
+fn append_pending_import_error(state: &mut MetadataTransferState, error: String) {
+    let Some(result) = state.pending_import_result.as_mut() else {
+        state.import_refresh_errors.push(error);
+        return;
+    };
+    match result {
+        Ok(summary) => {
+            summary.incomplete_error = Some(
+                summary
+                    .incomplete_error
+                    .take()
+                    .map_or(error.clone(), |existing| format!("{existing}\n{error}")),
+            );
+        }
+        Err(existing) => existing.push_str(&format!("\n{error}")),
+    }
 }
 
 enum WorkerMessage {
@@ -382,6 +401,7 @@ impl App {
                 Stage::LoadingPreview
                     | Stage::WaitingForWriters
                     | Stage::Running
+                    | Stage::WaitingForEditPreviewClear(_)
                     | Stage::RefreshPreparing
                     | Stage::Refreshing
             )
@@ -412,7 +432,29 @@ impl App {
         let mut restore_view_trim = None;
         let mut terminal_refresh = None;
         let mut begin_terminal_refresh = false;
+        let mut request_edit_preview_clear = false;
         let mut restart_terminal_refresh = false;
+        let clear_status = self.metadata_transfer.as_ref().and_then(|state| {
+            let Stage::WaitingForEditPreviewClear(completed) = &state.stage else {
+                return None;
+            };
+            match completed.try_recv() {
+                Ok(()) => Some(Ok(())),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "編集プレビューキャッシュの消去完了を確認できませんでした".to_string(),
+                )),
+            }
+        });
+        if let Some(clear_status) = clear_status
+            && let Some(state) = self.metadata_transfer.as_mut()
+        {
+            if let Err(error) = clear_status {
+                append_pending_import_error(state, error);
+            }
+            state.stage = Stage::RefreshPreparing;
+            begin_terminal_refresh = true;
+        }
         for message in messages {
             let Some(state) = self.metadata_transfer.as_mut() else {
                 break;
@@ -468,9 +510,12 @@ impl App {
                         .as_ref()
                         .is_ok_and(|summary| summary.applied_entries > 0);
                     if needs_refresh {
+                        request_edit_preview_clear = result.as_ref().is_ok_and(|summary| {
+                            summary.applied_entries > 0 && summary.changed.page_state
+                        });
                         state.pending_import_result = Some(result);
                         state.stage = Stage::RefreshPreparing;
-                        begin_terminal_refresh = true;
+                        begin_terminal_refresh = !request_edit_preview_clear;
                     } else {
                         state.stage = Stage::Result(ResultState::Import(result));
                     }
@@ -519,6 +564,29 @@ impl App {
         }
         if let Some(pending) = restore_view_trim {
             self.restore_pending_view_trim_transfer(pending);
+        }
+        if request_edit_preview_clear {
+            // 明示importは表示中context外も含むため、path一覧をUIへ全件保持せず、
+            // 派生cacheを一度だけ破棄する。消去完了前にterminal refreshを始めると、
+            // 別contextが旧previewを再materializeできるため、worker ACKを待つ。
+            match self
+                .edit_preview_cache
+                .as_ref()
+                .map(|service| service.clear_with_completion())
+            {
+                Some(Ok(completed)) => {
+                    if let Some(state) = self.metadata_transfer.as_mut() {
+                        state.stage = Stage::WaitingForEditPreviewClear(completed);
+                    }
+                }
+                Some(Err(error)) => {
+                    if let Some(state) = self.metadata_transfer.as_mut() {
+                        append_pending_import_error(state, error);
+                    }
+                    begin_terminal_refresh = true;
+                }
+                None => begin_terminal_refresh = true,
+            }
         }
         if begin_terminal_refresh {
             self.begin_metadata_import_terminal_refresh();
@@ -577,7 +645,8 @@ impl App {
             state.import_resources.is_some()
                 && matches!(
                     state.stage,
-                    Stage::RefreshPreparing
+                    Stage::WaitingForEditPreviewClear(_)
+                        | Stage::RefreshPreparing
                         | Stage::Refreshing
                         | Stage::Result(ResultState::Import(_))
                 )
@@ -710,7 +779,9 @@ fn draw_dialog(
                     ui.small("キャンセル時も、反映済みの項目はそのまま保持されます。");
                 }
             }
-            Stage::RefreshPreparing | Stage::Refreshing => {
+            Stage::WaitingForEditPreviewClear(_)
+            | Stage::RefreshPreparing
+            | Stage::Refreshing => {
                 ui.label("表示用メタ情報を更新しています…");
                 ui.spinner();
                 ui.small("データベースへの反映は完了しています。");
@@ -828,20 +899,38 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
                 summary.container_states,
                 summary.thumbnail_pins,
             ));
+            if summary.skipped_reparse_directories > 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "junction／シンボリックリンク {} フォルダの配下は、安全のため除外しました。",
+                        summary.skipped_reparse_directories
+                    ),
+                );
+                for path in &summary.skipped_reparse_paths {
+                    ui.small(format!("・{path}"));
+                }
+                if summary.skipped_reparse_directories > summary.skipped_reparse_paths.len() {
+                    ui.small(format!(
+                        "ほか {} フォルダ",
+                        summary.skipped_reparse_directories - summary.skipped_reparse_paths.len()
+                    ));
+                }
+            }
         }
         ResultState::Import(Ok(summary)) => {
             if summary.cancelled {
                 ui.label("インポートをキャンセルしました。反映済みの項目は保持されています。");
-            } else if summary.incomplete_error.is_some() {
+            } else if summary.incomplete_error.is_some() || summary.failed_entries > 0 {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
-                    "途中でエラーが発生しました。反映済みの項目は保持されています。",
+                    "一部の項目を反映できませんでした。反映済みの項目は保持されています。",
                 );
             } else {
                 ui.label("インポートが完了しました。");
             }
             ui.label(format!(
-                "反映 {} / 見つからない {} / サイズ相違 {} / 失敗 {}（全 {} 項目）",
+                "反映 {} / 見つからない {} / 種類・サイズ相違 {} / 失敗 {}（全 {} 項目）",
                 summary.applied_entries,
                 summary.skipped_missing,
                 summary.skipped_changed,
@@ -850,6 +939,15 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState) {
             ));
             if let Some(error) = summary.incomplete_error.as_deref() {
                 ui.label(error);
+            }
+            for failure in &summary.failed_items {
+                ui.small(format!("・{}: {}", failure.path, failure.reason));
+            }
+            if summary.failed_entries > summary.failed_items.len() {
+                ui.small(format!(
+                    "ほか {} 項目。詳細はmIVログを確認してください。",
+                    summary.failed_entries - summary.failed_items.len()
+                ));
             }
         }
         ResultState::Export(Err(error)) | ResultState::Import(Err(error)) => {
@@ -957,6 +1055,7 @@ fn start_import_worker(
     let spawn = std::thread::Builder::new()
         .name("metadata-import".to_string())
         .spawn(move || {
+            let worker_started = std::time::Instant::now();
             // tags.db is normally held open in WAL mode by App.  Drop that idle
             // connection on this worker before metadata_transfer switches it to
             // DELETE journal mode for a crash-atomic attached transaction.
@@ -970,10 +1069,12 @@ fn start_import_worker(
             drop(tags_db);
 
             let mut progress_relay = ProgressRelay::new(tx.clone());
+            let preparation_started = std::time::Instant::now();
             let view_trim_result =
                 flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import");
             let view_trim_saved = view_trim_result.is_ok();
             let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
+            let preparation_ms = preparation_started.elapsed().as_secs_f64() * 1000.0;
             let result = match flush_result {
                 Ok(()) => {
                     crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
@@ -998,6 +1099,23 @@ fn start_import_worker(
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 resources.tags_db = tags_db;
+            }
+            let worker_ms = worker_started.elapsed().as_secs_f64() * 1000.0;
+            crate::logger::log(format!(
+                "metadata import worker: preparation_ms={preparation_ms:.1} \
+                 through_db_reopen_ms={worker_ms:.1}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "metadata_import",
+                    "worker_summary",
+                    None,
+                    0,
+                    &[
+                        ("preparation_ms", serde_json::Value::from(preparation_ms)),
+                        ("through_db_reopen_ms", serde_json::Value::from(worker_ms)),
+                    ],
+                );
             }
             let _ = tx.send(WorkerMessage::Import {
                 result,

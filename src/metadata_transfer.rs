@@ -24,7 +24,7 @@ pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIR
 pub(crate) const UI_ENABLED: bool = true;
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 const BUNDLE_MANIFEST_FILENAME: &str = "manifest.json";
 const GENERATIONS_DIRNAME: &str = "generations";
 const SHARDS_DIRNAME: &str = "shards";
@@ -50,6 +50,7 @@ const MAX_RECURSION_DEPTH: usize = 40;
 const MAX_MASK_PIXELS: u64 = 100_000_000;
 const MAX_MASK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_VIDEO_THUMB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REPORTED_PATHS: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferPhase {
@@ -78,6 +79,10 @@ pub struct ExportSummary {
     pub page_states: usize,
     pub container_states: usize,
     pub thumbnail_pins: usize,
+    /// セキュリティ上再帰しなかったjunction / symlink directoryの数。
+    pub skipped_reparse_directories: usize,
+    /// UIへ表示する先頭分。総数は`skipped_reparse_directories`を参照する。
+    pub skipped_reparse_paths: Vec<String>,
     #[cfg(test)]
     pub metadata_batches: usize,
 }
@@ -99,6 +104,8 @@ pub struct ImportSummary {
     pub skipped_missing: usize,
     pub skipped_changed: usize,
     pub failed_entries: usize,
+    /// UIへ表示する項目単位失敗の先頭分。総数は`failed_entries`を参照する。
+    pub failed_items: Vec<ImportFailure>,
     pub cancelled: bool,
     /// preflight後の2回目の走査、または終端cache再取得で失敗した場合の終端エラー。
     /// それ以前にcommitしたbatchは保持される。
@@ -106,6 +113,12 @@ pub struct ImportSummary {
     pub changed: ImportChangedSections,
     #[cfg(test)]
     pub transaction_batches: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportFailure {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -305,6 +318,26 @@ enum PortableEntryKind {
     Directory,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PortableMediaKind {
+    Directory,
+    Image,
+    Video,
+    Audio,
+    Zip,
+    Pdf,
+    ConvertibleArchive,
+    OtherFile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PortableVirtualKeyBase {
+    Source,
+    ConvertedCache,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FileFingerprint {
     size: u64,
@@ -315,6 +348,8 @@ struct FileFingerprint {
 struct PortableEntry {
     path: String,
     kind: PortableEntryKind,
+    media_kind: PortableMediaKind,
+    virtual_key_base: PortableVirtualKeyBase,
     fingerprint: Option<FileFingerprint>,
     rating: Option<PortableRating>,
     #[serde(default)]
@@ -593,11 +628,11 @@ where
         exported_at_ms: manifest.exported_at_ms,
         ..ImportPreview::default()
     };
-    visit_bundle_entries(root, &manifest, cancel, |entry, index| {
+    visit_bundle_entries(root, &manifest, cancel, |entry, index, _record_bytes| {
         check_cancel(cancel)?;
         let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
         validate_bookmark_page_targets(&path, entry)?;
-        match verify_target(&path, entry) {
+        match verify_target(&path, entry, cancel)? {
             TargetState::Ready => preview.existing_entries += 1,
             TargetState::Missing => preview.missing_entries += 1,
             TargetState::Changed => preview.changed_files += 1,
@@ -624,7 +659,41 @@ pub fn import_at<F>(
 where
     F: FnMut(TransferProgress),
 {
-    import_at_batched(data_dir, root, cancel, progress)
+    let started = std::time::Instant::now();
+    if crate::perf::is_enabled() {
+        crate::perf::event("metadata_import", "begin", None, 0, &[]);
+    }
+    let result = import_at_batched(data_dir, root, cancel, progress);
+    let outcome = match &result {
+        Ok(summary) if summary.cancelled => "cancelled",
+        Ok(summary) if summary.incomplete_error.is_some() || summary.failed_entries > 0 => {
+            "partial"
+        }
+        Ok(_) => "success",
+        Err(_) => "error",
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "metadata_import",
+            "end",
+            None,
+            0,
+            &[
+                ("outcome", serde_json::Value::from(outcome)),
+                ("ms", serde_json::Value::from(elapsed_ms)),
+            ],
+        );
+    }
+    let error_suffix = result
+        .as_ref()
+        .err()
+        .map(|error| format!(" error={error}"))
+        .unwrap_or_default();
+    crate::logger::log(format!(
+        "metadata import end: outcome={outcome} total_ms={elapsed_ms:.1}{error_suffix}"
+    ));
+    result
 }
 
 fn import_at_batched<F>(
@@ -637,11 +706,14 @@ where
     F: FnMut(TransferProgress),
 {
     validate_root(root)?;
+    let manifest_started = std::time::Instant::now();
     let manifest = read_bundle_manifest(root, cancel)?;
+    let manifest_ms = manifest_started.elapsed().as_secs_f64() * 1000.0;
     let total = usize_from_count(manifest.entry_count, "項目数")?;
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| TransferError::Io(format!("{}: {error}", root.display())))?;
-    visit_bundle_entries(root, &manifest, cancel, |entry, index| {
+    let preflight_started = std::time::Instant::now();
+    visit_bundle_entries(root, &manifest, cancel, |entry, index, _record_bytes| {
         let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
         validate_bookmark_page_targets(&path, entry)?;
         progress(TransferProgress {
@@ -652,9 +724,12 @@ where
         });
         Ok(())
     })?;
+    let preflight_ms = preflight_started.elapsed().as_secs_f64() * 1000.0;
 
+    let database_open_started = std::time::Instant::now();
     ensure_database_schemas(data_dir)?;
     let conn = open_import_connection(data_dir)?;
+    let database_open_ms = database_open_started.elapsed().as_secs_f64() * 1000.0;
     let mut summary = ImportSummary {
         total_entries: total,
         changed: manifest.sections.changed(),
@@ -665,85 +740,202 @@ where
     let mut batch_applied = 0usize;
     let mut batch_started = std::time::Instant::now();
     let mut batch_active = false;
+    let apply_started = std::time::Instant::now();
+    let mut target_verify_ms = 0.0_f64;
+    let mut sql_apply_ms = 0.0_f64;
+    let mut commit_ms = 0.0_f64;
+    let mut max_commit_ms = 0.0_f64;
+    let mut transaction_batches = 0usize;
+    let mut applied_virtual_items = 0usize;
+    let mut applied_record_bytes = 0usize;
+    let mut automatic_sidecar_sync_cache: HashMap<PathBuf, Option<(String, i64)>> = HashMap::new();
+    let mut automatic_sidecar_adjustment_sync_written: HashSet<String> = HashSet::new();
+    let mut automatic_sidecar_tag_sync_written: HashSet<String> = HashSet::new();
 
-    let apply_result = visit_bundle_entries(root, &manifest, cancel, |entry, index| {
-        progress(TransferProgress {
-            phase: TransferPhase::Importing,
-            processed: index,
-            total,
-            current_path: Some(entry.path.clone()),
-        });
-        let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
-        validate_bookmark_page_targets(&path, entry)?;
-        match verify_target(&path, entry) {
-            TargetState::Missing => summary.skipped_missing += 1,
-            TargetState::Changed => summary.skipped_changed += 1,
-            TargetState::Ready => {
-                if !batch_active {
-                    begin_import_batch(&conn)?;
-                    batch_active = true;
-                    batch_started = std::time::Instant::now();
-                }
-                conn.execute_batch("SAVEPOINT metadata_import_item")
-                    .map_err(db_error)?;
-                match apply_entry(
-                    &conn,
-                    &path,
-                    entry,
-                    manifest.sections,
-                    manifest.exported_at_ms,
-                ) {
-                    Ok(()) => {
-                        conn.execute_batch("RELEASE metadata_import_item")
-                            .map_err(db_error)?;
-                        batch_applied = batch_applied.saturating_add(1);
+    let apply_result =
+        visit_bundle_entries(root, &manifest, cancel, |entry, index, record_bytes| {
+            progress(TransferProgress {
+                phase: TransferPhase::Importing,
+                processed: index,
+                total,
+                current_path: Some(entry.path.clone()),
+            });
+            let target_started = std::time::Instant::now();
+            let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
+            validate_bookmark_page_targets(&path, entry)?;
+            let target_state = verify_target(&path, entry, cancel)?;
+            target_verify_ms += target_started.elapsed().as_secs_f64() * 1000.0;
+            match target_state {
+                TargetState::Missing => summary.skipped_missing += 1,
+                TargetState::Changed => summary.skipped_changed += 1,
+                TargetState::Ready => {
+                    if !batch_active {
+                        begin_import_batch(&conn)?;
+                        batch_active = true;
+                        batch_started = std::time::Instant::now();
                     }
-                    Err(error) => {
-                        conn.execute_batch(
-                            "ROLLBACK TO metadata_import_item; RELEASE metadata_import_item",
-                        )
+                    let discovered_sidecar_sync = automatic_sidecar_sync_cached(
+                        &mut automatic_sidecar_sync_cache,
+                        &path,
+                        entry.kind,
+                    );
+                    let sidecar_sync =
+                        discovered_sidecar_sync
+                            .as_ref()
+                            .and_then(|(folder_key, modified_secs)| {
+                                let write_adjustment = manifest.sections.page_state
+                                    && matches!(
+                                        entry.media_kind,
+                                        PortableMediaKind::Image
+                                            | PortableMediaKind::Zip
+                                            | PortableMediaKind::Pdf
+                                            | PortableMediaKind::ConvertibleArchive
+                                    )
+                                    && !automatic_sidecar_adjustment_sync_written
+                                        .contains(folder_key);
+                                let write_tags = manifest.sections.tags
+                                    && !automatic_sidecar_tag_sync_written.contains(folder_key);
+                                (write_adjustment || write_tags).then(|| {
+                                    (
+                                        folder_key.clone(),
+                                        *modified_secs,
+                                        write_adjustment,
+                                        write_tags,
+                                    )
+                                })
+                            });
+                    let sidecar_sync_flags = sidecar_sync.as_ref().map(
+                        |(folder_key, _, write_adjustment, write_tags)| {
+                            (folder_key.clone(), *write_adjustment, *write_tags)
+                        },
+                    );
+                    let item_apply_started = std::time::Instant::now();
+                    conn.execute_batch("SAVEPOINT metadata_import_item")
                         .map_err(db_error)?;
-                        crate::logger::log(format!(
-                            "metadata import: failed to apply {}: {error}",
-                            entry.path
-                        ));
-                        summary.failed_entries = summary.failed_entries.saturating_add(1);
+                    match apply_entry(
+                        &conn,
+                        data_dir,
+                        &path,
+                        entry,
+                        manifest.sections,
+                        manifest.exported_at_ms,
+                        sidecar_sync,
+                    ) {
+                        Ok(()) => {
+                            conn.execute_batch("RELEASE metadata_import_item")
+                                .map_err(db_error)?;
+                            if let Some((folder_key, write_adjustment, write_tags)) =
+                                sidecar_sync_flags
+                            {
+                                if write_adjustment {
+                                    automatic_sidecar_adjustment_sync_written
+                                        .insert(folder_key.clone());
+                                }
+                                if write_tags {
+                                    automatic_sidecar_tag_sync_written.insert(folder_key);
+                                }
+                            }
+                            batch_applied = batch_applied.saturating_add(1);
+                        }
+                        Err(error) => {
+                            conn.execute_batch(
+                                "ROLLBACK TO metadata_import_item; RELEASE metadata_import_item",
+                            )
+                            .map_err(db_error)?;
+                            crate::logger::log(format!(
+                                "metadata import: failed to apply {}: {error}",
+                                entry.path
+                            ));
+                            summary.failed_entries = summary.failed_entries.saturating_add(1);
+                            if summary.failed_items.len() < MAX_REPORTED_PATHS {
+                                summary.failed_items.push(ImportFailure {
+                                    path: entry.path.clone(),
+                                    reason: error.to_string(),
+                                });
+                            }
+                        }
                     }
+                    sql_apply_ms += item_apply_started.elapsed().as_secs_f64() * 1000.0;
+                    batch_entries = batch_entries.saturating_add(1);
+                    batch_bytes = batch_bytes.saturating_add(record_bytes);
+                    applied_record_bytes = applied_record_bytes.saturating_add(record_bytes);
+                    applied_virtual_items =
+                        applied_virtual_items.saturating_add(entry.virtual_items.len());
                 }
-                batch_entries = batch_entries.saturating_add(1);
-                batch_bytes = batch_bytes.saturating_add(estimated_json_bytes(entry));
             }
-        }
-        if batch_entries > 0
-            && (batch_entries >= IMPORT_TRANSACTION_BATCH_ENTRIES
-                || batch_bytes >= IMPORT_TRANSACTION_BATCH_BYTES
-                || batch_started.elapsed() >= IMPORT_TRANSACTION_BATCH_TIME)
-        {
-            commit_import_batch(&conn)?;
-            summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
-            #[cfg(test)]
+            if batch_entries > 0
+                && (batch_entries >= IMPORT_TRANSACTION_BATCH_ENTRIES
+                    || batch_bytes >= IMPORT_TRANSACTION_BATCH_BYTES
+                    || batch_started.elapsed() >= IMPORT_TRANSACTION_BATCH_TIME)
             {
-                summary.transaction_batches += 1;
+                let commit_started = std::time::Instant::now();
+                commit_import_batch(&conn)?;
+                let current_commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
+                commit_ms += current_commit_ms;
+                max_commit_ms = max_commit_ms.max(current_commit_ms);
+                transaction_batches = transaction_batches.saturating_add(1);
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "metadata_import",
+                        "batch_commit",
+                        None,
+                        0,
+                        &[
+                            ("batch", serde_json::Value::from(transaction_batches as u64)),
+                            ("entries", serde_json::Value::from(batch_entries as u64)),
+                            ("applied", serde_json::Value::from(batch_applied as u64)),
+                            ("bytes", serde_json::Value::from(batch_bytes as u64)),
+                            ("commit_ms", serde_json::Value::from(current_commit_ms)),
+                        ],
+                    );
+                }
+                summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+                #[cfg(test)]
+                {
+                    summary.transaction_batches += 1;
+                }
+                batch_active = false;
+                batch_entries = 0;
+                batch_bytes = 0;
+                batch_applied = 0;
+                batch_started = std::time::Instant::now();
             }
-            batch_active = false;
-            batch_entries = 0;
-            batch_bytes = 0;
-            batch_applied = 0;
-            batch_started = std::time::Instant::now();
-        }
-        progress(TransferProgress {
-            phase: TransferPhase::Importing,
-            processed: index + 1,
-            total,
-            current_path: Some(entry.path.clone()),
+            progress(TransferProgress {
+                phase: TransferPhase::Importing,
+                processed: index + 1,
+                total,
+                current_path: Some(entry.path.clone()),
+            });
+            Ok(())
         });
-        Ok(())
-    });
 
     // cancel / shard I/O errorでも、仕様どおり完了済みitemは保持する。異常終了だけは
     // SQLiteが現在batchを一括rollbackする。
     let commit_result = if batch_active {
-        commit_import_batch(&conn)
+        let commit_started = std::time::Instant::now();
+        let result = commit_import_batch(&conn);
+        let current_commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
+        commit_ms += current_commit_ms;
+        max_commit_ms = max_commit_ms.max(current_commit_ms);
+        if result.is_ok() {
+            transaction_batches = transaction_batches.saturating_add(1);
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "metadata_import",
+                    "batch_commit",
+                    None,
+                    0,
+                    &[
+                        ("batch", serde_json::Value::from(transaction_batches as u64)),
+                        ("entries", serde_json::Value::from(batch_entries as u64)),
+                        ("applied", serde_json::Value::from(batch_applied as u64)),
+                        ("bytes", serde_json::Value::from(batch_bytes as u64)),
+                        ("commit_ms", serde_json::Value::from(current_commit_ms)),
+                    ],
+                );
+            }
+        }
+        result
     } else {
         Ok(())
     };
@@ -760,6 +952,63 @@ where
         Err(TransferError::Cancelled) => summary.cancelled = true,
         Err(error) => summary.incomplete_error = Some(error.to_string()),
     }
+    let apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0;
+    let outcome = if summary.cancelled {
+        "cancelled"
+    } else if summary.incomplete_error.is_some() || summary.failed_entries > 0 {
+        "partial"
+    } else {
+        "success"
+    };
+    crate::logger::log(format!(
+        "metadata import: outcome={outcome} entries={} applied={} virtual={} bytes={} \
+         manifest_ms={manifest_ms:.1} preflight_ms={preflight_ms:.1} db_open_ms={database_open_ms:.1} \
+         apply_ms={apply_ms:.1} target_verify_ms={target_verify_ms:.1} sql_apply_ms={sql_apply_ms:.1} \
+         commits={transaction_batches} commit_ms={commit_ms:.1} max_commit_ms={max_commit_ms:.1}",
+        summary.total_entries, summary.applied_entries, applied_virtual_items, applied_record_bytes,
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "metadata_import",
+            "apply_summary",
+            None,
+            0,
+            &[
+                ("outcome", serde_json::Value::from(outcome)),
+                (
+                    "entries",
+                    serde_json::Value::from(summary.total_entries as u64),
+                ),
+                (
+                    "applied",
+                    serde_json::Value::from(summary.applied_entries as u64),
+                ),
+                (
+                    "virtual_items",
+                    serde_json::Value::from(applied_virtual_items as u64),
+                ),
+                (
+                    "bytes",
+                    serde_json::Value::from(applied_record_bytes as u64),
+                ),
+                ("manifest_ms", serde_json::Value::from(manifest_ms)),
+                ("preflight_ms", serde_json::Value::from(preflight_ms)),
+                ("db_open_ms", serde_json::Value::from(database_open_ms)),
+                ("apply_ms", serde_json::Value::from(apply_ms)),
+                (
+                    "target_verify_ms",
+                    serde_json::Value::from(target_verify_ms),
+                ),
+                ("sql_apply_ms", serde_json::Value::from(sql_apply_ms)),
+                (
+                    "commits",
+                    serde_json::Value::from(transaction_batches as u64),
+                ),
+                ("commit_ms", serde_json::Value::from(commit_ms)),
+                ("max_commit_ms", serde_json::Value::from(max_commit_ms)),
+            ],
+        );
+    }
     Ok(summary)
 }
 
@@ -769,23 +1018,6 @@ fn begin_import_batch(conn: &Connection) -> Result<(), TransferError> {
 
 fn commit_import_batch(conn: &Connection) -> Result<(), TransferError> {
     conn.execute_batch("COMMIT").map_err(db_error)
-}
-
-fn estimated_json_bytes<T: Serialize>(value: &T) -> usize {
-    struct Counter(usize);
-    impl Write for Counter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buffer.len());
-            Ok(buffer.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, value)
-        .map(|()| counter.0)
-        .unwrap_or(MAX_RECORD_BYTES as usize)
 }
 
 /// 仮想項目のDB identity。ZIP member名は表示・manifestではcaseを保持するが、
@@ -879,7 +1111,7 @@ where
     if dir == root {
         batch.push(ShardedEnumeratedEntry {
             shard_path: shard_path.clone(),
-            entry: make_enumerated(root, ".".to_string(), PortableEntryKind::Directory)?,
+            entry: make_enumerated(root, ".".to_string(), PortableEntryKind::Directory, cancel)?,
         });
     }
     let children = fs::read_dir(dir)
@@ -907,8 +1139,15 @@ where
         let rel = relative_string(root, &path)?;
         batch.push(ShardedEnumeratedEntry {
             shard_path: shard_path.clone(),
-            entry: make_enumerated(&path, rel.clone(), portable_kind)?,
+            entry: make_enumerated(&path, rel.clone(), portable_kind, cancel)?,
         });
+        if recursive && kind == crate::fs_entry::DirEntryKind::ReparseDirectory {
+            summary.skipped_reparse_directories =
+                summary.skipped_reparse_directories.saturating_add(1);
+            if summary.skipped_reparse_paths.len() < MAX_REPORTED_PATHS {
+                summary.skipped_reparse_paths.push(rel.clone());
+            }
+        }
         progress(TransferProgress {
             phase: TransferPhase::Scanning,
             processed: usize_from_count(
@@ -1025,7 +1264,10 @@ fn make_enumerated(
     path: &Path,
     rel: String,
     kind: PortableEntryKind,
+    cancel: &AtomicBool,
 ) -> Result<EnumeratedEntry, TransferError> {
+    check_cancel(cancel)?;
+    let media_kind = portable_media_kind(path, kind);
     let fingerprint = if kind == PortableEntryKind::File {
         let metadata = fs::metadata(path)
             .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?;
@@ -1041,6 +1283,8 @@ fn make_enumerated(
         portable: PortableEntry {
             path: rel,
             kind,
+            media_kind,
+            virtual_key_base: PortableVirtualKeyBase::Source,
             fingerprint,
             rating: None,
             tags: Vec::new(),
@@ -1055,12 +1299,39 @@ fn make_enumerated(
     })
 }
 
+fn portable_media_kind(path: &Path, kind: PortableEntryKind) -> PortableMediaKind {
+    if kind == PortableEntryKind::Directory {
+        return PortableMediaKind::Directory;
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if crate::folder_tree::is_recognized_image_ext(&extension) {
+        PortableMediaKind::Image
+    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+        PortableMediaKind::Video
+    } else if crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS.contains(&extension.as_str()) {
+        PortableMediaKind::Audio
+    } else if crate::folder_tree::is_zip_extension(&extension) {
+        PortableMediaKind::Zip
+    } else if extension == "pdf" {
+        PortableMediaKind::Pdf
+    } else if crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some() {
+        PortableMediaKind::ConvertibleArchive
+    } else {
+        PortableMediaKind::OtherFile
+    }
+}
+
 /// read-only のメタ情報 DB ごとに、一時DBへ今回の物理キーだけを登録する。
 /// `CROSS JOIN` の外側をこの小さい表に固定し、主DBの path index を exact/range seek
 /// することで、対象フォルダが小さいときにグローバルDB全体を走査しない。
 fn prepare_metadata_scope(
     conn: &mut Connection,
     physical_index: &HashMap<String, usize>,
+    page_index: &HashMap<String, usize>,
     cancel: &AtomicBool,
 ) -> Result<(), TransferError> {
     conn.execute_batch(
@@ -1068,26 +1339,104 @@ fn prepare_metadata_scope(
             item_key      TEXT PRIMARY KEY,
             virtual_lower TEXT NOT NULL,
             virtual_upper TEXT NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE metadata_transfer_physical_scope (
+             item_key TEXT PRIMARY KEY
          ) WITHOUT ROWID;",
     )
     .map_err(db_error)?;
     let tx = conn.transaction().map_err(db_error)?;
     {
-        let mut insert = tx
+        let mut insert_page = tx
             .prepare(
                 "INSERT INTO metadata_transfer_scope
                     (item_key, virtual_lower, virtual_upper)
                  VALUES (?1, ?2, ?3)",
             )
             .map_err(db_error)?;
-        for key in physical_index.keys() {
+        for key in page_index.keys() {
             check_cancel(cancel)?;
-            insert
+            insert_page
                 .execute(params![key, format!("{key}::"), format!("{key}:;")])
                 .map_err(db_error)?;
         }
+        let mut insert_physical = tx
+            .prepare("INSERT INTO metadata_transfer_physical_scope (item_key) VALUES (?1)")
+            .map_err(db_error)?;
+        for key in physical_index.keys() {
+            check_cancel(cancel)?;
+            insert_physical.execute([key]).map_err(db_error)?;
+        }
     }
     tx.commit().map_err(db_error)
+}
+
+fn prepare_export_page_index(
+    data_dir: &Path,
+    entries: &mut [EnumeratedEntry],
+    physical_index: &HashMap<String, usize>,
+) -> HashMap<String, usize> {
+    let mut page_index = physical_index.clone();
+    let db_path = data_dir.join("archive_cache.db");
+    let connection = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok();
+    for (entry_index, entry) in entries.iter_mut().enumerate() {
+        if !matches!(
+            entry.portable.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+        ) {
+            continue;
+        }
+        let Some(fingerprint) = entry.portable.fingerprint.as_ref() else {
+            continue;
+        };
+        let Some(connection) = connection.as_ref() else {
+            continue;
+        };
+        let source_key = crate::path_key::normalize(&entry.path);
+        let row = connection
+            .query_row(
+                "SELECT src_mtime, src_size, cached_zip_path
+                   FROM converted_archives
+                  WHERE src_path_key = ?1",
+                [&source_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((source_mtime, source_size, cached_path)) = row else {
+            continue;
+        };
+        let fingerprint_mtime = fingerprint.modified_ms.map(|value| value.div_euclid(1000));
+        let cached_path = PathBuf::from(cached_path);
+        let expected_cached_path =
+            crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &entry.path);
+        if source_size < 0
+            || source_size as u64 != fingerprint.size
+            || fingerprint_mtime != Some(source_mtime)
+            || crate::path_key::normalize_keep_drive(&cached_path)
+                != crate::path_key::normalize_keep_drive(&expected_cached_path)
+            || !expected_cached_path.is_file()
+        {
+            continue;
+        }
+        let original_key = crate::path_key::normalize_keep_drive(&entry.path);
+        page_index.remove(&original_key);
+        page_index.insert(
+            crate::path_key::normalize_keep_drive(&expected_cached_path),
+            entry_index,
+        );
+        entry.portable.virtual_key_base = PortableVirtualKeyBase::ConvertedCache;
+    }
+    page_index
 }
 
 fn attach_metadata<F>(
@@ -1104,19 +1453,20 @@ where
         .enumerate()
         .map(|(index, entry)| (crate::path_key::normalize_keep_drive(&entry.path), index))
         .collect();
+    let page_index = prepare_export_page_index(data_dir, entries, &index);
     let mut virtual_index: HashMap<(usize, String), usize> = HashMap::new();
     let mut metadata_rows = 0usize;
 
     let rating_path = data_dir.join("rating.db");
     if rating_path.is_file() {
         let mut conn = open_readonly(&rating_path)?;
-        prepare_metadata_scope(&mut conn, &index, cancel)?;
+        prepare_metadata_scope(&mut conn, &index, &page_index, cancel)?;
         let mut stmt = conn
             .prepare(
                 "SELECT r.path, r.stars, r.rated_at_ms, r.kind, r.entry_name, r.page_num,
                         r.dir_prefix, r.archive_format, r.zipdir_is_archive,
                         r.zipdir_representative
-                   FROM metadata_transfer_scope AS s
+                   FROM metadata_transfer_physical_scope AS s
                   CROSS JOIN ratings AS r
                   WHERE r.path = s.item_key
                  UNION ALL
@@ -1130,18 +1480,48 @@ where
             .map_err(db_error)?;
         let rows = stmt
             .query_map([], |row| {
+                let key: String = row.get(0)?;
                 let stars: i64 = row.get(1)?;
                 let kind: Option<i64> = row.get(3)?;
+                if !(1..=5).contains(&stars) {
+                    return Err(invalid_db_value(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        format!("rating.db: {key}: stars={stars}"),
+                    ));
+                }
+                let kind = kind
+                    .map(|value| {
+                        rating_kind_name(value).ok_or_else(|| {
+                            invalid_db_value(
+                                3,
+                                rusqlite::types::Type::Integer,
+                                format!("rating.db: {key}: kind={value}"),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .map(str::to_string);
+                let page_num = row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| {
+                        u32::try_from(value).map_err(|_| {
+                            invalid_db_value(
+                                5,
+                                rusqlite::types::Type::Integer,
+                                format!("rating.db: {key}: page_num={value}"),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 Ok((
-                    row.get::<_, String>(0)?,
+                    key,
                     PortableRating {
-                        stars: stars.clamp(0, 5) as u8,
+                        stars: stars as u8,
                         rated_at_ms: row.get(2)?,
-                        kind: kind.and_then(rating_kind_name).map(str::to_string),
+                        kind,
                         entry_name: row.get(4)?,
-                        page_num: row
-                            .get::<_, Option<i64>>(5)?
-                            .and_then(|value| u32::try_from(value).ok()),
+                        page_num,
                         dir_prefix: row.get(6)?,
                         archive_format: row.get(7)?,
                         zipdir_is_archive: row.get::<_, Option<i64>>(8)?.map(|value| value != 0),
@@ -1154,10 +1534,12 @@ where
             check_cancel(cancel)?;
             let (key, rating) = row.map_err(db_error)?;
             report_metadata_progress(&mut metadata_rows, &key, progress);
-            if rating.stars == 0 {
-                continue;
-            }
-            if let Some((entry_index, member)) = locate_item_key(&key, &index) {
+            if let Some((entry_index, member)) = locate_item_key(&key, &page_index).or_else(|| {
+                index
+                    .get(&key)
+                    .copied()
+                    .map(|entry_index| (entry_index, None))
+            }) {
                 if let Some(member) = member {
                     let virtual_item =
                         get_virtual_item(entries, &mut virtual_index, entry_index, member);
@@ -1172,13 +1554,13 @@ where
     let tags_path = data_dir.join("tags.db");
     if tags_path.is_file() {
         let mut conn = open_readonly(&tags_path)?;
-        prepare_metadata_scope(&mut conn, &index, cancel)?;
+        prepare_metadata_scope(&mut conn, &index, &page_index, cancel)?;
         let mut tags_by_key: HashMap<String, Vec<PortableTag>> = HashMap::new();
         {
             let mut stmt = conn
                 .prepare(
                     "SELECT t.item_key, t.tag, t.applied_at, t.tag_key
-                       FROM metadata_transfer_scope AS s
+                       FROM metadata_transfer_physical_scope AS s
                       CROSS JOIN item_tags AS t
                       WHERE t.item_key = s.item_key
                      UNION ALL
@@ -1213,7 +1595,7 @@ where
             let mut stmt = conn
                 .prepare(
                     "SELECT t.item_key
-                       FROM metadata_transfer_scope AS s
+                       FROM metadata_transfer_physical_scope AS s
                       CROSS JOIN tag_item_state AS t
                       WHERE t.item_key = s.item_key
                      UNION ALL
@@ -1238,7 +1620,12 @@ where
         for key in decided {
             check_cancel(cancel)?;
             let tags = tags_by_key.remove(&key).unwrap_or_default();
-            if let Some((entry_index, member)) = locate_item_key(&key, &index) {
+            if let Some((entry_index, member)) = locate_item_key(&key, &page_index).or_else(|| {
+                index
+                    .get(&key)
+                    .copied()
+                    .map(|entry_index| (entry_index, None))
+            }) {
                 if let Some(member) = member {
                     get_virtual_item(entries, &mut virtual_index, entry_index, member).tags = tags;
                 } else {
@@ -1251,11 +1638,11 @@ where
     let video_path = data_dir.join("video_bookmarks.db");
     if video_path.is_file() {
         let mut conn = open_readonly(&video_path)?;
-        prepare_metadata_scope(&mut conn, &index, cancel)?;
+        prepare_metadata_scope(&mut conn, &index, &index, cancel)?;
         let mut stmt = conn
             .prepare(
                 "SELECT v.path, v.pts_secs, v.title, v.created_at
-                   FROM metadata_transfer_scope AS s
+                   FROM metadata_transfer_physical_scope AS s
                   CROSS JOIN video_bookmarks AS v
                   WHERE v.path = s.item_key
                   ORDER BY v.path, v.pts_secs, v.id",
@@ -1289,12 +1676,12 @@ where
     let book_path = data_dir.join("book_bookmarks.db");
     if book_path.is_file() {
         let mut conn = open_readonly(&book_path)?;
-        prepare_metadata_scope(&mut conn, &index, cancel)?;
+        prepare_metadata_scope(&mut conn, &index, &index, cancel)?;
         let mut stmt = conn
             .prepare(
                 "SELECT b.container_key, b.container_kind, b.page_kind, b.page_value,
                         b.page_index_hint, b.created_at_ms, b.title
-                   FROM metadata_transfer_scope AS s
+                   FROM metadata_transfer_physical_scope AS s
                   CROSS JOIN book_bookmarks AS b
                   WHERE b.container_key = s.item_key
                   ORDER BY b.container_key, b.page_index_hint, b.id",
@@ -1302,17 +1689,22 @@ where
             .map_err(db_error)?;
         let rows = stmt
             .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let raw_page_index: i64 = row.get(4)?;
+                let page_index_hint = usize::try_from(raw_page_index).map_err(|_| {
+                    invalid_db_value(
+                        4,
+                        rusqlite::types::Type::Integer,
+                        format!("book_bookmarks.db: {key}: page_index_hint={raw_page_index}"),
+                    )
+                })?;
                 Ok((
-                    row.get::<_, String>(0)?,
+                    key,
                     PortableBookBookmark {
                         container_kind: row.get(1)?,
                         page_kind: row.get(2)?,
                         page_value: row.get(3)?,
-                        page_index_hint: row
-                            .get::<_, i64>(4)?
-                            .max(0)
-                            .try_into()
-                            .unwrap_or(usize::MAX),
+                        page_index_hint,
                         created_at_ms: row.get(5)?,
                         title: row
                             .get::<_, Option<String>>(6)?
@@ -1335,6 +1727,7 @@ where
         data_dir,
         entries,
         &index,
+        &page_index,
         &mut virtual_index,
         cancel,
         &mut metadata_rows,
@@ -1466,6 +1859,7 @@ fn attach_extended_metadata<F>(
     data_dir: &Path,
     entries: &mut [EnumeratedEntry],
     physical_index: &HashMap<String, usize>,
+    page_index: &HashMap<String, usize>,
     virtual_index: &mut HashMap<(usize, String), usize>,
     cancel: &AtomicBool,
     metadata_rows: &mut usize,
@@ -1477,7 +1871,7 @@ where
     let mut attach_page_rows = |db_name: &str,
                                 sql: &str,
                                 mut apply: Box<
-        dyn FnMut(&rusqlite::Row<'_>, &mut PortablePageState) -> rusqlite::Result<()>,
+        dyn FnMut(&rusqlite::Row<'_>, &str, &mut PortablePageState) -> rusqlite::Result<()>,
     >|
      -> Result<(), TransferError> {
         let path = data_dir.join(db_name);
@@ -1485,17 +1879,15 @@ where
             return Ok(());
         }
         let mut conn = open_readonly(&path)?;
-        prepare_metadata_scope(&mut conn, physical_index, cancel)?;
+        prepare_metadata_scope(&mut conn, physical_index, page_index, cancel)?;
         let mut stmt = conn.prepare(sql).map_err(db_error)?;
         let mut rows = stmt.query([]).map_err(db_error)?;
         while let Some(row) = rows.next().map_err(db_error)? {
             check_cancel(cancel)?;
             let key: String = row.get(0).map_err(db_error)?;
             report_metadata_progress(metadata_rows, &key, progress);
-            if let Some(state) =
-                page_state_for_key_mut(entries, virtual_index, physical_index, &key)
-            {
-                apply(row, state).map_err(db_error)?;
+            if let Some(state) = page_state_for_key_mut(entries, virtual_index, page_index, &key) {
+                apply(row, &key, state).map_err(db_error)?;
             }
         }
         Ok(())
@@ -1510,11 +1902,16 @@ where
          SELECT r.path, r.angle
            FROM metadata_transfer_scope AS s CROSS JOIN rotations AS r
           WHERE r.path >= s.virtual_lower AND r.path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, key, state| {
             let angle = row.get::<_, i32>(1)?;
-            if matches!(angle, 90 | 180 | 270) {
-                state.rotation_degrees = Some(angle);
+            if !matches!(angle, 90 | 180 | 270) {
+                return Err(invalid_db_value(
+                    1,
+                    rusqlite::types::Type::Integer,
+                    format!("rotation.db: {key}: angle={angle}"),
+                ));
             }
+            state.rotation_degrees = Some(angle);
             Ok(())
         }),
     )?;
@@ -1527,7 +1924,7 @@ where
          SELECT p.page_path, p.params_json
            FROM metadata_transfer_scope AS s CROSS JOIN page_params AS p
           WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, _key, state| {
             let json: String = row.get(1)?;
             state.adjustment = Some(parse_db_json(&json, 1)?);
             Ok(())
@@ -1542,20 +1939,38 @@ where
          SELECT m.path, m.mask_data, m.width, m.height, m.vectors
            FROM metadata_transfer_scope AS s CROSS JOIN masks AS m
           WHERE m.path >= s.virtual_lower AND m.path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, key, state| {
             let raw: Vec<u8> = row.get(1)?;
             let width: i64 = row.get(2)?;
             let height: i64 = row.get(3)?;
             let vectors: Option<String> = row.get(4)?;
-            if let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) {
-                let shapes = vectors
-                    .as_deref()
-                    .map(crate::mask_db::shapes_from_json)
-                    .unwrap_or_default();
-                state.mask = Some(crate::sidecar::SidecarMask::from_raw(
-                    &raw, &shapes, width, height,
-                ));
-            }
+            let width = u32::try_from(width)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| {
+                    invalid_db_value(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        format!("mask.db: {key}: width={width}"),
+                    )
+                })?;
+            let height = u32::try_from(height)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| {
+                    invalid_db_value(
+                        3,
+                        rusqlite::types::Type::Integer,
+                        format!("mask.db: {key}: height={height}"),
+                    )
+                })?;
+            let shapes = vectors
+                .as_deref()
+                .map(crate::mask_db::shapes_from_json)
+                .unwrap_or_default();
+            state.mask = Some(crate::sidecar::SidecarMask::from_raw(
+                &raw, &shapes, width, height,
+            ));
             Ok(())
         }),
     )?;
@@ -1568,20 +1983,38 @@ where
          SELECT c.page_path, c.bitmap_data, c.bitmap_w, c.bitmap_h, c.shapes
            FROM metadata_transfer_scope AS s CROSS JOIN conceal_entries AS c
           WHERE c.page_path >= s.virtual_lower AND c.page_path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, key, state| {
             let raw: Vec<u8> = row.get(1)?;
             let width: i64 = row.get(2)?;
             let height: i64 = row.get(3)?;
             let vectors: Option<String> = row.get(4)?;
-            if let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) {
-                let shapes = vectors
-                    .as_deref()
-                    .map(crate::mask_db::shapes_from_json)
-                    .unwrap_or_default();
-                state.conceal = Some(crate::sidecar::SidecarMask::from_raw(
-                    &raw, &shapes, width, height,
-                ));
-            }
+            let width = u32::try_from(width)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| {
+                    invalid_db_value(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        format!("conceal.db: {key}: width={width}"),
+                    )
+                })?;
+            let height = u32::try_from(height)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| {
+                    invalid_db_value(
+                        3,
+                        rusqlite::types::Type::Integer,
+                        format!("conceal.db: {key}: height={height}"),
+                    )
+                })?;
+            let shapes = vectors
+                .as_deref()
+                .map(crate::mask_db::shapes_from_json)
+                .unwrap_or_default();
+            state.conceal = Some(crate::sidecar::SidecarMask::from_raw(
+                &raw, &shapes, width, height,
+            ));
             Ok(())
         }),
     )?;
@@ -1594,7 +2027,7 @@ where
          SELECT p.page_path, p.layers_json
            FROM metadata_transfer_scope AS s CROSS JOIN local_adjust_pages AS p
           WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, _key, state| {
             let json: String = row.get(1)?;
             state.local_adjust_layers = Some(parse_db_json(&json, 1)?);
             Ok(())
@@ -1609,7 +2042,7 @@ where
          SELECT p.page_path, p.min_x, p.min_y, p.max_x, p.max_y, p.aspect_mode
            FROM metadata_transfer_scope AS s CROSS JOIN export_crop_pages AS p
           WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, _key, state| {
             let aspect: String = row.get(5)?;
             state.export_crop = Some(crate::export_crop::CropSettings {
                 rect: crate::export_crop::CropRect {
@@ -1632,7 +2065,7 @@ where
          SELECT c.page_path, c.doc_json
            FROM metadata_transfer_scope AS s CROSS JOIN comic_entries AS c
           WHERE c.page_path >= s.virtual_lower AND c.page_path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, _key, state| {
             let json: String = row.get(1)?;
             state.comic = Some(parse_db_json(&json, 1)?);
             Ok(())
@@ -1647,7 +2080,7 @@ where
          SELECT p.page_path, p.override_json
            FROM metadata_transfer_scope AS s CROSS JOIN view_trim_pages AS p
           WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
-        Box::new(|row, state| {
+        Box::new(|row, _key, state| {
             let json: String = row.get(1)?;
             state.view_trim = Some(parse_db_json(&json, 1)?);
             Ok(())
@@ -1755,15 +2188,26 @@ where
             .map_err(db_error)?;
         let rows = stmt
             .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let raw_page = row.get::<_, Option<i64>>(4)?;
+                let source_page = raw_page
+                    .map(|value| {
+                        u32::try_from(value).map_err(|_| {
+                            invalid_db_value(
+                                4,
+                                rusqlite::types::Type::Integer,
+                                format!("folder_thumb_pins.db: {key}: source_page={value}"),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 Ok((
-                    row.get::<_, String>(0)?,
+                    key,
                     PortableFolderThumbPin {
                         source_kind: row.get(1)?,
                         source_rel: row.get(2)?,
                         source_entry: row.get(3)?,
-                        source_page: row
-                            .get::<_, Option<i64>>(4)?
-                            .and_then(|value| u32::try_from(value).ok()),
+                        source_page,
                     },
                 ))
             })
@@ -1790,11 +2234,11 @@ where
     let video_pin_path = data_dir.join("video_pins.db");
     if video_pin_path.is_file() {
         let mut conn = open_readonly(&video_pin_path)?;
-        prepare_metadata_scope(&mut conn, physical_index, cancel)?;
+        prepare_metadata_scope(&mut conn, physical_index, physical_index, cancel)?;
         let mut stmt = conn
             .prepare(
                 "SELECT p.path, p.pin_pts_secs, p.thumb_webp, p.thumb_pts_secs
-                   FROM metadata_transfer_scope AS s CROSS JOIN video_pins AS p
+                   FROM metadata_transfer_physical_scope AS s CROSS JOIN video_pins AS p
                   WHERE p.path = s.item_key",
             )
             .map_err(db_error)?;
@@ -1959,7 +2403,7 @@ fn visit_bundle_entries<F>(
     mut visit: F,
 ) -> Result<(), TransferError>
 where
-    F: FnMut(&PortableEntry, usize) -> Result<(), TransferError>,
+    F: FnMut(&PortableEntry, usize, usize) -> Result<(), TransferError>,
 {
     let bundle_dir = root.join(SIDECAR_FILENAME);
     let shards_dir = bundle_generation_dir(&bundle_dir, &manifest.generation).join(SHARDS_DIRNAME);
@@ -2022,7 +2466,7 @@ where
                 )));
             }
             let index = usize_from_count(entry_count, "項目数")?;
-            visit(&entry, index)?;
+            visit(&entry, index, line.len())?;
             entry_count = entry_count
                 .checked_add(1)
                 .ok_or_else(|| TransferError::Invalid("項目数が表現範囲を超えています".into()))?;
@@ -2245,13 +2689,120 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
 
 fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
     validate_relative_path(&entry.path)?;
+    let kind_pair_is_valid = matches!(
+        (entry.kind, entry.media_kind),
+        (PortableEntryKind::Directory, PortableMediaKind::Directory)
+            | (
+                PortableEntryKind::File,
+                PortableMediaKind::Image
+                    | PortableMediaKind::Video
+                    | PortableMediaKind::Audio
+                    | PortableMediaKind::Zip
+                    | PortableMediaKind::Pdf
+                    | PortableMediaKind::ConvertibleArchive
+                    | PortableMediaKind::OtherFile
+            )
+    );
+    if !kind_pair_is_valid
+        || (entry.virtual_key_base == PortableVirtualKeyBase::ConvertedCache
+            && !matches!(
+                entry.media_kind,
+                PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+            ))
+        || portable_media_kind(Path::new(&entry.path), entry.kind) != entry.media_kind
+    {
+        return Err(TransferError::Invalid(format!(
+            "ファイル種別が不正です: {}",
+            entry.path
+        )));
+    }
     if entry.kind == PortableEntryKind::File && entry.fingerprint.is_none() {
         return Err(TransferError::Invalid(format!(
             "ファイルの照合情報がありません: {}",
             entry.path
         )));
     }
+    if !entry.timed_bookmarks.is_empty()
+        && !matches!(
+            entry.media_kind,
+            PortableMediaKind::Video | PortableMediaKind::Audio
+        )
+    {
+        return Err(TransferError::Invalid(format!(
+            "時刻ブックマークを保存できないファイル種別です: {}",
+            entry.path
+        )));
+    }
+    if entry.video_pin.is_some() && entry.media_kind != PortableMediaKind::Video {
+        return Err(TransferError::Invalid(format!(
+            "動画ピンを保存できないファイル種別です: {}",
+            entry.path
+        )));
+    }
+    if !entry.page_state.is_empty() && entry.media_kind != PortableMediaKind::Image {
+        return Err(TransferError::Invalid(format!(
+            "ページ編集情報を保存できないファイル種別です: {}",
+            entry.path
+        )));
+    }
+    let is_container = matches!(
+        entry.media_kind,
+        PortableMediaKind::Directory
+            | PortableMediaKind::Zip
+            | PortableMediaKind::Pdf
+            | PortableMediaKind::ConvertibleArchive
+    );
+    if (!entry.container_state.is_empty() || !entry.book_bookmarks.is_empty()) && !is_container {
+        return Err(TransferError::Invalid(format!(
+            "本・コンテナ情報を保存できないファイル種別です: {}",
+            entry.path
+        )));
+    }
+    if !entry.virtual_items.is_empty()
+        && !matches!(
+            entry.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::Pdf | PortableMediaKind::ConvertibleArchive
+        )
+    {
+        return Err(TransferError::Invalid(format!(
+            "仮想ページを保存できないファイル種別です: {}",
+            entry.path
+        )));
+    }
+    if !entry.nested_containers.is_empty()
+        && !matches!(
+            entry.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive
+        )
+    {
+        return Err(TransferError::Invalid(format!(
+            "入れ子コンテナを保存できないファイル種別です: {}",
+            entry.path
+        )));
+    }
     validate_rating(entry.rating.as_ref())?;
+    if let Some(kind) = entry
+        .rating
+        .as_ref()
+        .and_then(|rating| rating.kind.as_deref())
+    {
+        let compatible = matches!(
+            (entry.media_kind, kind),
+            (PortableMediaKind::Directory, "folder")
+                | (PortableMediaKind::Image, "image")
+                | (PortableMediaKind::Video, "video")
+                | (PortableMediaKind::Audio, "audio")
+                | (PortableMediaKind::Zip, "zip_file")
+                | (PortableMediaKind::Pdf, "pdf_file")
+                | (PortableMediaKind::ConvertibleArchive, "convertible_archive")
+        );
+        if !compatible {
+            return Err(TransferError::Invalid(format!(
+                "評価種別とファイル種別が一致しません: {}",
+                entry.path
+            )));
+        }
+    }
     validate_tags(&entry.tags)?;
     if entry.timed_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
         || entry.book_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
@@ -2273,7 +2824,7 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
         validate_title(bookmark.title.as_deref())?;
     }
     for bookmark in &entry.book_bookmarks {
-        validate_book_bookmark(bookmark, entry.kind, &entry.path)?;
+        validate_book_bookmark(bookmark, entry.media_kind, &entry.path)?;
         validate_title(bookmark.title.as_deref())?;
     }
     validate_page_state(&entry.page_state, &entry.path)?;
@@ -2290,6 +2841,25 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
             )));
         }
         validate_rating(item.rating.as_ref())?;
+        if let Some(kind) = item
+            .rating
+            .as_ref()
+            .and_then(|rating| rating.kind.as_deref())
+        {
+            let compatible = matches!(
+                (entry.media_kind, kind),
+                (
+                    PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive,
+                    "zip_image" | "zip_dir",
+                ) | (PortableMediaKind::Pdf, "pdf_page")
+            );
+            if !compatible {
+                return Err(TransferError::Invalid(format!(
+                    "仮想項目の評価種別が不正です: {}",
+                    entry.path
+                )));
+            }
+        }
         validate_tags(&item.tags)?;
         validate_page_state(&item.page_state, &entry.path)?;
     }
@@ -2594,24 +3164,26 @@ fn validate_title(title: Option<&str>) -> Result<(), TransferError> {
 
 fn validate_book_bookmark(
     bookmark: &PortableBookBookmark,
-    entry_kind: PortableEntryKind,
+    media_kind: PortableMediaKind,
     entry_path: &str,
 ) -> Result<(), TransferError> {
     let valid_pair = matches!(
         (
             bookmark.container_kind.as_str(),
             bookmark.page_kind.as_str(),
-            entry_kind,
+            media_kind,
         ),
         (
             "compiled_book" | "image_folder",
             "relative_path",
-            PortableEntryKind::Directory,
-        ) | (
-            "zip" | "other_archive",
-            "archive_entry",
-            PortableEntryKind::File,
-        ) | ("pdf", "pdf_page", PortableEntryKind::File)
+            PortableMediaKind::Directory,
+        ) | ("zip", "archive_entry", PortableMediaKind::Zip)
+            | (
+                "other_archive",
+                "archive_entry",
+                PortableMediaKind::ConvertibleArchive,
+            )
+            | ("pdf", "pdf_page", PortableMediaKind::Pdf)
     );
     if !valid_pair {
         return Err(TransferError::Invalid(format!(
@@ -2755,25 +3327,28 @@ enum TargetState {
     Changed,
 }
 
-fn verify_target(path: &Path, entry: &PortableEntry) -> TargetState {
+fn verify_target(
+    path: &Path,
+    entry: &PortableEntry,
+    cancel: &AtomicBool,
+) -> Result<TargetState, TransferError> {
+    check_cancel(cancel)?;
     let Ok(metadata) = fs::metadata(path) else {
-        return TargetState::Missing;
+        return Ok(TargetState::Missing);
     };
-    match entry.kind {
+    Ok(match entry.kind {
         PortableEntryKind::Directory if metadata.is_dir() => TargetState::Ready,
         PortableEntryKind::File if metadata.is_file() => {
-            if entry
-                .fingerprint
-                .as_ref()
-                .is_some_and(|fingerprint| fingerprint.size == metadata.len())
-            {
-                TargetState::Ready
-            } else {
-                TargetState::Changed
+            let Some(fingerprint) = entry.fingerprint.as_ref() else {
+                return Ok(TargetState::Changed);
+            };
+            if fingerprint.size != metadata.len() {
+                return Ok(TargetState::Changed);
             }
+            TargetState::Ready
         }
         _ => TargetState::Changed,
-    }
+    })
 }
 
 fn ensure_database_schemas(data_dir: &Path) -> Result<(), TransferError> {
@@ -2817,6 +3392,9 @@ fn ensure_database_schemas(data_dir: &Path) -> Result<(), TransferError> {
 
 fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> {
     let conn = Connection::open(data_dir.join("rating.db")).map_err(db_error)?;
+    // 15 storeのfamily delete / sparse insertを項目ごとに再利用する。既定16では
+    // statement種類数を下回り、巨大importでprepare/finalizeが再発する。
+    conn.set_prepared_statement_cache_capacity(64);
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(db_error)?;
     conn.execute(
@@ -2913,15 +3491,41 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
 
 fn apply_entry(
     tx: &Connection,
+    data_dir: &Path,
     path: &Path,
     entry: &PortableEntry,
     sections: ManifestSections,
     fallback_time_ms: i64,
+    automatic_sidecar_sync: Option<(String, i64, bool, bool)>,
 ) -> Result<(), TransferError> {
     let base_key = crate::path_key::normalize_keep_drive(path);
-    let automatic_sidecar_sync = automatic_sidecar_sync(path, entry.kind);
+    let page_base_key = match entry.virtual_key_base {
+        PortableVirtualKeyBase::Source => base_key.clone(),
+        PortableVirtualKeyBase::ConvertedCache => crate::path_key::normalize_keep_drive(
+            &crate::archive_cache::cache_zip_path_for_data_dir(data_dir, path),
+        ),
+    };
+    let supports_timed_bookmarks = matches!(
+        entry.media_kind,
+        PortableMediaKind::Video | PortableMediaKind::Audio
+    );
+    let supports_container = matches!(
+        entry.media_kind,
+        PortableMediaKind::Directory
+            | PortableMediaKind::Zip
+            | PortableMediaKind::Pdf
+            | PortableMediaKind::ConvertibleArchive
+    );
+    let supports_page_state = entry.media_kind == PortableMediaKind::Image
+        || matches!(
+            entry.media_kind,
+            PortableMediaKind::Zip | PortableMediaKind::Pdf | PortableMediaKind::ConvertibleArchive
+        );
     if sections.ratings {
         delete_key_family(tx, "ratings", "path", &base_key)?;
+        if page_base_key != base_key {
+            delete_key_family(tx, "ratings", "path", &page_base_key)?;
+        }
         if let Some(rating) = &entry.rating {
             insert_rating(tx, &base_key, path, rating)?;
         }
@@ -2929,7 +3533,7 @@ fn apply_entry(
             if let Some(rating) = &item.rating {
                 insert_rating(
                     tx,
-                    &canonical_virtual_item_key(&base_key, &item.member_key),
+                    &canonical_virtual_item_key(&page_base_key, &item.member_key),
                     path,
                     rating,
                 )?;
@@ -2939,43 +3543,46 @@ fn apply_entry(
     if sections.tags {
         delete_key_family(tx, "tags.item_tags", "item_key", &base_key)?;
         delete_key_family(tx, "tags.tag_item_state", "item_key", &base_key)?;
+        if page_base_key != base_key {
+            delete_key_family(tx, "tags.item_tags", "item_key", &page_base_key)?;
+            delete_key_family(tx, "tags.tag_item_state", "item_key", &page_base_key)?;
+        }
         insert_tags(tx, &base_key, &entry.tags, fallback_time_ms)?;
         for item in &entry.virtual_items {
             insert_tags(
                 tx,
-                &canonical_virtual_item_key(&base_key, &item.member_key),
+                &canonical_virtual_item_key(&page_base_key, &item.member_key),
                 &item.tags,
                 fallback_time_ms,
             )?;
         }
     }
-    if sections.timed_bookmarks {
-        tx.execute(
-            "DELETE FROM video.video_bookmarks WHERE path = ?1",
-            [&base_key],
-        )
-        .map_err(db_error)?;
+    if sections.timed_bookmarks && supports_timed_bookmarks {
+        tx.prepare_cached("DELETE FROM video.video_bookmarks WHERE path = ?1")
+            .map_err(db_error)?
+            .execute([&base_key])
+            .map_err(db_error)?;
         for bookmark in &entry.timed_bookmarks {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO video.video_bookmarks
                     (path, pts_secs, title, thumb_webp, created_at)
                  VALUES (?1, ?2, ?3, NULL, ?4)",
-                params![
-                    base_key,
-                    bookmark.pts_secs,
-                    bookmark.title.as_deref(),
-                    bookmark.created_at_ms.div_euclid(1000),
-                ],
             )
+            .map_err(db_error)?
+            .execute(params![
+                base_key,
+                bookmark.pts_secs,
+                bookmark.title.as_deref(),
+                bookmark.created_at_ms.div_euclid(1000),
+            ])
             .map_err(db_error)?;
         }
     }
-    if sections.book_bookmarks {
-        tx.execute(
-            "DELETE FROM book.book_bookmarks WHERE container_key = ?1",
-            [&base_key],
-        )
-        .map_err(db_error)?;
+    if sections.book_bookmarks && supports_container {
+        tx.prepare_cached("DELETE FROM book.book_bookmarks WHERE container_key = ?1")
+            .map_err(db_error)?
+            .execute([&base_key])
+            .map_err(db_error)?;
         for bookmark in &entry.book_bookmarks {
             let page_key = match bookmark.page_kind.as_str() {
                 "relative_path" | "archive_entry" => canonical_member_key(&bookmark.page_value),
@@ -2986,50 +3593,54 @@ fn apply_entry(
                     ));
                 }
             };
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO book.book_bookmarks
                     (container_key, container_path, container_kind, page_kind, page_value,
                      page_key, page_index_hint, created_at_ms, title)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    base_key,
-                    path.to_string_lossy().as_ref(),
-                    bookmark.container_kind,
-                    bookmark.page_kind,
-                    bookmark.page_value,
-                    page_key,
-                    bookmark.page_index_hint.min(i64::MAX as usize) as i64,
-                    bookmark.created_at_ms,
-                    bookmark.title.as_deref(),
-                ],
             )
+            .map_err(db_error)?
+            .execute(params![
+                base_key,
+                path.to_string_lossy().as_ref(),
+                bookmark.container_kind,
+                bookmark.page_kind,
+                bookmark.page_value,
+                page_key,
+                bookmark.page_index_hint.min(i64::MAX as usize) as i64,
+                bookmark.created_at_ms,
+                bookmark.title.as_deref(),
+            ])
             .map_err(db_error)?;
         }
     }
-    if let Some((folder_key, modified_secs)) = automatic_sidecar_sync {
+    if let Some((folder_key, modified_secs, write_adjustment, write_tags)) = automatic_sidecar_sync
+    {
         // 明示 import が正本になった後、同じ場所へ残っている自動 backup の旧値を
         // 「DB に行が無い」項目へ再 import して復活させない。明示bundleのsectionが
         // 対象外なら、その種類の自動sidecar同期状態には触れない。
-        if sections.page_state {
-            tx.execute(
+        if write_adjustment {
+            tx.prepare_cached(
                 "INSERT INTO adjustment.sidecar_sync (folder_key, sidecar_mtime)
                  VALUES (?1, ?2)
                  ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = ?2",
-                params![folder_key, modified_secs],
             )
+            .map_err(db_error)?
+            .execute(params![folder_key, modified_secs])
             .map_err(db_error)?;
         }
-        if sections.tags {
-            tx.execute(
+        if write_tags {
+            tx.prepare_cached(
                 "INSERT INTO tags.tag_sidecar_sync (folder_key, sidecar_mtime)
                  VALUES (?1, ?2)
                  ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = ?2",
-                params![folder_key, modified_secs],
             )
+            .map_err(db_error)?
+            .execute(params![folder_key, modified_secs])
             .map_err(db_error)?;
         }
     }
-    if sections.page_state {
+    if sections.page_state && supports_page_state {
         delete_key_family(tx, "adjustment.page_params", "page_path", &base_key)?;
         delete_key_family(tx, "mask.masks", "path", &base_key)?;
         delete_key_family(tx, "conceal.conceal_entries", "page_path", &base_key)?;
@@ -3043,16 +3654,31 @@ fn apply_entry(
         delete_key_family(tx, "comic.comic_entries", "page_path", &base_key)?;
         delete_key_family(tx, "view_trim.view_trim_pages", "page_path", &base_key)?;
         delete_key_family(tx, "rotation.rotations", "path", &base_key)?;
+        if page_base_key != base_key {
+            delete_key_family(tx, "adjustment.page_params", "page_path", &page_base_key)?;
+            delete_key_family(tx, "mask.masks", "path", &page_base_key)?;
+            delete_key_family(tx, "conceal.conceal_entries", "page_path", &page_base_key)?;
+            delete_key_family(
+                tx,
+                "local_adjust.local_adjust_pages",
+                "page_path",
+                &page_base_key,
+            )?;
+            delete_key_family(tx, "crop.export_crop_pages", "page_path", &page_base_key)?;
+            delete_key_family(tx, "comic.comic_entries", "page_path", &page_base_key)?;
+            delete_key_family(tx, "view_trim.view_trim_pages", "page_path", &page_base_key)?;
+            delete_key_family(tx, "rotation.rotations", "path", &page_base_key)?;
+        }
         insert_page_state(tx, &base_key, &entry.page_state)?;
         for item in &entry.virtual_items {
             insert_page_state(
                 tx,
-                &canonical_virtual_item_key(&base_key, &item.member_key),
+                &canonical_virtual_item_key(&page_base_key, &item.member_key),
                 &item.page_state,
             )?;
         }
     }
-    if sections.container_state {
+    if sections.container_state && supports_container {
         let container_key = crate::path_key::normalize(path);
         let include_nested = entry.kind == PortableEntryKind::File;
         delete_container_family(tx, "spread.spreads", "path", &container_key, include_nested)?;
@@ -3073,30 +3699,33 @@ fn apply_entry(
         }
     }
     if sections.thumbnail_pins {
-        let include_nested = entry.kind == PortableEntryKind::File;
-        delete_container_family(
-            tx,
-            "folder_pin.folder_thumb_pins",
-            "container_key",
-            &base_key,
-            include_nested,
-        )?;
-        tx.execute(
-            "DELETE FROM video_pin.video_pins WHERE path = ?1",
-            [&base_key],
-        )
-        .map_err(db_error)?;
-        insert_folder_pin(
-            tx,
-            &base_key,
-            entry.container_state.folder_thumb_pin.as_ref(),
-        )?;
-        for container in &entry.nested_containers {
+        if supports_container {
+            let include_nested = entry.kind == PortableEntryKind::File;
+            delete_container_family(
+                tx,
+                "folder_pin.folder_thumb_pins",
+                "container_key",
+                &base_key,
+                include_nested,
+            )?;
             insert_folder_pin(
                 tx,
-                &join_container_key(&base_key, &container.member_key),
-                container.state.folder_thumb_pin.as_ref(),
+                &base_key,
+                entry.container_state.folder_thumb_pin.as_ref(),
             )?;
+            for container in &entry.nested_containers {
+                insert_folder_pin(
+                    tx,
+                    &join_container_key(&base_key, &container.member_key),
+                    container.state.folder_thumb_pin.as_ref(),
+                )?;
+            }
+        }
+        if entry.media_kind == PortableMediaKind::Video {
+            tx.prepare_cached("DELETE FROM video_pin.video_pins WHERE path = ?1")
+                .map_err(db_error)?
+                .execute([&base_key])
+                .map_err(db_error)?;
         }
         if let Some(pin) = &entry.video_pin {
             let webp = pin
@@ -3105,32 +3734,48 @@ fn apply_entry(
                 .map(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()))
                 .transpose()
                 .map_err(|_| TransferError::Invalid("動画サムネの base64 が不正です".into()))?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO video_pin.video_pins
                         (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
                      VALUES (?1, ?2, ?3, ?4)",
-                params![base_key, pin.pin_pts_secs, webp, pin.thumb_pts_secs],
             )
+            .map_err(db_error)?
+            .execute(params![
+                base_key,
+                pin.pin_pts_secs,
+                webp,
+                pin.thumb_pts_secs
+            ])
             .map_err(db_error)?;
         }
     }
     Ok(())
 }
 
-fn automatic_sidecar_sync(path: &Path, kind: PortableEntryKind) -> Option<(String, i64)> {
+fn automatic_sidecar_sync_cached(
+    cache: &mut HashMap<PathBuf, Option<(String, i64)>>,
+    path: &Path,
+    kind: PortableEntryKind,
+) -> Option<(String, i64)> {
     let folder = match kind {
         PortableEntryKind::Directory => path,
         PortableEntryKind::File => path.parent()?,
     };
-    let metadata = fs::metadata(folder.join(crate::sidecar::SIDECAR_FILENAME)).ok()?;
-    let modified_secs = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs()
-        .min(i64::MAX as u64) as i64;
-    Some((crate::adjustment_db::normalize_path(folder), modified_secs))
+    if let Some(cached) = cache.get(folder) {
+        return cached.clone();
+    }
+    let value = fs::metadata(folder.join(crate::sidecar::SIDECAR_FILENAME))
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|modified| {
+            (
+                crate::adjustment_db::normalize_path(folder),
+                modified.as_secs().min(i64::MAX as u64) as i64,
+            )
+        });
+    cache.insert(folder.to_path_buf(), value.clone());
+    value
 }
 
 fn insert_page_state(
@@ -3139,19 +3784,19 @@ fn insert_page_state(
     state: &PortablePageState,
 ) -> Result<(), TransferError> {
     if let Some(angle) = state.rotation_degrees {
-        tx.execute(
-            "INSERT INTO rotation.rotations (path, angle) VALUES (?1, ?2)",
-            params![key, angle],
-        )
-        .map_err(db_error)?;
+        tx.prepare_cached("INSERT INTO rotation.rotations (path, angle) VALUES (?1, ?2)")
+            .map_err(db_error)?
+            .execute(params![key, angle])
+            .map_err(db_error)?;
     }
     if let Some(adjustment) = &state.adjustment {
         let json = serde_json::to_string(adjustment)
             .map_err(|error| TransferError::Invalid(format!("画像補正: {error}")))?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO adjustment.page_params (page_path, params_json) VALUES (?1, ?2)",
-            params![key, json],
         )
+        .map_err(db_error)?
+        .execute(params![key, json])
         .map_err(db_error)?;
     }
     insert_mask(tx, "mask.masks", "path", key, state.mask.as_ref())?;
@@ -3165,47 +3810,51 @@ fn insert_page_state(
     if let Some(layers) = &state.local_adjust_layers {
         let json = serde_json::to_string(layers)
             .map_err(|error| TransferError::Invalid(format!("部分補正: {error}")))?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO local_adjust.local_adjust_pages (page_path, layers_json, updated_at)
              VALUES (?1, ?2, unixepoch())",
-            params![key, json],
         )
+        .map_err(db_error)?
+        .execute(params![key, json])
         .map_err(db_error)?;
     }
     if let Some(crop) = state.export_crop {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO crop.export_crop_pages
                 (page_path, min_x, min_y, max_x, max_y, aspect_mode, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())",
-            params![
-                key,
-                crop.rect.min_x,
-                crop.rect.min_y,
-                crop.rect.max_x,
-                crop.rect.max_y,
-                crop.aspect_mode.stable_key(),
-            ],
         )
+        .map_err(db_error)?
+        .execute(params![
+            key,
+            crop.rect.min_x,
+            crop.rect.min_y,
+            crop.rect.max_x,
+            crop.rect.max_y,
+            crop.aspect_mode.stable_key(),
+        ])
         .map_err(db_error)?;
     }
     if let Some(objects) = &state.comic {
         let json = serde_json::to_string(objects)
             .map_err(|error| TransferError::Invalid(format!("テキスト注釈: {error}")))?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO comic.comic_entries (page_path, doc_version, doc_json)
              VALUES (?1, ?2, ?3)",
-            params![key, crate::comic_db::DOC_VERSION, json],
         )
+        .map_err(db_error)?
+        .execute(params![key, crate::comic_db::DOC_VERSION, json])
         .map_err(db_error)?;
     }
     if let Some(view_trim) = state.view_trim {
         let json = serde_json::to_string(&view_trim)
             .map_err(|error| TransferError::Invalid(format!("表示トリム: {error}")))?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO view_trim.view_trim_pages (page_path, override_json, updated_at)
              VALUES (?1, ?2, unixepoch())",
-            params![key, json],
         )
+        .map_err(db_error)?
+        .execute(params![key, json])
         .map_err(db_error)?;
     }
     Ok(())
@@ -3236,7 +3885,9 @@ fn insert_mask(
              VALUES (?1, ?2, ?3, ?4, ?5)"
         )
     };
-    tx.execute(&sql, params![key, data, mask.w, mask.h, vectors])
+    tx.prepare_cached(&sql)
+        .map_err(db_error)?
+        .execute(params![key, data, mask.w, mask.h, vectors])
         .map_err(db_error)?;
     Ok(())
 }
@@ -3247,21 +3898,28 @@ fn insert_container_state(
     state: &PortableContainerState,
 ) -> Result<(), TransferError> {
     if let Some(spread) = state.spread {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO spread.spreads (path, mode, flow, direction)
                  VALUES (?1, ?2, ?3, ?4)",
-            params![stripped_key, spread.mode, spread.flow, spread.direction],
         )
+        .map_err(db_error)?
+        .execute(params![
+            stripped_key,
+            spread.mode,
+            spread.flow,
+            spread.direction
+        ])
         .map_err(db_error)?;
     }
     if let Some(view_trim) = state.view_trim {
         let json = serde_json::to_string(&view_trim)
             .map_err(|error| TransferError::Invalid(format!("表示トリム: {error}")))?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO view_trim.view_trim_books (book_key, state_json, updated_at)
              VALUES (?1, ?2, unixepoch())",
-            params![stripped_key, json],
         )
+        .map_err(db_error)?
+        .execute(params![stripped_key, json])
         .map_err(db_error)?;
     }
     Ok(())
@@ -3277,18 +3935,19 @@ fn insert_folder_pin(
     };
     portable_folder_pin_source(pin)
         .ok_or_else(|| TransferError::Invalid("代表サムネ設定が不正です".into()))?;
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO folder_pin.folder_thumb_pins
                 (container_key, source_kind, source_rel, source_entry, source_page)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            key,
-            pin.source_kind,
-            pin.source_rel,
-            pin.source_entry,
-            pin.source_page,
-        ],
     )
+    .map_err(db_error)?
+    .execute(params![
+        key,
+        pin.source_kind,
+        pin.source_rel,
+        pin.source_entry,
+        pin.source_page,
+    ])
     .map_err(db_error)?;
     Ok(())
 }
@@ -3308,7 +3967,10 @@ fn delete_container_family(
     } else {
         format!("DELETE FROM {table} WHERE {column} = ?1")
     };
-    tx.execute(&sql, [base_key]).map_err(db_error)?;
+    tx.prepare_cached(&sql)
+        .map_err(db_error)?
+        .execute([base_key])
+        .map_err(db_error)?;
     Ok(())
 }
 
@@ -3329,9 +3991,12 @@ fn delete_key_family(
     let sql = format!(
         "DELETE FROM {table}
           WHERE {column} = ?1
-             OR (substr({column}, 1, length(?1) + 2) = ?1 || '::')"
+             OR ({column} >= ?1 || '::' AND {column} < ?1 || ':;')"
     );
-    tx.execute(&sql, [base_key]).map_err(db_error)?;
+    tx.prepare_cached(&sql)
+        .map_err(db_error)?
+        .execute([base_key])
+        .map_err(db_error)?;
     Ok(())
 }
 
@@ -3341,25 +4006,26 @@ fn insert_rating(
     source_path: &Path,
     rating: &PortableRating,
 ) -> Result<(), TransferError> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO ratings
             (path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
              dir_prefix, archive_format, zipdir_is_archive, zipdir_representative)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            key,
-            rating.stars,
-            rating.rated_at_ms,
-            source_path.to_string_lossy().as_ref(),
-            rating.kind.as_deref().and_then(rating_kind_value),
-            rating.entry_name.as_deref(),
-            rating.page_num.map(i64::from),
-            rating.dir_prefix.as_deref(),
-            rating.archive_format.as_deref(),
-            rating.zipdir_is_archive.map(i64::from),
-            rating.zipdir_representative.as_deref(),
-        ],
     )
+    .map_err(db_error)?
+    .execute(params![
+        key,
+        rating.stars,
+        rating.rated_at_ms,
+        source_path.to_string_lossy().as_ref(),
+        rating.kind.as_deref().and_then(rating_kind_value),
+        rating.entry_name.as_deref(),
+        rating.page_num.map(i64::from),
+        rating.dir_prefix.as_deref(),
+        rating.archive_format.as_deref(),
+        rating.zipdir_is_archive.map(i64::from),
+        rating.zipdir_representative.as_deref(),
+    ])
     .map_err(db_error)?;
     Ok(())
 }
@@ -3373,19 +4039,25 @@ fn insert_tags(
     for tag in tags {
         let display = crate::tags_db::normalize_tag_display_name(&tag.name);
         let tag_key = crate::tags_db::normalize_tag_key(&display);
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO tags.item_tags (item_key, tag, tag_key, applied_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![key, display, tag_key, tag.applied_at],
         )
+        .map_err(db_error)?
+        .execute(params![key, display, tag_key, tag.applied_at])
         .map_err(db_error)?;
     }
     let decided_at = fallback_time_ms.div_euclid(1000);
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO tags.tag_item_state (item_key, decided_at, source)
          VALUES (?1, ?2, ?3)",
-        params![key, decided_at, crate::tags_db::source::METADATA_IMPORT],
     )
+    .map_err(db_error)?
+    .execute(params![
+        key,
+        decided_at,
+        crate::tags_db::source::METADATA_IMPORT
+    ])
     .map_err(db_error)?;
     Ok(())
 }
@@ -3844,7 +4516,7 @@ fn folders_len_for_manifest(entries: &[PortableEntry]) -> u64 {
 fn read_manifest(root: &Path, cancel: &AtomicBool) -> Result<Manifest, TransferError> {
     let bundle = read_bundle_manifest(root, cancel)?;
     let mut entries = Vec::new();
-    visit_bundle_entries(root, &bundle, cancel, |entry, _| {
+    visit_bundle_entries(root, &bundle, cancel, |entry, _, _record_bytes| {
         entries.push(entry.clone());
         Ok(())
     })?;
@@ -3977,6 +4649,21 @@ fn now_ms() -> i64 {
 
 fn db_error(error: rusqlite::Error) -> TransferError {
     TransferError::Database(error.to_string())
+}
+
+fn invalid_db_value(
+    column: usize,
+    value_type: rusqlite::types::Type,
+    message: String,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        value_type,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
 }
 
 struct CancelReader<'a, R> {
@@ -4118,13 +4805,24 @@ mod tests {
 
     fn set_rating(data_dir: &Path, path: &Path, stars: i64) {
         let conn = Connection::open(data_dir.join("rating.db")).unwrap();
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let kind = if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+            1
+        } else {
+            0
+        };
         conn.execute(
             "INSERT OR REPLACE INTO ratings (path, stars, rated_at_ms, source_path, kind)
-             VALUES (?1, ?2, 1234, ?3, 0)",
+             VALUES (?1, ?2, 1234, ?3, ?4)",
             params![
                 crate::path_key::normalize_keep_drive(path),
                 stars,
-                path.to_string_lossy().as_ref()
+                path.to_string_lossy().as_ref(),
+                kind,
             ],
         )
         .unwrap();
@@ -4213,6 +4911,12 @@ mod tests {
         page_kind: &str,
         page_value: &str,
     ) -> Manifest {
+        let entry_path = match (entry_kind, container_kind) {
+            (PortableEntryKind::Directory, _) => "book",
+            (_, "pdf") => "book.pdf",
+            (_, "other_archive") => "book.7z",
+            _ => "book.zip",
+        };
         Manifest {
             format: FORMAT_NAME.to_string(),
             version: FORMAT_VERSION,
@@ -4220,8 +4924,15 @@ mod tests {
             recursive: false,
             sections: ManifestSections::default(),
             entries: vec![PortableEntry {
-                path: "book".to_string(),
+                path: entry_path.to_string(),
                 kind: entry_kind,
+                media_kind: match (entry_kind, container_kind) {
+                    (PortableEntryKind::Directory, _) => PortableMediaKind::Directory,
+                    (_, "pdf") => PortableMediaKind::Pdf,
+                    (_, "other_archive") => PortableMediaKind::ConvertibleArchive,
+                    _ => PortableMediaKind::Zip,
+                },
+                virtual_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: (entry_kind == PortableEntryKind::File).then_some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
@@ -4257,6 +4968,8 @@ mod tests {
         fs::create_dir_all(destination.join("nested")).unwrap();
         fs::write(source.join("a.jpg"), b"abc").unwrap();
         fs::write(destination.join("a.jpg"), b"abc").unwrap();
+        fs::write(source.join("clip.mp4"), b"video").unwrap();
+        fs::write(destination.join("clip.mp4"), b"video").unwrap();
         fs::write(source.join("nested/book.zip"), b"zip").unwrap();
         fs::write(destination.join("nested/book.zip"), b"zip").unwrap();
         init_data_dir(&source_data);
@@ -4294,7 +5007,9 @@ mod tests {
             .execute(
                 "INSERT INTO video_bookmarks (path, pts_secs, title, created_at)
                  VALUES (?1, 12.5, '場面', 99)",
-                [crate::path_key::normalize_keep_drive(&source.join("a.jpg"))],
+                [crate::path_key::normalize_keep_drive(
+                    &source.join("clip.mp4"),
+                )],
             )
             .unwrap();
         let book = Connection::open(source_data.join("book_bookmarks.db")).unwrap();
@@ -4412,7 +5127,7 @@ mod tests {
         assert_eq!(
             video_row,
             (
-                crate::path_key::normalize_keep_drive(&destination.join("a.jpg")),
+                crate::path_key::normalize_keep_drive(&destination.join("clip.mp4")),
                 12.5,
                 "場面".to_string(),
                 99,
@@ -4448,6 +5163,128 @@ mod tests {
     }
 
     #[test]
+    fn converted_archive_pages_round_trip_via_environment_local_cache_key() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_archive = source.join("book.7z");
+        let destination_archive = destination.join("book.7z");
+        fs::write(&source_archive, b"same-archive").unwrap();
+        fs::write(&destination_archive, b"same-archive").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_cache =
+            crate::archive_cache::cache_zip_path_for_data_dir(&source_data, &source_archive);
+        fs::create_dir_all(source_cache.parent().unwrap()).unwrap();
+        fs::write(&source_cache, b"converted-zip").unwrap();
+        let source_metadata = fs::metadata(&source_archive).unwrap();
+        let source_mtime = source_metadata
+            .modified()
+            .ok()
+            .and_then(system_time_ms)
+            .unwrap()
+            .div_euclid(1000);
+        let archive_cache = Connection::open(source_data.join("archive_cache.db")).unwrap();
+        archive_cache
+            .execute_batch(
+                "CREATE TABLE converted_archives (
+                    src_path_key TEXT PRIMARY KEY,
+                    src_mtime INTEGER NOT NULL,
+                    src_size INTEGER NOT NULL,
+                    cached_zip_path TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        archive_cache
+            .execute(
+                "INSERT INTO converted_archives
+                    (src_path_key, src_mtime, src_size, cached_zip_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    crate::path_key::normalize(&source_archive),
+                    source_mtime,
+                    source_metadata.len() as i64,
+                    source_cache.to_string_lossy().as_ref(),
+                ],
+            )
+            .unwrap();
+
+        let source_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&source_cache),
+            "Pages/Cover.JPG",
+        );
+        Connection::open(source_data.join("rating.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ratings
+                    (path, stars, rated_at_ms, source_path, kind, entry_name)
+                 VALUES (?1, 5, 123, ?2, 6, 'Pages/Cover.JPG')",
+                params![source_page, source_archive.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        Connection::open(source_data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 270)",
+                [&source_page],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let exported = read_manifest(&source, &cancel).unwrap();
+        let archive_entry = exported
+            .entries
+            .iter()
+            .find(|entry| entry.path == "book.7z")
+            .unwrap();
+        assert_eq!(
+            archive_entry.virtual_key_base,
+            PortableVirtualKeyBase::ConvertedCache
+        );
+        assert_eq!(archive_entry.virtual_items.len(), 1);
+
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 0);
+        let destination_cache = crate::archive_cache::cache_zip_path_for_data_dir(
+            &destination_data,
+            &destination_archive,
+        );
+        let destination_page = canonical_virtual_item_key(
+            &crate::path_key::normalize_keep_drive(&destination_cache),
+            "Pages/Cover.JPG",
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rating.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT stars FROM ratings WHERE path = ?1",
+                    [&destination_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            Connection::open(destination_data.join("rotation.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&destination_page],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            270
+        );
+    }
+
+    #[test]
     fn mixed_case_virtual_member_uses_one_canonical_key_for_all_databases() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("library");
@@ -4467,6 +5304,8 @@ mod tests {
             entries: vec![PortableEntry {
                 path: "book.zip".to_string(),
                 kind: PortableEntryKind::File,
+                media_kind: PortableMediaKind::Zip,
+                virtual_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 3,
                     modified_ms: None,
@@ -4615,6 +5454,8 @@ mod tests {
             entries: vec![PortableEntry {
                 path: "book.zip".to_string(),
                 kind: PortableEntryKind::File,
+                media_kind: PortableMediaKind::Zip,
+                virtual_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
@@ -4709,6 +5550,13 @@ mod tests {
         // fault-injected and must remain wholly at its previous state.
         assert_eq!(imported.applied_entries, 1);
         assert_eq!(imported.failed_entries, 1);
+        assert_eq!(imported.failed_items.len(), 1);
+        assert_eq!(imported.failed_items[0].path, "clip.mp4");
+        assert!(
+            imported.failed_items[0]
+                .reason
+                .contains("injected late import failure")
+        );
         assert_eq!(rating(&destination_data, &destination_path), Some(2));
         let video_pins = Connection::open(destination_data.join("video_pins.db")).unwrap();
         let old_pin = video_pins
@@ -4722,7 +5570,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_round_trip_is_self_contained_without_automatic_sidecar() {
+    fn v5_round_trip_is_self_contained_without_automatic_sidecar() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -5379,7 +6227,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_import_marks_existing_automatic_sidecar_as_consumed() {
+    fn v5_import_marks_existing_automatic_sidecar_as_consumed() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -5692,7 +6540,7 @@ mod tests {
         scope.insert("c:/photos/a.jpg".to_string(), 0);
         let cancel = AtomicBool::new(false);
         let mut conn = open_readonly(&data.join("rating.db")).unwrap();
-        prepare_metadata_scope(&mut conn, &scope, &cancel).unwrap();
+        prepare_metadata_scope(&mut conn, &scope, &scope, &cancel).unwrap();
         let mut stmt = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
@@ -5719,6 +6567,58 @@ mod tests {
         assert!(
             details.iter().all(|detail| !detail.contains("SCAN r")),
             "query plan must not scan the global ratings table: {details:?}"
+        );
+    }
+
+    #[test]
+    fn family_delete_uses_indexed_range_and_keeps_neighbor_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE values_by_key (item_key TEXT PRIMARY KEY);
+             INSERT INTO values_by_key VALUES
+                ('c:/book.zip'),
+                ('c:/book.zip::page/1.jpg'),
+                ('c:/book.zip::page/2.jpg'),
+                ('c:/book.zip:;neighbor'),
+                ('c:/book.zipx::page/1.jpg');",
+        )
+        .unwrap();
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM values_by_key
+                  WHERE item_key = ?1
+                     OR (item_key >= ?1 || '::' AND item_key < ?1 || ':;')",
+            )
+            .unwrap();
+        let details = plan
+            .query_map(["c:/book.zip"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| detail.contains("SEARCH")),
+            "family delete should seek the primary-key index: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("SCAN")),
+            "family delete must not scan the global table: {details:?}"
+        );
+
+        delete_key_family(&conn, "values_by_key", "item_key", "c:/book.zip").unwrap();
+        let remaining = conn
+            .prepare("SELECT item_key FROM values_by_key ORDER BY item_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                "c:/book.zip:;neighbor".to_string(),
+                "c:/book.zipx::page/1.jpg".to_string()
+            ]
         );
     }
 
@@ -5762,6 +6662,37 @@ mod tests {
             Err(TransferError::Invalid(message)) if message.contains("深すぎます")
         ));
         assert!(!root.join(SIDECAR_FILENAME).exists());
+    }
+
+    #[test]
+    fn recursive_export_reports_skipped_reparse_directories() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("hidden.jpg"), b"x").unwrap();
+        let link = root.join("linked");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&outside, &link).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        init_data_dir(&data);
+
+        let summary = export_at(&data, &root, true, &AtomicBool::new(false), no_progress).unwrap();
+        assert_eq!(summary.skipped_reparse_directories, 1);
+        assert_eq!(summary.skipped_reparse_paths, vec!["linked".to_string()]);
+        let manifest = read_manifest(&root, &AtomicBool::new(false)).unwrap();
+        assert!(manifest.entries.iter().any(|entry| entry.path == "linked"));
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .all(|entry| entry.path != "linked/hidden.jpg")
+        );
     }
 
     #[test]
@@ -5969,6 +6900,132 @@ mod tests {
     }
 
     #[test]
+    fn same_path_kind_and_size_are_applied_without_reading_file_content() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("a.jpg"), b"source").unwrap();
+        fs::write(destination.join("a.jpg"), b"target").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_rating(&source_data, &source.join("a.jpg"), 1);
+        set_rating(&destination_data, &destination.join("a.jpg"), 5);
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let preview = inspect_import_at(&destination, &cancel, no_progress).unwrap();
+        assert_eq!(preview.existing_entries, 2);
+        assert_eq!(preview.changed_files, 0);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.applied_entries, 2);
+        assert_eq!(summary.skipped_changed, 0);
+        assert_eq!(
+            rating(&destination_data, &destination.join("a.jpg")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn media_kind_rejects_incompatible_metadata_sections() {
+        let plain_entry = |path: &str, media_kind: PortableMediaKind| PortableEntry {
+            path: path.to_string(),
+            kind: PortableEntryKind::File,
+            media_kind,
+            virtual_key_base: PortableVirtualKeyBase::Source,
+            fingerprint: Some(FileFingerprint {
+                size: 1,
+                modified_ms: None,
+            }),
+            rating: None,
+            tags: Vec::new(),
+            timed_bookmarks: Vec::new(),
+            book_bookmarks: Vec::new(),
+            page_state: PortablePageState::default(),
+            container_state: PortableContainerState::default(),
+            nested_containers: Vec::new(),
+            video_pin: None,
+            virtual_items: Vec::new(),
+        };
+
+        let mut image = plain_entry("image.jpg", PortableMediaKind::Image);
+        image.timed_bookmarks.push(PortableTimedBookmark {
+            pts_secs: 1.0,
+            title: None,
+            created_at_ms: 0,
+        });
+        assert!(validate_portable_entry(&image).is_err());
+
+        let mut audio = plain_entry("song.mp3", PortableMediaKind::Audio);
+        audio.video_pin = Some(PortableVideoPin {
+            pin_pts_secs: 1.0,
+            thumb_webp_base64: None,
+            thumb_pts_secs: None,
+        });
+        assert!(validate_portable_entry(&audio).is_err());
+
+        let mut video = plain_entry("movie.mp4", PortableMediaKind::Video);
+        video.page_state.rotation_degrees = Some(90);
+        assert!(validate_portable_entry(&video).is_err());
+
+        let mut other = plain_entry("notes.txt", PortableMediaKind::OtherFile);
+        other.virtual_items.push(PortableVirtualItem {
+            member_key: "page.jpg".to_string(),
+            rating: None,
+            tags: Vec::new(),
+            page_state: PortablePageState::default(),
+        });
+        assert!(validate_portable_entry(&other).is_err());
+    }
+
+    #[test]
+    fn export_rejects_invalid_source_database_values_instead_of_dropping_them() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("image.jpg");
+        fs::write(&image, b"image").unwrap();
+        init_data_dir(&data);
+        let key = crate::path_key::normalize_keep_drive(&image);
+        Connection::open(data.join("rating.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ratings (path, stars, source_path)
+                 VALUES (?1, 9, ?2)",
+                params![key, image.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, no_progress),
+            Err(TransferError::Database(message))
+                if message.contains("rating.db") && message.contains("stars=9")
+        ));
+
+        Connection::open(data.join("rating.db"))
+            .unwrap()
+            .execute("DELETE FROM ratings", [])
+            .unwrap();
+        Connection::open(data.join("rotation.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 45)",
+                [&key],
+            )
+            .unwrap();
+        assert!(matches!(
+            export_at(&data, &root, false, &cancel, no_progress),
+            Err(TransferError::Database(message))
+                if message.contains("rotation.db") && message.contains("angle=45")
+        ));
+    }
+
+    #[test]
     fn rejects_parent_path_and_newer_version() {
         let base = Manifest {
             format: FORMAT_NAME.to_string(),
@@ -5979,6 +7036,8 @@ mod tests {
             entries: vec![PortableEntry {
                 path: "../escape.jpg".to_string(),
                 kind: PortableEntryKind::File,
+                media_kind: PortableMediaKind::Image,
+                virtual_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
@@ -6077,7 +7136,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsafe_or_malformed_v4_state_before_import() {
+    fn rejects_unsafe_or_malformed_v5_state_before_import() {
         let mut base =
             manifest_with_bookmark(PortableEntryKind::File, "zip", "archive_entry", "page.jpg");
         base.entries[0].book_bookmarks.clear();
@@ -6157,6 +7216,8 @@ mod tests {
             entries: vec![PortableEntry {
                 path: "link/secret.jpg".to_string(),
                 kind: PortableEntryKind::File,
+                media_kind: PortableMediaKind::Image,
+                virtual_key_base: PortableVirtualKeyBase::Source,
                 fingerprint: Some(FileFingerprint {
                     size: 1,
                     modified_ms: None,
