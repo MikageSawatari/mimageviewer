@@ -87,9 +87,11 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
   保持する。明示した画像 path は Windows の filesystem identity で厳密に解決し、
   削除・hidden 設定などで完全一覧に存在しない場合は先頭画像へ fallback せず、
   失敗した detached session と runtime を正常終了する。
-- 画像のみ通常フォルダのコンテナ open も Enter / ダブルクリック / gamepad 共通の
-  descriptor 入口で先に detached 側へ取り込み、main を子フォルダへ移してから複製する
-  経路を廃止した。物理 folder scan と自動 fullscreen は空の detached bundle 内で完了する。
+- 画像のみ通常フォルダのコンテナ open は Enter / ダブルクリック / gamepad 共通の
+  typed open planを通す。Folderはmain-owned worker scanで「未分類候補」として走査し、
+  画像本と確定したcompleted scanだけをdetached bundleへ一度だけ移譲する。混在Folderは
+  session/runtimeを作らず通常main navigationへ戻す。これにより、候補段階でdetachedを作成し、
+  混在判明後に開く先を失う回帰を構造的に防ぐ。
 - ZIP/PDF page は従来どおり container enumerate worker の完全な結果から対象 entry/page を
   解決する。detached の明示 target は `Required` とし、entry 削除・archive 差し替え・
   PDF ページ数減少で消失した場合は保存ページや先頭ページへ fallback せず session を閉じる。
@@ -115,6 +117,9 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - 追加レビューの回帰として、detached PDF password request の owner 内再開、viewport 未生成の
   terminal close、ZIP/PDF 必須 target 消失、Folder container open の main 無変更、
   scan error 時の catalog row 保持を固定する。
+- Folderの回帰テストは、画像だけなら分類完了後に初めてdetached contextを生成し、画像+動画の
+  混在ならmain一覧へ遷移してdetached session/runtimeを生成しないことを固定する。
+  複数ウィンドウON/OFF × 画像フォルダ本設定ON/OFFの4象限も同じtyped入口で固定する。
 
 ## 7. 検証結果
 
@@ -122,7 +127,8 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - `python scripts/check_ui_glyphs.py`: 成功
 - `cargo check -p mimageviewer --bin mimageviewer-core`: 成功
 - `cargo test -p mimageviewer --lib still_window_mode_key_tests::detached_`: 84 passed
-- `cargo test -p mimageviewer --lib image_folder_container_open_starts_detached_scan_without_navigating_main`: 成功
+- `cargo test -p mimageviewer --lib image_folder_container_open_classifies_before_creating_detached_context`: 成功
+- `cargo test -p mimageviewer --lib mixed_folder_candidate_falls_back_to_main_navigation_without_detached_session`: 成功
 - `scripts/test-full.ps1`: PASS（workspace / integration / doctest を含む）
 - `scripts/build-dev.ps1`: 成功。`target/dev-runtime/mimageviewer-core.exe` を生成し、
   agent は起動していない。

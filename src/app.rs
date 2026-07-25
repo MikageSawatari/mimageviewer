@@ -1714,6 +1714,26 @@ pub(crate) enum ViewerContextDescriptor {
     Image { path: PathBuf },
 }
 
+/// A detached book context is created only after the source ownership is known.
+///
+/// Grid `Folder` tiles use `ScannedFolder`: the main context owns the asynchronous
+/// classification request, and only a confirmed image book crosses into a detached
+/// context. Reopen descriptors still use `Descriptor` and perform their own scan.
+#[cfg(windows)]
+enum DetachedBookContextStart {
+    Descriptor(ViewerContextDescriptor),
+    ScannedFolder { path: PathBuf, scan: ScannedDir },
+}
+
+#[cfg(windows)]
+enum DetachedGridItemOpenPlan {
+    /// The directory has not been enumerated yet, so it must remain main-owned until
+    /// the worker proves that it is an image book.
+    FolderCandidate { path: PathBuf },
+    /// ZIP/PDF and explicit leaf sources already have an unambiguous detached owner.
+    Descriptor(ViewerContextDescriptor),
+}
+
 #[cfg(windows)]
 struct ActiveDetachedViewerContext {
     bundle: ViewerContextBundle,
@@ -3455,8 +3475,14 @@ pub(crate) struct FolderPaneOpenPending {
 
 pub(crate) enum FolderOpenScanPurpose {
     PaneNavigation,
+    /// A grid `Folder` requested while always-new mode is active. The main context
+    /// owns this request until the completed scan classifies it as either an image
+    /// book (detached) or an ordinary mixed folder (main navigation).
+    GridFolderCandidate,
     DetachedFolder,
-    DetachedImage { image_path: PathBuf },
+    DetachedImage {
+        image_path: PathBuf,
+    },
 }
 
 /// folder open scan の完了候補。`purpose` に応じて main nav の優先順位で裁定するか、
@@ -15004,6 +15030,10 @@ impl App {
                 }
             },
         };
+        // Keep the image-book boundary independent from the caller and from the eventual
+        // detached/main owner. Grid Folder preflight uses this same predicate before it
+        // commits a context, preventing the two load paths from drifting apart.
+        let scanned_folder_is_image_book = self.scanned_folder_is_image_book(&path, &scan);
         // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
         // `start_loading_items` に引数として渡す。
         let folder_signature = signature_from_scan(&scan);
@@ -15123,8 +15153,7 @@ impl App {
         );
         let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
         let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
-            self.settings.auto_fullscreen_image_folders_enabled()
-                && Self::grid_items_are_image_only_folder_pages(&items)
+            self.settings.auto_fullscreen_image_folders_enabled() && scanned_folder_is_image_book
         } else {
             false
         };
@@ -30055,6 +30084,11 @@ impl App {
         self.start_folder_open_scan(path, FolderOpenScanPurpose::PaneNavigation);
     }
 
+    #[cfg(windows)]
+    fn start_grid_folder_candidate_open(&mut self, path: PathBuf) {
+        self.start_folder_open_scan(path, FolderOpenScanPurpose::GridFolderCandidate);
+    }
+
     fn start_detached_image_folder_open(&mut self, image_path: PathBuf) -> bool {
         let Some(parent) = image_path.parent().map(Path::to_path_buf) else {
             return false;
@@ -30137,6 +30171,89 @@ impl App {
         }
     }
 
+    /// Resolve a completed main-owned folder scan without conflating "requested as a book"
+    /// with "confirmed to be an image book".
+    ///
+    /// `Some` continues through ordinary main navigation. `None` means the request was consumed
+    /// by a detached open, rejected as cross-context state, or failed.
+    #[cfg(windows)]
+    fn resolve_main_folder_open_ready(
+        &mut self,
+        ctx: &egui::Context,
+        ready: FolderPaneOpenReady,
+    ) -> Option<(PathBuf, ScannedDir)> {
+        let scan = match ready.scan {
+            Ok(scan) => scan,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "folder open scan failed path={} purpose={} error={error}",
+                    ready.path.display(),
+                    match ready.purpose {
+                        FolderOpenScanPurpose::PaneNavigation => "pane-navigation",
+                        FolderOpenScanPurpose::GridFolderCandidate => "grid-folder-candidate",
+                        FolderOpenScanPurpose::DetachedFolder => "detached-folder",
+                        FolderOpenScanPurpose::DetachedImage { .. } => "detached-image",
+                    }
+                ));
+                self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                return None;
+            }
+        };
+
+        match ready.purpose {
+            FolderOpenScanPurpose::PaneNavigation => Some((ready.path, scan)),
+            FolderOpenScanPurpose::GridFolderCandidate => {
+                let image_book = self.settings.auto_fullscreen_image_folders_enabled()
+                    && self.scanned_folder_is_image_book(&ready.path, &scan);
+                let should_detach =
+                    self.settings.detached_viewer_open_images_in_window && image_book;
+                if !should_detach {
+                    // Rejoin the exact main navigation pipeline used by Enter/double-click/
+                    // gamepad. This restores history/search/smart-folder behavior for mixed
+                    // folders instead of terminating an unmaterialized detached context.
+                    if let Some(idx) = self.items.iter().position(|item| {
+                        matches!(
+                            item,
+                            GridItem::Folder(path)
+                                if crate::folder_tree::path_eq(path, &ready.path)
+                        )
+                    }) {
+                        self.maybe_suppress_rating_filter_for_opened_container(idx);
+                        self.maybe_suppress_facet_filter_for_opened_container(idx);
+                    }
+                    self.begin_smart_folder_drill(&ready.path);
+                    // If the user changed from always-new to full-feature mode during a slow
+                    // scan, preserve the current full-feature auto-open policy.
+                    self.pending_auto_fs_open = image_book;
+                    return Some((ready.path, scan));
+                }
+
+                let base_placement = self.active_detached_viewer_current_placement();
+                let had_active_detached = self.active_detached_viewer_context.is_some()
+                    || self.viewer_session_is_detached();
+                if !self.park_and_close_current_active_detached_viewer(ctx) {
+                    return None;
+                }
+                let placement_seed = had_active_detached
+                    .then(|| self.offset_detached_image_window_placement(base_placement));
+                self.start_active_detached_book_context_from_scanned_folder(
+                    ready.path,
+                    scan,
+                    ctx,
+                    placement_seed,
+                );
+                None
+            }
+            FolderOpenScanPurpose::DetachedFolder | FolderOpenScanPurpose::DetachedImage { .. } => {
+                crate::logger::log(format!(
+                    "main folder scan rejected detached-owned result path={}",
+                    ready.path.display()
+                ));
+                None
+            }
+        }
+    }
+
     /// detached の通常画像 open 用 folder scan を、その detached bundle 内だけで完了する。
     ///
     /// `FolderOpenScanPurpose::DetachedImage` が対象画像を request と一体で所有するため、
@@ -30207,6 +30324,15 @@ impl App {
                 // 将来ペインを共有しても結果を捨てず、その bundle の物理ナビとして適用する。
                 self.load_folder_with_scan(ready.path, Some(scan));
                 DetachedPhysicalFolderOpenPoll::Applied
+            }
+            FolderOpenScanPurpose::GridFolderCandidate => {
+                // Candidate classification is owned by main. Reaching a detached bundle would
+                // cross the ownership boundary, so never materialize it here.
+                crate::logger::log(format!(
+                    "detached folder scan rejected main-owned grid candidate path={}",
+                    ready.path.display()
+                ));
+                DetachedPhysicalFolderOpenPoll::Failed
             }
         }
     }
@@ -30366,6 +30492,26 @@ impl App {
 
     fn grid_items_are_image_only_folder_pages(items: &[GridItem]) -> bool {
         !items.is_empty() && items.iter().all(|item| matches!(item, GridItem::Image(_)))
+    }
+
+    /// Classify a completed physical directory scan with the same boundary used by
+    /// `load_folder_with_scan_claimed`.
+    ///
+    /// Unsupported files are absent from `ScannedDir` and therefore retain the historical
+    /// behavior. Recognized child containers, video, or audio make an ordinary folder mixed.
+    /// A direct compiled-book folder intentionally ignores non-image entries during load, so
+    /// the classifier mirrors that exception as well.
+    fn scanned_folder_is_image_book(&self, path: &Path, scan: &ScannedDir) -> bool {
+        if crate::books::is_direct_book_folder(&self.book_root_path(), path) {
+            return scan
+                .all_media
+                .iter()
+                .any(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image);
+        }
+        crate::app::folder_scan::is_image_only_book_contents(
+            !scan.folders.is_empty(),
+            &scan.all_media,
+        )
     }
 
     fn items_are_image_only_folder_pages(&self) -> bool {
@@ -32126,9 +32272,6 @@ impl App {
         idx: usize,
     ) -> Option<ViewerContextDescriptor> {
         match self.items.get(idx)? {
-            GridItem::Folder(path) => {
-                Some(ViewerContextDescriptor::BookFolder { path: path.clone() })
-            }
             GridItem::PdfFile(path) => Some(ViewerContextDescriptor::Pdf {
                 path: path.clone(),
                 page_num: None,
@@ -34268,13 +34411,51 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn start_active_detached_book_context_from_scanned_folder(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        ctx: &egui::Context,
+        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+    ) -> bool {
+        self.start_active_detached_book_context_with_start(
+            DetachedBookContextStart::ScannedFolder { path, scan },
+            ctx,
+            placement_seed,
+            None,
+        )
+    }
+
+    #[cfg(windows)]
     fn start_active_detached_book_context(
         &mut self,
         descriptor: ViewerContextDescriptor,
         ctx: &egui::Context,
         placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        bookmark_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+    ) -> bool {
+        self.start_active_detached_book_context_with_start(
+            DetachedBookContextStart::Descriptor(descriptor),
+            ctx,
+            placement_seed,
+            bookmark_pending,
+        )
+    }
+
+    #[cfg(windows)]
+    fn start_active_detached_book_context_with_start(
+        &mut self,
+        start: DetachedBookContextStart,
+        ctx: &egui::Context,
+        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
         mut bookmark_pending: Option<crate::bookmark_browser::PendingBookOpen>,
     ) -> bool {
+        let descriptor = match &start {
+            DetachedBookContextStart::Descriptor(descriptor) => descriptor.clone(),
+            DetachedBookContextStart::ScannedFolder { path, .. } => {
+                ViewerContextDescriptor::BookFolder { path: path.clone() }
+            }
+        };
         let target = Self::detached_book_context_target(&descriptor);
         let mut main_context = self.take_current_viewer_context_bundle();
         // From this point until the bundle is captured, all loads belong to the
@@ -34330,34 +34511,42 @@ impl App {
         self.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
         self.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
 
-        self.with_detached_viewer_main_history_suppressed(|app| match descriptor {
-            ViewerContextDescriptor::Zip {
-                path,
-                archive_source_override,
-                ..
-            } => {
-                app.load_zip_as_folder(path);
-                if let Some(source) = archive_source_override {
-                    app.archive_source_override = Some(source.clone());
-                    app.address = source.to_string_lossy().to_string();
+        self.with_detached_viewer_main_history_suppressed(|app| match start {
+            DetachedBookContextStart::Descriptor(descriptor) => match descriptor {
+                ViewerContextDescriptor::Zip {
+                    path,
+                    archive_source_override,
+                    ..
+                } => {
+                    app.load_zip_as_folder(path);
+                    if let Some(source) = archive_source_override {
+                        app.archive_source_override = Some(source.clone());
+                        app.address = source.to_string_lossy().to_string();
+                    }
                 }
-            }
-            ViewerContextDescriptor::Pdf { path, .. } => {
-                app.load_pdf_as_folder(path);
-            }
-            ViewerContextDescriptor::BookFolder { path } => {
-                app.start_detached_folder_open(path);
-            }
-            ViewerContextDescriptor::Image { path } => {
-                // 仮想一覧の backing snapshot は使わず、親フォルダを worker で完全走査する。
-                // 対象画像は scan request 自身が所有し、結果を detached bundle 内で
-                // materialize した後に物理順の index へ解決する。
-                if !app.start_detached_image_folder_open(path.clone()) {
-                    app.log_detached_image_window_debug(format!(
-                        "image_reopen_no_parent_for_async_folder_scan path={}",
-                        path.display()
-                    ));
+                ViewerContextDescriptor::Pdf { path, .. } => {
+                    app.load_pdf_as_folder(path);
                 }
+                ViewerContextDescriptor::BookFolder { path } => {
+                    app.start_detached_folder_open(path);
+                }
+                ViewerContextDescriptor::Image { path } => {
+                    // 仮想一覧の backing snapshot は使わず、親フォルダを worker で完全走査する。
+                    // 対象画像は scan request 自身が所有し、結果を detached bundle 内で
+                    // materialize した後に物理順の index へ解決する。
+                    if !app.start_detached_image_folder_open(path.clone()) {
+                        app.log_detached_image_window_debug(format!(
+                            "image_reopen_no_parent_for_async_folder_scan path={}",
+                            path.display()
+                        ));
+                    }
+                }
+            },
+            DetachedBookContextStart::ScannedFolder { path, scan } => {
+                // The main-owned preflight already established that this is an image book.
+                // Transfer the completed scan exactly once; do not re-read the directory or
+                // publish a detached session for mixed folders.
+                app.load_folder_with_scan(path, Some(scan));
             }
         });
 
@@ -34398,15 +34587,23 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn should_open_grid_item_in_detached_book_context_with_auto_fullscreen(
+    fn detached_grid_item_open_plan(
         &self,
         idx: usize,
         auto_fullscreen: bool,
-    ) -> bool {
-        self.settings.detached_viewer_open_images_in_window
-            && self
-                .detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
-                .is_some()
+    ) -> Option<DetachedGridItemOpenPlan> {
+        if !self.settings.detached_viewer_open_images_in_window {
+            return None;
+        }
+        if auto_fullscreen && let Some(GridItem::Folder(path)) = self.items.get(idx) {
+            // Ctrl+G drill folders are navigation nodes, not physical book containers.
+            if self.global_search.active && self.global_search.drill.is_some() {
+                return None;
+            }
+            return Some(DetachedGridItemOpenPlan::FolderCandidate { path: path.clone() });
+        }
+        self.detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
+            .map(DetachedGridItemOpenPlan::Descriptor)
     }
 
     #[cfg(windows)]
@@ -34439,20 +34636,25 @@ impl App {
         idx: usize,
         auto_fullscreen: bool,
     ) -> bool {
-        if !self.should_open_grid_item_in_detached_book_context_with_auto_fullscreen(
-            idx,
-            auto_fullscreen,
-        ) {
-            return false;
-        }
-        let Some(descriptor) =
-            self.detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
-        else {
+        let Some(plan) = self.detached_grid_item_open_plan(idx, auto_fullscreen) else {
             return false;
         };
 
-        self.maybe_suppress_rating_filter_for_opened_container(idx);
-        self.maybe_suppress_facet_filter_for_opened_container(idx);
+        let descriptor = match plan {
+            DetachedGridItemOpenPlan::Descriptor(descriptor) => {
+                self.maybe_suppress_rating_filter_for_opened_container(idx);
+                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                descriptor
+            }
+            DetachedGridItemOpenPlan::FolderCandidate { path } => {
+                // Classification is main-owned. No session/runtime or detached bundle exists
+                // until the completed scan proves this is an image book; mixed folders fall
+                // back through the normal main navigation arbitration.
+                self.start_grid_folder_candidate_open(path);
+                ctx.request_repaint();
+                return true;
+            }
+        };
 
         let base_placement = self.active_detached_viewer_current_placement();
         let had_active_detached =
@@ -58364,18 +58566,29 @@ impl eframe::App for App {
                 self.start_folder_pane_open(p);
                 None
             } else if let Some(ready) = folder_pane_open_ready.take() {
-                match ready.scan {
-                    Ok(scan) => {
-                        navigate_pre_scan = Some(scan);
-                        Some(ready.path)
-                    }
-                    Err(error) => {
-                        crate::logger::log(format!(
-                            "folder pane scan failed path={} error={error}",
-                            ready.path.display()
-                        ));
-                        self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
-                        None
+                #[cfg(windows)]
+                {
+                    self.resolve_main_folder_open_ready(ctx, ready)
+                        .map(|(path, scan)| {
+                            navigate_pre_scan = Some(scan);
+                            path
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    match ready.scan {
+                        Ok(scan) => {
+                            navigate_pre_scan = Some(scan);
+                            Some(ready.path)
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "folder pane scan failed path={} error={error}",
+                                ready.path.display()
+                            ));
+                            self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                            None
+                        }
                     }
                 }
             } else {

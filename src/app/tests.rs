@@ -25283,7 +25283,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn image_folder_container_open_starts_detached_scan_without_navigating_main() {
+    fn image_folder_container_open_classifies_before_creating_detached_context() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let temp = tempfile::TempDir::new().unwrap();
@@ -25302,6 +25302,8 @@ mod still_window_mode_key_tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
+        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.show_search_bar = true;
         app.selected = Some(0);
         app.scroll_offset_y = 246.0;
         app.settings.detached_viewer_open_images_in_window = true;
@@ -25320,38 +25322,51 @@ mod still_window_mode_key_tests {
         assert_eq!(app.scroll_offset_y, 246.0);
         assert_eq!(app.fullscreen_idx, None);
         assert!(
-            app.active_detached_viewer_context
-                .as_ref()
-                .is_some_and(|active| active.bundle.folder_pane_open_pending.is_some()),
-            "the child folder scan must be owned by the detached bundle"
+            app.active_detached_viewer_context.is_none(),
+            "an unclassified Folder candidate must not allocate a detached context"
         );
+        assert!(app.active_detached_session.is_none());
+        assert!(matches!(
+            app.folder_pane_open_pending
+                .as_ref()
+                .map(|pending| &pending.purpose),
+            Some(FolderOpenScanPurpose::GridFolderCandidate)
+        ));
 
         let (scan_tx, scan_rx) = mpsc::channel();
         scan_tx.send(Ok(physical_scan)).unwrap();
-        app.with_active_detached_viewer_context(|mounted| {
-            let real_pending = mounted
-                .folder_pane_open_pending
-                .take()
-                .expect("real detached folder scan must have started");
-            real_pending.cancel.store(true, Ordering::Relaxed);
-            mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
-                path: child.clone(),
-                cancel: Arc::new(AtomicBool::new(false)),
-                rx: scan_rx,
-                purpose: FolderOpenScanPurpose::DetachedFolder,
-            });
-        })
-        .expect("active detached folder context must mount");
-
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_detached_viewer_context(ctx);
+        let real_pending = app
+            .folder_pane_open_pending
+            .take()
+            .expect("main-owned Folder candidate scan must have started");
+        real_pending.cancel.store(true, Ordering::Relaxed);
+        app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path: child.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: scan_rx,
+            purpose: FolderOpenScanPurpose::GridFolderCandidate,
         });
+        let ready = app
+            .poll_folder_pane_open(&ctx)
+            .expect("completed Folder candidate scan");
+        assert!(
+            app.resolve_main_folder_open_ready(&ctx, ready).is_none(),
+            "an image-only result must be consumed by the detached transition"
+        );
 
         assert_eq!(app.current_folder, Some(parent));
         assert!(matches!(
             app.items.as_slice(),
             [GridItem::Folder(path)] if path == &child
         ));
+        assert_eq!(
+            app.search_filter,
+            Some(std::collections::HashSet::from([0]))
+        );
+        assert!(app.show_search_bar);
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 246.0);
         let active = app
             .active_detached_viewer_context
             .as_ref()
@@ -25370,6 +25385,136 @@ mod still_window_mode_key_tests {
                 .collect::<Vec<_>>(),
             vec![page_a, page_b]
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mixed_folder_candidate_falls_back_to_main_navigation_without_detached_session() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let parent = temp.path().join("library");
+        let child = parent.join("mixed");
+        std::fs::create_dir_all(&child).unwrap();
+        let image = child.join("page.jpg");
+        let video = child.join("clip.mp4");
+        std::fs::write(&image, b"fixture").unwrap();
+        std::fs::write(&video, b"fixture").unwrap();
+
+        app.current_folder = Some(parent.clone());
+        app.address = parent.to_string_lossy().to_string();
+        app.items = vec![GridItem::Folder(child.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.scroll_offset_y = 135.0;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "classification must precede detached context creation"
+        );
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.current_folder, Some(parent));
+
+        let ready = FolderPaneOpenReady {
+            path: child.clone(),
+            scan: Ok(scan_directory(&child)),
+            purpose: FolderOpenScanPurpose::GridFolderCandidate,
+        };
+        let (navigate_path, scan) = app
+            .resolve_main_folder_open_ready(&ctx, ready)
+            .expect("mixed folders must return to ordinary main navigation");
+        assert_eq!(navigate_path, child);
+        assert!(matches!(
+            app.load_folder_nav_target(navigate_path, Some(scan)),
+            FolderOpenOutcome::Loaded
+        ));
+
+        assert_eq!(app.current_folder, Some(child));
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.active_detached_viewer_context.is_none());
+        assert!(app.active_detached_session.is_none());
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &image))
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Video(path) if path == &video))
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn folder_candidate_mode_matrix_has_one_classification_entrypoint() {
+        let ctx = egui::Context::default();
+
+        for always_new in [false, true] {
+            for image_folder_books in [false, true] {
+                let mut app = setup_app();
+                let folder = app
+                    .tmp
+                    .path()
+                    .join(format!("candidate-{always_new}-{image_folder_books}"));
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("page.jpg"), b"fixture").unwrap();
+                app.items = vec![GridItem::Folder(folder)];
+                app.thumbnails = vec![ThumbnailState::Pending];
+                app.image_metas = vec![None];
+                app.visible_indices = vec![0];
+                app.selected = Some(0);
+                app.settings.detached_viewer_open_images_in_window = always_new;
+                app.settings.auto_fullscreen_image_folders = image_folder_books;
+
+                let auto_fullscreen = app.should_auto_fullscreen_grid_container(0);
+                let handled = app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                    &ctx,
+                    0,
+                    auto_fullscreen,
+                );
+                assert_eq!(
+                    handled,
+                    always_new && image_folder_books,
+                    "always_new={always_new} image_folder_books={image_folder_books}"
+                );
+                assert!(
+                    app.active_detached_viewer_context.is_none(),
+                    "Folder classification must never allocate a detached context synchronously"
+                );
+                assert_eq!(
+                    app.folder_pane_open_pending.is_some(),
+                    always_new && image_folder_books
+                );
+            }
+        }
+
+        let mut drilled = setup_app();
+        let folder = drilled.tmp.path().join("search-drill-child");
+        std::fs::create_dir_all(&folder).unwrap();
+        drilled.items = vec![GridItem::Folder(folder.clone())];
+        drilled.thumbnails = vec![ThumbnailState::Pending];
+        drilled.image_metas = vec![None];
+        drilled.visible_indices = vec![0];
+        drilled.selected = Some(0);
+        drilled.settings.detached_viewer_open_images_in_window = true;
+        drilled.settings.auto_fullscreen_image_folders = true;
+        drilled.global_search.active = true;
+        drilled.global_search.drill = Some(crate::global_search_ui::DrillState {
+            container_root: drilled.tmp.path().to_path_buf(),
+            current_path: drilled.tmp.path().to_path_buf(),
+            is_zip: false,
+        });
+        assert!(
+            !drilled.open_grid_container_in_detached_book_context(&ctx, 0),
+            "Ctrl+G drill Folder nodes must remain ordinary drill navigation"
+        );
+        assert!(drilled.folder_pane_open_pending.is_none());
     }
 
     #[test]

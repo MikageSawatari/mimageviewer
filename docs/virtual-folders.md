@@ -333,11 +333,13 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 `open_grid_container_with_mode` 入口で理由をトースト表示して no-op とし、RAR 変換開始や読書履歴更新を
 含む副作用を起こさない。通常 ZIP、直読み RAR、変換対象 RAR/7z/LZH でこの判定を分岐させない。
 
-- グリッド側の open (`ui_main` ダブルクリック / `handle_keyboard` Enter) で
-  `pending_auto_fs_open` を立てる (ZipFile/PdfFile/ConvertibleArchive、追加設定 ON の
-  Folder)。Folder は `load_folder_with_scan` 後に表示項目が 1 件以上かつ全て `Image`
-  だった場合だけ予約を消費してフルスクリーンを開き、サブフォルダ / 動画 / ZIP/PDF /
-  変換アーカイブが混ざる場合は一覧表示に戻す。
+- フル機能ウィンドウのグリッド open (`ui_main` ダブルクリック / `handle_keyboard` Enter) は
+  `pending_auto_fs_open` を立てる。Folder は `load_folder_with_scan` が共通のscan分類述語で
+  画像本と確定した場合だけ予約を消費してフルスクリーンを開き、サブフォルダ / 動画 / 音声 /
+  ZIP/PDF / 変換アーカイブが混ざる場合は一覧表示にする。
+- 複数ウィンドウモードのFolderは、Enter / ダブルクリック / gamepadが共通のtyped open planを
+  通り、main-owned worker scanで先に分類する。画像本と確定したcompleted scanだけをdetachedへ
+  一度だけ移譲し、混在Folderはsession/runtimeを作らず通常のmain navigationへ戻す。
 - 起動パス / 既存インスタンス転送 (`open_startup_path`) は、解決後の openable が
   ZIP/CBZ/PDF または RAR/CBR/7z/CB7/LZH/LHA、または追加設定 ON の Directory のときだけ
   同じ明示オープン意図を渡す。
@@ -360,8 +362,9 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 - detached のグリッドから明示された ZIP entry / PDF page は `Required` target として扱う。
   列挙中の差し替え・削除で target が消えた場合、保存ページ／先頭ページへは fallback せず、
   viewport 作成前の detached session を正常終了する。
-- 画像のみ通常Folderを複数ウィンドウモードで直開きする場合は、main を先に子フォルダへ
-  navigationせず、detached bundleが非同期scanと自動fullscreenを所有する。
+- 画像のみ通常Folderを複数ウィンドウモードで直開きする場合も、mainを先に子フォルダへ
+  navigationしない。ownership確定前のscan requestはmainが所有し、画像本と確定した時点で
+  completed scanを新しいdetached bundleへ移す。
 
 ### 退出ルーティング = 「設定で固定分岐」(一時フラグなし)
 

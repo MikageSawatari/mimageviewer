@@ -16,8 +16,9 @@ pub(crate) enum ScanMediaKind {
 ///
 /// Ctrl+↑↓ 移動時は DFS スレッドで事前に走査しておき、UI スレッドの
 /// `load_folder` で `read_dir` を走らせずに items を組み立てるために使う。
-/// 通常パス (ユーザーが明示的に開いたフォルダ等) では `scan_directory` を
-/// UI スレッドで呼んで即座に生成する。
+/// フル機能ウィンドウの直接ロードでは `scan_directory` を UI スレッドで呼ぶ経路も残る。
+/// 複数ウィンドウの grid Folder 候補は worker で生成し、画像本と確定した結果だけを
+/// detached context へ移譲する。
 pub(crate) struct ScannedDir {
     /// (GridItem, (mtime, file_size)) の対。GridItem は Folder / ZipFile /
     /// PdfFile / ConvertibleArchive のいずれか。load_folder 内でソートされる。
