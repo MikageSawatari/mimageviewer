@@ -495,6 +495,19 @@ fn build_lut(params: &ColorizeParams) -> [[u8; 3]; 256] {
     }
 }
 
+/// 設定パネルの階調プレビュー用 LUT。
+///
+/// 実画像処理と同じ palette LUT と輝度保持を 0..=255 の入力輝度へ適用する。
+/// 画像固有の分布を必要とする濃度正規化と、近傍画素を必要とするトーン変換は
+/// 1 次元バーでは表現しない。
+pub fn preview_lut(params: &ColorizeParams) -> [[u8; 3]; 256] {
+    let lut = build_lut(params);
+    let luminance_weight = f32::from(params.luminance_weight.min(100)) / 100.0;
+    std::array::from_fn(|index| {
+        preserve_luminance(lut[index], index as f32 / 255.0, luminance_weight)
+    })
+}
+
 fn build_custom_lut(points: &[ColorizeControlPoint]) -> [[u8; 3]; 256] {
     let fallback;
     let points = if points.len() >= 2 {
@@ -1014,5 +1027,31 @@ mod tests {
         let output = apply(&source, &params);
         assert_eq!(output.pixels[0], Color32::from_rgb(10, 20, 30));
         assert_eq!(output.pixels[1], Color32::from_rgb(210, 220, 230));
+    }
+
+    #[test]
+    fn preview_lut_matches_grayscale_image_colorization() {
+        let source = image(256, 1, |x, _| Color32::from_gray(x as u8));
+        let params = ColorizeParams {
+            mode: ColorizeMode::AllImages,
+            palette: ColorizePalette::Custom,
+            luminance_weight: 37,
+            control_points: vec![
+                ColorizeControlPoint::new([4, 8, 18], 2.0),
+                ColorizeControlPoint::new([200, 70, 55], 1.0),
+                ColorizeControlPoint::new([245, 235, 210], 3.0),
+            ],
+            ..ColorizeParams::default()
+        };
+
+        let preview = preview_lut(&params);
+        let output = apply(&source, &params);
+        for (index, pixel) in output.pixels.iter().enumerate() {
+            assert_eq!(
+                [pixel.r(), pixel.g(), pixel.b()],
+                preview[index],
+                "preview must use the same mapping as a grayscale input at {index}"
+            );
+        }
     }
 }

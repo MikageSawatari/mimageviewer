@@ -1233,6 +1233,33 @@ mod local_adjust_segmentation_tests {
         harness.snapshot("colorize_preset_slots_single_row");
     }
 
+    #[test]
+    fn colorize_gradient_preview_snapshot_custom_palette() {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(280.0, 92.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut params = crate::colorize::ColorizeParams::default();
+                    params.palette = crate::colorize::ColorizePalette::Custom;
+                    params.luminance_weight = 35;
+                    super::draw_colorize_gradient_preview(ui, &params);
+                });
+            });
+
+        harness.run();
+        harness.snapshot("colorize_gradient_preview_custom_palette");
+    }
+
     /// Snapshot シナリオ用の helper: 名前 / マスク / effect だけを受けて
     /// `LocalAdjustmentLayer` を作る (= 各 snapshot test の fixture を 1 行で書ける)。
     fn snapshot_layer(
@@ -7333,6 +7360,64 @@ macro_rules! slider_log_with_reset {
     }};
 }
 
+fn draw_colorize_gradient_bar(
+    ui: &mut egui::Ui,
+    colors: &[[u8; 3]; 256],
+    tooltip: &str,
+) -> egui::Response {
+    const BAR_HEIGHT: f32 = 18.0;
+    let width = ui.available_width().max(1.0);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, BAR_HEIGHT), egui::Sense::hover());
+    let inner = rect.shrink(1.0);
+    let mut mesh = egui::Mesh::default();
+    for (index, color) in colors.iter().enumerate() {
+        let x = egui::lerp(inner.left()..=inner.right(), index as f32 / 255.0);
+        let vertex = mesh.vertices.len() as u32;
+        let color = egui::Color32::from_rgb(color[0], color[1], color[2]);
+        mesh.colored_vertex(egui::pos2(x, inner.top()), color);
+        mesh.colored_vertex(egui::pos2(x, inner.bottom()), color);
+        if index > 0 {
+            mesh.add_triangle(vertex - 2, vertex, vertex + 1);
+            mesh.add_triangle(vertex - 2, vertex + 1, vertex - 1);
+        }
+    }
+    ui.painter().rect_filled(
+        rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+    );
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    response.on_hover_text(tooltip)
+}
+
+fn draw_colorize_gradient_preview(ui: &mut egui::Ui, params: &crate::colorize::ColorizeParams) {
+    let grayscale = std::array::from_fn(|index| [index as u8; 3]);
+    let colorized = crate::colorize::preview_lut(params);
+
+    ui.label(
+        egui::RichText::new("階調プレビュー（暗部 → 明部）")
+            .size(SECTION_FONT)
+            .color(ui.visuals().text_color()),
+    );
+    draw_colorize_gradient_bar(ui, &grayscale, "カラー化前の入力輝度です。");
+    ui.add_space(2.0);
+    draw_colorize_gradient_bar(
+        ui,
+        &colorized,
+        "現在のパレット、制御点、強さ、元画像の明るさ保持を反映した階調です。",
+    );
+}
+
 fn draw_colorize_preset_slots(
     ui: &mut egui::Ui,
     params: &mut crate::colorize::ColorizeParams,
@@ -7510,6 +7595,9 @@ fn draw_colorize_settings(
             changed = true;
         }
     }
+
+    ui.add_space(8.0);
+    draw_colorize_gradient_preview(ui, &params.colorize);
 
     if params.colorize.palette == ColorizePalette::Custom {
         ui.add_space(6.0);
