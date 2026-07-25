@@ -3314,6 +3314,10 @@ pub struct Settings {
     /// 画像補正タブの中央設定領域で最後に開いていたサブタブ。
     #[serde(default)]
     pub adjustment_settings_tab: AdjustmentSettingsTab,
+    /// 静止画・動画の「フィルタ」から選択できる Creative 3D LUT。
+    /// ファイル本体は設定 DB に埋め込まず、ユーザーが登録した `.cube` のパスを保持する。
+    #[serde(default)]
+    pub creative_luts: Vec<crate::creative_lut::CreativeLutEntry>,
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
@@ -3687,6 +3691,10 @@ pub struct Settings {
     /// 起動後の動画切替と次回起動へ引き継ぐ現在のミュート状態。
     #[serde(default)]
     pub video_muted: bool,
+    /// 全動画に共通して適用する表示用の色調補正と Creative LUT。
+    /// 入力色空間の変換ではなく、デコード後のプレビュー見た目だけを変更する。
+    #[serde(default)]
+    pub video_adjustments: crate::creative_lut::VideoAdjustments,
     /// 動画ファイルごとの最終再生位置 (絶対パス → 秒)。
     /// `VideoPlayer::open` 時に自動 resume、5 秒ごと + drop 時に保存。
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
@@ -4656,6 +4664,7 @@ impl Default for Settings {
             image_mipmap_lod_bias: 0.0,
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
+            creative_luts: Vec::new(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
@@ -4783,6 +4792,7 @@ impl Default for Settings {
             video_continuous_mode: crate::video::VideoContinuousMode::default(),
             video_start_muted: false,
             video_muted: false,
+            video_adjustments: crate::creative_lut::VideoAdjustments::default(),
             video_resume_positions: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
             video_nav_resume: ResumeMode::Resume,
@@ -5957,6 +5967,30 @@ impl Settings {
         self.video_volume = clamp_video_volume(self.video_volume);
         self.video_playback_speed =
             crate::video::clock::clamp_playback_speed(self.video_playback_speed);
+        self.video_adjustments.sanitize();
+        let mut lut_ids = std::collections::HashSet::new();
+        self.creative_luts.retain_mut(|entry| {
+            entry.name = entry.name.trim().to_owned();
+            if entry.name.is_empty() {
+                entry.name = entry
+                    .path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("LUT")
+                    .to_owned();
+            }
+            !entry.path.as_os_str().is_empty() && lut_ids.insert(entry.id)
+        });
+        let registered_lut_ids: std::collections::HashSet<_> =
+            self.creative_luts.iter().map(|entry| entry.id).collect();
+        if self
+            .video_adjustments
+            .creative_lut
+            .id
+            .is_some_and(|id| !registered_lut_ids.contains(&id))
+        {
+            self.video_adjustments.creative_lut.id = None;
+        }
         self.ring_shortcuts.sanitize();
         self.slideshow_interval_secs = if self.slideshow_interval_secs.is_finite() {
             self.slideshow_interval_secs.clamp(0.5, 30.0)
@@ -6274,6 +6308,8 @@ impl Settings {
         self.thumb_quality = src.thumb_quality;
         // ── 静止画 mipmap LOD (画像補正→フィルタでライブ編集) ──
         self.image_mipmap_lod_bias = src.image_mipmap_lod_bias;
+        // ── 動画プレビュー補正 (native 動画左パネルでライブ編集) ──
+        self.video_adjustments = src.video_adjustments.clone();
         // ── キャッシュ系 (環境設定に出ていない項目) ──
         self.cache_videos_always = src.cache_videos_always;
         self.batch_cache_zip_contents = src.batch_cache_zip_contents;
@@ -8182,6 +8218,31 @@ mod tests {
         s.video_playback_speed = f64::NAN;
         s.sanitize();
         assert_eq!(s.video_playback_speed, 1.0);
+    }
+
+    #[test]
+    fn sanitize_deduplicates_creative_luts_and_clears_missing_video_selection() {
+        let mut settings = Settings::default();
+        let id = uuid::Uuid::from_u128(1);
+        settings.creative_luts = vec![
+            crate::creative_lut::CreativeLutEntry {
+                id,
+                name: "  First  ".to_string(),
+                path: PathBuf::from(r"C:\LUT\first.cube"),
+            },
+            crate::creative_lut::CreativeLutEntry {
+                id,
+                name: "Duplicate".to_string(),
+                path: PathBuf::from(r"C:\LUT\duplicate.cube"),
+            },
+        ];
+        settings.video_adjustments.creative_lut.id = Some(uuid::Uuid::from_u128(2));
+
+        settings.sanitize();
+
+        assert_eq!(settings.creative_luts.len(), 1);
+        assert_eq!(settings.creative_luts[0].name, "First");
+        assert_eq!(settings.video_adjustments.creative_lut.id, None);
     }
 
     #[test]

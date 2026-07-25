@@ -7704,6 +7704,8 @@ fn draw_sliders(
     params: &mut AdjustParams,
     settings_tab: &mut crate::settings::AdjustmentSettingsTab,
     colorize_slots: &mut crate::colorize::ColorizePresetSlots,
+    creative_luts: &[crate::creative_lut::CreativeLutEntry],
+    creative_lut_library: &crate::creative_lut::CreativeLutLibrary,
     image_mipmap_lod_bias: &mut f32,
     ai_feature_mode: crate::settings::AiFeatureMode,
     ai_denoise_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
@@ -8111,6 +8113,89 @@ fn draw_sliders(
     }
 
     if *settings_tab == crate::settings::AdjustmentSettingsTab::PostFilter {
+        ui.label(
+            egui::RichText::new("Creative LUT")
+                .size(SECTION_FONT)
+                .color(ui.visuals().text_color()),
+        );
+        ui.label(
+            egui::RichText::new("登録した .cube LUT を最終表示・コピー・書き出しに適用します。")
+                .size(SECTION_FONT - 1.0)
+                .weak(),
+        );
+        let selected_name = params
+            .creative_lut
+            .id
+            .and_then(|id| creative_luts.iter().find(|entry| entry.id == id))
+            .map(|entry| entry.name.as_str())
+            .unwrap_or_else(|| {
+                if params.creative_lut.id.is_some() {
+                    "（未登録）"
+                } else {
+                    "なし"
+                }
+            });
+        let before_lut_id = params.creative_lut.id;
+        egui::ComboBox::from_id_salt("image_creative_lut")
+            .selected_text(selected_name)
+            .width(ui.available_width().max(120.0))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut params.creative_lut.id, None, "なし");
+                for entry in creative_luts {
+                    ui.selectable_value(&mut params.creative_lut.id, Some(entry.id), &entry.name)
+                        .on_hover_text(entry.path.display().to_string());
+                }
+            });
+        if params.creative_lut.id != before_lut_id {
+            changed = true;
+        }
+        if let Some(id) = params.creative_lut.id {
+            ui.horizontal(|ui| {
+                ui.label("適用量");
+                if (params.creative_lut.strength - 1.0).abs() > 0.001
+                    && ui.small_button("↩").on_hover_text("100% に戻す").clicked()
+                {
+                    params.creative_lut.strength = 1.0;
+                    changed = true;
+                }
+            });
+            let response = ui.add(
+                egui::Slider::new(&mut params.creative_lut.strength, 0.0..=1.0)
+                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                    .custom_parser(|text| {
+                        text.trim_end_matches('%')
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .map(|value| value / 100.0)
+                    }),
+            );
+            changed |= response.changed();
+            dragging |= response.dragged();
+
+            if let Some(error) = creative_lut_library.error(id) {
+                ui.label(
+                    egui::RichText::new(format!("LUTを読み込めません: {error}"))
+                        .size(SECTION_FONT - 1.0)
+                        .color(ui.visuals().error_fg_color),
+                );
+            } else if creative_lut_library.get(Some(id)).is_none() {
+                ui.label(
+                    egui::RichText::new("LUTを読み込み中…")
+                        .size(SECTION_FONT - 1.0)
+                        .weak(),
+                );
+            }
+        }
+        ui.label(
+            egui::RichText::new("追加・削除: 環境設定 > 表示 > LUT")
+                .size(SECTION_FONT - 1.0)
+                .weak(),
+        );
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
         // ── ポストフィルタ (レトロ系 + 写真系エフェクト) ──
         ui.label(
             egui::RichText::new("縮小モアレ抑制")
@@ -12914,6 +12999,8 @@ impl App {
                             &mut edit_params,
                             &mut self.settings.adjustment_settings_tab,
                             &mut self.settings.colorize_preset_slots,
+                            &self.settings.creative_luts,
+                            &self.creative_lut_library,
                             &mut self.settings.image_mipmap_lod_bias,
                             self.settings.ai_feature_mode,
                             ai_denoise_disabled_limit,

@@ -9621,7 +9621,7 @@ fn apply_cube_lut(src: &[u8], params: &CubeLutParams) -> Vec<u8> {
     out
 }
 
-fn sample_cube_lut(params: &CubeLutParams, rgb: [f32; 3]) -> [f32; 3] {
+pub fn sample_cube_lut(params: &CubeLutParams, rgb: [f32; 3]) -> [f32; 3] {
     let size = params.size;
     let normalize = |value: f32, min: f32, max: f32| {
         ((value - min) / (max - min).max(f32::EPSILON)).clamp(0.0, 1.0)

@@ -36,6 +36,7 @@ pub mod compare_wgpu;
 pub mod conceal;
 pub mod conceal_compose;
 pub mod conceal_db;
+pub mod creative_lut;
 pub mod data_dir;
 #[cfg(windows)]
 mod dcomp_presenter_test;

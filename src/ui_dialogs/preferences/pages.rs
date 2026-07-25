@@ -5884,6 +5884,80 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     // 「環境設定の中に新しい項目」)。動画タブには出さない。
 }
 
+pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    state.poll_creative_lut_import();
+
+    ui.label(
+        "静止画と動画のプレビューに使う Creative 3D LUT を登録します。\n\
+         対応形式は一般的な .cube（LUT_3D_SIZE）です。入力色空間の変換用ではなく、\
+         通常の表示結果へ好みのルックを加える用途です。",
+    );
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "登録元ファイルはコピーしません。移動・削除すると、そのLUTは読み込めなくなります。",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(10.0);
+
+    let importing = state.creative_lut_import_rx.is_some();
+    if ui
+        .add_enabled(!importing, egui::Button::new(".cube LUTを追加…"))
+        .clicked()
+        && let Some(path) = rfd::FileDialog::new()
+            .add_filter("3D LUT", &["cube"])
+            .pick_file()
+    {
+        state.start_creative_lut_import(path, ui.ctx());
+    }
+    if let Some(message) = state.creative_lut_message.as_deref() {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(message).small());
+    }
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    if state.settings.creative_luts.is_empty() {
+        ui.label(egui::RichText::new("登録済みのLUTはありません。").weak());
+        return;
+    }
+
+    let mut remove = None;
+    for (index, entry) in state.settings.creative_luts.iter_mut().enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("表示名:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.name)
+                        .desired_width(220.0)
+                        .hint_text("LUT名"),
+                );
+                if ui.button("登録解除").clicked() {
+                    remove = Some(index);
+                }
+            });
+            ui.label(
+                egui::RichText::new(entry.path.display().to_string())
+                    .small()
+                    .weak(),
+            )
+            .on_hover_text(entry.path.display().to_string());
+        });
+        ui.add_space(5.0);
+    }
+    if let Some(index) = remove {
+        let removed = state.settings.creative_luts.remove(index);
+        if state.settings.video_adjustments.creative_lut.id == Some(removed.id) {
+            state.settings.video_adjustments.creative_lut.id = None;
+        }
+        state.creative_lut_message = Some(format!("「{}」の登録を解除しました。", removed.name));
+    }
+}
+
 fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.label(egui::RichText::new("音量ノーマライズ測定値").strong());

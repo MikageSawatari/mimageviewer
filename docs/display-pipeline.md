@@ -1033,7 +1033,12 @@ final composite / comic composite は可視ページ単位で扱い、キャッ�
      新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
      次の holdover として維持し、`complete=true` の final だけが holdover を解放する。
    ↓
-10. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
+10. Creative 3D LUT
+   → 環境設定で登録した `.cube` を適用量付きで最終表示へ適用する。
+     入力色空間変換ではなく表示用ルック専用。カラー化と同じ `final_effect_pending`
+     worker で処理し、サムネイルには反映しない。
+   ↓
+11. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
    → final_composite_cache[FinalCompositeKey]
 ```
 
@@ -1066,10 +1071,13 @@ denoise は意図的に飛ばすため、grid / fullscreen / stack のどこか�
   せず、同ページが表示対象になったときは進行中 job を昇格して再利用する。通常ページ送りでは
   完成まで直前ページを保持し、生画像・サムネイルへフォールバックしない。`open_fullscreen` は
   ページ入場だけでは final composite / worker を無効化しない。サムネイル自体には反映しない。
+- **Creative LUT**: カラー化後・ポストフィルタ前に適用する。登録済み `.cube` の parse 済み
+  table を worker へ `Arc` で渡し、ファイル I/O は UI thread と final-effect worker の外で行う。
+  LUT の選択・適用量は final composite key に含め、変更時も edit / final AI cache は保持する。
 - **ポストフィルタ**: AI の後段で CPU 処理 (CRT/減色/複合)。rayon 並列化済み。
   `PostFilter::Nearest` のみ NEAREST サンプラー、それ以外は LINEAR でアップロードする。
 - **消しゴム/隠蔽加工/分析モード中の一時バイパス**: `App::post_filter_bypassed = true` の間は
-  final composite の key からカラー化と post-filter を外し、表示用最終段だけを切り替える。
+  final composite の key からカラー化・Creative LUT・post-filter を外し、表示用最終段だけを切り替える。
   edit 系 generation は進めない。
 - **補正レイヤー**: `local-adjust-render` worker で `local-adjust-core` を適用し、
   `local_adjust_cache` に載せる。生成中は古い補正レイヤー結果を使わず、

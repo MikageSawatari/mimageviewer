@@ -53,6 +53,9 @@ use crate::video::decoder::{VideoFrame, VideoFrameData};
 pub(crate) mod overlay_draw;
 use self::overlay_draw::*;
 
+mod grade_pipeline;
+use self::grade_pipeline::VideoGradePipeline;
+
 pub mod hud_window;
 
 /// `shared_texture_cache` (presenter 側 `OpenSharedResource1` キャッシュ) の上限。
@@ -208,6 +211,8 @@ pub struct NativeVideoPresenter {
     /// (= handle 値再利用による前動画フレーム混入の防止)。
     shared_texture_cache: Vec<((u64, u64), ID3D11Texture2D)>,
     cpu_upload_scratch: Vec<u8>,
+    video_grade: crate::creative_lut::VideoGradeSnapshot,
+    grade_pipeline: Option<VideoGradePipeline>,
     pixel_probe_enabled: bool,
     pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
@@ -420,6 +425,10 @@ struct NativeEguiOverlay {
     hover_texture_key: Option<(u32, u32, u64)>,
     timeline_markers: Vec<NativeOverlayTimelineMarker>,
     jump_entries: Vec<NativeOverlayJumpEntry>,
+    video_adjustments: crate::creative_lut::VideoAdjustments,
+    creative_lut_choices: Arc<[crate::creative_lut::CreativeLutChoice]>,
+    video_left_panel_tab: NativeVideoLeftPanelTab,
+    video_adjustment_tab: NativeVideoAdjustmentTab,
     bookmark_title_edit: Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: Option<NativeBulkBookmarkDialog>,
     shortcut_help_open: bool,
@@ -1329,6 +1338,10 @@ pub enum NativeOverlayCommand {
         volume: f64,
         persist: bool,
     },
+    SetVideoAdjustments {
+        adjustments: crate::creative_lut::VideoAdjustments,
+        persist: bool,
+    },
     SetPlaybackSpeed {
         speed: f64,
     },
@@ -1909,6 +1922,8 @@ impl NativeVideoPresenter {
                 copy_fence_value: 0,
                 shared_texture_cache: Vec::new(),
                 cpu_upload_scratch: Vec::new(),
+                video_grade: crate::creative_lut::VideoGradeSnapshot::default(),
+                grade_pipeline: None,
                 pixel_probe_enabled: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE").is_some(),
                 pixel_probe_strict: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE_STRICT")
                     .is_some(),
@@ -2394,9 +2409,10 @@ impl NativeVideoPresenter {
             copy_call_ms: 0.0,
             copy_fence_value: 0,
         };
+        let grade_active = !self.video_grade.adjustments.is_identity();
         match &frame.data {
             VideoFrameData::Cpu(bytes) => {
-                let probe_this_frame = self.pixel_probe_due();
+                let probe_this_frame = !grade_active && self.pixel_probe_due();
                 let src_probe = if probe_this_frame {
                     Some(sample_cpu_rgba_pixel(
                         bytes,
@@ -2415,14 +2431,35 @@ impl NativeVideoPresenter {
                 )?;
                 unsafe {
                     let copy_call_t0 = Instant::now();
-                    self.d3d_context.UpdateSubresource(
-                        backbuffer,
-                        0,
-                        None,
-                        self.cpu_upload_scratch.as_ptr().cast(),
-                        frame.width.saturating_mul(4),
-                        0,
-                    );
+                    if grade_active {
+                        let pipeline = self.grade_pipeline.as_mut().ok_or_else(|| {
+                            "video grade is active but shader pipeline is missing".to_string()
+                        })?;
+                        let source = pipeline.upload_cpu_source(
+                            &self.d3d_device1,
+                            &self.d3d_context,
+                            &self.cpu_upload_scratch,
+                            frame.width,
+                            frame.height,
+                        )?;
+                        pipeline.draw(
+                            &self.d3d_device1,
+                            &self.d3d_context,
+                            &source,
+                            backbuffer,
+                            frame.width,
+                            frame.height,
+                        )?;
+                    } else {
+                        self.d3d_context.UpdateSubresource(
+                            backbuffer,
+                            0,
+                            None,
+                            self.cpu_upload_scratch.as_ptr().cast(),
+                            frame.width.saturating_mul(4),
+                            0,
+                        );
+                    }
                     metrics.copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
                     if probe_this_frame {
                         let backbuffer_probe =
@@ -2444,7 +2481,11 @@ impl NativeVideoPresenter {
                         }
                     }
                 }
-                metrics.path = "cpu_upload";
+                metrics.path = if grade_active {
+                    "cpu_upload_grade"
+                } else {
+                    "cpu_upload"
+                };
             }
             VideoFrameData::Gpu(gpu_frame) => {
                 if gpu_frame.ten_bit {
@@ -2456,7 +2497,7 @@ impl NativeVideoPresenter {
                 metrics.shared_handle = gpu_frame.shared_handle.0 as usize as u64;
                 metrics.shared_texture_gen = gpu_frame.shared_texture_gen;
                 metrics.fence_value = gpu_frame.fence_value;
-                let probe_this_frame = self.pixel_probe_due();
+                let probe_this_frame = !grade_active && self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
                 unsafe {
@@ -2485,31 +2526,45 @@ impl NativeVideoPresenter {
                     None
                 };
                 unsafe {
-                    let dst_res: ID3D11Resource = backbuffer
-                        .cast()
-                        .map_err(|e| format!("cast backbuffer resource: {e:?}"))?;
-                    let src_res: ID3D11Resource = src
-                        .cast()
-                        .map_err(|e| format!("cast source resource: {e:?}"))?;
-                    let copy_box = D3D11_BOX {
-                        left: 0,
-                        top: 0,
-                        front: 0,
-                        right: gpu_frame.width,
-                        bottom: gpu_frame.height,
-                        back: 1,
-                    };
                     let copy_call_t0 = Instant::now();
-                    self.d3d_context.CopySubresourceRegion(
-                        &dst_res,
-                        0,
-                        0,
-                        0,
-                        0,
-                        &src_res,
-                        0,
-                        Some(&copy_box),
-                    );
+                    if grade_active {
+                        let pipeline = self.grade_pipeline.as_ref().ok_or_else(|| {
+                            "video grade is active but shader pipeline is missing".to_string()
+                        })?;
+                        pipeline.draw(
+                            &self.d3d_device1,
+                            &self.d3d_context,
+                            &src,
+                            backbuffer,
+                            frame.width,
+                            frame.height,
+                        )?;
+                    } else {
+                        let dst_res: ID3D11Resource = backbuffer
+                            .cast()
+                            .map_err(|e| format!("cast backbuffer resource: {e:?}"))?;
+                        let src_res: ID3D11Resource = src
+                            .cast()
+                            .map_err(|e| format!("cast source resource: {e:?}"))?;
+                        let copy_box = D3D11_BOX {
+                            left: 0,
+                            top: 0,
+                            front: 0,
+                            right: gpu_frame.width,
+                            bottom: gpu_frame.height,
+                            back: 1,
+                        };
+                        self.d3d_context.CopySubresourceRegion(
+                            &dst_res,
+                            0,
+                            0,
+                            0,
+                            0,
+                            &src_res,
+                            0,
+                            Some(&copy_box),
+                        );
+                    }
                     metrics.copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
                     if probe_this_frame {
                         let backbuffer_probe =
@@ -2531,7 +2586,11 @@ impl NativeVideoPresenter {
                         }
                     }
                 }
-                metrics.path = "d3d11_shared";
+                metrics.path = if grade_active {
+                    "d3d11_shared_grade"
+                } else {
+                    "d3d11_shared"
+                };
             }
         }
         // フレームコピー (UpdateSubresource / CopySubresourceRegion) を GPU タイムライン上で
@@ -3162,6 +3221,32 @@ impl NativeVideoPresenter {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_jump_entries(entries);
         }
+    }
+
+    pub fn set_video_grade(
+        &mut self,
+        mut grade: crate::creative_lut::VideoGradeSnapshot,
+    ) -> Result<(), String> {
+        grade.adjustments.sanitize();
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_video_grade(&grade);
+        }
+        if grade.adjustments.is_identity() {
+            self.video_grade = grade;
+            if let Some(pipeline) = self.grade_pipeline.as_mut() {
+                pipeline.update_grade(&self.d3d_device1, &self.d3d_context, &self.video_grade)?;
+            }
+            return Ok(());
+        }
+        if self.grade_pipeline.is_none() {
+            self.grade_pipeline = Some(VideoGradePipeline::new(&self.d3d_device1)?);
+        }
+        self.video_grade = grade;
+        self.grade_pipeline
+            .as_mut()
+            .expect("created above")
+            .update_grade(&self.d3d_device1, &self.d3d_context, &self.video_grade)?;
+        Ok(())
     }
 
     pub fn set_overlay_metadata(&mut self, metadata: Option<NativeOverlayMetadata>) {
@@ -4043,6 +4128,10 @@ impl NativeEguiOverlay {
             hover_texture_key: None,
             timeline_markers: Vec::new(),
             jump_entries: Vec::new(),
+            video_adjustments: crate::creative_lut::VideoAdjustments::default(),
+            creative_lut_choices: Arc::from([]),
+            video_left_panel_tab: NativeVideoLeftPanelTab::Jump,
+            video_adjustment_tab: NativeVideoAdjustmentTab::ColorTone,
             bookmark_title_edit: None,
             bulk_bookmark_dialog: None,
             shortcut_help_open: false,
@@ -4718,6 +4807,12 @@ impl NativeEguiOverlay {
             return;
         }
         self.jump_entries = entries;
+        self.dirty = true;
+    }
+
+    fn set_video_grade(&mut self, grade: &crate::creative_lut::VideoGradeSnapshot) {
+        self.video_adjustments = grade.adjustments.clone();
+        self.creative_lut_choices = grade.choices.clone();
         self.dirty = true;
     }
 
@@ -6091,6 +6186,10 @@ impl NativeEguiOverlay {
         let hover_preview_pinned = self.hover_preview_pinned;
         let timeline_markers = self.timeline_markers.clone();
         let jump_entries = self.jump_entries.clone();
+        let creative_lut_choices = self.creative_lut_choices.clone();
+        let mut video_adjustments = self.video_adjustments.clone();
+        let mut video_left_panel_tab = self.video_left_panel_tab;
+        let mut video_adjustment_tab = self.video_adjustment_tab;
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
@@ -6493,7 +6592,7 @@ impl NativeEguiOverlay {
                 );
             }
             if jump_panel_visible {
-                let close_left = draw_native_jump_panel(
+                let close_left = draw_native_video_left_panel(
                     ctx,
                     overlay_height_points,
                     position_secs,
@@ -6502,6 +6601,10 @@ impl NativeEguiOverlay {
                     shortcut_labels,
                     &mut bookmark_title_edit,
                     &mut bulk_bookmark_dialog,
+                    &mut video_left_panel_tab,
+                    &mut video_adjustment_tab,
+                    &mut video_adjustments,
+                    &creative_lut_choices,
                     &mut commands,
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
                 );
@@ -7891,6 +7994,9 @@ impl NativeEguiOverlay {
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;
         self.bulk_bookmark_dialog = bulk_bookmark_dialog;
+        self.video_left_panel_tab = video_left_panel_tab;
+        self.video_adjustment_tab = video_adjustment_tab;
+        self.video_adjustments = video_adjustments;
         self.shortcut_help_open = shortcut_help_open;
         self.maybe_claim_text_input_focus();
         self.top_bar_visible = top_bar_visible || side_panel_visible;

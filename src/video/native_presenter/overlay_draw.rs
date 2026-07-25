@@ -426,7 +426,20 @@ const VIDEO_JUMP_PANEL_OPTIONS: NativeJumpPanelOptions<'static> = NativeJumpPane
     show_thumbnails: true,
 };
 
-pub(super) fn draw_native_jump_panel(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NativeVideoLeftPanelTab {
+    Jump,
+    Adjustment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NativeVideoAdjustmentTab {
+    ColorTone,
+    Filter,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_native_video_left_panel(
     ctx: &egui::Context,
     overlay_height_points: f32,
     position_secs: f64,
@@ -435,6 +448,10 @@ pub(super) fn draw_native_jump_panel(
     shortcut_labels: Option<&NativeOverlayShortcutLabels>,
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: &mut Option<NativeBulkBookmarkDialog>,
+    panel_tab: &mut NativeVideoLeftPanelTab,
+    adjustment_tab: &mut NativeVideoAdjustmentTab,
+    adjustments: &mut crate::creative_lut::VideoAdjustments,
+    creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
 ) -> bool {
@@ -446,19 +463,85 @@ pub(super) fn draw_native_jump_panel(
         .fixed_pos(panel_rect.min)
         .show(ctx, |ui| {
             ui.set_min_size(panel_rect.size());
-            draw_native_jump_panel_body(
-                ui,
+            let painter = ui.painter().clone();
+            painter.rect_filled(
                 panel_rect,
-                &VIDEO_JUMP_PANEL_OPTIONS,
-                if click_to_show { 32.0 } else { 0.0 },
-                position_secs,
-                entries,
-                jump_texture_ids,
-                shortcut_labels,
-                bookmark_title_edit,
-                bulk_bookmark_dialog,
-                commands,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(14, 14, 18, 232),
             );
+            painter.line_segment(
+                [panel_rect.right_top(), panel_rect.right_bottom()],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55),
+                ),
+            );
+            let tab_y = panel_rect.min.y + 6.0;
+            let close_reserved = if click_to_show { 32.0 } else { 0.0 };
+            let tab_gap = 4.0;
+            let tab_width =
+                ((panel_rect.width() - 20.0 - close_reserved - tab_gap) * 0.5).max(70.0);
+            for (index, (tab, label)) in [
+                (NativeVideoLeftPanelTab::Jump, "ジャンプ"),
+                (NativeVideoLeftPanelTab::Adjustment, "画像補正"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        panel_rect.min.x + 10.0 + index as f32 * (tab_width + tab_gap),
+                        tab_y,
+                    ),
+                    egui::vec2(tab_width, 24.0),
+                );
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new(("native_video_left_panel_tab", index)),
+                    egui::Sense::click(),
+                );
+                draw_overlay_button_bg(&painter, rect, response.hovered(), *panel_tab == tab);
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(12.0),
+                    if *panel_tab == tab {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_gray(190)
+                    },
+                );
+                if response.clicked() {
+                    *panel_tab = tab;
+                }
+            }
+
+            let content_rect =
+                egui::Rect::from_min_max(panel_rect.min + egui::vec2(0.0, 36.0), panel_rect.max);
+            match *panel_tab {
+                NativeVideoLeftPanelTab::Jump => draw_native_jump_panel_body(
+                    ui,
+                    content_rect,
+                    &VIDEO_JUMP_PANEL_OPTIONS,
+                    0.0,
+                    position_secs,
+                    entries,
+                    jump_texture_ids,
+                    shortcut_labels,
+                    bookmark_title_edit,
+                    bulk_bookmark_dialog,
+                    commands,
+                ),
+                NativeVideoLeftPanelTab::Adjustment => draw_native_video_adjustment_body(
+                    ui,
+                    content_rect,
+                    adjustment_tab,
+                    adjustments,
+                    creative_luts,
+                    commands,
+                ),
+            }
             if click_to_show {
                 let close_rect = egui::Rect::from_min_size(
                     panel_rect.right_top() + egui::vec2(-30.0, 6.0),
@@ -471,10 +554,270 @@ pub(super) fn draw_native_jump_panel(
                 );
                 draw_overlay_button_bg(ui.painter(), close_rect, response.hovered(), false);
                 draw_overlay_close_icon(ui.painter(), close_rect);
-                close_clicked = response.on_hover_text("ジャンプパネルを閉じる").clicked();
+                close_clicked = response.on_hover_text("左パネルを閉じる").clicked();
             }
         });
     close_clicked
+}
+
+fn draw_native_video_adjustment_body(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    tab: &mut NativeVideoAdjustmentTab,
+    adjustments: &mut crate::creative_lut::VideoAdjustments,
+    creative_luts: &[crate::creative_lut::CreativeLutChoice],
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let painter = ui.painter().clone();
+    let _ = ui.interact(
+        rect,
+        egui::Id::new("native_video_adjustment_panel_bg"),
+        egui::Sense::click(),
+    );
+    let tab_gap = 4.0;
+    let tab_width = ((rect.width() - 24.0 - tab_gap) * 0.5).max(80.0);
+    for (index, (value, label)) in [
+        (NativeVideoAdjustmentTab::ColorTone, "色調"),
+        (NativeVideoAdjustmentTab::Filter, "フィルタ"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tab_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(10.0 + index as f32 * (tab_width + tab_gap), 6.0),
+            egui::vec2(tab_width, 24.0),
+        );
+        let response = ui.interact(
+            tab_rect,
+            egui::Id::new(("native_video_adjustment_tab", index)),
+            egui::Sense::click(),
+        );
+        draw_overlay_button_bg(&painter, tab_rect, response.hovered(), *tab == value);
+        painter.text(
+            tab_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            if *tab == value {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_gray(190)
+            },
+        );
+        if response.clicked() {
+            *tab = value;
+        }
+    }
+
+    let body_rect = egui::Rect::from_min_max(
+        rect.min + egui::vec2(10.0, 38.0),
+        rect.max - egui::vec2(8.0, 0.0),
+    );
+    let mut body = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    let mut changed = false;
+    let mut persist = false;
+    egui::ScrollArea::vertical()
+        .id_salt("native_video_adjustment_scroll")
+        .auto_shrink([false; 2])
+        .max_height(body_rect.height())
+        .show(&mut body, |ui| {
+            ui.set_width((body_rect.width() - 12.0).max(120.0));
+            match *tab {
+                NativeVideoAdjustmentTab::ColorTone => {
+                    let defaults = crate::creative_lut::VideoAdjustments::default();
+                    video_grade_slider(
+                        ui,
+                        "明るさ",
+                        &mut adjustments.brightness,
+                        -100.0..=100.0,
+                        defaults.brightness,
+                        &mut changed,
+                        &mut persist,
+                    );
+                    video_grade_slider(
+                        ui,
+                        "コントラスト",
+                        &mut adjustments.contrast,
+                        -100.0..=100.0,
+                        defaults.contrast,
+                        &mut changed,
+                        &mut persist,
+                    );
+                    video_grade_slider(
+                        ui,
+                        "ガンマ",
+                        &mut adjustments.gamma,
+                        0.2..=5.0,
+                        defaults.gamma,
+                        &mut changed,
+                        &mut persist,
+                    );
+                    video_grade_slider(
+                        ui,
+                        "彩度",
+                        &mut adjustments.saturation,
+                        -100.0..=100.0,
+                        defaults.saturation,
+                        &mut changed,
+                        &mut persist,
+                    );
+                    video_grade_slider(
+                        ui,
+                        "色温度",
+                        &mut adjustments.temperature,
+                        -100.0..=100.0,
+                        defaults.temperature,
+                        &mut changed,
+                        &mut persist,
+                    );
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("レベル補正").strong());
+                    let mut black = adjustments.black_point as f32;
+                    video_grade_slider(
+                        ui,
+                        "黒点",
+                        &mut black,
+                        0.0..=254.0,
+                        defaults.black_point as f32,
+                        &mut changed,
+                        &mut persist,
+                    );
+                    adjustments.black_point = black.round() as u8;
+                    let mut white = adjustments.white_point as f32;
+                    video_grade_slider(
+                        ui,
+                        "白点",
+                        &mut white,
+                        1.0..=255.0,
+                        defaults.white_point as f32,
+                        &mut changed,
+                        &mut persist,
+                    );
+                    adjustments.white_point = white.round() as u8;
+                    video_grade_slider(
+                        ui,
+                        "中間点",
+                        &mut adjustments.midtone,
+                        0.1..=10.0,
+                        defaults.midtone,
+                        &mut changed,
+                        &mut persist,
+                    );
+                }
+                NativeVideoAdjustmentTab::Filter => {
+                    ui.label(egui::RichText::new("Creative LUT").strong());
+                    ui.label(
+                        egui::RichText::new("環境設定 > 表示 > LUT で登録した .cube を適用")
+                            .small()
+                            .weak(),
+                    );
+                    let selected_name = adjustments
+                        .creative_lut
+                        .id
+                        .and_then(|id| creative_luts.iter().find(|entry| entry.id == id))
+                        .map(|entry| entry.name.as_str())
+                        .unwrap_or_else(|| {
+                            if adjustments.creative_lut.id.is_some() {
+                                "（未登録）"
+                            } else {
+                                "なし"
+                            }
+                        });
+                    let before = adjustments.creative_lut.id;
+                    egui::ComboBox::from_id_salt("native_video_creative_lut")
+                        .selected_text(selected_name)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut adjustments.creative_lut.id, None, "なし");
+                            for entry in creative_luts {
+                                ui.selectable_value(
+                                    &mut adjustments.creative_lut.id,
+                                    Some(entry.id),
+                                    &entry.name,
+                                )
+                                .on_hover_text(&entry.path);
+                            }
+                        });
+                    if adjustments.creative_lut.id != before {
+                        changed = true;
+                        persist = true;
+                    }
+                    if let Some(id) = adjustments.creative_lut.id {
+                        ui.horizontal(|ui| {
+                            ui.label("適用量");
+                            if (adjustments.creative_lut.strength - 1.0).abs() > 0.001
+                                && ui.small_button("↩").clicked()
+                            {
+                                adjustments.creative_lut.strength = 1.0;
+                                changed = true;
+                                persist = true;
+                            }
+                        });
+                        let mut percent = adjustments.creative_lut.strength * 100.0;
+                        let response =
+                            ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"));
+                        if response.changed() {
+                            adjustments.creative_lut.strength = percent / 100.0;
+                            changed = true;
+                        }
+                        persist |=
+                            response.drag_stopped() || (response.changed() && !response.dragged());
+                        if let Some(choice) = creative_luts.iter().find(|entry| entry.id == id) {
+                            if let Some(error) = choice.error.as_deref() {
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    egui::RichText::new(format!("LUTを読み込めません: {error}"))
+                                        .small(),
+                                );
+                            } else if !choice.loaded {
+                                ui.label(egui::RichText::new("LUTを読み込み中…").small().weak());
+                            }
+                        }
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            if ui.button("すべてリセット").clicked() {
+                *adjustments = crate::creative_lut::VideoAdjustments::default();
+                changed = true;
+                persist = true;
+            }
+        });
+    adjustments.sanitize();
+    if changed || persist {
+        commands.push(NativeOverlayCommand::SetVideoAdjustments {
+            adjustments: adjustments.clone(),
+            persist,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn video_grade_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    default: f32,
+    changed: &mut bool,
+    persist: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if (*value - default).abs() > 0.001 && ui.small_button("↩").clicked() {
+            *value = default;
+            *changed = true;
+            *persist = true;
+        }
+    });
+    let response = ui.add(egui::Slider::new(value, range));
+    *changed |= response.changed();
+    *persist |= response.drag_stopped() || (response.changed() && !response.dragged());
 }
 
 /// ジャンプ / ブックマークパネルの本体描画 (背景 + ヘッダボタン + スクロール一覧)。
@@ -5845,6 +6188,92 @@ pub(super) fn layout_truncated_to_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_video_adjustment_panel(
+        name: &str,
+        adjustment_tab: NativeVideoAdjustmentTab,
+        mut adjustments: crate::creative_lut::VideoAdjustments,
+        creative_luts: Vec<crate::creative_lut::CreativeLutChoice>,
+    ) {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut panel_tab = NativeVideoLeftPanelTab::Adjustment;
+        let mut adjustment_tab = adjustment_tab;
+        let mut bookmark_title_edit = None;
+        let mut bulk_bookmark_dialog = None;
+        let entries = Vec::new();
+        let jump_texture_ids = HashMap::new();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(340.0, 650.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |_| {});
+                let mut commands = Vec::new();
+                draw_native_video_left_panel(
+                    ctx,
+                    650.0,
+                    0.0,
+                    &entries,
+                    &jump_texture_ids,
+                    None,
+                    &mut bookmark_title_edit,
+                    &mut bulk_bookmark_dialog,
+                    &mut panel_tab,
+                    &mut adjustment_tab,
+                    &mut adjustments,
+                    &creative_luts,
+                    &mut commands,
+                    false,
+                );
+            });
+
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn native_video_adjustment_tone_panel_snapshot() {
+        snapshot_video_adjustment_panel(
+            "native_video_adjustment_tone_panel",
+            NativeVideoAdjustmentTab::ColorTone,
+            crate::creative_lut::VideoAdjustments {
+                brightness: 18.0,
+                saturation: 12.0,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    fn native_video_adjustment_lut_panel_snapshot() {
+        let lut_id = uuid::Uuid::from_u128(1);
+        snapshot_video_adjustment_panel(
+            "native_video_adjustment_lut_panel",
+            NativeVideoAdjustmentTab::Filter,
+            crate::creative_lut::VideoAdjustments {
+                creative_lut: crate::creative_lut::CreativeLutSelection {
+                    id: Some(lut_id),
+                    strength: 0.75,
+                },
+                ..Default::default()
+            },
+            vec![crate::creative_lut::CreativeLutChoice {
+                id: lut_id,
+                name: "Cinematic Warm".to_string(),
+                path: r"C:\LUT\Cinematic Warm.cube".to_string(),
+                loaded: true,
+                error: None,
+            }],
+        );
+    }
 
     /// Snapshot シナリオで使う `NativeOverlayJumpEntry` を最小フィールドだけで組み立てる。
     /// thumbnail は None (= 表示しないテスト)、bookmark_id も None (= 任意)。

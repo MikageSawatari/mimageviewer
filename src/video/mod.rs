@@ -324,6 +324,8 @@ pub struct NativeVideoOutputConfig {
     pub text_contrast: crate::settings::TextContrast,
     /// main egui Context と native HUD で共有する UI フォント。
     pub ui_font: crate::settings::UiFontSettings,
+    /// Viewer-wide tone controls and registered Creative LUT snapshot.
+    pub video_grade: crate::creative_lut::VideoGradeSnapshot,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -439,6 +441,10 @@ pub enum NativeVideoOutputEvent {
     ToggleContinuous,
     SetVolume {
         volume: f64,
+        persist: bool,
+    },
+    SetVideoAdjustments {
+        adjustments: crate::creative_lut::VideoAdjustments,
         persist: bool,
     },
     SetPlaybackSpeed {
@@ -557,6 +563,9 @@ enum NativeVideoOutputCommand {
     },
     SetJumpEntries {
         entries: Vec<native_presenter::NativeOverlayJumpEntry>,
+    },
+    SetVideoGrade {
+        grade: crate::creative_lut::VideoGradeSnapshot,
     },
     SetMetadata {
         metadata: Option<native_presenter::NativeOverlayMetadata>,
@@ -1020,6 +1029,13 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetJumpEntries { entries });
+    }
+
+    fn set_video_grade(&self, grade: crate::creative_lut::VideoGradeSnapshot) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVideoGrade { grade });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
     fn set_metadata(&self, metadata: Option<native_presenter::NativeOverlayMetadata>) {
@@ -1689,6 +1705,13 @@ fn send_native_overlay_command(
         Command::SetVolume { volume, persist } => {
             NativeVideoOutputEvent::SetVolume { volume, persist }
         }
+        Command::SetVideoAdjustments {
+            adjustments,
+            persist,
+        } => NativeVideoOutputEvent::SetVideoAdjustments {
+            adjustments,
+            persist,
+        },
         Command::SetPlaybackSpeed { speed } => NativeVideoOutputEvent::SetPlaybackSpeed { speed },
         Command::CopyFrameToClipboard => NativeVideoOutputEvent::CopyFrameToClipboard,
         Command::FrameStep { direction } => NativeVideoOutputEvent::FrameStep { direction },
@@ -2046,6 +2069,7 @@ fn run_native_video_output(
     let mut cur_continuous_mode: Option<VideoContinuousMode> = None;
     let mut cur_video_compact: Option<bool> = None;
     let mut cur_fallback_file_name = config.fallback_file_name.clone();
+    let mut cur_video_grade = config.video_grade.clone();
     fn publish_presenter_window(
         window: &crate::video::native_window::NativeVideoWindow,
         hwnd_out: &Arc<AtomicU64>,
@@ -2120,6 +2144,7 @@ fn run_native_video_output(
     }
     let run_started = Instant::now();
     presenter.set_overlay_vst3_available(config.vst3_available);
+    presenter.set_video_grade(cur_video_grade.clone())?;
     presenter.set_overlay_audio_only(config.audio_only);
     presenter.set_overlay_checked(config.checked);
     presenter.set_overlay_fallback_file_name(cur_fallback_file_name.clone());
@@ -2467,6 +2492,14 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetJumpEntries { entries } => {
                     presenter.set_overlay_jump_entries(entries);
+                }
+                NativeVideoOutputCommand::SetVideoGrade { grade } => {
+                    cur_video_grade = grade;
+                    if let Err(error) = presenter.set_video_grade(cur_video_grade.clone()) {
+                        crate::logger::log(format!(
+                            "[native-video] Creative LUT shader update failed: {error}"
+                        ));
+                    }
                 }
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
                     presenter.set_overlay_metadata(metadata);
@@ -2935,6 +2968,13 @@ fn run_native_video_output(
                                             cur_vst3_available
                                                 && placement.is_fullscreen_borderless(),
                                         );
+                                        if let Err(error) =
+                                            new_presenter.set_video_grade(cur_video_grade.clone())
+                                        {
+                                            crate::logger::log(format!(
+                                                "[native-video] Creative LUT shader restore failed: {error}"
+                                            ));
+                                        }
                                         new_presenter.set_overlay_hud_dimmed(cur_hud_dimmed);
                                         new_presenter.set_overlay_checked(cur_checked);
                                         new_presenter.set_overlay_fallback_file_name(
@@ -3575,6 +3615,19 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::SetVolume { volume, persist },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetVideoAdjustments {
+                                adjustments,
+                                persist,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetVideoAdjustments {
+                                        adjustments,
+                                        persist,
+                                    },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetPlaybackSpeed {
@@ -6013,6 +6066,13 @@ impl VideoPlayer {
     pub fn set_native_jump_entries(&self, entries: Vec<native_presenter::NativeOverlayJumpEntry>) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_jump_entries(entries);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_video_grade(&self, grade: crate::creative_lut::VideoGradeSnapshot) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_video_grade(grade);
         }
     }
 

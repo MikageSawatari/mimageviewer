@@ -90,6 +90,8 @@ pub(crate) enum PreferencesPage {
     Thumbnail,
     Slideshow,
     Capture,
+    /// 静止画・動画で共用する Creative 3D LUT (.cube) の登録
+    CreativeLut,
     MenuLayout,
     Parallelism,
     Prefetch,
@@ -134,6 +136,7 @@ impl PreferencesPage {
             Self::Thumbnail => "サムネイル",
             Self::Slideshow => "スライドショー",
             Self::Capture => "キャプチャ保存",
+            Self::CreativeLut => "LUT",
             Self::MenuLayout => "メニュー構成",
             Self::Parallelism => "並列読み込み",
             Self::Prefetch => "先読み",
@@ -360,6 +363,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::SpreadMode,
             PreferencesPage::Slideshow,
             PreferencesPage::Capture,
+            PreferencesPage::CreativeLut,
             PreferencesPage::MenuLayout,
         ],
     },
@@ -436,6 +440,13 @@ pub(crate) struct PreferencesState {
     pub ui_font_preview_ready_key: Option<String>,
     pub ui_font_preview_requested_at: Option<std::time::Instant>,
     pub ui_font_preview_error: Option<String>,
+    /// `.cube` の検証は UI スレッド外で行う。
+    pub creative_lut_import_rx: Option<
+        std::sync::mpsc::Receiver<
+            Result<(std::path::PathBuf, local_adjust_core::CubeLutParams), String>,
+        >,
+    >,
+    pub creative_lut_message: Option<String>,
 
     // ページ固有の一時状態
     pub manual_threads: usize,
@@ -662,6 +673,8 @@ impl PreferencesState {
             ui_font_preview_ready_key: None,
             ui_font_preview_requested_at: None,
             ui_font_preview_error: None,
+            creative_lut_import_rx: None,
+            creative_lut_message: None,
             manual_threads,
             capture_output_dir_input: s
                 .capture_output_dir
@@ -945,6 +958,62 @@ impl PreferencesState {
         self.ui_font_preview_error.is_none()
             && self.ui_font_preview_ready_key.as_deref()
                 == Some(ui_font_settings_key(&self.settings.ui_font).as_str())
+    }
+
+    pub(super) fn start_creative_lut_import(
+        &mut self,
+        path: std::path::PathBuf,
+        ctx: &egui::Context,
+    ) {
+        if self.creative_lut_import_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.creative_lut_import_rx = Some(rx);
+        self.creative_lut_message = Some("LUTを確認しています…".to_string());
+        let repaint = ctx.clone();
+        let worker_path = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("creative-lut-import".to_string())
+            .spawn(move || {
+                let result =
+                    crate::creative_lut::load_cube_file(&worker_path).map(|lut| (worker_path, lut));
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            });
+        if let Err(error) = spawned {
+            self.creative_lut_import_rx = None;
+            self.creative_lut_message = Some(format!("LUTの確認を開始できませんでした: {error}"));
+        }
+    }
+
+    pub(super) fn poll_creative_lut_import(&mut self) {
+        let Some(rx) = self.creative_lut_import_rx.as_ref() else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.creative_lut_import_rx = None;
+        match result {
+            Ok((path, lut)) => {
+                if self
+                    .settings
+                    .creative_luts
+                    .iter()
+                    .any(|entry| entry.path == path)
+                {
+                    self.creative_lut_message =
+                        Some("このLUTファイルはすでに登録されています。".to_string());
+                } else {
+                    let entry = crate::creative_lut::CreativeLutEntry::from_loaded_path(path, &lut);
+                    let name = entry.name.clone();
+                    self.settings.creative_luts.push(entry);
+                    self.creative_lut_message = Some(format!("「{name}」を追加しました。"));
+                }
+            }
+            Err(error) => self.creative_lut_message = Some(error),
+        }
     }
 }
 
@@ -1277,6 +1346,7 @@ impl App {
                 let old_fullscreen_side_panel_mode =
                     self.settings.fullscreen_side_panel_mode.normalized();
                 let old_ui_font = self.settings.ui_font.clone();
+                let old_creative_luts = self.settings.creative_luts.clone();
 
                 // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
                 // 無効化トリガに使う)
@@ -1336,6 +1406,28 @@ impl App {
                     .reading_history_limit
                     .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
                 self.settings = state.settings;
+                if old_creative_luts != self.settings.creative_luts {
+                    if self
+                        .settings
+                        .video_adjustments
+                        .creative_lut
+                        .id
+                        .is_some_and(|id| {
+                            !self
+                                .settings
+                                .creative_luts
+                                .iter()
+                                .any(|entry| entry.id == id)
+                        })
+                    {
+                        self.settings.video_adjustments.creative_lut.id = None;
+                    }
+                    self.creative_lut_library
+                        .reload(&self.settings.creative_luts);
+                    self.clear_all_final_pipeline_caches();
+                    #[cfg(windows)]
+                    self.sync_native_video_grade();
+                }
                 if old_ui_font != self.settings.ui_font {
                     #[cfg(windows)]
                     {
@@ -2188,6 +2280,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
         PreferencesPage::Capture => page_capture(ui, state),
+        PreferencesPage::CreativeLut => page_creative_lut(ui, state),
         PreferencesPage::MenuLayout => page_menu_layout(ui, state),
         PreferencesPage::Parallelism => page_parallelism(ui, state),
         PreferencesPage::Prefetch => page_prefetch(ui, state),

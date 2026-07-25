@@ -296,6 +296,10 @@ pub struct AdjustParams {
     /// ポストフィルタ (レトロ系表示エフェクト)。デフォルト = None
     #[serde(default)]
     pub post_filter: PostFilter,
+    /// デコード後の見た目に適用する Creative 3D LUT。入力色空間変換には使わない。
+    /// サムネイルには反映せず、最終表示・コピー・書き出しの final pixels にだけ適用する。
+    #[serde(default)]
+    pub creative_lut: crate::creative_lut::CreativeLutSelection,
     /// モノクロ系画像の専用カラー化。最終 AI / スマートシャープ後、
     /// `post_filter` 前に適用する。サムネイルには反映しない。
     #[serde(default)]
@@ -332,6 +336,7 @@ impl Default for AdjustParams {
             upscale_model: None,
             denoise_model: None,
             post_filter: PostFilter::None,
+            creative_lut: crate::creative_lut::CreativeLutSelection::default(),
             colorize: crate::colorize::ColorizeParams::default(),
             smart_sharpen: 0,
         }
@@ -357,6 +362,7 @@ struct AdjustParamsWire {
     upscale_model: Option<String>,
     denoise_model: Option<String>,
     post_filter: PostFilter,
+    creative_lut: crate::creative_lut::CreativeLutSelection,
     colorize: crate::colorize::ColorizeParams,
     smart_sharpen: u8,
 }
@@ -377,6 +383,7 @@ impl Default for AdjustParamsWire {
             upscale_model: params.upscale_model,
             denoise_model: params.denoise_model,
             post_filter: params.post_filter,
+            creative_lut: params.creative_lut,
             colorize: params.colorize,
             smart_sharpen: params.smart_sharpen,
         }
@@ -406,6 +413,8 @@ impl From<AdjustParamsWire> for AdjustParams {
             other => other,
         };
         colorize.sanitize();
+        let mut creative_lut = wire.creative_lut;
+        creative_lut.sanitize();
         Self {
             brightness: wire.brightness,
             contrast: wire.contrast,
@@ -419,6 +428,7 @@ impl From<AdjustParamsWire> for AdjustParams {
             upscale_model: wire.upscale_model,
             denoise_model: wire.denoise_model,
             post_filter,
+            creative_lut,
             colorize,
             smart_sharpen: wire.smart_sharpen.min(100),
         }
@@ -430,6 +440,7 @@ impl AdjustParams {
     pub fn is_identity(&self) -> bool {
         self.is_color_identity()
             && self.post_filter == PostFilter::None
+            && self.creative_lut.is_identity()
             && !self.colorize.is_enabled()
             && self.smart_sharpen == 0
     }
@@ -482,7 +493,8 @@ impl AdjustParams {
             && self.auto_mode == other.auto_mode
     }
 
-    /// other との差分が final 専用フィールド (`post_filter` / `colorize` / `smart_sharpen`)
+    /// other との差分が final 専用フィールド
+    /// (`post_filter` / `creative_lut` / `colorize` / `smart_sharpen`)
     /// のみ (または差分なし) か。
     /// これらは final pipeline の final AI より後段にしか効かないので、変更時に
     /// final AI cache を保持したまま再合成だけで済ませられる
@@ -491,6 +503,7 @@ impl AdjustParams {
     pub fn differs_only_in_final_stage(&self, other: &Self) -> bool {
         let mut probe = self.clone();
         probe.post_filter = other.post_filter;
+        probe.creative_lut = other.creative_lut.clone();
         probe.colorize = other.colorize.clone();
         probe.smart_sharpen = other.smart_sharpen;
         probe == *other
@@ -1128,6 +1141,17 @@ mod tests {
     }
 
     #[test]
+    fn creative_lut_is_a_final_stage_only_difference() {
+        let base = AdjustParams::default();
+        let mut changed = base.clone();
+        changed.creative_lut.id = Some(uuid::Uuid::from_u128(1));
+        changed.creative_lut.strength = 0.75;
+        assert!(base.differs_only_in_final_stage(&changed));
+        assert!(base.color_settings_eq(&changed));
+        assert!(!changed.is_identity());
+    }
+
+    #[test]
     fn effective_smart_sharpen_always_skips_upscaled_output() {
         // AI アップスケール出力には固定でスキップ (設定なし)。
         // 非 AI 合成 (デノイズのみ / サイズ上限スキップ含む) には強度どおり掛ける。
@@ -1147,8 +1171,10 @@ mod tests {
         let mut value = serde_json::to_value(AdjustParams::default()).unwrap();
         let obj = value.as_object_mut().unwrap();
         obj.remove("smart_sharpen");
+        obj.remove("creative_lut");
         let loaded: AdjustParams = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(loaded.smart_sharpen, 0);
+        assert!(loaded.creative_lut.is_identity());
 
         // 開発期に存在した撤去済みフィールド (smart_sharpen_skip_after_ai) が
         // 残っている JSON も無視して読めること (serde は未知フィールドを許容)。

@@ -185,6 +185,8 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 - AI 関連: `upscale_model`, `denoise_model` (`Option<String>`)
 - **カラー化**: `colorize: ColorizeParams` (近モノクロ判定、階調パレット、
   スクリーントーン濃淡変換。final pipeline 専用)
+- **Creative LUT**: `creative_lut: CreativeLutSelection` (環境設定で登録した 3D `.cube` の
+  ID と適用量。入力色空間変換ではなく、最終的なルックを変える表示用 LUT)
 - **ポストフィルタ**: `post_filter: PostFilter` (レトロ系表示エフェクト、色調補正の後に適用)
 - **シャープ化**: `smart_sharpen: u8` (0 = OFF, 1..=100。最終表示段スマートシャープの強度。
   final pipeline 専用でサムネイルには反映しない。§2.7 と
@@ -210,7 +212,7 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 - `temperature != 0` なら f32 パイプライン (やや遅い)
 - v1.1.0 以降のフルスクリーン通常表示では、source 解像度の edit 結果
   (`edit_result_cache`) に色調補正を掛け、その後に final AI、スマートシャープ
-  (`smart_sharpen`、§2.7)、カラー化、最後に `post_filter::apply` を掛けて
+  (`smart_sharpen`、§2.7)、カラー化、Creative LUT、最後に `post_filter::apply` を掛けて
   `final_composite_cache` に格納する。
 
 ### 2.2 カラー化
@@ -269,6 +271,18 @@ AI 待ちの `complete=false` カラー化結果が先にできた場合は、�
 AI 完了後の再合成まで維持する。フォルダ横断の nav lock も raw / thumbnail や
 `complete=false` の到着だけでは解放せず、`complete=true` の final composite を待つ。
 サムネイル自体には適用しない。
+
+### 2.2.1 Creative 3D LUT
+
+環境設定の「表示 > LUT」で `LUT_3D_SIZE` を持つ `.cube` を登録し、画像補正パネルの
+「フィルタ」でページごとに選択する。登録情報は表示名・UUID・元ファイルのパスを Settings に
+保存する。元ファイル自体はアプリデータへコピーしないため、移動・削除後は読み込みエラーを
+パネルに表示する。ファイル読み込みと parse は `creative-lut-loader` worker で行い、UI thread
+では完成済みの immutable table だけを参照する。
+
+LUT はカラー化の後、既存ポストフィルタの前に適用し、元画素との混合量を 0〜100% で指定できる。
+サムネイルには反映しない。これは Log / HLG などを表示色へ変換する入力 LUT ではなく、すでに
+通常表示できる画像へルックを加える Creative LUT 専用である。1D LUT は登録時に拒否する。
 
 旧 JSON の `post_filter = pseudo_color4` / `pseudo_color_skin` は読み込み時に
 `ColorizeParams` へ変換し、旧挙動維持のため移行時だけ `AllImages` にする。旧キーマップ名と

@@ -250,6 +250,20 @@ pub(super) fn apply_normalize_gain_with_perf(
 
 impl App {
     #[cfg(windows)]
+    pub(crate) fn sync_native_video_grade(&mut self) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        let grade = self.creative_lut_library.video_snapshot(
+            &self.settings.creative_luts,
+            &self.settings.video_adjustments,
+        );
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_video_grade(grade);
+        }
+    }
+
+    #[cfg(windows)]
     fn video_mtime_secs(path: &std::path::Path) -> i64 {
         video_mtime_secs_for_resume_thumb(path)
     }
@@ -3106,6 +3120,7 @@ impl App {
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
+                    | crate::video::NativeVideoOutputEvent::SetVideoAdjustments { .. }
             ) {
                 // fall through: NavigateItem は dispatch 続行
             } else {
@@ -3269,6 +3284,18 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::SetVolume { volume, persist } => {
                 self.handle_native_video_set_volume_command(ctx, fs_idx, volume, persist);
+            }
+            crate::video::NativeVideoOutputEvent::SetVideoAdjustments {
+                mut adjustments,
+                persist,
+            } => {
+                adjustments.sanitize();
+                self.settings.video_adjustments = adjustments;
+                self.sync_native_video_grade();
+                if persist {
+                    self.settings.save();
+                }
+                self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::SetPlaybackSpeed { speed } => {
                 self.handle_video_playback_speed_command(ctx, fs_idx, speed);
@@ -7073,6 +7100,10 @@ impl App {
             self.settings.fullscreen_cursor_hide_delay_secs,
             Some(self.dsp_bridge.editor_hwnds_snapshot()),
             self.main_hwnd.unwrap_or(0) as u64,
+            self.creative_lut_library.video_snapshot(
+                &self.settings.creative_luts,
+                &self.settings.video_adjustments,
+            ),
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
             return;
@@ -7577,6 +7608,10 @@ impl App {
                 self.settings.fullscreen_cursor_hide_delay_secs,
                 Some(self.dsp_bridge.editor_hwnds_snapshot()),
                 self.main_hwnd.unwrap_or(0) as u64,
+                self.creative_lut_library.video_snapshot(
+                    &self.settings.creative_luts,
+                    &self.settings.video_adjustments,
+                ),
                 false,
             )
         });

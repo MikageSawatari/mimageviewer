@@ -3871,6 +3871,8 @@ fn hash_adjust_final_params(
         if !post_filter_bypassed {
             format!("{:?}", params.colorize).hash(h);
             format!("{:?}", params.post_filter).hash(h);
+            params.creative_lut.id.hash(h);
+            params.creative_lut.strength.to_bits().hash(h);
         }
         // 最終表示段スマートシャープ。post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も
         // 色調補正と同様に適用したままにするので、bypassed の条件外で hash する。
@@ -4743,6 +4745,7 @@ struct FinalEffectJob {
     adjust_before_effect: Option<crate::adjustment::AdjustParams>,
     smart_sharpen: u8,
     colorize: crate::colorize::ColorizeParams,
+    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
     post_filter: crate::adjustment::PostFilter,
 }
 
@@ -4784,10 +4787,20 @@ fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffect
     if cancel.load(Ordering::Relaxed) {
         return FinalEffectResult::Cancelled;
     }
-    let pixels = if job.post_filter != crate::adjustment::PostFilter::None {
-        Arc::new(crate::post_filter::apply(&colorized, job.post_filter))
+    let lut_applied = if let Some((lut, strength)) = job.creative_lut {
+        Arc::new(crate::creative_lut::apply_to_color_image(
+            &colorized, &lut, strength,
+        ))
     } else {
         colorized
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return FinalEffectResult::Cancelled;
+    }
+    let pixels = if job.post_filter != crate::adjustment::PostFilter::None {
+        Arc::new(crate::post_filter::apply(&lut_applied, job.post_filter))
+    } else {
+        lut_applied
     };
     if cancel.load(Ordering::Relaxed) {
         FinalEffectResult::Cancelled
@@ -6458,6 +6471,7 @@ pub struct App {
     /// 誤って起点にしない。表示中の一覧コンテキストと一緒に所有・交換する。
     pub(crate) grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
     pub(crate) settings: crate::settings::Settings,
+    pub(crate) creative_lut_library: crate::creative_lut::CreativeLutLibrary,
     pub(crate) keymap: crate::keymap::Keymap,
     pub(crate) gamepad: crate::gamepad::GamepadRuntime,
     pub(crate) gamepad_state: crate::gamepad::GamepadInputState,
@@ -10030,6 +10044,8 @@ impl App {
             keymap
         };
         keymap.install_global_native_video_shortcuts();
+        let creative_lut_library =
+            crate::creative_lut::CreativeLutLibrary::new(&settings.creative_luts);
 
         let mut app = Self {
             address: String::new(),
@@ -10040,6 +10056,7 @@ impl App {
             selected: None,
             grid_click_selection_anchor: None,
             settings,
+            creative_lut_library,
             keymap,
             gamepad: crate::gamepad::GamepadRuntime::new(),
             gamepad_state: crate::gamepad::GamepadInputState::default(),
@@ -44182,6 +44199,10 @@ impl App {
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                             Some(self.dsp_bridge.editor_hwnds_snapshot()),
                             self.main_hwnd.unwrap_or(0) as u64,
+                            self.creative_lut_library.video_snapshot(
+                                &self.settings.creative_luts,
+                                &self.settings.video_adjustments,
+                            ),
                             // 動画経路: 常に映像フレームを持つ。
                             false,
                         )
@@ -46722,7 +46743,14 @@ impl App {
         }
         for idx in self.ai_prefetch_targets(current_idx) {
             let params = self.effective_params(idx).clone();
-            if !params.colorize.is_enabled() {
+            let creative_lut = (!params.creative_lut.is_identity())
+                .then(|| {
+                    self.creative_lut_library
+                        .get(params.creative_lut.id)
+                        .map(|lut| (lut, params.creative_lut.strength))
+                })
+                .flatten();
+            if !params.colorize.is_enabled() && creative_lut.is_none() {
                 continue;
             }
             let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
@@ -46763,6 +46791,7 @@ impl App {
                 adjust_before_effect,
                 smart_sharpen: params.effective_smart_sharpen(used_upscale),
                 colorize: params.colorize.clone(),
+                creative_lut,
                 post_filter: params.post_filter,
             };
             if self.spawn_final_effect_job(ctx, final_key, job, true, true) {
@@ -47966,7 +47995,7 @@ impl App {
         self.cancel_comic_bake_for_idx(idx);
     }
 
-    fn clear_all_final_pipeline_caches(&mut self) {
+    pub(crate) fn clear_all_final_pipeline_caches(&mut self) {
         for pending in self.final_ai_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -50508,6 +50537,13 @@ impl App {
             adjust_before_effect: None,
             smart_sharpen: 0,
             colorize: params.colorize.clone(),
+            creative_lut: (!self.post_filter_bypassed && !params.creative_lut.is_identity())
+                .then(|| {
+                    self.creative_lut_library
+                        .get(params.creative_lut.id)
+                        .map(|lut| (lut, params.creative_lut.strength))
+                })
+                .flatten(),
             post_filter: params.post_filter,
         };
         let _ = self.spawn_final_effect_job(ctx, key, job, output_complete, false);
@@ -50611,7 +50647,13 @@ impl App {
         };
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
-        if !self.post_filter_bypassed && params.colorize.is_enabled() {
+        let creative_lut_active = !self.post_filter_bypassed
+            && !params.creative_lut.is_identity()
+            && self
+                .creative_lut_library
+                .get(params.creative_lut.id)
+                .is_some();
+        if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
             return self.start_final_effect_worker(ctx, final_key, params, sharpened, complete);
         }
 
@@ -50828,7 +50870,13 @@ impl App {
         };
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
-        if !self.post_filter_bypassed && params.colorize.is_enabled() {
+        let creative_lut_active = !self.post_filter_bypassed
+            && !params.creative_lut.is_identity()
+            && self
+                .creative_lut_library
+                .get(params.creative_lut.id)
+                .is_some();
+        if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
             return self.start_final_effect_worker(ctx, final_key, &params, sharpened, complete);
         }
 
@@ -57248,6 +57296,14 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
         self.edit_preview_repaint_ctx = Some(ctx.clone());
+        if self
+            .creative_lut_library
+            .poll(&self.settings.creative_luts, ctx)
+        {
+            self.clear_all_final_pipeline_caches();
+            #[cfg(windows)]
+            self.sync_native_video_grade();
+        }
         if let Some(render_state) = self.wgpu_render_state.as_ref() {
             render_state
                 .renderer
@@ -61384,6 +61440,7 @@ fn native_video_presenter_config(
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
     >,
     main_hwnd_for_raise: u64,
+    video_grade: crate::creative_lut::VideoGradeSnapshot,
     // 音声のみ native シェル (music Inc 6 ②) は true。present ループが frameless で回る
     // (§5.9 / Inc 6 ②-1)。動画経路は false。
     audio_only: bool,
@@ -61413,6 +61470,7 @@ fn native_video_presenter_config(
         ),
         editor_hwnds_snapshot,
         main_hwnd_for_raise,
+        video_grade,
         // in-main-window / detached では topmost な HUD overlay HWND を使わず、
         // presenter の DComp tree に egui overlay を載せる。fullscreen だけ
         // 従来どおり HUD HWND を有効化 (`MIV_HUD_OVERLAY=0` で off)。

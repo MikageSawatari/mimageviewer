@@ -127,7 +127,9 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 左右パネルの召喚方法は Settings の `FsSidePanelMode` を presenter overlay へ同期する。`Hover` は
 左右それぞれの edge-hover 二段ラッチ、`ClickToShow` は最端の細い callout bar のクリックを使う。
 右メタデータパネルは App の per-file `fs_click_info_open` を正本として presenter へ同期し、
-左ジャンプパネルは presenter-local な per-file 状態とする。新しい動画への source swap では左を
+左パネルは上段の「ジャンプ / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
+ジャンプの開閉と選択中タブは presenter-local な session 状態、色調と Creative LUT の値は
+viewer-wide な `Settings::video_adjustments` を正本とする。新しい動画への source swap では左を
 presenter 内で閉じ、右も App から false を同期する。
 callout は実際にクリックする UI なので、表示中の bar rect だけを HUD region に含める。
 動画↔音声モードの遷移も左右パネルの session 境界として扱い、presenter の左ジャンプ状態と
@@ -254,8 +256,21 @@ ID3D11Fence::Signal (共有 fence で blit 完了通知)
 NativeVideoPresenter (= 独立 HWND を持つ別スレッド)
     ├─ ID3D11Device::OpenSharedHandle で受信 → ID3D11Texture2D
     ├─ KEYEDMUTEX 取得 + Fence Wait で同期
-    └─ CopyResource → swap chain backbuffer → Present (DComp visual tree 内)
+    ├─ 補正なし: CopyResource → swap chain backbuffer
+    └─ 色調 / Creative LUT あり: D3D11 fullscreen shader → swap chain backbuffer
+         → Present (DComp visual tree 内)
 ```
+
+動画の Creative LUT は入力変換ではない。VideoProcessor が NV12 / P010 を SDR BGRA8 にした
+後段へ、明るさ・コントラスト・ガンマ・彩度・色温度・レベル補正、3D `.cube`、適用量の順で
+D3D11 pixel shader を掛ける。したがってカメラ Log 素材の本来の色管理や 10-bit 精度を保証する
+機能ではなく、通常再生できる映像の見た目を変えるプレビュー機能である。
+
+`.cube` のファイル読み込みと parse は App の worker が担当し、presenter command には
+`Arc<CubeLutParams>` と表示用選択肢だけを渡す。presenter thread はファイル I/O を行わない。
+補正がすべて既定値なら shader pipeline は遅延生成も実行もせず従来の copy path を維持する。
+補正中は GPU decode の共有テクスチャを SRV として直接 sample し、CPU decode 時だけ再利用可能な
+BGRA8 texture へ upload して同じ shader を通す。LUT table は RGBA32F 3D texture として保持する。
 
 #### 共有テクスチャ identity (`shared_texture_gen`) — handle 値再利用への防御
 
@@ -322,7 +337,9 @@ swscale (NV12/YUV → RGBA、CPU で 24MB allocation)
 [ video_tx (bounded mpsc) で native presenter thread へ ]
     ↓
 NativeVideoPresenter::present (CPU 経路ブランチ)
-    └─ ID3D11DeviceContext::UpdateSubresource で backbuffer に upload → Present
+    ├─ 補正なし: ID3D11DeviceContext::UpdateSubresource で backbuffer に upload
+    └─ 色調 / Creative LUT あり: shader-resource texture へ upload → fullscreen shader
+         → Present
 ```
 
 旧 egui 描画パス (`gpu_renderer::video_paint::VideoPaintCallback` /
@@ -355,7 +372,8 @@ src/video/
 ├── native_window.rs        # ネイティブ Win32 message loop + 入力イベント変換 (577 行)
 ├── native_presenter/       # ネイティブ DComp プレゼンター + egui overlay
 │   ├── mod.rs              # NativeVideoPresenter / NativeEguiOverlay impl (3900 行級)
-│   └── overlay_draw.rs     # native overlay 描画・layout helper (2300 行級)
+│   ├── overlay_draw.rs     # native overlay 描画・layout helper (2300 行級)
+│   └── grade_pipeline.rs   # D3D11 色調補正 + Creative 3D LUT fullscreen pass
 ├── gpu_renderer/           # decoder + native presenter の D3D11 共有基盤、unsafe を局所化
 │   ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, GpuVideoError, VideoColorHint
 │   ├── d3d11_device.rs     # D3D11 Device + VideoProcessor + Fence (1134 行)
