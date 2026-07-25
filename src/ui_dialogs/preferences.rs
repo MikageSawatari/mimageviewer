@@ -412,6 +412,68 @@ const TREE: &[TreeCategory] = &[
 
 // ── 一時編集状態 ────────────────────────────────────────────────
 
+enum CreativeLutTransactionState {
+    Editing {
+        created: HashSet<uuid::Uuid>,
+        removed: HashSet<uuid::Uuid>,
+    },
+    Committed,
+}
+
+struct CreativeLutTransaction {
+    state: CreativeLutTransactionState,
+}
+
+impl Default for CreativeLutTransaction {
+    fn default() -> Self {
+        Self {
+            state: CreativeLutTransactionState::Editing {
+                created: HashSet::new(),
+                removed: HashSet::new(),
+            },
+        }
+    }
+}
+
+impl CreativeLutTransaction {
+    fn reserve_created(&mut self, id: uuid::Uuid) {
+        if let CreativeLutTransactionState::Editing { created, .. } = &mut self.state {
+            created.insert(id);
+        }
+    }
+
+    fn forget_created(&mut self, id: uuid::Uuid) {
+        if let CreativeLutTransactionState::Editing { created, .. } = &mut self.state {
+            created.remove(&id);
+        }
+    }
+
+    fn mark_removed(&mut self, id: uuid::Uuid) {
+        if let CreativeLutTransactionState::Editing { removed, .. } = &mut self.state {
+            removed.insert(id);
+        }
+    }
+
+    fn commit(&mut self) {
+        let CreativeLutTransactionState::Editing { removed, .. } =
+            std::mem::replace(&mut self.state, CreativeLutTransactionState::Committed)
+        else {
+            return;
+        };
+        crate::creative_lut::remove_managed_creative_luts_async(removed.into_iter().collect());
+    }
+}
+
+impl Drop for CreativeLutTransaction {
+    fn drop(&mut self) {
+        if let CreativeLutTransactionState::Editing { created, .. } = &self.state {
+            crate::creative_lut::remove_managed_creative_luts_async(
+                created.iter().copied().collect(),
+            );
+        }
+    }
+}
+
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
@@ -442,11 +504,13 @@ pub(crate) struct PreferencesState {
     pub ui_font_preview_error: Option<String>,
     /// `.cube` の検証は UI スレッド外で行う。
     pub creative_lut_import_rx: Option<
-        std::sync::mpsc::Receiver<
-            Result<(std::path::PathBuf, local_adjust_core::CubeLutParams), String>,
-        >,
+        std::sync::mpsc::Receiver<(
+            uuid::Uuid,
+            Result<crate::creative_lut::CreativeLutImport, String>,
+        )>,
     >,
     pub creative_lut_message: Option<String>,
+    creative_lut_transaction: CreativeLutTransaction,
 
     // ページ固有の一時状態
     pub manual_threads: usize,
@@ -675,6 +739,7 @@ impl PreferencesState {
             ui_font_preview_error: None,
             creative_lut_import_rx: None,
             creative_lut_message: None,
+            creative_lut_transaction: CreativeLutTransaction::default(),
             manual_threads,
             capture_output_dir_input: s
                 .capture_output_dir
@@ -968,21 +1033,37 @@ impl PreferencesState {
         if self.creative_lut_import_rx.is_some() {
             return;
         }
+        if self
+            .settings
+            .creative_luts
+            .iter()
+            .any(|entry| !entry.is_builtin() && entry.path == path)
+        {
+            self.creative_lut_message =
+                Some("このLUTファイルはすでに登録されています。".to_string());
+            return;
+        }
+
+        let id = uuid::Uuid::new_v4();
         let (tx, rx) = std::sync::mpsc::channel();
         self.creative_lut_import_rx = Some(rx);
-        self.creative_lut_message = Some("LUTを確認しています…".to_string());
+        self.creative_lut_transaction.reserve_created(id);
+        self.creative_lut_message = Some("LUTを確認してアプリ内へコピーしています…".to_string());
         let repaint = ctx.clone();
-        let worker_path = path.clone();
         let spawned = std::thread::Builder::new()
             .name("creative-lut-import".to_string())
             .spawn(move || {
-                let result =
-                    crate::creative_lut::load_cube_file(&worker_path).map(|lut| (worker_path, lut));
-                let _ = tx.send(result);
+                let result = crate::creative_lut::import_managed_cube_file(&path, id);
+                if let Err(error) = tx.send((id, result))
+                    && error.0.1.is_ok()
+                {
+                    let _ = crate::creative_lut::remove_managed_creative_lut(id);
+                }
                 repaint.request_repaint();
             });
         if let Err(error) = spawned {
             self.creative_lut_import_rx = None;
+            self.creative_lut_transaction.forget_created(id);
             self.creative_lut_message = Some(format!("LUTの確認を開始できませんでした: {error}"));
         }
     }
@@ -995,25 +1076,45 @@ impl PreferencesState {
             return;
         };
         self.creative_lut_import_rx = None;
+        let (reserved_id, result) = result;
         match result {
-            Ok((path, lut)) => {
+            Ok(import) => {
                 if self
                     .settings
                     .creative_luts
                     .iter()
-                    .any(|entry| entry.path == path)
+                    .any(|entry| !entry.is_builtin() && entry.path == import.entry.path)
                 {
+                    self.creative_lut_transaction.mark_removed(import.entry.id);
                     self.creative_lut_message =
                         Some("このLUTファイルはすでに登録されています。".to_string());
                 } else {
-                    let entry = crate::creative_lut::CreativeLutEntry::from_loaded_path(path, &lut);
-                    let name = entry.name.clone();
-                    self.settings.creative_luts.push(entry);
-                    self.creative_lut_message = Some(format!("「{name}」を追加しました。"));
+                    let name = import.entry.name.clone();
+                    self.settings.creative_luts.push(import.entry);
+                    self.creative_lut_message =
+                        Some(format!("「{name}」をアプリ内へコピーして追加しました。"));
                 }
             }
-            Err(error) => self.creative_lut_message = Some(error),
+            Err(error) => {
+                // import_managed_cube_file は書き込み失敗時に部分ファイルを除去する。
+                // 予約 ID は transaction の cancel cleanup 対象から外してよい。
+                self.creative_lut_transaction.forget_created(reserved_id);
+                self.creative_lut_message = Some(error);
+            }
         }
+    }
+
+    pub(super) fn remove_creative_lut(&mut self, index: usize) -> Option<String> {
+        let removed = self.settings.creative_luts.get(index)?;
+        if removed.is_builtin() {
+            return None;
+        }
+        let removed = self.settings.creative_luts.remove(index);
+        self.creative_lut_transaction.mark_removed(removed.id);
+        if self.settings.video_adjustments.creative_lut.id == Some(removed.id) {
+            self.settings.video_adjustments.creative_lut.id = None;
+        }
+        Some(removed.name)
     }
 }
 
@@ -1295,8 +1396,9 @@ impl App {
 
                 ui.horizontal(|ui| {
                     let font_ready = state.ui_font_apply_ready();
+                    let lut_ready = state.creative_lut_import_rx.is_none();
                     if ui
-                        .add_enabled(font_ready, egui::Button::new("  OK  "))
+                        .add_enabled(font_ready && lut_ready, egui::Button::new("  OK  "))
                         .clicked()
                     {
                         apply = true;
@@ -1307,6 +1409,8 @@ impl App {
                     }
                     if !font_ready {
                         ui.small("フォントの準備完了後に適用できます。");
+                    } else if !lut_ready {
+                        ui.small("LUTのコピー完了後に適用できます。");
                     }
                 });
             });
@@ -1347,6 +1451,8 @@ impl App {
                     self.settings.fullscreen_side_panel_mode.normalized();
                 let old_ui_font = self.settings.ui_font.clone();
                 let old_creative_luts = self.settings.creative_luts.clone();
+                let mut creative_lut_transaction =
+                    std::mem::take(&mut state.creative_lut_transaction);
 
                 // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
                 // 無効化トリガに使う)
@@ -1482,6 +1588,7 @@ impl App {
                     }
                 }
                 self.settings.save();
+                creative_lut_transaction.commit();
 
                 if let Some(service) = &self.edit_preview_cache {
                     if !self.settings.edit_preview_cache_enabled {

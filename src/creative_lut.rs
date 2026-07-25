@@ -1,16 +1,21 @@
 //! Creative 3D LUT registration, asynchronous loading, and CPU application.
 //!
-//! Registered entries keep the user-selected `.cube` path. Parsing is always
-//! performed on a worker thread; the UI and video-presenter threads only use
+//! Registered entries keep the original user-selected `.cube` path for display
+//! and legacy migration, while the app-owned copy lives under
+//! `<data_dir>/luts/<entry UUID>.cube`. Parsing and managed-file I/O are always
+//! performed on worker threads; the UI and video-presenter threads only use
 //! already parsed immutable tables.
 
 use eframe::egui;
 use local_adjust_core::CubeLutParams;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use uuid::Uuid;
+
+const MAX_CUBE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreativeLutEntry {
@@ -22,6 +27,12 @@ pub struct CreativeLutEntry {
 }
 
 impl CreativeLutEntry {
+    pub fn from_loaded_path_with_id(path: PathBuf, lut: &CubeLutParams, id: Uuid) -> Self {
+        let mut entry = Self::from_loaded_path(path, lut);
+        entry.id = id;
+        entry
+    }
+
     pub fn from_loaded_path(path: PathBuf, lut: &CubeLutParams) -> Self {
         let file_stem = path
             .file_stem()
@@ -49,6 +60,10 @@ impl CreativeLutEntry {
 
     pub fn is_builtin(&self) -> bool {
         self.builtin.is_some()
+    }
+
+    pub fn managed_path(&self) -> Option<PathBuf> {
+        (!self.is_builtin()).then(|| managed_creative_lut_path(self.id))
     }
 
     /// Repair names written by the old importer, which preferred a generic
@@ -270,14 +285,20 @@ struct LoadBatch {
     rx: mpsc::Receiver<Vec<(Uuid, Result<CubeLutParams, String>)>>,
 }
 
+struct ManagedCopyBatch {
+    rx: mpsc::Receiver<Vec<(Uuid, Result<CubeLutParams, String>)>>,
+}
+
 /// Runtime cache owned by `App`. File reads and `.cube` parsing happen in one
 /// background batch whenever the registered entry signature changes.
 #[derive(Default)]
 pub struct CreativeLutLibrary {
     loaded: HashMap<Uuid, SharedCreativeLut>,
     errors: HashMap<Uuid, String>,
+    managed_migrated: HashSet<Uuid>,
     signature: Vec<(Uuid, PathBuf, Option<BuiltinCreativeLut>)>,
     pending: Option<LoadBatch>,
+    managed_copy_pending: Option<ManagedCopyBatch>,
 }
 
 impl CreativeLutLibrary {
@@ -302,6 +323,8 @@ impl CreativeLutLibrary {
             .retain(|id, _| signature.iter().any(|(entry_id, _, _)| entry_id == id));
         self.errors
             .retain(|id, _| signature.iter().any(|(entry_id, _, _)| entry_id == id));
+        self.managed_migrated
+            .retain(|id| signature.iter().any(|(entry_id, _, _)| entry_id == id));
 
         if signature.is_empty() {
             self.pending = None;
@@ -321,7 +344,7 @@ impl CreativeLutLibrary {
                             builtin
                                 .map(build_builtin_creative_lut)
                                 .map(Ok)
-                                .unwrap_or_else(|| load_cube_file(path)),
+                                .unwrap_or_else(|| load_registered_cube_file(*id, path)),
                         )
                     })
                     .collect();
@@ -339,35 +362,120 @@ impl CreativeLutLibrary {
                 );
             }
         }
+        self.start_managed_copy_migration(entries);
     }
 
     pub fn poll(&mut self, entries: &[CreativeLutEntry], ctx: &egui::Context) -> bool {
         self.reload(entries);
-        let Some(pending) = self.pending.as_ref() else {
-            return false;
-        };
-        let Ok(results) = pending.rx.try_recv() else {
-            return false;
-        };
-        let pending = self.pending.take().expect("checked above");
-        if pending.signature != self.signature {
-            return false;
-        }
+        let mut changed = false;
 
-        self.loaded.clear();
-        self.errors.clear();
-        for (id, result) in results {
-            match result {
-                Ok(lut) => {
-                    self.loaded.insert(id, Arc::new(lut));
-                }
-                Err(error) => {
-                    self.errors.insert(id, error);
+        let load_result = self.pending.as_ref().map(|pending| pending.rx.try_recv());
+        match load_result {
+            Some(Ok(results)) => {
+                let pending = self.pending.take().expect("checked above");
+                if pending.signature == self.signature {
+                    let previous_loaded = std::mem::take(&mut self.loaded);
+                    self.errors.clear();
+                    for (id, result) in results {
+                        match result {
+                            Ok(lut) => {
+                                self.loaded.insert(id, Arc::new(lut));
+                            }
+                            Err(error) => {
+                                if self.managed_migrated.contains(&id)
+                                    && let Some(lut) = previous_loaded.get(&id)
+                                {
+                                    self.loaded.insert(id, Arc::clone(lut));
+                                } else {
+                                    self.errors.insert(id, error);
+                                }
+                            }
+                        }
+                    }
+                    changed = true;
                 }
             }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.pending = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
-        ctx.request_repaint();
-        true
+
+        let migration_result = self
+            .managed_copy_pending
+            .as_ref()
+            .map(|pending| pending.rx.try_recv());
+        match migration_result {
+            Some(Ok(results)) => {
+                self.managed_copy_pending = None;
+                let registered_ids: HashSet<_> = entries.iter().map(|entry| entry.id).collect();
+                let mut stale_ids = Vec::new();
+                for (id, result) in results {
+                    if !registered_ids.contains(&id) {
+                        stale_ids.push(id);
+                        continue;
+                    }
+                    match result {
+                        Ok(lut) => {
+                            self.loaded.insert(id, Arc::new(lut));
+                            self.errors.remove(&id);
+                            self.managed_migrated.insert(id);
+                            changed = true;
+                        }
+                        Err(error) => crate::logger::log(format!(
+                            "creative LUT managed-copy migration failed for {id}: {error}"
+                        )),
+                    }
+                }
+                remove_managed_creative_luts_async(stale_ids);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.managed_copy_pending = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+        changed
+    }
+
+    fn start_managed_copy_migration(&mut self, entries: &[CreativeLutEntry]) {
+        if self.managed_copy_pending.is_some() {
+            return;
+        }
+        let user_entries = entries
+            .iter()
+            .filter(|entry| !entry.is_builtin())
+            .map(|entry| (entry.id, entry.path.clone()))
+            .collect::<Vec<_>>();
+        if user_entries.is_empty() {
+            self.managed_copy_pending = None;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("creative-lut-managed-copy".to_owned())
+            .spawn(move || {
+                let results = user_entries
+                    .into_iter()
+                    .map(|(id, source_path)| (id, ensure_managed_creative_lut(id, &source_path)))
+                    .collect();
+                let _ = tx.send(results);
+            });
+        match spawned {
+            Ok(_) => {
+                self.managed_copy_pending = Some(ManagedCopyBatch { rx });
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "creative LUT managed-copy migration thread failed to start: {error}"
+                ));
+                self.managed_copy_pending = None;
+            }
+        }
     }
 
     pub fn get(&self, id: Option<Uuid>) -> Option<SharedCreativeLut> {
@@ -395,7 +503,7 @@ impl CreativeLutLibrary {
                 path: entry
                     .builtin
                     .map(|builtin| format!("組み込みプリセット: {}", builtin.description()))
-                    .unwrap_or_else(|| entry.path.display().to_string()),
+                    .unwrap_or_else(|| managed_creative_lut_path(entry.id).display().to_string()),
                 builtin: entry.is_builtin(),
                 loaded: self.loaded.contains_key(&entry.id),
                 error: self.errors.get(&entry.id).cloned(),
@@ -408,6 +516,80 @@ impl CreativeLutLibrary {
             lut: self.get(adjustments.creative_lut.id),
         }
     }
+}
+
+fn load_registered_cube_file(id: Uuid, source_path: &Path) -> Result<CubeLutParams, String> {
+    let managed_path = managed_creative_lut_path(id);
+    match std::fs::metadata(&managed_path) {
+        Ok(_) => load_cube_file(&managed_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => load_cube_file(source_path),
+        Err(error) => Err(format!(
+            "{} の情報を取得できません: {error}",
+            managed_path.display()
+        )),
+    }
+}
+
+fn ensure_managed_creative_lut(id: Uuid, source_path: &Path) -> Result<CubeLutParams, String> {
+    let managed_path = managed_creative_lut_path(id);
+    match std::fs::metadata(&managed_path) {
+        Ok(_) => return load_cube_file(&managed_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "{} の情報を取得できません: {error}",
+                managed_path.display()
+            ));
+        }
+    }
+
+    let payload = read_cube_payload(source_path)?;
+    write_managed_cube_atomic(&managed_path, &payload.bytes)?;
+    Ok(payload.lut)
+}
+
+pub struct CreativeLutImport {
+    pub entry: CreativeLutEntry,
+}
+
+pub fn import_managed_cube_file(path: &Path, id: Uuid) -> Result<CreativeLutImport, String> {
+    let payload = read_cube_payload(path)?;
+    let target = managed_creative_lut_path(id);
+    write_new_managed_cube(&target, &payload.bytes)?;
+    Ok(CreativeLutImport {
+        entry: CreativeLutEntry::from_loaded_path_with_id(path.to_path_buf(), &payload.lut, id),
+    })
+}
+
+pub fn managed_creative_lut_dir() -> PathBuf {
+    crate::data_dir::get().join("luts")
+}
+
+pub fn managed_creative_lut_path(id: Uuid) -> PathBuf {
+    managed_creative_lut_dir().join(format!("{id}.cube"))
+}
+
+pub fn remove_managed_creative_luts_async(ids: Vec<Uuid>) {
+    if ids.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("creative-lut-managed-remove".to_owned())
+        .spawn(move || {
+            for id in ids {
+                if let Err(error) = remove_managed_creative_lut(id)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::log(format!(
+                        "creative LUT managed copy removal failed for {id}: {error}"
+                    ));
+                }
+            }
+        });
+}
+
+pub fn remove_managed_creative_lut(id: Uuid) -> std::io::Result<()> {
+    std::fs::remove_file(managed_creative_lut_path(id))
 }
 
 fn entry_signature(
@@ -530,8 +712,12 @@ fn apply_builtin_look(builtin: BuiltinCreativeLut, rgb: [f32; 3]) -> [f32; 3] {
     }
 }
 
-pub fn load_cube_file(path: &Path) -> Result<CubeLutParams, String> {
-    const MAX_CUBE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+struct CubePayload {
+    lut: CubeLutParams,
+    bytes: Vec<u8>,
+}
+
+fn read_cube_payload(path: &Path) -> Result<CubePayload, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("{} の情報を取得できません: {error}", path.display()))?;
     if metadata.len() > MAX_CUBE_FILE_BYTES {
@@ -540,13 +726,60 @@ pub fn load_cube_file(path: &Path) -> Result<CubeLutParams, String> {
             MAX_CUBE_FILE_BYTES / 1024 / 1024
         ));
     }
-    let text = std::fs::read_to_string(path)
+    let bytes = std::fs::read(path)
         .map_err(|error| format!("{} を読み込めません: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_CUBE_FILE_BYTES {
+        return Err(format!(
+            "LUTファイルが大きすぎます（上限 {} MiB）",
+            MAX_CUBE_FILE_BYTES / 1024 / 1024
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("{} はUTF-8の.cubeではありません: {error}", path.display()))?;
     let fallback = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("LUT");
-    local_adjust_core::parse_cube_lut(&text, fallback)
+    let lut = local_adjust_core::parse_cube_lut(text, fallback)?;
+    Ok(CubePayload { lut, bytes })
+}
+
+fn write_new_managed_cube(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "LUTの保存先ディレクトリを決定できません。".to_owned())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("{} を作成できません: {error}", parent.display()))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("{} を作成できません: {error}", path.display()))?;
+    if let Err(error) = output.write_all(bytes).and_then(|_| output.sync_data()) {
+        drop(output);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("{} へ保存できません: {error}", path.display()));
+    }
+    Ok(())
+}
+
+fn write_managed_cube_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "LUTの保存先ディレクトリを決定できません。".to_owned())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("{} を作成できません: {error}", parent.display()))?;
+    let temp_path = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+    write_new_managed_cube(&temp_path, bytes)?;
+    if let Err(error) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("{} を確定できません: {error}", path.display()));
+    }
+    Ok(())
+}
+
+pub fn load_cube_file(path: &Path) -> Result<CubeLutParams, String> {
+    read_cube_payload(path).map(|payload| payload.lut)
 }
 
 pub fn apply_to_color_image(
@@ -582,6 +815,19 @@ pub fn apply_to_color_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_CUBE: &str = r#"
+TITLE "Managed test"
+LUT_3D_SIZE 2
+0.0 0.0 0.0
+1.0 0.0 0.0
+0.0 1.0 0.0
+1.0 1.0 0.0
+0.0 0.0 1.0
+1.0 0.0 1.0
+0.0 1.0 1.0
+1.0 1.0 1.0
+"#;
 
     #[test]
     fn identity_selection_does_not_enable_processing() {
@@ -682,6 +928,60 @@ mod tests {
         };
         custom.repair_legacy_generated_name();
         assert_eq!(custom.name, "My Ice Look");
+    }
+
+    #[test]
+    fn managed_import_remains_loadable_after_source_is_deleted() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let source = data_dir.path().join("source-look.cube");
+        std::fs::write(&source, VALID_CUBE).expect("write source LUT");
+        let id = Uuid::new_v4();
+
+        let imported = import_managed_cube_file(&source, id).expect("import LUT");
+        let managed = managed_creative_lut_path(id);
+        assert_eq!(imported.entry.id, id);
+        assert_eq!(
+            std::fs::read(&managed).expect("managed copy"),
+            VALID_CUBE.as_bytes()
+        );
+
+        std::fs::remove_file(&source).expect("remove original");
+        assert!(
+            load_registered_cube_file(id, &source)
+                .expect("load managed copy")
+                .is_loaded()
+        );
+    }
+
+    #[test]
+    fn legacy_registration_is_copied_to_managed_storage() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let source = data_dir.path().join("legacy-look.cube");
+        std::fs::write(&source, VALID_CUBE).expect("write source LUT");
+        let id = Uuid::new_v4();
+
+        assert!(
+            ensure_managed_creative_lut(id, &source)
+                .expect("migrate legacy LUT")
+                .is_loaded()
+        );
+        std::fs::remove_file(&source).expect("remove original");
+        assert!(
+            load_registered_cube_file(id, &source)
+                .expect("load migrated LUT")
+                .is_loaded()
+        );
+    }
+
+    #[test]
+    fn invalid_import_does_not_leave_a_managed_file() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let source = data_dir.path().join("invalid.cube");
+        std::fs::write(&source, "LUT_1D_SIZE 2\n0.0\n1.0\n").expect("write invalid LUT");
+        let id = Uuid::new_v4();
+
+        assert!(import_managed_cube_file(&source, id).is_err());
+        assert!(!managed_creative_lut_path(id).exists());
     }
 
     #[test]

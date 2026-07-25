@@ -5896,7 +5896,8 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(
-            "登録元ファイルはコピーしません。移動・削除すると、そのLUTは読み込めなくなります。",
+            "追加したLUTはアプリのデータフォルダーへコピーします。登録後は元ファイルを\
+             移動・削除しても利用できます。",
         )
         .small()
         .weak(),
@@ -5947,8 +5948,17 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
                         remove = Some(index);
                     }
                 });
+                let managed_path = entry
+                    .managed_path()
+                    .expect("user LUT always has a managed path");
                 ui.label(
-                    egui::RichText::new(entry.path.display().to_string())
+                    egui::RichText::new(format!("管理コピー: {}", managed_path.display()))
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text(managed_path.display().to_string());
+                ui.label(
+                    egui::RichText::new(format!("登録元: {}", entry.path.display()))
                         .small()
                         .weak(),
                 )
@@ -5958,11 +5968,11 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
         ui.add_space(5.0);
     }
     if let Some(index) = remove {
-        let removed = state.settings.creative_luts.remove(index);
-        if state.settings.video_adjustments.creative_lut.id == Some(removed.id) {
-            state.settings.video_adjustments.creative_lut.id = None;
+        if let Some(name) = state.remove_creative_lut(index) {
+            state.creative_lut_message = Some(format!(
+                "「{name}」の登録を解除しました。OKで管理コピーも削除します。"
+            ));
         }
-        state.creative_lut_message = Some(format!("「{}」の登録を解除しました。", removed.name));
     }
 }
 
