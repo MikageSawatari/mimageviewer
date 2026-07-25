@@ -4735,8 +4735,23 @@ pub(crate) enum FinalEffectResult {
     Ready {
         pixels: Arc<egui::ColorImage>,
         elapsed_ms: f64,
+        timing: FinalEffectTiming,
     },
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FinalEffectTiming {
+    adjust_ms: f64,
+    sharpen_ms: f64,
+    colorize_check_ms: f64,
+    colorize_apply_ms: f64,
+    creative_lut_ms: f64,
+    post_filter_ms: f64,
+    colorize_applied: bool,
+    colorize_mode: crate::colorize::ColorizeMode,
+    tone_method: crate::colorize::ToneDensityMethod,
+    tone_radius: f32,
 }
 
 struct FinalEffectJob {
@@ -4751,9 +4766,16 @@ struct FinalEffectJob {
 
 fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffectResult {
     let started = std::time::Instant::now();
+    let mut timing = FinalEffectTiming {
+        colorize_mode: job.colorize.mode,
+        tone_method: job.colorize.tone_method,
+        tone_radius: job.colorize.tone_radius,
+        ..FinalEffectTiming::default()
+    };
     if cancel.load(Ordering::Relaxed) {
         return FinalEffectResult::Cancelled;
     }
+    let stage_started = std::time::Instant::now();
     let adjusted = if let Some(params) = job.adjust_before_effect.as_ref() {
         Arc::new(crate::adjustment::apply_adjustments_fast(
             &job.source,
@@ -4762,9 +4784,11 @@ fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffect
     } else {
         job.source
     };
+    timing.adjust_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     if cancel.load(Ordering::Relaxed) {
         return FinalEffectResult::Cancelled;
     }
+    let stage_started = std::time::Instant::now();
     let sharpened = if job.smart_sharpen == 0 {
         adjusted
     } else {
@@ -4773,20 +4797,27 @@ fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffect
             job.smart_sharpen,
         ))
     };
+    timing.sharpen_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     if cancel.load(Ordering::Relaxed) {
         return FinalEffectResult::Cancelled;
     }
-    let colorized = if crate::colorize::should_apply(&sharpened, &job.colorize) {
-        match crate::colorize::apply_with_cancel(&sharpened, &job.colorize, cancel) {
+    let stage_started = std::time::Instant::now();
+    timing.colorize_applied = crate::colorize::should_apply(&sharpened, &job.colorize);
+    timing.colorize_check_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+    let stage_started = std::time::Instant::now();
+    let colorized = if timing.colorize_applied {
+        match crate::colorize::apply_applicable_with_cancel(&sharpened, &job.colorize, cancel) {
             Some(image) => Arc::new(image),
             None => return FinalEffectResult::Cancelled,
         }
     } else {
         sharpened
     };
+    timing.colorize_apply_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     if cancel.load(Ordering::Relaxed) {
         return FinalEffectResult::Cancelled;
     }
+    let stage_started = std::time::Instant::now();
     let lut_applied = if let Some((lut, strength)) = job.creative_lut {
         Arc::new(crate::creative_lut::apply_to_color_image(
             &colorized, &lut, strength,
@@ -4794,20 +4825,24 @@ fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffect
     } else {
         colorized
     };
+    timing.creative_lut_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     if cancel.load(Ordering::Relaxed) {
         return FinalEffectResult::Cancelled;
     }
+    let stage_started = std::time::Instant::now();
     let pixels = if job.post_filter != crate::adjustment::PostFilter::None {
         Arc::new(crate::post_filter::apply(&lut_applied, job.post_filter))
     } else {
         lut_applied
     };
+    timing.post_filter_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     if cancel.load(Ordering::Relaxed) {
         FinalEffectResult::Cancelled
     } else {
         FinalEffectResult::Ready {
             pixels,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            timing,
         }
     }
 }
@@ -50503,9 +50538,19 @@ impl App {
                 continue;
             }
             match result {
-                FinalEffectResult::Ready { pixels, elapsed_ms } => {
+                FinalEffectResult::Ready {
+                    pixels,
+                    elapsed_ms,
+                    timing,
+                } => {
                     let upload_started = std::time::Instant::now();
-                    let upload = clamp_for_gpu(&pixels).into_owned();
+                    let clamp_started = std::time::Instant::now();
+                    let upload = match clamp_for_gpu(&pixels) {
+                        std::borrow::Cow::Borrowed(_) => Arc::clone(&pixels),
+                        std::borrow::Cow::Owned(image) => Arc::new(image),
+                    };
+                    let clamp_ms = clamp_started.elapsed().as_secs_f64() * 1000.0;
+                    let load_texture_started = std::time::Instant::now();
                     let texture = ctx.load_texture(
                         format!(
                             "final_effect_{}_{}_{}_{}",
@@ -50518,6 +50563,7 @@ impl App {
                             DISPLAY_IMAGE_TEXTURE_OPTIONS
                         },
                     );
+                    let load_texture_ms = load_texture_started.elapsed().as_secs_f64() * 1000.0;
                     let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                     let [width, height] = pixels.size;
                     self.final_composite_cache.insert(
@@ -50531,6 +50577,21 @@ impl App {
                     self.comic_cache.remove(&key.edit_key.idx);
                     self.cancel_comic_bake_for_idx(key.edit_key.idx);
                     if crate::perf::is_enabled() {
+                        let colorize_mode = match timing.colorize_mode {
+                            crate::colorize::ColorizeMode::Disabled => "disabled",
+                            crate::colorize::ColorizeMode::MonochromeOnly => "monochrome_only",
+                            crate::colorize::ColorizeMode::AllImages => "all_images",
+                        };
+                        let tone_method = match timing.tone_method {
+                            crate::colorize::ToneDensityMethod::Off => "off",
+                            crate::colorize::ToneDensityMethod::Fast => "fast",
+                            crate::colorize::ToneDensityMethod::LocalMean => "local_mean",
+                            crate::colorize::ToneDensityMethod::Gaussian => "gaussian",
+                        };
+                        let effective_tone_radius = crate::colorize::effective_tone_radius(
+                            timing.tone_radius,
+                            [width, height],
+                        );
                         crate::perf::event(
                             "fs",
                             "final_effect_worker",
@@ -50540,6 +50601,24 @@ impl App {
                                 ("ms", (elapsed_ms + upload_ms).into()),
                                 ("worker_ms", elapsed_ms.into()),
                                 ("upload_ms", upload_ms.into()),
+                                ("clamp_ms", clamp_ms.into()),
+                                ("load_texture_ms", load_texture_ms.into()),
+                                ("adjust_ms", timing.adjust_ms.into()),
+                                ("sharpen_ms", timing.sharpen_ms.into()),
+                                ("colorize_check_ms", timing.colorize_check_ms.into()),
+                                ("colorize_apply_ms", timing.colorize_apply_ms.into()),
+                                ("creative_lut_ms", timing.creative_lut_ms.into()),
+                                ("post_filter_ms", timing.post_filter_ms.into()),
+                                ("colorize_applied", timing.colorize_applied.into()),
+                                ("colorize_mode", colorize_mode.into()),
+                                ("tone_method", tone_method.into()),
+                                ("tone_radius", f64::from(timing.tone_radius).into()),
+                                (
+                                    "effective_tone_radius",
+                                    f64::from(effective_tone_radius).into(),
+                                ),
+                                ("prefetch", pending.prefetch.into()),
+                                ("complete", pending.output_complete.into()),
                                 ("w", (width as u64).into()),
                                 ("h", (height as u64).into()),
                                 ("idx", (key.edit_key.idx as u64).into()),

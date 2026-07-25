@@ -78,17 +78,19 @@ fn default_control_points() -> Vec<ColorizeControlPoint> {
 pub enum ToneDensityMethod {
     #[default]
     Off,
+    Fast,
     LocalMean,
     #[serde(alias = "edge_preserving", alias = "multi_scale")]
     Gaussian,
 }
 
 impl ToneDensityMethod {
-    pub const ALL: &'static [Self] = &[Self::Off, Self::LocalMean, Self::Gaussian];
+    pub const ALL: &'static [Self] = &[Self::Off, Self::Fast, Self::LocalMean, Self::Gaussian];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "OFF（画素の輝度をそのまま使用）",
+            Self::Fast => "高速（縮小平均）",
             Self::LocalMean => "弱（局所平均）",
             Self::Gaussian => "強（ガウシアン）",
         }
@@ -97,6 +99,9 @@ impl ToneDensityMethod {
     pub fn description(self) -> &'static str {
         match self {
             Self::Off => "スクリーントーンの網点を濃淡へ変換しません。",
+            Self::Fast => {
+                "縮小平均で網点を濃淡化します。大きな画像でも高速ですが、細部は少し滑らかになります。"
+            }
             Self::LocalMean => {
                 "局所平均を1回適用します。網点を少しだけなじませたい場合に向きます。"
             }
@@ -321,6 +326,17 @@ pub fn apply_with_cancel(
     if !should_apply(src, params) {
         return Some(src.clone());
     }
+    apply_applicable_with_cancel(src, params, cancel)
+}
+
+/// `should_apply` 済みの呼び出し元向け。final effect worker は不適用時の
+/// `ColorImage` 全体 clone を避けるため先に判定するので、近モノクロ判定を
+/// もう一度走らせず本体処理へ入る。
+pub(crate) fn apply_applicable_with_cancel(
+    src: &ColorImage,
+    params: &ColorizeParams,
+    cancel: &AtomicBool,
+) -> Option<ColorImage> {
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
@@ -345,16 +361,34 @@ pub fn apply_with_cancel(
         params.density_normalization_strength,
         cancel,
     )?;
-    let tone = tone_density_luma(
-        &luma,
-        width,
-        height,
-        params.tone_method,
-        effective_tone_radius,
-        cancel,
-    )?;
+    let fast_tone = if params.tone_method == ToneDensityMethod::Fast {
+        Some(fast_tone_density_luma(
+            &luma,
+            width,
+            height,
+            effective_tone_radius,
+            cancel,
+        )?)
+    } else {
+        None
+    };
+    let tone = if fast_tone.is_none() {
+        tone_density_luma(
+            &luma,
+            width,
+            height,
+            params.tone_method,
+            effective_tone_radius,
+            cancel,
+        )?
+    } else {
+        None
+    };
     let tone_strength = f32::from(params.tone_strength) / 100.0;
     let luminance_weight = f32::from(params.luminance_weight) / 100.0;
+    let output_lut: [[u8; 3]; 256] = std::array::from_fn(|index| {
+        preserve_luminance(lut[index], index as f32 / 255.0, luminance_weight)
+    });
 
     let pixels: Vec<Color32> = src
         .pixels
@@ -362,15 +396,17 @@ pub fn apply_with_cancel(
         .enumerate()
         .map(|(index, pixel)| {
             let original_y = f32::from(luma[index]) / 255.0;
-            let mapped_y = if let Some(candidate) = tone.as_ref() {
-                original_y * (1.0 - tone_strength)
-                    + f32::from(candidate[index]) / 255.0 * tone_strength
+            let candidate = fast_tone
+                .as_ref()
+                .map(|tone| tone.sample(index, width, original_y))
+                .or_else(|| tone.as_ref().map(|tone| f32::from(tone[index]) / 255.0));
+            let mapped_y = if let Some(candidate) = candidate {
+                original_y * (1.0 - tone_strength) + candidate * tone_strength
             } else {
                 original_y
             };
             let lut_index = (mapped_y * 255.0).round().clamp(0.0, 255.0) as usize;
-            let color = lut[lut_index];
-            let result = preserve_luminance(color, mapped_y, luminance_weight);
+            let result = output_lut[lut_index];
             Color32::from_rgba_unmultiplied(result[0], result[1], result[2], pixel.a())
         })
         .collect();
@@ -473,7 +509,7 @@ fn density_normalization_bounds(src: &ColorImage, luma: &[u8]) -> Option<(u8, u8
     }
 }
 
-fn effective_tone_radius(configured_radius: f32, size: [usize; 2]) -> f32 {
+pub(crate) fn effective_tone_radius(configured_radius: f32, size: [usize; 2]) -> f32 {
     let configured_radius = if configured_radius.is_finite() {
         configured_radius.clamp(0.1, 4.0)
     } else {
@@ -574,6 +610,149 @@ fn preserve_luminance(color: [u8; 3], y: f32, weight: f32) -> [u8; 3] {
     })
 }
 
+struct ReducedToneLuma {
+    pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+    factor: usize,
+}
+
+impl ReducedToneLuma {
+    /// 全解像度の tone buffer を作らず、対応する縮小ブロックを直接参照する。
+    /// 高速モードでは数px単位の滑らかさよりメモリ帯域削減を優先する。
+    #[inline]
+    fn sample(&self, index: usize, source_width: usize) -> f32 {
+        let x = index % source_width;
+        let y = index / source_width;
+        let grid_x = (x / self.factor).min(self.width - 1);
+        let grid_y = (y / self.factor).min(self.height - 1);
+        f32::from(self.pixels[grid_y * self.width + grid_x]) / 255.0
+    }
+}
+
+struct FastToneLuma {
+    reduced: ReducedToneLuma,
+    original_weight: f32,
+}
+
+impl FastToneLuma {
+    #[inline]
+    fn sample(&self, index: usize, source_width: usize, original_y: f32) -> f32 {
+        let reduced = self.reduced.sample(index, source_width);
+        original_y * self.original_weight + reduced * (1.0 - self.original_weight)
+    }
+}
+
+/// 高速トーン濃度推定。
+///
+/// 全解像度画像へ box blur を繰り返す代わりに、指定スケール相当のブロック平均を
+/// 低解像度で作り、3x3 平均を1回だけ掛ける。最終着色ループから直接参照するため、
+/// 全解像度への再拡大 buffer とその読み書きも不要。50ms 級を優先するモードなので
+/// 1px 以上の実効スケールは最寄り整数へ丸めて縮小画像を1系統だけ作る。1px 未満は
+/// 元輝度から連続的に立ち上げる。
+fn fast_tone_density_luma(
+    luma: &[u8],
+    width: usize,
+    height: usize,
+    radius: f32,
+    cancel: &AtomicBool,
+) -> Option<FastToneLuma> {
+    let radius = if radius.is_finite() {
+        radius.clamp(0.0, MAX_EFFECTIVE_TONE_RADIUS)
+    } else {
+        default_tone_radius()
+    };
+    let (factor, original_weight) = if radius < 1.0 {
+        (1, 1.0 - radius)
+    } else {
+        (radius.round().max(1.0) as usize, 0.0)
+    };
+    Some(FastToneLuma {
+        reduced: build_reduced_tone_luma(luma, width, height, factor, cancel)?,
+        original_weight,
+    })
+}
+
+fn build_reduced_tone_luma(
+    luma: &[u8],
+    width: usize,
+    height: usize,
+    factor: usize,
+    cancel: &AtomicBool,
+) -> Option<ReducedToneLuma> {
+    debug_assert!(factor > 0);
+    let reduced_width = width.div_ceil(factor);
+    let reduced_height = height.div_ceil(factor);
+    if factor == 1 {
+        return blur_reduced_tone_luma(luma, reduced_width, reduced_height, factor, cancel);
+    }
+    let mut reduced = vec![0_u8; reduced_width * reduced_height];
+    reduced
+        .par_chunks_mut(reduced_width)
+        .enumerate()
+        .for_each(|(reduced_y, row)| {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let y0 = reduced_y * factor;
+            let y1 = (y0 + factor).min(height);
+            for (reduced_x, value) in row.iter_mut().enumerate() {
+                let x0 = reduced_x * factor;
+                let x1 = (x0 + factor).min(width);
+                let mut sum = 0_u32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        sum += u32::from(luma[y * width + x]);
+                    }
+                }
+                *value = (sum / ((x1 - x0) * (y1 - y0)) as u32) as u8;
+            }
+        });
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    blur_reduced_tone_luma(&reduced, reduced_width, reduced_height, factor, cancel)
+}
+
+fn blur_reduced_tone_luma(
+    reduced: &[u8],
+    width: usize,
+    height: usize,
+    factor: usize,
+    cancel: &AtomicBool,
+) -> Option<ReducedToneLuma> {
+    let mut pixels = vec![0_u8; reduced.len()];
+    pixels
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let y0 = y.saturating_sub(1);
+            let y1 = (y + 1).min(height - 1);
+            for (x, value) in row.iter_mut().enumerate() {
+                let x0 = x.saturating_sub(1);
+                let x1 = (x + 1).min(width - 1);
+                let mut sum = 0_u32;
+                let mut count = 0_u32;
+                for sample_y in y0..=y1 {
+                    for sample_x in x0..=x1 {
+                        sum += u32::from(reduced[sample_y * width + sample_x]);
+                        count += 1;
+                    }
+                }
+                *value = (sum / count) as u8;
+            }
+        });
+    (!cancel.load(Ordering::Relaxed)).then_some(ReducedToneLuma {
+        pixels,
+        width,
+        height,
+        factor,
+    })
+}
+
 fn tone_density_luma(
     luma: &[u8],
     width: usize,
@@ -592,11 +771,33 @@ fn tone_density_luma(
     };
     let lower_radius = radius.floor() as usize;
     let upper_radius = radius.ceil() as usize;
-    let lower = tone_density_luma_at_radius(luma, width, height, method, lower_radius, cancel)?;
     if upper_radius == lower_radius {
+        let lower = tone_density_luma_at_radius(luma, width, height, method, lower_radius, cancel)?;
         return Some(Some(lower));
     }
-    let upper = tone_density_luma_at_radius(luma, width, height, method, upper_radius, cancel)?;
+    let shared_gaussian_pair = if method == ToneDensityMethod::Gaussian
+        && lower_radius > 0
+        && gaussian_first_radius(lower_radius) == gaussian_first_radius(upper_radius)
+    {
+        Some(gaussian_approx_adjacent_with_shared_first_pass(
+            luma,
+            width,
+            height,
+            lower_radius,
+            upper_radius,
+            cancel,
+        )?)
+    } else {
+        None
+    };
+    let (lower, upper) = if let Some(pair) = shared_gaussian_pair {
+        pair
+    } else {
+        (
+            tone_density_luma_at_radius(luma, width, height, method, lower_radius, cancel)?,
+            tone_density_luma_at_radius(luma, width, height, method, upper_radius, cancel)?,
+        )
+    };
     let fraction = radius - lower_radius as f32;
     let blended = lower
         .into_par_iter()
@@ -623,6 +824,7 @@ fn tone_density_luma_at_radius(
     }
     let result = match method {
         ToneDensityMethod::Off => return Some(luma.to_vec()),
+        ToneDensityMethod::Fast => unreachable!("fast tone uses reduced-resolution path"),
         ToneDensityMethod::LocalMean => box_blur(luma, width, height, radius, cancel)?,
         ToneDensityMethod::Gaussian => gaussian_approx(luma, width, height, radius, cancel)?,
     };
@@ -711,6 +913,40 @@ fn gaussian_approx(
     let pass1 = box_blur(&pass0, width, height, r1, cancel)?;
     drop(pass0);
     box_blur(&pass1, width, height, r0, cancel)
+}
+
+#[inline]
+fn gaussian_first_radius(radius: usize) -> usize {
+    (radius / 2).max(1)
+}
+
+/// 隣接する整数半径のガウシアン近似で第1 box blur が同じ場合、その結果を共有する。
+///
+/// 長辺基準の検出スケールは多くの画像で小数半径になる。従来は floor / ceil の
+/// 3-pass 近似を独立に計6回実行してから補間していたが、たとえば半径 2.x は
+/// radius=2 (`1,1,1`) と radius=3 (`1,2,1`) の先頭 radius=1 が同一である。
+/// この1回を共有しても各整数半径の画素値と最終補間結果は変わらない。
+fn gaussian_approx_adjacent_with_shared_first_pass(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    lower_radius: usize,
+    upper_radius: usize,
+    cancel: &AtomicBool,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    debug_assert_eq!(upper_radius, lower_radius + 1);
+    let lower_r0 = gaussian_first_radius(lower_radius);
+    let upper_r0 = gaussian_first_radius(upper_radius);
+    debug_assert_eq!(lower_r0, upper_r0);
+    let lower_r1 = lower_radius.div_ceil(2).max(1);
+    let upper_r1 = upper_radius.div_ceil(2).max(1);
+
+    let shared = box_blur(src, width, height, lower_r0, cancel)?;
+    let lower_pass1 = box_blur(&shared, width, height, lower_r1, cancel)?;
+    let lower = box_blur(&lower_pass1, width, height, lower_r0, cancel)?;
+    let upper_pass1 = box_blur(&shared, width, height, upper_r1, cancel)?;
+    let upper = box_blur(&upper_pass1, width, height, upper_r0, cancel)?;
+    Some((lower, upper))
 }
 
 #[cfg(test)]
@@ -885,6 +1121,58 @@ mod tests {
     }
 
     #[test]
+    fn fast_tone_preserves_constant_luma_at_fractional_scale() {
+        let width = 37;
+        let height = 29;
+        let luma = vec![123_u8; width * height];
+        let cancel = AtomicBool::new(false);
+        let tone = fast_tone_density_luma(&luma, width, height, 2.75, &cancel).unwrap();
+        for index in 0..luma.len() {
+            let sampled =
+                (tone.sample(index, width, f32::from(luma[index]) / 255.0) * 255.0).round() as u8;
+            assert_eq!(sampled, 123);
+        }
+    }
+
+    #[test]
+    fn fast_tone_subpixel_scale_blends_from_original() {
+        let width = 17;
+        let height = 17;
+        let mut luma = vec![255_u8; width * height];
+        let center = (height / 2) * width + width / 2;
+        luma[center] = 0;
+        let cancel = AtomicBool::new(false);
+        let full = fast_tone_density_luma(&luma, width, height, 1.0, &cancel).unwrap();
+        let quarter = fast_tone_density_luma(&luma, width, height, 0.25, &cancel).unwrap();
+        let full_center = full.sample(center, width, 0.0);
+        let quarter_center = quarter.sample(center, width, 0.0);
+        assert!((quarter_center - full_center * 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fast_colorize_keeps_size_and_alpha() {
+        let source = image(64, 48, |x, y| {
+            Color32::from_rgba_unmultiplied(
+                ((x * 5 + y * 3) % 256) as u8,
+                ((x * 5 + y * 3) % 256) as u8,
+                ((x * 5 + y * 3) % 256) as u8,
+                ((x + y) % 256) as u8,
+            )
+        });
+        let params = ColorizeParams {
+            mode: ColorizeMode::AllImages,
+            tone_method: ToneDensityMethod::Fast,
+            tone_radius: 1.0,
+            ..ColorizeParams::default()
+        };
+        let output = apply(&source, &params);
+        assert_eq!(output.size, source.size);
+        for (actual, original) in output.pixels.iter().zip(&source.pixels) {
+            assert_eq!(actual.a(), original.a());
+        }
+    }
+
+    #[test]
     fn fractional_tone_radius_interpolates_adjacent_results() {
         let width = 48;
         let height = 32;
@@ -935,6 +1223,47 @@ mod tests {
             let expected = (f32::from(*a) * 0.5 + f32::from(*b) * 0.5).round() as i16;
             assert!((i16::from(*middle) - expected).abs() <= 1);
         }
+    }
+
+    #[test]
+    fn fractional_gaussian_reuses_first_pass_without_changing_pixels() {
+        let width = 48;
+        let height = 32;
+        let luma: Vec<u8> = (0..width * height)
+            .map(|index| {
+                let x = index % width;
+                let y = index / width;
+                if ((x / 3) + (y / 2)) % 2 == 0 {
+                    24
+                } else {
+                    236
+                }
+            })
+            .collect();
+        let cancel = AtomicBool::new(false);
+        let lower = gaussian_approx(&luma, width, height, 2, &cancel).unwrap();
+        let upper = gaussian_approx(&luma, width, height, 3, &cancel).unwrap();
+        let fraction = 0.75_f32;
+        let expected: Vec<u8> = lower
+            .into_iter()
+            .zip(upper)
+            .map(|(a, b)| {
+                (f32::from(a) * (1.0 - fraction) + f32::from(b) * fraction)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        let actual = tone_density_luma(
+            &luma,
+            width,
+            height,
+            ToneDensityMethod::Gaussian,
+            2.75,
+            &cancel,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1052,6 +1381,31 @@ mod tests {
                 preview[index],
                 "preview must use the same mapping as a grayscale input at {index}"
             );
+        }
+    }
+
+    #[test]
+    fn quantized_luminance_lut_differs_by_at_most_one_level() {
+        let params = ColorizeParams {
+            palette: ColorizePalette::Custom,
+            ..ColorizeParams::default()
+        };
+        let lut = build_lut(&params);
+        for weight in [0.0_f32, 0.37, 1.0] {
+            for index in 0..256 {
+                let quantized_y = index as f32 / 255.0;
+                let precomputed = preserve_luminance(lut[index], quantized_y, weight);
+                for delta in [-0.499_f32, 0.499] {
+                    let exact_y = ((index as f32 + delta) / 255.0).clamp(0.0, 1.0);
+                    let exact = preserve_luminance(lut[index], exact_y, weight);
+                    for channel in 0..3 {
+                        assert!(
+                            (i16::from(precomputed[channel]) - i16::from(exact[channel])).abs()
+                                <= 1
+                        );
+                    }
+                }
+            }
         }
     }
 }

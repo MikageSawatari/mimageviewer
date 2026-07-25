@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from analyze_perf import analyze_idle_health, cmd_idle_health
+from analyze_perf import analyze_idle_health, cmd_colorize, cmd_idle_health
 
 
 def frame(t: float, n: int) -> dict:
@@ -217,6 +217,83 @@ class IdleHealthTests(unittest.TestCase):
                     None,
                 )
             self.assertEqual(exit_code, 1)
+
+
+class ColorizeReportTests(unittest.TestCase):
+    def test_stage_breakdown_is_grouped_by_size_and_method(self) -> None:
+        events = [
+            {
+                "cat": "fs",
+                "kind": "final_effect_worker",
+                "w": 4299,
+                "h": 6071,
+                "colorize_mode": "monochrome_only",
+                "tone_method": "gaussian",
+                "colorize_applied": True,
+                "prefetch": True,
+                "complete": True,
+                "worker_ms": 120.0,
+                "colorize_check_ms": 1.0,
+                "colorize_apply_ms": 100.0,
+                "adjust_ms": 0.0,
+                "sharpen_ms": 0.0,
+                "creative_lut_ms": 0.0,
+                "post_filter_ms": 0.0,
+                "upload_ms": 30.0,
+                "clamp_ms": 20.0,
+                "load_texture_ms": 10.0,
+            },
+            {
+                "cat": "fs",
+                "kind": "final_effect_worker",
+                "w": 4299,
+                "h": 6071,
+                "colorize_mode": "monochrome_only",
+                "tone_method": "gaussian",
+                "colorize_applied": True,
+                "prefetch": False,
+                "complete": True,
+                "worker_ms": 140.0,
+                "colorize_check_ms": 1.0,
+                "colorize_apply_ms": 120.0,
+                "adjust_ms": 0.0,
+                "sharpen_ms": 0.0,
+                "creative_lut_ms": 0.0,
+                "post_filter_ms": 0.0,
+                "upload_ms": 40.0,
+                "clamp_ms": 25.0,
+                "load_texture_ms": 15.0,
+            },
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_colorize(events)
+
+        report = output.getvalue()
+        self.assertIn("4299x6071 (26.1MP)", report)
+        self.assertIn("tone=gaussian applied=True n=2 prefetch=1 complete=2", report)
+        self.assertIn("colorize total", report)
+        self.assertIn("p50=  111.0ms", report)
+
+    def test_legacy_event_falls_back_to_worker_and_upload(self) -> None:
+        events = [
+            {
+                "cat": "fs",
+                "kind": "final_effect_worker",
+                "w": 2900,
+                "h": 4095,
+                "worker_ms": 90.0,
+                "upload_ms": 15.0,
+            }
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_colorize(events)
+
+        report = output.getvalue()
+        self.assertIn("段階別フィールドがありません", report)
+        self.assertIn("worker", report)
+        self.assertNotIn("colorize total", report)
 
 
 if __name__ == "__main__":

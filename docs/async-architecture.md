@@ -97,7 +97,7 @@
 | `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, from_cache, source_dims, canceled, finalized)。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false, finalized=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + finalized=true) → UI は `requested` を抜くだけで **`thumbnails[i]` は変更しない**。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE 専用 (worker bail-out) で、UI は Evicted に戻して再試行可能にする (Failed にしない)。`finalized=true` と `canceled=true` は排他 |
 | `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly (非終端) / Static / Animated / Failed**。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は `fs_early_dims` に積み fs_pending は維持する (本デコードが続く)。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
-| `final_effect_pending[key].rx` | カラー化 / 最終エフェクト worker → UI | `FinalEffectResult::Ready { pixels, elapsed_ms }` / `Cancelled`。receiver は composite key、画像 index、`items_generation`、表示 / 先読み区分と同じ viewer context に保持し、stale 結果を texture cache へ公開しない。先読み結果も UI 側で完成 texture を 1 枚ずつ upload する |
+| `final_effect_pending[key].rx` | カラー化 / 最終エフェクト worker → UI | `FinalEffectResult::Ready { pixels, elapsed_ms, timing }` / `Cancelled`。`timing` は色調補正、smart sharpen、カラー化判定／適用、Creative LUT、post filter の段階別時間を保持する。receiver は composite key、画像 index、`items_generation`、表示 / 先読み区分と同じ viewer context に保持し、stale 結果を texture cache へ公開しない。先読み結果も UI 側で完成 texture を 1 枚ずつ upload する |
 | `export_pending.rx` | Ctrl+E エクスポート worker → UI | `ExportEvent`: `Started` / `Completed` / `Failed` / `Cancelled` / `AllDone`。UI は毎フレーム `try_recv` で進捗モーダルを更新し、エラーがあればモーダルを残す |
 | `pdf_enumerate_pending` | PDF 列挙スレッド → UI | `(pages, password_needed)` |
 | PDF ワーカー stdin/stdout | UI プロセス ↔ PDF ワーカープロセス | 長さプレフィクス付きバイナリプロトコル (Enumerate / Render / Shutdown) |
@@ -874,7 +874,7 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 
 - `input`  — ユーザー入力 (seq が振られる唯一のカテゴリ)
 - `frame`  — 毎フレーム begin。`n` はフレーム番号
-- `fs`     — フルスクリーン画像: `load_begin` / `decode_begin` / `decode_end` / `ready` / `paint`
+- `fs`     — フルスクリーン画像: `load_begin` / `decode_begin` / `decode_end` / `ready` / `paint`。`final_effect_worker` は `worker_ms` に加えて `colorize_check_ms` / `colorize_apply_ms`、各補正段、`clamp_ms` / `load_texture_ms`、`colorize_applied`、方式・設定スケール・長辺換算後の実効スケール、`prefetch` / `complete` を記録する
 - `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`。アイドル高画質化の最終判定は `idle_upgrade_enqueue` / `idle_upgrade_ineligible` に `key` / `idx` / `items_gen` を載せ、同一状態の反復を検出できるようにする
 - `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `inproc_*` / `enumerate_send`
 - `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`
@@ -889,6 +889,7 @@ python scripts/analyze_perf.py <path>/perf_events.jsonl summary   # 件数/カ�
 python scripts/analyze_perf.py <path>/perf_events.jsonl latency   # seq → ready/paint ms
 python scripts/analyze_perf.py <path>/perf_events.jsonl priority  # 優先度違反検出
 python scripts/analyze_perf.py <path>/perf_events.jsonl thumbs    # decode 時間分布
+python scripts/analyze_perf.py <path>/perf_events.jsonl colorize  # カラー化の解像度・方式別時間
 python scripts/analyze_perf.py <path>/perf_events.jsonl dump 42   # 特定 seq の全イベント
 python scripts/analyze_perf.py <path>/perf_events.jsonl timeline  # ガントチャート (matplotlib)
 python scripts/analyze_perf.py <path>/perf_events.jsonl idle-health --start-t 10 --end-t 25

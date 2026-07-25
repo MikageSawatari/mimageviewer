@@ -16,6 +16,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
     thumbs              サムネイル decode 時間の分布 (priority=H/L 別)
+    colorize            カラー化 / final effect の段階別時間を解像度・方式別に集計
     nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
                         start_loading_items / close_fullscreen) を集計
     hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
@@ -325,6 +326,93 @@ def cmd_thumbs(events: list[dict]) -> None:
         for cached in (True, False):
             label = f"priority={pri}  from_cache={cached}"
             stats(label, buckets.get((pri, cached), []))
+
+
+# -----------------------------------------------------------------------
+# colorize / final effect
+# -----------------------------------------------------------------------
+
+def cmd_colorize(events: list[dict]) -> None:
+    """final_effect_worker を解像度・カラー化設定別に集計する。"""
+    rows = [
+        e
+        for e in events
+        if e.get("cat") == "fs" and e.get("kind") == "final_effect_worker"
+    ]
+    if not rows:
+        print("(fs.final_effect_worker イベントなし)")
+        return
+
+    has_stage_detail = any("colorize_apply_ms" in e for e in rows)
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for e in rows:
+        key = (
+            int(e.get("w", 0)),
+            int(e.get("h", 0)),
+            e.get("colorize_mode", "legacy"),
+            e.get("tone_method", "unknown"),
+            e.get("colorize_applied", "unknown"),
+            e.get("tone_radius", "unknown"),
+            e.get("effective_tone_radius", "unknown"),
+        )
+        groups[key].append(e)
+
+    print(f"final effect 件数: {len(rows)}")
+    if not has_stage_detail:
+        print(
+            "注: このログには段階別フィールドがありません。"
+            "worker_ms / upload_ms のみ集計します。"
+        )
+    print()
+
+    for (width, height, mode, method, applied, radius, effective_radius), group in sorted(
+        groups.items(),
+        key=lambda item: (
+            item[0][0] * item[0][1],
+            str(item[0][3]),
+            str(item[0][4]),
+            str(item[0][5]),
+        ),
+    ):
+        megapixels = width * height / 1_000_000.0
+        prefetch_count = sum(bool(e.get("prefetch", False)) for e in group)
+        complete_count = sum(bool(e.get("complete", False)) for e in group)
+        print(
+            f"{width}x{height} ({megapixels:.1f}MP) "
+            f"mode={mode} tone={method} applied={applied} "
+            f"n={len(group)} prefetch={prefetch_count} complete={complete_count} "
+            f"radius={radius} effective={effective_radius}"
+        )
+
+        def show(label: str, field: str, extra_field: str | None = None) -> None:
+            values = []
+            for event in group:
+                if field not in event:
+                    continue
+                value = float(event[field])
+                if extra_field is not None:
+                    value += float(event.get(extra_field, 0.0))
+                values.append(value)
+            if values:
+                print(
+                    f"  {label:<18} "
+                    f"p50={_percentile(values, 50):7.1f}ms "
+                    f"p95={_percentile(values, 95):7.1f}ms "
+                    f"max={max(values):7.1f}ms"
+                )
+
+        show("worker", "worker_ms")
+        if has_stage_detail:
+            show("colorize total", "colorize_check_ms", "colorize_apply_ms")
+            show("adjust", "adjust_ms")
+            show("sharpen", "sharpen_ms")
+            show("creative LUT", "creative_lut_ms")
+            show("post filter", "post_filter_ms")
+        show("upload/prepare", "upload_ms")
+        if has_stage_detail:
+            show("clamp/copy", "clamp_ms")
+            show("load_texture", "load_texture_ms")
+        print()
 
 
 # -----------------------------------------------------------------------
@@ -1545,6 +1633,7 @@ def main() -> None:
     subs.add_parser("latency")
     subs.add_parser("priority")
     subs.add_parser("thumbs")
+    subs.add_parser("colorize")
     subs.add_parser("nav")
     subs.add_parser("startup")
     p_hit = subs.add_parser("hitches")
@@ -1607,6 +1696,8 @@ def main() -> None:
         cmd_priority(events)
     elif args.cmd == "thumbs":
         cmd_thumbs(events)
+    elif args.cmd == "colorize":
+        cmd_colorize(events)
     elif args.cmd == "nav":
         cmd_nav(events)
     elif args.cmd == "startup":
