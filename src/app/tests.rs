@@ -23395,6 +23395,207 @@ mod still_window_mode_key_tests {
         app.set_detached_window_live_hwnds_for_test(live_hwnds);
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn detached_context_polls_its_own_fs_nav_lock() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 31u64;
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        set_detached_host_for_test(&mut app, window_id, 0x4321, true);
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(PathBuf::from(r"C:\books\second"));
+        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\books\second\p1.jpg"))];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.image_metas = vec![None];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        // deferred reopen 完了直後: items が入れ替わって generation が進み、
+        // 新ページのデコード結果も確定している (Failed でも lock は解放されるべき)。
+        bundle.items_generation = 5;
+        bundle.fs_nav_locked_gen = Some(4);
+        bundle.fs_cache.insert(0, FsCacheEntry::Failed);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        let locked = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("context stays mounted")
+            .bundle
+            .fs_nav_locked_gen;
+        assert!(
+            locked.is_none(),
+            "the mounted detached bundle must poll and release its own Ctrl+arrow nav lock"
+        );
+    }
+
+    fn install_detached_transition_gap_for_test(
+        app: &mut App,
+        window_id: u64,
+        configure: impl FnOnce(&mut ViewerContextBundle),
+    ) -> egui::ViewportId {
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        set_detached_host_for_test(app, window_id, 0x4321, true);
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+
+        let viewport_id = app
+            .active_detached_session_viewport_id()
+            .expect("active detached session must own a viewport");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(PathBuf::from(r"C:\books\second.pdf"));
+        bundle.fullscreen_idx = None;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        configure(&mut bundle);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        viewport_id
+    }
+
+    fn run_active_detached_frame_for_test(app: &mut App, ctx: &egui::Context) {
+        let mut updated = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            updated = app.update_active_detached_viewer_context(ctx);
+        });
+        assert!(updated, "the active detached context must be updated");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_ctrl_nav_can_repeat_after_previous_nav_completed() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = temp.path().join("01");
+        let second = temp.path().join("02");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("a.jpg"), b"fixture").unwrap();
+        std::fs::write(second.join("b.jpg"), b"fixture").unwrap();
+        let window_id = 32u64;
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        set_detached_host_for_test(&mut app, window_id, 0x4321, true);
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(first.clone());
+        bundle.items = vec![GridItem::Image(first.join("a.jpg"))];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.image_metas = vec![None];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        bundle.items_generation = 4;
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        app.with_active_detached_viewer_context(|mounted| {
+            mounted.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+            assert!(
+                mounted.folder_nav_pending.is_some(),
+                "the first Ctrl+Down must create a detached-owned folder request"
+            );
+            assert_eq!(mounted.fs_nav_locked_gen, Some(4));
+
+            // Model a completed navigation without depending on worker timing: consume the
+            // pending request, advance the item generation, and settle the new display result.
+            let pending = mounted
+                .folder_nav_pending
+                .take()
+                .expect("the first request must still be owned by this context");
+            pending.cancel.store(true, Ordering::Relaxed);
+            mounted.current_folder = Some(second.clone());
+            mounted.items = vec![GridItem::Image(second.join("b.jpg"))];
+            mounted.thumbnails = vec![ThumbnailState::Pending];
+            mounted.image_metas = vec![None];
+            mounted.visible_indices = vec![0];
+            mounted.fullscreen_idx = Some(0);
+            mounted.items_generation = 5;
+            mounted.fs_cache.clear();
+            mounted.fs_cache.insert(0, FsCacheEntry::Failed);
+        })
+        .expect("the detached context must mount for its first navigation");
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.fs_nav_locked_gen.is_none()),
+            "the completed navigation must release its context-owned lock"
+        );
+
+        app.with_active_detached_viewer_context(|mounted| {
+            mounted.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+            assert!(
+                mounted.folder_nav_pending.is_some(),
+                "the second Ctrl+Down must not be swallowed by the previous navigation lock"
+            );
+            assert_eq!(mounted.pending_folder_nav_mode.perf_tag(), "fullscreen");
+        })
+        .expect("the detached context must mount for its repeated navigation");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_nav_lock_survives_deferred_reopen_gap() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 33u64;
+        let holdover = ctx.load_texture(
+            "detached_deferred_reopen_holdover",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+
+        install_detached_transition_gap_for_test(&mut app, window_id, move |bundle| {
+            bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+            bundle.items_generation = 5;
+            bundle.fs_nav_locked_gen = Some(4);
+            bundle.fs_holdover_tex = Some(holdover);
+        });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("the deferred reopen owner must stay mounted");
+        assert_eq!(
+            active.bundle.fs_nav_locked_gen,
+            Some(4),
+            "a fullscreen_idx=None deferred reopen gap must retain the navigation lock"
+        );
+        assert!(
+            active.bundle.fs_holdover_tex.is_some(),
+            "the old frame must remain available until deferred reopen installs its target"
+        );
+    }
+
     fn thread_window_entry(
         hwnd_raw: u64,
         is_main: bool,
@@ -26755,6 +26956,482 @@ mod still_window_mode_key_tests {
             active.bundle.fs_boundary_hint,
             Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_pdf_enumerate_gap_keeps_active_window_alive() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 21u64;
+
+        install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+        });
+        assert!(app.active_detached_session.is_some());
+        assert!(app.detached_window_runtime_placement(window_id).is_some());
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert!(
+            app.active_detached_session.is_some(),
+            "PDF enumerate gap is an internal reopen: the detached session must survive"
+        );
+        assert!(
+            app.detached_window_runtime_placement(window_id).is_some(),
+            "PDF enumerate gap must not remove the detached window runtime"
+        );
+        assert!(
+            app.fs_viewport_shown,
+            "PDF enumerate gap must keep the detached viewport shown"
+        );
+        assert!(
+            app.active_detached_viewer_context.is_some(),
+            "the bundle must stay mounted across the async gap"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_gap_survives_multiple_frames() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 22u64;
+        let viewport_id = install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+        });
+        let runtime_placement = app
+            .detached_window_runtime_placement(window_id)
+            .expect("detached gap must start with a runtime placement");
+
+        for frame in 1..=3 {
+            run_active_detached_frame_for_test(&mut app, &ctx);
+
+            assert_eq!(
+                app.active_detached_session.map(|session| session.window_id),
+                Some(window_id),
+                "frame {frame}: the same detached session must survive"
+            );
+            assert_eq!(
+                app.active_detached_session_viewport_id(),
+                Some(viewport_id),
+                "frame {frame}: the detached ViewportId must not change"
+            );
+            assert_eq!(
+                app.detached_window_runtime_placement(window_id),
+                Some(runtime_placement),
+                "frame {frame}: the same detached runtime must survive"
+            );
+            assert_eq!(
+                app.detached_window_state(window_id),
+                Some(DetachedWindowState::Active),
+                "frame {frame}: the runtime lifecycle must remain Active"
+            );
+            let active = app
+                .active_detached_viewer_context
+                .as_ref()
+                .expect("the transition bundle must remain mounted");
+            assert_eq!(
+                active.bundle.viewer_session.detached_window_id,
+                Some(window_id),
+                "frame {frame}: the bundle must retain the same window identity"
+            );
+            assert!(app.fs_viewport_shown);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_explicit_close_still_finalizes_viewport() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 23u64;
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        set_detached_host_for_test(&mut app, window_id, 0x4321, true);
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(PathBuf::from(r"C:\pics"));
+        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\pics\a.jpg"))];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.image_metas = vec![None];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        app.with_active_detached_viewer_context(|mounted| {
+            mounted.handle_fullscreen_close_request();
+        })
+        .expect("the active detached context must be mounted for explicit close");
+        assert!(
+            app.active_detached_session.is_none(),
+            "explicit close must declare terminal lifecycle before finalization"
+        );
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert!(!app.fs_viewport_shown);
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert!(app.active_detached_session.is_none());
+        assert!(app.detached_window_runtime_placement(window_id).is_none());
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "terminal close must drop the finished detached bundle"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_gap_does_not_touch_main_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 24u64;
+        let main_folder = PathBuf::from(r"C:\main\results");
+        let history_folder = PathBuf::from(r"C:\main\previous");
+
+        app.current_folder = Some(main_folder.clone());
+        app.items = vec![
+            GridItem::Image(main_folder.join("a.jpg")),
+            GridItem::Image(main_folder.join("b.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.image_metas = vec![None; 2];
+        app.visible_indices = vec![1];
+        app.selected = Some(1);
+        app.scroll_offset_y = 137.5;
+        app.show_search_bar = true;
+        app.search_query = "tag:keep".to_string();
+        app.search_filter = Some(HashSet::from([1]));
+        app.search_filter_origin_folder = Some(main_folder.clone());
+        app.settings.rating_filter = [false, true, false, true, false, true];
+        app.folder_history
+            .insert(history_folder.clone(), (88.0, Some(0)));
+
+        let expected_folder = app.current_folder.clone();
+        let expected_item_paths: Vec<PathBuf> = app
+            .items
+            .iter()
+            .map(|item| match item {
+                GridItem::Image(path) => path.clone(),
+                _ => unreachable!("T4 main fixture contains only images"),
+            })
+            .collect();
+        let expected_visible = app.visible_indices.clone();
+        let expected_selected = app.selected;
+        let expected_scroll = app.scroll_offset_y;
+        let expected_show_search_bar = app.show_search_bar;
+        let expected_search_query = app.search_query.clone();
+        let expected_search_filter = app.search_filter.clone();
+        let expected_search_origin = app.search_filter_origin_folder.clone();
+        let expected_rating_filter = app.settings.rating_filter;
+        let expected_history = app.folder_history.clone();
+
+        install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+        });
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert_eq!(app.current_folder, expected_folder);
+        let actual_item_paths: Vec<PathBuf> = app
+            .items
+            .iter()
+            .map(|item| match item {
+                GridItem::Image(path) => path.clone(),
+                _ => unreachable!("T4 main fixture must remain an image list"),
+            })
+            .collect();
+        assert_eq!(actual_item_paths, expected_item_paths);
+        assert_eq!(app.visible_indices, expected_visible);
+        assert_eq!(app.selected, expected_selected);
+        assert_eq!(app.scroll_offset_y, expected_scroll);
+        assert_eq!(app.show_search_bar, expected_show_search_bar);
+        assert_eq!(app.search_query, expected_search_query);
+        assert_eq!(app.search_filter, expected_search_filter);
+        assert_eq!(app.search_filter_origin_folder, expected_search_origin);
+        assert_eq!(app.settings.rating_filter, expected_rating_filter);
+        assert_eq!(app.folder_history, expected_history);
+        assert!(
+            app.active_detached_viewer_context.is_some(),
+            "the detached transition must remain isolated from the preserved main context"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_zip_enumerate_gap_keeps_active_window_alive() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 25u64;
+        let (zip_tx, zip_rx) = mpsc::channel::<Result<crate::zip_loader::ZipEnumeration, String>>();
+
+        install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.current_folder = Some(PathBuf::from(r"C:\books\second.zip"));
+            bundle.zip_enumerate_pending = Some(ZipEnumeratePending {
+                zip_path: PathBuf::from(r"C:\books\second.zip"),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: zip_rx,
+            });
+        });
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(window_id)
+        );
+        assert!(app.detached_window_runtime_placement(window_id).is_some());
+        assert!(app.fs_viewport_shown);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
+        );
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.zip_enumerate_pending.is_some()),
+            "ZIP enumerate pending must keep its owner bundle alive"
+        );
+        drop(zip_tx);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_folder_scan_gap_keeps_active_window_alive() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 26u64;
+        let (scan_tx, scan_rx) = mpsc::channel::<std::io::Result<ScannedDir>>();
+
+        install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.current_folder = Some(PathBuf::from(r"C:\books\images"));
+            bundle.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: PathBuf::from(r"C:\books\images"),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::DetachedImage {
+                    image_path: PathBuf::from(r"C:\books\images\page.jpg"),
+                },
+            });
+        });
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(window_id)
+        );
+        assert!(app.detached_window_runtime_placement(window_id).is_some());
+        assert!(app.fs_viewport_shown);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
+        );
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.folder_pane_open_pending.is_some()),
+            "folder scan pending must keep its owner bundle alive"
+        );
+        drop(scan_tx);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_pdf_password_gap_keeps_active_window_alive() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 27u64;
+
+        install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.pdf_password_request = Some(PdfPasswordRequest {
+                path: PathBuf::from(r"C:\books\protected.pdf"),
+            });
+        });
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(window_id)
+        );
+        assert!(app.detached_window_runtime_placement(window_id).is_some());
+        assert!(app.fs_viewport_shown);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
+        );
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.pdf_password_request.is_some()),
+            "PDF password request must keep its owner bundle alive"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_gap_escape_finalizes_viewport() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 29u64;
+
+        install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+        });
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut updated = false;
+        let _ = ctx.run(input, |ctx| {
+            updated = app.update_active_detached_viewer_context(ctx);
+        });
+        assert!(updated);
+
+        assert!(!app.fs_viewport_shown);
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert!(app.active_detached_session.is_none());
+        assert!(app.detached_window_runtime_placement(window_id).is_none());
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "Esc during an async gap must cancel the reopen and drop the detached context"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_folder_nav_boundary_keeps_current_pdf_and_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 28u64;
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        set_detached_host_for_test(&mut app, window_id, 0x4321, true);
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+        let viewport_id = app
+            .active_detached_session_viewport_id()
+            .expect("boundary test must start with a stable viewport");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (result_tx, result_rx) = mpsc::channel::<FolderNavThreadResult>();
+        result_tx
+            .send(FolderNavThreadResult {
+                outcome: None,
+                scanned: FolderNavScanResult::NotNeeded,
+            })
+            .unwrap();
+        let pdf = PathBuf::from(r"C:\books\current.pdf");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        bundle.current_folder = Some(pdf.clone());
+        bundle.items = vec![GridItem::PdfPage {
+            pdf_path: pdf,
+            page_num: 3,
+            content_type: None,
+        }];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.image_metas = vec![None];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        bundle.folder_nav_pending = Some(FolderNavPending {
+            cancel,
+            rx: result_rx,
+            forward: true,
+            mode: FolderNavMode::Fullscreen,
+        });
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(window_id)
+        );
+        assert_eq!(app.active_detached_session_viewport_id(), Some(viewport_id));
+        assert!(app.detached_window_runtime_placement(window_id).is_some());
+        assert!(app.fs_viewport_shown);
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("a folder-nav boundary must keep the current detached context");
+        assert_eq!(active.bundle.fullscreen_idx, Some(0));
+        assert!(matches!(
+            active.bundle.fs_boundary_hint,
+            Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_closing_window_finalizes_even_with_outstanding_transition() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 30u64;
+
+        // A non-deferred outstanding transition distinguishes the detached hold predicate from
+        // the legacy fullscreen deferred-reopen hold, which intentionally remains available to
+        // the main context as well.
+        install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
+            bundle.pdf_password_request = Some(PdfPasswordRequest {
+                path: PathBuf::from(r"C:\books\protected.pdf"),
+            });
+        });
+        app.begin_active_detached_session_close("test_closing");
+        assert!(app.active_detached_session.is_some());
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Closing)
+        );
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+
+        assert!(
+            !app.active_detached_viewport_rendered_this_frame(),
+            "a Closing window must not render an internal-transition holdover before finalization"
+        );
+        assert!(!app.fs_viewport_shown);
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert!(
+            app.active_detached_session.is_none(),
+            "finalization must finish the Closing session even while a transition is outstanding"
+        );
     }
 
     #[test]

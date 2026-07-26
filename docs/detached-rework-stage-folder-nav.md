@@ -33,6 +33,23 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
   cancel し、遅延結果を main または sibling context へ移さない。
 - folder-nav reopen は既存 detached window ID、位置、サイズを維持し、main へ focus を奪わない。
 
+### 2.1 ライフサイクル不変条件
+
+- terminal close の唯一の根拠は `detached_active_window_alive_wanted()`
+  (= active detached session が存在し、`DetachedWindowState::Closing` ではない) とする。
+  `fullscreen_idx` や pending field、shown flag の有無から close intent を推論しない。
+  internal reopen 中は session を Active のまま維持し、明示 close 側が session の
+  finish / `Closing` 遷移を宣言してから viewport を finalize する。
+- active detached bundle が内部遷移中かどうかは
+  `active_detached_transition_outstanding()` を唯一の述語とする。folder-nav、実フォルダ scan、
+  PDF / ZIP 列挙、deferred reopen、PDF password、本ブックマーク open の pending を追加・
+  変更するときはこの述語だけを更新し、repaint / bundle drop / keep-alive に条件列を複製しない。
+- active detached bundle が所有する viewer 状態（nav lock / holdover を含む）は、bundle を
+  mount している `update_active_detached_viewer_context` 内で poll する。main の `App::update`
+  poll block は detached bundle が unmount の状態で走るため、context 所有状態の poll を置かない。
+- 既知の follow-up: deferred reopen 以外の pending 中に Esc を押した場合、session/runtime は閉じるが
+  pending owner bundle は完了まで mount されたまま残る。Stage 1 では変更しない。
+
 ## 3. 触ってよい範囲
 
 - `src/app.rs`

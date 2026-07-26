@@ -32636,6 +32636,26 @@ impl App {
         self.active_detached_window_id().is_some() && !self.active_detached_window_is_closing()
     }
 
+    /// active detached bundle が「まだ内部遷移の途中」か。
+    /// このフレームで detached window を生かしておく理由が1つでもあれば true。
+    ///
+    /// 同じ条件列が repaint 要求 / should_drop / keep-alive の3箇所に複製されており、
+    /// finalize だけが更新から取り残されて 2026-07 の「Ctrl+↓ で detached window が閉じる」
+    /// 回帰を生んだ。以後 pending を増やすときはこの1箇所だけを更新すること。
+    #[cfg(windows)]
+    pub(crate) fn active_detached_transition_outstanding(&self) -> bool {
+        self.folder_nav_pending.is_some()
+            || self.folder_pane_open_pending.is_some()
+            || self.pdf_enumerate_pending.is_some()
+            || self.zip_enumerate_pending.is_some()
+            || self.fs_nav_deferred_reopen_wait_active()
+            || self.pdf_password_request.is_some()
+            || matches!(
+                self.bookmark_open_pending,
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+            )
+    }
+
     /// `fullscreen_viewport_id()` は active detached session が生きている間、その session の
     /// ViewportId を最優先で返す。したがってこの状態で backdrop cleanup を走らせると、
     /// 古い main/fullscreen viewport ではなく **生きている detached 窓** を隠してしまう。
@@ -34504,9 +34524,9 @@ impl App {
         self.fs_viewport_recreate_after_hide = false;
         self.clear_detached_viewer_host_hwnd();
         // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
-        // ここは should_drop (fullscreen_idx None + folder/image scan・列挙なし + !shown)
-        // 経路でのみ呼ばれる。folder-nav reopen や初回 image scan 中は呼ばれないので
-        // session を畳んでよい。
+        // terminal close が明示的に宣言され、session が finish 済みまたは Closing のとき
+        // だけ呼ばれる。internal reopen (folder-nav / PDF・ZIP 列挙 / scan / password) 中は
+        // detached_active_window_alive_wanted() が true なので呼ばれず、session を維持する。
         self.finish_active_detached_session_close("active_close_finalize");
         if let Some(window_id) = closing_window_id {
             self.remove_detached_window_runtime(window_id, "active_close_finalize");
@@ -35340,6 +35360,8 @@ impl App {
                 // サムネ抽出などが送ってきた結果を放置すると自分の rx に溜まり続ける。
                 // 表示する場が無いので読み捨てる (サムネ状態は Pending のまま = 従来挙動)。
                 app.drain_thumb_results_discard();
+                // main の thumbnail/prefetch 結果回収後と同じ位置で、mounted owner の nav lock を poll する。
+                app.poll_fs_nav_lock();
                 if app.current_viewer_context_contains_video() {
                     app.poll_video(ctx);
                 }
@@ -35359,17 +35381,7 @@ impl App {
                 app.poll_local_adjust_lut_load(ctx);
                 app.poll_local_adjust_segmentation(ctx);
 
-                if app.folder_nav_pending.is_some()
-                    || app.folder_pane_open_pending.is_some()
-                    || app.pdf_enumerate_pending.is_some()
-                    || app.zip_enumerate_pending.is_some()
-                    || app.fs_nav_deferred_reopen_wait_active()
-                    || app.pdf_password_request.is_some()
-                    || matches!(
-                        app.bookmark_open_pending,
-                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
-                    )
-                {
+                if app.active_detached_transition_outstanding() {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 }
 
@@ -35426,6 +35438,7 @@ impl App {
                 }
 
                 let detached_viewport_finalized = if app.fullscreen_idx.is_none()
+                    && !app.detached_active_window_alive_wanted()
                     && let Some(viewport_id) = close_viewport_id
                 {
                     app.finalize_closed_active_detached_viewport(ctx, viewport_id);
@@ -35434,16 +35447,7 @@ impl App {
                     false
                 };
                 let should_drop = app.fullscreen_idx.is_none()
-                    && app.folder_nav_pending.is_none()
-                    && app.folder_pane_open_pending.is_none()
-                    && app.pdf_enumerate_pending.is_none()
-                    && app.zip_enumerate_pending.is_none()
-                    && !app.fs_nav_deferred_reopen_wait_active()
-                    && app.pdf_password_request.is_none()
-                    && !matches!(
-                        app.bookmark_open_pending,
-                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
-                    )
+                    && !app.active_detached_transition_outstanding()
                     && !app.fs_viewport_shown;
                 (should_drop, detached_viewport_finalized)
             })

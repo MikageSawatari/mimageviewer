@@ -6782,12 +6782,22 @@ impl App {
         }
         let fs_id = self.fullscreen_viewport_id();
 
-        // Ctrl+↑↓ で PDF/ZIP enumerate や確認なしアーカイブ変換を挟む遷移中は
-        // fullscreen_idx が None のまま deferred reopen 完了を待つ。この間ビューポートを
+        #[cfg(windows)]
+        let detached_transition_hold = self.detached_active_window_alive_wanted()
+            && self.active_detached_transition_outstanding();
+        #[cfg(not(windows))]
+        let detached_transition_hold = false;
+
+        // Ctrl+↑↓ の deferred reopen、または active detached の PDF/ZIP 列挙・scan・password
+        // 待ちでは fullscreen_idx が None のまま内部遷移の完了を待つ。この間ビューポートを
         // 隠すとその下のグリッドが見えてちらつくので維持しつつ、ナビロックの holdover
         // (= 直前ページのテクスチャ) があればそれを表示して「黒画面で待たされる」
-        // 体感を緩和する。
-        if self.fs_viewport_shown && self.fs_nav_deferred_reopen_wait_active() {
+        // 体感を緩和する。terminal intent は finalize と同じ唯一の述語
+        // detached_active_window_alive_wanted() で判断し、main context では従来の
+        // deferred reopen だけを対象にする。
+        if self.fs_viewport_shown
+            && (self.fs_nav_deferred_reopen_wait_active() || detached_transition_hold)
+        {
             #[cfg(windows)]
             let fs_builder = self
                 .build_inactive_fullscreen_viewport_builder_with_source(0, "keep_alive_holdover");
