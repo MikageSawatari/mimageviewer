@@ -53,6 +53,32 @@ matter for decode/encode paths:
 When updating BtbN assets, verify the configure string and update this table if
 new `--enable-lib*` entries appear.
 
+## Corresponding Source
+
+BtbN builds from a specific FFmpeg commit, not from a release tag. The bundled
+DLLs report `n<tag>-<n>-g<hash>`, where `<n>` commits sit on top of `<tag>`.
+Publishing only the release tarball for `<tag>` therefore does **not** provide
+the corresponding source for the build we ship.
+
+Fetch the exact commit instead:
+
+```bash
+# hash comes from the g<hash> part of vendor/ffmpeg/VERSION
+curl -sSL --fail -o htdocs/mimageviewer/ffmpeg-<BUILD-ID>-source.tar.gz \
+  https://github.com/FFmpeg/FFmpeg/archive/<hash>.tar.gz
+```
+
+`<BUILD-ID>` is the version string from the DLLs, e.g.
+`ffmpeg-n7.1.5-10-g2aefd64d48-source.tar.gz`. Verify after downloading:
+
+- `tar tzf <file> | head -1` shows the full commit hash in the top-level
+  directory name, which must match the short hash in `vendor/ffmpeg/VERSION`
+- `tar xzf <file> -O <dir>/RELEASE` shows the base release version
+- record the `sha256sum` with the release materials
+
+Keep the tarballs of previous releases in place. Users of an older
+mImageViewer are entitled to the source matching *their* build.
+
 ## Notice Template
 
 Use this wording in user-facing software information:
@@ -61,7 +87,7 @@ Use this wording in user-facing software information:
 This software uses libraries from the FFmpeg project (https://ffmpeg.org/)
 under the LGPLv3-or-later.
 FFmpeg version: <vendor/ffmpeg/VERSION>
-Source: https://mikage.to/mimageviewer/ffmpeg-<VERSION>-source.tar.xz
+Source: https://mikage.to/mimageviewer/ffmpeg-<BUILD-ID>-source.tar.gz
 Source and external library notes: https://mikage.to/mimageviewer/
 License: https://www.gnu.org/licenses/lgpl-3.0.html
 ```
