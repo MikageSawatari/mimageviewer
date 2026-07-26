@@ -23,6 +23,7 @@ use crate::app::{
     LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset, LocalAdjustMaskEditTarget,
     LocalAdjustMaskShapeDrag, LocalAdjustMaskTool, LocalAdjustRegionSegmentationScope,
 };
+use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::KeyAction;
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
@@ -182,6 +183,27 @@ impl MaskKind {
 #[cfg(test)]
 mod local_adjust_segmentation_tests {
     use super::*;
+
+    fn test_transform(rect: egui::Rect, size: (usize, usize)) -> DisplayedImageTransform {
+        DisplayedImageTransform::resolve(
+            crate::displayed_image_transform::DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: rect,
+                source_size: egui::vec2(size.0 as f32, size.1 as f32),
+                texture_size: egui::vec2(size.0 as f32, size.1 as f32),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_scale_limits:
+                    crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                    zoom_pan: None,
+                },
+            },
+        )
+        .unwrap()
+    }
 
     #[test]
     fn local_adjust_mask_preview_alt_inverts_panel_toggle() {
@@ -512,24 +534,13 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalEffect::None,
         );
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let transform = test_transform(rect, (100, 100));
         assert_eq!(
-            local_adjust_gradient_handle_hit(
-                &layer,
-                egui::pos2(80.0, 70.0),
-                rect,
-                (100, 100),
-                None
-            ),
+            local_adjust_gradient_handle_hit(&layer, egui::pos2(80.0, 70.0), &transform,),
             Some(crate::app::LocalAdjustCanvasDragKind::LinearGradientEnd)
         );
         assert_eq!(
-            local_adjust_gradient_handle_hit(
-                &layer,
-                egui::pos2(20.0, 30.0),
-                rect,
-                (100, 100),
-                None
-            ),
+            local_adjust_gradient_handle_hit(&layer, egui::pos2(20.0, 30.0), &transform,),
             Some(crate::app::LocalAdjustCanvasDragKind::LinearGradientStart)
         );
     }
@@ -549,24 +560,13 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalEffect::None,
         );
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let transform = test_transform(rect, (200, 100));
         assert_eq!(
-            local_adjust_gradient_handle_hit(
-                &layer,
-                egui::pos2(160.0, 50.0),
-                rect,
-                (200, 100),
-                None
-            ),
+            local_adjust_gradient_handle_hit(&layer, egui::pos2(160.0, 50.0), &transform,),
             Some(crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterX)
         );
         assert_eq!(
-            local_adjust_gradient_handle_hit(
-                &layer,
-                egui::pos2(100.0, 50.0),
-                rect,
-                (200, 100),
-                None
-            ),
+            local_adjust_gradient_handle_hit(&layer, egui::pos2(100.0, 50.0), &transform,),
             Some(crate::app::LocalAdjustCanvasDragKind::RadialGradientCenter)
         );
     }
@@ -2779,67 +2779,42 @@ fn local_adjust_image_dims(app: &App, fs_idx: usize) -> (usize, usize) {
 }
 
 fn local_adjust_image_layout(
-    image_rect: egui::Rect,
+    transform: &DisplayedImageTransform,
     image_dims: (usize, usize),
-    zoom_pan: Option<(f32, egui::Vec2)>,
 ) -> Option<(f32, egui::Rect)> {
     let (iw, ih) = (image_dims.0.max(1), image_dims.1.max(1));
-    let display_size = egui::vec2(iw as f32, ih as f32);
-    let fit_scale = (image_rect.width() / display_size.x).min(image_rect.height() / display_size.y);
-    if !fit_scale.is_finite() || fit_scale <= 0.0 {
+    let scale = transform.screen_px_per_source_px(egui::vec2(iw as f32, ih as f32));
+    if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
-    let (total_scale, center) = match zoom_pan {
-        Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
-        None => (fit_scale, image_rect.center()),
-    };
-    Some((
-        total_scale,
-        egui::Rect::from_center_size(center, display_size * total_scale),
-    ))
+    Some((scale, transform.full_image_rect))
 }
 
 fn local_adjust_screen_to_norm(
     screen: egui::Pos2,
-    image_rect: egui::Rect,
-    image_dims: (usize, usize),
-    zoom_pan: Option<(f32, egui::Vec2)>,
+    transform: &DisplayedImageTransform,
     require_inside: bool,
 ) -> Option<[f32; 2]> {
-    let (_, rect) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
-    if require_inside && !rect.contains(screen) {
+    if require_inside && !transform.contains_screen(screen) {
         return None;
     }
-    Some([
-        ((screen.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
-        ((screen.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
-    ])
+    let p = transform.screen_to_source_normalized(screen);
+    Some([p.x.clamp(0.0, 1.0), p.y.clamp(0.0, 1.0)])
 }
 
 fn local_adjust_screen_to_norm_unclamped(
     screen: egui::Pos2,
-    image_rect: egui::Rect,
-    image_dims: (usize, usize),
-    zoom_pan: Option<(f32, egui::Vec2)>,
+    transform: &DisplayedImageTransform,
 ) -> Option<[f32; 2]> {
-    let (_, rect) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
-    Some([
-        (screen.x - rect.left()) / rect.width(),
-        (screen.y - rect.top()) / rect.height(),
-    ])
+    let p = transform.screen_to_source_normalized(screen);
+    Some([p.x, p.y])
 }
 
 fn local_adjust_norm_to_screen(
     norm: [f32; 2],
-    image_rect: egui::Rect,
-    image_dims: (usize, usize),
-    zoom_pan: Option<(f32, egui::Vec2)>,
+    transform: &DisplayedImageTransform,
 ) -> Option<egui::Pos2> {
-    let (_, rect) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
-    Some(egui::pos2(
-        rect.left() + norm[0] * rect.width(),
-        rect.top() + norm[1] * rect.height(),
-    ))
+    Some(transform.source_normalized_to_screen(egui::pos2(norm[0], norm[1])))
 }
 
 fn local_adjust_drawn_norm_to_screen(rect: egui::Rect, norm: [f32; 2]) -> egui::Pos2 {
@@ -4675,9 +4650,7 @@ fn set_selected_local_adjust_line_thickness(
 
 fn draw_local_adjust_ellipse(
     painter: &egui::Painter,
-    image_rect: egui::Rect,
-    image_dims: (usize, usize),
-    zoom_pan: Option<(f32, egui::Vec2)>,
+    transform: &DisplayedImageTransform,
     center: [f32; 2],
     rx: f32,
     ry: f32,
@@ -4687,7 +4660,7 @@ fn draw_local_adjust_ellipse(
     for i in 0..=72 {
         let t = i as f32 / 72.0 * std::f32::consts::TAU;
         let norm = [center[0] + rx * t.cos(), center[1] + ry * t.sin()];
-        if let Some(pos) = local_adjust_norm_to_screen(norm, image_rect, image_dims, zoom_pan) {
+        if let Some(pos) = local_adjust_norm_to_screen(norm, transform) {
             points.push(pos);
         }
     }
@@ -5096,6 +5069,7 @@ fn local_adjust_set_color_gradient_linear_points(
     }
 }
 
+#[cfg(test)]
 fn local_adjust_effect_gradient_handle_positions(
     effect: &local_adjust_core::LocalEffect,
     rect: egui::Rect,
@@ -5137,6 +5111,7 @@ fn local_adjust_effect_gradient_handle_positions(
     }
 }
 
+#[cfg(test)]
 fn local_adjust_effect_gradient_handle_hit(
     effect: &local_adjust_core::LocalEffect,
     pos: egui::Pos2,
@@ -5144,6 +5119,54 @@ fn local_adjust_effect_gradient_handle_hit(
 ) -> Option<crate::app::LocalAdjustCanvasDragKind> {
     const HIT_RADIUS: f32 = 15.0;
     local_adjust_effect_gradient_handle_positions(effect, drawn_rect)
+        .into_iter()
+        .find_map(|(kind, handle)| (handle.distance(pos) <= HIT_RADIUS).then_some(kind))
+}
+
+fn local_adjust_effect_gradient_handle_hit_transform(
+    effect: &local_adjust_core::LocalEffect,
+    pos: egui::Pos2,
+    transform: &DisplayedImageTransform,
+) -> Option<crate::app::LocalAdjustCanvasDragKind> {
+    const HIT_RADIUS: f32 = 15.0;
+    let geometry = local_adjust_effect_gradient_geometry(effect)?;
+    let positions = match geometry.shape {
+        local_adjust_core::ColorOverlayShape::Linear => {
+            let (start, end) = local_adjust_color_gradient_linear_points(geometry);
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientEnd,
+                    transform.source_normalized_to_screen(egui::pos2(end[0], end[1])),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientStart,
+                    transform.source_normalized_to_screen(egui::pos2(start[0], start[1])),
+                ),
+            ]
+        }
+        local_adjust_core::ColorOverlayShape::Radial => {
+            let radius = geometry.radius.clamp(0.02, 2.0);
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius,
+                    transform.source_normalized_to_screen(egui::pos2(
+                        geometry.center[0] + radius,
+                        geometry.center[1],
+                    )),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientCenter,
+                    transform.source_normalized_to_screen(egui::pos2(
+                        geometry.center[0],
+                        geometry.center[1],
+                    )),
+                ),
+            ]
+        }
+        local_adjust_core::ColorOverlayShape::Unselected
+        | local_adjust_core::ColorOverlayShape::Solid => Vec::new(),
+    };
+    positions
         .into_iter()
         .find_map(|(kind, handle)| (handle.distance(pos) <= HIT_RADIUS).then_some(kind))
 }
@@ -5759,6 +5782,7 @@ fn draw_local_adjust_effect_position_overlay(
     }
 }
 
+#[cfg(test)]
 fn local_adjust_tilt_shift_handle_positions(
     rect: egui::Rect,
     params: local_adjust_core::TiltShiftParams,
@@ -5819,6 +5843,7 @@ fn local_adjust_tilt_shift_handle_positions(
     }
 }
 
+#[cfg(test)]
 fn local_adjust_tilt_shift_handle_hit(
     effect: &local_adjust_core::LocalEffect,
     pos: egui::Pos2,
@@ -5830,6 +5855,74 @@ fn local_adjust_tilt_shift_handle_hit(
     local_adjust_tilt_shift_handle_positions(drawn_rect, *params)
         .into_iter()
         .find_map(|(kind, handle)| (handle.distance(pos) <= 15.0).then_some(kind))
+}
+
+fn local_adjust_tilt_shift_handle_hit_transform(
+    effect: &local_adjust_core::LocalEffect,
+    pos: egui::Pos2,
+    transform: &DisplayedImageTransform,
+) -> Option<crate::app::LocalAdjustCanvasDragKind> {
+    let local_adjust_core::LocalEffect::TiltShift(params) = effect else {
+        return None;
+    };
+    if !params.range_initialized {
+        return None;
+    }
+    let positions = match params.mode {
+        local_adjust_core::TiltShiftMode::Linear => {
+            let angle = params.angle_degrees.to_radians();
+            let dir = [angle.cos(), angle.sin()];
+            let focus = params.focus_width.max(0.0);
+            let outer = focus + params.falloff.max(0.001);
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus,
+                    local_adjust_offset_norm(params.center, dir, focus),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter,
+                    local_adjust_offset_norm(params.center, dir, outer),
+                ),
+            ]
+        }
+        local_adjust_core::TiltShiftMode::Radial => {
+            let outer = 1.0 + params.falloff.max(0.001);
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerX,
+                    [
+                        params.center[0] + params.radius[0].max(0.001),
+                        params.center[1],
+                    ],
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerY,
+                    [
+                        params.center[0],
+                        params.center[1] + params.radius[1].max(0.001),
+                    ],
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterX,
+                    [
+                        params.center[0] + params.radius[0].max(0.001) * outer,
+                        params.center[1],
+                    ],
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterY,
+                    [
+                        params.center[0],
+                        params.center[1] + params.radius[1].max(0.001) * outer,
+                    ],
+                ),
+            ]
+        }
+    };
+    positions.into_iter().find_map(|(kind, norm)| {
+        let handle = transform.source_normalized_to_screen(egui::pos2(norm[0], norm[1]));
+        (handle.distance(pos) <= 15.0).then_some(kind)
+    })
 }
 
 fn local_adjust_tilt_shift_range_create_pending(effect: &local_adjust_core::LocalEffect) -> bool {
@@ -6293,7 +6386,7 @@ fn local_adjust_hsv_to_rgb(hue: f32, sat: f32, val: f32) -> [u8; 3] {
 
 fn draw_local_adjust_mask_preview_overlay(
     painter: &egui::Painter,
-    drawn_rect: egui::Rect,
+    transform: &DisplayedImageTransform,
     layer: &local_adjust_core::LocalAdjustmentLayer,
     source: Option<&egui::ColorImage>,
     image_dims: (usize, usize),
@@ -6304,8 +6397,8 @@ fn draw_local_adjust_mask_preview_overlay(
 ) {
     let width = image_dims.0.max(1);
     let height = image_dims.1.max(1);
-    let rect_w = drawn_rect.width().max(1.0);
-    let rect_h = drawn_rect.height().max(1.0);
+    let rect_w = transform.full_image_rect.width().max(1.0);
+    let rect_h = transform.full_image_rect.height().max(1.0);
     let scale = (LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS / rect_w.max(rect_h)).min(1.0);
     let tex_w = (rect_w * scale)
         .round()
@@ -6340,12 +6433,7 @@ fn draw_local_adjust_mask_preview_overlay(
     let Some(texture) = texture_slot.as_ref() else {
         return;
     };
-    painter.image(
-        texture.id(),
-        drawn_rect,
-        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
+    transform.paint_texture(painter, texture.id(), egui::Color32::WHITE);
 }
 
 fn build_local_adjust_mask_preview_image(
@@ -6690,15 +6778,13 @@ fn local_adjust_ellipse_radius_for_direction(rx: f32, ry: f32, ux: f32, uy: f32)
 fn local_adjust_gradient_handle_hit(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     pos: egui::Pos2,
-    image_rect: egui::Rect,
-    image_dims: (usize, usize),
-    zoom_pan: Option<(f32, egui::Vec2)>,
+    transform: &DisplayedImageTransform,
 ) -> Option<crate::app::LocalAdjustCanvasDragKind> {
     const HIT_RADIUS: f32 = 14.0;
     match &layer.mask {
         local_adjust_core::LocalMask::LinearGradient(mask) if mask.initialized => {
-            let start = local_adjust_norm_to_screen(mask.start, image_rect, image_dims, zoom_pan)?;
-            let end = local_adjust_norm_to_screen(mask.end, image_rect, image_dims, zoom_pan)?;
+            let start = local_adjust_norm_to_screen(mask.start, transform)?;
+            let end = local_adjust_norm_to_screen(mask.end, transform)?;
             if end.distance(pos) <= HIT_RADIUS {
                 Some(crate::app::LocalAdjustCanvasDragKind::LinearGradientEnd)
             } else if start.distance(pos) <= HIT_RADIUS {
@@ -6708,33 +6794,46 @@ fn local_adjust_gradient_handle_hit(
             }
         }
         local_adjust_core::LocalMask::RadialGradient(mask) if mask.initialized => {
-            let (_, drawn_rect) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
-            let center =
-                local_adjust_norm_to_screen(mask.center, image_rect, image_dims, zoom_pan)?;
-            let inner_rx = mask.inner_radius.max(0.0) * drawn_rect.width();
-            let inner_ry = mask.inner_radius_y.max(0.0) * drawn_rect.height();
-            let outer_rx = mask.outer_radius.max(mask.inner_radius).max(0.0) * drawn_rect.width();
-            let outer_ry =
-                mask.outer_radius_y.max(mask.inner_radius_y).max(0.0) * drawn_rect.height();
             let handles = [
                 (
-                    egui::pos2(center.x + outer_rx, center.y),
+                    local_adjust_norm_to_screen(
+                        [
+                            mask.center[0] + mask.outer_radius.max(mask.inner_radius),
+                            mask.center[1],
+                        ],
+                        transform,
+                    )?,
                     crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterX,
                 ),
                 (
-                    egui::pos2(center.x, center.y + outer_ry),
+                    local_adjust_norm_to_screen(
+                        [
+                            mask.center[0],
+                            mask.center[1] + mask.outer_radius_y.max(mask.inner_radius_y),
+                        ],
+                        transform,
+                    )?,
                     crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterY,
                 ),
                 (
-                    egui::pos2(center.x + inner_rx, center.y),
+                    local_adjust_norm_to_screen(
+                        [mask.center[0] + mask.inner_radius.max(0.0), mask.center[1]],
+                        transform,
+                    )?,
                     crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerX,
                 ),
                 (
-                    egui::pos2(center.x, center.y + inner_ry),
+                    local_adjust_norm_to_screen(
+                        [
+                            mask.center[0],
+                            mask.center[1] + mask.inner_radius_y.max(0.0),
+                        ],
+                        transform,
+                    )?,
                     crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerY,
                 ),
                 (
-                    center,
+                    local_adjust_norm_to_screen(mask.center, transform)?,
                     crate::app::LocalAdjustCanvasDragKind::RadialGradientCenter,
                 ),
             ];
@@ -9619,8 +9718,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-        image_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if !self.local_adjust_mode {
             return;
@@ -9709,9 +9807,7 @@ impl App {
                 match self.local_adjust_mask_tool {
                     LocalAdjustMaskTool::Lasso => {
                         if let Some(pos) = pointer_pos
-                            && let Some(norm) = local_adjust_screen_to_norm(
-                                pos, image_rect, image_dims, zoom_pan, false,
-                            )
+                            && let Some(norm) = local_adjust_screen_to_norm(pos, transform, false)
                         {
                             let p = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
                             self.local_adjust_mask_lasso_points.push([p.0, p.1]);
@@ -9755,8 +9851,7 @@ impl App {
         if let Some(mut stroke) = self.local_adjust_mask_brush_stroke {
             if primary_down {
                 if let Some(pos) = pointer_pos
-                    && let Some(norm) =
-                        local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
+                    && let Some(norm) = local_adjust_screen_to_norm(pos, transform, false)
                 {
                     self.paint_local_adjust_mask_tool_segment(
                         stroke.fs_idx,
@@ -9786,9 +9881,9 @@ impl App {
                     && let Some(norm) = if drag.kind
                         == crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius
                     {
-                        local_adjust_screen_to_norm_unclamped(pos, image_rect, image_dims, zoom_pan)
+                        local_adjust_screen_to_norm_unclamped(pos, transform)
                     } else {
-                        local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
+                        local_adjust_screen_to_norm(pos, transform, false)
                     }
                 {
                     self.apply_local_adjust_gradient_drag(drag, norm, false);
@@ -9834,17 +9929,18 @@ impl App {
         {
             return;
         }
-        let Some(norm) = local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, true)
-        else {
+        let Some(norm) = local_adjust_screen_to_norm(pos, transform, true) else {
             if self.local_adjust_effect_position_handles_visible
                 && let Some(kind) = self
                     .local_adjust_page_layers
                     .get(&fs_idx)
                     .and_then(|layers| layers.get(layer_idx))
                     .and_then(|layer| {
-                        let (_, drawn_rect) =
-                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
-                        local_adjust_effect_gradient_handle_hit(&layer.effect, pos, drawn_rect)
+                        local_adjust_effect_gradient_handle_hit_transform(
+                            &layer.effect,
+                            pos,
+                            transform,
+                        )
                     })
             {
                 if primary_pressed
@@ -9855,9 +9951,9 @@ impl App {
                     let drag_norm = if kind
                         == crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius
                     {
-                        local_adjust_screen_to_norm_unclamped(pos, image_rect, image_dims, zoom_pan)
+                        local_adjust_screen_to_norm_unclamped(pos, transform)
                     } else {
-                        local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
+                        local_adjust_screen_to_norm(pos, transform, false)
                     };
                     if let Some(norm) = drag_norm {
                         self.local_adjust_canvas_drag_before_layers =
@@ -10025,9 +10121,7 @@ impl App {
                 .local_adjust_page_layers
                 .get(&fs_idx)
                 .and_then(|layers| layers.get(layer_idx))
-                .and_then(|layer| {
-                    local_adjust_gradient_handle_hit(layer, pos, image_rect, image_dims, zoom_pan)
-                })
+                .and_then(|layer| local_adjust_gradient_handle_hit(layer, pos, transform))
             {
                 self.local_adjust_canvas_drag_before_layers =
                     self.local_adjust_page_layers.get(&fs_idx).cloned();
@@ -10070,9 +10164,7 @@ impl App {
                     .get(&fs_idx)
                     .and_then(|layers| layers.get(layer_idx))
                     .and_then(|layer| {
-                        let (_, drawn_rect) =
-                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
-                        local_adjust_tilt_shift_handle_hit(&layer.effect, pos, drawn_rect)
+                        local_adjust_tilt_shift_handle_hit_transform(&layer.effect, pos, transform)
                     });
                 if let Some(kind) = tilt_shift_handle {
                     self.local_adjust_canvas_drag_before_layers =
@@ -10093,9 +10185,11 @@ impl App {
                     .get(&fs_idx)
                     .and_then(|layers| layers.get(layer_idx))
                     .and_then(|layer| {
-                        let (_, drawn_rect) =
-                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
-                        local_adjust_effect_gradient_handle_hit(&layer.effect, pos, drawn_rect)
+                        local_adjust_effect_gradient_handle_hit_transform(
+                            &layer.effect,
+                            pos,
+                            transform,
+                        )
                     });
                 if let Some(kind) = effect_gradient_handle {
                     self.local_adjust_canvas_drag_before_layers =
@@ -10116,9 +10210,7 @@ impl App {
                     .get(&fs_idx)
                     .and_then(|layers| layers.get(layer_idx))
                     .and_then(|layer| local_adjust_effect_center(&layer.effect))
-                    .and_then(|(center, _)| {
-                        local_adjust_norm_to_screen(center, image_rect, image_dims, zoom_pan)
-                    })
+                    .and_then(|(center, _)| local_adjust_norm_to_screen(center, transform))
                     .is_some_and(|center| center.distance(pos) <= 14.0);
                 if center_hit {
                     self.local_adjust_canvas_drag_before_layers =
@@ -10138,8 +10230,8 @@ impl App {
 
             if let Some(target) = active_mask_edit_target {
                 let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-                let shape_hit = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
-                    .and_then(|(scale, _)| {
+                let shape_hit =
+                    local_adjust_image_layout(transform, image_dims).and_then(|(scale, _)| {
                         self.hit_test_local_adjust_mask_shapes(
                             fs_idx,
                             layer_idx,
@@ -10231,7 +10323,7 @@ impl App {
                         self.local_adjust_mask_lasso_points.push([p.0, p.1]);
                     }
                     LocalAdjustMaskTool::Polygon => {
-                        let scale = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                        let scale = local_adjust_image_layout(transform, image_dims)
                             .map(|(scale, _)| scale)
                             .unwrap_or(1.0);
                         let source_pixels = self.current_local_adjust_source_pixels(fs_idx);
@@ -10365,7 +10457,7 @@ impl App {
                 return None;
             }
             let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-            let (scale, _) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
+            let (scale, _) = local_adjust_image_layout(transform, image_dims)?;
             let (shape_idx, handle) = self.hit_test_local_adjust_mask_shapes(
                 fs_idx,
                 layer_idx,
@@ -10387,9 +10479,7 @@ impl App {
             .local_adjust_page_layers
             .get(&fs_idx)
             .and_then(|layers| layers.get(layer_idx))
-            .and_then(|layer| {
-                local_adjust_gradient_handle_hit(layer, pos, image_rect, image_dims, zoom_pan)
-            })
+            .and_then(|layer| local_adjust_gradient_handle_hit(layer, pos, transform))
             .is_some()
         {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
@@ -10433,25 +10523,16 @@ impl App {
                 .and_then(|layers| layers.get(layer_idx))
                 .is_some_and(|layer| {
                     let tilt_shift_hit =
-                        local_adjust_image_layout(image_rect, image_dims, zoom_pan)
-                            .and_then(|(_, drawn_rect)| {
-                                local_adjust_tilt_shift_handle_hit(&layer.effect, pos, drawn_rect)
-                            })
+                        local_adjust_tilt_shift_handle_hit_transform(&layer.effect, pos, transform)
                             .is_some();
-                    let effect_gradient_hit =
-                        local_adjust_image_layout(image_rect, image_dims, zoom_pan)
-                            .and_then(|(_, drawn_rect)| {
-                                local_adjust_effect_gradient_handle_hit(
-                                    &layer.effect,
-                                    pos,
-                                    drawn_rect,
-                                )
-                            })
-                            .is_some();
+                    let effect_gradient_hit = local_adjust_effect_gradient_handle_hit_transform(
+                        &layer.effect,
+                        pos,
+                        transform,
+                    )
+                    .is_some();
                     let center_hit = local_adjust_effect_center(&layer.effect)
-                        .and_then(|(center, _)| {
-                            local_adjust_norm_to_screen(center, image_rect, image_dims, zoom_pan)
-                        })
+                        .and_then(|(center, _)| local_adjust_norm_to_screen(center, transform))
                         .is_some_and(|center| center.distance(pos) <= 14.0);
                     tilt_shift_hit || effect_gradient_hit || center_hit
                 })
@@ -10463,8 +10544,7 @@ impl App {
     pub(crate) fn draw_local_adjust_canvas_overlay(
         &mut self,
         ui: &mut egui::Ui,
-        image_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if !self.local_adjust_mode {
             return;
@@ -10499,12 +10579,11 @@ impl App {
             self.local_adjust_mode,
             self.local_adjust_show_mask,
             alt_down,
-        ) && let Some((_, drawn_rect)) =
-            local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+        ) && local_adjust_image_layout(transform, image_dims).is_some()
         {
             draw_local_adjust_mask_preview_overlay(
                 painter,
-                drawn_rect,
+                transform,
                 &layer,
                 source_pixels.as_deref(),
                 image_dims,
@@ -10520,15 +10599,12 @@ impl App {
                     ));
             }
         }
-        let shape_layout = local_adjust_image_layout(image_rect, image_dims, zoom_pan);
-        let shape_to_screen = shape_layout.map(|(_, drawn_rect)| {
+        let shape_layout = local_adjust_image_layout(transform, image_dims);
+        let shape_to_screen = shape_layout.map(|_| {
             let w = image_dims.0.max(1) as f32;
             let h = image_dims.1.max(1) as f32;
             move |p: [f32; 2]| -> egui::Pos2 {
-                egui::pos2(
-                    drawn_rect.left() + p[0] / w * drawn_rect.width(),
-                    drawn_rect.top() + p[1] / h * drawn_rect.height(),
-                )
+                transform.source_normalized_to_screen(egui::pos2(p[0] / w, p[1] / h))
             }
         });
         let active_mask_edit_target =
@@ -10542,15 +10618,13 @@ impl App {
                 self.local_adjust_mask_tool,
                 LocalAdjustMaskTool::EdgeBrush | LocalAdjustMaskTool::Polygon
             )
-            && let Some((_, drawn_rect)) = shape_layout
+            && shape_layout.is_some()
             && let Some(edge_texture) =
                 self.ensure_local_adjust_edge_preview_texture(ui.ctx(), fs_idx)
         {
-            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-            painter.image(
+            transform.paint_texture(
+                painter,
                 edge_texture.id(),
-                drawn_rect,
-                uv,
                 local_adjust_edge_overlay_color(ui.ctx(), 230),
             );
             ui.ctx()
@@ -10566,9 +10640,8 @@ impl App {
                     | LocalAdjustMaskTool::GapFillBrush
             )
             && let Some(pointer) = ui.ctx().input(|i| i.pointer.hover_pos())
-            && local_adjust_screen_to_norm(pointer, image_rect, image_dims, zoom_pan, true)
-                .is_some()
-            && let Some((scale, _)) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+            && local_adjust_screen_to_norm(pointer, transform, true).is_some()
+            && let Some((scale, _)) = local_adjust_image_layout(transform, image_dims)
         {
             let color = match (
                 self.local_adjust_mask_tool,
@@ -10592,14 +10665,12 @@ impl App {
                     || self.local_adjust_selected_shape.is_some()
                 {
                     ui.ctx().input(|i| i.pointer.hover_pos()).and_then(|pos| {
-                        let (scale, drawn_rect) = shape_layout?;
-                        if !drawn_rect.contains(pos) {
+                        let (scale, _drawn_rect) = shape_layout?;
+                        if !transform.contains_screen(pos) {
                             return None;
                         }
-                        let point = (
-                            (pos.x - drawn_rect.left()) / scale,
-                            (pos.y - drawn_rect.top()) / scale,
-                        );
+                        let norm = transform.screen_to_source_normalized(pos);
+                        let point = (norm.x * image_dims.0 as f32, norm.y * image_dims.1 as f32);
                         let selected = self.local_adjust_selected_shape?;
                         let shape = mask.shapes.get(selected).copied()?;
                         let vector_shape = local_adjust_shape_to_vector_shape(shape);
@@ -10690,10 +10761,9 @@ impl App {
 
             if self.local_adjust_mask_tool == LocalAdjustMaskTool::Polygon
                 && let Some(pointer) = ui.ctx().input(|i| i.pointer.hover_pos())
-                && let Some((scale, drawn_rect)) = shape_layout
-                && drawn_rect.contains(pointer)
-                && let Some(norm) =
-                    local_adjust_screen_to_norm(pointer, image_rect, image_dims, zoom_pan, true)
+                && let Some((scale, _drawn_rect)) = shape_layout
+                && transform.contains_screen(pointer)
+                && let Some(norm) = local_adjust_screen_to_norm(pointer, transform, true)
             {
                 let (candidate, raw_candidate, snapping) = local_adjust_polygon_candidate_point(
                     norm,
@@ -10790,26 +10860,21 @@ impl App {
                 local_adjust_core::LocalEffect::Repair(params)
                     if params.mode == local_adjust_core::RepairMode::Clone
             ))
-            && let Some((_, drawn_rect)) =
-                local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+            && local_adjust_image_layout(transform, image_dims).is_some()
         {
             draw_local_adjust_effect_position_overlay(
                 painter,
-                drawn_rect,
+                transform.full_image_rect,
                 image_dims,
                 &layer.effect,
             );
         }
         match &layer.mask {
             local_adjust_core::LocalMask::LinearGradient(mask) if mask.initialized => {
-                let Some(start) =
-                    local_adjust_norm_to_screen(mask.start, image_rect, image_dims, zoom_pan)
-                else {
+                let Some(start) = local_adjust_norm_to_screen(mask.start, transform) else {
                     return;
                 };
-                let Some(end) =
-                    local_adjust_norm_to_screen(mask.end, image_rect, image_dims, zoom_pan)
-                else {
+                let Some(end) = local_adjust_norm_to_screen(mask.end, transform) else {
                     return;
                 };
                 painter.line_segment([start, end], stroke);
@@ -10819,31 +10884,45 @@ impl App {
                 painter.circle_stroke(end, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
             }
             local_adjust_core::LocalMask::RadialGradient(mask) if mask.initialized => {
-                let Some(center) =
-                    local_adjust_norm_to_screen(mask.center, image_rect, image_dims, zoom_pan)
-                else {
+                let Some(center) = local_adjust_norm_to_screen(mask.center, transform) else {
                     return;
                 };
-                let Some((_, drawn_rect)) =
-                    local_adjust_image_layout(image_rect, image_dims, zoom_pan)
-                else {
+                let Some(inner_x_handle) = local_adjust_norm_to_screen(
+                    [mask.center[0] + mask.inner_radius.max(0.0), mask.center[1]],
+                    transform,
+                ) else {
                     return;
                 };
-                let inner_rx = mask.inner_radius.max(0.0) * drawn_rect.width();
-                let inner_ry = mask.inner_radius_y.max(0.0) * drawn_rect.height();
-                let outer_rx =
-                    mask.outer_radius.max(mask.inner_radius).max(0.0) * drawn_rect.width();
-                let outer_ry =
-                    mask.outer_radius_y.max(mask.inner_radius_y).max(0.0) * drawn_rect.height();
-                let inner_x_handle = egui::pos2(center.x + inner_rx, center.y);
-                let inner_y_handle = egui::pos2(center.x, center.y + inner_ry);
-                let outer_x_handle = egui::pos2(center.x + outer_rx, center.y);
-                let outer_y_handle = egui::pos2(center.x, center.y + outer_ry);
+                let Some(inner_y_handle) = local_adjust_norm_to_screen(
+                    [
+                        mask.center[0],
+                        mask.center[1] + mask.inner_radius_y.max(0.0),
+                    ],
+                    transform,
+                ) else {
+                    return;
+                };
+                let Some(outer_x_handle) = local_adjust_norm_to_screen(
+                    [
+                        mask.center[0] + mask.outer_radius.max(mask.inner_radius),
+                        mask.center[1],
+                    ],
+                    transform,
+                ) else {
+                    return;
+                };
+                let Some(outer_y_handle) = local_adjust_norm_to_screen(
+                    [
+                        mask.center[0],
+                        mask.center[1] + mask.outer_radius_y.max(mask.inner_radius_y),
+                    ],
+                    transform,
+                ) else {
+                    return;
+                };
                 draw_local_adjust_ellipse(
                     painter,
-                    image_rect,
-                    image_dims,
-                    zoom_pan,
+                    transform,
                     mask.center,
                     mask.outer_radius,
                     mask.outer_radius_y,
@@ -10852,24 +10931,40 @@ impl App {
                 if mask.inner_radius > 0.001 || mask.inner_radius_y > 0.001 {
                     draw_local_adjust_ellipse(
                         painter,
-                        image_rect,
-                        image_dims,
-                        zoom_pan,
+                        transform,
                         mask.center,
                         mask.inner_radius,
                         mask.inner_radius_y,
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 220, 255)),
                     );
                 }
+                let Some(outer_x_opposite) = local_adjust_norm_to_screen(
+                    [
+                        mask.center[0] - mask.outer_radius.max(mask.inner_radius),
+                        mask.center[1],
+                    ],
+                    transform,
+                ) else {
+                    return;
+                };
                 painter.line_segment(
-                    [egui::pos2(center.x - outer_rx, center.y), outer_x_handle],
+                    [outer_x_opposite, outer_x_handle],
                     egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 220, 80, 100),
                     ),
                 );
+                let Some(outer_y_opposite) = local_adjust_norm_to_screen(
+                    [
+                        mask.center[0],
+                        mask.center[1] - mask.outer_radius_y.max(mask.inner_radius_y),
+                    ],
+                    transform,
+                ) else {
+                    return;
+                };
                 painter.line_segment(
-                    [egui::pos2(center.x, center.y - outer_ry), outer_y_handle],
+                    [outer_y_opposite, outer_y_handle],
                     egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 220, 80, 100),

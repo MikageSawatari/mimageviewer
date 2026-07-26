@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use crate::app::{App, EraseSnapshot, EraseTool, MaskDirtyRect};
+use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::fs_animation::FsCacheEntry;
 use crate::keymap::KeyAction;
 use crate::mask_db::{LineKind, Shape, ShapeOp};
@@ -889,25 +890,14 @@ impl App {
     // ── 座標変換 ──────────────────────────────────────────────────
 
     /// 画像レイアウト情報 (total_scale, img_rect) を計算する。
-    fn erase_image_layout(
-        &self,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-    ) -> Option<(f32, egui::Rect)> {
+    fn erase_image_layout(&self, transform: &DisplayedImageTransform) -> Option<(f32, egui::Rect)> {
         let [iw, ih] = self.erase_mask_size;
         if iw == 0 || ih == 0 {
             return None;
         }
-        let display_size = egui::vec2(iw as f32, ih as f32);
-        let fit_scale =
-            (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
-        let (total_scale, center) = match zoom_pan {
-            Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-            None => (fit_scale, full_rect.center()),
-        };
         Some((
-            total_scale,
-            egui::Rect::from_center_size(center, display_size * total_scale),
+            transform.screen_px_per_source_px(egui::vec2(iw as f32, ih as f32)),
+            transform.full_image_rect,
         ))
     }
 
@@ -915,14 +905,13 @@ impl App {
     fn screen_to_image_f32_unclamped(
         &self,
         screen_pos: egui::Pos2,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) -> Option<(f32, f32)> {
-        let (total_scale, img_rect) = self.erase_image_layout(full_rect, zoom_pan)?;
-        Some((
-            (screen_pos.x - img_rect.min.x) / total_scale,
-            (screen_pos.y - img_rect.min.y) / total_scale,
-        ))
+        let [iw, ih] = self.erase_mask_size;
+        (iw > 0 && ih > 0).then(|| {
+            let p = transform.screen_to_source_normalized(screen_pos);
+            (p.x * iw as f32, p.y * ih as f32)
+        })
     }
 
     /// 画像ピクセル座標をスクリーン座標に変換する。
@@ -930,16 +919,13 @@ impl App {
         &self,
         img_x: f32,
         img_y: f32,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) -> egui::Pos2 {
-        let (total_scale, img_rect) = self
-            .erase_image_layout(full_rect, zoom_pan)
-            .unwrap_or((1.0, full_rect));
-        egui::pos2(
-            img_rect.min.x + img_x * total_scale,
-            img_rect.min.y + img_y * total_scale,
-        )
+        let [iw, ih] = self.erase_mask_size;
+        transform.source_normalized_to_screen(egui::pos2(
+            img_x / iw.max(1) as f32,
+            img_y / ih.max(1) as f32,
+        ))
     }
 
     // ── マスク操作 ────────────────────────────────────────────────
@@ -1182,21 +1168,13 @@ impl App {
         primary_pressed: bool,
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
         modifiers: egui::Modifiers,
     ) -> bool {
         // ① 進行中のドラッグがあれば最優先で処理
         if let Some(drag) = self.erase_drag {
-            let img_pos_opt = pointer_pos.and_then(|p| {
-                self.erase_image_layout(full_rect, zoom_pan)
-                    .map(|(scale, img_rect)| {
-                        (
-                            (p.x - img_rect.min.x) / scale,
-                            (p.y - img_rect.min.y) / scale,
-                        )
-                    })
-            });
+            let img_pos_opt =
+                pointer_pos.and_then(|p| self.screen_to_image_f32_unclamped(p, transform));
             if let Some(img_pos) = img_pos_opt {
                 let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
                 let drag_idx = drag.idx();
@@ -1229,13 +1207,12 @@ impl App {
         let Some(screen) = pointer_pos else {
             return false;
         };
-        let Some((scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else {
+        let Some((scale, _img_rect)) = self.erase_image_layout(transform) else {
             return false;
         };
-        let img_pos = (
-            (screen.x - img_rect.min.x) / scale,
-            (screen.y - img_rect.min.y) / scale,
-        );
+        let Some(img_pos) = self.screen_to_image_f32_unclamped(screen, transform) else {
+            return false;
+        };
         let Some(shape) = self.erase_shapes.get(sel).copied() else {
             return false;
         };
@@ -1264,20 +1241,18 @@ impl App {
     fn update_erase_drag(
         &mut self,
         pointer_pos: Option<egui::Pos2>,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
         modifiers: egui::Modifiers,
     ) {
         let Some(screen) = pointer_pos else {
             return;
         };
-        let Some((total_scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else {
+        let Some((_total_scale, _img_rect)) = self.erase_image_layout(transform) else {
             return;
         };
-        let cur = (
-            (screen.x - img_rect.min.x) / total_scale,
-            (screen.y - img_rect.min.y) / total_scale,
-        );
+        let Some(cur) = self.screen_to_image_f32_unclamped(screen, transform) else {
+            return;
+        };
 
         let Some(drag) = self.erase_drag else {
             return;
@@ -1335,9 +1310,9 @@ impl App {
     pub(crate) fn handle_erase_paint(
         &mut self,
         ctx: &egui::Context,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
+        let full_rect = transform.viewport_rect;
         // フォーカス復帰クリック中は塗り・選択操作を一切発生させない
         // (handle_fs_wheel_and_click で検出・セットされる)
         if self.fs_suppress_primary_until_release {
@@ -1400,12 +1375,12 @@ impl App {
         let modifiers = ctx.input(|i| i.modifiers);
         if self.erase_tool == EraseTool::Select {
             if primary_pressed {
-                if let Some((scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) {
+                if let Some((scale, _img_rect)) = self.erase_image_layout(transform) {
                     if let Some(screen) = pointer_pos {
-                        let img_pos = (
-                            (screen.x - img_rect.min.x) / scale,
-                            (screen.y - img_rect.min.y) / scale,
-                        );
+                        let Some(img_pos) = self.screen_to_image_f32_unclamped(screen, transform)
+                        else {
+                            return;
+                        };
                         if let Some((idx, target)) = self.hit_test_erase(img_pos, scale) {
                             self.push_undo_snapshot();
                             self.erase_selected_shape = Some(idx);
@@ -1422,7 +1397,7 @@ impl App {
                 }
             }
             if self.erase_drag.is_some() {
-                self.update_erase_drag(pointer_pos, full_rect, zoom_pan, modifiers);
+                self.update_erase_drag(pointer_pos, transform, modifiers);
                 if primary_released {
                     self.erase_drag = None;
                     self.erase_mask_texture = None;
@@ -1447,8 +1422,7 @@ impl App {
                 primary_pressed,
                 primary_released,
                 pointer_pos,
-                full_rect,
-                zoom_pan,
+                transform,
                 modifiers,
             )
         {
@@ -1462,17 +1436,13 @@ impl App {
             EraseTool::Brush => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) =
-                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
-                        {
+                        if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
                             if self.erase_last_paint_pos.is_none() {
                                 self.push_undo_snapshot();
                             }
                             let prev = self
                                 .erase_last_paint_pos
-                                .and_then(|p| {
-                                    self.screen_to_image_f32_unclamped(p, full_rect, zoom_pan)
-                                })
+                                .and_then(|p| self.screen_to_image_f32_unclamped(p, transform))
                                 .unwrap_or(img_pos);
                             self.paint_brush_line(prev, img_pos, paint);
                         }
@@ -1485,9 +1455,7 @@ impl App {
             EraseTool::Lasso => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) =
-                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
-                        {
+                        if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
                             // サンプリング間引き
                             crate::manual_mask_tools::push_freehand_point(
                                 &mut self.erase_lasso_points,
@@ -1515,12 +1483,11 @@ impl App {
                     }
                 } else if primary_pressed
                     && let Some(pos) = pointer_pos
-                    && let Some((scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan)
+                    && let Some((scale, _img_rect)) = self.erase_image_layout(transform)
                 {
-                    let img_pos = (
-                        (pos.x - img_rect.min.x) / scale,
-                        (pos.y - img_rect.min.y) / scale,
-                    );
+                    let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) else {
+                        return;
+                    };
                     if crate::manual_mask_tools::should_close_polygon(
                         &self.erase_lasso_points,
                         img_pos,
@@ -1548,8 +1515,7 @@ impl App {
                     primary_released,
                     pointer_pos,
                     paint,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                     true,
                 );
             }
@@ -1559,8 +1525,7 @@ impl App {
                     primary_released,
                     pointer_pos,
                     paint,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                     false,
                 );
             }
@@ -1571,9 +1536,7 @@ impl App {
                 // (= 矩形/楕円/縦線/横線と同じワークフロー)。
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) =
-                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
-                        {
+                        if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
                             if self.erase_line_start.is_none() {
                                 self.erase_line_start = Some(img_pos);
                             }
@@ -1611,9 +1574,7 @@ impl App {
                 // ハンドル編集する設計)。
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) =
-                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
-                        {
+                        if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
                             if self.erase_shape_drag_start.is_none() {
                                 self.erase_shape_drag_start = Some(img_pos);
                             }
@@ -1668,14 +1629,12 @@ impl App {
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
         paint: bool,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
         is_vertical: bool,
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
-                {
+                if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
                     if self.erase_line_start.is_none() {
                         self.erase_line_start = Some(img_pos);
                         self.erase_line_tilt = 0.0;
@@ -1756,68 +1715,49 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
+        let full_rect = transform.viewport_rect;
         // マスクオーバーレイ描画。プレビュー押下中は inpaint 反映後の結果を見せたいので
         // マスク表示はオフにする (= ユーザー要望: プレビュー中はマスク非表示)。
         if !self.erase_preview_active {
             self.ensure_mask_texture(ctx);
             if let Some(ref tex) = self.erase_mask_texture {
-                let Some((_total_scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan)
-                else {
+                let Some((_total_scale, _img_rect)) = self.erase_image_layout(transform) else {
                     return;
                 };
-                let painter = if zoom_pan.is_some() {
-                    ui.painter().with_clip_rect(full_rect)
-                } else {
-                    ui.painter().clone()
-                };
-                painter.image(
-                    tex.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
+                let painter = ui.painter().with_clip_rect(full_rect);
+                transform.paint_texture(&painter, tex.id(), egui::Color32::WHITE);
             }
         }
 
         // ドラッグ中のプレビュー
-        self.draw_tool_preview(ui, full_rect, zoom_pan);
+        self.draw_tool_preview(ui, transform);
 
         // カーソル
         ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
-        self.draw_brush_cursor(ui, ctx, full_rect, zoom_pan);
+        self.draw_brush_cursor(ui, ctx, transform);
 
         // ツールパネル
         self.draw_erase_panel(ui, ctx, full_rect);
     }
 
     /// ドラッグ中のプレビュー表示。
-    fn draw_tool_preview(
-        &self,
-        ui: &mut egui::Ui,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-    ) {
-        self.draw_shape_outlines(ui, full_rect, zoom_pan);
+    fn draw_tool_preview(&self, ui: &mut egui::Ui, transform: &DisplayedImageTransform) {
+        let full_rect = transform.viewport_rect;
+        self.draw_shape_outlines(ui, transform);
 
         // 選択中の Shape のハンドル (Phase 2b: vector_edit::draw_handles に委譲)
         if let Some(idx) = self.erase_selected_shape {
             if let Some(shape) = self.erase_shapes.get(idx) {
-                if let Some((scale, _img_rect)) = self.erase_image_layout(full_rect, zoom_pan) {
+                if let Some((scale, _img_rect)) = self.erase_image_layout(transform) {
                     let layout = vector_edit::compute_handle_layout(shape, scale);
                     let painter = ui.painter().with_clip_rect(full_rect);
                     let hovered = ui.ctx().input(|i| i.pointer.hover_pos()).and_then(|p| {
-                        let img_rect = self.erase_image_layout(full_rect, zoom_pan)?.1;
-                        let img_pos = (
-                            (p.x - img_rect.min.x) / scale,
-                            (p.y - img_rect.min.y) / scale,
-                        );
+                        let img_pos = self.screen_to_image_f32_unclamped(p, transform)?;
                         vector_edit::hit_test(&layout, img_pos, scale)
                     });
-                    let to_screen =
-                        |p: (f32, f32)| self.image_to_screen(p.0, p.1, full_rect, zoom_pan);
+                    let to_screen = |p: (f32, f32)| self.image_to_screen(p.0, p.1, transform);
                     vector_edit::draw_handles(&painter, &layout, true, hovered, &to_screen);
                 }
             }
@@ -1841,7 +1781,7 @@ impl App {
                 let pts: Vec<egui::Pos2> = self
                     .erase_lasso_points
                     .iter()
-                    .map(|&(x, y)| self.image_to_screen(x, y, full_rect, zoom_pan))
+                    .map(|&(x, y)| self.image_to_screen(x, y, transform))
                     .collect();
                 if pts.len() >= 2 {
                     for i in 0..pts.len() - 1 {
@@ -1876,10 +1816,10 @@ impl App {
                 }
             }
             EraseTool::VertLine => {
-                self.draw_line_tool_preview(ui, full_rect, zoom_pan, color, stroke_color, true);
+                self.draw_line_tool_preview(ui, transform, color, stroke_color, true);
             }
             EraseTool::HorizLine => {
-                self.draw_line_tool_preview(ui, full_rect, zoom_pan, color, stroke_color, false);
+                self.draw_line_tool_preview(ui, transform, color, stroke_color, false);
             }
             EraseTool::Line => {
                 if let (Some((x0, y0)), Some((x1, y1))) =
@@ -1893,30 +1833,10 @@ impl App {
                         let ny = dx / len;
                         let half_w = self.erase_line_width * 0.5;
                         let pts = vec![
-                            self.image_to_screen(
-                                x0 + nx * half_w,
-                                y0 + ny * half_w,
-                                full_rect,
-                                zoom_pan,
-                            ),
-                            self.image_to_screen(
-                                x1 + nx * half_w,
-                                y1 + ny * half_w,
-                                full_rect,
-                                zoom_pan,
-                            ),
-                            self.image_to_screen(
-                                x1 - nx * half_w,
-                                y1 - ny * half_w,
-                                full_rect,
-                                zoom_pan,
-                            ),
-                            self.image_to_screen(
-                                x0 - nx * half_w,
-                                y0 - ny * half_w,
-                                full_rect,
-                                zoom_pan,
-                            ),
+                            self.image_to_screen(x0 + nx * half_w, y0 + ny * half_w, transform),
+                            self.image_to_screen(x1 + nx * half_w, y1 + ny * half_w, transform),
+                            self.image_to_screen(x1 - nx * half_w, y1 - ny * half_w, transform),
+                            self.image_to_screen(x0 - nx * half_w, y0 - ny * half_w, transform),
                         ];
                         ui.painter().add(egui::Shape::convex_polygon(
                             pts,
@@ -1924,8 +1844,8 @@ impl App {
                             egui::Stroke::new(1.0, stroke_color),
                         ));
                         // 中心線も重ねて表示
-                        let p0 = self.image_to_screen(x0, y0, full_rect, zoom_pan);
-                        let p1 = self.image_to_screen(x1, y1, full_rect, zoom_pan);
+                        let p0 = self.image_to_screen(x0, y0, transform);
+                        let p1 = self.image_to_screen(x1, y1, transform);
                         ui.painter()
                             .line_segment([p0, p1], egui::Stroke::new(1.0, stroke_color));
                     }
@@ -1935,29 +1855,31 @@ impl App {
                 if let (Some(start), Some(end)) =
                     (self.erase_shape_drag_start, self.erase_shape_drag_end)
                 {
-                    let s0 = self.image_to_screen(start.0, start.1, full_rect, zoom_pan);
-                    let s1 = self.image_to_screen(end.0, end.1, full_rect, zoom_pan);
-                    let rect = egui::Rect::from_two_pos(s0, s1);
+                    let source_center = ((start.0 + end.0) * 0.5, (start.1 + end.1) * 0.5);
+                    let source_radius =
+                        ((end.0 - start.0).abs() * 0.5, (end.1 - start.1).abs() * 0.5);
                     match self.erase_tool {
                         EraseTool::Rect => {
-                            ui.painter().rect_stroke(
-                                rect,
-                                0.0,
-                                egui::Stroke::new(2.0, stroke_color),
-                                egui::StrokeKind::Inside,
-                            );
+                            let pts = vec![
+                                self.image_to_screen(start.0, start.1, transform),
+                                self.image_to_screen(end.0, start.1, transform),
+                                self.image_to_screen(end.0, end.1, transform),
+                                self.image_to_screen(start.0, end.1, transform),
+                                self.image_to_screen(start.0, start.1, transform),
+                            ];
+                            ui.painter()
+                                .add(egui::Shape::line(pts, egui::Stroke::new(2.0, stroke_color)));
                         }
                         EraseTool::Ellipse => {
                             // 楕円: 36 角形近似で描画
-                            let center = rect.center();
-                            let r = egui::vec2(rect.width() * 0.5, rect.height() * 0.5);
                             const N: usize = 36;
                             let mut pts = Vec::with_capacity(N + 1);
                             for i in 0..=N {
                                 let theta = i as f32 * std::f32::consts::TAU / N as f32;
-                                pts.push(egui::pos2(
-                                    center.x + r.x * theta.cos(),
-                                    center.y + r.y * theta.sin(),
+                                pts.push(self.image_to_screen(
+                                    source_center.0 + source_radius.0 * theta.cos(),
+                                    source_center.1 + source_radius.1 * theta.sin(),
+                                    transform,
                                 ));
                             }
                             ui.painter()
@@ -1975,24 +1897,19 @@ impl App {
     ///
     /// `Subtract` Shape は最終マスクでは透明になるため、マスクテクスチャだけでは
     /// クリック対象が見えない。選択中 Shape は直後のハンドル描画に任せる。
-    fn draw_shape_outlines(
-        &self,
-        ui: &mut egui::Ui,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-    ) {
+    fn draw_shape_outlines(&self, ui: &mut egui::Ui, transform: &DisplayedImageTransform) {
         if self.erase_preview_active
             || self.erase_tool != EraseTool::Select
             || self.erase_shapes.is_empty()
         {
             return;
         }
-        let Some((scale, _img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else {
+        let Some((scale, _img_rect)) = self.erase_image_layout(transform) else {
             return;
         };
 
-        let painter = ui.painter().with_clip_rect(full_rect);
-        let to_screen = |p: (f32, f32)| self.image_to_screen(p.0, p.1, full_rect, zoom_pan);
+        let painter = ui.painter().with_clip_rect(transform.viewport_rect);
+        let to_screen = |p: (f32, f32)| self.image_to_screen(p.0, p.1, transform);
         for (idx, shape) in self.erase_shapes.iter().enumerate() {
             if Some(idx) == self.erase_selected_shape {
                 continue;
@@ -2006,8 +1923,7 @@ impl App {
     fn draw_line_tool_preview(
         &self,
         ui: &mut egui::Ui,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
         color: egui::Color32,
         stroke_color: egui::Color32,
         is_vertical: bool,
@@ -2027,23 +1943,24 @@ impl App {
 
         let corner = |axis: f32, span: f32, tilt_offset: f32| -> egui::Pos2 {
             if is_vertical {
-                self.image_to_screen(axis + tilt_offset, span, full_rect, zoom_pan)
+                self.image_to_screen(axis + tilt_offset, span, transform)
             } else {
-                self.image_to_screen(span, axis + tilt_offset, full_rect, zoom_pan)
+                self.image_to_screen(span, axis + tilt_offset, transform)
             }
         };
 
         if tilt.abs() < 0.5 {
-            let p0 = corner(a0, span_min, 0.0);
-            let p1 = corner(a1, span_max, 0.0);
-            let rect = egui::Rect::from_min_max(p0.min(p1), p0.max(p1));
-            ui.painter().rect_filled(rect, 0.0, color);
-            ui.painter().rect_stroke(
-                rect,
-                0.0,
+            let pts = vec![
+                corner(a0, span_min, 0.0),
+                corner(a1, span_min, 0.0),
+                corner(a1, span_max, 0.0),
+                corner(a0, span_max, 0.0),
+            ];
+            ui.painter().add(egui::Shape::convex_polygon(
+                pts,
+                color,
                 egui::Stroke::new(1.0, stroke_color),
-                egui::StrokeKind::Outside,
-            );
+            ));
         } else {
             // span_min 側は基準、span_max 側に tilt が加わる (is_vertical のとき上端→下端で x が tilt 分だけシフト)
             let pts = if is_vertical {
@@ -2074,15 +1991,14 @@ impl App {
         &self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if self.erase_tool != EraseTool::Brush {
             return;
         }
         if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-            if full_rect.contains(pos) {
-                let Some((total_scale, _)) = self.erase_image_layout(full_rect, zoom_pan) else {
+            if transform.contains_screen(pos) {
+                let Some((total_scale, _)) = self.erase_image_layout(transform) else {
                     return;
                 };
                 let screen_r = self.erase_brush_radius * total_scale;

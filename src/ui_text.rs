@@ -28,6 +28,7 @@
 
 use crate::app::{App, TextDrag, TextDragKind, TextMarquee, TextSmartGuides};
 use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset};
+use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::{KeyAction, ModKind, modifier_held_via_os};
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
@@ -518,10 +519,9 @@ fn sel_color() -> egui::Color32 {
 /// 画面上の画像矩形 `img_rect` は一致する** (アップスケール係数は相殺される)。よって
 /// 本 view はソース寸法だけで完結し、得られる画素は常に canonical ソース px になる。
 pub(crate) struct TextImgView {
+    transform: DisplayedImageTransform,
+    #[cfg(test)]
     img_rect: egui::Rect,
-    center: egui::Pos2,
-    rotation: crate::rotation_db::Rotation,
-    free_rot: f32,
     sw: f32,
     sh: f32,
     /// 画像 px → 画面 px の一様スケール (= fit * zoom)。回転ノブを画面上 28px 上に
@@ -529,64 +529,17 @@ pub(crate) struct TextImgView {
     scale: f32,
 }
 
-/// `draw_rotated_image_ex` の UV 割り当てに対応する forward 写像
-/// (canonical 正規化 `(s,t)` → 画像矩形内正規化 `(u,v)`)。
-fn forward_uv(rot: crate::rotation_db::Rotation, s: f32, t: f32) -> (f32, f32) {
-    use crate::rotation_db::Rotation::*;
-    match rot {
-        None => (s, t),
-        Cw90 => (1.0 - t, s),
-        Cw180 => (1.0 - s, 1.0 - t),
-        Cw270 => (t, 1.0 - s),
-    }
-}
-
-/// `forward_uv` の逆写像 (`(u,v)` → `(s,t)`)。
-fn inverse_uv(rot: crate::rotation_db::Rotation, u: f32, v: f32) -> (f32, f32) {
-    use crate::rotation_db::Rotation::*;
-    match rot {
-        None => (u, v),
-        Cw90 => (v, 1.0 - u),
-        Cw180 => (1.0 - u, 1.0 - v),
-        Cw270 => (1.0 - v, u),
-    }
-}
-
-/// `p` を `center` まわりに `theta` (rad, 画面 y 下向き = CW) 回転する。
-/// `draw_rotated_image_ex` のフリー回転と同式。
-fn rotate_about_pos(p: egui::Pos2, center: egui::Pos2, theta: f32) -> egui::Pos2 {
-    if theta.abs() < 1e-6 {
-        return p;
-    }
-    let (sin, cos) = theta.sin_cos();
-    let dx = p.x - center.x;
-    let dy = p.y - center.y;
-    egui::pos2(
-        center.x + dx * cos - dy * sin,
-        center.y + dx * sin + dy * cos,
-    )
-}
-
 impl TextImgView {
     /// 画面座標 → canonical ソース画素座標。
     pub(crate) fn screen_to_image(&self, p: egui::Pos2) -> (f32, f32) {
-        let q = rotate_about_pos(p, self.center, -self.free_rot);
-        let w = self.img_rect.width().max(1e-3);
-        let h = self.img_rect.height().max(1e-3);
-        let u = (q.x - self.img_rect.min.x) / w;
-        let v = (q.y - self.img_rect.min.y) / h;
-        let (s, t) = inverse_uv(self.rotation, u, v);
-        (s * self.sw, t * self.sh)
+        let source = self.transform.screen_to_source_normalized(p);
+        (source.x * self.sw, source.y * self.sh)
     }
 
     /// canonical ソース画素座標 → 画面座標。
     pub(crate) fn image_to_screen(&self, px: f32, py: f32) -> egui::Pos2 {
-        let s = px / self.sw.max(1e-3);
-        let t = py / self.sh.max(1e-3);
-        let (u, v) = forward_uv(self.rotation, s, t);
-        let bx = self.img_rect.min.x + u * self.img_rect.width();
-        let by = self.img_rect.min.y + v * self.img_rect.height();
-        rotate_about_pos(egui::pos2(bx, by), self.center, self.free_rot)
+        self.transform
+            .source_normalized_to_screen(egui::pos2(px / self.sw.max(1e-3), py / self.sh.max(1e-3)))
     }
 }
 
@@ -2338,35 +2291,20 @@ impl App {
     pub(crate) fn text_img_view(
         &mut self,
         idx: usize,
-        image_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) -> Option<TextImgView> {
         let (sw, sh) = self.source_dims_for_idx(idx)?;
-        let rotation = self.get_rotation(idx);
-        let free_rot = self.fs_free_rotation;
-        let display_size = match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(sh, sw)
-            }
-            _ => egui::vec2(sw, sh),
-        };
-        let fit = (image_rect.width() / display_size.x).min(image_rect.height() / display_size.y);
-        if !fit.is_finite() || fit <= 0.0 {
+        let scale = transform.screen_px_per_source_px(egui::vec2(sw, sh));
+        if !scale.is_finite() || scale <= 0.0 {
             return None;
         }
-        let (total_scale, center) = match zoom_pan {
-            Some((zoom, pan)) => (fit * zoom, image_rect.center() + pan),
-            None => (fit, image_rect.center()),
-        };
-        let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
         Some(TextImgView {
-            img_rect,
-            center,
-            rotation,
-            free_rot,
+            transform: *transform,
+            #[cfg(test)]
+            img_rect: transform.full_image_rect,
             sw,
             sh,
-            scale: total_scale,
+            scale,
         })
     }
 
@@ -2377,16 +2315,16 @@ impl App {
     pub(crate) fn handle_text_canvas_input(
         &mut self,
         ctx: &egui::Context,
-        image_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
+        let image_rect = transform.viewport_rect;
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
         let Some(key) = self.page_path_key(fs_idx) else {
             return;
         };
-        let Some(view) = self.text_img_view(fs_idx, image_rect, zoom_pan) else {
+        let Some(view) = self.text_img_view(fs_idx, transform) else {
             return;
         };
         let panel_rect = self.text_panel_rect(image_rect);
@@ -2707,10 +2645,10 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        image_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
-        self.draw_text_selection(ui, image_rect, zoom_pan);
+        let image_rect = transform.viewport_rect;
+        self.draw_text_selection(ui, transform);
         self.draw_text_panel(ctx, image_rect);
         // 追加ダイアログ (パネルが comic_docs を書き戻した後に描く)。
         // これらは暗フレームを使うため、タイトルバーを含めて共通の暗色 Window scope で描く。
@@ -2734,19 +2672,15 @@ impl App {
     /// 選択中オブジェクトの変形ハンドルを画面に描く。回転を反映した境界四角形 +
     /// 回転ノブ (緑) + 四隅リサイズハンドル (白角) + 吹き出しのしっぽハンドル
     /// (cyan=根元 / 橙=先端)。ラボ `draw_selection_handles` と同じ見た目。
-    fn draw_text_selection(
-        &mut self,
-        ui: &mut egui::Ui,
-        image_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-    ) {
+    fn draw_text_selection(&mut self, ui: &mut egui::Ui, transform: &DisplayedImageTransform) {
+        let image_rect = transform.viewport_rect;
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
         let Some(key) = self.page_path_key(fs_idx) else {
             return;
         };
-        let Some(view) = self.text_img_view(fs_idx, image_rect, zoom_pan) else {
+        let Some(view) = self.text_img_view(fs_idx, transform) else {
             return;
         };
         let fonts = self.ensure_comic_fonts();
@@ -10442,8 +10376,8 @@ mod tests {
             Rotation::Cw270,
         ] {
             for &(s, t) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.3, 0.7), (0.9, 0.2)] {
-                let (u, v) = forward_uv(rot, s, t);
-                let (s2, t2) = inverse_uv(rot, u, v);
+                let (u, v) = crate::displayed_image_transform::forward_uv(rot, s, t);
+                let (s2, t2) = crate::displayed_image_transform::inverse_uv(rot, u, v);
                 assert!(
                     (s - s2).abs() < 1e-5 && (t - t2).abs() < 1e-5,
                     "{rot:?}: ({s},{t}) -> ({s2},{t2})"
@@ -10456,21 +10390,30 @@ mod tests {
         // source 400x300 を 800x800 の画面矩形へ fit。
         let (sw, sh) = (400.0_f32, 300.0_f32);
         let image_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 800.0));
-        let display = match rot {
-            Rotation::Cw90 | Rotation::Cw270 => egui::vec2(sh, sw),
-            _ => egui::vec2(sw, sh),
-        };
-        let fit = (image_rect.width() / display.x).min(image_rect.height() / display.y);
-        let center = image_rect.center();
-        let img_rect = egui::Rect::from_center_size(center, display * fit);
+        let transform = DisplayedImageTransform::resolve(
+            crate::displayed_image_transform::DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: image_rect,
+                source_size: egui::vec2(sw, sh),
+                texture_size: egui::vec2(sw, sh),
+                rotation: rot,
+                free_rotation_rad: free,
+                content_bbox: None,
+                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_scale_limits:
+                    crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                    zoom_pan: None,
+                },
+            },
+        )
+        .unwrap();
         TextImgView {
-            img_rect,
-            center,
-            rotation: rot,
-            free_rot: free,
+            transform,
+            img_rect: transform.full_image_rect,
             sw,
             sh,
-            scale: fit,
+            scale: transform.screen_px_per_source_px(egui::vec2(sw, sh)),
         }
     }
 

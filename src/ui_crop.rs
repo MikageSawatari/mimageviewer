@@ -1,4 +1,5 @@
 use crate::app::{App, ExportCropCreateDrag, ExportCropDrag};
+use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::export_crop::{CropAspectMode, CropHandle, CropRect, CropSettings};
 use crate::keymap::KeyAction;
 
@@ -10,21 +11,6 @@ fn export_crop_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) 
     (full_rect.bottom() - panel_pos.y - PANEL_MARGIN).clamp(220.0, 440.0)
 }
 
-fn outside_rects(image: egui::Rect, crop: egui::Rect) -> [egui::Rect; 4] {
-    [
-        egui::Rect::from_min_max(image.min, egui::pos2(image.max.x, crop.min.y)),
-        egui::Rect::from_min_max(egui::pos2(image.min.x, crop.max.y), image.max),
-        egui::Rect::from_min_max(
-            egui::pos2(image.min.x, crop.min.y),
-            egui::pos2(crop.min.x, crop.max.y),
-        ),
-        egui::Rect::from_min_max(
-            egui::pos2(crop.max.x, crop.min.y),
-            egui::pos2(image.max.x, crop.max.y),
-        ),
-    ]
-}
-
 fn clamp_pos_to_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
     egui::pos2(
         pos.x.clamp(rect.left(), rect.right()),
@@ -32,28 +18,110 @@ fn clamp_pos_to_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
     )
 }
 
-fn screen_to_image(image_rect: egui::Rect, image_size: [usize; 2], pos: egui::Pos2) -> [f32; 2] {
-    let p = clamp_pos_to_rect(pos, image_rect);
+fn screen_to_image(
+    transform: &DisplayedImageTransform,
+    image_size: [usize; 2],
+    pos: egui::Pos2,
+) -> [f32; 2] {
+    let p = transform.screen_to_source_normalized(pos);
     [
-        ((p.x - image_rect.left()) / image_rect.width().max(1.0) * image_size[0].max(1) as f32)
-            .clamp(0.0, image_size[0].max(1) as f32),
-        ((p.y - image_rect.top()) / image_rect.height().max(1.0) * image_size[1].max(1) as f32)
-            .clamp(0.0, image_size[1].max(1) as f32),
+        (p.x * image_size[0].max(1) as f32).clamp(0.0, image_size[0].max(1) as f32),
+        (p.y * image_size[1].max(1) as f32).clamp(0.0, image_size[1].max(1) as f32),
     ]
 }
 
-fn handle_points(rect: egui::Rect) -> [(CropHandle, egui::Pos2); 8] {
-    let c = rect.center();
+fn image_to_screen(
+    transform: &DisplayedImageTransform,
+    image_size: [usize; 2],
+    point: [f32; 2],
+) -> egui::Pos2 {
+    transform.source_normalized_to_screen(egui::pos2(
+        point[0] / image_size[0].max(1) as f32,
+        point[1] / image_size[1].max(1) as f32,
+    ))
+}
+
+fn crop_corners(
+    transform: &DisplayedImageTransform,
+    image_size: [usize; 2],
+    rect: CropRect,
+) -> [egui::Pos2; 4] {
     [
-        (CropHandle::NorthWest, rect.left_top()),
-        (CropHandle::North, egui::pos2(c.x, rect.top())),
-        (CropHandle::NorthEast, rect.right_top()),
-        (CropHandle::East, egui::pos2(rect.right(), c.y)),
-        (CropHandle::SouthEast, rect.right_bottom()),
-        (CropHandle::South, egui::pos2(c.x, rect.bottom())),
-        (CropHandle::SouthWest, rect.left_bottom()),
-        (CropHandle::West, egui::pos2(rect.left(), c.y)),
+        image_to_screen(transform, image_size, [rect.min_x, rect.min_y]),
+        image_to_screen(transform, image_size, [rect.max_x, rect.min_y]),
+        image_to_screen(transform, image_size, [rect.max_x, rect.max_y]),
+        image_to_screen(transform, image_size, [rect.min_x, rect.max_y]),
     ]
+}
+
+fn handle_points(
+    transform: &DisplayedImageTransform,
+    image_size: [usize; 2],
+    rect: CropRect,
+) -> [(CropHandle, egui::Pos2); 8] {
+    let cx = (rect.min_x + rect.max_x) * 0.5;
+    let cy = (rect.min_y + rect.max_y) * 0.5;
+    [
+        (
+            CropHandle::NorthWest,
+            image_to_screen(transform, image_size, [rect.min_x, rect.min_y]),
+        ),
+        (
+            CropHandle::North,
+            image_to_screen(transform, image_size, [cx, rect.min_y]),
+        ),
+        (
+            CropHandle::NorthEast,
+            image_to_screen(transform, image_size, [rect.max_x, rect.min_y]),
+        ),
+        (
+            CropHandle::East,
+            image_to_screen(transform, image_size, [rect.max_x, cy]),
+        ),
+        (
+            CropHandle::SouthEast,
+            image_to_screen(transform, image_size, [rect.max_x, rect.max_y]),
+        ),
+        (
+            CropHandle::South,
+            image_to_screen(transform, image_size, [cx, rect.max_y]),
+        ),
+        (
+            CropHandle::SouthWest,
+            image_to_screen(transform, image_size, [rect.min_x, rect.max_y]),
+        ),
+        (
+            CropHandle::West,
+            image_to_screen(transform, image_size, [rect.min_x, cy]),
+        ),
+    ]
+}
+
+fn paint_outside_crop(
+    painter: &egui::Painter,
+    transform: &DisplayedImageTransform,
+    image_size: [usize; 2],
+    crop: CropRect,
+) {
+    let full = crop_corners(
+        transform,
+        image_size,
+        CropRect::full(image_size[0], image_size[1]),
+    );
+    let crop = crop_corners(transform, image_size, crop);
+    let color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 145);
+    for points in [
+        vec![full[0], full[1], crop[1], crop[0]],
+        vec![full[1], full[2], crop[2], crop[1]],
+        vec![full[2], full[3], crop[3], crop[2]],
+        vec![full[3], full[0], crop[0], crop[3]],
+    ] {
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
 }
 
 fn crop_handle_cursor(handle: CropHandle) -> egui::CursorIcon {
@@ -393,7 +461,7 @@ impl App {
     pub(crate) fn draw_export_crop_overlay(
         &mut self,
         ui: &mut egui::Ui,
-        image_rect: egui::Rect,
+        transform: &DisplayedImageTransform,
         fs_idx: usize,
         image_size: [usize; 2],
         pointer_allowed: bool,
@@ -406,36 +474,26 @@ impl App {
             rect: CropRect::full(image_size[0], image_size[1]),
             aspect_mode: self.export_crop_aspect_mode,
         });
-        let crop_screen = settings
-            .rect
-            .to_screen_rect(image_rect, image_size[0], image_size[1]);
-        let painter = ui.painter().clone();
-        for outside in outside_rects(image_rect, crop_screen) {
-            painter.rect_filled(
-                outside,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 145),
-            );
-        }
-        painter.rect_stroke(
-            crop_screen,
-            0.0,
+        let crop_corners = crop_corners(transform, image_size, settings.rect);
+        let painter = ui.painter().with_clip_rect(transform.viewport_rect);
+        paint_outside_crop(&painter, transform, image_size, settings.rect);
+        let mut outline = crop_corners.to_vec();
+        outline.push(crop_corners[0]);
+        painter.add(egui::Shape::line(
+            outline.clone(),
+            egui::Stroke::new(3.0, egui::Color32::BLACK),
+        ));
+        painter.add(egui::Shape::line(
+            outline,
             egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 230, 100)),
-            egui::StrokeKind::Inside,
-        );
-        painter.rect_stroke(
-            crop_screen.expand(1.0),
-            0.0,
-            egui::Stroke::new(1.0, egui::Color32::BLACK),
-            egui::StrokeKind::Outside,
-        );
+        ));
 
         if !self.export_crop_mode {
             return false;
         }
 
-        let handle_bounds = image_rect.shrink(14.0);
-        let handles = handle_points(crop_screen);
+        let handle_bounds = transform.viewport_rect.shrink(14.0);
+        let handles = handle_points(transform, image_size, settings.rect);
         for (_, center) in handles {
             let center = clamp_pos_to_rect(center, handle_bounds);
             painter.circle_filled(center, 5.5, egui::Color32::from_rgb(255, 245, 180));
@@ -452,13 +510,13 @@ impl App {
             return false;
         }
 
-        self.handle_export_crop_pointer(ui, image_rect, fs_idx, image_size, settings, handles)
+        self.handle_export_crop_pointer(ui, transform, fs_idx, image_size, settings, handles)
     }
 
     fn handle_export_crop_pointer(
         &mut self,
         ui: &mut egui::Ui,
-        image_rect: egui::Rect,
+        transform: &DisplayedImageTransform,
         fs_idx: usize,
         image_size: [usize; 2],
         settings: CropSettings,
@@ -485,7 +543,7 @@ impl App {
                 ui.ctx(),
                 self.keymap
                     .key_held_action(ui.ctx(), KeyAction::CropSpacePan),
-                pointer_pos.is_some_and(|pos| image_rect.contains(pos)),
+                pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
                 primary_pressed,
                 primary_down,
                 primary_released,
@@ -497,16 +555,17 @@ impl App {
 
         let target_at = |pos: egui::Pos2| -> Option<CropHandle> {
             for (handle, center) in handles {
-                let center = clamp_pos_to_rect(center, image_rect.shrink(14.0));
+                let center = clamp_pos_to_rect(center, transform.viewport_rect.shrink(14.0));
                 if (pos - center).length() <= HANDLE_HIT {
                     return Some(handle);
                 }
             }
-            let crop_screen =
-                settings
-                    .rect
-                    .to_screen_rect(image_rect, image_size[0], image_size[1]);
-            if crop_screen.contains(pos) {
+            let image = screen_to_image(transform, image_size, pos);
+            if image[0] >= settings.rect.min_x
+                && image[0] <= settings.rect.max_x
+                && image[1] >= settings.rect.min_y
+                && image[1] <= settings.rect.max_y
+            {
                 Some(CropHandle::Body)
             } else {
                 None
@@ -520,10 +579,10 @@ impl App {
                     base: settings.rect,
                 });
                 self.export_crop_create_drag = None;
-            } else if image_rect.contains(origin) {
+            } else if transform.contains_screen(origin) {
                 self.export_crop_drag = None;
                 self.export_crop_create_drag = Some(ExportCropCreateDrag {
-                    start: screen_to_image(image_rect, image_size, origin),
+                    start: screen_to_image(transform, image_size, origin),
                 });
             }
         }
@@ -531,12 +590,13 @@ impl App {
         let mut used = false;
         if primary_down {
             if let Some(drag) = self.export_crop_drag {
-                let scale_x = image_size[0].max(1) as f32 / image_rect.width().max(1.0);
-                let scale_y = image_size[1].max(1) as f32 / image_rect.height().max(1.0);
+                let origin = press_origin.unwrap_or_else(|| transform.viewport_rect.center());
+                let start = screen_to_image(transform, image_size, origin);
+                let end = screen_to_image(transform, image_size, origin + total_delta);
                 let rect = drag.base.dragged(
                     drag.handle,
-                    total_delta.x * scale_x,
-                    total_delta.y * scale_y,
+                    end[0] - start[0],
+                    end[1] - start[1],
                     image_size[0],
                     image_size[1],
                     self.export_crop_aspect_ratio(settings, image_size),
@@ -562,7 +622,7 @@ impl App {
                 if (cur - origin).length() >= CREATE_DRAG_THRESHOLD {
                     let rect = crate::export_crop::crop_from_points(
                         create.start,
-                        screen_to_image(image_rect, image_size, cur),
+                        screen_to_image(transform, image_size, cur),
                         image_size[0],
                         image_size[1],
                         self.export_crop_aspect_ratio(settings, image_size),
@@ -592,7 +652,7 @@ impl App {
             if let Some(handle) = target_at(pos) {
                 ui.ctx().set_cursor_icon(crop_handle_cursor(handle));
                 used = true;
-            } else if image_rect.contains(pos) {
+            } else if transform.contains_screen(pos) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                 used = true;
             }

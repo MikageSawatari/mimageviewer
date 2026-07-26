@@ -24,6 +24,10 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{App, ViewerPresentation};
+use crate::displayed_image_transform::{
+    DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+    ResolvedDisplayPlacement, ResolvedZTransform, ZTransformInput,
+};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{
@@ -1295,8 +1299,7 @@ struct SpreadPageDrawRects {
 pub(crate) struct CaptureRegionTarget {
     pub(crate) idx: usize,
     pub(crate) source_size: [usize; 2],
-    pub(crate) image_rect: egui::Rect,
-    pub(crate) rotation: crate::rotation_db::Rotation,
+    pub(crate) transform: DisplayedImageTransform,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1414,29 +1417,6 @@ fn continuous_spread_fit_width(
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct FullscreenFitScaleLimits {
-    no_upscale: bool,
-    no_downscale: bool,
-}
-
-impl FullscreenFitScaleLimits {
-    fn active(self) -> bool {
-        self.no_upscale || self.no_downscale
-    }
-
-    fn apply(self, scale: f32) -> f32 {
-        let mut scale = scale;
-        if self.no_upscale {
-            scale = scale.min(1.0);
-        }
-        if self.no_downscale {
-            scale = scale.max(1.0);
-        }
-        scale
-    }
-}
-
 fn fs_image_fit_bbox(
     rotation: crate::rotation_db::Rotation,
     free_rotation_rad: f32,
@@ -1455,55 +1435,19 @@ fn fs_image_draw_rect_for_size(
     fit_scale_limits: FullscreenFitScaleLimits,
     content_bbox: Option<egui::Rect>,
 ) -> Option<egui::Rect> {
-    if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
-        return None;
-    }
-    let display_size = match rotation {
-        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-            egui::vec2(tex_size.y, tex_size.x)
-        }
-        _ => tex_size,
-    };
-    let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
-    let bbox_fit = fit_bbox.map(|bbox| {
-        let bbox_w = (bbox.width() * display_size.x).max(1.0);
-        let bbox_h = (bbox.height() * display_size.y).max(1.0);
-        let center_px = egui::vec2(
-            (bbox.center().x - 0.5) * display_size.x,
-            (bbox.center().y - 0.5) * display_size.y,
-        );
-        (bbox_w, bbox_h, center_px)
-    });
-    let page_fit = || (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
-    let (fit_scale, content_center_px) = match (fit_mode, bbox_fit) {
-        (FullscreenFitMode::Width, Some((bbox_w, _, center_px))) => {
-            (full_rect.width() / bbox_w, center_px)
-        }
-        (FullscreenFitMode::Width, None) => (full_rect.width() / display_size.x, egui::Vec2::ZERO),
-        (FullscreenFitMode::Height, Some((_, bbox_h, center_px))) => {
-            (full_rect.height() / bbox_h, center_px)
-        }
-        (FullscreenFitMode::Height, None) => {
-            (full_rect.height() / display_size.y, egui::Vec2::ZERO)
-        }
-        (FullscreenFitMode::Original, Some((_, _, center_px))) => (1.0, center_px),
-        (FullscreenFitMode::Original, None) => (1.0, egui::Vec2::ZERO),
-        (_, Some((bbox_w, bbox_h, center_px))) => (
-            (full_rect.width() / bbox_w).min(full_rect.height() / bbox_h),
-            center_px,
-        ),
-        (_, None) => (page_fit(), egui::Vec2::ZERO),
-    };
-    let fit_scale = fit_scale_limits.apply(fit_scale);
-    let (total_scale, base_center) = match zoom_pan {
-        Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-        None => (fit_scale, full_rect.center()),
-    };
-    let center = base_center - content_center_px * total_scale;
-    Some(egui::Rect::from_center_size(
-        center,
-        display_size * total_scale,
-    ))
+    DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+        page_idx: 0,
+        viewport_rect: full_rect,
+        source_size: tex_size,
+        texture_size: tex_size,
+        rotation,
+        free_rotation_rad,
+        content_bbox,
+        fit_mode,
+        fit_scale_limits,
+        placement: ResolvedDisplayPlacement::Normal { zoom_pan },
+    })
+    .map(|transform| transform.full_image_rect)
 }
 
 fn fs_image_paint_rect_and_uv(
@@ -2659,10 +2603,9 @@ impl App {
         image_rect: egui::Rect,
         fs_idx: usize,
         state: &FsFrameState,
-    ) {
+    ) -> Option<DisplayedImageTransform> {
         let rotation = self.get_rotation(fs_idx);
         let active = self.fs_zoom_active;
-        // factor はコンテンツ領域確定後に contain 下限へ clamp する (下記)。
         let pixel_grid = self.fs_pixel_grid_enabled;
         let tex_size = state
             .tex
@@ -2676,9 +2619,12 @@ impl App {
         let Some(tex_size) = tex_size else {
             // テクスチャ未ロード: 通常のプレースホルダ描画へ委ねる。
             let bg_style = self.fs_bg_style(ctx);
-            Self::draw_fs_image(
+            return Self::draw_fs_image(
                 ui,
                 image_rect,
+                fs_idx,
+                None,
+                None,
                 state.tex.as_ref(),
                 state.thumb_tex.as_ref(),
                 state.is_video,
@@ -2694,13 +2640,6 @@ impl App {
                 no_limits,
                 None,
             );
-            return;
-        };
-        let display_size = match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(tex_size.y, tex_size.x)
-            }
-            _ => tex_size,
         };
         // 表示トリムが有効ならズーム対象をトリム後 bbox に絞る (切り落とした余白を見せない)。
         // 回転ページは draw_fs_image 側で bbox を使わないので通常どおり全体を対象にする。
@@ -2710,30 +2649,6 @@ impl App {
             .is_none()
             .then(|| self.view_trim_single_content_bbox(fs_idx))
             .flatten();
-        let (content_min, content_size) = match trim_bbox {
-            Some(bbox) => (
-                egui::vec2(bbox.min.x * display_size.x, bbox.min.y * display_size.y),
-                egui::vec2(
-                    (bbox.width() * display_size.x).max(1.0),
-                    (bbox.height() * display_size.y).max(1.0),
-                ),
-            ),
-            None => (egui::Vec2::ZERO, display_size),
-        };
-        // ズームアウト下限 = contain (片方の軸が画面に収まり、もう片方に余白が出る点)。
-        // factor をその下限 (= contain/cover) まで clamp して、ズームアウト後のホイールアップが
-        // 即反応するようにする (geometry も contain で floor するが、factor の dead zone を防ぐ)。
-        let z_cover =
-            (image_rect.width() / content_size.x).max(image_rect.height() / content_size.y);
-        let z_contain =
-            (image_rect.width() / content_size.x).min(image_rect.height() / content_size.y);
-        let factor_min = if z_cover > 0.0 {
-            (z_contain / z_cover).min(1.0)
-        } else {
-            1.0
-        };
-        self.fs_zoom_factor = self.fs_zoom_factor.clamp(factor_min, 16.0);
-        let factor = self.fs_zoom_factor;
         // パン操作帯: 上下のホバーバー (上部バー / 下部シークバー) 分を内側へ詰め、カーソルが
         // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
         // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
@@ -2743,86 +2658,79 @@ impl App {
             egui::pos2(image_rect.left(), image_rect.top() + top_m),
             egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
         );
-        // 照準枠とズームパンで共通のカーソル→画像写像を使う (両者の表示範囲を一致させる)。
-        let cursor_img = zip_cursor_image_px(pan_band, content_min, content_size, cursor);
-        let bg_style = self.fs_bg_style(ctx);
-        if active {
-            let (zoom_full, pan_full) = zip_cover_zoom_pan(
-                image_rect.size(),
-                display_size,
-                content_min,
-                content_size,
-                factor,
-                cursor_img,
-            );
-            // トリム時は content_bbox を draw_fs_image に渡して切り落とした余白を crop する
-            // (ズームアウトで contain まで縮めても余白を再表示しない、Codex P2)。content_bbox 経路は
-            // bbox-fit で座標系が変わるので、full-image 基準の (zoom, pan) を bbox 基準へ変換して
-            // 位置を保つ。トリム無しはそのまま (恒等)。
-            let (zoom, pan) = match trim_bbox {
-                Some(_) => zip_bbox_zoom_pan_from_full(
-                    zoom_full,
-                    pan_full,
-                    image_rect.size(),
-                    display_size,
-                    content_min,
-                    content_size,
-                ),
-                None => (zoom_full, pan_full),
-            };
-            Self::draw_fs_image(
-                ui,
-                image_rect,
-                state.tex.as_ref(),
-                state.thumb_tex.as_ref(),
-                false,
-                false,
-                state.fs_load_failed,
+        let source_size = self
+            .source_dims_for_idx(fs_idx)
+            .map(|(w, h)| egui::vec2(w, h))
+            .or_else(|| {
+                state
+                    .image_dims
+                    .map(|(w, h)| egui::vec2(w as f32, h as f32))
+            })
+            .unwrap_or(tex_size);
+        let resolved = ResolvedZTransform::resolve(ZTransformInput {
+            image: DisplayedImageTransformInput {
+                page_idx: fs_idx,
+                viewport_rect: image_rect,
+                source_size,
+                texture_size: tex_size,
                 rotation,
-                Some((zoom, pan)),
-                0.0,
-                &bg_style,
-                &state.location_display,
-                pixel_grid,
-                FullscreenFitMode::Page,
-                no_limits,
-                trim_bbox,
-            );
+                free_rotation_rad: 0.0,
+                content_bbox: trim_bbox,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: no_limits,
+                placement: ResolvedDisplayPlacement::Z {
+                    active,
+                    factor: self.fs_zoom_factor,
+                    zoom_pan: None,
+                },
+            },
+            active,
+            factor: self.fs_zoom_factor,
+            cursor,
+            pan_band,
+        })?;
+        self.fs_zoom_factor = resolved.factor;
+        let zoom_pan = match resolved.transform.placement {
+            ResolvedDisplayPlacement::Z { zoom_pan, .. } => zoom_pan,
+            ResolvedDisplayPlacement::Normal { .. } => None,
+        };
+        let bg_style = self.fs_bg_style(ctx);
+        let transform = resolved.transform;
+        Self::draw_fs_image(
+            ui,
+            image_rect,
+            fs_idx,
+            Some(source_size),
+            Some(transform),
+            state.tex.as_ref(),
+            state.thumb_tex.as_ref(),
+            false,
+            false,
+            state.fs_load_failed,
+            rotation,
+            zoom_pan,
+            0.0,
+            &bg_style,
+            &state.location_display,
+            pixel_grid && active,
+            FullscreenFitMode::Page,
+            no_limits,
+            trim_bbox,
+        );
+        if active {
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
             // in-flight 要求をキャンセルし続けて完了しないので (Codex P1)、(idx, zoom) が変わった
             // ときだけ要求する。判定は画面上の拡大率に比例する full-image 基準 zoom_full を使う。
             let rerender = self.fs_zoom_pdf_rerender_idx != Some(fs_idx)
-                || (zoom_full - self.fs_zoom_pdf_rerender_zoom).abs()
+                || (resolved.full_image_zoom - self.fs_zoom_pdf_rerender_zoom).abs()
                     > self.fs_zoom_pdf_rerender_zoom.max(1.0) * 0.02;
             if rerender {
                 self.fs_zoom_pdf_rerender_idx = Some(fs_idx);
-                self.fs_zoom_pdf_rerender_zoom = zoom_full;
-                self.maybe_rerender_pdf(zoom_full);
+                self.fs_zoom_pdf_rerender_zoom = resolved.full_image_zoom;
+                self.maybe_rerender_pdf(resolved.full_image_zoom);
             }
-        } else {
+        } else if let Some(frame) = resolved.aim_frame {
             // 照準: トリム後コンテンツを contain 表示してズーム範囲の枠を重ねる。
-            // content_bbox に trim_bbox を渡すことで、オーバービューにも余白を出さない
-            // (= 通常表示と同じトリム後の見た目)。枠はそのコンテンツ表示矩形内に描く。
-            Self::draw_fs_image(
-                ui,
-                image_rect,
-                state.tex.as_ref(),
-                state.thumb_tex.as_ref(),
-                false,
-                false,
-                state.fs_load_failed,
-                rotation,
-                None,
-                0.0,
-                &bg_style,
-                &state.location_display,
-                false,
-                FullscreenFitMode::Page,
-                no_limits,
-                trim_bbox,
-            );
-            let frame =
-                zip_aim_frame_rect(image_rect, content_min, content_size, factor, cursor_img);
             let painter = ui.painter().with_clip_rect(image_rect);
             let dim = egui::Color32::from_black_alpha(120);
             for r in capture_region_outside_rects(image_rect, frame) {
@@ -2835,6 +2743,7 @@ impl App {
                 egui::StrokeKind::Outside,
             );
         }
+        Some(transform)
     }
 
     /// 中ボタンドラッグズームを処理する。
@@ -3155,32 +3064,27 @@ fn zip_cursor_image_px(
 /// コンテンツ領域 (`content_size`) を cover する倍率 × `factor` で、画面に映る範囲サイズ (画像
 /// ピクセル) と、その中心 (コンテンツ領域内へ clamp 済み・`content_min` 相対) を返す。
 /// 照準枠・ズームパンの共通土台。
+#[cfg(test)]
+#[allow(dead_code)]
 fn zip_visible_src(
     view: egui::Vec2,
     content_size: egui::Vec2,
     factor: f32,
     cursor_in_content: egui::Vec2,
 ) -> (egui::Vec2, egui::Vec2) {
-    let cover = (view.x / content_size.x.max(1.0)).max(view.y / content_size.y.max(1.0));
-    // ズームアウト下限 = contain (片方の軸が画面に収まり、もう片方に余白が出始める点)。
-    // それ以上ズームアウトすると上下左右どちらにも余白が出るので止める (factor は 1.0 未満可)。
-    let contain = (view.x / content_size.x.max(1.0)).min(view.y / content_size.y.max(1.0));
-    let total = (cover * factor).max(contain).max(f32::EPSILON);
-    let vis_w = (view.x / total).min(content_size.x);
-    let vis_h = (view.y / total).min(content_size.y);
-    let cx = cursor_in_content
-        .x
-        .clamp(vis_w / 2.0, (content_size.x - vis_w / 2.0).max(vis_w / 2.0));
-    let cy = cursor_in_content
-        .y
-        .clamp(vis_h / 2.0, (content_size.y - vis_h / 2.0).max(vis_h / 2.0));
-    (egui::vec2(vis_w, vis_h), egui::vec2(cx, cy))
+    crate::displayed_image_transform::z_visible_source(
+        view,
+        content_size,
+        factor,
+        cursor_in_content,
+    )
 }
 
 /// ZipPla 風全画面ズーム: コンテンツ領域 (`content_min`/`content_size`、表示トリム時は bbox、
 /// 通常は `(0, display_size)`) を cover する倍率 × `factor` を、`draw_fs_image` の `zoom_pan`
 /// (= ページ全体フィット `display_size` に対する倍率, パン) として返す。表示範囲はコンテンツ
 /// 領域内へ clamp する (= 余白 / 切り落とした領域を見せない)。
+#[cfg(test)]
 fn zip_cover_zoom_pan(
     view: egui::Vec2,
     display_size: egui::Vec2,
@@ -3189,33 +3093,14 @@ fn zip_cover_zoom_pan(
     factor: f32,
     cursor_img: egui::Vec2,
 ) -> (f32, egui::Vec2) {
-    if display_size.x <= 0.0
-        || display_size.y <= 0.0
-        || content_size.x <= 0.0
-        || content_size.y <= 0.0
-        || view.x <= 0.0
-        || view.y <= 0.0
-    {
-        return (1.0, egui::Vec2::ZERO);
-    }
-    let page_fit = (view.x / display_size.x).min(view.y / display_size.y);
-    let cover = (view.x / content_size.x).max(view.y / content_size.y);
-    // ズームアウト下限 = contain (zip_visible_src と同じ。factor < 1.0 で contain まで縮小可)。
-    let contain = (view.x / content_size.x).min(view.y / content_size.y);
-    let total = (cover * factor).max(contain);
-    let zoom = if page_fit > 0.0 {
-        total / page_fit
-    } else {
-        1.0
-    };
-    let (_vis, center_rel) = zip_visible_src(view, content_size, factor, cursor_img - content_min);
-    let center_img = content_min + center_rel;
-    // 表示中心 (画像ピクセル) を画面中心へ寄せる pan (スクリーン座標)。
-    let pan = egui::vec2(
-        (display_size.x / 2.0 - center_img.x) * total,
-        (display_size.y / 2.0 - center_img.y) * total,
-    );
-    (zoom, pan)
+    crate::displayed_image_transform::z_cover_zoom_pan(
+        view,
+        display_size,
+        content_min,
+        content_size,
+        factor,
+        cursor_img,
+    )
 }
 
 /// `zip_cover_zoom_pan` が返す **full-image 基準** (ページ全体フィット `display_size` に対する)
@@ -3226,6 +3111,7 @@ fn zip_cover_zoom_pan(
 /// 描くため、full-image 基準の値をそのまま渡すと位置がずれる。本変換で **位置 (img_rect) を保ったまま
 /// content_bbox による UV クロップだけを得る** (= ズームアウトで contain まで縮めても切り落とした余白を
 /// 再表示しない、Codex P2)。トリム無し (`content_min = 0`, `content_size = display_size`) では恒等変換。
+#[cfg(test)]
 fn zip_bbox_zoom_pan_from_full(
     zoom_full: f32,
     pan_full: egui::Vec2,
@@ -3234,23 +3120,21 @@ fn zip_bbox_zoom_pan_from_full(
     content_min: egui::Vec2,
     content_size: egui::Vec2,
 ) -> (f32, egui::Vec2) {
-    let page_fit = (view.x / display_size.x.max(1.0)).min(view.y / display_size.y.max(1.0));
-    let contain = (view.x / content_size.x.max(1.0)).min(view.y / content_size.y.max(1.0));
-    let total = zoom_full * page_fit;
-    let content_center = content_min + content_size * 0.5;
-    let zoom = if contain > 0.0 {
-        zoom_full * page_fit / contain
-    } else {
-        zoom_full
-    };
-    let pan = pan_full + (content_center - display_size * 0.5) * total;
-    (zoom, pan)
+    crate::displayed_image_transform::z_bbox_zoom_pan_from_full(
+        zoom_full,
+        pan_full,
+        view,
+        display_size,
+        content_min,
+        content_size,
+    )
 }
 
 /// 照準 (Z 押下中) で表示する枠のスクリーン矩形。オーバービューは**トリム後コンテンツ**を
 /// contain 表示している前提で (draw_fs_image に content_bbox を渡すのと同じ配置)、そのコンテンツ
 /// 表示矩形の中に表示範囲を枠として描く。離した瞬間の `zip_cover_zoom_pan` の表示範囲と一致する。
 /// トリムが無いとき (`content_min = 0`, `content_size = display_size`) は従来の全体表示と一致する。
+#[cfg(test)]
 fn zip_aim_frame_rect(
     view_rect: egui::Rect,
     content_min: egui::Vec2,
@@ -3258,27 +3142,13 @@ fn zip_aim_frame_rect(
     factor: f32,
     cursor_img: egui::Vec2,
 ) -> egui::Rect {
-    if content_size.x <= 0.0 || content_size.y <= 0.0 {
-        return view_rect;
-    }
-    // コンテンツを contain 表示する矩形 (= draw_fs_image が content_bbox 指定時に描く位置)。
-    let fit = (view_rect.width() / content_size.x).min(view_rect.height() / content_size.y);
-    let content_disp = egui::Rect::from_center_size(
-        view_rect.center(),
-        egui::vec2(content_size.x * fit, content_size.y * fit),
-    );
-    let (vis, center_rel) = zip_visible_src(
-        view_rect.size(),
+    crate::displayed_image_transform::z_aim_frame_rect(
+        view_rect,
+        content_min,
         content_size,
         factor,
-        cursor_img - content_min,
-    );
-    // center_rel はコンテンツ相対 (0..content_size) なので、content_disp 内へそのまま写す。
-    let min = egui::pos2(
-        content_disp.left() + (center_rel.x - vis.x / 2.0) * fit,
-        content_disp.top() + (center_rel.y - vis.y / 2.0) * fit,
-    );
-    egui::Rect::from_min_size(min, egui::vec2(vis.x * fit, vis.y * fit))
+        cursor_img,
+    )
 }
 
 /// 見開き (合成ページ) 用 ZipPla ズーム。可視幅 = 単ページ幅 × 1.2 / factor を狙い (ZipPla の
@@ -7879,9 +7749,18 @@ impl App {
                         } else {
                             self.fullscreen_media_rect(full_rect, fs_idx, state.is_video)
                         };
+                        let source_size = self
+                            .source_dims_for_idx(fs_idx)
+                            .map(|(w, h)| egui::vec2(w, h))
+                            .or_else(|| {
+                                state
+                                    .image_dims
+                                    .map(|(w, h)| egui::vec2(w as f32, h as f32))
+                            });
 
                         // ── 画像 / 動画描画 ──
                         let media_t0 = std::time::Instant::now();
+                        let mut single_transform: Option<DisplayedImageTransform> = None;
                         if self.continuous_reading_active_for_idx(fs_idx) {
                             self.draw_fs_continuous_reading(
                                 ui,
@@ -7922,7 +7801,9 @@ impl App {
                                     {
                                         // ZipPla 風全画面ズーム (Z): 専用描画へ分岐。
                                         // 通常のズーム/パン/比較/フィット経路はスキップする。
-                                        self.draw_fs_zoom_mode(ui, ctx, image_rect, fs_idx, &state);
+                                        single_transform = self.draw_fs_zoom_mode(
+                                            ui, ctx, image_rect, fs_idx, &state,
+                                        );
                                         self.fs_spread_layout = None;
                                     } else {
 
@@ -8032,9 +7913,12 @@ impl App {
                                                 self.view_trim_single_content_bbox(fs_idx)
                                             };
                                             let bg_style = self.fs_bg_style(ctx);
-                                            Self::draw_fs_image(
+                                            single_transform = Self::draw_fs_image(
                                                 ui,
                                                 image_rect,
+                                                fs_idx,
+                                                source_size,
+                                                None,
                                                 state.tex.as_ref(),
                                                 state.thumb_tex.as_ref(),
                                                 state.is_video,
@@ -8101,8 +7985,8 @@ impl App {
                                             self.view_trim_single_content_bbox(fs_idx)
                                         };
                                         let bg_style = self.fs_bg_style(ctx);
-                                        Self::draw_fs_image(
-                                            ui, image_rect,
+                                        single_transform = Self::draw_fs_image(
+                                            ui, image_rect, fs_idx, source_size, None,
                                             state.tex.as_ref(), state.thumb_tex.as_ref(),
                                             state.is_video, state.vst3_waiting_for_video,
                                             state.fs_load_failed, fs_rotation, zp,
@@ -8222,9 +8106,10 @@ impl App {
                         // レンダ + 消しゴム overlay を併発させずスキップして、次フレームに
                         // 単一ページ表示で消しゴムを描画する。
                         if self.erase_mode && !is_spread_double && !state.original_preview_active {
-                            let zp = self.fs_zoom_pan();
-                            self.handle_erase_paint(ctx, image_rect, zp);
-                            self.draw_erase_overlay(ui, ctx, image_rect, zp);
+                            if let Some(transform) = single_transform.as_ref() {
+                                self.handle_erase_paint(ctx, transform);
+                                self.draw_erase_overlay(ui, ctx, transform);
+                            }
                             ctx.request_repaint();
                         } else if self.erase_mode {
                             // 遷移フレームでも次フレームを必ず描画させる (request_repaint)
@@ -8239,9 +8124,10 @@ impl App {
                             && !is_spread_double
                             && !state.original_preview_active
                         {
-                            let zp = self.fs_zoom_pan();
-                            self.handle_conceal_paint(ctx, image_rect, zp);
-                            self.draw_conceal_overlay(ui, ctx, image_rect, zp);
+                            if let Some(transform) = single_transform.as_ref() {
+                                self.handle_conceal_paint(ctx, transform);
+                                self.draw_conceal_overlay(ui, ctx, transform);
+                            }
                             ctx.request_repaint();
                         } else if self.conceal_mode {
                             ctx.request_repaint();
@@ -8253,14 +8139,15 @@ impl App {
                             && !is_spread_double
                             && !state.original_preview_active
                         {
-                            let zp = self.fs_zoom_pan();
-                            // 子ダイアログ表示中はキャンバスのポインタ操作を止める (Codex P2:
-                            // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
-                            // 漏れるのを防ぐ)。ダイアログ自体の描画は draw_text_overlay で行う。
-                            if !self.text_subdialog_open() {
-                                self.handle_text_canvas_input(ctx, image_rect, zp);
+                            if let Some(transform) = single_transform.as_ref() {
+                                // 子ダイアログ表示中はキャンバスのポインタ操作を止める (Codex P2:
+                                // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
+                                // 漏れるのを防ぐ)。ダイアログ自体の描画は draw_text_overlay で行う。
+                                if !self.text_subdialog_open() {
+                                    self.handle_text_canvas_input(ctx, transform);
+                                }
+                                self.draw_text_overlay(ui, ctx, transform);
                             }
-                            self.draw_text_overlay(ui, ctx, image_rect, zp);
                             ctx.request_repaint();
                         } else if self.text_mode {
                             ctx.request_repaint();
@@ -8270,9 +8157,10 @@ impl App {
                             && !is_spread_double
                             && !state.original_preview_active
                         {
-                            let zp = self.fs_zoom_pan();
-                            self.handle_local_adjust_canvas_input(ctx, full_rect, image_rect, zp);
-                            self.draw_local_adjust_canvas_overlay(ui, image_rect, zp);
+                            if let Some(transform) = single_transform.as_ref() {
+                                self.handle_local_adjust_canvas_input(ctx, full_rect, transform);
+                                self.draw_local_adjust_canvas_overlay(ui, transform);
+                            }
                         } else if self.local_adjust_mode {
                             ctx.request_repaint();
                         }
@@ -8292,29 +8180,8 @@ impl App {
                             if !is_spread_double
                                 && !state.original_preview_active
                                 && (self.export_crop_mode || (has_crop && !in_earlier_tool))
+                                && let Some(transform) = single_transform.as_ref()
                             {
-                                // crop overlay は full_rect ではなく、実際に表示されている
-                                // 画像のフィット矩形 (レターボックス + zoom/pan 反映) に
-                                // 写像する (消しゴム / 隠蔽の image_layout と同じ作法)。
-                                // 既知の制限: 回転 / 自由回転は未対応 (消しゴム / 隠蔽の
-                                // overlay と同じく source 座標で写像する)。保存は source 方位の
-                                // composite に crop を適用するので正しいが、回転表示中は
-                                // overlay の向きが表示とズレる (アプリ全体の overlay 共通制限)。
-                                let crop_image_rect = {
-                                    let display_size = egui::vec2(w as f32, h as f32);
-                                    let fit_scale = (image_rect.width() / display_size.x)
-                                        .min(image_rect.height() / display_size.y);
-                                    let (total_scale, center) = match self.fs_zoom_pan() {
-                                        Some((zoom, pan)) => {
-                                            (fit_scale * zoom, image_rect.center() + pan)
-                                        }
-                                        None => (fit_scale, image_rect.center()),
-                                    };
-                                    egui::Rect::from_center_size(
-                                        center,
-                                        display_size * total_scale,
-                                    )
-                                };
                                 let pointer_allowed = !self.any_dialog_open()
                                     && !ctx.input(|i| {
                                         i.pointer.hover_pos().is_some_and(|p| {
@@ -8323,7 +8190,7 @@ impl App {
                                     });
                                 let used = self.draw_export_crop_overlay(
                                     ui,
-                                    crop_image_rect,
+                                    transform,
                                     fs_idx,
                                     image_size,
                                     pointer_allowed,
@@ -8343,9 +8210,9 @@ impl App {
                             ui,
                             ctx,
                             full_rect,
-                            image_rect,
                             fs_idx,
                             is_spread_double,
+                            single_transform.as_ref(),
                         );
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // パノラマ・分析・補正・テキスト注釈モードでは内部で早期 return する。
@@ -8354,6 +8221,7 @@ impl App {
                             ui, ctx, image_rect, fs_idx,
                             state.tex.as_ref(), state.thumb_tex.as_ref(),
                             is_spread_double,
+                            single_transform.as_ref(),
                         );
 
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
@@ -14296,6 +14164,9 @@ impl App {
     fn draw_fs_image(
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
+        page_idx: usize,
+        source_size: Option<egui::Vec2>,
+        resolved_transform: Option<DisplayedImageTransform>,
         tex: Option<&egui::TextureHandle>,
         thumb_tex: Option<&egui::TextureHandle>,
         is_video: bool,
@@ -14313,37 +14184,31 @@ impl App {
         fit_scale_limits: FullscreenFitScaleLimits,
         // 余白カットフィット用の中身 bbox (正規化 0..1)。Some & rotation なしのとき適用。
         content_bbox: Option<egui::Rect>,
-    ) {
+    ) -> Option<DisplayedImageTransform> {
         let using_full_texture = tex.is_some();
         let display_tex = Self::fs_display_texture_choice(is_video, tex, thumb_tex);
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
-            let display_size = match rotation {
-                crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                    egui::vec2(tex_size.y, tex_size.x)
-                }
-                _ => tex_size,
-            };
             let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
-            let Some(img_rect) = fs_image_draw_rect_for_size(
-                full_rect,
-                tex_size,
-                rotation,
-                zoom_pan,
-                free_rotation_rad,
-                fit_mode,
-                fit_scale_limits,
-                content_bbox,
-            ) else {
-                return;
+            let Some(transform) = resolved_transform.or_else(|| {
+                DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                    page_idx,
+                    viewport_rect: full_rect,
+                    source_size: source_size.unwrap_or(tex_size),
+                    texture_size: tex_size,
+                    rotation,
+                    free_rotation_rad,
+                    content_bbox,
+                    fit_mode,
+                    fit_scale_limits,
+                    placement: ResolvedDisplayPlacement::Normal { zoom_pan },
+                })
+            }) else {
+                return None;
             };
-            let total_scale = if display_size.x > 0.0 {
-                img_rect.width() / display_size.x
-            } else {
-                1.0
-            };
-            let (paint_rect, uv_rect) =
-                fs_image_paint_rect_and_uv(img_rect, rotation, free_rotation_rad, content_bbox);
+            let img_rect = transform.full_image_rect;
+            let paint_rect = transform.paint_rect;
+            let total_scale = transform.total_scale;
             let needs_clip = zoom_pan.is_some()
                 || free_rotation_rad.abs() > TRANSFORM_EPSILON
                 || fit_bbox.is_some()
@@ -14359,18 +14224,7 @@ impl App {
             if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
                 paint_transparent_bg(&painter, paint_rect, bg_style);
             }
-            if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
-                painter.image(handle.id(), paint_rect, uv_rect, egui::Color32::WHITE);
-            } else {
-                crate::app::draw_rotated_image_ex(
-                    &painter,
-                    handle.id(),
-                    img_rect,
-                    rotation,
-                    free_rotation_rad,
-                    img_rect.center(),
-                );
-            }
+            transform.paint_texture(&painter, handle.id(), egui::Color32::WHITE);
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
             {
@@ -14386,6 +14240,7 @@ impl App {
                     ui.ctx().pixels_per_point(),
                 );
             }
+            return Some(transform);
         } else if fs_load_failed {
             ui.painter().text(
                 full_rect.center(),
@@ -14430,6 +14285,7 @@ impl App {
                 20.0,
             );
         }
+        None
     }
 
     pub(crate) fn scroll_vertical_reading_by(&mut self, ctx: &egui::Context, delta: f32) {
@@ -16143,20 +15999,20 @@ impl App {
         fit_scale_limits: FullscreenFitScaleLimits,
     ) -> Option<egui::Rect> {
         let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
-        if tex_size.x <= 0.0
-            || tex_size.y <= 0.0
-            || full_rect.width() <= 0.0
-            || full_rect.height() <= 0.0
-        {
-            return None;
-        }
-        let fit_scale = fit_scale_limits
-            .apply((full_rect.width() / tex_size.x).min(full_rect.height() / tex_size.y));
-        let (total_scale, center) = match zoom_pan {
-            Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-            None => (fit_scale, full_rect.center()),
-        };
-        Some(egui::Rect::from_center_size(center, tex_size * total_scale))
+        DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect: full_rect,
+            source_size: tex_size,
+            texture_size: tex_size,
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            // 比較は現行どおり明示的な Page fit。通常表示設定へ追従させない。
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits,
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan },
+        })
+        .map(|transform| transform.full_image_rect)
     }
 
     #[cfg(windows)]
@@ -17360,6 +17216,7 @@ impl App {
         tex: Option<&egui::TextureHandle>,
         thumb_tex: Option<&egui::TextureHandle>,
         spread_double: bool,
+        single_transform: Option<&DisplayedImageTransform>,
     ) {
         if self.is_panorama_mode_active(fs_idx) {
             return;
@@ -17396,7 +17253,7 @@ impl App {
 
         // ── 対象のページ矩形 + テクスチャを決定 ───────────────────────
         // Single / Spread で分岐。見開きはカーソル直下のページを選ぶ。
-        let (img_rect, handle_owned, idx_for_rot) = if spread_double {
+        let (img_rect, handle_owned, idx_for_rot, resolved_single) = if spread_double {
             let Some(layout) = self.fs_spread_layout else {
                 return;
             };
@@ -17426,23 +17283,41 @@ impl App {
             let Some(handle) = page_tex.or(page_thumb) else {
                 return;
             };
-            (page_rect, handle, page_idx)
+            (page_rect, handle, page_idx, None)
         } else {
             let Some(handle) = tex.or(thumb_tex) else {
                 return;
             };
-            let tex_size = handle.size_vec2();
-            if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+            let transform = single_transform.copied().or_else(|| {
+                (!matches!(self.compare_view_mode, crate::app::CompareViewMode::Off))
+                    .then(|| {
+                        let size = handle.size_vec2();
+                        DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                            page_idx: fs_idx,
+                            viewport_rect: full_rect,
+                            source_size: size,
+                            texture_size: size,
+                            rotation: crate::rotation_db::Rotation::None,
+                            free_rotation_rad: 0.0,
+                            content_bbox: None,
+                            fit_mode: FullscreenFitMode::Page,
+                            fit_scale_limits: self.fullscreen_fit_scale_limits(),
+                            placement: ResolvedDisplayPlacement::Normal {
+                                zoom_pan: self.fs_zoom_pan(),
+                            },
+                        })
+                    })
+                    .flatten()
+            });
+            let Some(transform) = transform else {
                 return;
-            }
-            let fit_scale = (full_rect.width() / tex_size.x).min(full_rect.height() / tex_size.y);
-            let (total_scale, img_center) = match self.fs_zoom_pan() {
-                Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-                None => (fit_scale, full_rect.center()),
             };
-            let size = tex_size * total_scale;
-            let rect = egui::Rect::from_center_size(img_center, size);
-            (rect, handle.clone(), fs_idx)
+            (
+                transform.full_image_rect,
+                handle.clone(),
+                fs_idx,
+                Some(transform),
+            )
         };
 
         // 回転 / 任意回転時は UV 逆変換が複雑なためルーペ非対応
@@ -17455,16 +17330,24 @@ impl App {
         if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
             return;
         }
-        if !img_rect.contains(cursor) {
+        if resolved_single
+            .map(|transform| transform.contains_screen(cursor))
+            .unwrap_or_else(|| img_rect.contains(cursor))
+            == false
+        {
             return;
         }
 
         // 画面 px → テクスチャ px の変換倍率 (見開きでも単一でも共通のスカラー)
         let total_scale = img_rect.width() / tex_size.x;
-        let uv_center = egui::vec2(
-            (cursor.x - img_rect.min.x) / img_rect.width(),
-            (cursor.y - img_rect.min.y) / img_rect.height(),
-        );
+        let uv_center = resolved_single
+            .map(|transform| transform.screen_to_source_normalized(cursor).to_vec2())
+            .unwrap_or_else(|| {
+                egui::vec2(
+                    (cursor.x - img_rect.min.x) / img_rect.width(),
+                    (cursor.y - img_rect.min.y) / img_rect.height(),
+                )
+            });
 
         // ルーペパラメータ (将来設定化)
         const LOUPE_SIZE: f32 = 300.0;
@@ -20378,77 +20261,34 @@ impl App {
         Ok(job.source.size)
     }
 
-    fn capture_region_image_rect_for_source(
-        &self,
-        image_rect: egui::Rect,
-        source_size: [usize; 2],
-        rotation: crate::rotation_db::Rotation,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-        fit_mode: FullscreenFitMode,
-        fit_scale_limits: FullscreenFitScaleLimits,
-        content_bbox: Option<egui::Rect>,
-    ) -> egui::Rect {
-        let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
-        let display_size = rotated_display_size(tex_size, rotation);
-        let fit_bbox = content_bbox.filter(|_| rotation.is_none());
-        let bbox_fit = fit_bbox.map(|bbox| {
-            let bbox_w = (bbox.width() * display_size.x).max(1.0);
-            let bbox_h = (bbox.height() * display_size.y).max(1.0);
-            let center = egui::vec2(
-                (bbox.center().x - 0.5) * display_size.x,
-                (bbox.center().y - 0.5) * display_size.y,
-            );
-            (bbox_w, bbox_h, center)
-        });
-        let page_fit =
-            || (image_rect.width() / display_size.x).min(image_rect.height() / display_size.y);
-        let (fit_scale, content_center_px) = match (fit_mode, bbox_fit) {
-            (FullscreenFitMode::Width, Some((bbox_w, _, center))) => {
-                (image_rect.width() / bbox_w, center)
-            }
-            (FullscreenFitMode::Width, None) => {
-                (image_rect.width() / display_size.x, egui::Vec2::ZERO)
-            }
-            (FullscreenFitMode::Height, Some((_, bbox_h, center))) => {
-                (image_rect.height() / bbox_h, center)
-            }
-            (FullscreenFitMode::Height, None) => {
-                (image_rect.height() / display_size.y, egui::Vec2::ZERO)
-            }
-            (FullscreenFitMode::Original, Some((_, _, center))) => (1.0, center),
-            (FullscreenFitMode::Original, None) => (1.0, egui::Vec2::ZERO),
-            (_, Some((bbox_w, bbox_h, center))) => (
-                (image_rect.width() / bbox_w).min(image_rect.height() / bbox_h),
-                center,
-            ),
-            (_, None) => (page_fit(), egui::Vec2::ZERO),
-        };
-        let fit_scale = fit_scale_limits.apply(fit_scale);
-        let (total_scale, base_center) = match zoom_pan {
-            Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
-            None => (fit_scale, image_rect.center()),
-        };
-        let center = base_center - content_center_px * total_scale;
-        egui::Rect::from_center_size(center, display_size * total_scale)
-    }
-
-    fn capture_region_spread_image_rect_for_source(
+    fn capture_region_spread_transform_for_source(
+        idx: usize,
         page_rect: egui::Rect,
         source_size: [usize; 2],
         rotation: crate::rotation_db::Rotation,
-    ) -> egui::Rect {
+    ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
-        let display_size = rotated_display_size(tex_size, rotation);
-        fit_display_size_in_rect(page_rect, display_size)
+        DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            page_idx: idx,
+            viewport_rect: page_rect,
+            source_size: tex_size,
+            texture_size: tex_size,
+            rotation,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        })
     }
 
     fn capture_region_target_at(
         &mut self,
         ctx: &egui::Context,
-        image_rect: egui::Rect,
         fs_idx: usize,
         is_spread_double: bool,
         pos: egui::Pos2,
+        single_transform: Option<&DisplayedImageTransform>,
     ) -> Result<CaptureRegionTarget, String> {
         if is_spread_double {
             let Some(layout) = self.fs_spread_layout else {
@@ -20463,35 +20303,41 @@ impl App {
             };
             let source_size = self.capture_region_source_size_for_idx(ctx, idx)?;
             let rotation = self.get_rotation(idx);
-            let image_rect =
-                Self::capture_region_spread_image_rect_for_source(page_rect, source_size, rotation);
+            let transform = Self::capture_region_spread_transform_for_source(
+                idx,
+                page_rect,
+                source_size,
+                rotation,
+            )
+            .ok_or_else(|| {
+                [
+                    'ペ', 'ー', 'ジ', 'の', '表', '示', '矩', '形', 'を', '解', '決', 'で', 'き',
+                    'ま', 'せ', 'ん',
+                ]
+                .into_iter()
+                .collect::<String>()
+            })?;
             return Ok(CaptureRegionTarget {
                 idx,
                 source_size,
-                image_rect,
-                rotation,
+                transform,
             });
         }
 
         let source_size = self.capture_region_source_size_for_idx(ctx, fs_idx)?;
-        let rotation = self.get_rotation(fs_idx);
-        let content_bbox = self.view_trim_single_content_bbox(fs_idx);
-        let fit_mode = self.effective_fullscreen_fit_mode();
-        let fit_scale_limits = self.fullscreen_fit_scale_limits();
-        let target_rect = self.capture_region_image_rect_for_source(
-            image_rect,
-            source_size,
-            rotation,
-            self.fs_zoom_pan(),
-            fit_mode,
-            fit_scale_limits,
-            content_bbox,
-        );
+        let mut transform = single_transform.copied().ok_or_else(|| {
+            [
+                '画', '像', 'の', '表', '示', '矩', '形', 'を', '解', '決', 'で', 'き', 'ま', 'せ',
+                'ん',
+            ]
+            .into_iter()
+            .collect::<String>()
+        })?;
+        transform.source_size = egui::vec2(source_size[0] as f32, source_size[1] as f32);
         Ok(CaptureRegionTarget {
             idx: fs_idx,
             source_size,
-            image_rect: target_rect,
-            rotation,
+            transform,
         })
     }
 
@@ -20499,61 +20345,27 @@ impl App {
         target: CaptureRegionTarget,
         screen_rect: egui::Rect,
     ) -> Option<crate::export_crop::CropRect> {
-        let clipped = screen_rect.intersect(target.image_rect);
+        let clipped = screen_rect.intersect(target.transform.hit_rect);
         if clipped.width() < 3.0 || clipped.height() < 3.0 {
             return None;
         }
+        let points = [
+            clipped.left_top(),
+            clipped.right_top(),
+            clipped.left_bottom(),
+            clipped.right_bottom(),
+        ]
+        .map(|point| target.transform.screen_to_source(point));
+        let min_x = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let min_y = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let max_x = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
         let [src_w, src_h] = target.source_size;
-        let src_wf = src_w.max(1) as f32;
-        let src_hf = src_h.max(1) as f32;
-        let display_w = match target.rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => src_hf,
-            _ => src_wf,
-        };
-        let display_h = match target.rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => src_wf,
-            _ => src_hf,
-        };
-        let dx0 = ((clipped.left() - target.image_rect.left())
-            / target.image_rect.width().max(1.0)
-            * display_w)
-            .clamp(0.0, display_w);
-        let dx1 = ((clipped.right() - target.image_rect.left())
-            / target.image_rect.width().max(1.0)
-            * display_w)
-            .clamp(0.0, display_w);
-        let dy0 = ((clipped.top() - target.image_rect.top()) / target.image_rect.height().max(1.0)
-            * display_h)
-            .clamp(0.0, display_h);
-        let dy1 = ((clipped.bottom() - target.image_rect.top())
-            / target.image_rect.height().max(1.0)
-            * display_h)
-            .clamp(0.0, display_h);
-        let rect = match target.rotation {
-            crate::rotation_db::Rotation::None => crate::export_crop::CropRect {
-                min_x: dx0,
-                min_y: dy0,
-                max_x: dx1,
-                max_y: dy1,
-            },
-            crate::rotation_db::Rotation::Cw90 => crate::export_crop::CropRect {
-                min_x: dy0,
-                min_y: src_hf - dx1,
-                max_x: dy1,
-                max_y: src_hf - dx0,
-            },
-            crate::rotation_db::Rotation::Cw180 => crate::export_crop::CropRect {
-                min_x: src_wf - dx1,
-                min_y: src_hf - dy1,
-                max_x: src_wf - dx0,
-                max_y: src_hf - dy0,
-            },
-            crate::rotation_db::Rotation::Cw270 => crate::export_crop::CropRect {
-                min_x: src_wf - dy1,
-                min_y: dx0,
-                max_x: src_wf - dy0,
-                max_y: dx1,
-            },
+        let rect = crate::export_crop::CropRect {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
         }
         .sanitized(src_w, src_h);
         if rect.width() < 1.0 || rect.height() < 1.0 {
@@ -20568,9 +20380,9 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-        image_rect: egui::Rect,
         fs_idx: usize,
         is_spread_double: bool,
+        single_transform: Option<&DisplayedImageTransform>,
     ) {
         let Some(mut selection) = self.capture_region_selection else {
             return;
@@ -20611,9 +20423,16 @@ impl App {
             && selection.target.is_none()
             && let Some(pos) = pointer_pos
         {
-            match self.capture_region_target_at(ctx, image_rect, fs_idx, is_spread_double, pos) {
+            match self.capture_region_target_at(
+                ctx,
+                fs_idx,
+                is_spread_double,
+                pos,
+                single_transform,
+            ) {
                 Ok(target) => {
-                    let clamped = pos.clamp(target.image_rect.min, target.image_rect.max);
+                    let clamped =
+                        pos.clamp(target.transform.hit_rect.min, target.transform.hit_rect.max);
                     selection.target = Some(target);
                     selection.start_pos = Some(clamped);
                     selection.current_pos = Some(clamped);
@@ -20625,7 +20444,8 @@ impl App {
         }
 
         if primary_down && let (Some(target), Some(pos)) = (selection.target, pointer_pos) {
-            selection.current_pos = Some(pos.clamp(target.image_rect.min, target.image_rect.max));
+            selection.current_pos =
+                Some(pos.clamp(target.transform.hit_rect.min, target.transform.hit_rect.max));
         }
 
         let screen_rect = selection.screen_rect();
@@ -25155,11 +24975,26 @@ mod tests {
 
     #[test]
     fn capture_region_maps_screen_rect_to_source_crop() {
+        let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect: egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(200.0, 100.0),
+            ),
+            source_size: egui::vec2(200.0, 100.0),
+            texture_size: egui::vec2(200.0, 100.0),
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        })
+        .unwrap();
         let target = CaptureRegionTarget {
             idx: 0,
             source_size: [200, 100],
-            image_rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0)),
-            rotation: crate::rotation_db::Rotation::None,
+            transform,
         };
         let screen = egui::Rect::from_min_max(egui::pos2(50.0, 10.0), egui::pos2(150.0, 60.0));
 
@@ -25178,11 +25013,26 @@ mod tests {
 
     #[test]
     fn capture_region_maps_cw90_display_rect_back_to_source_crop() {
+        let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect: egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(200.0, 100.0),
+            ),
+            source_size: egui::vec2(100.0, 200.0),
+            texture_size: egui::vec2(100.0, 200.0),
+            rotation: crate::rotation_db::Rotation::Cw90,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        })
+        .unwrap();
         let target = CaptureRegionTarget {
             idx: 0,
             source_size: [100, 200],
-            image_rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0)),
-            rotation: crate::rotation_db::Rotation::Cw90,
+            transform,
         };
         let left_half = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
 
@@ -25202,22 +25052,23 @@ mod tests {
     #[test]
     fn capture_region_spread_target_uses_letterboxed_image_rect() {
         let page_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
-        let image_rect = crate::app::App::capture_region_spread_image_rect_for_source(
+        let transform = crate::app::App::capture_region_spread_transform_for_source(
+            0,
             page_rect,
             [200, 100],
             crate::rotation_db::Rotation::None,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(image_rect.left(), 0.0);
-        assert_eq!(image_rect.right(), 300.0);
-        assert_eq!(image_rect.top(), 75.0);
-        assert_eq!(image_rect.bottom(), 225.0);
+        assert_eq!(transform.full_image_rect.left(), 0.0);
+        assert_eq!(transform.full_image_rect.right(), 300.0);
+        assert_eq!(transform.full_image_rect.top(), 75.0);
+        assert_eq!(transform.full_image_rect.bottom(), 225.0);
 
         let target = CaptureRegionTarget {
             idx: 0,
             source_size: [200, 100],
-            image_rect,
-            rotation: crate::rotation_db::Rotation::None,
+            transform,
         };
         let screen = egui::Rect::from_min_max(egui::pos2(0.0, 75.0), egui::pos2(150.0, 150.0));
 

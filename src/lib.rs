@@ -42,6 +42,7 @@ pub mod data_dir;
 mod dcomp_presenter_test;
 pub mod delete_worker;
 pub mod diagnostics;
+mod displayed_image_transform;
 #[cfg(windows)]
 pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]

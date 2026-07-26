@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::app::{App, ConcealSnapshot, EraseSpreadCtx, MaskDirtyRect};
 use crate::conceal::ConcealTool;
+use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::KeyAction;
 use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
@@ -758,56 +759,42 @@ impl App {
 
     fn conceal_image_layout(
         &self,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) -> Option<(f32, egui::Rect)> {
         let [iw, ih] = self.conceal_mask_size;
         if iw == 0 || ih == 0 {
             return None;
         }
-        let display_size = egui::vec2(iw as f32, ih as f32);
-        let fit_scale =
-            (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
-        let (total_scale, center) = match zoom_pan {
-            Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-            None => (fit_scale, full_rect.center()),
-        };
         Some((
-            total_scale,
-            egui::Rect::from_center_size(center, display_size * total_scale),
+            transform.screen_px_per_source_px(egui::vec2(iw as f32, ih as f32)),
+            transform.full_image_rect,
         ))
     }
 
     fn conceal_screen_to_image(
         &self,
         screen_pos: egui::Pos2,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
         clamp_inside: bool,
     ) -> Option<(f32, f32)> {
-        let (total_scale, img_rect) = self.conceal_image_layout(full_rect, zoom_pan)?;
         let [iw, ih] = self.conceal_mask_size;
-        let nx = (screen_pos.x - img_rect.min.x) / total_scale;
-        let ny = (screen_pos.y - img_rect.min.y) / total_scale;
-        if clamp_inside && (nx < 0.0 || ny < 0.0 || nx >= iw as f32 || ny >= ih as f32) {
+        if iw == 0 || ih == 0 || (clamp_inside && !transform.contains_screen(screen_pos)) {
             return None;
         }
-        Some((nx, ny))
+        let p = transform.screen_to_source_normalized(screen_pos);
+        Some((p.x * iw as f32, p.y * ih as f32))
     }
 
     fn conceal_image_to_screen(
         &self,
         img: (f32, f32),
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) -> egui::Pos2 {
-        let (total_scale, img_rect) = self
-            .conceal_image_layout(full_rect, zoom_pan)
-            .unwrap_or((1.0, full_rect));
-        egui::pos2(
-            img_rect.min.x + img.0 * total_scale,
-            img_rect.min.y + img.1 * total_scale,
-        )
+        let [iw, ih] = self.conceal_mask_size;
+        transform.source_normalized_to_screen(egui::pos2(
+            img.0 / iw.max(1) as f32,
+            img.1 / ih.max(1) as f32,
+        ))
     }
 
     // ── ビットマップ塗り (Brush / Lasso 用) ────────────────────────────
@@ -1032,9 +1019,9 @@ impl App {
     pub(crate) fn handle_conceal_paint(
         &mut self,
         ctx: &egui::Context,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
+        let full_rect = transform.viewport_rect;
         if self.fs_suppress_primary_until_release {
             return;
         }
@@ -1103,8 +1090,7 @@ impl App {
                 primary_pressed,
                 primary_released,
                 pointer_pos,
-                full_rect,
-                zoom_pan,
+                transform,
                 modifiers,
             )
         {
@@ -1117,8 +1103,7 @@ impl App {
                     primary_pressed,
                     primary_released,
                     pointer_pos,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                     modifiers,
                 );
             }
@@ -1128,8 +1113,7 @@ impl App {
                     primary_released,
                     pointer_pos,
                     paint,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                 );
             }
             ConcealTool::Lasso => {
@@ -1138,8 +1122,7 @@ impl App {
                     primary_released,
                     pointer_pos,
                     paint,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                 );
             }
             ConcealTool::Polygon => {
@@ -1148,8 +1131,7 @@ impl App {
                     secondary_pressed,
                     pointer_pos,
                     paint,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                 );
             }
             ConcealTool::Line | ConcealTool::VertLine | ConcealTool::HorizLine => {
@@ -1158,8 +1140,7 @@ impl App {
                     primary_released,
                     pointer_pos,
                     paint,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                 );
             }
             ConcealTool::Rect | ConcealTool::Ellipse => {
@@ -1168,8 +1149,7 @@ impl App {
                     primary_released,
                     pointer_pos,
                     paint,
-                    full_rect,
-                    zoom_pan,
+                    transform,
                 );
             }
         }
@@ -1191,23 +1171,15 @@ impl App {
         primary_pressed: bool,
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
         modifiers: egui::Modifiers,
     ) -> bool {
         // ① 進行中のドラッグがあれば最優先で処理
         if let Some(drag) = self.conceal_drag {
             // ポインタが取れないと apply_drag は走らせない (落としてしまうので
             // primary_released だけは検出して drag を片付ける)。
-            let img_pos_opt = pointer_pos.and_then(|p| {
-                self.conceal_image_layout(full_rect, zoom_pan)
-                    .map(|(scale, img_rect)| {
-                        (
-                            (p.x - img_rect.min.x) / scale,
-                            (p.y - img_rect.min.y) / scale,
-                        )
-                    })
-            });
+            let img_pos_opt =
+                pointer_pos.and_then(|p| self.conceal_screen_to_image(p, transform, false));
             if let Some(img_pos) = img_pos_opt {
                 let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
                 let drag_idx = drag.idx();
@@ -1241,13 +1213,12 @@ impl App {
         let Some(screen) = pointer_pos else {
             return false;
         };
-        let Some((scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+        let Some((scale, _img_rect)) = self.conceal_image_layout(transform) else {
             return false;
         };
-        let img_pos = (
-            (screen.x - img_rect.min.x) / scale,
-            (screen.y - img_rect.min.y) / scale,
-        );
+        let Some(img_pos) = self.conceal_screen_to_image(screen, transform, false) else {
+            return false;
+        };
         let Some(shape) = self.conceal_shapes.get(sel).copied() else {
             return false;
         };
@@ -1275,8 +1246,7 @@ impl App {
         primary_pressed: bool,
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
         modifiers: egui::Modifiers,
     ) {
         let Some(screen) = pointer_pos else {
@@ -1288,13 +1258,12 @@ impl App {
             }
             return;
         };
-        let Some((scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+        let Some((scale, _img_rect)) = self.conceal_image_layout(transform) else {
             return;
         };
-        let img_pos = (
-            (screen.x - img_rect.min.x) / scale,
-            (screen.y - img_rect.min.y) / scale,
-        );
+        let Some(img_pos) = self.conceal_screen_to_image(screen, transform, false) else {
+            return;
+        };
 
         if primary_pressed {
             if let Some((idx, target)) = self.hit_test_conceal(img_pos, scale) {
@@ -1344,19 +1313,17 @@ impl App {
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
         paint: bool,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, false)
-                {
+                if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
                     if self.conceal_last_paint_pos.is_none() {
                         self.push_conceal_undo();
                     }
                     let prev = self
                         .conceal_last_paint_pos
-                        .and_then(|p| self.conceal_screen_to_image(p, full_rect, zoom_pan, false))
+                        .and_then(|p| self.conceal_screen_to_image(p, transform, false))
                         .unwrap_or(img_pos);
                     self.paint_brush_line_conceal(prev, img_pos, paint);
                 }
@@ -1374,13 +1341,11 @@ impl App {
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
         paint: bool,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, false)
-                {
+                if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
                     // サンプリング間引き (~2px 離れたら追加)
                     crate::manual_mask_tools::push_freehand_point(
                         &mut self.conceal_lasso_points,
@@ -1406,8 +1371,7 @@ impl App {
         secondary_pressed: bool,
         pointer_pos: Option<egui::Pos2>,
         paint: bool,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if secondary_pressed {
             if let Some(pts) =
@@ -1425,13 +1389,12 @@ impl App {
         let Some(screen) = pointer_pos else {
             return;
         };
-        let Some((scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+        let Some((scale, _img_rect)) = self.conceal_image_layout(transform) else {
             return;
         };
-        let img_pos = (
-            (screen.x - img_rect.min.x) / scale,
-            (screen.y - img_rect.min.y) / scale,
-        );
+        let Some(img_pos) = self.conceal_screen_to_image(screen, transform, false) else {
+            return;
+        };
         if crate::manual_mask_tools::should_close_polygon(
             &self.conceal_lasso_points,
             img_pos,
@@ -1461,13 +1424,11 @@ impl App {
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
         paint: bool,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, false)
-                {
+                if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
                     if self.conceal_line_start.is_none() {
                         self.conceal_line_start = Some(img_pos);
                     }
@@ -1530,13 +1491,11 @@ impl App {
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
         paint: bool,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, false)
-                {
+                if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
                     if self.conceal_shape_drag_start.is_none() {
                         self.conceal_shape_drag_start = Some(img_pos);
                     }
@@ -1644,39 +1603,28 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
+        let full_rect = transform.viewport_rect;
         // マスクオーバーレイ (紫半透明)。プレビュー押下中はマスクを隠して
         // 「合成後の結果」だけが見えるようにする (= ユーザー要望: プレビューでは
         // マスク表示オフ)。
         if !self.conceal_preview_active {
             self.ensure_conceal_mask_texture(ctx);
             if let Some(ref tex) = self.conceal_mask_texture {
-                if let Some((_total_scale, img_rect)) =
-                    self.conceal_image_layout(full_rect, zoom_pan)
-                {
-                    let painter = if zoom_pan.is_some() {
-                        ui.painter().with_clip_rect(full_rect)
-                    } else {
-                        ui.painter().clone()
-                    };
-                    painter.image(
-                        tex.id(),
-                        img_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                if let Some((_total_scale, _img_rect)) = self.conceal_image_layout(transform) {
+                    let painter = ui.painter().with_clip_rect(full_rect);
+                    transform.paint_texture(&painter, tex.id(), egui::Color32::WHITE);
                 }
             }
         }
 
         // ツールプレビュー (ドラッグ中)
-        self.draw_conceal_tool_preview(ui, full_rect, zoom_pan);
+        self.draw_conceal_tool_preview(ui, transform);
 
         // 選択ツール中は、最終マスクでは透明になる削除オブジェクトも編集対象として
         // 見えるように全ベクタのアウトラインを表示する。
-        self.draw_conceal_shape_outlines(ui, full_rect, zoom_pan);
+        self.draw_conceal_shape_outlines(ui, transform);
 
         // カーソルを Crosshair に。`draw_selected_handles` 内でハンドル上にホバー時のみ
         // 専用カーソル (Resize* / PointingHand) へ上書きする。順序を逆にしないこと
@@ -1684,10 +1632,10 @@ impl App {
         ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
 
         // 筆ツール中はブラシ範囲の点線サークル (消しゴムと同じ表示)
-        self.draw_conceal_brush_cursor(ui, ctx, full_rect, zoom_pan);
+        self.draw_conceal_brush_cursor(ui, ctx, transform);
 
         // 選択中の shape のハンドル
-        self.draw_selected_handles(ui, ctx, full_rect, zoom_pan);
+        self.draw_selected_handles(ui, ctx, transform);
 
         // パネル
         self.draw_conceal_panel(ctx, full_rect);
@@ -1699,15 +1647,14 @@ impl App {
         &self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         if self.conceal_tool != ConcealTool::Brush {
             return;
         }
         if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-            if full_rect.contains(pos) {
-                let Some((total_scale, _)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+            if transform.contains_screen(pos) {
+                let Some((total_scale, _)) = self.conceal_image_layout(transform) else {
                     return;
                 };
                 let screen_r = self.settings.conceal_brush_radius.max(1.0) * total_scale;
@@ -1716,17 +1663,8 @@ impl App {
         }
     }
 
-    fn draw_conceal_tool_preview(
-        &self,
-        ui: &mut egui::Ui,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-    ) {
-        let painter = if zoom_pan.is_some() {
-            ui.painter().with_clip_rect(full_rect)
-        } else {
-            ui.painter().clone()
-        };
+    fn draw_conceal_tool_preview(&self, ui: &mut egui::Ui, transform: &DisplayedImageTransform) {
+        let painter = ui.painter().with_clip_rect(transform.viewport_rect);
         let preview_color = egui::Color32::from_rgba_unmultiplied(
             MASK_OVERLAY_R,
             MASK_OVERLAY_G,
@@ -1740,7 +1678,7 @@ impl App {
             let pts: Vec<egui::Pos2> = self
                 .conceal_lasso_points
                 .iter()
-                .map(|&p| self.conceal_image_to_screen(p, full_rect, zoom_pan))
+                .map(|&p| self.conceal_image_to_screen(p, transform))
                 .collect();
             painter.add(egui::Shape::line(pts.clone(), stroke));
             if matches!(self.conceal_tool, ConcealTool::Lasso | ConcealTool::Polygon) {
@@ -1765,7 +1703,7 @@ impl App {
             }
         } else if self.conceal_tool == ConcealTool::Polygon && self.conceal_lasso_points.len() == 1
         {
-            let p = self.conceal_image_to_screen(self.conceal_lasso_points[0], full_rect, zoom_pan);
+            let p = self.conceal_image_to_screen(self.conceal_lasso_points[0], transform);
             painter.circle_filled(p, 4.0, egui::Color32::from_rgb(255, 245, 120));
             painter.circle_stroke(p, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
         }
@@ -1787,32 +1725,36 @@ impl App {
                 }
                 _ => (start, end),
             };
-            let s0 = self.conceal_image_to_screen(p0, full_rect, zoom_pan);
-            let s1 = self.conceal_image_to_screen(p1, full_rect, zoom_pan);
+            let s0 = self.conceal_image_to_screen(p0, transform);
+            let s1 = self.conceal_image_to_screen(p1, transform);
             painter.line_segment([s0, s1], stroke);
         }
         // Rect / Ellipse プレビュー
         if let (Some(start), Some(end)) =
             (self.conceal_shape_drag_start, self.conceal_shape_drag_end)
         {
-            let s0 = self.conceal_image_to_screen(start, full_rect, zoom_pan);
-            let s1 = self.conceal_image_to_screen(end, full_rect, zoom_pan);
-            let rect = egui::Rect::from_two_pos(s0, s1);
             match self.conceal_tool {
                 ConcealTool::Rect => {
-                    painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+                    let pts = vec![
+                        self.conceal_image_to_screen(start, transform),
+                        self.conceal_image_to_screen((end.0, start.1), transform),
+                        self.conceal_image_to_screen(end, transform),
+                        self.conceal_image_to_screen((start.0, end.1), transform),
+                        self.conceal_image_to_screen(start, transform),
+                    ];
+                    painter.add(egui::Shape::line(pts, stroke));
                 }
                 ConcealTool::Ellipse => {
                     // egui に楕円 stroke が無いので円周点列で代用
-                    let center = rect.center();
-                    let r = egui::vec2(rect.width() * 0.5, rect.height() * 0.5);
+                    let center = ((start.0 + end.0) * 0.5, (start.1 + end.1) * 0.5);
+                    let r = ((end.0 - start.0).abs() * 0.5, (end.1 - start.1).abs() * 0.5);
                     const N: usize = 36;
                     let mut pts = Vec::with_capacity(N + 1);
                     for i in 0..=N {
                         let theta = i as f32 * std::f32::consts::TAU / N as f32;
-                        pts.push(egui::pos2(
-                            center.x + r.x * theta.cos(),
-                            center.y + r.y * theta.sin(),
+                        pts.push(self.conceal_image_to_screen(
+                            (center.0 + r.0 * theta.cos(), center.1 + r.1 * theta.sin()),
+                            transform,
                         ));
                     }
                     painter.add(egui::Shape::line(pts, stroke));
@@ -1826,24 +1768,19 @@ impl App {
     ///
     /// `Subtract` Shape は合成済みのマスク上では透明になるため、選択・編集のための
     /// 補助表示として add/subtract を色分けした枠を別レイヤーに描く。
-    fn draw_conceal_shape_outlines(
-        &self,
-        ui: &mut egui::Ui,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-    ) {
+    fn draw_conceal_shape_outlines(&self, ui: &mut egui::Ui, transform: &DisplayedImageTransform) {
         if self.conceal_preview_active
             || self.conceal_tool != ConcealTool::Select
             || self.conceal_shapes.is_empty()
         {
             return;
         }
-        let Some((scale, _img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+        let Some((scale, _img_rect)) = self.conceal_image_layout(transform) else {
             return;
         };
 
-        let painter = ui.painter().with_clip_rect(full_rect);
-        let to_screen = |p: (f32, f32)| self.conceal_image_to_screen(p, full_rect, zoom_pan);
+        let painter = ui.painter().with_clip_rect(transform.viewport_rect);
+        let to_screen = |p: (f32, f32)| self.conceal_image_to_screen(p, transform);
         for (idx, shape) in self.conceal_shapes.iter().enumerate() {
             if Some(idx) == self.conceal_selected_shape {
                 continue;
@@ -1857,8 +1794,7 @@ impl App {
         &self,
         ui: &mut egui::Ui,
         _ctx: &egui::Context,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
+        transform: &DisplayedImageTransform,
     ) {
         let Some(sel) = self.conceal_selected_shape else {
             return;
@@ -1866,18 +1802,15 @@ impl App {
         let Some(shape) = self.conceal_shapes.get(sel) else {
             return;
         };
-        let Some((scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+        let Some((scale, _img_rect)) = self.conceal_image_layout(transform) else {
             return;
         };
         let layout = vector_edit::compute_handle_layout(shape, scale);
-        let painter = ui.painter().with_clip_rect(full_rect);
+        let painter = ui.painter().with_clip_rect(transform.viewport_rect);
 
         // ホバー判定はカーソル位置を画像座標に変換してから
         let hovered = ui.ctx().input(|i| i.pointer.hover_pos()).and_then(|p| {
-            let img_pos = (
-                (p.x - img_rect.min.x) / scale,
-                (p.y - img_rect.min.y) / scale,
-            );
+            let img_pos = self.conceal_screen_to_image(p, transform, false)?;
             vector_edit::hit_test(&layout, img_pos, scale)
         });
 
@@ -1889,7 +1822,7 @@ impl App {
             }
         }
 
-        let to_screen = |p: (f32, f32)| self.conceal_image_to_screen(p, full_rect, zoom_pan);
+        let to_screen = |p: (f32, f32)| self.conceal_image_to_screen(p, transform);
         vector_edit::draw_handles(&painter, &layout, true, hovered, &to_screen);
     }
 
