@@ -3,7 +3,63 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>mImageViewer - 高速画像ビューワー for Windows</title>
+  <title>mImageViewer｜Windows の高速画像ビューア（ZIP・PDF・動画も一覧）</title>
+  <meta name="description" content="フォルダを開くだけで、数十万枚でもサムネイルで一覧。ZIP・PDF はディスクに展開せずそのまま閲覧。長い動画はタイル表示で全体を見渡し、見たい場面から再生できます。RAW・HEIC も表示できる Windows 用の無料画像ビューアです。AI 処理はすべて PC 内で完結します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="mikage.to">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/">
+  <meta property="og:title" content="mImageViewer｜Windows の高速画像ビューア">
+  <meta property="og:description" content="フォルダを開くだけで、数十万枚でもサムネイルで一覧。ZIP・PDF はディスクに展開せずそのまま、長い動画はタイル表示で全体を見渡せる、無料・広告なしの Windows 用画像ビューア。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="mImageViewer のサムネイルグリッド表示">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="mImageViewer｜Windows の高速画像ビューア">
+  <meta name="twitter:description" content="フォルダを開くだけで、数十万枚でもサムネイルで一覧。ZIP・PDF はディスクに展開せずそのまま、長い動画はタイル表示で全体を見渡せる、無料・広告なしの Windows 用画像ビューア。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "mImageViewer",
+    "url": "https://mikage.to/mimageviewer/",
+    "applicationCategory": "MultimediaApplication",
+    "applicationSubCategory": "画像ビューア",
+    "operatingSystem": "Windows 11 (64bit)",
+    "softwareVersion": "2.8.0",
+    "inLanguage": "ja",
+    "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。AI 処理はすべて利用者の PC 内で完結します。",
+    "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
+    "downloadUrl": "https://mikage.to/mimageviewer/#download",
+    "softwareHelp": "https://mikage.to/mimageviewer/manual/",
+    "license": "https://github.com/MikageSawatari/mimageviewer/blob/main/LICENSE",
+    "isAccessibleForFree": true,
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "JPY"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Mikage Sawatari",
+      "url": "https://mikage.to/"
+    },
+    "featureList": [
+      "サムネイルグリッド表示",
+      "ZIP / CBZ / RAR / 7z / PDF の直接閲覧",
+      "RAW・HEIC・AVIF・JPEG XL 対応",
+      "動画のインライン再生と一定間隔のサムネイル一覧（タイル表示）",
+      "AI アップスケール（ローカル GPU 実行）",
+      "非破壊の補正・注釈・消しゴム",
+      "★レーティング・タグ・ブックマーク（本のページ／再生位置）・全文検索"
+    ]
+  }
+  </script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -112,6 +168,28 @@
       font-size: 0.85rem;
       color: #a02860;
       opacity: 0.8;
+    }
+
+    /* ── Hero screenshot ── */
+    .hero-shot {
+      max-width: 940px;
+      margin: 2.2rem auto 0;
+      padding: 0 2rem;
+      text-align: center;
+    }
+    .hero-shot img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 14px;
+      border: 1px solid #ffb0d9;
+      box-shadow: 0 10px 34px rgba(214, 51, 132, 0.18);
+    }
+    .hero-shot-caption {
+      margin: 0.7rem 0 0;
+      font-size: 0.85rem;
+      color: #a02860;
+      opacity: 0.85;
     }
 
     /* ── Microsoft Store link (secondary) ── */
@@ -544,7 +622,7 @@
     /* ── Use-case cards ��─ */
     .usecases {
       max-width: 900px;
-      margin: -2rem auto 0;
+      margin: 2.6rem auto 0;
       padding: 0 2rem;
       position: relative;
       z-index: 10;
@@ -552,6 +630,38 @@
       grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
       gap: 1rem;
     }
+    .usecases-lead {
+      max-width: 900px;
+      margin: 2.8rem auto -1.2rem;
+      padding: 0 2rem;
+      text-align: center;
+      font-size: 1.02rem;
+      font-weight: 700;
+      color: #c0255a;
+    }
+    /* ── Folded extra use-cases ── */
+    .usecases-more {
+      max-width: 900px;
+      margin: 1rem auto 0;
+      padding: 0 2rem;
+    }
+    .usecases-more > summary {
+      cursor: pointer;
+      list-style: none;
+      text-align: center;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #a02860;
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid #ffb0d9;
+      border-radius: 24px;
+      padding: 0.55rem 1.2rem;
+      transition: background 0.2s;
+    }
+    .usecases-more > summary::-webkit-details-marker { display: none; }
+    .usecases-more > summary:hover { background: #fff; }
+    .usecases-more[open] > summary { margin-bottom: 1rem; }
+    .usecases-more .usecases { margin-top: 0; padding: 0; }
     .usecase-card {
       background: #fff;
       border: 1px solid #ffe0ec;
@@ -613,12 +723,74 @@
       line-height: 1.55;
     }
 
+    /* ── Collapsible spec block ── */
+    .spec-details {
+      margin-top: 1.2rem;
+      background: #fff;
+      border: 1px solid #ffe0ec;
+      border-radius: 12px;
+      padding: 0.4rem 1.2rem;
+    }
+    .spec-details > summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 0.6rem 0;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #a02860;
+    }
+    .spec-details > summary::-webkit-details-marker { display: none; }
+    .spec-details > summary::before { content: "▸ "; }
+    .spec-details[open] > summary::before { content: "▾ "; }
+    .spec-details p {
+      font-size: 0.87rem;
+      color: #666;
+      line-height: 1.7;
+    }
+    .spec-details p:last-child { margin-bottom: 0.8rem; }
+
+    /* ── Trust / safety ── */
+    .trust-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+    }
+    .trust-item {
+      background: #fff;
+      border: 1px solid #ffe0ec;
+      border-left: 4px solid #d63384;
+      border-radius: 12px;
+      padding: 1rem 1.2rem;
+      box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08);
+    }
+    .trust-item h3 {
+      margin: 0 0 0.35rem;
+      font-size: 0.96rem;
+      color: #c0255a;
+    }
+    .trust-item p {
+      margin: 0;
+      font-size: 0.86rem;
+      color: #666;
+      line-height: 1.6;
+    }
+    .trust-note {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: #888;
+    }
+
     /* ── Responsive ── */
     @media (max-width: 600px) {
       .hero h1 { font-size: 2.2rem; }
       main { padding: 2rem 1rem; }
       .download-box { flex-direction: column; align-items: flex-start; }
-      .usecases { grid-template-columns: repeat(2, 1fr); margin-top: -1.5rem; padding: 0 1rem; }
+      .usecases { grid-template-columns: repeat(2, 1fr); margin-top: 1.8rem; padding: 0 1rem; }
+      .hero-shot { padding: 0 1rem; margin-top: 1.6rem; }
+      .usecases-lead { padding: 0 1rem; margin: 2rem auto -0.6rem; font-size: 0.95rem; }
+      .usecases-more { padding: 0 1rem; }
+      .usecases-more .usecases { padding: 0; }
+      .trust-grid { grid-template-columns: 1fr; }
       .showcase-grid { grid-template-columns: 1fr; }
       .showcase-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
       .showcase-button { font-size: 0.78rem; padding: 0.5rem 0.6rem; }
@@ -641,23 +813,39 @@
 <!-- ===== Hero ===== -->
 <div class="hero">
   <h1>mImageViewer</h1>
-  <p class="tagline">Windows 11 向け高速サムネイルビューワー</p>
+  <p class="tagline">フォルダを開いた瞬間に、中身が全部見える。<br>
+    ZIP・PDF・動画もそのまま一覧できる Windows の画像ビューア</p>
   <div class="badges">
     <span class="badge">Windows 11</span>
-    <span class="badge">GPU アクセラレーション</span>
-    <span class="badge">MIT ライセンス</span>
-    <span class="badge">Rust 製</span>
+    <span class="badge">無料・広告なし</span>
+    <span class="badge">画像を外部に送信しません</span>
+    <span class="badge">コード署名済み</span>
   </div>
   <a class="btn-download" href="#download">ダウンロード</a>
   <p class="download-note">無料 &nbsp;·&nbsp; インストール不要のポータブル版あり</p>
 </div>
 
+<!-- ===== Hero shot ===== -->
+<div class="hero-shot">
+  <a href="ss_grid.png" aria-label="サムネイルグリッド表示の拡大画像を開く">
+    <img src="ss_grid.webp" width="1600" height="1084"
+         alt="mImageViewer のサムネイル一覧。フォルダ・ZIP・画像・動画・音楽ファイルが 7 列のサムネイルで並び、下部に選択中のファイル情報が表示されている画面">
+  </a>
+  <p class="hero-shot-caption">フォルダ・ZIP・画像・動画・音楽が、同じ一覧に並びます（画面は 6,775 件のフォルダ）。</p>
+</div>
+
 <!-- ===== Use-case Cards ===== -->
+<p class="usecases-lead">こんなときに使えます</p>
 <div class="usecases">
   <div class="usecase-card">
-    <div class="uc-icon">📷</div>
-    <div class="uc-title">大量の写真を素早く確認したい</div>
-    <p class="uc-desc">RAW・HEIC にも対応。フォルダを開くだけでサムネイル一覧。キャッシュで2回目以降は瞬時表示。</p>
+    <div class="uc-icon">🗂️</div>
+    <div class="uc-title">種類の違うファイルを 1 つの画面で扱いたい</div>
+    <p class="uc-desc">画像・ZIP・PDF・動画・音声が同じ一覧に並び、同じ操作で開けます。種類ごとにソフトを使い分ける必要はありません。RAW・HEIC も追加インストール不要で、数十万枚のフォルダでも高速です。</p>
+  </div>
+  <div class="usecase-card">
+    <div class="uc-icon">📚</div>
+    <div class="uc-title">ZIP の漫画・同人誌を見開きで読みたい</div>
+    <p class="uc-desc">ZIP・CBZ は展開せずそのまま、RAR・7z・LZH にも対応。見開き・右→左読み・余白の自動トリムに対応し、続きのページから再開できます。</p>
   </div>
   <div class="usecase-card">
     <div class="uc-icon">🤖</div>
@@ -665,14 +853,9 @@
     <p class="uc-desc">PNG に埋め込まれた Stable Diffusion / ComfyUI のメタデータを自動表示。キーワード検索も可能。</p>
   </div>
   <div class="usecase-card">
-    <div class="uc-icon">📚</div>
-    <div class="uc-title">ZIP にまとめた漫画や同人誌をそのまま読みたい</div>
-    <p class="uc-desc">展開不要で ZIP 内をブラウズ。見開き表示・右→左読みに対応。</p>
-  </div>
-  <div class="usecase-card">
-    <div class="uc-icon">📖</div>
-    <div class="uc-title">好きなページだけを集めて 1 冊にしたい</div>
-    <p class="uc-desc">フォルダ・ZIP・PDF・動画フレームからページを集め、補正・加工・注釈・切り取りを原寸で本棚に保存。表示用フィルタやシャープ化、AI 拡大は焼き込まず、並べ替えて通し読みできます。</p>
+    <div class="uc-icon">🎞️</div>
+    <div class="uc-title">長い動画の中身をサムネイル一覧でパッと把握したい</div>
+    <p class="uc-desc">タイルモードで動画を一定間隔のサムネイルに展開。気になる場面をクリックして頭出しできます。</p>
   </div>
   <div class="usecase-card">
     <div class="uc-icon">✨</div>
@@ -680,36 +863,47 @@
     <p class="uc-desc">アップスケールしてきれいな画質で閲覧。GPUに合わせて軽量 / 高画質を選べ、モデル自動選択や手動切り替えにも対応。</p>
   </div>
   <div class="usecase-card">
-    <div class="uc-icon">🧹</div>
-    <div class="uc-title">スキャンの汚れを補修したい</div>
-    <p class="uc-desc">非破壊で元のファイルを修正することなしに、スキャン汚れなどを消しゴムツールで補修。</p>
-  </div>
-  <div class="usecase-card">
-    <div class="uc-icon">💬</div>
-    <div class="uc-title">漫画やイラストにセリフ・ツッコミを入れたい</div>
-    <p class="uc-desc">吹き出しでセリフ、装飾テキストで見出しやコメント、赤枠・矢印・蛍光マーカー・番号バッジで注目箇所を示し、画像の上に非破壊で重ねられます。書き出し時にそのまま焼き込み。</p>
-  </div>
-  <div class="usecase-card">
-    <div class="uc-icon">🕹️</div>
-    <div class="uc-title">PI / MAG / PIC などレトロ画像を閲覧したい</div>
-    <p class="uc-desc">Susie 画像プラグイン（.spi、32bit）対応。PC-98 / X68000 時代の画像を AI アップスケールと組み合わせて高画質で鑑賞。</p>
-  </div>
-  <div class="usecase-card">
-    <div class="uc-icon">🎬</div>
-    <div class="uc-title">動画も高機能なプレイヤーで快適に見たい</div>
-    <p class="uc-desc">サムネイル付きシーク・倍速再生・ブックマーク・フレーム送り＋コピーに対応。測定済み動画は再生開始前から音量ノーマライズし、未測定動画は再生時に自動測定。100% 超ブーストで音が小さい動画も快適。</p>
-  </div>
-  <div class="usecase-card">
-    <div class="uc-icon">🎞️</div>
-    <div class="uc-title">長い動画の中身をサムネイル一覧でパッと把握したい</div>
-    <p class="uc-desc">タイルモードで動画を一定間隔のサムネイルに展開。気になる場面をクリックして頭出しできます。</p>
-  </div>
-  <div class="usecase-card">
-    <div class="uc-icon">📌</div>
-    <div class="uc-title">フォルダや ZIP の「表紙」を自分で選びたい</div>
-    <p class="uc-desc">自動選択では出てこないお気に入りの 1 枚を、フォルダ・ZIP・PDF・動画の代表サムネイルに固定。ZIP / PDF を親フォルダの表紙にした場合も、その中で選んだページを引き継ぐ。</p>
+    <div class="uc-icon">🏷️</div>
+    <div class="uc-title">気に入ったものへ後からたどり着きたい</div>
+    <p class="uc-desc">★1〜5 の評価を付けるか、タグで分類しておけば、フォルダをまたいだ 1 つの一覧に。本の途中のページや動画・音声の再生位置もブックマークできます。</p>
   </div>
 </div>
+
+<details class="usecases-more">
+  <summary>ほかの使い方も見る（レトロ画像・製本・スキャン補修・注釈・動画再生・表紙の指定）</summary>
+  <div class="usecases">
+    <div class="usecase-card">
+      <div class="uc-icon">🕹️</div>
+      <div class="uc-title">PI / MAG / PIC などレトロ画像を閲覧したい</div>
+      <p class="uc-desc">Susie 画像プラグイン（.spi、32bit）対応。PC-98 / X68000 時代の画像を AI アップスケールと組み合わせて高画質で鑑賞。</p>
+    </div>
+    <div class="usecase-card">
+      <div class="uc-icon">📖</div>
+      <div class="uc-title">整えた画像を集めて保存しておきたい</div>
+      <p class="uc-desc">フォルダ・ZIP・PDF から選んだ画像を、補正・消しゴム・隠蔽加工・注釈・切り取りを原寸で焼き込んだ実ファイルとして保存。好きなページを集めて 1 冊として並べ替え・通し読みするほか、仕上げた生成画像を投稿候補としてためておく使い方もできます。表示用フィルタ・シャープ化・AI 拡大は焼き込みません。</p>
+    </div>
+    <div class="usecase-card">
+      <div class="uc-icon">🧹</div>
+      <div class="uc-title">スキャンの汚れを補修したい</div>
+      <p class="uc-desc">非破壊で元のファイルを修正することなしに、スキャン汚れなどを消しゴムツールで補修。</p>
+    </div>
+    <div class="usecase-card">
+      <div class="uc-icon">💬</div>
+      <div class="uc-title">漫画やイラストにセリフ・ツッコミを入れたい</div>
+      <p class="uc-desc">吹き出しでセリフ、装飾テキストで見出しやコメント、赤枠・矢印・蛍光マーカー・番号バッジで注目箇所を示し、画像の上に非破壊で重ねられます。書き出し時にそのまま焼き込み。</p>
+    </div>
+    <div class="usecase-card">
+      <div class="uc-icon">🎬</div>
+      <div class="uc-title">動画も高機能なプレイヤーで快適に見たい</div>
+      <p class="uc-desc">サムネイル付きシーク・倍速再生・ブックマーク・フレーム送り＋コピーに対応。測定済み動画は再生開始前から音量ノーマライズし、未測定動画は再生時に自動測定。100% 超ブーストで音が小さい動画も快適。</p>
+    </div>
+    <div class="usecase-card">
+      <div class="uc-icon">📌</div>
+      <div class="uc-title">フォルダや ZIP の「表紙」を自分で選びたい</div>
+      <p class="uc-desc">自動選択では出てこないお気に入りの 1 枚を、フォルダ・ZIP・PDF・動画の代表サムネイルに固定。ZIP / PDF を親フォルダの表紙にした場合も、その中で選んだページを引き継ぐ。</p>
+    </div>
+  </div>
+</details>
 
 <main>
 
@@ -717,27 +911,48 @@
   <section id="overview">
     <h2>概要</h2>
     <p>
-      mImageViewer は、大量の画像を快適に閲覧するための Windows 11 向け画像ビューワーです。
-      GPU アクセラレーションを使ったサムネイルグリッド表示と、サムネイルキャッシュにより、
-      同じフォルダを再度開いたときは瞬時に表示されます。
+      <strong>mImageViewer は「探すこと」に強い Windows 用の画像ビューアです。</strong>
+      フォルダを開くだけで、中の画像・動画がサムネイルで一覧表示されます。ZIP や PDF は
+      <strong>ディスクに展開せず</strong>、そのまま中のページをめくれます。
+      長い動画は、再生画面から<strong>タイル表示</strong>に切り替えると一定間隔のサムネイルが並び、
+      全体を見渡して気になった場面をクリックすれば、そこから再生できます。
+      一度表示したサムネイルはキャッシュされるので、同じフォルダを開き直したときは待ち時間がありません。
     </p>
     <p>
-      AI アップスケール (Real-ESRGAN / Real-CUGAN / NMKD-Siax) を内蔵し、低解像度の画像も高精細に拡大して閲覧できます。
-      初回設定または環境設定の「全体設定」から、AI なし / 軽量 / 高画質の利用範囲を選べます。
-      さらに消しゴムツールによる AI 非破壊修復 (MI-GAN) で、スキャン汚れ・傷・綴じ跡などを
-      元のファイルを書き換えずにマスクで補修でき、いつでも元の状態に戻せます。
-      隠蔽加工と Ctrl+E エクスポートにより、モザイク・塗りつぶし・ぼかしを反映した別ファイルも安全に書き出せます。
-      さらに、吹き出し・装飾テキスト・スタンプに加え、強調枠・矢印・蛍光マーカー・自動採番の番号バッジ・カーソルを重ねる注釈にも対応します（同じく非破壊で、書き出し時に焼き込まれます）。
+      「探す」には、まだ見ていないものを<strong>見つける</strong>ことと、一度見たものに
+      <strong>もう一度たどり着く</strong>ことの 2 つがあります。★1〜5 のレーティングを付けるか、タグで分類しておけば、
+      「★5 を付けたものだけ」「このタグだけ」を、<strong>フォルダをまたいだ 1 つの一覧</strong>として呼び出せます。
+      ブックマークが覚えるのはファイルではなく<strong>位置</strong>です。本の途中のページや、動画・音声の
+      気になった箇所に印を付けておくと、次はそこへ直接戻れます。これらの目印は元のファイルには書き込まず、
+      いつでも付け直せます。
     </p>
     <p>
-      標準は DirectML で全 DirectX 12 対応 GPU で動きますが、NVIDIA GeForce RTX 30 / 40 / 50 シリーズ
-      利用時は環境設定から <strong>TensorRT バックエンド</strong>に切り替えることで AI 処理を大幅に
-      高速化できます（アップスケール 1.4〜3.4 倍、ノイズ除去 約 4.5 倍）。専用ランタイム (約 1.97 GB) は
-      ボタン 1 つで自動ダウンロードされ、アプリの再起動なしですぐ有効になります。
+      かつて多くの人が使っていた 32bit ビューワー <strong>「ViX」</strong>の
+      「フォルダを俯瞰して目当ての 1 枚を探す」使い勝手を、64bit・GPU・高 DPI の
+      いまの環境に合わせて Rust でゼロから作り直したものです。
     </p>
     <p>
-      旧来の 32bit ビューワー「ViX」にインスパイアされ、現代の環境に合わせて Rust でゼロから実装しました。
+      見つけたあとの作業も、ビューア内で完結します。低解像度の画像は
+      <strong>AI アップスケール</strong>で拡大でき、スキャンの汚れや傷は<strong>消しゴムツール</strong>で補修できます。
+      明るさ・コントラストなどの補正、吹き出しや矢印などの注釈、モザイクなどの隠蔽加工も使えます。
+      <strong>これらはすべて非破壊です</strong>。元のファイルは書き換えず、必要なときだけ別ファイルとして書き出します。
+      <strong>AI の処理はすべてお使いの PC 内で実行され、画像が外部に送信されることはありません。</strong>
     </p>
+
+    <details class="spec-details">
+      <summary>AI 処理の詳しい仕様（使用モデル・GPU 高速化）</summary>
+      <p>
+        AI アップスケールは Real-ESRGAN / Real-CUGAN / NMKD-Siax を内蔵し、画像タイプ（イラスト / 漫画 / 写真）を
+        自動判定して使い分けます。初回設定または環境設定の「全体設定」から、AI なし / 軽量 / 高画質の
+        利用範囲を選べます。消しゴムツールの補完には MI-GAN を使用します。
+      </p>
+      <p>
+        標準は DirectML で全 DirectX 12 対応 GPU で動きますが、NVIDIA GeForce RTX 30 / 40 / 50 シリーズ
+        利用時は環境設定から <strong>TensorRT バックエンド</strong>に切り替えることで AI 処理を大幅に
+        高速化できます（アップスケール 1.4〜3.4 倍、ノイズ除去 約 4.5 倍）。専用ランタイム（約 1.97 GB）は
+        ボタン 1 つで自動ダウンロードされ、アプリの再起動なしですぐ有効になります。
+      </p>
+    </details>
   </section>
 
   <!-- ===== Screenshots ===== -->
@@ -746,16 +961,16 @@
     <div class="showcase" data-showcase>
       <div class="showcase-grid">
         <div class="showcase-list" role="listbox" aria-label="スクリーンショット一覧">
-          <button class="showcase-button is-active" type="button" data-showcase-button data-src="ss_grid.png" data-title="サムネイルグリッド表示" data-desc="フォルダ・ZIP・PDF・画像・動画をサムネイルで見渡して開けます。" data-alt="mImageViewer のサムネイルグリッド表示">サムネイルグリッド</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_fullscreen.png" data-title="EXIF 表示" data-desc="フルスクリーンで画像を見ながら、撮影情報やファイル情報を確認できます。" data-alt="mImageViewer のEXIF表示">EXIF 表示</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_metadata.png" data-title="AI 生成情報表示" data-desc="Stable Diffusion / ComfyUI などの生成情報を画像と一緒に確認できます。" data-alt="mImageViewer のAI生成情報表示">AI 生成情報</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_analysis.png" data-title="画像分析モード" data-desc="画像の色や情報を確認しながら、閲覧・整理に使えます。" data-alt="mImageViewer の画像分析モード">画像分析モード</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_upscale.png" data-title="AI アップスケール" data-desc="低解像度画像を高精細化して、きれいな表示・書き出しに使えます。" data-alt="mImageViewer のAIアップスケール">AI アップスケール</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_eraser.png" data-title="AI 非破壊修復" data-desc="スキャン汚れや傷を、元ファイルを変えずに補修できます。" data-alt="mImageViewer のAI非破壊修復">AI 非破壊修復</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_tile.png" data-title="動画タイルモード" data-desc="長い動画の中身を一定間隔のサムネイルで確認できます。" data-alt="mImageViewer の動画タイルモード">動画タイルモード</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_bookmark.png" data-title="動画ブックマーク" data-desc="気になる場面をブックマークして、あとからすぐ開けます。" data-alt="mImageViewer の動画ブックマーク">動画ブックマーク</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_music.png" data-title="音楽プレーヤー" data-desc="曲全体を行に分けた波形タイムラインで構成を見渡せます。スペクトラムとピアノ鍵盤で鳴っている音程が分かり、動画と同じラウドネス ノーマライズも使えます。" data-alt="mImageViewer の音楽プレーヤー">音楽プレーヤー</button>
-          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_vst.png" data-title="VST3 プラグイン" data-desc="動画と音楽の音声へ VST3 プラグインを適用できます。" data-alt="mImageViewer のVST3プラグイン">VST3 プラグイン</button>
+          <button class="showcase-button is-active" type="button" data-showcase-button data-src="ss_grid.webp" data-full-src="ss_grid.png" data-title="サムネイルグリッド表示" data-desc="フォルダ・ZIP・PDF・画像・動画をサムネイルで見渡して開けます。" data-alt="mImageViewer のサムネイルグリッド表示">サムネイルグリッド</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_fullscreen.webp" data-full-src="ss_fullscreen.png" data-title="EXIF 表示" data-desc="フルスクリーンで画像を見ながら、撮影情報やファイル情報を確認できます。" data-alt="mImageViewer のEXIF表示">EXIF 表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_metadata.webp" data-full-src="ss_metadata.png" data-title="AI 生成情報表示" data-desc="Stable Diffusion / ComfyUI などの生成情報を画像と一緒に確認できます。" data-alt="mImageViewer のAI生成情報表示">AI 生成情報</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_analysis.webp" data-full-src="ss_analysis.png" data-title="画像分析モード" data-desc="画像の色や情報を確認しながら、閲覧・整理に使えます。" data-alt="mImageViewer の画像分析モード">画像分析モード</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_upscale.webp" data-full-src="ss_upscale.png" data-title="AI アップスケール" data-desc="低解像度画像を高精細化して、きれいな表示・書き出しに使えます。" data-alt="mImageViewer のAIアップスケール">AI アップスケール</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_eraser.webp" data-full-src="ss_eraser.png" data-title="AI 非破壊修復" data-desc="スキャン汚れや傷を、元ファイルを変えずに補修できます。" data-alt="mImageViewer のAI非破壊修復">AI 非破壊修復</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_tile.webp" data-full-src="ss_video_tile.png" data-title="動画タイルモード" data-desc="長い動画の中身を一定間隔のサムネイルで確認できます。" data-alt="mImageViewer の動画タイルモード">動画タイルモード</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_bookmark.webp" data-full-src="ss_video_bookmark.png" data-title="動画ブックマーク" data-desc="気になる場面をブックマークして、あとからすぐ開けます。" data-alt="mImageViewer の動画ブックマーク">動画ブックマーク</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_music.webp" data-full-src="ss_music.png" data-title="音楽プレーヤー" data-desc="曲全体を行に分けた波形タイムラインで構成を見渡せます。スペクトラムとピアノ鍵盤で鳴っている音程が分かり、動画と同じラウドネス ノーマライズも使えます。" data-alt="mImageViewer の音楽プレーヤー">音楽プレーヤー</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_vst.webp" data-full-src="ss_video_vst.png" data-title="VST3 プラグイン" data-desc="動画と音楽の音声へ VST3 プラグインを適用できます。" data-alt="mImageViewer のVST3プラグイン">VST3 プラグイン</button>
           <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_spread_4px.webp" data-title="漫画の見開き表示" data-desc="右→左の表紙あり見開きで、ZIP/PDFの漫画をそのまま読めます。" data-alt="mImageViewer の漫画見開き表示">漫画の見開き表示</button>
           <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_trim_off.webp" data-alt-src="ss_comic_trim_on.webp" data-title="見開き＋自動トリム" data-desc="余白のあるページを、読むときだけ自動で詰めて表示します。" data-alt="mImageViewer の漫画自動トリム表示">見開き＋自動トリム</button>
           <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_zzoom_off.webp" data-alt-src="ss_comic_zzoom_on.webp" data-title="Zキー部分拡大ズーム" data-desc="細かい文字や描き込みを、Zキーで部分拡大して確認できます。" data-alt="mImageViewer のZキー部分拡大ズーム">Zキー部分拡大</button>
@@ -767,7 +982,7 @@
         <div class="showcase-stage" data-showcase-stage>
           <a class="showcase-link" data-showcase-link href="ss_grid.png" target="_blank">
             <span class="showcase-frame">
-              <img class="showcase-image-main" data-showcase-main src="ss_grid.png" alt="mImageViewer のサムネイルグリッド表示">
+              <img class="showcase-image-main" data-showcase-main src="ss_grid.webp" width="1600" height="1084" alt="mImageViewer のサムネイルグリッド表示">
               <img class="showcase-image-alt" data-showcase-alt alt="" hidden>
             </span>
           </a>
@@ -936,6 +1151,47 @@
     </p>
   </section>
 
+  <!-- ===== Trust / safety ===== -->
+  <section id="safety">
+    <h2>安心して使えます</h2>
+    <div class="trust-grid">
+      <div class="trust-item">
+        <h3>🔒 画像は外部に送信されません</h3>
+        <p>AI アップスケール・ノイズ除去・消しゴムの補完・画像タイプの自動判別は、
+          <strong>すべてお使いの PC の GPU で実行</strong>されます。画像やその内容が外部のサーバーへ
+          送られることはありません。</p>
+      </div>
+      <div class="trust-item">
+        <h3>🌐 通信するのは 2 つだけ</h3>
+        <p>①新しいバージョンの有無を確認するとき（<strong>設定でオフにできます</strong>）②AI を高速化する
+          追加コンポーネントを、ご自分で選んでダウンロードするとき。この 2 つ以外に通信しません。</p>
+      </div>
+      <div class="trust-item">
+        <h3>✅ コード署名済み</h3>
+        <p>配布ファイルにはコード署名とタイムスタンプが付いています。インストール時の発行元は
+          <strong>Open Source Developer Taku Sano</strong> と表示されます。</p>
+      </div>
+      <div class="trust-item">
+        <h3>🚫 広告・解析・アカウント不要</h3>
+        <p>広告、アクセス解析ツール、利用状況の送信を<strong>一切含みません</strong>。
+          アカウント登録もログインも不要で、そのまま使い始められます。</p>
+      </div>
+      <div class="trust-item">
+        <h3>💾 データはあなたの PC の中だけ</h3>
+        <p>設定・サムネイルキャッシュ・タグ・★評価・読書履歴は、すべて PC 内に保存されます。
+          アンインストール時にまとめて削除できます。</p>
+      </div>
+      <div class="trust-item">
+        <h3>📖 オープンソース（MIT）</h3>
+        <p>ソースコードは GitHub で公開しています。何をしているソフトなのか、誰でも確認できます。</p>
+      </div>
+    </div>
+    <p class="trust-note">
+      詳細は <a href="privacy.html">プライバシーポリシー</a> と
+      <a href="https://github.com/MikageSawatari/mimageviewer">ソースコード（GitHub）</a> をご覧ください。
+    </p>
+  </section>
+
   <!-- ===== Download ===== -->
   <section id="download">
     <h2>ダウンロード</h2>
@@ -1035,8 +1291,12 @@
   <!-- ===== Migration Guides ===== -->
   <section id="migration-guides">
     <h2>他ビューアからの移行ガイド</h2>
-    <p style="margin-bottom:1rem;">Leeyes、マンガミーヤ、ZipPla から乗り換える方向けに、見開き表示・操作キー・整理機能・おすすめ初期設定の違いをまとめています。</p>
+    <p style="margin-bottom:1rem;">ViX、Leeyes、マンガミーヤ、ZipPla から乗り換える方向けに、引き継げる操作・見開き表示・整理機能・おすすめ初期設定の違いをまとめています。</p>
     <div class="migration-guides">
+      <a class="migration-card" href="migrate-vix.html">
+        <h3>ViX からの移行</h3>
+        <p>そのまま引き継げる一覧操作、非破壊編集に変わった加工まわり、一括リネームなど対応しない機能と代わりの手段をまとめています。</p>
+      </a>
       <a class="migration-card" href="migrate-leeyes.html">
         <h3>Leeyes からの移行</h3>
         <p>Susie プラグインの引き継ぎ、見開き操作、本棚に当たる「お気に入り」の違いをまとめています。</p>

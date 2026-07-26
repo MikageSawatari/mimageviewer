@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ViX の後継・代替に｜mImageViewer 移行ガイド</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="ViX の後継・代替を探している方へ。Windows 11・64bit 対応の mImageViewer への移行案内です。サムネイル一覧・フォルダツリー・Susie プラグインなどそのまま引き継げる操作、非破壊編集に変わった加工まわり、一括リネームなど対応していない機能とその代わりの手段をまとめています。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/migrate-vix.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/migrate-vix.html">
+  <meta property="og:title" content="ViX の後継・代替に｜mImageViewer 移行ガイド">
+  <meta property="og:description" content="ViX の後継・代替を探している方へ。Windows 11・64bit 対応の mImageViewer への移行案内です。サムネイル一覧・フォルダツリー・Susie プラグインなどそのまま引き継げる操作、非破壊編集に変わった加工まわり、一括リネームなど対応していない機能とその代わりの手段をまとめています。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="ViX の後継・代替に｜mImageViewer 移行ガイド">
+  <meta name="twitter:description" content="ViX の後継・代替を探している方へ。Windows 11・64bit 対応の mImageViewer への移行案内です。サムネイル一覧・フォルダツリー・Susie プラグインなどそのまま引き継げる操作、非破壊編集に変わった加工まわり、一括リネームなど対応していない機能とその代わりの手段をまとめています。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+                   "游ゴシック体", YuGothic, "Yu Gothic", "メイリオ", Meiryo, sans-serif;
+      background: linear-gradient(135deg, #fff5f9 0%, #ffeef7 100%);
+      background-attachment: fixed;
+      color: #333; line-height: 1.7; min-height: 100vh;
+    }
+    a { color: #d63384; text-decoration: none; }
+    a:hover { text-decoration: underline; color: #a02860; }
+
+    header {
+      background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px);
+      border-bottom: 1px solid #ffb0d9; padding: 0 2rem;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .header-inner { max-width: 900px; margin: 0 auto; display: flex; align-items: center; gap: 2rem; height: 56px; }
+    .logo { font-size: 1.2rem; font-weight: 700; background: linear-gradient(90deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .site-nav a { color: #a02860; font-size: 0.9rem; font-weight: 600; }
+    .site-nav a:hover { color: #d63384; text-decoration: none; }
+
+    .hero {
+      background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 50%, #ffd0eb 100%);
+      border-bottom: 1px solid #ffb0d9; padding: 2.75rem 2rem 2.5rem; text-align: center;
+    }
+    .hero .crumb { font-size: 0.82rem; color: #a02860; opacity: 0.85; margin-bottom: 0.6rem; }
+    .hero h1 {
+      font-size: 2.1rem; font-weight: 700;
+      background: linear-gradient(135deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+      margin-bottom: 0.5rem;
+    }
+    .hero .tagline { font-size: 1rem; color: #a02860; }
+
+    main { max-width: 820px; margin: 0 auto; padding: 2.75rem 2rem 1rem; }
+    section { margin-bottom: 2.75rem; }
+    .lead { color: #555; font-size: 1rem; }
+
+    h2 {
+      font-size: 1.3rem; font-weight: 700; color: #c0255a;
+      margin-bottom: 1.1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #ffb0d9; position: relative;
+    }
+    h2::after { content: ""; position: absolute; left: 0; bottom: -2px; width: 60px; height: 2px;
+      background: linear-gradient(90deg, #ff60c0, #d63384); }
+    h3 { font-size: 1.02rem; font-weight: 700; color: #d63384; margin: 1.4rem 0 0.5rem; }
+    p { margin-bottom: 0.8rem; color: #444; }
+    strong { color: #c0255a; }
+
+    .pink-list { list-style: none; padding: 0; }
+    .pink-list li { padding: 0.45rem 0 0.45rem 1.4rem; border-bottom: 1px solid #ffeef7;
+      font-size: 0.95rem; color: #444; position: relative; }
+    .pink-list li::before { content: "♦"; position: absolute; left: 0; color: #ff60c0; font-size: 0.65rem; top: 0.7rem; }
+    .pink-list li:last-child { border-bottom: none; }
+
+    .steps { counter-reset: step; list-style: none; padding: 0; margin: 0.4rem 0; }
+    .steps li { position: relative; padding: 0.55rem 0 0.55rem 2.5rem; border-bottom: 1px solid #ffeef7;
+      color: #444; font-size: 0.95rem; }
+    .steps li:last-child { border-bottom: none; }
+    .steps li::before { counter-increment: step; content: counter(step);
+      position: absolute; left: 0; top: 0.5rem; width: 1.65rem; height: 1.65rem; line-height: 1.65rem;
+      text-align: center; border-radius: 50%; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; font-size: 0.8rem; font-weight: 700; }
+
+    kbd { display: inline-block; background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 5px;
+      padding: 0.1em 0.55em; font-family: "Consolas", "Courier New", monospace; font-size: 0.83em;
+      color: #c0255a; white-space: nowrap; }
+    code { background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 4px; padding: 0.1em 0.45em;
+      font-family: "Consolas", "Courier New", monospace; font-size: 0.88em; color: #c0255a; }
+
+    .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
+      border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
+
+    .table-scroll { overflow-x: auto; margin: 0.75rem 0 1rem; background: #fff;
+      border: 1px solid #ffe0ec; border-radius: 8px; }
+    .compare-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 0.9rem; }
+    .compare-table th, .compare-table td { padding: 0.65rem 0.8rem; border-bottom: 1px solid #ffeef7;
+      vertical-align: top; text-align: left; }
+    .compare-table th { background: #fff0f7; color: #c0255a; font-weight: 700; white-space: nowrap; }
+    .compare-table td:first-child { width: 24%; color: #a02860; font-weight: 700; }
+    .compare-table tr:last-child td { border-bottom: none; }
+
+    .shot { width: 100%; border-radius: 12px; border: 1px solid #ffe0ec;
+      box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
+    .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
+
+    .showcase { background: #fff; border: 1px solid #ffe0ec; border-radius: 14px;
+      padding: 1rem; box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); margin-top: 1rem; }
+    .showcase-grid { display: grid; grid-template-columns: minmax(185px, 0.8fr) minmax(0, 2.2fr);
+      gap: 1rem; align-items: start; }
+    .showcase-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 520px;
+      overflow: auto; padding-right: 0.15rem; }
+    .showcase-button { width: 100%; border: 1px solid #ffd2e8; background: #fff7fb;
+      border-radius: 9px; padding: 0.62rem 0.75rem; color: #a02860; font-weight: 700;
+      text-align: left; cursor: pointer; font: inherit; line-height: 1.35; }
+    .showcase-button:hover, .showcase-button:focus, .showcase-button.is-active {
+      background: #d63384; border-color: #d63384; color: #fff; outline: none; }
+    .showcase-stage { min-width: 0; }
+    .showcase-link { display: block; border-radius: 10px; overflow: hidden; background: #111;
+      border: 1px solid #ffe0ec; }
+    .showcase-frame { position: relative; display: block; aspect-ratio: 16 / 9; background: #111; }
+    .showcase-frame img { position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; display: block; }
+    .showcase-image-alt { opacity: 0; }
+    .showcase-stage.is-animated .showcase-image-main { animation: showcase-main 2.8s steps(1, end) infinite; }
+    .showcase-stage.is-animated .showcase-image-alt { animation: showcase-alt 2.8s steps(1, end) infinite; }
+    .showcase-caption { margin-top: 0.65rem; color: #666; font-size: 0.9rem; }
+    .showcase-caption strong { color: #c0255a; display: block; margin-bottom: 0.15rem; }
+    .showcase-credit { margin-top: 0.55rem; color: #888; font-size: 0.78rem; text-align: right; }
+    @keyframes showcase-main { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+    @keyframes showcase-alt { 0%, 49% { opacity: 0; } 50%, 100% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .showcase-stage.is-animated .showcase-image-main,
+      .showcase-stage.is-animated .showcase-image-alt { animation: none; }
+      .showcase-stage.is-animated .showcase-image-main { opacity: 1; }
+      .showcase-stage.is-animated .showcase-image-alt { opacity: 0; }
+    }
+
+    .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.1rem; }
+    .feature-card { background: #fff; border: 1px solid #ffe0ec; border-radius: 15px; padding: 1.2rem 1.3rem;
+      box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08); }
+    .feature-card .icon { font-size: 1.6rem; margin-bottom: 0.4rem; }
+    .feature-card h3 { margin: 0 0 0.35rem; font-size: 0.97rem; color: #c0255a; }
+    .feature-card p { font-size: 0.88rem; color: #666; margin: 0; }
+
+    .manual-cta { background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 100%);
+      border: 1px solid #ffb0d9; border-radius: 16px; padding: 1.8rem 2.2rem; display: flex;
+      align-items: center; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+    .manual-cta-body { flex: 1; min-width: 200px; }
+    .manual-cta-title { font-size: 1.12rem; font-weight: 700; color: #c0255a; margin-bottom: 0.3rem; }
+    .manual-cta-body p { font-size: 0.92rem; color: #a02860; margin: 0; }
+    .btn-download { display: inline-block; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; padding: 0.7rem 2rem; border-radius: 30px; font-size: 1rem; font-weight: 700;
+      box-shadow: 0 4px 15px rgba(214, 51, 132, 0.35); white-space: nowrap; }
+    .btn-download:hover { text-decoration: none; color: #fff; transform: translateY(-2px); }
+
+    .related { display: flex; gap: 0.7rem; flex-wrap: wrap; }
+    .related a { display: inline-block; background: #fff; border: 1px solid #ffb0d9; border-radius: 20px;
+      padding: 0.4rem 1.1rem; font-size: 0.88rem; color: #a02860; font-weight: 600; }
+    .related a:hover { background: #d63384; color: #fff; text-decoration: none; }
+
+    footer { border-top: 1px solid #ffb0d9; background: rgba(255, 255, 255, 0.6); padding: 2rem;
+      text-align: center; color: #a02860; font-size: 0.85rem; }
+
+    @media (max-width: 700px) {
+      .hero h1 { font-size: 1.7rem; }
+      main { padding: 2rem 1rem; }
+      .showcase-grid { grid-template-columns: 1fr; }
+      .showcase-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
+      .showcase-button { font-size: 0.84rem; padding: 0.55rem 0.65rem; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <span class="logo">mikage.to</span>
+    <nav class="site-nav">
+      <a href="index.html">mImageViewer</a>
+      <a href="manual/index.html">マニュアル</a>
+      <a href="index.html#download">ダウンロード</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="crumb"><a href="index.html">mImageViewer</a> ＞ 移行ガイド</div>
+  <h1>ViX からの移行ガイド</h1>
+  <p class="tagline">ViX を使ってきた方が mImageViewer に乗り換えるために</p>
+</div>
+
+<main>
+
+  <section>
+    <p class="lead">mImageViewer は、32bit ビューワー <strong>ViX</strong> の「フォルダを俯瞰して目当ての 1 枚を探す」使い勝手を、
+      64bit・GPU・高 DPI のいまの環境に合わせて作り直したビューアです。一覧中心の操作感はそのまま引き継いでいますが、
+      <strong>画像の加工まわりは方針が大きく変わっています</strong>。
+      このページでは、そのまま引き継げること・形が変わること・<strong>対応していないこと</strong>を先にまとめました。</p>
+    <ul class="pink-list">
+      <li><strong>一覧で探す使い勝手はそのまま。</strong>フォルダツリーとサムネイル一覧が中心で、ZIP・PDF・動画も同じ一覧に並びます。</li>
+      <li><strong>加工はすべて非破壊になりました。</strong>元のファイルは書き換えず、必要なときだけ別ファイルとして書き出します。</li>
+      <li><strong>ファイルの一括処理はありません。</strong>一括リネームや複数ファイルのまとめて変換はありません（後述の代わりの手段をご覧ください）。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>まだ ViX をお使いの方へ</h2>
+    <p>ViX は 2003 年 11 月の更新を最後に開発が止まっており、その後 JPCERT/CC と IPA が運営する
+      脆弱性情報ポータル JVN から、脆弱性の公表と<strong>使用中止の検討を促す案内</strong>が出ています。</p>
+    <div class="info-box">
+      <p style="margin:0 0 0.5rem;"><strong>JVN#56764650「ViX における DLL 読み込みに関する脆弱性」</strong>（2018 年 3 月 13 日公開）</p>
+      <p style="margin:0 0 0.5rem;">対象は ViX バージョン 2.21.148.0。DLL を読み込む際の検索パスに問題があり、
+        画像ファイルと同じディレクトリに置かれた特定の DLL を読み込んでしまう、というものです
+        （CVSS v3 基本値 7.8）。開発者との連絡が取れない状態が続いたため修正版は提供されておらず、
+        JVN は「使用中止を検討してください」と案内しています。</p>
+      <p style="margin:0;font-size:0.85rem;">出典:
+        <a href="https://jvn.jp/jp/JVN56764650/index.html" target="_blank" rel="noopener">JVN#56764650</a>
+      </p>
+    </div>
+    <p style="margin-top:0.9rem;">とはいえ、更新が止まったあとも長く使われ続けてきたのは、ViX の一覧表示がそれだけ良くできていたからだと思います。
+      mImageViewer は、その使い勝手を今の環境で使えるようにすることを目指して作りました。</p>
+  </section>
+
+  <section>
+    <h2>そのまま引き継げること</h2>
+    <p>ViX で日常的にやっていた操作は、ほぼそのまま mImageViewer でもできます。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>やっていたこと</th><th>mImageViewer では</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>フォルダをサムネイルで一覧</td><td>生成したサムネイルはキャッシュされるので、2 回目以降は待ち時間なく開きます。<strong>数十万枚のフォルダ</strong>でもスクロールできます。</td></tr>
+          <tr><td>左のツリーでフォルダを移動</td><td>フォルダツリーに加えて、<kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> で深さ優先にフォルダを渡り歩けます。<kbd>BS</kbd> で親フォルダへ。</td></tr>
+          <tr><td>名前・サイズ・日時を一覧で確認</td><td>詳細一覧表示で確認できます。列幅と列順を調整でき、★評価・タグ・本のページ数の列も出せます。</td></tr>
+          <tr><td>全画面表示・スライドショー</td><td>スライドショーは間隔を指定でき、末尾でループ / 次フォルダ / 停止を選べます。</td></tr>
+          <tr><td>Susie プラグイン（.spi）</td><td>本体は 64bit ですが、<strong>32bit の .spi をそのまま利用できます</strong>（後述）。</td></tr>
+          <tr><td>画像の回転</td><td>回転は<strong>非破壊</strong>で、元ファイルは書き換えず表示の向きだけを覚えます。</td></tr>
+          <tr><td>コピー・移動・削除</td><td>右クリックメニュー、エクスプローラーとのドラッグ＆ドロップ、コピー先を 2 つ登録しておく A / B クイックフォルダが使えます。</td></tr>
+          <tr><td>書庫の中を見る</td><td>ZIP / CBZ と、条件を満たす RAR / CBR はそのまま開きます。7z・LZH・ソリッド RAR などは一度 ZIP に変換してから開きます。<strong>外部の DLL を用意する必要はありません</strong>（ViX では LZH の展開に <code>UNLHA32.DLL</code> の導入が必要でした）。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>形が変わること ―― 加工は「非破壊」になりました</h2>
+    <p>ViX には、リサイズ・トリミング・減色・色調補正・回転・連結といった画像の加工機能がありました。
+      mImageViewer にも補正や加工はありますが、<strong>元のファイルを書き換えません</strong>。
+      補正・消しゴム・注釈・隠蔽加工・切り取りはすべて「表示に重ねる情報」として保存され、
+      必要になったときだけ <kbd>Ctrl</kbd>+<kbd>E</kbd> で別ファイルとして書き出します。</p>
+    <ul class="pink-list">
+      <li><strong>元の画像を書き換えません</strong> ―― 加工に失敗しても原本はそのまま残ります。</li>
+      <li><strong>いつでも取り消せる</strong> ―― 補正やマスクは後から編集・削除でき、元の見た目に戻せます。</li>
+      <li><strong>何度でもやり直せる</strong> ―― 一度書き出したあとでも、設定を変えて別の書き出しができます。</li>
+    </ul>
+
+    <h3>加工して保存するまでの流れ</h3>
+    <ul class="steps">
+      <li>一覧から画像をダブルクリックしてフルスクリーンで開きます。</li>
+      <li>画面の左端にマウスを寄せると<strong>左パネル</strong>が出ます。「画像補正」タブで明るさ・コントラスト・色などを調整でき、
+        パネル上部のアイコンから消しゴム・補正レイヤー・隠蔽加工・切り取り・テキスト注釈に切り替えられます。</li>
+      <li>結果をファイルにしたくなったら、<kbd>Ctrl</kbd>+<kbd>E</kbd>、または左パネル上部の<strong>エクスポートアイコン</strong>
+        （トレイへの下向き矢印）を押します。</li>
+      <li>形式は JPEG / PNG / WebP から選べます。EXIF・XMP を引き継ぐことも、長辺を指定した px 以下に縮小して書き出すこともできます。</li>
+    </ul>
+    <div class="info-box">書き出し名は既定で<strong>元の名前に <code>_edited</code> を付けたもの</strong>になります。
+      同名のファイルが既にある場合は上書きせず、番号を挟んだ別名で保存します。</div>
+  </section>
+
+  <section>
+    <h2>mImageViewer にない機能と、代わりの手段</h2>
+    <p>ViX で次の機能を使っていた場合は、別の手段が必要です。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>機能</th><th>mImageViewer</th><th>代わりにどうするか</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>ファイル名の一括変更<br>（連番リネームなど）</td>
+            <td>ありません</td>
+            <td>エクスプローラーで複数選択してからの名前変更、または専用のリネームツールをお使いください。1 件ずつなら mImageViewer の一覧で右クリック →「名前の変更...」から行えます（<strong>下の注意</strong>もお読みください）。</td>
+          </tr>
+          <tr>
+            <td>複数ファイルをまとめて<br>リサイズ・形式変換</td>
+            <td>ありません</td>
+            <td><strong>1 枚ずつなら、エクスポートで形式変換と縮小ができます</strong>（JPEG / PNG / WebP、長辺を指定 px 以下に縮小）。
+              多数のファイルをまとめて処理したい場合は、専用の変換ツールをお使いください。</td>
+          </tr>
+          <tr>
+            <td>画像の印刷</td>
+            <td>ありません</td>
+            <td>書き出した画像を、他のソフトから印刷してください。</td>
+          </tr>
+          <tr>
+            <td>Windows 10 以前での利用</td>
+            <td>対応していません</td>
+            <td>Windows 11（64bit）と DirectX 12 対応 GPU が必要です。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>⚠ 一括リネームを使う場合は、順番にご注意ください</h3>
+    <p>mImageViewer は、★評価・タグ・回転・補正・注釈・ブックマーク・読書履歴などを
+      <strong>ファイルの場所（パス）と結びつけて</strong>覚えています。
+      そのため、mImageViewer の外（エクスプローラーやリネームツール）でファイル名やフォルダ名を変えると、
+      <strong>それらの情報との結びつきが切れてしまいます</strong>。</p>
+    <ul class="steps">
+      <li><strong>ファイル名の整理は、先に済ませてください。</strong>一括リネームをかけてから、mImageViewer でタグ付けや★評価を始めるのが安全です。</li>
+      <li><strong>整理を始めたあとに名前を変えるときは、mImageViewer から行ってください。</strong>一覧で右クリック →「名前の変更...」で変更すると、★・タグ・回転・補正・注釈などが自動的に新しい名前へ引き継がれます。</li>
+    </ul>
+    <div class="info-box">この引き継ぎが働くのは <strong>mImageViewer から名前を変えたとき</strong>だけです。外部ツールでの変更は検知できません。</div>
+  </section>
+
+  <section>
+    <h2>Susie プラグインの引き継ぎ</h2>
+    <p>ViX で使っていた <code>.spi</code> をそのまま持ってこられます。PI / MAG / PIC など、
+      PC-98 / X68000 時代の画像を表示するのに使えます。</p>
+    <ul class="steps">
+      <li>「環境設定 → ファイル処理 → Susie プラグイン」を開きます。</li>
+      <li><strong>Susie 画像プラグインを有効にする</strong> をオンにします。</li>
+      <li>プラグインフォルダを開き、ViX で使っていた <strong>32bit の .spi</strong> をコピーします。</li>
+      <li>プラグインの再読み込みを実行し、一覧に名前と対応形式が出れば完了です。</li>
+    </ul>
+    <div class="info-box">読み込んだレトロ画像は、そのまま <strong>AI アップスケール</strong>と組み合わせて拡大表示できます。低解像度の古い画像を大画面で見るときに役立ちます。</div>
+  </section>
+
+  <section>
+    <h2>おすすめの初期設定</h2>
+    <p>ViX に近い画面で使い始めるための設定です。最初に一度だけ設定しておけば以降ずっと有効です。</p>
+    <ul class="steps">
+      <li><strong>フォルダツリーを表示する</strong> ―― ツールバーの <strong>ツリー</strong> ボタンを押すと、左側にフォルダツリーが出ます。
+        <strong>初期状態では非表示</strong>なので、ViX のような「左にツリー・右にサムネイル」の画面にしたい場合はここをオンにします。</li>
+      <li><strong>選択情報を画面下のバーに出す</strong> ―― 「環境設定 → <strong>選択情報の表示方法</strong>」を
+        <strong>下部情報バー</strong> に変えると、選択中のファイルの名前・サイズ・更新日時・★・タグが、
+        一覧に重ならない位置に固定表示されます。初期状態はマウスを乗せたときに出るツールチップです。</li>
+      <li><strong>詳細一覧表示を使ってみる</strong> ―― 名前・サイズ・日時を並べて確認したいときは、表示形式を詳細一覧に切り替えます。列幅と列順は後から調整できます。</li>
+      <li><strong>よく使う場所をお気に入りに登録する</strong> ―― ViX のお気に入りに当たる機能です。登録しておくと、ツリーをたどらずに場所メニューから一発でジャンプできます。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>ViX にはなかった機能</h2>
+    <div class="features">
+      <div class="feature-card"><div class="icon">📄</div><h3>PDF をページ単位で</h3><p>PDF をページごとにサムネイル一覧・閲覧できます。パスワード付きにも対応し、画像や書庫と同じ一覧に並びます。</p></div>
+      <div class="feature-card"><div class="icon">🎬</div><h3>動画も同じ一覧で</h3><p>動画をサムネイルで一覧し、そのまま再生できます。長い動画は等間隔のサムネイルに展開して中身を把握できます。</p></div>
+      <div class="feature-card"><div class="icon">🔼</div><h3>AI アップスケール</h3><p>低解像度の画像を高精細に拡大して閲覧できます。処理はすべてお使いの PC 内で実行されます。</p></div>
+      <div class="feature-card"><div class="icon">🧹</div><h3>AI 消しゴム</h3><p>スキャンの汚れ・傷・綴じ跡を塗って指定すると、AI が周囲から自然に補完します。元ファイルは書き換えません。</p></div>
+      <div class="feature-card"><div class="icon">📷</div><h3>RAW・HEIC・AVIF</h3><p>HEIC・AVIF・JPEG XL・各社 RAW を、追加のプラグインなしで表示できます。スマートフォンやデジタルカメラの写真をそのまま見られます。</p></div>
+      <div class="feature-card"><div class="icon">🏷️</div><h3>タグ・★評価・全文検索</h3><p>タグや★で整理し、ファイル名・EXIF・AI 生成プロンプトを対象に横断検索できます。</p></div>
+      <div class="feature-card"><div class="icon">📖</div><h3>見開き読書・製本</h3><p>右→左の見開きで漫画を読めます。好きなページを集めて 1 冊の本にまとめることもできます。</p></div>
+      <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、拡大縮小がきれいで滑らかです。</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="manual-cta">
+      <div class="manual-cta-body">
+        <div class="manual-cta-title">mImageViewer を使ってみる</div>
+        <p>無料でダウンロードできます。インストール不要の単体 exe 版・ポータブル版もあります。</p>
+      </div>
+      <a class="btn-download" href="index.html#download">ダウンロード</a>
+    </div>
+    <p style="margin-top:1rem;font-size:0.9rem;">操作やショートカットの詳細は <a href="manual/index.html">オンラインマニュアル</a> を参照してください。</p>
+  </section>
+
+  <section>
+    <h2>ほかのビューアから移行する方</h2>
+    <div class="related">
+      <a href="migrate-leeyes.html">Leeyes からの移行</a>
+      <a href="migrate-mangameeya.html">マンガミーヤからの移行</a>
+      <a href="migrate-zippla.html">ZipPla からの移行</a>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
+</footer>
+
+</body>
+</html>
