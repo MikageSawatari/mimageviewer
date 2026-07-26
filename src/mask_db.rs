@@ -646,6 +646,25 @@ pub fn shapes_from_json(s: &str) -> Vec<Shape> {
     try_shapes_from_json(s).unwrap_or_default()
 }
 
+/// worker materialization 用の協調 cancel 版。Shape 境界ごとに token を確認し、
+/// 世代変更後の残り Shape をラスタライズしない。
+pub fn rasterize_shapes_into_cancel(
+    mask: &mut [bool],
+    shapes: &[Shape],
+    w: usize,
+    h: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
+    for shape in shapes {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let value = matches!(shape.op(), ShapeOp::Add);
+        rasterize_shape_into(mask, shape, w, h, value);
+    }
+    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 移行・exportなど、壊れた図形を「図形なし」と同一視してはならない経路用。
 /// 通常表示の寛容な [`shapes_from_json`] は互換性のため維持する。
 pub fn try_shapes_from_json(s: &str) -> Result<Vec<Shape>, serde_json::Error> {

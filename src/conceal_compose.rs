@@ -26,6 +26,7 @@
 
 use eframe::egui;
 use eframe::egui::Color32;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::conceal::{
     BlurMode, ConcealPreset, ConcealType, FillEdge, MosaicBoundary, TileSizeMode, compute_tile_size,
@@ -49,9 +50,20 @@ pub fn compose_mosaic(
     tile_size: u32,
     boundary: MosaicBoundary,
 ) -> egui::ColorImage {
+    compose_mosaic_impl(base, mask, tile_size, boundary, None)
+        .expect("non-cancellable mosaic compose")
+}
+
+fn compose_mosaic_impl(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    tile_size: u32,
+    boundary: MosaicBoundary,
+    cancel: Option<&AtomicBool>,
+) -> Option<egui::ColorImage> {
     let [w, h] = base.size;
     if w == 0 || h == 0 {
-        return base.clone();
+        return Some(base.clone());
     }
     assert_eq!(
         mask.len(),
@@ -70,6 +82,9 @@ pub fn compose_mosaic(
     // 255*count が u32 を wrap して平均色が化ける (v1.0.0 安定性レビュー P3-4)。
     let mut tile_stats = vec![(0u64, 0u64, 0u64, 0u32, 0u32); tw * th];
     for y in 0..h {
+        if y % 16 == 0 && cancelled(cancel) {
+            return None;
+        }
         let ty = y / tile;
         for x in 0..w {
             let tx = x / tile;
@@ -89,6 +104,9 @@ pub fn compose_mosaic(
     // Pass 2: 出力画素を決定
     let mut out_pixels = base.pixels.clone();
     for y in 0..h {
+        if y % 16 == 0 && cancelled(cancel) {
+            return None;
+        }
         let ty = y / tile;
         for x in 0..w {
             let tx = x / tile;
@@ -120,7 +138,7 @@ pub fn compose_mosaic(
         }
     }
 
-    egui::ColorImage::new([w, h], out_pixels)
+    Some(egui::ColorImage::new([w, h], out_pixels))
 }
 
 /// MosaicBoundary を `TileSizeMode` + 画像長辺から自動計算するラッパ。
@@ -147,34 +165,61 @@ pub fn compose_with_preset(
     mask: &[bool],
     params: &ConcealPreset,
 ) -> egui::ColorImage {
+    compose_with_preset_impl(base, mask, params, None).expect("non-cancellable conceal compose")
+}
+
+/// worker 用の協調 cancel 付き合成。長い走査は行単位で cancel を観測する。
+pub fn compose_with_preset_cancel(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    params: &ConcealPreset,
+    cancel: &AtomicBool,
+) -> Option<egui::ColorImage> {
+    compose_with_preset_impl(base, mask, params, Some(cancel))
+}
+
+fn compose_with_preset_impl(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    params: &ConcealPreset,
+    cancel: Option<&AtomicBool>,
+) -> Option<egui::ColorImage> {
     match params.conceal_type {
         ConcealType::Mosaic => {
             let long_edge = base.size[0].max(base.size[1]) as u32;
             let tile = compute_tile_size(long_edge, params.mosaic_tile_mode);
-            compose_mosaic(base, mask, tile, params.mosaic_boundary)
+            compose_mosaic_impl(base, mask, tile, params.mosaic_boundary, cancel)
         }
-        ConcealType::WhiteFill => compose_solid_fill(
+        ConcealType::WhiteFill => compose_solid_fill_impl(
             base,
             mask,
             Color32::WHITE,
             params.fill_opacity_percent,
             params.fill_edge,
+            cancel,
         ),
-        ConcealType::BlackFill => compose_solid_fill(
+        ConcealType::BlackFill => compose_solid_fill_impl(
             base,
             mask,
             Color32::BLACK,
             params.fill_opacity_percent,
             params.fill_edge,
+            cancel,
         ),
-        ConcealType::Blur => compose_blur(
+        ConcealType::Blur => compose_blur_impl(
             base,
             mask,
             params.blur_radius_px,
             params.blur_mode,
             params.blur_feather,
+            cancel,
         ),
     }
+}
+
+#[inline]
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
 }
 
 /// 元画素 `base` の上に `over` を不透明度 `alpha` (0..=1) で重ねる。
@@ -223,9 +268,21 @@ pub fn compose_solid_fill(
     opacity_percent: u8,
     edge: FillEdge,
 ) -> egui::ColorImage {
+    compose_solid_fill_impl(base, mask, color, opacity_percent, edge, None)
+        .expect("non-cancellable solid-fill compose")
+}
+
+fn compose_solid_fill_impl(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    color: Color32,
+    opacity_percent: u8,
+    edge: FillEdge,
+    cancel: Option<&AtomicBool>,
+) -> Option<egui::ColorImage> {
     let [w, h] = base.size;
     if w == 0 || h == 0 {
-        return base.clone();
+        return Some(base.clone());
     }
     assert_eq!(
         mask.len(),
@@ -241,11 +298,20 @@ pub fn compose_solid_fill(
 
     let edge_alpha_map: Option<Vec<u8>> = match edge {
         FillEdge::Sharp => None,
-        FillEdge::Feathered => Some(compute_edge_feather_alpha(mask, w, h, FEATHER_RADIUS_PX)),
+        FillEdge::Feathered => Some(compute_edge_feather_alpha(
+            mask,
+            w,
+            h,
+            FEATHER_RADIUS_PX,
+            cancel,
+        )?),
     };
 
     let mut out_pixels = base.pixels.clone();
     for y in 0..h {
+        if y % 16 == 0 && cancelled(cancel) {
+            return None;
+        }
         for x in 0..w {
             let i = y * w + x;
             if !mask[i] {
@@ -262,7 +328,7 @@ pub fn compose_solid_fill(
         }
     }
 
-    egui::ColorImage::new([w, h], out_pixels)
+    Some(egui::ColorImage::new([w, h], out_pixels))
 }
 
 // ── Gaussian ぼかし合成 (Phase 3c) ──────────────────────────────────────
@@ -285,10 +351,8 @@ pub fn compose_solid_fill(
 /// マスクの bounding box + `radius * 3` を計算範囲とすることで、局所マスク (顔
 /// ぼかし等) で全画像走査を避ける。実測で 4K 顔ぼかし sigma=20 が ~50-150ms の目安。
 ///
-/// **注意**: 同期実行。仕様 §7.7 では「最初から worker thread + cancel」だが、
-/// Phase 3c 初版は同期 + bbox 最適化のみで実装し、実機でヒッチが目立てば
-/// `App::ensure_conceal_texture` 側で worker 化する (`docs/conceal-feature-plan.md
-/// §13` の Phase 3c 工数想定の半分)。
+/// 表示用 materialization は worker から cancel 付き実装を呼ぶ。同期ラッパーは
+/// 既に worker 内にいる export / book 経路と単体テスト向けに残す。
 pub fn compose_blur(
     base: &egui::ColorImage,
     mask: &[bool],
@@ -296,9 +360,21 @@ pub fn compose_blur(
     mode: BlurMode,
     feather_boundary: bool,
 ) -> egui::ColorImage {
+    compose_blur_impl(base, mask, radius_px, mode, feather_boundary, None)
+        .expect("non-cancellable blur compose")
+}
+
+fn compose_blur_impl(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    radius_px: f32,
+    mode: BlurMode,
+    feather_boundary: bool,
+    cancel: Option<&AtomicBool>,
+) -> Option<egui::ColorImage> {
     let [w, h] = base.size;
     if w == 0 || h == 0 {
-        return base.clone();
+        return Some(base.clone());
     }
     assert_eq!(
         mask.len(),
@@ -309,19 +385,19 @@ pub fn compose_blur(
     );
     let radius = radius_px.max(1.0).min(100.0).round() as usize;
     if radius == 0 {
-        return base.clone();
+        return Some(base.clone());
     }
 
     // ExtendByRadius: マスクを膨張させてから以降の処理に流す。
     let working_mask: Vec<bool> = match mode {
-        BlurMode::ExtendByRadius => dilate_mask(mask, w, h, radius),
+        BlurMode::ExtendByRadius => dilate_mask(mask, w, h, radius, cancel)?,
         _ => mask.to_vec(),
     };
 
     // bbox 計算 (マスク内画素の最小矩形) + sigma*3 余白でクリップ。
-    let bbox = match mask_bbox(&working_mask, w, h) {
+    let bbox = match mask_bbox(&working_mask, w, h, cancel)? {
         Some(b) => expand_bbox_clipped(b, radius * 3, w, h),
-        None => return base.clone(), // マスク全部 false → 何もしない
+        None => return Some(base.clone()), // マスク全部 false → 何もしない
     };
 
     // Gaussian カーネル (1D)。sigma = radius / 3 が一般的な係数。
@@ -342,7 +418,8 @@ pub fn compose_blur(
         } else {
             None
         },
-    );
+        cancel,
+    )?;
 
     // 境界フェード alpha (オプション)。
     let edge_alpha_map: Option<Vec<u8>> = if feather_boundary {
@@ -351,13 +428,17 @@ pub fn compose_blur(
             w,
             h,
             FEATHER_RADIUS_PX,
-        ))
+            cancel,
+        )?)
     } else {
         None
     };
 
     let mut out_pixels = base.pixels.clone();
     for y in bbox.y0..bbox.y1 {
+        if y % 16 == 0 && cancelled(cancel) {
+            return None;
+        }
         for x in bbox.x0..bbox.x1 {
             let i = y * w + x;
             if !working_mask[i] {
@@ -371,7 +452,7 @@ pub fn compose_blur(
         }
     }
 
-    egui::ColorImage::new([w, h], out_pixels)
+    Some(egui::ColorImage::new([w, h], out_pixels))
 }
 
 /// マスク内画素の bounding box (inclusive 形式の min/max → exclusive 矩形に変換)。
@@ -383,13 +464,21 @@ struct Bbox {
     pub y1: usize, // exclusive
 }
 
-fn mask_bbox(mask: &[bool], w: usize, h: usize) -> Option<Bbox> {
+fn mask_bbox(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+    cancel: Option<&AtomicBool>,
+) -> Option<Option<Bbox>> {
     let mut x0 = usize::MAX;
     let mut y0 = usize::MAX;
     let mut x1 = 0usize;
     let mut y1 = 0usize;
     let mut any = false;
     for y in 0..h {
+        if y % 32 == 0 && cancelled(cancel) {
+            return None;
+        }
         for x in 0..w {
             if mask[y * w + x] {
                 any = true;
@@ -409,14 +498,14 @@ fn mask_bbox(mask: &[bool], w: usize, h: usize) -> Option<Bbox> {
         }
     }
     if !any {
-        return None;
+        return Some(None);
     }
-    Some(Bbox {
+    Some(Some(Bbox {
         x0,
         y0,
         x1: x1 + 1,
         y1: y1 + 1,
-    })
+    }))
 }
 
 fn expand_bbox_clipped(b: Bbox, margin: usize, w: usize, h: usize) -> Bbox {
@@ -432,10 +521,19 @@ fn expand_bbox_clipped(b: Bbox, margin: usize, w: usize, h: usize) -> Bbox {
 ///
 /// マスクが画像全域なら何もしない (= 全域 true)。マスクが小さければ
 /// O(masked_count * radius * radius) で済む (4K 顔ぼかしの典型値で問題ない)。
-fn dilate_mask(mask: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
+fn dilate_mask(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+    radius: usize,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<bool>> {
     let mut out = mask.to_vec();
     let r2 = (radius * radius) as i32;
     for y in 0..h {
+        if y % 8 == 0 && cancelled(cancel) {
+            return None;
+        }
         for x in 0..w {
             if !mask[y * w + x] {
                 continue;
@@ -456,7 +554,7 @@ fn dilate_mask(mask: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// 1D Gaussian カーネルを生成 (長さ `2 * radius + 1`、合計 1.0 に正規化)。
@@ -495,7 +593,8 @@ fn gaussian_blur_separable_bbox(
     kernel: &[f32],
     radius: usize,
     mask_for_sampling: Option<&[bool]>,
-) -> Vec<Color32> {
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<Color32>> {
     let bw = bbox.x1 - bbox.x0;
     let bh = bbox.y1 - bbox.y0;
 
@@ -503,6 +602,9 @@ fn gaussian_blur_separable_bbox(
     // (マスク制限あり時は寄与を 0 にして重み再正規化)
     let mut tmp = vec![Color32::TRANSPARENT; bw * bh];
     for by in 0..bh {
+        if by % 4 == 0 && cancelled(cancel) {
+            return None;
+        }
         let y = bbox.y0 + by;
         for bx in 0..bw {
             let x = bbox.x0 + bx;
@@ -545,6 +647,9 @@ fn gaussian_blur_separable_bbox(
     // 縦方向 kernel は bbox 外を参照しないように clip する。
     let mut out = vec![Color32::TRANSPARENT; bw * bh];
     for by in 0..bh {
+        if by % 4 == 0 && cancelled(cancel) {
+            return None;
+        }
         let y = bbox.y0 + by;
         for bx in 0..bw {
             let mut acc_r = 0.0f32;
@@ -603,7 +708,7 @@ fn gaussian_blur_separable_bbox(
             };
         }
     }
-    out
+    Some(out)
 }
 
 /// マスク境界から内側への距離 (上限 `radius`) を計算し、線形ランプの alpha map を返す。
@@ -618,13 +723,22 @@ fn gaussian_blur_separable_bbox(
 ///
 /// BFS は 4 近傍。8 近傍も検討したが、4K 画像でのコスト差より単純さを優先。
 /// 8 近傍が必要なら将来 GPU/rayon 化 + 8 近傍 distance transform に置き換える。
-fn compute_edge_feather_alpha(mask: &[bool], w: usize, h: usize, radius: u32) -> Vec<u8> {
+fn compute_edge_feather_alpha(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+    radius: u32,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<u8>> {
     let n = w * h;
     let mut dist = vec![u16::MAX; n];
     let mut queue: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
 
     // Seed: マスク外画素 (= 境界の「外」側)。これらの距離 0 から内側に拡張する。
     for y in 0..h {
+        if y % 16 == 0 && cancelled(cancel) {
+            return None;
+        }
         for x in 0..w {
             if !mask[y * w + x] {
                 dist[y * w + x] = 0;
@@ -634,7 +748,12 @@ fn compute_edge_feather_alpha(mask: &[bool], w: usize, h: usize, radius: u32) ->
     }
 
     // 4 近傍 BFS で距離計算 (radius を超えたら打ち切り)
+    let mut visited = 0usize;
     while let Some((x, y)) = queue.pop_front() {
+        visited = visited.wrapping_add(1);
+        if visited % 4096 == 0 && cancelled(cancel) {
+            return None;
+        }
         let d = dist[y * w + x];
         if d >= radius as u16 {
             continue;
@@ -659,6 +778,9 @@ fn compute_edge_feather_alpha(mask: &[bool], w: usize, h: usize, radius: u32) ->
     // 距離 → alpha (0..radius を 0..255 にマップ、radius 以上は 255)
     let mut out = vec![0u8; n];
     for i in 0..n {
+        if i % 4096 == 0 && cancelled(cancel) {
+            return None;
+        }
         if !mask[i] {
             out[i] = 0; // マスク外は 0 (使われない)
         } else if dist[i] >= radius as u16 {
@@ -669,7 +791,7 @@ fn compute_edge_feather_alpha(mask: &[bool], w: usize, h: usize, radius: u32) ->
             out[i] = ((dist[i] as u32 * 255) / radius) as u8;
         }
     }
-    out
+    Some(out)
 }
 
 // ── テスト ───────────────────────────────────────────────────────────
@@ -980,7 +1102,7 @@ mod tests {
         // 単純なケース: 8x8 全マスク + radius 3 → 角は alpha=0、中央は alpha=255
         // ただし全マスクなら境界なし → 全画素 dist=u16::MAX → alpha=255
         let mask = vec![true; 8 * 8];
-        let alpha = compute_edge_feather_alpha(&mask, 8, 8, 3);
+        let alpha = compute_edge_feather_alpha(&mask, 8, 8, 3, None).unwrap();
         assert!(alpha.iter().all(|&a| a == 255));
     }
 
@@ -994,7 +1116,7 @@ mod tests {
                 mask[y * 6 + x] = true;
             }
         }
-        let alpha = compute_edge_feather_alpha(&mask, 6, 6, 2);
+        let alpha = compute_edge_feather_alpha(&mask, 6, 6, 2, None).unwrap();
         // 境界画素 (1,1): dist=1 → alpha = 1/2 * 255 ≈ 127
         let boundary = alpha[1 * 6 + 1];
         assert!(
@@ -1133,7 +1255,7 @@ mod tests {
                 mask[y * 16 + x] = true;
             }
         }
-        let dilated = dilate_mask(&mask, 16, 16, 4);
+        let dilated = dilate_mask(&mask, 16, 16, 4, None).unwrap();
         // 中央元マスクは true のまま
         assert!(dilated[8 * 16 + 8]);
         // 半径 4 内のすぐ外 ((5,5) は元マスク (6,6) から距離 sqrt(2)、半径 4 内) → true
@@ -1147,7 +1269,7 @@ mod tests {
         let mut mask = vec![false; 10 * 10];
         mask[2 * 10 + 3] = true;
         mask[7 * 10 + 6] = true;
-        let bbox = mask_bbox(&mask, 10, 10).unwrap();
+        let bbox = mask_bbox(&mask, 10, 10, None).unwrap().unwrap();
         assert_eq!(bbox.x0, 3);
         assert_eq!(bbox.y0, 2);
         assert_eq!(bbox.x1, 7); // exclusive
@@ -1157,7 +1279,7 @@ mod tests {
     #[test]
     fn mask_bbox_returns_none_for_empty() {
         let mask = vec![false; 10 * 10];
-        assert!(mask_bbox(&mask, 10, 10).is_none());
+        assert!(mask_bbox(&mask, 10, 10, None).unwrap().is_none());
     }
 
     #[test]

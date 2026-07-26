@@ -2219,7 +2219,7 @@ impl App {
             // フルスクリーンが OS フォーカスを持つ間は modifier event が届かないため、
             // `original_preview_active` と同じく OS キー状態を見る (fs_prev_focused
             // ガードは decide 関数内に集約済み)。
-            self.ensure_local_adjust_layers_loaded(idx);
+            self.maybe_start_local_adjust_render(idx);
             let total_layers = self
                 .local_adjust_page_layers
                 .get(&idx)
@@ -20882,7 +20882,7 @@ impl App {
 
         let local_adjust = if has_local_adjust {
             if let Some(idx) = idx {
-                self.ensure_local_adjust_layers_loaded(idx);
+                self.load_local_adjust_layers_for_book_snapshot_sync(idx);
                 self.local_adjust_page_layers.get(&idx).cloned()
             } else {
                 self.local_adjust_db
@@ -21302,9 +21302,17 @@ impl App {
         indices: &[usize],
     ) -> Result<(), String> {
         for &idx in indices {
-            self.ensure_local_adjust_layers_loaded(idx);
+            self.maybe_start_local_adjust_render(idx);
+            if self.local_adjust_pages.contains(&idx)
+                && !self.local_adjust_page_layers.contains_key(&idx)
+            {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                return Err(
+                    "補正レイヤーの読み込み中です。少し待ってから Ctrl+E を再実行してください"
+                        .to_string(),
+                );
+            }
             if self.has_active_local_adjust_layers(idx) {
-                self.maybe_start_local_adjust_render(idx);
                 if self.current_local_adjust_pixels(idx).is_none() {
                     ctx.request_repaint_after(std::time::Duration::from_millis(50));
                     return Err(

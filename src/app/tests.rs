@@ -15641,6 +15641,14 @@ mod favorite_adjustment_defaults_tests {
 
         app.enter_conceal_mode(idx);
 
+        for _ in 0..200 {
+            app.poll_local_adjust_render(&ctx);
+            if app.conceal_mode {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
         assert!(app.conceal_mode);
         assert!(app.post_filter_bypassed);
         assert_eq!(app.input_generation.get(&idx), Some(&5));
@@ -17712,7 +17720,7 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(app.local_adjust_selected_layers.is_empty());
 
-        assert!(app.ensure_local_adjust_layers_loaded(b));
+        assert!(app.load_local_adjust_layers_for_book_snapshot_sync(b));
         assert_eq!(app.local_adjust_page_layers.get(&b), Some(&layers));
     }
 
@@ -19358,16 +19366,29 @@ mod pipeline_cache_refactor_tests {
             },
         );
 
-        let _ = app
-            .ensure_conceal_texture(&ctx, idx)
-            .expect("opaque preview should compose");
+        assert!(app.ensure_conceal_texture(&ctx, idx).is_none());
+        for _ in 0..200 {
+            app.poll_local_adjust_render(&ctx);
+            if app.conceal_cache.contains_key(&idx) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.conceal_cache.contains_key(&idx));
         let opaque = app.conceal_cache[&idx].pixels.clone();
 
         app.settings.conceal_mosaic_boundary = crate::conceal::MosaicBoundary::MaskShape;
         app.bump_conceal_generation();
-        let _ = app
-            .ensure_conceal_texture(&ctx, idx)
-            .expect("mask-shape preview should recompose");
+        app.frame_counter = app.frame_counter.wrapping_add(1);
+        assert!(app.ensure_conceal_texture(&ctx, idx).is_none());
+        for _ in 0..200 {
+            app.poll_local_adjust_render(&ctx);
+            if app.conceal_cache.contains_key(&idx) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.conceal_cache.contains_key(&idx));
         let mask_shape = &app.conceal_cache[&idx];
 
         assert_ne!(opaque.pixels, mask_shape.pixels.pixels);
@@ -22603,6 +22624,240 @@ mod pipeline_display_edit_split_tests {
 
         assert_eq!(kind, "local_adjust");
         assert_eq!(conceal_source.pixels[0], local.pixels[0]);
+    }
+}
+
+#[cfg(test)]
+mod edit_materialize_worker_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
+
+    fn push_image(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Image(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.items.len() - 1
+    }
+
+    fn active_layer() -> local_adjust_core::LocalAdjustmentLayer {
+        local_adjust_core::LocalAdjustmentLayer::new(
+            "worker-test",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
+                brightness: 10.0,
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn local_request(app: &App, idx: usize) -> EditMaterializeRequest {
+        EditMaterializeRequest {
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            kind: EditMaterializeKind::Local {
+                key: app.current_local_adjust_key(idx),
+                continuation: LocalMaterializeContinuation::Display,
+            },
+        }
+    }
+
+    fn ready_local_pending(
+        request: EditMaterializeRequest,
+        image: egui::ColorImage,
+    ) -> (LocalAdjustRenderPending, Arc<AtomicBool>) {
+        let (_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        (
+            LocalAdjustRenderPending {
+                request,
+                cancel: Arc::clone(&cancel),
+                rx,
+                ready: Some(EditMaterializeResult::Ready {
+                    request,
+                    payload: EditMaterializePayload::LocalReady {
+                        layers: vec![active_layer()],
+                        image,
+                    },
+                }),
+            },
+            cancel,
+        )
+    }
+
+    #[test]
+    fn stale_generation_is_discarded_and_generation_change_cancels_pending() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/stale-worker.jpg");
+        app.local_adjust_pages.insert(idx);
+        let stale_request = local_request(&app, idx);
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::RED]);
+        let (pending, _) = ready_local_pending(stale_request, image);
+        app.local_adjust_pending.insert(idx, pending);
+
+        *app.input_generation.entry(idx).or_insert(0) += 1;
+        app.poll_local_adjust_render(&ctx);
+        assert!(
+            app.local_adjust_cache.is_empty(),
+            "a completed result from the old input generation must not be applied"
+        );
+
+        let current_request = local_request(&app, idx);
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::GREEN]);
+        let (pending, cancel) = ready_local_pending(current_request, image);
+        app.local_adjust_pending.insert(idx, pending);
+        app.bump_input_generation(idx);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!app.local_adjust_pending.contains_key(&idx));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn materialize_result_is_applied_only_in_its_own_viewer_context() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/context-owner.jpg");
+        app.local_adjust_pages.insert(idx);
+        let request = local_request(&app, idx);
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::BLUE]);
+        let (pending, _) = ready_local_pending(request, image);
+        app.local_adjust_pending.insert(idx, pending);
+
+        let mut owner = ViewerContextBundle::empty();
+        app.swap_viewer_context_bundle(&mut owner);
+        app.poll_local_adjust_render(&ctx);
+        assert!(
+            app.local_adjust_cache.is_empty(),
+            "the active sibling context must not see the parked context's result"
+        );
+
+        app.swap_viewer_context_bundle(&mut owner);
+        app.poll_local_adjust_render(&ctx);
+        assert!(
+            app.local_adjust_cache
+                .contains_key(&app.current_local_adjust_key(idx)),
+            "the result must remain pending until its owning context is active"
+        );
+    }
+
+    #[test]
+    fn display_uses_lower_layer_while_local_materialization_is_pending() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/lower-layer.jpg");
+        app.fullscreen_idx = Some(idx);
+        let raw_image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(4, 5, 6)]);
+        let raw_pixels = Arc::new(raw_image.clone());
+        let raw_texture = ctx.load_texture("lower_raw", raw_image, egui::TextureOptions::LINEAR);
+        let raw_id = raw_texture.id();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw_texture,
+                pixels: raw_pixels,
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+            },
+        );
+        app.local_adjust_page_layers
+            .insert(idx, vec![active_layer()]);
+        app.local_adjust_pages.insert(idx);
+        let request = local_request(&app, idx);
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.local_adjust_pending.insert(
+            idx,
+            LocalAdjustRenderPending {
+                request,
+                cancel,
+                rx,
+                ready: None,
+            },
+        );
+
+        let displayed = app
+            .resolve_fs_processed_texture(&ctx, idx, false)
+            .expect("raw lower layer remains displayable");
+        assert_eq!(displayed.id(), raw_id);
+        assert!(app.edit_result_cache.is_empty());
+        drop(tx);
+    }
+
+    #[test]
+    fn display_uses_lower_layer_while_conceal_materialization_is_pending() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/lower-conceal.jpg");
+        app.fullscreen_idx = Some(idx);
+        let raw_image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(7, 8, 9)]);
+        let raw_pixels = Arc::new(raw_image.clone());
+        let raw_texture =
+            ctx.load_texture("lower_conceal_raw", raw_image, egui::TextureOptions::LINEAR);
+        let raw_id = raw_texture.id();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw_texture,
+                pixels: raw_pixels,
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+            },
+        );
+        app.conceal_pages.insert(idx);
+        let request = EditMaterializeRequest {
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            kind: EditMaterializeKind::Conceal {
+                key: app.current_edit_result_key(idx),
+                purpose: ConcealMaterializePurpose::Display,
+            },
+        };
+        let (tx, rx) = mpsc::channel();
+        app.local_adjust_pending.insert(
+            idx,
+            LocalAdjustRenderPending {
+                request,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                ready: None,
+            },
+        );
+
+        let displayed = app
+            .resolve_fs_processed_texture(&ctx, idx, false)
+            .expect("raw lower layer remains displayable");
+        assert_eq!(displayed.id(), raw_id);
+        assert!(app.edit_result_cache.is_empty());
+        drop(tx);
+    }
+
+    #[test]
+    fn materialize_upload_backlog_applies_at_most_one_texture_per_frame() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for path in ["C:/pics/upload-a.jpg", "C:/pics/upload-b.jpg"] {
+            let idx = push_image(&mut app, path);
+            app.local_adjust_pages.insert(idx);
+            let request = local_request(&app, idx);
+            let image =
+                egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(idx as u8, 20, 30)]);
+            let (pending, _) = ready_local_pending(request, image);
+            app.local_adjust_pending.insert(idx, pending);
+        }
+
+        app.poll_local_adjust_render(&ctx);
+        assert_eq!(app.local_adjust_cache.len(), 1);
+        app.poll_local_adjust_render(&ctx);
+        assert_eq!(
+            app.local_adjust_cache.len(),
+            1,
+            "a second poll in the same frame must leave the next upload queued"
+        );
+        app.frame_counter = app.frame_counter.wrapping_add(1);
+        app.poll_local_adjust_render(&ctx);
+        assert_eq!(app.local_adjust_cache.len(), 2);
     }
 }
 

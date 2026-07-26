@@ -90,28 +90,62 @@ impl App {
     /// (消しゴムと同じ振る舞い、`conceal_spread_ctx` に元状態を保存)、
     /// `reset_conceal_mode` で復元する。
     pub(crate) fn enter_conceal_mode(&mut self, fs_idx: usize) {
-        // 見開き → Single ピボット (消しゴムの enter_erase_mode と同じ作法)
-        let spread_pair = match self.resolve_spread_pair(fs_idx) {
+        let target_idx = match self.resolve_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
+            crate::ui_fullscreen::SpreadPair::Single => fs_idx,
+        };
+        if self.local_adjust_pages.contains(&target_idx)
+            && !self.local_adjust_page_layers.contains_key(&target_idx)
+            || self.has_active_local_adjust_layers(target_idx)
+                && self.current_local_adjust_pixels(target_idx).is_none()
+        {
+            self.maybe_start_local_adjust_render_with_continuation(
+                target_idx,
+                crate::app::LocalMaterializeContinuation::EnterConceal {
+                    requested_fs_idx: fs_idx,
+                },
+            );
+            return;
+        }
+        if self.current_conceal_source_pixels(target_idx).is_none() {
+            crate::logger::log("conceal: enter deferred (no base pixels)".to_string());
+            return;
+        }
+        self.maybe_start_conceal_materialize(
+            target_idx,
+            crate::app::ConcealMaterializePurpose::EnterMode {
+                requested_fs_idx: fs_idx,
+            },
+        );
+    }
+
+    pub(crate) fn complete_conceal_mode_entry(
+        &mut self,
+        requested_fs_idx: usize,
+        pixels: Arc<egui::ColorImage>,
+        source_kind: &'static str,
+        loaded_mask: Vec<bool>,
+        loaded_shapes: Vec<crate::mask_db::Shape>,
+    ) -> bool {
+        let spread_pair = match self.resolve_spread_pair(requested_fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
             crate::ui_fullscreen::SpreadPair::Single => None,
         };
-        let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
-        self.ensure_local_adjust_layers_loaded(target_idx);
+        let target_idx = spread_pair
+            .map(|(left, _)| left)
+            .unwrap_or(requested_fs_idx);
+        let current_target = self
+            .fullscreen_idx
+            .map(|idx| match self.resolve_spread_pair(idx) {
+                crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
+                crate::ui_fullscreen::SpreadPair::Single => idx,
+            });
+        if current_target != Some(target_idx) {
+            return false;
+        }
+        self.conceal_base_cache
+            .insert(target_idx, Arc::clone(&pixels));
 
-        // 元画像取得 (state mutation 前)。プレビュー合成と同じ優先順位
-        // (erase_result > adjustment > ai_upscale > fs) で source を決める。
-        let (pixels, source_kind) = match self.current_conceal_source_pixels(target_idx) {
-            Some((p, kind)) => {
-                self.conceal_base_cache.insert(target_idx, Arc::clone(&p));
-                (p, kind)
-            }
-            None => {
-                crate::logger::log("conceal: enter aborted (no base pixels)".to_string());
-                return;
-            }
-        };
-
-        // 見開き状態をスナップショット
         if let Some(pair) = spread_pair {
             self.conceal_spread_ctx = Some(EraseSpreadCtx {
                 saved_mode: self.spread_mode,
@@ -152,19 +186,12 @@ impl App {
         self.conceal_shape_drag_start = None;
         self.conceal_shape_drag_end = None;
 
-        // デフォルトブラシ半径 / 直線幅 (まだ未初期化のときだけ)
         if self.settings.conceal_brush_radius <= 0.0 {
             self.settings.conceal_brush_radius = (w.max(h) as f32 / 100.0).max(2.0);
         }
         if self.settings.conceal_line_width <= 0.0 {
             self.settings.conceal_line_width = (w.max(h) as f32 / 500.0).max(2.0);
         }
-
-        // DB からマスク (ビットマップ + ベクタ) をロード
-        let (loaded_mask, loaded_shapes) = self
-            .page_path_key(fs_idx)
-            .and_then(|key| self.conceal_db.as_ref()?.get_full(&key, w, h))
-            .unwrap_or_else(|| (vec![false; w * h], Vec::new()));
 
         self.conceal_mask = Some(loaded_mask);
         self.conceal_shapes = loaded_shapes;
@@ -174,6 +201,7 @@ impl App {
             self.settings.conceal_type,
             self.conceal_tool,
         ));
+        true
     }
 
     fn finish_conceal_edit_for_current(&mut self, reason: &'static str) {
@@ -190,7 +218,6 @@ impl App {
         self.conceal_line_end = None;
         self.conceal_shape_drag_start = None;
         self.conceal_shape_drag_end = None;
-        self.ensure_local_adjust_layers_loaded(idx);
         if let Some((pixels, _)) = self.current_conceal_source_pixels(idx) {
             self.rescale_active_conceal_edit_to_size(idx, pixels.size, reason);
         }
@@ -279,6 +306,14 @@ impl App {
             return;
         }
         self.finish_conceal_edit_for_current("switch_save");
+        // 次ページの DB mask が worker から戻るまでは、前ページの in-memory mask を
+        // 新ページへ重ねず lower layer を表示する。
+        self.conceal_mode = false;
+        self.conceal_preview_active = false;
+        self.conceal_mask = None;
+        self.conceal_mask_size = [0, 0];
+        self.conceal_mask_texture = None;
+        self.conceal_shapes.clear();
         self.spread_mode = crate::settings::SpreadMode::Single;
         self.fullscreen_idx = Some(new_idx);
         self.fs_zoom = 1.0;

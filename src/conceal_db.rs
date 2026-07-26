@@ -18,6 +18,7 @@
 //! 「同じマスクで異なるパラメータの結果を Ctrl+E で複数保存」が自然に成立する。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mask_db::{Shape, compress_mask, shapes_from_json, shapes_to_json};
 
@@ -26,6 +27,15 @@ use crate::mask_db::{Shape, compress_mask, shapes_from_json, shapes_to_json};
 /// 内部は SQLite `conceal_entries` テーブル。スキーマは [`open_at`] 参照。
 pub struct ConcealDb {
     conn: rusqlite::Connection,
+}
+
+/// SQLite 読み込み直後の conceal entry。deflate / JSON 復元とサイズ追従は
+/// worker 側の [`ConcealDb::materialize_raw`] で行う。
+pub(crate) struct ConcealRawEntry {
+    bitmap_data: Vec<u8>,
+    bitmap_w: usize,
+    bitmap_h: usize,
+    shapes_json: Option<String>,
 }
 
 impl ConcealDb {
@@ -51,8 +61,20 @@ impl ConcealDb {
         Ok(Self { conn })
     }
 
-    fn db_path() -> PathBuf {
+    /// materialize worker が UI thread の connection と共有せずに開く DB path。
+    pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("conceal.db")
+    }
+
+    pub fn open_readonly(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self { conn })
     }
 
     /// マスクとベクタ群をまとめて取得する。
@@ -65,6 +87,12 @@ impl ConcealDb {
         expected_w: usize,
         expected_h: usize,
     ) -> Option<(Vec<bool>, Vec<Shape>)> {
+        let raw = self.get_raw(key)?;
+        Self::materialize_raw(raw, expected_w, expected_h, None)
+    }
+
+    /// SQLite/BLOB read だけを行う。deflate と JSON 復元を含めない。
+    pub(crate) fn get_raw(&self, key: &str) -> Option<ConcealRawEntry> {
         let mut stmt = self
             .conn
             .prepare_cached(
@@ -72,7 +100,12 @@ impl ConcealDb {
                  FROM conceal_entries WHERE page_path = ?1",
             )
             .ok()?;
-        let (blob, w, h, shapes_json): (Vec<u8>, usize, usize, Option<String>) = stmt
+        let (bitmap_data, bitmap_w, bitmap_h, shapes_json): (
+            Vec<u8>,
+            usize,
+            usize,
+            Option<String>,
+        ) = stmt
             .query_row([key], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -82,17 +115,45 @@ impl ConcealDb {
                 ))
             })
             .ok()?;
+        Some(ConcealRawEntry {
+            bitmap_data,
+            bitmap_w,
+            bitmap_h,
+            shapes_json,
+        })
+    }
 
-        let mut mask = decompress_mask(&blob, w, h)?;
-        let mut shapes = shapes_json
+    /// raw entry の deflate / JSON 復元と期待解像度への追従を行う。
+    pub(crate) fn materialize_raw(
+        raw: ConcealRawEntry,
+        expected_w: usize,
+        expected_h: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<(Vec<bool>, Vec<Shape>)> {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return None;
+        }
+        let mut mask = decompress_mask(&raw.bitmap_data, raw.bitmap_w, raw.bitmap_h)?;
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return None;
+        }
+        let mut shapes = raw
+            .shapes_json
             .as_deref()
             .map(shapes_from_json)
             .unwrap_or_default();
 
-        if w != expected_w || h != expected_h {
-            mask = rescale_mask(&mask, w, h, expected_w, expected_h);
-            let sx = expected_w as f32 / w.max(1) as f32;
-            let sy = expected_h as f32 / h.max(1) as f32;
+        if raw.bitmap_w != expected_w || raw.bitmap_h != expected_h {
+            mask = rescale_mask_cancel(
+                &mask,
+                raw.bitmap_w,
+                raw.bitmap_h,
+                expected_w,
+                expected_h,
+                cancel,
+            )?;
+            let sx = expected_w as f32 / raw.bitmap_w.max(1) as f32;
+            let sy = expected_h as f32 / raw.bitmap_h.max(1) as f32;
             for s in &mut shapes {
                 s.scale_xy(sx, sy);
             }
@@ -321,6 +382,34 @@ impl ConcealDb {
     }
 }
 
+fn rescale_mask_cancel(
+    src: &[bool],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<bool>> {
+    if src_w == dst_w && src_h == dst_h {
+        return Some(src.to_vec());
+    }
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Some(vec![false; dst_w.saturating_mul(dst_h)]);
+    }
+    let mut out = vec![false; dst_w.saturating_mul(dst_h)];
+    for y in 0..dst_h {
+        if y % 32 == 0 && cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return None;
+        }
+        let sy = (y.saturating_mul(src_h) / dst_h).min(src_h - 1);
+        for x in 0..dst_w {
+            let sx = (x.saturating_mul(src_w) / dst_w).min(src_w - 1);
+            out[y * dst_w + x] = src.get(sy * src_w + sx).copied().unwrap_or(false);
+        }
+    }
+    Some(out)
+}
+
 /// スロットキー (`__slot_1` / `__slot_2`) を生成する。
 pub fn slot_key(slot: usize) -> String {
     format!("__slot_{}", slot)
@@ -350,21 +439,6 @@ fn decompress_mask(blob: &[u8], w: usize, h: usize) -> Option<Vec<bool>> {
         }
     }
     Some(mask)
-}
-
-/// マスクを最近傍法でリスケールする (`mask_db::rescale_mask` と同じ)。
-fn rescale_mask(src: &[bool], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<bool> {
-    let mut dst = vec![false; dst_w * dst_h];
-    let x_ratio = src_w as f32 / dst_w as f32;
-    let y_ratio = src_h as f32 / dst_h as f32;
-    for dy in 0..dst_h {
-        let sy = ((dy as f32 * y_ratio) as usize).min(src_h.saturating_sub(1));
-        for dx in 0..dst_w {
-            let sx = ((dx as f32 * x_ratio) as usize).min(src_w.saturating_sub(1));
-            dst[dy * dst_w + dx] = src[sy * src_w + sx];
-        }
-    }
-    dst
 }
 
 #[cfg(test)]

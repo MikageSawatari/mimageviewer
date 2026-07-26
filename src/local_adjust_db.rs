@@ -55,12 +55,18 @@ impl LocalAdjustDb {
 
     /// ページの補正レイヤー配列を取得する。未登録または JSON 破損なら None。
     pub fn get_layers(&self, page_key: &str) -> Option<Vec<LocalAdjustmentLayer>> {
+        let json = self.get_layers_json(page_key)?;
+        serde_json::from_str(&json).ok()
+    }
+
+    /// worker 側で SQLite 読み込みと JSON 復元を別々に計測するため、
+    /// 永続化された JSON 文字列だけを取得する。
+    pub fn get_layers_json(&self, page_key: &str) -> Option<String> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT layers_json FROM local_adjust_pages WHERE page_path = ?1")
             .ok()?;
-        let json: String = stmt.query_row([page_key], |row| row.get(0)).ok()?;
-        serde_json::from_str(&json).ok()
+        stmt.query_row([page_key], |row| row.get(0)).ok()
     }
 
     /// ページの補正レイヤー配列を書き込む。空配列は削除として扱う。

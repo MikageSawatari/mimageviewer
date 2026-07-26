@@ -9736,7 +9736,9 @@ impl App {
             self.local_adjust_mask_brush_stroke = None;
             return;
         };
-        self.ensure_local_adjust_masks_match_source_dims(fs_idx);
+        if !self.ensure_local_adjust_masks_match_source_dims(fs_idx) {
+            return;
+        }
         let (
             primary_pressed,
             primary_down,
@@ -10558,7 +10560,9 @@ impl App {
         let Some(fs_idx) = self.current_local_adjust_edit_idx() else {
             return;
         };
-        self.ensure_local_adjust_masks_match_source_dims(fs_idx);
+        if !self.ensure_local_adjust_masks_match_source_dims(fs_idx) {
+            return;
+        }
         let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
             return;
         };
@@ -12010,8 +12014,7 @@ impl App {
             }
             SpreadPair::Single => (fs_root_idx, None),
         };
-        self.ensure_local_adjust_layers_loaded(fs_idx);
-        self.ensure_local_adjust_masks_match_source_dims(fs_idx);
+        self.maybe_start_local_adjust_render(fs_idx);
         let layers = self
             .local_adjust_page_layers
             .get(&fs_idx)
@@ -12034,10 +12037,16 @@ impl App {
         let segmentation_pending = self.local_adjust_segmentation_pending.is_some();
         let active_local_adjust_layers = self.has_active_local_adjust_layers(fs_idx);
         let current_local_adjust_key = self.current_local_adjust_key(fs_idx);
-        let local_adjust_render_pending = self
-            .local_adjust_pending
-            .get(&fs_idx)
-            .is_some_and(|pending| pending.key == current_local_adjust_key);
+        let local_adjust_render_pending =
+            self.local_adjust_pending
+                .get(&fs_idx)
+                .is_some_and(|pending| {
+                    matches!(
+                        pending.request.kind,
+                        crate::app::EditMaterializeKind::Local { key, .. }
+                            if key == current_local_adjust_key
+                    )
+                });
         let local_adjust_render_ready = self.current_local_adjust_texture(fs_idx).is_some();
         let local_adjust_status = if segmentation_pending {
             "マスク生成中...".to_string()

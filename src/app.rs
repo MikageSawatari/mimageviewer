@@ -2985,9 +2985,10 @@ pub(crate) struct ComparePinPending {
 }
 
 pub(crate) struct LocalAdjustRenderPending {
-    pub(crate) key: LocalAdjustResultKey,
+    pub(crate) request: EditMaterializeRequest,
     pub(crate) cancel: Arc<AtomicBool>,
-    pub(crate) rx: mpsc::Receiver<LocalAdjustRenderResult>,
+    pub(crate) rx: mpsc::Receiver<EditMaterializeResult>,
+    pub(crate) ready: Option<EditMaterializeResult>,
 }
 
 impl Drop for LocalAdjustRenderPending {
@@ -3028,6 +3029,76 @@ pub(crate) enum LocalAdjustRenderResult {
     Cancelled,
     Failed {
         key: LocalAdjustResultKey,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalMaterializeContinuation {
+    Display,
+    EnterConceal { requested_fs_idx: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConcealMaterializePurpose {
+    Display,
+    EnterMode { requested_fs_idx: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditMaterializeKind {
+    Local {
+        key: LocalAdjustResultKey,
+        continuation: LocalMaterializeContinuation,
+    },
+    Conceal {
+        key: EditResultKey,
+        purpose: ConcealMaterializePurpose,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EditMaterializeRequest {
+    pub(crate) items_generation: u64,
+    pub(crate) input_seq: u64,
+    pub(crate) kind: EditMaterializeKind,
+}
+
+pub(crate) enum EditMaterializePayload {
+    LocalReady {
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        image: egui::ColorImage,
+    },
+    LocalInactive {
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    },
+    ConcealDisplayReady {
+        image: egui::ColorImage,
+        source_kind: &'static str,
+        shape_count: usize,
+    },
+    ConcealDisplayEmpty {
+        source: Arc<egui::ColorImage>,
+        source_kind: &'static str,
+    },
+    ConcealEnter {
+        source: Arc<egui::ColorImage>,
+        source_kind: &'static str,
+        mask: Vec<bool>,
+        shapes: Vec<crate::mask_db::Shape>,
+    },
+}
+
+pub(crate) enum EditMaterializeResult {
+    Ready {
+        request: EditMaterializeRequest,
+        payload: EditMaterializePayload,
+    },
+    Cancelled {
+        request: EditMaterializeRequest,
+    },
+    Failed {
+        request: EditMaterializeRequest,
         error: String,
     },
 }
@@ -3304,6 +3375,361 @@ fn run_local_adjust_render(
             error: err.to_string(),
         },
     }
+}
+
+enum LocalMaterializeLayers {
+    Memory(Vec<local_adjust_core::LocalAdjustmentLayer>),
+    Database { path: PathBuf, page_key: String },
+}
+
+enum ConcealMaterializeMask {
+    Memory {
+        bitmap: Vec<bool>,
+        shapes: Vec<crate::mask_db::Shape>,
+        size: [usize; 2],
+    },
+    Database {
+        path: PathBuf,
+        page_key: String,
+    },
+}
+
+fn emit_edit_materialize_ms(
+    kind: &'static str,
+    stage: &'static str,
+    key: Option<&str>,
+    seq: u64,
+    t0: std::time::Instant,
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "edit_materialize",
+        kind,
+        key,
+        seq,
+        &[
+            ("stage", serde_json::Value::from(stage)),
+            (
+                "ms",
+                serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+            ),
+        ],
+    );
+}
+
+fn run_local_materialize(
+    request: EditMaterializeRequest,
+    source: Arc<egui::ColorImage>,
+    layers_source: LocalMaterializeLayers,
+    cancel: Arc<AtomicBool>,
+) -> EditMaterializeResult {
+    let perf_key = match &layers_source {
+        LocalMaterializeLayers::Database { page_key, .. } => Some(page_key.clone()),
+        LocalMaterializeLayers::Memory(_) => None,
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return EditMaterializeResult::Cancelled { request };
+    }
+    let mut layers = match layers_source {
+        LocalMaterializeLayers::Memory(layers) => layers,
+        LocalMaterializeLayers::Database { path, page_key } => {
+            let db_t0 = std::time::Instant::now();
+            let db = match crate::local_adjust_db::LocalAdjustDb::open_readonly(&path) {
+                Ok(db) => db,
+                Err(err) => {
+                    return EditMaterializeResult::Failed {
+                        request,
+                        error: format!("local adjust DB open failed: {err}"),
+                    };
+                }
+            };
+            let json = db.get_layers_json(&page_key);
+            emit_edit_materialize_ms(
+                "db_read",
+                "local",
+                Some(&page_key),
+                request.input_seq,
+                db_t0,
+            );
+            let Some(json) = json else {
+                return EditMaterializeResult::Ready {
+                    request,
+                    payload: EditMaterializePayload::LocalInactive { layers: Vec::new() },
+                };
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return EditMaterializeResult::Cancelled { request };
+            }
+            let decode_t0 = std::time::Instant::now();
+            let parsed =
+                serde_json::from_str::<Vec<local_adjust_core::LocalAdjustmentLayer>>(&json);
+            emit_edit_materialize_ms(
+                "decode",
+                "local_json",
+                Some(&page_key),
+                request.input_seq,
+                decode_t0,
+            );
+            match parsed {
+                Ok(layers) => layers,
+                Err(err) => {
+                    crate::logger::log(format!(
+                        "local_adjust: invalid layers_json key={page_key} error={err}"
+                    ));
+                    return EditMaterializeResult::Ready {
+                        request,
+                        payload: EditMaterializePayload::LocalInactive { layers: Vec::new() },
+                    };
+                }
+            }
+        }
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return EditMaterializeResult::Cancelled { request };
+    }
+
+    let [width, height] = source.size;
+    let raster_t0 = std::time::Instant::now();
+    for layer in &mut layers {
+        if cancel.load(Ordering::Relaxed) {
+            return EditMaterializeResult::Cancelled { request };
+        }
+        if !layer.masks_match_dims(width.max(1), height.max(1)) {
+            layer.resize_masks_to(width.max(1), height.max(1));
+        }
+    }
+    emit_edit_materialize_ms(
+        "raster",
+        "local_mask_resize",
+        perf_key.as_deref(),
+        request.input_seq,
+        raster_t0,
+    );
+
+    if !layers
+        .iter()
+        .any(|layer| layer.enabled && layer.opacity > 0.0)
+    {
+        return EditMaterializeResult::Ready {
+            request,
+            payload: EditMaterializePayload::LocalInactive { layers },
+        };
+    }
+    let compose_t0 = std::time::Instant::now();
+    let rgba = crate::capture::color_image_to_rgba(&source);
+    let src = local_adjust_core::RgbaImageRef {
+        width,
+        height,
+        pixels: &rgba,
+    };
+    let rendered =
+        local_adjust_core::apply_layers_with_progress(src, &layers, Some(&cancel), |_| {});
+    emit_edit_materialize_ms(
+        "compose",
+        "local",
+        perf_key.as_deref(),
+        request.input_seq,
+        compose_t0,
+    );
+    match rendered {
+        Ok(out) if !cancel.load(Ordering::Relaxed) => EditMaterializeResult::Ready {
+            request,
+            payload: EditMaterializePayload::LocalReady {
+                layers,
+                image: egui::ColorImage::from_rgba_unmultiplied(
+                    [out.width, out.height],
+                    &out.pixels,
+                ),
+            },
+        },
+        Ok(_) | Err(local_adjust_core::LocalAdjustError::Cancelled) => {
+            EditMaterializeResult::Cancelled { request }
+        }
+        Err(err) => EditMaterializeResult::Failed {
+            request,
+            error: err.to_string(),
+        },
+    }
+}
+
+fn run_conceal_materialize(
+    request: EditMaterializeRequest,
+    source: Arc<egui::ColorImage>,
+    source_kind: &'static str,
+    mask_source: ConcealMaterializeMask,
+    preset: Option<crate::conceal::ConcealPreset>,
+    cancel: Arc<AtomicBool>,
+) -> EditMaterializeResult {
+    let [w, h] = source.size;
+    let perf_key = match &mask_source {
+        ConcealMaterializeMask::Database { page_key, .. } => Some(page_key.clone()),
+        ConcealMaterializeMask::Memory { .. } => None,
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return EditMaterializeResult::Cancelled { request };
+    }
+    let loaded = match mask_source {
+        ConcealMaterializeMask::Memory {
+            mut bitmap,
+            mut shapes,
+            size: [mw, mh],
+        } => {
+            if [mw, mh] != [w, h] {
+                let decode_t0 = std::time::Instant::now();
+                bitmap = crate::mask_db::rescale_mask(&bitmap, mw, mh, w, h);
+                let sx = w as f32 / mw.max(1) as f32;
+                let sy = h as f32 / mh.max(1) as f32;
+                for shape in &mut shapes {
+                    shape.scale_xy(sx, sy);
+                }
+                emit_edit_materialize_ms(
+                    "decode",
+                    "conceal_memory_rescale",
+                    None,
+                    request.input_seq,
+                    decode_t0,
+                );
+            }
+            Some((bitmap, shapes))
+        }
+        ConcealMaterializeMask::Database { path, page_key } => {
+            let db_t0 = std::time::Instant::now();
+            let db = match crate::conceal_db::ConcealDb::open_readonly(&path) {
+                Ok(db) => db,
+                Err(err) => {
+                    return EditMaterializeResult::Failed {
+                        request,
+                        error: format!("conceal DB open failed: {err}"),
+                    };
+                }
+            };
+            let raw = db.get_raw(&page_key);
+            emit_edit_materialize_ms(
+                "db_read",
+                "conceal",
+                Some(&page_key),
+                request.input_seq,
+                db_t0,
+            );
+            if let Some(raw) = raw {
+                let decode_t0 = std::time::Instant::now();
+                let decoded =
+                    crate::conceal_db::ConcealDb::materialize_raw(raw, w, h, Some(&cancel));
+                emit_edit_materialize_ms(
+                    "decode",
+                    "conceal_deflate_json",
+                    Some(&page_key),
+                    request.input_seq,
+                    decode_t0,
+                );
+                decoded
+            } else {
+                None
+            }
+        }
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return EditMaterializeResult::Cancelled { request };
+    }
+    let (mut bitmap, shapes) = loaded.unwrap_or_else(|| (vec![false; w * h], Vec::new()));
+    if matches!(
+        request.kind,
+        EditMaterializeKind::Conceal {
+            purpose: ConcealMaterializePurpose::EnterMode { .. },
+            ..
+        }
+    ) {
+        return EditMaterializeResult::Ready {
+            request,
+            payload: EditMaterializePayload::ConcealEnter {
+                source,
+                source_kind,
+                mask: bitmap,
+                shapes,
+            },
+        };
+    }
+    if !bitmap.iter().any(|&bit| bit) && shapes.is_empty() {
+        return EditMaterializeResult::Ready {
+            request,
+            payload: EditMaterializePayload::ConcealDisplayEmpty {
+                source,
+                source_kind,
+            },
+        };
+    }
+
+    let raster_t0 = std::time::Instant::now();
+    if !crate::mask_db::rasterize_shapes_into_cancel(&mut bitmap, &shapes, w, h, &cancel) {
+        return EditMaterializeResult::Cancelled { request };
+    }
+    emit_edit_materialize_ms(
+        "raster",
+        "conceal",
+        perf_key.as_deref(),
+        request.input_seq,
+        raster_t0,
+    );
+    if cancel.load(Ordering::Relaxed) {
+        return EditMaterializeResult::Cancelled { request };
+    }
+    let image = if bitmap.iter().any(|&bit| bit) {
+        let compose_t0 = std::time::Instant::now();
+        let image = crate::conceal_compose::compose_with_preset_cancel(
+            &source,
+            &bitmap,
+            &preset.expect("display conceal request has preset"),
+            &cancel,
+        );
+        emit_edit_materialize_ms(
+            "compose",
+            "conceal",
+            perf_key.as_deref(),
+            request.input_seq,
+            compose_t0,
+        );
+        image
+    } else {
+        None
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return EditMaterializeResult::Cancelled { request };
+    }
+    EditMaterializeResult::Ready {
+        request,
+        payload: match image {
+            Some(image) => EditMaterializePayload::ConcealDisplayReady {
+                image,
+                source_kind,
+                shape_count: shapes.len(),
+            },
+            None => EditMaterializePayload::ConcealDisplayEmpty {
+                source,
+                source_kind,
+            },
+        },
+    }
+}
+
+fn edit_materialize_result_request(result: &EditMaterializeResult) -> EditMaterializeRequest {
+    match result {
+        EditMaterializeResult::Ready { request, .. }
+        | EditMaterializeResult::Cancelled { request }
+        | EditMaterializeResult::Failed { request, .. } => *request,
+    }
+}
+
+fn edit_materialize_result_needs_upload(result: &EditMaterializeResult) -> bool {
+    matches!(
+        result,
+        EditMaterializeResult::Ready {
+            payload: EditMaterializePayload::LocalReady { .. }
+                | EditMaterializePayload::ConcealDisplayReady { .. },
+            ..
+        }
+    )
 }
 
 pub(crate) struct ComparePinLoadPending {
@@ -9461,6 +9887,9 @@ pub struct App {
     pub(crate) last_input_at: Option<std::time::Instant>,
     /// フレーム番号 (update 呼出しのたびに +1)
     pub(crate) frame_counter: u64,
+    /// local / conceal / edit materialization の GPU upload を 1 frame 1 枚に制限する。
+    /// pending/cache は ViewerContextBundle 所有だが、frame budget 自体は全 context 共通。
+    last_edit_materialize_upload_frame: u64,
     /// Previous `App::update` frame boundary. Used by perf diagnostics to
     /// catch stalls that happen before the next Rust frame begins.
     pub(crate) perf_last_frame_begin: Option<std::time::Instant>,
@@ -11145,6 +11574,7 @@ impl App {
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
+            last_edit_materialize_upload_frame: u64::MAX,
             perf_last_frame_begin: None,
             perf_last_flush: None,
             fs_painted_last: None,
@@ -22258,7 +22688,7 @@ impl App {
         }
     }
 
-    pub(crate) fn ensure_local_adjust_layers_loaded(&mut self, idx: usize) -> bool {
+    pub(crate) fn load_local_adjust_layers_for_book_snapshot_sync(&mut self, idx: usize) -> bool {
         if self.local_adjust_page_layers.contains_key(&idx) {
             return true;
         }
@@ -47805,16 +48235,11 @@ impl App {
                     .any(|layer| !layer.masks_match_dims(width, height))
             });
         if !needs_resize {
-            return false;
+            return true;
         }
-        let Some(mut layers) = self.local_adjust_page_layers.get(&idx).cloned() else {
-            return false;
-        };
-        for layer in &mut layers {
-            layer.resize_masks_to(width, height);
-        }
-        self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
-        true
+        self.local_adjust_cache.retain(|key, _| key.idx != idx);
+        self.maybe_start_local_adjust_render(idx);
+        false
     }
 
     /// 指定 idx の最後段 crop 設定を DB / サイドカー / in-memory state に反映する。
@@ -47961,6 +48386,28 @@ impl App {
     fn cancel_local_adjust_pending_for_idx(&mut self, idx: usize) {
         if let Some(pending) = self.local_adjust_pending.remove(&idx) {
             pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cancel_conceal_materialize_pending_for_idx(&mut self, idx: usize) {
+        let is_conceal = self.local_adjust_pending.get(&idx).is_some_and(|pending| {
+            matches!(pending.request.kind, EditMaterializeKind::Conceal { .. })
+        });
+        if is_conceal {
+            self.cancel_local_adjust_pending_for_idx(idx);
+        }
+    }
+
+    fn cancel_all_conceal_materialize_pending(&mut self) {
+        let indices = self
+            .local_adjust_pending
+            .iter()
+            .filter_map(|(&idx, pending)| {
+                matches!(pending.request.kind, EditMaterializeKind::Conceal { .. }).then_some(idx)
+            })
+            .collect::<Vec<_>>();
+        for idx in indices {
+            self.cancel_local_adjust_pending_for_idx(idx);
         }
     }
 
@@ -48327,26 +48774,75 @@ impl App {
     }
 
     pub(crate) fn maybe_start_local_adjust_render(&mut self, idx: usize) {
-        if !self.ensure_local_adjust_layers_loaded(idx) {
-            return;
-        }
-        self.ensure_local_adjust_masks_match_source_dims(idx);
-        if self.current_local_adjust_texture(idx).is_some() {
-            return;
-        }
-        let Some(layers) = self.local_adjust_layers_for_render(idx) else {
-            return;
-        };
-        let key = self.current_local_adjust_key(idx);
-        if self
-            .local_adjust_pending
-            .get(&idx)
-            .is_some_and(|pending| pending.key == key)
+        self.maybe_start_local_adjust_render_with_continuation(
+            idx,
+            LocalMaterializeContinuation::Display,
+        );
+    }
+
+    pub(crate) fn maybe_start_local_adjust_render_with_continuation(
+        &mut self,
+        idx: usize,
+        continuation: LocalMaterializeContinuation,
+    ) {
+        if !self.local_adjust_pages.contains(&idx)
+            && !self.local_adjust_page_layers.contains_key(&idx)
         {
+            return;
+        }
+        let key = self.current_local_adjust_key(idx);
+        let request = EditMaterializeRequest {
+            items_generation: self.items_generation,
+            input_seq: self.input_seq,
+            kind: EditMaterializeKind::Local { key, continuation },
+        };
+        if self.local_adjust_pending.get(&idx).is_some_and(|pending| {
+            pending.request.items_generation == request.items_generation
+                && pending.request.kind == request.kind
+        }) {
             return;
         }
         let Some(source) = self.current_local_adjust_source_pixels(idx) else {
             return;
+        };
+        let [width, height] = source.size;
+        let masks_need_resize = self
+            .local_adjust_page_layers
+            .get(&idx)
+            .is_some_and(|layers| {
+                layers
+                    .iter()
+                    .any(|layer| !layer.masks_match_dims(width.max(1), height.max(1)))
+            });
+        let loaded_layers_are_inactive =
+            self.local_adjust_page_layers
+                .get(&idx)
+                .is_some_and(|layers| {
+                    !layers
+                        .iter()
+                        .any(|layer| layer.enabled && layer.opacity > 0.0)
+                });
+        if loaded_layers_are_inactive && !masks_need_resize {
+            return;
+        }
+        if self.current_local_adjust_texture(idx).is_some() && !masks_need_resize {
+            return;
+        }
+        if masks_need_resize {
+            self.local_adjust_cache
+                .retain(|cache_key, _| cache_key.idx != idx);
+        }
+        let layers_source = if let Some(layers) = self.local_adjust_page_layers.get(&idx) {
+            LocalMaterializeLayers::Memory(layers.clone())
+        } else {
+            let Some(page_key) = self.page_path_key(idx) else {
+                self.local_adjust_pages.remove(&idx);
+                return;
+            };
+            LocalMaterializeLayers::Database {
+                path: crate::local_adjust_db::LocalAdjustDb::db_path(),
+                page_key,
+            }
         };
 
         self.cancel_local_adjust_pending_for_idx(idx);
@@ -48356,7 +48852,7 @@ impl App {
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-render".to_string())
             .spawn(move || {
-                let result = run_local_adjust_render(key, source, layers, cancel_worker);
+                let result = run_local_materialize(request, source, layers_source, cancel_worker);
                 let _ = tx.send(result);
             });
         if let Err(err) = spawn_result {
@@ -48364,8 +48860,15 @@ impl App {
             return;
         }
 
-        self.local_adjust_pending
-            .insert(idx, LocalAdjustRenderPending { key, cancel, rx });
+        self.local_adjust_pending.insert(
+            idx,
+            LocalAdjustRenderPending {
+                request,
+                cancel,
+                rx,
+                ready: None,
+            },
+        );
     }
 
     pub(crate) fn maybe_start_local_adjust_layer_bypass_preview(
@@ -48373,10 +48876,10 @@ impl App {
         idx: usize,
         layer_idx: usize,
     ) {
-        if !self.ensure_local_adjust_layers_loaded(idx) {
+        if !self.local_adjust_page_layers.contains_key(&idx) {
+            self.maybe_start_local_adjust_render(idx);
             return;
         }
-        self.ensure_local_adjust_masks_match_source_dims(idx);
         if self
             .current_local_adjust_layer_bypass_texture(idx, layer_idx)
             .is_some()
@@ -48426,10 +48929,10 @@ impl App {
         idx: usize,
         layer_count: usize,
     ) {
-        if !self.ensure_local_adjust_layers_loaded(idx) {
+        if !self.local_adjust_page_layers.contains_key(&idx) {
+            self.maybe_start_local_adjust_render(idx);
             return;
         }
-        self.ensure_local_adjust_masks_match_source_dims(idx);
         if self
             .current_local_adjust_prefix_preview_texture(idx, layer_count)
             .is_some()
@@ -48474,28 +48977,104 @@ impl App {
     }
 
     pub(crate) fn poll_local_adjust_render(&mut self, ctx: &egui::Context) {
-        let mut completed = Vec::new();
         let mut disconnected = Vec::new();
-        for (&idx, pending) in &self.local_adjust_pending {
+        for (&idx, pending) in &mut self.local_adjust_pending {
+            if pending.ready.is_some() {
+                continue;
+            }
             match pending.rx.try_recv() {
-                Ok(result) => completed.push((idx, result)),
+                Ok(result) => pending.ready = Some(result),
                 Err(mpsc::TryRecvError::Disconnected) => disconnected.push(idx),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-
-        let mut repaint = false;
         for idx in disconnected {
             self.local_adjust_pending.remove(&idx);
         }
-        for (idx, result) in completed {
-            self.local_adjust_pending.remove(&idx);
-            match result {
-                LocalAdjustRenderResult::Ready { key, image } => {
-                    if key != self.current_local_adjust_key(idx) {
-                        continue;
-                    }
+
+        let preferred = self
+            .fullscreen_idx
+            .filter(|idx| {
+                self.local_adjust_pending
+                    .get(idx)
+                    .is_some_and(|pending| pending.ready.is_some())
+            })
+            .or_else(|| {
+                self.local_adjust_pending
+                    .iter()
+                    .find_map(|(&idx, pending)| pending.ready.as_ref().map(|_| idx))
+            });
+        let Some(idx) = preferred else {
+            if !self.local_adjust_pending.is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            return;
+        };
+        let needs_upload = self
+            .local_adjust_pending
+            .get(&idx)
+            .and_then(|pending| pending.ready.as_ref())
+            .is_some_and(edit_materialize_result_needs_upload);
+        if needs_upload && self.last_edit_materialize_upload_frame == self.frame_counter {
+            ctx.request_repaint();
+            return;
+        }
+        let Some(mut pending) = self.local_adjust_pending.remove(&idx) else {
+            return;
+        };
+        let Some(result) = pending.ready.take() else {
+            return;
+        };
+        if edit_materialize_result_request(&result) != pending.request {
+            return;
+        }
+        if needs_upload {
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+        }
+
+        let repaint = self.apply_edit_materialize_result(ctx, idx, result);
+        if repaint {
+            ctx.request_repaint();
+        }
+        if !self.local_adjust_pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn apply_edit_materialize_result(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        result: EditMaterializeResult,
+    ) -> bool {
+        let request = edit_materialize_result_request(&result);
+        if request.items_generation != self.items_generation {
+            return false;
+        }
+        let request_is_current = match request.kind {
+            EditMaterializeKind::Local { key, .. } => {
+                key.idx == idx && key == self.current_local_adjust_key(idx)
+            }
+            EditMaterializeKind::Conceal { key, .. } => {
+                key.idx == idx && key == self.current_edit_result_key(idx)
+            }
+        };
+        if !request_is_current {
+            return false;
+        }
+
+        match result {
+            EditMaterializeResult::Ready { payload, .. } => match payload {
+                EditMaterializePayload::LocalReady { layers, image } => {
+                    let continuation = match request.kind {
+                        EditMaterializeKind::Local { continuation, .. } => continuation,
+                        _ => return false,
+                    };
+                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    self.local_adjust_cache.retain(|key, _| key.idx != idx);
+                    let key = self.current_local_adjust_key(idx);
                     let pixels = Arc::new(image);
+                    let upload_t0 = std::time::Instant::now();
                     let upload = clamp_for_gpu(&pixels);
                     let texture = ctx.load_texture(
                         format!(
@@ -48505,32 +49084,154 @@ impl App {
                         upload.into_owned(),
                         DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     );
+                    emit_edit_materialize_ms(
+                        "upload",
+                        "local",
+                        self.page_path_key(idx).as_deref(),
+                        request.input_seq,
+                        upload_t0,
+                    );
                     self.local_adjust_cache
                         .insert(key, LocalAdjustCacheEntry { pixels, texture });
                     self.clear_conceal_caches(idx);
-                    repaint = true;
-                }
-                LocalAdjustRenderResult::Cancelled => {}
-                LocalAdjustRenderResult::Failed { key, error } => {
-                    if key == self.current_local_adjust_key(idx) {
-                        crate::logger::log(format!(
-                            "local_adjust: render failed idx={} error={error}",
-                            key.idx
-                        ));
+                    if let LocalMaterializeContinuation::EnterConceal { requested_fs_idx } =
+                        continuation
+                    {
+                        self.enter_conceal_mode(requested_fs_idx);
                     }
+                    true
                 }
+                EditMaterializePayload::LocalInactive { layers } => {
+                    let continuation = match request.kind {
+                        EditMaterializeKind::Local { continuation, .. } => continuation,
+                        _ => return false,
+                    };
+                    let layers_empty = layers.is_empty();
+                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    if layers_empty && let Some(page_key) = self.page_path_key(idx) {
+                        Self::set_page_key_presence(
+                            &mut self.local_adjust_page_keys,
+                            &page_key,
+                            false,
+                        );
+                    }
+                    self.local_adjust_cache.retain(|key, _| key.idx != idx);
+                    self.clear_conceal_caches(idx);
+                    if let LocalMaterializeContinuation::EnterConceal { requested_fs_idx } =
+                        continuation
+                    {
+                        self.enter_conceal_mode(requested_fs_idx);
+                    }
+                    true
+                }
+                EditMaterializePayload::ConcealDisplayReady {
+                    image,
+                    source_kind,
+                    shape_count,
+                } => {
+                    let key = match request.kind {
+                        EditMaterializeKind::Conceal { key, .. } => key,
+                        _ => return false,
+                    };
+                    let pixels = Arc::new(image);
+                    let upload_t0 = std::time::Instant::now();
+                    let upload = clamp_for_gpu(&pixels);
+                    let texture = ctx.load_texture(
+                        format!("conceal_{idx}_g{}", key.conceal_gen),
+                        upload.into_owned(),
+                        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                    );
+                    emit_edit_materialize_ms(
+                        "upload",
+                        "conceal",
+                        self.page_path_key(idx).as_deref(),
+                        request.input_seq,
+                        upload_t0,
+                    );
+                    crate::logger::log(format!(
+                        "conceal: worker ready idx={idx} source={source_kind} shapes={shape_count}"
+                    ));
+                    self.conceal_cache.insert(
+                        idx,
+                        ConcealCacheEntry {
+                            pixels,
+                            texture,
+                            generation: key.conceal_gen,
+                        },
+                    );
+                    self.clear_edit_result_caches_for_idx(idx);
+                    true
+                }
+                EditMaterializePayload::ConcealDisplayEmpty {
+                    source,
+                    source_kind,
+                } => {
+                    let key = match request.kind {
+                        EditMaterializeKind::Conceal { key, .. } => key,
+                        _ => return false,
+                    };
+                    let editing_this_idx = self.conceal_mode && self.fullscreen_idx == Some(idx);
+                    if !editing_this_idx {
+                        self.conceal_pages.remove(&idx);
+                        if let Some(page_key) = self.page_path_key(idx) {
+                            Self::set_page_key_presence(
+                                &mut self.conceal_page_keys,
+                                &page_key,
+                                false,
+                            );
+                        }
+                    }
+                    crate::logger::log(format!(
+                        "conceal: worker found empty mask idx={idx} source={source_kind}"
+                    ));
+                    self.edit_result_cache.insert(
+                        key,
+                        EditResultEntry {
+                            pixels: source,
+                            texture: None,
+                        },
+                    );
+                    true
+                }
+                EditMaterializePayload::ConcealEnter {
+                    source,
+                    source_kind,
+                    mask,
+                    shapes,
+                } => {
+                    let requested_fs_idx = match request.kind {
+                        EditMaterializeKind::Conceal {
+                            purpose: ConcealMaterializePurpose::EnterMode { requested_fs_idx },
+                            ..
+                        } => requested_fs_idx,
+                        _ => return false,
+                    };
+                    self.complete_conceal_mode_entry(
+                        requested_fs_idx,
+                        source,
+                        source_kind,
+                        mask,
+                        shapes,
+                    )
+                }
+            },
+            EditMaterializeResult::Cancelled { .. } => false,
+            EditMaterializeResult::Failed { error, .. } => {
+                crate::logger::log(format!(
+                    "edit_materialize: worker failed idx={idx} error={error}"
+                ));
+                false
             }
-        }
-
-        if repaint {
-            ctx.request_repaint();
-        }
-        if !self.local_adjust_pending.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
     pub(crate) fn poll_local_adjust_layer_bypass_preview(&mut self, ctx: &egui::Context) {
+        if self.last_edit_materialize_upload_frame == self.frame_counter {
+            if self.local_adjust_layer_bypass_pending.is_some() {
+                ctx.request_repaint();
+            }
+            return;
+        }
         let recv_result = {
             let Some(pending) = self.local_adjust_layer_bypass_pending.as_ref() else {
                 return;
@@ -48546,7 +49247,9 @@ impl App {
                     return;
                 }
                 let pixels = Arc::new(image);
+                let upload_t0 = std::time::Instant::now();
                 let upload = clamp_for_gpu(&pixels);
+                self.last_edit_materialize_upload_frame = self.frame_counter;
                 let texture = ctx.load_texture(
                     format!(
                         "local_adjust_layer_bypass_{}_{}_{}_{}_{}",
@@ -48558,6 +49261,13 @@ impl App {
                     ),
                     upload.into_owned(),
                     DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                );
+                emit_edit_materialize_ms(
+                    "upload",
+                    "local_bypass_preview",
+                    self.page_path_key(key.idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
                 );
                 self.local_adjust_layer_bypass_cache
                     .insert(pending.key, LocalAdjustCacheEntry { pixels, texture });
@@ -48585,6 +49295,12 @@ impl App {
     }
 
     pub(crate) fn poll_local_adjust_prefix_preview(&mut self, ctx: &egui::Context) {
+        if self.last_edit_materialize_upload_frame == self.frame_counter {
+            if self.local_adjust_prefix_preview_pending.is_some() {
+                ctx.request_repaint();
+            }
+            return;
+        }
         let recv_result = {
             let Some(pending) = self.local_adjust_prefix_preview_pending.as_ref() else {
                 return;
@@ -48600,7 +49316,9 @@ impl App {
                     return;
                 }
                 let pixels = Arc::new(image);
+                let upload_t0 = std::time::Instant::now();
                 let upload = clamp_for_gpu(&pixels);
+                self.last_edit_materialize_upload_frame = self.frame_counter;
                 let texture = ctx.load_texture(
                     format!(
                         "local_adjust_prefix_preview_{}_{}_{}_{}_{}",
@@ -48612,6 +49330,13 @@ impl App {
                     ),
                     upload.into_owned(),
                     DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                );
+                emit_edit_materialize_ms(
+                    "upload",
+                    "local_prefix_preview",
+                    self.page_path_key(key.idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
                 );
                 self.local_adjust_prefix_preview_cache
                     .insert(pending.key, LocalAdjustCacheEntry { pixels, texture });
@@ -48641,6 +49366,7 @@ impl App {
     /// 指定 idx の `conceal_cache` エントリを破棄する。マスク確定 / 削除のように
     /// **その 1 ページだけ** 入力が変わった場合に呼ぶ。
     pub(crate) fn clear_conceal_caches(&mut self, idx: usize) {
+        self.cancel_conceal_materialize_pending_for_idx(idx);
         self.conceal_cache.remove(&idx);
         self.comic_cache.remove(&idx);
         self.clear_edit_result_caches_for_idx(idx);
@@ -49008,6 +49734,7 @@ impl App {
     /// UI ヒッチを避けるための設計 (Codex P2、`docs/conceal-feature-plan.md §9.1`)。
     pub(crate) fn bump_conceal_generation(&mut self) {
         self.conceal_generation = self.conceal_generation.wrapping_add(1);
+        self.cancel_all_conceal_materialize_pending();
         // 非表示ページは generation 不一致で lazy eviction のままにする。一方、編集中の
         // 現在ページはパラメータ変更直後にも旧 GPU texture を描画経路が保持し得るため、
         // entry 自体を即時に外す。次のプレビュー lookup は必ず現在設定で compose し直す。
@@ -49050,178 +49777,150 @@ impl App {
     ///
     /// 隠蔽タイプ (Mosaic / Fill / Blur) ごとの合成処理は
     /// `conceal_compose` の共通ヘルパー群と同じ実装を使う。
+    pub(crate) fn maybe_start_conceal_materialize(
+        &mut self,
+        idx: usize,
+        purpose: ConcealMaterializePurpose,
+    ) {
+        if self.local_adjust_pages.contains(&idx)
+            && !self.local_adjust_page_layers.contains_key(&idx)
+        {
+            let continuation = match purpose {
+                ConcealMaterializePurpose::Display => LocalMaterializeContinuation::Display,
+                ConcealMaterializePurpose::EnterMode { requested_fs_idx } => {
+                    LocalMaterializeContinuation::EnterConceal { requested_fs_idx }
+                }
+            };
+            self.maybe_start_local_adjust_render_with_continuation(idx, continuation);
+            return;
+        }
+        if self.has_active_local_adjust_layers(idx)
+            && self.current_local_adjust_pixels(idx).is_none()
+        {
+            let continuation = match purpose {
+                ConcealMaterializePurpose::Display => LocalMaterializeContinuation::Display,
+                ConcealMaterializePurpose::EnterMode { requested_fs_idx } => {
+                    LocalMaterializeContinuation::EnterConceal { requested_fs_idx }
+                }
+            };
+            self.maybe_start_local_adjust_render_with_continuation(idx, continuation);
+            return;
+        }
+        let editing_this_idx = self.conceal_mode && self.fullscreen_idx == Some(idx);
+        if matches!(purpose, ConcealMaterializePurpose::Display)
+            && ((!editing_this_idx && !self.conceal_pages.contains(&idx))
+                || (self.conceal_mode && !self.conceal_preview_active))
+        {
+            return;
+        }
+        let Some((source, source_kind)) = self.current_conceal_source_pixels(idx).or_else(|| {
+            editing_this_idx
+                .then(|| {
+                    self.conceal_base_cache
+                        .get(&idx)
+                        .map(|pixels| (Arc::clone(pixels), "edit_base"))
+                })
+                .flatten()
+        }) else {
+            return;
+        };
+        let [w, h] = source.size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let key = self.current_edit_result_key(idx);
+        let request = EditMaterializeRequest {
+            items_generation: self.items_generation,
+            input_seq: self.input_seq,
+            kind: EditMaterializeKind::Conceal { key, purpose },
+        };
+        if let Some(pending) = self.local_adjust_pending.get(&idx) {
+            if pending.request.items_generation == request.items_generation
+                && pending.request.kind == request.kind
+                || matches!(
+                    pending.request.kind,
+                    EditMaterializeKind::Conceal {
+                        purpose: ConcealMaterializePurpose::EnterMode { .. },
+                        ..
+                    }
+                ) && matches!(purpose, ConcealMaterializePurpose::Display)
+            {
+                return;
+            }
+        }
+
+        let mask_source = if matches!(purpose, ConcealMaterializePurpose::Display)
+            && editing_this_idx
+            && self.conceal_mask.is_some()
+        {
+            ConcealMaterializeMask::Memory {
+                bitmap: self.conceal_mask.clone().unwrap_or_default(),
+                shapes: self.conceal_shapes.clone(),
+                size: self.conceal_mask_size,
+            }
+        } else {
+            let Some(page_key) = self.page_path_key(idx) else {
+                return;
+            };
+            ConcealMaterializeMask::Database {
+                path: crate::conceal_db::ConcealDb::db_path(),
+                page_key,
+            }
+        };
+        let preset = matches!(purpose, ConcealMaterializePurpose::Display)
+            .then(|| self.current_conceal_preset_from_settings());
+        self.cancel_local_adjust_pending_for_idx(idx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("conceal-materialize".to_string())
+            .spawn(move || {
+                let result = run_conceal_materialize(
+                    request,
+                    source,
+                    source_kind,
+                    mask_source,
+                    preset,
+                    cancel_worker,
+                );
+                let _ = tx.send(result);
+            });
+        if let Err(err) = spawn_result {
+            crate::logger::log(format!("conceal: materialize worker spawn failed: {err}"));
+            return;
+        }
+        self.local_adjust_pending.insert(
+            idx,
+            LocalAdjustRenderPending {
+                request,
+                cancel,
+                rx,
+                ready: None,
+            },
+        );
+    }
+
     pub(crate) fn ensure_conceal_texture(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        self.ensure_local_adjust_layers_loaded(idx);
-        // 消しゴム編集中: 隠蔽はパイプライン下流なので、編集中は焼き込まない
-        // (= ユーザーは消しゴムマスクを見たいので、その上に紫モザイクが乗ると
-        // 視認性が落ちる)。プレビュー中もエラーザーが選んだ「inpaint 結果のみ」を
-        // 見せたいので隠蔽はスキップする (ユーザー指定: 消しゴムプレビュー = 隠蔽なし)。
-        if self.erase_mode {
+        if self.erase_mode || (self.conceal_mode && !self.conceal_preview_active) {
             return None;
         }
-        // 隠蔽編集中: デフォルトでは隠蔽をスキップして「pre-conceal データ + マスク」
-        // を見せる。プレビューボタン押下時 (`conceal_preview_active`) のみ通常通り
-        // 焼き込んで「最終結果」を見せる。
-        if self.conceal_mode && !self.conceal_preview_active {
-            return None;
-        }
-        // **編集中ページの判定**:
-        // - `conceal_mode && fullscreen_idx == Some(idx)` のとき、in-memory state
-        //   (`self.conceal_mask` + `self.conceal_shapes`) を使う。
-        // - DB は `reset_conceal_mode` でモード退出時にのみ保存されるため、
-        //   編集中は DB が stale で「描いたばかりの shape がプレビューに乗らない」
-        //   バグになる (実機 FB)。
-        // - `conceal_pages` バッジ集合に未登録 (= まだ DB に保存していないページ)
-        //   でも、編集中なら preview を出したいので、メンバー判定はこの後に分岐。
         let editing_this_idx = self.conceal_mode && self.fullscreen_idx == Some(idx);
         if !editing_this_idx && !self.conceal_pages.contains(&idx) {
             return None;
         }
         let current_gen = self.conceal_generation;
-
-        // ヒット: generation 一致なら既存テクスチャをそのまま返す (高頻度パス)。
-        // 編集中ページは前段で `clear_conceal_caches(idx)` を逐一呼ぶので、
-        // この hit が起きるのは編集していない他ページ or 編集中ページの「変更なし」
-        // 状態 (= 数フレーム同じ状態が続いたとき) のみ。
         if let Some(entry) = self.conceal_cache.get(&idx) {
             if entry.generation == current_gen {
                 return Some(entry.texture.clone());
             }
         }
-
-        // 入力ピクセル取得: spec §3.1 の優先順位 (erase_result > adj > ai > fs)。
-        // 編集中に AI アップスケールが完了することがあるため、プレビュー時も現在の
-        // 表示ソースを取り直し、下の in-memory マスク解像度補正で追従する。
-        // `conceal_base_cache` は入場時ソースなので、古い他ページの値を拾わないよう
-        // 編集中ページのフォールバックに限定する。
-        let (source_pixels, source_kind) =
-            self.current_conceal_source_pixels(idx).or_else(|| {
-                editing_this_idx
-                    .then(|| {
-                        self.conceal_base_cache
-                            .get(&idx)
-                            .map(|p| (Arc::clone(p), "edit_base"))
-                    })
-                    .flatten()
-            })?;
-        let [w, h] = source_pixels.size;
-        if w == 0 || h == 0 {
-            return None;
-        }
-
-        // マスク + Shape の取得元: 編集中ページは in-memory、それ以外は DB。
-        // 編集中に AI アップスケールが完了すると source_pixels の `[w, h]` が
-        // `self.conceal_mask_size` と変わる。通常は AI 完了 hook で in-memory state を
-        // 一度だけ追従済みだが、ドラッグ中など hook が延期したケースはここで再試行する。
-        if editing_this_idx && self.conceal_mask.is_some() && self.conceal_mask_size != [w, h] {
-            self.rescale_active_conceal_edit_to_size(idx, [w, h], "compose_source_mismatch");
-        }
-        // それでもサイズが違う場合 (ドラッグ中など) だけ一時 clone をリスケールする。
-        // DB はモード終了まで stale なので、ここで DB フォールバックすると最後に追加した
-        // オブジェクトがプレビューに乗らない。
-        let mut scaled_edit_mask = false;
-        let (bitmap, shapes) = if editing_this_idx && self.conceal_mask.is_some() {
-            // in-memory state を直接使う (DB は最終保存時のみ)。
-            let [mw, mh] = self.conceal_mask_size;
-            let mut bitmap = self.conceal_mask.as_ref().unwrap().clone();
-            let mut shapes = self.conceal_shapes.clone();
-            if [mw, mh] != [w, h] {
-                bitmap = crate::mask_db::rescale_mask(&bitmap, mw, mh, w, h);
-                let sx = w as f32 / mw.max(1) as f32;
-                let sy = h as f32 / mh.max(1) as f32;
-                debug_assert!(
-                    Self::conceal_rescale_exact_enough(&shapes, sx, sy),
-                    "non-isotropic conceal mask rescale with rotated shapes is approximate"
-                );
-                for shape in &mut shapes {
-                    shape.scale_xy(sx, sy);
-                }
-                scaled_edit_mask = true;
-            }
-            (bitmap, shapes)
-        } else {
-            // 他ページ or サイズ不一致時: DB から取得 (= モード退出時の状態)。
-            let key = self.page_path_key(idx)?;
-            let db = self.conceal_db.as_ref()?;
-            match db.get_full(&key, w, h) {
-                Some(v) => v,
-                None => {
-                    if !editing_this_idx {
-                        // バッジ集合に居るが DB に実体が無い (race / 外部削除など)。
-                        // 集合からも外して以降の試行を止める。
-                        self.conceal_pages.remove(&idx);
-                        Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
-                    }
-                    return None;
-                }
-            }
-        };
-        if !bitmap.iter().any(|&b| b) && shapes.is_empty() {
-            // 実質空マスク。バッジから外す。
-            self.conceal_pages.remove(&idx);
-            if let Some(key) = self.page_path_key(idx) {
-                Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
-            }
-            return None;
-        }
-
-        // ビットマップ + Shape をラスタライズしてマスク確定
-        let mut composite = bitmap;
-        crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
-        // composite が全 false (= subtract-only / shape が bitmap を上書き) のときも
-        // 実質空マスクとして bage を外して合成スキップ。erase 側の対称処理
-        // (ensure_erase_result_texture) と合わせる (Phase 1-5 code-review CONFIRMED)。
-        if !composite.iter().any(|&b| b) {
-            if !editing_this_idx {
-                self.conceal_pages.remove(&idx);
-                if let Some(key) = self.page_path_key(idx) {
-                    Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
-                }
-            }
-            return None;
-        }
-
-        let compose_t0 = std::time::Instant::now();
-
-        let composed = crate::conceal_compose::compose_with_preset(
-            source_pixels.as_ref(),
-            &composite,
-            &self.current_conceal_preset_from_settings(),
-        );
-        let compose_ms = compose_t0.elapsed().as_secs_f64() * 1000.0;
-
-        let upload_t0 = std::time::Instant::now();
-        let tex = ctx.load_texture(
-            format!("conceal_{idx}_g{current_gen}"),
-            composed.clone(),
-            DISPLAY_IMAGE_TEXTURE_OPTIONS,
-        );
-        let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
-        if scaled_edit_mask || compose_ms >= 80.0 || upload_ms >= 80.0 {
-            crate::logger::log(format!(
-                "conceal: compose idx={idx} type={:?} source={source_kind} {w}x{h} edit_mask={}x{} shapes={} scaled_edit={} compose={:.0}ms upload={:.0}ms",
-                self.settings.conceal_type,
-                self.conceal_mask_size[0],
-                self.conceal_mask_size[1],
-                shapes.len(),
-                scaled_edit_mask,
-                compose_ms,
-                upload_ms,
-            ));
-        }
-        self.conceal_cache.insert(
-            idx,
-            ConcealCacheEntry {
-                pixels: Arc::new(composed),
-                texture: tex.clone(),
-                generation: current_gen,
-            },
-        );
-        Some(tex)
+        self.maybe_start_conceal_materialize(idx, ConcealMaterializePurpose::Display);
+        None
     }
 
     fn current_edit_result_key(&self, idx: usize) -> EditResultKey {
@@ -49252,22 +49951,46 @@ impl App {
             if entry.texture.is_some() {
                 return Some((key, Arc::clone(&entry.pixels)));
             }
-            // 先読みで CPU 専用に積まれていた → 表示に入るので今テクスチャを焼く。
             let pixels = Arc::clone(&entry.pixels);
-            let texture = upload_edit_result_texture(ctx, &key, &pixels);
-            if let Some(e) = self.edit_result_cache.get_mut(&key) {
-                e.texture = Some(texture);
+            if self.last_edit_materialize_upload_frame != self.frame_counter {
+                self.last_edit_materialize_upload_frame = self.frame_counter;
+                let upload_t0 = std::time::Instant::now();
+                let texture = upload_edit_result_texture(ctx, &key, &pixels);
+                emit_edit_materialize_ms(
+                    "upload",
+                    "edit_result",
+                    self.page_path_key(idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
+                );
+                if let Some(e) = self.edit_result_cache.get_mut(&key) {
+                    e.texture = Some(texture);
+                }
             }
             return Some((key, pixels));
         }
 
         let pixels = self.assemble_edit_result_pixels(ctx, idx)?;
-        let texture = upload_edit_result_texture(ctx, &key, &pixels);
+        let texture = if self.last_edit_materialize_upload_frame != self.frame_counter {
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+            let upload_t0 = std::time::Instant::now();
+            let texture = upload_edit_result_texture(ctx, &key, &pixels);
+            emit_edit_materialize_ms(
+                "upload",
+                "edit_result",
+                self.page_path_key(idx).as_deref(),
+                self.input_seq,
+                upload_t0,
+            );
+            Some(texture)
+        } else {
+            None
+        };
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
                 pixels: Arc::clone(&pixels),
-                texture: Some(texture),
+                texture,
             },
         );
         Some((key, pixels))
@@ -49316,9 +50039,16 @@ impl App {
             self.current_raw_source_pixels(idx)?
         };
 
-        if self.ensure_local_adjust_layers_loaded(idx) && self.has_active_local_adjust_layers(idx) {
+        if self.local_adjust_pages.contains(&idx)
+            || self.local_adjust_page_layers.contains_key(&idx)
+        {
             self.maybe_start_local_adjust_render(idx);
-            pixels = self.current_local_adjust_pixels(idx)?;
+            if !self.local_adjust_page_layers.contains_key(&idx) {
+                return None;
+            }
+            if self.has_active_local_adjust_layers(idx) {
+                pixels = self.current_local_adjust_pixels(idx)?;
+            }
         }
 
         let should_apply_conceal = self.conceal_pages.contains(&idx)
@@ -49326,11 +50056,9 @@ impl App {
                 && self.conceal_preview_active
                 && self.fullscreen_idx == Some(idx));
         if should_apply_conceal {
-            if self.ensure_conceal_texture(ctx, idx).is_some()
-                && let Some(entry) = self.conceal_cache.get(&idx)
-            {
-                pixels = Arc::clone(&entry.pixels);
-            }
+            let _ = self.ensure_conceal_texture(ctx, idx);
+            let entry = self.conceal_cache.get(&idx)?;
+            pixels = Arc::clone(&entry.pixels);
         }
         // crop は表示パイプラインでは適用しない (暗転 overlay のみ)。実際の切り出しは
         // capture / export の最終段で `export_crop_rect_for_pixels` を使って行う。
