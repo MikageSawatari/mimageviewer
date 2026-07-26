@@ -25662,7 +25662,7 @@ impl App {
             self.texture_backlog.push(crate::thumb_loader::ThumbMsg {
                 idx,
                 image: Some((**image).clone()),
-                from_cache: true,
+                origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: Some((width as u32, height as u32)),
@@ -27163,7 +27163,7 @@ impl App {
                         let _ = tx_w.send(crate::thumb_loader::ThumbMsg {
                             idx: req.idx,
                             image: None,
-                            from_cache: false,
+                            origin: crate::thumb_loader::ThumbLoadOrigin::Source,
                             from_edit_preview: false,
                             edit_preview_adjustment: None,
                             source_dims: None,
@@ -27492,13 +27492,13 @@ impl App {
                         s.record_failed();
                     }
                 }
-                // 動画 Shell API はアップグレード経路を持たないので from_cache = false。
+                // 動画 Shell API はアップグレード経路を持たないので Source origin。
                 // ピクセル寸法は取得できない。動画ロードは LoadRequest を経由しないため
                 // input_seq は動画スレッドでは未使用 (計装経路でエンキューされない)。
                 let _ = tx.send(crate::thumb_loader::ThumbMsg {
                     idx,
                     image: ci,
-                    from_cache: false,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::Source,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -27560,7 +27560,7 @@ impl App {
             let crate::thumb_loader::ThumbMsg {
                 idx: i,
                 image: color_image_opt,
-                from_cache,
+                origin,
                 from_edit_preview,
                 edit_preview_adjustment,
                 source_dims,
@@ -27569,6 +27569,8 @@ impl App {
                 input_seq: req_input_seq,
                 items_gen: msg_items_gen,
             } = msg;
+            let from_cache = origin.from_cache();
+            let blocks_idle_upgrade = origin.blocks_idle_upgrade();
             // 世代不一致 (旧 items 由来) のメッセージは破棄する。items 差し替え後に
             // 旧ワーカー結果が同じ idx の新 items に適用されるとサムネが化けるため。
             // 全エンキュー経路 (通常 / idle upgrade / 動画スレッド) で現世代をスナップ
@@ -27665,8 +27667,8 @@ impl App {
                         && textures_created < MAX_TEXTURES_PER_FRAME
                         && !defer_texture_uploads
                     {
-                        // from_cache=true: 1 ショット経路 (cache save なし) → 即 remove。
-                        // from_cache=false: from-source 経路。cache save 完了後の
+                        // cache origin: 1 ショット経路 (cache save なし) → 即 remove。
+                        // source origin: from-source 経路。cache save 完了後の
                         //   第 2 シグナル (canceled=true) 到着まで `requested` を保持。
                         //   cache save 進行中の再エンキュー + 二重レンダを防ぐ。
                         if from_cache {
@@ -27713,9 +27715,13 @@ impl App {
                         // 新しいピクセルに差し替わったので、古い補正済みテクスチャは捨てる。
                         // 次フレームで `maybe_apply_thumb_adjustment` により再生成される。
                         self.thumb_adjust_tex.remove(&i);
-                        // Loaded の実体が差し替わるため、以前の完成済みキャッシュ判定は
-                        // 失効させる。新しい状態が必要なら次の idle 判定で再評価する。
-                        self.idle_upgrade_cache_bypass_ineligible.remove(&i);
+                        // 完成済み派生 WebP は元 PDF/ZIP 等へ idle quality-upgrade
+                        // しない。通常 cache / source へ差し替わった場合は解除する。
+                        if blocks_idle_upgrade {
+                            self.idle_upgrade_cache_bypass_ineligible.insert(i);
+                        } else {
+                            self.idle_upgrade_cache_bypass_ineligible.remove(&i);
+                        }
                         self.thumbnails[i] = ThumbnailState::Loaded {
                             tex: handle,
                             from_cache,
@@ -27800,7 +27806,7 @@ impl App {
                         self.texture_backlog.push(crate::thumb_loader::ThumbMsg {
                             idx: i,
                             image: Some(color_image),
-                            from_cache,
+                            origin,
                             from_edit_preview,
                             edit_preview_adjustment,
                             source_dims,
@@ -28818,7 +28824,8 @@ impl App {
     /// - `reload_queue` が空で `requested` も空 (他の作業が全て終わっている)
     ///
     /// アップグレード対象:
-    /// 1. `Loaded { from_cache: true }` — キャッシュ (WebP q=75) 由来で画質劣化
+    /// 1. `Loaded { from_cache: true }` — キャッシュ (WebP q=75) 由来で画質劣化。
+    ///    ただし `FinalCache` origin は対象外集合に記録される
     /// 2. `Loaded { rendered_at_px < current_display_px * 0.8 }` —
     ///    列数変更などで現在のセルサイズより 20% 以上小さい解像度で生成されている
     ///
@@ -59897,17 +59904,13 @@ fn container_cache_base_key(
 ) -> Option<String> {
     let (path, prefix) = match item {
         GridItem::Folder(p) => {
-            let identity = if use_full_path {
-                p.to_string_lossy().into_owned()
-            } else {
-                p.file_name().and_then(|n| n.to_str())?.to_string()
-            };
             let sort = folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric);
-            return Some(crate::thumb_loader::folder_thumb_auto_cache_key(
-                &identity,
+            return crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+                p,
+                use_full_path,
                 sort,
                 folder_thumb_depth,
-            ));
+            );
         }
         GridItem::ZipFile(p) => (p, CACHE_KEY_ZIP),
         GridItem::PdfFile(p) => (p, CACHE_KEY_PDF),

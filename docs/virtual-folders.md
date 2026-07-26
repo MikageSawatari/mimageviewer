@@ -482,6 +482,15 @@ cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解�
   - `folder_thumb_existing_keys_for` も同じ cascade を実行して existing_keys に leaf
     pinned_key を含める。これをしないと delete_missing が cascade 由来の cache 行を
     毎ロード掃除してしまう (Phase D 後のバグ修正 / 二重実装で識別)。
+  - **実フォルダ再帰の cache-only 境界**: 上位 Folder の既存代表 cache hit は従来どおり
+    再探索しない。miss して `resolve_folder_thumb_image` が子フォルダを辿る場合、非 Image
+    leaf (PDF / ZIP / Video / 仮想ページ) は、子フォルダが直上一覧で作った
+    `folderthumb:auto-v2:{sort}:d{depth}:{child}#pin:{source_id}` の完全一致 WebP だけを
+    直上 catalog から読み取り専用で再利用する。DB / 行が無い、metadata 不一致、WebP
+    decode 失敗では空 DB を作らず、PDF render・ZIP 列挙・動画抽出もせず標準の画像
+    auto-pick へ戻る。採用した WebP は通常の cache policy に従って現在の上位 catalog
+    へミラーできるが、完成済み派生 cache として idle quality-upgrade の対象外にする。
+    したがってサムネイル削除は、深い pin の自動再生成や伝播を発生させない
 - **container/source の compat check**: `pin_source_compatible_with_container`
   で DB 汚染や将来の schema 拡張による不整合 (ZipFile container に PdfPage source 等) を
   弾き、`base_req` にフォールバックする。

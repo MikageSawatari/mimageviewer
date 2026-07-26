@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 const CATALOG_VERSION: &str = "2";
@@ -93,6 +93,25 @@ impl CatalogDb {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// 既存 catalog だけを読み取り専用で開く。
+    ///
+    /// 再帰フォルダ代表の cache-only 伝播では、キャッシュ削除後に空 DB を作り直すと
+    /// 「キャッシュがある」ように見えてしまうため、ファイルが無い場合は `Ok(None)` を返す。
+    /// 呼び出し元はサムネイル重 I/O worker に限定し、UI スレッドから cold open しないこと。
+    pub fn open_existing_read_only(
+        cache_dir: &Path,
+        folder_path: &Path,
+    ) -> rusqlite::Result<Option<Self>> {
+        let db_path = db_path_for(cache_dir, folder_path);
+        if !db_path.try_exists().unwrap_or(false) {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Some(Self {
+            conn: Mutex::new(conn),
+        }))
     }
 
     /// DB 内の全エントリを HashMap<filename, CacheEntry> として返す（一括 SELECT）。

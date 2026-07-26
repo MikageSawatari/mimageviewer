@@ -143,6 +143,25 @@ pub fn folder_thumb_auto_cache_key(
     )
 }
 
+/// Folder item の自動代表 cache key を、通常一覧と再帰 cache-only 参照で同じ規則から作る。
+///
+/// ドライブルートや集約ビューは同名衝突を避けるため full path、それ以外は basename を
+/// identity にする。再帰探索側は物理フォルダだけを扱うため、直上がドライブ / share root
+/// かどうかから `use_full_path` を決めてこの helper を呼ぶ。
+pub fn folder_thumb_auto_cache_key_for_path(
+    path: &Path,
+    use_full_path: bool,
+    sort: crate::settings::SortOrder,
+    depth: u32,
+) -> Option<String> {
+    let identity = if use_full_path {
+        path.to_string_lossy().into_owned()
+    } else {
+        path.file_name().and_then(|name| name.to_str())?.to_owned()
+    };
+    Some(folder_thumb_auto_cache_key(&identity, sort, depth))
+}
+
 // -----------------------------------------------------------------------
 // 共通型
 // -----------------------------------------------------------------------
@@ -153,17 +172,38 @@ pub struct ThumbEditPreviewAdjustment {
     pub annotation_layers: Vec<crate::edit_preview_cache::CachedAnnotationLayer>,
 }
 
+/// UI へ渡すサムネイル画像の生成元。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbLoadOrigin {
+    /// 元画像 / ZIP entry / PDF render / 動画 Shell API から得た完成画像。
+    Source,
+    /// 通常の WebP cache hit。元ソースからの idle quality-upgrade が可能。
+    UpgradeableCache,
+    /// 編集 preview、drive-list、再帰 pin 伝播など、WebP 自体を完成ソースとして扱う画像。
+    /// UI は `from_cache=true` として保持するが、idle quality-upgrade へ再投入しない。
+    FinalCache,
+}
+
+impl ThumbLoadOrigin {
+    pub fn from_cache(self) -> bool {
+        !matches!(self, Self::Source)
+    }
+
+    pub fn blocks_idle_upgrade(self) -> bool {
+        matches!(self, Self::FinalCache)
+    }
+}
+
 /// サムネイル読み込み結果メッセージ。
 ///
 /// ワーカースレッドが UI スレッドに送る。フィールドを位置に頼らず名前で判別できる
-/// ように struct で保持している (`bool` が隣接するため tuple だと取り違えやすい)。
+/// ように struct で保持している。
 pub struct ThumbMsg {
     pub idx: usize,
     /// デコード成功時のピクセル。キャンセル / 失敗時は None。
     pub image: Option<egui::ColorImage>,
-    /// true: WebP キャッシュから復元 (段階 E アップグレード対象)。
-    /// false: 元画像から直接デコード (高画質) または動画 Shell API。
-    pub from_cache: bool,
+    /// 元ソース / 高画質化可能 cache / 完成済み派生 cache の区別。
+    pub origin: ThumbLoadOrigin,
     /// true: 非破壊編集結果のプレビューキャッシュから復元。
     pub from_edit_preview: bool,
     /// `from_edit_preview` のとき、色調補正を下地だけへ掛けてから注釈を戻すためのデータ。
@@ -811,7 +851,7 @@ fn send_thumb_failed(req: &LoadRequest, tx: &mpsc::Sender<ThumbMsg>, gen_done: &
     let _ = tx.send(ThumbMsg {
         idx: req.idx,
         image: None,
-        from_cache: false,
+        origin: ThumbLoadOrigin::Source,
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims: None,
@@ -857,7 +897,7 @@ fn send_pinned_only_cached(
     let _ = tx.send(ThumbMsg {
         idx: req.idx,
         image: ci,
-        from_cache: true,
+        origin: ThumbLoadOrigin::FinalCache,
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims,
@@ -877,9 +917,9 @@ fn send_pinned_only_cached(
 /// 段階 B: 1 つの `LoadRequest` を処理する。
 ///
 /// - 通常: `cache_map` を参照しキャッシュヒットしていれば WebP を復号して送信する
-///   (`from_cache = true`)
+///   (`ThumbLoadOrigin::UpgradeableCache`)
 /// - ミスまたは `req.skip_cache = true`: `load_one_cached` に委譲してフルデコード
-///   (`from_cache = false`、段階 E のアップグレード経路)
+///   (`ThumbLoadOrigin::Source`、段階 E のアップグレード経路)
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_request(
     req: &LoadRequest,
@@ -961,7 +1001,7 @@ pub fn process_load_request(
         let _ = tx.send(ThumbMsg {
             idx: req.idx,
             image: Some(image),
-            from_cache: true,
+            origin: ThumbLoadOrigin::FinalCache,
             from_edit_preview: true,
             edit_preview_adjustment: Some(ThumbEditPreviewAdjustment {
                 base: preview.adjustment_base,
@@ -1018,13 +1058,13 @@ pub fn process_load_request(
                 }
             });
             let cache_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
-            // from_cache = true: アップグレード対象
+            // 通常 cache hit: 元ソースからの idle quality-upgrade 対象
             // source_dims はカタログ由来 (旧バージョンで作成された
             // エントリには None が入っている)
             let _ = tx.send(ThumbMsg {
                 idx: req.idx,
                 image: ci,
-                from_cache: true,
+                origin: ThumbLoadOrigin::UpgradeableCache,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims,
@@ -1063,7 +1103,7 @@ pub fn process_load_request(
     }
 
     // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
-    // load_one_cached は from_cache = false を送信する
+    // load_one_cached は Source origin を送信する
 
     // 重い I/O (Folder / ZipFile / ConvertibleArchive / ZipDir) は専用 I/O ワーカーキューで処理されるため、
     // セマフォは不要。I/O ワーカー数 (1-2) で自然に同時実行数が制限される。
@@ -1097,12 +1137,12 @@ pub fn process_load_request(
     );
     let needs_heavy_io = is_folder_thumb || is_zip_thumb || is_zip_dir_thumb;
 
-    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え。
+    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替える。
     // pin-aware: 再帰中に見つけたサブフォルダに pin があれば cascade 解決して
-    // leaf 画像を採用する (= auto-pick が経由する子フォルダの pin を尊重)。
-    let resolved_folder_image = if is_folder_thumb {
+    // leaf 画像、またはその子用に既に生成済みの pin WebP を採用する。
+    let (resolved_folder_image, cached_pinned_folder_thumb) = if is_folder_thumb {
         let t_resolve = std::time::Instant::now();
-        let img = resolve_folder_thumb_image(
+        let resolution = resolve_folder_thumb_image(
             &req.path,
             req.folder_thumb_sort
                 .unwrap_or(crate::settings::SortOrder::Numeric),
@@ -1117,25 +1157,28 @@ pub fn process_load_request(
                 req.path.display(),
             ));
         }
-        if img.is_none() {
-            let _ = tx.send(ThumbMsg {
-                idx: req.idx,
-                image: None,
-                from_cache: false,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: req.input_seq,
-                items_gen: req.items_gen,
-            });
-            gen_done.fetch_add(1, Ordering::Relaxed);
-            return;
+        match resolution {
+            Some(FolderThumbResolution::Image(path)) => (Some(path), None),
+            Some(FolderThumbResolution::CachedPinned(cached)) => (None, Some(cached)),
+            None => {
+                let _ = tx.send(ThumbMsg {
+                    idx: req.idx,
+                    image: None,
+                    origin: ThumbLoadOrigin::Source,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
+                    source_dims: None,
+                    canceled: false,
+                    finalized: false,
+                    input_seq: req.input_seq,
+                    items_gen: req.items_gen,
+                });
+                gen_done.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
-        img
     } else {
-        None
+        (None, None)
     };
     let load_path: &Path = resolved_folder_image.as_deref().unwrap_or(&req.path);
 
@@ -1199,7 +1242,7 @@ pub fn process_load_request(
                 let _ = tx.send(ThumbMsg {
                     idx: req.idx,
                     image: None,
-                    from_cache: false,
+                    origin: ThumbLoadOrigin::Source,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -1234,7 +1277,7 @@ pub fn process_load_request(
                 let _ = tx.send(ThumbMsg {
                     idx: req.idx,
                     image: None,
-                    from_cache: false,
+                    origin: ThumbLoadOrigin::Source,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -1281,7 +1324,7 @@ pub fn process_load_request(
             let _ = tx.send(ThumbMsg {
                 idx: req.idx,
                 image: None,
-                from_cache: false,
+                origin: ThumbLoadOrigin::Source,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
@@ -1293,6 +1336,88 @@ pub fn process_load_request(
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
+    }
+
+    // 再帰先の非画像 pin は、直上一覧で生成済みだった WebP を完成ソースとして使う。
+    // DB miss / stale / decode failure は resolver 側で従来の画像 auto-pick へ戻っており、
+    // ここから PDF render や ZIP scan を起動することはない。
+    if let Some(cached) = cached_pinned_folder_thumb {
+        let policy_should_save =
+            cache_decision.should_cache(&cached.source_path, cached.source_file_size, 0.0, 0.0);
+        let should_save = catalog_ref.is_some() && (req.force_cache || policy_should_save);
+        let mut mirrored = false;
+        if should_save {
+            let cat = catalog_ref.expect("should_save => catalog is Some");
+            match cat.save_thumb_bytes(
+                filename,
+                req.mtime,
+                req.file_size,
+                cached.source_dims,
+                &cached.webp_data,
+            ) {
+                Ok(true) => {
+                    if let Ok(mut map) = cache_map.write() {
+                        map.insert(
+                            filename.to_owned(),
+                            crate::catalog::CacheEntry {
+                                mtime: req.mtime,
+                                file_size: req.file_size,
+                                jpeg_data: cached.webp_data.clone(),
+                                source_dims: cached.source_dims,
+                            },
+                        );
+                    }
+                    mirrored = true;
+                }
+                Ok(false) => {
+                    crate::logger::log(format!(
+                        "    idx={:>4} recursive pin cache mirror skipped: invalid bytes  {}",
+                        req.idx, cached.cache_key
+                    ));
+                }
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "    idx={:>4} recursive pin cache mirror failed: {error}  {}",
+                        req.idx, cached.cache_key
+                    ));
+                }
+            }
+        }
+        let _ = tx.send(ThumbMsg {
+            idx: req.idx,
+            image: Some(cached.image),
+            origin: ThumbLoadOrigin::FinalCache,
+            from_edit_preview: false,
+            edit_preview_adjustment: None,
+            source_dims: cached.source_dims,
+            canceled: false,
+            finalized: false,
+            input_seq: req.input_seq,
+            items_gen: req.items_gen,
+        });
+        gen_done.fetch_add(1, Ordering::Relaxed);
+        crate::logger::log(format!(
+            "    idx={:>4} recursive_pin_cache_hit mirrored={} source={}/{}  {}",
+            req.idx, mirrored, cached.source_mtime, cached.source_file_size, cached.cache_key
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "thumb",
+                "decode_end",
+                Some(filename),
+                req.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(req.idx)),
+                    (
+                        "ms",
+                        serde_json::Value::from(req_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("from_cache", serde_json::Value::from(true)),
+                    ("recursive_pin_cache", serde_json::Value::from(true)),
+                ],
+            );
+        }
+        return;
     }
 
     // PDF ページの stale チェック:
@@ -1323,7 +1448,7 @@ pub fn process_load_request(
             let _ = tx.send(ThumbMsg {
                 idx: req.idx,
                 image: None,
-                from_cache: false,
+                origin: ThumbLoadOrigin::Source,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
@@ -1988,7 +2113,91 @@ pub fn spawn_pdf_neighbor_prefetch(
     queue.cv.notify_one();
 }
 
-/// フォルダ内をスキャンして代表画像のパスを返す。
+/// フォルダ代表の解決結果。
+///
+/// 再帰先の pin が PDF / ZIP 等を指す場合、その子フォルダの表示用に既に生成済みの
+/// WebP だけを採用できる。元コンテナへ戻って生成してはいけないため、通常の画像パスと
+/// 完成済み cache を型で分ける。
+enum FolderThumbResolution {
+    Image(std::path::PathBuf),
+    CachedPinned(CachedPinnedFolderThumb),
+}
+
+struct CachedPinnedFolderThumb {
+    image: egui::ColorImage,
+    webp_data: Vec<u8>,
+    source_dims: Option<(u32, u32)>,
+    source_path: std::path::PathBuf,
+    source_mtime: i64,
+    source_file_size: i64,
+    cache_key: String,
+}
+
+/// `child_folder` が直上の一覧で表示されたときの pin WebP を完全一致キーで読む。
+///
+/// この経路は cache-only。DB ファイルや行が無い、metadata が古い、WebP が壊れている
+/// 場合はいずれも `None` とし、呼び出し元が従来の自動選定へ戻る。PDF render / ZIP scan
+/// など元ソースの生成処理は一切呼ばない。
+fn load_cached_pinned_folder_thumb(
+    cache_dir: &Path,
+    parent_folder: &Path,
+    child_folder: &Path,
+    sort: crate::settings::SortOrder,
+    configured_depth: u32,
+    resolved: &crate::folder_thumb_pins::ResolvedPinTarget,
+) -> Option<CachedPinnedFolderThumb> {
+    let use_full_path = crate::path_key::is_drive_or_share_root(parent_folder);
+    let base_key =
+        folder_thumb_auto_cache_key_for_path(child_folder, use_full_path, sort, configured_depth)?;
+    let cache_key = format!("{base_key}{CACHE_KEY_PIN_SUFFIX}{}", resolved.source_id);
+    let catalog = match crate::catalog::CatalogDb::open_existing_read_only(cache_dir, parent_folder)
+    {
+        Ok(Some(catalog)) => catalog,
+        Ok(None) => return None,
+        Err(error) => {
+            crate::logger::log(format!(
+                "  recursive pin cache open failed: folder={} error={error}",
+                parent_folder.display()
+            ));
+            return None;
+        }
+    };
+    let entry = match catalog.load_one(&cache_key) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return None,
+        Err(error) => {
+            crate::logger::log(format!(
+                "  recursive pin cache lookup failed: key={cache_key} error={error}"
+            ));
+            return None;
+        }
+    };
+    if entry.mtime != resolved.mtime || entry.file_size != resolved.file_size {
+        crate::logger::log(format!(
+            "  recursive pin cache stale: key={cache_key} cached={}/{} source={}/{}",
+            entry.mtime, entry.file_size, resolved.mtime, resolved.file_size
+        ));
+        return None;
+    }
+    let Some(image) = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data) else {
+        crate::logger::log(format!(
+            "  recursive pin cache decode failed: key={cache_key}"
+        ));
+        return None;
+    };
+    crate::logger::log(format!("  recursive pin cache hit: key={cache_key}"));
+    Some(CachedPinnedFolderThumb {
+        image,
+        webp_data: entry.jpeg_data,
+        source_dims: entry.source_dims,
+        source_path: resolved.abs_path.clone(),
+        source_mtime: resolved.mtime,
+        source_file_size: resolved.file_size,
+        cache_key,
+    })
+}
+
+/// フォルダ内をスキャンして代表画像、または再利用可能な pin WebP を返す。
 /// `sort` で指定されたソート順でフォルダブロックと画像ブロックをそれぞれ並べ、
 /// サムネイル一覧に近い順序 (フォルダ → 画像) で最初に見つかった画像を選ぶ。
 /// サブフォルダ再帰は最大 `remaining_depth` 階層。
@@ -2002,19 +2211,46 @@ fn resolve_folder_thumb_image(
     sort: crate::settings::SortOrder,
     remaining_depth: u32,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-) -> Option<std::path::PathBuf> {
-    let result = resolve_folder_thumb_image_inner(folder, sort, remaining_depth, pin_db);
+) -> Option<FolderThumbResolution> {
+    resolve_folder_thumb_image_with_cache_dir(
+        folder,
+        sort,
+        remaining_depth,
+        pin_db,
+        &crate::catalog::default_cache_dir(),
+    )
+}
+
+fn resolve_folder_thumb_image_with_cache_dir(
+    folder: &Path,
+    sort: crate::settings::SortOrder,
+    remaining_depth: u32,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    cache_dir: &Path,
+) -> Option<FolderThumbResolution> {
+    let result = resolve_folder_thumb_image_inner(
+        folder,
+        sort,
+        remaining_depth,
+        remaining_depth,
+        pin_db,
+        cache_dir,
+    );
     // pin 経路の切り分け用診断ログ (= 最上位 entry 点のみ。再帰ステップ内側は出さない)
+    let result_label = match result.as_ref() {
+        Some(FolderThumbResolution::Image(path)) => path.display().to_string(),
+        Some(FolderThumbResolution::CachedPinned(cached)) => {
+            format!("<cached-pin:{}>", cached.cache_key)
+        }
+        None => "<none>".to_string(),
+    };
     crate::logger::log(format!(
         "  resolve_folder_thumb_image: folder={} sort={:?} depth={} pin_aware={} -> {}",
         folder.display(),
         sort,
         remaining_depth,
         pin_db.is_some(),
-        result
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string()),
+        result_label,
     ));
     result
 }
@@ -2023,8 +2259,10 @@ fn resolve_folder_thumb_image_inner(
     folder: &Path,
     sort: crate::settings::SortOrder,
     remaining_depth: u32,
+    configured_depth: u32,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-) -> Option<std::path::PathBuf> {
+    cache_dir: &Path,
+) -> Option<FolderThumbResolution> {
     fn mtime_for_sort(entry: &std::fs::DirEntry, sort: crate::settings::SortOrder) -> i64 {
         match sort {
             crate::settings::SortOrder::DateAsc | crate::settings::SortOrder::DateDesc => entry
@@ -2091,13 +2329,13 @@ fn resolve_folder_thumb_image_inner(
                             sub,
                             &source,
                             lookup,
-                            remaining_depth as usize,
+                            configured_depth as usize,
                         )
                     {
                         use crate::folder_thumb_pins::ResolvedKind;
                         match resolved.kind {
                             ResolvedKind::Image => {
-                                return Some(resolved.abs_path);
+                                return Some(FolderThumbResolution::Image(resolved.abs_path));
                             }
                             ResolvedKind::Folder => {
                                 // cascade が pin 無し Folder leaf に到達。
@@ -2106,25 +2344,42 @@ fn resolve_folder_thumb_image_inner(
                                     &resolved.abs_path,
                                     sort,
                                     remaining_depth - 1,
+                                    configured_depth,
                                     pin_db,
+                                    cache_dir,
                                 ) {
                                     return Some(img);
                                 }
                                 // 見つからなければ次のサブフォルダへ
                                 continue;
                             }
-                            // Video / ZipEntry / PdfPage / ZipFirstImage / PdfFirstPage:
-                            // PathBuf として返せないので、pin を尊重できない。
-                            // 標準再帰にフォールバックする。
-                            _ => {}
+                            // 非画像 pin は元ソースを生成せず、その子が直上一覧で既に
+                            // 生成した完全一致 WebP だけを使う。無ければ従来の標準再帰へ。
+                            _ => {
+                                if let Some(cached) = load_cached_pinned_folder_thumb(
+                                    cache_dir,
+                                    folder,
+                                    sub,
+                                    sort,
+                                    configured_depth,
+                                    &resolved,
+                                ) {
+                                    return Some(FolderThumbResolution::CachedPinned(cached));
+                                }
+                            }
                         }
                     }
                 }
             }
             // 標準再帰 (pin 無し or 非 Image/Folder pin)
-            if let Some(img) =
-                resolve_folder_thumb_image_inner(sub, sort, remaining_depth - 1, pin_db)
-            {
+            if let Some(img) = resolve_folder_thumb_image_inner(
+                sub,
+                sort,
+                remaining_depth - 1,
+                configured_depth,
+                pin_db,
+                cache_dir,
+            ) {
                 return Some(img);
             }
         }
@@ -2145,7 +2400,9 @@ fn resolve_folder_thumb_image_inner(
             .into_iter()
             .map(|(path, mtime, _)| (path, mtime))
             .collect();
-        return Some(images.into_iter().next().unwrap().0);
+        return Some(FolderThumbResolution::Image(
+            images.into_iter().next().unwrap().0,
+        ));
     }
 
     None
@@ -2493,7 +2750,7 @@ pub fn load_one_cached(
                 let _ = tx.send(ThumbMsg {
                     idx,
                     image: None,
-                    from_cache: false,
+                    origin: ThumbLoadOrigin::Source,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -2509,7 +2766,7 @@ pub fn load_one_cached(
             let _ = tx.send(ThumbMsg {
                 idx,
                 image: None,
-                from_cache: false,
+                origin: ThumbLoadOrigin::Source,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
@@ -2588,7 +2845,7 @@ pub fn load_one_cached(
     let _ = tx.send(ThumbMsg {
         idx,
         image: Some(display_ci),
-        from_cache: false,
+        origin: ThumbLoadOrigin::Source,
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims,
@@ -2692,7 +2949,7 @@ pub fn load_one_cached(
     let _ = tx.send(ThumbMsg {
         idx,
         image: None,
-        from_cache: false,
+        origin: ThumbLoadOrigin::Source,
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims: None,
@@ -3244,6 +3501,180 @@ mod tests {
         assert_ne!(numeric, depth);
     }
 
+    fn resolved_image_path(result: Option<FolderThumbResolution>) -> Option<PathBuf> {
+        match result {
+            Some(FolderThumbResolution::Image(path)) => Some(path),
+            Some(FolderThumbResolution::CachedPinned(_)) | None => None,
+        }
+    }
+
+    struct PdfPinFixture {
+        root: PathBuf,
+        child: PathBuf,
+        pdf: PathBuf,
+        fallback: PathBuf,
+        cache_dir: PathBuf,
+        pin_db: crate::folder_thumb_pins::FolderThumbPinDb,
+        resolved: crate::folder_thumb_pins::ResolvedPinTarget,
+    }
+
+    fn prepare_pdf_pin_fixture(tmp: &TempDir, depth: u32) -> PdfPinFixture {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let root = tmp.path().join("library");
+        let child = root.join("01-child");
+        std::fs::create_dir_all(&child).unwrap();
+        let pdf = child.join("book.pdf");
+        std::fs::write(&pdf, b"fake pdf bytes").unwrap();
+        let fallback = root.join("99-fallback.jpg");
+        std::fs::write(&fallback, b"not decoded").unwrap();
+        let pin_db =
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+                .unwrap();
+        let source = FolderPinSource::File {
+            rel: "book.pdf".to_owned(),
+            kind: FileKind::PdfFile,
+        };
+        pin_db.set(&child, &source).unwrap();
+        let resolved = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+            &child,
+            &source,
+            |path| pin_db.lookup(path),
+            depth as usize,
+        )
+        .unwrap();
+        PdfPinFixture {
+            root,
+            child,
+            pdf,
+            fallback,
+            cache_dir: tmp.path().join("cache"),
+            pin_db,
+            resolved,
+        }
+    }
+
+    fn save_pdf_pin_webp(fixture: &PdfPinFixture, depth: u32, bytes: &[u8]) -> String {
+        let base_key =
+            folder_thumb_auto_cache_key_for_path(&fixture.child, false, SortOrder::Numeric, depth)
+                .unwrap();
+        let cache_key = format!(
+            "{base_key}{CACHE_KEY_PIN_SUFFIX}{}",
+            fixture.resolved.source_id
+        );
+        let catalog = crate::catalog::CatalogDb::open(&fixture.cache_dir, &fixture.root).unwrap();
+        assert!(
+            catalog
+                .save_thumb_bytes(
+                    &cache_key,
+                    fixture.resolved.mtime,
+                    fixture.resolved.file_size,
+                    Some((8, 8)),
+                    bytes,
+                )
+                .unwrap()
+        );
+        cache_key
+    }
+
+    #[test]
+    fn resolve_folder_thumb_reuses_existing_pdf_pin_webp_across_levels() {
+        let tmp = TempDir::new().unwrap();
+        let depth = 3;
+        let fixture = prepare_pdf_pin_fixture(&tmp, depth);
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([20, 80, 160, 255]),
+        ));
+        let (webp, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 75.0).unwrap();
+        let expected_key = save_pdf_pin_webp(&fixture, depth, &webp);
+
+        let result = resolve_folder_thumb_image_with_cache_dir(
+            &fixture.root,
+            SortOrder::Numeric,
+            depth,
+            Some(&fixture.pin_db),
+            &fixture.cache_dir,
+        );
+
+        match result {
+            Some(FolderThumbResolution::CachedPinned(cached)) => {
+                assert_eq!(cached.cache_key, expected_key);
+                assert_eq!(cached.source_path, fixture.pdf);
+                assert_eq!(cached.image.size, [8, 8]);
+                assert_eq!(cached.webp_data, webp);
+            }
+            Some(FolderThumbResolution::Image(path)) => {
+                panic!("expected cached PDF pin, got image {}", path.display())
+            }
+            None => panic!("expected cached PDF pin"),
+        }
+    }
+
+    #[test]
+    fn resolve_folder_thumb_falls_back_after_pdf_pin_cache_is_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let depth = 3;
+        let fixture = prepare_pdf_pin_fixture(&tmp, depth);
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([20, 80, 160, 255]),
+        ));
+        let (webp, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 75.0).unwrap();
+        save_pdf_pin_webp(&fixture, depth, &webp);
+        assert_eq!(crate::catalog::delete_all_cache(&fixture.cache_dir), 1);
+
+        let result = resolve_folder_thumb_image_with_cache_dir(
+            &fixture.root,
+            SortOrder::Numeric,
+            depth,
+            Some(&fixture.pin_db),
+            &fixture.cache_dir,
+        );
+
+        assert_eq!(resolved_image_path(result), Some(fixture.fallback));
+        assert!(!crate::catalog::db_path_for(&fixture.cache_dir, &fixture.root).exists());
+    }
+
+    #[test]
+    fn resolve_folder_thumb_ignores_corrupt_pdf_pin_cache() {
+        let tmp = TempDir::new().unwrap();
+        let depth = 3;
+        let fixture = prepare_pdf_pin_fixture(&tmp, depth);
+        let base_key =
+            folder_thumb_auto_cache_key_for_path(&fixture.child, false, SortOrder::Numeric, depth)
+                .unwrap();
+        let cache_key = format!(
+            "{base_key}{CACHE_KEY_PIN_SUFFIX}{}",
+            fixture.resolved.source_id
+        );
+        let catalog = crate::catalog::CatalogDb::open(&fixture.cache_dir, &fixture.root).unwrap();
+        catalog
+            .save(
+                &cache_key,
+                fixture.resolved.mtime,
+                fixture.resolved.file_size,
+                8,
+                8,
+                Some((8, 8)),
+                b"not a webp",
+            )
+            .unwrap();
+        drop(catalog);
+
+        let result = resolve_folder_thumb_image_with_cache_dir(
+            &fixture.root,
+            SortOrder::Numeric,
+            depth,
+            Some(&fixture.pin_db),
+            &fixture.cache_dir,
+        );
+
+        assert_eq!(resolved_image_path(result), Some(fixture.fallback));
+    }
+
     #[test]
     fn resolve_folder_thumb_sorts_subdirs_numerically() {
         let tmp = TempDir::new().unwrap();
@@ -3257,7 +3688,7 @@ mod tests {
 
         let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 1, None);
 
-        assert_eq!(picked, Some(expected));
+        assert_eq!(resolved_image_path(picked), Some(expected));
     }
 
     #[test]
@@ -3277,7 +3708,7 @@ mod tests {
 
         let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::DateDesc, 1, None);
 
-        assert_eq!(picked, Some(expected));
+        assert_eq!(resolved_image_path(picked), Some(expected));
     }
 
     #[test]
@@ -3291,7 +3722,7 @@ mod tests {
 
         let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 1, None);
 
-        assert_eq!(picked, Some(expected));
+        assert_eq!(resolved_image_path(picked), Some(expected));
     }
 
     #[test]
@@ -3305,7 +3736,7 @@ mod tests {
 
         let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 0, None);
 
-        assert_eq!(picked, Some(expected));
+        assert_eq!(resolved_image_path(picked), Some(expected));
     }
 }
 

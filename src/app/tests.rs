@@ -10517,7 +10517,7 @@ mod favorite_adjustment_defaults_tests {
                 .send(crate::thumb_loader::ThumbMsg {
                     idx: 0,
                     image: Some(color.clone()),
-                    from_cache: true,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: Some((2, 2)),
@@ -10580,6 +10580,66 @@ mod favorite_adjustment_defaults_tests {
             "after the surface returns the thumbnail uploads normally"
         );
         assert!(app.texture_backlog.is_empty(), "backlog should be drained");
+    }
+
+    #[test]
+    fn final_cache_thumbnail_is_not_enqueued_for_idle_source_upgrade() {
+        use std::sync::{Arc, Condvar, Mutex, atomic::Ordering};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.items = vec![GridItem::Folder(folder)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![Some((10, 20))];
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.requested.insert(0, false);
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.settings.thumb_idle_upgrade = true;
+        app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.display_px_shared.store(1024, Ordering::Relaxed);
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 0,
+                image: Some(egui::ColorImage::filled(
+                    [64, 64],
+                    egui::Color32::LIGHT_BLUE,
+                )),
+                origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((64, 64)),
+                canceled: false,
+                finalized: false,
+                input_seq: 0,
+                items_gen: app.items_generation,
+            })
+            .unwrap();
+
+        app.poll_thumbnails(&egui::Context::default());
+        app.enqueue_idle_upgrades();
+
+        assert!(matches!(
+            app.thumbnails[0],
+            ThumbnailState::Loaded {
+                from_cache: true,
+                ..
+            }
+        ));
+        assert!(app.idle_upgrade_cache_bypass_ineligible.contains(&0));
+        assert!(app.requested.is_empty());
+        assert!(
+            app.heavy_io_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// アイドル高画質化の repaint レース対策 (2026-06-19): idle 閾値 (500ms) を過ぎても、
@@ -27054,7 +27114,7 @@ mod still_window_mode_key_tests {
         app.texture_backlog.push(crate::thumb_loader::ThumbMsg {
             idx: video,
             image: None,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::Source,
             from_edit_preview: false,
             edit_preview_adjustment: None,
             source_dims: None,

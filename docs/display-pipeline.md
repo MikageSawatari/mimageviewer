@@ -167,7 +167,12 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
    自動選定アルゴリズム版・sort・depth を含めるため、番号順ロジックや設定が
    変わったときは自然にミスして再スキャンされる。キャッシュミス時の Folder
    自動選定は、グリッドのブロック順に揃えて「サブフォルダ (folder_thumb_sort 順) →
-   直接画像 (sort 順)」で候補を辿る。
+   直接画像 (sort 順)」で候補を辿る。途中の子フォルダに非 Image の代表 pin がある場合は、
+   子が直上一覧で既に生成した完全一致 WebP だけを読み取り専用で再利用する。WebP が無い・
+   stale・破損の場合は PDF/ZIP/動画を生成せず、そのまま従来の画像候補探索を続ける。
+   再利用した WebP は `ThumbLoadOrigin::FinalCache` として UI へ渡し、idle
+   quality-upgrade が元 PDF 等を再生成しないようにする。既に有効な上位キャッシュはこの
+   再探索より先に通常の cache hit となるため、従来どおりそのまま使う。
    ConvertibleArchive は有効な変換キャッシュ ZIP がある場合だけ、その ZIP の先頭画像を
    `archivethumb:{format}:{identity}` キーで読む。キャッシュ未作成/失効時は要求を出さず
    アイコンに戻す。
