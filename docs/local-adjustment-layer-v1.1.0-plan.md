@@ -11,8 +11,9 @@ Date: 2026-05-31
 > - **現行の正本**: 処理順は §3、データモデルは §4.1、永続化は §7、cache 境界は §8。
 > - **未実装**: `local-adjust-ui` の共通 crate 化。これは現行機能の動作要件ではない。
 > - **手動検証**: §11.1 の実機チェックを完了した記録は本書から確認できないため未確認。
-> - **既知の実装未達**: UI thread 同期 materialization と preview cache の context ownership は
->   [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録済み。ここでは仕様を弱めない。
+> - **既知の実装未達**: layer bypass / prefix preview cache の viewer context ownership は
+>   [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録済み。通常の local / conceal
+>   materialization は worker 化・context ownership 済みだが、この preview lane の注記は残す。
 
 ## 1. 実装前の背景 (設計経緯)
 
@@ -667,6 +668,13 @@ ZIP / PDF ページのキーも既存のページキー生成に合わせる。
 `mimageviewer.dat` の `local_adjust_layers` から import するため、既存 DB をサイドカーで
 上書きしない。
 
+フォルダ load / rehydrate では exact page key の存在集合 (`local_adjust_pages`) だけを取得し、
+巨大になり得る `layers_json` は UI thread で読まない。表示、補正レイヤーパネル入場、
+capture / export など実体が必要になったとき、`maybe_start_local_adjust_render*` が DB path /
+page key を `local-adjust-render` worker へ渡す。worker が `LocalAdjustDb` を read-only で開き、
+1 ページ分の JSON load / deserialize、mask resize、source 解像度 compose まで行う。UI は
+request / generation が現在値と一致する結果だけを cache へ入れ、GPU upload を律速する。
+
 サイドカーバックアップ `mimageviewer.dat` には `local_adjust_layers` 配列と `export_crop` を保存する。
 `local_adjust_lab` の `foo.png.miv` 形式は検証用で、本体の正式保存形式ではない。
 
@@ -718,10 +726,14 @@ stale、または worker 実行中の場合、表示は `local adjust source` �
 `edit_result_cache` / final AI / final composite の内部画像を変えず、通常表示の overlay と
 capture / export の切り出し範囲だけを変える。
 
-各 cache / pending / worker は viewer context 単位の owner に属し、作成・cancel・drain・drop を
-同じ context に閉じる。別 context の read-only close で sibling の preview を失効させてはならない。
-現実装の未達は [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録するが、
-この ownership 不変条件自体は変更しない。
+通常の local / conceal materialization は、`ViewerContextBundle` 所有の
+`local_adjust_pending[idx]` と対応 cache に閉じる。bundle swap / park では pending も一緒に移動し、
+context の invalidation / drop はその context の token だけを cancel する。別 context の read-only
+close で sibling の materialization を失効させてはならない。
+
+一方、layer bypass / prefix preview の cache と pending はまだこの bundle ownership に入っていない。
+この残件は [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録しており、通常
+materialization の解消を理由に注記を外さない。
 
 ## 9. パフォーマンス方針
 
@@ -738,12 +750,15 @@ capture / export の切り出し範囲だけを変える。
   古い結果の破棄」で成立させる。
 - 全体補正のドラッグ中は、重い補正レイヤーと隠蔽加工の再合成を debounce し、release または
   短い idle 後に最新パラメータだけを再合成する。必要なら暫定表示は上流補正のみでよい。
-- 重いレイヤー合成は worker 化する。UI スレッドで同期実行する場合は、軽い効果に限定する。
+- 表示 / edit assembly 用のレイヤー合成は効果の軽重にかかわらず `local-adjust-render` worker で
+  実行し、lazy DB / JSON load も同じ worker 境界へ置く。UI スレッドは poll / stale 検証と
+  1 フレーム 1 枚の GPU upload だけを行う。
 - worker の結果には generation を持たせ、古い合成結果が遅れて返ってきても採用しない。
 - パラメータ変更で新しい generation が発生した場合、実行中 worker にはキャンセルフラグを立てる。
   generation 破棄は古い結果の採用防止、キャンセルはメディアンなど重い効果の待ち時間削減として
-  別に扱う。行単位やタイル単位で進められる重い効果は、処理ループ内でキャンセル確認と進捗通知を
-  行い、左パネルのステータスに `メディアンフィルタ 30%` のような効果名 + 進捗率を表示する。
+  別に扱う。行単位や layer 単位で進められる重い効果は、処理ループ内でもキャンセルを確認する。
+  現行 materialization は専用の進捗率 state を持たず、cat=&quot;edit_materialize&quot; の stage 別 perf
+  event (`db_read` / `decode` / `raster` / `compose` / `upload`) で時間を追跡する。
 - 再合成や反映待ちは、ステータス文字列だけでなく左パネル上部の常時見えるインジケータで示す。
   `再合成中`、`反映待ち`、`マスク更新`、`最新` を色付きの `●` で表示し、処理遅延が仕様通りで
   あることをユーザーがすぐ判断できるようにする。

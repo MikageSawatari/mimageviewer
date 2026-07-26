@@ -113,7 +113,35 @@ if let Some(p) = self.xxx_pending.take() {
 }
 ```
 
-### 2.1 キャンセルの置き場所
+### 2.1 edit materialization worker
+
+local-adjust / conceal の表示用 materialization は、このテンプレに従う短命 worker である。
+UI スレッドは source snapshot と DB path / page key を要求へ詰め、`local-adjust-render` /
+`conceal-materialize` を起動するだけにする。worker 側で lazy DB read、JSON / deflate decode、
+mask resize / raster、CPU compose までを行い、UI 側は `try_recv`、generation / key 検証、
+GPU upload だけを担当する。通常の local / conceal pending map は viewer context と一緒に
+swap / park / drop され、同じ idx の再要求は古い worker を cancel して最新 1 本へ置き換える。
+
+GPU upload は `last_edit_materialize_upload_frame` を共通予算にして **1 フレーム 1 枚**に
+制限する。複数結果が ready でも残りは pending に保持して repaint を要求し、表示中ページの
+ready result を先に選ぶ。この予算には local / conceal 本体だけでなく、layer bypass preview、
+prefix preview、CPU 完成済み `edit_result` の lazy texture 化も含む。
+
+`--perf-log` の構造化イベントは cat=&quot;edit_materialize&quot; で、`kind` と `stage` は次の組合せ:
+
+| `kind` | `stage` | 計測範囲 |
+| --- | --- | --- |
+| `db_read` | `local` / `conceal` | SQLite の read-only open とページ payload 取得 |
+| `decode` | `local_json` | local-adjust の `layers_json` deserialize |
+| `decode` | `conceal_memory_rescale` / `conceal_deflate_json` | in-memory shape の寸法変換、または DB payload の展開・deserialize |
+| `raster` | `local_mask_resize` / `conceal` | local mask の source 寸法合わせ、conceal shape rasterize |
+| `compose` | `local` / `conceal` | source 解像度での各 edit 合成 |
+| `upload` | `local` / `conceal` / `local_bypass_preview` / `local_prefix_preview` / `edit_result` | UI スレッドでの `load_texture` |
+
+各イベントは対象 `key` / `seq` と `ms` も持つ。`upload` だけが UI thread stage であり、
+DB / decode / raster / compose の長さと分けて追跡する。
+
+### 2.2 キャンセルの置き場所
 
 3 箇所で cancel できるようにするのが基本:
 
@@ -123,7 +151,7 @@ if let Some(p) = self.xxx_pending.take() {
 3. **ループ内早期離脱**: worker の長いループ内で `cancel.load(Ordering::Relaxed)` を
    定期チェック (タイルデコード / マッチング等の per-item ループ内に入れる)
 
-### 2.2 キャッシュへのマージルール
+### 2.3 キャッシュへのマージルール
 
 worker が途中で新しいエントリを読んだ場合、結果を UI に返して `cache.insert` させる。
 `cache.entry(k).or_insert(v)` で「既存キーは上書きしない」にすることで、並行する別の
@@ -383,9 +411,11 @@ v0.8.1 で Codex レビューが指摘したが、通常運用での体感影響
 対策として、`load_folder` / `rehydrate_page_edit_state_for_current_items` は
 現在 `items` の page key に対して `page_path IN (...)` の exact lookup だけを行い、
 `local_adjust_pages` を復元する。`page_path` は PRIMARY KEY なので追加 index は不要。
-実際の `layers_json` は `ensure_local_adjust_layers_loaded(idx)` で、フルスクリーン表示、
-補正レイヤーパネル、エクスポート準備など該当ページの実体が必要になった時点で
-1 ページ分だけ読む。
+実際の `layers_json` は、フルスクリーン表示、補正レイヤーパネル、エクスポート準備など
+該当ページの実体が必要になった時点で 1 ページ分だけ要求する。UI スレッドでは読まず、
+`local-adjust-render` worker が `LocalAdjustDb` を read-only で開いて JSON を取得・deserializeし、
+mask resize と compose まで済ませる。UI は §2.1 の pending を poll して検証済み結果だけを
+1 フレーム 1 枚で upload する。
 
 ### 全検索 (Ctrl+G) の大量件数時スパイク
 

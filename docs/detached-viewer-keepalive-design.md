@@ -251,10 +251,14 @@ fullscreen 専用に縮小する。
 混用しない。後者では detached identity を一切壊さず、`fullscreen_idx` / `items` / 表示物
 だけが入れ替わる。`Visible(false)` / `Close` はセッション終了時のみ送る。
 
-> **既知の実装違反:** terminal close 後にも in-flight open/navigation producer が適用され得る経路と、
-> 動画 F12 OFF 後に manager runtime が `Closing` で残る経路が
-> [v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されている。前者は BA-7/R2b
-> 後続リワークへ引き継ぎ、後者は **v2.8.1 で対応予定**。本節の不変条件は後退させない。
+> **既知の実装違反:** terminal close 後にも in-flight open/navigation producer が適用され得る経路は
+> [v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されており、BA-7/R2b の
+> 後続リワークへ引き継ぐ。本節の不変条件は後退させない。
+>
+> **v2.8.1 対応済み:** terminal close の finish helper が active session を take した同じ
+> `window_id` の manager runtime まで除去する。動画 F12 OFF も presenter の
+> `PlacementSwitched` を確定適用する経路からこの helper を通るため、runtime を `Closing` のまま
+> 残さない。matched / stale-but-converged / pending 無しの 3 経路は App-level test で固定している。
 
 ---
 
@@ -317,7 +321,7 @@ active_detached_viewport_rendered_this_frame()      // rendered_frame == frame_c
 | --- | --- | --- | --- |
 | **K0 (backstop)** | **完了** | marker と backstop を導入。既存描画入口は維持 | 当時の実機記録あり。直近変更は未確認 |
 | **K1** | **未完** | `render_active_detached_viewport` 1 本への集約と、既存 render / keepalive の非 detached 専用化が未実施 | detached / fullscreen 回帰、PDF/ZIP/画像 folder-nav |
-| **K2** | **部分完了** | terminal session/runtime routing はあるが、全 pending producer の cancel と `fs_viewport_shown` 依存の解消が未完 | Esc / × / グリッド復帰 / F12 トグル |
+| **K2** | **部分完了** | terminal close は session と同じ `window_id` の runtime 除去まで所有する。全 pending producer の cancel と `fs_viewport_shown` 依存の解消は未完 | Esc / × / グリッド復帰 / F12 トグル |
 | **K3** | **部分完了** | manager と `Opening/Active/Parked/ParkedLive/Resuming/Closing` は導入済み。合法遷移 reducer と余剰 flag 集約は未完 | 全 detached テスト |
 
 - **K0 を最優先**: backstop は既存構造を壊さずに不変条件を「事後保証」するので、まず

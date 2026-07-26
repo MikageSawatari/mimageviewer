@@ -95,6 +95,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
 | `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う。終了・トレイ退避の共通保存境界では有効 draft を Settings へ確定するが worker は開始せず、トレイ復帰時だけ遅延した副作用を1回適用する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定 |
+| `displayed_image_transform.rs` | ページ単位の実表示 transform の正本。fit / scale limit / trim / 90 度・free rotation / 通常または Z の zoom-pan から paint・hit・UV rect、source↔screen 写像、total scale を一度に解決する。`FullscreenPageLayout` はフレーム中に実際に描いた Single / Spread / Continuous の各ページ transform を paint 順で保持し、ルーペと範囲キャプチャへ共通 `hit_test` を提供する。見開き・連結読みの配置計算自体は `ui_fullscreen.rs` が担当する |
 | `vendor/egui-wgpu` | egui 0.33.3 の managed texture に opt-in GPU mipmap を追加するローカルパッチ。`TextureOptions::mipmap_mode` 指定時だけ完全な mip chain を確保・生成し、静止画の論理 `TextureHandle` / cache 構造は変えない。`Rgba8Unorm`生成器は比較callbackと360度パノラマの独自textureにも公開して共用する。上流の`LICENSE-MIT` / `LICENSE-APACHE`本文をcrate内に保持し、アプリ内表示と配布物同梱の正本にする |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は base pixels / mask / preset を snapshot し、隠蔽合成・画像エンコード・メタデータ転記は worker が担当 |

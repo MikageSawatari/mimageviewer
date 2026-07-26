@@ -750,8 +750,17 @@ raw `fs_cache` を直接描くため、Static / Animated またはサムネイ�
 「AI 処理中にプリセットを変えると古い final composite が残る」等の不整合が出る。
 
 実装上は `ui_fullscreen.rs::resolve_fs_processed_texture` を通常表示の共通入口にする。
-単ページ、見開き、ルーペなどが `edit_result_cache → fs_cache` のような独自チェーンを
+単ページ、見開き、連結読み、ルーペが `edit_result_cache → fs_cache` のような独自チェーンを
 再実装すると、新しい派生レイヤ (消しゴム / 隠蔽加工 / AI など) の横展開漏れが起きる。
+見開きと連結読みも、画面全体で 1 枚を解決するのではなく、描画対象の **各ページ idx**
+についてこの入口を呼び、完成テクスチャが無ければそのページの transition texture /
+サムネイルへ落とす。ルーペも hit-test 後に選ばれたページ idx で同じ入口を呼ぶ。
+
+local-adjust / conceal の materialization は worker で進む。必要な local 結果が未完成なら
+conceal は erase / raw を入力にして先へ合成せず `None` を返し、edit / final assembly も
+未完成の上位結果を作らない。表示側はその間だけ現在有効な下位レイヤーへフォールバックし、
+古い local / conceal cache を再表示しない。保存・比較・クリップボードの pixel job はこの
+表示用フォールバックを完成結果として扱わず、必要な edit materialization の完了を待つ。
 360 度パノラマ表示も同じ考え方で、完了済みの `final_composite_cache` を 8K base
 アップロード元として優先する。final AI が未完了の間だけ旧 `adjustment_cache` /
 `ai_upscale_cache` / `fs_cache` へフォールバックし、AI 完了後は cache_key を変えて
@@ -785,18 +794,39 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 
 ### 2.4 変換の合成順序
 
-描画時、`draw_fs_image` は以下の順で変換を掛ける:
+各ページの実表示幾何の正本は
+[`DisplayedImageTransform`](../src/displayed_image_transform.rs) である。単ページでは
+`draw_fs_image` が、Z ズームでは `ResolvedZTransform` が `DisplayedImageTransform::resolve`
+を 1 回だけ呼び、次の入力を同じ transform に確定する:
 
 ```
-1. テクスチャ選択 (上記の優先順位)
-2. 回転 (rotation_db, 0/90/180/270)
-3. ユーザーのフリー回転 (fs_free_rotation, 一時的・非永続)
-4. 表示トリムの content bbox 決定
-5. フィットモード (ページ全体 / 横幅 / 縦幅 / 100%原寸)
-6. 自動フィット倍率制限 (`fullscreen_fit_no_upscale` / `fullscreen_fit_no_downscale`)
-7. Zoom (fs_zoom, 0.1〜50.0)
-8. Pan (fs_pan)
+1. 上記の優先順位で解決済みのページテクスチャと source / texture size
+2. 表示トリムの実効 content bbox
+3. 回転 (rotation_db, 0/90/180/270) と一時的なフリー回転
+4. フィットモードと自動フィット倍率制限
+5. Zoom / Pan、または Z ズームの確定済み placement
+6. paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
+
+fit / trim / rotation / zoom-pan を overlay や入力処理が再計算してはならない。
+`draw_fs_image` は解決した transform 自身で描画し、その同じ値を次の consumer へ渡す:
+
+- 消しゴム、隠蔽加工、補正レイヤー、テキスト注釈、crop の overlay と pointer 座標変換
+- ルーペのカーソル位置から source pixel への逆変換
+- 範囲キャプチャの対象ページ判定と source rect 変換
+- フレーム内のページ hit-test 用 `FullscreenPageLayout`
+
+Z ズームも別の screen/source 計算を持たず、`ResolvedZTransform` が cover / contain と
+pan を決めた後の `DisplayedImageTransform` を描画と上記 consumer が共有する。このため
+ルーペはズーム前の矩形ではなく、実際に描いた Z transform を逆変換に使う。
+
+`FullscreenPageLayout` は毎フレーム `Single` / `Spread` / `Continuous` の種別で初期化し、
+**実際に描けたページ**を paint 順に `DisplayedImageTransform` ごと登録する。
+`hit_test(pos)` は 3 モード共通でページと transform を返す。ページ間 gap はどのページにも
+属さず、gap が 0 の共有境界は先に描いたページへ決定論的に割り当てる。ルーペはここで得た
+page idx の processed texture をページ単位で解決し、範囲キャプチャも同じ hit-test を使う。
+見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当し、その結果を
+`DisplayedImageTransform::from_resolved_rect` で共通レイアウトへ登録する。
 
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
 `FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
@@ -820,7 +850,7 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 `FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
-**描画は `draw_fs_image` を再利用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
+**解決後の `DisplayedImageTransform` と描画は共用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
 keymap カスタマイズ可) のホールドで動き、
 ズーム中は「cover 倍率 (画像が画面を覆う最小倍率) × `fs_zoom_factor`」を `zoom_pan` に変換して
 ページ全体フィット指定で描く (`zip_cover_zoom_pan`)。**既定 `fs_zoom_factor = 1.0` = cover** で、
@@ -911,9 +941,10 @@ logger へ出力 (`[margin-fit diag]`)。
 上 / 下は左右の少ないカット幅を共通採用し、横方向 (左 / 右、中央側 / 外側) はページ別の検出を残す。
 中央側をトリムした場合も、切った領域を見開き中央に残さず、左右の見える端が設定 gap で並ぶ。
 `fit_scale` は左右の見える幅の合計と上下 bbox の union 高さを基準にし、描画時はページ全体
-rect のうち bbox 部分だけを UV 指定して描く。内部的にはトリム量によって左右のページ rect が
-重なることがあるため、`FsSpreadLayout` は UV 変換用のページ rect とヒットテスト用の見える rect
-を分けて保持する。どちらかが回転していれば通常フィットにフォールバック。
+rect のうち bbox 部分だけを UV 指定して描く。トリム量によってページ全体 rect が重なり得ても、
+各ページの `DisplayedImageTransform` が実際の UV / paint / hit rect を保持し、
+`FullscreenPageLayout::hit_test` はその見える hit rect だけを判定する。どちらかが回転していれば
+通常フィットにフォールバック。
 
 **表示トリム** (`ui_view_trim.rs` / `view_trim.rs` / `view_trim_db.rs`) は、
 漫画ビューア用途で読みながら使う表示専用トリム。左端 / 上端 / 右端ホバーで開く左パネルの

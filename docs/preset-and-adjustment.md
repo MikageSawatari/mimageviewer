@@ -61,7 +61,9 @@ idx へ hydrate し直す。これをやらないと差し替え前 idx の補�
 (Codex P1 2026-06-05)。補正レイヤーはフォルダロード / rehydrate 時点では
 `local_adjust.db` の `page_path` exact lookup (`IN`) で `local_adjust_pages` だけを復元し、
 巨大な `layers_json` はフルスクリーン表示 / 補正レイヤーパネルに入ったタイミングで
-`LocalAdjustDb::get_layers` から 1 ページ分だけ遅延ロードする。
+1 ページ分だけ遅延要求する。DB read / JSON deserialize は UI thread では行わず、
+`local-adjust-render` worker が `LocalAdjustDb` を read-only で開いて mask resize / compose まで
+完了させる。
 **`load_folder` 側の hydration を変えたら同関数も揃えること**。
 ただし **cross-folder 検索 (Ctrl+S/Ctrl+G) 由来 snapshot は `App::clear_page_edit_state()`
 で clear のみ** (= subset が cross-folder で単一 prefix hydrate できず、検索 view は元々
@@ -623,6 +625,18 @@ final 表示解像度が変わっても、source 解像度の edit cache とマ�
 post_filter を一切適用しない。色調スライダーの
 drag 中でも `edit_result_cache` は再利用されるため、マスクやブラシ stroke の重い再計算が走らない。
 
+local / conceal の DB load、decode、raster、compose は非同期境界である。
+`assemble_edit_result_pixels` は必要な materialization を起動するが、UI thread では待たない。
+active local の現在世代 pixels、または必要な conceal result がまだ無ければ `None` を返し、
+未完成の入力から `edit_result_cache` を作らない。`ensure_final_composite_texture` も edit result の
+`None` をそのまま伝播し、不完全な final assembly を開始しない。
+
+表示 resolver は pending 中だけ下位レイヤーへフォールバックする。local 編集中は
+`erase_result_cache > fs_cache`、conceal は active local の完成を待ってから合成し、local を飛ばして
+erase / raw 上へ conceal を載せない。通常表示で edit / final が未完成なら raw 表示へ落ち、worker
+完了後に最新 generation の上位 cache へ差し替える。capture / export はこの表示用下位レイヤーを
+完成 edit result として保存せず、必要な materialization 完了後に再開する。
+
 **crop は表示パイプラインに含めない** (通常表示は crop 外を暗くする overlay のみで、
 画像そのものは切り取らない)。実際の切り出しは Ctrl+S コピー / Ctrl+E 書き出しの最終段で
 `App::export_crop_rect_for_pixels` を使い、final composite (AI アップスケール後で source と
@@ -681,8 +695,10 @@ crop 済み comic 注釈ラスターレイヤーを分離して読み込む。�
 結果を `local_adjust_cache` に格納する。消しゴムマスクが存在するが現在世代の
 `erase_result_cache` がまだ無い場合は、古い補正レイヤー結果を表示せず、消しゴム結果の生成を待つ。
 フォルダロード / グリッド表示では `local_adjust_pages` の存在判定だけを使い、
-`layers_json` の実体は `ensure_local_adjust_layers_loaded(idx)` でフルスクリーン表示、
-補正レイヤーパネル、エクスポート準備など実際に必要になったページだけ読む。
+`layers_json` の実体はフルスクリーン表示、補正レイヤーパネル、エクスポート準備など実際に
+必要になったページだけ `local-adjust-render` worker で読む。worker が DB read / JSON decode /
+mask resize / compose を行い、UI は現在の `items_generation` と `LocalAdjustResultKey` に一致する
+完成結果だけを 1 フレーム 1 枚で upload する。
 
 生成中または stale の間は、下位レイヤの画像をそのまま表示する。これにより補正レイヤーの古い結果が
 一瞬残ることを避け、非同期完了後に最新の `local_adjust_cache` へ差し替える。サムネイルには
@@ -771,8 +787,8 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | keep_range からの eviction | 該当 idx の edit/final を evict | 該当 idx の final を evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | **クリアしない** | — |
 | 消しゴムマスク変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | erase/local/conceal/final pending をキャンセル |
-| 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | local/final pending をキャンセル |
-| 隠蔽加工変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | final pending をキャンセル |
+| 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | local / downstream conceal / final pending をキャンセル |
+| 隠蔽加工変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | conceal materialization / final pending をキャンセル |
 | crop 変更 | **クリアしない** (表示は overlay のみ) | **クリアしない** | 永続 edit preview WebP のみ非同期削除し、編集終了後に crop 済み preview を再生成 | **触らない** (AI を無駄にキャンセルしない) |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode

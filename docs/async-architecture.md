@@ -19,6 +19,7 @@
 | Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる |
 | AI 推論 (final pipeline) | `std::thread` (`final-ai-worker`, 常駐) + 優先度キュー (`AiJobQueue`) + 共有 mpsc | 1 | final AI (upscale/denoise) を `AiJob` キューから逐次処理。`AiRuntime` の sessions Mutex が全推論を直列化するため worker は 1 本で十分。**モデルロード (`load_model`) / 推論を worker スレッド上で実行し、UI スレッドは sessions ロックに触らない** (= per-job spawn だった旧設計の「UI THREAD HANG: 推論ロック飢餓」を解消、§3.2.1)。優先度は Display(表示中ページ, LIFO) → Prefetch(先読み, FIFO) |
 | カラー化 / 最終エフェクト | `std::thread` (`miv-final-effect-{idx}` / `miv-final-effect-prefetch-{idx}`、要求ごとの短命 worker) + 個別 mpsc | 表示要求 + 背景先読み最大 1 本 | final AI / sharpen 後の `ColorImage` に、モノクロ系判定、スクリーントーン濃淡変換、階調カラー LUT、ポストフィルタを順に適用する。AI と共通の前後枚数で非表示ページも 1 枚ずつ先読みし、色調補正・smart sharpen も worker 上で行う。先読み／表示開始時とも無着色の provisional texture を upload せず、完成結果だけを `final_composite_cache` へ upload する。表示要求が先読み中の同じ key に来た場合は job を昇格して再利用し、同一 viewer のページ送りでは完成まで直前ページを holdover する。連結読みでは keep-set 内の各表示済みページがページ別 transition texture を持ち、raw source 差し替えや incomplete → complete 再合成で live final が一時的に消えても黒い読込表示へ戻さない。complete final の GPU 登録後に差し替え、keep-set 離脱時は旧 texture も破棄する。ページ入場だけでは完成 cache / pending を破棄しない。別 key の表示要求、設定変更、keep-set 除外、context close / drop では `Arc<AtomicBool>` を立て、`items_generation` と composite key が一致する結果だけを採用する。pending map とページ別 transition は viewer context の swap / park と一緒に所有権移動するため、別ウィンドウの要求や表示を誤って共有しない |
+| edit materialization (local / conceal) | `std::thread` (`local-adjust-render` / `conceal-materialize`、要求ごとの短命 worker) + idx 別 mpsc | viewer context 内で idx ごとに最新 1 本。可視ページが複数なら別 idx は並行し得る | source 解像度 edit chain の lazy LocalAdjust DB / JSON load、mask resize、local compose、および Conceal DB read、deflate / JSON decode、shape raster、conceal compose を UI thread 外で行う。local と conceal は同じ `local_adjust_pending[idx]` slot を共有し、後段が必要な local 完了前に conceal を誤った下位 source へ合成しない。CPU 結果だけを返し、generation / key を UI 側で検証した後、共通予算で 1 フレーム 1 枚だけ GPU upload する。詳細は §3.2.2 |
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
 | Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
 | 操作カスタマイズ共有 / 世代取り込み | `std::thread` (操作ごとの短命 worker) + mpsc | 「設定の復元」ダイアログ中に最大 1 本 | 過去世代 DB の一時コピーと読み込み、`.mivkeys.json` の読み書き、取り込み前の自動退避を UI スレッド外で行う。UI は native ファイルダイアログでパスを選び、50ms polling で結果を受け取ってから差分表示またはライブ適用する |
@@ -99,6 +100,7 @@
 | `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly (非終端) / Static / Animated / Failed**。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は `fs_early_dims` に積み fs_pending は維持する (本デコードが続く)。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `final_effect_pending[key].rx` | カラー化 / 最終エフェクト worker → UI | `FinalEffectResult::Ready { pixels, elapsed_ms, timing }` / `Cancelled`。`timing` は色調補正、smart sharpen、カラー化判定／適用、Creative LUT、post filter の段階別時間を保持する。receiver は composite key、画像 index、`items_generation`、表示 / 先読み区分と同じ viewer context に保持し、stale 結果を texture cache へ公開しない。先読み結果も UI 側で完成 texture を 1 枚ずつ upload する |
+| `local_adjust_pending[idx].rx` | local / conceal materialization worker → UI | `EditMaterializeResult`。request は `items_generation`、`input_seq` と、local なら `LocalAdjustResultKey`、conceal なら `EditResultKey` を持つ。pending map は `ViewerContextBundle` 所有で context の swap / park とともに移動し、bundle drop / clear では cancel token を立てる。受信時は pending request identity と現在の generation key の両方を検証してから cache へ公開する |
 | `export_pending.rx` | Ctrl+E エクスポート worker → UI | `ExportEvent`: `Started` / `Completed` / `Failed` / `Cancelled` / `AllDone`。UI は毎フレーム `try_recv` で進捗モーダルを更新し、エラーがあればモーダルを残す |
 | `pdf_enumerate_pending` | PDF 列挙スレッド → UI | `(pages, password_needed)` |
 | PDF ワーカー stdin/stdout | UI プロセス ↔ PDF ワーカープロセス | 長さプレフィクス付きバイナリプロトコル (Enumerate / Render / Shutdown) |
@@ -321,6 +323,35 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
 > PDF retained orphan はこの retained layer へ store するためだけの例外であり、表示中
 > キャッシュ / GPU 常駐分を延命するものではない。残る課題は、表示中キャッシュ / GPU 常駐分の
 > バイト予算と、高速ページ送り中の AI 起動デバウンスである。
+
+### 3.2.2 edit materialization の ownership / generation / cancel / upload
+
+通常の local-adjust / conceal materialization pending は `ViewerContextBundle` の
+`local_adjust_pending: HashMap<idx, LocalAdjustRenderPending>` が所有する。active detached /
+parked context を mount し直すと pending も cache と一緒に移り、別 context の read-only close が
+sibling の要求を cancel または drain してはならない。context が破棄されれば pending の Drop で
+cancel token が立つ。layer bypass / prefix preview の別 lane はこの context-owned map とは別物である。
+
+結果採用は 2 段階で行う。まず receiver から来た request 全体が、同じ idx の現在 pending request
+(request identity。`input_seq` を含む) と一致することを確認する。次に
+`items_generation` が現在値と一致し、local は現在の `LocalAdjustResultKey`、conceal は現在の
+`EditResultKey` と一致するときだけ cache へ insert / texture upload する。cancel が間に合わず
+worker が完走しても、この検証で旧 folder、旧 input、旧 erase / local / conceal generation の
+結果は公開されない。
+
+cancel 境界は次の 3 箇所をそろえる:
+
+1. **同じ idx の新要求**: slot を置き換える前に旧 pending の token を立てる。
+2. **無効化 / context 終了**: input・mask・local・conceal generation の更新、folder / fullscreen
+   lifecycle、context pause / drop で owner が該当 pending を cancel する。
+3. **worker 内**: DB read / decode の境界、local layer / mask resize、conceal raster / compose など
+   長い処理の途中でも token を確認して早期終了する。
+
+worker は CPU pixels までを作り、`ctx.load_texture` は UI スレッドに残す。ただし
+`last_edit_materialize_upload_frame` を App 全体の frame budget とし、local / conceal、layer bypass /
+prefix preview、`edit_result` texture 化を合わせて **1 フレーム 1 枚**だけ upload する。ready result が
+複数あれば表示中ページを優先し、残りは pending の `ready` に保持して repaint を要求する。
+materialization 待ちの edit / final assembly は `None` を返し、未完成の上位レイヤーを作らない。
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 

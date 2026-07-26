@@ -313,10 +313,12 @@ snapshot/active はその runtime を参照するだけ。ヒューリスティ�
 ### BA-7: ~55 個の transient フラグで状態機械を表現できる
 
 **現況: 部分解消。** manager runtime state は導入済みだが、`transition_state` は任意の遷移先を
-代入し、pending producer は複数 field の OR で判定する。terminal close 後の in-flight 適用と、
-動画 F12 OFF 後の `Closing` runtime 残留という具体的な違反経路が
-[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されている。前者は BA-7/R2b
-リワークへ引き継ぎ、後者は **v2.8.1 で対応予定**。
+代入し、pending producer は複数 field の OR で判定する。terminal close 後の in-flight 適用は
+[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されており、BA-7/R2b
+リワークへ引き継ぐ。動画 F12 OFF 後の `Closing` runtime 残留は v2.8.1 で対応済みで、
+terminal close の finish helper が
+session と同じ `window_id` の manager runtime を除去し、動画の main 側
+`PlacementSwitched` 確定経路も同じ helper を通る。
 
 **前提**: one-shot bool 群（focus_requested / recreate_on_next_render / no_activate_once /
 suppress_primary / host_lost_recreate_armed / grace 群…）の組合せで window の状態を表せる。

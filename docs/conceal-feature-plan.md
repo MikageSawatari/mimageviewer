@@ -9,9 +9,9 @@
 >   [display-pipeline.md](display-pipeline.md) と
 >   [preset-and-adjustment.md](preset-and-adjustment.md)。§3.1 / §3.2 / §3.4 / §13 / §15 は
 >   実装前の案・作業記録であり、現行の型や module 境界の正本ではない。
-> - **既知の実装未達**: conceal の load / raster / compose / GPU upload が UI thread 同期で、
->   §7.7 の worker / cancel / progress 要件を満たさない。
->   [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録済みで、要件は維持する。
+> - **非同期境界**: conceal の DB load / decode / raster / compose は viewer context 所有の
+>   `conceal-materialize` worker で実行する。UI thread は generation / key を検証した完成結果を
+>   1 フレーム 1 枚だけ GPU upload する。
 > - **手動検証**: §14.3 の実施状況は記録から確認できないため未確認。
 
 汎用的な「隠蔽加工」ツールを「消しゴムツール」の双子サブシステムとして実装する。
@@ -630,31 +630,24 @@ fn compose_blur(
 
 #### 性能上の注意
 
-**Codex P1 指摘により最初から worker thread 化**。`docs/ui-responsiveness.md` §4
-チェックリストに従う。
+現行実装は Blur だけを閾値分岐する初期案を採らず、Mosaic / Fill / Blur を同じ
+`conceal-materialize` worker 経路へ統合している。小さい画像でも UI thread で同期合成しない。
 
-- 推定コスト判定: `estimated_cost_ms = (bbox_area_px / 1e6) * (radius_px / 20.0) * 10.0`
-  程度の概算 (実測でチューニング)
-- 閾値 80ms 未満なら同期 (Mosaic/Fill と同じ流れで `conceal_cache` に書く)、
-  80ms 以上なら worker:
-  ```rust
-  if estimated_cost_ms > 80 {
-      spawn_blur_worker(idx, ...);  // ConcealBlurPending { cancel, rx } パターン
-  } else {
-      compose_blur_sync(idx, ...);
-  }
-  ```
-- `ConcealBlurPending` は `ai_upscale_pending` と同形態:
-  ```rust
-  struct ConcealBlurPending {
-      cancel: Arc<AtomicBool>,
-      rx: mpsc::Receiver<ConcealBlurResult>,
-      target_idx: usize,
-      generation: u64,  // 結果到着時に generation が変わっていたら破棄
-  }
-  ```
-- cancel タイミング: フォルダ移動 / モード退場 / generation bump / fullscreen idx 移動
-- 統合テストでキャンセル/進捗を確認 (Codex P1 指摘)
+- in-memory mask が使える編集プレビューは shape snapshot を、lazy load では conceal DB path /
+  page key を worker へ渡す。worker が read-only DB read、deflate / JSON decode、source 寸法への
+  shape rescale、raster、preset compose を順に行う。
+- local-adjust が active なのに現在世代の local pixels が無い間は conceal を起動せず、local
+  materialization を先に完了させる。erase / raw を代用して順序を飛ばさない。
+- pending は local と共通の `LocalAdjustRenderPending` / `EditMaterializeRequest` を使い、idx ごとに
+  最新 1 本を viewer context が所有する。新要求、generation bump、folder / context lifecycle で
+  cancel し、worker も decode / raster / compose の境界と長いループ内で token を確認する。
+- UI は request identity、`items_generation`、現在の `EditResultKey` が一致する結果だけを採用し、
+  `last_edit_materialize_upload_frame` により local 系と合わせて 1 フレーム 1 枚だけ upload する。
+- pending 中の表示 / edit assembly は `None` を返して下位レイヤーへ落ちる。capture / export は
+  下位表示を完成結果として保存せず、materialization 完了後に再開する。
+- 専用の進捗率 state は持たない。段階時間は cat=&quot;edit_materialize&quot; の `db_read` / `decode` /
+  `raster` / `compose` / `upload` event で計測する。詳細は
+  [ui-responsiveness.md](ui-responsiveness.md) §2.1。
 
 ## 8. 永続化
 
@@ -972,7 +965,7 @@ struct Settings {
 
 ダイアログを開いた時点で前回値を復元。「いつも同じ組合せで出す」ユーザーがクリック数最小で完了。
 
-#### 進捗ダイアログ (同期実行)
+#### 進捗ダイアログ (worker 実行)
 
 複数エントリの生成中は **モーダル進捗ダイアログ** で状況を表示:
 
@@ -985,10 +978,13 @@ struct Settings {
 └────────────────────────────┘
 ```
 
-- 同期処理 (UI スレッドで順次実行 + 各エントリ完了時に `ctx.request_repaint()`)
+- `ctrl-e-export` worker が snapshot 済み base pixels / mask / preset から各エントリの隠蔽合成、
+  encode、メタデータ転記、`create_new` 保存を順次実行する。UI スレッドは `ExportEvent` を poll して
+  進捗モーダルを更新するだけで、合成やファイル I/O を行わない。
 - 1 エントリの生成時間目安: モザイク ~50ms + メタデータ ~50ms = ~100ms。
   ぼかし大きめなら ~200ms。5 エントリで合計 0.5-2 秒。許容範囲
-- キャンセル時は処理中エントリ完了後に中断 (生成済みファイルはそのまま残す)
+- キャンセル token は各エントリ開始前に確認するため、処理中エントリ完了後に中断する
+  (生成済みファイルはそのまま残す)
 - **フォルダ内画像への multi-image batch は v1 では入れない** (v2 で検討、UI 複雑度が大幅に増えるため)
 
 ### 10.2 Settings 追加
@@ -1149,7 +1145,7 @@ raw → erase → local-adjust → conceal と、同じ crop を適用した注�
 | 2b | 消しゴム側 Select モードを `vector_edit.rs` 経由に置換。**旧 Ctrl+ドラッグ複合操作 (回転+太さ) は完全廃止** — まだ利用者が少ない段階での UX 統一なので CHANGELOG 記載のみで legacy alias は持たない (ユーザー判断)、回帰テスト | 1-2 日 |
 | 3a | Mosaic 合成実装 (3 境界モード × 2 タイルサイズモード)、タイル平均計算の rayon 並列化、`conceal_cache` + 表示パイプライン統合。**`conceal_cache` は generation-keyed + lazy eviction** (Codex P2)、`clear_*_caches` の代わりに `bump_conceal_generation()`、idx-keyed cache lifecycle checklist 完備 (Codex P1) | 3-4 日 |
 | 3b | WhiteFill / BlackFill 合成実装、不透明度スライダー (1% 刻み)、Feathered 境界 (distance transform) | 1-2 日 |
-| 3c | Blur 合成実装 (3 モード)、bbox 最適化、Gaussian separable blur。**最初から worker thread + cancel + progress** (Codex P1)。閾値 (estimated_cost_ms > 80) で同期/非同期分岐 | 3-4 日 |
+| 3c | Blur 合成実装 (3 モード)、bbox 最適化、Gaussian separable blur。当初は 80 ms 閾値で同期 / 非同期を分ける案だったが、現行は Mosaic / Fill と同じ materialization worker + cancel 経路へ統合済み。段階 perf event はあるが専用進捗率 state は持たない | 3-4 日 |
 | 4 | 永続化 (DB + サイドカー)、マスクスロット 2 個 UI、パラメータプリセット 4 個 UI、`conceal_pages` バッジ、Undo / Redo | 2-3 日 |
 | 5 | `save_with_metadata.rs` (JPEG / PNG / WebP 3 形式) + ユニットテスト (roundtrip)。**WebP RIFF mux は既存 `xmp_writer.rs` から RIFF パーサ部分を共通化して流用** (Codex P2)。**PNG は生 chunk read/write が必要** (`png_metadata.rs` の生 chunk 取得 API を追加、Codex P3) | 4-5 日 |
 | 6 | ✅ 完了: `export_dialog.rs` (`Ctrl+E` UI、**バリエーション一括チェックリスト**、`_N` 接尾辞)。**Worker pattern で最初から実装** (Codex P1) — 既存 `fs_capture_pending` を参考に `ExportPending { cancel, rx, total, done }`、進捗モーダル、UI スレッドはポーリングのみ。**ファイル名衝突は `OpenOptions::create_new(true)` リトライ** (Codex P3) | 4-5 日 |
@@ -1193,7 +1189,7 @@ raw → erase → local-adjust → conceal と、同じ crop を適用した注�
 - 実 ComfyUI 出力 WebP (もしあれば) で同様
 - 1x / 2x / 5x の各倍率でモザイクを掛けた画像をビューアで確認 (タイル目に見えること)
 - 半透明モード / マスク形状モードの見た目確認
-- 4K 画像で `compose_mosaic` のレスポンス (~50ms 目標、UI 同期 OK ならその場で適用)
+- 4K 画像で `compose_mosaic` 実行中も UI 入力 / パネル描画が止まらず、worker 完了後に最新世代だけが反映されること
 
 ## 15. 実装前のドキュメント更新計画 (履歴)
 
