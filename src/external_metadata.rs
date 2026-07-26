@@ -245,7 +245,7 @@ pub fn images_for_sidecar(sidecar_path: &Path) -> Vec<PathBuf> {
 
 /// 先頭の UTF-8 BOM (`EF BB BF`) を取り除く。JSON は RFC 8259 上 BOM を付けない規定だが、
 /// 一部の Windows ツールが付与するため、付いていればパース前に剥がす
-/// (docs/sidecar-encoding-utf8.md §3.2 / TC4)。BOM を残すと serde_json が先頭で
+/// (docs/archive/search-metadata/sidecar-encoding-utf8.md §3.2 / TC4)。BOM を残すと serde_json が先頭で
 /// パース失敗し、TXT では先頭に U+FEFF が残って表示・検索が崩れる。
 fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
@@ -506,7 +506,7 @@ mod tests {
         assert!(images_for_sidecar(&sc).is_empty());
     }
 
-    // ── エンコーディング回帰 (docs/sidecar-encoding-utf8.md の TC1〜TC6) ──────
+    // ── エンコーディング回帰 (docs/archive/search-metadata/sidecar-encoding-utf8.md の TC1〜TC6) ──────
     // サイドカー JSON/TXT は常に UTF-8 として読む。CP932/ANSI で誤読すると CJK が
     // mojibake (縺ｮ…) になる。生 UTF-8 / \u エスケープ / BOM / 4byte / 不正バイトを網羅。
 

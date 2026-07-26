@@ -9,7 +9,7 @@ Date: 2026-06-30
 
 関連:
 
-- [music-lab-plan.md](music-lab-plan.md)
+- [archive/video/music-lab-plan.md](archive/video/music-lab-plan.md)
 - [async-architecture.md](async-architecture.md)
 - [ui-responsiveness.md](ui-responsiveness.md)
 - [video-architecture.md](video-architecture.md)

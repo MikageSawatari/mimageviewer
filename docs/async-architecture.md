@@ -825,7 +825,7 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 
 ## 6. 参考 (実測値)
 
-`docs/bench-scroll-report.md` に詳細あり。要点:
+`docs/archive/performance-refactoring/bench-scroll-report.md` に詳細あり。要点:
 
 - キャッシュヒット時のサムネ読み込み: 2〜3 ms/枚
 - PDF レンダリング: 5 ワーカー並列 (うち 1 を Critical 予約) で Cold 1441ms → 10ms (2 枚目以降)

@@ -99,7 +99,7 @@ pub enum GridItem {
     /// Ctrl+G グローバルメタ検索結果の集約コンテナ (v0.8.0)。
     /// トップレベル結果ビューで、ヒットを含む親フォルダ or ZIP を 1 セルで表現する。
     /// クリックでそのコンテナに入ると、drill-down ビューに遷移して階層を維持した
-    /// まま絞り込み表示になる (docs/search-expansion-design.md §10.3)。
+    /// まま絞り込み表示になる (docs/archive/search-metadata/search-expansion-design.md §10.3)。
     SearchContainer {
         /// 親フォルダ or ZIP ファイルの絶対パス
         path: PathBuf,

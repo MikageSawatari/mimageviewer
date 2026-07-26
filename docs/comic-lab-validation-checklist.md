@@ -8,10 +8,10 @@ Date: 2026-06-04
 
 関連:
 
-- [speech-bubble-tool-design.md](speech-bubble-tool-design.md)
-- [speech-bubble-text-tool-plan.md](speech-bubble-text-tool-plan.md)
-- [comic-lab-progress.md](comic-lab-progress.md)
-- [message-window-design.md](message-window-design.md)
+- [archive/comic/speech-bubble-tool-design.md](archive/comic/speech-bubble-tool-design.md)
+- [archive/comic/speech-bubble-text-tool-plan.md](archive/comic/speech-bubble-text-tool-plan.md)
+- [archive/comic/comic-lab-progress.md](archive/comic/comic-lab-progress.md)
+- [archive/ui-input/message-window-design.md](archive/ui-input/message-window-design.md)
 
 ## 1. 現時点で見つけた問題
 

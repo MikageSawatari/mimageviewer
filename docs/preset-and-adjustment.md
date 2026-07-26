@@ -190,7 +190,7 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 - **ポストフィルタ**: `post_filter: PostFilter` (レトロ系表示エフェクト、色調補正の後に適用)
 - **シャープ化**: `smart_sharpen: u8` (0 = OFF, 1..=100。最終表示段スマートシャープの強度。
   final pipeline 専用でサムネイルには反映しない。§2.7 と
-  [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md) を参照)
+  [archive/editing/final-smart-sharpen-plan.md](archive/editing/final-smart-sharpen-plan.md) を参照)
 
 AI 関連フィールドは「ページ / お気に入り / グローバルに保存された希望設定」であり、
 実際に走るモデル範囲はアプリ全体設定 `Settings::ai_feature_mode` でさらに制限される。
@@ -515,7 +515,7 @@ final composite の `params_hash` から `colorize` と `post_filter` を外す�
 
 ### 2.7 最終表示段スマートシャープ (`smart_sharpen`、v1.3.0)
 
-設計の出所は [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md)。
+設計の出所は [archive/editing/final-smart-sharpen-plan.md](archive/editing/final-smart-sharpen-plan.md)。
 
 - **UI**: 補正パネルのポストフィルタの上に `シャープ化 0..=100` の 1 本スライダー。
   詳細パラメータ (半径 / 輪郭しきい値 / ハロー抑制) は出さない。

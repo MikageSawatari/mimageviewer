@@ -1,6 +1,6 @@
 //! `GlobalIoSemaphore` — ワーカー横断の I/O 同時実行制御。
 //!
-//! docs/search-expansion-design.md §7.5 + §15.1.6 に準拠。
+//! docs/archive/search-metadata/search-expansion-design.md §7.5 + §15.1.6 に準拠。
 //!
 //! 目的: UI スレッドのスクロール・入力応答がバックグラウンド I/O 競合で阻害されないよう、
 //! ディスク同時アクセス数に上限を設ける。PDF ワーカー / サムネイルワーカー / 全文インデクサ

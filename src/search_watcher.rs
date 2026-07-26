@@ -1,4 +1,4 @@
-//! ファイルシステム監視 + debounce (docs/search-expansion-design.md §7.1〜7.3)。
+//! ファイルシステム監視 + debounce (docs/archive/search-metadata/search-expansion-design.md §7.1〜7.3)。
 //!
 //! お気に入りルートを再帰的に watch し、create/modify/remove/rename イベントを
 //! 500ms デバウンスして「変更された path 集合」を Diff Applier に送る。

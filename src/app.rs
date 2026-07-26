@@ -6950,7 +6950,7 @@ pub struct App {
     pub(crate) smart_folder_rule_draft:
         Option<crate::ui_dialogs::smart_folder_editor::SmartFolderRuleDraft>,
 
-    // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
+    // ── タグ編集ダイアログ (docs/archive/search-metadata/tag-feature.md) ─────────────────
     pub(crate) show_tag_editor: bool,
     /// タグ編集ダイアログ中で編集中のタグ一覧 (キャンセルで破棄するため Settings から分離)
     pub(crate) tag_editor_draft: Vec<crate::settings::TagDef>,
@@ -51868,7 +51868,7 @@ impl App {
     /// 注: ダウンサンプル**前**(base 解像度)で焼くため、強い縮小時はテキストが下地と一緒に
     /// 縮小される。D10 の「ダウンサンプル後に最終解像度直焼き」は **不採用 (2026-06-07)** —
     /// 座標多段でズレ系バグが出やすく、最終出力縮小は重視機能でないため (詳細は
-    /// docs/comic-ui-bugfix-checklist.md C5 / docs/comic-integration-plan.md D10)。等倍/軽縮小では
+    /// docs/archive/comic/comic-ui-bugfix-checklist.md C5 / docs/comic-integration-plan.md D10)。等倍/軽縮小では
     /// 差は出ない。フルスクリーン Ctrl+E 経路は conceal_mask=None なので、ここで焼いた注釈が
     /// conceal preset に潰されることはない。
     pub(crate) fn comic_composited_pixels_for_export(
@@ -58742,7 +58742,7 @@ impl eframe::App for App {
         // 「読み込み中…」を出す。先読み N/M と同じ場所で進行中セマンティクスを統一。
         self.render_container_enumerate_overlay(ctx);
 
-        // タグ書き込み worker の結果ポーリング (docs/tag-feature.md §5.6)
+        // タグ書き込み worker の結果ポーリング (docs/archive/search-metadata/tag-feature.md §5.6)
         self.poll_tag_write_results();
         self.poll_tag_maintenance_results();
         self.poll_rating_write_results();

@@ -2,7 +2,7 @@
 
 ## 0. このドキュメントの位置づけ
 
-[docs/tag-feature.md](tag-feature.md) は **v1.0 のタグ機能 (= ファイル埋め込み中心)** の設計書である。
+[docs/archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md) は **v1.0 のタグ機能 (= ファイル埋め込み中心)** の設計書である。
 本ドキュメントはその **保存・検索モデルを置き換える再設計**で、以下を実現する:
 
 - 画像・動画だけでなく **ZIP / PDF / 変換可能アーカイブ (実ファイルのコンテナ) / フォルダ にもタグを付与**できる
@@ -10,10 +10,10 @@
   全文検索索引のいずれにも書かない (非破壊・投影ゼロ)**
 - タグの発見は Ctrl+G / Ctrl+S とは **完全に分離**し、**専用のタグビュー (Ctrl+T) + facet フィルタ**で行う
 
-tag-feature.md から **生かす部分**: §3.3 タグ名のルール (使用可能文字・長さ・大小文字無視)、
+archive/search-metadata/tag-feature.md から **生かす部分**: §3.3 タグ名のルール (使用可能文字・長さ・大小文字無視)、
 XMP `dc:subject` の **読み取り**ロジック ([src/xmp_reader.rs](../src/xmp_reader.rs)、移行専用)。
 
-tag-feature.md から **置き換える部分**: §1/§3.1/§5 (XMP・動画 `.xmp` への**書き込み**を正本とする
+archive/search-metadata/tag-feature.md から **置き換える部分**: §1/§3.1/§5 (XMP・動画 `.xmp` への**書き込み**を正本とする
 モデル全体)、`#` プレフィックスをファイルに刻む規約、ZIP内画像/PDFページ/フォルダを非対象とする
 スコープ定義、Ctrl+G `#tag` でのタグ検索。
 
@@ -85,7 +85,7 @@ ZipImage/PdfPage/ZipDir 用合成キーは不要 (それらは付与対象外)�
 - **画面表示時のみ `#` を冠して「タグ」であることを示す** (`#原神`)。`#` は表示上の飾りで、保存・
   照合・キー化はすべて `#` なしで行う。
 - v1.0 互換: v1.0 はファイル XMP に `#原神` と刻んでいた。移行 (§7) で `#` を剥がして `tags.db` に取り込む。
-- タグ名ルールは tag-feature.md §3.3 を踏襲 (1〜64 文字、大小無視、`#` は入力させず表示時に付与)。
+- タグ名ルールは archive/search-metadata/tag-feature.md §3.3 を踏襲 (1〜64 文字、大小無視、`#` は入力させず表示時に付与)。
 
 ### 3.2 他アプリ由来 dc:subject は「タグ」として扱わない (D10)
 
@@ -295,7 +295,7 @@ Shell 成功 path だけを、共通 delete worker が全 path-keyed store と�
   (コンテナ/フォルダをグレーアウトしない)。
 - [`cell_tag_list` (src/app.rs:20307)](../src/app.rs) を `tags.db` 参照に変更し 6 種対応。
 - [src/ui_dialogs/context_menu.rs](../src/ui_dialogs/context_menu.rs) のタグ項目を 6 種で有効化。
-- 複数選択時のトグルは **all-or-nothing** (全付与済みなら全削除、それ以外は全付与、tag-feature.md §2.3、
+- 複数選択時のトグルは **all-or-nothing** (全付与済みなら全削除、それ以外は全付与、archive/search-metadata/tag-feature.md §2.3、
   D18)。**現行マニュアルの「各ファイル独立トグル」記述はこれに合わせて改める** (UX レビュー【低10】、
   出荷挙動と引用元設計の矛盾を解消)。
 - **フルスクリーンでコンテナ閲覧中のタグ操作はコンテナ自身へ自動フォールバック (UX レビュー【高3】)**:
@@ -487,7 +487,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 - [`passes_facet_filter` (src/app.rs:18656)](../src/app.rs): タグフィルタ ON 時にタグ非対応アイテムを
   **除外しない (素通り)** (§5.2)。distinct/一致は `tags.db` から。
 - [facet タグメニュー (src/ui_main.rs:1970)](../src/ui_main.rs): 現在の一覧に含まれるタグを列挙し、検索欄で全タグに到達。
-- メニュー/ツールバーのタグボタン: show_shortcut のみ (tag-feature.md §4.2/§4.3 を更新)。
+- メニュー/ツールバーのタグボタン: show_shortcut のみ (archive/search-metadata/tag-feature.md §4.2/§4.3 を更新)。
 - [src/tag_write_worker.rs](../src/tag_write_worker.rs): 書き込み先を **`tags.db` のみ**に。**Tantivy upsert /
   XMP 書き込みは通常タグ付けから外す** (D13)。`xmp_writer` のファイル書き込みは §7.3 の「削除」専用に縮退。
 - **既存 FTS タグ経路の閉鎖 (§5.4)**: `SourceKind::ALL` から `Tags` 除外 ([src/fts_index.rs:87](../src/fts_index.rs))、
@@ -563,7 +563,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 
 ## 11. 実装着手時に更新するドキュメント
 
-- [docs/tag-feature.md](tag-feature.md): 本設計への置き換えを冒頭で参照 (v1.0 として保存)。
+- [docs/archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md): 本設計への置き換えを冒頭で参照 (v1.0 として保存)。
 - [docs/spec.md](spec.md) / [docs/architecture-overview.md](architecture-overview.md): タグ仕様・`tags_db` 追加。
 - [docs/virtual-folders.md](virtual-folders.md): 付与対象表 (コンテナ + **フォルダ**)・キー規則。
 - [docs/preset-and-adjustment.md](preset-and-adjustment.md): サイドカー二層にタグが加わる点。

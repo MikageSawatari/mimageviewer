@@ -12,9 +12,9 @@ detached viewport の生成・配置・再生成・host 捕捉・active↔passiv
 「前提そのものが壊れている箇所」を洗い出し**、作り直し方針を提示する。
 
 Phase A1/A2/B の関連ドキュメント:
-- [detached-window-phase-a1-transient-audit.md](detached-window-phase-a1-transient-audit.md)
-- [detached-window-phase-a2-runtime-separation.md](detached-window-phase-a2-runtime-separation.md)
-- [detached-window-phase-b-placement-stabilization.md](detached-window-phase-b-placement-stabilization.md)
+- [archive/detached/detached-window-phase-a1-transient-audit.md](archive/detached/detached-window-phase-a1-transient-audit.md)
+- [archive/detached/detached-window-phase-a2-runtime-separation.md](archive/detached/detached-window-phase-a2-runtime-separation.md)
+- [archive/detached/detached-window-phase-b-placement-stabilization.md](archive/detached/detached-window-phase-b-placement-stabilization.md)
 
 ---
 

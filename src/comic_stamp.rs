@@ -1,6 +1,6 @@
 //! 絵文字スタンプ (画像ステッカー) の同梱カタログとデコード (Inc 4c)。
 //!
-//! 絵文字は **画像**として扱う (フォントのカラー字形ではない、`docs/stamp-feature-design.md`)。
+//! 絵文字は **画像**として扱う (フォントのカラー字形ではない、`docs/archive/comic/stamp-feature-design.md`)。
 //! Twemoji の SVG を `build.rs` が `vendor/twemoji/svg/*.svg` から `include_bytes!` で exe に
 //! 同梱し (生成コードは `$OUT_DIR/emoji_svgs.rs`)、表示時に resvg (純 Rust) で 512px へ
 //! ラスタライズして `comic_core::RgbaOverlay` (straight-alpha) を得る。ベイカ

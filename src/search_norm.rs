@@ -1,4 +1,4 @@
-//! 検索テキストの正規化関数 (docs/search-expansion-design.md §5.2)。
+//! 検索テキストの正規化関数 (docs/archive/search-metadata/search-expansion-design.md §5.2)。
 //!
 //! **設計上の重要制約**:
 //!   インデックス作成時 (ingest の `all_text_norm` 生成)、

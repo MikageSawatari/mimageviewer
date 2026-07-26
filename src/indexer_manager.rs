@@ -1,4 +1,4 @@
-//! `IndexerManager` — App 統合のための Supervisor 群管理 (docs/search-expansion-design.md §3)。
+//! `IndexerManager` — App 統合のための Supervisor 群管理 (docs/archive/search-metadata/search-expansion-design.md §3)。
 //!
 //! 全お気に入りの `SupervisorHandle` を束ねて、以下を提供する:
 //!

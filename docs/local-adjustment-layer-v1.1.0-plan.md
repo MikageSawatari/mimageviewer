@@ -271,7 +271,7 @@ UI では非手動マスクの追加 / 削除マスクパネルを初期非表�
 SAM / SAM2 系の AI 領域分割は `local_adjust_lab` で検証したが、promptable object mask
 generator の出力をユーザーが期待する髪 / 服 / 小物などの意味単位へ安定して変換できず、
 過分割や細かい破片が目立った。v1.1.0 では領域分割への AI 導入を見送り、クラシック分割と
-手動補正をチューニングする。詳細は [ai-region-segmentation-retrospective.md](ai-region-segmentation-retrospective.md) を参照。
+手動補正をチューニングする。詳細は [archive/ai/ai-region-segmentation-retrospective.md](archive/ai/ai-region-segmentation-retrospective.md) を参照。
 
 ## 5. v1.1.0 の効果候補
 
@@ -1031,7 +1031,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   マスクの隙間が残りにくいようにする
 - `local_adjust_lab` では、外部 SAM 候補マスク読み込みと SAM2 Hiera Tiny 直接実行の
   試験経路をいったん実装したが、AI イラストで期待する意味単位の領域分割にならなかったため
-  削除した。失敗内容と再導入条件は [ai-region-segmentation-retrospective.md](ai-region-segmentation-retrospective.md)
+  削除した。失敗内容と再導入条件は [archive/ai/ai-region-segmentation-retrospective.md](archive/ai/ai-region-segmentation-retrospective.md)
   に残す
 - 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance / Photo Filter /
   3-way Color Grading / Selective Color / Part Color / Channel Mixer / Monochrome Mixer / Color Mixer / Clarity / Highlights-Shadows /

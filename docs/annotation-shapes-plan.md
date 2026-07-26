@@ -5,7 +5,7 @@
 実機確認 = ユーザー。本書が正本。
 
 関連正本: [comic-integration-plan.md](comic-integration-plan.md)
-(層構造・保存・合成の契約)、[stamp-feature-design.md](stamp-feature-design.md)
+(層構造・保存・合成の契約)、[archive/comic/stamp-feature-design.md](archive/comic/stamp-feature-design.md)
 (スタンプ機構)。
 
 ---

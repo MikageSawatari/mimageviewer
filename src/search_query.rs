@@ -13,7 +13,7 @@
 //!
 //! ## 結合モード (`MatchMode`)
 //!
-//! 検索 UI の「□OR」チェックで切り替える (docs/search-expansion-design.md §20)。
+//! 検索 UI の「□OR」チェックで切り替える (docs/archive/search-metadata/search-expansion-design.md §20)。
 //! - `MatchMode::And` (既定): include トークンを **すべて** 含むものがマッチ
 //! - `MatchMode::Or`: include トークンを **1 つ以上** 含むものがマッチ
 //!
@@ -434,7 +434,7 @@ mod tests {
         );
     }
 
-    // ---- タグ構文 (docs/tag-feature.md) ----
+    // ---- タグ構文 (docs/archive/search-metadata/tag-feature.md) ----
 
     #[test]
     fn parse_tag_prefix() {

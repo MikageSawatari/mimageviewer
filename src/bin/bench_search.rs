@@ -1,4 +1,4 @@
-//! Tantivy + bigram プロトタイプ計測 (docs/search-expansion-design.md §15.1.1)。
+//! Tantivy + bigram プロトタイプ計測 (docs/archive/search-metadata/search-expansion-design.md §15.1.1)。
 //!
 //! 目的:
 //!  1. Tantivy + NgramTokenizer(2,2) + post-filter 方式でグローバルメタ検索の速度が許容範囲か判定
@@ -601,7 +601,9 @@ fn main() {
         i += 1;
     }
 
-    println!("=== Tantivy + bigram プロトタイプ計測 (docs/search-expansion-design.md §15.1.1) ===");
+    println!(
+        "=== Tantivy + bigram プロトタイプ計測 (docs/archive/search-metadata/search-expansion-design.md §15.1.1) ==="
+    );
     println!("  num_docs = {}", num_docs);
     println!("  page_size = {}, HARD_MAX = {}", PAGE_SIZE, HARD_MAX);
     println!();

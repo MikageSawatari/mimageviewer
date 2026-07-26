@@ -863,7 +863,7 @@ enum TagButtonState {
     On,
 }
 
-/// タグパネル描画 (docs/tag-feature.md §4.4)。
+/// タグパネル描画 (docs/archive/search-metadata/tag-feature.md §4.4)。
 ///
 /// 登録タグを ON/OFF ボタンで横並び表示。各ボタンの外観:
 /// - ON (現在のファイルに付与済み): 緑背景 + 強調

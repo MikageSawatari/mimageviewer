@@ -4,7 +4,7 @@
 //! [`crate::mask_db::Shape`] のハンドル編集 (本体移動 / 端点 / 角 / 辺中点 /
 //! 回転ハンドル) を担う。詳細仕様は
 //! [docs/conceal-feature-plan.md §5](../../docs/conceal-feature-plan.md) と
-//! [docs/conceal-impl-plan-codex-brief.md §5](../../docs/conceal-impl-plan-codex-brief.md)。
+//! [docs/archive/editing/conceal-impl-plan-codex-brief.md §5](../../docs/archive/editing/conceal-impl-plan-codex-brief.md)。
 //!
 //! # 設計の要点
 //!

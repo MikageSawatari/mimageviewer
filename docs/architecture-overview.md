@@ -147,7 +147,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 
 ⚠️ 構造リワーク中 (凍結ルールあり)。正本:
 [detached-rework-plan.md](detached-rework-plan.md) (§2 憲法 = BA-1〜BA-7)。
-音声メディア窓は [detached-rework-stage-audio.md](detached-rework-stage-audio.md)。
+音声メディア窓は [archive/detached/detached-rework-stage-audio.md](archive/detached/detached-rework-stage-audio.md)。
 
 | モジュール / 概念 | 役割 |
 | --- | --- |
@@ -471,7 +471,7 @@ PDFの仮想項目はruntime keyと同じ`page_<u32>`だけを許可し、評価
 | [detached-rework-plan.md](detached-rework-plan.md) | detached viewer / F12 / 複数ウィンドウを触るとき。**§2 憲法 (BA-1〜7) 必読、凍結ルールあり** |
 | [spec.md](spec.md) | 機能仕様・設定項目の正式な定義 |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の詳細設計 |
-| [thumbnail-memory-redesign.md](thumbnail-memory-redesign.md) | サムネイルメモリ管理の背景経緯 |
+| [archive/performance-refactoring/thumbnail-memory-redesign.md](archive/performance-refactoring/thumbnail-memory-redesign.md) | サムネイルメモリ管理の背景経緯 |
 
 ---
 

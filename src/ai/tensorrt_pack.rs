@@ -24,7 +24,7 @@ use std::path::PathBuf;
 /// - v3 (May 02): `UpscaleRealEsrGeneralV3` を pack 同梱対象から除外 (= in-process
 ///   DirectML 経路に固定)。bench で TRT/DirectML がほぼ互角だったため worker IPC
 ///   overhead を払う価値なしと判断。詳細は
-///   `docs/tensorrt-batching-feasibility.md` を参照。
+///   `docs/archive/ai/tensorrt-batching-feasibility.md` を参照。
 #[allow(dead_code)]
 pub const EXPECTED_TRT_PACK_VERSION: u32 = 3;
 

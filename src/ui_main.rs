@@ -6550,7 +6550,7 @@ impl App {
                         }
                     }
                 }
-                // タグセクション (docs/tag-feature.md §4.3)
+                // タグセクション (docs/archive/search-metadata/tag-feature.md §4.3)
                 TS::Tags => {
                     let lead = toolbar_label(ui, "タグ:", 42.0, drag_enabled).hover_tip(lead_hint);
                     self.finish_toolbar_section_lead(

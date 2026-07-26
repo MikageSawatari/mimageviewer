@@ -1,4 +1,4 @@
-//! タグ編集ダイアログ (docs/tag-feature.md §4.1)。
+//! タグ編集ダイアログ (docs/archive/search-metadata/tag-feature.md §4.1)。
 //!
 //! ユーザがタグ一覧を編集するための UI。お気に入り編集 (`favorites_editor.rs`) と
 //! 同じ構造で、表示名編集 / 並べ替え / 削除 / 末尾への新規追加 をサポート。

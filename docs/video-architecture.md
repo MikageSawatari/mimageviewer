@@ -1271,7 +1271,7 @@ overlay bounds に clamp するため、解像度・DPI・モニター構成が�
   `ui_text_links` でリンク化する。リンククリックは native overlay command として
   UI thread へ戻し、`VideoPlayer::set_playing(false)` 後に
   `opener` 経由で既定ブラウザを起動する。URL は `external_links` で HTTP(S) のみに制限する。
-- 経緯と設計判断は [docs/dcomp-native-presenter-integration-plan.md](dcomp-native-presenter-integration-plan.md)
+- 経緯と設計判断は [docs/archive/video/dcomp-native-presenter-integration-plan.md](archive/video/dcomp-native-presenter-integration-plan.md)
   に詳細あり (Phase A〜D の段階的移行)
 
 #### 動画オープン準備中 HUD のデバッグ環境変数
@@ -2397,7 +2397,7 @@ codex exec --sandbox read-only -o /tmp/codex-video.txt \
 
 ### 経緯
 2026-04 に「NVIDIA コンパネで RTX VSR を『アクティブ』表示にしたい」目標で Phase 2
-(DComp overlay 経路) の実装を開始。`docs/dcomp-video-overlay.md` (= 撤回後 archived) に
+(DComp overlay 経路) の実装を開始。`docs/archive/video/archive-dcomp-video-overlay.md` (= 撤回後 archived) に
 詳細な経過を記録。Phase 2.0/2.1/2.2/2.3 まで段階実装し、各段階で Codex レビューを
 受けて P1/P2/P3 を順次解消した。
 

@@ -1,7 +1,7 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
 > ステータス: **実装済み / 保守メモ**。v1.1.0+。
-> 設計の経緯・調査・代替案は [key-customization-plan.md](key-customization-plan.md) に残す。
+> 設計の経緯・調査・代替案は [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) に残す。
 > 簡易版の実装判断は本書を優先し、差異が出たら本書へ集約する。
 > 本書は「簡易版 (テキスト ini / GUI なし / 競合は警告のみ)」を実際に作るための手順書。
 >
@@ -12,7 +12,7 @@
 > `Settings.keymap` を編集できる。`keymap.ini.default` は Action 名と既定キーの参照として引き続き生成する。
 
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
-[key-customization-plan.md](key-customization-plan.md) §8 (簡易版の設計確定事項)。
+[archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) §8 (簡易版の設計確定事項)。
 
 実装結果:
 - `src/keymap.rs` に Action 定義、ini parser、egui exact match、KeyHold /

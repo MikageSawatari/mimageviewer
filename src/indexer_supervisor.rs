@@ -1,4 +1,4 @@
-//! Indexer Supervisor (docs/search-expansion-design.md §3 アーキテクチャ図)。
+//! Indexer Supervisor (docs/archive/search-metadata/search-expansion-design.md §3 アーキテクチャ図)。
 //!
 //! お気に入り単位で以下を統括するバックグラウンドスレッド:
 //!

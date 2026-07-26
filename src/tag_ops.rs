@@ -1,4 +1,4 @@
-//! タグ付与/削除操作のファサード (docs/tag-feature.md §5)。
+//! タグ付与/削除操作のファサード (docs/archive/search-metadata/tag-feature.md §5)。
 //!
 //! メニュー・ツールバー・メタデータパネルからのタグ操作のエントリーポイント。
 //! tags.db 更新はすべて `tag_write_worker` に委譲する。UI 側は all-or-nothing 判定に

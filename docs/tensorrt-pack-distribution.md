@@ -44,7 +44,7 @@ foreach ($kind in @(
 ### `realesr_general_v3` を含めない理由 (pack v3、2026-05)
 
 bench (RTX 4090、tile=512、1 tile/frame〜12 tile/image) で本モデルだけ
-**TRT と DirectML がほぼ互角〜DirectML 微優位**となった (`docs/tensorrt-batching-feasibility.md`
+**TRT と DirectML がほぼ互角〜DirectML 微優位**となった (`docs/archive/ai/tensorrt-batching-feasibility.md`
 末尾の比較表)。worker IPC overhead を払う価値が無いため、`runtime.rs::should_route_to_worker`
 が本モデルを in-process DirectML へ流す設計。**`--tensorrt-build realesr_general_v3` は
 no-op (= "skip" 出力して exit 0) で engine cache を作成しない**ため、上記ループに

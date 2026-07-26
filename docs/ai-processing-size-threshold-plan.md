@@ -1,7 +1,7 @@
 # AI 処理サイズしきい値 修正要件
 
 > ステータス: **実装済み (2026-06-10)**。render-to-target 最適化は 2026-06-15 に実装。
-> `final-smart-sharpen-plan.md` とは別管理にする。
+> `archive/editing/final-smart-sharpen-plan.md` とは別管理にする。
 >
 > 実装サマリ:
 >

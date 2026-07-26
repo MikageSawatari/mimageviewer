@@ -1,4 +1,4 @@
-//! メタ抽出 → ソース別テキスト構築 (docs/search-expansion-design.md §19.5 Ingest Worker)。
+//! メタ抽出 → ソース別テキスト構築 (docs/archive/search-metadata/search-expansion-design.md §19.5 Ingest Worker)。
 //!
 //! 画像 / 動画 1 ファイルに対して以下のソースを個別にビルドする:
 //!   - ファイル名 (拡張子を含む) → `SourceKind::Filename`

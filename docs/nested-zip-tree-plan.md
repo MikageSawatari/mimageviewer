@@ -36,7 +36,7 @@
 ### フラット採用の経緯 (調査結果)
 **機能上の障害が原因ではない。** 最初の ZIP 対応 (commit `ad4e4b4f`) の時点で
 「サブフォルダはフラット + セパレータ」が出発点で、ネスト ZIP (commit `aac30139`, v0.7.0)
-はそれを内側 ZIP に延長した簡易拡張 ([plan-v0.7.0.md](plan-v0.7.0.md) §4、見積 1〜2 日)。
+はそれを内側 ZIP に延長した簡易拡張 ([archive/release/plan-v0.7.0.md](archive/release/plan-v0.7.0.md) §4、見積 1〜2 日)。
 ツリー実装を試して撤退した形跡はない。
 
 関連する過去の実害 (実装時に踏まないよう注意):
@@ -281,7 +281,7 @@ Codex CLI は `codex exec` (1 回目) → `codex exec resume --last` (以降) �
 
 ## 13. 実機確認チェックリスト (ユーザー復帰時)
 
-**テスト ZIP + 詳細チェックリストは [nested-zip-test-guide.md](nested-zip-test-guide.md)。**
+**テスト ZIP + 詳細チェックリストは [archive/folders-archives/nested-zip-test-guide.md](archive/folders-archives/nested-zip-test-guide.md)。**
 `python scripts/make_nested_zip_test.py [--big]` で `dist/ziptest/` に自己説明的な
 テスト ZIP を生成する (各頁画像に本名・頁番号・構造説明入り)。以下は要点の要約:
 

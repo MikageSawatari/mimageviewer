@@ -1381,7 +1381,7 @@ placement に作り直す経路。headless→native の「presenter 無し→有
 ## 12. 参照ドキュメント
 
 ### ラボ側（機能の正本）
-- `C:\home\mimageviewer-music-lab\docs\music-lab-plan.md`（データ契約・非同期境界・解析エンジン方針）
+- `C:\home\mimageviewer-music-lab\docs\archive/video/music-lab-plan.md`（データ契約・非同期境界・解析エンジン方針）
 - `music-lab-validation-checklist.md`（ラボ実機検証）
 - `crates/music-core/src/lib.rs`（公開契約）
 

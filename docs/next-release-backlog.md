@@ -31,7 +31,7 @@
 
 ### 1.9 parked 窓のリソース制御 (サムネ pipeline 停止 / VRAM 合算予算) — 角度⑥送り
 
-- 出典: v2.3.0 角度⑥レビュー (Sol/Terra 一致、docs/review-v2.3.0/sol-angle-reviews.md)。
+- 出典: v2.3.0 角度⑥レビュー (Sol/Terra 一致、docs/archive/review-v2.3.0/sol-angle-reviews.md)。
   いずれも bounded な効率問題でデータ喪失は無し。park/再活性ライフサイクルの構造に
   踏み込むため、リリース直前パッチではなく detached リワーク後続で設計対応する。
   1. **P2: park してもサムネ pipeline が止まらない**: `pause_background_work_keep_current_frame`
@@ -177,6 +177,31 @@
   分岐を書き足す形にはしない (同じ計算の 3 つ目の複製になる)。
   既存の「原寸フィットの実表示矩形統一」の議論とも関連する。
 - 規模 / 優先度: Small〜Medium / P3。1.23 と対象コードが重なるので同時着手が効率的。
+
+### 1.25 一時停止中に動画フィルタを変えても画面へ反映されない
+
+- 出典: v2.8.1 検討中のユーザー報告 (2026-07-26)。動画を一時停止した状態で色調補正 /
+  Creative LUT を操作しても絵が変わらず、再生を再開して初めて反映される。静止させて
+  パラメータの効きを見比べたいケース (微調整・前後比較) で機能しない。
+- 原因 (コード確認済み): `NativeVideoPresenter::set_video_grade`
+  ([src/video/native_presenter/mod.rs:3226](../src/video/native_presenter/mod.rs)) は grade 定数バッファと
+  Creative LUT テクスチャを更新するだけで、present を行わない。実際に絵へ乗るのは
+  `VideoGradePipeline::draw` が走る次の `present()` = 次のデコード済みフレームを提示する
+  ときなので、新しいフレームが来ない一時停止中は画面が更新されない。
+- 対応案: 一時停止中に grade が変わったら、直近フレームを新しい grade で再 present する。
+  ウィンドウ切替の prime 経路 ([src/video/mod.rs:3079](../src/video/mod.rs) 付近) が
+  `present_retire.back()` / `source.queue.front()` から直近フレームを取り出して
+  `presenter.present()` を呼ぶ形を既に持っているので、これを「grade 変更時の再提示」
+  として一般化できる。
+- 注意:
+  - `present_retire` は GPU コピー完了で pop されるため、一時停止が続くと空になり得る。
+    再提示用に「最後に present したフレーム」を保持する所有者を明示的に決める
+    (フレーム 1 枚分を恒常的に握ることになるので、hidden presenter / 音声モードとの
+    兼ね合いも同時に見る)。
+  - 再提示は grade 変更を検知したときだけにする。一時停止中に無条件の present ループを
+    回すと `docs/idle-health-check.md` の静止時 repaint 検査に引っかかる。
+  - 音声モード / hidden presenter 中は presenter が非表示なので再提示しない。
+- 規模 / 優先度: Small〜Medium / P2 candidate。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

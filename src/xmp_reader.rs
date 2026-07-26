@@ -578,7 +578,7 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// dc:subject 読み取り (タグ機能 — docs/tag-feature.md §6.4)
+// dc:subject 読み取り (タグ機能 — docs/archive/search-metadata/tag-feature.md §6.4)
 // ---------------------------------------------------------------------------
 
 /// ファイルの XMP `dc:subject` Bag 要素を読み取る。

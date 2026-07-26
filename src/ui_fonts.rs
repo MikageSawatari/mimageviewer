@@ -925,7 +925,7 @@ mod tests {
 
     /// CJK サイドカーメタデータ (簡体字 / ハングル) が追加 fallback に正しく回り、
     /// 日本語と共有する漢字は引き続き Yu Gothic ("japanese") が拾うことを確認する。
-    /// (docs/sidecar-encoding-utf8.md: 読み取りは UTF-8 で正しく、表示はフォント被覆の問題)
+    /// (docs/archive/search-metadata/sidecar-encoding-utf8.md: 読み取りは UTF-8 で正しく、表示はフォント被覆の問題)
     #[test]
     fn user_text_covers_cjk_scripts() {
         let mut fonts = egui::FontDefinitions::default();

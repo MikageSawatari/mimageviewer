@@ -92,7 +92,7 @@ h_advance ≈46µs/回、bake ≈6.4ms/回 (release) と重く、ドラッグ中
   （循環 paint→stack overflow 等）が見合わない。
 - **絵文字は案C で取り込まず、画像スタンプ機能として別建て**（環境非依存で一定・拡縮/回転/縁取り可・
   決定的でテストしやすく・未知フォント塗りのリスク無し）。仕様は
-  [stamp-feature-design.md](stamp-feature-design.md)。
+  [archive/comic/stamp-feature-design.md](archive/comic/stamp-feature-design.md)。
 
 ## 0. 結論（先に）
 

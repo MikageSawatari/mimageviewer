@@ -1556,7 +1556,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 - 閉じクォート `"` がない場合は行末までを 1 トークンとして扱う（寛容パース）
 - `-` 単体や末尾にある `-` はノイズとして無視する（`jean-claude` のような語内 `-` は通常の文字として扱う）
 
-#### OR 検索モード (v0.7.2+、設計 [search-expansion-design.md §20](search-expansion-design.md))
+#### OR 検索モード (v0.7.2+、設計 [archive/search-metadata/search-expansion-design.md §20](archive/search-metadata/search-expansion-design.md))
 
 各検索バー右端の **`□OR`** チェックを入れると include トークンを OR 結合する (既定は AND)。
 **NOT (`-word`) は常に AND** のまま (チェック有無に関わらず除外は効く)。
@@ -1883,7 +1883,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
     実行時は適用されません）」の注記を表示。デノイズのみ / サイズ上限スキップの
     ページには通常どおり適用される
   - CPU + rayon 行並列。radius は内部で最大 3.0 に clamp
-  - 詳細: [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md) /
+  - 詳細: [archive/editing/final-smart-sharpen-plan.md](archive/editing/final-smart-sharpen-plan.md) /
     [preset-and-adjustment.md §2.6](preset-and-adjustment.md)
 
 ### Phase 3（お気に入り・設定）✅ 完了
@@ -1937,7 +1937,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 
 ### Phase 5（全文検索拡充 / v0.8.0）✅ 完了
 
-設計ドキュメント: [docs/search-expansion-design.md](search-expansion-design.md)
+設計ドキュメント: [docs/archive/search-metadata/search-expansion-design.md](archive/search-metadata/search-expansion-design.md)
 
 - [x] **Ctrl+G グローバルメタ検索** — お気に入り全体を Tantivy + bigram で横断検索
 - [x] Ctrl+G の音声ファイル名検索 (共通対応拡張子、種別フィルタ、結果から音楽ビュー再生)
@@ -1965,7 +1965,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 
 ### Phase 5.5 (タグ機能 / v0.8.0) ✅ 完了
 
-設計ドキュメント: [docs/tag-feature.md](tag-feature.md)
+設計ドキュメント: [docs/archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md)
 
 現在のタグ実装は [docs/tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) の
 `tags.db` 正本モデルへ移行済み。通常のタグ付与/削除はファイル本体や XMP を書き換えず、

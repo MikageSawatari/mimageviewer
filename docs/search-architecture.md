@@ -2,8 +2,8 @@
 
 mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の全体像。
 修正作業の前に必ず読むこと。実装詳細・個別の仕様選択の掘り下げは
-[search-expansion-design.md](search-expansion-design.md) と
-[tag-feature.md](tag-feature.md) を参照。
+[archive/search-metadata/search-expansion-design.md](archive/search-metadata/search-expansion-design.md) と
+[archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md) を参照。
 
 ---
 
@@ -678,7 +678,7 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
 現行仕様では通常タグは `tags.db` 正本で、`dc:subject` への書き込みや Ctrl+G
 検索投影は行わない。この節は v1.0 互換タグを移行元として読むための背景メモ。
 
-詳細は [tag-feature.md](tag-feature.md) 参照。
+詳細は [archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md) 参照。
 
 ---
 
@@ -765,7 +765,7 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
 
 ### 8.2 ベンチマーク
 
-- [docs/search-bench-results.md](search-bench-results.md) — Tantivy + bigram のプロトタイプ
+- [docs/archive/search-metadata/search-bench-results.md](archive/search-metadata/search-bench-results.md) — Tantivy + bigram のプロトタイプ
   計測結果。50 万件 HARD_MAX 到達でも total 161ms、typical 10〜50ms、SQLite
   post-filter 500 件バッチ 9ms。
 
@@ -808,9 +808,9 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
 
 | ドキュメント | 内容 |
 | --- | --- |
-| [search-expansion-design.md](search-expansion-design.md) | 個別の仕様選択の詳細 (Tantivy スキーマ設計、ZIP ingest の負荷制御、UI drill-down 集約ロジック、streaming プロトコル等) |
-| [tag-feature.md](tag-feature.md) | タグ機能のデータモデル (XMP dc:subject 仕様) + UI フロー + 書き込みプロトコル |
-| [search-bench-results.md](search-bench-results.md) | Tantivy + bigram のプロトタイプ計測結果 (50 万件規模まで) |
+| [archive/search-metadata/search-expansion-design.md](archive/search-metadata/search-expansion-design.md) | 個別の仕様選択の詳細 (Tantivy スキーマ設計、ZIP ingest の負荷制御、UI drill-down 集約ロジック、streaming プロトコル等) |
+| [archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md) | タグ機能のデータモデル (XMP dc:subject 仕様) + UI フロー + 書き込みプロトコル |
+| [archive/search-metadata/search-bench-results.md](archive/search-metadata/search-bench-results.md) | Tantivy + bigram のプロトタイプ計測結果 (50 万件規模まで) |
 | [search-test-plan.md](search-test-plan.md) | 検索 / notify-rs / キー操作の自動テスト整備計画 (Phase A/B/C) |
 | [architecture-overview.md](architecture-overview.md) | リポジトリ全体のモジュールマップ・永続化ストア一覧 |
 | [async-architecture.md](async-architecture.md) | ワーカー一覧・キャンセル規約・`try_lock+sleep` 禁止パターン |

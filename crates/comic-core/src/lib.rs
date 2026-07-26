@@ -1,7 +1,7 @@
 //! `comic-core` — pure (egui/eframe-free) data model + layout + rasterizer for
 //! the speech-bubble / text-annotation feature.
 //!
-//! Phase 1 scope (see `docs/speech-bubble-text-tool-plan.md` §9):
+//! Phase 1 scope (see `docs/archive/comic/speech-bubble-text-tool-plan.md` §9):
 //!   - data model (AnnotationObject / BubbleObject / Tail / TextBlock),
 //!   - a shared text layout engine (horizontal + vertical/縦書き + minimal
 //!     auto-縦中横),

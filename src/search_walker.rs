@@ -1,4 +1,4 @@
-//! 起動時差分走査 (docs/search-expansion-design.md §7.4)。
+//! 起動時差分走査 (docs/archive/search-metadata/search-expansion-design.md §7.4)。
 //!
 //! お気に入りルートを再帰的に walk し、現在の FS 状態と `fts_meta.db` の
 //! 登録状態を 3-way diff して「ingest すべき path」「削除すべき path」を返す。

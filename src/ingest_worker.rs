@@ -1,4 +1,4 @@
-//! Ingest Worker (docs/search-expansion-design.md §7.5, §5.6)。
+//! Ingest Worker (docs/archive/search-metadata/search-expansion-design.md §7.5, §5.6)。
 //!
 //! Walker が返した `to_ingest` / `to_delete` キューを受け取り、以下を行う:
 //!

@@ -306,7 +306,7 @@ pub struct AdjustParams {
     pub colorize: crate::colorize::ColorizeParams,
     /// 最終表示段スマートシャープの強度。0 = OFF, 1..=100。
     /// サムネイルには反映せず、フルスクリーン最終表示・コピー・書き出しの final pixels に
-    /// だけ掛かる (docs/final-smart-sharpen-plan.md)。色調補正 → final AI の後、
+    /// だけ掛かる (docs/archive/editing/final-smart-sharpen-plan.md)。色調補正 → final AI の後、
     /// post_filter の前に適用される。
     ///
     /// AI アップスケールが実行された合成には**常に掛けない** (固定動作、設定なし)。
@@ -587,7 +587,7 @@ pub fn pixel_lum_f32(c: egui::Color32) -> f32 {
 /// (strength, amount, radius_px, edge_threshold, halo_suppression)。
 /// strength 0 のアンカーは 1..25 の補間起点 (amount のみ 0 へ漸減) で、
 /// strength == 0 自体は OFF (`smart_sharpen_params_for_strength` が None)。
-/// 数値の出所は docs/final-smart-sharpen-plan.md の内部パラメータ案 (当初は
+/// 数値の出所は docs/archive/editing/final-smart-sharpen-plan.md の内部パラメータ案 (当初は
 /// 30/60/100 に配置)。最大 100 が控えめだったため、未リリースのうちに
 /// 旧アンカーを 25/50/75 へ詰めて 100 = 計算式上限 (amount 2.0 / 半径 3.0、
 /// `apply_smart_sharpen_rgba` の clamp 値) まで拡張した (2026-06-10 ユーザー要望。

@@ -5,7 +5,7 @@ v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィン�
 
 PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本一覧を親一覧のまま維持する本対応は、
 この初期計画の「メイン一覧と常に同期する 1 セッション」前提を超えるため、
-[detached-viewer-context-separation-plan.md](detached-viewer-context-separation-plan.md)
+[archive/detached/detached-viewer-context-separation-plan.md](archive/detached/detached-viewer-context-separation-plan.md)
 を追加の設計方針として扱う。
 
 ## 1. 目的

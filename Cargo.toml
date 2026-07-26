@@ -264,7 +264,7 @@ music-core = { path = "crates/music-core" }
 # 絵文字スタンプ (Twemoji SVG) を表示時に RGBA へラスタライズする。純 Rust
 # (usvg + tiny-skia) なので crt-static と両立。SVG バイトは build.rs が
 # vendor/twemoji/svg/*.svg から include_bytes! で exe へ同梱する (Inc 4c、
-# docs/comic-integration-plan.md / docs/stamp-feature-design.md)。
+# docs/comic-integration-plan.md / docs/archive/comic/stamp-feature-design.md)。
 resvg = "0.45"
 kamadak-exif = "0.6"
 rexif = "0.7"
@@ -301,7 +301,7 @@ opener = "0.8"
 # Ctrl+E エクスポートの保存先フォルダ選択ダイアログ。
 rfd = "0.15"
 # 全文検索エンジン。Ctrl+G グローバルメタ検索の bigram インデックスに使用予定。
-# v1 プロトタイプ計測中 (docs/search-expansion-design.md §15.1.1)。問題なければ本採用。
+# v1 プロトタイプ計測中 (docs/archive/search-metadata/search-expansion-design.md §15.1.1)。問題なければ本採用。
 tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # お気に入りのファイルシステム監視。Windows は ReadDirectoryChangesW ベース。

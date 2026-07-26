@@ -26,7 +26,7 @@ CC-BY 帰属 + bootstrap 配線。Inc 4c オノマトペ + フォント基盤: �
 (`src/font_assets.rs` = pack/user/system 列挙 + 遅延ロード) `9fed07e3` → オノマトペ
 プリセット 18 種 + 実フォントピッカー `4ae8fcef` → テキスト詳細パネルのフォント選択
 ピッカー (見本グリッド + ユーザーフォント追加) `00de7a18`。
-**署名後の UI 配置監査 + 是正 (2026-06-06)**: [docs/comic-ui-parity-audit.md](comic-ui-parity-audit.md)
+**署名後の UI 配置監査 + 是正 (2026-06-06)**: [docs/archive/comic/comic-ui-parity-audit.md](archive/comic/comic-ui-parity-audit.md)
 で右詳細パネルの 2 層構造未一致 / 形状別スライダー欠落 / しっぽ tip・付け根欠落 / セリフ
 プリセット未常時表示を検出 → `85e3327d` (2層構造化) / `690d7a17` (形状別+tip/付け根) /
 `228786ca` (左追加UI+一覧抜粋+題名) で解消 (詳細は §7.0 補遺)。
@@ -116,7 +116,7 @@ Inc 8 (仕上げ・回帰) 完了 (2026-06-07): マニュアル (`annotation.htm
 | D7 | Undo/Redo | エディタ専用スナップショットスタック（`meta_undo` に載せない。隠蔽/消しゴムと同様）。 |
 | D8 | 座標系（回転） | 注釈は **canonical（非回転）ソース画素座標**で保持（EXIF/PDF レンダ/clamp 後・`rotation_db` 適用前。＝消しゴム/隠蔽マスクと同じ空間）。表示/書き出しは既存の最終画素と同じ回転ポリシーを適用。回転表示中の編集はポインタを逆回転して canonical へ写像。 |
 | D9 | スタンプ画像の持ち運び | 絵文字スタンプ=同梱アセットへのキー参照（軽量）。**ユーザー画像スタンプ=選択時に長辺 1024px 上限へ縮小した PNG/base64 を注釈データに埋め込み**（フォルダ移動・別マシン・元ファイル削除でも保持）。さらに再利用用のコピーを `comic_user_stamps.db` に履歴保存する（§6）。 |
-| D10 | テキストとダウンサンプルの前後（当初案 2026-06-05 / **不採用に変更 2026-06-07**） | ~~最終出力解像度（エクスポート時はダウンサンプル後）で焼いて最後に合成する~~。**当初は「ダウンサンプル後に最終解像度で直焼き」を計画したが、実装しない判断に変更（2026-06-07）。** 現状は `comic_composited_pixels_for_export` が **base（canonical ソース）解像度で焼いてから crop+ダウンサンプル**する。理由: 正しく直すには source→base（AI 倍率）→crop オフセット→最終縮小 と座標が多段で掛かり（`scale_scene` は scale のみで translate 不可）、crop×強縮小×注釈の隅でしか出ない座標ズレの視覚バグが入りやすい。最終出力の縮小は重視機能でなく、複雑さ/リスクに見合わない。詳細・最終判断は `docs/comic-ui-bugfix-checklist.md` の C5 エントリ。 |
+| D10 | テキストとダウンサンプルの前後（当初案 2026-06-05 / **不採用に変更 2026-06-07**） | ~~最終出力解像度（エクスポート時はダウンサンプル後）で焼いて最後に合成する~~。**当初は「ダウンサンプル後に最終解像度で直焼き」を計画したが、実装しない判断に変更（2026-06-07）。** 現状は `comic_composited_pixels_for_export` が **base（canonical ソース）解像度で焼いてから crop+ダウンサンプル**する。理由: 正しく直すには source→base（AI 倍率）→crop オフセット→最終縮小 と座標が多段で掛かり（`scale_scene` は scale のみで translate 不可）、crop×強縮小×注釈の隅でしか出ない座標ズレの視覚バグが入りやすい。最終出力の縮小は重視機能でなく、複雑さ/リスクに見合わない。詳細・最終判断は `docs/archive/comic/comic-ui-bugfix-checklist.md` の C5 エントリ。 |
 | D11 | 絵文字アセットの同梱方式（方向付け 2026-06-05、最終確定 Inc 4c） | Twemoji（jdecked fork、**CC-BY 4.0**）の curated カタログ（`tools/comic_lab/src/stamp.rs` の `EMOJI_CATALOG`、数百個。キー=コードポイント hex）を採用。**推奨=事前ラスタライズ PNG を `include_bytes!` で本体に内包→初回スタンプ利用時に `%APPDATA%/mimageviewer/emoji/` へ展開し、既存 `image` クレートでデコード**（PDFium/ORT/models と同パターン。本体 mIV に resvg を増やさない）。代替=SVG 同梱＋resvg をランタイム依存に追加。ラスタライズ解像度（`EMOJI_RENDER_PX=512` 基準）／サイズ予算と最終決定は **Inc 4c**（ピッカー実装時）。アセットは optional（欠落時はユーザー画像のみに degrade）。**ライセンス確認済（ユーザー承認 2026-06-05）**: CC-BY 4.0 は表示のみ条件でコピーレフト無し（share-alike は CC-BY-SA であり Twemoji は非該当）→ **MIT で配布する mIV コードに影響しない**（混在ライセンス: コード=MIT / 絵文字画像=CC-BY のまま。MIT に付け替えない）。**帰属表記の必須要素**: ①作品名・作者「Twemoji © Twitter, Inc. and other contributors（jdecked fork）」②**ライセンス名＋リンク**（CC-BY 4.0, https://creativecommons.org/licenses/by/4.0/ ）③**改変した旨**（SVG→PNG ラスタライズ＋縮小＝adaptation なので「rasterized/resized」を明記）④endorsement を匂わせない中立表現。表記場所は「ソフトウェア情報（環境設定→ヘルプ）」＋`installer/readme.txt`（既存 FFmpeg LGPL / VST3 表記と同列）。文面の最終確定は Inc 4c。Inc 0/1 は非ブロッキング（スタンプは Inc 4c で初めて必要）。 |
 
 ---
@@ -275,7 +275,7 @@ master に対して再確認する**（このスナップショットに固定�
 ### 7.0 最終署名（2026-06-06）— **✅ ラボ完全パリティ達成（v1 スコープ）**
 
 > 📌 **補遺（2026-06-06、署名後の UI 配置監査と是正）**: 上記サインオフ直後の精密照合
-> ([docs/comic-ui-parity-audit.md](comic-ui-parity-audit.md)) で、**右詳細パネルの配置と一部
+> ([docs/archive/comic/comic-ui-parity-audit.md](archive/comic/comic-ui-parity-audit.md)) で、**右詳細パネルの配置と一部
 > コントロールがラボと未一致**だったことが判明した（= サインオフが一時的に先行しすぎた）:
 > ①右パネルがラボの「常時表示エリア＋詳細タブ」の 2 層構造になっておらず、本文テキスト/
 > プリセットバー/構造トグルが全部タブの中に畳まれていた（よく使う本文欄がタブで埋もれる）。
@@ -618,11 +618,11 @@ Inc 6（変形ハンドル + Undo/Redo）→ Inc 4d（ウィンドウ詳細編�
 ## 12. 参照ドキュメント
 
 ### ラボ側（機能の正本）
-- `docs/speech-bubble-text-tool-plan.md` / `docs/speech-bubble-tool-design.md`
-- `docs/comic-lab-frameplanner-shapes.md` / `docs/stamp-feature-design.md` /
-  `docs/message-window-design.md` / `docs/vertical-text-opentype-plan.md`
+- `docs/archive/comic/speech-bubble-text-tool-plan.md` / `docs/archive/comic/speech-bubble-tool-design.md`
+- `docs/archive/comic/comic-lab-frameplanner-shapes.md` / `docs/archive/comic/stamp-feature-design.md` /
+  `docs/archive/ui-input/message-window-design.md` / `docs/vertical-text-opentype-plan.md`
 - `docs/comic-lab-validation-checklist.md`（注: 合成順序は本書 §5.1 が上書き）
-- `docs/comic-lab-progress.md`（進捗・本体統合メモ）
+- `docs/archive/comic/comic-lab-progress.md`（進捗・本体統合メモ）
 
 ### mIV 本体側（統合先の作法）
 - `docs/architecture-overview.md` / `docs/display-pipeline.md`

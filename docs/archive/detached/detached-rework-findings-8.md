@@ -1,0 +1,230 @@
+﻿# 検収所見 #8: ON モードのクリック取りこぼし (armed 条件) + open 時フラッシュの証拠収集
+
+正本プラン: [../../detached-rework-plan.md](../../detached-rework-plan.md)
+CUT fix3 (500cbd1f) / findings-7 (519f8faa) は検収合格 (テスト確認済み)。
+本書はゲート C smoke 続行中 (2026-07-07) の新規 2 件。
+
+## A1: passive 窓のクリックが飲まれることがある (アクティブ化の取りこぼし)
+
+### 実機症状
+
+ON モードで複数窓を切り替え中、窓をクリックしてもアクティブにならずホイールも
+無効。何度かやると動く。
+
+### ログ + コードで確定した機構
+
+- ログ (bug-20260707-on-activate-miss.log): `passive_activate_queued` は 3 回だけで、
+  **queued された 3 回は全て commit 成功**。= クリックが検知されれば動く。
+  取りこぼしは **queue 以前**で起きている。
+- コード ([ui_fullscreen.rs:3933](../src/ui_fullscreen.rs)):
+
+  ```rust
+  if !focused {
+      window.activation_armed = true;   // 非フォーカスを 1 フレーム観測して初めて armed
+  }
+  ```
+
+  activation は `can_activate && armed && user_activation`。snapshot 生成直後は
+  armed=false で、**その窓が「フォーカスを失った状態」を一度観測するまでクリックが
+  全て無視される**。park 直後の窓は OS フォーカスを保持したままのことがあり
+  (クリック自体がフォーカスを与える)、その間クリックが飲まれ続ける。
+  別の窓を触るなどでフォーカスが離れると armed が立ち、次のクリックから効く —
+  「何度かやると動く」と一致。
+
+### 修正要件
+
+- armed の意図 (直前まで active だった窓への残クリック誤爆防止) を、フォーカス
+  観測ではなく**状態ベース**で実現する。例: park/snapshot 生成の**次の root frame
+  以降のポインタ press→release 完結**を復帰トリガにする (ParkedLive native 経路の
+  press→release 変換と同じ意味論)。時間窓は禁止 (憲法 5)。
+- 「park された窓はフォーカスの有無に関係なく、次フレーム以降のクリック 1 回で
+  必ず復帰できる」をテストで固定 (focused=true のままの snapshot に対する
+  pointer_activation → queued)。
+- 誤爆防止の回帰: park を引き起こしたクリック自体 (同フレーム) では復帰しない。
+
+## A2: ON モードで窓を開くときのフラッシュ (F12 と同種)
+
+### 状況
+
+- CUT fix3 (backstop 初回 host 生成の抑止) は**本ビルドで有効に動作している**
+  (ログ: `keepalive_backstop skip` ×4、registered host は全て label=active_render、
+  host_lost_diag 0 件)。**それでもフラッシュは残っている** → fix3 が塞いだ
+  「短命 backstop host」説とは別の機構が存在する。
+- 次の有力候補 (Fable): **新規 OS 窓が内容テクスチャの準備前に可視化され、
+  クリア色 (ライトテーマ = 白) のフレームが見える**。前回の動画解析 (frame 247/317)
+  で見えた「タイトルバー付き・全面白のフレーム」とも整合する。
+
+### 進め方 (証拠を先に)
+
+1. Codex: open 経路の可視化タイミングを調査 — 新規 detached 窓の
+   `ViewportBuilder.with_visible` / Visible コマンド発行と、初回の内容描画
+   (テクスチャ ready) の順序を確認し、`MIV_DETACHED_WINDOW_DEBUG=1` に
+   「窓可視化時点で内容 ready だったか」のログを追加。
+2. ユーザー: ON モードで窓 open を数回、録画 + ログ退避 (1 回)。
+3. フラッシュしている窓の正体 (新規窓のクリア色フレーム / 他) をフレームと
+   ログで確定してから修正案を Fable に出す。
+   - 候補: 内容 ready まで窓を非可視のまま保つ (`Visible(true)` を初回内容描画後に
+     送る)。読み込みが長い場合はローディング表示 (暗色) を先に描いて可視化。
+
+## 完了条件
+
+- [ ] A1: 修正 + 上記テスト。コミットに `(detached-rework findings-8 A1)` を含める
+- [ ] A2: 調査ログ追加 (+ 望ましくは根因確定)。修正は Fable 承認後
+- [ ] 既存テスト + full test 緑
+
+---
+
+## A1-v2 (2026-07-07): A1 修正後も実機 NG — 真因は egui deferred viewport への
+ポインタイベント配送の欠落
+
+### 実機ログの事実 (bug-20260707-a1-still-miss.log、Fable 解析)
+
+- ユーザーが窓 1 をクリックし続けても、deferred callback の観測は
+  **`pointer_pressed=false / pointer_released=false` が全パスで false のまま**
+  (armed も永久 false)。一方 **focused=true / focus_edge は正しく届いている**。
+- A1 前のコードも同じ `i.pointer.any_pressed()` 読みだった (diff 確認済み)。
+  前セッションで 3 回成功していたのは配送が間欠的に届いた分で、**A1 のゲート
+  変更は無関係。真因は「deferred viewport の egui 入力にマウスイベントが
+  乗らない (少なくとも間欠的に欠落する)」**。
+- 付随観測: 同一ミリ秒に同一 passive_event が 12 連続 (deferred callback が
+  一瞬に 12 パス実行) — repaint 要求の暴走気味も併発。原因特定の材料にする。
+
+### 対応方針 (Fable 指示)
+
+**方針転換: アクティブ化のトリガを egui の deferred 入力に依存させない。**
+フォーカスイベントは確実に届いているので、OS レベルの信頼できる信号で組む
+(stale-F12 / ParkedLive native click と同じ「OS の物理状態を正とする」パターン):
+
+1. **クリック復帰の新実装**: passive 窓への **focus 到達 (focus_edge) 時に
+   `GetAsyncKeyState(VK_LBUTTON)` で物理左ボタンが押されている**こと =
+   「クリックによるフォーカス」判定。その後の**ボタン物理解放** (root 側で
+   ポーリング可能) で復帰を commit する。
+   - Alt+Tab によるフォーカスは物理ボタンが上がっているので誤発火しない
+     (クリック限定ルール維持)。
+   - タイトルバードラッグでの移動と区別するため、press〜release 間の
+     カーソル移動が小さいことを条件にしてよい (クリック/ドラッグ判別は標準的
+     UI 慣行として許容)。
+2. **egui 側の調査は並行で 1 ラウンドだけ**: egui-winit 0.33 のソースで deferred
+   viewport への pointer イベント配送経路を確認し、「なぜ届かない/間欠なのか」
+   「12 連続パスの原因」を報告する (将来 egui 更新時の判断材料。修正はしない)。
+3. 既存の deferred 入力ベースの activation 経路 (press/release 観測) は撤去し、
+   イベントキューには focus / close / placement 系だけを残す。
+4. テスト: focus_edge + 物理ボタン押下 (cfg(test) 注入) → 復帰 commit /
+   Alt+Tab 相当 (focus_edge + ボタン上げ) → 復帰しない / ドラッグ相当
+   (大きなカーソル移動) → 復帰しない。
+5. コミットに `(detached-rework findings-8 A1v2)` を含める。
+
+## A1-v3 (2026-07-07): 速いクリックの全滅 — 検出を専用 OS ポーリングへ
+
+### 実機ログの事実 (bug-20260707-a1v2-partial.log、Fable 解析)
+
+- `focus_edge=true ... physical_left_down=false` → `passive_activate_focus_ignored`
+  が **170 回**。focus_edge がドレインされる時点で物理ボタンが既に上がっている =
+  **速いクリックは全て棄却**。長押し気味のクリックのみ 11 回検出 (8 commit /
+  3 drop)。「先程よりは動くが何度か操作できない」と完全に一致。
+- 同一 ms に同一イベント 12 連の重複が再発 = deferred callback の実行はバースト的に
+  遅延する。**どの観測点でサンプリングしても遅延競合が残る**。
+
+### 修正方針: egui のイベント/repaint スケジューリングから検出を完全に切り離す
+
+1. **専用ウォッチャ** (実装は専用スレッド or root フレームポーリング +
+   `request_repaint_after` keep-alive のどちらか。トレードオフを完了報告に書く。
+   スレッド案が egui スケジューリング非依存で確実):
+   - passive 窓が 1 つ以上存在する間だけ稼働 (ゼロなら停止 = 常時コスト回避)
+   - `GetAsyncKeyState(VK_LBUTTON)` の **down エッジを自前検出** (前回状態との比較)
+   - down エッジ時に `GetForegroundWindow` + `GetCursorPos` を取得し、
+     runtime registry の passive 窓 hwnd + rect と照合 → 一致すればクリック開始
+   - **up エッジ** (自前検出) で、移動 < 8px なら activation commit を
+     チャネルで root へ送信 + `request_repaint` (root が次フレームで適用)
+2. focus_edge / deferred callback からの activation 系検出は撤去 (focus 情報は
+   診断ログのみに)。A1-v2 のドラッグ判別 (8px) と park 同フレーム誤発火防止は維持。
+3. テスト: エッジ検出とヒットテストを純関数化して固定 (down→up move<8px →
+   commit / 移動大 → drop / down 時 foreground が passive 外 → 無視 /
+   passive ゼロでウォッチャ停止)。
+4. コミットに `(detached-rework findings-8 A1v3)` を含める。
+
+## A1-v4 (2026-07-07): 初回クリックの取りこぼしは down エッジの foreground 競合
+
+### 実機ログの事実 (bug-20260707-0128-input-probe.log、Fable 解析)
+
+- `active_input_probe stage=wheel_gate`: ホイールイベントが届いた **114 フレーム全てで
+  foreground_matches=true かつゲート通過** = active 側の受理ゲートは無実。
+- 失敗時はホイールが active 側に**そもそも届いていない** = 最初のクリックの
+  activation 自体が成立していない (窓は Parked のまま。フォーカスだけ来るので
+  ユーザーには「フォーカスしたのに動かない」に見える)。
+- watcher は down エッジを棄却したとき**何も記録しない**ため沈黙していた。
+
+### 機構 (確定度高)
+
+watcher の down エッジ判定は「**down エッジのサンプリング瞬間に
+`GetForegroundWindow()` == 対象窓**」を要求する。しかし未フォーカスの passive 窓を
+クリックした場合、**OS の foreground 切替はボタン down の数 ms 後**に完了するため、
+8ms ポーリングの down エッジ時点では foreground がまだ前の窓を指す → 候補にならず
+**初回クリックが黙って捨てられる**。2 回目のクリックは foreground が既に対象窓なので
+必ず成功 — 「もう 1 回クリックすると動く」と完全に一致。成功ログが全て
+foreground 一致なのも当然 (一致したものだけ成功するため)。
+
+### 修正指示
+
+1. down エッジの窓同定を **`WindowFromPoint(cursor)` → root HWND 化 → registry 照合**
+   に変更する (クリックされた窓の真実はカーソル下の窓であり、foreground の切替
+   タイミングに依存しない)。
+2. **foreground 一致の検証は up エッジ側へ移す** (クリック完了時点なら OS の
+   フォーカス切替は済んでいる。up 時に foreground ≠ 対象窓なら破棄 = クリックが
+   別窓に取られたケースの安全弁)。
+3. **watcher の棄却ログを追加**: down エッジでカーソルが passive 窓 rect 内なのに
+   候補化しなかった場合、理由付きで App へ診断イベントを送る (今回のような沈黙を
+   二度と起こさない)。
+4. テスト: 「down 時 foreground=旧窓・カーソル=対象窓 → up 時 foreground=対象窓」
+   のシーケンスで commit されることを純関数テストで固定 (今回の競合の再現)。
+5. コミットに `(detached-rework findings-8 A1v4)` を含める。
+
+### 監視項目 (未再現 1 回)
+
+窓 close 時に「ウィンドウの位置がおかしくちらつく」が 1 回発生 (2026-07-07 01:2x、
+その後未再現、動画 01-28-43.mkv には未収録の可能性大)。A2 可視化ゲートまたは
+close 時 placement 永続化との関連が候補。再発時に録画 + 即ログ退避で捕捉する。
+
+### A1-v3 実装メモ (Codex, 2026-07-07)
+
+- A1-v2 の `focus_edge + GetAsyncKeyState` サンプリングは撤去。deferred callback は
+  close / focus 診断 / placement だけを root pass へ渡し、activation 判定には使わない。
+- 実装は専用 watcher thread を採用した。root frame polling では短いクリックが
+  次フレーム前に down→up 完了する競合を再導入するため、`GetAsyncKeyState(VK_LBUTTON)`
+  の down/up edge を watcher 側で継続監視する。
+- watcher は passive target が 0 件なら `recv()` でブロックし、target がある間だけ
+  8ms 間隔で `GetForegroundWindow` / `GetCursorPos` / `GetWindowRect` を読む。
+  App 側は root frame ごとに Parked + can_activate + registered HWND の target を渡す。
+- park 起点クリックの誤発火防止は、target に `eligible` を持たせて維持する。
+  `activation_ready_frame` 前でも target は watcher に渡すが `eligible=false` なので、
+  watcher は押下状態だけを消費し、次フレームで eligible になっても同じ押下を
+  new down edge として扱わない。
+- reducer / hit-test は純関数化した:
+  down edge 時に foreground HWND と cursor が eligible target rect に一致した場合だけ
+  candidate を作り、up edge 時に移動距離が 8px 以下なら activation request を channel
+  送信する。Alt+Tab (down edge なし)、foreground 外、ドラッグ、passive zero を
+  headless test で固定。
+
+### A1-v2 実装メモ / egui 0.33 ソース確認 (Codex, 2026-07-07)
+
+- `egui-0.33.3/src/viewport.rs` の viewport 概説では、deferred viewport は
+  「integration が後で、場合によって複数回 callback を呼ぶ」独立 repaint 型であり、
+  通信は channel / `Arc<Mutex>` 前提と説明されている。
+- `egui-0.33.3/src/context.rs:3891` 付近の `show_viewport_deferred` は、
+  `viewport_ui_cb` を `ctx.viewports[new_viewport_id].viewport_ui_cb` に登録するだけで、
+  callback 実行タイミングや入力配送は eframe integration 側に委ねている。
+- `eframe-0.33.3/src/native/wgpu_integration.rs:542` 付近では root / deferred
+  viewport 共通の `run_ui_and_paint` があり、deferred viewport は
+  `egui_winit.take_egui_input(window)` でその window の raw input を取ってから
+  登録済み `viewport_ui_cb` を実行する。したがって「focus は viewport info として
+  届くが、press/release が常に届く」ことは mIV 側では保証できない。
+- 同ファイル `CloseRequested` 処理では viewport と parent の両方に
+  `request_repaint_of` を投げており、`egui::Context::show_viewport_deferred` の
+  docs も callback が複数回呼ばれうることを明記している。mIV 側で focus-only /
+  pointer-only のたびに root repaint を要求すると、今回観測した 12 連続 pass を
+  増幅し得るため、A1-v2 では `focused && physical_left_button_down` のときだけ
+  root repaint を要求し、focus-only では要求しない。
+- 修正方針: deferred callback の `i.pointer.any_pressed/released` は activation
+  入力として使わず、focus edge + `GetAsyncKeyState(VK_LBUTTON)` + `GetCursorPos`
+  で物理クリックを開始し、root pass の物理解放で commit する。press-release 間の
+  カーソル移動が 8px を超えた場合はドラッグとして破棄する。

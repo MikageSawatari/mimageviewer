@@ -70,7 +70,7 @@ detached viewer (F12 別ウィンドウ / 複数ウィンドウ) は構造リワ
 - 状態バグには状態遷移テスト、入力 routing バグには handler-level test、非同期・multi-window
   lifecycle には request 相関と sibling context 不変を検証するテストまたはログ検査を追加する。
   v2.7.0 出荷前の具体的な横断監査は
-  [docs/review-v2.7.0/systemic-review-plan.md](docs/review-v2.7.0/systemic-review-plan.md) を正本とする。
+  [docs/archive/review-v2.7.0/systemic-review-plan.md](docs/archive/review-v2.7.0/systemic-review-plan.md) を正本とする。
 
 キー操作を追加・変更するときは、ユーザーが明示していなくても keymap 対応を検討する。
 閲覧・編集・動画の通常ショートカットは `KeyAction` に追加し、`ini_name()` / `context()` /
@@ -99,7 +99,7 @@ dual-window approach.
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
 - **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、初回 AiRuntime 作成時に `%APPDATA%/mimageviewer/` に展開。`ort::init_from()` で動的ロードする。これにより VC++ 再頒布可能パッケージ不要
-- **TensorRT 対応 (NVIDIA GPU 高速化、オプション)**: `Microsoft.ML.OnnxRuntime.Gpu.Windows` + NVIDIA CUDA Runtime / cuBLAS / cuFFT / cuRAND / cuSOLVER / cuSPARSE / NVRTC / nvJitLink / cuDNN / TensorRT (合計 ~6.8 GB) を `%APPDATA%/mimageviewer/tensorrt/` に展開して使用。pack DL は `scripts/setup-tensorrt-pack.ps1` (PoC 版、アプリ内 DL UI は将来実装)。実測 1.4-3.4x (アップスケール) / 4.5x (デノイズ) 高速化。エンジンビルダーは `mimageviewer.exe --tensorrt-build <model>` 子プロセス。詳細は [docs/tensorrt-batching-feasibility.md](docs/tensorrt-batching-feasibility.md)
+- **TensorRT 対応 (NVIDIA GPU 高速化、オプション)**: `Microsoft.ML.OnnxRuntime.Gpu.Windows` + NVIDIA CUDA Runtime / cuBLAS / cuFFT / cuRAND / cuSOLVER / cuSPARSE / NVRTC / nvJitLink / cuDNN / TensorRT (合計 ~6.8 GB) を `%APPDATA%/mimageviewer/tensorrt/` に展開して使用。pack DL は `scripts/setup-tensorrt-pack.ps1` (PoC 版、アプリ内 DL UI は将来実装)。実測 1.4-3.4x (アップスケール) / 4.5x (デノイズ) 高速化。エンジンビルダーは `mimageviewer.exe --tensorrt-build <model>` 子プロセス。詳細は [docs/archive/ai/tensorrt-batching-feasibility.md](docs/archive/ai/tensorrt-batching-feasibility.md)
 - **AI image classification**: ヒューリスティクスでイラスト/漫画/CG/写真を自動判別
 - **AI inpainting**: MI-GAN (ONNX, DirectML) を消しゴムツールから利用してマスク領域を補完
   （見開きページ中央欠落補完は精度不足で削除済み。タグ `v0.6.0-with-spread-inpaint` 参照）
@@ -608,7 +608,7 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
 - **キャッシュ読み込み**: 2〜3ms/枚（WebP デコード）
 - **キャンセル遅延**: 旧タスクが1枚のデコード中の場合、最大1デコード時間待つ
 - **ログ**: `cargo run` 時に `mimageviewer.log` へ出力（.gitignore 済み）
-- **ベンチマーク**: `docs/bench-scroll-report.md` に詳細結果あり
+- **ベンチマーク**: `docs/archive/performance-refactoring/bench-scroll-report.md` に詳細結果あり
 
 ## Screenshot Workflow
 
@@ -1139,7 +1139,7 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 
 mIV は JPEG / PNG / WebP のタグを XMP `dc:subject` にだけ書く (IPTC Keywords は書かない)。
 そのため **Windows エクスプローラーの「タグ」欄には表示されない** (Explorer は IPTC Keywords を
-優先して読むため)。`docs/tag-feature.md` および `htdocs/mimageviewer/manual/tags.html` の互換性
+優先して読むため)。`docs/archive/search-metadata/tag-feature.md` および `htdocs/mimageviewer/manual/tags.html` の互換性
 記述はこの前提を反映している。
 
 Lightroom / Bridge / digiKam / XnView MP 等の XMP 対応ソフトとは互換があるが、開発環境で
@@ -1434,7 +1434,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     - 注意: 8KB 上限は **更新を受け取る側 (= 旧バージョンのバイナリ)** に焼かれている
       ので、今リリースで `BODY_CAP` を上げても今回の通知には効かない (効くのは次版以降)。
       短縮版で回避するのが確実。
-    - 実例: v1.0.0 (README セクション 17.5KB → [docs/release-body-v1.0.0.md](docs/release-body-v1.0.0.md) 6KB)。
+    - 実例: v1.0.0 (README セクション 17.5KB → [docs/archive/release/release-body-v1.0.0.md](docs/archive/release/release-body-v1.0.0.md) 6KB)。
 
 ### Phase 1: バージョン番号・関連ファイル更新
 
@@ -1621,7 +1621,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       `mImageViewer_portable_v<VERSION>.zip` (ポータブル版)。過去リリース (v1.5.0 等) は
       この 4 点を添付済みなので、`gh release view v<前版> --json assets` で添付漏れがないか
       照合する。
-    - 実例: v1.0.0 は短縮版 [docs/release-body-v1.0.0.md](docs/release-body-v1.0.0.md) を使用。
+    - 実例: v1.0.0 は短縮版 [docs/archive/release/release-body-v1.0.0.md](docs/archive/release/release-body-v1.0.0.md) を使用。
 15. 公開後、別マシンから `mimageviewer.exe` を起動 → 起動時更新通知ダイアログで
     body が想定どおりに表示されることを目視確認 (改行・見出し・リンクの崩れチェック)。
     短縮版を使った場合は、目玉の新機能が末尾で切れずに表示されているかを特に確認する。

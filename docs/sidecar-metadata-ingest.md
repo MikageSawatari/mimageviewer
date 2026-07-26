@@ -16,7 +16,7 @@
 > を例示に使うのは可だが、特定サイト固有のスキーマ (カテゴリ別タグキー等) に依存した実装はしない (§5)。
 
 > **本機能と mIV タグ機能の関係 (重要)**
-> 本機能は **読み取り専用のフリーテキスト検索**であり、mIV の「タグ機能」([tag-feature.md](tag-feature.md))
+> 本機能は **読み取り専用のフリーテキスト検索**であり、mIV の「タグ機能」([archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md))
 > とは **別系統で明確に分離**する。
 > - **mIV タグ** … 利用者が付与・編集する `#xxx` 要素。XMP `dc:subject` に書き込まれ、検索 UI の
 >   「対象=タグ」プルダウンで専用に絞り込める。追加 / 全消去などの編集対象。
@@ -55,7 +55,7 @@ mIV の既存検索は **画像本体に埋め込まれた XMP / EXIF / PNG メ�
 
 ### 非対象 (v1)
 - **ZIP 内画像 / PDF ページ** … サイドカーはアーカイブ外のファイルシステム上に存在し得ず、紐付けが曖昧に
-  なるため対象外 (タグ機能と同じ判断: `docs/tag-feature.md` §1)。
+  なるため対象外 (タグ機能と同じ判断: `docs/archive/search-metadata/tag-feature.md` §1)。
 - **動画** … 動画は既に同名 `.xmp` サイドカーを mIV タグの一次ソースとして扱っている
   (`ingest_text.rs` の video 経路)。JSON/TXT サイドカーは v1 では読まない (既存挙動を維持)。
 - **サイドカーへの書き込み** … 本機能は **読み取り専用**。mIV がサイドカーを生成・更新することはない。
@@ -337,7 +337,7 @@ if !is_video_sidecar {
 
 ## 13. 参照
 
-- 既存タグ機能 (別系統): `docs/tag-feature.md`
+- 既存タグ機能 (別系統): `docs/archive/search-metadata/tag-feature.md`
 - 検索アーキテクチャ: `docs/search-architecture.md`
 - 索引スキーマ: `src/fts_index.rs` (`SourceKind`, `SearchTarget`, `schema_is_stale`) / `INDEX_VERSION` は `src/fts_meta.rs`
 - 取り込み: `src/ingest_text.rs` (`build_per_source_for_file`)

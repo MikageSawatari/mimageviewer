@@ -1,6 +1,6 @@
 //! Data model for speech-bubble / text annotation objects.
 //!
-//! Mirrors `docs/speech-bubble-text-tool-plan.md` §4. Every type is
+//! Mirrors `docs/archive/comic/speech-bubble-text-tool-plan.md` §4. Every type is
 //! serde Serialize/Deserialize so the lab can persist a `<image>.comic.json`
 //! sidecar, analogous to local_adjust_lab's `.miv` sidecar.
 //!
@@ -697,7 +697,7 @@ impl Default for BubbleObject {
 // =====================================================================
 // Message window (dialogue box) — DQ/FF JRPG / VN / social-game style.
 // A screen-space rectangular panel with flowed text, unlike a balloon.
-// See docs/message-window-design.md. Coordinates are source-image space;
+// See docs/archive/ui-input/message-window-design.md. Coordinates are source-image space;
 // `pivot` is the panel CENTER (position presets are resolved to a pivot by
 // the lab/app, which knows the image size — comic-core stays size-agnostic).
 // =====================================================================

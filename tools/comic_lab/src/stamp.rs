@@ -3,7 +3,7 @@
 //! decode-free), and recent-stamp persistence.
 //!
 //! Emoji are loaded as IMAGES (SVG via resvg, or PNG via the image crate) from an
-//! asset directory — NOT as font color glyphs (see docs/stamp-feature-design.md).
+//! asset directory — NOT as font color glyphs (see docs/archive/comic/stamp-feature-design.md).
 //! Assets are optional: if the directory is absent the picker degrades to user
 //! images only. Populate it with `scripts/setup-twemoji.sh`.
 

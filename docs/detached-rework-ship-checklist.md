@@ -2,7 +2,7 @@
 
 正本プラン: [detached-rework-plan.md](detached-rework-plan.md) §7 (出荷ゲート)
 
-**v2 の位置づけ**: 旧 [smoke-matrix](detached-viewer-smoke-matrix-20260630.md) は CUT 前の
+**v2 の位置づけ**: 旧 [smoke-matrix](archive/detached/detached-viewer-smoke-matrix-20260630.md) は CUT 前の
 仕様 (ピン留め・linked passive 復帰) を含むため**参照不要** (歴史資料として残置)。本書だけで
 現行仕様の機能チェック + findings 回帰が完結する。
 

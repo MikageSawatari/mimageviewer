@@ -6,7 +6,7 @@
 # vendor/twemoji/svg/<key>.svg, so the catalog and the assets never drift.
 #
 # Assets: Twemoji (maintained jdecked fork). Graphics are CC-BY 4.0 — attribution
-# is required when distributing (see docs/stamp-feature-design.md). The stamp
+# is required when distributing (see docs/archive/comic/stamp-feature-design.md). The stamp
 # picker degrades to user-image-only if these assets are absent, so this is
 # optional for development.
 #

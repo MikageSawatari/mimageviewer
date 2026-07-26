@@ -162,7 +162,7 @@ for plugin relayout/paint work on every mouse step.
 
 ⚠️ **2026-05 に「1 bridge per plugin」→「1 bridge per chain」へ移行済**。本書末尾の
 「2026-05 chain bridge note」セクションは plan として書かれているが、実装は完了して
-いる ([vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md) も同じ)。
+いる ([archive/vst3/vst3-chain-bridge-redesign.md](archive/vst3/vst3-chain-bridge-redesign.md) も同じ)。
 以下の図は移行後の現状。
 
 ```
@@ -452,7 +452,7 @@ CLAUDE.md の「リリース手順チェックリスト」に追記:
 
 ⚠️ 旧版「1 bridge per plugin」→「1 bridge per chain」への移行は v0.9.0 リリース前
 までに完了している。本節は経緯記録として残す。詳細は
-[vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md) を参照。
+[archive/vst3/vst3-chain-bridge-redesign.md](archive/vst3/vst3-chain-bridge-redesign.md) を参照。
 
 実装上の確認ポイント:
 - `src/video/dsp/mod.rs::add_plugin` で `inner.slots.first()` が存在するなら

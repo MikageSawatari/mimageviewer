@@ -1,4 +1,4 @@
-//! Ctrl+G グローバルメタ検索の UI + 状態管理 (docs/search-expansion-design.md §10.3)。
+//! Ctrl+G グローバルメタ検索の UI + 状態管理 (docs/archive/search-metadata/search-expansion-design.md §10.3)。
 //!
 //! - 状態: `GlobalSearchState` (App が所有)
 //! - キーバインド: Ctrl+G で toggle

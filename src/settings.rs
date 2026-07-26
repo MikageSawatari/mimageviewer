@@ -102,7 +102,7 @@ impl DetachedViewerWindowPlacement {
 ///
 /// `id` は Tantivy / fts_meta.db の `favorite_id` として使われる安定 UUID。
 /// お気に入りを表示名 rename しても保持される。root path を変更すると index は
-/// 再スキャンされる (docs/search-expansion-design.md §5.5)。
+/// 再スキャンされる (docs/archive/search-metadata/search-expansion-design.md §5.5)。
 ///
 /// `auto_index_*` はお気に入り単位の自動インデックス管理フラグ (v0.8.0 新設)。
 /// 既存お気に入りは全て false 初期値で読み込まれ、後段の UI で個別 ON にする。
@@ -350,7 +350,7 @@ impl FavoriteEntry {
 }
 
 // -----------------------------------------------------------------------
-// TagDef (docs/tag-feature.md)
+// TagDef (docs/archive/search-metadata/tag-feature.md)
 // -----------------------------------------------------------------------
 
 /// ユーザ定義のタグ 1 エントリ。
@@ -1873,7 +1873,7 @@ impl ArchiveFileHandling {
 }
 
 // -----------------------------------------------------------------------
-// インデクサ速度プロファイル (v0.8.0, docs/search-expansion-design.md §7.5)
+// インデクサ速度プロファイル (v0.8.0, docs/archive/search-metadata/search-expansion-design.md §7.5)
 // -----------------------------------------------------------------------
 
 /// バックグラウンドインデクサの速度プロファイル。
@@ -2965,7 +2965,7 @@ pub struct Settings {
     /// チェック状態をセッションをまたいで保存する (正規化せず元のパスで記録)。
     #[serde(default)]
     pub search_index_checks: Vec<PathBuf>,
-    /// v0.8.0: 自動インデクサの速度プロファイル (docs/search-expansion-design.md §7.5)。
+    /// v0.8.0: 自動インデクサの速度プロファイル (docs/archive/search-metadata/search-expansion-design.md §7.5)。
     /// I/O 同時実行数 (GlobalIoSemaphore permits) を決める。
     /// 変更は次回起動時に反映 (IndexerManager::new で読まれる)。
     #[serde(default)]
@@ -3040,7 +3040,7 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_reading_history_progress: bool,
 
-    // ── タグ機能 (docs/tag-feature.md) ──────────────────────────
+    // ── タグ機能 (docs/archive/search-metadata/tag-feature.md) ──────────────────────────
     /// ユーザ定義のタグ一覧 (メニュー / ツールバー に表示される順)。
     #[serde(default)]
     pub tags: Vec<TagDef>,

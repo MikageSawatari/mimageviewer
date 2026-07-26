@@ -4,7 +4,7 @@ mimageviewer の検索 (Ctrl+F / Ctrl+S / Ctrl+G) を「コンテナ検索 / ア
 分かりやすい概念モデルに寄せ直すための設計ドキュメント。Codex レビュー → 実装の順で進める。
 
 関連ドキュメント: [search-architecture.md](search-architecture.md) (現行アーキテクチャの決定版)、
-[search-expansion-design.md](search-expansion-design.md)、[tag-feature.md](tag-feature.md)。
+[archive/search-metadata/search-expansion-design.md](archive/search-metadata/search-expansion-design.md)、[archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md)。
 
 ---
 

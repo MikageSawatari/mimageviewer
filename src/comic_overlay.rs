@@ -21,7 +21,7 @@
 //! する (`comic_composited_pixels_for_export`)。設計メモ D10 の「ダウンサンプル後に最終解像度で
 //! 直焼き」は **採用しない判断** (2026-06-07)。crop/scale/comic 座標が多段で掛かりズレ系の視覚
 //! バグが出やすく、最終出力縮小が重視機能でないため複雑さに見合わない。詳細は
-//! docs/comic-ui-bugfix-checklist.md の C5 エントリ。
+//! docs/archive/comic/comic-ui-bugfix-checklist.md の C5 エントリ。
 
 use comic_core::{
     AnnotationLayer, AnnotationObject, FontSet, LoadedFont, Orientation, Rgba, RgbaOverlay,

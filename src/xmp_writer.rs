@@ -1,4 +1,4 @@
-//! XMP `dc:subject` (タグ) の書き込み (docs/tag-feature.md §5)。
+//! XMP `dc:subject` (タグ) の書き込み (docs/archive/search-metadata/tag-feature.md §5)。
 //!
 //! # 対応形式
 //!

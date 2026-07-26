@@ -20328,7 +20328,7 @@ mod pipeline_cache_refactor_tests {
     // P6-3: M-6 退行ガード (補正レイヤー編集中は隠蔽加工を見せない設計の符号化)
     // ========================================================================
     //
-    // ユーザー報告 (docs/local-adjust-integration-audit.md §M-6):
+    // ユーザー報告 (docs/archive/editing/local-adjust-integration-audit.md §M-6):
     //   「消しゴムツールでは、補正レイヤー・隠蔽加工が見えないようになっていると
     //    思いますが、同様に補正レイヤー編集中は隠蔽加工の処理はみえないように
     //    してください。」
@@ -20422,7 +20422,7 @@ mod pipeline_cache_refactor_tests {
                  If this fires, the compose chain for `current_local_adjust_source_pixels` \
                  has started routing through conceal_cache, which means the editor will \
                  show conceal-applied output while editing layers (= the exact behavior \
-                 docs/local-adjust-integration-audit.md §M-6 forbids)."
+                 docs/archive/editing/local-adjust-integration-audit.md §M-6 forbids)."
             );
         }
     }
