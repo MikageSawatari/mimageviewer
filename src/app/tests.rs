@@ -15771,6 +15771,64 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn viewer_context_bundle_owns_continuous_page_transitions() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = ctx.load_texture(
+            "continuous_transition_first_context",
+            egui::ColorImage::filled([1, 1], egui::Color32::from_rgb(10, 20, 30)),
+            egui::TextureOptions::LINEAR,
+        );
+        let first_id = first.id();
+        let first_generation = app.items_generation;
+        app.continuous_page_transitions.insert(
+            3,
+            ContinuousPageTransition {
+                texture: first,
+                items_generation: first_generation,
+            },
+        );
+
+        let mut bundle = app.take_current_viewer_context_bundle();
+        assert!(
+            app.continuous_page_transitions.is_empty(),
+            "a fresh viewer context must not inherit another context's page transition"
+        );
+
+        let second = ctx.load_texture(
+            "continuous_transition_second_context",
+            egui::ColorImage::filled([1, 1], egui::Color32::from_rgb(40, 50, 60)),
+            egui::TextureOptions::LINEAR,
+        );
+        let second_id = second.id();
+        let second_generation = app.items_generation;
+        app.continuous_page_transitions.insert(
+            9,
+            ContinuousPageTransition {
+                texture: second,
+                items_generation: second_generation,
+            },
+        );
+
+        app.swap_viewer_context_bundle(&mut bundle);
+
+        assert_eq!(
+            app.continuous_page_transitions
+                .get(&3)
+                .map(|entry| entry.texture.id()),
+            Some(first_id)
+        );
+        assert_eq!(
+            bundle
+                .continuous_page_transitions
+                .get(&9)
+                .map(|entry| entry.texture.id()),
+            Some(second_id),
+            "the displaced context keeps ownership of its own transition texture"
+        );
+    }
+
+    #[test]
     fn viewer_context_bundle_preserves_flat_stack_state() {
         use crate::filename_stack::{StackMember, StackView};
 
@@ -18685,6 +18743,155 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.fs_holdover_tex.is_none(),
             "only a complete final composite releases the colorize holdover"
+        );
+    }
+
+    /// 連結読みの非アンカーページは単ページ用 `fs_holdover_tex` を共有しない。
+    /// raw source 差し替えで旧 final が消え、AI 待ちの incomplete final が一度公開されて
+    /// 再び消え、complete final が届くまでの全区間をページ別 transition が橋渡しする。
+    #[test]
+    fn continuous_colorize_page_transition_bridges_raw_incomplete_and_complete_states() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let anchor = push_image(&mut app, "C:/pics/continuous-anchor.jpg");
+        let idx = push_pdf_page(&mut app, "C:/pics/continuous-colorize.pdf", 0);
+        app.fullscreen_idx = Some(anchor);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        app.fs_vertical_cache_keep_set = std::collections::HashSet::from([anchor, idx]);
+
+        let (_, _, _, old_final_key) =
+            populate_all_idx_caches(&mut app, &ctx, idx, "continuous_old_final");
+        let old_id = app
+            .final_composite_cache
+            .get(&old_final_key)
+            .expect("fixture should contain the old final")
+            .texture
+            .id();
+
+        app.capture_colorize_source_reload_holdover(idx);
+        app.bump_input_generation_for_fs_cache_reload(idx);
+        assert_eq!(
+            app.continuous_page_transition_texture(idx)
+                .map(|texture| texture.id()),
+            Some(old_id),
+            "the non-anchor page must retain its displayed final across raw reload invalidation"
+        );
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "a non-anchor page must not take ownership of the single-page holdover"
+        );
+
+        let edit_key = dummy_edit_key(&app, idx);
+        let params = app.effective_params(idx).clone();
+        let final_key = app.final_composite_key_for_pixels(edit_key, [2, 2], &params);
+        let provisional_pixels = Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_rgb(110, 90, 70),
+        ));
+        let items_generation = app.items_generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(FinalEffectResult::Ready {
+            pixels: Arc::clone(&provisional_pixels),
+            elapsed_ms: 0.0,
+            timing: FinalEffectTiming::default(),
+        })
+        .unwrap();
+        app.final_effect_pending.insert(
+            final_key,
+            FinalEffectPending {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                items_generation,
+                output_complete: false,
+                nearest_sampler: false,
+                prefetch: false,
+            },
+        );
+        app.poll_final_effects(&ctx);
+        let provisional_id = app
+            .final_composite_cache
+            .get(&final_key)
+            .expect("incomplete final should be uploaded")
+            .texture
+            .id();
+        assert_eq!(
+            app.continuous_page_transition_texture(idx)
+                .map(|texture| texture.id()),
+            Some(provisional_id),
+            "the displayed incomplete final becomes the next transition texture"
+        );
+
+        app.final_composite_cache.remove(&final_key);
+        assert_eq!(
+            app.continuous_page_transition_texture(idx)
+                .map(|texture| texture.id()),
+            Some(provisional_id),
+            "AI-driven rebuild must not expose loading after the incomplete final disappears"
+        );
+
+        let complete_pixels = Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_rgb(130, 105, 80),
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(FinalEffectResult::Ready {
+            pixels: complete_pixels,
+            elapsed_ms: 0.0,
+            timing: FinalEffectTiming::default(),
+        })
+        .unwrap();
+        app.final_effect_pending.insert(
+            final_key,
+            FinalEffectPending {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                items_generation,
+                output_complete: true,
+                nearest_sampler: false,
+                prefetch: false,
+            },
+        );
+        app.poll_final_effects(&ctx);
+
+        assert!(
+            app.final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete),
+            "the replacement final must be complete before the transition is released"
+        );
+        assert!(
+            app.continuous_page_transition_texture(idx).is_none(),
+            "the old transition texture must be released after the complete final is uploaded"
+        );
+        assert!(!app.continuous_page_transitions.contains_key(&idx));
+    }
+
+    /// ページ別 transition は連結読み keep-set と同じ所有範囲に限定し、スクロールで
+    /// 範囲外になった高解像度 texture を保持し続けない。
+    #[test]
+    fn continuous_colorize_page_transition_is_dropped_outside_keep_set() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let anchor = push_image(&mut app, "C:/pics/continuous-keep-anchor.jpg");
+        let idx = push_image(&mut app, "C:/pics/continuous-keep-drop.jpg");
+        app.fullscreen_idx = Some(anchor);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        app.fs_vertical_cache_keep_set = std::collections::HashSet::from([anchor, idx]);
+        let (_, _, _, final_key) =
+            populate_all_idx_caches(&mut app, &ctx, idx, "continuous_keep_drop");
+
+        app.capture_colorize_source_reload_holdover(idx);
+        assert!(app.continuous_page_transitions.contains_key(&idx));
+
+        let keep_set = std::collections::HashSet::from([anchor]);
+        app.evict_final_pipeline_cache_for_keep_set(&keep_set);
+
+        assert!(!app.final_composite_cache.contains_key(&final_key));
+        assert!(
+            !app.continuous_page_transitions.contains_key(&idx),
+            "transition textures must obey the continuous-reading VRAM keep-set"
         );
     }
 

@@ -2083,6 +2083,7 @@ struct ViewerContextBundle {
     fs_seek_drag_active: bool,
     fs_seek_overlay_visible: bool,
     fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
     fs_free_rotation: f32,
     fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
     analysis_zoom: f32,
@@ -2365,6 +2366,7 @@ impl ViewerContextBundle {
             fs_seek_drag_active: false,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
+            continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
             analysis_zoom: 1.0,
@@ -2451,6 +2453,7 @@ impl ViewerContextBundle {
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
+        self.continuous_page_transitions.clear();
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
         if let Some(pending) = self.folder_nav_pending.take() {
@@ -4719,6 +4722,14 @@ pub(crate) struct FinalCompositeEntry {
     pub(crate) texture: egui::TextureHandle,
     /// false は AI 完了待ち中の暫定プレビュー。AI が届いたら同じ key を上書きする。
     pub(crate) complete: bool,
+}
+
+/// 連結読みで表示済みのページを、同ページの新しい final composite が完成するまで
+/// 保持する表示専用状態。idx と texture だけを別々に持つと一覧差し替え後の同じ idx に
+/// 誤適用できるため、所有する items 世代と一体で管理する。
+pub(crate) struct ContinuousPageTransition {
+    pub(crate) texture: egui::TextureHandle,
+    pub(crate) items_generation: u64,
 }
 
 pub(crate) struct FinalEffectPending {
@@ -8140,6 +8151,10 @@ pub struct App {
     pub(crate) fs_seek_overlay_visible: bool,
     /// 連結読み描画で最後に計算した raw/final/comic cache の保持対象。
     pub(crate) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    /// 連結読みのページ別更新中表示。raw source 再読込や incomplete → complete の
+    /// 再合成で live final が一時的に消えても、完成済みの差し替え先が届くまで保持する。
+    pub(crate) continuous_page_transitions:
+        std::collections::HashMap<usize, ContinuousPageTransition>,
     /// 任意角度回転（ラジアン、一時的・保存しない）
     pub(crate) fs_free_rotation: f32,
     /// 回転ドラッグ開始状態（開始位置, 開始時の回転角）
@@ -10704,6 +10719,7 @@ impl App {
             fs_seek_drag_active: false,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
+            continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
             fs_loupe_locked: false,
@@ -12327,6 +12343,7 @@ impl App {
             fs_seek_drag_active,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
+            continuous_page_transitions,
             fs_free_rotation,
             fs_rotation_drag_start,
             analysis_zoom,
@@ -12551,6 +12568,7 @@ impl App {
         swap_field!(fs_seek_drag_active);
         swap_field!(fs_seek_overlay_visible);
         swap_field!(fs_vertical_cache_keep_set);
+        swap_field!(continuous_page_transitions);
         swap_field!(fs_free_rotation);
         swap_field!(fs_rotation_drag_start);
         swap_field!(analysis_zoom);
@@ -35954,6 +35972,7 @@ impl App {
             fs_seek_drag_active,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
+            continuous_page_transitions,
             fs_free_rotation,
             fs_rotation_drag_start,
             analysis_zoom,
@@ -36118,6 +36137,7 @@ impl App {
             fs_seek_drag_active,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
+            continuous_page_transitions,
             fs_free_rotation,
             fs_rotation_drag_start,
             analysis_zoom,
@@ -38442,6 +38462,7 @@ impl App {
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
         self.fs_vertical_cache_keep_set.clear();
+        self.continuous_page_transitions.clear();
         self.fs_free_rotation = 0.0;
         self.fs_rotation_drag_start = None;
         // 透過背景は「一時的な好み」なので画像切替時にリセット (plan-v0.7.0.md の方針)
@@ -48750,16 +48771,71 @@ impl App {
         self.clear_edit_result_caches_for_idx_preserving_retained_final_ai(idx);
     }
 
-    /// 表示中ページの static source を差し替える直前に、完成済みのカラー化表示だけを
-    /// display-only holdover へ退避する。初回ロードでは `resolve_fs_display_tex` が
-    /// `None` を返すので、ページ遷移が所有している既存 holdover は上書きしない。
-    pub(crate) fn capture_colorize_source_reload_holdover(&mut self, idx: usize) {
-        if self.fullscreen_idx == Some(idx)
-            && self.fs_nav_locked_gen.is_none()
+    fn continuous_page_transition_is_owned_here(&self, idx: usize) -> bool {
+        self.continuous_reading_active_for_idx(idx)
+            && self.fs_vertical_cache_keep_set.contains(&idx)
             && self.colorize_display_requires_final_effect(idx)
-            && let Some(texture) = self.resolve_fs_display_tex(idx, false)
-        {
-            self.fs_holdover_tex = Some(texture);
+    }
+
+    fn set_continuous_page_transition(&mut self, idx: usize, texture: egui::TextureHandle) {
+        if self.continuous_page_transition_is_owned_here(idx) {
+            self.continuous_page_transitions.insert(
+                idx,
+                ContinuousPageTransition {
+                    texture,
+                    items_generation: self.items_generation,
+                },
+            );
+        }
+    }
+
+    /// 連結読みで現在の items 世代・keep-set に属するページ別 holdover を返す。
+    /// 生画像へ戻さないため、カラー化が現在も有効な場合にだけ公開する。
+    pub(crate) fn continuous_page_transition_texture(
+        &self,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.continuous_page_transition_is_owned_here(idx)
+            .then(|| self.continuous_page_transitions.get(&idx))
+            .flatten()
+            .filter(|entry| entry.items_generation == self.items_generation)
+            .map(|entry| entry.texture.clone())
+    }
+
+    /// 連結読みで表示候補になった final/comic texture をページ別遷移状態へ反映する。
+    /// incomplete は次の再合成の谷間を橋渡しする表示へ昇格し、complete は差し替え先が
+    /// 既に存在するので旧表示を解放する。
+    pub(crate) fn observe_continuous_page_processed_texture(
+        &mut self,
+        idx: usize,
+        texture: &egui::TextureHandle,
+    ) {
+        let comic_complete = self
+            .current_comic_composite_texture(idx)
+            .is_some_and(|comic| comic.id() == texture.id());
+        let complete = comic_complete || self.final_composite_texture_is_complete(idx, texture);
+        if complete {
+            self.continuous_page_transitions.remove(&idx);
+        } else {
+            self.set_continuous_page_transition(idx, texture.clone());
+        }
+    }
+
+    /// static source を差し替える直前に、完成済みのカラー化表示を display-only
+    /// holdover へ退避する。単ページは従来の viewer holdover、連結読みはページ別
+    /// transition が所有する。初回ロードでは `resolve_fs_display_tex` が `None` を
+    /// 返すので、既存 holdover は上書きしない。
+    pub(crate) fn capture_colorize_source_reload_holdover(&mut self, idx: usize) {
+        if self.fs_nav_locked_gen.is_some() || !self.colorize_display_requires_final_effect(idx) {
+            return;
+        }
+        if let Some(texture) = self.resolve_fs_display_tex(idx, false) {
+            if self.continuous_page_transition_is_owned_here(idx) {
+                self.set_continuous_page_transition(idx, texture.clone());
+            }
+            if self.fullscreen_idx == Some(idx) {
+                self.fs_holdover_tex = Some(texture);
+            }
         }
     }
 
@@ -50570,10 +50646,20 @@ impl App {
                         key,
                         FinalCompositeEntry {
                             pixels,
-                            texture,
+                            texture: texture.clone(),
                             complete: pending.output_complete,
                         },
                     );
+                    if pending.output_complete {
+                        self.continuous_page_transitions.remove(&key.edit_key.idx);
+                        if self.fs_nav_locked_gen.is_none()
+                            && self.fullscreen_idx == Some(key.edit_key.idx)
+                        {
+                            self.fs_holdover_tex = None;
+                        }
+                    } else {
+                        self.set_continuous_page_transition(key.edit_key.idx, texture);
+                    }
                     self.comic_cache.remove(&key.edit_key.idx);
                     self.cancel_comic_bake_for_idx(key.edit_key.idx);
                     if crate::perf::is_enabled() {
@@ -52008,6 +52094,10 @@ impl App {
             .retain(|key| keep_set.contains(&key.edit_key.idx));
         self.final_composite_cache
             .retain(|key, _| keep_set.contains(&key.edit_key.idx));
+        let items_generation = self.items_generation;
+        self.continuous_page_transitions.retain(|idx, entry| {
+            keep_set.contains(idx) && entry.items_generation == items_generation
+        });
         let final_effect_evict: Vec<FinalCompositeKey> = self
             .final_effect_pending
             .keys()

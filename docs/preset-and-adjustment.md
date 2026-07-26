@@ -285,6 +285,10 @@ PDF の Z ズーム再描画などで表示中ページの source が高解像�
 AI 待ちの `complete=false` カラー化結果が先にできた場合は、その結果を次の holdover に昇格して
 AI 完了後の再合成まで維持する。フォルダ横断の nav lock も raw / thumbnail や
 `complete=false` の到着だけでは解放せず、`complete=true` の final composite を待つ。
+連結読みでは単一の nav holdover を使わず、keep-set 内のページごとに直前の表示済み
+カラー化 texture と items 世代を保持する。PDF の再読込や AI 再合成中もそのページだけは
+旧表示を続け、`complete=true` の差し替え先を GPU 登録した後に解放する。ページが keep-set を
+外れた場合は raw / final cache と同時に破棄し、表示枚数が多い場合も VRAM 上限を迂回しない。
 サムネイル自体には適用しない。
 
 ### 2.2.1 Creative 3D LUT

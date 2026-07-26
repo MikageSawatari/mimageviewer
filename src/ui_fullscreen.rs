@@ -14729,6 +14729,7 @@ impl App {
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_free_rotation = 0.0;
         self.fs_vertical_cache_keep_set.clear();
+        self.continuous_page_transitions.clear();
         self.slideshow_scroll_range_cache = None;
     }
 
@@ -15311,6 +15312,11 @@ impl App {
         if let Some(entry) = self.comic_cache.get(&idx) {
             add_texture_texels(&mut seen, &mut total, &entry.texture, true);
         }
+        if let Some(entry) = self.continuous_page_transitions.get(&idx)
+            && entry.items_generation == self.items_generation
+        {
+            add_texture_texels(&mut seen, &mut total, &entry.texture, true);
+        }
 
         total
     }
@@ -15770,14 +15776,20 @@ impl App {
                 self.resolve_original_preview_tex(page.idx)
                     .or_else(|| self.resolve_fs_display_tex(page.idx, true))
             } else if let Some(tex) = self.vertical_reading_cached_processed_texture(page.idx) {
+                self.observe_continuous_page_processed_texture(page.idx, &tex);
                 Some(tex)
             } else if process_indices.contains(&page.idx) {
                 // 連結読みでも単ページ/見開きと同じ final pipeline を使う。ただし
                 // 新規 GPU upload は未生成の可視ページだけを 1 フレームずつ進め、
                 // スクロール中の大量同期生成を避ける。
-                self.resolve_fs_processed_texture(ctx, page.idx, false)
+                let processed = self.resolve_fs_processed_texture(ctx, page.idx, false);
+                if let Some(tex) = processed.as_ref() {
+                    self.observe_continuous_page_processed_texture(page.idx, tex);
+                }
+                processed.or_else(|| self.continuous_page_transition_texture(page.idx))
             } else {
-                self.resolve_fs_display_tex(page.idx, true)
+                self.continuous_page_transition_texture(page.idx)
+                    .or_else(|| self.resolve_fs_display_tex(page.idx, true))
             };
             if matches!(self.fs_cache.get(&page.idx), Some(FsCacheEntry::Failed)) {
                 painter.text(
