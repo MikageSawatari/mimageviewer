@@ -26,7 +26,7 @@ use crate::ai::ModelKind;
 use crate::app::{App, ViewerPresentation};
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
-    ResolvedDisplayPlacement, ResolvedZTransform, ZTransformInput,
+    FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform, ZTransformInput,
 };
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
@@ -1275,19 +1275,8 @@ impl AdjustScope {
     }
 }
 
-/// 見開き描画時に書き出されるページ矩形レイアウト。
-/// ルーペ描画がカーソル位置からどちらのページかを判定し、UV サンプリングに使う。
-#[derive(Clone, Copy)]
-pub struct FsSpreadLayout {
-    pub left_idx: usize,
-    pub left_rect: egui::Rect,
-    pub left_hit_rect: egui::Rect,
-    pub right_idx: usize,
-    pub right_rect: egui::Rect,
-    pub right_hit_rect: egui::Rect,
-}
-
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct SpreadPageDrawRects {
     left_rect: egui::Rect,
     left_hit_rect: egui::Rect,
@@ -7760,6 +7749,7 @@ impl App {
 
                         // ── 画像 / 動画描画 ──
                         let media_t0 = std::time::Instant::now();
+                        self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
                         if self.continuous_reading_active_for_idx(fs_idx) {
                             self.draw_fs_continuous_reading(
@@ -7792,9 +7782,7 @@ impl App {
                                         if std::mem::take(&mut self.music_view_close_requested) {
                                             close_fs = true;
                                         }
-                                        self.fs_spread_layout = None;
                                     } else if panorama_painted {
-                                        self.fs_spread_layout = None;
                                     } else if self.fs_zoom_mode_engaged()
                                         && !state.is_video
                                         && !analysis_active
@@ -7804,7 +7792,6 @@ impl App {
                                         single_transform = self.draw_fs_zoom_mode(
                                             ui, ctx, image_rect, fs_idx, &state,
                                         );
-                                        self.fs_spread_layout = None;
                                     } else {
 
                                     let fs_rotation = self.get_rotation(fs_idx);
@@ -7997,8 +7984,6 @@ impl App {
                                             content_bbox,
                                         );
                                     }
-                                    // 単一表示時は見開きレイアウトキャッシュを破棄
-                                    self.fs_spread_layout = None;
                                     } // else (= !panorama_painted) ブロック終端
                                 }
                                 SpreadPair::Double { left, right } => {
@@ -8021,7 +8006,6 @@ impl App {
                                             zoom_pan,
                                         )
                                     {
-                                        self.fs_spread_layout = None;
                                     } else if matches!(
                                         compare_mode,
                                         crate::app::CompareViewMode::PinnedNormal
@@ -8038,7 +8022,6 @@ impl App {
                                                 None,
                                                 fit_scale_limits,
                                             );
-                                            self.fs_spread_layout = None;
                                         }
                                     } else {
                                         let fallback_compare_tex = if matches!(
@@ -8095,6 +8078,37 @@ impl App {
                                     }
                                 }
                             }
+                        }
+                        if single_transform.is_none()
+                            && spread_pair == SpreadPair::Single
+                            && !matches!(
+                                self.compare_view_mode,
+                                crate::app::CompareViewMode::Off
+                            )
+                            && let Some(handle) = state.tex.as_ref().or(state.thumb_tex.as_ref())
+                        {
+                            let size = handle.size_vec2();
+                            single_transform = DisplayedImageTransform::resolve(
+                                DisplayedImageTransformInput {
+                                    page_idx: fs_idx,
+                                    viewport_rect: image_rect,
+                                    source_size: source_size.unwrap_or(size),
+                                    texture_size: size,
+                                    rotation: crate::rotation_db::Rotation::None,
+                                    free_rotation_rad: 0.0,
+                                    content_bbox: None,
+                                    fit_mode: FullscreenFitMode::Page,
+                                    fit_scale_limits: self.fullscreen_fit_scale_limits(),
+                                    placement: ResolvedDisplayPlacement::Normal {
+                                        zoom_pan: self.fs_zoom_pan(),
+                                    },
+                                },
+                            );
+                        }
+                        if let Some(transform) = single_transform {
+                            self.fullscreen_page_layout
+                                .begin(FullscreenPageLayoutKind::Single);
+                            self.fullscreen_page_layout.push(transform);
                         }
                         fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -8211,17 +8225,12 @@ impl App {
                             ctx,
                             full_rect,
                             fs_idx,
-                            is_spread_double,
-                            single_transform.as_ref(),
                         );
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // パノラマ・分析・補正・テキスト注釈モードでは内部で早期 return する。
                         // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
                         self.draw_fs_loupe_if_active(
                             ui, ctx, image_rect, fs_idx,
-                            state.tex.as_ref(), state.thumb_tex.as_ref(),
-                            is_spread_double,
-                            single_transform.as_ref(),
                         );
 
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
@@ -9947,17 +9956,14 @@ impl App {
     /// 現在画面に出ている見開きレイアウトを優先してペアを返す。
     ///
     /// Ctrl+S / Ctrl+E は「表示中のものを保存する」操作なので、直近の描画で確定した
-    /// `fs_spread_layout` が現在 idx を含む場合はそちらを正とする。レイアウトが無い
+    /// `fullscreen_page_layout` の見開きが現在 idx を含む場合はそちらを正とする。レイアウトが無い
     /// フレームでは通常のペアリング規則へフォールバックする。
     pub(crate) fn resolve_visible_spread_pair(&mut self, idx: usize) -> SpreadPair {
         if self.spread_mode.is_spread()
-            && let Some(layout) = self.fs_spread_layout
-            && (layout.left_idx == idx || layout.right_idx == idx)
+            && let Some((left, right)) = self.fullscreen_page_layout.spread_pair()
+            && (left == idx || right == idx)
         {
-            return SpreadPair::Double {
-                left: layout.left_idx,
-                right: layout.right_idx,
-            };
+            return SpreadPair::Double { left, right };
         }
         self.resolve_spread_pair(idx)
     }
@@ -15563,7 +15569,7 @@ impl App {
         original_preview_active: bool,
     ) {
         let Some((units, current_pos)) = self.continuous_reading_units_and_pos(fs_idx) else {
-            self.fs_spread_layout = None;
+            self.fullscreen_page_layout.clear();
             self.slideshow_scroll_range_cache = None;
             return;
         };
@@ -15577,7 +15583,7 @@ impl App {
                 prefer_processed_layout,
             )
         else {
-            self.fs_spread_layout = None;
+            self.fullscreen_page_layout.clear();
             self.slideshow_scroll_range_cache = None;
             return;
         };
@@ -15592,6 +15598,8 @@ impl App {
         };
         let bg_style = transparent_bg_style(self.fs_transparent_bg_mode, bg_tex.as_ref());
         let painter = ui.painter().with_clip_rect(image_rect);
+        self.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Continuous);
 
         let process_indices = if original_preview_active {
             std::collections::HashSet::new()
@@ -15647,10 +15655,15 @@ impl App {
             }
             let allow_thumbnail =
                 original_preview_active || !self.colorize_display_requires_final_effect(page.idx);
-            Self::draw_fs_spread_page(
+            let source_size = self
+                .source_dims_for_idx(page.idx)
+                .map(|(w, h)| egui::vec2(w, h));
+            if let Some(transform) = Self::draw_fs_spread_page(
                 &painter,
+                image_rect,
                 page.rect,
                 page.idx,
+                source_size,
                 rotation,
                 &self.thumbnails,
                 &bg_style,
@@ -15658,7 +15671,9 @@ impl App {
                 display_tex.as_ref(),
                 allow_thumbnail,
                 page.content_bbox,
-            );
+            ) {
+                self.fullscreen_page_layout.push(transform);
+            }
         }
         // スライドショーの短時間スクロール中に current_pos を張り替えると、
         // アニメーションの start/target が旧 offset 基準のまま残り、見た目の移動量が
@@ -15673,7 +15688,6 @@ impl App {
             self.reanchor_continuous_reading_viewer(ctx, &offsets, new_pos, new_idx);
         }
 
-        self.fs_spread_layout = None;
         if any_loading || has_deferred_processed {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
@@ -17204,19 +17218,13 @@ impl App {
     /// - 分析モード・補正モード・テキスト注釈モードに入っていない
     /// - カーソルが `full_rect` 内
     /// - 画像が回転 0 / 任意回転なし (回転時は UV 逆変換が複雑なため v0.7.0 では非対応)
-    /// - 現在 Single (非見開き) 表示で、テクスチャが存在する
-    ///
-    /// 見開き時は現状は未対応 (v0.7.0 のスコープ外)。
+    /// - カーソル直下に描画済みページとテクスチャが存在する
     pub(crate) fn draw_fs_loupe_if_active(
         &mut self,
         ui: &egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
         fs_idx: usize,
-        tex: Option<&egui::TextureHandle>,
-        thumb_tex: Option<&egui::TextureHandle>,
-        spread_double: bool,
-        single_transform: Option<&DisplayedImageTransform>,
     ) {
         if self.is_panorama_mode_active(fs_idx) {
             return;
@@ -17251,78 +17259,33 @@ impl App {
             return;
         }
 
-        // ── 対象のページ矩形 + テクスチャを決定 ───────────────────────
-        // Single / Spread で分岐。見開きはカーソル直下のページを選ぶ。
-        let (img_rect, handle_owned, idx_for_rot, resolved_single) = if spread_double {
-            let Some(layout) = self.fs_spread_layout else {
-                return;
-            };
-            let (page_idx, page_rect) = if layout.left_hit_rect.contains(cursor) {
-                (layout.left_idx, layout.left_rect)
-            } else if layout.right_hit_rect.contains(cursor) {
-                (layout.right_idx, layout.right_rect)
-            } else {
-                return;
-            };
-            // 見開き時はページ rect がそのまま image rect (draw_fs_spread が高さ統一で
-            // アスペクトをぴったり合わせた矩形を組むため、letterbox は発生しない)。
-            // ルーペも通常描画と同じ加工済みレイヤを参照する。
-            let page_original_preview_active = self.original_preview_active(ctx, page_idx);
-            let page_tex =
-                self.resolve_fs_processed_texture(ctx, page_idx, page_original_preview_active);
-            let page_thumb: Option<egui::TextureHandle> = if !page_original_preview_active
-                && self.colorize_display_requires_final_effect(page_idx)
-            {
-                None
-            } else {
-                match self.thumbnails.get(page_idx) {
-                    Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-                    _ => None,
-                }
-            };
-            let Some(handle) = page_tex.or(page_thumb) else {
-                return;
-            };
-            (page_rect, handle, page_idx, None)
-        } else {
-            let Some(handle) = tex.or(thumb_tex) else {
-                return;
-            };
-            let transform = single_transform.copied().or_else(|| {
-                (!matches!(self.compare_view_mode, crate::app::CompareViewMode::Off))
-                    .then(|| {
-                        let size = handle.size_vec2();
-                        DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-                            page_idx: fs_idx,
-                            viewport_rect: full_rect,
-                            source_size: size,
-                            texture_size: size,
-                            rotation: crate::rotation_db::Rotation::None,
-                            free_rotation_rad: 0.0,
-                            content_bbox: None,
-                            fit_mode: FullscreenFitMode::Page,
-                            fit_scale_limits: self.fullscreen_fit_scale_limits(),
-                            placement: ResolvedDisplayPlacement::Normal {
-                                zoom_pan: self.fs_zoom_pan(),
-                            },
-                        })
-                    })
-                    .flatten()
-            });
-            let Some(transform) = transform else {
-                return;
-            };
-            (
-                transform.full_image_rect,
-                handle.clone(),
-                fs_idx,
-                Some(transform),
-            )
+        let Some(page) = self.fullscreen_page_layout.hit_test(cursor).copied() else {
+            return;
         };
+        let page_idx = page.page_idx();
+        if matches!(self.items.get(page_idx), Some(GridItem::Video(_))) {
+            return;
+        }
+        let page_original_preview_active = self.original_preview_active(ctx, page_idx);
+        let page_tex =
+            self.resolve_fs_processed_texture(ctx, page_idx, page_original_preview_active);
+        let page_thumb = if !page_original_preview_active
+            && self.colorize_display_requires_final_effect(page_idx)
+        {
+            None
+        } else {
+            match self.thumbnails.get(page_idx) {
+                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+                _ => None,
+            }
+        };
+        let Some(handle_owned) = page_tex.or(page_thumb) else {
+            return;
+        };
+        let transform = page.transform;
 
         // 回転 / 任意回転時は UV 逆変換が複雑なためルーペ非対応
-        let rotation = self.get_rotation(idx_for_rot);
-        if !rotation.is_none() || self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
+        if !transform.rotation.is_none() || transform.free_rotation_rad.abs() > TRANSFORM_EPSILON {
             return;
         }
 
@@ -17330,24 +17293,9 @@ impl App {
         if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
             return;
         }
-        if resolved_single
-            .map(|transform| transform.contains_screen(cursor))
-            .unwrap_or_else(|| img_rect.contains(cursor))
-            == false
-        {
-            return;
-        }
-
-        // 画面 px → テクスチャ px の変換倍率 (見開きでも単一でも共通のスカラー)
-        let total_scale = img_rect.width() / tex_size.x;
-        let uv_center = resolved_single
-            .map(|transform| transform.screen_to_source_normalized(cursor).to_vec2())
-            .unwrap_or_else(|| {
-                egui::vec2(
-                    (cursor.x - img_rect.min.x) / img_rect.width(),
-                    (cursor.y - img_rect.min.y) / img_rect.height(),
-                )
-            });
+        // 画面 px → 今ルーペが参照するテクスチャ px の変換倍率。
+        let total_scale = transform.screen_px_per_source_px(tex_size);
+        let uv_center = transform.screen_to_source_normalized(cursor).to_vec2();
 
         // ルーペパラメータ (将来設定化)
         const LOUPE_SIZE: f32 = 300.0;
@@ -17407,6 +17355,7 @@ impl App {
         right_idx: usize,
         original_preview_active: bool,
     ) {
+        self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = self.effective_fullscreen_fit_mode();
         let fit_scale_limits = self.fullscreen_fit_scale_limits();
@@ -17638,6 +17587,8 @@ impl App {
                 original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
             let right_allow_thumbnail =
                 original_preview_active || !self.colorize_display_requires_final_effect(right_idx);
+            self.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Spread);
             for (rect, idx, rot, location, display_tex, allow_thumbnail, content_bbox) in [
                 (
                     spread_rects.left_rect,
@@ -17658,10 +17609,13 @@ impl App {
                     content_right,
                 ),
             ] {
-                Self::draw_fs_spread_page(
+                let source_size = self.source_dims_for_idx(idx).map(|(w, h)| egui::vec2(w, h));
+                if let Some(transform) = Self::draw_fs_spread_page(
                     &painter,
+                    image_rect,
                     rect,
                     idx,
+                    source_size,
                     rot,
                     &self.thumbnails,
                     &bg_style,
@@ -17669,18 +17623,10 @@ impl App {
                     display_tex,
                     allow_thumbnail,
                     content_bbox,
-                );
+                ) {
+                    self.fullscreen_page_layout.push(transform);
+                }
             }
-
-            // ルーペが参照するレイアウトを記録 (両ページのサイズが既知のときのみ信頼できる)
-            self.fs_spread_layout = Some(FsSpreadLayout {
-                left_idx,
-                left_rect: spread_rects.left_rect,
-                left_hit_rect: spread_rects.left_hit_rect,
-                right_idx,
-                right_rect: spread_rects.right_rect,
-                right_hit_rect: spread_rects.right_hit_rect,
-            });
 
             // ZipPla ズーム照準中の枠 (見開き)。離すと枠の範囲が全画面化する。
             if let Some(frame) = aim_frame {
@@ -17731,10 +17677,13 @@ impl App {
                     content_right,
                 ),
             ] {
+                let source_size = self.source_dims_for_idx(idx).map(|(w, h)| egui::vec2(w, h));
                 Self::draw_fs_spread_page(
                     &painter,
+                    image_rect,
                     rect,
                     idx,
+                    source_size,
                     rot,
                     &self.thumbnails,
                     &bg_style,
@@ -17746,7 +17695,7 @@ impl App {
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
             // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
-            self.fs_spread_layout = None;
+            self.fullscreen_page_layout.clear();
         }
     }
 
@@ -17789,8 +17738,10 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         painter: &egui::Painter,
+        viewport_rect: egui::Rect,
         rect: egui::Rect,
         idx: usize,
+        source_size: Option<egui::Vec2>,
         rotation: crate::rotation_db::Rotation,
         thumbnails: &[ThumbnailState],
         bg_style: &FsBgStyle<'_>,
@@ -17798,7 +17749,7 @@ impl App {
         display_tex: Option<&egui::TextureHandle>,
         allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
-    ) {
+    ) -> Option<DisplayedImageTransform> {
         let thumb_tex = if allow_thumbnail {
             match thumbnails.get(idx) {
                 Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
@@ -17833,6 +17784,21 @@ impl App {
             } else {
                 crate::app::draw_rotated_image(painter, handle.id(), img_rect, rotation);
             }
+            return DisplayedImageTransform::from_resolved_rect(
+                DisplayedImageTransformInput {
+                    page_idx: idx,
+                    viewport_rect,
+                    source_size: source_size.unwrap_or(tex_size),
+                    texture_size: tex_size,
+                    rotation,
+                    free_rotation_rad: 0.0,
+                    content_bbox,
+                    fit_mode: FullscreenFitMode::Page,
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                },
+                img_rect,
+            );
         } else {
             painter.text(
                 rect.center(),
@@ -17851,6 +17817,7 @@ impl App {
                 12.0,
             );
         }
+        None
     }
 
     /// フルスクリーン UI が「クリーンな状態」(= 上部バー / 左右パネル / HUD / モーダルが
@@ -20285,57 +20252,43 @@ impl App {
     fn capture_region_target_at(
         &mut self,
         ctx: &egui::Context,
-        fs_idx: usize,
-        is_spread_double: bool,
         pos: egui::Pos2,
-        single_transform: Option<&DisplayedImageTransform>,
     ) -> Result<CaptureRegionTarget, String> {
-        if is_spread_double {
-            let Some(layout) = self.fs_spread_layout else {
-                return Err("見開きレイアウトの準備後に再実行してください".to_string());
-            };
-            let (idx, page_rect) = if layout.left_hit_rect.contains(pos) {
-                (layout.left_idx, layout.left_rect)
-            } else if layout.right_hit_rect.contains(pos) {
-                (layout.right_idx, layout.right_rect)
-            } else {
-                return Err("ページ上をドラッグしてください".to_string());
-            };
-            let source_size = self.capture_region_source_size_for_idx(ctx, idx)?;
-            let rotation = self.get_rotation(idx);
-            let transform = Self::capture_region_spread_transform_for_source(
-                idx,
-                page_rect,
-                source_size,
-                rotation,
-            )
+        // Single の範囲選択は従来どおりレターボックス上で押しても画像端へ吸着する。
+        // ページ選択自体は見開きと同じ hit-test を通し、見開き gap は対象外のままにする。
+        let hit_pos = self
+            .fullscreen_page_layout
+            .single_page()
+            .map(|page| pos.clamp(page.transform.hit_rect.min, page.transform.hit_rect.max))
+            .unwrap_or(pos);
+        let page = self
+            .fullscreen_page_layout
+            .hit_test(hit_pos)
+            .copied()
             .ok_or_else(|| {
-                [
-                    'ペ', 'ー', 'ジ', 'の', '表', '示', '矩', '形', 'を', '解', '決', 'で', 'き',
-                    'ま', 'せ', 'ん',
-                ]
-                .into_iter()
-                .collect::<String>()
+                if self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Single {
+                    "画像の表示矩形を解決できません".to_string()
+                } else {
+                    "ページ上をドラッグしてください".to_string()
+                }
             })?;
-            return Ok(CaptureRegionTarget {
-                idx,
-                source_size,
-                transform,
-            });
-        }
-
-        let source_size = self.capture_region_source_size_for_idx(ctx, fs_idx)?;
-        let mut transform = single_transform.copied().ok_or_else(|| {
-            [
-                '画', '像', 'の', '表', '示', '矩', '形', 'を', '解', '決', 'で', 'き', 'ま', 'せ',
-                'ん',
-            ]
-            .into_iter()
-            .collect::<String>()
-        })?;
+        let idx = page.page_idx();
+        let source_size = self.capture_region_source_size_for_idx(ctx, idx)?;
+        let mut transform =
+            if self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Spread {
+                Self::capture_region_spread_transform_for_source(
+                    idx,
+                    page.transform.full_image_rect,
+                    source_size,
+                    self.get_rotation(idx),
+                )
+                .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
+            } else {
+                page.transform
+            };
         transform.source_size = egui::vec2(source_size[0] as f32, source_size[1] as f32);
         Ok(CaptureRegionTarget {
-            idx: fs_idx,
+            idx,
             source_size,
             transform,
         })
@@ -20381,8 +20334,6 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         fs_idx: usize,
-        is_spread_double: bool,
-        single_transform: Option<&DisplayedImageTransform>,
     ) {
         let Some(mut selection) = self.capture_region_selection else {
             return;
@@ -20423,13 +20374,7 @@ impl App {
             && selection.target.is_none()
             && let Some(pos) = pointer_pos
         {
-            match self.capture_region_target_at(
-                ctx,
-                fs_idx,
-                is_spread_double,
-                pos,
-                single_transform,
-            ) {
+            match self.capture_region_target_at(ctx, pos) {
                 Ok(target) => {
                     let clamped =
                         pos.clamp(target.transform.hit_rect.min, target.transform.hit_rect.max);
@@ -24804,6 +24749,33 @@ mod tests {
                 (6, vec![6, 7])
             ]
         );
+    }
+
+    #[test]
+    fn spread_columns_with_cover_and_landscape_keep_screen_page_assignment() {
+        let nav = [0, 1, 2, 3, 4, 5, 6];
+        for (mode, expected_screen_pages) in [
+            (
+                SpreadMode::LtrCover,
+                vec![vec![0], vec![1, 2], vec![3], vec![4, 5], vec![6]],
+            ),
+            (
+                SpreadMode::RtlCover,
+                vec![vec![0], vec![2, 1], vec![3], vec![5, 4], vec![6]],
+            ),
+        ] {
+            let units = build_spread_display_units_with_landscape(&nav, mode, None, |idx| idx == 3);
+            assert_eq!(
+                units
+                    .iter()
+                    .map(|unit| unit.screen_pages(mode))
+                    .collect::<Vec<_>>(),
+                expected_screen_pages
+            );
+            assert_eq!(units[0].anchor_idx(), 0);
+            assert_eq!(units[2].anchor_idx(), 3);
+            assert_eq!(units[4].anchor_idx(), 6);
+        }
     }
 
     #[test]

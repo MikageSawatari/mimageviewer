@@ -142,6 +142,29 @@ impl DisplayedImageTransform {
         }
         let center = base_center - content_center * total_scale;
         let full_image_rect = egui::Rect::from_center_size(center, display_size * total_scale);
+        Self::from_resolved_rect(input, full_image_rect)
+    }
+
+    /// 見開き・連結読みのレイアウトが先に確定させた画像全体矩形から transform を構築する。
+    pub(crate) fn from_resolved_rect(
+        input: DisplayedImageTransformInput,
+        full_image_rect: egui::Rect,
+    ) -> Option<Self> {
+        if !rect_is_valid(input.viewport_rect)
+            || !rect_is_valid(full_image_rect)
+            || !size_is_valid(input.source_size)
+            || !size_is_valid(input.texture_size)
+        {
+            return None;
+        }
+        let display_size = rotated_size(input.texture_size, input.rotation);
+        let scale_x = full_image_rect.width() / display_size.x;
+        let scale_y = full_image_rect.height() / display_size.y;
+        let total_scale = (scale_x + scale_y) * 0.5;
+        if !total_scale.is_finite() || total_scale <= 0.0 {
+            return None;
+        }
+        let fit_bbox = effective_bbox(input.rotation, input.free_rotation_rad, input.content_bbox);
         let (paint_rect, uv_rect) = fit_bbox
             .map(|bbox| (normalized_sub_rect(full_image_rect, bbox), bbox))
             .unwrap_or((full_image_rect, full_uv_rect()));
@@ -253,6 +276,79 @@ impl DisplayedImageTransform {
         }
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DisplayedPage {
+    pub(crate) transform: DisplayedImageTransform,
+}
+
+impl DisplayedPage {
+    pub(crate) fn new(transform: DisplayedImageTransform) -> Self {
+        Self { transform }
+    }
+
+    pub(crate) fn page_idx(self) -> usize {
+        self.transform.page_idx
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FullscreenPageLayoutKind {
+    #[default]
+    Empty,
+    Single,
+    Spread,
+    Continuous,
+}
+
+/// 1 フレームで実際に描画されたページ列と、その screen/source transform。
+///
+/// ページは画面上の描画順で保持する。gap はどのページにも属さず、gap が 0 の共有境界は
+/// 先に描画されたページへ決定論的に割り当てる。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FullscreenPageLayout {
+    kind: FullscreenPageLayoutKind,
+    pages: Vec<DisplayedPage>,
+}
+
+impl FullscreenPageLayout {
+    pub(crate) fn begin(&mut self, kind: FullscreenPageLayoutKind) {
+        self.pages.clear();
+        self.kind = kind;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.begin(FullscreenPageLayoutKind::Empty);
+    }
+
+    pub(crate) fn push(&mut self, transform: DisplayedImageTransform) {
+        self.pages.push(DisplayedPage::new(transform));
+    }
+
+    pub(crate) fn hit_test(&self, pos: egui::Pos2) -> Option<&DisplayedPage> {
+        self.pages
+            .iter()
+            .find(|page| page.transform.contains_screen(pos))
+    }
+
+    pub(crate) fn kind(&self) -> FullscreenPageLayoutKind {
+        self.kind
+    }
+
+    pub(crate) fn single_page(&self) -> Option<&DisplayedPage> {
+        if self.kind != FullscreenPageLayoutKind::Single || self.pages.len() != 1 {
+            return None;
+        }
+        self.pages.first()
+    }
+
+    pub(crate) fn spread_pair(&self) -> Option<(usize, usize)> {
+        if self.kind != FullscreenPageLayoutKind::Spread || self.pages.len() != 2 {
+            return None;
+        }
+        Some((self.pages[0].page_idx(), self.pages[1].page_idx()))
     }
 }
 
@@ -586,6 +682,149 @@ mod tests {
         close(a.top(), b.top());
         close(a.right(), b.right());
         close(a.bottom(), b.bottom());
+    }
+
+    fn page_transform(page_idx: usize, rect: egui::Rect) -> DisplayedImageTransform {
+        DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx,
+                viewport_rect: egui::Rect::from_min_max(
+                    egui::pos2(-1000.0, -1000.0),
+                    egui::pos2(1000.0, 1000.0),
+                ),
+                source_size: rect.size(),
+                texture_size: rect.size(),
+                rotation: Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            rect,
+        )
+        .unwrap()
+    }
+
+    fn page_layout(
+        kind: FullscreenPageLayoutKind,
+        pages: &[(usize, egui::Rect)],
+    ) -> FullscreenPageLayout {
+        let mut layout = FullscreenPageLayout::default();
+        layout.begin(kind);
+        for &(idx, rect) in pages {
+            layout.push(page_transform(idx, rect));
+        }
+        layout
+    }
+
+    #[test]
+    fn single_page_layout_hits_only_the_displayed_page() {
+        let rect = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(220.0, 330.0));
+        let layout = page_layout(FullscreenPageLayoutKind::Single, &[(7, rect)]);
+
+        assert_eq!(
+            layout.hit_test(rect.center()).map(|page| page.page_idx()),
+            Some(7)
+        );
+        assert!(layout.hit_test(egui::pos2(10.0, 10.0)).is_none());
+    }
+
+    #[test]
+    fn continuous_layout_hits_cursor_page_in_vertical_and_horizontal_flows() {
+        let vertical = page_layout(
+            FullscreenPageLayoutKind::Continuous,
+            &[
+                (
+                    10,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(80.0, 90.0)),
+                ),
+                (
+                    11,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 110.0), egui::pos2(80.0, 200.0)),
+                ),
+            ],
+        );
+        assert_eq!(
+            vertical
+                .hit_test(egui::pos2(40.0, 45.0))
+                .map(|p| p.page_idx()),
+            Some(10)
+        );
+        assert_eq!(
+            vertical
+                .hit_test(egui::pos2(40.0, 155.0))
+                .map(|p| p.page_idx()),
+            Some(11)
+        );
+
+        let horizontal = page_layout(
+            FullscreenPageLayoutKind::Continuous,
+            &[
+                (
+                    20,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(90.0, 80.0)),
+                ),
+                (
+                    21,
+                    egui::Rect::from_min_max(egui::pos2(110.0, 0.0), egui::pos2(200.0, 80.0)),
+                ),
+            ],
+        );
+        assert_eq!(
+            horizontal
+                .hit_test(egui::pos2(45.0, 40.0))
+                .map(|p| p.page_idx()),
+            Some(20)
+        );
+        assert_eq!(
+            horizontal
+                .hit_test(egui::pos2(155.0, 40.0))
+                .map(|p| p.page_idx()),
+            Some(21)
+        );
+    }
+
+    #[test]
+    fn spread_layout_hits_physical_left_and_right_pages_for_ltr_and_rtl() {
+        let left = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(95.0, 100.0));
+        let right = egui::Rect::from_min_max(egui::pos2(105.0, 0.0), egui::pos2(200.0, 100.0));
+        for (left_idx, right_idx) in [(30, 31), (31, 30)] {
+            let layout = page_layout(
+                FullscreenPageLayoutKind::Spread,
+                &[(left_idx, left), (right_idx, right)],
+            );
+            assert_eq!(
+                layout.hit_test(left.center()).map(|p| p.page_idx()),
+                Some(left_idx)
+            );
+            assert_eq!(
+                layout.hit_test(right.center()).map(|p| p.page_idx()),
+                Some(right_idx)
+            );
+            assert_eq!(layout.spread_pair(), Some((left_idx, right_idx)));
+        }
+    }
+
+    #[test]
+    fn page_gap_is_not_hit_and_zero_gap_boundary_uses_first_page() {
+        let left = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(90.0, 100.0));
+        let right = egui::Rect::from_min_max(egui::pos2(110.0, 0.0), egui::pos2(200.0, 100.0));
+        let with_gap = page_layout(FullscreenPageLayoutKind::Spread, &[(1, left), (2, right)]);
+        assert!(with_gap.hit_test(egui::pos2(100.0, 50.0)).is_none());
+
+        let touching_right =
+            egui::Rect::from_min_max(egui::pos2(90.0, 0.0), egui::pos2(180.0, 100.0));
+        let touching = page_layout(
+            FullscreenPageLayoutKind::Spread,
+            &[(1, left), (2, touching_right)],
+        );
+        assert_eq!(
+            touching
+                .hit_test(egui::pos2(90.0, 50.0))
+                .map(|p| p.page_idx()),
+            Some(1)
+        );
     }
 
     #[test]

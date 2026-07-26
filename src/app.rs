@@ -8164,9 +8164,9 @@ pub struct App {
     pub(crate) fs_loupe_locked: bool,
     /// 高倍率時のピクセル境界グリッド表示。実画像は線形補間のまま、表示補助だけ重ねる。
     pub(crate) fs_pixel_grid_enabled: bool,
-    /// 見開きモード描画後のページ矩形。ルーペ描画がカーソル位置から該当ページを
-    /// 特定するのに使う。毎フレーム描画後に更新、非見開き時は None。
-    pub(crate) fs_spread_layout: Option<crate::ui_fullscreen::FsSpreadLayout>,
+    /// このフレームで実際に描画した単ページ / 見開き / 連結読みのページ列。
+    /// ルーペと範囲キャプチャの対象ページ解決を同じ hit-test に集約する。
+    pub(crate) fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout,
     /// 透過画像の背景サイクル (Shift+B): 0=黒 / 1=白 / 2=市松
     /// 画像切替時にリセット。永続化しない。
     pub(crate) fs_transparent_bg_mode: u8,
@@ -10732,7 +10732,8 @@ impl App {
             fs_rotation_drag_start: None,
             fs_loupe_locked: false,
             fs_pixel_grid_enabled: true,
-            fs_spread_layout: None,
+            fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout::default(
+            ),
             fs_transparent_bg_mode: 0,
             fs_checker_texture: None,
             post_filter_bypassed: false,

@@ -15221,17 +15221,30 @@ mod favorite_adjustment_defaults_tests {
         );
         app.fullscreen_idx = Some(1);
         app.spread_mode = SpreadMode::Ltr;
-        app.fs_spread_layout = Some(crate::ui_fullscreen::FsSpreadLayout {
-            left_idx: 0,
-            left_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)),
-            left_hit_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)),
-            right_idx: 1,
-            right_rect: egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(10.0, 10.0)),
-            right_hit_rect: egui::Rect::from_min_size(
-                egui::pos2(10.0, 0.0),
-                egui::vec2(10.0, 10.0),
-            ),
-        });
+        app.fullscreen_page_layout
+            .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Spread);
+        for (idx, min) in [(0, egui::Pos2::ZERO), (1, egui::pos2(10.0, 0.0))] {
+            let rect = egui::Rect::from_min_size(min, egui::vec2(10.0, 10.0));
+            let transform = crate::displayed_image_transform::DisplayedImageTransform::resolve(
+                crate::displayed_image_transform::DisplayedImageTransformInput {
+                    page_idx: idx,
+                    viewport_rect: rect,
+                    source_size: egui::vec2(10.0, 10.0),
+                    texture_size: egui::vec2(10.0, 10.0),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::settings::FullscreenFitMode::Page,
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                },
+            )
+            .unwrap();
+            app.fullscreen_page_layout.push(transform);
+        }
 
         app.open_export_dialog_for_current(&ctx, 1);
 
