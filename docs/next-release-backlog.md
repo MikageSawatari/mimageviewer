@@ -298,6 +298,36 @@
   - perf smoke
   - `dumpbin /dependents` で不要な VC runtime DLL が復活していないこと
 
+### 5.3 リリース / テストスクリプトの並行実行耐性とクリーン環境再現性
+
+- 出典: v2.8.0 リリース前確認 (2026-07-26)。別セッションで
+  `scripts/build-release.ps1` を実行中に通常並列の `scripts/test-full.ps1` を実行すると、
+  `mimageviewer` のライブラリテストが assertion / panic を出さず `0xffffffff` で終了した。
+  リリース処理の完了後、同じコミットを競合プロセスなしで再実行すると正式ゲートは
+  `[test-full] PASS` で完走したため、製品テストの並列不具合ではなくリリースツール間の
+  干渉と判定。v2.8.0 の出荷は止めず、次版でツールを堅牢化する。
+- **P2: `build-release.ps1` の停止対象が広すぎる**:
+  - 現状はリポジトリ配下のプロセス名 `mimageviewer*` を列挙して
+    `Stop-Process -Force` する。Cargo のテストハーネスも
+    `target\debug\deps\mimageviewer-<hash>.exe` なので、別セッションのテストまで
+    強制終了し得る。
+  - 対応案 = 停止対象を launcher / core / helper の正確な実行ファイル名と想定配置へ
+    allowlist 化する。必要なら test / release の同時実行を検知するリポジトリ単位の
+    mutex またはロックも追加し、黙って相手を終了せず明示的に待機または失敗させる。
+  - 完了条件 = 実行中のダミー `mimageviewer-<hash>.exe` を停止せず、repo の launcher /
+    core と APPDATA に展開された対象 helper だけを従来どおり停止できること。
+- **P2: クリーン環境の正式テストゲートが release core に依存する**:
+  - `scripts/test-full.ps1` の workspace test には launcher が含まれるが、launcher の
+    build script は既存の `target\release\mimageviewer-core.exe` を要求する。このため
+    release core がないクリーン checkout ではテストゲートを開始できず、既存成果物が
+    ある開発環境でだけ成功する。
+  - 対応案 = launcher のテストを正式ゲート内で別段に分けて必要な core を明示的に用意
+    するか、launcher のテストビルドを埋め込み用 release core から分離する。
+  - 完了条件 = `target\release\mimageviewer-core.exe` が存在しないクリーン環境から
+    `scripts/test-full.ps1` が完走し、launcher のテストも省略されないこと。
+- 規模 / 優先度: Small〜Medium / P2。いずれも製品 runtime の品質問題ではなく、
+  同一 worktree で複数セッションを使うリリース運用とクリーン再現性の改善。
+
 ---
 
 ## 6. 着手時に読み直す関連ドキュメント
