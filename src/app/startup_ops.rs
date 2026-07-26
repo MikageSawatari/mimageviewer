@@ -634,14 +634,16 @@ impl App {
                 });
 
         if !opened_target {
-            let closing_window_id = self
+            let session_window_id = self
                 .active_detached_session
-                .map(|session| session.window_id)
-                .or(self.detached_viewer_window_id);
+                .map(|session| session.window_id);
+            let closing_window_id = session_window_id.or(self.detached_viewer_window_id);
             self.begin_active_detached_session_close("bookmark_media_detached_open_failed");
             self.finish_active_detached_session_close("bookmark_media_detached_open_failed");
             self.close_fullscreen();
-            if let Some(window_id) = closing_window_id {
+            if session_window_id.is_none()
+                && let Some(window_id) = closing_window_id
+            {
                 self.remove_detached_window_runtime(
                     window_id,
                     "bookmark_media_detached_open_failed",

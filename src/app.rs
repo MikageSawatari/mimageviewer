@@ -13051,14 +13051,8 @@ impl App {
             // virtual page list (本の中の親) から detached を閉じる = セッション終了 (§3.7)。
             #[cfg(windows)]
             {
-                let closing_window_id = self
-                    .active_detached_session
-                    .map(|session| session.window_id);
                 self.begin_active_detached_session_close("virtual_page_list_parent_nav");
                 self.finish_active_detached_session_close("virtual_page_list_parent_nav");
-                if let Some(window_id) = closing_window_id {
-                    self.remove_detached_window_runtime(window_id, "virtual_page_list_parent_nav");
-                }
             }
             self.close_fullscreen();
         }
@@ -32619,12 +32613,26 @@ impl App {
         }
     }
 
-    /// セッション終了を完了する (None)。teardown 完了経路で必ず呼ぶ (漏れると stale session)。
+    /// terminal close を完了し、session と同じ window_id の runtime を一体で除去する。
+    /// `Closing -> Removed` もここで所有し、font-atlas resync を stale runtime で塞がない。
     #[cfg(windows)]
     pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
+        let Some(session) = self.active_detached_session.take() else {
+            return;
+        };
+        self.log_detached_image_window_debug(format!(
+            "session_finish window_id={} reason={reason}",
+            session.window_id
+        ));
+        self.remove_detached_window_runtime(session.window_id, reason);
+    }
+
+    /// Active-to-passive is not terminal: the passive renderer keeps the runtime and OS viewport.
+    #[cfg(windows)]
+    fn finish_active_detached_session_handoff(&mut self, reason: &'static str) {
         if let Some(session) = self.active_detached_session.take() {
             self.log_detached_image_window_debug(format!(
-                "session_finish window_id={} reason={reason}",
+                "session_handoff window_id={} reason={reason}",
                 session.window_id
             ));
         }
@@ -32914,7 +32922,7 @@ impl App {
         // renderer が描く。ここを通常 close と同じ cleanup に流すと Visible(false) が送られ、
         // ユーザーには「ピン留め窓が消えた」ように見える。
         self.begin_active_detached_session_close(reason);
-        self.finish_active_detached_session_close(reason);
+        self.finish_active_detached_session_handoff(reason);
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
@@ -33031,9 +33039,6 @@ impl App {
         // book context の明示 close = detached セッション終了 (§3.7 closing)。Close 送信前に
         // closing を立て、teardown 後に finish して backstop が窓を復活させないようにする。
         self.begin_active_detached_session_close(reason);
-        let closing_window_id = self
-            .active_detached_session
-            .map(|session| session.window_id);
         self.swap_viewer_context_bundle(&mut active.bundle);
         if self.fs_viewport_shown {
             let fs_id = self.fullscreen_viewport_id();
@@ -33043,9 +33048,6 @@ impl App {
         let closed_context = self.take_current_viewer_context_bundle();
         self.swap_viewer_context_bundle(&mut active.bundle);
         self.finish_active_detached_session_close(reason);
-        if let Some(window_id) = closing_window_id {
-            self.remove_detached_window_runtime(window_id, reason);
-        }
         // PDF password dialog の UI state 自体は App-global だが、request owner は bundle。
         // viewport 作成前の terminal close で owner を捨てた後に orphan dialog を残さない。
         if closed_context.pdf_password_request.is_some() && self.pdf_password_request.is_none() {
@@ -34515,9 +34517,6 @@ impl App {
             self.detached_viewer_host_debug_state()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
-        let closing_window_id = self
-            .active_detached_session
-            .map(|session| session.window_id);
         ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
@@ -34528,9 +34527,6 @@ impl App {
         // だけ呼ばれる。internal reopen (folder-nav / PDF・ZIP 列挙 / scan / password) 中は
         // detached_active_window_alive_wanted() が true なので呼ばれず、session を維持する。
         self.finish_active_detached_session_close("active_close_finalize");
-        if let Some(window_id) = closing_window_id {
-            self.remove_detached_window_runtime(window_id, "active_close_finalize");
-        }
         self.request_detached_cleanup_font_atlas_resync("active_close_finalize");
         self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
         self.log_detached_image_window_debug(format!(
@@ -34637,20 +34633,22 @@ impl App {
                 self.detached_viewer_independent_active,
                 self.detached_image_windows.len()
             ));
-            let closing_window_id = self
+            let session_window_id = self
                 .active_detached_session
-                .map(|session| session.window_id)
-                .or(self.detached_viewer_window_id);
+                .map(|session| session.window_id);
+            let closing_window_id = session_window_id.or(self.detached_viewer_window_id);
             let fs_id = self.fullscreen_viewport_id();
             self.begin_active_detached_session_close("park_close_legacy_detached");
             if self.fs_viewport_shown {
                 ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
             }
             self.finish_active_detached_session_close("park_close_legacy_detached");
-            self.close_fullscreen();
-            if let Some(window_id) = closing_window_id {
+            if session_window_id.is_none()
+                && let Some(window_id) = closing_window_id
+            {
                 self.remove_detached_window_runtime(window_id, "park_close_legacy_detached");
             }
+            self.close_fullscreen();
             return true;
         }
         self.active_detached_viewer_context.is_none()
@@ -38141,14 +38139,8 @@ impl App {
             // ページ切替に巻き込まれ、同じ ViewportId / bundle が混線する。
             let owns_active_detached_session = self.active_detached_viewer_context.is_none();
             if owns_active_detached_session && self.active_detached_session.is_some() {
-                let closing_window_id = self
-                    .active_detached_session
-                    .map(|session| session.window_id);
                 self.begin_active_detached_session_close("open_non_detached");
                 self.finish_active_detached_session_close("open_non_detached");
-                if let Some(window_id) = closing_window_id {
-                    self.remove_detached_window_runtime(window_id, "open_non_detached");
-                }
             }
             self.detached_viewer_window_id = None;
         }
@@ -45348,14 +45340,8 @@ impl App {
         // 内部 close とは別経路なので、ここでは確実に session を畳んでよい。
         #[cfg(windows)]
         {
-            let closing_window_id = self
-                .active_detached_session
-                .map(|session| session.window_id);
             self.begin_active_detached_session_close("handle_fullscreen_close_request");
             self.finish_active_detached_session_close("handle_fullscreen_close_request");
-            if let Some(window_id) = closing_window_id {
-                self.remove_detached_window_runtime(window_id, "handle_fullscreen_close_request");
-            }
         }
         self.close_fullscreen();
     }
@@ -52583,14 +52569,8 @@ impl App {
                 reason,
             );
         } else {
-            let closing_window_id = self
-                .active_detached_session
-                .map(|session| session.window_id);
             self.begin_active_detached_session_close(reason);
             self.finish_active_detached_session_close(reason);
-            if let Some(window_id) = closing_window_id {
-                self.remove_detached_window_runtime(window_id, reason);
-            }
         }
         self.log_detached_image_window_debug(format!(
             "apply_egui_viewer_presentation idx={idx} target={target_presentation:?} \

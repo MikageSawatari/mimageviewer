@@ -6897,14 +6897,8 @@ impl App {
                 // (Codex レビュー #3 site 3)。(detached session は cfg(windows))
                 #[cfg(windows)]
                 {
-                    let closing_window_id = self
-                        .active_detached_session
-                        .map(|session| session.window_id);
                     self.begin_active_detached_session_close("deferred_holdover_cancel");
                     self.finish_active_detached_session_close("deferred_holdover_cancel");
-                    if let Some(window_id) = closing_window_id {
-                        self.remove_detached_window_runtime(window_id, "deferred_holdover_cancel");
-                    }
                 }
                 ctx.request_repaint();
             }
@@ -6924,14 +6918,8 @@ impl App {
         // 明示 close 経路 (handle_fullscreen_close_request 等) と二重でも idempotent。
         #[cfg(windows)]
         if self.active_detached_session.is_some() {
-            let closing_window_id = self
-                .active_detached_session
-                .map(|session| session.window_id);
             self.begin_active_detached_session_close("keep_alive_cleanup");
             self.finish_active_detached_session_close("keep_alive_cleanup");
-            if let Some(window_id) = closing_window_id {
-                self.remove_detached_window_runtime(window_id, "keep_alive_cleanup");
-            }
         }
         // ここに来るのは close_fullscreen 直後の 1 フレーム。
         // show_viewport_immediate を 1 回呼んで viewport を alive にし、

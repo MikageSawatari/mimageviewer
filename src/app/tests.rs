@@ -23817,7 +23817,8 @@ mod still_window_mode_key_tests {
         app.begin_active_detached_session(42, DetachedSource::Image);
         assert_eq!(app.detached_viewer_host_hwnd_alive(), Some(0x4200));
 
-        app.finish_active_detached_session_close("test");
+        app.finish_active_detached_session_handoff("test");
+        app.transition_detached_window_state(42, DetachedWindowState::Parked, "test_handoff");
         app.detached_viewer_window_id = None;
         assert_eq!(
             app.detached_window_hwnd_alive_for_window_id(42),
@@ -24948,6 +24949,109 @@ mod still_window_mode_key_tests {
             app.active_detached_session.is_none(),
             "switching the current video back to main/fullscreen must end the detached keep-alive session"
         );
+        assert_eq!(
+            app.detached_window_state(session.window_id),
+            None,
+            "the terminal video presentation transition must remove its detached runtime"
+        );
+    }
+
+    #[cfg(windows)]
+    fn prepare_detached_video_placement_switch(app: &mut App, window_id: u64) {
+        let video = push_video(app, r"C:\clips\placement-switch.mp4");
+        app.fullscreen_idx = Some(video);
+        app.detached_viewer_window_id = Some(window_id);
+        app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
+        app.detached_window_hwnd_set(window_id, 0x1000 + window_id);
+
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_video_placement_switch_removed_detached_runtime(app: &mut App, window_id: u64) {
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert_eq!(
+            app.detached_window_hwnd_raw_for_window_id(window_id),
+            0,
+            "runtime removal must also remove the detached host registration"
+        );
+        assert_eq!(
+            app.main_font_atlas_resync_frame_safety().closing_count,
+            0,
+            "a terminal placement switch must not leave Closing runtime churn"
+        );
+
+        // The still-playing main/fullscreen video is an intentional safety blocker. Once that
+        // unrelated live backdrop is gone, the removed runtime must not keep resync unsettled.
+        app.fullscreen_idx = None;
+        assert!(app.main_font_atlas_resync_settled_frame());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn placement_switched_matched_removes_detached_runtime() {
+        let mut app = setup_app();
+        let window_id = 201;
+        prepare_detached_video_placement_switch(&mut app, window_id);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 41,
+            target_presentation: ViewerPresentation::MainWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
+        });
+
+        app.apply_native_video_placement_switch_state(
+            41,
+            crate::video::NativeVideoPlacement::MainWindowChild,
+            2,
+        );
+
+        assert!(app.native_video_mode_switch.is_none());
+        assert_video_placement_switch_removed_detached_runtime(&mut app, window_id);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn placement_switched_stale_converged_removes_detached_runtime() {
+        let mut app = setup_app();
+        let window_id = 202;
+        prepare_detached_video_placement_switch(&mut app, window_id);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 52,
+            target_presentation: ViewerPresentation::Fullscreen,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
+        });
+
+        app.apply_native_video_placement_switch_state(
+            51,
+            crate::video::NativeVideoPlacement::FullscreenBorderless,
+            3,
+        );
+
+        assert!(app.native_video_mode_switch.is_none());
+        assert_video_placement_switch_removed_detached_runtime(&mut app, window_id);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn placement_switched_without_pending_removes_detached_runtime() {
+        let mut app = setup_app();
+        let window_id = 203;
+        prepare_detached_video_placement_switch(&mut app, window_id);
+        assert!(app.native_video_mode_switch.is_none());
+
+        app.apply_native_video_placement_switch_state(
+            61,
+            crate::video::NativeVideoPlacement::MainWindowChild,
+            4,
+        );
+
+        assert_video_placement_switch_removed_detached_runtime(&mut app, window_id);
     }
 
     #[test]
@@ -32986,8 +33090,6 @@ mod still_window_mode_key_tests {
             Some(DetachedWindowState::Closing)
         );
         app.finish_active_detached_session_close("test_finish");
-        let removed = app.remove_detached_window_runtime(window_id, "test_removed");
-        assert!(removed.is_some());
         assert_eq!(app.detached_window_state(window_id), None);
     }
 
@@ -33174,9 +33276,8 @@ mod still_window_mode_key_tests {
         app.set_detached_window_runtime_placement(42, final_placement, "test_final");
         app.begin_active_detached_session_close("test_close");
         app.finish_active_detached_session_close("test_close");
-        let removed = app.remove_detached_window_runtime(42, "test_remove");
 
-        assert!(removed.is_some());
+        assert_eq!(app.detached_window_state(42), None);
         assert_eq!(
             app.settings.detached_viewer_window_placement,
             Some(final_placement),
