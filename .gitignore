@@ -3,6 +3,9 @@
 /testimage
 /test_images
 mimageviewer.log
+# mIV 自身がフォルダへ書く編集情報サイドカー (src/sidecar.rs、「設定のバックアップ」ON 時)。
+# samples/ などをビューアで開くと生成されるため、リポジトリ内のどこでも追跡しない。
+mimageviewer.dat
 bench_thumbs.tsv
 /installer/Output
 /vendor/pdfium
