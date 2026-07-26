@@ -1088,12 +1088,14 @@ pub fn run() -> eframe::Result {
             }
             app.applied_ui_theme = Some(resolved);
 
-            // 動画 GPU レンダリング用の wgpu::Device / Queue を保存。
-            // また同時に共有 D3D11 デバイスを初期化 (失敗してもアプリは起動継続、
-            // 動画は旧経路 = CPU readback + swscale にフォールバック)。
-            #[cfg(windows)]
-            {
-                if let Some(rs) = cc.wgpu_render_state.clone() {
+            // wgpu::Device / Queue を保存。mipmap の LOD bias、比較モードの GPU
+            // テクスチャ、パノラマ overlay はプラットフォーム非依存でこれを使うため、
+            // 保存自体は cfg なしで行う。Windows では同時に共有 D3D11 デバイスを
+            // 初期化する (失敗してもアプリは起動継続、動画は旧経路 = CPU readback +
+            // swscale にフォールバック)。
+            if let Some(rs) = cc.wgpu_render_state.clone() {
+                #[cfg(windows)]
+                {
                     // 実際に選ばれた wgpu バックエンドを確認。動画 GPU 経路は
                     // `wgpu_hal::api::Dx12` 経由で D3D11 NT shared texture を
                     // import するので **DX12 でないと使えない**。Vulkan
@@ -1117,8 +1119,8 @@ pub fn run() -> eframe::Result {
                             ));
                         }
                     }
-                    app.wgpu_render_state = Some(rs);
                 }
+                app.wgpu_render_state = Some(rs);
             }
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
             let t = Instant::now();

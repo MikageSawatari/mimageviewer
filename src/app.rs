@@ -8232,11 +8232,19 @@ pub struct App {
     pub(crate) applied_ui_theme: Option<crate::os_theme::ResolvedTheme>,
     pub(crate) applied_text_contrast: Option<crate::settings::TextContrast>,
 
-    /// eframe の wgpu::Device / Queue / Adapter / target_format。動画 GPU レンダリング
-    /// で `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared
-    /// テクスチャを import するために必要。`main.rs` の creator closure で
-    /// `cc.wgpu_render_state` から渡される。`None` なら GPU 動画レンダリング無効。
-    #[cfg(windows)]
+    /// eframe の wgpu::Device / Queue / Adapter / target_format。起動時の creator closure
+    /// (`lib.rs`) で `cc.wgpu_render_state` から渡される。
+    ///
+    /// 導入時の用途は Windows 固有 (動画 GPU レンダリングで
+    /// `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared テクスチャを
+    /// import する) だったが、現在は **プラットフォーム非依存の用途にも使う** —
+    /// mipmap の LOD bias 設定、比較モードの GPU テクスチャ解放、パノラマの settle overlay。
+    /// そのため `cfg(windows)` を付けない。付けると、cfg なしの経路 (`eframe::App::update`
+    /// など) から参照するたびに非 Windows ビルドが壊れ、CI の
+    /// `cargo check (ubuntu / non-Windows cfg)` でしか気付けない
+    /// (実際に 2026-07 の mipmap 対応で発生した)。
+    ///
+    /// `None` の場合、wgpu を使う機能はすべて no-op になる。
     pub(crate) wgpu_render_state: Option<egui_wgpu::RenderState>,
     /// 動画 GPU レンダリング用の共有 D3D11 デバイス。VideoPlayer ごとに生成すると
     /// FFmpeg HW デコーダ + ID3D11VideoProcessor を別デバイスに作る重複コストが
@@ -10747,7 +10755,6 @@ impl App {
             startup_open_path_resolve_pending: None,
             applied_ui_theme: None,
             applied_text_contrast: None,
-            #[cfg(windows)]
             wgpu_render_state: None,
             #[cfg(windows)]
             gpu_video_device: None,
@@ -54463,10 +54470,7 @@ impl App {
         }
 
         let now = std::time::Instant::now();
-        #[cfg(windows)]
         let current_target_format = self.wgpu_render_state.as_ref().map(|s| s.target_format);
-        #[cfg(not(windows))]
-        let current_target_format: Option<wgpu::TextureFormat> = None;
         let ready_to_render = match self.pano_refinement.as_mut() {
             Some(refinement) => {
                 if refinement.rendering.is_some() {
