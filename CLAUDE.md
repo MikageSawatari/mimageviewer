@@ -1462,7 +1462,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    操作・既定の変更が無いリリースでは追記不要。追記したら
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-   - マニュアル左サイドバーを持つ通常ページ 25 ページでリンク一覧が揃っているか
+   - マニュアル左サイドバーを持つ通常ページ 26 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -1472,7 +1472,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 25 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 26 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
      (`changelog.html` のサイドバーは `gen-changelog-html.py` が `getting-started.html` から

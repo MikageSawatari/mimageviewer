@@ -1,8 +1,9 @@
 # Detached rework stage-folder-nav — 独立静止画窓の物理フォルダ移動
 
 作成: 2026-07-24 / v2.8.0
+最終更新: 2026-07-26
 
-状態: コード・自動テスト実装済み、Windows 実機 smoke 待ち
+状態: 完了（コード・自動テスト・Windows 実機 smoke すべて実施済み）
 
 ## 1. 目的
 
@@ -150,4 +151,7 @@ Ctrl+PageUp/PageDown（同じ `KeyAction` へ割り当てたマウス進む・�
 - `scripts/build-dev.ps1`: 成功。`target/dev-runtime/mimageviewer-core.exe` を生成し、
   agent は起動していない。
 - `scripts/build-release.ps1`: 今回の追修正では未実施（通常確認用 `build-dev.ps1` を使用）。
-- Windows 実機 smoke: 未実施
+- Windows 実機 smoke: 実施済み（2026-07-26、利用者確認）。§5 の Ctrl+↑↓ /
+  Ctrl+PageUp/PageDown による移動を実機で確認した。実機で見つかった
+  「Ctrl+↓ で detached window が破棄される」回帰は `32f68fed` で修正し、
+  §2.1 のライフサイクル不変条件として固定済み。
