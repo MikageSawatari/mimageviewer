@@ -1601,6 +1601,27 @@ fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui:
     egui::Rect::from_center_size(rect.center(), display_size * fit_scale)
 }
 
+fn fs_nav_holdover_overlay_rect(rect: egui::Rect, texture_size: egui::Vec2) -> Option<egui::Rect> {
+    (rect.width() > 0.0 && rect.height() > 0.0 && texture_size.x > 0.0 && texture_size.y > 0.0)
+        .then(|| fit_display_size_in_rect(rect, texture_size))
+}
+
+fn paint_fs_nav_holdover_overlay(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    texture: &egui::TextureHandle,
+) {
+    let Some(image_rect) = fs_nav_holdover_overlay_rect(rect, texture.size_vec2()) else {
+        return;
+    };
+    painter.with_clip_rect(rect).image(
+        texture.id(),
+        image_rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
 fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(
@@ -2169,6 +2190,19 @@ impl App {
         )
     }
 
+    /// 現在の表示が final pipeline (補正 / AI / カラー化合成) を迂回するか。
+    ///
+    /// 元画像表示 (右 Ctrl) と分析モードは raw `fs_cache` を直接描くため、
+    /// 描画側 (`resolve_fs_processed_texture`) と nav lock 解放側
+    /// (`poll_fs_nav_lock`) は必ずこの述語を共有する。片方だけ更新すると
+    /// 「表示は出ているのに lock が解放されない」型のデッドロックになる。
+    ///
+    /// `original_preview_active` は OS キー状態を読むため、呼び出し側で一度だけ
+    /// 評価した値を渡す。
+    fn fs_display_bypasses_final_pipeline(&self, original_preview_active: bool) -> bool {
+        original_preview_active || self.analysis_mode
+    }
+
     fn resolve_original_preview_tex(&self, idx: usize) -> Option<egui::TextureHandle> {
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
@@ -2226,7 +2260,7 @@ impl App {
         // **raw 元画像**を表示する (右 Ctrl の original preview と同じ経路)。分析パネルの色取得・
         // ヒストグラム・グレースケール/拡大鏡オーバーレイは raw fs_cache を読むので、表示も raw に
         // 揃えることで「クリックした見た目の色 = 分析値」が一致する (Codex 指摘 + ユーザー要望)。
-        if original_preview_active || self.analysis_mode {
+        if self.fs_display_bypasses_final_pipeline(original_preview_active) {
             return self.resolve_original_preview_tex(idx);
         }
 
@@ -2359,12 +2393,9 @@ impl App {
 
     /// 描画側で使ってよい Ctrl+↑↓ nav holdover を返す。
     ///
-    /// `fs_holdover_tex` は旧ページの見た目を一時的に残すためのものだが、
-    /// `items_generation` が進み、かつ新しい `fullscreen_idx` が既に入った後まで
-    /// 実ページ描画の fallback に使うと、タイトル/パスだけ新しいフォルダに進んで
-    /// 画像だけ旧フォルダのまま残る。新 target が有効になった後は loading 表示へ
-    /// 落とし、old image は PDF/ZIP enumerate defer など `fullscreen_idx == None`
-    /// の待機窓だけで使う。
+    /// `fs_holdover_tex` は旧ページの見た目を一時的に残すビュー単位の状態。
+    /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ 1 枚だけ
+    /// contain オーバーレイする。
     pub(crate) fn fs_nav_holdover_tex_for_draw(&self) -> Option<egui::TextureHandle> {
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return None;
@@ -2379,10 +2410,9 @@ impl App {
             // 一瞬ちらつく」症状になる (v2.2.0 比の体感差。詳細は
             // docs/detached-viewer-lifecycle-redesign-proposal.md)。
             //
-            // 描画側 (`prepare_fullscreen_state`) は full → サムネ → holdover の順で
-            // 優先するため、新 idx の表示物が用意できた / デコード失敗が確定した時点で
-            // holdover を返さないようにすれば、stale な旧画像が残ることはない。
-            // それまでは holdover (旧画像) を維持して黒を挟まず滑らかに繋ぐ。
+            // 新 idx の表示物が用意できた / デコード失敗が確定した時点で
+            // ビュー単位の holdover overlay を止める。それまでは旧ビューを
+            // 1 枚だけ維持して黒を挟まず滑らかに繋ぐ。
             let new_content_ready = self.resolve_fs_display_tex(idx, true).is_some();
             let new_content_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
             if new_content_ready || new_content_failed {
@@ -2420,11 +2450,12 @@ impl App {
     /// 毎フレーム呼び出され、ナビロックの解除条件を満たしたら lock を解除する。
     /// 解除条件: ① items が入れ替わって `items_generation` が進んだ
     /// (= `install_new_items` で新フォルダの items が導入された) かつ
-    /// ② 現フルスクリーン idx に対して thumbnails が `Loaded` か
-    /// fs_cache に Static / Animated エントリが入った状態。
+    /// ② 現表示が final pipeline を使うカラー化ページなら complete composite が、
+    /// pipeline を迂回する元画像表示 / 分析モードまたはカラー化なしなら
+    /// thumbnail / raw fs_cache が表示可能になった状態。
     /// 「items が進む前」(= 旧ページがロード済み判定で誤って解除される) のを
     /// items_generation チェックで防ぐ。
-    pub(crate) fn poll_fs_nav_lock(&mut self) {
+    pub(crate) fn poll_fs_nav_lock(&mut self, ctx: &egui::Context) {
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return;
         };
@@ -2468,7 +2499,11 @@ impl App {
         // 新 idx のデコードが失敗確定 (Failed) の場合も lock を解放する。さもないと
         // holdover (旧画像) が残り続け、以降の Ctrl+↑↓ が lock でブロックされる。
         let has_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
-        let display_ready = if self.colorize_display_requires_final_effect(idx) {
+        let original_preview_active = self.original_preview_active(ctx, idx);
+        let requires_final_effect = !self
+            .fs_display_bypasses_final_pipeline(original_preview_active)
+            && self.colorize_display_requires_final_effect(idx);
+        let display_ready = if requires_final_effect {
             self.resolve_fs_display_tex(idx, true).is_some()
                 && self.current_final_composite_is_complete(idx)
         } else {
@@ -6829,31 +6864,7 @@ impl App {
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
                         if let Some(handle) = holdover.as_ref() {
-                            // 中央 contain フィット (= はみ出さないアスペクト維持)。
-                            let avail = ui.available_size();
-                            let tex_size = handle.size_vec2();
-                            if tex_size.x > 0.0
-                                && tex_size.y > 0.0
-                                && avail.x > 0.0
-                                && avail.y > 0.0
-                            {
-                                let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
-                                let w = tex_size.x * scale;
-                                let h = tex_size.y * scale;
-                                let img_rect = egui::Rect::from_center_size(
-                                    ui.max_rect().center(),
-                                    egui::vec2(w, h),
-                                );
-                                ui.painter().image(
-                                    handle.id(),
-                                    img_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            }
+                            paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
                         }
                     });
             });
@@ -7109,22 +7120,7 @@ impl App {
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 if let Some(handle) = holdover.as_ref() {
-                    // 中央 contain フィット (= はみ出さないアスペクト維持)。
-                    let avail = ui.available_size();
-                    let tex_size = handle.size_vec2();
-                    if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
-                        let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
-                        let w = tex_size.x * scale;
-                        let h = tex_size.y * scale;
-                        let img_rect =
-                            egui::Rect::from_center_size(ui.max_rect().center(), egui::vec2(w, h));
-                        ui.painter().image(
-                            handle.id(),
-                            img_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    }
+                    paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
                 }
             });
 
@@ -7177,21 +7173,7 @@ impl App {
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 if let Some(handle) = holdover.as_ref() {
-                    let avail = ui.available_size();
-                    let tex_size = handle.size_vec2();
-                    if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
-                        let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
-                        let w = tex_size.x * scale;
-                        let h = tex_size.y * scale;
-                        let img_rect =
-                            egui::Rect::from_center_size(ui.max_rect().center(), egui::vec2(w, h));
-                        ui.painter().image(
-                            handle.id(),
-                            img_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    }
+                    paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
                 }
             });
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -8241,6 +8223,9 @@ impl App {
                                     }
                                 }
                             }
+                        }
+                        if let Some(holdover) = self.fs_nav_holdover_tex_for_draw() {
+                            paint_fs_nav_holdover_overlay(ui.painter(), image_rect, &holdover);
                         }
                         fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -9307,14 +9292,14 @@ impl App {
             && tex.is_none()
             && self.colorize_display_requires_final_effect(fs_idx);
         let thumb_tex = if waiting_for_colorize {
-            // フォルダ移動用 holdover だけは維持する。生サムネイルは白黒なので使わない。
-            self.fs_nav_holdover_tex_for_draw()
+            // 生サムネイルは白黒なので使わない。nav holdover はページ単位の
+            // fallback にせず、ビュー単位の overlay として後段で描く。
+            None
         } else {
             match self.thumbnails.get(fs_idx) {
                 Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
                 _ => None,
             }
-            .or_else(|| self.fs_nav_holdover_tex_for_draw())
         };
 
         let mut location_display = self.location_display_for(fs_idx);
@@ -15760,7 +15745,6 @@ impl App {
         };
         let bg_style = transparent_bg_style(self.fs_transparent_bg_mode, bg_tex.as_ref());
         let painter = ui.painter().with_clip_rect(image_rect);
-        let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
 
         let process_indices = if original_preview_active {
             std::collections::HashSet::new()
@@ -15824,7 +15808,6 @@ impl App {
                 &self.thumbnails,
                 &bg_style,
                 &location,
-                holdover_for_locked.as_ref(),
                 display_tex.as_ref(),
                 allow_thumbnail,
                 page.content_bbox,
@@ -17776,10 +17759,6 @@ impl App {
                 content_active,
             );
 
-            // ナビロック中でも、新 target が items に入った後は旧ページを
-            // fallback 描画しない。タイトル/パスだけ先に進み、画像だけ旧フォルダに
-            // 残る状態を避けるため、描画可否は helper に集約する。
-            let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
             let left_allow_thumbnail =
                 original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
             let right_allow_thumbnail =
@@ -17812,7 +17791,6 @@ impl App {
                     &self.thumbnails,
                     &bg_style,
                     location,
-                    holdover_for_locked.as_ref(),
                     display_tex,
                     allow_thumbnail,
                     content_bbox,
@@ -17854,8 +17832,6 @@ impl App {
                 egui::pos2(image_rect.min.x + half_w + spread_gap, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
-            // フォールバック分岐でも nav ロック中の holdover 可否は上のパスと同じ。
-            let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
             let left_allow_thumbnail =
                 original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
             let right_allow_thumbnail =
@@ -17888,7 +17864,6 @@ impl App {
                     &self.thumbnails,
                     &bg_style,
                     location,
-                    holdover_for_locked.as_ref(),
                     display_tex,
                     allow_thumbnail,
                     content_bbox,
@@ -17935,7 +17910,7 @@ impl App {
     /// `painter` は呼び出し側でクリップ済みのものを渡すことで、ズーム時のはみ出しを防ぐ。
     /// `location_display` は draw_fs_image と同じで、空なら読込中ラベル描画をスキップ。
     /// `display_tex` は `resolve_fs_processed_texture` で解決済みの加工済みテクスチャ。
-    /// ここでは thumbnail → holdover の最終フォールバックだけを担当する。
+    /// ここではページ単位の thumbnail フォールバックだけを担当する。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         painter: &egui::Painter,
@@ -17945,7 +17920,6 @@ impl App {
         thumbnails: &[ThumbnailState],
         bg_style: &FsBgStyle<'_>,
         location_display: &str,
-        holdover_tex: Option<&egui::TextureHandle>,
         display_tex: Option<&egui::TextureHandle>,
         allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
@@ -17958,7 +17932,7 @@ impl App {
         } else {
             None
         };
-        let display_tex = display_tex.or(thumb_tex.as_ref()).or(holdover_tex);
+        let display_tex = display_tex.or(thumb_tex.as_ref());
 
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
@@ -23527,6 +23501,24 @@ mod tests {
         assert_eq!(compare_indicator_size(4096, 8192), Some((27, 54)));
         assert_eq!(compare_indicator_size(32, 24), Some((32, 24)));
         assert_eq!(compare_indicator_size(0, 24), None);
+    }
+
+    #[test]
+    fn fs_nav_holdover_overlay_rect_centers_portrait_landscape_and_square() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
+
+        for texture_size in [
+            egui::vec2(100.0, 200.0),
+            egui::vec2(300.0, 100.0),
+            egui::vec2(100.0, 100.0),
+        ] {
+            let fitted = fs_nav_holdover_overlay_rect(viewport, texture_size).unwrap();
+            assert_eq!(fitted.center(), viewport.center());
+            assert!(fitted.left() >= viewport.left());
+            assert!(fitted.right() <= viewport.right());
+            assert!(fitted.top() >= viewport.top());
+            assert!(fitted.bottom() <= viewport.bottom());
+        }
     }
 
     #[test]

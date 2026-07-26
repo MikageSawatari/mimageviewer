@@ -35361,7 +35361,7 @@ impl App {
                 // 表示する場が無いので読み捨てる (サムネ状態は Pending のまま = 従来挙動)。
                 app.drain_thumb_results_discard();
                 // main の thumbnail/prefetch 結果回収後と同じ位置で、mounted owner の nav lock を poll する。
-                app.poll_fs_nav_lock();
+                app.poll_fs_nav_lock(ctx);
                 if app.current_viewer_context_contains_video() {
                     app.poll_video(ctx);
                 }
@@ -58106,7 +58106,7 @@ impl eframe::App for App {
         self.reconcile_edit_preview_refreshes(ctx);
         // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
         // 立った同フレームで holdover を捨てて新画面に切り替える)。
-        self.poll_fs_nav_lock();
+        self.poll_fs_nav_lock(ctx);
         let t_poll = frame_t0.elapsed();
 
         self.update_keep_range_and_requests(ctx, frame_t0);

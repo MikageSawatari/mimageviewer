@@ -15043,8 +15043,8 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn folder_nav_holdover_bridges_until_new_content_ready() {
         // フォルダナビ (Ctrl+↑↓) で新フォルダ先頭画像のデコード待ち中、holdover
-        // (旧フレーム) を維持して黒フレームを挟まないことを固定する。新 idx の
-        // 表示物 (full / サムネ) が用意できたら holdover を返さない (stale 防止)。
+        // (旧ビュー) の overlay を維持して黒フレームを挟まないことを固定する。
+        // 新 idx の表示物 (full / サムネ) が用意できたら holdover を返さない。
         // detached window で「次のファイルへ移るたびにちらつく」症状の回帰防止。
         // docs/detached-viewer-lifecycle-redesign-proposal.md 参照。
         let ctx = egui::Context::default();
@@ -15062,7 +15062,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.items_generation = app.items_generation.wrapping_add(1);
 
-        // 新 idx の full もサムネもまだ無い → holdover で黒を防ぐ。
+        // 新 idx の full もサムネもまだ無い → holdover overlay で黒を防ぐ。
         assert!(
             app.fs_nav_holdover_tex_for_draw().is_some(),
             "new content not ready yet -> keep showing the previous frame (no black flicker)"
@@ -16389,7 +16389,7 @@ mod favorite_adjustment_defaults_tests {
             app.fs_holdover_tex.is_some(),
             "poll_fs_nav_lock が解除するまで内部 holdover は保持される"
         );
-        // 新 target の表示物がまだ無い間は holdover (旧画像) を描画 fallback に使う。
+        // 新 target の表示物がまだ無い間は holdover (旧ビュー) を overlay に使う。
         // ここで None にすると新画像デコード完了までの数フレームが黒になり、装飾付き
         // detached window で「次のファイルへ移るたびにちらつく」症状になる。
         assert!(
@@ -16946,7 +16946,7 @@ mod favorite_adjustment_defaults_tests {
 
         // ① items_generation が進んでいない (= まだナビが完了していない) →
         //    現ページが Loaded でもロック解除されない (主要バグの回帰防止)。
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(
             app.fs_nav_locked_gen.is_some(),
             "items_generation 据え置きならロック維持 (旧ページの Loaded で誤解除しない)"
@@ -16954,7 +16954,7 @@ mod favorite_adjustment_defaults_tests {
 
         // ② items_generation を進めて再度 poll: 新ページのサムネ Loaded を見て解除。
         app.items_generation += 1;
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(app.fs_nav_locked_gen.is_none(), "gen 進行 + Loaded で解除");
         assert!(app.fs_holdover_tex.is_none(), "holdover も解放");
 
@@ -16963,14 +16963,14 @@ mod favorite_adjustment_defaults_tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(dummy_tex.clone());
         app.fullscreen_idx = None;
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(
             app.fs_nav_locked_gen.is_some(),
             "items_generation 据え置きなら fs_idx=None でも維持 (apply_folder_nav_result 内の close→open 遷移を許容)"
         );
         // items が進んでから抜け検知すれば解除される。
         app.items_generation += 1;
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(app.fs_nav_locked_gen.is_none());
         assert!(app.fs_holdover_tex.is_none());
     }
@@ -17012,7 +17012,7 @@ mod favorite_adjustment_defaults_tests {
             preserve_after_password_prompt: false,
         });
 
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(
             app.fs_nav_locked_gen.is_some(),
             "deferred enumerate 中は items_gen 進行 + fs_idx=None でも lock を維持"
@@ -17025,7 +17025,7 @@ mod favorite_adjustment_defaults_tests {
         // enumerate 完了で fs_nav_after_pdf_enumerate がクリアされたあとは
         // 通常通り fs_idx=None の解除経路に乗る (= Esc 等で抜けたケース)。
         app.fs_nav_after_pdf_enumerate = None;
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(app.fs_nav_locked_gen.is_none());
         assert!(app.fs_holdover_tex.is_none());
     }
@@ -18955,23 +18955,21 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// フォルダ横断 nav lock は raw / thumbnail の到着だけでは解除しない。
-    /// カラー化対象では final composite が表示可能になって初めて旧ページ holdover を解放する。
-    #[test]
-    fn colorize_nav_lock_waits_for_final_composite() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        let idx = push_image(&mut app, "C:/pics/colorize-nav-target.jpg");
+    fn install_nav_locked_static_target(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) {
         app.fullscreen_idx = Some(idx);
-        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
-        app.fs_nav_locked_gen = Some(10);
-        app.items_generation = 11;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.items_generation += 1;
         let raw_pixels = Arc::new(egui::ColorImage::filled(
             [1, 1],
             egui::Color32::from_gray(160),
         ));
         let raw = ctx.load_texture(
-            "colorize_nav_raw",
+            format!("{label}_raw"),
             (*raw_pixels).clone(),
             egui::TextureOptions::LINEAR,
         );
@@ -18985,12 +18983,24 @@ mod pipeline_cache_refactor_tests {
             },
         );
         app.fs_holdover_tex = Some(ctx.load_texture(
-            "colorize_nav_holdover",
+            format!("{label}_holdover"),
             egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
             egui::TextureOptions::LINEAR,
         ));
+    }
 
-        app.poll_fs_nav_lock();
+    /// フォルダ横断 nav lock は raw / thumbnail の到着だけでは解除しない。
+    /// カラー化対象で final pipeline を使う表示では、complete composite が表示可能に
+    /// なって初めて旧ページ holdover を解放する。
+    #[test]
+    fn nav_lock_waits_for_colorize_composite_when_pipeline_is_used() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/colorize-nav-target.jpg");
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        install_nav_locked_static_target(&mut app, &ctx, idx, "colorize_nav");
+
+        app.poll_fs_nav_lock(&ctx);
         assert!(
             app.fs_nav_locked_gen.is_some() && app.fs_holdover_tex.is_some(),
             "raw readiness must not release a colorized navigation target"
@@ -19001,7 +19011,7 @@ mod pipeline_cache_refactor_tests {
             .get_mut(&final_key)
             .expect("fixture should populate final composite")
             .complete = false;
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(
             app.fs_nav_locked_gen.is_some() && app.fs_holdover_tex.is_some(),
             "AI-incomplete final must not release the navigation holdover"
@@ -19011,12 +19021,47 @@ mod pipeline_cache_refactor_tests {
             .get_mut(&final_key)
             .expect("fixture should retain final composite")
             .complete = true;
-        app.poll_fs_nav_lock();
+        app.poll_fs_nav_lock(&ctx);
         assert!(app.fs_nav_locked_gen.is_none());
         assert!(
             app.fs_holdover_tex.is_none(),
             "completed final display releases nav lock and holdover"
         );
+    }
+
+    /// 分析モードは raw `fs_cache` を直接表示するため、カラー化設定が有効でも
+    /// final composite を待たず、raw 到着時点で nav lock を解放する。
+    #[test]
+    fn nav_lock_releases_without_composite_when_display_bypasses_pipeline() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/colorize-nav-analysis.jpg");
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        app.analysis_mode = true;
+        install_nav_locked_static_target(&mut app, &ctx, idx, "colorize_nav_analysis");
+
+        assert!(app.colorize_display_requires_final_effect(idx));
+        assert!(!app.current_final_composite_is_complete(idx));
+        app.poll_fs_nav_lock(&ctx);
+
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
+    /// カラー化が無効なら final composite は nav lock の解除条件ではなく、raw の
+    /// Static 到着だけで解放する。
+    #[test]
+    fn nav_lock_releases_when_colorize_disabled() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/plain-nav-target.jpg");
+        install_nav_locked_static_target(&mut app, &ctx, idx, "plain_nav");
+
+        assert!(!app.colorize_display_requires_final_effect(idx));
+        app.poll_fs_nav_lock(&ctx);
+
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
     }
 
     /// P9-1b: `bump_erase_mask_generation(idx)` は `bump_input_generation` と

@@ -286,11 +286,11 @@ ui_fullscreen.rs::render_fullscreen_viewport
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
 
 Ctrl+↑↓ のフォルダ横断では、遷移開始時に `fs_holdover_tex` へ旧ページのテクスチャを
-保持する。ただしこれは、新 target がまだ active になっていない間、または PDF/ZIP
-enumerate defer で `fullscreen_idx == None` の間に限って描く。`items_generation` が進み、
-新しい `fullscreen_idx` が入った後は `fs_nav_holdover_tex_for_draw` が旧テクスチャを
-返さず、サムネ/本画像が来るまで loading 表示に落とす。これにより、タイトルバーや
-パス表示だけ新しい ZIP を指しているのに画像だけ前の 7z のまま残る状態を防ぐ。
+保持する。これはページごとの fallback ではなく、直前に見ていた**ビュー単位**の hold である。
+`fs_nav_holdover_tex_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
+gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`image_rect` に
+1 枚だけ中央 contain フィットで重ねる。移動先ページの回転、表示トリム
+(`content_bbox`)、透過背景スタイルは適用しない。
 
 フルスクリーンの先読み対象は、`items` 全体ではなく `visible_indices` 由来の display list から
 作る。★フィルタや Ctrl+F で一覧が疎になっているときも、スライドショー / 前後移動と同じ
@@ -728,6 +728,17 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 4. fs_cache[idx] (生デコード結果、raw 専用)
 5. フォールバック: サムネイル (低解像度)
 ```
+
+ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
+`continuous_page_transition_texture` → サムネイル → `読込中...` である。
+`fs_holdover_tex` はこの優先順位には入らず、上記のビュー単位 overlay としてだけ描く。
+
+Ctrl+↑↓ の nav lock 解放判定も、描画側と同じ
+`fs_display_bypasses_final_pipeline` を使う。通常表示でカラー化が有効なページは
+`complete=true` の final composite まで待つ一方、右 Ctrl の元画像表示と分析モードは
+raw `fs_cache` を直接描くため、Static / Animated またはサムネイルの到着で解放する。
+この表示モード判定を描画側と lock 側へ別々に実装してはならない。表示だけ raw に
+切り替わって composite が生成されない場合、lock 側だけが完成を待ち続けるためである。
 
 **この優先順位は動かさないこと**。変更すると「補正を掛けた瞬間に一瞬生画像が見える」
 「AI 処理中にプリセットを変えると古い final composite が残る」等の不整合が出る。
