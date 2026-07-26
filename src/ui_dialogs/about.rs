@@ -85,6 +85,32 @@ impl App {
                         ui.end_row();
                     });
 
+                // FFmpeg は LGPL のライブラリを DLL として同梱・再配布しているので、
+                // ライセンス名だけでなく「どのビルドか」と「対応ソースの入手先」を
+                // アプリ内から辿れるようにする (docs/ffmpeg-lgpl-source-distribution.md
+                // の Notice Template)。配布経路によっては (GitHub Releases など)
+                // 製品ページを経由しないため、サイト側の記載だけでは導線が切れる。
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("FFmpeg (LGPLv3-or-later)").strong());
+                ui.add_space(2.0);
+                ui.label(
+                    "本ソフトウェアは FFmpeg プロジェクトのライブラリを LGPLv3-or-later で\
+                     使用しています。",
+                );
+                ui.label(format!("同梱バージョン: {}", env!("MIV_FFMPEG_BUILD_ID")));
+                ui.hyperlink_to(
+                    "対応するソースコード",
+                    format!(
+                        "https://mikage.to/mimageviewer/ffmpeg-{}-source.tar.gz",
+                        env!("MIV_FFMPEG_BUILD_ID")
+                    ),
+                );
+                ui.hyperlink_to("FFmpeg プロジェクト", "https://ffmpeg.org/");
+                ui.hyperlink_to(
+                    "LGPL-3.0 ライセンス全文",
+                    "https://www.gnu.org/licenses/lgpl-3.0.html",
+                );
+
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new("egui MIT License 全文")
                     .id_salt("about_egui_mit_license")

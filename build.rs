@@ -21,6 +21,9 @@ fn main() {
     // mIV オリジナルの注釈スタンプは Twemoji 更新処理と独立したテーブルへ同梱する。
     generate_annotation_stamp_assets();
 
+    // 同梱 FFmpeg のビルド識別子を焼き込む (バージョン情報ダイアログの LGPL 通知)。
+    emit_ffmpeg_build_id();
+
     // FFmpeg DLL は `target/release/` には自動でコピーしない。
     //
     // 本体 (`mimageviewer-core.exe`) は配布物としては直接使われず、ランチャー
@@ -68,6 +71,40 @@ fn main() {
             eprintln!("winresource compile error: {e}");
         }
     }
+}
+
+/// 同梱 FFmpeg のビルド識別子を `MIV_FFMPEG_BUILD_ID` として埋め込む。
+///
+/// `docs/ffmpeg-lgpl-source-distribution.md` の Notice Template は、ソフトウェア情報へ
+/// FFmpeg のバージョンと対応ソース URL を出すことを求めている。BtbN はタグではなく
+/// commit からビルドするので、この識別子 (`n7.1.5-10-g2aefd64d48` 形式) が
+/// DLL の ProductVersion・`vendor/ffmpeg/VERSION`・配布するソース tarball 名の 3 つを
+/// 突き合わせる唯一の鍵になる。ここで焼き込むことで、FFmpeg を更新しても UI 側の
+/// 文字列を手で直す必要がなくなる (直し忘れが LGPL 通知の齟齬に直結するため)。
+fn emit_ffmpeg_build_id() {
+    println!("cargo:rerun-if-changed=vendor/ffmpeg/VERSION");
+    let id = std::fs::read_to_string("vendor/ffmpeg/VERSION")
+        .ok()
+        .and_then(|raw| parse_ffmpeg_build_id(raw.trim()))
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=MIV_FFMPEG_BUILD_ID={id}");
+}
+
+/// BtbN の資産名からビルド識別子を取り出す。
+///
+/// 入力例: `ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip`
+/// 戻り値: `n7.1.5-10-g2aefd64d48`
+///
+/// 資産名の形式が変わって解釈できない場合は `None` を返し、呼び出し側が `unknown` へ
+/// 落とす。ここでビルドを失敗させないのは、非 Windows の CI チェックなど vendor が
+/// 揃わない構成でもコンパイル自体は通す必要があるため。
+fn parse_ffmpeg_build_id(asset: &str) -> Option<String> {
+    let rest = asset.strip_prefix("ffmpeg-")?;
+    let end = rest.find("-win64-")?;
+    if end == 0 {
+        return None;
+    }
+    Some(rest[..end].to_string())
 }
 
 /// `include_bytes!` で埋め込む vendor ファイル (PDFium / ONNX Runtime / Susie 32bit ワーカー /
