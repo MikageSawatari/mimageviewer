@@ -111,6 +111,12 @@
 | [vst3-integration.md](vst3-integration.md) | VST3 プラグイン統合 (v0.9.0+) — C++ bridge プロセス + Rust IPC、audio-pump からの bridge 経由、プラグイン GUI のクロスプロセス attach、チェーン編集 UI、再生中 VST3 パネル、後段 safety limiter |
 | [settings-sqlite-migration.md](settings-sqlite-migration.md) | 設定永続化を `settings.json` から `settings.db` (SQLite) に移行する spec。transient NotFound による設定消失事故の構造的解消、将来版の未知設定値を `Incompatible` として無変更・save 抑止にする downgrade 保護、VST3 BLOB の dirty-skip による I/O 浪費解消。4 ラウンドの Codex review 反映済み |
 
+## 進行中のレビュー
+
+- [review-v2.8.1/README.md](review-v2.8.1/README.md) — v2.8.1 前の全体点検。領域別の
+  docs↔コード整合監査の結果 (不一致 / リファクタ候補 / バグ) と、文書ごとの信頼度。
+  **文書を現行仕様として読む前に、ここで該当文書の信頼度を確認すること。**
+
 ## 完了した作業の記録
 
 完了した計画、brief、findings、レビュー、過去リリースの記録は
