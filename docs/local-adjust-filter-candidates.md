@@ -68,14 +68,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、106種)
+### `LocalEffect` (部分補正レイヤー、107種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別), PhotoFilter(色付きフィルター),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 MonochromeMixer(6色帯白黒ミックス), Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定), RetroPalette(固定/適応パレット減色), CrtDisplay(ブラウン管表示),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, FrequencySeparation, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, RadialFlash, TiltShift, LensBlur, BokehSprite, LensDirt, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, Frame, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, BacklightHaze, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Anaglyph3d, Defringe, ScanlineGlitch, Vhs, DataMosh, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, DiffractionStarburst, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, Repair, Frame, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, BacklightHaze, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Anaglyph3d, Defringe, ScanlineGlitch, Vhs, DataMosh, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, DiffractionStarburst, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /

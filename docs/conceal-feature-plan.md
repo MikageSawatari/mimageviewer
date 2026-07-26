@@ -1,5 +1,19 @@
 # 隠蔽加工機能 + 統一エクスポート (Ctrl+E) 設計
 
+> **現況 (2026-07)**
+>
+> - **コードで実装確認済み**: Mosaic / WhiteFill / BlackFill / Blur、9 ツール
+>   (Polygon を含む)、ページ別 `conceal.db`、`settings.db` のグローバル設定、
+>   サイドカー、Undo / Redo、マスクスロット、Ctrl+E、永続 edit preview。
+> - **現行の正本**: データとツールは §6 / §8、表示・cache 順序は
+>   [display-pipeline.md](display-pipeline.md) と
+>   [preset-and-adjustment.md](preset-and-adjustment.md)。§3.1 / §3.2 / §3.4 / §13 / §15 は
+>   実装前の案・作業記録であり、現行の型や module 境界の正本ではない。
+> - **既知の実装未達**: conceal の load / raster / compose / GPU upload が UI thread 同期で、
+>   §7.7 の worker / cancel / progress 要件を満たさない。
+>   [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録済みで、要件は維持する。
+> - **手動検証**: §14.3 の実施状況は記録から確認できないため未確認。
+
 汎用的な「隠蔽加工」ツールを「消しゴムツール」の双子サブシステムとして実装する。
 モザイク・白塗り・黒塗り・ぼかしの 4 タイプを切り替えて使え、AI 画像投稿の修正から
 個人情報マスキング、SNS スクショの顔隠しまで幅広くカバーする。
@@ -49,9 +63,13 @@ AI 画像整理では「元画像と同じフォルダに、元と同じ形式�
 設計上はこれらの慣行を「ありがちな初期値」として採用するが、UI 上で「この設定はどこそこの
 基準に合う」と表示することはしない。
 
-## 3. アーキテクチャ
+## 3. アーキテクチャ (現行境界と実装前の設計経緯)
 
-### 3.1 表示パイプライン (キャッシュ階層) の拡張
+### 3.1 初期 cache 拡張案 (未採用)
+
+以下の `adjustment_cache > ai_upscale_cache` を基準にした階層は実装前の案であり、
+現行 pipeline には使用しない。現行は raw → erase → local-adjust → conceal → edit result の後に
+final pipeline を適用する。
 
 現状: `adjustment_cache > ai_upscale_cache > fs_cache`
 
@@ -63,7 +81,7 @@ AI 画像整理では「元画像と同じフォルダに、元と同じ形式�
 これにより `Ctrl+S` (既存キャプチャ保存) は display pixels を読むので自動的に隠蔽加工込みで
 保存される。新規コードはほぼ不要。
 
-### 3.2 新規ファイル
+### 3.2 初期ファイル分割・行数見積もり (実装前の設計経緯)
 
 | ファイル | 役割 | 想定行数 |
 | --- | --- | --- |
@@ -73,9 +91,9 @@ AI 画像整理では「元画像と同じフォルダに、元と同じ形式�
 | `src/export_dialog.rs` | `Ctrl+E` のエクスポートダイアログ UI | ~400 |
 | `src/save_with_metadata.rs` | JPEG / PNG / WebP のメタデータ保持エンコード | ~500 |
 
-### 3.3 既存モジュールからの再利用 (共有)
+### 3.3 現行の共有境界
 
-消しゴムとツールパレットを **完全一致 (8 種)** させる方針なので、`mask_db.rs` を
+消しゴムとツールパレットを **完全一致 (9 種)** させ、`mask_db.rs` と
 `Shape` enum 対応に拡張し、両ツールから共有する:
 
 ```rust
@@ -86,7 +104,7 @@ use crate::vector_edit::{HoverTarget, hit_test, cursor_icon_for, draw_handles, a
 
 | 共有要素 | 出元 | 共有理由 |
 | --- | --- | --- |
-| `Shape` enum (Line / Rect / Ellipse) | `mask_db.rs` (既存 LineObject から拡張) | 全 8 ツールが生成するベクタオブジェクトの統一表現 |
+| `Shape` enum (Line / Rect / Ellipse) | `mask_db.rs` (既存 LineObject から拡張) | Line / Rect / Ellipse のベクタオブジェクトの統一表現。Brush / Lasso / Polygon は bitmap へ確定 |
 | `LineKind` enum (Vert / Horiz / Diag) | `mask_db.rs` | Line variant 内で使用、ツールパレット統一に伴い共有 |
 | `rasterize_shape_into` 関数 (新規) | `mask_db.rs` | Shape variant ごとのラスタライズ (Line/Rect=多角形、Ellipse=楕円方程式) |
 | `scanline_fill_polygon` 関数 | `mask_db.rs` (既存) | 筆 / 囲み / Line / Rect 共通の多角形塗り |
@@ -109,7 +127,10 @@ mask_db は既にリリース済みで、旧 `LineObject` の素 JSON が DB / �
 - 一度新版で開いて保存し直すと自動的に新形式に移行
 - 旧 JSON が読めるテストを `mask_db::tests` に追加 (released データの互換性検証)
 
-### 3.4 App 状態追加
+### 3.4 初期 App 状態スケッチ (実装前の設計経緯)
+
+以下はフィールド名と cache 型を確定する前のスケッチ。現行の canonical type は
+`src/app.rs` / `src/conceal.rs` / `src/settings.rs` を参照する。
 
 ```rust
 // モード状態
@@ -124,11 +145,11 @@ conceal_mask: Option<Vec<bool>>,
 conceal_mask_size: [usize; 2],
 conceal_vectors: Vec<LineObject>,           // LineKind::{Vert, Horiz, Diag} 全種類
 
-// 描画ツール設定 (グローバル、settings.json に永続化)
+// 描画ツール設定 (グローバル、settings.db の settings_kv に永続化)
 conceal_brush_radius: f32,
 conceal_line_width: f32,
 
-// 隠蔽パラメータ (グローバル、settings.json に永続化)
+// 隠蔽パラメータ (グローバル、settings.db の settings_kv に永続化)
 conceal_type: ConcealType,                  // Mosaic / WhiteFill / BlackFill / Blur
 // モザイク用
 conceal_mosaic_tile_mode: TileSizeMode,     // LongEdgeRatio(0.25..=5.0, 0.25刻み) or FixedPx(4..=200)
@@ -141,7 +162,7 @@ conceal_blur_radius_px: f32,                // 5..=100、1px 刻み、デフォ�
 conceal_blur_mode: BlurMode,                // AsMask / ExtendByRadius / InsideOnly
 conceal_blur_feather: bool,                 // 境界フェード ON/OFF
 
-// パラメータプリセット 4 スロット (グローバル、settings.json)
+// パラメータプリセット 4 スロット (グローバル、settings.db の settings_kv)
 // 上記パラメータ一式を ConcealPreset { name, conceal_type, ... } として 4 つ保存
 // (詳細は §8.3)
 
@@ -185,7 +206,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | キー | 動作 |
 | --- | --- |
 | `Esc` | モード終了 (マスク保持、DB 書込) |
-| `S` / `B` / `L` / `I` / `V` / `H` / `R` / `O` | ツール切替 (選択 / 筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円) — 消しゴムと完全同一 |
+| `S` / `B` / `L` / `P` / `I` / `V` / `H` / `R` / `O` | ツール切替 (選択 / 筆 / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円) — 消しゴムと完全同一 |
 | `D` / `F` | 描画 / 消去 |
 | `1` / `2` / `3` / `4` | パラメータプリセット 1〜4 を適用 |
 | `T` | 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …) |
@@ -209,7 +230,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 ```
 ┌─ 隠蔽加工 ───────────────────────────────────┐
 │ ツール:                                          │
-│  [選] [筆] [囲] [直] [縦] [横] [矩] [楕]         │  ← S/B/L/I/V/H/R/O キー (消しゴムと同一)
+│  [選] [筆] [囲] [多] [直] [縦] [横] [矩] [楕]    │  ← S/B/L/P/I/V/H/R/O キー (消しゴムと同一)
 │  ● 描画   ○ 消去                                │  ← D/F キー
 │  太さ: ──●─── 12px                              │
 │                                                  │
@@ -285,9 +306,9 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 **処理の機構**を書くこと。これがないと利用者は自分の用途 (投稿先の規定など) に
 合っているかを判断できない。
 
-## 6. ツール 8 種仕様 (消しゴムと完全同一)
+## 6. ツール 9 種仕様 (消しゴムと完全同一)
 
-両ツール (消しゴム / 隠蔽加工) で同じ 8 種パレットを採用。`Shape` enum / rasterizer / UI
+両ツール (消しゴム / 隠蔽加工) で同じ 9 種パレットを採用。`Shape` enum / rasterizer / UI
 パネル骨子を共有することで実装重複を排除。順序は **描画系 → 拘束系 → bbox 系** の流れに
 そろえる:
 
@@ -296,6 +317,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | 選択 | S | ベクタ本体を hit test、ハンドルドラッグで編集 (`vector_edit.rs` 参照) | `Shape` 編集 |
 | 筆 | B | 半径 `brush_radius`、ストロークで `scanline_fill_polygon` ラスタライズ | ビットマップ |
 | 囲み | L | ポリゴン → `scanline_fill_polygon` | ビットマップ |
+| 多角形 | P | クリックで頂点追加、始点付近 / 右クリック / Enter で確定して `scanline_fill_polygon` | ビットマップ |
 | 直線 | I | `Shape::Line { p0, p1, thickness }`、両端ドラッグで端点編集 | `Shape` vec |
 | 縦線 | V | `Shape::Line { kind: Vert, .. }`、生成時に縦に拘束 | `Shape` vec |
 | 横線 | H | `Shape::Line { kind: Horiz, .. }`、生成時に横に拘束 | `Shape` vec |
@@ -644,16 +666,16 @@ CREATE TABLE conceal_entries (
     bitmap_w      INTEGER NOT NULL,
     bitmap_h      INTEGER NOT NULL,
     bitmap_data   BLOB NOT NULL,    -- 1bit/pixel + deflate (mask_db と同じ)
-    vectors_json  TEXT NOT NULL DEFAULT '[]'
+    shapes        TEXT              -- nullable。Shape 配列の JSON、空なら NULL
 );
 ```
 
-**DB に保存するのはマスク (ビットマップ + ベクタ) のみ**。隠蔽タイプ・各種パラメータは
-すべてグローバル設定 (`settings.json`) または プリセット (§8.3) に保存される。
+**DB に保存するのはマスク (ビットマップ + `Shape` 配列) のみ**。隠蔽タイプ・各種パラメータは
+すべてグローバル設定 (`settings.db` の `settings_kv`) または プリセット (§8.3) に保存される。
 ページとパラメータが疎結合になるため、「同じマスクで異なるパラメータの結果を Ctrl+E で
 複数保存」のワークフローが自然に成立する。
 
-`settings.json` に追加するフィールド:
+`Settings` の次のフィールドは serde JSON 値として `settings.db` の `settings_kv` に保存する:
 
 ```rust
 struct Settings {
@@ -756,7 +778,7 @@ fn apply_preset(&mut self, slot: usize) {
 
 #### 永続化
 
-`settings.json` の `conceal_presets` フィールドに書く。サイドカーには書かない
+`settings.db` の `settings_kv` に `conceal_presets` フィールドを書き、サイドカーには書かない
 (プリセットはフォルダ依存しないグローバル状態)。空スロット (`None`) も 4 つ分エントリ
 保持。`Some(ConcealPreset { name: "", ... })` と `None` の違い:
 - `None`: ボタンがグレーアウト、`[空] [💾]` 表示
@@ -788,7 +810,7 @@ fn apply_preset(&mut self, slot: usize) {
 - 5 秒アイドル時の `flush_idle_sidecars` (dirty 時のみ)
 
 ストロークごとには書かない。Undo はメモリ内 `conceal_undo_stack` で十分。
-プリセットとパラメータは `settings.json` 側に書かれるので、サイドカーには含めない。
+プリセットとパラメータは `settings.db` 側に書かれるので、サイドカーには含めない。
 
 ## 9. キャッシュ無効化ルール
 
@@ -1107,11 +1129,12 @@ struct ConcealSnapshot {
   - フォルダロード時に `conceal_db::load_conceal_keys` で hydrate
   - `save_conceal_with_sidecar` / `delete_conceal_with_sidecar` で同期更新
 
-サムネイル本体には **隠蔽加工結果を反映しない** (消しゴムと同じ挙動)。
-バッジのみで状態表示。これで「サムネとフルスクリーンで見た目が違う」が消しゴムと
-一貫し、サムネスクロール中の負荷も増えない。
+永続 edit preview が有効な場合、グリッドは `edit_result_cache` 相当の
+raw → erase → local-adjust → conceal と、同じ crop を適用した注釈を分離保存した preview を
+優先表示する。未生成・失効中は raw thumbnail へ fallback し、[隠] バッジで編集の存在を示す。
+マスクまたは crop 変更時は該当 preview を非同期削除し、編集終了後に再生成する。
 
-## 13. 実装フェーズ
+## 13. 実装フェーズ (実装前の見積もりと作業記録)
 
 **Codex P2 (1) 指摘により Phase 順を入れ替え**: `0 → 1 → 2 → 0b → 2b → ...` の順。
 `vector_edit.rs` を先に作って Conceal 側で運用してから、消しゴム側に矩形/楕円を
@@ -1121,7 +1144,7 @@ struct ConcealSnapshot {
 | --- | --- | --- |
 | 0 | **mask_db.rs の `Shape` enum 化 + マイグレーション**: 旧 `LineObject` 互換デシリアライザ (**明示的な `"type"` キー判定、untagged fallback ではない** — Codex P1)、`rasterize_shape_into` 新設、`scanline_fill_ellipse` 新設、回帰テスト (旧 JSON / 旧サイドカー / 壊れた JSON / 未知 type / 混在配列 / 空配列)。**Sidecar の `Vec<LineObject>` → `Vec<Shape>` 移行も同 Phase で対応** (Codex P1) | 3-4 日 |
 | 1 | App 状態追加、`ConcealType` / `MosaicBoundary` / `FillEdge` / `BlurMode` / `TileSizeMode` enum、`conceal_db.rs` (mask_db 流用、マスクスロット API 含む)、`Ctrl+M` モード遷移 + 空パネル。**Settings は `settings.db` 経由** (Codex P2、`COMPLEX_FIELDS` 不要) | 2-3 日 |
-| 2 | `vector_edit.rs` 新設 (ハンドル方式・専用回転ハンドル + ↻ アイコン・Shift/Alt 修飾子・カーソル選択・ドラッグ状態機械、両ツール共用)、Conceal 側で 8 ツール実装 (Select/Brush/Lasso/Line/Vert/Horiz/Rect/Ellipse)、マスクオーバーレイ表示 | 4-5 日 |
+| 2 | `vector_edit.rs` 新設 (ハンドル方式・専用回転ハンドル + ↻ アイコン・Shift/Alt 修飾子・カーソル選択・ドラッグ状態機械、両ツール共用)、Conceal 側で 9 ツール実装 (Select/Brush/Lasso/Polygon/Line/Vert/Horiz/Rect/Ellipse)、マスクオーバーレイ表示 | 4-5 日 |
 | 0b | **消しゴム側のツールパレット拡張**: `ui_erase.rs` に矩形 (R) / 楕円 (O) ツールを **ハンドル付きで** 追加 (Phase 2 の `vector_edit.rs` を流用)、`EraseTool` enum 拡張 | 1-2 日 |
 | 2b | 消しゴム側 Select モードを `vector_edit.rs` 経由に置換。**旧 Ctrl+ドラッグ複合操作 (回転+太さ) は完全廃止** — まだ利用者が少ない段階での UX 統一なので CHANGELOG 記載のみで legacy alias は持たない (ユーザー判断)、回帰テスト | 1-2 日 |
 | 3a | Mosaic 合成実装 (3 境界モード × 2 タイルサイズモード)、タイル平均計算の rayon 並列化、`conceal_cache` + 表示パイプライン統合。**`conceal_cache` は generation-keyed + lazy eviction** (Codex P2)、`clear_*_caches` の代わりに `bump_conceal_generation()`、idx-keyed cache lifecycle checklist 完備 (Codex P1) | 3-4 日 |
@@ -1130,7 +1153,7 @@ struct ConcealSnapshot {
 | 4 | 永続化 (DB + サイドカー)、マスクスロット 2 個 UI、パラメータプリセット 4 個 UI、`conceal_pages` バッジ、Undo / Redo | 2-3 日 |
 | 5 | `save_with_metadata.rs` (JPEG / PNG / WebP 3 形式) + ユニットテスト (roundtrip)。**WebP RIFF mux は既存 `xmp_writer.rs` から RIFF パーサ部分を共通化して流用** (Codex P2)。**PNG は生 chunk read/write が必要** (`png_metadata.rs` の生 chunk 取得 API を追加、Codex P3) | 4-5 日 |
 | 6 | ✅ 完了: `export_dialog.rs` (`Ctrl+E` UI、**バリエーション一括チェックリスト**、`_N` 接尾辞)。**Worker pattern で最初から実装** (Codex P1) — 既存 `fs_capture_pending` を参考に `ExportPending { cancel, rx, total, done }`、進捗モーダル、UI スレッドはポーリングのみ。**ファイル名衝突は `OpenOptions::create_new(true)` リトライ** (Codex P3) | 4-5 日 |
-| 7 | ✅ 完了: 統合テスト (mask_db 旧形式 → 新形式マイグレーション、sidecar Vec<Shape> 移行 roundtrip、conceal_db ラウンドトリップ、マスクスロット、ZIP/PDF ソースの export、一括バリエーション生成のファイル名衝突、worker キャンセル/進捗)、手動 E2E | 2-3 日 |
+| 7 | 自動テスト実装済み: mask_db 旧形式 → 新形式マイグレーション、sidecar Vec<Shape> 移行 roundtrip、conceal_db ラウンドトリップ、マスクスロット、ZIP/PDF ソースの export、一括バリエーション生成のファイル名衝突。手動 E2E の実施状況は未確認 | 2-3 日 |
 | 8 | ✅ 完了: ドキュメント更新 (下記 §15)。UI スナップショットは既存カバレッジ維持 | 1-2 日 |
 
 **合計概算: 約 31-43 日** (Codex 指摘の worker 化分 + generation cache + 順序入れ替えで +5-6 日増)
@@ -1163,7 +1186,7 @@ struct ConcealSnapshot {
 - サイドカー復元 (空 DB + サイドカー → DB に mosaic エントリ復元)
 - ZIP / PDF エントリのキー整合 (`conceal_db::normalize_path` と一致)
 
-### 14.3 手動 E2E
+### 14.3 手動 E2E (実施状況未確認)
 
 - 実 AI 生成 PNG (A1111 形式 prompt) でラウンドトリップ → prompt 維持確認
 - 実 AI 生成 JPEG (EXIF UserComment 形式) で同様
@@ -1172,7 +1195,7 @@ struct ConcealSnapshot {
 - 半透明モード / マスク形状モードの見た目確認
 - 4K 画像で `compose_mosaic` のレスポンス (~50ms 目標、UI 同期 OK ならその場で適用)
 
-## 15. ドキュメント同時更新
+## 15. 実装前のドキュメント更新計画 (履歴)
 
 CLAUDE.md の「コード修正時のドキュメント同時更新」ルールに従って:
 
@@ -1194,8 +1217,8 @@ CLAUDE.md の「コード修正時のドキュメント同時更新」ルール�
 - ホットキー: **`Ctrl+M`** で入退場、モード内で `T` キーは隠蔽タイプ順次切替
 - 処理タイプ 4 種: **Mosaic / WhiteFill / BlackFill / Blur**。タイプごとに異なるパラメータと境界モードを持つ
 - タイルサイズは **2 モード** (長辺比率モード = 0.25 刻み / 固定 px モード = 1px 刻み) から選択
-- 隠蔽加工は **サムネイルには反映しない** (消しゴムと同じ挙動、[隠] バッジのみ)
-- ツールパレット **8 種** を消しゴムと完全統一: 選択 (S) / 筆 (B) / 囲み (L) / 直線 (I) /
+- 隠蔽加工は永続 edit preview に反映する。未生成・失効中は raw thumbnail + [隠] バッジへ fallback
+- ツールパレット **9 種** を消しゴムと完全統一: 選択 (S) / 筆 (B) / 囲み (L) / 多角形 (P) / 直線 (I) /
   縦線 (V) / 横線 (H) / 矩形 (R) / 楕円 (O)。`Shape` enum / rasterizer / `vector_edit.rs`
   を共有
 - データモデル `Shape` enum (Line / Rect / Ellipse) を `mask_db.rs` に新設。
@@ -1203,7 +1226,7 @@ CLAUDE.md の「コード修正時のドキュメント同時更新」ルール�
 - 消しゴム側にも矩形 / 楕円ツールを追加 (写真のゴミ消し用途)。リリース済み機能拡張のため
   Phase 0 でデータマイグレーションが必須
 - すべてのパラメータ (タイプ、タイルモード、不透明度、ぼかし半径、境界モード等) は
-  **グローバル設定** (`settings.json` 永続化、ページ間共有)。複数の好みを保持したい
+  **グローバル設定** (`settings.db` の `settings_kv` に永続化、ページ間共有)。複数の好みを保持したい
   ときは **パラメータプリセット 4 スロット** (`1`〜`4` キーで適用)
 - マスクは **ページ個別** に保存 (`conceal.db` + サイドカー)
 - マスク用 2 スロット (`__slot_1` / `__slot_2`) で差分画像生成をサポート
@@ -1223,13 +1246,11 @@ CLAUDE.md の「コード修正時のドキュメント同時更新」ルール�
 ## 17. 未確定 / 将来課題
 
 - 非対応形式 (HEIC 等) の **書き出し対応**: 将来 WIC エンコーダ経由で書ければ、フォールバックを廃止できる
-- **隠蔽加工済み画像のサムネイル反映**: ユーザーから要望があれば、消しゴム反映と一緒に別枠で対応
 - **WebP の XMP に AI prompt を埋める汎用フォーマット**: 各 AI ツールの慣行を更に調査する余地あり
 - **マスクスロット数の拡張 (3 個以上)**: 現状 2 スロットで消しゴムと揃えているが、用途が増えたら拡張
 - **パラメータプリセット数の拡張 (5 個以上)**: 現状 4 個でロック、要望次第で 8 / 10 に拡張
 - **WhiteFill / BlackFill の任意カラー対応**: 当面は白/黒固定、要望次第でカラーピッカー追加
 - **Blur 境界フェード半径の可変化**: 当面は固定値 (8px 想定)、要望次第でスライダー化
-- **Blur の worker thread 化**: 実測 200ms 超のケースが頻発したら pending パターンに移行
 - **マスクスロット数の拡張時の quick apply キー設計**: 3 個以上に増やす場合は F キー列以外の割当てを再検討する
 - **タイル倍率のページ別オーバーライド**: グローバル設定で始めて、後でニーズが出たらページ個別を追加
 - **ぼかし半径の上限拡張**: 現状 100px、超巨大なマスク (4K の人物全体など) で足りなければ拡張

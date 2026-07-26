@@ -2,6 +2,28 @@
 
 作成: 2026-06-28 / ClaudeCode 横断レビュー
 
+> **現況ステータス (2026-07-26 コード確認)**
+>
+> - 実装済み: `DetachedWindowManager`、window_id ごとの runtime/placement/HWND registry、
+>   `ViewerSession`、`Opening/Active/Parked/ParkedLive/Resuming/Closing` state、active session の
+>   `window_id` を優先する viewport identity。
+> - 部分実装: BA-1 は host registry へ移行したが key subclass に rect 探索が残る。BA-7 は
+>   manager state を導入したが reducer の合法遷移制約と全 pending producer の typed ownership が未完。
+> - 未実装: BA-5 の deferred viewport / single render entry。現行は keepalive/backstop で緩和する。
+> - §§1〜4 は 2026-06-28 時点の historical diagnosis / 最小手術記録、§§5〜8 は初期の
+>   リワーク案・移行案である。現在の進捗判定は
+>   [構造リワーク正本 §9](detached-rework-plan.md) を優先する。直近変更の手動検証状況は未確認。
+
+| BA | 現況 |
+| --- | --- |
+| BA-1 | **部分解消** — host HWND は registry 所有、key subclass の rect 探索は残存 |
+| BA-2 | **解消済み** |
+| BA-3 | **解消済み** |
+| BA-4 | **解消済み** |
+| BA-5 | **未解消・緩和のみ** — 複数描画入口が残り R4 対象 |
+| BA-6 | **解消済み** |
+| BA-7 | **部分解消** — manager state は導入済み、reducer/typed transition ownership は未完 |
+
 対象: F12 別ウィンドウ表示 (detached image window) と fullscreen viewport の
 ライフサイクル。`src/app.rs` / `src/ui_fullscreen.rs`。
 
@@ -18,7 +40,7 @@ Phase A1/A2/B の関連ドキュメント:
 
 ---
 
-## 実装状況 (2026-06-28 更新)
+## 2026-06-28 時点の実装状況 (historical snapshot)
 
 §4 の **最小手術 S0 を適用済み**:
 
@@ -49,13 +71,14 @@ Phase A1/A2/B の関連ドキュメント:
 
 そのため、以下 **§1.4 と BA-3 の本文は「撤去前 (= 修正前) の状態の記録」** として読むこと
 (これらが言及する `host_lost_recreate_armed` 等の機械は現行コードには存在しない)。
-§5 の構造リワーク (identity 一本化・hwnd 生成確定・rect 捕捉廃止・deferred 化) は未着手。
+この時点では、§5 の構造リワーク (identity 一本化・hwnd 生成確定・rect 捕捉廃止・
+deferred 化) は未着手だった。現在の到達点は冒頭の現況表を参照する。
 
 ---
 
-## 0. TL;DR
+## 0. 初期診断 TL;DR (historical)
 
-現行設計は **6 個の独立した「壊れた前提」** の上に立っており、それぞれを後追いの
+初期診断では、当時の設計は **7 個の独立した「壊れた前提」** の上に立っており、それぞれを後追いの
 ヒューリスティック（rect 一致・default 誤採用フィルタ・1500ms debounce・armed ガード）で
 塞いでいる。ヒューリスティックは互いに干渉し、1 つが滑ると別のループを誘発する。
 
@@ -70,7 +93,7 @@ Phase A1/A2/B の関連ドキュメント:
 
 ---
 
-## 1. 現状アーキテクチャの要約
+## 1. 2026-06-28 時点のアーキテクチャ (historical diagnosis)
 
 ### 1.1 ウィンドウの 3 形態
 
@@ -157,9 +180,14 @@ passive 側 `build_detached_image_window_builder(window, apply_initial_placement
 
 ---
 
-## 2. 壊れている前提の一覧
+## 2. 初期診断の壊れた前提と現在の解消状況
 
 ### BA-1: OS ウィンドウを「論理矩形の一致」で同定できる ⚠️ 最重要
+
+**現況: 部分解消。** detached host HWND は生成前後 snapshot の registry へ移行済み。
+ただし key input subclass は viewport rect から HWND を選ぶため、この前提を破る具体的経路が
+[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されている。registry/window_id 所有へ
+統合する後続課題であり、ここで仕様を後退させない。
 
 **前提**: detached 窓の HWND は、egui の outer_rect を物理化した期待矩形に
 「中心含有 + 面積 2/3 + 隅距離最小」で一致する窓として一意に見つけられる。
@@ -183,6 +211,8 @@ DPI 変化・多窓のすべてで滑る。`candidate=none` が 4 本のログ�
 
 ### BA-2: 既定サイズで生成 → resize すれば正サイズになる ⚠️
 
+**現況: 解消済み。** 初回 builder の runtime placement と builder latch で生成属性を固定する。
+
 **前提**: ViewportBuilder に placement を渡さず生成しても、直後に
 `with_inner_size`/`ViewportCommand::InnerSize` で正サイズに直せばユーザーには見えない。
 
@@ -199,6 +229,8 @@ builder が DetachedWindow に存在すること自体が誤り。
 ---
 
 ### BA-3: host_lost(IsWindow==false) は自動 recreate すべき異常である ⚠️
+
+**現況: 解消済み。** host_lost を自己駆動 recreate trigger にする旧機構は撤去済み。
 
 **前提**: host HWND が消えていたら、viewport を作り直して復旧すべき。
 
@@ -222,6 +254,9 @@ recreate トリガにしない**。
 
 ### BA-4: viewport identity を generation で頻繁に作り替えてよい
 
+**現況: 解消済み。** active session の `window_id` を ViewportId 決定で最優先し、passive も
+window_id 由来である。
+
 **前提**: active detached の identity は `fs_viewport_generation` でよく、recreate ごとに
 bump して別 ViewportId にしても問題ない。
 
@@ -237,6 +272,9 @@ nav/ recreate のたびに別人格の窓が生まれ、passive snapshot との�
 ---
 
 ### BA-5: immediate viewport を「親が毎フレーム描く」前提で多フラグ管理できる
+
+**現況: 未解消・緩和のみ。** keepalive、holdover、backstop で gap を補うが複数描画入口が残る。
+deferred viewport / single render entry は R4 対象で未実装。
 
 **前提**: `show_viewport_immediate` の「親が描かないと即破棄」性質を、
 `fs_viewport_shown` / `fs_viewport_recreate_after_hide` / `fs_nav_locked_gen` /
@@ -255,6 +293,9 @@ viewport を 1 本のレンダラで描き**、live か frozen かだけを切�
 
 ### BA-6: placement の所有者が settings / live / snapshot に三重化していてよい
 
+**現況: 解消済み。** placement は window_id ごとの runtime が所有し、settings は seed と
+close/remove 時の永続化に限定する。
+
 **前提**: 「次に開く窓の seed (settings)」「今の窓の実測 (live)」「passive の保存値 (snapshot)」を
 別々に持ち、必要時に同期すればよい。
 
@@ -271,6 +312,12 @@ snapshot/active はその runtime を参照するだけ。ヒューリスティ�
 
 ### BA-7: ~55 個の transient フラグで状態機械を表現できる
 
+**現況: 部分解消。** manager runtime state は導入済みだが、`transition_state` は任意の遷移先を
+代入し、pending producer は複数 field の OR で判定する。terminal close 後の in-flight 適用と、
+動画 F12 OFF 後の `Closing` runtime 残留という具体的な違反経路が
+[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されている。前者は BA-7/R2b
+リワークへ引き継ぎ、後者は **v2.8.1 で対応予定**。
+
 **前提**: one-shot bool 群（focus_requested / recreate_on_next_render / no_activate_once /
 suppress_primary / host_lost_recreate_armed / grace 群…）の組合せで window の状態を表せる。
 
@@ -278,12 +325,12 @@ suppress_primary / host_lost_recreate_armed / grace 群…）の組合せで win
 「どの組合せが正規状態か」がコードのどこにも明示されていない。
 
 **あるべき前提**: 明示 enum:
-`DetachedWindowState { Opening, Active, Parked, Resuming, Closing }` を window_id ごとに持ち、
+`DetachedWindowState { Opening, Active, Parked, ParkedLive, Resuming, Closing }` を window_id ごとに持ち、
 遷移を 1 箇所（reducer）で管理。transient は遷移の副作用として閉じ込める。
 
 ---
 
-## 3. 現行 Ctrl+↓ 小窓フラッシュ + host_lost ループの因果連鎖
+## 3. 当時の Ctrl+↓ 小窓フラッシュ + host_lost ループの因果連鎖 (historical)
 
 BA-1〜BA-3 が連鎖した複合症状。detached な PDF/ZIP を開いた状態で Ctrl+↓:
 
@@ -309,7 +356,7 @@ BA-1〜BA-3 が連鎖した複合症状。detached な PDF/ZIP を開いた状�
 
 ---
 
-## 4. 最小手術案（出血を止める / 低リスク / 即着手可）
+## 4. 初期の最小手術案 (実装経緯)
 
 構造リワーク前に、ループとフラッシュを止める 3 点。いずれも局所的で回帰テストを足せる。
 
@@ -357,7 +404,7 @@ holdover/resize 途中フレームでは capture を試みない。
 
 ---
 
-## 5. 本命リワーク案（根治 / 中規模）
+## 5. 初期の本命リワーク案 (採用済み・未採用が混在)
 
 detached viewport を「本ごとに安定 ID・生成時に配置確定・hwnd は生成で確定・自動 recreate なし・
 明示 state machine」の 1 モデルに統一する。fullscreen（従来全画面）はこのモデルの 1 ケースとして扱う。
@@ -419,6 +466,7 @@ enum DetachedWindowState {
     Opening,    // OS 窓生成 → hwnd 確定待ち
     Active,     // live content。編集/AI/先読み/スライドショー可
     Parked,     // frozen texture のみ。passive
+    ParkedLive, // 非 active のメディアを再生継続
     Resuming,   // Parked → Active 復帰中（bundle swap-in）
     Closing,    // Close 送信 → 破棄確認待ち
 }
@@ -439,7 +487,7 @@ enum DetachedWindowState {
 
 ---
 
-## 6. 段階移行プラン
+## 6. 初期の段階移行プラン (historical; 現況は冒頭表)
 
 | 段階 | 内容 | リスク | 検証 |
 | --- | --- | --- | --- |
@@ -455,7 +503,7 @@ enum DetachedWindowState {
 
 ---
 
-## 7. 未確認/要確認事項（実装前に潰す）
+## 7. 実装前の未確認事項 (historical)
 
 1. **genuine OS close の受け口**: 手術-1 で自動 recreate を外したとき、ユーザーが OS の×で
    detached 窓を閉じた場合に `close_requested` で正しく後始末できるか（現行コードの
@@ -470,7 +518,7 @@ enum DetachedWindowState {
 
 ---
 
-## 8. 結論
+## 8. 初期診断時の結論 (historical)
 
 - 現行の detached viewport は **rect 一致 host 捕捉 (BA-1)**・**生成時 placement 未適用 (BA-2)**・
   **自動 recreate ループ (BA-3)** の 3 つが噛み合って、Ctrl+↓ のたびに小窓フラッシュ + host_lost

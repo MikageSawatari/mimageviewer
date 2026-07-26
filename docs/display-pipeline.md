@@ -725,11 +725,12 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 0. 右 Ctrl ホールド中の元画像プレビュー (fs_cache の raw decode)
 1. erase / local_adjust / conceal の編集中プレビュー (各 UI の in-memory state)
 2. final_composite_cache[edit_key, params_hash, bg]
-   (= edit_result_cache + 色調補正 + final AI + スマートシャープ + post_filter。
+   (= edit_result_cache + 色調補正 + final AI + スマートシャープ + カラー化
+    + Creative LUT + post_filter。
     スマートシャープは AI アップスケール出力には掛からない —
     preset-and-adjustment.md §2.7)
 3. edit_result_cache[edit_key]
-   (= raw -> erase -> local_adjust -> conceal -> crop。最終段待ちの fallback)
+   (= raw -> erase -> local_adjust -> conceal。crop を含まない最終段待ちの fallback)
 4. fs_cache[idx] (生デコード結果、raw 専用)
 5. フォールバック: サムネイル (低解像度)
 ```
@@ -872,8 +873,9 @@ fit 解像度のまま (画像見開きは問題なし。PDF 見開きズーム�
 100% 判定の基準サイズは、単ページ / 見開きでは「今実際に描くテクスチャ」のサイズであり、
 AI アップスケール完了後は `final_composite_cache` の寸法で再レイアウトする。
 連結読みではスクロール中の配置ジャンプを避けるため、processed テクスチャが raw と同じ
-アスペクト比なら raw/source サイズをレイアウト基準として保つ。crop などでアスペクト比が
-変わった場合だけ processed 側のサイズを使う。右 Ctrl の元画像プレビューや分析モードでは
+アスペクト比なら raw/source サイズをレイアウト基準として保つ。別の処理で processed 側の
+アスペクト比が変わった場合だけ processed 側のサイズを使う。crop は通常表示では暗転 overlay
+だけなので、レイアウト基準も描画 UV も変えない。右 Ctrl の元画像プレビューや分析モードでは
 raw 表示に合わせるため、raw サイズを優先する。
 
 旧 **余白カットフィット** (`FullscreenFitMode::MarginFit`) は設定互換入口としてだけ残している。
@@ -993,8 +995,9 @@ final composite / comic composite は可視ページ単位で扱い、キャッ�
 即描画する。未生成ページだけを 1 フレーム 1 枚ずつ final pipeline に流し、現在ページが
 キャッシュ済みの場合は次の可視未生成ページへ処理枠を回すことで、スクロール中の大量 GPU
 アップロードを避けつつ画面端から表示品質を追従させる。AI アップスケールのように
-アスペクト比が変わらない processed テクスチャは配置サイズへ反映せず、crop などアスペクト比が
-変わる処理だけが連結読みのレイアウトを更新する。
+processed テクスチャは配置サイズへ反映せず、raw/source のアスペクト比を連結読みの
+レイアウト基準として保つ。crop は通常表示では暗転 overlay だけなので、連結読みの
+配置サイズや UV を変えない。
 通常見開き・ページ送り・連結読みは同じ画像表示ユニット列を使うため、横長ページの前後で
 単ページ扱いと一時的なずらしアンカーの扱いがずれない。
 横連結では `ReadingDirection` により
@@ -1024,14 +1027,14 @@ final composite / comic composite は可視ページ単位で扱い、キャッ�
    → local_adjust_cache[idx,input_gen,erase_mask_gen,local_gen]
    消しゴム結果があればそれを、なければ raw を入力にして非同期 worker で合成する。
    未生成または stale の間は古い補正レイヤー結果を表示せず、下位レイヤの画像を表示する。
-   サムネイルには反映しない。
+   raw thumbnail 自体は書き換えないが、永続 edit preview 経路では補正レイヤーを含む
+   編集結果を一覧へ表示できる。
    ↓
 4. 隠蔽加工 (モザイク / 白塗り / 黒塗り / ぼかし)
    → conceal_cache[idx, generation] (= local_adjust_cache / erase_result_cache / raw をベースに合成)
    ↓
-5. crop
-   → edit_result_cache[EditResultKey]
-   ここまでが source 解像度の edit pipeline。AdjustParams / AI / post_filter は含めない。
+5. edit_result_cache[EditResultKey]
+   ここまでが source 解像度の edit pipeline。crop / AdjustParams / AI / post_filter は含めない。
    ↓
 6. 色補正 (色温度・彩度・コントラスト・露出など)
    → apply_adjustments_fast(edit_result)
@@ -1061,17 +1064,21 @@ final composite / comic composite は可視ページ単位で扱い、キャッ�
    ↓
 11. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
    → final_composite_cache[FinalCompositeKey]
+   ↓
+12. capture / export 時だけ crop で実切り出し
 ```
 
-**ユーザー向けの言い換え**: 消しゴム / 補正レイヤー / モザイク加工 / crop は元画像の
-解像度で先に確定し、その後に明るさ・色・AI 拡大・効果フィルタが最後に乗る。
+**ユーザー向けの言い換え**: 消しゴム / 補正レイヤー / モザイク加工は元画像の
+解像度で先に確定し、その後に明るさ・色・AI 拡大・効果フィルタが乗る。crop は
+通常表示では範囲外を暗転するだけで、capture / export の最終段で初めて切り出す。
 そのためアップスケール ON/OFF や補正スライダー変更で編集マスクの解像度は変わらない。
 
 製本追加は表示 cache を読まず、UI thread で固定した `BakedEditSnapshot` を book worker の
 headless compositor が復元する。順序は raw → erase → local_adjust → conceal → adjustment →
-smart sharpen → post_filter → comic → rotation → export crop。表示専用の global AI upscale /
-denoise は意図的に飛ばすため、grid / fullscreen / stack のどこから追加しても原寸の edit composite
-になる。編集が 1 つも無い File / ZIP entry はこの経路へ入れず byte copy を維持する。
+comic → rotation → export crop。表示専用の global AI upscale / denoise / smart sharpen /
+colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fullscreen / stack の
+どこから追加しても原寸の edit composite になる。編集が 1 つも無い File / ZIP entry は
+この経路へ入れず byte copy を維持する。
 
 ### 3.1 詳細
 
@@ -1160,9 +1167,12 @@ denoise は意図的に飛ばすため、grid / fullscreen / stack のどこか�
     (`edit_result_cache` は保持)。post_filter / シャープ化**のみ**の変更は
     `final_composite_cache` だけクリアして final AI を保持する
     (preset-and-adjustment.md §4)
-  - 消しゴム / 補正レイヤー / 隠蔽加工 / crop 変更 → source 解像度の edit cache と final cache をクリア。
+  - 消しゴム / 補正レイヤー / 隠蔽加工変更 → source 解像度の edit cache と final cache をクリア。
     特に全ページ共通の隠蔽パラメータ変更は、edit 世代を安定キーに含めない
     `retained_final_ai_cache` も全失効し、変更前の AI 結果の復元を防ぐ
+  - crop 変更 → `edit_result_cache` / `final_ai_cache` / `final_composite_cache` は保持。
+    crop 済み下地と注釈を保存する永続 edit preview WebP だけを非同期失効し、
+    capture / export の切り出し範囲を更新する
   - 消しゴム/隠蔽加工/分析モード入出 → 該当 idx の final cache のみクリア (bypass 切替のため)
   - フォルダ切替 → edit / final / thumb 系 cache をグローバルクリア
   - 回転変更 → **キャッシュはクリアしない** (GPU 行列で回すため)

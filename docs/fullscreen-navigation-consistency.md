@@ -252,7 +252,7 @@ no-op 案内は段階を分ける:
      `PointerButton::Extra1/Extra2` として届く。`handle_keyboard` / `update_fullscreen` /
      native video `handle_native_video_mouse_button` が直接 bind 済み。
   2. **WM_APPCOMMAND** (mouse driver / Microsoft IntelliPoint 系が APPCOMMAND_BROWSER_BACKWARD/FORWARD を送る経路、または `WM_XBUTTONUP` を未処理にした際に `DefWindowProc` が自動昇格): winit はハンドリングしないため、mIV が自前で拾う。
-     - **メインウィンドウ**: `src/main.rs` の `install_mouse_nav_hook` が `WH_GETMESSAGE`
+     - **メインウィンドウ**: `src/lib.rs` の `install_mouse_nav_hook` が `WH_GETMESSAGE`
        フックで観測し、グローバル atomic `PENDING_MOUSE_NAV_BACK/FORWARD` に積む。
        `App::take_pending_mouse_nav` を介して `handle_keyboard` / `update_fullscreen` が
        消費し、`apply_mouse_back_forward_button` に合流する。

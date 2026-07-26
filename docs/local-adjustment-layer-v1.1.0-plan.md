@@ -1,9 +1,20 @@
 # v1.1.0 画像補正・補正レイヤー計画
 
-Status: Codex 案 / Draft
+Status: 実装済み機能の現行仕様 + 実装前の設計経緯
 Date: 2026-05-31
 
-## 1. 背景
+> **現況 (2026-07)**
+>
+> - **コードで実装確認済み**: 複数補正レイヤー、9 mask variant、107 effect
+>   (`LocalEffect` は `None` 込み 108 variant)、非同期合成、Undo / Redo、ページ単位 DB、
+>   サイドカー、永続 edit preview、独立 crop、capture / export 連携。
+> - **現行の正本**: 処理順は §3、データモデルは §4.1、永続化は §7、cache 境界は §8。
+> - **未実装**: `local-adjust-ui` の共通 crate 化。これは現行機能の動作要件ではない。
+> - **手動検証**: §11.1 の実機チェックを完了した記録は本書から確認できないため未確認。
+> - **既知の実装未達**: UI thread 同期 materialization と preview cache の context ownership は
+>   [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録済み。ここでは仕様を弱めない。
+
+## 1. 実装前の背景 (設計経緯)
 
 v1.0.0 後の拡張候補として、自動検出によるマスク生成を検証したが、局部検出はイラストで
 見逃しが多く、検出範囲も実際の隠蔽用途には広すぎる傾向があった。検出が外れると事故に
@@ -19,7 +30,7 @@ v1.1.0 では次の 3 本をまとめて進める。
 - マスク作成・調整機能の強化
 - マスクを使った補正レイヤーの導入
 
-## 2. 目標
+## 2. 初期目標とスコープ (実装前の設計経緯)
 
 ### 2.1 ユーザー価値
 
@@ -51,30 +62,36 @@ v1.1.0 では次の 3 本をまとめて進める。
 
 ## 3. 処理順序
 
-v1.1.0 では、既存挙動を大きく崩さず、消しゴム後・隠蔽加工前に補正レイヤーを差し込む。
+現行実装は source 解像度の edit pipeline と、表示用 final pipeline を分離する。
+crop はどちらの cache key にも入らず、通常表示では暗転 overlay、capture / export では
+最終段の実切り出しとして扱う。
 
 ```
-元画像
-  -> AI denoise / upscale
-  -> 全体画像補正
-  -> ポストフィルタ
-  -> 消しゴム / 補完
-  -> 補正レイヤー x N
-  -> 隠蔽加工
-  -> crop (任意、最後段)
-  -> 表示 / 書き出し
+raw decode
+  -> erase
+  -> local-adjust x N
+  -> conceal
+  -> edit_result_cache[EditResultKey]
+  -> 色調補正 (AdjustParams)
+  -> final AI
+  -> smart sharpen
+  -> colorize
+  -> Creative LUT
+  -> post-filter
+  -> final_composite_cache[FinalCompositeKey]
+  -> 通常表示 (crop は暗転 overlay のみ)
+  -> capture / export の最終段で crop
 ```
 
-本体 UI では画像補正パネルのヘッダーに処理順を合わせ、`消しゴム -> 補正レイヤー -> 隠蔽加工 -> エクスポート`
-の順にアイコンを並べる。`local_adjust_lab` では同じ流れを確認できるように、消しゴムと隠蔽加工は
-軽量なダミーパネル、補正レイヤー、切り取り、保存は実操作パネルとして用意する。
+`EditResultKey` は idx / source generation / erase mask generation / local generation /
+conceal mask generation / conceal generation を持ち、crop を持たない。crop 変更では edit / final AI /
+final composite を保持し、crop 済み下地・注釈を保存する永続 edit preview WebP だけを失効する。
 
-現状のポストフィルタは鑑賞時のおまけ的な機能として追加されたもので、調整項目も少ない。
-そのため v1.1.0 では全体画像補正の中に置いたままにする。
-
-将来、ポストフィルタをアップロード前の最終ルックとして使う要望が強くなった場合は、
-「隠蔽加工後に再適用できる最終フィルタ」として別段に分ける。ただし、その場合は各フィルタの
-強度調整や書き出し UI も合わせて再設計する。
+グリッドは raw thumbnail に加えて、erase / local-adjust / conceal と crop、注釈を反映した
+永続 edit preview を優先表示できる。表示 final pipeline の colorize / Creative LUT /
+post-filter は edit preview には焼き込まない。詳細は
+[display-pipeline.md](display-pipeline.md) と
+[preset-and-adjustment.md](preset-and-adjustment.md) を正本とする。
 
 ## 4. 補正レイヤー
 
@@ -94,6 +111,46 @@ UI 上の呼称は「補正レイヤー」とする。
 ように専用ハンドル系があるものは、効果中心ハンドルには混ぜず、その専用操作を維持する。
 
 ### 4.1 基本モデル
+
+現行の serialization model は `crates/local-adjust-core/src/lib.rs` の型を正本とする。
+レイヤー自身に UUID は持たず、ページごとの順序付き `Vec<LocalAdjustmentLayer>` として保存する。
+
+```rust
+pub struct LocalAdjustmentLayer {
+    pub name: String,
+    pub enabled: bool,
+    pub opacity: f32,
+    pub mask: LocalMask,
+    pub manual_override: ManualMaskOverride,
+    pub mask_inverted: bool,
+    pub mask_expand_px: f32,
+    pub mask_feather_px: f32,
+    pub mask_before_effect: bool,
+    pub mask_after_effect: bool,
+    pub effect: LocalEffect,
+}
+
+pub enum LocalMask {
+    Full,
+    Raster(RasterMask),
+    RasterVector(RasterVectorMask),
+    LinearGradient(LinearGradientMask),
+    RadialGradient(RadialGradientMask),
+    LumaRange(RangeMask),
+    ColorRange(ColorRangeMask),
+    Subject(SubjectMask),
+    Segmentation(RegionMask),
+}
+```
+
+`LocalEffect` は `None` を含む 108 variant、実効果は 107 種。`Repair` を含む現行一覧は
+[local-adjust-filter-candidates.md](local-adjust-filter-candidates.md) の実装済み棚卸しを参照する。
+1 レイヤーにつき effect は 1 つで、複数効果は複数レイヤーとして順に合成する。
+
+#### 初期データモデル案 (未採用)
+
+以下の UUID 付きレイヤー、縮小版 effect enum、6 系統にまとめた mask enum は実装前の案であり、
+現行の serialization や DB schema には使用しない。
 
 ```rust
 struct LocalAdjustmentLayer {
@@ -273,7 +330,7 @@ generator の出力をユーザーが期待する髪 / 服 / 小物などの意�
 過分割や細かい破片が目立った。v1.1.0 では領域分割への AI 導入を見送り、クラシック分割と
 手動補正をチューニングする。詳細は [archive/ai/ai-region-segmentation-retrospective.md](archive/ai/ai-region-segmentation-retrospective.md) を参照。
 
-## 5. v1.1.0 の効果候補
+## 5. v1.1.0 の初期効果候補 (実装前の設計経緯)
 
 ### 5.1 全体画像補正に追加する候補
 
@@ -351,7 +408,7 @@ Look / LUT は「プリセット名 + 強度 + 適用色空間」を持つ。内
 外部 LUT 読み込みは、v1.1.0 の後半または次フェーズで `.cube` を候補にする。ライセンス上、
 同梱 LUT は自作または配布許諾が明確なものに限定する。
 
-## 6. UI 案
+## 6. 初期 UI 案 (実装前の設計経緯)
 
 ### 6.1 全体補正パネル
 
@@ -552,7 +609,7 @@ Undo / Redo は `Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z` をサポートする。
 AI 自動検出よりも、ユーザーの意図した範囲を狭く安全に作れることを優先する。
 セグメンテーションは「自動で完璧に確定する」機能ではなく、マスク作成の出発点として扱う。
 
-## 7. 永続化案
+## 7. 現行の永続化
 
 ### 7.0 mIV 本体統合時の最小方針
 
@@ -566,11 +623,12 @@ AI 自動検出よりも、ユーザーの意図した範囲を狭く安全に�
 - crop サイドカー: 同じエントリに `export_crop` を保存する。
 - キー規則: `App::page_path_key` と同じ正規化済み page key
 - 対象: 通常画像 / ZIP 内画像 / PDF ページ
-- サムネイル: 補正レイヤー結果は反映しない。消しゴム / 隠蔽加工と同じく、必要ならバッジのみ表示する。
+- サムネイル: raw thumbnail と永続 edit preview を分離する。edit preview は
+  erase / local-adjust / conceal / crop / 注釈を反映し、未生成・失効中は raw とバッジへ fallback する。
 - stale 中の表示: 古い補正レイヤー結果を残さず、補正レイヤー抜きの現在ベース画像を即時表示する。
 
 現在の mIV 本体 UI は、フルスクリーン左パネルのヘッダーに
-`消しゴム -> 補正レイヤー -> 隠蔽加工 -> エクスポート` の順でアイコンを並べ、
+`消しゴム -> 補正レイヤー -> 隠蔽加工 -> 切り取り -> エクスポート` の順でアイコンを並べ、
 補正レイヤーアイコンから、消しゴム / 隠蔽加工と同じ右上 `×` 付きの
 独立左パネルを開く。切り取りアイコンは crop モードの独立左パネルを開き、エクスポート
 アイコンは `Ctrl+E` と同じ別ダイアログへ合流する (crop とエクスポートは別機能)。
@@ -584,70 +642,59 @@ Undo / Redo、独立した切り取り (crop) モードまで本体へ接続済�
 フォルダ単位 `mimageviewer.dat` を使う。中央 DB に既に補正レイヤーがある場合、サイドカーからの
 インポートでは上書きしない。
 
-DB 案は、将来本体に統合するときの高速検索 / 一括管理 / 仮想フォルダ対応用として残す。
-
-候補:
+現行の中央 DB と crop DB:
 
 - `local_adjust_db.rs`
 - `%APPDATA%/mimageviewer/local_adjust.db`
 - `export_crop.rs`
 - `%APPDATA%/mimageviewer/export_crop.db`
 
-テーブル案:
+`local_adjust.db` はレイヤーごとの行ではなく、ページ単位の JSON 配列を保存する:
 
 ```sql
-CREATE TABLE local_adjust_layers (
-    page_path TEXT NOT NULL,
-    layer_id TEXT NOT NULL,
-    z_index INTEGER NOT NULL,
-    enabled INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    opacity REAL NOT NULL,
-    mask_inverted INTEGER NOT NULL,
-    mask_expand_px REAL NOT NULL,
-    mask_feather_px REAL NOT NULL,
-    mask_width INTEGER NOT NULL,
-    mask_height INTEGER NOT NULL,
-    mask_blob BLOB NOT NULL,
-    vectors_json TEXT NOT NULL,
-    mask_source_json TEXT NOT NULL,
-    effect_json TEXT NOT NULL,
-    PRIMARY KEY (page_path, layer_id)
+CREATE TABLE local_adjust_pages (
+    page_path   TEXT PRIMARY KEY,
+    layers_json TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
 );
 ```
 
 `page_path` の正規化は `adjustment_db::normalize_path` と同じ規則に揃える。
 ZIP / PDF ページのキーも既存のページキー生成に合わせる。
 
-`mask_blob` は最終的な raster alpha mask の保存またはキャッシュとして使う。
-`vectors_json` は手描き / ポリゴン系の編集情報、`mask_source_json` はグラデーション、
-輝度 / カラー範囲、被写体選択、領域分割などのパラメータを保存する。
-合成時は `mask_source_json` から必要なら raster alpha mask を再生成し、既存の mask pipeline に流す。
+`layers_json` はページの順序付き `Vec<LocalAdjustmentLayer>` 全体を serialize する。
+空配列は行削除として扱う。中央 DB を authoritative とし、DB に行がない場合だけ
+`mimageviewer.dat` の `local_adjust_layers` から import するため、既存 DB をサイドカーで
+上書きしない。
 
 サイドカーバックアップ `mimageviewer.dat` には `local_adjust_layers` 配列と `export_crop` を保存する。
 `local_adjust_lab` の `foo.png.miv` 形式は検証用で、本体の正式保存形式ではない。
 
-## 8. キャッシュ案
+## 8. 現行のキャッシュ境界
 
-新しい表示優先順位:
+source 解像度の edit chain は次の ownership を持つ:
 
 ```
-conceal_cache
-  > local_adjust_cache
-  > erase_result_cache
-  > adjustment_cache
-  > ai_upscale_cache
-  > fs_cache
+raw fs_cache
+  -> erase_result_cache
+  -> local_adjust_cache
+  -> conceal_cache
+  -> edit_result_cache[EditResultKey]
 ```
 
-ただし、隠蔽加工の合成入力は `local_adjust_cache` を優先する。
+全体色調 / final AI / smart sharpen / colorize / Creative LUT / post-filter はこの後の
+`final_composite_cache` 側で適用する。したがって local-adjust の入力へ adjustment / AI の
+表示結果を戻してはならない。
 
 ```
 local adjust source:
-  erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache
+  erase_result_cache > fs_cache
 
 conceal source:
-  local_adjust_cache > erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache
+  local_adjust_cache > erase_result_cache > fs_cache
+
+normal display:
+  final_composite_cache > edit_result_cache > fs_cache
 ```
 
 `local_adjust_cache` は非同期 worker で生成する。補正レイヤーが存在するが cache が未生成、
@@ -657,22 +704,24 @@ stale、または worker 実行中の場合、表示は `local adjust source` �
 
 ### 8.1 無効化
 
-| 変更 | local_adjust_cache | conceal_cache |
-| --- | --- | --- |
-| 全体補正変更 | クリア | クリア |
-| AI denoise / upscale 結果変更 | クリア | クリア |
-| 消しゴムマスク変更 / 補完結果変更 | クリア | クリア |
-| 補正レイヤー変更 | クリア | クリア |
-| 隠蔽加工変更 | 残す | クリア |
-| 最後段 crop 変更 | 残す | 残す |
-| 回転変更 | 残す | 残す |
+| 変更 | edit chain | final pipeline | 永続 edit preview |
+| --- | --- | --- | --- |
+| raw 入力 / 消しゴム変更 | 該当 idx の erase 以降を失効 | 該当 idx を失効 | 非同期削除 |
+| 補正レイヤー変更 | erase は保持、local / conceal / edit を失効 | 該当 idx を失効 | 非同期削除 |
+| 隠蔽マスク変更 | erase / local は保持、conceal / edit を失効 | 該当 idx を失効 | 非同期削除 |
+| 隠蔽パラメータ変更 | local まで保持、全 idx の edit を失効 | 全 idx を失効 | 対象 preview を失効 |
+| 全体補正 / AI / final effect 変更 | **保持** | 必要な final 段だけ失効 | 色調 preview だけを必要に応じ再生成 |
+| crop 変更 | **保持** | **保持** | crop 済み preview だけ非同期削除・再生成 |
+| 回転変更 | **保持** | **保持** | 保持 |
 
-補正レイヤーは隠蔽加工より前段なので、補正の変更は隠蔽加工の表示結果にも影響する。
-そのため `local_adjust_cache` と `conceal_cache` の両方を stale にする。
+`EditResultKey` に crop は含めない。最後段 crop は `local_adjust_cache` / `conceal_cache` /
+`edit_result_cache` / final AI / final composite の内部画像を変えず、通常表示の overlay と
+capture / export の切り出し範囲だけを変える。
 
-最後段 crop は `local_adjust_cache` / `conceal_cache` の内部画像を変えず、表示または書き出し時に
-切り出すだけにする。この場合、crop 変更は crop preview / export のみを更新し、上流 cache は
-残せる。
+各 cache / pending / worker は viewer context 単位の owner に属し、作成・cancel・drain・drop を
+同じ context に閉じる。別 context の read-only close で sibling の preview を失効させてはならない。
+現実装の未達は [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録するが、
+この ownership 不変条件自体は変更しない。
 
 ## 9. パフォーマンス方針
 
@@ -704,7 +753,7 @@ stale、または worker 実行中の場合、表示は `local adjust source` �
 - PDF ズーム再レンダリングや AI アップスケールでソース解像度が変わる場合、マスクを一度だけ
   ソース解像度へリスケールする。
 
-## 10. 実装フェーズ
+## 10. 実装フェーズ (完了までの設計経緯)
 
 ### mIV 本体統合タスクリスト
 
@@ -799,7 +848,8 @@ crop は **エクスポートとは別機能** で、エクスポートダイア
   暗転、モード外でも crop を持つページは暗転枠を表示する (`export_crop_mode || has_crop`)。
   内部画像サイズ・表示 UV は変えない (UV rect での実切り出しはしない方針)。
 - 実際の切り出しは **Ctrl+S コピー / Ctrl+E 書き出しの最終段**で `crop_color_image` により行う。
-- `local_adjust_cache` / `conceal_cache` は crop 変更で破棄しない。
+- `local_adjust_cache` / `conceal_cache` / `edit_result_cache` / final AI / final composite は
+  crop 変更で破棄しない。永続 edit preview WebP だけを失効・再生成する。
 - 切り取りパネル (`draw_crop_panel`): 比率 (自由 / 現在比率 / 1:1 / 4:3 / 3:4 / 16:9 / 9:16)、
   有効化・解除、X / Y / W / H 数値入力、画像内ドラッグでの crop rect 作成 / ハンドル編集。
   全体サイズと同じ crop rect は切り取りなしとして扱う。
@@ -809,7 +859,11 @@ crop は **エクスポートとは別機能** で、エクスポートダイア
   指定は AI アップスケールの巨大サイズを一定上限へ収める用途で、長辺が指定値を超えるときだけ
   等比縮小しアップスケールはしない。
 
-### Future: crop / ジオメトリ系の非破壊編集
+### crop / ジオメトリ案の比較 (実装前の設計経緯)
+
+以下は実装前に比較した案である。現行実装は案 B を基礎に、通常表示を暗転 overlay、
+実切り出しを capture / export の最終出力段とした。例示した当時の pipeline 順は現行仕様では
+ないため、処理順は §3 を正本とする。途中 crop と水平補正だけが将来候補として残る。
 
 crop は投稿前の軽い仕上げとして価値が高い。特に Look / Bloom / 粒子などの仕上げ系レイヤーを
 整備すると、「最後に構図を詰めたい」需要が強くなる。
@@ -892,15 +946,15 @@ crop は投稿前の軽い仕上げとして価値が高い。特に Look / Bloo
 - crop 前に行った補正やマスクを再利用しづらい。
 - ユーザー体験としては、軽い仕上げ用途には不便。
 
-#### Codex 推奨
+#### 当時の推奨と採用結果
 
-v1.1.0 では、まず案 B の「最後段の非破壊 crop」を推奨する。
+案 B の「最後段の非破壊 crop」を採用した。
 
 - 内部パイプラインの解像度は最後まで変えない。
 - crop rect は source image coordinate で保存する。
 - 切り取りパネル表示中は crop 外を常に暗くし、crop 範囲を確認しながら調整できるようにする。
 - 書き出し時は隠蔽加工まで反映した最終画像に crop を適用する。
-- crop 外を暗くする overlay と、crop 内だけへズームする preview mode を用意する。
+- crop 外を暗くする overlay を実装した。crop 内だけへズームする preview mode は採用していない。
 
 この形なら、パイプライン途中で解像度が変わらないため、v1.1.0 の補正レイヤー実装を
 大きく複雑化せずに crop 需要へ応えられる。将来、crop 後解像度での編集や水平補正まで
@@ -921,7 +975,7 @@ v1.1.0 では、まず案 B の「最後段の非破壊 crop」を推奨する�
   crop 外暗転 overlay と書き出し範囲だけが変わる。
 - crop を持つページでも、内部マスク座標は source image coordinate のまま扱える。
 
-### 11.1 mIV 最小統合の実機試験チェック
+### 11.1 mIV 最小統合の手動実機試験チェック (実施状況未確認)
 
 2026-06-03 時点の mIV 本体統合では、`local_adjust_lab` の効果ピッカー、効果パラメータ UI、
 マスク種別 UI、グラデーション/カラー/手描き/効果位置ハンドルの主要キャンバス操作、
@@ -954,7 +1008,8 @@ Undo / Redo を本体へ移植済み。2026-06-05 に切り取り (crop) を独�
 - 追加直後は古い補正レイヤー結果を残さず、一度下位画像で表示された後、非同期完了で
   補正レイヤー結果へ差し替わる。
 - ON/OFF、削除、全削除が DB に保存され、フォルダを開き直してもレイヤー一覧と `局`
-  バッジが復元される。サムネイル画像自体は補正レイヤー結果に変わらない。
+  バッジが復元される。永続 edit preview が有効なら補正レイヤー結果を反映した preview が
+  復元され、未生成・失効中は raw thumbnail とバッジへ fallback する。
 - 消しゴムマスクがあるページでは、消しゴム結果が揃ってから補正レイヤーが乗る。
 - 隠蔽加工マスクがあるページでは、補正レイヤー結果の上に隠蔽加工が乗る。
 - 右 Ctrl 元画像プレビューでは補正レイヤー結果も一時的に外れる。
@@ -968,7 +1023,7 @@ Undo / Redo を本体へ移植済み。2026-06-05 に切り取り (crop) を独�
 - Ctrl+Z / Ctrl+Y でレイヤー追加/削除、パラメータ編集、キャンバス編集、LUT 読み込みが戻る。
 - 現時点の意図的な未実装: `local-adjust-ui` 共通 crate 化。
 
-## 12. 優先順位
+## 12. 初期優先順位 (実装前の設計経緯)
 
 最初に作る価値が高い組み合わせ:
 
@@ -992,7 +1047,7 @@ Undo / Redo を本体へ移植済み。2026-06-05 に切り取り (crop) を独�
 この順なら、今回のフィードバックにあった「背景をぼかしてキャラクターを強調する」用途に
 早く到達でき、同時に v1.1.0 の基盤としてマスク強化と補正強化を自然につなげられる。
 
-## 13. プロトタイプ実装
+## 13. プロトタイプ実装 (本体統合前の設計経緯)
 
 本体統合前の検証用として、以下を追加した。
 

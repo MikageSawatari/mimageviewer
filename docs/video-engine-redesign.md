@@ -1,6 +1,23 @@
-# 動画再生エンジン リデザイン (草案 v0)
+# 動画再生エンジン リデザイン — 設計案と採否履歴
 
-## 背景
+> **現況ステータス (2026-07-26 コード確認)**
+>
+> - topology: `VideoPlayer` が `Arc<Mutex<EngineActor>>` を所有する。UI tick が engine event を
+>   drain し、操作は mutex 下の `apply_command` へ同期適用する。専用 actor thread と
+>   `TransportController` / command channel は未採用の将来候補。
+> - state schema: `Idle / Loading / Buffering / Playing / Paused /
+>   Seeking { target_secs } / Eof`。resume intent は state payload ではなく actor context が所有する。
+> - readiness: `(NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)`。映像・音声が
+>   どちらもない場合は never-ready。audio-only は `NoVideo` で ready になれる。
+> - anchor: `BufferReady` では PTS を latch するが、その event の wall は Playing anchor に
+>   使わない。wall は Playing 遷移時の `Instant::now()` を採る。
+> - audio ready threshold: 100ms。再生 decoder は output device rate を使い、48kHz は fallback。
+> - pacing: Buffering/Seeking 中は Full の frame を保持して retry し、Paused/Eof では
+>   video/audio decode worker を park する。Playing 中だけ通常の drop/pacing policy を使う。
+> - 以下の初期案・実装履歴に日付付きの手動記録はあるが、この 2026-07-26 整合更新では
+>   新たな手動検証を行っていない。
+
+## 初期設計時の背景 (historical)
 
 [docs/video-architecture.md](video-architecture.md) でまとめた現行構成の `AvClock` が、
 **マスタークロック・再生状態・シーク要求・音量・EOF・音声バッファ会計** を 1 オブジェクトに
@@ -21,7 +38,7 @@
    audio resample rate の両方を協調更新する必要があるが、一つのオブジェクトに混ざって
    いる現状ではテストが書きづらい。
 
-## 目標
+## 初期設計時の目標 (historical)
 
 | 優先 | 目標 |
 |---|---|
@@ -33,7 +50,7 @@
 
 スコープ外: 動画編集、字幕、HDR トーンマップ。
 
-## 現行 `AvClock` の責務分解
+## 初期設計時の `AvClock` 責務分解 (historical)
 
 70 箇所以上のメソッド呼び出しを 4 つの concern にグルーピング:
 
@@ -45,7 +62,10 @@
 | **AudioBookkeeping** (音声バッファ会計) | `set_audio_pump_buf_secs` / `add_audio_tx_queued_secs` / `total_audio_buffer_secs` | decoder pacing 用の参照値だが、所有者が不明 (clock?audio?) |
 | **Volume** | `volume` / `set_volume` / `is_muted` / `set_muted` | 純粋に表示状態。clock とは無関係。 |
 
-## 採用する分解
+## 初期案の分解 (採用済み・未採用が混在)
+
+次の図は初期案である。`EngineState` / `MasterClock` の考え方は採用したが、図中の
+`TransportController`、command channel、専用 actor thread は未採用。現行 topology は冒頭を正とする。
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -98,17 +118,18 @@ impl MasterClock {
 }
 ```
 
-- **書き手は EngineActor のみ** (Codex P1 反映)。`AudioActor` / `DecoderActor` / UI tick
-  は anchor を直接書かず、events として `EngineActor` に送る。**全 events は seek_epoch
+- **書き手は EngineActor のみ**。decoder/audio producer と UI tick は anchor を直接書かず、
+  UI tick が event を drain して mutex 下の `EngineActor` に適用する。**全 events は seek_epoch
   を含む** (= stale 検出のため):
   - `AudioRendered { epoch, pts, wall_now }` (cpal callback ごと)
   - `SeekCompleted { epoch, actual_pts }` (decoder seek 完了)
   - `FirstFrameReady { epoch, pts }` (post-seek/open の最初の動画 frame)
-  - `BufferReady { epoch, pts, wall_now }` (audio buffer が READY_THRESHOLD 到達)
+  - `BufferReady { epoch, pts, wall_now }` (audio buffer が READY_THRESHOLD 到達。PTS は latch、
+    wall は Playing anchor に使わない)
   - `BufferStarved { epoch }` (audio underrun = SAFE_LO 未満)
   - `EofReached { epoch, duration }` (decoder EOF)
   - `AudioInactive` (audio 出力起動失敗、epoch 非依存)
-  EngineActor はこれらの events を直列に処理して `MasterClock.set_anchor` を呼ぶ。
+  EngineActor はこれらの events を直列に処理し、必要な遷移で `MasterClock.set_anchor` を呼ぶ。
   → 旧 AvClock の「複数経路から同じ atomic を書く race」が消える。
   - 追加 events: `FirstFrameReady` (decoder)、`BufferReady` (audio)、
     `BufferStarved` (audio underrun)。Buffering↔Playing の遷移トリガに使う
@@ -143,22 +164,26 @@ pub enum EngineState {
     Loading,
     /// info 受領 + resume seek 適用中。最初の post-seek frame 到着待ち。
     /// Clock は Frozen で時間進行なし。UI には既存の thumbnail を表示。
-    Buffering { resume_target: Option<f64> },
+    Buffering,
     /// 再生中。Clock は Audio/Wall で進行。
     Playing,
     /// 一時停止中。Clock は Frozen。
     Paused,
     /// シーク中。pre-seek frames を drain して target 到達まで待つ。
     /// Clock は Frozen (= override target 値で固定)。
-    Seeking { target: f64 },
+    Seeking { target_secs: f64 },
     /// EOF 到達 (loop_enabled=false で停止状態)。Clock は Frozen at duration。
     Eof,
 }
 ```
 
+resume target / autoplay-after-buffer の intent は `EngineState` payload ではなく
+`EngineActor` の context が所有する。
+
 遷移図:
 
-凡例: `READY = FirstFrameReady ∧ (NoAudio ∨ BufferReady)` (= readiness latch、
+凡例: `READY = (NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)`
+(= readiness latch。映像・音声の両方がない場合は never-ready)、
 詳細は「latch ロジック」節)
 
 ```
@@ -180,7 +205,8 @@ Eof ── loop=true ──► Seeking{0} ── … ──► Playing
 **重要な不変条件**:
 - `Loading` / `Buffering` / `Seeking` / `Paused` / `Eof` のとき MasterClock は
   必ず `Frozen` source。**時間が暴走することがない**。
-- `Buffering` から `Playing` への遷移トリガは **`FirstFrameReady ∧ (NoAudio ∨ BufferReady)`**
+- `Buffering` から `Playing` への遷移トリガは
+  **`(NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)`**
   の latch。両 readiness イベントは seek_epoch スコープで管理し、片方が先着しても
   もう片方を待つ (詳細は「latch ロジック」節)。これにより resume 中に「anchor は
   target だが decoder はまだ pts=0 をデコード中」というギャップが Engine API レベル
@@ -188,7 +214,7 @@ Eof ── loop=true ──► Seeking{0} ── … ──► Playing
 - 序盤早送りの根本原因 (= AUDIO_SAFE_LO による pacing skip) も `Buffering` 中は
   「audio が満たされてから Playing に遷移」する保証で消える。
 
-### 3. `TransportController` (外部 API)
+### 3. 将来候補 (未採用): `TransportController` / command channel
 
 ```rust
 pub struct TransportController { /* command_tx + state subscription */ }
@@ -209,7 +235,8 @@ impl TransportController {
 }
 ```
 
-- 操作はすべて **command channel** 経由で `EngineActor` に渡る。
+- この節は未採用案。現行の操作は `VideoPlayer` が保持する
+  `Arc<Mutex<EngineActor>>` を lock し、`apply_command` へ同期適用する。
 - 外部から直接書ける可変状態は **Volume と LoopEnabled のみ** (これらは clock 進行に
   影響しないので atomic で公開しても安全)。
 - `position_secs()` は MasterClock を読むだけ。
@@ -232,10 +259,14 @@ self.published_state.store(EngineState::Playing as u8, Ordering::Release);
 decoder pacing 側は `Acquire` で state を読み、その後 `Acquire` で anchor を読む。
 release/acquire の同期で anchor の最新値を確実に観測できる。
 
-### 4. `EngineActor` (内部調停)
+### 4. `EngineActor` (現行の内部調停)
 
-ロックフリー I/O (RT 経路: cpal callback、wgpu paint) と分離するため、状態遷移は
-**専用 worker thread** で命令 + イベントの統合ループとして処理する。
+現行は `VideoPlayer.engine: Arc<Mutex<EngineActor>>` が状態 owner である。UI tick が
+`drain_engine_events()` で decoder/audio event を drain して actor に適用し、外部操作も
+同じ actor の `apply_command` へ同期適用する。これにより state transition は直列化されるが、
+専用 actor worker thread / command channel は採用していない。
+
+次の統合 loop は **将来候補 (未採用)** である。
 
 ```rust
 fn run(...) {
@@ -253,11 +284,11 @@ fn run(...) {
 
 - **シーク要求の調停**もここで行う。`apply_command(SeekAbsolute(t))` 受信で
   `handle_seek_request(t, ...)` (= epoch++ + latch reset + decoder へ SeekTo)、
-  state を `Seeking { target: t }` に遷移。
+  state を `Seeking { target_secs: t }` に遷移。
 - decoder からの `SeekCompleted { epoch, actual_pts }` イベントで `ev.epoch <
   current_seek_epoch` を捨てた上で Clock anchor を `Frozen at actual_pts` に書き換え、
   state を `Buffering` に遷移。**まだ Playing ではない** — readiness latch
-  (`FirstFrameReady ∧ (NoAudio ∨ BufferReady)`) が揃って初めて
+  (`(NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)`) が揃って初めて
   `transition_to_playing(audio_anchor)` が呼ばれる。
 - `BufferReady` 単独では Playing には遷移しない (= 動画 frame の準備が先に揃って
   いれば BufferReady で latch 完成、揃っていなければ FirstFrameReady を待つ)。
@@ -273,7 +304,7 @@ read-only スナップショットを atomic で公開する。
 
 decoder の pacing は `engine.audio_status().buf_secs < SAFE_LO` で参照する。
 
-## resume の atomic open path
+## 初期案: resume の atomic open path (topology は未採用)
 
 これが本リデザインの最大の利益:
 
@@ -304,10 +335,12 @@ match state {
             duration = Some(info.duration_secs);
             if let Some(resume) = opts.resume_secs.and_then(in_range) {
                 decoder.send(DecoderCmd::SeekTo(resume));
-                state = Buffering { resume_target: Some(resume) };
+                resume_target = Some(resume); // actor context ownership
+                state = Buffering;
                 clock.set_anchor(ClockAnchor::frozen_at(resume));
             } else {
-                state = Buffering { resume_target: None };
+                resume_target = None;
+                state = Buffering;
                 clock.set_anchor(ClockAnchor::frozen_at(0.0));
             }
         }
@@ -329,20 +362,19 @@ match state {
 - `Loading` / `Buffering` で Clock は **Frozen** = 時間進行 0。decoder pacing の
   pace_now も Frozen 値。pacing skip 条件 (`audio_buf < SAFE_LO`) を踏まないので
   decoder は通常 pacing で送出。
-- audio buffer が **READY_THRESHOLD (500ms)** 溜まってから `Playing` 遷移
-  (Codex P2 反映: 旧 AUDIO_SAFE_LO = 250ms と同値だと low-water level に張り付き、
-  jitter で即 buffering に戻る。ready 500ms / low 250ms の hysteresis を採用)。
-- VBR audio でも sample-count ベースで 500ms = 24000 stereo pairs @ 48kHz と決まるので
-  PTS 揺らぎの影響を受けない。
-- `Playing` 遷移と同時に `set_anchor(audio_pts, wall_now)` で、wall extrapolation 起点を
-  「buffering 完了時刻」に揃える。
+- audio buffer が **READY_THRESHOLD (100ms)** 溜まってから `Playing` 遷移する。変更理由の
+  恒久記録は [video-architecture.md](video-architecture.md) を正とする。
+- threshold は output device sample rate から sample count へ換算する。再生系の rate は
+  device rate、取得できない場合だけ 48kHz fallback であり、48kHz 固定なのは解析用 decoder。
+- `BufferReady` では audio PTS を latch し、`Playing` 遷移時に
+  `set_anchor(audio_pts, Instant::now())` として wall extrapolation 起点を採る。
 
 ## Buffering deadlock 回避 (Codex v2 P1 反映)
 
 「Buffering 中は decoder pacing が sleep するなら、audio fill も止まり、READY_THRESHOLD
-500ms に永久に到達できないのでは?」という deadlock リスクは、後述の「Decoder pacing
-規定 (確定版)」で **Buffering 中は pacing skip + audio decode/send は state 不問で常時
-実施** とすることで構造的に消える。詳細は当該節を参照。
+100ms に永久に到達できないのでは?」という deadlock リスクは、後述の現行 pacing 規定で
+**Buffering 中は pacing をせず audio decode/send を進める**ことで回避する。Paused/Eof では
+audio/video worker とも park する。
 
 **latch ロジック** (Buffering→Playing 遷移):
 
@@ -357,7 +389,8 @@ struct ReadinessLatch {
     /// 音声無し動画の anchor source として使う。
     first_frame_pts: Option<f64>,
     buffer_ready: bool,
-    /// BufferReady event が返した最初の有効 audio PTS / wall (anchor 設定用)。
+    /// BufferReady event が返した最初の有効 audio PTS / wall。
+    /// PTS は anchor 用。wall は event 記録であり Playing anchor には再利用しない。
     audio_anchor: Option<(f64, Instant)>,
 }
 
@@ -388,12 +421,14 @@ fn handle_readiness_event(&mut self, ev: ReadinessEvent) {
 
 fn try_transition_to_playing(&mut self) {
     if self.state != Buffering { return; }
+    if !self.has_video && !self.has_audio { return; } // playable stream なしは never-ready
+    let video_ready = !self.has_video || self.latch.first_frame;
     let audio_ready = !self.has_audio || self.latch.buffer_ready;
-    if self.latch.first_frame && audio_ready {
+    if video_ready && audio_ready {
         // helper: anchor → state の順を強制 (Codex v3 P2 反映)
         let anchor = if self.has_audio {
             let (pts, wall) = self.latch.audio_anchor.expect("buffer_ready implies anchor");
-            ClockAnchor::audio(pts, wall)
+            ClockAnchor::audio(pts, Instant::now()) // BufferReady の wall は使わない
         } else {
             let pts = self.latch.first_frame_pts.expect("first_frame implies pts");
             ClockAnchor::wall(pts, Instant::now())
@@ -450,7 +485,7 @@ fn enter_initial_buffering(&mut self) {
 - pre-seek の stale event は epoch 不一致で捨てられる → 古い frame で誤遷移しない
 - transition は helper 経由で必ず anchor → state の順 (publish 順序の race 防止)
 
-## Decoder pacing 規定 (確定版、Codex v3 P2 反映)
+## 現行 Decoder pacing 規定
 
 旧 decoder pacing:
 ```rust
@@ -464,9 +499,9 @@ if clock.is_audio_active() && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO {
 | State | video pacing | video try_send 失敗時 | audio decode/send | 備考 |
 |---|---|---|---|---|
 | `Playing` | 通常: `pts - pace_now <= PACE_LEAD` で break、それ未満なら 5ms sleep | 通常 (Full なら drop) | 常時実施 | 唯一 escape (audio_buf<SAFE_LO) が有効 |
-| `Buffering` (preroll) | **pacing なし即送出** | drop (UI に表示しない約束) | 最大速で実施 → READY_THRESHOLD まで進める | escape 不要 (元から sleep しない) |
+| `Buffering` (preroll) | **pacing なし** | pending frame を保持して空きができるまで retry | 最大速で実施 → READY_THRESHOLD まで進める | escape 不要 (元から sleep しない) |
 | `Loading` | (= Buffering と同じ動き、まだ info も来てないので decode 自体起こらない) | — | — | — |
-| `Seeking` | pacing なし即送出 (pre-seek frame は UI で drop) | drop | 同上 | epoch++ 後の post-seek frame を急いで送る |
+| `Seeking` | pacing なし (pre-seek frame は UI で drop) | post-seek pending frame を保持して retry | 同上 | epoch++ 後の post-seek frame を急いで送る |
 | `Paused` / `Eof` | decoder thread park (= `cancel.load==false && state in {Paused,Eof}` で wait_condvar) | — | park | thread が起きるのは外部 command 受信時のみ |
 
 ```rust
@@ -488,7 +523,8 @@ loop {
             sleep(5ms);
         }
     }
-    let _ = video_tx.try_send(frame);  // Full なら drop (Buffering/Seeking では正常)
+    // Playing の Full は drop 可。Buffering/Seeking は pending frame を保持して retry。
+    send_with_state_policy(frame, s);
 }
 ```
 
@@ -497,10 +533,10 @@ audio が READY_THRESHOLD まで溜まってから `Playing` に遷移**。Playi
 通常 pacing が有効化される。これで「序盤早送り」問題が **構造的に消える**。
 
 「Buffering 中は audio fill が止まらないか?」(deadlock 懸念) はこの規定で解消:
-audio decode/send は state 不問で常時実施されるため、`READY_THRESHOLD` (500ms) は
-必ず到達する。
+Buffering/Seeking では audio decode/send を進めるため、`READY_THRESHOLD` (100ms) へ
+到達できる。Paused/Eof では audio/video worker とも park する。
 
-## Command 順序保証 (Codex P3 反映)
+## 将来候補 (未採用): command channel の順序保証
 
 `TransportController` から `EngineActor` への command channel:
 
@@ -531,7 +567,7 @@ audio decode/send は state 不問で常時実施されるため、`READY_THRESH
 
 → 一時停止中のシーク UI 操作で意図せず再生開始しない。
 
-## Shutdown 順 (Codex P3 反映)
+## 将来候補 (未採用 topology): actor thread の shutdown 順
 
 VideoEngine drop 時:
 1. `TransportController::shutdown()` で EngineActor に `Shutdown` 命令送出
@@ -543,7 +579,7 @@ VideoEngine drop 時:
    - ここで wgpu (D3D12) 側の paint がまだ texture を持っていても、**fence_gen + 内部
      refcount で生存** (旧コードと同じ保証)
 
-## migration plan (4 phase、各 phase で動作維持)
+## 初期 migration plan と実装履歴 (採否注記を優先)
 
 ### Phase 1: skeleton 導入 (動作変化なし)
 - 新規ファイル `src/video/clock_v2.rs` に `MasterClock` を導入
@@ -559,7 +595,7 @@ VideoEngine drop 時:
 - decoder.rs / audio.rs / VideoPlayer は依然 AvClock を見るが、書き込みは新型に渡る
 - ここまでで動作は変わらないが、**resume の急送出問題はまだ残る** (open path 未変更)
 
-### Phase 3: 外部 API を `TransportController` に切替 + open path atomic 化
+### Phase 3 初期案 (未採用): 外部 API を `TransportController` に切替
 - VideoPlayer の API を `TransportController` 経由に置換
 - `VideoPlayer::open(path, opts)` で `OpenOptions { resume_secs, ... }` を受け取り、
   EngineActor が `Loading→Buffering→Playing` で resume を atomic に処理
@@ -921,7 +957,7 @@ backward seek (例: 30秒位置 → 10秒位置) でも、`handle_seek_request` 
 `last_audio_pts` を 10 にリセットするので、「古い 30 と比較して 10 を捨てる」誤動作が
 起きない (epoch++ は seek 要求受領時の 1 回のみで、SeekCompleted では進めない)。
 
-## Codex レビュー反映ログ (2026-04-29)
+## 初期設計の Codex レビュー反映ログ (2026-04-29、historical)
 
 ### v0 → v1 (初回 P1/P2/P3 対応)
 
@@ -970,7 +1006,7 @@ backward seek (例: 30秒位置 → 10秒位置) でも、`handle_seek_request` 
 | 指摘 | 反映先 |
 |---|---|
 | P1/P2: monotonic guard pseudocode の `handle_seek_completed` で `epoch += 1` が残っていた | 該当行を「epoch++ しない」コメントに置換、stale 検出が ev.epoch 比較で完結することを明記 |
-| P2: 遷移図に `── first_frame ──► Playing` の単独 trigger 表記が残っていた | 遷移図を全面改訂、`READY = FirstFrameReady ∧ (NoAudio ∨ BufferReady)` の latch 表現に統一、Buffering→Playing は単独 event ではなく READY 揃いがトリガと明記 |
+| P2: 遷移図に `── first_frame ──► Playing` の単独 trigger 表記が残っていた | 遷移図を latch 表現に統一。現行式は `(NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)` |
 | P2: EngineActor 散文に「BufferReady で Playing 遷移」と書かれていた | `BufferReady` 単独では遷移しない旨を明記、latch 完成のみがトリガと書き直し |
 
 ### v5 → v6 (6 度目のレビュー対応)
@@ -1155,7 +1191,8 @@ DB スキーマは `video_pins (video_path, pin_pts_secs, thumb_webp BLOB)` と
 Phase 5.1–5.6 のいずれも:
 - `EngineActor` の `apply_command(TransportCommand::Pause)` の信頼性
 - `OpenOptions.autoplay = false` で開いたときの遷移経路:
-  - `Loading` → `Buffering` で **READY (= `FirstFrameReady ∧ (NoAudio ∨ BufferReady)`)** が
+  - `Loading` → `Buffering` で **READY (=
+    `(NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)`)** が
     完成するまでは従来通り (= 既存 latch 不変条件を維持)。
   - READY 完成時に `try_transition_from_buffering` が `autoplay=false` を尊重して
     `Playing` ではなく `Paused` に遷移する。

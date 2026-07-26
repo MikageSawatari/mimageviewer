@@ -2,6 +2,16 @@
 
 作成: 2026-06-29 / ClaudeCode
 
+> **現況ステータス (2026-07-26 コード確認)**
+>
+> - K0 は完了。active session の `window_id` を優先する keepalive/backstop と描画 marker がある。
+> - K1 は未実装。通常 render、keepalive、backstop の複数入口が残り、single render entry ではない。
+> - K2 / K3 は部分実装。`DetachedWindowManager` と runtime state は導入済みだが、
+>   `ActiveDetachedSession` は `window_id` / `source` だけを持ち、`closing` は manager runtime が表す。
+>   reducer は合法遷移を制約せず、散在 pending/flag の typed state 集約も未完。
+> - §§3〜6 は到達目標を含む。実装済みの構造として読まず、段階別の現況は §4 を正とする。
+>   直近変更の手動検証状況は未確認。
+
 対象: F12 / 複数別ウィンドウ (detached image window) のアクティブ viewport の lifetime。
 `src/ui_fullscreen.rs` / `src/app.rs`。
 
@@ -47,7 +57,7 @@ egui の immediate viewport は「親フレームが `show_viewport_immediate` �
 
 ---
 
-## 2. 現状がなぜ壊れるか (棚卸し結果)
+## 2. K0 前の棚卸し結果 (実装前の設計経緯)
 
 ### 2.1 症状の二段階 (v2.2.0 比較 + 現行ログ)
 
@@ -119,7 +129,7 @@ detached 窓が「描かれないフレーム」を踏み、egui が破棄 → r
 
 ---
 
-## 3. ターゲット設計
+## 3. ターゲット設計 (未到達部分を含む)
 
 ### 3.1 「生かす意思」を明示状態にする (既存 bool 合成は不可)
 
@@ -128,8 +138,9 @@ detached 窓が「描かれないフレーム」を踏み、egui が破棄 → r
 フレーム」「F12 OFF」「Esc/×」「main へ戻る途中」でも真になりうるので、backstop が
 **閉じたい窓を復活させる**。`fs_viewport_shown` のような「過去に表示したか」も不可。
 
-代わりに **「この detached 窓を生かす意思」を表す単一の明示状態**を導入し、これを唯一の
-真実にする:
+当初案では **「この detached 窓を生かす意思」を表す単一の明示状態**を導入し、これを唯一の
+真実にする構造を想定した。次の `closing` field は **未採用の target schema** であり、現行は
+`ActiveDetachedSession { window_id, source }` と manager runtime の `Closing` state に分かれている。
 
 ```rust
 enum DetachedSource { Image, Video, Audio, Book } // 再オープン経路の判別
@@ -170,6 +181,8 @@ fn detached_active_window_alive_wanted(&self) -> bool {
   `last_active_detached_window_id` への二重管理を将来この 1 つへ寄せる (K3)。
 
 ### 3.2 描画入口を 1 本にする (single render entry)
+
+**未実装 target**。現行は `render_fullscreen_viewport`、keepalive、backstop が併存する。
 
 `show_viewport_immediate(detached_id, …)` を呼ぶ場所を **`render_active_detached_viewport()`
 ただ 1 つ**にする。`App::update` のフルスクリーン区間を:
@@ -238,6 +251,11 @@ fullscreen 専用に縮小する。
 混用しない。後者では detached identity を一切壊さず、`fullscreen_idx` / `items` / 表示物
 だけが入れ替わる。`Visible(false)` / `Close` はセッション終了時のみ送る。
 
+> **既知の実装違反:** terminal close 後にも in-flight open/navigation producer が適用され得る経路と、
+> 動画 F12 OFF 後に manager runtime が `Closing` で残る経路が
+> [v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されている。前者は BA-7/R2b
+> 後続リワークへ引き継ぎ、後者は **v2.8.1 で対応予定**。本節の不変条件は後退させない。
+
 ---
 
 ### 3.7 session/marker は helper 5 つ経由でのみ触る (Codex #2 採用)
@@ -264,7 +282,8 @@ active_detached_viewport_rendered_this_frame()      // rendered_frame == frame_c
 
 **closing 責務 (begin_active_detached_session_close → finish...)** — 明示終了経路のみ:
 
-- detached × / Esc / Enter / 右クリック close: `handle_fs_navigation(close_fs)` 共通入口。
+- detached × / Esc / Enter と、close に割り当てた短い右クリック:
+  `handle_fs_navigation(close_fs)` 共通入口。
   `auto_open_for_current_container()` で `pending_return_to_parent` のみ立てる場合も意図は終了。
 - BS / close-to-page-list: `handle_fs_navigation(close_to_page_list)`。
 - virtual page list から親へ戻る: `close_detached_viewer_for_virtual_page_list_parent_nav()`。
@@ -292,14 +311,14 @@ active_detached_viewport_rendered_this_frame()      // rendered_frame == frame_c
 
 ---
 
-## 4. 移行計画 (段階)
+## 4. 移行計画と現況 (段階)
 
-| 段階 | 内容 | リスク | 検証 |
+| 段階 | 現況 | 内容 / 残件 | 検証 |
 | --- | --- | --- | --- |
-| **K0 (backstop)** | §3.1 の明示状態 + §3.6 marker を入れ、末尾に「`alive_wanted` かつ今フレーム未描画なら holdover で 1 回描く」backstop を足す。既存 2 関数はそのまま。**最小で PDF の窓破棄を止める** | 低 | 実機: §5 の成功条件 |
-| **K1** | 描画入口を §3.2 の `render_active_detached_viewport` 1 本に集約。`render_fullscreen_viewport` / `keep_fullscreen_viewport_alive` を非 detached 専用に縮小 | 中 | detached / fullscreen 回帰、PDF/ZIP/画像 folder-nav |
-| **K2** | close を §3.5 に整理。session-end とそれ以外を分離。`fs_viewport_shown` への依存を述語へ置換 | 中 | Esc / × / グリッド復帰 / F12 トグル |
-| **K3** | 余剰フラグ整理 + 明示 state enum (`Opening/Active/Parked/Resuming/Closing`) | 高 | 全 detached テスト |
+| **K0 (backstop)** | **完了** | marker と backstop を導入。既存描画入口は維持 | 当時の実機記録あり。直近変更は未確認 |
+| **K1** | **未完** | `render_active_detached_viewport` 1 本への集約と、既存 render / keepalive の非 detached 専用化が未実施 | detached / fullscreen 回帰、PDF/ZIP/画像 folder-nav |
+| **K2** | **部分完了** | terminal session/runtime routing はあるが、全 pending producer の cancel と `fs_viewport_shown` 依存の解消が未完 | Esc / × / グリッド復帰 / F12 トグル |
+| **K3** | **部分完了** | manager と `Opening/Active/Parked/ParkedLive/Resuming/Closing` は導入済み。合法遷移 reducer と余剰 flag 集約は未完 | 全 detached テスト |
 
 - **K0 を最優先**: backstop は既存構造を壊さずに不変条件を「事後保証」するので、まず
   ちらつきを止めて切り分けできる。K1 以降で構造を本来の単一入口へ寄せる。
@@ -326,7 +345,7 @@ active_detached_viewport_rendered_this_frame()      // rendered_frame == frame_c
 
 ---
 
-## 6. この設計が守る最終形
+## 6. 到達目標 (現行仕様では未達を含む)
 
 - detached 窓は「1 セッション = 1 安定 ViewportId = 1 OS ウィンドウ」。
 - 描画は 1 本の入口が毎フレーム保証 (skip しうる分岐を排除)。
@@ -337,7 +356,7 @@ active_detached_viewport_rendered_this_frame()      // rendered_frame == frame_c
 
 ---
 
-## 7. レビューログ (Codex ⇄ ClaudeCode)
+## 7. 実装前・K0 当時のレビューログ (Codex ⇄ ClaudeCode)
 
 この節で Codex と ClaudeCode がレビューを往復する。**伝えたいことは各自ここへ追記**し、
 相手に確認してもらう (ユーザーが中継)。新しいエントリは末尾へ追記し、日付と発信者を明記する。

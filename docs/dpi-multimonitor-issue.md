@@ -1,5 +1,11 @@
 # マルチモニター DPI 問題 調査メモ
 
+> **現況 (2026-07)**: 下記ログは過去の観測記録。起動時の inner size 再適用、inner size
+> 保存、トレイ復帰時の `WINDOWPLACEMENT` 復元は実装済み。一方、eframe 0.33 の現行版で
+> `Win+Shift+Arrow` の位置ずれが再現するか、また根本原因が winit/Windows のどちらに
+> あるかは未確認。現在はアプリ自身も用途別に viewport の位置・サイズ command を送るため、
+> 本書の旧「アプリ側は一切変更しない」という切り分けは成立しない。
+
 ## 環境
 
 | 項目 | 内容 |
@@ -33,26 +39,33 @@
 - ウィンドウが複数のモニター間を短時間で往復するような挙動が見られる
 - 最終的には元のモニターに近い位置に収まるが、ずれが生じる
 
-## 原因の仮説
+## 原因の仮説 (未確認)
 
 Windows は DPI の異なるモニター間をウィンドウが移動したとき、
 `WM_DPICHANGED` メッセージをアプリに送信し、推奨ウィンドウ矩形を通知する。
 
 winit はこのメッセージを受け取り、推奨矩形に従ってウィンドウを自動的にリサイズ・再配置する。
 3台のモニターで DPI が交互に異なる場合、この `WM_DPICHANGED` 処理が連鎖して
-ウィンドウ位置の振動が発生すると考えられる。
+ウィンドウ位置の振動が発生する可能性がある。ただし、現行版でのメッセージ trace と
+アプリ発 command の時系列を突き合わせていないため、根本原因とは断定しない。
 
 ## アプリ側コードの確認
 
-`app.rs` 内で `ctx.send_viewport_cmd()` を呼び出しているのは以下の2箇所のみ：
+現行コードにはタイトル・終了だけでなく、次の意図した viewport command がある:
 
-```rust
-ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));  // タイトルバー更新
-ctx.send_viewport_cmd(egui::ViewportCommand::Close);         // 終了ボタン
-```
+| 対象 | command | 主な用途 |
+| --- | --- | --- |
+| main / ROOT | `InnerSize` | 起動後、DPI 確定時に保存済み inner size を再適用 |
+| main / ROOT | `Title` | フォルダや表示モードに応じたタイトル変更時だけ送信 |
+| main / ROOT | `Maximized` | F11 / `ToggleMaximize` による最大化・復元 |
+| main / ROOT | `Focus` | detached viewer の terminal close 後に main を前面化 |
+| detached / fullscreen viewport | `Close` | session close、mode 切替、viewport teardown |
+| detached / fullscreen viewport | `Maximized` / `Decorations` / `OuterPosition` / `InnerSize` | 通常表示と borderless fullscreen の切替、保存 placement の復元 |
+| detached / fullscreen viewport | `Minimized(false)` / `Visible(true)` / `Focus` | 既存 viewer の再アクティブ化、foreground 復帰 |
 
-ウィンドウの位置・サイズを変更するコマンドは一切送っていない。
-**問題はアプリのコードではなく eframe/winit のレイヤーにある。**
+これらは主に起動補正、最大化、detached viewer、フォーカス復帰の経路であり、通常の
+`Win+Shift+Arrow` 中に発火するとは限らない。再調査時は `[viewport]` ログへ command の
+発火理由も併記し、OS の DPI 変更と同一時系列で切り分ける。
 
 ## 調査すべき点
 
@@ -102,7 +115,8 @@ ctx.send_viewport_cmd(egui::ViewportCommand::Close);         // 終了ボタン
 - 対策: `App::pending_initial_size` に意図したサイズを保持し、
   初回 `update()` 呼び出し（= DPI 確定後）で
   `ctx.send_viewport_cmd(ViewportCommand::InnerSize(..))` により再適用する。
-- 実装: `src/main.rs` → `src/app.rs` の `initialized` ブロック。
+- 実装: `src/lib.rs` の creator closure で `pending_initial_size` を設定し、
+  `src/app.rs` の初回 `update()` で `ViewportCommand::InnerSize` を送る。
 - 通常経路でも無害な no-op になるため、副作用なし。
 - Win+Shift+Arrow による位置ずれ（移動時のバグ）は別問題で、この対策では解消しない。
 
@@ -166,6 +180,6 @@ Remove-Item Env:MIV_DETAILS_LAYOUT_DEBUG
 
 | ファイル | 内容 |
 |----------|------|
-| `src/main.rs` | ウィンドウ初期サイズ・位置の設定、モニター境界チェック |
+| `src/lib.rs` | ウィンドウ初期サイズ・位置の設定、モニター境界チェック、`pending_initial_size` の設定 |
 | `src/monitor.rs` | `MonitorFromPoint` / `GetMonitorInfoW` / `GetDpiForMonitor` を使ったモニター情報取得 |
-| `src/app.rs` | `last_outer_rect` / `last_pixels_per_point` の追跡、`on_exit` でのウィンドウ状態保存 |
+| `src/app.rs` | `last_outer_rect` / `last_inner_size` / `last_pixels_per_point` の追跡、初回 size 再適用、viewport command、`on_exit` でのウィンドウ状態保存 |

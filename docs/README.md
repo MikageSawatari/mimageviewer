@@ -10,7 +10,7 @@
 | --- | --- |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
-| [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー一覧とテンプレ |
+| [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー一覧とテンプレ。動画 packet/control channel、bridge 内 per-slot VST GUI thread、Normalize scan lifecycle を含む |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [idle-health-check.md](idle-health-check.md) | 静止中・背面表示中の高速 repaint / work 再投入 / CPU・ログ肥大をリリース前に自動検出する手順と判定値 |
@@ -31,15 +31,15 @@
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
-| [panorama-360-view-plan.md](panorama-360-view-plan.md) | 360° パノラマ表示、crop、mipmap、fullscreen 合成の現行仕様 |
-| [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **設計確定・未実装**。フルスクリーン時のサイドパネル表示モード計画 |
+| [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
+| [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。未対応の P2/P3・要判断項目、ユーザー要望、依存ライブラリ更新、リリース前確認だけを恒久管理。完了した項目はこのファイルから削除する |
-| [detached-viewer-implementation-plan.md](detached-viewer-implementation-plan.md) | 画像・動画を共通の別ウィンドウビューアとして扱う設計・実装メモ。F12 別ウィンドウモード、別ウィンドウの F11 仮想フルスクリーン、×/Esc/Enter/右クリックで session close、メイン一覧カーソルとの双方向同期、動画 native presenter の `NativeVideoPlacement::DetachedViewerChild` 化、close-to-tray 時の再生継続、ClaudeCode レビュー反映メモを整理 |
-| [detached-viewer-lifecycle-redesign-proposal.md](detached-viewer-lifecycle-redesign-proposal.md) | **設計/問題カタログ**。detached viewport ライフサイクルの「壊れている前提 (BA-1〜BA-7)」一覧と段階的作り直し方針。rect ベース host 捕捉・generation churn・host_lost 自動 recreate など根本原因を整理 |
-| [detached-viewer-keepalive-design.md](detached-viewer-keepalive-design.md) | **設計 (正本) + Codex⇄ClaudeCode レビューログ**。アクティブ detached viewport を「毎フレーム必ず描画する」単一不変条件へ集約する keep-alive 設計。明示状態 `ActiveDetachedSession`、単一描画入口、rendered-frame marker、段階移行 (K0〜K3)。末尾の §7 でレビュー往復を記録 |
-| [detached-viewer-smoke-checklist.md](detached-viewer-smoke-checklist.md) | **実機 smoke チェックリスト**。keep-alive (K0) 後の detached window をモード (通常/常に別ウィンドウ/F12 OFF) × コンテンツ × 操作で検証する手順。`MIV_DETACHED_WINDOW_DEBUG` のログ成功マーカー付き |
-| [detached-rework-plan.md](detached-rework-plan.md) | **detached viewport リワーク正本**。rect ベース HWND 捕捉を撤去するための憲法、ステージ実行プロトコル、R0〜R4 の段階計画 |
-| [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | リワーク出荷前の実機 smoke マトリクス (F/W/V/P/R 系)。V9 = detached×音声モードは v2.3.0 レビューで追加 |
+| [detached-viewer-implementation-plan.md](detached-viewer-implementation-plan.md) | 画像・動画別ウィンドウの設計・実装履歴。冒頭 §§1〜2 は初期 v1 案、§3.0 は現行モード、§11 以降は CUT 前 pin 案を含む履歴 |
+| [detached-viewer-lifecycle-redesign-proposal.md](detached-viewer-lifecycle-redesign-proposal.md) | **historical diagnosis + 現況表**。BA-1〜BA-7 の初期診断と、解消 / 部分解消 / 未解消の現在地。進捗の正本は `detached-rework-plan.md` §9 |
+| [detached-viewer-keepalive-design.md](detached-viewer-keepalive-design.md) | keep-alive の不変条件、target 設計、K0〜K3 の現況。K0 完了、K1 未完、K2/K3 部分完了で、single render entry は未実装 |
+| [detached-viewer-smoke-checklist.md](detached-viewer-smoke-checklist.md) | K0 詳細 smoke の補助チェックリスト。現行 registry ログ (`registered host` / `hwnd_adopted_*`) に対応。リリース全体は ship checklist を正とする |
+| [detached-rework-plan.md](detached-rework-plan.md) | **detached viewport リワーク正本**。§9 が唯一の現況表。R2b は部分完了、R3 は実質完了、R4 は未完 |
+| [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | 現行リワーク出荷前 smoke matrix (F/W/V/P/R 系)。独立静止画窓の Ctrl 物理フォルダ移動と configurable 右クリックを含む |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/場所/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、長さ/動画解像度/コーデック列まで実装済み (長さ・コーデックは音声も対応)。場所は元ファイル/元コンテナの親フォルダで、製本フォルダは `本棚 > 本名` 表記。場所条件は移動で解除される非永続の一時条件。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
 | [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md) | **一部実装済み**。Windows Shell の `IFileOperation` とネイティブ右クリックメニューへ寄せるファイル整理機能の実装計画。A/B クイックフォルダ、実ファイル/実フォルダの Shell 標準右クリックメニュー、rename、delete-to-recycle は実装済み。copy/move/drop の `IFileOperation` 化、仮想 ZIP/PDF アイテム向けの native custom menu は後続 |
 | [key-customization-impl-plan.md](key-customization-impl-plan.md) | **実装済みメモ**。簡易版 (旧テキスト ini / GUI なし / 競合は警告のみ) の手順書と実装判断。現在の正本は `Settings.keymap` で、旧 `keymap.ini` は初回起動時に settings.db へ移行して `keymap.ini.imported*.bak` へ退避する。`src/keymap.rs` の型・`keymap.ini.default` 生成・旧 ini 仕様 (`Action.1` 形式)・exact match ヘルパー・native 動画転送対応・エッジケース規則・`KeyAction` インベントリ (付録 A)・キー変換ホワイトリスト (付録 B) |
@@ -97,18 +97,18 @@
 | [search-container-item-redesign.md](search-container-item-redesign.md) | 検索を「コンテナ検索 (Ctrl+S) / アイテム検索 (Ctrl+G)」モデルへ整理する再設計案。Ctrl+G 一覧/集約ビュー・動画索引除外・mtime 追加・Ctrl+F の構造アイテム絞り込み |
 | [tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) | `tags.db`、タグ facet、メタデータ転送を含む現行タグ機能の正本 |
 | [sidecar-metadata-ingest.md](sidecar-metadata-ingest.md) | サイドカー経由のメタデータ取り込み。**`tags.db` 移行前の記述が残っており内容更新待ち**。現行のタグ正本は上の tag-catalog-redesign-plan.md |
-| [video-architecture.md](video-architecture.md) | 動画インライン再生サブシステムの設計指針と内部構造 (D3D11VA HW デコード + DX12 zero-copy interop + CPU fallback)。**Phase 2 (DComp / NVIDIA VSR) 撤回の経緯も巻末に記載** |
-| [playback-speed-design.md](playback-speed-design.md) | 動画倍速再生機能の仕様。Signalsmith Stretch 採用、AvClock 中心の速度配線、音声 PTS/PDC/queue 秒数の扱い、HUD UI、検証計画 |
+| [video-architecture.md](video-architecture.md) | 動画サブシステムの恒久正本。D3D11VA + native presenter、channel/pacing、current module responsibility、ownership 負債を記載。行数 snapshot は監査記録へ分離 |
+| [playback-speed-design.md](playback-speed-design.md) | 動画倍速再生機能の仕様。Signalsmith Stretch、音声 PTS/PDC/queue 秒数、native-only 速度 HUD、検証計画 |
 | [ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md) | FFmpeg LGPLv3-or-later build の配布時チェックリスト、対応ソース、同梱外部ライブラリの確認メモ |
 | [licensing-tensorrt.md](licensing-tensorrt.md) | TensorRT 対応のライセンス、再配布境界、確認事項 |
 | [tensorrt-worker-design.md](tensorrt-worker-design.md) | TensorRT worker / IPC / fallback の現行設計 |
 | [tensorrt-pack-distribution.md](tensorrt-pack-distribution.md) | TensorRT pack の作成・検証・配布 runbook |
 | [tensorrt-pack-release-notes.md](tensorrt-pack-release-notes.md) | TensorRT pack 配布時のリリース本文の正本 |
 | [ffmpeg-lgpl-current-report.txt](ffmpeg-lgpl-current-report.txt) | 現在の同梱 FFmpeg DLL から抽出した版、ライセンス、configure flags、GPL 混入検査の監査記録。依存更新時に `collect-ffmpeg-lgpl-info.ps1` で再生成する |
-| [video-engine-redesign.md](video-engine-redesign.md) | エンジン側 (`AvClock` / `EngineActor` / `MasterClock` / `AudioBookkeeping`) のリデザイン経緯と各 Phase 詳細。Phase 8.K の pacing 仕様、Phase 9 の 3-thread 分離、Phase 9.A〜9.G の追加修正 (wall-rate cap / cpal warmup silence / forward seek backward+preroll / perf overlay seek freeze 等) を網羅 |
+| [video-engine-redesign.md](video-engine-redesign.md) | エンジンの現行仕様 + 初期設計案 / 採否履歴。現行は `Arc<Mutex<EngineActor>>` + UI tick drain。未採用の `TransportController` / 専用 actor thread は将来候補として隔離 |
 | [audio-normalize-scan-bench.md](audio-normalize-scan-bench.md) | 音量ノーマライズ初回スキャン待ち時間の実測用 CLI (`normalize_scan_bench`) と、HDD 上の動画で逐次 / 並列スキャンを比較するときの読み方 |
 | [music-integration-plan.md](music-integration-plan.md) | **主要 Inc 実装完了**。`VideoPlayer` 再利用による音声再生、音楽ビュー、ブックマーク、VST3、動画→音声モードの統合契約と継続保守事項 |
-| [vst3-integration.md](vst3-integration.md) | VST3 プラグイン統合 (v0.9.0+) — C++ bridge プロセス + Rust IPC、audio-pump からの bridge 経由、プラグイン GUI のクロスプロセス attach、チェーン編集 UI、再生中 VST3 パネル、後段 safety limiter |
+| [vst3-integration.md](vst3-integration.md) | VST3 統合 — 1 chain = 1 C++ bridge、音声 IPC 1 roundtrip、bridge 内 per-slot STA editor、Rust chain/GUI/persistence/audio hot-path ownership と現行負債 |
 | [settings-sqlite-migration.md](settings-sqlite-migration.md) | 設定永続化を `settings.json` から `settings.db` (SQLite) に移行する spec。transient NotFound による設定消失事故の構造的解消、将来版の未知設定値を `Incompatible` として無変更・save 抑止にする downgrade 保護、VST3 BLOB の dirty-skip による I/O 浪費解消。4 ラウンドの Codex review 反映済み |
 
 ## 進行中のレビュー

@@ -2,6 +2,12 @@
 
 更新日: 2026-05-08
 
+> **現況ステータス (2026-07-26 コード確認):** 倍速再生と速度選択 UI は実装済み。
+> production の動画表示は native presenter 必須で、速度 button/popup は
+> `src/video/native_presenter/overlay_draw.rs`、event/command 配線は
+> `src/video/native_presenter/mod.rs` にある。legacy egui 動画 HUD は撤去済みで、
+> `draw_video_hud` は error 表示だけを担う。直近の手動検証状況は未確認。
+
 この文書は、動画再生に 0.5x から 3.0x の倍速再生を追加するための実装仕様である。
 Claude Code 案は参考にしたが、現在のコードと合わない箇所、または根拠が弱い箇所は採用しない。
 
@@ -47,7 +53,7 @@ UI に表示する速度は次の 11 段階とする。
 - クリックで HUD の上側にポップアップを出す。
 - ポップアップは 11 個のボタンを横並びまたは折り返しグリッドで表示する。
 - 画面端ではポップアップ位置を clamp し、シークバーや時間表示に重ならないようにする。
-- legacy egui path と native overlay path の両方に実装する。
+- production で必須の native overlay path に実装する。legacy egui 動画 HUD は対象外。
 
 ### 3.3 設定への保持
 
@@ -296,28 +302,11 @@ drop/abort 経路では `duration_secs` を直接使わず、enqueue 時に loca
 
 旧 epoch frame は raw 音声としては有効なので捨てない。pump に届いた時点の現在 speed で stretch する。ただし tx 会計上は速度変更時に無効化済みとして扱う。
 
-## 6. native overlay と legacy UI
+## 6. native-only 速度 UI (実装済み)
 
-### 6.1 legacy egui path
-
-`src/ui_fullscreen.rs` の `draw_video_hud()` に速度ボタンとポップアップを追加する。
-
-UI helper はできるだけ共有する。
-
-```rust
-fn draw_video_speed_button(
-    ui: &mut egui::Ui,
-    current_speed: f64,
-    popup_open: &mut bool,
-) -> Option<f64>
-```
-
-戻り値が `Some(speed)` のとき、`App.video_playback_speed` / `Settings.video_playback_speed` /
-`VideoPlayer` を更新する。
-
-### 6.2 native overlay path
-
-`src/video/native_presenter.rs` にも同等 UI を追加する。
+`src/video/native_presenter/overlay_draw.rs` が速度 button / popup の描画と hit-test を担い、
+`src/video/native_presenter/mod.rs` が overlay state と App への event/command を接続する。
+`src/ui_fullscreen.rs::draw_video_hud()` は動画描画 fallback ではなく error 表示専用である。
 
 追加するイベント/コマンド:
 
@@ -326,7 +315,7 @@ NativeOverlayCommand::SetPlaybackSpeed { speed: f64 }
 NativeVideoOutputEvent::SetPlaybackSpeed { speed: f64 }
 ```
 
-native overlay の state に `playback_speed: f64` を追加し、UI thread から毎 frame 最新値を渡す。この値はボタン表示と選択状態のためだけに使う。present delay、frame sleep、動画 PTS の計算は常に `clock.playback_speed()` を読む。
+native overlay の state に `playback_speed: f64` を渡す。この値はボタン表示と選択状態のためだけに使う。present delay、frame sleep、動画 PTS の計算は常に `clock.playback_speed()` を読む。
 
 ## 7. 変更対象ファイル
 
@@ -339,8 +328,9 @@ native overlay の state に `playback_speed: f64` を追加し、UI thread か�
 | `src/video/decoder.rs` | pacing lead と audio tx queued 秒数を speed 対応。enqueue/drop/abort の全経路で `queued_wall_secs` を対称に加減算 |
 | `src/video/mod.rs` | `VideoPlayer::set_playback_speed()` / `playback_speed()` 追加、tick delay 修正 |
 | `src/video/engine/actor.rs` | `TransportCommand::SetSpeed` を実装し、内部 `MasterClock` の速度を更新 |
-| `src/video/native_presenter.rs` | native HUD 速度 UI、イベント、present delay 修正 |
-| `src/ui_fullscreen.rs` | legacy HUD 速度 UI |
+| `src/video/native_presenter/overlay_draw.rs` | native HUD 速度 UI の描画 / hit-test |
+| `src/video/native_presenter/mod.rs` | overlay state、速度イベント、present delay |
+| `src/ui_fullscreen.rs` | legacy 動画 UI は追加しない。error HUD のみ |
 | `src/app.rs` | speed の保持と設定保存、動画切替時の再適用 |
 | `docs/video-architecture.md` | 実装後に倍速再生の構造を追記 |
 | `docs/video-engine-redesign.md` | 実装後に Phase 4 speed 配線の完了状態を更新 |
@@ -378,9 +368,8 @@ native overlay の state に `playback_speed: f64` を追加し、UI thread か�
 ### Phase 4: UI
 
 1. `Settings.video_playback_speed` と `App.video_playback_speed` を追加する。
-2. legacy HUD に速度ボタンとポップアップを追加する。
-3. native overlay に同じ UI とイベントを追加する。
-4. 動画切替時に保存済み speed を再適用する。
+2. native overlay に速度ボタン、ポップアップ、イベントを追加する。
+3. 動画切替時に保存済み speed を再適用する。
 
 ### Phase 5: documentation と manual
 
@@ -430,7 +419,7 @@ native overlay の state に `playback_speed: f64` を追加し、UI thread か�
 - 速度変更直後に再生が止まらない。
 - seek 連打と速度変更の組み合わせで buffer が詰まらない。
 - VST3 有効時に音が途切れ続けない。
-- native overlay path と legacy path の両方で UI が動く。
+- native overlay の速度 button/popup が動き、legacy egui 動画 UI が再導入されていない。
 - 3.0x で decode が追いつかない場合、queue cap や lead cap の調整が必要か perf-log で判断する。
 - `audio/stretch` perf event で Signalsmith 処理時間が継続的に audio budget を超えない。
 
@@ -463,7 +452,7 @@ Signalsmith 公式は time-stretch の得意範囲を 0.75x から 1.5x 程度�
 4. Signalsmith latency と VST3 PDC が source timeline に換算されているか。
 5. `audio_tx_queued_secs` が wall 秒として加算/減算されているか。
 6. 速度変更時の `audio_tx_accounting_epoch` 更新で旧 frame の減算が新会計を壊していないか。
-7. native presenter と legacy path の両方で frame wait が `source_delta / speed` になっているか。
+7. native presenter の frame wait が `source_delta / speed` になっているか。
 8. 1.0x bypass が既存音声 path を極力変えないか。
 9. 1.0x bypass 境界と AV seek 以外で stretcher reset が過剰に発生していないか。
 10. 3.0x で queue 詰まりが起きたときに、cap/queue 調整で原因を切り分けられるログが残っているか。

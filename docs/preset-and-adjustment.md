@@ -161,7 +161,8 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
   取得する。これがないと片側だけ final pipeline が走らず、スライダー変更や final AI 完了が
   見開きに反映されない。
 - final composite は各ページ idx ごとに `edit_result_cache` から lazy 生成するため、
-  見開きの右ページも描画時に同じ経路で補正・AI・post_filter が適用される。
+  見開きの右ページも描画時に同じ経路で色調補正・final AI・スマートシャープ・カラー化・
+  Creative LUT・post_filter が適用される。
 
 #### 「両ページ同時編集」を入れない理由
 
@@ -481,23 +482,24 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 
 **並列化**: `rayon::par_chunks_mut` で行単位に並列処理。4K 画像でも 4080ms 程度。
 
-### 2.4 カラー化・ポストフィルタの一時バイパス
+### 2.4 カラー化・Creative LUT・ポストフィルタの一時バイパス
 
 消しゴム / 隠蔽加工 / 分析モード中は `App::post_filter_bypassed: bool` が `true` になり、
-final composite の `params_hash` から `colorize` と `post_filter` を外す。モード解除時に false に戻し、
+final composite の `params_hash` から `colorize` / `creative_lut` / `post_filter` を外す。
+モード解除時に false に戻し、
 該当 idx の final pipeline cache だけをクリアして最終表示エフェクト適用状態で再生成させる。
 これは編集時の見やすさだけの切替なので、source 解像度の edit cache や
 `input_generation` は進めない。
 
 - **消しゴム**: 減色プリセット (GameBoy 4 色など) が有効だと境界が潰れてマスクを精密に塗れないため
-  編集表示だけ post-filter を外す。MI-GAN の preview / apply / auto-apply /
+  編集表示だけカラー化・Creative LUT・post-filter を外す。MI-GAN の preview / apply / auto-apply /
   ensure-result 入力も source 解像度の edit pipeline から取り、post-filter や final AI の
   解像度変更には引きずられない。
 - **分析**: ヒストグラムは `fs_cache` の生ピクセルから計算されるため、表示だけを生に揃える
 
 `AdjustParams` には:
 - `is_identity()` = 色調 identity **かつ** カラー化無効 **かつ**
-  `post_filter == None` **かつ** `smart_sharpen == 0`
+  Creative LUT 無効 **かつ** `post_filter == None` **かつ** `smart_sharpen == 0`
 - `is_color_identity()` = 色調 identity のみ (バイパス中の早期 return 判定用)
 
 ### 2.5 元画像プレビュー
@@ -546,7 +548,8 @@ final composite の `params_hash` から `colorize` と `post_filter` を外す�
   - legacy の `apply_sync_adjustment` / `adjustment_cache` 経路にはスマートシャープを
     焼き込まない。final composite 完了までの暫定表示用 cache に upscaler 実行有無の
     判定を持ち込まず、final composite 側だけで適用する
-- **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
+- **適用位置**: final pipeline の
+  `色調補正 → final AI → スマートシャープ → カラー化 → Creative LUT → post_filter`。
   AI 入力には掛けないので、強度変更で final AI は再実行されない
   (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
   単ページ書き換え経路 (スライダー / T キーのポストフィルタ循環 / スロット適用 /
@@ -589,7 +592,7 @@ final composite の `params_hash` から `colorize` と `post_filter` を外す�
 | `final_ai_cache` | `HashMap<FinalAiKey, FinalAiEntry>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果。`FinalAiEntry` は `pixels` と smart sharpen 判定用の `used_upscale` を持つ |
 | `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI entry。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、PDF retained page cache と合算した枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
 | PDF retained page cache | `HashMap<item_key, Raster \| FinalAi>` | PDF ページ専用の保持スロット。PDF レンダリング後は `Raster`、final AI 完了後は同じスロットを `FinalAi` に昇格するため、同一ページのラスタ結果とAI結果を二重保持しない。`FinalAi` は `pixels` と `used_upscale` を保持する。容量は `retained_final_ai_cache` と同じ設定枠に合算する。`FinalAi` hit 時は raw PDF レンダリングを待たずに final composite を直接復元できる |
-| `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、スマートシャープ、post_filter を適用した通常表示用テクスチャ |
+| `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams の色調、final AI、スマートシャープ、カラー化、Creative LUT、post_filter を適用した通常表示用テクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
 
@@ -616,7 +619,8 @@ final 表示解像度が変わっても、source 解像度の edit cache とマ�
 3. 補正レイヤーがあれば `local_adjust_cache`
 4. 隠蔽マスク / プレビューがあれば `conceal_cache`
 
-この段階では AdjustParams / final AI / post_filter を一切適用しない。色調スライダーの
+この段階では色調補正 / final AI / スマートシャープ / カラー化 / Creative LUT /
+post_filter を一切適用しない。色調スライダーの
 drag 中でも `edit_result_cache` は再利用されるため、マスクやブラシ stroke の重い再計算が走らない。
 
 **crop は表示パイプラインに含めない** (通常表示は crop 外を暗くする overlay のみで、
@@ -633,8 +637,10 @@ AI を無駄に再実行してしまう)。
 1. 色調補正 (`apply_adjustments_fast`)
 2. final AI アップスケール / デノイズ (`final_ai_pending` → `final_ai_cache`)
 3. スマートシャープ (`apply_final_smart_sharpen`、`smart_sharpen != 0` のときだけ。§2.7)
-4. post_filter (`post_filter::apply`)
-5. GPU upload (`final_composite_cache`)
+4. カラー化 (`colorize::apply_applicable_with_cancel`)
+5. Creative LUT (`creative_lut::apply_to_color_image`)
+6. post_filter (`post_filter::apply`)
+7. GPU upload (`final_composite_cache`)
 
 の順で最終表示を作る。AI 未完了中は色調補正済み (+シャープ化済み) の画像を暫定表示し、
 AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛け直して再合成する。
@@ -738,7 +744,7 @@ idle まで遅延する。release 時は遅延をキャンセルして 1 回だ�
 `edit_result_cache` とテキスト／スタンプの注釈ラスターレイヤーへ同じ crop を適用し、下地 WebP と
 lossless 注釈 WebP に分けて編集プレビューキャッシュへ非同期保存する。表示時は下地へだけ色調補正を
 掛けた後で注釈を合成し、fullscreen と同じ処理順にする。final AI / スマートシャープ /
-post-filter は含めない。
+カラー化 / Creative LUT / post-filter は含めない。
 
 Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページでは `local_adjust_cache` が揃ってから
 実行する。表示中の暫定フォールバック画像をそのまま保存しない。
@@ -767,7 +773,7 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | 消しゴムマスク変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | erase/local/conceal/final pending をキャンセル |
 | 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | local/final pending をキャンセル |
 | 隠蔽加工変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | final pending をキャンセル |
-| crop 変更 | **クリアしない** (表示は overlay のみ) | **クリアしない** | 触らない | **触らない** (AI を無駄にキャンセルしない) |
+| crop 変更 | **クリアしない** (表示は overlay のみ) | **クリアしない** | 永続 edit preview WebP のみ非同期削除し、編集終了後に crop 済み preview を再生成 | **触らない** (AI を無駄にキャンセルしない) |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
 (ポストフィルタ / シャープ化は final 専用項目で、単独変更なら上記の
@@ -853,7 +859,8 @@ erase 契約を使う。UI thread で `mask.db` の bitmap + shapes と AI runti
 snapshot し、book worker が raw decode を必要なら黒で不透明化してから保存マスクをラスタライズし、
 MI-GAN を再推論する。erase 完了後にだけ local_adjust → conceal → adjustment の下流を合成するため、
 erase mask があるページを未消去 base のまま部分焼き込みすることはない。製本では global AI
-upscale / denoise を除外するが、非 AI 出力用 smart sharpen と post_filter は維持する。
+upscale / denoise に加えて、表示専用の smart sharpen / colorize / Creative LUT /
+post-filter も除外する。
 MI-GAN が利用できず diffusion fallback になった場合は処理を継続し、追加完了トーストで通知する。
 
 `ui_erase.rs` と `mask_db.rs` で実装された消しゴム機能は、補正パイプラインと連携している:
@@ -867,7 +874,10 @@ MI-GAN が利用できず diffusion fallback になった場合は処理を継�
 local_adjust_cache ─▶ conceal_cache ─▶ edit_result_cache
                                            │
                                            ▼
-                         色調補正 ─▶ final AI ─▶ post_filter ─▶ final_composite_cache ─▶ 画面
+                         色調補正 ─▶ final AI ─▶ smart sharpen ─▶ colorize
+                                                        │
+                                                        ▼
+                                      Creative LUT ─▶ post_filter ─▶ final_composite_cache ─▶ 画面
                                                                        │
                                                                        ▼
                                      (Ctrl+S / Ctrl+E) crop で切り出し ─▶ 保存
@@ -1047,7 +1057,8 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
   色系であれば `thumb_adjust_tex` 経由で自動適用される。`is_color_identity()` の
   判定に参加するよう、新フィールドのデフォルトは「効果なし」にしておくこと
   (そうでないとサムネが常時再生成される)。
-- [ ] **final pipeline 専用の項目** (post_filter / smart_sharpen のようにサムネへ乗せない
+- [ ] **final pipeline 専用の項目** (smart_sharpen / colorize / Creative LUT /
+  post_filter のようにサムネへ乗せない
   もの) は逆に `is_color_identity()` へ参加させず、`is_identity()` と
   `hash_adjust_final_params` にだけ追加する (§2.7 のシャープ化が実例)。
 

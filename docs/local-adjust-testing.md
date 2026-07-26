@@ -4,6 +4,10 @@
 継続的に検知** するためのテスト方針。Codex/Claude Code が修正コミットを作るときは、
 **修正と同じコミット内に最低 1 本の自動テスト**を追加することをルール化する。
 
+> **現況 (2026-07)**: Phase 3 の cache/compose guard と Phase 5 の補正レイヤーパネル
+> snapshot は実装済み。M-6 は App 統合の構造 + 動作テストまで追加済みで、全 UI 分岐の
+> E2E は引き続き L4 候補。以下の行番号を伴わない関数名を現行の参照点とする。
+
 ## なぜテストを書くか
 
 実機検証で振る舞いの差分が次々に出る (M-1〜M-7 のような UI レベルバグ) のは、
@@ -16,11 +20,11 @@
 | レイヤー | 場所 | 検証対象 | アクセス可能な型 |
 |---|---|---|---|
 | **(L1) コアロジック** | `crates/local-adjust-core/src/lib.rs` の `#[cfg(test)] mod` | mask 評価、effect 適用、core algorithm | 全ての pub 型 |
-| **(L2) パネル関数 unit** | `src/ui_adjustment_panel.rs` の `#[cfg(test)] mod` (panel:180-) | mask preview alpha、ハンドル hit-test、ジオメトリ計算 | `pub(crate)` 含めて全部 |
+| **(L2) パネル関数 unit** | `src/ui_adjustment_panel.rs` の `#[cfg(test)] mod` | mask preview alpha、ハンドル hit-test、ジオメトリ計算 | `pub(crate)` 含めて全部 |
 | **(L3) integration parity** | `tests/local_adjust_core_parity.rs` 他 | ラボ既知値 (色 RGB、デフォルト、preset 値) と pub API の一致 | crate pub のみ |
 
 **新規バグ修正には、L2 (panel 内 #[cfg(test)]) を最低 1 本添える** ことを Codex への
-標準指示にする。M-N がすでに混じった panel の test mod (panel:180-547) に追加していく。
+標準指示にする。M-N がすでに混じった panel の test mod に追加していく。
 
 ## どのバグをどこでテストすべきか
 
@@ -31,7 +35,7 @@
 | M-3 Rect/Ellipse ハンドル | L2 | `rect_and_ellipse_shape_handles_are_hit_testable` ✅ + drag apply のテスト追加 | 6770ad63 |
 | M-4 グラデーション再ドラッグ保存 | L2 | **未追加** — Codex 修正と同時に `linear_gradient_initialized_canvas_click_does_not_reset` を書く | (Codex M-N 対応) |
 | M-5 領域カラーアニメーション | L1+L3 | L3 `lab_animated_overlay_color_is_time_dependent` ✅ + L2 で mIV 側の boundary color が同じ式か検証 | core_parity.rs |
-| M-6 隠蔽加工バイパス | App統合 | **難度高** — 別途 conceal_compose 周辺の unit test として書く必要あり | (TBD) |
+| M-6 隠蔽加工バイパス | App統合 | `local_adjust_result_key_excludes_conceal_generation_m6` (構造) + `current_local_adjust_source_pixels_ignores_conceal_cache_m6` (動作) ✅。全 UI 分岐の E2E は L4 候補 | Phase 3 |
 | M-7 被写体マスク UI gating | L3 (値) + L2 (UI gating) | L3 `subject_refinement_default_is_disabled_with_lab_baseline` ✅ + `subject_refinement_three_preset_values_match_lab` ✅ + L2 で UI 描画が disabled になることを別途 | core_parity.rs + Codex 追加 |
 | A-1 直線端の round cap | L2+L3 | L2 `line_shape_preview_uses_square_end_caps` ✅ + L3 `line_shape_has_square_end_caps` ✅ + L3 `line_shape_vertical_has_square_end_caps` / `line_shape_diagonal_has_square_end_caps` ✅ (方向別ガード) | ef750308 / P4-6 |
 | A-2 アニメーション点滅が点 | L2 | L2 `mask_preview_overlay_at_2048_completes_in_30ms` ✅ (性能) + `mask_preview_max_texels_constant_stays_at_or_above_2048` ✅ (= 定数値ガード、768 への退行を検知) + `region_boundary_color_completes_meaningful_hue_rotation_in_one_second` ✅ (= アニメーション周波数ガード) | ef750308 / P4-7 |
@@ -81,7 +85,7 @@ Codex が修正で値を書く際の参照。**ラボの値を一字一句揃え
 - **CyanOrange** (`label="2"`): `[0, 205, 255]` / `[255, 150, 40]` / `[255, 235, 80]`
 - **YellowViolet** (`label="3"`): `[255, 225, 40]` / `[185, 115, 255]` / `[80, 230, 255]`
 - ラボ参照: `tools/local_adjust_lab/src/main.rs:937-957` の `impl MaskColorPreset::colors`
-- mIV 側: `src/app.rs:415-444` の `impl LocalAdjustMaskColorPreset::colors`
+- mIV 側: `src/app.rs` の `impl LocalAdjustMaskColorPreset::colors`
 
 ### SubjectMaskRefinement デフォルト + 3 プリセット
 - デフォルト: `enabled=false, threshold=0.52, expand_px=0, feather_px=1`
@@ -323,9 +327,10 @@ None 経路 (= AI モデル未設定ユーザー) も符号化。
 **上のマトリクス表と P7-1/P9-1 のテストが全 green を保つこと**を確認すれば
 P5-6 級の退行は予防できる。
 
-これらの guard は src/app.rs 18957- (bypass) / 19007- (prefix) にある 4 つの
-`is_some() return` + `let Some(..) else return` パターン、および
-src/app.rs:18905- (`current_local_adjust_source_pixels`) の compose chain。
+これらの guard は `src/app.rs` の `maybe_start_layer_bypass_preview` /
+`maybe_start_prefix_preview` にある 4 つの `is_some() return` +
+`let Some(..) else return` パターン、および `current_local_adjust_source_pixels` の
+compose chain を対象にする。
 **`fn maybe_start_*` / `LocalAdjustResultKey` / `current_local_adjust_source_pixels`
 をリファクタしたら必ず**この 10 本が green を保つことを確認すること。
 
@@ -335,8 +340,7 @@ src/app.rs:18905- (`current_local_adjust_source_pixels`) の compose chain。
 |---|---|---|---|
 | M-6 隠蔽加工バイパス | L3 (App統合) | `local_adjust_result_key_excludes_conceal_generation_m6` (構造) + `current_local_adjust_source_pixels_ignores_conceal_cache_m6` (動作) ✅ | (Phase 3) |
 
-(冒頭の M-6 行が「難度高 / TBD」になっていたのを **Phase 3 で着手済み** と本表で
-上書きしている。M-6 の完全カバー = compose chain 全分岐 (BypassLayer /
+(M-6 の完全カバー = compose chain 全分岐 (BypassLayer /
 PrefixPreview / FullComposite / ShowSource × `ensure_final_composite_texture`
 非経由) まで踏み込むのは L4 (egui_kittest による E2E) 待ちで、現状は
 構造 + 動作の 2 軸ガードで実用上の退行は検知できる。)

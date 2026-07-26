@@ -2,6 +2,11 @@
 
 作成: 2026-06-29 / ClaudeCode
 
+> **位置づけ (2026-07-26 更新):** 本書は K0 導入時の詳細 smoke を現行ログ名へ追従させた
+> 補助チェックリストである。リリース全体の現行 matrix は
+> [出荷前チェックリスト](detached-rework-ship-checklist.md) を正とする。下記ケースの直近の
+> 手動実施状況は未確認。
+
 目的: keep-alive (K0) 導入後の detached image window を、モード × コンテンツ × 操作の
 組合せで実機確認する。immediate viewport の破棄/再生成・小窓・閉じ漏れは unit test で
 再現できないため、ここを目視 + デバッグログで確認する。
@@ -22,7 +27,8 @@
 | 観点 | 成功 | 失敗 (要報告) |
 | --- | --- | --- |
 | ウィンドウ破棄/再生成 | `host_lost_diag` / `clear host` が **folder-nav で出ない** | folder-nav のたびに出る |
-| 小窓 | `captured host` の rect が **822x656 等の既定サイズにならない**・HWND 値が変わらない | 822x656 がカスケード |
+| HWND registry | 初回の `[detached-viewer] registered host hwnd=... window_id=... label=... viewport=...`、または fallback の `hwnd_adopted_unclaimed` / `hwnd_adopted_deferred` / `hwnd_adopted_watcher` で、対象 `window_id` と host HWND の対応を記録できる | 同じ生存 `window_id` が別の HWND へ無理由に再登録される、または別 `window_id` と同じ HWND を同時所有する |
+| 小窓 | 上記対応で同じ `window_id` の HWND 値が folder-nav を跨いで変わらず、822x656 等の既定サイズ窓が出ない | 既定サイズがカスケード、または同じ `window_id` の HWND が変わる |
 | window_id churn | folder-nav で `allocate_window_id` が **出ない** (`reuse_active_window_id` は可) | 毎ナビ allocate |
 | 空窓の生き残り | close 後に `keepalive_backstop` が **続かない** | close 後も延々 backstop |
 | session 整合 | close 操作で `session_closing` → `session_finish` が **出る** | 出ない (= 閉じられない) |
@@ -31,7 +37,7 @@
 
 ## 1. 通常モード (設定「画像を別ウィンドウで開く」= OFF)
 
-> F12 で現在の画像/本を別ウィンドウへ。メイン一覧カーソルに追従 (ピンで切り離し)。
+> F12 で現在の画像/本を別ウィンドウへ。メイン一覧カーソルに追従する。現行仕様に pin はない。
 
 ### 1.1 静止画
 
@@ -71,7 +77,7 @@
 
 ---
 
-## 2. 常に別ウィンドウモード (設定「画像を別ウィンドウで開く」= ON) ⚠️ 未検証重点
+## 2. 常に別ウィンドウモード (設定「画像を別ウィンドウで開く」= ON)
 
 > 画像を開くたびに新しいウィンドウ。古い窓は passive (frozen) として残る。
 > active な静止画窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown が、その窓自身の物理フォルダ順で
@@ -106,7 +112,8 @@
 
 - [ ] active 窓を Esc/× → 閉じる・空窓が残らない
 - [ ] 全 passive 窓を順に閉じられる
-- [ ] ログで `session_closing`/`session_finish` が各 close で出る・backstop が残らない
+- [ ] active close では `session_closing`/`session_finish` が出て backstop が残らない。
+      passive close は対象 window の runtime/remove だけで完了し、active session ログを要求しない
 
 ---
 
@@ -136,7 +143,7 @@
 - [ ] PDF/ZIP の enumerate 待ち中の holdover (前ページ表示) が出る・黒フラッシュしない
 - [ ] スライドショーが detached/非 detached で動く
 - [ ] 通常 F12 linked detached では補正/AI アップスケール/消しゴム等が動く
-- [ ] ピン / always-new detached では消しゴム等の編集入口が無効化され、全体補正/ポストフィルタ/V/Shift+Z は動く
+- [ ] independent / always-new detached では消しゴム等の編集入口が無効化され、全体補正/ポストフィルタ/V/Shift+Z は動く
 
 ---
 

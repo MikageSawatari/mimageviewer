@@ -16222,7 +16222,8 @@ impl App {
     ///
     /// - 左ドラッグ → yaw/pitch (sens = fov_y / viewport_h)
     /// - ダブルクリック → reset (GPano hint or 0)
-    /// - **通常 Wheel / 矢印 / Esc は奪わない** (= 既存ナビ動作維持)
+    /// - Wheel は別ハンドラで修飾キーに関係なく FOV 操作へ転用
+    /// - 矢印 / Esc は奪わない (= 既存ナビ動作維持)
     fn handle_panorama_drag_if_active(
         &mut self,
         ctx: &egui::Context,

@@ -3,8 +3,9 @@
 作成: 2026-07-05 / ClaudeCode (Fable)
 体制: **実装 = Codex / 検収 = ClaudeCode (Fable) / 実機検証 = ユーザー**
 
-対象: F12 別ウィンドウ表示 (detached viewer) と複数ウィンドウ (passive / pin /
-always-new) のライフサイクル全体。
+対象: F12 別ウィンドウ表示 (detached viewer) と複数ウィンドウ (passive /
+always-new) のライフサイクル全体。CUT 後の現行仕様には pin はなく、再導入する場合は
+「独立窓として複製する」将来機能として別途設計する。
 
 技術的な診断の正本は
 [detached-viewer-lifecycle-redesign-proposal.md](detached-viewer-lifecycle-redesign-proposal.md)
@@ -107,13 +108,14 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 
 ### R2: 状態の集約 — `DetachedWindowRuntime` + reducer + placement 一本化 (提案書 S1 / BA-6, BA-7)
 
-- **R2a** (挙動不変): `DetachedWindowRuntime { window_id, state, hwnd, pinned, linked }`
+- **R2a** (挙動不変): `DetachedWindowRuntime { window_id, state, hwnd, linked, ... }`
   を導入し、R1 の hwnd registry を吸収。状態 enum
   `{ Opening, Active, Parked, ParkedLive, Resuming, Closing }` を定義し、既存遷移点
   から `transition_detached_window_state()` 1 本で**記録** (診断ログ専用の shadow state)。
   指示書: [stage-r2a](archive/detached/detached-rework-stage-r2a.md)
-- **R2b** (挙動変更): 遷移 reducer 化。park/close/activate の分岐が state を読む形に
-  し、対応する散在 bool を削除。**§6-3 のメディア live-park (`ParkedLive`) を実装**
+- **R2b** (挙動変更): Runtime を経由する park/close/activate routing と
+  **§6-3 のメディア live-park (`ParkedLive`) を実装**する。純粋 reducer、合法遷移の
+  検証、相互排他的な pending/flag の typed state 集約までを本来の完了条件とする
   (park 時にメディアは凍結せず native presenter を生かしたまま非アクティブ化、
   クリックで復帰、新メディア再生開始で旧窓 close)。実機 smoke は R2b 完了後に実施。
 - **R2c**: placement を runtime に一本化 (settings は seed のみ)。
@@ -125,6 +127,8 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 
 - active / passive / fullscreen の ViewportId を window_id 由来に統一。
   `fs_viewport_generation` は content 世代専用に格下げ。
+- 現行実装では `fullscreen_viewport_id()` が active session の `window_id` を最優先する。
+  passive window も window_id 由来であり、このステージは実質完了している。
 - active↔passive 切替・folder-nav reopen で OS 窓が作り直されないことをログで確認。
 
 ### R4 (実施判断はゲート C で): deferred viewport 化 + state machine 完成 (提案書 S4)
@@ -133,6 +137,8 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
   keep-alive / holdover / backstop の特殊フレーム分岐を撤去。
 - リスク最大。R3 まで到達した時点の安定度と残バグの性質を見て、実施可否を
   ユーザー + Fable で判断する。R3 までで smoke が安定していれば見送り (= 出荷) も可。
+- 現行には keepalive / holdover / backstop が残り、通常 render と複数の描画入口を構成する。
+  single render entry 化は未実施である。
 
 ## 5. ゲート (ステージ間の判断点)
 
@@ -152,8 +158,8 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 3. **新要件: メディア窓の live-park (ユーザー決定 2026-07-06)**。再生中の動画 / 音声の
    detached 窓は、別の窓をアクティブ化しても**閉じずに再生を継続**する
    (現行は park 不能 → `close_legacy_detached` で閉じてしまう)。仕様:
-   - live-park はピン留めの有無に関係なく適用。メディア窓は常に最大 1 本
-     (再生エンジンが 1 本のため)。
+   - live-park は OFF / ON の両モードに適用。メディア窓は常に最大 1 本
+     (再生エンジンが 1 本のため)。当初案にあった pin は後続 CUT で撤去済み。
    - 非アクティブ中は映像と音声のみ継続。**操作は最初のクリックで復帰のみ**
      (シークバー等は復帰後に有効化。passive のクリック限定ルールと一貫)。
    - 別のメディアを新しく再生開始したら、live-park 中の古いメディア窓は**閉じる**。
@@ -163,7 +169,11 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 
 - [smoke-matrix](archive/detached/detached-viewer-smoke-matrix-20260630.md) の 3 設定セット × 全ケースを
   **連続 2 回**グリーン。
-- その後 **2 週間の実機常用で新規 P1 ゼロ** (P2 以下は backlog 化して出荷可)。
+- マスタープランの基準は、その後 **2 週間の実機常用で新規 P1 ゼロ**
+  (P2 以下は backlog 化して出荷可)。
+- ただし 2026-07-07 の当該リリース出荷判断では、ユーザー判断により
+  [出荷前チェックリスト](detached-rework-ship-checklist.md) の **1 日程度**へ短縮した。
+  これは release-specific override であり、一般基準の変更ではない。
 - `panic.log` に detached 起因の新規 panic なし (Y-32 / OOM 含む)。
 - 満たせない場合は「設定既定 OFF の実験的機能」としての出荷、または動画 detached の
   部分封印 (§6-1) へフォールバック。
@@ -177,6 +187,41 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 - これが landed してから R0 に着手する (作業ツリー衝突を避ける)。
 
 ## 9. 進捗記録
+
+### 9.1 現況 (唯一の進捗表、2026-07-26 コード確認)
+
+この表だけを現行ステージ判定に使う。後続のコミット・検収記録は、各時点の実装履歴であり、
+現在の完了判定ではない。コードから実装を確認できた範囲を記載し、7 月 24〜26 日分を含む
+直近変更の手動検証状況は未確認とする。
+
+| ステージ | 現況 | コード上の到達点 / 残件 |
+| --- | --- | --- |
+| R0 | **完了** | geometry 非依存の生成前後 HWND registry 方式を採用済み |
+| R1 | **完了** | detached host HWND は registry 所有へ移行済み。キー入力 subclass の rect 探索は R1 の対象外として残り、BA-1 の後続課題 |
+| R2a | **完了** | `DetachedWindowRuntime` と manager を導入済み |
+| R2b | **部分完了** | Runtime routing と `ParkedLive` は実装済み。純粋 reducer、合法遷移制約、散在 pending/flag の typed state 集約は未完 |
+| R2c | **完了** | placement は runtime 所有、settings は seed |
+| R2d | **完了** | live-park と active 復帰の直列化を実装済み |
+| R3 | **実質完了** | active session の `window_id` を ViewportId 決定で最優先し、passive も window_id 由来 |
+| R4 | **未完** | keepalive / holdover / backstop はあるが、deferred viewport 化と single render entry 化は未実施 |
+| CUT | **完了** | 現行は OFF=連動 1 窓、ON=独立複数窓。pin は撤去済み |
+
+完了済みの拡張と、後続 lifecycle 整理は次のとおり。
+
+| 項目 | 現況 | コード上の到達点 / 残件 |
+| --- | --- | --- |
+| stage-audio | **完了** | 音声も動画と共通の単一メディア窓へ接続済み |
+| stage-folder-nav | **完了** | 独立静止画窓の通常画像 / PDF / ZIP の物理フォルダ移動を context-owned pending で実装済み |
+| physical open routing | **実装済み** | strict target と detached `window_id` を維持して bundle 内で poll / apply |
+| terminal close routing | **基盤実装済み・不変条件は未完** | session/runtime の terminal 経路はあるが、close 後の全 in-flight producer 停止は未達。BA-7 / R2b の残件 |
+| nav lock ownership | **実装済み** | lock generation と遅延 nav intent は `ViewerContextBundle` 所有 |
+| holdover ownership | **実装済み** | holdover texture は `ViewerContextBundle` とともに mount / swap |
+| manager / session 分離 | **実装済み** | `DetachedWindowManager` と `ViewerSession` を導入済み |
+
+### 9.2 実装・検収履歴
+
+以下は当時の状態を保存した履歴である。たとえば R2b の当時の検収合格は、現在の
+R2b 完了条件 (純粋 reducer / 合法遷移 / typed state 集約) を満たしたことを意味しない。
 
 | ステージ | 状態 | 指示書 | 完了日 / メモ |
 | --- | --- | --- | --- |
@@ -206,7 +251,8 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | findings-17 | **完了** (cc488bd9) | [findings-17](archive/detached/detached-rework-findings-17.md) | 動画 live-park でメイングリッドの自動比率が 1:1 にリセット (findings-12 D3 の取り漏らし = `clone_current_viewer_context_grid_fields_into` に auto_aspect が無く default で復元)。clone 対象に追加 |
 | findings-19 | **fix15 まで適用・検収済み** (eac47547〜01910684、実機 OK 記録あり: fix10〜12) | [findings-19](archive/detached/detached-rework-findings-19.md) | ON モードのアクティブ切替が close+reopen 往復で窓を再構築し高速切替で窓が消える (A/P1) + アクティブ化時に画像がわずかに移動 (B/P2)。fix10a=in-place park / fix10b=snapshot rect 一致 / fix11=passive の OS × ボタン / fix12=VST UI を main fullscreen 限定 / fix13 系=凍結見開きの trim/clip パリティ / fix14=trim bbox の runtime 焼き込み / fix15=trim 状態の viewer context 保持 |
 
-**→ R2 全サブステージ完了。ゲート C (2026-07-06 到達)。スコープ決定 = CUT (2026-07-07)。findings-10 で多窓 churn 根治済み、findings-11 も C1/C3 完了済み (行参照)。findings-19 は fix15 まで検収済み。**
+**当時の判断: ゲート C (2026-07-06 到達)、スコープ決定 = CUT
+(2026-07-07)。現在のステージ判定は §9.1 を正とする。**
 **2026-07-09 追記: 出荷前品質レビュー (docs/archive/review-v2.3.0/final-report.md) で BA-7 系の構造修正を実施 (コミット 1bb26360): ロード複合体 (thumb channel / cancel_token / worker queue / keep atomic) の ViewerContextBundle 化 + bundle Drop teardown + legacy ParkedLive park の複合体引き継ぎ + unclaimed HWND fallback の可視性フィルタ (BA-1/BA-4)。凍結例外はユーザー指示。実機確認は archive/review-v2.3.0/fix-verification-checklist.md。**
 
 **2026-07-09 夜 追記 (実機検証で出た findings-19 続報 + stage-media-window 前倒し、凍結例外はユーザー指示):**
@@ -216,7 +262,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 - **連動 park 画像窓の復帰フォールバック**: 連動セッション由来の parked still (descriptor=none) は main の一覧変更で stamp_not_resolved になり復帰不能だった。`ViewerContextDescriptor::Image` を parked snapshot 専用フォールバックとして追加 (open ルーティングは不変)。activation は stamp 優先・解決不能時のみ親フォルダを窓内コンテキストとして開き直す。
 - **stage-media-window (旧バックログ §1.7) 前倒し実装**: フル機能モードのサブオプション「動画・音声は別ウィンドウで再生」(`Settings::fullfeature_media_window` + 派生述語 `effective_media_in_media_window()`)。メディア窓インフラはモード非依存のまま、入口 (`requested_viewer_presentation_for_open` / F12 / カーソル同期 skip / grid open 前の unbundled live-park) だけ実効述語化。
 
-### 9.1 DetachedWindowManager 構造分離 (2026-07-15)
+### 9.3 DetachedWindowManager 構造分離 (2026-07-15)
 
 `App` が直接所有していた window_id ごとの runtime map、activation watcher、HWND 生存判定用の
 テスト状態を `src/app/detached_window_manager.rs` の `DetachedWindowManager` へ移した。
@@ -233,7 +279,7 @@ placement 永続化、メディア presenter、ログなど複数領域をまた
 - `ViewerContextBundle` の swap 廃止、`ViewerSession` / `MediaWindowSession` 導入、native presenter
   再設計はこの段階の対象外。Manager 抽出後も既存の表示・park / resume 意味論は維持する。
 
-### 9.2 ViewerSession 準備分離 (2026-07-16、実機確認済み)
+### 9.4 ViewerSession 準備分離 (2026-07-16、実機確認済み)
 
 退避中の `ViewerContextBundle` が個別フィールドとして持っていた次の session 意味状態を
 `src/app/viewer_session.rs` の `ViewerSession` に集約した。
@@ -260,17 +306,9 @@ identity tuple を `activate_independent_detached` で同時設定する。
 Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaWindowSession` のどちらへ
 進むかを判断する。
 
-## 10. ゲート C 後の候補ステージ (別機能、リワーク出荷スコープ外)
+## 10. 将来候補 (現行仕様では未採用)
 
-- **音声ファイルの detached 対応** (stage-audio): Phase S 検収合格後、Phase I で実装。
-  音声も単一メディアウィンドウへ合流し、F12 / always-new open を動画と対称に扱う。
-  `music_*` は bundle 化せず global のまま維持し、メディア窓 1 本規則で main 側との混線を排除する。
-- **独立静止画窓の物理フォルダ移動** (stage-folder-nav、v2.8.0):
-  [指示書](archive/detached/detached-rework-stage-folder-nav.md) に従い、folder-nav pending を
-  `ViewerContextBundle` 所有へ移して active context 内で poll / apply する。main の検索・
-  絞り込みを継承せず、通常画像フォルダ、ZIP/CBZ、PDF の物理順だけを初期対象とする。
-| R2 | 未着手 | — | |
-| R3 | 未着手 | — | |
-| R4 | 実施判断待ち (ゲート C) | — | |
-
-ステージ完了ごとに Fable が本表を更新する。
+- **pin の再導入**: CUT 前の linked/pin 意味論は戻さない。必要なら、既存窓を
+  「独立窓として複製する」明示操作として新規設計する。
+- **R4 の実施**: ステージ状態は §9.1 だけで管理する。deferred viewport 化と
+  single render entry 化を行う場合は、BA-5 と BA-7 を同時に閉じる設計として扱う。

@@ -349,53 +349,36 @@ NativeVideoPresenter::present (CPU 経路ブランチ)
 (= FFmpeg D3D11VA hw_device_ctx 共有) は残っており、decoder と native presenter の
 共通基盤として機能する。
 
-## モジュール構成 (v0.9.0 時点)
+## モジュール構成 (現行責務)
+
+行数は変動が大きく、恒久仕様と同じ表では管理しない。2026-07-26 監査時点の規模 snapshot は
+[v2.8.1 video 監査](review-v2.8.1/s4-video.md) に残し、本節はファイルの実在と責務だけを管理する。
 
 ```
 src/video/
-├── mod.rs                  # VideoPlayer 公開 API + NativeVideoOutput 統合 (3445 行 ⚠ 肥大)
-├── decoder.rs              # demux + 動画/音声 decode の 3-thread 実装 (4962 行 ⚠ 肥大)
-├── audio.rs                # cpal WASAPI Shared 出力 + audio-pump thread + VST3 経由 (1864 行)
-├── audio_stretch.rs        # Signalsmith Stretch によるピッチ維持の倍速音声処理 (172 行)
-├── clock.rs                # AvClock (薄い facade、engine/ に委譲) — 詳細は下記 (905 行)
-├── engine/                 # 動画再生エンジン (state machine + master clock 分割実装)
-│   ├── mod.rs              # EngineEvent enum (Decoder/Audio events) (37 行)
-│   ├── actor.rs            # EngineActor (state machine の source of truth) (1873 行)
-│   ├── state.rs            # EngineState / DecoderEvent / AudioEvent / ReadinessLatch (357 行)
-│   ├── clock.rs            # MasterClock + ClockAnchor (純粋な値オブジェクト) (292 行)
-│   └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、単独で unit test 可) (316 行)
-├── ffmpeg_loader.rs        # exe 同居 DLL のログ検証 (展開は launcher、ロードは Windows ローダ) (57 行)
-├── screenshot.rs           # 現在フレームのクリップボードコピー用 one-shot RGBA 抽出 (173 行)
-├── thumbnail.rs            # シーク先サムネイル取得 worker (361 行)
-├── tile_thumbnails.rs      # タイルモード用一括サムネイル抽出 worker (384 行)
-├── tile_thumb_cache.rs     # タイル サムネ SQLite WebP 永続キャッシュ (358 行)
-├── native_window.rs        # ネイティブ Win32 message loop + 入力イベント変換 (577 行)
-├── native_presenter/       # ネイティブ DComp プレゼンター + egui overlay
-│   ├── mod.rs              # NativeVideoPresenter / NativeEguiOverlay impl (3900 行級)
-│   ├── overlay_draw.rs     # native overlay 描画・layout helper (2300 行級)
-│   └── grade_pipeline.rs   # D3D11 色調補正 + Creative 3D LUT fullscreen pass
-├── gpu_renderer/           # decoder + native presenter の D3D11 共有基盤、unsafe を局所化
-│   ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, GpuVideoError, VideoColorHint
-│   ├── d3d11_device.rs     # D3D11 Device + VideoProcessor + Fence (1134 行)
-│   └── ffmpeg_d3d11.rs     # FFmpeg D3D11VA hw_device_ctx 共有 (159 行)
-├── dsp/                    # VST3 プラグインチェーン (詳細は docs/vst3-integration.md)
-│   ├── mod.rs              # DspBridge 公開 API + チェーン管理 (2102 行 ⚠ 肥大)
-│   ├── bridge.rs           # bridge 子プロセス管理 + IPC (1033 行)
-│   ├── gui.rs              # プラグイン GUI Win32 親ウィンドウ管理 (1164 行)
-│   ├── scanner.rs          # VST3 plugin スキャン (291 行)
-│   └── extract.rs          # bridge exe APPDATA 展開 (30 行)
-└── upscale/                # オフライン動画アップスケール (詳細は本書「オフラインアップスケール」節)
-    ├── mod.rs              # 公開 API (6 行)
-    ├── job.rs              # ジョブ実行 (resumable segment 化) (2551 行 ⚠ 肥大)
-    ├── queue.rs            # 永続キュー (465 行)
-    ├── manifest.rs         # マニフェスト (進捗 / セグメント完了状態) (408 行)
-    ├── sidecar.rs          # サイドカーファイル管理 (284 行)
-    ├── disk.rs             # ディスク I/O (92 行)
-    └── paths.rs            # パス管理 (188 行)
+├── mod.rs                  # VideoPlayer 公開 API、UI tick、NativeVideoOutput 統合
+├── decoder.rs              # demux + video/audio decode の 3-thread 実装
+├── audio.rs                # cpal 出力、audio-pump、VST3 経由、back-pressure
+├── audio_diagnostics.rs    # audio 診断 snapshot / perf 情報
+├── audio_stretch.rs        # Signalsmith Stretch によるピッチ維持の倍速処理
+├── avio_progress.rs        # FFmpeg AVIO の進捗・停止監視
+├── clock.rs                # AvClock compatibility facade
+├── frame_selection.rs      # 表示 frame の選択純ロジック
+├── normalize_scanner.rs    # Normalize 全尺 scan worker
+├── normalize_types.rs      # Normalize scan の共有型
+├── swscale_helpers.rs      # CPU pixel conversion 共通 helper
+├── engine/                 # EngineActor / EngineState / MasterClock / audio bookkeeping
+├── native_window.rs        # Win32 message loop + 入力イベント変換
+├── native_presenter/       # DComp presenter、overlay、HUD window、grade pipeline
+├── gpu_renderer/           # decoder + presenter の D3D11 共有基盤、unsafe 境界
+├── dsp/                    # chain 単位 VST3 bridge / GUI / scanner / extract
+├── thumbnail.rs            # hover / marker thumbnail worker
+├── tile_thumbnails.rs      # tile mode 一括 thumbnail worker
+├── tile_thumb_cache.rs     # tile thumbnail SQLite/WebP cache
+├── screenshot.rs           # 現在 frame の clipboard copy
+├── ffmpeg_loader.rs        # 同居 FFmpeg DLL の検証
+└── upscale/                # resumable offline upscale job / queue / manifest / paths
 ```
-
-⚠ マークは「設計ドキュメントが想定する単一責務に対して、ファイルが太りすぎているか責務が
-混ざっている」ファイル。詳細は本書末尾「抽象化の現状と既知の負債」節を参照。
 
 エンジン側のリデザイン経緯は [docs/video-engine-redesign.md](video-engine-redesign.md) を
 参照。Phase 1 (skeleton) → Phase 2 (facade 化、AvClock を MasterClock + AudioBookkeeping に
@@ -454,8 +437,8 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 | thread 名 | 責務 | 入力 | 出力 |
 |---|---|---|---|
 | `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火。スレッド本体は `catch_unwind` で囲み、panic は `info_tx(Err)` + `DecoderEvent::Failed` に変換して engine/UI に伝える (無言ハング防止) | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` (bounded=32) / `audio_pkt_tx` (bounded=64) / `video_ctl_tx` / `audio_ctl_tx` |
-| `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoPacketMsg::{Packet, Eof}`) + `video_ctl_rx` (`VideoControlMsg::Flush`) | `video_tx` (bounded=24、`VideoFrame`) |
-| `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioPacketMsg::{Packet, Eof}`) + `audio_ctl_rx` (`AudioControlMsg::Flush`) | `audio_tx` (bounded=32、`AudioFrame`) |
+| `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoPacketMsg::{Packet, Eof}`、bounded=32) + `video_ctl_rx` (`VideoControlMsg::Flush`、bounded=8) | `video_tx` (bounded=8、`VideoFrame`) |
+| `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioPacketMsg::{Packet, Eof}`、bounded=64) + `audio_ctl_rx` (`AudioControlMsg::Flush`、bounded=8) | `audio_tx` (bounded=32、`AudioFrame`) |
 
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
 (= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、packet queue とは別の
@@ -1944,16 +1927,16 @@ publish 順序 (Codex 助言): clear 系は **valid=false を先に**書き、`s
 ### 既知の症状 (修正済): Norm clear で audio が 5+ 秒先行する
 
 **症状** (修正前、〜 2026-05-11):
-`clear_audio_output_buffer` ([src/video/audio.rs:55](src/video/audio.rs:55)) は
+`clear_audio_output_buffer` ([src/video/audio.rs](../src/video/audio.rs)) は
 seek 文脈で decoder が flush 直前という前提で書かれている。Norm 経路 ([src/app/
-native_video.rs](src/app/native_video.rs) の `apply_normalize_gain_with_perf` 経由) は
+native_video.rs](../src/app/native_video.rs) の `apply_normalize_gain_with_perf` 経由) は
 seek_serial も engine flush も走らせないので、`raw_pending` (= 通常 5 秒分) を捨てた
 直後に新しい audio frame は 5 秒先 PTS で届き、`set_audio_pts` の wall-rate cap で
 master clock が追従できず、**A/V offset = −5000ms 級の永続ズレ**が残った。
 toggle を繰り返すと累積で −10s, −15s, −20s と進行 (Codex 確認、2026-05-10 perf-log)。
 
 **修正** (2026-05-11):
-[src/app/native_video.rs::apply_normalize_gain_with_perf](src/app/native_video.rs)
+[src/app/native_video.rs::apply_normalize_gain_with_perf](../src/app/native_video.rs)
 から `clear_audio_output_buffer()` 呼出を削除。`set_normalize_gain` だけ呼んで
 buffer は触らない。Codex の A' 案 (`processed` も `raw_pending` も保持) を採用。
 
@@ -2257,10 +2240,28 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
 
 ## 抽象化の現状と既知の負債
 
-v0.9.0 リリース直前 (2026-05-08) に行ったアーキテクチャ レビューの所見を残す。
-**設計レイヤ自体は妥当だが、実装ファイルが太りすぎている**箇所が複数ある。
+### 現行評価 (2026-07-26 コード確認)
 
-### レイヤ階層自体の評価
+層の境界は維持されているが、単なるファイル分割だけでは閉じない ownership 負債もある。
+行数は本節で固定せず、監査時点の snapshot は
+[v2.8.1 video 監査](review-v2.8.1/s4-video.md) に分離する。
+
+| 領域 | 現況 | 主な負債 / 次の境界 |
+| --- | --- | --- |
+| `engine/` | typed state / readiness / master clock を実装済み | `EngineActor` は `Arc<Mutex<_>>` を UI tick が駆動し、`AvClock` と actor の clock ownership が並存する。専用 actor thread は現行仕様ではない |
+| `decoder.rs` | demux / video / audio の 3 worker、packet/control 分離は安定 | 3 worker の codec、HW、seek、pacing helper が同居し、責務分離点がファイル境界になっていない |
+| `video/mod.rs` | `VideoPlayer` API と native output lifecycle の owner | UI tick event drain、output loop、source swap、native presenter orchestration が集中する |
+| `native_presenter/` | production の必須 presenter。legacy eframe video path は撤去済み | device/surface/presentation、overlay state、入力/HUD policy の責務が `mod.rs` / `overlay_draw.rs` に集中する |
+| `native_window.rs` | Win32 event translation | owner/focus/DPI/input policy まで広がっており、「問題なし」と固定評価できない |
+| `gpu_renderer/` | D3D11/FFmpeg interop と unsafe 境界 | 境界は比較的明確。presenter/decoder との resource lifetime は引き続き横断監査が必要 |
+| `audio.rs` / `dsp/` | device-rate playback、stretch、chain bridge を統合 | pump、RT callback、VST IPC/back-pressure の ownership が近接し、DSP 側も chain/GUI/persistence/hot path が混在する |
+
+### 2026-05-08 の評価 (historical snapshot)
+
+以下は v0.9.0 リリース直前の所見であり、行数・test 件数・「問題なし」評価を現況として
+使わない。後段の分割案も設計履歴として残す。
+
+#### 当時のレイヤ階層評価
 
 | レイヤ | 状態 | 評価 |
 |---|---|---|
@@ -2269,7 +2270,7 @@ v0.9.0 リリース直前 (2026-05-08) に行ったアーキテクチャ レビ�
 | `clock.rs` (`AvClock` facade) | ⚠️ 計画的負債 | 設計上は engine に委譲する薄い facade だが、905 行と肥大。理由は legacy 互換のため `volume` / `muted` / `seek_serial` 等を所有したまま (= EngineActor への完全移行が Phase 5+ 以降に持ち越し)。**新規コードは AvClock を直接呼ばずに EngineActor 経由で書くこと** |
 | `native_window.rs` | ✅ 良好 | 単一責務 (Win32 → enum 変換) で 577 行。問題なし |
 
-### ファイル規模の負債
+#### 当時のファイル規模評価
 
 以下のファイル / モジュールはまだ責務が混ざって肥大しており、Phase 10 以降の
 リファクタ対象。`native_presenter/` は Tier 1 #2 で描画関数だけ分離済みだが、
@@ -2359,14 +2360,13 @@ VST3 と offline upscale。これらの分割方針は別ドキュメント
 ([docs/vst3-integration.md](vst3-integration.md), 後述の offline upscale design) で
 扱う。
 
-### 抽象化の境界として正しい分け方になっているか
+#### 当時の抽象化境界評価
 
 **結論: 大きな線引きは正しい**。
 
 - `engine/` ↔ `decoder.rs` ↔ `audio.rs` ↔ `gpu_renderer/` ↔ `native_presenter/` の
-  境界は妥当。各層が他の層に対して「event channel + Arc<X> 共有」という最小 API で
-  接続されており、内部を入れ替えやすい (実際 native presenter は eframe ビューポート版
-  と切り替え可能になっている)
+  境界を分ける方針自体は維持されている。ただし現行の動画表示は native presenter 必須で、
+  legacy eframe video path との切替はできない。
 - `engine/` 内部の `MasterClock` / `EngineActor` / `AudioBookkeeping` の 3 分割は
   Codex レビューで明示的に推奨された分割で、適切なグラニュラリティ
 - `gpu_renderer/` は unsafe 境界としても綺麗 (4 つのモジュールにまたがる D3D11 / D3D12
@@ -2375,7 +2375,7 @@ VST3 と offline upscale。これらの分割方針は別ドキュメント
 **問題なのは「層の中の責務」が太っていること**で、層をまたいだ抽象化リークではない。
 将来の Phase 10+ で機械的にファイル分割すれば解消できる範囲の負債。
 
-### Codex レビューを定期的に取る運用について
+#### 当時のレビュー運用メモ
 
 video サブシステムは Codex P1〜P3 反映を多数行ってきた経緯がある (=
 [docs/video-engine-redesign.md](video-engine-redesign.md) の Phase 9.A〜9.G、Phase 9

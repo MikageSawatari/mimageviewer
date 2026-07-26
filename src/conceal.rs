@@ -9,7 +9,7 @@
 //! # 設計の要点
 //!
 //! - 4 種類の処理タイプ (`ConcealType`): Mosaic / WhiteFill / BlackFill / Blur
-//! - 8 種類のツール (`ConcealTool`): 消しゴムと完全統一
+//! - 9 種類のツール (`ConcealTool`): 消しゴムと完全統一
 //! - パラメータは **グローバル設定** (ページ間共有)。複数の好みを保持したい
 //!   ときは `ConcealPreset` 4 スロットを使う。マスク本体は `conceal_db` で
 //!   ページごとに保存される
@@ -194,7 +194,7 @@ pub fn compute_tile_size(image_long_edge: u32, mode: TileSizeMode) -> u32 {
 
 // ── ConcealTool ─────────────────────────────────────────────────────────
 
-/// 隠蔽加工モードのツール種別 (8 種、消しゴムと統一)。
+/// 隠蔽加工モードのツール種別 (9 種、消しゴムと統一)。
 ///
 /// Phase 2 で実装。Phase 1 では型定義のみ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

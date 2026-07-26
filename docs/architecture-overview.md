@@ -151,12 +151,16 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 
 | モジュール / 概念 | 役割 |
 | --- | --- |
-| `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / ピン / Book) と parked live 窓は bundle swap で mount/unmount する。通常画像の always-new grid open も open 前に `DetachedPhysical` active bundle へ昇格し、main の検索・選択・スクロールから分離する。仮想一覧由来でも backing `items` は複製せず、通常フォルダは bundle-owned worker scan、ZIP/PDF は既存 enumerate worker で完全な物理一覧を構築し、対象 leaf を新しい物理 index へ解決する。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む)。swap前後のApp-global rating session差分は各context cacheへ同期するが、ownership交換自体はnavigationではないためfacet scope / suppressionを変更しない |
+| `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / Book) と parked live 窓は bundle swap で mount/unmount する。現行仕様に pin はない。通常画像の always-new grid open も open 前に `DetachedPhysical` active bundle へ昇格し、main の検索・選択・スクロールから分離する。仮想一覧由来でも backing `items` は複製せず、通常フォルダは bundle-owned worker scan、ZIP/PDF は既存 enumerate worker で完全な物理一覧を構築し、対象 leaf を新しい物理 index へ解決する。folder-nav pending、PDF/ZIP enumerate、nav lock generation、遅延 nav intent、holdover texture も context-owned。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む)。swap前後のApp-global rating session差分は各context cacheへ同期するが、ownership交換自体はnavigationではないためfacet scope / suppressionを変更しない |
 | detached open request state (app.rs) | 通常画像のscan、ZIP/PDF enumerate、protected PDFのpassword request・session password・保存予約、明示leafの`Required` targetをbundle内に保持する。グリッドのFolderはmain-owned worker scanで「候補」を先に分類し、画像本と確定したcompleted scanだけをdetached contextへ移譲する。混在Folderはsession/runtimeを作らず通常main navigationへ戻す。password dialogはowner bundleをmountして再開する。空／error／必須target消失でviewportが未生成でも共通terminal closeがsession finishとwindow runtime削除を行う。実フォルダscan errorは空一覧と区別し、catalogへ適用しない |
 | `ViewerSession` (`app/viewer_session.rs`) | 退避中 bundle の表示先・同期 stamp・独立 detached 状態・window ID を一括所有する。現在表示中の session は当面 `App` の既存フィールドへマウントし、`swap_with_mounted` で5項目を同時交換する |
-| `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (Active/Passive/Parked/ParkedLive/Resuming/Closing) と activation watcher を一元管理する。`ViewerSession` の意味状態とは分離する |
+| `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (`Opening/Active/Parked/ParkedLive/Resuming/Closing`) と activation watcher を一元管理する。passive window は window collection / frozen 表示上の役割であり、runtime state 名ではない。`ViewerSession` の意味状態とは分離する |
 | `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
 | `app/native_video.rs` | F12 host migration / source-swap / 動画→音声モード enter/exit など、native 動画 presenter と detached 窓の接続層 |
+
+BA-1 の不変条件は geometry 非依存の HWND 所有である。detached host 登録は registry 化済みだが、
+キー入力 subclass に rect 選択が残る具体的な仕様違反は
+[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されており、後続リワークへ引き継ぐ。
 
 ### 補正 / 編集 / AI
 

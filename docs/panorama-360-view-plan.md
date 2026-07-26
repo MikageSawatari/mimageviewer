@@ -1,12 +1,26 @@
-# 360 度パノラマビュー機能 — 調査と設計案
+# 360 度パノラマビュー機能 — 現行仕様と設計経緯
 
 ChatGPT / DALL-E や 360 カメラ (Insta360 / RICOH Theta 等) が出力する
 **equirectangular projection** の画像を、フルスクリーンでドラッグして自由視点で見られる
 ようにする機能。マウスドラッグで yaw / pitch、ホイールで FOV (ズーム)、
 リセットでデフォルト向きへ。
 
-本ドキュメントは **調査 + 設計まで**。実装は別セッションのファイル修正と競合しないよう、
-本ドキュメント承認後に着手する。
+> **現況 (2026-07)**
+>
+> - **コードで実装確認済み**: GPano XMP と negative cache、2:1 fallback、部分 FOV UV、
+>   `KeyAction::FsPanorama` の V キー、ホバーバー、WGSL、GPU upload、complete mip chain、
+>   final composite 優先入力、修飾キー不問の wheel FOV、settle-refinement と高解像度 gate。
+> - **lifecycle**: 通常ナビでは pose を保持し、非 360 ページで非アクティブ化する。明示 V/× の
+>   OFF と fullscreen 退出では state を破棄する。360 入場時は slideshow を停止する。
+> - **限定対応**: PDF は GPano XMP を抽出せず、2:1 fallback の 8K `BaseOnly` 表示のみ。
+>   ZIP は XMP / base 表示に対応するが high-res settle は行わない。
+> - **未実装 / 将来候補**: slideshow による連続 equirect pose 連動、慣性ドラッグ、
+>   ミニコンパス、アニメーション / 360 動画、巨大 JPEG の部分デコード。
+> - **手動検証**: 2K / 11K・12K 実素材、200 MP 超、実機性能の完了記録は確認できない。
+>   §8 の手動チェックは未確認のまま残す。
+>
+> §2〜§7 は現行仕様を優先し、§8 の完了済み code checklist は実装記録、未チェックの
+> manual checklist は未確認、§9〜§12 は明示ラベルどおり設計経緯 / 将来候補として読む。
 
 ---
 
@@ -15,7 +29,8 @@ ChatGPT / DALL-E や 360 カメラ (Insta360 / RICOH Theta 等) が出力する
 緯度経度を 2D 画像に展開する標準投影方式:
 
 - 画像幅 (X 軸) を経度 [-π, π] (360°)、画像高 (Y 軸) を緯度 [-π/2, π/2] (180°) に対応させる
-- アスペクト比は **必ず 2:1**
+- フル球面画像のアスペクト比は **2:1**。GPano `CroppedArea*` を持つ部分 FOV 画像は
+  2:1 でない場合がある
 - 中央 (赤道) が真っ直ぐ、上下 (極) で激しく横方向に歪む
 - 画像の左端と右端は連続する (シームレスにラップ)
 
@@ -42,14 +57,13 @@ Google が定義した [Photo Sphere XMP Metadata](https://developers.google.com
 | --- | --- | --- |
 | `GPano:ProjectionType` | `"equirectangular"` 等 | これがあれば確実 |
 | `GPano:UsePanoramaViewer` | `"True"` ならビューア推奨 | 自動起動の判断 |
-| `GPano:FullPanoWidthPixels` / `FullPanoHeightPixels` | 元解像度 | 部分パノラマ判定 (将来) |
-| `GPano:CroppedAreaImageWidthPixels` / `CroppedAreaImageHeightPixels` / `CroppedAreaLeftPixels` / `CroppedAreaTopPixels` | クロップ範囲 | 部分パノラマ補正 (将来) |
+| `GPano:FullPanoWidthPixels` / `FullPanoHeightPixels` | 元解像度 | 部分パノラマの full sphere 寸法として使用 |
+| `GPano:CroppedAreaImageWidthPixels` / `CroppedAreaImageHeightPixels` / `CroppedAreaLeftPixels` / `CroppedAreaTopPixels` | クロップ範囲 | `PanoUvTransform` で部分 FOV を補正 |
 | `GPano:PosePitchDegrees` / `PoseRollDegrees` / `PoseHeadingDegrees` | 初期向き | 初期 yaw/pitch の hint |
 
-`src/xmp_reader.rs` は既に **quick-xml** で XMP packet をパースしており、
-`xtw:` (X/Twitter) 名前空間を抽出している。**GPano 用に `read_panorama_info(path) ->
-Option<XmpPanoramaInfo>` を追加する**だけで再利用できる (`extract_xmp_packet` /
-`read_*_from_bytes` の枠組みはそのまま流用)。
+`src/xmp_reader.rs` は **quick-xml** で XMP packet を一度抽出し、`xtw:` と GPano を
+同じ metadata worker でパースする。単独 API の `read_panorama_info(path)` /
+`read_panorama_info_from_bytes(bytes)` もあり、通常画像と ZIP 内画像の双方で利用できる。
 
 ### 2.3 判定の使い分け
 
@@ -94,12 +108,14 @@ packet 切り出し) は完全に共通化できる。
 (`src/app.rs:12144`) と同じ String キー**を使う:
 
 ```rust
-pub(crate) xmp_panorama_info: HashMap<String, XmpPanoramaInfo>,
+pub(crate) xmp_panorama_info: HashMap<String, Option<XmpPanoramaInfo>>,
 // キー例:
 //   Image:    "c:/foo/bar.jpg"                      (normalize_path 済み)
 //   ZipImage: "c:/foo/bar.zip::内部/画像.jpg"        (entry_name lowercase)
-//   PdfPage:  対象外 (PDF は 360 候補にしない)
+//   PdfPage:  GPano XMP は対象外。fs_cache source_dims の 2:1 fallback は利用可能
 ```
+
+内側の `None` は「metadata load 済みだが GPano property なし」という negative cache。
 
 UI スレッドからは `metadata_cache_key(idx)` でキーを解決して引く。並び替えや
 items_generation バンプの影響を受けない。
@@ -290,7 +306,7 @@ AI ガード等を併せて再設計)。
 ドラッグ中画質が下がる。これを **「視点が止まった瞬間に画面解像度ぶんだけ CPU で
 フル解像度から再サンプリング**」してオーバーレイ表示する方式で補完する。
 
-**Phase 1 では settle は実装しない** (8K base 表示のみ)。**Phase 2a の発動条件 =
+settle-refinement は実装済み。**現行の発動条件 =
 「stationary (500 ms 静止) かつ `settle_enabled(state, policy) == true`」**。
 `settle_enabled` は (a) state が `SettleReady` / `SettleApproved` のいずれか、かつ
 (b) policy が `EnabledFromRaw` / `EnabledWithColorAdjustments` のいずれか、の両方を満たすときだけ
@@ -1885,22 +1901,25 @@ pub struct PanoramaState {
     pub fov_y:   f32,                     // 初期 1.2 rad ≒ 69°
     pub drag_active: bool,
     pub last_pointer: Option<egui::Pos2>,
-    pub inertia: egui::Vec2,              // 慣性 (Phase 2)
+    pub initial_yaw: f32,                  // reset 用 GPano hint
+    pub initial_pitch: f32,
 }
 
-pub(crate) xmp_panorama_info: HashMap<String, XmpPanoramaInfo>,
+pub(crate) xmp_panorama_info: HashMap<String, Option<XmpPanoramaInfo>>,
 // キーは metadata_cache_key(idx) (§2.4)、idx ベースだと並び替えで破綻
 ```
 
-ファイル切替 / フルスクリーン退出時に `panorama_state = None`。
+V / 上部 × による明示 OFF とフルスクリーン退出時に `panorama_state = None`。
+通常ナビでは state を保持し、`is_panorama_mode_active(fs_idx)` が検出結果のあるページだけを
+active にする。非 360 ページでは非アクティブになり、同じセッションで 360 ページへ戻ると
+yaw / pitch / fov を引き継ぐ。
 360 モードと相互排他: compare / erase / analysis / spread / free_rotation は
 360 アクティブ中に `early-return` で抑止する。
 
 ### 5.2 入力ハンドリング (Codex P2 反映)
 
-**既存の前後送り (Wheel) / フルスクリーン移動 (矢印) / フルスクリーン終了 (Esc) は
-維持し、奪わない**。`src/ui_fullscreen.rs:3613-3622` で Wheel = 前後アイテム送り、
-Ctrl+Wheel = 画像ズーム という運用が確立しているため、これらを破壊する設計は採らない。
+矢印によるフルスクリーン移動と Esc によるフルスクリーン終了は維持する。一方、360 中の
+wheel は修飾キーに関係なくすべて FOV 操作として consume し、意図しないページ送りを防ぐ。
 
 | 入力 | 360 モード中の動作 | 既存動作との関係 |
 | --- | --- | --- |
@@ -1991,8 +2010,7 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 - <kbd>V</kbd> キー → トグル (360 ON → OFF 復路)
 - <kbd>Esc</kbd> / システム終了 → **既存どおりフルスクリーン全体を閉じる**。360 中に
   Esc を押した場合は 360 + フルスクリーン同時終了 (Esc は途中で 360 だけを止めない)
-- 360 でない画像へナビ → 自動 OFF (`panorama_state` は保持しつつ非アクティブ化)
-- 360 モードでない画像へナビした際は、**`panorama_state` を保持しつつ非アクティブ
+- 360 でない画像へナビした際は、**`panorama_state` を保持しつつ非アクティブ
   化**。次に equirect 画像に戻ったら yaw / pitch / fov を引き継いで再開する。
   (これは「セッション内の 360 表示記憶」程度の軽い扱い。永続化はしない)
 
@@ -2026,11 +2044,11 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 | AI upscale / denoise | 適用される (final composite 経由、source_kind=4) | 通常表示と 360 表示の画質を一致させる |
 | プリセット補正 | 適用される (final composite 経由、source_kind=4) | 通常表示と 360 表示の画質を一致させる |
 | ポストフィルタ | 適用される | CRT/減色も equirect の上で OK |
-| スライドショー | 360 中も次画像へ進む | equirect が続けば yaw/pitch 引き継ぎ |
+| スライドショー | 360 入場時に停止 | 連続 equirect の pose 連動は未実装の将来候補 |
 | アニメーション (GIF/APNG) | **将来検討**。当面は静的フレームのみ (`FsCacheEntry::Animated` は 360 対象外) | GIF 360 はレアケース |
 | 動画 | **対象外** (FFmpeg 経路で 360 動画再生は別議論) | スコープ外 |
 | ZIP 内画像 | サポート (パス解決は `metadata_cache_key` 経由) | パイプライン上は同じ |
-| PDF ページ | 対象外 | PDF 内 equirect は実需が薄い |
+| PDF ページ | 2:1 aspect fallback による 8K base 表示のみ | GPano XMP 抽出と high-res settle は行わず `BaseOnly` |
 
 ---
 
@@ -2038,17 +2056,20 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 
 ### Phase 1: MVP (1 週程度、案 A 確定で大幅簡素化)
 
+> **実装記録**: 下の code 項目は実装済み。工数と Phase 分けは当時の計画値。
+> 最後の実素材テストだけは実施記録を確認できないため未チェックのまま残す。
+
 **スコープ**: 8K base + WGSL equirect 描画 + UI トグル + GPano XMP 検出。
 **含まれないもの (Phase 2a 以降)**: settle-refinement / フル RGBA 保持 /
 ミニコンパス / 慣性ドラッグ。mipmapは共通GPU生成器の導入後に8K baseへ追加済み。
 
-- [ ] `src/xmp_reader.rs` に GPano パーサ追加: `read_panorama_info(path)` +
+- [x] `src/xmp_reader.rs` に GPano パーサ追加: `read_panorama_info(path)` +
       `read_panorama_info_from_bytes(bytes)` + `XmpPanoramaInfo` 型 (Codex P2 反映)
-- [ ] `start_metadata_load` ワーカーで GPano XMP を読み、結果を
-      `App::xmp_panorama_info: HashMap<String, XmpPanoramaInfo>` に格納
+- [x] `start_metadata_load` ワーカーで GPano XMP を読み、結果を
+      `App::xmp_panorama_info: HashMap<String, Option<XmpPanoramaInfo>>` に格納
       (キーは `metadata_cache_key`、Codex P2 反映)
-- [ ] App 状態: `panorama_state` / `xmp_panorama_info` / `pano_uploaded` 追加
-- [ ] **`adjustment_generation: HashMap<String, u32>` 必須追加** (Codex P1 第 12 反映):
+- [x] App 状態: `panorama_state` / `xmp_panorama_info` / `pano_uploaded` 追加
+- [x] **`adjustment_generation: HashMap<String, u32>` 必須追加** (Codex P1 第 12 反映):
       `metadata_cache_key` をキーに u32 世代カウンタ。**粒度: 該当 source_key で
       +1** (adjustment_cache の idx 単位 clear と整合、Codex P3 第 17 反映)。
       **bump 箇所**:
@@ -2056,7 +2077,7 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
       (b) `clear_adjustment_caches(idx)` / `clear_all_adjustment_and_ai_caches(idx)` /
           バルク補正クリア
       (c) AI 完了後の補正自動適用 (`apply_sync_adjustment` line 15458)
-- [ ] **`ai_upscale_generation: HashMap<String, u32>` 必須追加** (Codex P1 第 12 反映):
+- [x] **`ai_upscale_generation: HashMap<String, u32>` 必須追加** (Codex P1 第 12 反映):
       同じく u32 世代カウンタ。**粒度: AI cache 全体 clear 時は全 entry を +1**
       (ai_upscale_cache の全体 clear と整合、Codex P3 第 17 反映)。
       ⚠️ **`.clear()` ではなく `for v in values_mut() { *v += 1 }`** にすること
@@ -2065,9 +2086,9 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
       (a) `ai_upscale_cache.insert` (AI 完了時、`src/app.rs:15463`) → 該当 source_key を +1
       (b) `ai_upscale_cache` の clear / モデル切替 / `bg_mode` 切替 →
           `bump_all_ai_generations()` で全 entry +1
-- [ ] **両 generation の不変条件**: 該当 idx の cache が無効化された時点で必ず bump。
+- [x] **両 generation の不変条件**: 該当 idx の cache が無効化された時点で必ず bump。
       cache 内容が変わるのに generation が同じだと cache_key 衝突で stale guard が機能しない
-- [ ] **`clear_caches_and_bump_generation(idx)` ヘルパの導入** (Codex P2 第 16 +
+- [x] **`clear_caches_and_bump_generation(idx)` ヘルパの導入** (Codex P2 第 16 +
       P3 第 17 反映):
       cache clear と generation bump を **同じヘルパで一括処理**、かつ粒度を実コード
       と整合させる:
@@ -2076,31 +2097,31 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
       - `adjustment_generation[source_key] += 1` (idx 単位)
       - `bump_all_ai_generations()` で全 AI gen entry を +1 (全体)
       AI ON/OFF / モデル切替 / bg_mode 切替の全経路でこのヘルパを呼び出し
-- [ ] 検出ヘルパ `App::detect_panorama(fs_idx) -> Option<PanoramaTrigger>` (Auto / Hint / None)
-- [ ] `src/panorama_wgpu.rs` (compare_wgpu.rs をテンプレートに WGSL を §3.3 のものに差替え、
+- [x] 検出ヘルパ `App::detect_panorama(fs_idx) -> Option<PanoramaTrigger>` (Auto / Hint / None)
+- [x] `src/panorama_wgpu.rs` (compare_wgpu.rs をテンプレートに WGSL を §3.3 のものに差替え、
       §4.1 のキャッシュキー設計 + `Arc::ptr_eq` 保険、Codex P1 反映)
-- [ ] **callback は `UploadedPanoTexture` 参照、テクスチャ実体を持たない** (§4.1)
-- [ ] アップロード経路: `resolve_pano_source` が選んだ final composite / fallback pixels を `color_image_to_rgba` 変換 →
+- [x] **callback は `UploadedPanoTexture` 参照、テクスチャ実体を持たない** (§4.1)
+- [x] アップロード経路: `resolve_pano_source` が選んだ final composite / fallback pixels を `color_image_to_rgba` 変換 →
       raw wgpu テクスチャ生成 → `pano_uploaded` に格納 (§4.3 / §4.1.1)
-- [ ] `ui_fullscreen.rs` で 360 モード分岐 (描画 + 入力)
-- [ ] **左ドラッグで yaw/pitch、Ctrl+Wheel で FOV、Wheel 単独 / 矢印 / Esc は奪わない**
-      (§5.2、Codex P2 反映)
-- [ ] **トグル経路: ホバーバーの 360 ボタン + V キー** (フィードバック反映で
+- [x] `ui_fullscreen.rs` で 360 モード分岐 (描画 + 入力)
+- [x] **左ドラッグで yaw/pitch、修飾キー不問の Wheel で FOV、矢印 / Esc は奪わない**
+      (§5.2、2026-05 フィードバック反映)
+- [x] **トグル経路: ホバーバーの 360 ボタン + V キー** (フィードバック反映で
       V キー採用、§5.3)。検出済み (= `detect_panorama(fs_idx).is_some()`) のときだけ反応
-- [ ] **360 モード中の機能制限**: メタデータパネル / 補正パネル / 分析パネル / 比較 /
+- [x] **360 モード中の機能制限**: メタデータパネル / 補正パネル / 分析パネル / 比較 /
       見開き / VST3 GUI を全て抑止。上バーは × / ウィンドウ切替 / 360 ボタンのみ
       (フィードバック反映、`is_panorama_mode_active(fs_idx)` で判定)
-- [ ] 補正・AI テクスチャの優先順位を 360 入力に反映 (display-pipeline.md §2.3 と整合、
+- [x] 補正・AI テクスチャの優先順位を 360 入力に反映 (display-pipeline.md §2.3 と整合、
       source_kind を §4.3 のとおりキーに焼き付け)
-- [ ] **検出 (`detect_panorama`)**: GPano `UsePanoramaViewer=True` → Auto、
+- [x] **検出 (`detect_panorama`)**: GPano `UsePanoramaViewer=True` → Auto、
       GPano `ProjectionType` のみ or アスペクト 2:1 → Hint。**自動 ON は廃止**
       (フィードバック反映)、代わりに `open_fullscreen` / `poll_metadata_load` /
       `poll_prefetch` から `maybe_show_panorama_hint_toast` で「V キーで 360°
       ビューワー」案内トーストを 1 度だけ表示 (`pano_toast_shown_for_current_fs`
       フラグで重複抑止)
-- [ ] **ホバーバーの 360 ボタンは常時表示**、非対応画像では disabled (グレーアウト)
+- [x] **ホバーバーの 360 ボタンは常時表示**、非対応画像では disabled (グレーアウト)
       (フィードバック反映で「検出時のみ表示」から変更、§5.3)
-- [ ] サムネは equirect のまま表示 (グリッドでは平面のままで OK)
+- [x] サムネは equirect のまま表示 (グリッドでは平面のままで OK)
 - [ ] テスト: ChatGPT 出力サンプル (2K) + Insta360 X3 等の 11K 画像 (8K に縮小されて
       表示されることを確認) + ZIP 内 equirect + 補正 / AI 切替時の再アップロード確認
 
@@ -2177,9 +2198,10 @@ WGSL の `select(raw, clamped, cond)` は分岐ではなく **両辺を評価し
 スループットから見ると実用上は無視できるオーバーヘッド (4K viewport の equirect
 フラグメントシェーダ全体で見ると 1% 未満のコスト増)。
 
-### Phase 2a: settle-refinement (1〜2 週、解像度ゲート + ユーザー確認版)
+### Phase 2a: settle-refinement (実装済み、当初見積もり 1〜2 週)
 
-§3.6 / §4.6 の高解像度品質補完。**Phase 1 完成後すぐ着手**。
+§3.6 / §4.6 の高解像度品質補完。code checklist は実装済み、末尾の performance / 実素材
+checklist は実施状況未確認として残す。
 
 **Phase 2a で実装する範囲**:
 
@@ -2478,7 +2500,7 @@ Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅�
           確認 (実害は低いが long session の保険)
   - [ ] **フル RGBA drop**: 別画像へのナビ後にエントリ remove されること
 
-### Phase 3 (settle 拡張): 巨大 JPEG 最適化 (任意)
+### Phase 3 (settle 拡張): 巨大 JPEG 最適化 (未実装の将来候補)
 
 Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 
@@ -2490,9 +2512,9 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 - [ ] 等価性テスト: Full tier と Compressed tier で同じ pose の settle 出力を比較
       (PSNR ≥ 40 dB 等)
 
-### Phase 2b: 品質と利便性 (1 週)
+### Phase 2b: 品質と利便性 (一部実装済み + 将来候補)
 
-- [ ] mipmap 生成 (4〜6 levels) でズームアウト時のモアレ抑制
+- [x] base texture の complete mip chain 生成 + trilinear filtering
 - [ ] 右下ミニコンパス
 - [ ] 慣性ドラッグ (`fs_drag_inertia` パターン)
 - [ ] 矢印キー操作
@@ -2515,7 +2537,14 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 
 ---
 
-## 9. リスクと未解決事項
+## 9. 実装前レビュー記録と残存リスク (履歴)
+
+以下は実装前レビューの指摘を追跡した履歴である。「解決済み」は現行コードへ反映済み、
+未チェックまたは将来 Phase を明記した項目だけが残存候補であり、現行仕様は §2〜§8 を
+優先する。
+
+この表には解決済みの設計レビュー記録と、手動計測・将来実装が必要な現行リスクが混在する。
+「解決済み」は履歴、「未実測」「Phase 3」は現在も残る事項として読む。
 
 | 項目 | 内容 | 軽減策 |
 | --- | --- | --- |
@@ -2523,12 +2552,12 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 | **メタデータ idx キーの脆さ** (Codex P2) | `HashMap<usize, _>` は並び替え / 仮想フォルダで idx ずれ | §2.4 のとおり `metadata_cache_key(idx)` (String) に統一 |
 | **ZIP 内 equirect** (Codex P2) | `read_panorama_info(path)` だけでは対応不可 | `read_panorama_info_from_bytes` を追加し、metadata worker の既存 ZIP bytes 経路に乗せる |
 | **ColorImage 内部表現依存** (Codex P2) | 「`Color32` の内部表現が連続 RGBA8」は egui 実装詳細であり将来変動の可能性 | `src/capture.rs:393` の `color_image_to_rgba` を明示的に経由 (§4.3)。compare_wgpu の本流に揃える |
-| **入力衝突** (Codex P2) | Wheel / 矢印 / Esc を奪うと既存ナビが壊れる | §5.2 のとおり、Wheel 単独 / 矢印 / Esc は奪わず、左ドラッグと Ctrl+Wheel のみで操作 |
-| **<kbd>P</kbd> キー衝突** (Codex P1) | 静止画フルスクリーン P は `set_folder_thumb_pin` で既に consume (`src/ui_fullscreen.rs:2904-2910`) | §5.3 のとおりキーは Phase 1 では割り当てず、トグルボタンを主導線にする |
-| **wgpu mipmap 生成** | `queue.write_texture` だけでは自動生成されない。手動 blit / compute シェーダ or CPU 側生成 + 全レベルアップロードが必要 | Phase 1 は mipmap なし、Phase 2 で CPU 側 (image::imageops::resize の `fast_resize` 経由) で半分ずつ縮小してアップロード |
+| **入力衝突** (解決済み) | Wheel / 矢印 / Esc の既存操作と競合 | §5.2 のとおり、360 中は wheel を修飾キー不問で FOV に統一し、矢印 / Esc は既存動作を維持 |
+| **<kbd>P</kbd> キー衝突** (解決済み) | 静止画フルスクリーン P は `set_folder_thumb_pin` で既に consume | `KeyAction::FsPanorama` の既定 V とホバーバーボタンを実装 |
+| **wgpu mipmap 生成** (解決済み) | `queue.write_texture` だけでは自動生成されない | `egui_wgpu::MipmapGenerator` で complete mip chain を生成し trilinear sampling |
 | **ColorImage → Arc<Vec<u8>>** | `Color32` の内部表現に依存しない明示変換が必要 | `src/capture.rs:393` の `color_image_to_rgba` を経由 (§4.3 で確定、`compare_wgpu` 本流と同じ) |
 | **アスペクト誤検出** | 2:1 スティッチ写真や横長壁紙を equirect 扱いしないか | アスペクト単独では自動起動せず、ヒント止まり (§2.3) |
-| **PDF / ZIP 内の equirect 画像** | PDF ページが 2:1 はあり得ない、ZIP 内 equirect はあり得る | ZIP は通常画像と同じパスで動く。PDF は対象外で OK |
+| **PDF / ZIP 内の equirect 画像** | container 内では metadata / high-res source の取得経路が通常画像と異なる | ZIP は GPano XMP と base 表示、PDF は 2:1 fallback の `BaseOnly`。どちらも high-res settle は行わない |
 | **rotation_db との競合** | 既に 90° 回転されている equirect は壊れる (アスペクト 2:1 でなくなる) | 360 モード中は `rotation_db` の角度を無視。アスペクト判定は `source_dims` の生値で行う |
 | **タスクバーサムネ / DWM** | 動画フルスクリーン用の dwm_iconic_thumbnail は静止画 360 でも害なし | 触らない |
 | **メモリ (~8K)** | 5760×2880 ≒ 66 MB RGBA。8K equirect (8192×4096) ≒ 134 MB | wgpu 8192 制限内で `clamp_dynamic_for_gpu` の既定範囲。問題なし |
@@ -2573,7 +2602,7 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 | **AI 由来 adjustment_cache 判定の脆さ** (Codex P2 第 11 ラウンド) | `ai_upscale_cache.contains_key` だけだと AI トグル OFF 直後の誤判定の余地 | §3.6.2.1 で許容 (実害は数フレ古い settle で、次フレで cache_key 差で無効化)。Phase 3 で `AdjustmentCacheEntry { kind: Raw \| FromAi }` 構造化に拡張する余地を明記 |
 | **cache_key 不一致時の再要求動作** (Codex P2 第 11 ラウンド) | 古い結果を捨てるだけだとユーザーが「高品質」を押しても永久に反映されない | §4.6.0 `poll_pano_high_res` で stale 検出時に **現在の resolution で再キック** する経路を追加 |
 | **settle overlay の cache_key 欠落** (Codex P1 第 12 ラウンド) | `PanoramaRefinement.overlay_pose` だけだと、静止中に補正/AI を切り替えても古い overlay が居座る | §4.6.1 で `last_cache_key` / `overlay_cache_key` を追加、`RenderingHandle.for_cache_key` / `SettleRenderResult.cache_key` で start-to-end 一貫した stale 判定。描画時にも cache_key 一致を確認 |
-| **adjustment_generation / ai_upscale_generation の未実装** (Codex P1 第 12 ラウンド) | 同じ source_kind・同じサイズで補正だけ変わったケースを cache_key で検出できない | Phase 1 必須項目化。**bump 箇所を明文化**: adjustment 適用 / cache 更新 / AI 完了 / cache clear |
+| **adjustment_generation / ai_upscale_generation** (解決済み、Codex P1 第 12 ラウンド) | 同じ source_kind・同じサイズで補正だけ変わったケースを cache_key で検出できない | 両 generation と bump 経路を実装し、`resolve_pano_source` の cache key に含めた |
 | **effective_params が参照を返すため clone 必須** (Codex P2 第 12 ラウンド) | `EnabledWithColorAdjustments { params }` (当時は `EnabledWithLut`) で所有権要求、`&AdjustParams` のまま渡せない | §3.6.2.1 で `params: params.clone()` に修正、`src/app.rs:16244` の実型コメント追加 |
 | **high-res 再デコードの重さ** (Codex P2 第 12 ラウンド) | 補正スライダー変更で 26K JPEG が毎回再デコードされる | §4.6.0 のコメントで明示。Phase 3 で `HighResSource` の source_key 単位再利用 pool 化を検討する余地を明文化 |
 | **settle policy と source_kind の整合** (Codex P1 第 13 ラウンド) | params 有効だが adjustment_cache 未生成の transient で 8K base = raw、settle overlay = 補正済みになりズレる | §3.6.2.1 で `compute_settle_policy(fs_idx, source_kind)` シグネチャに変更。source_kind=0 + params 非 identity は **Disabled (transient 待ち)** に倒す。adjustment_cache 完成後に cache_key 変化で再評価 |
@@ -2597,7 +2626,7 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 | ~~**JPEG 部分デコードの非対応形式**~~ | ~~PNG / WebP の 26K で Compressed tier に降格できない~~ | **不要になった**: 第 7 ラウンドで RAM tier 廃止、PNG/WebP 巨大も NeedsUserConfirmation バナー経由でユーザー判断 |
 | **HDR / EXR** | RICOH Theta などで HDR equirect が出る | スコープ外 (色管理自体が未実装) |
 
-### 開いている問い (実装前に user 判断)
+### 実装前に挙げた問い (履歴。現行仕様は §2〜§8 を優先)
 
 1. ~~**ホットキー**: <kbd>P</kbd> でよいか?~~ → **Codex P1 で衝突確認済 (`set_folder_thumb_pin`)。
    Phase 1 はキー割当なし、トグルボタン主導で確定**
@@ -2612,7 +2641,7 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 
 ---
 
-## 10. 関連ドキュメントの更新範囲 (実装時)
+## 10. 実装時に計画した関連ドキュメント更新 (履歴)
 
 CLAUDE.md「コード修正時のドキュメント同時更新」に従い、実装時は以下を併せて更新:
 
@@ -2668,7 +2697,7 @@ Codex レビューでは「最初から WGSL でいくならキャッシュキ�
 
 ---
 
-## 12. 未決定の設計判断 (Codex 第 3 ラウンド指摘より)
+## 12. 実装前の設計判断 (決定済みの経緯)
 
 ### 12.1 16K base 採用の是非 (**案 A 確定**)
 
