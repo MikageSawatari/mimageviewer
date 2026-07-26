@@ -8224,9 +8224,6 @@ impl App {
                                 }
                             }
                         }
-                        if let Some(holdover) = self.fs_nav_holdover_tex_for_draw() {
-                            paint_fs_nav_holdover_overlay(ui.painter(), image_rect, &holdover);
-                        }
                         fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
@@ -8370,6 +8367,12 @@ impl App {
                             state.tex.as_ref(), state.thumb_tex.as_ref(),
                             is_spread_double,
                         );
+
+                        // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
+                        // 移動先ページの矩形を旧ビューの上に重ねない。
+                        if let Some(holdover) = self.fs_nav_holdover_tex_for_draw() {
+                            paint_fs_nav_holdover_overlay(ui.painter(), image_rect, &holdover);
+                        }
 
                         // ── 透過背景インジケータ (Shift+B 変更直後のみフェード表示) ──
                         self.draw_fs_transparent_bg_indicator(ui, full_rect);

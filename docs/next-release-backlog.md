@@ -182,6 +182,45 @@
 - 規模 / 優先度: 初期スコープは Medium / P2 candidate。変換アーカイブ・メディア・
   検索スコープ parity まで含める場合は Large。
 
+### 1.23 ルーペの対象ページ解決が連結読みに未対応
+
+- 出典: v2.8.0 開発中の実機確認 (2026-07-26)。連結読み (縦 / 横スクロール) 中にルーペを
+  出すと、カーソルがどのページの上にあっても **アンカーページ (`fullscreen_idx`) だけ** が
+  拡大される。ユーザー裁定「一旦このままでよい」。
+- 原因 (コード確認済み): `draw_fs_loupe_if_active` (`src/ui_fullscreen.rs`) の対象ページ解決が
+  `spread_double` の二分岐しか持たない。見開きは `fs_spread_layout` の
+  `left_hit_rect` / `right_hit_rect` でカーソル直下のページを選ぶが、連結読みは
+  `spread_double == false` なので single 分岐へ落ち、引数で渡された
+  アンカーページの `tex` / `thumb_tex` と `full_rect` ベースの矩形をそのまま使う。
+  連結読み側は `continuous_reading_layout` が可視ページごとの rect を持っているので、
+  情報自体は存在する。
+- 対応案: 対象ページ解決を「Single / Spread / Continuous」の 3 経路を扱う 1 つの
+  純粋なヒットテストへ集約する (カーソル位置 → (page_idx, page_rect) を返す)。
+  連結読みでは可視ページ rect と突き合わせ、見開きと同じくカーソル直下のページの
+  加工済みテクスチャを引く。分岐を `spread_double` の bool で増やさない。
+- 注意: ルーペは `resolve_fs_processed_texture` を呼ぶので、カラー化・元画像表示の
+  バイパス述語 (`fs_display_bypasses_final_pipeline`) と整合させること。
+- 規模 / 優先度: Small〜Medium / P3。
+
+### 1.24 Z ズームモード中にルーペの拡大位置がずれる
+
+- 出典: v2.8.0 開発中の実機確認 (2026-07-26)。Z キーの全画面ズーム中にルーペを使うと、
+  拡大される位置がカーソル位置とずれる (ズーム前の座標で計算しているように見える)。
+  ユーザー裁定「バックログで良い」。
+- 原因 (コード確認済み): 表示側とルーペ側で**画像矩形の計算に使う変換が違う**。
+  - 表示: `fs_zoom_mode_engaged()` のとき `draw_fs_zoom_mode` へ分岐し、
+    `fs_zoom_factor` + カーソル基準のパンで描く (`src/ui_fullscreen.rs:2655` 付近)。
+  - ルーペ: single 分岐で `fit_scale` と `fs_zoom_pan()` (= `fs_zoom` / `fs_pan`) から
+    `img_rect` を組む。**`fs_zoom_factor` を見ていない**ため、Z モード中は
+    実際の表示矩形と異なる矩形を基準にサンプル位置を逆算する。
+  `fs_zoom` / `fs_pan` (通常ズーム) と `fs_zoom_factor` (Z モード) は別系統の状態で、
+  ルーペは前者しか知らない。
+- 対応案: 「現在の実表示画像矩形」を返す単一のヘルパを作り、通常描画・Z モード描画・
+  ルーペ・(必要なら分析モード) がそれを共有する。ルーペ側で `fs_zoom_factor` の
+  分岐を書き足す形にはしない (同じ計算の 3 つ目の複製になる)。
+  既存の「原寸フィットの実表示矩形統一」の議論とも関連する。
+- 規模 / 優先度: Small〜Medium / P3。1.23 と対象コードが重なるので同時着手が効率的。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
