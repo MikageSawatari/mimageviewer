@@ -7372,7 +7372,7 @@ impl App {
             && std::mem::take(&mut self.detached_viewer_focus_requested);
         // egui は同じ ViewportId でも OS 窓を内部で teardown/再生成する。特に detached **動画**
         // では、presenter child (WS_CHILD) を host に付け替える過程で egui が「別の既定位置 host 窓
-        // (822x656)」を一瞬作り直す挙動が既知 (src/app/native_video.rs の death-gate コメント参照。
+        // (822x656)」を一瞬作り直す挙動が既知 (src/app/native_video.rs の host-parent 同期を参照。
         // 実機で『拡大された古いフレームの小窓が一瞬』= この再生成窓)。その再生成は最後に渡した
         // builder を使うため、seed しないと既定サイズで作られてから保存配置へリサイズされフラッシュ
         // する。旧 host が **生存したまま** 新既定サイズ窓が生えるので host 生存判定だけでは

@@ -738,6 +738,37 @@ impl App {
         self.video_audio_mode == Some(fs_idx) && !self.video_audio_vst_active_for(fs_idx)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn detached_video_host_resync_reason(
+        child_alive: bool,
+        child_parent_hwnd: Option<u64>,
+        current_host_hwnd: u64,
+    ) -> Option<&'static str> {
+        if !child_alive {
+            Some("child_lost")
+        } else if child_parent_hwnd != Some(current_host_hwnd) {
+            Some("parent_changed")
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    fn detached_video_current_host_geometry_settled(&self) -> bool {
+        if let Some(window_id) = self.native_video_parked_live_input_window_id {
+            // Passive host の HWND を作り直したフレームでは
+            // detached_window_hwnd_clear_if_dead がこの latch を false に戻す。保存 placement
+            // を新 host へ適用した後のフレームまで presenter rebuild を待つことで、egui の
+            // 既定 822x656 host へ一度付け替えるちらつきを避ける。
+            self.detached_image_windows
+                .iter()
+                .find(|window| window.id == window_id)
+                .is_some_and(|window| window.initial_placement_applied)
+        } else {
+            self.detached_viewer_host_geometry_settled
+        }
+    }
+
     /// detached host 変更に対する presenter child の再親付けを 1 回試みる。
     /// 戻り値 `true` = 「解決した (再親付け発行 or そもそも不要)」→ 要求フラグを落としてよい。
     /// `false` = 「保留 (mode switch 進行中 / host 未確定などで今は発行できない)」→ フラグを
@@ -767,16 +798,11 @@ impl App {
         if self.native_video_mode_switch.is_some() {
             return false; // 切替中は重ねられない。完了後に再試行
         }
-        // **presenter child が生きている間は再親付けしない (death-gate)**。egui は detached
-        // viewport を作り直す過程で「別の既定位置 host 窓」を一瞬見せる (host_generation が
-        // 上がる) が、現 child が生きていれば映像はそこに正しく (fit で) 出ている。その live な
-        // host 変更を追って rebuild すると、追加の presenter 窓が一瞬「拡大された古いフレーム」
-        // や黒を出す = 実機で見えていた乱れの主因。よって **child (WS_CHILD) が host teardown で
-        // 道連れ破棄されて映像が黒に落ちたときだけ**、現 host へ再親付けして復旧する。
-        //
-        // 判定は presenter が publish している HWND の生存で行う (手動追跡フィールドは
-        // switch 送信時に楽観 set され rebuild 失敗/初回 open で stale になるため使わない
-        // = Codex 指摘。publish HWND は常に「今実際に出している窓」を指す committed 値)。
+        // publish HWND は presenter が今実際に出している committed window を指す。ただし
+        // child 自体が生きていることだけでは表示先の正しさを保証できない。tray restore では
+        // egui host が新 HWND へ作り直された後も child が旧 host の子として生存し、フレームを
+        // present し続けながら新 host は黒、という状態になり得る。現在の registry host と
+        // GetParent(child) を比較し、child lost と parent mismatch の両方を再同期対象にする。
         let child_hwnd = self
             .fullscreen_idx
             .and_then(|idx| match self.fs_cache.get(&idx) {
@@ -787,30 +813,41 @@ impl App {
         if child_hwnd == 0 {
             return true; // presenter 未確立 → 追従不要
         }
-        if crate::video::native_window::is_window_alive(child_hwnd) {
-            return true; // child 健在 = 映像は出ている → 追従不要。要求は破棄。
+        let current_host_hwnd = self.detached_viewer_host_hwnd_raw();
+        if current_host_hwnd == 0 {
+            return false; // host registry の再取得待ち。要求を保持して次フレームに再試行。
         }
-        // child が破棄された (映像が黒)。現 host が保存配置に確定してから再親付けする
-        // (過渡的な小サイズ host へ移すと縮みちらつきになるため settled を待つ)。未確定なら
-        // フラグを保持して次フレーム再試行。rebuild 失敗時も child は dead のまま残るので
-        // 次フレームで再試行される (retry は取りこぼさない)。
-        if !self.detached_viewer_host_geometry_settled {
+        let child_alive = crate::video::native_window::is_window_alive(child_hwnd);
+        let child_parent_hwnd = child_alive
+            .then(|| crate::video::native_window::window_parent(child_hwnd))
+            .flatten();
+        let Some(reason) = Self::detached_video_host_resync_reason(
+            child_alive,
+            child_parent_hwnd,
+            current_host_hwnd,
+        ) else {
+            return true; // child は現在の registry host に正しく接続済み。
+        };
+        if !self.detached_video_current_host_geometry_settled() {
             return false;
         }
         let queued = self.sync_detached_video_child_presenter_rect();
         if queued {
             crate::logger::log(format!(
-                "[native-video] detached child (hwnd=0x{child_hwnd:x}) lost -> resync presenter \
-                 child to current host=0x{:x} host_generation={}",
-                self.detached_viewer_host_hwnd_raw(),
+                "[native-video] detached child host mismatch -> resync presenter \
+                 reason={reason} child=0x{child_hwnd:x} child_parent={} \
+                 current_host=0x{current_host_hwnd:x} host_generation={}",
+                child_parent_hwnd
+                    .map(|parent| format!("0x{parent:x}"))
+                    .unwrap_or_else(|| "none".to_string()),
                 self.detached_viewer_host_generation
             ));
         }
         queued
     }
 
-    /// 毎フレーム、detached child の host が破棄されていないかを確認し、破棄されていれば
-    /// 現 host へ再親付けして黒表示を復旧する (death-gate)。child host 健在なら no-op。
+    /// 毎フレーム、detached child の実親が現在の registry host と一致するか確認し、
+    /// child の破棄または親不一致なら現 host へ再親付けして黒表示を復旧する。
     #[cfg(windows)]
     pub(super) fn poll_detached_video_host_resync(&mut self) {
         // detached 動画でなくなったら再親付け要求を掃除する (次 session へ持ち越さない)。
@@ -818,9 +855,8 @@ impl App {
             self.pending_detached_video_host_resync = false;
             return;
         }
-        // death-gate では「host 変更フラグ待ち」ではなく **毎フレーム child host の生存**を
-        // 見る。旧 host が capture の後で遅れて破棄されても取りこぼさないため。try_resync は
-        // child host 健在なら安価な is_window_alive チェックだけで no-op (true) を返す。
+        // 「host 変更フラグ待ち」ではなく毎フレーム child の生存と実親を確認する。
+        // registration と旧 host teardown の順序に依存せず、遅延した親不一致も拾う。
         if self.try_resync_detached_video_host() {
             self.pending_detached_video_host_resync = false;
         }

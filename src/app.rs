@@ -712,7 +712,19 @@ impl App {
     }
 
     fn detached_window_hwnd_clear_if_dead(&mut self, window_id: u64) -> Option<u64> {
-        self.detached_window_manager.clear_hwnd_if_dead(window_id)
+        let cleared = self.detached_window_manager.clear_hwnd_if_dead(window_id);
+        if cleared.is_some()
+            && let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == window_id)
+        {
+            // egui が同じ ViewportId の OS window を作り直すときは、旧 HWND へ一度適用済み
+            // だった placement も新 HWND へ再適用する必要がある。ParkedLive は通常の
+            // parked liveness sweep の対象外なので、HWND ownership 境界で共通に戻す。
+            window.initial_placement_applied = false;
+        }
+        cleared
     }
 
     fn detached_window_hwnd_set(&mut self, window_id: u64, hwnd: u64) -> Option<u64> {
@@ -781,17 +793,42 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn begin_detached_window_hwnd_registration(&mut self, window_id: u64, reason: &'static str) {
+        // HWND の欠落は OS host の生成状態であって、メディア session の意味状態ではない。
+        // ParkedLive を Opening に落とすと live poll / 新メディア close routing から外れる。
+        // Closing も host の再登録だけで復活させない。
+        if !matches!(
+            self.detached_window_state(window_id),
+            Some(DetachedWindowState::ParkedLive | DetachedWindowState::Closing)
+        ) {
+            self.transition_detached_window_state(window_id, DetachedWindowState::Opening, reason);
+        }
+    }
+
+    #[cfg(windows)]
     fn detached_window_state_for_show_label(
         &self,
         window_id: u64,
         label: &'static str,
     ) -> DetachedWindowState {
-        if self.detached_window_state_is_parked_live(window_id) {
-            DetachedWindowState::ParkedLive
-        } else if label == "passive" {
-            DetachedWindowState::Parked
-        } else {
-            DetachedWindowState::Active
+        match self.detached_window_state(window_id) {
+            Some(DetachedWindowState::ParkedLive) => DetachedWindowState::ParkedLive,
+            Some(DetachedWindowState::Closing) => DetachedWindowState::Closing,
+            _ if label == "passive" => DetachedWindowState::Parked,
+            _ => DetachedWindowState::Active,
+        }
+    }
+
+    #[cfg(windows)]
+    fn try_resync_detached_video_host_after_registration(&mut self, window_id: u64) {
+        // Passive ParkedLive bundle はこの時点では mount されていない。別の active context
+        // を見たまま try_resync を呼ぶと、その context を「対象外」と判定して pending を
+        // 消費してしまう。owner bundle の poll 中、または active owner の登録時だけ即時試行し、
+        // passive owner は次の poll_parked_live_detached_windows まで要求を保持する。
+        if self.pending_detached_video_host_resync
+            && self.active_detached_hwnd_window_id() == Some(window_id)
+        {
+            self.pending_detached_video_host_resync = !self.try_resync_detached_video_host();
         }
     }
 
@@ -823,10 +860,7 @@ impl App {
                     self.frame_counter,
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
-                if self.pending_detached_video_host_resync {
-                    self.pending_detached_video_host_resync =
-                        !self.try_resync_detached_video_host();
-                }
+                self.try_resync_detached_video_host_after_registration(window_id);
                 true
             }
             DetachedWindowHwndDiff::NoChange => {
@@ -1449,11 +1483,8 @@ impl App {
         hwnd: u64,
     ) -> bool {
         let previous = self.detached_window_hwnd_set(window_id, hwnd);
-        self.transition_detached_window_state(
-            window_id,
-            DetachedWindowState::Parked,
-            "watcher_repair_hwnd",
-        );
+        let state = self.detached_window_state_for_show_label(window_id, "passive");
+        self.transition_detached_window_state(window_id, state, "watcher_repair_hwnd");
         self.detached_viewer_host_generation =
             self.detached_viewer_host_generation.saturating_add(1);
         crate::logger::log(format!(
@@ -1466,9 +1497,7 @@ impl App {
                 .unwrap_or_else(|| "none".to_string()),
             Self::win32_hwnd_debug_state(hwnd)
         ));
-        if self.pending_detached_video_host_resync {
-            self.pending_detached_video_host_resync = !self.try_resync_detached_video_host();
-        }
+        self.try_resync_detached_video_host_after_registration(window_id);
         true
     }
 
@@ -8469,8 +8498,8 @@ pub struct App {
     pub(crate) detached_viewer_host_generation: u64,
     /// detached 動画再生中に host HWND が変わったが、mode switch 進行中で即座に
     /// presenter child を再親付けできなかったときに立てるフラグ。switch 完了後の
-    /// フレームで `poll_detached_video_host_resync` が現 host へ再同期する。旧 host
-    /// 破棄で child (WS_CHILD) が道連れ死 → WM_QUIT → 再生終了する既存バグの根本対策。
+    /// フレームで `poll_detached_video_host_resync` が child の実親と現 host を比較して
+    /// 再同期する。旧 host 配下で child が生存したまま不可視になる場合も対象。
     #[cfg(windows)]
     pub(crate) pending_detached_video_host_resync: bool,
     /// 現在の detached host のジオメトリが保存配置に確定しているか。egui は
@@ -33839,7 +33868,7 @@ impl App {
                 self.pending_detached_video_host_resync = true;
             }
         }
-        self.transition_detached_window_state(window_id, DetachedWindowState::Opening, label);
+        self.begin_detached_window_hwnd_registration(window_id, label);
         let main_hwnd = self.main_hwnd?;
         let snapshot = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
@@ -33892,10 +33921,7 @@ impl App {
                         .unwrap_or_else(|| "none".to_string()),
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
-                if self.pending_detached_video_host_resync {
-                    self.pending_detached_video_host_resync =
-                        !self.try_resync_detached_video_host();
-                }
+                self.try_resync_detached_video_host_after_registration(window_id);
             }
             DetachedWindowHwndDiff::NoChange => {
                 if self.adopt_unclaimed_detached_window_hwnd_after_show(
@@ -33945,7 +33971,7 @@ impl App {
             return;
         }
         self.detached_window_hwnd_clear(window_id);
-        self.transition_detached_window_state(window_id, DetachedWindowState::Opening, label);
+        self.begin_detached_window_hwnd_registration(window_id, label);
         self.log_detached_image_window_debug(format!(
             "detached_hwnd_dead_after_show window_id={window_id} hwnd=0x{previous_hwnd:x} \
              label={label} viewport={viewport_id:?}"
@@ -34736,7 +34762,7 @@ impl App {
             return;
         }
         let previous_hwnd = self.detached_window_hwnd_clear_if_dead(window_id);
-        self.transition_detached_window_state(window_id, DetachedWindowState::Opening, "deferred");
+        self.begin_detached_window_hwnd_registration(window_id, "deferred");
         let Some(main_hwnd) = self.main_hwnd else {
             self.log_detached_image_window_debug(format!(
                 "hwnd_deferred_retry frame={} window_id={window_id} viewport={viewport_id:?} \
@@ -34757,11 +34783,8 @@ impl App {
                 let old = self
                     .detached_window_hwnd_set(window_id, hwnd)
                     .or(previous_hwnd);
-                self.transition_detached_window_state(
-                    window_id,
-                    DetachedWindowState::Parked,
-                    "hwnd_adopted_deferred",
-                );
+                let state = self.detached_window_state_for_show_label(window_id, "passive");
+                self.transition_detached_window_state(window_id, state, "hwnd_adopted_deferred");
                 self.detached_viewer_host_generation =
                     self.detached_viewer_host_generation.saturating_add(1);
                 crate::logger::log(format!(
@@ -34774,6 +34797,7 @@ impl App {
                         .unwrap_or_else(|| "none".to_string()),
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
+                self.try_resync_detached_video_host_after_registration(window_id);
             }
             DetachedWindowHwndDiff::NoChange => {
                 self.log_detached_image_window_debug(format!(

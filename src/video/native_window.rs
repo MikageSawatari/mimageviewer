@@ -674,6 +674,23 @@ pub fn is_window_alive(hwnd_raw: u64) -> bool {
     unsafe { IsWindow(Some(HWND(hwnd_raw as *mut _))).as_bool() }
 }
 
+/// `hwnd_raw` が child window なら、現在の親 HWND を返す。
+///
+/// HWND の生存だけでは、detached viewer host の再生成後も presenter child が旧 host の
+/// 子として残っている状態を区別できない。呼び出し側はこの実 OS 関係を現在の registry
+/// owner と比較し、必要なときだけ placement switch を行う。
+pub fn window_parent(hwnd_raw: u64) -> Option<u64> {
+    if hwnd_raw == 0 {
+        return None;
+    }
+    unsafe {
+        GetParent(HWND(hwnd_raw as *mut _))
+            .ok()
+            .map(|parent| parent.0 as usize as u64)
+            .filter(|parent| *parent != 0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ForegroundClaimReport {
     pub foreground_hwnd: u64,

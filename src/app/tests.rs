@@ -24202,6 +24202,43 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn parked_live_hwnd_recreation_preserves_media_state_and_reseeds_placement() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\parked-live.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(12);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 12, bundle));
+        app.transition_detached_window_state(12, DetachedWindowState::ParkedLive, "test_setup");
+        set_detached_host_for_test(&mut app, 12, 0x1200, false);
+        app.main_hwnd = None;
+
+        assert!(
+            app.detached_window_hwnd_snapshot_before_show(
+                12,
+                "passive",
+                App::detached_image_window_viewport_id(12),
+            )
+            .is_none(),
+            "without a main HWND the test stops after the dead-host ownership transition"
+        );
+        assert_eq!(
+            app.detached_window_state(12),
+            Some(DetachedWindowState::ParkedLive),
+            "OS host recreation must not demote the live media session to Opening"
+        );
+        assert_eq!(app.detached_window_hwnd_raw_for_window_id(12), 0);
+        assert!(
+            !app.detached_image_windows[0].initial_placement_applied,
+            "the replacement HWND must receive the saved detached placement"
+        );
+    }
+
+    #[test]
     fn detached_hwnd_registry_is_shared_by_active_and_passive_window_id() {
         let mut app = setup_app();
         set_detached_host_for_test(&mut app, 42, 0x4200, true);
@@ -24236,6 +24273,19 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.detached_window_state(7),
             Some(DetachedWindowState::Parked)
+        );
+    }
+
+    #[test]
+    fn watcher_hwnd_repair_does_not_demote_parked_live_media() {
+        let mut app = setup_app();
+        app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(7, 0x7000));
+        assert_eq!(
+            app.detached_window_state(7),
+            Some(DetachedWindowState::ParkedLive),
+            "HWND repair changes the OS host identity, not the media lifecycle"
         );
     }
 
@@ -25493,9 +25543,8 @@ mod still_window_mode_key_tests {
     #[test]
     #[cfg(windows)]
     fn detached_video_host_change_resync_request_lifecycle() {
-        // host capture race 対策: detached 動画再生中に host HWND が変わったら presenter
-        // child を現 host へ再親付けする要求 (pending_detached_video_host_resync) を、
-        // 適用可否と mode switch 進行状況に応じて正しく処理する。
+        // detached 動画再生中に host HWND が変わったら presenter child を現 host へ
+        // 再親付けする要求を、適用可否と mode switch 進行状況に応じて正しく処理する。
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
@@ -25525,23 +25574,47 @@ mod still_window_mode_key_tests {
             "resync must wait while a placement switch is in flight"
         );
 
-        // 切替が終わっても、child host が生きている (テストは追跡 host なし = 0) 限り
-        // 再親付けは不要なので要求は破棄される (death-gate: live な host 変更は追わない)。
+        // テスト player は presenter 未確立 (publish HWND=0) なので再親付け対象はなく、
+        // 切替完了後に要求を消費できる。
         app.native_video_mode_switch = None;
         app.poll_detached_video_host_resync();
         assert!(
             !app.pending_detached_video_host_resync,
-            "with a live/absent child host the video is fine; the resync request is dropped"
+            "without a committed presenter child the resync request is dropped"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_video_host_resync_reason_uses_actual_parent_identity() {
+        assert_eq!(
+            App::detached_video_host_resync_reason(true, Some(0x2000), 0x2000),
+            None,
+            "a live child attached to the current registry host needs no rebuild"
+        );
+        assert_eq!(
+            App::detached_video_host_resync_reason(true, Some(0x1000), 0x2000),
+            Some("parent_changed"),
+            "a live child under the old host must still be re-parented"
+        );
+        assert_eq!(
+            App::detached_video_host_resync_reason(true, None, 0x2000),
+            Some("parent_changed"),
+            "a detached child with no reported parent is not attached to the current host"
+        );
+        assert_eq!(
+            App::detached_video_host_resync_reason(false, None, 0x2000),
+            Some("child_lost"),
+            "a destroyed child continues to use the existing rebuild path"
         );
     }
 
     #[test]
     #[cfg(windows)]
     fn detached_video_host_resync_noop_without_live_presenter() {
-        // death-gate: 判定は presenter が publish している child HWND の生存で行う。テスト
-        // player は native_output を持たない (= publish HWND が 0) ので「presenter 未確立」
-        // 扱いになり、host が過渡ジオメトリでも再親付けせず要求を破棄する。実際の
-        // 「child 破棄 → 再親付け」経路は live な presenter が要るため実機/統合で検証する。
+        // テスト player は native_output を持たない (= publish HWND が 0) ので
+        // 「presenter 未確立」扱いになり、host が過渡ジオメトリでも再親付けせず要求を
+        // 破棄する。実際の child parent 比較は live presenter が必要なため実機で検証する。
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
@@ -25602,13 +25675,13 @@ mod still_window_mode_key_tests {
             "hidden presenter audio mode must not issue SwitchPlacement"
         );
 
-        // 音声モードを抜けたら通常の death-gate 判定に戻る (テスト player は publish HWND=0 =
+        // 音声モードを抜けたら通常の host-parent 判定に戻る (テスト player は publish HWND=0 =
         // presenter 未確立なので再親付け不要 → 要求は破棄される)。
         app.video_audio_mode = None;
         app.poll_detached_video_host_resync();
         assert!(
             !app.pending_detached_video_host_resync,
-            "after leaving audio mode the resync request resolves via the normal death-gate"
+            "after leaving audio mode the resync request resolves via normal host-parent checking"
         );
 
         // VST ホスト表示中 (presenter を意図的に un-hide) は保留せず通常経路に任せる。

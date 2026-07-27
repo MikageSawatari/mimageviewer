@@ -1688,15 +1688,20 @@ detached の egui viewport の OS window (host HWND) は main⇔detached 切替�
 ごと死に、動画再生が終了してしまう (2026-07-01 実機バグ)。**常に現在の detached host へ
 child を追従させる**ことで防ぐ:
 
-- `capture_detached_viewer_host_hwnd_from_logical_rect` が host HWND の変化を lifecycle
-  event として扱い、`detached_viewer_host_generation` を +1 し、直前 host を置き換えたとき
-  (または host-lost 後の再取得) は `try_resync_detached_video_host` を**同フレームで即時**
-  呼んで presenter child を現 host へ再親付け (`sync_detached_video_child_presenter_rect` =
-  owner を新 host にした `SwitchPlacement`) する。即発行できなければ
-  `pending_detached_video_host_resync` に退避し、`poll_detached_video_host_resync` が
-  毎フレーム再試行する。適用可否は「detached で再生中 **または** detached へ切替中」で判定し
-  (`detached_video_presentation_active_or_targeted`)、initial main→detached の switch 進行中の
-  host 変更も取りこぼさない。
+- `show_viewport_*` 前後の生成差分 registry が host HWND の変化を lifecycle event として扱い、
+  `detached_viewer_host_generation` を +1 する。HWND の欠落・再登録は OS host の状態であり、
+  メディア session の意味状態ではないため、passive 動画の `ParkedLive` は
+  `Opening` / `Parked` へ降格させない。新 HWND には保存 placement も再適用する。
+- `try_resync_detached_video_host` は presenter child の生存だけで正常判定しない。
+  `GetParent(child)` と現在の window-id registry host を毎フレーム比較し、child が破棄された場合と、
+  child は生存しているが旧 host の子として残った場合の両方で、owner を新 host にした
+  `SwitchPlacement` (`sync_detached_video_child_presenter_rect`) を発行する。passive
+  `ParkedLive` は owner bundle を mount した poll 中に判定するため、別の active context の
+  host へ誤接続しない。保存 placement の適用前なら要求を保持して次フレームへ回す。
+- 即発行できない mode switch 中や host 未確定時は `pending_detached_video_host_resync` を保持し、
+  `poll_detached_video_host_resync` が再試行する。適用可否は「detached で再生中 **または**
+  detached へ切替中」で判定し (`detached_video_presentation_active_or_targeted`)、
+  initial main→detached の switch 進行中の host 変更も取りこぼさない。
 - **安全網**: `DetachedViewerChild` の window だけ `post_quit_on_destroy=false` で生成する。
   この child は borderless で正当な user close を受けず、正当な終了は
   `NativeVideoOutput::Drop → cancel` (loop 冒頭の `while !cancel.load()`) 経由なので WM_QUIT は
