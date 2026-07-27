@@ -54134,9 +54134,42 @@ impl App {
             .collect()
     }
 
+    /// 標準設定 (global / お気に入り) を書き換えた後に、その結果「実効標準と完全一致」
+    /// になった個別設定を削除して、`set_page_params` が書き込み時に守っている不変条件
+    /// (個別 == 実効標準 なら個別を持たない) を張り直す。
+    ///
+    /// 消す対象は定義上「消しても実効値が変わらないページ」だけなので、表示・サムネ・
+    /// AI は動かない。比較は新しい標準値そのものではなく **そのページの実効標準**
+    /// (`effective_default_for_idx`) と行う — お気に入り標準が効いているページを
+    /// global の新値と比べて消すと、実効値がお気に入り標準へ変わって見た目が動く。
+    ///
+    /// 削除は `clear_page_params` に通す。DB / サイドカーだけでなく
+    /// `adjusted_page_keys` (グリッドの補正バッジ・スマートフォルダの集計) まで
+    /// 同じ経路で更新するため。
+    ///
+    /// Undo/Redo: `capture_adjust_full` がここでの削除も Page 差分として記録し、
+    /// 復元は Global → Favorite → Page の順に流れるので、個別は元に戻る。
+    fn prune_page_params_matching_default(&mut self) {
+        let redundant: Vec<usize> = (0..self.items.len())
+            .filter(|idx| {
+                self.adjustment_page_params
+                    .get(idx)
+                    .is_some_and(|p| p == self.effective_default_for_idx(*idx))
+            })
+            .collect();
+        for idx in redundant {
+            self.clear_page_params(idx);
+        }
+    }
+
     /// 指定パラメータを settings.global_preset にコピーして保存する。
     /// global の AI 設定が変わった場合、個別設定を持たない (= global を継承している)
     /// 画像ページの AI キャッシュもクリアして、新 global での再実行を促す。
+    ///
+    /// 書き換え後は冗長になった個別設定を掃除する。これが無いと「標準にする」の後も
+    /// そのページが `PageOverride` スコープに残り続け、`resolve_adjust_scope` 経由の
+    /// U/N/P が標準ではなくページを編集してしまう (お気に入り標準側は
+    /// `apply_favorite_change` が同じ掃除を先に持っていた)。
     pub(crate) fn copy_params_to_global(&mut self, params: crate::adjustment::AdjustParams) {
         let ai_changed = !self.settings.global_preset.ai_settings_eq(&params);
         let ai_changed_indices: Vec<usize> = if ai_changed {
@@ -54149,6 +54182,7 @@ impl App {
         };
         self.settings.global_preset = params;
         self.settings.save();
+        self.prune_page_params_matching_default();
         self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
@@ -54189,28 +54223,12 @@ impl App {
                 }
             }
         }
-        // 標準が動いた後、このお気に入り傘下で個別設定が新標準と一致するページは冗長。
+        // 標準が動いた後、個別設定が実効標準と一致するページは冗長。
         // set_page_params と同じ不変条件 (個別 == effective_default なら個別削除) を
         // 維持する。これをやらないと「このお気に入りの標準にする」押下後もページが
         // PageOverride スコープに残り、スコープ表示や U/N/P ショートカットの挙動が
         // 想定外になる (Codex P2 指摘)。
-        let redundant: Vec<usize> = (0..self.items.len())
-            .filter(|idx| {
-                self.adjustment_page_params
-                    .get(idx)
-                    .is_some_and(|p| p == &new_effective)
-                    && self.current_favorite_id_for_idx(*idx) == Some(favorite_id)
-            })
-            .collect();
-        for idx in redundant {
-            self.adjustment_page_params.remove(&idx);
-            if let Some(key) = self.page_path_key(idx) {
-                if let Some(db) = &self.adjustment_db {
-                    let _ = db.remove_page_params(&key);
-                }
-            }
-            self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
-        }
+        self.prune_page_params_matching_default();
         self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
     }

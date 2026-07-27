@@ -9747,6 +9747,77 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 「標準にする」直後も、ちょうど同じ値の個別設定を持っていたページは冗長なので
+    /// 自動的に解除され、スコープは Global に戻る。これが無いと以降の U/N/P が
+    /// 標準ではなくページを編集し続ける。補正バッジ用の `adjusted_page_keys` も畳む。
+    #[test]
+    fn copy_params_to_global_collapses_redundant_page_override() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        let key = app.page_path_key(idx).expect("page key");
+
+        // 個別に brightness=25 を設定 (= これから標準にしたい値)
+        let custom = params_with_brightness(25.0);
+        app.set_page_params(idx, custom.clone());
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::PageOverride
+        ));
+        assert!(app.adjusted_page_keys.contains(&key));
+
+        // 「標準にする」と同じ操作
+        app.copy_params_to_global(custom);
+
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "新しい標準と一致する個別は解除されるべき"
+        );
+        assert!(matches!(app.resolve_adjust_scope(idx), AdjustScope::Global));
+        assert!(
+            !app.adjusted_page_keys.contains(&key),
+            "補正バッジ用のキーも一緒に畳まれるべき"
+        );
+        assert_eq!(app.effective_params(idx).brightness, 25.0);
+    }
+
+    /// お気に入り標準が効いているページの個別設定は、新しい global と同値でも残す。
+    /// ここで消すと実効値がお気に入り標準へ落ちて見た目が変わってしまう。
+    #[test]
+    fn copy_params_to_global_keeps_override_shadowed_by_favorite_default() {
+        let mut app = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.adjustment_favorite_params
+            .insert(fav_id, params_with_brightness(10.0));
+        app.set_page_params(idx, params_with_brightness(42.0));
+
+        app.copy_params_to_global(params_with_brightness(42.0));
+
+        assert!(
+            app.adjustment_page_params.contains_key(&idx),
+            "実効標準 (お気に入り標準) と違う個別は残すべき"
+        );
+        assert_eq!(app.effective_params(idx).brightness, 42.0);
+    }
+
+    /// 新しい標準と違う値の個別設定はそのまま残る。
+    #[test]
+    fn copy_params_to_global_keeps_differing_page_override() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.set_page_params(idx, params_with_brightness(25.0));
+
+        app.copy_params_to_global(params_with_brightness(60.0));
+
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::PageOverride
+        ));
+        assert_eq!(app.effective_params(idx).brightness, 25.0);
+    }
+
     /// clear_favorite_default でそのお気に入り配下の、global と同値な個別もまとめて解除される。
     #[test]
     fn clear_favorite_default_collapses_overrides_matching_global() {
