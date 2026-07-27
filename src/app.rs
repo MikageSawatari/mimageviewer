@@ -54180,11 +54180,36 @@ impl App {
         } else {
             Vec::new()
         };
+        crate::logger::log(format!(
+            "[adjust scope] global <- {}",
+            crate::adjustment::color_log_summary(&params),
+        ));
         self.settings.global_preset = params;
         self.settings.save();
         self.prune_page_params_matching_default();
         self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
+    }
+
+    /// 標準側を書き換えたときに、この一覧でまだ個別設定を持っているページ数を数える。
+    /// 個別設定は標準より優先されるので、この数が残っていると「標準を変えたのに
+    /// 表示が変わらない」状態になる。トーストで理由を示すために使う。
+    /// `exclude_idx` は直前に個別設定を解除した対象ページ (二重に数えない)。
+    fn remaining_page_override_count(&self, exclude_idx: Option<usize>) -> usize {
+        (0..self.items.len())
+            .filter(|idx| {
+                Some(*idx) != exclude_idx && self.adjustment_page_params.contains_key(idx)
+            })
+            .count()
+    }
+
+    /// 標準を書き換えた操作のトーストに足す「まだ個別設定が残っている」注記。
+    /// 残っていなければ空文字。
+    pub(crate) fn page_override_toast_suffix(&self, exclude_idx: Option<usize>) -> String {
+        match self.remaining_page_override_count(exclude_idx) {
+            0 => String::new(),
+            n => format!(" (他{n}枚は個別設定のまま)"),
+        }
     }
 
     /// お気に入り単位の標準設定を変更する共通パス。
@@ -54208,6 +54233,13 @@ impl App {
         } else {
             Vec::new()
         };
+        crate::logger::log(match &new_value {
+            Some(p) => format!(
+                "[adjust scope] favorite {favorite_id} <- {}",
+                crate::adjustment::color_log_summary(p)
+            ),
+            None => format!("[adjust scope] favorite {favorite_id} cleared"),
+        });
         match &new_value {
             Some(p) => {
                 self.adjustment_favorite_params
@@ -54273,9 +54305,15 @@ impl App {
             return;
         };
         let old_params = self.effective_params(idx).clone();
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        crate::logger::log(format!(
+            "[adjust slot] load slot={} idx={} {}",
+            key_label,
+            idx,
+            crate::adjustment::color_log_summary(&slot.params),
+        ));
         self.set_page_params(idx, slot.params.clone());
         self.clear_caches_for_param_change(idx, &old_params, &slot.params);
-        let key_label = crate::adjustment::slot_key_label(slot_idx);
         self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
     }
 
@@ -54292,6 +54330,17 @@ impl App {
             return;
         };
 
+        crate::logger::log(format!(
+            "[adjust slot] load->default slot={} idx={} target={} {}",
+            key_label,
+            idx,
+            if self.current_favorite_id_for_idx(idx).is_some() {
+                "favorite"
+            } else {
+                "global"
+            },
+            crate::adjustment::color_log_summary(&slot.params),
+        ));
         if let Some(favorite_id) = self.current_favorite_id_for_idx(idx) {
             let favorite_name = self
                 .settings
@@ -54302,14 +54351,19 @@ impl App {
                 .unwrap_or_default();
             self.set_favorite_default(favorite_id, slot.params.clone());
             self.clear_page_params(idx);
+            let remaining = self.page_override_toast_suffix(Some(idx));
             self.show_feedback_toast(format!(
-                "[スロット{key_label}:{} → お気に入り「{favorite_name}」の標準]",
+                "[スロット{key_label}:{} → お気に入り「{favorite_name}」の標準{remaining}]",
                 slot.name
             ));
         } else {
             self.copy_params_to_global(slot.params.clone());
             self.clear_page_params(idx);
-            self.show_feedback_toast(format!("[スロット{key_label}:{} → 標準設定]", slot.name));
+            let remaining = self.page_override_toast_suffix(Some(idx));
+            self.show_feedback_toast(format!(
+                "[スロット{key_label}:{} → 標準設定{remaining}]",
+                slot.name
+            ));
         }
     }
 
@@ -54606,6 +54660,14 @@ impl App {
     /// 既に `thumb_adjust_tex[idx]` があればスキップ。ピクセル未保持ならスキップ
     /// (keep_range 外で evict 済み)。identity (無補正) なら再描画時に生サムネを
     /// そのまま使うため、キャッシュ生成も行わない。
+    ///
+    /// ただし**編集プレビュー由来のサムネイルだけは identity でも生成する**。
+    /// `thumbnails[idx]` に載っているテクスチャは、materialize 時点の DB 個別補正を
+    /// 焼き込んだ合成画像 (`thumb_loader` の `pinned_page_adjustment`) なので、
+    /// 「identity なら生サムネで正しい」という前提が成り立たない。ここで return すると
+    /// 描画は焼き込み済みテクスチャへフォールバックし、個別設定を解除しても
+    /// 一覧だけ古い色のまま残る (フォルダを出入りして再 materialize するまで直らない)。
+    /// identity のときは色調を掛けずに下地 + 注釈で組み直す。
     pub(crate) fn maybe_apply_thumb_adjustment(&mut self, ctx: &egui::Context, idx: usize) {
         if !is_thumb_adjust_target(self.items.get(idx)) {
             return;
@@ -54616,12 +54678,17 @@ impl App {
         let Some(pixels) = self.thumb_pixels.get(&idx).cloned() else {
             return;
         };
+        let from_edit_preview = self.thumb_edit_preview_layers.contains_key(&idx);
         let mut adjusted = {
             let params = self.effective_params(idx);
             if params.is_color_identity() {
-                return;
+                if !from_edit_preview {
+                    return;
+                }
+                (*pixels).clone()
+            } else {
+                crate::adjustment::apply_adjustments_fast(&pixels, params)
             }
-            crate::adjustment::apply_adjustments_fast(&pixels, params)
         };
         if let Some(layers) = self.thumb_edit_preview_layers.get(&idx) {
             // fullscreen と同じ `edit -> color -> comic`。注釈を先に焼くと gamma 等が
@@ -54659,7 +54726,11 @@ impl App {
             if !self.thumb_pixels.contains_key(&idx) {
                 continue;
             }
-            if self.effective_params(idx).is_color_identity() {
+            // identity でも編集プレビュー由来は組み直す (焼き込み済みテクスチャへ
+            // フォールバックさせないため、`maybe_apply_thumb_adjustment` 参照)。
+            if self.effective_params(idx).is_color_identity()
+                && !self.thumb_edit_preview_layers.contains_key(&idx)
+            {
                 continue;
             }
             self.maybe_apply_thumb_adjustment(ctx, idx);

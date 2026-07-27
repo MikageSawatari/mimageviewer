@@ -275,6 +275,22 @@ pub fn upscale_model_label(key: Option<&str>) -> &'static str {
         .unwrap_or("不明")
 }
 
+/// ログ用の色調サマリ。`{:?}` は AI / カラー化 / ポストフィルタまで含んで長いので、
+/// スコープ間の値の食い違いを追うのに要る色調 8 項目だけを 1 行に畳む。
+pub fn color_log_summary(p: &AdjustParams) -> String {
+    format!(
+        "b={:.1} c={:.1} g={:.2} s={:.1} t={:.1} lv={}..{}/{:.2}",
+        p.brightness,
+        p.contrast,
+        p.gamma,
+        p.saturation,
+        p.temperature,
+        p.black_point,
+        p.white_point,
+        p.midtone
+    )
+}
+
 /// 画像補正パラメータ。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(from = "AdjustParamsWire")]

@@ -6,8 +6,11 @@
 //! - パネルでスライダーを操作すると、その瞬間に「現在のページ個別パラメータ」が更新される
 //!   (ページ個別設定が自動生成される)
 //! - アクションボタン 4 種 (2x2 グリッド):
-//!     - 「全画像に適用」   — 現在の一覧 (フォルダ/ZIP/PDF) の全画像ページに反映
-//!     - 「全画像から削除」 — 現在の一覧の全画像ページから個別設定を削除 (標準に戻す)
+//!     - 「このフォルダ全画像の個別設定に適用」 — 現在の一覧 (フォルダ/ZIP/PDF) の
+//!       全画像ページへ**個別設定として**書き込む (標準設定より優先されるため、以後
+//!       この一覧は標準設定の変更を受けなくなる)
+//!     - 「このフォルダ全画像の個別設定を解除」 — 現在の一覧の全画像ページから個別設定を
+//!       削除 (標準に戻す)
 //!     - 「標準にする」     — 現在のパラメータを settings.global_preset にコピー
 //!     - 「個別設定を解除」 — 現在のページの個別設定を削除 (標準値に戻す)
 //! - 保存スロット 10 個: クリック or Ctrl+数字で現在のページに適用
@@ -13263,16 +13266,23 @@ impl App {
                         // ── アクションボタン (5 行) ──
                         let wide = egui::vec2(content_width, 24.0);
                         if ui
-                            .add(egui::Button::new("このフォルダの全画像に適用").min_size(wide))
+                            .add(
+                                egui::Button::new("このフォルダ全画像の個別設定に適用")
+                                    .min_size(wide),
+                            )
                             .on_hover_text(
-                                "このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む",
+                                "このフォルダ/ZIP/PDF の全画像に、現在のパラメータを個別設定として書き込む。\
+                                 個別設定は標準設定より優先されるので、以後この一覧は標準設定の変更を受けなくなる",
                             )
                             .clicked()
                         {
                             apply_all_clicked = true;
                         }
                         if ui
-                            .add(egui::Button::new("このフォルダの全画像から解除").min_size(wide))
+                            .add(
+                                egui::Button::new("このフォルダ全画像の個別設定を解除")
+                                    .min_size(wide),
+                            )
                             .on_hover_text(
                                 "このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す",
                             )
@@ -13505,16 +13515,16 @@ impl App {
         // Vec<AdjustmentChange> として正しく記録される (Codex P2)。
         if apply_all_clicked {
             let params = self.effective_params(fs_idx).clone();
-            self.capture_adjust_full("全画像に適用".to_string(), |app| {
+            self.capture_adjust_full("全画像の個別設定に適用".to_string(), |app| {
                 app.apply_params_to_all_pages(params);
             });
-            self.show_feedback_toast("全画像に適用".to_string());
+            self.show_feedback_toast("全画像の個別設定に適用".to_string());
         }
         if clear_all_clicked {
-            self.capture_adjust_full("全画像の個別設定を削除".to_string(), |app| {
+            self.capture_adjust_full("全画像の個別設定を解除".to_string(), |app| {
                 app.clear_all_page_params();
             });
-            self.show_feedback_toast("全画像の個別設定を削除".to_string());
+            self.show_feedback_toast("全画像の個別設定を解除".to_string());
         }
         if set_as_favorite_clicked {
             if let Some((fav_id, fav_name)) = fav_info.clone() {
@@ -13524,7 +13534,11 @@ impl App {
                     format!("お気に入り「{}」の標準", truncated),
                     |app| app.set_favorite_default(fav_id, params),
                 );
-                self.show_feedback_toast(format!("お気に入り「{}」の標準を更新", truncated));
+                let remaining = self.page_override_toast_suffix(None);
+                self.show_feedback_toast(format!(
+                    "お気に入り「{}」の標準を更新{}",
+                    truncated, remaining
+                ));
             }
         }
         if clear_favorite_clicked {
@@ -13542,7 +13556,8 @@ impl App {
             self.capture_adjust_full("標準設定の更新".to_string(), |app| {
                 app.copy_params_to_global(params)
             });
-            self.show_feedback_toast("標準設定を更新".to_string());
+            let remaining = self.page_override_toast_suffix(None);
+            self.show_feedback_toast(format!("標準設定を更新{remaining}"));
         }
         if clear_page_clicked {
             self.capture_adjust_full("個別設定の解除".to_string(), |app| {
@@ -13559,6 +13574,13 @@ impl App {
                 .unwrap_or_default();
             // 保存対象の補正値はクリック時点で確定 (見開き L/R 切替やスライダー操作で揺れない)
             let params = self.effective_params(fs_idx).clone();
+            crate::logger::log(format!(
+                "[adjust slot] capture slot={} idx={} scope={} {}",
+                crate::adjustment::slot_key_label(slot_idx),
+                fs_idx,
+                self.resolve_adjust_scope(fs_idx).label(),
+                crate::adjustment::color_log_summary(&params),
+            ));
             self.slot_save_dialog = Some((slot_idx, default_name, params));
         }
         if let Some(slot_idx) = load_from_slot {
@@ -13626,6 +13648,12 @@ impl App {
         }
 
         if confirmed && !name_input.trim().is_empty() {
+            crate::logger::log(format!(
+                "[adjust slot] save slot={} name=\"{}\" {}",
+                crate::adjustment::slot_key_label(slot_idx),
+                name_input.trim(),
+                crate::adjustment::color_log_summary(&params),
+            ));
             self.settings.preset_slots.slots[slot_idx] = Some(PresetSlot {
                 name: name_input.trim().to_string(),
                 params,

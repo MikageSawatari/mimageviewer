@@ -6846,6 +6846,42 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    /// 編集プレビュー由来のサムネイルは、`thumbnails[idx]` に載るテクスチャへ
+    /// materialize 時点の個別補正が焼き込まれている。補正を解除して identity に
+    /// なっても生サムネへフォールバックさせず、下地から組み直す。これをしないと
+    /// 一覧だけ古い色のまま残り、フォルダを出入りするまで直らない。
+    #[test]
+    fn identity_params_still_rebuild_edit_preview_thumbnail() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from("c:/a.jpg"))];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.thumb_pixels.insert(
+            0,
+            std::sync::Arc::new(egui::ColorImage::new(
+                [2, 2],
+                vec![egui::Color32::from_rgb(10, 20, 30); 4],
+            )),
+        );
+
+        // 通常のサムネイルは identity なら生サムネで正しいので生成しない。
+        app.maybe_apply_thumb_adjustment(&ctx, 0);
+        assert!(
+            !app.thumb_adjust_tex.contains_key(&0),
+            "焼き込みの無いサムネイルでは identity で生成しない"
+        );
+
+        // 編集プレビュー由来は identity でも下地 + 注釈で組み直す。
+        app.thumb_edit_preview_layers
+            .insert(0, std::sync::Arc::new(Vec::new()));
+        app.maybe_apply_thumb_adjustment(&ctx, 0);
+        assert!(
+            app.thumb_adjust_tex.contains_key(&0),
+            "焼き込み済みテクスチャへフォールバックさせない"
+        );
+    }
+
     /// 旧選択アイテムが新 items から消えた場合は内容キー復元を諦め、
     /// 常時可視カーソルの不変条件に従って先頭の選択可能アイテムへフォールバックする。
     #[test]
@@ -9800,6 +9836,53 @@ mod favorite_adjustment_defaults_tests {
             "実効標準 (お気に入り標準) と違う個別は残すべき"
         );
         assert_eq!(app.effective_params(idx).brightness, 42.0);
+    }
+
+    /// 標準へ読み込んでも、他ページの個別設定が残っていれば表示は変わらない。
+    /// 「効かない」ように見える理由が分かるよう、残存枚数をトーストに出す。
+    #[test]
+    fn apply_slot_to_default_scope_reports_remaining_page_overrides() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        let other = push_image(&mut app, "C:/pics/b.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.set_page_params(idx, params_with_brightness(50.0));
+        // 「このフォルダの全画像に適用」で他ページにも個別設定が書かれた状態を作る
+        app.set_page_params(other, params_with_brightness(50.0));
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "Std".to_string(),
+            params: params_with_brightness(12.0),
+        });
+
+        app.apply_slot_to_default_scope(0);
+
+        assert_eq!(app.settings.global_preset.brightness, 12.0);
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+        assert!(
+            app.adjustment_page_params.contains_key(&other),
+            "他ページの個別設定は消さない"
+        );
+        assert_eq!(
+            toast_text(&app),
+            "[スロット1:Std → 標準設定 (他1枚は個別設定のまま)]"
+        );
+    }
+
+    /// 個別設定が残っていなければ注記は付かない。
+    #[test]
+    fn apply_slot_to_default_scope_omits_note_without_remaining_overrides() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.set_page_params(idx, params_with_brightness(50.0));
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "Std".to_string(),
+            params: params_with_brightness(12.0),
+        });
+
+        app.apply_slot_to_default_scope(0);
+
+        assert_eq!(toast_text(&app), "[スロット1:Std → 標準設定]");
     }
 
     /// 新しい標準と違う値の個別設定はそのまま残る。
