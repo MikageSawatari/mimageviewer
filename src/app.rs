@@ -874,10 +874,47 @@ impl App {
         new_state: DetachedWindowState,
         reason: &'static str,
     ) {
+        // A passive snapshot that still owns a media player must remain ParkedLive until
+        // activation or terminal close. Log only an actual lifecycle transition that violates
+        // that invariant; unlike MIV_DETACHED_WINDOW_DEBUG this is intentionally always on so a
+        // rare overnight/tray-restore failure survives until the next report without per-frame
+        // noise. Resuming/Closing are valid handoff states even while the snapshot is still
+        // present for part of the transition.
+        let passive_media_owner = self
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .and_then(|window| window.paused_bundle.as_deref())
+            .filter(|bundle| Self::viewer_context_bundle_contains_video(bundle))
+            .map(|bundle| {
+                let video_cache_entries = bundle
+                    .fs_cache
+                    .values()
+                    .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+                    .count();
+                (bundle.fullscreen_idx, video_cache_entries)
+            });
+        let previous_state = self.detached_window_state(window_id);
         let default_linked = self.detached_window_runtime_default_linked();
         let transition =
             self.detached_window_manager
                 .transition_state(window_id, new_state, default_linked);
+        if let Some((bundle_fullscreen_idx, video_cache_entries)) = passive_media_owner
+            && !matches!(
+                new_state,
+                DetachedWindowState::ParkedLive
+                    | DetachedWindowState::Resuming
+                    | DetachedWindowState::Closing
+            )
+        {
+            crate::logger::log(format!(
+                "[detached-media-invariant] passive media owner entered non-live state: \
+                 window_id={window_id} from={previous_state:?} to={new_state:?} reason={reason} \
+                 bundle_fullscreen_idx={bundle_fullscreen_idx:?} \
+                 video_cache_entries={video_cache_entries} hwnd=0x{:x}",
+                transition.hwnd
+            ));
+        }
         let entering_active = transition.from != DetachedWindowState::Active
             && transition.to == DetachedWindowState::Active;
         self.log_detached_image_window_debug(format!(
@@ -34559,6 +34596,45 @@ impl App {
 
     #[cfg(windows)]
     fn close_parked_live_media_windows_for_new_media(&mut self, reason: &'static str) {
+        // The close selector below intentionally accepts only ParkedLive. If a passive bundle
+        // owns a player under any other runtime state, the decoder would survive this open and
+        // the one-decoder gate would eventually time out. Diagnose that ownership/state split
+        // once per media-open event instead of enabling the high-volume detached debug stream.
+        let mismatches = self
+            .detached_image_windows
+            .iter()
+            .filter_map(|window| {
+                let bundle = window.paused_bundle.as_deref()?;
+                if !Self::viewer_context_bundle_contains_video(bundle) {
+                    return None;
+                }
+                let state = self.detached_window_state(window.id);
+                if state == Some(DetachedWindowState::ParkedLive) {
+                    return None;
+                }
+                let video_cache_entries = bundle
+                    .fs_cache
+                    .values()
+                    .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+                    .count();
+                Some(format!(
+                    "id={} state={state:?} hwnd=0x{:x} bundle_fullscreen_idx={:?} \
+                     video_cache_entries={video_cache_entries}",
+                    window.id,
+                    self.detached_window_hwnd_raw_for_window_id(window.id),
+                    bundle.fullscreen_idx
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !mismatches.is_empty() {
+            let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+                .load(std::sync::atomic::Ordering::Acquire);
+            crate::logger::log(format!(
+                "[detached-media-invariant] new media open found unclassified passive media: \
+                 reason={reason} live_video_decode_threads={live_decoders} windows=[{}]",
+                mismatches.join("; ")
+            ));
+        }
         let ids = self.parked_live_media_window_ids();
         if ids.is_empty() {
             return;
