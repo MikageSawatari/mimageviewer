@@ -3097,7 +3097,7 @@ impl App {
                     self.report_rating_write_error(&error);
                 }
             }
-            RingPickerRowId::PostFilter if self.reading_flow.is_paged() => {
+            RingPickerRowId::PostFilter => {
                 self.preview_picker_post_filter(fs_idx, picker);
             }
             // UpscaleModel remains commit-only to avoid expensive redraws per repeat.
@@ -4033,27 +4033,21 @@ impl App {
                 self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, fit);
             }
         }
-        if self.reading_flow.is_paged() {
-            if picker.dirty_rows.contains(&RingPickerRowId::PostFilter) {
-                let current = self.effective_params(fs_idx);
-                if current.post_filter != picker.original.post_filter
-                    || current.colorize != picker.original.colorize
-                {
-                    self.preview_picker_post_filter_selection(
-                        fs_idx,
-                        picker.original.post_filter,
-                        &picker.original.colorize,
-                    );
-                }
-                self.apply_picker_post_filter(
+        if picker.dirty_rows.contains(&RingPickerRowId::PostFilter) {
+            let current = self.effective_params(fs_idx);
+            if current.post_filter != picker.original.post_filter
+                || current.colorize != picker.original.colorize
+            {
+                self.preview_picker_post_filter_selection(
                     fs_idx,
-                    picker.post_filter,
+                    picker.original.post_filter,
                     &picker.original.colorize,
                 );
             }
-            if picker.dirty_rows.contains(&RingPickerRowId::UpscaleModel) {
-                self.apply_picker_upscale_model(fs_idx, picker.upscale_model_key);
-            }
+            self.apply_picker_post_filter(fs_idx, picker.post_filter, &picker.original.colorize);
+        }
+        if picker.dirty_rows.contains(&RingPickerRowId::UpscaleModel) {
+            self.apply_picker_upscale_model(fs_idx, picker.upscale_model_key);
         }
     }
 

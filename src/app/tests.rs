@@ -11216,6 +11216,58 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn continuous_adjust_outline_target_follows_current_unit_and_spread_side() {
+        use crate::app::AdjustSpreadTarget;
+        use crate::grid_item::GridItem;
+        use crate::settings::{ReadingFlow, SpreadMode};
+        let mut app = setup_app();
+        for name in ["a.jpg", "b.jpg"] {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{name}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1];
+        app.cached_nav_indices = None;
+        app.reading_flow = ReadingFlow::Vertical;
+        app.fullscreen_idx = Some(0);
+
+        app.spread_mode = SpreadMode::Single;
+        assert_eq!(app.current_adjust_target_idx(), Some(0));
+
+        app.spread_mode = SpreadMode::Ltr;
+        app.adjust_spread_target = AdjustSpreadTarget::Left;
+        assert_eq!(app.current_adjust_target_idx(), Some(0));
+        app.adjust_spread_target = AdjustSpreadTarget::Right;
+        assert_eq!(app.current_adjust_target_idx(), Some(1));
+    }
+
+    #[test]
+    fn view_trim_change_recenters_only_an_active_continuous_reader() {
+        use crate::grid_item::GridItem;
+        use crate::settings::ReadingFlow;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.fs_vertical_scroll = 420.0;
+        app.slideshow_scroll_range_cache = Some((0, 0.0, 800.0));
+
+        app.reanchor_continuous_reading_after_view_trim_change(0);
+
+        assert_eq!(app.fs_vertical_scroll, 0.0);
+        assert!(app.slideshow_scroll_range_cache.is_none());
+
+        app.reading_flow = ReadingFlow::Paged;
+        app.fs_vertical_scroll = 37.0;
+        app.reanchor_continuous_reading_after_view_trim_change(0);
+        assert_eq!(app.fs_vertical_scroll, 37.0);
+    }
+
+    #[test]
     fn bug766_spread_pair_resyncs_after_landscape_in_cover_mode() {
         use crate::grid_item::{GridItem, ThumbnailState};
         use crate::settings::SpreadMode;
@@ -41137,6 +41189,34 @@ fn fullscreen_file_change_resets_left_and_right_click_panels() {
     assert!(!app.adjustment_mode);
     assert!(!app.fs_click_info_open);
     assert!(!app.metadata_panel_click_shown());
+}
+
+#[test]
+fn continuous_reanchor_preserves_left_and_right_panels_and_persists_trim() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let first = app.items.len();
+    app.items
+        .push(GridItem::Image(PathBuf::from("C:/photos/continuous-a.jpg")));
+    let second = app.items.len();
+    app.items
+        .push(GridItem::Image(PathBuf::from("C:/photos/continuous-b.jpg")));
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+    app.reading_flow = crate::settings::ReadingFlow::Vertical;
+    app.fullscreen_idx = Some(first);
+    app.adjustment_mode = true;
+    app.fs_click_info_open = true;
+    app.view_trim_save_pending = true;
+    app.fs_vertical_scroll = 125.0;
+
+    app.reanchor_continuous_reading_viewer(&ctx, &[0.0, 100.0], 1, second);
+
+    assert_eq!(app.fullscreen_idx, Some(second));
+    assert_eq!(app.fs_vertical_scroll, 25.0);
+    assert!(app.adjustment_mode);
+    assert!(app.fs_click_info_open);
+    assert!(app.metadata_panel_click_shown());
+    assert!(!app.view_trim_save_pending);
 }
 
 #[test]

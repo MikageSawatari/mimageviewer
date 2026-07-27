@@ -333,6 +333,10 @@ impl FullscreenPageLayout {
             .find(|page| page.transform.contains_screen(pos))
     }
 
+    pub(crate) fn page_by_idx(&self, page_idx: usize) -> Option<&DisplayedPage> {
+        self.pages.iter().find(|page| page.page_idx() == page_idx)
+    }
+
     pub(crate) fn kind(&self) -> FullscreenPageLayoutKind {
         self.kind
     }
@@ -757,6 +761,8 @@ mod tests {
                 .map(|p| p.page_idx()),
             Some(11)
         );
+        assert_eq!(vertical.page_by_idx(11).map(|p| p.page_idx()), Some(11));
+        assert!(vertical.page_by_idx(99).is_none());
 
         let horizontal = page_layout(
             FullscreenPageLayoutKind::Continuous,

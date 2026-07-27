@@ -7321,6 +7321,60 @@ fn draw_header_icon_button(
     }
 }
 
+fn image_edit_tools_disabled_reason(
+    detached_reason: Option<&'static str>,
+    continuous_reading: bool,
+) -> Option<&'static str> {
+    detached_reason.or_else(|| {
+        continuous_reading
+            .then_some(crate::ui_fullscreen::CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON)
+    })
+}
+
+fn image_export_disabled_reason(continuous_reading: bool) -> Option<&'static str> {
+    continuous_reading
+        .then_some(crate::ui_fullscreen::CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON)
+}
+
+#[cfg(test)]
+mod image_edit_tools_disabled_reason_tests {
+    use super::*;
+    use crate::ui_fullscreen::CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON;
+
+    #[test]
+    fn edit_tools_combine_detached_and_continuous_reasons() {
+        assert_eq!(image_edit_tools_disabled_reason(None, false), None);
+        assert_eq!(
+            image_edit_tools_disabled_reason(None, true),
+            Some(CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON)
+        );
+        assert_eq!(
+            image_edit_tools_disabled_reason(Some("detached"), true),
+            Some("detached")
+        );
+    }
+
+    #[test]
+    fn export_ignores_detached_reason_but_not_continuous_reading() {
+        let detached_reason = Some("detached");
+
+        assert_eq!(
+            image_edit_tools_disabled_reason(detached_reason, false),
+            detached_reason
+        );
+        assert_eq!(image_export_disabled_reason(false), None);
+        assert_eq!(
+            image_export_disabled_reason(true),
+            Some(CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON)
+        );
+        assert_eq!(
+            image_edit_tools_disabled_reason(detached_reason, true),
+            detached_reason,
+            "the other five tools keep the detached reason"
+        );
+    }
+}
+
 fn draw_left_panel_tab_button(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -12471,12 +12525,33 @@ impl App {
         let thumb_indices: Vec<usize> = resolved.iter().flatten().copied().collect();
         self.ensure_bookmark_panel_thumbnails(&thumb_indices);
 
+        let add_tooltip = self
+            .keymap
+            .chord_list_bracket_label("現在ページをブックマークに追加", KeyAction::FsBookBookmark);
+        let empty_hint = match self.keymap.first_chord_label(KeyAction::FsBookBookmark) {
+            Some(shortcut) => {
+                format!("{shortcut} キーまたは上の追加ボタンで現在ページを追加できます。")
+            }
+            None => "上の追加ボタンで現在ページを追加できます。".to_string(),
+        };
+        let mut add_requested = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("この本のブックマーク").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let add_response = ui.add_sized(egui::vec2(24.0, 20.0), egui::Button::new(""));
+                crate::ui_fullscreen::draw_icons::draw_bookmark_icon(
+                    ui.painter(),
+                    add_response.rect.center(),
+                    5.8,
+                    egui::Color32::from_rgb(255, 220, 82),
+                );
+                add_requested = add_response.on_hover_text(&add_tooltip).clicked();
                 ui.label(format!("{} 件", rows.len()));
             });
         });
+        if add_requested {
+            self.add_current_book_bookmark(fs_idx);
+        }
         ui.separator();
         if self.current_book_bookmarks_request.is_some() && rows.is_empty() {
             ui.add_space(12.0);
@@ -12489,7 +12564,7 @@ impl App {
             ui.add_space(12.0);
             ui.label("ブックマークはまだありません。");
             ui.label(
-                egui::RichText::new("B キーで現在ページを追加できます。")
+                egui::RichText::new(empty_hint)
                     .small()
                     .color(egui::Color32::from_gray(170)),
             );
@@ -12810,8 +12885,14 @@ impl App {
                             | crate::grid_item::GridItem::PdfPage { .. }
                     )
                 );
-            let edit_tool_disabled_reason = self.detached_viewer_image_edit_tools_disabled_reason();
+            let continuous_reading = self.continuous_reading_active_for_idx(fs_root_idx);
+            let edit_tool_disabled_reason = image_edit_tools_disabled_reason(
+                self.detached_viewer_image_edit_tools_disabled_reason(),
+                continuous_reading,
+            );
             let can_start_edit_tool = can_overlay_edit && edit_tool_disabled_reason.is_none();
+            let export_disabled_reason = image_export_disabled_reason(continuous_reading);
+            let can_export = can_overlay_edit && export_disabled_reason.is_none();
             // 右側 6 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / テキスト / エクスポート。
             // テキストは comic 注釈モード (最前面・パイプライン最終段) なので crop と export の間に置く。
             let btn_y = header_rect.min.y + 34.0;
@@ -12930,13 +13011,13 @@ impl App {
                 &mut child,
                 export_rect,
                 "adjust_panel_export_btn",
-                can_overlay_edit,
+                can_export,
                 false,
                 "エクスポート",
-                None,
+                export_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_export_icon,
             );
-            if can_overlay_edit && export_resp.clicked() {
+            if can_export && export_resp.clicked() {
                 activate_export = true;
             }
             // クリック処理は描画後にディスパッチ (借用衝突回避)。

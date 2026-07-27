@@ -359,7 +359,6 @@ struct StillSidePanelChromeInputs {
     overlay_edit_active: bool,
     view_trim_active: bool,
     zoom_active: bool,
-    paged: bool,
     animated: bool,
 }
 
@@ -372,7 +371,6 @@ fn still_side_panel_chrome_enabled(input: StillSidePanelChromeInputs) -> bool {
         && !input.overlay_edit_active
         && !input.view_trim_active
         && !input.zoom_active
-        && input.paged
         && !input.animated
 }
 
@@ -1881,7 +1879,55 @@ pub(crate) enum FsBoundaryHint {
     },
 }
 
-#[derive(Copy, Clone)]
+pub(crate) const CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON: &str =
+    "ページ単位表示でのみ使用できます";
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FsContinuousReadingUnavailableFeature {
+    ImageAnalysis,
+    Zoom,
+    Panorama,
+    Comparison,
+    Erase,
+    LocalAdjust,
+    Conceal,
+    Text,
+    Export,
+    CaptureRegion,
+}
+
+impl FsContinuousReadingUnavailableFeature {
+    #[cfg(test)]
+    const ALL: [Self; 10] = [
+        Self::ImageAnalysis,
+        Self::Zoom,
+        Self::Panorama,
+        Self::Comparison,
+        Self::Erase,
+        Self::LocalAdjust,
+        Self::Conceal,
+        Self::Text,
+        Self::Export,
+        Self::CaptureRegion,
+    ];
+
+    fn noop_title(self) -> &'static str {
+        match self {
+            Self::ImageAnalysis => "[画像分析] ページ単位表示でのみ使用できます",
+            Self::Zoom => "[全画面ズーム] ページ単位表示でのみ使用できます",
+            Self::Panorama => "[360度パノラマ] ページ単位表示でのみ使用できます",
+            Self::Comparison => "[比較表示] ページ単位表示でのみ使用できます",
+            Self::Erase => "[消しゴム] ページ単位表示でのみ使用できます",
+            Self::LocalAdjust => "[補正レイヤー] ページ単位表示でのみ使用できます",
+            Self::Conceal => "[隠蔽加工] ページ単位表示でのみ使用できます",
+            Self::Text => "[テキスト注釈] ページ単位表示でのみ使用できます",
+            Self::Export => "[エクスポート] ページ単位表示でのみ使用できます",
+            Self::CaptureRegion => "[範囲コピー] ページ単位表示でのみ使用できます",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavNoOpReason {
     LocalFilterActive,
     SearchResultList,
@@ -1891,6 +1937,7 @@ pub(crate) enum FsNavNoOpReason {
     DetachedIndependent,
     DetachedVideoUnsupported,
     DetachedEditUnavailable,
+    ContinuousReadingUnavailable(FsContinuousReadingUnavailableFeature),
 }
 
 impl FsBoundaryHint {
@@ -2487,7 +2534,14 @@ impl App {
     pub(crate) fn toggle_fs_zoom_mode_action(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if !self.fs_zoom_mode_context_ok(fs_idx) {
             self.fs_zoom_reset();
-            self.show_feedback_toast("この表示では全画面ズームモードを使えません".to_string());
+            if !self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                true,
+                FsContinuousReadingUnavailableFeature::Zoom,
+            ) {
+                self.show_feedback_toast("この表示では全画面ズームモードを使えません".to_string());
+            }
             ctx.request_repaint();
             return;
         }
@@ -2524,21 +2578,30 @@ impl App {
     /// OS 直読みのエッジで検出する。fit 状態で押下=照準開始、離す=ズーム確定、ズーム中の押下=解除。
     /// 通常閲覧 (単ページ / 見開き) で動く (連結/パノラマ/動画/分析/編集モードは対象外)。
     fn update_fs_zoom_mode_keys(&mut self, ctx: &egui::Context, fs_idx: usize) {
-        if !self.fs_zoom_mode_context_ok(fs_idx) {
-            // コンテキスト外: ズーム解除し、エッジ状態もリセット
-            // (Z 押しっぱで対象外へ移った時の誤発火を防ぐ)。
-            self.fs_zoom_reset();
-            return;
-        }
         // FsZoomMode (KeyHold、既定 Z) の押下/離しを (a) egui イベント (b) OS 直読みの両方から取る。
-        // イベントは高速タップ (同フレーム内の押下+離し) を取りこぼさず、OS 直読みは FS ビュー
-        // ポートで KeyUp が届かず stale 化したホールドを救う (Codex P2)。割当キーは keymap で
-        // カスタマイズ可。エッジ取得時に該当キーイベントは消費して他経路へ漏らさない。
+        // コンテキスト外でも先に edge を消費し、連結表示では無言抑止せず rising edge に一度だけ
+        // 理由を表示する。`fs_zoom_z_was_down` のラッチでホールド中の連打を防ぐ。
         let (z_press_event, z_release_event) =
             self.keymap.take_key_hold_edges(ctx, KeyAction::FsZoomMode);
         let z_down = self.keymap.key_held_action(ctx, KeyAction::FsZoomMode);
         let rising = z_press_event || (z_down && !self.fs_zoom_z_was_down);
         let falling = z_release_event || (!z_down && self.fs_zoom_z_was_down);
+        if !self.fs_zoom_mode_context_ok(fs_idx) {
+            // コンテキスト外: ズーム解除し、エッジ状態もリセット
+            // (Z 押しっぱで対象外へ移った時の誤発火を防ぐ)。
+            self.fs_zoom_reset();
+            self.fs_zoom_z_was_down = z_down;
+            self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                rising,
+                FsContinuousReadingUnavailableFeature::Zoom,
+            );
+            return;
+        }
+        // イベントは高速タップ (同フレーム内の押下+離し) を取りこぼさず、OS 直読みは FS ビュー
+        // ポートで KeyUp が届かず stale 化したホールドを救う (Codex P2)。割当キーは keymap で
+        // カスタマイズ可。エッジ取得時に該当キーイベントは消費して他経路へ漏らさない。
         if rising {
             if self.fs_zoom_active {
                 // ズーム中の Z 押下 = 解除 (照準しない)。離すまでラッチして再照準を抑止。
@@ -3454,6 +3517,48 @@ where
     process
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ContinuousProcessedAttempt {
+    NotAttempted,
+    Resolved,
+    /// 保存済み編集マーカーの不整合を同期的に整理したため、次フレームでもう一度解決する。
+    StateChanged,
+    /// 解決できなかった。非同期 owner の有無をこの呼び出し元だけでは完全に判別できないため、
+    /// 実機で確認された「読み込み中…」固着を避ける側へ倒して次フレームでも再試行する。
+    Unresolved,
+}
+
+/// 連結表示が次フレームを必要とするか。
+///
+/// 純粋な色調補正は同フレームで final composite まで同期生成され `Resolved` になる。一方、
+/// 実機で観測された未解決状態の owner をコード上で確定できていないため、`Unresolved` も再描画を
+/// 継続する。終端 `None` では idle repaint が残り得るが、既知の表示固着を再発させないことを優先する。
+fn continuous_reading_needs_repaint(
+    any_raw_work_pending: bool,
+    has_deferred_processed: bool,
+    selected_processed_attempt: ContinuousProcessedAttempt,
+) -> bool {
+    if any_raw_work_pending {
+        return true;
+    }
+    match selected_processed_attempt {
+        ContinuousProcessedAttempt::NotAttempted | ContinuousProcessedAttempt::Resolved => {
+            has_deferred_processed
+        }
+        ContinuousProcessedAttempt::StateChanged => true,
+        ContinuousProcessedAttempt::Unresolved => true,
+    }
+}
+
+fn continuous_reading_shortcut_noop_reason(
+    continuous_reading: bool,
+    pressed: bool,
+    feature: FsContinuousReadingUnavailableFeature,
+) -> Option<FsNavNoOpReason> {
+    (continuous_reading && pressed)
+        .then_some(FsNavNoOpReason::ContinuousReadingUnavailable(feature))
+}
+
 fn vertical_reading_nearest_position(offsets: &[f32], scroll: f32) -> Option<usize> {
     offsets
         .iter()
@@ -3472,6 +3577,43 @@ fn vertical_reading_reanchor_scroll(scroll: f32, old_offsets: &[f32], new_pos: u
         .get(new_pos)
         .map(|offset| scroll - *offset)
         .unwrap_or(scroll)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ContinuousReadingDragDelta {
+    scroll: f32,
+    pan: egui::Vec2,
+}
+
+fn continuous_reading_drag_delta(
+    flow: ReadingFlow,
+    direction: ReadingDirection,
+    pointer_delta: egui::Vec2,
+    unlock_axis: bool,
+) -> ContinuousReadingDragDelta {
+    if flow.is_horizontal() {
+        ContinuousReadingDragDelta {
+            scroll: if direction == ReadingDirection::Rtl {
+                pointer_delta.x
+            } else {
+                -pointer_delta.x
+            },
+            pan: if unlock_axis {
+                egui::vec2(0.0, pointer_delta.y)
+            } else {
+                egui::Vec2::ZERO
+            },
+        }
+    } else {
+        ContinuousReadingDragDelta {
+            scroll: -pointer_delta.y,
+            pan: if unlock_axis {
+                egui::vec2(pointer_delta.x, 0.0)
+            } else {
+                egui::Vec2::ZERO
+            },
+        }
+    }
 }
 
 /// 指定インデックスの画像が横長（幅>高さ）かを判定する。
@@ -3942,6 +4084,42 @@ impl App {
                 }
             }
         }
+    }
+
+    fn draw_continuous_adjust_target_outline(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        if self.fullscreen_page_layout.kind() != FullscreenPageLayoutKind::Continuous {
+            return;
+        }
+        let Some(target_idx) = self.current_adjust_target_idx() else {
+            return;
+        };
+        let Some(transform) = self
+            .fullscreen_page_layout
+            .page_by_idx(target_idx)
+            .map(|page| page.transform)
+        else {
+            return;
+        };
+
+        let painter = ui.painter().with_clip_rect(image_rect);
+        // 暗い外縁 + 高輝度の青線。白い紙面では外縁、暗い画像では内線がコントラストを
+        // 担うため、単色線より背景の明暗に左右されにくい。両方とも Inside で描き、
+        // 既存どおり画像領域からはみ出す部分は clip に任せる。
+        painter.rect_stroke(
+            transform.paint_rect,
+            0.0,
+            egui::Stroke::new(4.25, egui::Color32::from_rgba_unmultiplied(8, 18, 28, 220)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            transform.paint_rect,
+            0.0,
+            egui::Stroke::new(
+                3.0,
+                egui::Color32::from_rgba_unmultiplied(45, 205, 255, 255),
+            ),
+            egui::StrokeKind::Inside,
+        );
     }
 
     fn draw_music_panel_callouts(
@@ -8300,6 +8478,12 @@ impl App {
                             ui.painter().galley(text_rect.min, galley, egui::Color32::WHITE);
                         }
 
+                        // 連結読みではシークバーと同じ current page を左パネルの編集対象にする。
+                        // 見開きは L/R セレクタで選んだ片側だけを、パネルより下のレイヤーで囲む。
+                        if adjustment_active {
+                            self.draw_continuous_adjust_target_outline(ui, image_rect);
+                        }
+
                         // ── 分析パネル（分析モード時、見開き中は無効）──
                         let panels_t0 = std::time::Instant::now();
                         let mut side_panel_visible = false;
@@ -8418,7 +8602,6 @@ impl App {
                                 overlay_edit_active: self.is_overlay_edit_mode_active(),
                                 view_trim_active: self.view_trim_mode,
                                 zoom_active: self.fs_zoom_mode_engaged(),
-                                paged: self.reading_flow.is_paged(),
                                 animated: self.fs_entry_is_animated(fs_idx),
                             });
                         self.draw_fs_panel_callouts(
@@ -10220,9 +10403,6 @@ impl App {
         label: &'static str,
         shortcut_label: &'static str,
     ) {
-        if !self.reading_flow.is_paged() {
-            return;
-        }
         let allowed = match model_key {
             None => true,
             Some("auto") => !matches!(
@@ -10287,9 +10467,6 @@ impl App {
         next: PostFilter,
         shortcut_label: &'static str,
     ) {
-        if !self.reading_flow.is_paged() {
-            return;
-        }
         let scope = self.resolve_adjust_scope(fs_idx);
         let old_params = self.effective_params(fs_idx).clone();
         if old_params.post_filter == next {
@@ -10327,9 +10504,6 @@ impl App {
         palette: crate::colorize::ColorizePalette,
         shortcut_label: &'static str,
     ) {
-        if !self.reading_flow.is_paged() {
-            return;
-        }
         let scope = self.resolve_adjust_scope(fs_idx);
         let old_params = self.effective_params(fs_idx).clone();
         let mut params = old_params.clone();
@@ -11206,7 +11380,7 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsLoupeLockToggle);
-        let key_e =
+        let key_e_raw =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsEraseMode);
         // B: 本の現在ページへブックマークを追加。編集サブモードでは各モードの B 操作が
         // 先に consume される。動画・音声の B はそれぞれ既存のブックマーク経路で処理済み。
@@ -11222,10 +11396,15 @@ impl App {
         //   / I (メタデータ) / C 系 (比較)
         // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
         let pano_active_now = self.is_panorama_mode_active(fs_idx);
-        let continuous_reading = !self.reading_flow.is_paged();
+        // 描画・PageUp/Down・通常ナビと同じ正本を使う。reading_flow だけでは、比較等で
+        // 実際には単ページ描画へフォールバック中なのに連結表示扱いする食い違いが起きる。
+        let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
+        let image_edit_unavailable = self
+            .detached_viewer_image_edit_tools_disabled_reason()
+            .is_some();
         let key_z = key_z_raw && !pano_active_now;
         let key_s = key_s && !pano_active_now;
-        let key_e = key_e && !pano_active_now;
+        let key_e = key_e_raw && !pano_active_now;
         let key_m = key_m && !pano_active_now;
         let key_b_bg = key_b_bg && !pano_active_now;
         let key_g = key_g && !pano_active_now;
@@ -11234,9 +11413,40 @@ impl App {
         let key_compare_alt_c = key_compare_alt_c && !pano_active_now;
         let key_compare_shift_c = key_compare_shift_c && !pano_active_now;
         let key_compare_c = key_compare_c && !pano_active_now;
-        let key_z = key_z && !continuous_reading;
-        let key_e = key_e && !continuous_reading;
-        let key_v_panorama = key_v_panorama_raw && !continuous_reading;
+        let analysis_continuous_blocked = self.show_continuous_reading_shortcut_noop(
+            ctx,
+            fs_idx,
+            key_z,
+            FsContinuousReadingUnavailableFeature::ImageAnalysis,
+        );
+        let erase_continuous_blocked = !image_edit_unavailable
+            && self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                key_e,
+                FsContinuousReadingUnavailableFeature::Erase,
+            );
+        let panorama_continuous_blocked = self.show_continuous_reading_shortcut_noop(
+            ctx,
+            fs_idx,
+            key_v_panorama_raw,
+            FsContinuousReadingUnavailableFeature::Panorama,
+        );
+        let key_z = key_z && !analysis_continuous_blocked;
+        let key_e = key_e && !erase_continuous_blocked;
+        let key_v_panorama = key_v_panorama_raw && !panorama_continuous_blocked;
+        let _ = self.show_continuous_reading_shortcut_noop(
+            ctx,
+            fs_idx,
+            key_compare_x || key_compare_alt_c || key_compare_shift_c || key_compare_c,
+            FsContinuousReadingUnavailableFeature::Comparison,
+        );
+        // 比較 renderer 自体は単ページへフォールバックできるが、仕様上は連結表示中に
+        // 比較へ入れない。従来の gate を維持し、上の no-op 表示で理由だけを伝える。
+        let key_compare_x = key_compare_x && !continuous_reading;
+        let key_compare_alt_c = key_compare_alt_c && !continuous_reading;
+        let key_compare_shift_c = key_compare_shift_c && !continuous_reading;
+        let key_compare_c = key_compare_c && !continuous_reading;
         #[cfg(windows)]
         if Self::detached_image_window_debug_enabled()
             && self.viewer_session_is_detached_or_switching()
@@ -11295,13 +11505,6 @@ impl App {
                 ));
             }
         }
-        let key_compare_x = key_compare_x && !continuous_reading;
-        let key_compare_alt_c = key_compare_alt_c && !continuous_reading;
-        let key_compare_shift_c = key_compare_shift_c && !continuous_reading;
-        let key_compare_c = key_compare_c && !continuous_reading;
-        let image_edit_unavailable = self
-            .detached_viewer_image_edit_tools_disabled_reason()
-            .is_some();
         // P: 現在表示中アイテムを親コンテナの代表サムネに固定 / 解除。
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
@@ -11636,7 +11839,7 @@ impl App {
         // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
         if let Some((model_key, label)) = ai_direct_model {
             self.apply_fullscreen_ai_model_selection(fs_idx, model_key, label, "AI");
-        } else if (key_u || key_u_shift || key_u_alt) && self.reading_flow.is_paged() {
+        } else if key_u || key_u_shift || key_u_alt {
             let items =
                 crate::adjustment::upscale_menu_items_for_mode(self.settings.ai_feature_mode);
             let cur = items.iter().position(|(_, k)| {
@@ -11671,7 +11874,7 @@ impl App {
         }
 
         // N キー: AI デノイズをトグル
-        if key_n && self.reading_flow.is_paged() {
+        if key_n {
             if !self.settings.ai_feature_mode.allows_denoise() {
                 self.show_feedback_toast(format!(
                     "[N:デノイズ無効]\nAI 機能: {}",
@@ -11702,7 +11905,7 @@ impl App {
             self.apply_fullscreen_colorize_selection(fs_idx, palette, "カラー化");
         } else if let Some(filter) = post_filter_direct {
             self.apply_fullscreen_post_filter_selection(fs_idx, filter, "PF");
-        } else if (key_t || key_t_shift || key_t_alt) && self.reading_flow.is_paged() {
+        } else if key_t || key_t_shift || key_t_alt {
             let all = PostFilter::ALL;
             let cur = all
                 .iter()
@@ -11721,7 +11924,7 @@ impl App {
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
         for (slot_idx, &pressed) in slot_keys.iter().enumerate() {
-            if pressed && self.reading_flow.is_paged() {
+            if pressed {
                 self.capture_adjust_full(
                     format!(
                         "スロット{}を適用",
@@ -11734,7 +11937,7 @@ impl App {
 
         // Ctrl+Alt+数字キー: 保存スロットを標準設定へ適用し、現在ページの個別設定を解除
         for (slot_idx, &pressed) in slot_default_keys.iter().enumerate() {
-            if pressed && self.reading_flow.is_paged() {
+            if pressed {
                 let key_label = crate::adjustment::slot_key_label(slot_idx);
                 self.capture_adjust_full(
                     format!("スロット{key_label}を標準に適用"),
@@ -11744,7 +11947,7 @@ impl App {
         }
 
         // Ctrl+Backspace: 個別設定があれば解除、なければフィードバックのみ
-        if clear_page_key && self.reading_flow.is_paged() {
+        if clear_page_key {
             if self.adjustment_page_params.contains_key(&fs_idx) {
                 self.capture_adjust_full("個別設定の解除".to_string(), |app| {
                     app.clear_page_params(fs_idx)
@@ -11906,13 +12109,17 @@ impl App {
             && !self.erase_mode
             && !self.conceal_mode
             && !self.text_mode
-            && self.reading_flow.is_paged()
             && !is_video_fs
             && !self.fs_entry_is_animated(fs_idx)
         {
             if image_edit_unavailable {
                 self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
-            } else {
+            } else if !self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                true,
+                FsContinuousReadingUnavailableFeature::LocalAdjust,
+            ) {
                 self.enter_local_adjust_mode();
             }
         }
@@ -11926,13 +12133,17 @@ impl App {
             && !self.analysis_mode
             && !self.adjustment_mode
             && !self.erase_mode
-            && self.reading_flow.is_paged()
             && !is_video_fs
             && !self.fs_entry_is_animated(fs_idx)
         {
             if image_edit_unavailable {
                 self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
-            } else {
+            } else if !self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                true,
+                FsContinuousReadingUnavailableFeature::Conceal,
+            ) {
                 self.enter_conceal_mode(fs_idx);
             }
         }
@@ -11946,13 +12157,17 @@ impl App {
             && !self.adjustment_mode
             && !self.erase_mode
             && !self.conceal_mode
-            && self.reading_flow.is_paged()
             && !is_video_fs
             && !self.fs_entry_is_animated(fs_idx)
         {
             if image_edit_unavailable {
                 self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
-            } else {
+            } else if !self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                true,
+                FsContinuousReadingUnavailableFeature::Text,
+            ) {
                 self.enter_text_mode(fs_idx);
             }
         }
@@ -11963,7 +12178,14 @@ impl App {
         if key_ctrl_b_book {
             self.add_fullscreen_image_to_active_book(ctx, fs_idx);
         }
-        if key_ctrl_e_export {
+        if key_ctrl_e_export
+            && !self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                true,
+                FsContinuousReadingUnavailableFeature::Export,
+            )
+        {
             self.open_export_dialog_for_current(ctx, fs_idx);
         }
 
@@ -12260,9 +12482,9 @@ impl App {
         let mut page_nav = FsPageNav::None;
         let mut close = false;
 
-        // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、連続読み中の
-        // デッドな pan-drag (fs_pan に書いても縦/横描画は fs_vertical_scroll しか見ないため
-        // has_transform だけ汚す) の抑制に使う。キー側の continuous_active と同一述語。
+        // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、
+        // 連結方向スクロール / 直交方向パンの振り分けに使う。
+        // キー側の continuous_active と同一述語。
         let continuous_active = self
             .fullscreen_idx
             .is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
@@ -12383,7 +12605,6 @@ impl App {
                 overlay_edit_active: self.is_overlay_edit_mode_active(),
                 view_trim_active: self.view_trim_mode,
                 zoom_active: self.fs_zoom_mode_engaged(),
-                paged: self.reading_flow.is_paged(),
                 animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
             });
 
@@ -12518,7 +12739,6 @@ impl App {
                     crate::ui_helpers::PanelEdge::Left,
                 )
                 && !self.analysis_mode
-                && self.reading_flow.is_paged()
                 && self.fullscreen_idx.is_some()
                 && adjustment_panel_hover_active_at(
                     full_rect,
@@ -12844,24 +13064,26 @@ impl App {
                 }
             } else if continuous_active && primary_down && !cursor_in_panel {
                 let pointer_delta = ctx.input(|i| i.pointer.delta());
-                let scroll_delta = if self.reading_flow.is_horizontal() {
-                    if self.reading_direction == ReadingDirection::Rtl {
-                        pointer_delta.x
-                    } else {
-                        -pointer_delta.x
-                    }
-                } else {
-                    -pointer_delta.y
-                };
-                self.scroll_vertical_reading_by(ctx, scroll_delta);
+                let delta = continuous_reading_drag_delta(
+                    self.reading_flow,
+                    self.reading_direction,
+                    pointer_delta,
+                    mods.ctrl,
+                );
+                self.scroll_vertical_reading_by(ctx, delta.scroll);
+                if delta.pan != egui::Vec2::ZERO {
+                    // 連結方向は fs_vertical_scroll が正本。未使用の主軸側 fs_pan を
+                    // 汚さず、レイアウトが参照する直交成分だけを動かす。
+                    self.fs_pan += delta.pan;
+                    ctx.request_repaint();
+                }
             } else if !continuous_active
                 && (self.fullscreen_fit_allows_drag_pan()
                     || self.fs_zoom > ZOOM_NEAR_ONE
                     || self.fs_free_rotation.abs() > TRANSFORM_EPSILON)
             {
-                // ズームまたは回転中: ドラッグでパン (連続読み中は fs_zoom が自動インフレ
-                // されるが、その pan は描画に反映されず has_transform を汚すだけなので除外。
-                // 連続読みのスクロールはホイール / 矢印 / gamepad で行う)
+                // ページ単位表示でズームまたは回転中: ドラッグでパン。
+                // 連結読みのドラッグは直前の分岐で、主軸スクロールと直交パンに分けて扱う。
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {
                         self.fs_pan_drag_start = Some((pos, self.fs_pan));
@@ -13861,6 +14083,25 @@ impl App {
         });
     }
 
+    fn show_continuous_reading_shortcut_noop(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        pressed: bool,
+        feature: FsContinuousReadingUnavailableFeature,
+    ) -> bool {
+        let Some(reason) = continuous_reading_shortcut_noop_reason(
+            self.continuous_reading_active_for_idx(fs_idx),
+            pressed,
+            feature,
+        ) else {
+            return false;
+        };
+        // `fs_boundary_hint` は単一値なので、キーリピートでも通知をキューへ蓄積しない。
+        self.show_fullscreen_nav_noop(ctx, reason, false);
+        true
+    }
+
     pub(crate) fn nav_noop_title(reason: FsNavNoOpReason) -> &'static str {
         match reason {
             FsNavNoOpReason::LocalFilterActive => "Ctrl+F検索中はフォルダ移動しません",
@@ -13875,6 +14116,7 @@ impl App {
             FsNavNoOpReason::DetachedEditUnavailable => {
                 "この別ウィンドウでは画像編集機能を利用できません"
             }
+            FsNavNoOpReason::ContinuousReadingUnavailable(feature) => feature.noop_title(),
         }
     }
 
@@ -14616,6 +14858,17 @@ impl App {
         self.fs_free_rotation = 0.0;
         self.fs_vertical_cache_keep_set.clear();
         self.continuous_page_transitions.clear();
+        self.slideshow_scroll_range_cache = None;
+    }
+
+    pub(crate) fn reanchor_continuous_reading_after_view_trim_change(&mut self, fs_idx: usize) {
+        if !self.continuous_reading_active_for_idx(fs_idx) {
+            return;
+        }
+        // 表示トリムは全ユニットの寸法を変え得る。current unit をスクロール原点へ
+        // 戻すことで、次フレームの再レイアウトでも編集対象ページを画面内に保つ。
+        self.fs_vertical_scroll = 0.0;
+        self.slideshow_scroll_anim = None;
         self.slideshow_scroll_range_cache = None;
     }
 
@@ -15548,7 +15801,11 @@ impl App {
     }
 
     fn vertical_reading_cached_processed_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
-        if self.comic_pages.contains(&idx) {
+        if self.fs_entry_is_animated(idx) {
+            self.current_animated_frame_texture(idx)
+        } else if self.comic_pages.contains(&idx) {
+            // 注釈ページは comic composite 自体の完成を待つ。final へフォールバックして
+            // cached 扱いするとベイクを開始できなくなるため、描画時の fallback とは分ける。
             self.current_comic_composite_texture(idx)
         } else {
             self.current_final_composite_texture(idx)
@@ -15586,7 +15843,9 @@ impl App {
             return;
         }
         if self.fullscreen_idx != Some(new_idx) {
-            self.reset_fs_side_panel_runtime_for_file_change();
+            // 連結ストリーム内の再アンカーはファイルを開き直す遷移ではないため、
+            // 左右パネルは維持する。表示トリムの pending 値だけ旧対象へ確定する。
+            self.persist_pending_view_trim_state();
         }
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
@@ -15654,7 +15913,8 @@ impl App {
                     && !self.vertical_reading_processed_texture_cached(page.idx)
             });
 
-        let mut any_loading = false;
+        let mut any_raw_work_pending = false;
+        let mut selected_processed_attempt = ContinuousProcessedAttempt::NotAttempted;
         for page in pages {
             self.advance_animation(ctx, page.idx);
             let rotation = self.get_rotation(page.idx);
@@ -15669,10 +15929,32 @@ impl App {
                 // 連結読みでも単ページ/見開きと同じ final pipeline を使う。ただし
                 // 新規 GPU upload は未生成の可視ページだけを 1 フレームずつ進め、
                 // スクロール中の大量同期生成を避ける。
+                let edit_markers_before = (
+                    self.mask_pages.contains(&page.idx),
+                    self.local_adjust_pages.contains(&page.idx),
+                    self.conceal_pages.contains(&page.idx),
+                    self.comic_pages.contains(&page.idx),
+                );
                 let processed = self.resolve_fs_processed_texture(ctx, page.idx, false);
                 if let Some(tex) = processed.as_ref() {
                     self.observe_continuous_page_processed_texture(page.idx, tex);
                 }
+                let edit_markers_after = (
+                    self.mask_pages.contains(&page.idx),
+                    self.local_adjust_pages.contains(&page.idx),
+                    self.conceal_pages.contains(&page.idx),
+                    self.comic_pages.contains(&page.idx),
+                );
+                selected_processed_attempt =
+                    if self.vertical_reading_processed_texture_cached(page.idx) {
+                        ContinuousProcessedAttempt::Resolved
+                    } else if edit_markers_before != edit_markers_after {
+                        ContinuousProcessedAttempt::StateChanged
+                    } else {
+                        // owner をこの場だけでは確定できない未解決状態。終端失敗を含み得るが、
+                        // 実機で観測された固着を再発させないため次フレームでも解決を試す。
+                        ContinuousProcessedAttempt::Unresolved
+                    };
                 processed.or_else(|| self.continuous_page_transition_texture(page.idx))
             } else {
                 self.continuous_page_transition_texture(page.idx)
@@ -15688,8 +15970,14 @@ impl App {
                 );
                 continue;
             }
-            if !self.fs_cache.contains_key(&page.idx) {
-                any_loading = true;
+            if !self.fs_cache.contains_key(&page.idx)
+                && (self.fs_pending.contains_key(&page.idx)
+                    || self
+                        .fs_upload_backlog
+                        .iter()
+                        .any(|(idx, _, _)| *idx == page.idx))
+            {
+                any_raw_work_pending = true;
             }
             let allow_thumbnail =
                 original_preview_active || !self.colorize_display_requires_final_effect(page.idx);
@@ -15726,7 +16014,11 @@ impl App {
             self.reanchor_continuous_reading_viewer(ctx, &offsets, new_pos, new_idx);
         }
 
-        if any_loading || has_deferred_processed {
+        if continuous_reading_needs_repaint(
+            any_raw_work_pending,
+            has_deferred_processed,
+            selected_processed_attempt,
+        ) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
@@ -19751,6 +20043,13 @@ impl App {
                 Self::nav_noop_title(FsNavNoOpReason::DetachedEditUnavailable),
                 vec!["通常の連動ウィンドウ、またはメイン側で編集してください"],
             ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::ContinuousReadingUnavailable(feature),
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::ContinuousReadingUnavailable(feature)),
+                vec!["表示モードを「ページ単位」に切り替えてください"],
+            ),
         };
 
         let title_font = egui::FontId::proportional(32.0);
@@ -20233,7 +20532,13 @@ impl App {
             return;
         }
         if self.continuous_reading_active_for_idx(fs_idx) {
-            self.show_feedback_toast("連結読み中は範囲コピーを使用できません".to_string());
+            self.show_fullscreen_nav_noop(
+                ctx,
+                FsNavNoOpReason::ContinuousReadingUnavailable(
+                    FsContinuousReadingUnavailableFeature::CaptureRegion,
+                ),
+                false,
+            );
             return;
         }
         if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
@@ -23298,6 +23603,227 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn continuous_reading_drag_splits_scroll_and_cross_axis_pan() {
+        let pointer_delta = egui::vec2(7.0, -11.0);
+
+        for (flow, direction, expected_scroll, expected_pan) in [
+            (
+                ReadingFlow::Horizontal,
+                ReadingDirection::Ltr,
+                -7.0,
+                egui::vec2(0.0, -11.0),
+            ),
+            (
+                ReadingFlow::Horizontal,
+                ReadingDirection::Rtl,
+                7.0,
+                egui::vec2(0.0, -11.0),
+            ),
+            (
+                ReadingFlow::Vertical,
+                ReadingDirection::Ltr,
+                11.0,
+                egui::vec2(7.0, 0.0),
+            ),
+        ] {
+            assert_eq!(
+                continuous_reading_drag_delta(flow, direction, pointer_delta, false),
+                ContinuousReadingDragDelta {
+                    scroll: expected_scroll,
+                    pan: egui::Vec2::ZERO,
+                },
+                "{flow:?} {direction:?}: Ctrl なしは軸固定"
+            );
+            assert_eq!(
+                continuous_reading_drag_delta(flow, direction, pointer_delta, true),
+                ContinuousReadingDragDelta {
+                    scroll: expected_scroll,
+                    pan: expected_pan,
+                },
+                "{flow:?} {direction:?}: Ctrl ありは直交方向もパン"
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_reading_repaint_contract_keeps_unresolved_attempt_alive() {
+        assert!(continuous_reading_needs_repaint(
+            true,
+            false,
+            ContinuousProcessedAttempt::Unresolved,
+        ));
+        assert!(continuous_reading_needs_repaint(
+            false,
+            true,
+            ContinuousProcessedAttempt::NotAttempted,
+        ));
+        assert!(continuous_reading_needs_repaint(
+            false,
+            true,
+            ContinuousProcessedAttempt::Resolved,
+        ));
+        assert!(continuous_reading_needs_repaint(
+            false,
+            false,
+            ContinuousProcessedAttempt::StateChanged,
+        ));
+        assert!(continuous_reading_needs_repaint(
+            false,
+            false,
+            ContinuousProcessedAttempt::Unresolved,
+        ));
+        assert!(!continuous_reading_needs_repaint(
+            false,
+            false,
+            ContinuousProcessedAttempt::NotAttempted,
+        ));
+    }
+
+    #[test]
+    fn continuous_reading_unavailable_shortcuts_set_named_noop_reason() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let idx = app.items.len();
+        app.items.push(GridItem::Image(PathBuf::from(
+            "c:/test/continuous-shortcut.jpg",
+        )));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(idx);
+        app.reading_flow = ReadingFlow::Vertical;
+
+        for feature in FsContinuousReadingUnavailableFeature::ALL {
+            app.fs_boundary_hint = None;
+            assert!(app.show_continuous_reading_shortcut_noop(&ctx, idx, true, feature));
+            assert!(matches!(
+                app.fs_boundary_hint,
+                Some(FsBoundaryHint::NavNoOp {
+                    reason: FsNavNoOpReason::ContinuousReadingUnavailable(actual),
+                    ..
+                }) if actual == feature
+            ));
+            assert!(
+                feature
+                    .noop_title()
+                    .contains(CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON)
+            );
+        }
+
+        app.reading_flow = ReadingFlow::Paged;
+        app.fs_boundary_hint = None;
+        assert!(!app.show_continuous_reading_shortcut_noop(
+            &ctx,
+            idx,
+            true,
+            FsContinuousReadingUnavailableFeature::Erase,
+        ));
+        assert!(app.fs_boundary_hint.is_none());
+
+        app.reading_flow = ReadingFlow::Vertical;
+        assert!(!app.show_continuous_reading_shortcut_noop(
+            &ctx,
+            idx,
+            false,
+            FsContinuousReadingUnavailableFeature::Erase,
+        ));
+
+        // reading_flow が連結でも、描画の正本が単ページへフォールバックしている間は
+        // 「ページ単位表示でのみ」の誤ったトーストを出さない。
+        app.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
+        app.fs_boundary_hint = None;
+        assert!(!app.show_continuous_reading_shortcut_noop(
+            &ctx,
+            idx,
+            true,
+            FsContinuousReadingUnavailableFeature::Erase,
+        ));
+        assert!(app.fs_boundary_hint.is_none());
+    }
+
+    #[test]
+    fn continuous_reading_brightness_change_rebuilds_final_composite_synchronously() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let idx = app.items.len();
+        app.items.push(GridItem::Image(PathBuf::from(
+            "c:/test/continuous-brightness.jpg",
+        )));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(idx);
+        app.reading_flow = ReadingFlow::Vertical;
+
+        let image = egui::ColorImage::new([2, 2], vec![egui::Color32::GRAY; 4]);
+        let pixels = Arc::new(image.clone());
+        let texture = ctx.load_texture(
+            "continuous_brightness_raw",
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([2, 2]),
+                load_seq: 1,
+            },
+        );
+
+        assert!(app.resolve_fs_processed_texture(&ctx, idx, false).is_some());
+        assert!(app.current_final_composite_texture(idx).is_some());
+
+        let old_params = app.effective_params(idx).clone();
+        let mut new_params = old_params.clone();
+        new_params.brightness = 25.0;
+        app.adjustment_page_params.insert(idx, new_params.clone());
+        app.clear_caches_for_param_change(idx, &old_params, &new_params);
+        assert!(app.current_final_composite_texture(idx).is_none());
+
+        let rebuilt = app.resolve_fs_processed_texture(&ctx, idx, false);
+        assert!(rebuilt.is_some());
+        assert!(app.vertical_reading_processed_texture_cached(idx));
+    }
+
+    #[test]
+    fn continuous_reading_adjustment_selection_methods_update_effective_params() {
+        let mut app = crate::app::setup_app_for_test();
+        let idx = app.items.len();
+        app.items.push(GridItem::Image(PathBuf::from(
+            "c:/test/continuous-adjustment.jpg",
+        )));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(idx);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+
+        let model = ModelKind::UpscaleRealEsrGeneralV3;
+        app.apply_fullscreen_ai_model_selection(
+            idx,
+            Some(model.as_str()),
+            model.display_label(),
+            "U",
+        );
+        assert_eq!(
+            app.effective_params(idx).upscale_model.as_deref(),
+            Some(model.as_str())
+        );
+
+        app.apply_fullscreen_post_filter_selection(idx, PostFilter::Sepia, "T");
+        assert_eq!(app.effective_params(idx).post_filter, PostFilter::Sepia);
+
+        app.apply_fullscreen_colorize_selection(
+            idx,
+            crate::colorize::ColorizePalette::LegacySkin,
+            "カラー化",
+        );
+        let params = app.effective_params(idx);
+        assert!(params.colorize.is_enabled());
+        assert_eq!(
+            params.colorize.palette,
+            crate::colorize::ColorizePalette::LegacySkin
+        );
+    }
+
+    #[test]
     fn compare_indicator_size_fits_without_upscaling() {
         assert_eq!(compare_indicator_size(8192, 8192), Some((54, 54)));
         assert_eq!(compare_indicator_size(8192, 4096), Some((72, 36)));
@@ -23883,28 +24409,49 @@ mod tests {
             overlay_edit_active: false,
             view_trim_active: false,
             zoom_active: false,
-            paged: true,
             animated: false,
         };
         assert!(still_side_panel_chrome_enabled(base));
-        assert!(!still_side_panel_chrome_enabled(
+        for suppressed in [
             StillSidePanelChromeInputs {
-                overlay_edit_active: true,
+                is_music_view: true,
                 ..base
-            }
-        ));
-        assert!(!still_side_panel_chrome_enabled(
-            StillSidePanelChromeInputs {
-                view_trim_active: true,
-                ..base
-            }
-        ));
-        assert!(!still_side_panel_chrome_enabled(
+            },
             StillSidePanelChromeInputs {
                 analysis_active: true,
                 ..base
-            }
-        ));
+            },
+            StillSidePanelChromeInputs {
+                is_video: true,
+                ..base
+            },
+            StillSidePanelChromeInputs {
+                compare_wipe_active: true,
+                ..base
+            },
+            StillSidePanelChromeInputs {
+                panorama_active: true,
+                ..base
+            },
+            StillSidePanelChromeInputs {
+                overlay_edit_active: true,
+                ..base
+            },
+            StillSidePanelChromeInputs {
+                view_trim_active: true,
+                ..base
+            },
+            StillSidePanelChromeInputs {
+                zoom_active: true,
+                ..base
+            },
+            StillSidePanelChromeInputs {
+                animated: true,
+                ..base
+            },
+        ] {
+            assert!(!still_side_panel_chrome_enabled(suppressed));
+        }
     }
 
     #[test]

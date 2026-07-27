@@ -183,6 +183,32 @@ pub(crate) fn draw_eye_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     painter.circle_filled(c, r * 0.32, white);
 }
 
+/// 動画 / 音楽のブックマーク追加ボタンと同じ、切り欠き付きのブックマーク形状。
+///
+/// 実体は `video::native_presenter::overlay_draw::draw_overlay_bookmark_icon` と同じ形だが、
+/// あちらは native presenter (= `#[cfg(windows)]`) 配下にあり非 Windows ビルドから参照できない
+/// ため、静止画パネル用にここへ複製している。**形を変えるときは両方揃えること**。
+pub(crate) fn draw_bookmark_icon(
+    painter: &egui::Painter,
+    c: egui::Pos2,
+    r: f32,
+    fill: egui::Color32,
+) {
+    let rect = egui::Rect::from_center_size(c, egui::vec2(r * 1.10, r * 1.55));
+    let notch = egui::pos2(rect.center().x, rect.max.y - r * 0.35);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            notch,
+            rect.left_bottom(),
+        ],
+        fill,
+        egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 245, 190)),
+    ));
+}
+
 /// 消しゴムアイコン (= Codex Phase 4 redesign)。コンパクトな斜めブロックの消しゴム +
 /// 先端の摩擦帯 + 消しカスの小さな粒で「消す動作」を示唆する。
 ///

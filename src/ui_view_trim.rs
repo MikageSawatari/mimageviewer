@@ -1067,6 +1067,7 @@ impl App {
         }
 
         if changed || repaint_requested {
+            self.reanchor_continuous_reading_after_view_trim_change(fs_idx);
             ctx.request_repaint();
         }
     }
