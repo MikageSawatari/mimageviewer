@@ -129,8 +129,13 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 右メタデータパネルは App の per-file `fs_click_info_open` を正本として presenter へ同期し、
 左パネルは上段の「ジャンプ / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
 ジャンプの開閉と選択中タブは presenter-local な session 状態、色調と Creative LUT の値は
-viewer-wide な `Settings::video_adjustments` を正本とする。新しい動画への source swap では左を
-presenter 内で閉じ、右も App から false を同期する。
+viewer-wide な `Settings::video_adjustments` を正本とする。画像補正パネル末尾には動画専用の
+10 個の保存スロットを読込行 / 保存行で表示する。スロット内容は App 側の
+`Settings::video_preset_slots` が正本で、presenter へは `VideoGradeSnapshot` で名前だけを同期するため、
+presenter thread は設定 I/O を行わない。パネル操作は `NativeOverlayCommand` →
+`NativeVideoOutputEvent` で App に戻し、保存または読込後に最新の補正値とスロット名を再同期する。
+`VideoAdjustSlot1..10` の既定 `Ctrl+1〜9` / `Ctrl+0` は映像表示中だけ読込を行い、動画→音声モードでは
+発火させない。新しい動画への source swap では左を presenter 内で閉じ、右も App から false を同期する。
 callout は実際にクリックする UI なので、表示中の bar rect だけを HUD region に含める。
 動画↔音声モードの遷移も左右パネルの session 境界として扱い、presenter の左ジャンプ状態と
 音楽ビューの左ブックマーク状態を両方閉じる。同じファイル内の遷移では右状態を保持するが、

@@ -3700,6 +3700,9 @@ pub struct Settings {
     /// 入力色空間の変換ではなく、デコード後のプレビュー見た目だけを変更する。
     #[serde(default)]
     pub video_adjustments: crate::creative_lut::VideoAdjustments,
+    /// 全動画で共有する動画補正の保存スロット (10個)。
+    #[serde(default)]
+    pub video_preset_slots: crate::creative_lut::VideoPresetSlots,
     /// 動画ファイルごとの最終再生位置 (絶対パス → 秒)。
     /// `VideoPlayer::open` 時に自動 resume、5 秒ごと + drop 時に保存。
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
@@ -4799,6 +4802,7 @@ impl Default for Settings {
             video_start_muted: false,
             video_muted: false,
             video_adjustments: crate::creative_lut::VideoAdjustments::default(),
+            video_preset_slots: crate::creative_lut::VideoPresetSlots::default(),
             video_resume_positions: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
             video_nav_resume: ResumeMode::Resume,
@@ -5974,6 +5978,7 @@ impl Settings {
         self.video_playback_speed =
             crate::video::clock::clamp_playback_speed(self.video_playback_speed);
         self.video_adjustments.sanitize();
+        self.video_preset_slots.sanitize();
         let builtin_entries = crate::creative_lut::builtin_creative_lut_entries();
         let reserved_ids: std::collections::HashSet<_> =
             builtin_entries.iter().map(|entry| entry.id).collect();
@@ -6334,6 +6339,7 @@ impl Settings {
         self.image_mipmap_lod_bias = src.image_mipmap_lod_bias;
         // ── 動画プレビュー補正 (native 動画左パネルでライブ編集) ──
         self.video_adjustments = src.video_adjustments.clone();
+        self.video_preset_slots = src.video_preset_slots.clone();
         // ── キャッシュ系 (環境設定に出ていない項目) ──
         self.cache_videos_always = src.cache_videos_always;
         self.batch_cache_zip_contents = src.batch_cache_zip_contents;

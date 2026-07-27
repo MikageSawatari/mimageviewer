@@ -426,6 +426,7 @@ struct NativeEguiOverlay {
     timeline_markers: Vec<NativeOverlayTimelineMarker>,
     jump_entries: Vec<NativeOverlayJumpEntry>,
     video_adjustments: crate::creative_lut::VideoAdjustments,
+    video_preset_slots: Arc<[Option<String>]>,
     creative_lut_choices: Arc<[crate::creative_lut::CreativeLutChoice]>,
     video_left_panel_tab: NativeVideoLeftPanelTab,
     video_adjustment_tab: NativeVideoAdjustmentTab,
@@ -1329,6 +1330,12 @@ pub enum NativeOverlayCommand {
         slot_idx: usize,
     },
     Vst3SaveChainSlot {
+        slot_idx: usize,
+    },
+    VideoAdjustLoadSlot {
+        slot_idx: usize,
+    },
+    VideoAdjustSaveSlot {
         slot_idx: usize,
     },
     SeekToStartAndPlay,
@@ -4129,6 +4136,7 @@ impl NativeEguiOverlay {
             timeline_markers: Vec::new(),
             jump_entries: Vec::new(),
             video_adjustments: crate::creative_lut::VideoAdjustments::default(),
+            video_preset_slots: vec![None; 10].into(),
             creative_lut_choices: Arc::from([]),
             video_left_panel_tab: NativeVideoLeftPanelTab::Jump,
             video_adjustment_tab: NativeVideoAdjustmentTab::ColorTone,
@@ -4812,6 +4820,7 @@ impl NativeEguiOverlay {
 
     fn set_video_grade(&mut self, grade: &crate::creative_lut::VideoGradeSnapshot) {
         self.video_adjustments = grade.adjustments.clone();
+        self.video_preset_slots = grade.slots.clone();
         self.creative_lut_choices = grade.choices.clone();
         self.dirty = true;
     }
@@ -6188,6 +6197,7 @@ impl NativeEguiOverlay {
         let jump_entries = self.jump_entries.clone();
         let creative_lut_choices = self.creative_lut_choices.clone();
         let mut video_adjustments = self.video_adjustments.clone();
+        let video_preset_slots = self.video_preset_slots.clone();
         let mut video_left_panel_tab = self.video_left_panel_tab;
         let mut video_adjustment_tab = self.video_adjustment_tab;
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
@@ -6604,6 +6614,7 @@ impl NativeEguiOverlay {
                     &mut video_left_panel_tab,
                     &mut video_adjustment_tab,
                     &mut video_adjustments,
+                    &video_preset_slots,
                     &creative_lut_choices,
                     &mut commands,
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,

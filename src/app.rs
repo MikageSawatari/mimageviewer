@@ -44763,6 +44763,7 @@ impl App {
                             self.creative_lut_library.video_snapshot(
                                 &self.settings.creative_luts,
                                 &self.settings.video_adjustments,
+                                &self.settings.video_preset_slots,
                             ),
                             // 動画経路: 常に映像フレームを持つ。
                             false,
@@ -54158,6 +54159,40 @@ impl App {
         self.clear_caches_for_param_change(idx, &old_params, &slot.params);
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
+    }
+
+    /// 保存スロットを「標準設定」へ読み込む。個別設定ではなく標準側を置き換える。
+    /// 対象ページがお気に入り配下ならお気に入り標準を、そうでなければアプリ全体標準を置き換え、
+    /// いずれの場合もそのページの個別設定は解除する。
+    pub(crate) fn apply_slot_to_default_scope(&mut self, slot_idx: usize) {
+        let Some(idx) = self.current_adjust_target_idx() else {
+            return;
+        };
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
+            self.show_feedback_toast(format!("[スロット{key_label} は空です]"));
+            return;
+        };
+
+        if let Some(favorite_id) = self.current_favorite_id_for_idx(idx) {
+            let favorite_name = self
+                .settings
+                .favorites
+                .iter()
+                .find(|favorite| favorite.id == favorite_id)
+                .map(|favorite| crate::ui_helpers::truncate_name(&favorite.name, 10))
+                .unwrap_or_default();
+            self.set_favorite_default(favorite_id, slot.params.clone());
+            self.clear_page_params(idx);
+            self.show_feedback_toast(format!(
+                "[スロット{key_label}:{} → お気に入り「{favorite_name}」の標準]",
+                slot.name
+            ));
+        } else {
+            self.copy_params_to_global(slot.params.clone());
+            self.clear_page_params(idx);
+            self.show_feedback_toast(format!("[スロット{key_label}:{} → 標準設定]", slot.name));
+        }
     }
 
     /// 現在のフルスクリーンページに保存スロットを適用する (Ctrl+0..9 等のショートカット用)。

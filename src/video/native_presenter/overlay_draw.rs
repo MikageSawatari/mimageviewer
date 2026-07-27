@@ -451,6 +451,7 @@ pub(super) fn draw_native_video_left_panel(
     panel_tab: &mut NativeVideoLeftPanelTab,
     adjustment_tab: &mut NativeVideoAdjustmentTab,
     adjustments: &mut crate::creative_lut::VideoAdjustments,
+    preset_slots: &[Option<String>],
     creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
@@ -537,6 +538,7 @@ pub(super) fn draw_native_video_left_panel(
                     ui,
                     content_rect,
                     adjustment_tab,
+                    preset_slots,
                     adjustments,
                     creative_luts,
                     commands,
@@ -564,6 +566,7 @@ fn draw_native_video_adjustment_body(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     tab: &mut NativeVideoAdjustmentTab,
+    preset_slots: &[Option<String>],
     adjustments: &mut crate::creative_lut::VideoAdjustments,
     creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
@@ -793,6 +796,44 @@ fn draw_native_video_adjustment_body(
                 changed = true;
                 persist = true;
             }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(egui::RichText::new("保存スロット").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("読込").small());
+                for slot_idx in 0..10 {
+                    let key = crate::adjustment::slot_key_label(slot_idx);
+                    let name = preset_slots.get(slot_idx).and_then(Option::as_ref);
+                    let response = ui
+                        .add_enabled(name.is_some(), egui::Button::new(key.clone()).small())
+                        .on_hover_text(match name {
+                            Some(name) => format!("{name}\nCtrl+{key} で読み込む"),
+                            None => format!("スロット{key} は空です"),
+                        });
+                    if response.clicked() {
+                        commands.push(NativeOverlayCommand::VideoAdjustLoadSlot { slot_idx });
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("保存").small());
+                for slot_idx in 0..10 {
+                    let key = crate::adjustment::slot_key_label(slot_idx);
+                    let name = preset_slots.get(slot_idx).and_then(Option::as_ref);
+                    let response = ui
+                        .add(egui::Button::new(key.clone()).small())
+                        .on_hover_text(match name {
+                            Some(name) => {
+                                format!("現在の動画補正をスロット{key}に保存\n現在: {name}")
+                            }
+                            None => format!("現在の動画補正をスロット{key}に保存"),
+                        });
+                    if response.clicked() {
+                        commands.push(NativeOverlayCommand::VideoAdjustSaveSlot { slot_idx });
+                    }
+                }
+            });
         });
     adjustments.sanitize();
     if changed || persist {
@@ -6210,6 +6251,7 @@ mod tests {
         let mut bulk_bookmark_dialog = None;
         let entries = Vec::new();
         let jump_texture_ids = HashMap::new();
+        let preset_slots = vec![None; 10];
         let mut harness = Harness::builder()
             .with_size(egui::vec2(340.0, 650.0))
             .build(move |ctx| {
@@ -6234,6 +6276,7 @@ mod tests {
                     &mut panel_tab,
                     &mut adjustment_tab,
                     &mut adjustments,
+                    &preset_slots,
                     &creative_luts,
                     &mut commands,
                     false,

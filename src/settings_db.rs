@@ -2910,6 +2910,14 @@ mod tests {
         s.video_playback_speed = 1.75;
         s.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
         s.video_muted = true;
+        s.video_preset_slots.slots[0] = Some(crate::creative_lut::VideoPresetSlot {
+            name: "Warm".to_string(),
+            adjustments: crate::creative_lut::VideoAdjustments {
+                brightness: 12.0,
+                temperature: 24.0,
+                ..Default::default()
+            },
+        });
         s.recent_open_with_apps = vec![RecentApp {
             display_name: "Editor".to_string(),
             exe_path: r"C:\bin\edit.exe".to_string(),
@@ -3002,6 +3010,12 @@ mod tests {
             loaded.grid_click_selection_mode,
             crate::settings::GridClickSelectionMode::Explorer
         );
+        let video_slot = loaded.video_preset_slots.slots[0]
+            .as_ref()
+            .expect("video preset slot restored from settings_kv");
+        assert_eq!(video_slot.name, "Warm");
+        assert_eq!(video_slot.adjustments.brightness, 12.0);
+        assert_eq!(video_slot.adjustments.temperature, 24.0);
     }
 
     #[test]

@@ -966,6 +966,10 @@ impl Chord {
         Self::new(true, true, false, key)
     }
 
+    pub const fn ctrl_alt(key: KeyName) -> Self {
+        Self::new(true, false, true, key)
+    }
+
     pub const fn modifier(kind: ModKind) -> Self {
         match kind {
             ModKind::Ctrl => Self {
@@ -1154,6 +1158,10 @@ const fn digit_pair(main: KeyName, numpad: KeyName) -> ChordList {
 
 const fn ctrl_digit_pair(main: KeyName, numpad: KeyName) -> ChordList {
     ChordList::two(Chord::ctrl(main), Chord::ctrl(numpad))
+}
+
+const fn ctrl_alt_digit_pair(main: KeyName, numpad: KeyName) -> ChordList {
+    ChordList::two(Chord::ctrl_alt(main), Chord::ctrl_alt(numpad))
 }
 
 const fn alt_digit_pair(main: KeyName, numpad: KeyName) -> ChordList {
@@ -1457,6 +1465,16 @@ pub enum KeyAction {
     FsAdjustSlot8,
     FsAdjustSlot9,
     FsAdjustSlot10,
+    FsAdjustSlotDefault1,
+    FsAdjustSlotDefault2,
+    FsAdjustSlotDefault3,
+    FsAdjustSlotDefault4,
+    FsAdjustSlotDefault5,
+    FsAdjustSlotDefault6,
+    FsAdjustSlotDefault7,
+    FsAdjustSlotDefault8,
+    FsAdjustSlotDefault9,
+    FsAdjustSlotDefault10,
     FsClearAdjust,
     FsApplyErase1,
     FsApplyErase2,
@@ -1492,6 +1510,16 @@ pub enum KeyAction {
     VideoCompareCycle,
     VideoCompareWipe,
     VideoCompareDiff,
+    VideoAdjustSlot1,
+    VideoAdjustSlot2,
+    VideoAdjustSlot3,
+    VideoAdjustSlot4,
+    VideoAdjustSlot5,
+    VideoAdjustSlot6,
+    VideoAdjustSlot7,
+    VideoAdjustSlot8,
+    VideoAdjustSlot9,
+    VideoAdjustSlot10,
     /// 動画→音声モード (映像を消して音楽ビューで聴く、Inc 7) のトグル。動画では enter、
     /// 音声モード中は exit。音声ファイル単体では対象外 (映像が無いので no-op)。
     VideoToggleAudioMode,
@@ -1854,6 +1882,16 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsAdjustSlot8,
     KeyAction::FsAdjustSlot9,
     KeyAction::FsAdjustSlot10,
+    KeyAction::FsAdjustSlotDefault1,
+    KeyAction::FsAdjustSlotDefault2,
+    KeyAction::FsAdjustSlotDefault3,
+    KeyAction::FsAdjustSlotDefault4,
+    KeyAction::FsAdjustSlotDefault5,
+    KeyAction::FsAdjustSlotDefault6,
+    KeyAction::FsAdjustSlotDefault7,
+    KeyAction::FsAdjustSlotDefault8,
+    KeyAction::FsAdjustSlotDefault9,
+    KeyAction::FsAdjustSlotDefault10,
     KeyAction::FsClearAdjust,
     KeyAction::FsApplyErase1,
     KeyAction::FsApplyErase2,
@@ -1889,6 +1927,16 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoCompareCycle,
     KeyAction::VideoCompareWipe,
     KeyAction::VideoCompareDiff,
+    KeyAction::VideoAdjustSlot1,
+    KeyAction::VideoAdjustSlot2,
+    KeyAction::VideoAdjustSlot3,
+    KeyAction::VideoAdjustSlot4,
+    KeyAction::VideoAdjustSlot5,
+    KeyAction::VideoAdjustSlot6,
+    KeyAction::VideoAdjustSlot7,
+    KeyAction::VideoAdjustSlot8,
+    KeyAction::VideoAdjustSlot9,
+    KeyAction::VideoAdjustSlot10,
     KeyAction::VideoToggleAudioMode,
     KeyAction::EraseConfirm,
     KeyAction::EraseConfirmPolygon,
@@ -3314,6 +3362,16 @@ impl KeyAction {
             FsAdjustSlot8 => "FsAdjustSlot8",
             FsAdjustSlot9 => "FsAdjustSlot9",
             FsAdjustSlot10 => "FsAdjustSlot10",
+            FsAdjustSlotDefault1 => "FsAdjustSlotDefault1",
+            FsAdjustSlotDefault2 => "FsAdjustSlotDefault2",
+            FsAdjustSlotDefault3 => "FsAdjustSlotDefault3",
+            FsAdjustSlotDefault4 => "FsAdjustSlotDefault4",
+            FsAdjustSlotDefault5 => "FsAdjustSlotDefault5",
+            FsAdjustSlotDefault6 => "FsAdjustSlotDefault6",
+            FsAdjustSlotDefault7 => "FsAdjustSlotDefault7",
+            FsAdjustSlotDefault8 => "FsAdjustSlotDefault8",
+            FsAdjustSlotDefault9 => "FsAdjustSlotDefault9",
+            FsAdjustSlotDefault10 => "FsAdjustSlotDefault10",
             FsClearAdjust => "FsClearAdjust",
             FsApplyErase1 => "FsApplyErase1",
             FsApplyErase2 => "FsApplyErase2",
@@ -3349,6 +3407,16 @@ impl KeyAction {
             VideoCompareCycle => "VideoCompareCycle",
             VideoCompareWipe => "VideoCompareWipe",
             VideoCompareDiff => "VideoCompareDiff",
+            VideoAdjustSlot1 => "VideoAdjustSlot1",
+            VideoAdjustSlot2 => "VideoAdjustSlot2",
+            VideoAdjustSlot3 => "VideoAdjustSlot3",
+            VideoAdjustSlot4 => "VideoAdjustSlot4",
+            VideoAdjustSlot5 => "VideoAdjustSlot5",
+            VideoAdjustSlot6 => "VideoAdjustSlot6",
+            VideoAdjustSlot7 => "VideoAdjustSlot7",
+            VideoAdjustSlot8 => "VideoAdjustSlot8",
+            VideoAdjustSlot9 => "VideoAdjustSlot9",
+            VideoAdjustSlot10 => "VideoAdjustSlot10",
             VideoToggleAudioMode => "VideoToggleAudioMode",
             EraseConfirm => "EraseConfirm",
             EraseConfirmPolygon => "EraseConfirmPolygon",
@@ -3833,6 +3901,16 @@ impl KeyAction {
             FsAdjustSlot8 => "補正プリセットスロット8を適用する",
             FsAdjustSlot9 => "補正プリセットスロット9を適用する",
             FsAdjustSlot10 => "補正プリセットスロット10を適用する",
+            FsAdjustSlotDefault1 => "補正プリセットスロット1を標準設定へ読み込む",
+            FsAdjustSlotDefault2 => "補正プリセットスロット2を標準設定へ読み込む",
+            FsAdjustSlotDefault3 => "補正プリセットスロット3を標準設定へ読み込む",
+            FsAdjustSlotDefault4 => "補正プリセットスロット4を標準設定へ読み込む",
+            FsAdjustSlotDefault5 => "補正プリセットスロット5を標準設定へ読み込む",
+            FsAdjustSlotDefault6 => "補正プリセットスロット6を標準設定へ読み込む",
+            FsAdjustSlotDefault7 => "補正プリセットスロット7を標準設定へ読み込む",
+            FsAdjustSlotDefault8 => "補正プリセットスロット8を標準設定へ読み込む",
+            FsAdjustSlotDefault9 => "補正プリセットスロット9を標準設定へ読み込む",
+            FsAdjustSlotDefault10 => "補正プリセットスロット10を標準設定へ読み込む",
             FsClearAdjust => "現在の画像の補正を解除する",
             FsApplyErase1 => "消しゴムマスクスロット1を現在ページに適用する",
             FsApplyErase2 => "消しゴムマスクスロット2を現在ページに適用する",
@@ -3868,6 +3946,16 @@ impl KeyAction {
             VideoCompareCycle => "動画では比較切り替えキーを何もしない操作として消費する",
             VideoCompareWipe => "動画ではワイプ比較キーを何もしない操作として消費する",
             VideoCompareDiff => "動画では差分比較キーを何もしない操作として消費する",
+            VideoAdjustSlot1 => "動画補正スロット1を読み込む",
+            VideoAdjustSlot2 => "動画補正スロット2を読み込む",
+            VideoAdjustSlot3 => "動画補正スロット3を読み込む",
+            VideoAdjustSlot4 => "動画補正スロット4を読み込む",
+            VideoAdjustSlot5 => "動画補正スロット5を読み込む",
+            VideoAdjustSlot6 => "動画補正スロット6を読み込む",
+            VideoAdjustSlot7 => "動画補正スロット7を読み込む",
+            VideoAdjustSlot8 => "動画補正スロット8を読み込む",
+            VideoAdjustSlot9 => "動画補正スロット9を読み込む",
+            VideoAdjustSlot10 => "動画補正スロット10を読み込む",
             VideoToggleAudioMode => {
                 "映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す"
             }
@@ -4217,6 +4305,16 @@ impl KeyAction {
             | FsAdjustSlot8
             | FsAdjustSlot9
             | FsAdjustSlot10
+            | FsAdjustSlotDefault1
+            | FsAdjustSlotDefault2
+            | FsAdjustSlotDefault3
+            | FsAdjustSlotDefault4
+            | FsAdjustSlotDefault5
+            | FsAdjustSlotDefault6
+            | FsAdjustSlotDefault7
+            | FsAdjustSlotDefault8
+            | FsAdjustSlotDefault9
+            | FsAdjustSlotDefault10
             | FsClearAdjust
             | FsApplyErase1
             | FsApplyErase2
@@ -4252,6 +4350,16 @@ impl KeyAction {
             | VideoCompareCycle
             | VideoCompareWipe
             | VideoCompareDiff
+            | VideoAdjustSlot1
+            | VideoAdjustSlot2
+            | VideoAdjustSlot3
+            | VideoAdjustSlot4
+            | VideoAdjustSlot5
+            | VideoAdjustSlot6
+            | VideoAdjustSlot7
+            | VideoAdjustSlot8
+            | VideoAdjustSlot9
+            | VideoAdjustSlot10
             | VideoToggleAudioMode => KeyContext::FsVideo,
             EraseConfirm | EraseConfirmPolygon | EraseUndo | EraseDeleteShape | EraseToolSelect
             | EraseToolBrush | EraseToolLasso | EraseToolPolygon | EraseToolVLine
@@ -4587,6 +4695,16 @@ impl KeyAction {
             | FsAdjustSlot8
             | FsAdjustSlot9
             | FsAdjustSlot10
+            | FsAdjustSlotDefault1
+            | FsAdjustSlotDefault2
+            | FsAdjustSlotDefault3
+            | FsAdjustSlotDefault4
+            | FsAdjustSlotDefault5
+            | FsAdjustSlotDefault6
+            | FsAdjustSlotDefault7
+            | FsAdjustSlotDefault8
+            | FsAdjustSlotDefault9
+            | FsAdjustSlotDefault10
             | FsClearAdjust
             | FsApplyErase1
             | FsApplyErase2
@@ -4622,6 +4740,16 @@ impl KeyAction {
             | VideoCompareCycle
             | VideoCompareWipe
             | VideoCompareDiff
+            | VideoAdjustSlot1
+            | VideoAdjustSlot2
+            | VideoAdjustSlot3
+            | VideoAdjustSlot4
+            | VideoAdjustSlot5
+            | VideoAdjustSlot6
+            | VideoAdjustSlot7
+            | VideoAdjustSlot8
+            | VideoAdjustSlot9
+            | VideoAdjustSlot10
             | VideoToggleAudioMode
             | EraseConfirm
             | EraseConfirmPolygon
@@ -4981,6 +5109,16 @@ impl KeyAction {
             FsAdjustSlot8 => ctrl_digit_pair(Num8, Numpad8),
             FsAdjustSlot9 => ctrl_digit_pair(Num9, Numpad9),
             FsAdjustSlot10 => ctrl_digit_pair(Num0, Numpad0),
+            FsAdjustSlotDefault1 => ctrl_alt_digit_pair(Num1, Numpad1),
+            FsAdjustSlotDefault2 => ctrl_alt_digit_pair(Num2, Numpad2),
+            FsAdjustSlotDefault3 => ctrl_alt_digit_pair(Num3, Numpad3),
+            FsAdjustSlotDefault4 => ctrl_alt_digit_pair(Num4, Numpad4),
+            FsAdjustSlotDefault5 => ctrl_alt_digit_pair(Num5, Numpad5),
+            FsAdjustSlotDefault6 => ctrl_alt_digit_pair(Num6, Numpad6),
+            FsAdjustSlotDefault7 => ctrl_alt_digit_pair(Num7, Numpad7),
+            FsAdjustSlotDefault8 => ctrl_alt_digit_pair(Num8, Numpad8),
+            FsAdjustSlotDefault9 => ctrl_alt_digit_pair(Num9, Numpad9),
+            FsAdjustSlotDefault10 => ctrl_alt_digit_pair(Num0, Numpad0),
             FsClearAdjust => ChordList::two(Chord::ctrl(Backspace), Chord::key(Q)),
             FsApplyErase1 => ChordList::one(Chord::key(F7)),
             FsApplyErase2 => ChordList::one(Chord::key(F8)),
@@ -5016,6 +5154,16 @@ impl KeyAction {
             VideoCompareCycle => ChordList::one(Chord::key(C)),
             VideoCompareWipe => ChordList::one(Chord::shift(C)),
             VideoCompareDiff => ChordList::one(Chord::alt(C)),
+            VideoAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
+            VideoAdjustSlot2 => ctrl_digit_pair(Num2, Numpad2),
+            VideoAdjustSlot3 => ctrl_digit_pair(Num3, Numpad3),
+            VideoAdjustSlot4 => ctrl_digit_pair(Num4, Numpad4),
+            VideoAdjustSlot5 => ctrl_digit_pair(Num5, Numpad5),
+            VideoAdjustSlot6 => ctrl_digit_pair(Num6, Numpad6),
+            VideoAdjustSlot7 => ctrl_digit_pair(Num7, Numpad7),
+            VideoAdjustSlot8 => ctrl_digit_pair(Num8, Numpad8),
+            VideoAdjustSlot9 => ctrl_digit_pair(Num9, Numpad9),
+            VideoAdjustSlot10 => ctrl_digit_pair(Num0, Numpad0),
             // Z: 動画→音声モードのトグル。画像の Z (FsZoomMode) とは別コンテキスト (FsVideo) なので競合しない。
             VideoToggleAudioMode => ChordList::one(Chord::key(Z)),
             EraseConfirm => ChordList::one(Chord::key(E)),
@@ -7193,6 +7341,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn adjustment_slot_actions_are_registered_and_have_unique_context_defaults() {
+        let actions = [
+            KeyAction::FsAdjustSlotDefault1,
+            KeyAction::FsAdjustSlotDefault2,
+            KeyAction::FsAdjustSlotDefault3,
+            KeyAction::FsAdjustSlotDefault4,
+            KeyAction::FsAdjustSlotDefault5,
+            KeyAction::FsAdjustSlotDefault6,
+            KeyAction::FsAdjustSlotDefault7,
+            KeyAction::FsAdjustSlotDefault8,
+            KeyAction::FsAdjustSlotDefault9,
+            KeyAction::FsAdjustSlotDefault10,
+            KeyAction::VideoAdjustSlot1,
+            KeyAction::VideoAdjustSlot2,
+            KeyAction::VideoAdjustSlot3,
+            KeyAction::VideoAdjustSlot4,
+            KeyAction::VideoAdjustSlot5,
+            KeyAction::VideoAdjustSlot6,
+            KeyAction::VideoAdjustSlot7,
+            KeyAction::VideoAdjustSlot8,
+            KeyAction::VideoAdjustSlot9,
+            KeyAction::VideoAdjustSlot10,
+        ];
+
+        for action in actions {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            for chord in action.default_chords().iter() {
+                for other in KeyAction::all()
+                    .iter()
+                    .copied()
+                    .filter(|other| *other != action && other.context() == action.context())
+                {
+                    assert!(
+                        !other
+                            .default_chords()
+                            .iter()
+                            .any(|candidate| candidate == chord),
+                        "{} default {} conflicts with {} in {:?}",
+                        action.ini_name(),
+                        chord.display_name(),
+                        other.ini_name(),
+                        action.context()
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            KeyAction::FsAdjustSlotDefault1
+                .default_chords()
+                .iter()
+                .next(),
+            Some(Chord::ctrl_alt(KeyName::Num1))
+        );
+        assert_eq!(
+            KeyAction::VideoAdjustSlot10.default_chords().iter().next(),
+            Some(Chord::ctrl(KeyName::Num0))
+        );
     }
 
     #[test]

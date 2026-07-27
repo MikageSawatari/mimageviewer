@@ -249,6 +249,34 @@ impl VideoAdjustments {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VideoPresetSlot {
+    pub name: String,
+    pub adjustments: VideoAdjustments,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoPresetSlots {
+    pub slots: [Option<VideoPresetSlot>; 10],
+}
+
+impl Default for VideoPresetSlots {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+        }
+    }
+}
+
+impl VideoPresetSlots {
+    pub fn sanitize(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            slot.adjustments.sanitize();
+        }
+    }
+}
+
 pub type SharedCreativeLut = Arc<CubeLutParams>;
 
 #[derive(Clone, Debug)]
@@ -268,6 +296,7 @@ pub struct VideoGradeSnapshot {
     pub adjustments: VideoAdjustments,
     pub choices: Arc<[CreativeLutChoice]>,
     pub lut: Option<SharedCreativeLut>,
+    pub slots: Arc<[Option<String>]>,
 }
 
 impl Default for VideoGradeSnapshot {
@@ -276,6 +305,7 @@ impl Default for VideoGradeSnapshot {
             adjustments: VideoAdjustments::default(),
             choices: Arc::from([]),
             lut: None,
+            slots: vec![None; 10].into(),
         }
     }
 }
@@ -494,6 +524,7 @@ impl CreativeLutLibrary {
         &self,
         entries: &[CreativeLutEntry],
         adjustments: &VideoAdjustments,
+        preset_slots: &VideoPresetSlots,
     ) -> VideoGradeSnapshot {
         let choices = entries
             .iter()
@@ -514,6 +545,12 @@ impl CreativeLutLibrary {
             adjustments: adjustments.clone(),
             choices,
             lut: self.get(adjustments.creative_lut.id),
+            slots: preset_slots
+                .slots
+                .iter()
+                .map(|slot| slot.as_ref().map(|slot| slot.name.clone()))
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 }
@@ -848,6 +885,41 @@ LUT_3D_SIZE 2
         };
         params.sanitize();
         assert!(params.white_point > params.black_point);
+    }
+
+    #[test]
+    fn video_preset_slots_serde_round_trip_empty() {
+        let slots = VideoPresetSlots::default();
+        let json = serde_json::to_string(&slots).expect("serialize empty video preset slots");
+        let restored: VideoPresetSlots =
+            serde_json::from_str(&json).expect("deserialize empty video preset slots");
+        assert_eq!(restored, slots);
+    }
+
+    #[test]
+    fn video_preset_slots_serde_round_trip_partially_filled() {
+        let mut slots = VideoPresetSlots::default();
+        slots.slots[0] = Some(VideoPresetSlot {
+            name: "明るめ".to_string(),
+            adjustments: VideoAdjustments {
+                brightness: 24.0,
+                contrast: 12.0,
+                ..Default::default()
+            },
+        });
+        slots.slots[9] = Some(VideoPresetSlot {
+            name: "映画".to_string(),
+            adjustments: VideoAdjustments {
+                gamma: 1.4,
+                saturation: -18.0,
+                ..Default::default()
+            },
+        });
+
+        let json = serde_json::to_string(&slots).expect("serialize populated video preset slots");
+        let restored: VideoPresetSlots =
+            serde_json::from_str(&json).expect("deserialize populated video preset slots");
+        assert_eq!(restored, slots);
     }
 
     #[test]

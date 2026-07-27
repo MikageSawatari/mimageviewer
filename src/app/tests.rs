@@ -9600,6 +9600,77 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.effective_params(idx).brightness, 5.0);
     }
 
+    #[test]
+    fn apply_slot_to_default_scope_updates_favorite_and_clears_page_override() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("お気に入り".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_favorite_params
+            .insert(favorite_id, params_with_brightness(20.0));
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(50.0));
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "Favorite".to_string(),
+            params: params_with_brightness(35.0),
+        });
+
+        app.apply_slot_to_default_scope(0);
+
+        assert_eq!(
+            app.adjustment_favorite_params
+                .get(&favorite_id)
+                .expect("favorite default")
+                .brightness,
+            35.0
+        );
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+        assert_eq!(app.settings.global_preset.brightness, 5.0);
+    }
+
+    #[test]
+    fn apply_slot_to_default_scope_updates_global_and_clears_page_override() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/other/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(50.0));
+        app.settings.preset_slots.slots[9] = Some(crate::adjustment::PresetSlot {
+            name: "Global".to_string(),
+            params: params_with_brightness(42.0),
+        });
+
+        app.apply_slot_to_default_scope(9);
+
+        assert_eq!(app.settings.global_preset.brightness, 42.0);
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+        assert!(app.adjustment_favorite_params.is_empty());
+    }
+
+    #[test]
+    fn apply_empty_slot_to_default_scope_changes_nothing() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/other/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(50.0));
+        let global_before = app.settings.global_preset.clone();
+        let page_before = app.adjustment_page_params.clone();
+        let favorite_before = app.adjustment_favorite_params.clone();
+
+        app.apply_slot_to_default_scope(0);
+
+        assert_eq!(app.settings.global_preset, global_before);
+        assert_eq!(app.adjustment_page_params, page_before);
+        assert_eq!(app.adjustment_favorite_params, favorite_before);
+        assert_eq!(toast_text(&app), "[スロット1 は空です]");
+    }
+
     /// 入れ子お気に入りでは最も近い祖先 (パス最長) が優先される。
     #[test]
     fn nested_favorite_picks_nearest_ancestor() {

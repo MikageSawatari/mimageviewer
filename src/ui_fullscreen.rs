@@ -11547,6 +11547,33 @@ impl App {
             ]
         };
 
+        let slot_default_keys: [bool; 10] = if fs_music_view_active {
+            [false; 10]
+        } else {
+            [
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault1),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault2),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault3),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault4),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault5),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault6),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault7),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault8),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault9),
+                self.keymap
+                    .consume_action(ctx, KeyAction::FsAdjustSlotDefault10),
+            ]
+        };
+
         // Ctrl+Backspace / Q: 現在ページの個別補正設定を解除 (標準値に戻す)
         // Q は片手で押しやすいショートカット (補正パネルでの操作中に素早く元に戻したい用途)
         let clear_page_key =
@@ -11701,6 +11728,17 @@ impl App {
                         crate::adjustment::slot_key_label(slot_idx)
                     ),
                     |app| app.apply_slot_to_current_page(slot_idx),
+                );
+            }
+        }
+
+        // Ctrl+Alt+数字キー: 保存スロットを標準設定へ適用し、現在ページの個別設定を解除
+        for (slot_idx, &pressed) in slot_default_keys.iter().enumerate() {
+            if pressed && self.reading_flow.is_paged() {
+                let key_label = crate::adjustment::slot_key_label(slot_idx);
+                self.capture_adjust_full(
+                    format!("スロット{key_label}を標準に適用"),
+                    |app| app.apply_slot_to_default_scope(slot_idx),
                 );
             }
         }

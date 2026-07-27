@@ -13314,8 +13314,8 @@ impl App {
                                     }
                                     if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
                                         name_resp.on_hover_text(format!(
-                                            "{} をこのページに適用 (Ctrl+{})",
-                                            s.name, key_label
+                                            "{} をこのページに適用 (Ctrl+{})\n標準設定へ読み込む: Ctrl+Alt+{}",
+                                            s.name, key_label, key_label
                                         ));
                                     }
                                     let save_btn =

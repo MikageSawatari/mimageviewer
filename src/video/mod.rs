@@ -434,6 +434,12 @@ pub enum NativeVideoOutputEvent {
     Vst3SaveChainSlot {
         slot_idx: usize,
     },
+    VideoAdjustLoadSlot {
+        slot_idx: usize,
+    },
+    VideoAdjustSaveSlot {
+        slot_idx: usize,
+    },
     SeekToStartAndPlay,
     TogglePlay,
     ToggleMute,
@@ -1692,6 +1698,12 @@ fn send_native_overlay_command(
         }
         Command::Vst3SetBypass { idx, path, bypass } => {
             NativeVideoOutputEvent::Vst3SetBypass { idx, path, bypass }
+        }
+        Command::VideoAdjustLoadSlot { slot_idx } => {
+            NativeVideoOutputEvent::VideoAdjustLoadSlot { slot_idx }
+        }
+        Command::VideoAdjustSaveSlot { slot_idx } => {
+            NativeVideoOutputEvent::VideoAdjustSaveSlot { slot_idx }
         }
         Command::Vst3LoadChainSlot { slot_idx } => {
             NativeVideoOutputEvent::Vst3LoadChainSlot { slot_idx }
@@ -3570,6 +3582,24 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::Vst3SaveChainSlot { slot_idx },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::VideoAdjustLoadSlot {
+                                slot_idx,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::VideoAdjustLoadSlot { slot_idx },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::VideoAdjustSaveSlot {
+                                slot_idx,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::VideoAdjustSaveSlot { slot_idx },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SeekToStartAndPlay => {

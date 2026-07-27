@@ -72,7 +72,7 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 消して音声だけ聴くモードは、どちらも `[FsVideo]` のキーをそのまま流用する。映像 ↔ 音声の切り替えは
 `VideoToggleAudioMode` (既定 <kbd>Z</kbd>)。`VideoLoop` / `VideoBookmark` / `VideoMarkerPrev` /
 `VideoMarkerNext` は音楽ビューでは音楽のループ / ブックマーク / ブックマーク移動へ翻訳される。
-動画専用の `VideoTileMode` / `VideoCapture` / `VideoFrameStep` / `VideoPin` は音楽ビューでは無効
+動画専用の `VideoTileMode` / `VideoCapture` / `VideoFrameStep` / `VideoPin` / `VideoAdjustSlot1..10` は音楽ビューでは無効
 (キャプチャパレット / コマ送り UI を出さない)。`[Rating]` グループは静止画・動画と同じく
 音楽ビューでも使える。左右パネル表示モードの <kbd>I</kbd> / <kbd>Tab</kbd> は 3 面で同じ
 `FsToggleMetadata` を使い、native 動画も effective chord を App 側へ転送する。
@@ -294,6 +294,8 @@ detached viewer とメイングリッドが同時に表示される場合、ゲ�
 | <kbd>Shift</kbd>+<kbd>B</kbd> | `FsBgCycle`。透過背景色サイクル (黒 → 白 → 市松)。AI アップスケール時は黒 ↔ 白の 2 段 (市松は出力に焼き込まれるため不可) + 背景変更時に `clear_adjustment_caches` を呼び背景別 `(idx,bg)` 結果を表示し直す (idx キーの派生キャッシュ取り違えによる固着防止)。透過 (alpha) の無い画像では無効化してトースト案内 |
 | <kbd>E</kbd> | 消しゴムモード開始 / 確定 |
 | <kbd>Ctrl</kbd>+<kbd>G</kbd> | 補正レイヤーモードを開始する。Action: `FsLocalAdjustMode`。画像フルスクリーンの操作カスタマイズ対象。モード終了は <kbd>Esc</kbd> |
+| <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | 画像補正保存スロット 1〜10 を現在ページの個別設定として読み込む。Action: `FsAdjustSlot1..10`。通常数字とテンキー数字の両方を既定割り当てにする |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd> | 画像補正保存スロット 1〜10 を対象ページの標準設定へ読み込み、ページ個別設定を解除する。お気に入り配下ならお気に入り標準、それ以外はアプリ全体標準を更新する。Action: `FsAdjustSlotDefault1..10`。通常数字とテンキー数字の両方を既定割り当てにする |
 | <kbd>Ctrl</kbd>+<kbd>M</kbd> | 隠蔽加工モード開始 / 終了 |
 | <kbd>F7</kbd> / <kbd>F8</kbd> | 消しゴムマスクスロット 1 / 2 を現在ページに即適用 |
 | <kbd>F9</kbd> / <kbd>F10</kbd> | 隠蔽マスクスロット 1 / 2 を現在ページに即適用 |
@@ -429,6 +431,7 @@ detached viewer とメイングリッドが同時に表示される場合、ゲ�
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 秒シーク (細かい) | Action: `VideoSeekBackSmall` / `VideoSeekForwardSmall` |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Action: `VideoSeekBackLarge` / `VideoSeekForwardLarge` |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 フレーム戻る / 進む | Action: `VideoFrameStepBack` / `VideoFrameStepForward` |
+| <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | 動画補正保存スロット 1〜10 を読み込む | Action: `VideoAdjustSlot1..10`。通常数字とテンキー数字の両方を既定割り当てにし、音声モードでは無効 |
 | <kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを前 / 次へ移動 | seek しない。現在位置より後の最初のタイルを時刻ラベル込みで強調表示 |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを 1 行分移動 | 列数分だけ前 / 次へ移動 |
 | <kbd>Space</kbd> / <kbd>Enter</kbd> (タイル中) | タイルカーソル位置から再生 | S / Esc で閉じた場合は再生位置を変更しない |

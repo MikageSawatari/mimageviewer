@@ -257,10 +257,51 @@ impl App {
         let grade = self.creative_lut_library.video_snapshot(
             &self.settings.creative_luts,
             &self.settings.video_adjustments,
+            &self.settings.video_preset_slots,
         );
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_video_grade(grade);
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn save_video_adjust_slot(&mut self, slot_idx: usize) {
+        if slot_idx >= self.settings.video_preset_slots.slots.len() {
+            return;
+        }
+
+        let existing_name = self.settings.video_preset_slots.slots[slot_idx]
+            .as_ref()
+            .map(|slot| slot.name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        let name = existing_name.unwrap_or_else(|| format!("Slot {key_label}"));
+        self.settings.video_preset_slots.slots[slot_idx] =
+            Some(crate::creative_lut::VideoPresetSlot {
+                name: name.clone(),
+                adjustments: self.settings.video_adjustments.clone(),
+            });
+        self.sync_native_video_grade();
+        self.settings.save();
+        self.show_feedback_toast(format!("[動画スロット{key_label}: {name} 保存]"));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn load_video_adjust_slot(&mut self, slot_idx: usize) {
+        if slot_idx >= self.settings.video_preset_slots.slots.len() {
+            return;
+        }
+
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        let Some(slot) = self.settings.video_preset_slots.slots[slot_idx].clone() else {
+            self.show_feedback_toast(format!("[動画スロット{key_label} は空です]"));
+            return;
+        };
+        self.settings.video_adjustments = slot.adjustments;
+        self.settings.video_adjustments.sanitize();
+        self.sync_native_video_grade();
+        self.settings.save();
+        self.show_feedback_toast(format!("[動画スロット{key_label}: {}]", slot.name));
     }
 
     #[cfg(windows)]
@@ -3265,6 +3306,14 @@ impl App {
             crate::video::NativeVideoOutputEvent::Vst3SaveChainSlot { slot_idx } => {
                 self.save_vst3_chain_slot(slot_idx);
                 self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::VideoAdjustLoadSlot { slot_idx } => {
+                self.load_video_adjust_slot(slot_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::VideoAdjustSaveSlot { slot_idx } => {
+                self.save_video_adjust_slot(slot_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::SeekToStartAndPlay => {
@@ -6462,6 +6511,28 @@ impl App {
             }
             return;
         }
+        if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
+            let slot_actions = [
+                KeyAction::VideoAdjustSlot1,
+                KeyAction::VideoAdjustSlot2,
+                KeyAction::VideoAdjustSlot3,
+                KeyAction::VideoAdjustSlot4,
+                KeyAction::VideoAdjustSlot5,
+                KeyAction::VideoAdjustSlot6,
+                KeyAction::VideoAdjustSlot7,
+                KeyAction::VideoAdjustSlot8,
+                KeyAction::VideoAdjustSlot9,
+                KeyAction::VideoAdjustSlot10,
+            ];
+            if let Some(slot_idx) = slot_actions
+                .iter()
+                .position(|action| self.keymap.matches_vk_action(*action, &key))
+            {
+                self.load_video_adjust_slot(slot_idx);
+                self.request_native_video_hud_repaint(ctx);
+                return;
+            }
+        }
         let side_panel_key_owned_by_native = crate::ui_helpers::fs_side_panel_key_owner(
             matches!(self.items.get(fs_idx), Some(GridItem::Video(_))),
             self.fs_music_view_active(fs_idx),
@@ -7103,6 +7174,7 @@ impl App {
             self.creative_lut_library.video_snapshot(
                 &self.settings.creative_luts,
                 &self.settings.video_adjustments,
+                &self.settings.video_preset_slots,
             ),
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
@@ -7611,6 +7683,7 @@ impl App {
                 self.creative_lut_library.video_snapshot(
                     &self.settings.creative_luts,
                     &self.settings.video_adjustments,
+                    &self.settings.video_preset_slots,
                 ),
                 false,
             )
