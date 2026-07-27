@@ -17,6 +17,7 @@
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
 | [pdf-page-count-cache-plan.md](pdf-page-count-cache-plan.md) | PDF ページ数キャッシュ、worker 境界、失敗時の扱いを触るとき |
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
+| [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md) | **設計合意済み・未実装**。補正スコープを「このページの個別設定 > その場所の標準」の 2 段へ再設計する計画。お気に入りごとの `□ お気に入り用標準設定を使う` (既定 OFF、ON/OFF の実体は `favorite_params` 行の有無)、標準（共通）/ 標準（お気に入り「xxx」）の名称、`Ctrl+Alt+数字` の書き込み先統一と `Ctrl+Alt+-` 追加、表示トリムとの語彙・見た目統一。永続データ変更なし・移行不要 |
 | [ai-processing-size-threshold-plan.md](ai-processing-size-threshold-plan.md) | AI 処理の入力サイズ閾値、縮小規則、テスト要件を触るとき |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |
