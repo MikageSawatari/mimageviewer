@@ -22,6 +22,19 @@ impl ShellClipboardVerb {
     }
 }
 
+const DROP_EFFECT_COPY_VALUE: u32 = 1;
+const DROP_EFFECT_MOVE_VALUE: u32 = 2;
+
+/// ファイル選択を OLE clipboard へ載せるときの `Preferred DropEffect`。
+/// Paste はフォルダ背景の canonical verb 経路なので、この経路の対象外。
+fn preferred_drop_effect_for_file_verb(verb: ShellClipboardVerb) -> Option<u32> {
+    match verb {
+        ShellClipboardVerb::Copy => Some(DROP_EFFECT_COPY_VALUE),
+        ShellClipboardVerb::Cut => Some(DROP_EFFECT_MOVE_VALUE),
+        ShellClipboardVerb::Paste => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeMivCommand {
     NewFolder,
@@ -137,29 +150,36 @@ pub fn invoke_shell_folder_background_verb(
 mod windows_impl {
     use super::*;
     use std::ffi::CString;
+    use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
     use std::time::Instant;
 
     use serde_json::Value;
     use windows::Win32::Foundation::{
-        HANDLE, HWND, LPARAM, LRESULT, POINT, RPC_E_CHANGED_MODE, WPARAM,
+        DV_E_DVASPECT, DV_E_LINDEX, DV_E_TYMED, E_INVALIDARG, E_OUTOFMEMORY, HANDLE, HWND, LPARAM,
+        LRESULT, POINT, RPC_E_CHANGED_MODE, S_OK, WPARAM,
     };
     use windows::Win32::System::Com::{
-        COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
+        COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize, DATADIR_GET,
+        DVASPECT_CONTENT, FORMATETC, IAdviseSink, IBindCtx, IDataObject, IDataObject_Impl,
+        IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
     };
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::{OleSetClipboard, ReleaseStgMedium};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        BHID_SFUIObject, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO, DefSubclassProc,
-        IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, RemoveWindowSubclass,
-        SHCreateShellItemArrayFromIDLists, SHGetDesktopFolder, SHParseDisplayName,
-        SetWindowSubclass,
+        BHID_SFUIObject, CFSTR_PREFERREDDROPEFFECT, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
+        DefSubclassProc, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder,
+        RemoveWindowSubclass, SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc,
+        SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_SEPARATOR, MF_STRING,
         SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM,
         WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
     };
-    use windows::core::{Interface, PCSTR, PCWSTR};
+    use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, Ref};
 
     const SUBCLASS_ID: usize = 0x6d69_7643; // "mivC"
     const SLOW_NATIVE_MENU_STAGE_LOG_MS: f64 = 120.0;
@@ -580,50 +600,58 @@ mod windows_impl {
     }
 
     pub(super) fn invoke_shell_file_verb(
-        hwnd: isize,
+        _hwnd: isize,
         paths: &[PathBuf],
         verb: ShellClipboardVerb,
     ) -> Result<(), String> {
-        if hwnd == 0 {
-            return Err("main HWND is not available".to_string());
-        }
         if paths.is_empty() {
             return Ok(());
         }
+        let preferred_drop_effect = preferred_drop_effect_for_file_verb(verb)
+            .ok_or_else(|| "file clipboard path accepts only Copy or Cut".to_string())?;
         let _com = ComStaGuard::new()?;
-        let hwnd = HWND(hwnd as *mut core::ffi::c_void);
         let stage_t0 = Instant::now();
-        let menu_result = shell_context_menu_for_paths(paths);
+        let data_result = crate::file_drag::shell_data_object_for_paths(paths).map_err(
+            |(failed_paths, error)| {
+                format!("could not build Shell IDataObject: {error:?}; failed_paths={failed_paths}")
+            },
+        );
         let ms = elapsed_ms(stage_t0);
         emit_shell_verb_timing(
-            "verb_shell_bind",
+            "verb_data_object_bind",
             "paths",
             verb,
             ms,
             paths.len(),
-            menu_result.is_ok(),
+            data_result.is_ok(),
         );
-        let menu = menu_result?;
-        let popup = MenuGuard::new(
-            unsafe { CreatePopupMenu() }.map_err(|e| format!("CreatePopupMenu failed: {e}"))?,
-        );
+        let (data, failed_paths) = data_result?;
+        if failed_paths != 0 {
+            return Err(format!(
+                "SHParseDisplayName failed for {failed_paths} of {} clipboard paths",
+                paths.len()
+            ));
+        }
+
         let stage_t0 = Instant::now();
-        let query_result = query_shell_context_menu(&menu, popup.handle(), 0);
+        let effect_result = data_object_with_preferred_drop_effect(data, preferred_drop_effect);
         let ms = elapsed_ms(stage_t0);
         emit_shell_verb_timing(
-            "verb_query_shell",
+            "verb_set_preferred_drop_effect",
             "paths",
             verb,
             ms,
             paths.len(),
-            query_result.is_ok(),
+            effect_result.is_ok(),
         );
-        query_result?;
+        let clipboard_data = effect_result?;
+
         let stage_t0 = Instant::now();
-        let result = invoke_canonical_verb(&menu, hwnd, verb);
+        let result = unsafe { OleSetClipboard(&clipboard_data) }
+            .map_err(|error| format!("OleSetClipboard failed: {error}"));
         let ms = elapsed_ms(stage_t0);
         emit_shell_verb_timing(
-            "verb_invoke",
+            "verb_set_clipboard",
             "paths",
             verb,
             ms,
@@ -631,6 +659,188 @@ mod windows_impl {
             result.is_ok(),
         );
         result
+    }
+
+    fn data_object_with_preferred_drop_effect(
+        shell_data: IDataObject,
+        effect: u32,
+    ) -> Result<IDataObject, String> {
+        let format_id = unsafe { RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT) };
+        if format_id == 0 {
+            return Err("RegisterClipboardFormatW(Preferred DropEffect) failed".to_string());
+        }
+        let cf_format = u16::try_from(format_id)
+            .map_err(|_| format!("Preferred DropEffect format ID is out of range: {format_id}"))?;
+        Ok(ClipboardDataObject {
+            inner: shell_data,
+            preferred_format: cf_format,
+            preferred_effect: effect,
+        }
+        .into())
+    }
+
+    fn preferred_drop_effect_format(cf_format: u16) -> FORMATETC {
+        FORMATETC {
+            cfFormat: cf_format,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        }
+    }
+
+    fn validate_preferred_drop_effect_request(
+        format: &FORMATETC,
+    ) -> std::result::Result<(), HRESULT> {
+        if format.dwAspect != DVASPECT_CONTENT.0 {
+            return Err(DV_E_DVASPECT);
+        }
+        if format.lindex != -1 {
+            return Err(DV_E_LINDEX);
+        }
+        if format.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+            return Err(DV_E_TYMED);
+        }
+        Ok(())
+    }
+
+    fn preferred_drop_effect_medium(effect: u32) -> windows::core::Result<STGMEDIUM> {
+        let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>()) }
+            .map_err(|_| windows::core::Error::from_hresult(E_OUTOFMEMORY))?;
+        let mut medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: hglobal },
+            pUnkForRelease: ManuallyDrop::new(None),
+        };
+        let locked = unsafe { GlobalLock(hglobal) };
+        if locked.is_null() {
+            unsafe { ReleaseStgMedium(&mut medium) };
+            return Err(windows::core::Error::from_hresult(E_OUTOFMEMORY));
+        }
+        unsafe { locked.cast::<u32>().write(effect) };
+        // GlobalUnlock はロック数が 0 になった成功時にも false を返す。
+        let _ = unsafe { GlobalUnlock(hglobal) };
+        Ok(medium)
+    }
+
+    /// BHID_DataObject のファイル形式をそのまま委譲し、Copy/Cut の意図だけを追加する。
+    /// Shell の IDataObject は SetData が E_NOTIMPL のため、既知の追加形式を所有する外側の
+    /// IDataObject が必要になる。
+    #[windows::core::implement(IDataObject)]
+    struct ClipboardDataObject {
+        inner: IDataObject,
+        preferred_format: u16,
+        preferred_effect: u32,
+    }
+
+    impl IDataObject_Impl for ClipboardDataObject_Impl {
+        fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+            let Some(format_ref) = (unsafe { format.as_ref() }) else {
+                return Err(windows::core::Error::from_hresult(E_INVALIDARG));
+            };
+            if format_ref.cfFormat != self.preferred_format {
+                return unsafe { self.inner.GetData(format) };
+            }
+            validate_preferred_drop_effect_request(format_ref)
+                .map_err(windows::core::Error::from_hresult)?;
+            preferred_drop_effect_medium(self.preferred_effect)
+        }
+
+        fn GetDataHere(
+            &self,
+            format: *const FORMATETC,
+            medium: *mut STGMEDIUM,
+        ) -> windows::core::Result<()> {
+            unsafe { self.inner.GetDataHere(format, medium) }
+        }
+
+        fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+            let Some(format_ref) = (unsafe { format.as_ref() }) else {
+                return E_INVALIDARG;
+            };
+            if format_ref.cfFormat != self.preferred_format {
+                return unsafe { self.inner.QueryGetData(format) };
+            }
+            validate_preferred_drop_effect_request(format_ref).map_or_else(|error| error, |_| S_OK)
+        }
+
+        fn GetCanonicalFormatEtc(
+            &self,
+            format_in: *const FORMATETC,
+            format_out: *mut FORMATETC,
+        ) -> HRESULT {
+            unsafe { self.inner.GetCanonicalFormatEtc(format_in, format_out) }
+        }
+
+        fn SetData(
+            &self,
+            format: *const FORMATETC,
+            medium: *const STGMEDIUM,
+            release: windows::core::BOOL,
+        ) -> windows::core::Result<()> {
+            unsafe { self.inner.SetData(format, medium, release.as_bool()) }
+        }
+
+        fn EnumFormatEtc(&self, direction: u32) -> windows::core::Result<IEnumFORMATETC> {
+            let inner_enum = unsafe { self.inner.EnumFormatEtc(direction) }?;
+            if direction != DATADIR_GET.0 as u32 {
+                return Ok(inner_enum);
+            }
+
+            let mut formats: Vec<FORMATETC> = Vec::new();
+            loop {
+                let mut format = FORMATETC::default();
+                let mut fetched = 0;
+                let status = unsafe {
+                    inner_enum.Next(std::slice::from_mut(&mut format), Some(&mut fetched))
+                };
+                if status.is_err() {
+                    for existing in &formats {
+                        if !existing.ptd.is_null() {
+                            unsafe { CoTaskMemFree(Some(existing.ptd.cast())) };
+                        }
+                    }
+                    return Err(windows::core::Error::from_hresult(status));
+                }
+                if fetched == 0 {
+                    break;
+                }
+                formats.push(format);
+                if status != S_OK {
+                    break;
+                }
+            }
+            if !formats
+                .iter()
+                .any(|format| format.cfFormat == self.preferred_format)
+            {
+                formats.push(preferred_drop_effect_format(self.preferred_format));
+            }
+            let result = unsafe { SHCreateStdEnumFmtEtc(&formats) };
+            for format in &formats {
+                if !format.ptd.is_null() {
+                    unsafe { CoTaskMemFree(Some(format.ptd.cast())) };
+                }
+            }
+            result
+        }
+
+        fn DAdvise(
+            &self,
+            format: *const FORMATETC,
+            flags: u32,
+            sink: Ref<IAdviseSink>,
+        ) -> windows::core::Result<u32> {
+            unsafe { self.inner.DAdvise(format, flags, sink.as_ref()) }
+        }
+
+        fn DUnadvise(&self, connection: u32) -> windows::core::Result<()> {
+            unsafe { self.inner.DUnadvise(connection) }
+        }
+
+        fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
+            unsafe { self.inner.EnumDAdvise() }
+        }
     }
 
     pub(super) fn invoke_shell_folder_background_verb(
@@ -964,6 +1174,46 @@ mod windows_impl {
         }
         unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
     }
+
+    #[cfg(test)]
+    mod data_object_smoke_test {
+        use super::*;
+
+        #[test]
+        fn cross_folder_clipboard_data_object_exposes_preferred_move_effect() {
+            let _com = ComStaGuard::new().expect("COM STA");
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let paths = [root.join("Cargo.toml"), root.join("src/lib.rs")];
+            let (data, failed_paths) = crate::file_drag::shell_data_object_for_paths(&paths)
+                .expect("cross-folder Shell IDataObject");
+            assert_eq!(failed_paths, 0);
+            let data = data_object_with_preferred_drop_effect(data, DROP_EFFECT_MOVE_VALUE)
+                .expect("Preferred DropEffect");
+
+            let file_drop_format = FORMATETC {
+                cfFormat: windows::Win32::System::Ole::CF_HDROP.0,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            };
+            assert_eq!(unsafe { data.QueryGetData(&file_drop_format) }, S_OK);
+
+            let format_id = unsafe { RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT) };
+            let format = preferred_drop_effect_format(format_id as u16);
+            assert_eq!(unsafe { data.QueryGetData(&format) }, S_OK);
+            let mut medium = unsafe { data.GetData(&format) }.expect("Preferred DropEffect data");
+            let hglobal = unsafe { medium.u.hGlobal };
+            let locked = unsafe { GlobalLock(hglobal) };
+            assert!(!locked.is_null());
+            assert_eq!(
+                unsafe { locked.cast::<u32>().read() },
+                DROP_EFFECT_MOVE_VALUE
+            );
+            let _ = unsafe { GlobalUnlock(hglobal) };
+            unsafe { ReleaseStgMedium(&mut medium) };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -989,5 +1239,22 @@ mod tests {
         assert_eq!(ShellClipboardVerb::Copy.canonical_name(), "copy");
         assert_eq!(ShellClipboardVerb::Cut.canonical_name(), "cut");
         assert_eq!(ShellClipboardVerb::Paste.canonical_name(), "paste");
+    }
+
+    #[test]
+    fn file_clipboard_verbs_select_copy_and_move_drop_effects() {
+        assert_eq!(
+            preferred_drop_effect_for_file_verb(ShellClipboardVerb::Copy),
+            Some(DROP_EFFECT_COPY_VALUE)
+        );
+        assert_eq!(
+            preferred_drop_effect_for_file_verb(ShellClipboardVerb::Cut),
+            Some(DROP_EFFECT_MOVE_VALUE)
+        );
+        assert_eq!(
+            preferred_drop_effect_for_file_verb(ShellClipboardVerb::Paste),
+            None,
+            "Paste remains a folder-background canonical Shell verb"
+        );
     }
 }

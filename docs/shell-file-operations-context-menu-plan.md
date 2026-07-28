@@ -304,8 +304,17 @@ migrated.
 
 Current status:
 
-- Ctrl+C/Ctrl+X on real filesystem selections invokes Shell `copy`/`cut`
-  verbs through `src/native_context_menu.rs`.
+- Ctrl+C/Ctrl+X on real filesystem selections uses the shared
+  `SHCreateShellItemArrayFromIDLists` + `BindToHandler(BHID_DataObject)` path in
+  `src/file_drag.rs`, then publishes the result with `OleSetClipboard`.
+  `src/native_context_menu.rs` wraps that Shell data object so it also exposes
+  `CFSTR_PREFERREDDROPEFFECT`: `DROPEFFECT_COPY` for Copy and
+  `DROPEFFECT_MOVE` for Cut. The wrapper delegates all file formats to the
+  Shell object because the object returned by `BHID_DataObject` does not itself
+  implement `IDataObject::SetData`.
+- The DataObject route is used for every real-file Copy/Cut selection, not only
+  selections detected as spanning multiple parents. This keeps one path for
+  normal folders and cross-location views.
 - Ctrl+V invokes the current real folder's Shell background `paste` verb. Folder
   paste, collision prompts, and progress UI are therefore handled by Windows.
 - egui fallback menus no longer expose file copy/cut/paste. They are limited to
@@ -326,10 +335,6 @@ Remaining sequence:
 1. Replace drop-to-folder internals with `IFileOperation`. This removes the
    remaining PowerShell path and keeps folder support, collision prompts,
    progress UI, and permanent-delete safety where it matters most.
-2. If a direct Shell clipboard writer is needed later, use the existing
-   `IDataObject` path-building logic from `src/file_drag.rs` and add/override
-   `CFSTR_PREFERREDDROPEFFECT` for cut. This likely requires a wrapper
-   `IDataObject`; avoid that until the verb route is proven insufficient.
 
 Keep the existing image clipboard code separate:
 
@@ -353,7 +358,9 @@ messages.
 Current routing details:
 
 - Real file/folder tiles use `IShellItemArray::BindToHandler(BHID_SFUIObject)`
-  for Shell commands.
+  for the native right-click Shell commands. `IContextMenu` requires a common
+  parent, so a multi-selection spanning folders cannot show one combined Shell
+  context menu; this Windows constraint is separate from keyboard Copy/Cut.
 - Background right-click on the current real folder uses
   `IShellFolder::CreateViewObject(IContextMenu)` so Paste/New-style background
   verbs come from Shell instead of treating the current folder as a deletable
@@ -369,11 +376,11 @@ Current routing details:
   dedicated STA worker and reloads the visible folder. The Shell context menu is
   queried without `CMF_CANRENAME` because the Shell `Rename` verb expects an
   Explorer-style inline edit target that mIV's grid does not provide.
-- Keyboard Ctrl+C/Ctrl+X/Ctrl+V use the same native helper and canonical Shell
-  `copy`/`cut`/`paste` verbs instead of mIV's custom clipboard writer. If a
-  selected or checked item lacks filesystem identity (ZIP image, PDF page,
-  virtual container, or stale selection), Ctrl+C/X aborts the whole operation
-  and shows a toast instead of silently applying Shell verbs to only the real
+- Keyboard Ctrl+C/Ctrl+X always publishes a Shell `IDataObject` through OLE;
+  Ctrl+V continues to invoke the destination folder's canonical Shell `paste`
+  verb. If a selected or checked item lacks filesystem identity (ZIP image,
+  PDF page, virtual container, or stale selection), Ctrl+C/X aborts the whole
+  operation and shows a toast instead of silently applying it to only the real
   subset.
 - After Shell verbs and native context menus return, the App resynchronizes
   egui's current Ctrl/Shift/Alt modifier state from Win32 physical key state.

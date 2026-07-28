@@ -189,44 +189,6 @@
   fallback 経路にだけ足す形にはしない。
 - 規模 / 優先度: 1.25 と同一作業 / P2 candidate。
 
-### 1.27 場所横断一覧で複数選択して Ctrl+C するとクリップボード操作に失敗する
-
-- 出典: v2.8.1 開発中のユーザー報告 (2026-07-26)。フォルダツールバーの「場所」から
-  レーティング ★5 などの横断一覧を開き、複数ファイルを選択して Ctrl+C を押すと
-  「OSクリップボード操作に失敗しました」のトーストになる。
-- 原因 (アプリログとコードで確認済み): `invoke_shell_file_verb` →
-  `shell_context_menu_for_paths` ([src/native_context_menu.rs](../src/native_context_menu.rs)) は
-  `SHCreateShellItemArrayFromIDLists` で作った配列へ `BindToHandler(BHID_SFUIObject)` を呼び、
-  得た `IContextMenu` の canonical verb (`copy` / `cut`) を invoke する。ログの記録:
-
-  ```
-  shell_clipboard: Copy failed: IShellItemArray::BindToHandler(BHID_SFUIObject) failed:
-  ... (0x80004005); failed_paths=0
-  ```
-
-  `failed_paths=0` なので全パスの PIDL 解決は成功しており、パス側の問題ではない。
-  **`BHID_SFUIObject` は共通の親フォルダを持つアイテム集合を前提とする**ため、
-  複数フォルダにまたがる選択では `E_FAIL` になる。通常フォルダ内の複数選択は同一親なので
-  成功する。
-- 影響範囲 (未確認・要確認): レーティング一覧だけでなく、**場所横断のビューはすべて同じ
-  経路を通る**。タグ一覧、検索結果 (Ctrl+G)、サブ展開、ブックマーク一覧、スマートフォルダで
-  複数フォルダのファイルを選んだ場合も同様に失敗するはず。着手時に列挙して確認する。
-- 対応案: Copy / Cut を `IContextMenu` の canonical verb 経由ではなく、
-  `BindToHandler(BHID_DataObject)` で得た `IDataObject` を `OleSetClipboard` する方式へ変える。
-  **`BHID_DataObject` は複数フォルダをまたいでも構築できる** —
-  [src/file_drag.rs](../src/file_drag.rs) のドラッグ送出が既にこの形なので、場所横断一覧からの
-  ドラッグは動いているはず (これも確認する)。Cut では "Preferred DropEffect"
-  (`DROPEFFECT_MOVE`) を `IDataObject` へ設定する必要がある。
-- 注意:
-  - **右クリックのネイティブコンテキストメニューも同じ `BHID_SFUIObject` 経路**なので、
-    場所横断一覧では複数選択時にメニューが出ないはず。こちらは `IContextMenu` が本質的に
-    必要で、DataObject への置き換えでは解決しない (共通親を持たない選択に Shell メニューを
-    出せないのは Windows 側の制約)。別問題として切り分ける。
-  - 単一選択なら親が 1 つなので現行経路で成功する。「複数親のときだけ DataObject 経路」に
-    するか常に DataObject にするかは設計判断。分岐を増やすより常に DataObject へ寄せる方が
-    経路が 1 本になる。
-- 規模 / 優先度: Small〜Medium / P2。
-
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断

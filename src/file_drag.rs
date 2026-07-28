@@ -97,29 +97,22 @@ pub enum FileDragError {
     DoDragDrop(i32),
 }
 
-/// 指定パス群の OLE ドラッグ＆ドロップ (コピー) を開始する。
+/// 実パス群を Shell の `IDataObject` へ変換する共有経路。
 ///
-/// `SHDoDragDrop` が戻る (ドロップ完了 or キャンセル) までブロックする。
-/// UI スレッドから、かつマウスボタンが押下中に呼ぶこと。
+/// ドラッグ送出とファイル Copy/Cut のクリップボード送出を同じ
+/// `SHCreateShellItemArrayFromIDLists` + `BHID_DataObject` 実装へ揃える。
+/// エラー時の tuple 先頭は `SHParseDisplayName` に失敗したパス数。
 #[cfg(windows)]
-pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
-    use windows::Win32::Foundation::HWND;
+pub(crate) fn shell_data_object_for_paths(
+    paths: &[PathBuf],
+) -> Result<(windows::Win32::System::Com::IDataObject, usize), (usize, FileDragError)> {
     use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx, IDataObject};
-    use windows::Win32::System::Ole::{DROPEFFECT_COPY, IDropSource};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        BHID_DataObject, SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHParseDisplayName,
+        BHID_DataObject, SHCreateShellItemArrayFromIDLists, SHParseDisplayName,
     };
     use windows::core::PCWSTR;
 
-    if paths.is_empty() {
-        return DragOutcome::not_started();
-    }
-
-    // COM 初期化はしない: winit が UI スレッドを STA 初期化済み
-    // (docs/file-drag-drop-design.md §6.3)。この関数は UI スレッドからのみ呼ばれる。
-
-    // 1. 各パスを PIDL に変換する。
     let mut pidls: Vec<*const ITEMIDLIST> = Vec::with_capacity(paths.len());
     let mut failed_paths = 0usize;
     for path in paths {
@@ -133,54 +126,65 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
         } else {
             failed_paths += 1;
             if !pidl.is_null() {
-                // 異常系の保険: 失敗扱いでも非 null なら解放する。
                 unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
             }
         }
     }
 
     let free_pidls = |pidls: &[*const ITEMIDLIST]| {
-        for &p in pidls {
-            unsafe { CoTaskMemFree(Some(p as *const core::ffi::c_void)) };
+        for &pidl in pidls {
+            unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
         }
     };
 
     if pidls.is_empty() {
-        crate::logger::log("file_drag: all paths failed SHParseDisplayName");
-        return DragOutcome::failed_before_start(failed_paths, FileDragError::AllPathsUnresolved);
+        return Err((failed_paths, FileDragError::AllPathsUnresolved));
     }
 
-    // 2. PIDL 配列から IShellItemArray を作る。
     let array = match unsafe { SHCreateShellItemArrayFromIDLists(&pidls) } {
-        Ok(a) => a,
-        Err(e) => {
+        Ok(array) => array,
+        Err(error) => {
             free_pidls(&pidls);
-            crate::logger::log(format!(
-                "file_drag: SHCreateShellItemArrayFromIDLists failed: {e}"
-            ));
-            return DragOutcome::failed_before_start(
+            return Err((
                 failed_paths,
-                FileDragError::ShellArrayCreate(e.code().0),
-            );
+                FileDragError::ShellArrayCreate(error.code().0),
+            ));
         }
     };
-    // 配列が PIDL をコピー済みなので、ここで元の PIDL を解放してよい。
     free_pidls(&pidls);
+    let data: IDataObject = unsafe { array.BindToHandler(None::<&IBindCtx>, &BHID_DataObject) }
+        .map_err(|error| (failed_paths, FileDragError::BindToHandler(error.code().0)))?;
+    Ok((data, failed_paths))
+}
 
-    // 3. シェル完成済みの IDataObject を借りる。
-    let data: IDataObject =
-        match unsafe { array.BindToHandler(None::<&IBindCtx>, &BHID_DataObject) } {
-            Ok(d) => d,
-            Err(e) => {
-                crate::logger::log(format!("file_drag: BindToHandler failed: {e}"));
-                return DragOutcome::failed_before_start(
-                    failed_paths,
-                    FileDragError::BindToHandler(e.code().0),
-                );
-            }
-        };
+/// 指定パス群の OLE ドラッグ＆ドロップ (コピー) を開始する。
+///
+/// `SHDoDragDrop` が戻る (ドロップ完了 or キャンセル) までブロックする。
+/// UI スレッドから、かつマウスボタンが押下中に呼ぶこと。
+#[cfg(windows)]
+pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, IDropSource};
+    use windows::Win32::UI::Shell::SHDoDragDrop;
 
-    // 4. SHDoDragDrop (モーダルブロック)。pdsrc は None でシェル既定の
+    if paths.is_empty() {
+        return DragOutcome::not_started();
+    }
+
+    // COM 初期化はしない: winit が UI スレッドを STA 初期化済み
+    // (docs/file-drag-drop-design.md §6.3)。この関数は UI スレッドからのみ呼ばれる。
+
+    let (data, failed_paths) = match shell_data_object_for_paths(paths) {
+        Ok(result) => result,
+        Err((failed_paths, error)) => {
+            crate::logger::log(format!(
+                "file_drag: could not build Shell IDataObject: {error:?}; failed_paths={failed_paths}"
+            ));
+            return DragOutcome::failed_before_start(failed_paths, error);
+        }
+    };
+
+    // SHDoDragDrop (モーダルブロック)。pdsrc は None でシェル既定の
     //    IDropSource が使われる (docs/file-drag-drop-design.md §4.3)。
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
     crate::logger::log(format!(

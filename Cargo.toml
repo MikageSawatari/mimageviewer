@@ -178,6 +178,7 @@ bench = false
 required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.61"
 # wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも
 # 公開し、wgpu の hal::Api::Device 経由で得る ID3D12Resource を OpenSharedHandle
 # 経由で生成するときに使う (本体の windows 0.61 とは ID3D12Resource 型互換性なし)。
