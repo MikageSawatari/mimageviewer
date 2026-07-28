@@ -296,7 +296,8 @@ detached viewer とメイングリッドが同時に表示される場合、ゲ�
 | <kbd>E</kbd> | 消しゴムモード開始 / 確定 |
 | <kbd>Ctrl</kbd>+<kbd>G</kbd> | 補正レイヤーモードを開始する。Action: `FsLocalAdjustMode`。画像フルスクリーンの操作カスタマイズ対象。モード終了は <kbd>Esc</kbd> |
 | <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | 画像補正保存スロット 1〜10 を現在ページの個別設定として読み込む。Action: `FsAdjustSlot1..10`。通常数字とテンキー数字の両方を既定割り当てにする |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd> | 画像補正保存スロット 1〜10 を対象ページの標準設定へ読み込み、ページ個別設定を解除する。お気に入り配下ならお気に入り標準、それ以外はアプリ全体標準を更新する。Action: `FsAdjustSlotDefault1..10`。通常数字とテンキー数字の両方を既定割り当てにする |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd> | 画像補正保存スロット 1〜10 を**その場所の標準**へ読み込み、ページ個別設定を解除する。「このお気に入り用に標準を分ける」が ON のお気に入り配下ならそのお気に入り標準、それ以外は共通の標準を更新する。Action: `FsAdjustSlotDefault1..10`。通常数字とテンキー数字の両方を既定割り当てにする |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>-</kbd> | 共通の標準の内容を、この場所のお気に入り標準へ複製する。書き込み先が共通の標準のときは no-op + トースト。Action: `FsAdjustCopyGlobalDefaultToFavorite`。上段の `-` とテンキーの `-` の両方を既定割り当てにする (JIS 配列の上段 `-` は実機確認が必要) |
 | <kbd>Ctrl</kbd>+<kbd>M</kbd> | 隠蔽加工モード開始 / 終了 |
 | <kbd>F7</kbd> / <kbd>F8</kbd> | 消しゴムマスクスロット 1 / 2 を現在ページに即適用 |
 | <kbd>F9</kbd> / <kbd>F10</kbd> | 隠蔽マスクスロット 1 / 2 を現在ページに即適用 |

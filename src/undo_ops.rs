@@ -112,18 +112,47 @@ impl App {
         // ドラッグ中に境界を跨いだ場合 (フォルダ移動・フルスクリーン遷移・消しゴム遷移)、
         // 進行中のセッションを安全に終了させる。
         //
-        // ドラッグ中は DB / sidecar 書き込みをスキップしているため、在の `adjustment_page_params`
-        // (in-memory) はドラッグ最後の値を持つが永続化されていない可能性がある。ここで
-        // session.fs_idx の現在値を `set_page_params` で 1 回だけ書き出して、ユーザーが
-        // 「ドラッグ中に画面が切り替わってしまっても操作は失われない」挙動を保証する。
+        // ドラッグ中は DB / sidecar / settings.save をスキップしているため、ページ map
+        // または標準値はドラッグ最後の値をメモリにだけ持つ可能性がある。ここで対象の
+        // 通常書き込み API へ 1 回だけ流し、「ドラッグ中に画面が切り替わってしまっても
+        // 操作は失われない」挙動を保証する。
         // Undo エントリは積まない (= boundary を跨ぐ操作は redo 不可) — Undo スタック自体を
         // クリアする処理の最中なので一貫性が取れる。
+        let mut interrupted_adjustment_drag = false;
         if let Some(session) = self.adjustment_drag_session.take() {
+            interrupted_adjustment_drag = true;
             if let Some(p) = self.adjustment_page_params.get(&session.fs_idx).cloned() {
                 if Some(&p) != session.before.as_ref() {
                     self.set_page_params(session.fs_idx, p);
                 }
             }
+        }
+        if let Some(session) = self.adjustment_standard_drag_session.take() {
+            interrupted_adjustment_drag = true;
+            let after = match session.scope {
+                crate::app::AdjustmentStandardScope::Favorite(id) => self
+                    .adjustment_favorite_params
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| self.settings.global_preset.clone()),
+                crate::app::AdjustmentStandardScope::Global => self.settings.global_preset.clone(),
+            };
+            if session.before != after {
+                match session.scope {
+                    crate::app::AdjustmentStandardScope::Favorite(id) => {
+                        // ドラッグ中の map はプレビュー値。通常 release と同じく
+                        // before へ戻してから永続化し、AI 影響判定と prune の前後差を保つ。
+                        self.adjustment_favorite_params.insert(id, session.before);
+                        self.set_favorite_default(id, after)
+                    }
+                    crate::app::AdjustmentStandardScope::Global => {
+                        self.settings.global_preset = session.before;
+                        self.copy_params_to_global(after)
+                    }
+                }
+            }
+        }
+        if interrupted_adjustment_drag {
             // 中断したドラッグの色調 dirty を清算する。色調が動いていたなら
             // 旧コンテキストのサムネ補正を作り直し、シャープ化だけなら温存する
             // (release 遷移を経由しないのでここで明示的に処理する)。

@@ -417,6 +417,8 @@
 # FsAdjustSlotDefault9.2 = Ctrl+Alt+Numpad9 ; 補正プリセットスロット9を標準設定へ読み込む
 # FsAdjustSlotDefault10.1 = Ctrl+Alt+0 ; 補正プリセットスロット10を標準設定へ読み込む
 # FsAdjustSlotDefault10.2 = Ctrl+Alt+Numpad0 ; 補正プリセットスロット10を標準設定へ読み込む
+# FsAdjustCopyGlobalDefaultToFavorite.1 = Ctrl+Alt+- ; 共通の標準を現在地のお気に入り標準へコピーする
+# FsAdjustCopyGlobalDefaultToFavorite.2 = Ctrl+Alt+NumpadSubtract ; 共通の標準を現在地のお気に入り標準へコピーする
 # FsClearAdjust.1 = Ctrl+Backspace ; 現在の画像の補正を解除する
 # FsClearAdjust.2 = Q ; 現在の画像の補正を解除する
 # FsApplyErase1 = F7 ; 消しゴムマスクスロット1を現在ページに適用する

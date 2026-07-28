@@ -135,6 +135,7 @@ impl App {
         // (ループ中に self を再帰的に &mut 借りる回避)。
         let mut name_index_toggles: Vec<(uuid::Uuid, std::path::PathBuf, bool)> = Vec::new();
         let mut meta_index_toggles: Vec<(uuid::Uuid, bool)> = Vec::new();
+        let mut favorite_default_toggles: Vec<(uuid::Uuid, String, bool)> = Vec::new();
         let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
@@ -423,7 +424,7 @@ impl App {
                     let n = self.settings.favorites.len();
                     egui::Grid::new("fav_edit_grid")
                         .striped(true)
-                        .num_columns(6)
+                        .num_columns(7)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
                                     // ── ヘッダ (状態は各索引列にインライン) ──
@@ -433,6 +434,12 @@ impl App {
                                         );
                                     ui.label(egui::RichText::new("表示名").strong());
                                     ui.label(egui::RichText::new("パス").strong());
+                                    ui.label(
+                                        egui::RichText::new("標準設定を分ける").strong(),
+                                    )
+                                    .on_hover_text(
+                                        "このお気に入り専用の標準設定を持たせます",
+                                    );
                                     ui.label(egui::RichText::new("コンテナ索引 (Ctrl+S)").strong())
                                         .on_hover_text(
                                             "フォルダ / ZIP / PDF を名前で横断検索\n\
@@ -481,6 +488,25 @@ impl App {
                                                 .weak(),
                                         )
                                         .on_hover_text(&path_str);
+
+                                        // お気に入り標準: favorite_params 行の有無が ON/OFF。
+                                        let favorite_name =
+                                            self.settings.favorites[i].name.clone();
+                                        let mut separate_standard = self
+                                            .adjustment_favorite_params
+                                            .contains_key(&fav_id);
+                                        let standard_resp =
+                                            ui.checkbox(&mut separate_standard, "");
+                                        if standard_resp.changed() {
+                                            favorite_default_toggles.push((
+                                                fav_id,
+                                                favorite_name.clone(),
+                                                separate_standard,
+                                            ));
+                                        }
+                                        standard_resp.on_hover_text(format!(
+                                            "お気に入り「{favorite_name}」に、このお気に入り専用の標準設定を持たせます"
+                                        ));
 
                                         // 名前索引: チェック + 状態インライン
                                         ui.horizontal(|ui| {
@@ -734,6 +760,18 @@ impl App {
                 });
                     });
             });
+
+        // お気に入り編集には「現在のページ」が無い。ON の種と OFF 後の比較先は
+        // どちらも共通標準に固定する。
+        for (favorite_id, favorite_name, enabled) in favorite_default_toggles {
+            if enabled {
+                let seed = self.settings.global_preset.clone();
+                self.create_favorite_specific_default(favorite_id, &favorite_name, seed);
+            } else {
+                let fallback = self.settings.global_preset.clone();
+                self.request_favorite_specific_default_clear(favorite_id, favorite_name, fallback);
+            }
+        }
 
         // ── 削除確認 ────────────────────────────────────────────────
         if let Some(fav_id) = self.favorite_delete_confirm {

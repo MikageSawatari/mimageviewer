@@ -5,21 +5,27 @@
 
 ---
 
-## 1. スコープ (v0.8.1 で 3 層化)
+## 1. スコープ (v2.9.0 で 2 段化)
 
-補正パラメータは **3 スコープ + 10 個の全設定スロット + 4 個のカラー化専用スロット**
+補正パラメータは **2 段の解決 + 10 個の全設定スロット + 4 個のカラー化専用スロット**
 で構成される:
 
 ```
-スコープ              保存先
+段                    保存先
 ────────────────────────────────────────────────
-グローバル            settings.json の global_preset
-お気に入り標準        adjustment.db の favorite_params テーブル (favorite_id TEXT PK)
-ページ個別            adjustment.db の page_params テーブル
+この画像の個別設定    adjustment.db の page_params テーブル
+その場所の標準設定    settings.json の global_preset          ... 「標準（共通）」
+                      adjustment.db の favorite_params テーブル ... 「標準（お気に入り「x」）」
 
 保存スロット 0〜9     settings.json の preset_slots  (独立)
 カラー化スロット 1〜4 settings.json の colorize_preset_slots (独立)
 ```
+
+**「場所」は 2 種類しかない**。`favorite_params` に行があるお気に入りだけが独自の場所を
+持ち (= ON)、行が無いお気に入りは透過して外側の場所へ落ちる (= OFF、既定)。
+**行の存在そのものが ON フラグ**なので、内容が無補正や global と同一でも
+「冗長だから」と行を間引いてはならない (間引くと ON が黙って OFF に変わる)。
+正本は [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md)。
 
 旧 (v0.5.0〜v0.6.0 開発版) の「フォルダ単位 4 プリセット + ページ→プリセット idx」方式は廃止した。
 未リリース機能だったため DB マイグレーションは行わず、`AdjustmentDb::open()` が
@@ -32,19 +38,24 @@ v0.8.1 で「お気に入り単位の標準 (favorite_params)」を追加した�
 
 ### 1.1 有効パラメータの決定
 
-表示時のページ `idx` の有効パラメータは 3 層のカスケードで決まる:
+表示時のページ `idx` の有効パラメータは 2 段で決まる:
 
 ```
 effective =
     adjustment_page_params.get(idx)
-      ?? adjustment_favorite_params.get(nearest_favorite_id_of(container(idx)))
+      ?? adjustment_favorite_params.get(nearest_ON_favorite_id_of(container(idx)))
       ?? settings.global_preset
 ```
 
 解決は `App::effective_params(idx)` に集約される。お気に入り層のルックアップには
-`App::current_favorite_id_for_idx(idx)` → `App::find_nearest_favorite(container_path)`
-を使う。**最も近い祖先** (パス最長一致) を選ぶため、ネスト登録されたお気に入り
-(例: `G:\pics` と `G:\pics\AI` が両方登録されている) のときは `G:\pics\AI` が優先される。
+`App::active_favorite_default_id_for_idx(idx)` を使う。これは
+**祖先お気に入りのうち `adjustment_favorite_params` に行を持つ (= ON) 最深のもの**
+(パス最長一致) を返す。ネスト登録 (例: `G:\pics` と `G:\pics\AI` が両方登録) では、
+両方 ON なら `G:\pics\AI` が勝ち、`G:\pics\AI` が OFF なら透過して `G:\pics` が効く。
+
+`App::current_favorite_id_for_idx(idx)` は別物で、**ON/OFF を問わない最も近い祖先**を返す。
+補正パネルが「今どのお気に入り配下にいるか」(= 分離チェックボックスの対象) を知るために使う。
+`App::find_nearest_favorite(container_path)` はナビゲーション用途と共用なのでどちらとも独立。
 
 ZIP/PDF を開いている最中は `container(idx)` が ZIP/PDF 本体のパスになるため、
 「AI 生成画像」お気に入り配下の ZIP 内ページにもそのお気に入り標準が自動適用される。
@@ -93,21 +104,50 @@ rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの
 `is_removable` 判定は廃止済みで、呼び出し側 (`App::set_page_params`) で
 削除/保存の振り分けを行う構造になっている。
 
-### 1.3 アクションボタン
+### 1.3 スコープ選択とアクションボタン
 
-補正パネルに 6 つのボタンがある (v0.8.1):
+パネル上部は **2 行ラジオ** で、スライダーの書き込み先を選ぶ (v2.9.0)。
 
-| ボタン | 動作 |
-| --- | --- |
-| このフォルダ全画像の個別設定に適用 | 現在のパラメータを、現フォルダ/ZIP/PDF の全画像ページへ**個別設定として**一括書込 (`apply_params_to_all_pages`)。`matches_default` 判定はその一覧の先頭 idx の `effective_default_for_idx` で代表する (一覧内は同じコンテナに属するため同じ標準を共有する)。書き込んだ個別設定は標準設定より優先されるため、**以後この一覧は標準設定の変更を受けなくなる** — ラベルに「個別設定」を含めるのはこの副作用を操作前に見せるため (旧ラベル「このフォルダの全画像に適用」はフォルダ単位のスコープを作るように読め、標準を書き換えても表示が変わらない理由が分からなかった) |
-| このフォルダ全画像の個別設定を解除 | 現フォルダ/ZIP/PDF の全画像ページから個別設定を削除 (`clear_all_page_params`)。個別を解除するとお気に入り標準 or グローバルにフォールバック |
-| このお気に入り「{name}」の標準にする | 現在のパラメータをそのお気に入りの標準として保存 (`set_favorite_default`)。お気に入り登録フォルダ配下にいないとき disabled |
-| このお気に入り「{name}」の標準を解除 | そのお気に入りの標準を削除 (`clear_favorite_default`)。以後そのお気に入りはグローバルにフォールバック。未登録のとき disabled |
-| 標準にする | 現在のパラメータを `settings.global_preset` にコピー (`copy_params_to_global`) |
-| 個別設定を解除 [Q] | 現ページの個別レコードを削除 (`clear_page_params`)。フォールバックで「お気に入り標準 → グローバル」の順にマッチしたものが効く。フルスクリーン・グリッドとも `Q` / `Ctrl+Backspace`、グリッドはチェック済み (なければ選択 1 件) に一括適用可能 (`clear_page_params_for_selection`) |
+```
+◉ 標準（共通）  または  標準（お気に入り「{name}」）
+     □ このお気に入り用に標準を分ける      ← 何らかのお気に入り配下のときだけ表示
+◯ このページ
+```
 
-ボタンラベル内の `{name}` は `ui_helpers::truncate_name(name, 10)` で 10 文字に切り詰める。
-スコープ表示 (ヘッダー直下) も同様に 3 種類: `個別設定を適用中` / `お気に入り「{name}」の標準を適用中` / `標準設定を適用中`。
+- 上段ラベルは **書き込み対象** (`active_favorite_default_id_for_idx`) で決まる。
+  OFF のお気に入り配下では「標準（共通）」になる
+- `{name}` は `ui_helpers::truncate_name(name, 7)` で 7 文字に切り詰める
+  (258px 実測。7 文字 = 252px、8 文字 = 265px)
+- 初期選択は個別設定の有無から導出。**「個別設定がある ⟹ 選択は『このページ』」を
+  不変条件として張る** ので、`Ctrl+数字` や Undo で後から個別設定が生まれても追従する
+- 「このページ」→「標準」への切替は、その場でこのページの個別設定を解除する
+  (`clear_page_params`、`capture_adjust_full` で Undo 可)
+- チェックボックスの対象は `current_favorite_id_for_idx` (= ON/OFF を問わない最寄り)。
+  ON にすると `effective_default_for_idx` を種に `favorite_params` の行を作る
+  (見た目が変わらない)。OFF は、行の内容が「消したあとに落ちる先の標準」と
+  違うときだけ確認ダイアログを出す
+
+ボタンは選択中スコープで入れ替わる:
+
+| ボタン | 表示条件 | 動作 |
+| --- | --- | --- |
+| 共通の標準からコピー | 書き込み先が `Favorite(_)` | `settings.global_preset` の内容をそのお気に入りの標準へ複製 (`set_favorite_default`)。`Ctrl+Alt+-` と同じ |
+| 現在の設定値を標準に反映 | 「このページ」選択時 | 現ページの実効値をその場所の標準へ保存 (`persist_adjustment_standard_params`)。同値になった個別設定は `prune_page_params_matching_default` が畳むので**見た目は変わらず**、ラジオは「標準」へ移る |
+| このフォルダの全画像を標準に揃える | 「標準」選択時 | 現フォルダ/ZIP/PDF の全画像ページから個別設定を削除 (`clear_all_page_params`) |
+| フォルダ全画像をこのページに揃える | 「このページ」選択時 | 現在の実効値を全画像ページへ**個別設定として**一括書込 (`apply_params_to_all_pages`)。`matches_default` 判定はその一覧の先頭 idx の `effective_default_for_idx` で代表する (一覧内は同じコンテナに属するため同じ標準を共有する)。書き込んだ個別設定は標準より優先されるため、**以後この一覧は標準設定の変更を受けなくなる** — 副作用は tooltip で操作前に見せる。ラベルは 258px 実測で溢れたため短縮版 |
+| 個別設定を解除 [Q] | 「このページ」選択時 | 現ページの個別レコードを削除 (`clear_page_params`)。フルスクリーン・グリッドとも `Q` / `Ctrl+Backspace`、グリッドはチェック済み (なければ選択 1 件) に一括適用可能 (`clear_page_params_for_selection`) |
+| すべてリセット | 常時（スライダー下） | 選択中スコープへ `AdjustParams::default()` を書く。「標準」ならその標準を無補正へ戻し、「このページ」なら無補正の個別値にする。後者は個別レコードを削除して標準へ従わせる「個別設定を解除」と異なり、標準に補正がある場合もページを無補正にできる。書き込み先はスコープ別 tooltip に表示する |
+
+同じ ON/OFF チェックボックスは、お気に入り編集ダイアログ
+([favorites_editor.rs](../src/ui_dialogs/favorites_editor.rs)) の「標準設定を分ける」列にもある。
+そちらは「現在のページ」の文脈が無いので、ON の種と OFF 時の比較先はどちらも
+`settings.global_preset` を使う。
+
+ドラッグ中の書き込みは、ページ個別と同じく **in-memory のみ** で、release で 1 回だけ
+永続化する (`AdjustmentStandardDragSession`)。`copy_params_to_global` は
+`settings.save()` を、`set_favorite_default` は DB UPSERT と `clear_all_color_caches()` を
+伴うため、毎フレーム呼んではならない。ドラッグ開始時にスコープを焼き付けるので、
+ドラッグ中に UI 状態が変わっても行き先はぶれない。
 
 ### 1.4 保存スロット
 
@@ -115,10 +155,16 @@ rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの
 `App::apply_slot_to_current_page(slot_idx)` が呼ばれ、該当スロットのパラメータを
 **現在のページ個別設定として書き込む** (= そのページを個別化する)。
 
-`Ctrl+Alt+1〜9` / `Ctrl+Alt+0` は、同じスロットを**標準設定側へ読み込む**。
-対象ページがお気に入り配下ならそのお気に入り標準、配下でなければアプリ全体標準を
-スロット内容で置き換えたうえで、対象ページの個別設定を解除する。見開き Double では
-補正パネルの L/R 対象に従う。この操作は標準側の更新と個別解除を 1 件の Undo として記録する。
+`Ctrl+Alt+1〜9` / `Ctrl+Alt+0` は、同じスロットを **その場所の標準へ読み込む**。
+書き込み先はパネルのラジオ上段と同じ規則 (`active_favorite_default_id_for_idx`、
+無ければ global) で決まるので、**OFF のお気に入り配下では共通の標準へ書く**
+(= 黙って行を作って ON にしてしまわない)。置き換えたうえで対象ページの個別設定を解除する。
+見開き Double では補正パネルの L/R 対象に従う。
+この操作は標準側の更新と個別解除を 1 件の Undo として記録する。
+
+`Ctrl+Alt+-` (`FsAdjustCopyGlobalDefaultToFavorite`) は「共通の標準をこの場所の
+お気に入り標準へ複製」する。書き込み先が共通の標準のときは no-op + トースト。
+パネルの「共通の標準からコピー」ボタンと同じヘルパーを共有する。
 
 > 旧来は `Shift+0〜9` だったが、egui の logical-key 方式ではキーボード配列によって
 > Shift+数字が記号 (`!"#$%&'()` など) に置き換わり `Key::Num1` 等にマッチしないため

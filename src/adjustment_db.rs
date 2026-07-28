@@ -224,6 +224,9 @@ impl AdjustmentDb {
     }
 
     // ── お気に入り単位の標準パラメータ ─────────────────────────────
+    //
+    // `favorite_params` 行の存在自体が、そのお気に入りで独自標準を使う ON フラグ。
+    // 内容が無補正または global と同一でも「冗長」として間引いてはならない。
 
     /// 全お気に入りの標準パラメータを読み込む (起動時に 1 回)。
     pub fn load_all_favorite_params(&self) -> HashMap<Uuid, AdjustParams> {
@@ -277,7 +280,8 @@ impl AdjustmentDb {
     }
 
     /// `keep` に含まれない favorite_id の行を削除する (起動時 orphan cleanup)。
-    /// お気に入りが削除された後もロジック上は無害だが、DB が肥大化しないよう定期的に掃除する。
+    /// お気に入りが削除された後の orphan だけが対象。パラメータ内容による間引きを
+    /// 追加してはならない (`favorite_params` 行の存在自体が独自標準 ON を表すため)。
     pub fn prune_favorite_params(&self, keep: &HashSet<Uuid>) -> Result<usize, rusqlite::Error> {
         let mut stmt = self
             .conn

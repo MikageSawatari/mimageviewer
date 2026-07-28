@@ -5414,6 +5414,39 @@ pub(crate) struct AdjustmentDragSession {
     pub before: Option<crate::adjustment::AdjustParams>,
 }
 
+/// 画像補正パネルで選ばれている書き込み先。
+///
+/// 表示中だけ保持する UI 状態で、設定や adjustment.db には永続化しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdjustScopeSelection {
+    Standard,
+    Page,
+}
+
+/// 標準スコープのドラッグ開始時に確定した書き込み先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdjustmentStandardScope {
+    Favorite(uuid::Uuid),
+    Global,
+}
+
+/// 標準スコープのスライダードラッグ中に保持するスナップショット。
+///
+/// ページ個別用の [`AdjustmentDragSession`] と分離し、既存のページ永続化経路を
+/// 変えずに、標準側だけを release 時の 1 回書き込みへまとめる。
+#[derive(Debug, Clone)]
+pub(crate) struct AdjustmentStandardDragSession {
+    pub scope: AdjustmentStandardScope,
+    pub before: crate::adjustment::AdjustParams,
+}
+
+/// お気に入り専用の標準を解除する前の確認対象。
+#[derive(Debug, Clone)]
+pub(crate) struct FavoriteDefaultClearConfirm {
+    pub favorite_id: uuid::Uuid,
+    pub favorite_name: String,
+}
+
 /// メタ操作 (タグ付与など) を発火させた UI 面。
 ///
 /// detached viewer 時代はメイングリッドとビューア窓が同時に見える + 同時に操作できる
@@ -7320,8 +7353,8 @@ pub struct App {
     pub(crate) view_trim_mode: bool,
     /// 表示トリムの本単位適用モード。Page は旧 DB 互換用で、新規 UI ではここへ永続しない。
     pub(crate) view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
-    /// 表示トリムの「このページの個別設定を適用」チェックが有効な fullscreen root idx。
-    /// ページ移動時に外れる一時状態で、DB へは保存しない。
+    /// 廃止済みの一時 Page scope slot。detached viewer の凍結中は context bundle の形を
+    /// 変えないため常に None の互換枠として残す。適用範囲は enabled なページ行から導出する。
     pub(crate) view_trim_page_apply_root_idx: Option<usize>,
     /// Page 個別適用中の見開き左右別 UI 状態。Book 設定には保存しない。
     pub(crate) view_trim_page_spread_separate: bool,
@@ -8975,6 +9008,10 @@ pub struct App {
     /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
     /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
     pub(crate) adjust_spread_target: AdjustSpreadTarget,
+    /// 補正パネルの標準 / このページ選択。対象 idx が変わったときだけ初期化する。
+    pub(crate) adjust_scope_selection: AdjustScopeSelection,
+    /// `adjust_scope_selection` を初期化済みの編集対象 idx。
+    pub(crate) adjust_scope_selection_idx: Option<usize>,
     /// ページ個別の補正パラメータ: item_idx → AdjustParams
     /// ここに登録されていないページは「お気に入り標準 → グローバル (settings.global_preset)」
     /// の順でフォールバックする。解決は [`App::effective_params`] に集約。
@@ -9231,6 +9268,8 @@ pub struct App {
     /// 補正値は開始時にキャプチャしておくことで、見開きの L/R 切替や
     /// ダイアログ中にスライダーを動かしても保存内容がブレない。
     pub(crate) slot_save_dialog: Option<(usize, String, crate::adjustment::AdjustParams)>,
+    /// お気に入り専用の標準を解除すると表示が変わる場合の確認ダイアログ。
+    pub(crate) favorite_default_clear_confirm: Option<FavoriteDefaultClearConfirm>,
     /// IME 変換中フラグ。Ime イベントで更新される持続状態。
     /// Enabled/Preedit(非空) で true、Preedit("")/Commit/Disabled で false。
     pub(crate) ime_composing: bool,
@@ -9509,6 +9548,8 @@ pub struct App {
     /// ドラッグ中は DB 書き込みをスキップし in-memory のみ更新、ドラッグ終了時に
     /// 一括で `set_page_params` を呼んで永続化 + Undo エントリを 1 件積む。
     pub(crate) adjustment_drag_session: Option<AdjustmentDragSession>,
+    /// 標準スコープのドラッグセッション。書き込み先はドラッグ開始時に固定する。
+    pub(crate) adjustment_standard_drag_session: Option<AdjustmentStandardDragSession>,
     /// タグ操作の保留 Undo 集計バッファ。`request_tag_*_for_selection` が tx_id を発行し
     /// `PendingTagUndo` を入れ、`poll_tag_write_results` が worker 結果 1 件ごとに
     /// `TagChange` を accumulate する。完了時に「tags.db の before/after」で構築した
@@ -11326,6 +11367,8 @@ impl App {
             local_adjust_mode: false,
             export_crop_mode: false,
             adjust_spread_target: AdjustSpreadTarget::Left,
+            adjust_scope_selection: AdjustScopeSelection::Standard,
+            adjust_scope_selection_idx: None,
             adjustment_page_params: std::collections::HashMap::new(),
             adjusted_page_keys,
             local_adjust_page_keys,
@@ -11425,6 +11468,7 @@ impl App {
             local_adjust_db,
             export_crop_db,
             slot_save_dialog: None,
+            favorite_default_clear_confirm: None,
             ime_composing: false,
             ime_last_event_at: None,
             fs_feedback_toast: None,
@@ -11505,6 +11549,7 @@ impl App {
             erase_undo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
             adjustment_drag_session: None,
+            adjustment_standard_drag_session: None,
             pending_tag_undos: std::collections::HashMap::new(),
             next_tag_tx_id: 1,
             erase_last_undo_at: None,
@@ -12597,6 +12642,7 @@ impl App {
             || self.show_update_dialog
             || self.show_tray_enabled_notice
             || self.slot_save_dialog.is_some()
+            || self.favorite_default_clear_confirm.is_some()
             || self.export_dialog.is_some()
             || self.export_pending.is_some()
             || self.local_adjust_add_layer_dialog_open
@@ -15102,23 +15148,29 @@ impl App {
         self.invalidate_smart_folder_resort_metadata();
     }
 
-    pub(crate) fn hydrate_view_trim_page_overrides_for_current_items(
-        &mut self,
-        prefix_path: &std::path::Path,
-    ) {
+    pub(crate) fn hydrate_view_trim_page_overrides_for_current_items(&mut self) {
         self.view_trim_page_overrides.clear();
         let Some(db) = &self.view_trim_db else {
             return;
         };
-        let prefix = crate::adjustment_db::normalize_path(prefix_path);
-        let page_map = db.load_page_overrides_by_prefix(&prefix);
+        // current_folder / source_path は WSL 形式やライブラリエイリアスのままでも、
+        // GridItem 内の PDF / ZIP 実体パスは Windows の実パスへ解決済みの場合がある。
+        // コンテナ prefix で検索すると、その2つの名前空間が異なる本では保存済みの
+        // page_path を拾えない。永続化も表示も page_path_key を正本にしているため、
+        // 再水和も現在 items の exact key だけを同じ境界で列挙して取得する。
+        let page_keys = (0..self.items.len())
+            .filter_map(|idx| self.page_path_key(idx).map(|key| (idx, key)))
+            .collect::<Vec<_>>();
+        let page_key_refs = page_keys
+            .iter()
+            .map(|(_, key)| key.as_str())
+            .collect::<Vec<_>>();
+        let page_map = db.load_page_overrides_many(&page_key_refs);
         if page_map.is_empty() {
             return;
         }
-        for idx in 0..self.items.len() {
-            if let Some(key) = self.page_path_key(idx)
-                && let Some(page_override) = page_map.get(&key)
-            {
+        for (idx, key) in page_keys {
+            if let Some(page_override) = page_map.get(&key) {
                 self.view_trim_page_overrides.insert(idx, *page_override);
             }
         }
@@ -20745,7 +20797,7 @@ impl App {
         if let Some(metadata) = prepared_aggregate.as_mut() {
             self.view_trim_page_overrides = std::mem::take(&mut metadata.view_trim_page_overrides);
         } else {
-            self.hydrate_view_trim_page_overrides_for_current_items(&source_path);
+            self.hydrate_view_trim_page_overrides_for_current_items();
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -22817,7 +22869,7 @@ impl App {
                 }
             }
         }
-        self.hydrate_view_trim_page_overrides_for_current_items(prefix_path);
+        self.hydrate_view_trim_page_overrides_for_current_items();
         if let Some(db) = &self.mask_db {
             let mask_keys = db.load_mask_keys(&prefix);
             if !mask_keys.is_empty() {
@@ -24469,7 +24521,10 @@ impl App {
     pub(crate) fn poll_rename_migration_pending(&mut self, ctx: &egui::Context) {
         self.ensure_rename_migration_journal_loaded();
         // ドラッグ中で繰り延べた main 文脈の再構築を、ドラッグが終わったフレームで実行。
-        if self.rename_rehydrate_main_deferred && self.adjustment_drag_session.is_none() {
+        if self.rename_rehydrate_main_deferred
+            && self.adjustment_drag_session.is_none()
+            && self.adjustment_standard_drag_session.is_none()
+        {
             self.rename_rehydrate_main_deferred = false;
             self.rehydrate_mounted_context_after_rename();
         }
@@ -24605,7 +24660,9 @@ impl App {
         };
 
         if folder_refs(self.current_folder.as_deref()) || items_ref(&self.items) {
-            if self.adjustment_drag_session.is_some() {
+            if self.adjustment_drag_session.is_some()
+                || self.adjustment_standard_drag_session.is_some()
+            {
                 self.rename_rehydrate_main_deferred = true;
             } else {
                 self.rehydrate_mounted_context_after_rename();
@@ -53331,15 +53388,21 @@ impl App {
 
     /// モード依存の左右パネルと hover latch を閉じる。
     pub(crate) fn reset_fs_side_panel_runtime_for_mode_change(&mut self) {
-        self.reset_fs_side_panel_runtime_for_file_change();
+        self.persist_pending_view_trim_state();
+        self.close_fs_side_panel_runtime();
     }
 
     /// ClickToShow の左右パネルを現在ファイルの境界で閉じる。
     pub(crate) fn reset_fs_side_panel_runtime_for_file_change(&mut self) {
+        // 表示トリムの保存責務はパネルが現在見えているかではなく、編集対象ファイルが
+        // 変わるこの境界が持つ。Hover パネル外で mouse-up した場合や、同フレームに
+        // ナビゲーションした場合も旧ページの dirty 値を確定してから idx を切り替える。
+        self.persist_pending_view_trim_state();
+        self.close_fs_side_panel_runtime();
+    }
+
+    fn close_fs_side_panel_runtime(&mut self) {
         self.metadata_panel_hover_active = false;
-        if self.adjustment_mode {
-            self.persist_pending_view_trim_state();
-        }
         self.adjustment_mode = false;
         self.fs_click_info_open = false;
         self.music_left_panel_active = false;
@@ -53732,7 +53795,7 @@ impl App {
     ///
     /// 解決順:
     /// 1. `adjustment_page_params[idx]` (ページ個別)
-    /// 2. `adjustment_favorite_params[nearest_fav_id]` (お気に入り単位の標準)
+    /// 2. `adjustment_favorite_params[nearest_on_fav_id]` (最近祖先の ON お気に入り標準)
     /// 3. `settings.global_preset` (全体の標準)
     ///
     /// 所有権が必要な呼び出し側は `.clone()` する。毎フレーム呼ばれるので無用なクローンを避ける。
@@ -53751,7 +53814,7 @@ impl App {
 
     /// 指定 idx のコンテキストにおける「ページ個別を除いた有効パラメータ」。
     /// 個別設定の冗長判定 (個別を保存する意味があるか) に使う。
-    /// お気に入り配下なら favorite 標準、そうでなければ global。
+    /// 最近祖先の ON お気に入りがあればその標準、そうでなければ global。
     pub(crate) fn effective_default_for_idx(&self, idx: usize) -> &crate::adjustment::AdjustParams {
         if self.idx_is_compiled_book_page(idx) {
             return Self::book_page_default_adjust_params();
@@ -53837,31 +53900,88 @@ impl App {
         DEFAULT.get_or_init(crate::adjustment::AdjustParams::default)
     }
 
-    /// 指定 idx が属するお気に入り (最も近い祖先) の標準パラメータへの参照を返す。
-    /// ZIP/PDF ページは ZIP/PDF 本体のパスでお気に入り判定される。
+    /// 指定 idx に適用される、最近祖先の ON お気に入り標準への参照を返す。
     fn favorite_default_for_idx(&self, idx: usize) -> Option<&crate::adjustment::AdjustParams> {
-        let fav_id = self.current_favorite_id_for_idx(idx)?;
+        let fav_id = self.active_favorite_default_id_for_idx(idx)?;
         self.adjustment_favorite_params.get(&fav_id)
+    }
+
+    /// 補正スコープの祖先判定に使うコンテナパスを返す。
+    /// ZIP/PDF ページは ZIP/PDF 本体のパスをコンテナとして扱う。
+    fn adjust_container_path_for_idx(&self, idx: usize) -> Option<std::path::PathBuf> {
+        if self.idx_is_compiled_book_page(idx) {
+            return None;
+        }
+        match self.items.get(idx)? {
+            GridItem::Image(p) | GridItem::Video(p) => Some(p.parent()?.to_path_buf()),
+            GridItem::ZipImage { zip_path, .. } => Some(zip_path.clone()),
+            GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
+            _ => None,
+        }
     }
 
     /// 指定 idx が属するお気に入り (最も近い祖先) の id を返す。
     pub(crate) fn current_favorite_id_for_idx(&self, idx: usize) -> Option<uuid::Uuid> {
-        if self.idx_is_compiled_book_page(idx) {
-            return None;
-        }
-        let item = self.items.get(idx)?;
-        let container_path: std::path::PathBuf = match item {
-            GridItem::Image(p) => p.parent()?.to_path_buf(),
-            GridItem::Video(p) => p.parent()?.to_path_buf(),
-            GridItem::ZipImage { zip_path, .. } => zip_path.clone(),
-            GridItem::PdfPage { pdf_path, .. } => pdf_path.clone(),
-            _ => return None,
-        };
+        let container_path = self.adjust_container_path_for_idx(idx)?;
         self.find_nearest_favorite(&container_path).map(|f| f.id)
     }
 
+    /// 指定 idx の祖先お気に入りのうち、独自標準が ON
+    /// (`adjustment_favorite_params` に行がある) で最も深いものの id を返す。
+    pub(crate) fn active_favorite_default_id_for_idx(&self, idx: usize) -> Option<uuid::Uuid> {
+        self.active_favorite_default_id_for_idx_excluding(idx, None)
+    }
+
+    /// 補正パネルと標準向けショートカットが共有する、現在地の標準書き込み先。
+    /// 最寄りのお気に入りが OFF ならそこで行を作らず、外側の ON 標準か共通標準へ透過する。
+    pub(crate) fn adjustment_standard_scope_for_idx(&self, idx: usize) -> AdjustmentStandardScope {
+        self.active_favorite_default_id_for_idx(idx)
+            .map(AdjustmentStandardScope::Favorite)
+            .unwrap_or(AdjustmentStandardScope::Global)
+    }
+
+    /// 指定行を取り除いた後に有効になるお気に入り標準を解決する内部版。
+    fn active_favorite_default_id_for_idx_excluding(
+        &self,
+        idx: usize,
+        excluded_id: Option<uuid::Uuid>,
+    ) -> Option<uuid::Uuid> {
+        let container_path = self.adjust_container_path_for_idx(idx)?;
+        let mut best: Option<uuid::Uuid> = None;
+        let mut best_len = 0usize;
+        for fav in &self.settings.favorites {
+            if excluded_id == Some(fav.id)
+                || !self.adjustment_favorite_params.contains_key(&fav.id)
+                || !crate::search_index_db::is_under(&container_path, &fav.path)
+            {
+                continue;
+            }
+            let len = fav.path.as_os_str().len();
+            if best.is_none() || len > best_len {
+                best = Some(fav.id);
+                best_len = len;
+            }
+        }
+        best
+    }
+
+    /// `favorite_id` の独自標準を解除した直後に `idx` へ適用される標準値。
+    /// 入れ子のお気に入りでは外側の ON 標準、無ければ共通標準へ戻る。
+    pub(crate) fn favorite_default_fallback_after_clear_for_idx(
+        &self,
+        idx: usize,
+        favorite_id: uuid::Uuid,
+    ) -> &crate::adjustment::AdjustParams {
+        if self.idx_is_compiled_book_page(idx) {
+            return Self::book_page_default_adjust_params();
+        }
+        self.active_favorite_default_id_for_idx_excluding(idx, Some(favorite_id))
+            .and_then(|id| self.adjustment_favorite_params.get(&id))
+            .unwrap_or(&self.settings.global_preset)
+    }
+
     /// U/N/P 補正ショートカットで書き換える対象のスコープを決定する。
-    /// 個別設定 → お気に入り標準 → global の順で最初に存在する層を選ぶ。
+    /// 個別設定 → 最近祖先の ON お気に入り標準 → global の順で層を選ぶ。
     pub(crate) fn resolve_adjust_scope(&self, fs_idx: usize) -> crate::ui_fullscreen::AdjustScope {
         use crate::ui_fullscreen::AdjustScope;
         if self.idx_is_compiled_book_page(fs_idx) {
@@ -53870,10 +53990,8 @@ impl App {
         if self.adjustment_page_params.contains_key(&fs_idx) {
             return AdjustScope::PageOverride;
         }
-        if let Some(fav_id) = self.current_favorite_id_for_idx(fs_idx) {
-            if self.adjustment_favorite_params.contains_key(&fav_id) {
-                return AdjustScope::FavoriteDefault(fav_id);
-            }
+        if let Some(fav_id) = self.active_favorite_default_id_for_idx(fs_idx) {
+            return AdjustScope::FavoriteDefault(fav_id);
         }
         AdjustScope::Global
     }
@@ -53944,9 +54062,9 @@ impl App {
 
     /// 指定ページの個別設定を解除する (DB からも削除)。
     ///
-    /// 個別 → グローバル へのフォールバックで AI 設定 (upscale / denoise) が
-    /// 切り替わる場合は、その idx の AI キャッシュ / 失敗マーカ / pending を
-    /// クリアして次フレームで再実行されるようにする。
+    /// 個別 → 最近祖先の ON お気に入り標準または global へのフォールバックで
+    /// AI 設定 (upscale / denoise) が切り替わる場合は、その idx の AI キャッシュ /
+    /// 失敗マーカ / pending をクリアして次フレームで再実行されるようにする。
     /// 色調 (adjustment) キャッシュは常にクリアする。
     pub(crate) fn clear_page_params(&mut self, idx: usize) {
         let old_params = self.effective_params(idx).clone();
@@ -54113,14 +54231,10 @@ impl App {
         );
     }
 
-    /// 指定述語にマッチする画像ページ (Image / ZipImage / PdfPage) で個別設定を持たない
-    /// idx を集める。`copy_params_to_global` / `set_favorite_default` /
-    /// `clear_favorite_default` が「標準設定側を書き換えたときに AI 再実行が必要なページ」を
-    /// 拾うために使う共通ヘルパー。
-    fn image_idx_inheriting_default<F>(&self, favorite_pred: F) -> Vec<usize>
-    where
-        F: Fn(&Self, usize) -> bool,
-    {
+    /// 個別設定を持たない画像ページと、その変更前の実効標準を記録する。
+    /// 標準変更後に `inherited_default_ai_changed_indices` と突き合わせることで、
+    /// 入れ子や ON/OFF 遷移を推測せず、実際に AI 設定が変わったページだけを求める。
+    fn snapshot_inherited_default_params(&self) -> Vec<(usize, crate::adjustment::AdjustParams)> {
         (0..self.items.len())
             .filter(|idx| {
                 matches!(
@@ -54129,7 +54243,20 @@ impl App {
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::PdfPage { .. })
                 ) && !self.adjustment_page_params.contains_key(idx)
-                    && favorite_pred(self, *idx)
+            })
+            .map(|idx| (idx, self.effective_default_for_idx(idx).clone()))
+            .collect()
+    }
+
+    /// 標準変更前後で実効標準の AI 設定が変わったページだけを返す。
+    fn inherited_default_ai_changed_indices(
+        &self,
+        before: &[(usize, crate::adjustment::AdjustParams)],
+    ) -> Vec<usize> {
+        before
+            .iter()
+            .filter_map(|(idx, old)| {
+                (!old.ai_settings_eq(self.effective_default_for_idx(*idx))).then_some(*idx)
             })
             .collect()
     }
@@ -54163,29 +54290,22 @@ impl App {
     }
 
     /// 指定パラメータを settings.global_preset にコピーして保存する。
-    /// global の AI 設定が変わった場合、個別設定を持たない (= global を継承している)
-    /// 画像ページの AI キャッシュもクリアして、新 global での再実行を促す。
+    /// 個別設定を持たない画像ページの実効標準を変更前後で比較し、AI 設定が実際に
+    /// 変わったページだけ AI キャッシュをクリアして再実行を促す。
     ///
     /// 書き換え後は冗長になった個別設定を掃除する。これが無いと「標準にする」の後も
     /// そのページが `PageOverride` スコープに残り続け、`resolve_adjust_scope` 経由の
     /// U/N/P が標準ではなくページを編集してしまう (お気に入り標準側は
     /// `apply_favorite_change` が同じ掃除を先に持っていた)。
     pub(crate) fn copy_params_to_global(&mut self, params: crate::adjustment::AdjustParams) {
-        let ai_changed = !self.settings.global_preset.ai_settings_eq(&params);
-        let ai_changed_indices: Vec<usize> = if ai_changed {
-            // global を継承しているページ (個別 / お気に入り標準のどちらもない) だけ影響
-            self.image_idx_inheriting_default(|app, idx| {
-                app.favorite_default_for_idx(idx).is_none()
-            })
-        } else {
-            Vec::new()
-        };
+        let default_params_before = self.snapshot_inherited_default_params();
         crate::logger::log(format!(
             "[adjust scope] global <- {}",
             crate::adjustment::color_log_summary(&params),
         ));
         self.settings.global_preset = params;
         self.settings.save();
+        let ai_changed_indices = self.inherited_default_ai_changed_indices(&default_params_before);
         self.prune_page_params_matching_default();
         self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
@@ -54219,20 +54339,7 @@ impl App {
         favorite_id: uuid::Uuid,
         new_value: Option<crate::adjustment::AdjustParams>,
     ) {
-        let old = self.adjustment_favorite_params.get(&favorite_id).cloned();
-        let new_effective = new_value
-            .clone()
-            .unwrap_or_else(|| self.settings.global_preset.clone());
-        let old_effective = old.unwrap_or_else(|| self.settings.global_preset.clone());
-        let ai_changed = !old_effective.ai_settings_eq(&new_effective);
-        let ai_changed_indices: Vec<usize> = if ai_changed {
-            // このお気に入り傘下かつ個別設定なしのページのみ AI 影響あり
-            self.image_idx_inheriting_default(|app, idx| {
-                app.current_favorite_id_for_idx(idx) == Some(favorite_id)
-            })
-        } else {
-            Vec::new()
-        };
+        let default_params_before = self.snapshot_inherited_default_params();
         crate::logger::log(match &new_value {
             Some(p) => format!(
                 "[adjust scope] favorite {favorite_id} <- {}",
@@ -54240,6 +54347,8 @@ impl App {
             ),
             None => format!("[adjust scope] favorite {favorite_id} cleared"),
         });
+        // `favorite_params` 行の存在自体が「独自標準 ON」を表す。内容が無補正や
+        // global と同一でも行を間引かず、明示的な OFF 操作 (`None`) だけで削除する。
         match &new_value {
             Some(p) => {
                 self.adjustment_favorite_params
@@ -54255,6 +54364,7 @@ impl App {
                 }
             }
         }
+        let ai_changed_indices = self.inherited_default_ai_changed_indices(&default_params_before);
         // 標準が動いた後、個別設定が実効標準と一致するページは冗長。
         // set_page_params と同じ不変条件 (個別 == effective_default なら個別削除) を
         // 維持する。これをやらないと「このお気に入りの標準にする」押下後もページが
@@ -54266,7 +54376,7 @@ impl App {
     }
 
     /// 指定パラメータをお気に入りの標準設定として保存する。
-    /// そのお気に入り配下で、個別設定を持たないページの表示が新しい標準に切り替わる。
+    /// そのお気に入りが最近祖先の ON 標準になるページの表示が新しい値へ切り替わる。
     pub(crate) fn set_favorite_default(
         &mut self,
         favorite_id: uuid::Uuid,
@@ -54275,7 +54385,8 @@ impl App {
         self.apply_favorite_change(favorite_id, Some(params));
     }
 
-    /// お気に入りの標準設定を解除する (= そのお気に入りでは global_preset にフォールバック)。
+    /// お気に入りの標準設定を解除する。
+    /// 配下は、さらに外側の最近祖先の ON お気に入り標準または global へフォールバックする。
     pub(crate) fn clear_favorite_default(&mut self, favorite_id: uuid::Uuid) {
         self.apply_favorite_change(favorite_id, None);
     }
@@ -54330,18 +54441,18 @@ impl App {
             return;
         };
 
+        let standard_scope = self.adjustment_standard_scope_for_idx(idx);
         crate::logger::log(format!(
             "[adjust slot] load->default slot={} idx={} target={} {}",
             key_label,
             idx,
-            if self.current_favorite_id_for_idx(idx).is_some() {
-                "favorite"
-            } else {
-                "global"
+            match standard_scope {
+                AdjustmentStandardScope::Favorite(id) => format!("favorite:{id}"),
+                AdjustmentStandardScope::Global => "global".to_string(),
             },
             crate::adjustment::color_log_summary(&slot.params),
         ));
-        if let Some(favorite_id) = self.current_favorite_id_for_idx(idx) {
+        if let AdjustmentStandardScope::Favorite(favorite_id) = standard_scope {
             let favorite_name = self
                 .settings
                 .favorites
@@ -54353,7 +54464,7 @@ impl App {
             self.clear_page_params(idx);
             let remaining = self.page_override_toast_suffix(Some(idx));
             self.show_feedback_toast(format!(
-                "[スロット{key_label}:{} → お気に入り「{favorite_name}」の標準{remaining}]",
+                "[スロット{key_label}:{} → 標準（お気に入り「{favorite_name}」）{remaining}]",
                 slot.name
             ));
         } else {
@@ -54361,10 +54472,35 @@ impl App {
             self.clear_page_params(idx);
             let remaining = self.page_override_toast_suffix(Some(idx));
             self.show_feedback_toast(format!(
-                "[スロット{key_label}:{} → 標準設定{remaining}]",
+                "[スロット{key_label}:{} → 標準（共通）{remaining}]",
                 slot.name
             ));
         }
+    }
+
+    /// 共通標準を、現在のページで実際に有効な ON お気に入り標準へ複製する。
+    /// パネルボタンと Ctrl+Alt+- が同じ undo / prune / toast 経路を使う。
+    pub(crate) fn copy_global_default_to_current_favorite(&mut self) {
+        let Some(idx) = self.current_adjust_target_idx() else {
+            return;
+        };
+        let AdjustmentStandardScope::Favorite(favorite_id) =
+            self.adjustment_standard_scope_for_idx(idx)
+        else {
+            self.show_feedback_toast("[共通の標準を選択中です]".to_string());
+            return;
+        };
+        let favorite_name = self
+            .settings
+            .favorite_by_id(favorite_id)
+            .map(|favorite| favorite.name.clone())
+            .unwrap_or_default();
+        let label = format!("標準（お気に入り「{favorite_name}」）へ共通の標準をコピー");
+        let params = self.settings.global_preset.clone();
+        self.capture_adjust_full(label.clone(), |app| {
+            app.set_favorite_default(favorite_id, params)
+        });
+        self.show_feedback_toast(label);
     }
 
     /// 現在のフルスクリーンページに保存スロットを適用する (Ctrl+0..9 等のショートカット用)。
@@ -59689,6 +59825,9 @@ impl eframe::App for App {
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
+        if !main_viewer_blocked {
+            self.draw_favorite_default_clear_confirm_dialog(ctx);
+        }
         self.show_smart_folder_editor_dialog(ctx);
         self.show_tag_editor_dialog(ctx);
         self.show_tag_apply_dialog(ctx);

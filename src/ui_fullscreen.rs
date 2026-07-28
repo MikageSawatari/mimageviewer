@@ -8703,9 +8703,6 @@ impl App {
                                 || panorama_mode_active
                             {
                                 self.view_trim_mode = false;
-                                self.view_trim_page_apply_root_idx = None;
-                                self.view_trim_page_spread_separate =
-                                    self.view_trim_book_settings.spread_separate;
                             }
                             let view_trim_active =
                                 self.view_trim_active_for_display(fs_idx, spread_pair);
@@ -8971,6 +8968,7 @@ impl App {
 
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
+                        self.draw_favorite_default_clear_confirm_dialog(ctx);
                         self.draw_export_dialog(ctx);
                         self.draw_export_progress_dialog(ctx);
 
@@ -11776,6 +11774,10 @@ impl App {
                     .consume_action(ctx, KeyAction::FsAdjustSlotDefault10),
             ]
         };
+        let copy_global_default_to_favorite_key = !fs_music_view_active
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsAdjustCopyGlobalDefaultToFavorite);
 
         // Ctrl+Backspace / Q: 現在ページの個別補正設定を解除 (標準値に戻す)
         // Q は片手で押しやすいショートカット (補正パネルでの操作中に素早く元に戻したい用途)
@@ -11944,6 +11946,9 @@ impl App {
                     |app| app.apply_slot_to_default_scope(slot_idx),
                 );
             }
+        }
+        if copy_global_default_to_favorite_key {
+            self.copy_global_default_to_current_favorite();
         }
 
         // Ctrl+Backspace: 個別設定があれば解除、なければフィードバックのみ

@@ -5,14 +5,12 @@
 //!
 //! - パネルでスライダーを操作すると、その瞬間に「現在のページ個別パラメータ」が更新される
 //!   (ページ個別設定が自動生成される)
-//! - アクションボタン 4 種 (2x2 グリッド):
-//!     - 「このフォルダ全画像の個別設定に適用」 — 現在の一覧 (フォルダ/ZIP/PDF) の
-//!       全画像ページへ**個別設定として**書き込む (標準設定より優先されるため、以後
-//!       この一覧は標準設定の変更を受けなくなる)
-//!     - 「このフォルダ全画像の個別設定を解除」 — 現在の一覧の全画像ページから個別設定を
-//!       削除 (標準に戻す)
-//!     - 「標準にする」     — 現在のパラメータを settings.global_preset にコピー
-//!     - 「個別設定を解除」 — 現在のページの個別設定を削除 (標準値に戻す)
+//! - アクションは選択中スコープに合わせた操作行:
+//!     - お気に入り標準では「共通の標準からコピー」
+//!     - ページ個別では現在の実効値を場所の標準へ反映
+//!     - 現在一覧の全画像を、場所の標準または現在ページの実効値へ揃える
+//!     - ページ個別では現在ページの個別設定を解除する
+//! - スライダー下の「すべてリセット」は選択中スコープの全補正値を初期値へ戻す
 //! - 保存スロット 10 個: クリック or Ctrl+数字で現在のページに適用
 
 use std::collections::VecDeque;
@@ -22,9 +20,11 @@ use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 use crate::app::{
-    AdjustSpreadTarget, App, LocalAdjustEdgePreviewCache, LocalAdjustEdgePreviewKey,
-    LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset, LocalAdjustMaskEditTarget,
-    LocalAdjustMaskShapeDrag, LocalAdjustMaskTool, LocalAdjustRegionSegmentationScope,
+    AdjustScopeSelection, AdjustSpreadTarget, AdjustmentStandardDragSession,
+    AdjustmentStandardScope, App, FavoriteDefaultClearConfirm, LocalAdjustEdgePreviewCache,
+    LocalAdjustEdgePreviewKey, LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset,
+    LocalAdjustMaskEditTarget, LocalAdjustMaskShapeDrag, LocalAdjustMaskTool,
+    LocalAdjustRegionSegmentationScope,
 };
 use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::KeyAction;
@@ -50,6 +50,12 @@ const BODY_PAD_LEFT: f32 = 10.0;
 const BODY_PAD_RIGHT: f32 = 10.0;
 /// ScrollArea の縦バーが重なる分として、本文 widget 幅から差し引く余白。
 const BODY_SCROLLBAR_RESERVE: f32 = 14.0;
+/// 258px の本文幅でアプリフォント + 暗色 radio を実測し、7文字は252px、
+/// 8文字は265pxだったため、1行に収まる最大の7文字を採る。
+const ADJUST_SCOPE_FAVORITE_NAME_MAX_CHARS: usize = 7;
+const ADJUST_ALIGN_ALL_STANDARD_LABEL: &str = "このフォルダの全画像を標準に揃える";
+// 指定文言は実測 268px で本文幅 258px を超えるため、対象を保ったまま短縮する。
+const ADJUST_ALIGN_ALL_PAGE_LABEL: &str = "フォルダ全画像をこのページに揃える";
 /// 補正レイヤー左パネルの幅。`local_adjust_lab` の `PANEL_W` と揃える。
 const LOCAL_ADJUST_PANEL_W: f32 = 340.0;
 /// 選択中レイヤーのマスク / 効果パラメータ用右パネル幅。`local_adjust_lab` と揃える。
@@ -78,6 +84,209 @@ pub(crate) const LOCAL_ADJUST_NUDGE_PIXELS: f32 = 1.0;
 pub(crate) const LOCAL_ADJUST_NUDGE_PIXELS_FAST: f32 = 10.0;
 pub(crate) const LOCAL_ADJUST_ROTATE_DEG_STEP: f32 = 0.1;
 pub(crate) const LOCAL_ADJUST_ROTATE_DEG_STEP_FAST: f32 = 1.0;
+
+fn initial_adjust_scope_selection(has_page_override: bool) -> AdjustScopeSelection {
+    if has_page_override {
+        AdjustScopeSelection::Page
+    } else {
+        AdjustScopeSelection::Standard
+    }
+}
+
+fn effective_adjust_scope_selection(
+    has_page_override: bool,
+    stored: AdjustScopeSelection,
+) -> AdjustScopeSelection {
+    if has_page_override {
+        AdjustScopeSelection::Page
+    } else {
+        stored
+    }
+}
+
+fn should_save_settings(settings_changed: bool, is_dragging: bool) -> bool {
+    settings_changed && !is_dragging
+}
+
+fn adjust_scope_standard_label(active_favorite_name: Option<&str>) -> String {
+    adjust_scope_standard_label_with_limit(
+        active_favorite_name,
+        ADJUST_SCOPE_FAVORITE_NAME_MAX_CHARS,
+    )
+}
+
+fn adjust_scope_standard_label_with_limit(
+    active_favorite_name: Option<&str>,
+    max_chars: usize,
+) -> String {
+    match active_favorite_name {
+        Some(name) => format!(
+            "標準（お気に入り「{}」）",
+            crate::ui_helpers::truncate_name(name, max_chars)
+        ),
+        None => "標準（共通）".to_string(),
+    }
+}
+
+fn favorite_default_clear_needs_confirmation(
+    current: &AdjustParams,
+    fallback: &AdjustParams,
+) -> bool {
+    current != fallback
+}
+
+#[cfg(test)]
+mod adjust_scope_selector_tests {
+    use super::*;
+
+    #[test]
+    fn adjust_scope_top_label_uses_active_favorite_or_common() {
+        assert_eq!(adjust_scope_standard_label(None), "標準（共通）");
+        assert_eq!(
+            adjust_scope_standard_label(Some("スキャン画像集")),
+            "標準（お気に入り「スキャン画像集」）"
+        );
+    }
+
+    #[test]
+    fn favorite_default_clear_confirmation_depends_on_fallback_difference() {
+        let current = AdjustParams::default();
+        let same = current.clone();
+        let mut different = current.clone();
+        different.brightness = 1.0;
+
+        assert!(!favorite_default_clear_needs_confirmation(&current, &same));
+        assert!(favorite_default_clear_needs_confirmation(
+            &current, &different
+        ));
+    }
+
+    #[test]
+    fn adjust_scope_initial_selection_follows_page_override() {
+        assert_eq!(
+            initial_adjust_scope_selection(false),
+            AdjustScopeSelection::Standard
+        );
+        assert_eq!(
+            initial_adjust_scope_selection(true),
+            AdjustScopeSelection::Page
+        );
+    }
+
+    #[test]
+    fn effective_adjust_scope_selection_forces_page_when_override_exists() {
+        assert_eq!(
+            effective_adjust_scope_selection(false, AdjustScopeSelection::Standard),
+            AdjustScopeSelection::Standard
+        );
+        assert_eq!(
+            effective_adjust_scope_selection(false, AdjustScopeSelection::Page),
+            AdjustScopeSelection::Page
+        );
+        assert_eq!(
+            effective_adjust_scope_selection(true, AdjustScopeSelection::Standard),
+            AdjustScopeSelection::Page
+        );
+        assert_eq!(
+            effective_adjust_scope_selection(true, AdjustScopeSelection::Page),
+            AdjustScopeSelection::Page
+        );
+    }
+
+    #[test]
+    fn settings_save_waits_only_while_currently_dragging() {
+        assert!(!should_save_settings(false, false));
+        assert!(!should_save_settings(false, true));
+        assert!(!should_save_settings(true, true));
+        assert!(should_save_settings(true, false));
+    }
+
+    #[test]
+    fn adjust_scope_top_radio_uses_maximum_limit_for_258px_body() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let measured = Arc::new(Mutex::new(Vec::new()));
+        let measured_in_ui = measured.clone();
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(400.0, 72.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let mut measured = measured_in_ui.lock().unwrap();
+                        measured.clear();
+                        for max_chars in [7, 8] {
+                            let label = adjust_scope_standard_label_with_limit(
+                                Some("あいうえおかきくけこ"),
+                                max_chars,
+                            );
+                            let response = ui.radio(false, label);
+                            measured.push(response.rect.size());
+                        }
+                    });
+            });
+        harness.run();
+
+        let sizes = measured.lock().unwrap();
+        assert_eq!(sizes.len(), 2, "both radios were rendered");
+        assert!(sizes[0].x <= 258.0, "7-char radio was {}px", sizes[0].x);
+        assert!(sizes[0].y <= 24.0, "7-char radio was {}px high", sizes[0].y);
+        assert!(sizes[1].x > 258.0, "8-char radio was only {}px", sizes[1].x);
+    }
+
+    #[test]
+    fn adjust_scope_action_labels_fit_258px_body() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let measured = Arc::new(Mutex::new(Vec::new()));
+        let measured_in_ui = measured.clone();
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(400.0, 180.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let mut measured = measured_in_ui.lock().unwrap();
+                        measured.clear();
+                        for label in [
+                            "共通の標準からコピー",
+                            "現在の設定値を標準に反映",
+                            ADJUST_ALIGN_ALL_STANDARD_LABEL,
+                            ADJUST_ALIGN_ALL_PAGE_LABEL,
+                            "個別設定を解除 [Q]",
+                        ] {
+                            measured.push((label, ui.button(label).rect.size()));
+                        }
+                    });
+            });
+        harness.run();
+
+        let sizes = measured.lock().unwrap();
+        assert_eq!(sizes.len(), 5, "all action labels were rendered");
+        for (label, size) in sizes.iter() {
+            assert!(size.x <= 258.0, "{label} was {}px wide", size.x);
+            assert!(size.y <= 24.0, "{label} was {}px high", size.y);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalAdjustBitmapMaskOp {
@@ -12071,6 +12280,7 @@ impl App {
             }
             SpreadPair::Single => (fs_root_idx, None),
         };
+
         self.maybe_start_local_adjust_render(fs_idx);
         let layers = self
             .local_adjust_page_layers
@@ -12747,6 +12957,161 @@ impl App {
         }
     }
 
+    fn adjustment_standard_params_for_scope(&self, scope: AdjustmentStandardScope) -> AdjustParams {
+        match scope {
+            AdjustmentStandardScope::Favorite(id) => self
+                .adjustment_favorite_params
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| self.settings.global_preset.clone()),
+            AdjustmentStandardScope::Global => self.settings.global_preset.clone(),
+        }
+    }
+
+    /// ドラッグ中のプレビューだけを更新する。DB / settings.save / prune は行わない。
+    fn set_adjustment_standard_params_in_memory(
+        &mut self,
+        scope: AdjustmentStandardScope,
+        params: AdjustParams,
+    ) {
+        match scope {
+            AdjustmentStandardScope::Favorite(id) => {
+                self.adjustment_favorite_params.insert(id, params);
+            }
+            AdjustmentStandardScope::Global => self.settings.global_preset = params,
+        }
+    }
+
+    fn persist_adjustment_standard_params(
+        &mut self,
+        scope: AdjustmentStandardScope,
+        params: AdjustParams,
+    ) {
+        match scope {
+            AdjustmentStandardScope::Favorite(id) => self.set_favorite_default(id, params),
+            AdjustmentStandardScope::Global => self.copy_params_to_global(params),
+        }
+    }
+
+    fn adjustment_standard_label_for_scope(&self, scope: AdjustmentStandardScope) -> String {
+        let favorite_name = match scope {
+            AdjustmentStandardScope::Favorite(id) => self
+                .settings
+                .favorite_by_id(id)
+                .map(|favorite| favorite.name.as_str()),
+            AdjustmentStandardScope::Global => None,
+        };
+        adjust_scope_standard_label(favorite_name)
+    }
+
+    /// 現在ページの実効値を場所の標準へ移し、同値になった個別設定を既存 prune で畳む。
+    pub(crate) fn apply_current_params_to_standard(&mut self, fs_idx: usize) {
+        let params = self.effective_params(fs_idx).clone();
+        let scope = self.adjustment_standard_scope_for_idx(fs_idx);
+        let label = self.adjustment_standard_label_for_scope(scope);
+        self.capture_adjust_full(format!("現在の設定値を{label}に反映"), |app| {
+            app.persist_adjustment_standard_params(scope, params)
+        });
+        self.adjust_scope_selection = AdjustScopeSelection::Standard;
+        self.adjust_scope_selection_idx = Some(fs_idx);
+        let remaining = self.page_override_toast_suffix(Some(fs_idx));
+        self.show_feedback_toast(format!("{label}に反映{remaining}"));
+    }
+
+    pub(crate) fn create_favorite_specific_default(
+        &mut self,
+        favorite_id: uuid::Uuid,
+        favorite_name: &str,
+        seed: AdjustParams,
+    ) {
+        if self.adjustment_favorite_params.contains_key(&favorite_id) {
+            return;
+        }
+        self.capture_adjust_full(
+            format!("お気に入り「{favorite_name}」用の標準を作成"),
+            |app| app.set_favorite_default(favorite_id, seed),
+        );
+        self.show_feedback_toast(format!("お気に入り「{favorite_name}」用の標準を作成"));
+    }
+
+    fn clear_favorite_specific_default(&mut self, favorite_id: uuid::Uuid, favorite_name: &str) {
+        if !self.adjustment_favorite_params.contains_key(&favorite_id) {
+            return;
+        }
+        self.capture_adjust_full(
+            format!("お気に入り「{favorite_name}」用の標準を解除"),
+            |app| app.clear_favorite_default(favorite_id),
+        );
+        self.show_feedback_toast(format!("お気に入り「{favorite_name}」用の標準を解除"));
+    }
+
+    pub(crate) fn request_favorite_specific_default_clear(
+        &mut self,
+        favorite_id: uuid::Uuid,
+        favorite_name: String,
+        fallback: AdjustParams,
+    ) {
+        let Some(current) = self.adjustment_favorite_params.get(&favorite_id) else {
+            return;
+        };
+        if favorite_default_clear_needs_confirmation(current, &fallback) {
+            self.favorite_default_clear_confirm = Some(FavoriteDefaultClearConfirm {
+                favorite_id,
+                favorite_name,
+            });
+        } else {
+            self.clear_favorite_specific_default(favorite_id, &favorite_name);
+        }
+    }
+
+    pub(crate) fn draw_favorite_default_clear_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.favorite_default_clear_confirm.clone() else {
+            return;
+        };
+
+        // IME 判定は Window closure の前に確定する (共通ダイアログ規約)。
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let mut confirmed = false;
+        let mut canceled = false;
+        crate::os_theme::with_dark_context_style(ctx, || {
+            egui::Window::new("このお気に入りの標準設定が削除されます")
+                .order(egui::Order::Debug)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    crate::os_theme::apply_dark_ui(ui);
+                    ui.set_min_width(420.0);
+                    ui.label(format!(
+                        "お気に入り「{}」の標準設定を解除します。",
+                        pending.favorite_name
+                    ));
+                    ui.label("このお気に入りの標準設定が削除されます");
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            canceled = true;
+                        }
+                    });
+                });
+        });
+
+        confirmed |= enter_pressed;
+        canceled |= escape_pressed;
+        if confirmed {
+            self.favorite_default_clear_confirm = None;
+            self.clear_favorite_specific_default(pending.favorite_id, &pending.favorite_name);
+        } else if canceled {
+            self.favorite_default_clear_confirm = None;
+        }
+    }
+
     /// 左パネルの画像補正パネルを描画する。
     pub(crate) fn draw_adjustment_panel(
         &mut self,
@@ -12773,6 +13138,14 @@ impl App {
             }
             SpreadPair::Single => (fs_root_idx, None),
         };
+
+        // 選択はページごとの一時 UI 状態。ページ移動・見開き L/R 切替で対象 idx が
+        // 変わったときだけ、個別行の有無から初期値を導出する。
+        if self.adjust_scope_selection_idx != Some(fs_idx) {
+            self.adjust_scope_selection =
+                initial_adjust_scope_selection(self.adjustment_page_params.contains_key(&fs_idx));
+            self.adjust_scope_selection_idx = Some(fs_idx);
+        }
 
         let painter = ui.painter_at(panel_rect);
         painter.rect_filled(
@@ -13120,59 +13493,41 @@ impl App {
             return;
         }
 
-        let mut apply_all_clicked = false;
-        let mut clear_all_clicked = false;
-        let mut set_as_favorite_clicked = false;
-        let mut clear_favorite_clicked = false;
-        let mut set_as_global_clicked = false;
+        let mut copy_global_to_favorite_clicked = false;
+        let mut apply_current_to_standard_clicked = false;
+        let mut align_all_clicked = false;
         let mut clear_page_clicked = false;
+        let mut favorite_default_toggle: Option<bool> = None;
         let mut save_to_slot: Option<usize> = None;
         let mut load_from_slot: Option<usize> = None;
+        let has_override = self.adjustment_page_params.contains_key(&fs_idx);
+        let scope_selection_before =
+            effective_adjust_scope_selection(has_override, self.adjust_scope_selection);
+        let mut requested_scope_selection = scope_selection_before;
+        let mut scope_selection_clicked: Option<AdjustScopeSelection> = None;
 
         // 編集対象ページを含むお気に入り (なければ None)。
         let fav_info = self
             .current_favorite_id_for_idx(fs_idx)
             .and_then(|id| self.settings.favorite_by_id(id))
             .map(|f| (f.id, f.name.clone()));
-        let fav_display_name = fav_info
-            .as_ref()
-            .map(|(_, n)| crate::ui_helpers::truncate_name(n, 10))
-            .unwrap_or_else(|| "このお気に入り".to_string());
         let has_favorite_default = fav_info
             .as_ref()
             .map(|(id, _)| self.adjustment_favorite_params.contains_key(id))
             .unwrap_or(false);
-        let under_favorite = fav_info.is_some();
 
-        // スコープ判定
-        let has_override = self.adjustment_page_params.contains_key(&fs_idx);
-        let fav_default_active = !has_override
-            && self
-                .current_favorite_id_for_idx(fs_idx)
-                .map(|id| self.adjustment_favorite_params.contains_key(&id))
-                .unwrap_or(false);
-        let scope_text = if has_override {
-            "個別設定を適用中".to_string()
-        } else if fav_default_active {
-            let name = self
-                .current_favorite_id_for_idx(fs_idx)
-                .and_then(|id| self.settings.favorite_by_id(id))
-                .map(|f| crate::ui_helpers::truncate_name(&f.name, 10))
-                .unwrap_or_default();
-            format!("お気に入り「{}」の標準を適用中", name)
-        } else {
-            "標準設定を適用中".to_string()
-        };
-        let scope_color = if has_override {
-            egui::Color32::from_rgb(220, 180, 80)
-        } else if fav_default_active {
-            egui::Color32::from_rgb(120, 180, 220)
-        } else {
-            egui::Color32::from_gray(180)
-        };
+        // ラジオ上段は「現在地の最寄りお気に入り」ではなく、実際に書き込む
+        // 最近祖先の ON 標準を表示する。OFF のお気に入り配下なら共通になる。
+        let standard_scope = self.adjustment_standard_scope_for_idx(fs_idx);
+        let standard_scope_label = self.adjustment_standard_label_for_scope(standard_scope);
 
         // 現在の有効パラメータを取得して編集用コピーを作る
-        let mut edit_params = self.effective_params(fs_idx).clone();
+        let mut edit_params = match scope_selection_before {
+            AdjustScopeSelection::Standard => {
+                self.adjustment_standard_params_for_scope(standard_scope)
+            }
+            AdjustScopeSelection::Page => self.effective_params(fs_idx).clone(),
+        };
         let original = edit_params.clone();
 
         // サイズ上限以上ならスキップされる → その場合は「無効」を UI に反映する
@@ -13254,89 +13609,110 @@ impl App {
                             ui.add_space(2.0);
                         }
 
-                        // ── スコープ表示 ──
+                        // ── 書き込みスコープ ──
                         ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(&scope_text)
-                                .size(12.0)
-                                .color(scope_color),
+                        let standard_radio = ui.radio_value(
+                            &mut requested_scope_selection,
+                            AdjustScopeSelection::Standard,
+                            &standard_scope_label,
                         );
+                        if standard_radio.clicked() {
+                            scope_selection_clicked = Some(AdjustScopeSelection::Standard);
+                        }
+                        if let Some((_, favorite_name)) = fav_info.as_ref() {
+                            let mut enabled = has_favorite_default;
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0);
+                                let response = ui.add(egui::Checkbox::new(
+                                    &mut enabled,
+                                    egui::RichText::new(
+                                        "このお気に入り用に標準を分ける",
+                                    )
+                                    .size(12.0),
+                                ));
+                                if response.changed() {
+                                    favorite_default_toggle = Some(enabled);
+                                }
+                                response.on_hover_text(format!(
+                                    "お気に入り「{favorite_name}」に、このお気に入り専用の標準設定を持たせます"
+                                ));
+                            });
+                        }
+                        let page_radio = ui.radio_value(
+                            &mut requested_scope_selection,
+                            AdjustScopeSelection::Page,
+                            "このページ",
+                        );
+                        if page_radio.clicked() {
+                            scope_selection_clicked = Some(AdjustScopeSelection::Page);
+                        }
                         ui.add_space(4.0);
 
-                        // ── アクションボタン (5 行) ──
+                        // ── アクションボタン (選択中スコープに応じた操作行) ──
                         let wide = egui::vec2(content_width, 24.0);
-                        if ui
-                            .add(
-                                egui::Button::new("このフォルダ全画像の個別設定に適用")
-                                    .min_size(wide),
-                            )
-                            .on_hover_text(
-                                "このフォルダ/ZIP/PDF の全画像に、現在のパラメータを個別設定として書き込む。\
-                                 個別設定は標準設定より優先されるので、以後この一覧は標準設定の変更を受けなくなる",
-                            )
-                            .clicked()
-                        {
-                            apply_all_clicked = true;
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new("このフォルダ全画像の個別設定を解除")
-                                    .min_size(wide),
-                            )
-                            .on_hover_text(
-                                "このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す",
-                            )
-                            .clicked()
-                        {
-                            clear_all_clicked = true;
-                        }
-                        let set_fav_label =
-                            format!("このお気に入り「{}」の標準にする", fav_display_name);
-                        let clear_fav_label =
-                            format!("このお気に入り「{}」の標準を解除", fav_display_name);
-                        let set_fav_resp = ui.add_enabled(
-                            under_favorite,
-                            egui::Button::new(set_fav_label).min_size(wide),
-                        );
-                        if set_fav_resp.clicked() {
-                            set_as_favorite_clicked = true;
-                        }
-                        set_fav_resp.on_hover_text(if under_favorite {
-                    "このお気に入り配下のページで効く標準設定を、現在のパラメータで上書きする"
-                } else {
-                    "お気に入り登録されたフォルダ配下にいるときのみ使用できます"
-                });
-                        let clear_fav_resp = ui.add_enabled(
-                            under_favorite && has_favorite_default,
-                            egui::Button::new(clear_fav_label).min_size(wide),
-                        );
-                        if clear_fav_resp.clicked() {
-                            clear_favorite_clicked = true;
-                        }
-                        clear_fav_resp.on_hover_text(
-                    "このお気に入りの標準設定を削除し、アプリ全体の標準設定にフォールバックする",
-                );
-                        ui.horizontal(|ui| {
-                            if ui
-                                .small_button("標準にする")
-                                .on_hover_text("現在のパラメータをアプリ全体の標準設定にする")
+                        if matches!(standard_scope, AdjustmentStandardScope::Favorite(_))
+                            && ui
+                                .add(
+                                    egui::Button::new("共通の標準からコピー").min_size(wide),
+                                )
+                                .on_hover_text(
+                                    "共通の標準の内容を、この場所の標準へ複製します",
+                                )
                                 .clicked()
-                            {
-                                set_as_global_clicked = true;
+                        {
+                            copy_global_to_favorite_clicked = true;
+                        }
+
+                        if scope_selection_before == AdjustScopeSelection::Page
+                            && ui
+                                .add(
+                                    egui::Button::new("現在の設定値を標準に反映")
+                                        .min_size(wide),
+                                )
+                                .on_hover_text(
+                                    "現在のページに効いている補正値を、この場所の標準として保存します。\
+                                     このページの個別設定は標準と同じ内容になるため解除されます",
+                                )
+                                .clicked()
+                        {
+                            apply_current_to_standard_clicked = true;
+                        }
+
+                        let (align_all_label, align_all_tooltip) = match scope_selection_before {
+                            AdjustScopeSelection::Standard => (
+                                ADJUST_ALIGN_ALL_STANDARD_LABEL,
+                                format!(
+                                    "このフォルダ/ZIP/PDF の全画像から個別設定を削除し、{standard_scope_label}に揃えます"
+                                ),
+                            ),
+                            AdjustScopeSelection::Page => (
+                                ADJUST_ALIGN_ALL_PAGE_LABEL,
+                                "このフォルダ/ZIP/PDF の全画像に、現在のページの実効値を個別設定として書き込みます。\
+                                 個別設定は標準より優先されるので、以後この一覧は標準設定の変更を受けなくなる"
+                                    .to_string(),
+                            ),
+                        };
+                        if ui
+                            .add(egui::Button::new(align_all_label).min_size(wide))
+                            .on_hover_text(align_all_tooltip)
+                            .clicked()
+                        {
+                            align_all_clicked = true;
+                        }
+
+                        if scope_selection_before == AdjustScopeSelection::Page {
+                            let response = ui
+                                .add_enabled(
+                                    has_override,
+                                    egui::Button::new("個別設定を解除 [Q]").min_size(wide),
+                                )
+                                .on_hover_text(
+                                    "このページの個別設定を削除し、標準値に戻す (Q または Ctrl+Backspace)",
+                                );
+                            if response.clicked() {
+                                clear_page_clicked = true;
                             }
-                            if ui
-                        .add_enabled(
-                            has_override,
-                            egui::Button::new("個別設定を解除 [Q]").small(),
-                        )
-                        .on_hover_text(
-                            "このページの個別設定を削除し、標準値に戻す (Q または Ctrl+Backspace)",
-                        )
-                        .clicked()
-                    {
-                        clear_page_clicked = true;
-                    }
-                        });
+                        }
                         ui.add_space(6.0);
 
                         // ── スライダー群 ──
@@ -13357,7 +13733,19 @@ impl App {
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(4.0);
-                        if ui.button("すべてリセット").clicked() {
+                        let reset_tooltip = match scope_selection_before {
+                            AdjustScopeSelection::Standard => format!(
+                                "{standard_scope_label}のすべての補正値を初期値に戻します"
+                            ),
+                            AdjustScopeSelection::Page =>
+                                "このページのすべての補正値を初期値に戻します（標準に従わせるのではなく、無補正で固定します）"
+                                    .to_string(),
+                        };
+                        if ui
+                            .button("すべてリセット")
+                            .on_hover_text(reset_tooltip)
+                            .clicked()
+                        {
                             edit_params = AdjustParams::default();
                             slider_result.0 = true;
                         }
@@ -13429,19 +13817,76 @@ impl App {
             },
         );
         let (changed, is_dragging, settings_changed) = scroll_output.inner;
-        if settings_changed {
+        let was_dragging = self.adjustment_dragging;
+        // LOD 等の settings_changed は drag_stopped の release フレームでだけ立つ。
+        // `was_dragging` まで除外するとその最終値を失うため、現在ドラッグ中かだけを見る。
+        if should_save_settings(settings_changed, is_dragging) {
             self.settings.save();
         }
 
+        // 「このページ」→「標準」は、選択変更そのものが個別解除操作になる。
+        if requested_scope_selection != scope_selection_before {
+            if scope_selection_before == AdjustScopeSelection::Page
+                && requested_scope_selection == AdjustScopeSelection::Standard
+                && self.adjustment_page_params.contains_key(&fs_idx)
+            {
+                self.capture_adjust_full("個別設定の解除".to_string(), |app| {
+                    app.clear_page_params(fs_idx)
+                });
+                self.show_feedback_toast("個別設定を解除".to_string());
+            }
+            self.adjust_scope_selection = requested_scope_selection;
+        } else if let Some(clicked) = scope_selection_clicked {
+            // 個別行に強制されて表示上は既に Page の場合でも、明示クリックは保持値へ反映する。
+            self.adjust_scope_selection = clicked;
+        }
+        let effective_scope_selection_after = effective_adjust_scope_selection(
+            self.adjustment_page_params.contains_key(&fs_idx),
+            self.adjust_scope_selection,
+        );
+
+        if let (Some(enabled), Some((favorite_id, favorite_name))) =
+            (favorite_default_toggle, fav_info.as_ref())
+        {
+            if enabled {
+                // OFF→ON は現在見えている標準を種にする。global 固定ではなく
+                // effective_default を使うことで、入れ子の外側標準が ON の場合も
+                // 見た目を保ったまま内側を独立させられる。
+                let seed = self.effective_default_for_idx(fs_idx).clone();
+                self.create_favorite_specific_default(*favorite_id, favorite_name, seed);
+            } else {
+                let fallback = self
+                    .favorite_default_fallback_after_clear_for_idx(fs_idx, *favorite_id)
+                    .clone();
+                self.request_favorite_specific_default_clear(
+                    *favorite_id,
+                    favorite_name.clone(),
+                    fallback,
+                );
+            }
+        }
+
         // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
-        let was_dragging = self.adjustment_dragging;
         self.adjustment_dragging = is_dragging;
         let drag_just_started = is_dragging && !was_dragging;
         if drag_just_started {
-            self.adjustment_drag_session = Some(crate::app::AdjustmentDragSession {
-                fs_idx,
-                before: self.adjustment_page_params.get(&fs_idx).cloned(),
-            });
+            match effective_scope_selection_after {
+                AdjustScopeSelection::Page => {
+                    self.adjustment_drag_session = Some(crate::app::AdjustmentDragSession {
+                        fs_idx,
+                        before: self.adjustment_page_params.get(&fs_idx).cloned(),
+                    });
+                    self.adjustment_standard_drag_session = None;
+                }
+                AdjustScopeSelection::Standard => {
+                    let scope = self.adjustment_standard_scope_for_idx(fs_idx);
+                    self.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
+                        scope,
+                        before: self.adjustment_standard_params_for_scope(scope),
+                    });
+                    self.adjustment_drag_session = None;
+                }
+            }
         }
         // セッションが存在するが fs_idx がズレている (= ページ移動した) 場合は破棄。
         // 通常は open_fullscreen での clear_meta_undo が落とすが念のため。
@@ -13451,35 +13896,49 @@ impl App {
             }
         }
 
-        // ── スライダー変更を反映 (自動的にページ個別化) ──
-        // ドラッグ中は **in-memory のみ** 更新し DB / sidecar 書き込みをスキップする
-        // (60 frames/sec の DB UPSERT を避ける)。ドラッグ終了時に session で 1 回だけ
-        // 永続化 + Undo エントリを積む経路 (下部の `drag_just_ended` ブロック) に流す。
-        // ラジオ・コンボボックス・リセット↩ ボタンなどの非ドラッグ変更は即時通常パス。
+        // ── スライダー変更を選択中スコープへ反映 ──
+        // ドラッグ中はページ / 標準とも in-memory のみ。release で 1 回だけ永続化する。
+        // 非ドラッグのラジオ・コンボボックス・リセットは即時通常パスへ流す。
         if changed {
-            if is_dragging {
-                self.adjustment_page_params
-                    .insert(fs_idx, edit_params.clone());
+            if is_dragging || was_dragging {
+                if let Some(session) = self.adjustment_standard_drag_session.as_ref() {
+                    // scope はドラッグ開始時に固定し、途中の UI 状態変化に追従させない。
+                    let scope = session.scope;
+                    self.set_adjustment_standard_params_in_memory(scope, edit_params.clone());
+                } else {
+                    self.adjustment_page_params
+                        .insert(fs_idx, edit_params.clone());
+                }
             } else {
-                let before = self
-                    .adjustment_drag_session
-                    .take()
-                    .map(|s| s.before)
-                    .unwrap_or_else(|| self.adjustment_page_params.get(&fs_idx).cloned());
-                self.set_page_params(fs_idx, edit_params.clone());
-                let after = self.adjustment_page_params.get(&fs_idx).cloned();
-                self.capture_adjustment_undo(
-                    crate::undo_stack::AdjustUndoScope::Page(fs_idx),
-                    before,
-                    after,
-                    "ページ個別の補正".to_string(),
-                );
+                match effective_scope_selection_after {
+                    AdjustScopeSelection::Page => {
+                        let before = self.adjustment_page_params.get(&fs_idx).cloned();
+                        self.set_page_params(fs_idx, edit_params.clone());
+                        let after = self.adjustment_page_params.get(&fs_idx).cloned();
+                        self.capture_adjustment_undo(
+                            crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                            before,
+                            after,
+                            "ページ個別の補正".to_string(),
+                        );
+                    }
+                    AdjustScopeSelection::Standard => {
+                        let scope = self.adjustment_standard_scope_for_idx(fs_idx);
+                        let label = self.adjustment_standard_label_for_scope(scope);
+                        let params = edit_params.clone();
+                        self.capture_adjust_full(format!("{label}の補正"), |app| {
+                            app.persist_adjustment_standard_params(scope, params)
+                        });
+                        let remaining = self.page_override_toast_suffix(None);
+                        self.show_feedback_toast(format!("{label}を更新{remaining}"));
+                    }
+                }
             }
             // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
             self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
             // ドラッグ中に色調が動いたら、release 時のサムネ補正テクスチャ全クリアを
             // 予約する (シャープ化だけのドラッグではサムネを無駄に再生成しない)。
-            if is_dragging && !original.color_settings_eq(&edit_params) {
+            if (is_dragging || was_dragging) && !original.color_settings_eq(&edit_params) {
                 self.thumb_adjust_drag_color_dirty = true;
             }
         }
@@ -13487,7 +13946,20 @@ impl App {
         // ドラッグ終了 (release) フレーム: changed が立たないことが多いので別経路で確定。
         let drag_just_ended = !is_dragging && was_dragging;
         if drag_just_ended {
-            if let Some(session) = self.adjustment_drag_session.take() {
+            if let Some(session) = self.adjustment_standard_drag_session.take() {
+                let after = self.adjustment_standard_params_for_scope(session.scope);
+                if session.before != after {
+                    // capture_adjust_full が正しい before を取れるよう、プレビューだけに
+                    // 書いた値を一瞬戻してから通常の永続化 API へ最終値を渡す。
+                    self.set_adjustment_standard_params_in_memory(session.scope, session.before);
+                    let label = self.adjustment_standard_label_for_scope(session.scope);
+                    self.capture_adjust_full(format!("{label}の補正"), |app| {
+                        app.persist_adjustment_standard_params(session.scope, after)
+                    });
+                    let remaining = self.page_override_toast_suffix(None);
+                    self.show_feedback_toast(format!("{label}を更新{remaining}"));
+                }
+            } else if let Some(session) = self.adjustment_drag_session.take() {
                 let in_memory = self.adjustment_page_params.get(&fs_idx).cloned();
                 if session.before != in_memory {
                     // in-memory に書いた最終値を `set_page_params` で永続化
@@ -13510,54 +13982,31 @@ impl App {
         }
 
         // ── アクションボタン処理 ──
-        // バルク系 (apply_all / clear_all) も capture_adjust_full で囲む — 数百ページの
-        // 個別設定を一括書き換えする操作だが、ヘルパーが 3 層全体の差分を取るので
-        // Vec<AdjustmentChange> として正しく記録される (Codex P2)。
-        if apply_all_clicked {
-            let params = self.effective_params(fs_idx).clone();
-            self.capture_adjust_full("全画像の個別設定に適用".to_string(), |app| {
-                app.apply_params_to_all_pages(params);
-            });
-            self.show_feedback_toast("全画像の個別設定に適用".to_string());
+        if copy_global_to_favorite_clicked {
+            self.copy_global_default_to_current_favorite();
         }
-        if clear_all_clicked {
-            self.capture_adjust_full("全画像の個別設定を解除".to_string(), |app| {
-                app.clear_all_page_params();
-            });
-            self.show_feedback_toast("全画像の個別設定を解除".to_string());
+        if apply_current_to_standard_clicked {
+            self.apply_current_params_to_standard(fs_idx);
         }
-        if set_as_favorite_clicked {
-            if let Some((fav_id, fav_name)) = fav_info.clone() {
-                let params = self.effective_params(fs_idx).clone();
-                let truncated = crate::ui_helpers::truncate_name(&fav_name, 10);
-                self.capture_adjust_full(
-                    format!("お気に入り「{}」の標準", truncated),
-                    |app| app.set_favorite_default(fav_id, params),
-                );
-                let remaining = self.page_override_toast_suffix(None);
-                self.show_feedback_toast(format!(
-                    "お気に入り「{}」の標準を更新{}",
-                    truncated, remaining
-                ));
+        if align_all_clicked {
+            match effective_scope_selection_after {
+                AdjustScopeSelection::Standard => {
+                    self.capture_adjust_full("全画像を標準に揃える".to_string(), |app| {
+                        app.clear_all_page_params();
+                    });
+                    self.show_feedback_toast("全画像を標準に揃える".to_string());
+                }
+                AdjustScopeSelection::Page => {
+                    let params = self.effective_params(fs_idx).clone();
+                    self.capture_adjust_full(
+                        "全画像をこのページに揃える".to_string(),
+                        |app| {
+                            app.apply_params_to_all_pages(params);
+                        },
+                    );
+                    self.show_feedback_toast("全画像をこのページに揃える".to_string());
+                }
             }
-        }
-        if clear_favorite_clicked {
-            if let Some((fav_id, fav_name)) = fav_info.clone() {
-                let truncated = crate::ui_helpers::truncate_name(&fav_name, 10);
-                self.capture_adjust_full(
-                    format!("お気に入り「{}」の標準を解除", truncated),
-                    |app| app.clear_favorite_default(fav_id),
-                );
-                self.show_feedback_toast(format!("お気に入り「{}」の標準を解除", truncated));
-            }
-        }
-        if set_as_global_clicked {
-            let params = self.effective_params(fs_idx).clone();
-            self.capture_adjust_full("標準設定の更新".to_string(), |app| {
-                app.copy_params_to_global(params)
-            });
-            let remaining = self.page_override_toast_suffix(None);
-            self.show_feedback_toast(format!("標準設定を更新{remaining}"));
         }
         if clear_page_clicked {
             self.capture_adjust_full("個別設定の解除".to_string(), |app| {

@@ -1475,6 +1475,7 @@ pub enum KeyAction {
     FsAdjustSlotDefault8,
     FsAdjustSlotDefault9,
     FsAdjustSlotDefault10,
+    FsAdjustCopyGlobalDefaultToFavorite,
     FsClearAdjust,
     FsApplyErase1,
     FsApplyErase2,
@@ -1892,6 +1893,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsAdjustSlotDefault8,
     KeyAction::FsAdjustSlotDefault9,
     KeyAction::FsAdjustSlotDefault10,
+    KeyAction::FsAdjustCopyGlobalDefaultToFavorite,
     KeyAction::FsClearAdjust,
     KeyAction::FsApplyErase1,
     KeyAction::FsApplyErase2,
@@ -3372,6 +3374,7 @@ impl KeyAction {
             FsAdjustSlotDefault8 => "FsAdjustSlotDefault8",
             FsAdjustSlotDefault9 => "FsAdjustSlotDefault9",
             FsAdjustSlotDefault10 => "FsAdjustSlotDefault10",
+            FsAdjustCopyGlobalDefaultToFavorite => "FsAdjustCopyGlobalDefaultToFavorite",
             FsClearAdjust => "FsClearAdjust",
             FsApplyErase1 => "FsApplyErase1",
             FsApplyErase2 => "FsApplyErase2",
@@ -3911,6 +3914,7 @@ impl KeyAction {
             FsAdjustSlotDefault8 => "補正プリセットスロット8を標準設定へ読み込む",
             FsAdjustSlotDefault9 => "補正プリセットスロット9を標準設定へ読み込む",
             FsAdjustSlotDefault10 => "補正プリセットスロット10を標準設定へ読み込む",
+            FsAdjustCopyGlobalDefaultToFavorite => "共通の標準を現在地のお気に入り標準へコピーする",
             FsClearAdjust => "現在の画像の補正を解除する",
             FsApplyErase1 => "消しゴムマスクスロット1を現在ページに適用する",
             FsApplyErase2 => "消しゴムマスクスロット2を現在ページに適用する",
@@ -4315,6 +4319,7 @@ impl KeyAction {
             | FsAdjustSlotDefault8
             | FsAdjustSlotDefault9
             | FsAdjustSlotDefault10
+            | FsAdjustCopyGlobalDefaultToFavorite
             | FsClearAdjust
             | FsApplyErase1
             | FsApplyErase2
@@ -4705,6 +4710,7 @@ impl KeyAction {
             | FsAdjustSlotDefault8
             | FsAdjustSlotDefault9
             | FsAdjustSlotDefault10
+            | FsAdjustCopyGlobalDefaultToFavorite
             | FsClearAdjust
             | FsApplyErase1
             | FsApplyErase2
@@ -5119,6 +5125,9 @@ impl KeyAction {
             FsAdjustSlotDefault8 => ctrl_alt_digit_pair(Num8, Numpad8),
             FsAdjustSlotDefault9 => ctrl_alt_digit_pair(Num9, Numpad9),
             FsAdjustSlotDefault10 => ctrl_alt_digit_pair(Num0, Numpad0),
+            FsAdjustCopyGlobalDefaultToFavorite => {
+                ChordList::two(Chord::ctrl_alt(Minus), Chord::ctrl_alt(NumpadSubtract))
+            }
             FsClearAdjust => ChordList::two(Chord::ctrl(Backspace), Chord::key(Q)),
             FsApplyErase1 => ChordList::one(Chord::key(F7)),
             FsApplyErase2 => ChordList::one(Chord::key(F8)),
@@ -7356,6 +7365,7 @@ mod tests {
             KeyAction::FsAdjustSlotDefault8,
             KeyAction::FsAdjustSlotDefault9,
             KeyAction::FsAdjustSlotDefault10,
+            KeyAction::FsAdjustCopyGlobalDefaultToFavorite,
             KeyAction::VideoAdjustSlot1,
             KeyAction::VideoAdjustSlot2,
             KeyAction::VideoAdjustSlot3,
@@ -7403,6 +7413,16 @@ mod tests {
         assert_eq!(
             KeyAction::VideoAdjustSlot10.default_chords().iter().next(),
             Some(Chord::ctrl(KeyName::Num0))
+        );
+        assert_eq!(
+            KeyAction::FsAdjustCopyGlobalDefaultToFavorite
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![
+                Chord::ctrl_alt(KeyName::Minus),
+                Chord::ctrl_alt(KeyName::NumpadSubtract),
+            ]
         );
     }
 

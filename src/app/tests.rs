@@ -9688,6 +9688,129 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn apply_slot_to_default_scope_uses_global_when_nearest_favorite_is_off() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("OFF".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "Global".to_string(),
+            params: params_with_brightness(42.0),
+        });
+
+        app.apply_slot_to_default_scope(0);
+
+        assert_eq!(app.settings.global_preset.brightness, 42.0);
+        assert!(!app.adjustment_favorite_params.contains_key(&favorite_id));
+        assert_eq!(toast_text(&app), "[スロット1:Global → 標準（共通）]");
+    }
+
+    #[test]
+    fn copy_global_default_to_current_favorite_uses_active_standard_scope() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("お気に入り".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(7.0);
+        app.adjustment_favorite_params
+            .insert(favorite_id, params_with_brightness(20.0));
+
+        app.copy_global_default_to_current_favorite();
+
+        assert_eq!(app.adjustment_favorite_params[&favorite_id].brightness, 7.0);
+        assert_eq!(
+            toast_text(&app),
+            "標準（お気に入り「お気に入り」）へ共通の標準をコピー"
+        );
+    }
+
+    #[test]
+    fn copy_global_default_to_current_favorite_reports_global_scope_noop() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/other/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        let before = app.settings.global_preset.clone();
+
+        app.copy_global_default_to_current_favorite();
+
+        assert_eq!(app.settings.global_preset, before);
+        assert_eq!(toast_text(&app), "[共通の標準を選択中です]");
+    }
+
+    #[test]
+    fn apply_current_params_to_standard_updates_active_favorite_and_prunes_page() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("お気に入り".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_favorite_params
+            .insert(favorite_id, params_with_brightness(20.0));
+        app.set_page_params(idx, params_with_brightness(35.0));
+        app.adjust_scope_selection = AdjustScopeSelection::Page;
+        app.adjust_scope_selection_idx = Some(idx);
+
+        app.apply_current_params_to_standard(idx);
+
+        assert_eq!(
+            app.adjustment_favorite_params[&favorite_id].brightness,
+            35.0
+        );
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::FavoriteDefault(id) if id == favorite_id
+        ));
+        assert_eq!(app.adjust_scope_selection, AdjustScopeSelection::Standard);
+        assert_eq!(app.adjust_scope_selection_idx, Some(idx));
+        assert_eq!(toast_text(&app), "標準（お気に入り「お気に入り」）に反映");
+
+        app.apply_meta_undo();
+        assert_eq!(
+            app.adjustment_favorite_params[&favorite_id].brightness,
+            20.0
+        );
+        assert_eq!(app.adjustment_page_params[&idx].brightness, 35.0);
+    }
+
+    #[test]
+    fn apply_current_params_to_standard_uses_global_for_off_favorite_and_reports_remaining() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("OFF".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        let other = push_image(&mut app, "C:/pics/b.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.set_page_params(idx, params_with_brightness(42.0));
+        app.set_page_params(other, params_with_brightness(50.0));
+        app.adjust_scope_selection = AdjustScopeSelection::Page;
+        app.adjust_scope_selection_idx = Some(idx);
+
+        app.apply_current_params_to_standard(idx);
+
+        assert_eq!(app.settings.global_preset.brightness, 42.0);
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+        assert!(app.adjustment_page_params.contains_key(&other));
+        assert!(!app.adjustment_favorite_params.contains_key(&favorite_id));
+        assert!(matches!(app.resolve_adjust_scope(idx), AdjustScope::Global));
+        assert_eq!(app.adjust_scope_selection, AdjustScopeSelection::Standard);
+        assert_eq!(app.adjust_scope_selection_idx, Some(idx));
+        assert_eq!(
+            toast_text(&app),
+            "標準（共通）に反映 (他1枚は個別設定のまま)"
+        );
+    }
+
+    #[test]
     fn apply_empty_slot_to_default_scope_changes_nothing() {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/other/a.jpg");
@@ -9747,6 +9870,181 @@ mod favorite_adjustment_defaults_tests {
             app.resolve_adjust_scope(idx),
             AdjustScope::PageOverride
         ));
+    }
+
+    /// favorite_params 行の有無だけから独自標準の ON/OFF を導出する。
+    #[test]
+    fn favorite_default_presence_derives_on_off_scope() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("fav".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        app.settings.global_preset = params_with_brightness(5.0);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        assert_eq!(app.effective_params(idx).brightness, 5.0);
+        assert!(matches!(app.resolve_adjust_scope(idx), AdjustScope::Global));
+
+        app.adjustment_favorite_params
+            .insert(favorite_id, params_with_brightness(20.0));
+        assert_eq!(app.effective_params(idx).brightness, 20.0);
+        assert!(
+            matches!(app.resolve_adjust_scope(idx), AdjustScope::FavoriteDefault(id) if id == favorite_id)
+        );
+    }
+
+    /// 内側のお気に入りが OFF なら透過し、外側で最も近い ON の標準を使う。
+    #[test]
+    fn nested_off_favorite_falls_through_to_outer_on_default() {
+        let mut app = setup_app();
+        let outer = FavoriteEntry::new("outer".to_string(), PathBuf::from("C:/pics"));
+        let outer_id = outer.id;
+        let inner = FavoriteEntry::new("inner".to_string(), PathBuf::from("C:/pics/AI"));
+        let inner_id = inner.id;
+        app.settings.favorites.extend([outer, inner]);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_favorite_params
+            .insert(outer_id, params_with_brightness(20.0));
+        let idx = push_image(&mut app, "C:/pics/AI/a.jpg");
+
+        assert_eq!(app.current_favorite_id_for_idx(idx), Some(inner_id));
+        assert_eq!(app.active_favorite_default_id_for_idx(idx), Some(outer_id));
+        assert_eq!(app.effective_params(idx).brightness, 20.0);
+        assert!(
+            matches!(app.resolve_adjust_scope(idx), AdjustScope::FavoriteDefault(id) if id == outer_id)
+        );
+    }
+
+    /// 内側も ON なら、従来どおり最も深いお気に入り標準が勝つ。
+    #[test]
+    fn nested_on_favorite_wins_over_outer_on_default() {
+        let mut app = setup_app();
+        let outer = FavoriteEntry::new("outer".to_string(), PathBuf::from("C:/pics"));
+        let outer_id = outer.id;
+        let inner = FavoriteEntry::new("inner".to_string(), PathBuf::from("C:/pics/AI"));
+        let inner_id = inner.id;
+        app.settings.favorites.extend([outer, inner]);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_favorite_params
+            .insert(outer_id, params_with_brightness(20.0));
+        app.adjustment_favorite_params
+            .insert(inner_id, params_with_brightness(30.0));
+        let idx = push_image(&mut app, "C:/pics/AI/a.jpg");
+
+        assert_eq!(app.active_favorite_default_id_for_idx(idx), Some(inner_id));
+        assert_eq!(app.effective_params(idx).brightness, 30.0);
+        assert_eq!(
+            app.favorite_default_fallback_after_clear_for_idx(idx, inner_id)
+                .brightness,
+            20.0
+        );
+        assert!(
+            matches!(app.resolve_adjust_scope(idx), AdjustScope::FavoriteDefault(id) if id == inner_id)
+        );
+    }
+
+    /// お気に入りの祖先を持たないページは共通標準を使う。
+    #[test]
+    fn page_outside_favorites_uses_global_default() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("fav".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        app.adjustment_favorite_params
+            .insert(favorite_id, params_with_brightness(20.0));
+        app.settings.global_preset = params_with_brightness(7.0);
+        let idx = push_image(&mut app, "C:/other/a.jpg");
+
+        assert_eq!(app.effective_params(idx).brightness, 7.0);
+        assert!(matches!(app.resolve_adjust_scope(idx), AdjustScope::Global));
+    }
+
+    /// 無補正かつ共通標準と同値でも、favorite_params 行は明示解除まで ON のまま残る。
+    #[test]
+    fn identity_favorite_default_row_survives_until_cleared() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("fav".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        app.set_favorite_default(favorite_id, AdjustParams::default());
+
+        assert!(app.adjustment_favorite_params.contains_key(&favorite_id));
+        assert!(
+            matches!(app.resolve_adjust_scope(idx), AdjustScope::FavoriteDefault(id) if id == favorite_id)
+        );
+
+        app.clear_favorite_default(favorite_id);
+        assert!(!app.adjustment_favorite_params.contains_key(&favorite_id));
+        assert!(matches!(app.resolve_adjust_scope(idx), AdjustScope::Global));
+    }
+
+    /// 最近祖先の ON お気に入り標準よりページ個別が常に優先される。
+    #[test]
+    fn page_override_beats_nearest_on_favorite_default() {
+        let mut app = setup_app();
+        let favorite = FavoriteEntry::new("fav".to_string(), PathBuf::from("C:/pics"));
+        let favorite_id = favorite.id;
+        app.settings.favorites.push(favorite);
+        app.adjustment_favorite_params
+            .insert(favorite_id, params_with_brightness(20.0));
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(40.0));
+
+        assert_eq!(app.effective_params(idx).brightness, 40.0);
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::PageOverride
+        ));
+    }
+
+    /// 外側 ON の AI 設定変更は、内側 OFF を透過して継承するページも無効化対象にする。
+    #[test]
+    fn outer_favorite_ai_change_invalidates_nested_off_descendant() {
+        let mut app = setup_app();
+        let outer = FavoriteEntry::new("outer".to_string(), PathBuf::from("C:/pics"));
+        let outer_id = outer.id;
+        let inner = FavoriteEntry::new("inner".to_string(), PathBuf::from("C:/pics/AI"));
+        app.settings.favorites.extend([outer, inner]);
+        let mut old_outer = AdjustParams::default();
+        old_outer.upscale_model = Some("auto".to_string());
+        app.adjustment_favorite_params.insert(outer_id, old_outer);
+        let idx = push_image(&mut app, "C:/pics/AI/a.jpg");
+        app.ai_upscale_failed.insert((idx, 0));
+        app.ai_upscale_failed.insert((idx, 1));
+
+        let mut new_outer = AdjustParams::default();
+        new_outer.denoise_model = Some("auto".to_string());
+        app.set_favorite_default(outer_id, new_outer);
+
+        assert!(!app.ai_upscale_failed.contains(&(idx, 0)));
+        assert!(!app.ai_upscale_failed.contains(&(idx, 1)));
+    }
+
+    /// 共通標準の AI 設定を変えても、外側 ON を継承する内側 OFF 配下は影響を受けない。
+    #[test]
+    fn global_ai_change_keeps_nested_on_favorite_descendant_cache() {
+        let mut app = setup_app();
+        let outer = FavoriteEntry::new("outer".to_string(), PathBuf::from("C:/pics"));
+        let outer_id = outer.id;
+        let inner = FavoriteEntry::new("inner".to_string(), PathBuf::from("C:/pics/AI"));
+        app.settings.favorites.extend([outer, inner]);
+        let mut outer_params = AdjustParams::default();
+        outer_params.upscale_model = Some("auto".to_string());
+        app.adjustment_favorite_params
+            .insert(outer_id, outer_params);
+        let idx = push_image(&mut app, "C:/pics/AI/a.jpg");
+        app.ai_upscale_failed.insert((idx, 0));
+        app.ai_upscale_failed.insert((idx, 1));
+
+        let mut new_global = AdjustParams::default();
+        new_global.denoise_model = Some("auto".to_string());
+        app.copy_params_to_global(new_global);
+
+        assert!(app.ai_upscale_failed.contains(&(idx, 0)));
+        assert!(app.ai_upscale_failed.contains(&(idx, 1)));
     }
 
     /// set_favorite_default 直後に、ちょうど同じ値の個別設定を持っていたページは
@@ -9864,7 +10162,7 @@ mod favorite_adjustment_defaults_tests {
         );
         assert_eq!(
             toast_text(&app),
-            "[スロット1:Std → 標準設定 (他1枚は個別設定のまま)]"
+            "[スロット1:Std → 標準（共通） (他1枚は個別設定のまま)]"
         );
     }
 
@@ -9882,7 +10180,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.apply_slot_to_default_scope(0);
 
-        assert_eq!(toast_text(&app), "[スロット1:Std → 標準設定]");
+        assert_eq!(toast_text(&app), "[スロット1:Std → 標準（共通）]");
     }
 
     /// 新しい標準と違う値の個別設定はそのまま残る。
@@ -10160,6 +10458,31 @@ mod favorite_adjustment_defaults_tests {
             undo_len_before,
             "no-op は積まれない"
         );
+    }
+
+    /// 標準ドラッグの途中で画面境界を跨いでも、プレビュー値を通常 API へ 1 回流し、
+    /// 新しい標準と一致した個別行の prune まで完了する。境界なので Undo は積まない。
+    #[test]
+    fn interrupted_standard_drag_persists_and_prunes_without_undo() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        let before = params_with_brightness(5.0);
+        let after = params_with_brightness(30.0);
+        app.settings.global_preset = before.clone();
+        app.adjustment_page_params.insert(idx, after.clone());
+        app.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
+            scope: AdjustmentStandardScope::Global,
+            before,
+        });
+        // ドラッグ中のプレビュー書き込み (まだ settings.save / prune 前)。
+        app.settings.global_preset = after;
+
+        app.clear_meta_undo();
+
+        assert!(app.adjustment_standard_drag_session.is_none());
+        assert_eq!(app.settings.global_preset.brightness, 30.0);
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+        assert_eq!(app.meta_undo.undo_len(), 0);
     }
 
     /// Codex P2 #1 回帰: グリッド Ctrl+1〜0 のスロット一括適用 (`apply_slot_to_grid_selection`)
@@ -11419,6 +11742,184 @@ mod favorite_adjustment_defaults_tests {
         app.fs_vertical_scroll = 37.0;
         app.reanchor_continuous_reading_after_view_trim_change(0);
         assert_eq!(app.fs_vertical_scroll, 37.0);
+    }
+
+    #[test]
+    fn view_trim_hydration_uses_exact_page_keys_when_container_alias_differs() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
+
+        let mut app = setup_app();
+        // 実機で確認された形: 本は WSL / ライブラリ側の別名、列挙済み PdfPage は
+        // Windows 実体ドライブを持つ。この2つを prefix 比較してはいけない。
+        app.current_folder = Some(std::path::PathBuf::from(
+            "/home/scan/comic/aliased-book.pdf",
+        ));
+        app.items.push(GridItem::PdfPage {
+            pdf_path: std::path::PathBuf::from(r"D:\home\scan\comic\aliased-book.pdf"),
+            page_num: 7,
+            content_type: None,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        let saved = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.137,
+            top: 0.02,
+            ..Default::default()
+        });
+        app.persist_view_trim_page_override(0, saved);
+
+        app.view_trim_page_overrides.clear();
+        app.hydrate_view_trim_page_overrides_for_current_items();
+
+        assert_eq!(app.view_trim_page_overrides.get(&0), Some(&saved));
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        // 再水和した enabled 行は一時的な選択操作を待たず、そのページの手動設定になる。
+        assert_eq!(
+            app.effective_view_trim_apply_mode_for_idx(0),
+            crate::view_trim::ViewTrimApplyMode::Page
+        );
+        assert_eq!(app.view_trim_single_bbox(0), saved.bbox());
+    }
+
+    #[test]
+    fn manual_view_trim_resolves_each_page_after_navigation_and_in_continuous_reading() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+
+        let mut app = setup_app();
+        for name in ["page-0.jpg", "page-1.jpg"] {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{name}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        let book_margins = ViewTrimMargins {
+            left: 0.02,
+            ..Default::default()
+        };
+        let page_override = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.13,
+            top: 0.04,
+            ..Default::default()
+        });
+        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_settings.enabled = true;
+        app.view_trim_book_settings.single = book_margins;
+        app.view_trim_page_overrides.insert(0, page_override);
+
+        app.fullscreen_idx = Some(0);
+        assert_eq!(
+            app.effective_view_trim_apply_mode_for_idx(0),
+            ViewTrimApplyMode::Page
+        );
+        assert_eq!(app.view_trim_single_content_bbox(0), page_override.bbox());
+
+        app.fullscreen_idx = Some(1);
+        assert_eq!(
+            app.effective_view_trim_apply_mode_for_idx(1),
+            ViewTrimApplyMode::Book
+        );
+        assert_eq!(app.view_trim_single_content_bbox(1), book_margins.bbox());
+
+        // 旧仕様と違い、ページ0へ戻ったときもスコープ選択なしで個別値が復元される。
+        app.fullscreen_idx = Some(0);
+        assert_eq!(app.view_trim_single_content_bbox(0), page_override.bbox());
+        // 連結読みで同時に解決されても、各 idx は個別行の有無を別々に見る。
+        assert_eq!(app.view_trim_single_content_bbox(1), book_margins.bbox());
+    }
+
+    #[test]
+    fn non_manual_view_trim_modes_ignore_page_overrides() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/page.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.view_trim_page_overrides.insert(
+            0,
+            ViewTrimPageOverride::from_margins(ViewTrimMargins {
+                left: 0.17,
+                ..Default::default()
+            }),
+        );
+
+        for mode in [ViewTrimApplyMode::None, ViewTrimApplyMode::Auto] {
+            app.view_trim_apply_mode = mode;
+            assert_eq!(app.effective_view_trim_apply_mode_for_idx(0), mode);
+            assert_eq!(app.view_trim_single_bbox(0), None);
+        }
+    }
+
+    #[test]
+    fn manual_spread_resolves_one_sided_override_and_book_fallback() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::view_trim::{
+            ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide,
+        };
+
+        let mut app = setup_app();
+        for name in ["left.jpg", "right.jpg"] {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{name}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        let left_override = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.11,
+            ..Default::default()
+        });
+        let right_book = ViewTrimMargins {
+            right: 0.06,
+            ..Default::default()
+        };
+        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_settings.enabled = true;
+        app.view_trim_book_settings.spread_separate = true;
+        app.view_trim_book_settings.spread_right = right_book;
+        app.view_trim_page_overrides.insert(0, left_override);
+
+        assert_eq!(
+            app.view_trim_spread_bbox(0, ViewTrimSpreadSide::Left),
+            left_override.spread_bbox(ViewTrimSpreadSide::Left)
+        );
+        assert_eq!(
+            app.view_trim_spread_bbox(1, ViewTrimSpreadSide::Right),
+            right_book.bbox()
+        );
+    }
+
+    #[test]
+    fn selecting_book_removes_persisted_page_override() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::ui_fullscreen::SpreadPair;
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
+
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/page.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let page_override = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            top: 0.09,
+            ..Default::default()
+        });
+        let key = app.page_path_key(0).unwrap();
+        app.view_trim_page_overrides.insert(0, page_override);
+        app.persist_view_trim_page_override(0, page_override);
+
+        app.remove_view_trim_page_overrides_for_spread(0, SpreadPair::Single);
+
+        assert!(!app.view_trim_page_overrides.contains_key(&0));
+        assert!(
+            !app.view_trim_db
+                .as_ref()
+                .unwrap()
+                .load_page_overrides_many(&[key.as_str()])
+                .contains_key(&key)
+        );
     }
 
     #[test]
@@ -17933,26 +18434,25 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn remove_items_batch_shifts_view_trim_page_apply_root_idx() {
+    fn remove_items_batch_shifts_view_trim_page_overrides() {
         let mut app = setup_app();
         let a = push_image(&mut app, "C:/p/a.jpg");
         let b = push_image(&mut app, "C:/p/b.jpg");
         let c = push_image(&mut app, "C:/p/c.jpg");
         assert_eq!((a, b, c), (0, 1, 2));
 
-        app.view_trim_page_apply_root_idx = Some(c);
-        app.remove_items_batch(&[b]);
-        assert_eq!(
-            app.view_trim_page_apply_root_idx,
-            Some(1),
-            "削除位置より後ろの一時適用 root idx は新 idx へ shift される"
+        let page_override = crate::view_trim::ViewTrimPageOverride::from_margins(
+            crate::view_trim::ViewTrimMargins {
+                left: 0.08,
+                ..Default::default()
+            },
         );
+        app.view_trim_page_overrides.insert(c, page_override);
+        app.remove_items_batch(&[b]);
+        assert_eq!(app.view_trim_page_overrides.get(&1), Some(&page_override));
 
         app.remove_items_batch(&[1]);
-        assert_eq!(
-            app.view_trim_page_apply_root_idx, None,
-            "一時適用中ページ自体が削除されたら root idx はクリアされる"
-        );
+        assert!(app.view_trim_page_overrides.is_empty());
     }
 
     /// フォルダ / snapshot rehydrate ではグリッドの `局` バッジ用 key 集合だけを復元し、
@@ -41419,7 +41919,7 @@ fn fullscreen_file_change_resets_left_and_right_click_panels() {
 }
 
 #[test]
-fn continuous_reanchor_preserves_left_and_right_panels_and_persists_trim() {
+fn continuous_reanchor_preserves_panels_and_page_trim_override() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let first = app.items.len();
@@ -41433,6 +41933,12 @@ fn continuous_reanchor_preserves_left_and_right_panels_and_persists_trim() {
     app.fullscreen_idx = Some(first);
     app.adjustment_mode = true;
     app.fs_click_info_open = true;
+    let page_override =
+        crate::view_trim::ViewTrimPageOverride::from_margins(crate::view_trim::ViewTrimMargins {
+            left: 0.07,
+            ..Default::default()
+        });
+    app.view_trim_page_overrides.insert(first, page_override);
     app.view_trim_save_pending = true;
     app.fs_vertical_scroll = 125.0;
 
@@ -41443,7 +41949,34 @@ fn continuous_reanchor_preserves_left_and_right_panels_and_persists_trim() {
     assert!(app.adjustment_mode);
     assert!(app.fs_click_info_open);
     assert!(app.metadata_panel_click_shown());
+    // 旧仕様の一時スコープは移動時に消えたが、個別行はページへ戻るため保持する。
+    assert_eq!(
+        app.view_trim_page_overrides.get(&first),
+        Some(&page_override)
+    );
     assert!(!app.view_trim_save_pending);
+}
+
+#[test]
+fn file_change_persists_trim_when_panel_is_hidden_and_keeps_page_override() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::new()));
+    app.fullscreen_idx = Some(idx);
+    app.adjustment_mode = false;
+    let page_override =
+        crate::view_trim::ViewTrimPageOverride::from_margins(crate::view_trim::ViewTrimMargins {
+            top: 0.05,
+            ..Default::default()
+        });
+    app.view_trim_page_overrides.insert(idx, page_override);
+    app.view_trim_save_pending = true;
+
+    app.reset_fs_side_panel_runtime_for_file_change();
+
+    assert!(!app.view_trim_save_pending);
+    assert_eq!(app.view_trim_page_overrides.get(&idx), Some(&page_override));
+    assert!(!app.adjustment_mode);
 }
 
 #[test]
