@@ -50,6 +50,8 @@ const SELECTION_INFO_BAR_CONTENT_HEIGHT: f32 = 58.0;
 const DETAILS_BEST_FIT_ROWS_PER_FRAME: usize = 192;
 const DETAILS_BEST_FIT_HORIZONTAL_PADDING: f32 = 14.0;
 const DETAILS_BEST_FIT_MAX_WIDTH: f32 = 800.0;
+const DETAILS_RATING_BEST_FIT_SEED: &str = "★★★★★";
+const DETAILS_STATE_BEST_FIT_SEED: &str = "補 レ 消 隠 文 回 ピ";
 // ScrollArea 本体の外にある popup frame と、上下の配置余白を合わせて確保する。
 const DETAILS_COLUMN_MENU_SCREEN_MARGIN: f32 = 48.0;
 const DETAILS_COLUMN_MENU_COLUMNS_WIDTH: f32 = 240.0;
@@ -1320,16 +1322,20 @@ impl DetailsColumn {
     }
 
     fn default_width(self) -> f32 {
+        // `egui_kittest` で本体の既定フォント (Yu Gothic Medium) を入れ、100% scale の
+        // Body text を実測した固定シード幅 + DETAILS_BEST_FIT_HORIZONTAL_PADDING の ceil。
+        // Rating: 65 + 14 = 79、State: 113 + 14 = 127。バッジ種別を増やした場合は
+        // DETAILS_STATE_BEST_FIT_SEED とこの既定幅を必ず一緒に見直す。
         match self {
             Self::Preview => 34.0,
             Self::Name => 140.0,
-            Self::Rating => 58.0,
+            Self::Rating => 79.0,
             Self::Tags => 160.0,
             Self::Kind => 96.0,
             Self::PageCount => 80.0,
             Self::Size => 92.0,
             Self::Modified | Self::Created => 138.0,
-            Self::State => 92.0,
+            Self::State => 127.0,
             Self::ImageDimensions => 108.0,
             Self::VideoDuration => 94.0,
             Self::VideoDimensions => 112.0,
@@ -12629,13 +12635,13 @@ impl App {
             DetailsColumn::Rating => {
                 widest = widest.max(Self::details_best_fit_measure(
                     ui,
-                    "★★★★★".to_owned(),
+                    DETAILS_RATING_BEST_FIT_SEED.to_owned(),
                     key.body_font.clone(),
                 ));
                 false
             }
             DetailsColumn::State => {
-                for sample in ["補 レ 消 隠 文 回 ピ", "9999 / 9999", "未読"] {
+                for sample in [DETAILS_STATE_BEST_FIT_SEED, "9999 / 9999", "未読"] {
                     widest = widest.max(Self::details_best_fit_measure(
                         ui,
                         sample.to_owned(),
@@ -15292,7 +15298,7 @@ mod book_reorder_drag_tests {
 #[cfg(test)]
 mod compute_cell_size_tests {
     use super::*;
-    use crate::app::setup_app_for_test;
+    use crate::app::{GridEditBadges, setup_app_for_test};
 
     #[test]
     fn selected_ui_scale_menu_button_stays_on_one_row_in_a_narrow_popup() {
@@ -15372,6 +15378,28 @@ mod compute_cell_size_tests {
             measured_rows: 0,
             batches: 0,
         }
+    }
+
+    #[test]
+    fn details_fixed_best_fit_seeds_track_bounded_markers() {
+        let GridEditBadges {
+            page_override,
+            local_adjust,
+            mask,
+            conceal,
+            comic,
+            rotation,
+        } = GridEditBadges::default();
+        let edit_badge_field_count =
+            [page_override, local_adjust, mask, conceal, comic, rotation].len();
+        let pin_badge_count = 1;
+
+        assert_eq!(
+            DETAILS_STATE_BEST_FIT_SEED.split_whitespace().count(),
+            edit_badge_field_count + pin_badge_count,
+            "バッジ種別を増減したら状態列のシード文字列と既定幅を一緒に見直す"
+        );
+        assert_eq!(DETAILS_RATING_BEST_FIT_SEED.chars().count(), 5);
     }
 
     #[test]
