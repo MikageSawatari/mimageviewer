@@ -2427,6 +2427,37 @@ fn draw_book_reorder_insert_indicator(ui: &egui::Ui, x: f32, rect: egui::Rect) {
     painter.line_segment([egui::pos2(x - cap, y1), egui::pos2(x + cap, y1)], stroke);
 }
 
+fn details_text_is_right_aligned(align: egui::Align2) -> bool {
+    matches!(
+        align,
+        egui::Align2::RIGHT_TOP | egui::Align2::RIGHT_CENTER | egui::Align2::RIGHT_BOTTOM
+    )
+}
+
+fn details_text_clip_rect(
+    clip: egui::Rect,
+    align: egui::Align2,
+    pixels_per_point: f32,
+) -> Option<egui::Rect> {
+    if clip.width() <= 1.0 {
+        return None;
+    }
+    if details_text_is_right_aligned(align) {
+        // The right-aligned anchor stays at the padded column edge, but text and scissor
+        // rounding can otherwise clip its last glyph. Left-aligned text has no reported
+        // issue, so only give the right clip edge one physical pixel of rounding room.
+        Some(egui::Rect::from_min_max(
+            clip.min,
+            egui::pos2(
+                clip.right() + 1.0 / normalized_pixels_per_point(pixels_per_point),
+                clip.bottom(),
+            ),
+        ))
+    } else {
+        Some(clip)
+    }
+}
+
 fn draw_details_text(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -2439,13 +2470,10 @@ fn draw_details_text(
         return;
     }
     let clip = rect.shrink2(egui::vec2(6.0, 1.0));
-    if clip.width() <= 1.0 {
+    let Some(text_clip) = details_text_clip_rect(clip, align, ui.ctx().pixels_per_point()) else {
         return;
-    }
-    let x = if matches!(
-        align,
-        egui::Align2::RIGHT_TOP | egui::Align2::RIGHT_CENTER | egui::Align2::RIGHT_BOTTOM
-    ) {
+    };
+    let x = if details_text_is_right_aligned(align) {
         clip.right()
     } else {
         clip.left()
@@ -2455,13 +2483,50 @@ fn draw_details_text(
     } else {
         egui::TextStyle::Body.resolve(ui.style())
     };
-    ui.painter().with_clip_rect(clip).text(
+    ui.painter().with_clip_rect(text_clip).text(
         egui::pos2(x, clip.center().y),
         align,
         text,
         font,
         color,
     );
+}
+
+#[cfg(test)]
+mod details_text_clip_tests {
+    use super::*;
+
+    #[test]
+    fn right_aligned_clip_adds_one_physical_pixel() {
+        let clip = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 40.0));
+        for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+            let text_clip =
+                details_text_clip_rect(clip, egui::Align2::RIGHT_CENTER, pixels_per_point)
+                    .expect("wide clip should be drawable");
+            assert_eq!(text_clip.min, clip.min);
+            assert!((text_clip.right() - clip.right() - 1.0 / pixels_per_point).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn left_aligned_clip_is_unchanged() {
+        let clip = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 40.0));
+        assert_eq!(
+            details_text_clip_rect(clip, egui::Align2::LEFT_CENTER, 1.0),
+            Some(clip)
+        );
+    }
+
+    #[test]
+    fn tiny_clip_is_not_drawn() {
+        for width in [0.0_f32, 0.5, 1.0] {
+            let clip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 20.0));
+            assert_eq!(
+                details_text_clip_rect(clip, egui::Align2::RIGHT_CENTER, 1.0),
+                None
+            );
+        }
+    }
 }
 
 fn draw_details_preview_icon(
