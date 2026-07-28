@@ -321,6 +321,28 @@ first_choice のまま描画してクリップされる) ため、下端の項�
 
 `htdocs/mimageviewer/manual/grid.html` に列設定メニューの説明があれば表現を合わせる。
 
+### 実機フィードバック後の補正 (2026-07-28)
+
+最初の 2 列化では、実機で popup がウィンドウ右端まで広がり、左列だけが縦 1 列で見え、
+右列が画面外へ押し出された。原因は egui 0.33.3 のメニュー popup が
+`Layout::top_down_justified(Align::Min)` を使う一方、`ScrollArea` 直下の `ui.horizontal` と
+その中の `ui.vertical` に列幅を指定していなかったことにある。`ScrollArea` の content UI は
+popup の利用可能幅をそのまま受け、左列内の `ui.separator()` がその `max_rect` 全幅を実使用幅に
+確定した。その後ろへ右列を置くため、popup 自身もさらに広がるレイアウトになっていた。
+
+対処は、`ui.horizontal_top` の中で左列を 240px、右列を 200px の
+`allocate_ui_with_layout(..., Layout::top_down(Align::Min), ...)` に分け、各 child UI にも同じ
+固定幅を設定すること。これにより各列は justified でない独立した `max_rect` を持ち、列内の
+区切り線も各列幅で止まる。`ScrollArea` は内容幅へ shrink するため、popup 全体も 2 列 + 中央の
+区切り線と spacing の幅に収まる。左右で高さが違っても上端は揃う。
+
+番人として
+`details_column_context_menu_layout_tests::menu_width_is_bounded_and_columns_are_side_by_side`
+を追加した。egui_kittest で 1200px の `top_down_justified` 親 UI を再現し、メニュー本体が
+500px 以下、左右が 240px / 200px、上端揃え、x 範囲が非重複、右列がメニュー矩形内であることを
+実測する。列幅を外して利用可能幅へ追従すると、今回と同じく左列が 1200px 側へ伸び、このテストが
+失敗する。S6 で同じメニューを分岐するときも、メニュー直下の利用可能幅を列 UI へ渡さないこと。
+
 ---
 
 ## S6. 下部情報バーの表示項目をサムネイル表示 / 詳細表示で分ける
