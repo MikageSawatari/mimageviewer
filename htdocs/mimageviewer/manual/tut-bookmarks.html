@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ブックマークで続きから戻る — チュートリアル — mImageViewer</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="本の途中のページや、動画・音声の再生位置に目印を付けて、あとから続きへ戻る方法。種類をまたいだブックマーク一覧の使い方も。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/tut-bookmarks.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/tut-bookmarks.html">
+  <meta property="og:title" content="ブックマークで続きから戻る｜mImageViewer">
+  <meta property="og:description" content="本の途中のページや、動画・音声の再生位置に目印を付けて、あとから続きへ戻る方法。種類をまたいだブックマーク一覧の使い方も。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="ブックマークで続きから戻る｜mImageViewer">
+  <meta name="twitter:description" content="本の途中のページや、動画・音声の再生位置に目印を付けて、あとから続きへ戻る方法。種類をまたいだブックマーク一覧の使い方も。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>ブックマークで続きから戻る</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">ブックマークで続きから戻る</h1>
+    <p class="page-desc">
+      本の途中のページや、動画・音声の再生位置に目印を付けておける機能です。
+      タグや★が「ファイルを選ぶ」ための印なのに対し、ブックマークは「<strong>その位置に戻る</strong>」ための印です。
+      付けたものは種類をまたいだ 1 つの一覧に集まるので、読みかけ・見かけをまとめて確認できます。
+    </p>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        「前回どこまで読んだか」は本ごとに自動で記録されるので、単に続きから読むだけならブックマークは要りません
+        （開いたときに続きへ戻すか先頭から開くかは、環境設定の「ライブラリ → 履歴と復元」で選べます）。
+        ブックマークは<strong>あとで見返したい場面を、自分で選んで残しておく</strong>ためのものです。
+        1 冊の中に何か所でも付けられます。
+      </div>
+    </div>
+
+    <h2>本のページに目印を付ける</h2>
+    <p>
+      本をフルスクリーンで読んでいるときに <kbd>B</kbd> を押すと、いま表示している基準ページが登録されます。
+      同じページを二重に登録することはありません。対象は ZIP / CBZ / PDF、対応アーカイブ、製本した本、
+      そして「画像のみのフォルダを本として扱う」が有効な画像フォルダです。
+    </p>
+    <p>
+      左パネルの<strong>「ブックマーク」タブ</strong>でも同じことができます。上部の 🔖 ボタンで現在ページを登録し、
+      登録済みのページはサムネイル付きで並びます。行を選ぶとそのページへ移動し、
+      <strong>「名前を編集」</strong>で「お気に入りページ」のような名前を付けられます。
+    </p>
+
+    <figure class="tut-shot">
+      <img src="images/tut-bookmarks-1.webp" alt="ZIP で開いた本のフルスクリーン表示。左パネルの「ブックマーク」タブ（赤枠）に「この本のブックマーク 1 件」と追加ボタンがあり、その下に「お気に入りページ / 3 ページ / 003.jpg」のサムネイル付き項目と「名前を編集」「削除」ボタンが並んでいる">
+      <figcaption>左パネルの「ブックマーク」タブ（赤枠）。右上の 🔖 で現在ページを登録し、登録済みの行を選ぶとそのページへ移動します。「削除」で消えるのはブックマークだけで、ページや画像は残ります。</figcaption>
+    </figure>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        画像フォルダの本では、ページ番号ではなく<strong>ファイル名</strong>を記録します。あとから画像を足したり消したりして
+        ページ番号がずれても、同じ画像を探し当てます。見開き表示や連結読みでは、シークバーが示す基準ページが 1 件登録されます。
+      </div>
+    </div>
+
+    <h2>動画・音声の再生位置に目印を付ける</h2>
+    <p>
+      動画と音声でも同じ <kbd>B</kbd> キー、または左のジャンプパネルの 🔖 ボタンで、現在の再生位置を登録できます。
+      登録した位置へは <kbd>J</kbd> / <kbd>K</kbd> で前後にジャンプできます。
+    </p>
+    <p>
+      動画側の使い方（ジャンプパネル、チャプターやピン留めとの違い）は
+      <a href="tut-video-power.html">動画を使いこなす</a>で詳しく説明しています。
+    </p>
+
+    <h2>種類をまたいで見返す — ブックマーク一覧</h2>
+    <p>
+      フォルダバーの<strong>「場所▼」→「ブックマーク」</strong>を選ぶと、動画・音声・本に付けたブックマークが
+      置き場所に関係なく 1 つの一覧に集まります。1 ブックマークが 1 項目として並ぶので、
+      通常のサムネイル一覧と同じ感覚で扱えます。
+    </p>
+    <ul>
+      <li>ダブルクリックまたは <kbd>Enter</kbd> で、動画・音声は<strong>登録時刻から再生</strong>、本は<strong>登録ページ</strong>を開きます</li>
+      <li>絞り込みバーの「ブックマーク種別」で「すべて / 動画 / 音声 / 本」を切り替えられます。本はさらに「画像フォルダ / ZIP・CBZ / PDF / その他アーカイブ」で絞れます</li>
+      <li>並び順の既定は<strong>登録日時の新しい順</strong>です</li>
+      <li>名前を付けたブックマークは、サムネイルの中央にその名前が表示されます</li>
+      <li><kbd>Delete</kbd> や右クリックの削除で消えるのは<strong>ブックマークだけ</strong>で、元の動画・音声・本は削除されません</li>
+      <li>元ファイルが一時的に見つからない項目は「見つかりません」と表示されたまま残ります（外付けドライブを外しているときなど）</li>
+    </ul>
+
+    <figure class="tut-shot">
+      <img src="images/tut-bookmarks-2.webp" alt="ブックマーク一覧を開いたメイン画面。フォルダ欄が「ブックマーク」になり、絞り込みバーに「ブックマーク種別: すべて」「本: すべて」がある。一覧には再生位置 0:04 の動画ブックマークと、P.3 の本のページブックマーク（中央に「お気に入りページ」の名前）が並び、下部に選択中の動画ブックマークの位置・登録日時・長さが表示されている">
+      <figcaption>「場所▼」→「ブックマーク」で開いた一覧。動画の再生位置（左）と本のページ（右）が同じ一覧に並びます。サムネイル左上のバッジが再生位置やページ番号、中央の文字が付けた名前です。</figcaption>
+    </figure>
+
+    <h2>★・タグとの使い分け</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th></th><th>印を付ける対象</th><th>向いている用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ブックマーク</td><td>本のページ / 再生位置</td><td>「あの場面にもう一度」「この続きから」</td></tr>
+          <tr><td>レーティング（★）</td><td>ファイル・フォルダ</td><td>良し悪しで段階を付けて選び出す</td></tr>
+          <tr><td>タグ</td><td>ファイル</td><td>内容で分類して探し出す</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      同じファイルにブックマークと★とタグを同時に付けても、互いに干渉しません。
+      「★を付けた本の、この 3 ページ」といった組み合わせもそのまま使えます。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        ブックマークの詳しい仕様は<a href="books.html">製本・本棚</a>リファレンスの「ページをブックマークする」と
+        <a href="grid.html">グリッド表示</a>リファレンスの「ブックマーク一覧」に、動画側は
+        <a href="video.html">動画再生</a>にまとまっています。キー割り当ての変更は
+        <a href="settings.html">設定リファレンス</a>の操作カスタマイズから行えます。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
