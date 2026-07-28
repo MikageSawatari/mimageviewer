@@ -296,7 +296,37 @@ stale なまま返してしまう** (= 動画切替直後に前動画のフレ�
 `texture_gen` が必ず異なるので、別エントリとして開き直す。これは `fence` 側の `fence_gen`
 (同じ handle 値再利用問題への既存対策) と完全に同じ思想。
 
-#### present 済みフレームの遅延解放 (`present_retire`)
+#### native output の最新フレーム所有 (`FramePresentationState`)
+
+`run_native_video_output` は最近のフレームを次の単一 typed state で所有する。
+
+- `Empty`: 再利用できるフレームがない
+- `Hidden { frame }`: presenter 非表示中に選択した未提示フレーム、または hide 前の
+  re-arm 済みフレーム。hidden 中は grade 変更でも present しない
+- `Visible { frame, fence }`: 最後に表示し、再提示できるよう同期済みのフレーム。
+  `fence` はこの frame が別フレームに置換されて retire へ移るときに使う
+
+`source.queue` は時刻選択前の未提示フレームだけを保持し、`present_retire` は廃棄待ちだけを
+保持する。grade 変更の再提示と placement rebuild の prime は `Visible` / `Hidden` を使い、
+`present_retire` を「最後に表示したフレーム」として参照しない。新フレームの提示成功時は旧
+`Visible` を retire へ移し、新フレームを `Visible` にする。source switch / close でも同じ
+state を drain し、別 source の最近フレームを fallback に残さない。
+
+GPU decode frame は producer が `ReleaseSync(1)` で reader へ渡し、presenter が
+`AcquireSync(1)` → コピー → `ReleaseSync(0)` で writer key へ戻す。そのままでは同じ frame を
+再提示できないため、native output context は **present 成功直後に** frame 側 keyed mutex で
+`AcquireSync(0)` → `ReleaseSync(1)` を行って reader key=1 へ再 arm する。再 arm 成功済みの
+frame だけを `Visible` に保持する。再 arm に失敗した frame は `Visible` として公開せず retire
+へ送り、placement / grade fallback が非再利用フレームを選ばない不変条件を守る。CPU frame は
+keyed mutex を持たないため再 arm 不要で、同じ typed state に入る。
+
+grade command は前回 snapshot と render に影響する adjustment / 選択 LUT を比較し、差分があり
+かつ state が `Visible` のときだけ 1 回再提示する。`Empty` / `Hidden` と同一 grade では要求を
+立てないため、一時停止中に無条件の present / repaint loop は発生しない。通常 fullscreen と
+detached の可視 presenter は native output thread の同じ処理を通り、App-global な再提示 flag は
+持たない。
+
+#### 置換済みフレームの遅延解放 (`present_retire`)
 
 presenter の `CopySubresourceRegion` は **非同期** (GPU コマンドキューに積むだけ) なので、
 `present` 直後に `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot の `in_use` が
@@ -304,8 +334,9 @@ presenter の `CopySubresourceRegion` は **非同期** (GPU コマンドキュ�
 GPU コピーがまだ source texture を読み終えていないと、別フレームの内容が混入する
 (2026-05-15、別動画フレームの 1 枚混入)。
 
-対策として `run_native_video_output` は present 済みの `VideoFrame` を即 drop せず、
-`present_retire` リングバッファに `(VideoFrame, copy_fence_value)` で保持する。presenter は
+対策として `run_native_video_output` は新 `Visible` に置換された旧 `VideoFrame` を即 drop せず、
+廃棄待ち専用の `present_retire` リングバッファに `(VideoFrame, copy_fence_value)` で保持する。
+presenter は
 自前の `ID3D11Fence` (`copy_fence`) を持ち、`copy_frame_into_backbuffer` のコピー後に
 `Signal` して値を進める (`outcome.copy_fence_value`)。`present_retire` は
 `presenter.copy_fence_completed_value()` がその値へ到達した = **コピーが GPU 上で完了した**
@@ -316,8 +347,9 @@ fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 
 (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、深さキャップ
 `NATIVE_PRESENT_RETIRE_CAP = 4` のみで解放する (= 時間ベースに縮退、旧挙動と等価)。キャップは
 fence が万一 stall したときの上限も兼ねるが、**stall 時のフットプリント (= 共有出力プール
-16 slot のうち retire が占める数) を 4 に抑える**ことで、decoder の in-flight (~10-15) と
-合わせてもプールに余裕が残るようにしている (2026-05-15 に 8 から 4 へ縮小: cap=8 では
+16 slot のうち retire が占める数) を 4 に抑える**。typed state が最新 frame 1 slot を
+保持しても残り 11 slot を decoder / channel / source queue の in-flight に使える
+(2026-05-15 に 8 から 4 へ縮小: cap=8 では
 stall 時にプール枯渇 → CPU readback フォールバック → スパイラル悪化の実害があったため)。
 `fullscreen_present` perf イベントの `retire_queue_len` で長さを観測できる (fence が
 効いていれば通常 1〜3)。
@@ -1763,6 +1795,11 @@ D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{vi
   数百 ms の無音が入る。hide/show だけならオーディオリングは無停止。
 - **exit race を避ける**。presenter HWND を生かすことで、hide→show の順序と owner / focus guard の
   再取得を決定的に扱える。
+
+hide 中の最新映像は native output の `FramePresentationState::Hidden` が 1 枚だけ所有する。
+新フレームを選択すると旧 `Hidden` を解放し、show 時は同じ frame を present + GPU 再 arm して
+`Visible` へ移してから HWND を表示する。grade 変更は hidden 中に再提示せず、show の初回 present
+が最新 grade を使う。
 
 hide 中は HUD overlay HWND も明示 hide し、overlay tick / cursor polling / HUD raise burst を
 抑止する。音声モードの owner 同期・focus guard・`ensure_native_video_front` は

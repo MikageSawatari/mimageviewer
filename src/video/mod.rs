@@ -697,6 +697,91 @@ enum NativeVideoOutputCommand {
     },
 }
 
+/// The single owner of the most recent native-output frame.
+///
+/// `Hidden` frames have never been presented since entering hidden mode (or
+/// have been synchronously re-armed after their last presentation). `Visible`
+/// frames have likewise been re-armed and can therefore be presented again.
+/// The fence belongs to the presenter that last displayed the frame and is
+/// used only when that frame is displaced into the retire queue.
+#[cfg(any(windows, test))]
+enum FramePresentationState<F> {
+    Empty,
+    Hidden { frame: F },
+    Visible { frame: F, fence: u64 },
+}
+
+#[cfg(any(windows, test))]
+enum DisplacedPresentation<F> {
+    Hidden { frame: F },
+    Visible { frame: F, fence: u64 },
+}
+
+#[cfg(any(windows, test))]
+impl<F> FramePresentationState<F> {
+    fn replace_hidden(&mut self, frame: F) -> Option<DisplacedPresentation<F>> {
+        let previous = std::mem::replace(self, Self::Hidden { frame });
+        Self::into_displaced(previous)
+    }
+
+    fn replace_visible(&mut self, frame: F, fence: u64) -> Option<DisplacedPresentation<F>> {
+        let previous = std::mem::replace(self, Self::Visible { frame, fence });
+        Self::into_displaced(previous)
+    }
+
+    fn hide(&mut self) {
+        let previous = std::mem::replace(self, Self::Empty);
+        *self = match previous {
+            Self::Visible { frame, .. } | Self::Hidden { frame } => Self::Hidden { frame },
+            Self::Empty => Self::Empty,
+        };
+    }
+
+    fn take_frame(&mut self) -> Option<F> {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => None,
+            Self::Hidden { frame } | Self::Visible { frame, .. } => Some(frame),
+        }
+    }
+
+    fn take_visible_frame(&mut self) -> Option<F> {
+        let previous = std::mem::replace(self, Self::Empty);
+        match previous {
+            Self::Visible { frame, .. } => Some(frame),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    fn take_displaced(&mut self) -> Option<DisplacedPresentation<F>> {
+        let previous = std::mem::replace(self, Self::Empty);
+        Self::into_displaced(previous)
+    }
+
+    fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
+        render_grade_changed && matches!(self, Self::Visible { .. })
+    }
+
+    fn is_hidden(&self) -> bool {
+        matches!(self, Self::Hidden { .. })
+    }
+
+    #[cfg(test)]
+    fn is_visible(&self) -> bool {
+        matches!(self, Self::Visible { .. })
+    }
+
+    fn into_displaced(state: Self) -> Option<DisplacedPresentation<F>> {
+        match state {
+            Self::Empty => None,
+            Self::Hidden { frame } => Some(DisplacedPresentation::Hidden { frame }),
+            Self::Visible { frame, fence } => Some(DisplacedPresentation::Visible { frame, fence }),
+        }
+    }
+}
+
 #[cfg(windows)]
 struct PresenterSourceState {
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
@@ -1504,6 +1589,190 @@ fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFr
     queue.clear();
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentedFrameRearmRequirement {
+    NotRequired,
+    Required,
+    MissingKeyedMutex,
+}
+
+#[cfg(any(windows, test))]
+fn presented_frame_rearm_requirement(
+    is_gpu: bool,
+    has_keyed_mutex: bool,
+) -> PresentedFrameRearmRequirement {
+    match (is_gpu, has_keyed_mutex) {
+        (false, _) => PresentedFrameRearmRequirement::NotRequired,
+        (true, true) => PresentedFrameRearmRequirement::Required,
+        (true, false) => PresentedFrameRearmRequirement::MissingKeyedMutex,
+    }
+}
+
+#[cfg(windows)]
+fn native_rearm_presented_frame(frame: &mut VideoFrame) -> Result<(), String> {
+    match &mut frame.data {
+        VideoFrameData::Cpu(_) => {
+            debug_assert_eq!(
+                presented_frame_rearm_requirement(false, false),
+                PresentedFrameRearmRequirement::NotRequired
+            );
+            Ok(())
+        }
+        VideoFrameData::Gpu(gpu) => {
+            match presented_frame_rearm_requirement(true, gpu.shared_output_keyed_mutex.is_some()) {
+                PresentedFrameRearmRequirement::Required => gpu.rearm_presented_shared_output(),
+                PresentedFrameRearmRequirement::MissingKeyedMutex => {
+                    Err("GPU frame cannot be retained without a keyed mutex".to_string())
+                }
+                PresentedFrameRearmRequirement::NotRequired => unreachable!(),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+// Fence-stall fallback cap. The 16-slot shared pool also retains at most one
+// typed Visible/Hidden frame, so retire is bounded to four and leaves eleven
+// slots for decoder/channel/source-queue in-flight work.
+const NATIVE_PRESENT_RETIRE_CAP: usize = 4;
+
+/// Native output thread-local ownership for the current frame and frames whose
+/// asynchronous presenter copy has not yet been retired.
+///
+/// `presentation` is the only recent-frame fallback. `present_retire` never
+/// supplies frames for presentation; it only delays drop until the copy fence
+/// completes (or the bounded fallback cap is reached).
+#[cfg(windows)]
+struct NativeFrameOutputContext {
+    presentation: FramePresentationState<VideoFrame>,
+    present_retire: std::collections::VecDeque<(VideoFrame, u64)>,
+}
+
+#[cfg(windows)]
+impl NativeFrameOutputContext {
+    fn new() -> Self {
+        Self {
+            presentation: FramePresentationState::Empty,
+            present_retire: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn retire_len(&self) -> usize {
+        self.present_retire.len()
+    }
+
+    fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
+        self.presentation
+            .should_represent_for_grade_change(render_grade_changed)
+    }
+
+    fn hide(&mut self) {
+        self.presentation.hide();
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.presentation.is_hidden()
+    }
+
+    fn take_frame(&mut self) -> Option<VideoFrame> {
+        self.presentation.take_frame()
+    }
+
+    fn take_visible_frame(&mut self) -> Option<VideoFrame> {
+        self.presentation.take_visible_frame()
+    }
+
+    fn hold_hidden(&mut self, frame: VideoFrame) {
+        let displaced = self.presentation.replace_hidden(frame);
+        self.dispose_displaced(displaced);
+    }
+
+    /// Commit a successful presenter copy as the reusable visible frame.
+    ///
+    /// GPU frames are re-armed before becoming `Visible`. If re-arm fails, the
+    /// displayed frame and the previous state are both retired and the typed
+    /// state becomes `Empty`; no non-reusable GPU frame is ever advertised as
+    /// a placement/grade fallback.
+    fn commit_presented(&mut self, mut frame: VideoFrame, fence: u64) -> Result<(), String> {
+        match native_rearm_presented_frame(&mut frame) {
+            Ok(()) => {
+                let displaced = self.presentation.replace_visible(frame, fence);
+                self.dispose_displaced(displaced);
+                Ok(())
+            }
+            Err(error) => {
+                let displaced = self.presentation.take_displaced();
+                self.dispose_displaced(displaced);
+                self.present_retire.push_back((frame, fence));
+                self.enforce_retire_cap();
+                Err(error)
+            }
+        }
+    }
+
+    fn clear_current(&mut self) {
+        let displaced = self.presentation.take_displaced();
+        self.dispose_displaced(displaced);
+    }
+
+    fn retire_completed(&mut self, completed: Option<u64>) {
+        if let Some(completed) = completed {
+            while self
+                .present_retire
+                .front()
+                .is_some_and(|(_, value)| *value != 0 && *value <= completed)
+            {
+                self.present_retire.pop_front();
+            }
+        }
+        self.enforce_retire_cap();
+    }
+
+    fn invalidate_retire_fence_prefix(&mut self, count: usize) {
+        for entry in self.present_retire.iter_mut().take(count) {
+            entry.1 = 0;
+        }
+    }
+
+    fn dispose_displaced(&mut self, displaced: Option<DisplacedPresentation<VideoFrame>>) {
+        match displaced {
+            Some(DisplacedPresentation::Hidden { frame }) => {
+                native_reset_unpresented_frame(frame);
+            }
+            Some(DisplacedPresentation::Visible { frame, fence }) => {
+                self.present_retire.push_back((frame, fence));
+                self.enforce_retire_cap();
+            }
+            None => {}
+        }
+    }
+
+    fn enforce_retire_cap(&mut self) {
+        while self.present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
+            self.present_retire.pop_front();
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn video_grade_render_changed(
+    previous: &crate::creative_lut::VideoGradeSnapshot,
+    next: &crate::creative_lut::VideoGradeSnapshot,
+) -> bool {
+    if previous.adjustments != next.adjustments {
+        return true;
+    }
+    if next.adjustments.creative_lut.is_identity() {
+        return false;
+    }
+    match (&previous.lut, &next.lut) {
+        (Some(previous), Some(next)) => !std::sync::Arc::ptr_eq(previous, next),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 #[cfg(windows)]
 fn emit_native_vram_trace(
     kind: &str,
@@ -2301,32 +2570,19 @@ fn run_native_video_output(
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     let mut pending_navigation_preview_clear_at: Option<Instant> = None;
     const NAVIGATION_PREVIEW_CLEAR_DELAY: Duration = Duration::from_millis(40);
-    // present 済みの VideoFrame を遅延解放するためのリングバッファ。
-    // presenter の `CopySubresourceRegion` は非同期 (GPU に積むだけ) なので、present 直後に
-    // `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot が即 producer に再利用され、
-    // presenter 側のコピーが source texture を読み終える前に上書きされうる (= 別フレーム
-    // 混入。2026-05-15 frame 114)。
+    // native output context が最新フレームを Empty / Hidden / Visible の単一 state で所有する。
+    // Visible は present 後に keyed mutex を reader key=1 へ再 arm した再利用可能フレーム。
+    // 新しい Visible に置き換わった旧フレームだけを disposal-only の present_retire へ移す。
     //
-    // 各エントリは `(VideoFrame, copy_fence_value)`。presenter は frame コピー後に自前の
-    // copy fence を `Signal` し、その値を `outcome.copy_fence_value` で返す。ここでは
-    // `presenter.copy_fence_completed_value()` がその値へ到達した (= コピーが GPU 上で
-    // 完了した) フレームだけを解放する。これにより「presenter のコピー完了後に共有出力
-    // slot を返す」ことが保証され、時間ベースのヒューリスティックではなくなる。
+    // present_retire の各エントリは `(VideoFrame, copy_fence_value)`。presenter の copy fence
+    // 到達後だけ drop し、fence が使えない場合は bounded depth cap に縮退する。retire は
+    // grade 再提示や placement prime の入力には決して使わない。
     //
     // fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 失敗
     // (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、
     // `NATIVE_PRESENT_RETIRE_CAP` の depth キャップのみで解放する (時間ベースに縮退)。
     // キャップは fence が万一 stall したときの上限も兼ねる (= 共有プール枯渇の防止)。
-    let mut present_retire: std::collections::VecDeque<(VideoFrame, u64)> =
-        std::collections::VecDeque::new();
-    // cap は **fence stall 時のフォールバック上限**。fence が機能していれば retire は
-    // 通常 1〜3 で推移するのでこの値は影響しないが、stall すると `cap` 個の slot が
-    // 共有出力プールから占有される。プールは 24 slot、decoder in-flight が ~10-15 なので
-    // cap=4 で残 ~5-10 slot 余裕、cap=8 だと ~1-6 まで圧迫されて rapid swap 時にプール
-    // 枯渇 → CPU readback フォールバック → スパイラル悪化 (2026-05-15 報告)。
-    // 前回検証で frame 114 の混入が止まることが確認された cap=4 を採用する (fence の
-    // 真のゲート効果は変わらず、stall 時のフットプリントだけ旧来比へ戻す)。
-    const NATIVE_PRESENT_RETIRE_CAP: usize = 4;
+    let mut frame_output = NativeFrameOutputContext::new();
     /// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
     /// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
     /// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
@@ -2335,20 +2591,17 @@ fn run_native_video_output(
     /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
     /// 30fps で約 270ms 分 = pacing 上は十分。
     const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
-    // Inc 7 hidden presenter (動画→音声モード): `SetWindowVisible{visible:false}` で
-    // presenter を「consume-and-hold」モードに入れる。hidden 中は present() を呼ばず
-    // (frame-latency waitable の 100ms 待ちを避ける)、drain + frame selection + present
-    // 成功時 bookkeeping だけ続けて最新フレームを `hidden_latest_frame` に保持する。
-    // show 時にこのフレームを 1 回 present してから再表示する。音声 routing は全経路で
-    // 無改変なので音は途切れない。
+    // Inc 7 hidden presenter (動画→音声モード): hidden 中は present() を呼ばず、選択した
+    // 最新フレームを `FramePresentationState::Hidden` として 1 枚だけ保持する。show 時は
+    // 同じ state から present + re-arm して `Visible` へ戻す。音声 routing は無改変。
+    // この bool は HWND/HUD の visibility mode だけを追跡し、フレームは所有しない。
     let mut presenter_hidden = false;
-    let mut hidden_latest_frame: Option<VideoFrame> = None;
     emit_native_vram_trace(
         "native_presenter_started",
         "after_presenter_init",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
@@ -2376,7 +2629,7 @@ fn run_native_video_output(
                     "native_loop_1hz",
                     &source,
                     &presenter,
-                    present_retire.len(),
+                    frame_output.retire_len(),
                 );
                 last_vram_trace = now;
             }
@@ -2389,7 +2642,7 @@ fn run_native_video_output(
                         reason,
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                 } else {
                     i += 1;
@@ -2506,11 +2759,43 @@ fn run_native_video_output(
                     presenter.set_overlay_jump_entries(entries);
                 }
                 NativeVideoOutputCommand::SetVideoGrade { grade } => {
+                    let render_grade_changed = video_grade_render_changed(&cur_video_grade, &grade);
                     cur_video_grade = grade;
-                    if let Err(error) = presenter.set_video_grade(cur_video_grade.clone()) {
-                        crate::logger::log(format!(
-                            "[native-video] Creative LUT shader update failed: {error}"
-                        ));
+                    match presenter.set_video_grade(cur_video_grade.clone()) {
+                        Ok(()) => {
+                            // Only a render-affecting grade change may request a re-present.
+                            // Hidden and Empty states intentionally do nothing; Hidden will
+                            // use the latest grade when it is first shown.
+                            if frame_output.should_represent_for_grade_change(render_grade_changed)
+                                && let Some(frame) = frame_output.take_visible_frame()
+                            {
+                                match presenter.present(&frame, config.sync_interval) {
+                                    Ok(outcome) => {
+                                        if let Err(error) = frame_output
+                                            .commit_presented(frame, outcome.copy_fence_value)
+                                        {
+                                            crate::logger::log(format!(
+                                                "[native-video] grade refresh frame re-arm failed: {error}"
+                                            ));
+                                        }
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        crate::logger::log(format!(
+                                            "[native-video] grade refresh present failed: {error}"
+                                        ));
+                                        native_reset_unpresented_frame(frame);
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "[native-video] Creative LUT shader update failed: {error}"
+                            ));
+                        }
                     }
                 }
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
@@ -2654,28 +2939,26 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetWindowVisible { visible } => {
                     if visible {
-                        // Inc 7 hidden presenter show (音声モード→動画): hold していた最新
-                        // フレームを 1 回 present してから再表示する。これで音声モード中に
-                        // seek していても正しい位置の映像で復帰し、hide 前の古いフレームが
-                        // 一瞬見える flash を防ぐ。present は通常経路と同じ retire 管理を通す。
-                        if let Some(frame) = hidden_latest_frame.take() {
+                        // Inc 7 hidden presenter show (音声モード→動画): typed state が hold
+                        // していた最新フレームを通常経路と同じ present + re-arm で Visible
+                        // にしてから再表示する。
+                        if frame_output.is_hidden()
+                            && let Some(frame) = frame_output.take_frame()
+                        {
                             match presenter.present(&frame, config.sync_interval) {
                                 Ok(outcome) => {
                                     source
                                         .last_displayed_pts_bits
                                         .store(frame.pts_secs.to_bits(), Ordering::Release);
-                                    present_retire.push_back((frame, outcome.copy_fence_value));
-                                    if let Some(completed) = presenter.copy_fence_completed_value()
+                                    if let Err(error) = frame_output
+                                        .commit_presented(frame, outcome.copy_fence_value)
                                     {
-                                        while present_retire.front().is_some_and(|(_, value)| {
-                                            *value != 0 && *value <= completed
-                                        }) {
-                                            present_retire.pop_front();
-                                        }
+                                        crate::logger::log(format!(
+                                            "[native-video] hidden-show frame re-arm failed: {error}"
+                                        ));
                                     }
-                                    while present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
-                                        present_retire.pop_front();
-                                    }
+                                    frame_output
+                                        .retire_completed(presenter.copy_fence_completed_value());
                                 }
                                 Err(err) => {
                                     crate::logger::log(format!(
@@ -2708,6 +2991,7 @@ fn run_native_video_output(
                         // present() を呼ばず最新フレームだけ hold する (音声は無中断)。
                         let _ = window.hide();
                         presenter.set_hud_window_visible(false);
+                        frame_output.hide();
                         presenter_hidden = true;
                         presenter_hidden_out.store(true, Ordering::Release);
                         crate::logger::log(
@@ -2721,29 +3005,16 @@ fn run_native_video_output(
                         "before_drain_old_source",
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                     native_drain_unpresented_queue(&mut source.queue);
-                    // Inc 7 hidden presenter (Codex #4、音声モード連続再生 EOF): hidden 中の
-                    // source-swap では旧 source の hold フレームを破棄する。残すと B の first
-                    // hidden frame 到達前に「動画へ戻る」(SetWindowVisible(true)) を押したとき、
-                    // 前 source (A) の古いフレームを present してしまう。破棄後は B の hidden
-                    // first-frame が hidden_latest_frame を埋め直す。presenter_hidden=false の
-                    // 通常 source-swap には影響しない (hidden_latest_frame は常に None)。
-                    if presenter_hidden && let Some(prev) = hidden_latest_frame.take() {
-                        native_reset_unpresented_frame(prev);
-                    }
-                    // present_retire の OLD source 由来エントリのうち fence が完了したものを
+                    // The current typed state belongs to the old source. Hidden is reset as
+                    // unpresented; Visible moves to the disposal-only retire queue.
+                    frame_output.clear_current();
+                    // OLD source 由来 retire のうち fence が完了したものを
                     // 解放する (rapid swap で旧 slot が retire に滞留して共有出力プールを
                     // 圧迫するのを防ぐ)。fence ゲート付きなので未完コピーは解放しない (安全)。
-                    if let Some(completed) = presenter.copy_fence_completed_value() {
-                        while present_retire
-                            .front()
-                            .is_some_and(|(_, value)| *value != 0 && *value <= completed)
-                        {
-                            present_retire.pop_front();
-                        }
-                    }
+                    frame_output.retire_completed(presenter.copy_fence_completed_value());
                     // 旧 source の `shared_texture_cache` (presenter 側 D3D11 共有 texture
                     // キャッシュ、4K で 32 MB/枚) を即時破棄し adapter memory を解放する
                     // (Codex 助言 2026-05-15、wgpu OOM 対策)。新 source は新 shared_handle で
@@ -2754,7 +3025,7 @@ fn run_native_video_output(
                         "after_drain_retire_and_shared_cache_clear",
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     cur_fallback_file_name = payload.fallback_file_name.clone();
@@ -2764,7 +3035,7 @@ fn run_native_video_output(
                         "after_new_source_attached",
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                     let switch_trace_now = Instant::now();
                     vram_trace_deadlines.push((
@@ -2875,10 +3146,29 @@ fn run_native_video_output(
                         // (= 通常動画の detached 仮想フルスクリーン resize 等) はこのブロックを skip
                         // するのでバイト等価。
                         if presenter_hidden {
-                            if let Some(frame) = hidden_latest_frame.take() {
-                                // fence=0: この present の GPU コピー完了まで depth cap で保持 (P1 同様)。
-                                let _ = presenter.present(&frame, config.sync_interval);
-                                present_retire.push_back((frame, 0));
+                            if frame_output.is_hidden()
+                                && let Some(frame) = frame_output.take_frame()
+                            {
+                                match presenter.present(&frame, config.sync_interval) {
+                                    Ok(outcome) => {
+                                        if let Err(error) = frame_output
+                                            .commit_presented(frame, outcome.copy_fence_value)
+                                        {
+                                            crate::logger::log(format!(
+                                                "[native-video] same-placement show frame re-arm failed: {error}"
+                                            ));
+                                        }
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        crate::logger::log(format!(
+                                            "[native-video] same-placement show present failed: {error}"
+                                        ));
+                                        native_reset_unpresented_frame(frame);
+                                    }
+                                }
                             }
                             let shown = if activate_on_show {
                                 window.show_and_raise()
@@ -3063,57 +3353,42 @@ fn run_native_video_output(
                                         }
                                         // 表示前に 1 フレーム present して新ウィンドウを
                                         // 現在フレームで埋める (黒画面 / 別フレーム混入の
-                                        // 防止 = Codex #3 二段階スワップの prime 相当)。
-                                        let primed = if let Some(frame) = hidden_latest_frame.take()
-                                        {
-                                            // Inc 7 hidden presenter からの exit (placement 変更を
-                                            // 伴う SwitchPlacement 復帰): consume-and-hold で保持して
-                                            // いた最新フレームで新 presenter を prime する。hidden 中は
-                                            // present していないので present_retire / source.queue は
-                                            // 空 / stale。prime の GPU コピー完了まで frame を保持する
-                                            // ため present_retire へ積むが、**fence 値は 0** にする
-                                            // (Codex P1): この直後の retire 掃除は旧 presenter の
-                                            // `copy_fence_completed_value()` で pop するので、新 presenter
-                                            // の fence 値 (別 timeline) を入れると、旧完了値との大小比較で
-                                            // GPU コピー未完了の frame を誤解放し得る。fence=0 は旧 fence
-                                            // 掃除の対象外 (`*value != 0` gate) で、下の zero-out と同義に
-                                            // depth cap でのみ解放される (= 数フレーム後、新 presenter の
-                                            // コピー完了後)。
-                                            let ok = new_presenter
+                                        // 防止)。最近のフレーム fallback は typed state だけ。
+                                        // source.queue は通常の時刻選択と first-frame bookkeeping
+                                        // に残し、disposal-only の present_retire も prime に使わない。
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                        let old_retire_len = frame_output.retire_len();
+                                        let prime_frame = frame_output.take_frame();
+                                        let primed = if let Some(frame) = prime_frame {
+                                            match new_presenter
                                                 .present(&frame, config.sync_interval)
-                                                .is_ok();
-                                            if ok {
-                                                present_retire.push_back((frame, 0));
-                                            } else {
-                                                native_reset_unpresented_frame(frame);
+                                            {
+                                                Ok(outcome) => {
+                                                    if let Err(error) = frame_output
+                                                        .commit_presented(
+                                                            frame,
+                                                            outcome.copy_fence_value,
+                                                        )
+                                                    {
+                                                        crate::logger::log(format!(
+                                                            "[native-video] placement prime frame re-arm failed: {error}"
+                                                        ));
+                                                    }
+                                                    true
+                                                }
+                                                Err(error) => {
+                                                    crate::logger::log(format!(
+                                                        "[native-video] placement prime present failed: {error}"
+                                                    ));
+                                                    native_reset_unpresented_frame(frame);
+                                                    false
+                                                }
                                             }
-                                            ok
-                                        } else if let Some((frame, _)) = present_retire.back() {
-                                            new_presenter
-                                                .present(frame, config.sync_interval)
-                                                .is_ok()
-                                        } else if let Some(frame) = source.queue.front() {
-                                            new_presenter
-                                                .present(frame, config.sync_interval)
-                                                .is_ok()
                                         } else {
                                             false
                                         };
-                                        // 旧 present_retire を旧 presenter の copy fence で
-                                        // 解決してから旧 presenter を破棄する (Codex #2、
-                                        // fence は presenter 固有)。未完了分はキャップ
-                                        // (NATIVE_PRESENT_RETIRE_CAP) で数フレーム内に
-                                        // 自然解放される。
-                                        if let Some(completed) =
-                                            presenter.copy_fence_completed_value()
-                                        {
-                                            while present_retire
-                                                .front()
-                                                .is_some_and(|(_, v)| *v != 0 && *v <= completed)
-                                            {
-                                                present_retire.pop_front();
-                                            }
-                                        }
                                         // window / presenter をスワップ。
                                         let mut old_window =
                                             std::mem::replace(&mut window, new_window);
@@ -3161,17 +3436,15 @@ fn run_native_video_output(
                                                     .to_string(),
                                             );
                                         }
-                                        // 残った present_retire エントリは旧 presenter の
-                                        // copy fence で採番されている。新 presenter の
-                                        // fence timeline とは無関係なので fence 値を 0
+                                        // prime 前から残る present_retire prefix は旧 presenter の
+                                        // copy fence で採番されている。新 presenter の fence
+                                        // timeline とは無関係なので、その prefix の fence 値を 0
                                         // (= 「fence 未追跡、depth cap でのみ解放」) に
                                         // 上書きする (Codex P1)。旧 presenter は drop 済みで
                                         // そのコピーは完了しているため、cap
                                         // (NATIVE_PRESENT_RETIRE_CAP) で数フレーム内に
                                         // 安全に解放される。
-                                        for entry in present_retire.iter_mut() {
-                                            entry.1 = 0;
-                                        }
+                                        frame_output.invalidate_retire_fence_prefix(old_retire_len);
                                         cur_placement = placement;
                                         cur_owner_hwnd = owner_hwnd;
                                         last_parent_client_size = (new_width, new_height);
@@ -4103,9 +4376,7 @@ fn run_native_video_output(
                 }
                 // 最新フレームを 1 枚だけ hold し、前回 hold を解放する (共有出力 slot を
                 // 溜め込まない)。show 時にこれを present してから再表示する。
-                if let Some(prev) = hidden_latest_frame.replace(frame) {
-                    native_reset_unpresented_frame(prev);
-                }
+                frame_output.hold_hidden(frame);
                 continue;
             }
             let present_t0 = Instant::now();
@@ -4362,7 +4633,7 @@ fn run_native_video_output(
                                     ),
                                     (
                                         "retire_queue_len",
-                                        serde_json::Value::from(present_retire.len() as i64),
+                                        serde_json::Value::from(frame_output.retire_len() as i64),
                                     ),
                                     (
                                         "queue_len",
@@ -4422,24 +4693,16 @@ fn run_native_video_output(
                             );
                         }
                     }
-                    // present 済みフレームを遅延解放する。詳細は `present_retire` 宣言箇所
-                    // のコメント参照。
-                    present_retire.push_back((frame, outcome.copy_fence_value));
-                    // copy fence が到達したフレームを解放する (= GPU コピー完了を保証)。
-                    // `value == 0` (fence 未作成 / Signal 失敗) は fence ゲートでは扱わず、
-                    // 下の depth キャップに委ねる。
-                    if let Some(completed) = presenter.copy_fence_completed_value() {
-                        while present_retire
-                            .front()
-                            .is_some_and(|(_, value)| *value != 0 && *value <= completed)
-                        {
-                            present_retire.pop_front();
-                        }
+                    // The newly displayed frame becomes the sole reusable Visible frame.
+                    // Its predecessor moves to the disposal-only retire queue.
+                    if let Err(error) =
+                        frame_output.commit_presented(frame, outcome.copy_fence_value)
+                    {
+                        crate::logger::log(format!(
+                            "[native-video] presented frame re-arm failed: {error}"
+                        ));
                     }
-                    // 安全キャップ: fence 未作成 / stall 時の上限。これを超えたら強制解放。
-                    while present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
-                        present_retire.pop_front();
-                    }
+                    frame_output.retire_completed(presenter.copy_fence_completed_value());
                 }
                 Err(err) => {
                     crate::logger::log(format!("[native-video] present failed: {err}"));
@@ -4468,12 +4731,14 @@ fn run_native_video_output(
         }
     }
 
+    frame_output.clear_current();
+    frame_output.retire_completed(presenter.copy_fence_completed_value());
     emit_native_vram_trace(
         "native_presenter_exit_begin",
         "before_exit_drain",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
     native_drain_unpresented_queue(&mut source.queue);
     emit_native_vram_trace(
@@ -4481,7 +4746,7 @@ fn run_native_video_output(
         "after_exit_drain",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
     source.present_stats.emit_summary(run_started.elapsed());
     crate::logger::log(format!(
@@ -4518,7 +4783,7 @@ fn run_native_video_output(
         "before_window_destroy",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
     window.destroy();
     closed.store(true, Ordering::Release);
@@ -7232,6 +7497,100 @@ fn dummy_audio_rx() -> crossbeam_channel::Receiver<decoder::AudioFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn video_grade_render_change_ignores_overlay_only_snapshot_fields() {
+        let previous = crate::creative_lut::VideoGradeSnapshot::default();
+        let mut next = crate::creative_lut::VideoGradeSnapshot::default();
+        next.slots = vec![Some("renamed slot".to_string())].into();
+        assert!(!super::video_grade_render_changed(&previous, &next));
+
+        next.adjustments.brightness = 1.0;
+        assert!(super::video_grade_render_changed(&previous, &next));
+    }
+
+    #[test]
+    fn frame_presentation_new_visible_retires_previous_visible() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("first", 7).is_none());
+
+        let displaced = state
+            .replace_visible("second", 11)
+            .expect("previous visible frame must be displaced");
+        match displaced {
+            super::DisplacedPresentation::Visible { frame, fence } => {
+                assert_eq!(frame, "first");
+                assert_eq!(fence, 7);
+            }
+            super::DisplacedPresentation::Hidden { .. } => {
+                panic!("visible replacement must retire a visible frame")
+            }
+        }
+        assert!(state.is_visible());
+    }
+
+    #[test]
+    fn frame_presentation_grade_change_requests_only_visible_represent() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(!state.should_represent_for_grade_change(true));
+
+        assert!(state.replace_hidden("hidden").is_none());
+        assert!(state.is_hidden());
+        assert!(!state.should_represent_for_grade_change(true));
+
+        let _ = state.replace_visible("visible", 3);
+        assert!(state.should_represent_for_grade_change(true));
+    }
+
+    #[test]
+    fn frame_presentation_unchanged_grade_does_not_request_idle_present() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("visible", 5).is_none());
+        assert!(!state.should_represent_for_grade_change(false));
+    }
+
+    #[test]
+    fn frame_presentation_hide_preserves_frame_without_represent_request() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("visible", 13).is_none());
+
+        state.hide();
+
+        assert!(state.is_hidden());
+        assert!(!state.should_represent_for_grade_change(true));
+        assert_eq!(state.take_frame(), Some("visible"));
+    }
+
+    #[test]
+    fn frame_presentation_visible_frame_is_owned_for_placement_prime() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("visible", 17).is_none());
+
+        assert_eq!(state.take_frame(), Some("visible"));
+        assert!(!state.should_represent_for_grade_change(true));
+    }
+
+    #[test]
+    fn presented_frame_rearm_requirement_distinguishes_cpu_and_gpu() {
+        use super::PresentedFrameRearmRequirement::{MissingKeyedMutex, NotRequired, Required};
+
+        assert_eq!(
+            super::presented_frame_rearm_requirement(false, false),
+            NotRequired
+        );
+        assert_eq!(
+            super::presented_frame_rearm_requirement(false, true),
+            NotRequired
+        );
+        assert_eq!(
+            super::presented_frame_rearm_requirement(true, true),
+            Required
+        );
+        assert_eq!(
+            super::presented_frame_rearm_requirement(true, false),
+            MissingKeyedMutex
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn child_presenter_focus_requires_activation() {
