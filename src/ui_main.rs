@@ -16,9 +16,9 @@ use crate::app::{
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
 use crate::settings::{
-    DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSelectionBarMode, DetailsSortKey,
-    FacetCalendarDate, FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset,
-    FacetTagMode, GridClickSelectionMode, GridViewMode,
+    DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSelectionBarMode,
+    DetailsSizeDisplayMode, DetailsSortKey, FacetCalendarDate, FacetDatePreset, FacetEditFlag,
+    FacetItemKind, FacetSizePreset, FacetTagMode, GridClickSelectionMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -1004,11 +1004,18 @@ pub(crate) enum DetailsColumn {
     VideoCodec,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DetailsColumnSet {
     Details,
     SharedBar,
     DedicatedBar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsColumnMenuOrigin {
+    DetailsListHeader,
+    ThumbnailSelectionBar,
+    DetailsSelectionBar,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1018,6 +1025,7 @@ struct DetailsBestFitJobKey {
     content_revision: u64,
     total_rows: usize,
     column: DetailsColumn,
+    column_set: DetailsColumnSet,
     view_kind: DetailsBestFitViewKind,
     book_sort_locked: bool,
     header_title: String,
@@ -1405,6 +1413,36 @@ fn selection_info_bottom_bar_column_set(settings: &crate::settings::Settings) ->
     }
 }
 
+fn details_column_menu_heading(
+    mode: DetailsSelectionBarMode,
+    origin: DetailsColumnMenuOrigin,
+) -> &'static str {
+    if mode.normalized() == DetailsSelectionBarMode::SameAsDetails {
+        "一覧と下部情報バー共通"
+    } else if origin == DetailsColumnMenuOrigin::DetailsSelectionBar {
+        "詳細表示の下部情報バー専用"
+    } else {
+        "一覧・サムネイル表示の下部情報バー"
+    }
+}
+
+fn toggle_details_selection_bar_mode_from_menu(settings: &mut crate::settings::Settings) -> bool {
+    let old_mode = settings.details_selection_bar_mode.normalized();
+    let new_mode = if old_mode == DetailsSelectionBarMode::Dedicated {
+        DetailsSelectionBarMode::SameAsDetails
+    } else {
+        DetailsSelectionBarMode::Dedicated
+    };
+    if old_mode == new_mode {
+        return false;
+    }
+    if new_mode == DetailsSelectionBarMode::Dedicated {
+        settings.copy_details_columns_to_selection_bar();
+    }
+    settings.details_selection_bar_mode = new_mode;
+    true
+}
+
 pub(crate) fn selection_info_bottom_bar_shows_column(
     settings: &crate::settings::Settings,
     column: DetailsColumn,
@@ -1446,6 +1484,7 @@ fn details_column_width(
 
 fn set_details_column_width(
     settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
     col: DetailsColumn,
     width: f32,
 ) -> bool {
@@ -1453,17 +1492,19 @@ fn set_details_column_width(
         return false;
     }
     let width = width.clamp(col.min_width(), 800.0);
-    if let Some(entry) = settings
-        .details_column_widths
-        .iter_mut()
-        .find(|entry| entry.column == col.id())
-    {
+    let widths = match column_set {
+        DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
+            &mut settings.details_column_widths
+        }
+        DetailsColumnSet::DedicatedBar => &mut settings.details_selection_bar_column_widths,
+    };
+    if let Some(entry) = widths.iter_mut().find(|entry| entry.column == col.id()) {
         if (entry.width - width).abs() <= 0.1 {
             return false;
         }
         entry.width = width;
     } else {
-        settings.details_column_widths.push(DetailsColumnWidth {
+        widths.push(DetailsColumnWidth {
             column: col.id(),
             width,
         });
@@ -1482,14 +1523,244 @@ fn details_name_fixed_width(
 }
 
 /// 名前列を固定幅へ切り替えて幅を保存する。値が変わったら true。
-fn set_details_name_width(settings: &mut crate::settings::Settings, width: f32) -> bool {
+fn set_details_name_width(
+    settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    width: f32,
+) -> bool {
     let width = width.clamp(DetailsColumn::Name.min_width(), 800.0);
-    if !settings.details_name_width_auto && (settings.details_name_width - width).abs() <= 0.1 {
+    match column_set {
+        DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
+            if !settings.details_name_width_auto
+                && (settings.details_name_width - width).abs() <= 0.1
+            {
+                return false;
+            }
+            settings.details_name_width_auto = false;
+            settings.details_name_width = width;
+        }
+        DetailsColumnSet::DedicatedBar => {
+            if !settings.details_selection_bar_name_width_auto
+                && (settings.details_selection_bar_name_width - width).abs() <= 0.1
+            {
+                return false;
+            }
+            settings.details_selection_bar_name_width_auto = false;
+            settings.details_selection_bar_name_width = width;
+        }
+    }
+    true
+}
+
+fn details_column_visibility_slot(
+    settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    column: DetailsColumn,
+) -> Option<&mut bool> {
+    let dedicated = column_set == DetailsColumnSet::DedicatedBar;
+    Some(match (dedicated, column) {
+        (_, DetailsColumn::Name) => return None,
+        (false, DetailsColumn::Preview) => &mut settings.details_show_preview,
+        (false, DetailsColumn::Rating) => &mut settings.details_show_rating,
+        (false, DetailsColumn::Tags) => &mut settings.details_show_tags,
+        (false, DetailsColumn::Kind) => &mut settings.details_show_kind,
+        (false, DetailsColumn::PageCount) => &mut settings.details_show_page_count,
+        (false, DetailsColumn::Size) => &mut settings.details_show_size,
+        (false, DetailsColumn::Modified) => &mut settings.details_show_modified,
+        (false, DetailsColumn::Created) => &mut settings.details_show_created,
+        (false, DetailsColumn::State) => &mut settings.details_show_state,
+        (false, DetailsColumn::ImageDimensions) => &mut settings.details_show_image_dimensions,
+        (false, DetailsColumn::VideoDuration) => &mut settings.details_show_video_duration,
+        (false, DetailsColumn::VideoDimensions) => &mut settings.details_show_video_dimensions,
+        (false, DetailsColumn::VideoCodec) => &mut settings.details_show_video_codec,
+        (true, DetailsColumn::Preview) => &mut settings.details_selection_bar_show_preview,
+        (true, DetailsColumn::Rating) => &mut settings.details_selection_bar_show_rating,
+        (true, DetailsColumn::Tags) => &mut settings.details_selection_bar_show_tags,
+        (true, DetailsColumn::Kind) => &mut settings.details_selection_bar_show_kind,
+        (true, DetailsColumn::PageCount) => &mut settings.details_selection_bar_show_page_count,
+        (true, DetailsColumn::Size) => &mut settings.details_selection_bar_show_size,
+        (true, DetailsColumn::Modified) => &mut settings.details_selection_bar_show_modified,
+        (true, DetailsColumn::Created) => &mut settings.details_selection_bar_show_created,
+        (true, DetailsColumn::State) => &mut settings.details_selection_bar_show_state,
+        (true, DetailsColumn::ImageDimensions) => {
+            &mut settings.details_selection_bar_show_image_dimensions
+        }
+        (true, DetailsColumn::VideoDuration) => {
+            &mut settings.details_selection_bar_show_video_duration
+        }
+        (true, DetailsColumn::VideoDimensions) => {
+            &mut settings.details_selection_bar_show_video_dimensions
+        }
+        (true, DetailsColumn::VideoCodec) => &mut settings.details_selection_bar_show_video_codec,
+    })
+}
+
+fn set_details_name_width_auto(
+    settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    enabled: bool,
+    current_name_width: f32,
+) -> bool {
+    if column_set.name_width_auto(settings) == enabled {
         return false;
     }
-    settings.details_name_width_auto = false;
-    settings.details_name_width = width;
-    true
+    if enabled {
+        match column_set {
+            DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
+                settings.details_name_width_auto = true;
+                settings.details_name_width = DetailsColumn::Name.default_width();
+            }
+            DetailsColumnSet::DedicatedBar => {
+                settings.details_selection_bar_name_width_auto = true;
+                settings.details_selection_bar_name_width = DetailsColumn::Name.default_width();
+            }
+        }
+        true
+    } else {
+        set_details_name_width(settings, column_set, current_name_width)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DetailsColumnMenuState {
+    name_width_auto: bool,
+    show_preview: bool,
+    show_rating: bool,
+    show_tags: bool,
+    show_kind: bool,
+    show_page_count: bool,
+    show_size: bool,
+    show_modified: bool,
+    show_created: bool,
+    show_state: bool,
+    show_image_dimensions: bool,
+    show_video_duration: bool,
+    show_video_dimensions: bool,
+    show_video_codec: bool,
+    size_display_mode: DetailsSizeDisplayMode,
+    timestamp_show_seconds: bool,
+    row_style: DetailsRowStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DetailsColumnMenuChanges {
+    columns: bool,
+    lazy_columns: bool,
+    format: bool,
+}
+
+impl DetailsColumnMenuChanges {
+    fn any(self) -> bool {
+        self.columns || self.format
+    }
+}
+
+impl DetailsColumnMenuState {
+    fn from_settings(settings: &crate::settings::Settings, column_set: DetailsColumnSet) -> Self {
+        Self {
+            name_width_auto: column_set.name_width_auto(settings),
+            show_preview: DetailsColumn::Preview.visible(settings, column_set),
+            show_rating: DetailsColumn::Rating.visible(settings, column_set),
+            show_tags: DetailsColumn::Tags.visible(settings, column_set),
+            show_kind: DetailsColumn::Kind.visible(settings, column_set),
+            show_page_count: DetailsColumn::PageCount.visible(settings, column_set),
+            show_size: DetailsColumn::Size.visible(settings, column_set),
+            show_modified: DetailsColumn::Modified.visible(settings, column_set),
+            show_created: DetailsColumn::Created.visible(settings, column_set),
+            show_state: DetailsColumn::State.visible(settings, column_set),
+            show_image_dimensions: DetailsColumn::ImageDimensions.visible(settings, column_set),
+            show_video_duration: DetailsColumn::VideoDuration.visible(settings, column_set),
+            show_video_dimensions: DetailsColumn::VideoDimensions.visible(settings, column_set),
+            show_video_codec: DetailsColumn::VideoCodec.visible(settings, column_set),
+            // 書式はセット C を編集するメニューでもセット A と共有する。
+            size_display_mode: settings.details_size_display_mode,
+            timestamp_show_seconds: settings.details_timestamp_show_seconds,
+            row_style: settings.details_row_style,
+        }
+    }
+}
+
+impl DetailsColumnMenuState {
+    fn apply(
+        &self,
+        settings: &mut crate::settings::Settings,
+        column_set: DetailsColumnSet,
+        current_name_width: f32,
+    ) -> DetailsColumnMenuChanges {
+        let mut changes = DetailsColumnMenuChanges::default();
+        changes.columns |= set_details_name_width_auto(
+            settings,
+            column_set,
+            self.name_width_auto,
+            current_name_width,
+        );
+        apply_details_column_menu_visibility(self, settings, column_set, &mut changes);
+        if settings.details_size_display_mode != self.size_display_mode {
+            settings.details_size_display_mode = self.size_display_mode;
+            changes.format = true;
+        }
+        if settings.details_timestamp_show_seconds != self.timestamp_show_seconds {
+            settings.details_timestamp_show_seconds = self.timestamp_show_seconds;
+            changes.format = true;
+        }
+        if settings.details_row_style != self.row_style {
+            settings.details_row_style = self.row_style;
+            changes.format = true;
+        }
+        changes
+    }
+}
+
+fn apply_details_column_menu_visibility(
+    state: &DetailsColumnMenuState,
+    settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    changes: &mut DetailsColumnMenuChanges,
+) {
+    apply_details_column_menu_visibility_group(
+        settings,
+        column_set,
+        changes,
+        &[
+            (DetailsColumn::Preview, state.show_preview),
+            (DetailsColumn::Rating, state.show_rating),
+            (DetailsColumn::Tags, state.show_tags),
+            (DetailsColumn::Kind, state.show_kind),
+            (DetailsColumn::PageCount, state.show_page_count),
+            (DetailsColumn::Size, state.show_size),
+        ],
+    );
+    apply_details_column_menu_visibility_group(
+        settings,
+        column_set,
+        changes,
+        &[
+            (DetailsColumn::Modified, state.show_modified),
+            (DetailsColumn::Created, state.show_created),
+            (DetailsColumn::State, state.show_state),
+            (DetailsColumn::ImageDimensions, state.show_image_dimensions),
+            (DetailsColumn::VideoDuration, state.show_video_duration),
+            (DetailsColumn::VideoDimensions, state.show_video_dimensions),
+            (DetailsColumn::VideoCodec, state.show_video_codec),
+        ],
+    );
+}
+
+fn apply_details_column_menu_visibility_group(
+    settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    changes: &mut DetailsColumnMenuChanges,
+    values: &[(DetailsColumn, bool)],
+) {
+    for &(column, visible) in values {
+        let slot = details_column_visibility_slot(settings, column_set, column)
+            .expect("name is the only immutable details column");
+        if *slot != visible {
+            *slot = visible;
+            changes.columns = true;
+            changes.lazy_columns |= column.is_lazy();
+        }
+    }
 }
 
 fn blend_details_row_color(
@@ -3413,6 +3684,8 @@ mod details_column_context_menu_layout_tests {
     fn draw_height_test_menu(pane: DetailsColumnMenuPane, ui: &mut egui::Ui) {
         match pane {
             DetailsColumnMenuPane::Columns => {
+                let _ = ui.button("専用の設定にする");
+                ui.separator();
                 ui.label(egui::RichText::new("表示する列").strong());
                 ui.separator();
                 let mut checked = true;
@@ -12223,12 +12496,18 @@ impl App {
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
         let book_sort_locked = self.page_order_locked_for_current_view();
+        self.advance_details_best_fit_job(ui, book_sort_locked);
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
             egui::Stroke::new(1.0, stroke_color),
         );
-        for (col, col_rect) in details_column_rects_for_columns(rect, &self.settings, column_set) {
+        let columns = details_column_rects_for_columns(rect, &self.settings, column_set);
+        let current_name_width = columns
+            .iter()
+            .find_map(|(column, rect)| (*column == DetailsColumn::Name).then_some(rect.width()))
+            .unwrap_or_else(|| DetailsColumn::Name.default_width());
+        for (col, col_rect) in columns.iter().copied() {
             draw_details_text(
                 ui,
                 col_rect,
@@ -12241,12 +12520,19 @@ impl App {
                 [col_rect.right_top(), col_rect.right_bottom()],
                 egui::Stroke::new(1.0, stroke_color),
             );
+            self.draw_details_column_resize_handle(ui, col, col_rect, column_set, book_sort_locked);
         }
+        let origin = if self.settings.grid_view_mode == GridViewMode::Details {
+            DetailsColumnMenuOrigin::DetailsSelectionBar
+        } else {
+            DetailsColumnMenuOrigin::ThumbnailSelectionBar
+        };
         self.show_details_column_context_menu(
             ui,
             &response,
-            "表示する列",
-            "書式 (すべての表示で共通)",
+            column_set,
+            origin,
+            current_name_width,
         );
     }
 
@@ -12288,6 +12574,7 @@ impl App {
         &self,
         ui: &egui::Ui,
         column: DetailsColumn,
+        column_set: DetailsColumnSet,
         book_sort_locked: bool,
     ) -> DetailsBestFitJobKey {
         let view_kind = if self.items_are_bookmark_view {
@@ -12314,6 +12601,7 @@ impl App {
             content_revision,
             total_rows: self.current_grid_order().len(),
             column,
+            column_set,
             view_kind,
             book_sort_locked,
             header_title: self.details_header_title(column, book_sort_locked, true),
@@ -12361,18 +12649,25 @@ impl App {
         (widest, needs_dynamic_rows)
     }
 
-    fn apply_details_best_fit_width(&mut self, ui: &egui::Ui, column: DetailsColumn, widest: f32) {
+    fn apply_details_best_fit_width(
+        &mut self,
+        ui: &egui::Ui,
+        column_set: DetailsColumnSet,
+        column: DetailsColumn,
+        widest: f32,
+    ) {
         let width = (widest + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
             .ceil()
             .clamp(column.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
         let changed = if column == DetailsColumn::Name {
-            set_details_name_width(&mut self.settings, width)
+            set_details_name_width(&mut self.settings, column_set, width)
         } else {
-            set_details_column_width(&mut self.settings, column, width)
+            set_details_column_width(&mut self.settings, column_set, column, width)
         };
         if changed {
             crate::logger::log(format!(
-                "details column best-fit: {:?} -> {:.1}",
+                "details column best-fit: {:?} {:?} -> {:.1}",
+                column_set,
                 column.id(),
                 width
             ));
@@ -12405,7 +12700,7 @@ impl App {
                 ],
             );
         }
-        self.apply_details_best_fit_width(ui, job.key.column, job.widest);
+        self.apply_details_best_fit_width(ui, job.key.column_set, job.key.column, job.widest);
     }
 
     fn advance_details_best_fit_job(&mut self, ui: &egui::Ui, book_sort_locked: bool) {
@@ -12417,12 +12712,11 @@ impl App {
             return;
         };
 
-        if !details_visible_columns(&self.settings, DetailsColumnSet::Details)
-            .contains(&job.key.column)
-        {
+        if !details_visible_columns(&self.settings, job.key.column_set).contains(&job.key.column) {
             return;
         }
-        let current_key = self.details_best_fit_job_key(ui, job.key.column, book_sort_locked);
+        let current_key =
+            self.details_best_fit_job_key(ui, job.key.column, job.key.column_set, book_sort_locked);
         if job.key == current_key
             && job.next_row < job.key.total_rows
             && !Self::claim_details_best_fit_frame_budget(ui.ctx())
@@ -12547,13 +12841,14 @@ impl App {
         &mut self,
         ui: &egui::Ui,
         column: DetailsColumn,
+        column_set: DetailsColumnSet,
         book_sort_locked: bool,
     ) {
-        let key = self.details_best_fit_job_key(ui, column, book_sort_locked);
+        let key = self.details_best_fit_job_key(ui, column, column_set, book_sort_locked);
         let (widest, needs_dynamic_rows) = self.details_best_fit_seed_width(ui, &key);
         if !needs_dynamic_rows {
             Self::cancel_details_best_fit_job(ui.ctx());
-            self.apply_details_best_fit_width(ui, column, widest);
+            self.apply_details_best_fit_width(ui, column_set, column, widest);
             return;
         }
 
@@ -12569,6 +12864,63 @@ impl App {
             .data_mut(|data| data.insert_temp(Self::details_best_fit_job_id(), Some(job)));
         // クリック frame で最初の batch を測る。小規模一覧はこの 1 回で exact 幅になる。
         self.advance_details_best_fit_job(ui, book_sort_locked);
+    }
+
+    fn draw_details_column_resize_handle(
+        &mut self,
+        ui: &mut egui::Ui,
+        column: DetailsColumn,
+        column_rect: egui::Rect,
+        column_set: DetailsColumnSet,
+        book_sort_locked: bool,
+    ) {
+        // つかみ代は列の内側へ置き、隣のヘッダ操作と重ねない。詳細一覧ではソートと
+        // 並べ替え、下部情報バーでは右クリックメニューから境界操作を分離する。
+        let resize_rect = egui::Rect::from_min_max(
+            egui::pos2(column_rect.right() - 8.0, column_rect.top()),
+            egui::pos2(column_rect.right(), column_rect.bottom()),
+        );
+        let resize_response = ui
+            .interact(
+                resize_rect,
+                ui.id().with(("details_header_resize", column_set, column)),
+                egui::Sense::click_and_drag(),
+            )
+            .on_hover_text("ドラッグで幅変更 / ダブルクリックで内容に合わせる");
+        if resize_response.hovered() || resize_response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            ui.painter().line_segment(
+                [column_rect.right_top(), column_rect.right_bottom()],
+                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+            );
+        }
+        if resize_response.double_clicked() {
+            self.start_details_best_fit_job(ui, column, column_set, book_sort_locked);
+        } else if resize_response.dragged() {
+            // 手動幅変更はユーザーの最新意思。進行中の測定結果で後から上書きしない。
+            Self::cancel_details_best_fit_job(ui.ctx());
+            let changed = if column == DetailsColumn::Name {
+                set_details_name_width(
+                    &mut self.settings,
+                    column_set,
+                    column_rect.width() + resize_response.drag_delta().x,
+                )
+            } else {
+                let current = details_column_width(&self.settings, column_set, column);
+                set_details_column_width(
+                    &mut self.settings,
+                    column_set,
+                    column,
+                    current + resize_response.drag_delta().x,
+                )
+            };
+            if changed {
+                ui.ctx().request_repaint();
+            }
+        }
+        if resize_response.drag_stopped() {
+            self.settings.save();
+        }
     }
 
     fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -12693,56 +13045,13 @@ impl App {
                 [col_rect.right_top(), col_rect.right_bottom()],
                 egui::Stroke::new(1.0, stroke_color),
             );
-            {
-                // リサイズのつかみ代は列の内側 (右端から左へ 8px) に置く。境界中央に置くと右半分が
-                // 次列ヘッダ (click_and_drag) の当たり判定と重なり、ドラッグがソート/並べ替えに
-                // 横取りされる。境界線の視覚インジケータは下で別途描くので操作感は保たれる。
-                let resize_rect = egui::Rect::from_min_max(
-                    egui::pos2(col_rect.right() - 8.0, col_rect.top()),
-                    egui::pos2(col_rect.right(), col_rect.bottom()),
-                );
-                let resize_response = ui
-                    .interact(
-                        resize_rect,
-                        ui.id().with(("details_header_resize", col)),
-                        egui::Sense::click_and_drag(),
-                    )
-                    .on_hover_text("ドラッグで幅変更 / ダブルクリックで内容に合わせる");
-                if resize_response.hovered() || resize_response.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    ui.painter().line_segment(
-                        [col_rect.right_top(), col_rect.right_bottom()],
-                        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
-                    );
-                }
-                if resize_response.double_clicked() {
-                    self.start_details_best_fit_job(ui, col, book_sort_locked);
-                } else if resize_response.dragged() {
-                    // 手動幅変更はユーザーの最新意思。進行中の自動測定結果で後から上書きしない。
-                    Self::cancel_details_best_fit_job(ui.ctx());
-                    let changed = if col == DetailsColumn::Name {
-                        // 名前列の境界ドラッグ = 自動調整をやめ、その幅を固定幅として保存する。
-                        set_details_name_width(
-                            &mut self.settings,
-                            col_rect.width() + resize_response.drag_delta().x,
-                        )
-                    } else {
-                        let current =
-                            details_column_width(&self.settings, DetailsColumnSet::Details, col);
-                        set_details_column_width(
-                            &mut self.settings,
-                            col,
-                            current + resize_response.drag_delta().x,
-                        )
-                    };
-                    if changed {
-                        ui.ctx().request_repaint();
-                    }
-                }
-                if resize_response.drag_stopped() {
-                    self.settings.save();
-                }
-            }
+            self.draw_details_column_resize_handle(
+                ui,
+                col,
+                col_rect,
+                DetailsColumnSet::Details,
+                book_sort_locked,
+            );
             let response = if sort_enabled {
                 response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
             } else if book_sort_locked && sort_key.is_some() {
@@ -12757,8 +13066,9 @@ impl App {
             self.show_details_column_context_menu(
                 ui,
                 &response,
-                "表示する列",
-                "書式 (すべての表示で共通)",
+                DetailsColumnSet::Details,
+                DetailsColumnMenuOrigin::DetailsListHeader,
+                self.last_details_name_width,
             );
         }
     }
@@ -12777,11 +13087,12 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         response: &egui::Response,
-        columns_heading: &str,
-        format_heading: &str,
+        column_set: DetailsColumnSet,
+        origin: DetailsColumnMenuOrigin,
+        current_name_width: f32,
     ) {
         response.context_menu(|ui| {
-            self.draw_details_column_context_menu(ui, columns_heading, format_heading);
+            self.draw_details_column_context_menu(ui, column_set, origin, current_name_width);
         });
         let popup_id = egui::Popup::default_response_id(response);
         if egui::Popup::is_id_open(ui.ctx(), popup_id) {
@@ -12798,22 +13109,35 @@ impl App {
     fn draw_details_column_context_menu(
         &mut self,
         ui: &mut egui::Ui,
-        columns_heading: &str,
-        format_heading: &str,
+        column_set: DetailsColumnSet,
+        origin: DetailsColumnMenuOrigin,
+        current_name_width: f32,
     ) {
-        let old_lazy = (
-            self.settings.details_show_page_count,
-            self.settings.details_show_created,
-            self.settings.details_show_image_dimensions,
-            self.settings.details_show_video_duration,
-            self.settings.details_show_video_dimensions,
-            self.settings.details_show_video_codec,
-        );
-        let mut changed = false;
+        let columns_heading =
+            details_column_menu_heading(self.settings.details_selection_bar_mode, origin);
+        let show_mode_toggle = origin == DetailsColumnMenuOrigin::DetailsSelectionBar;
+        let mode_toggle_label = if self.settings.details_selection_bar_mode.normalized()
+            == DetailsSelectionBarMode::Dedicated
+        {
+            "一覧と同じ設定にする"
+        } else {
+            "専用の設定にする"
+        };
+        let (modified_label, state_label) = if self.items_are_reading_history_view {
+            ("最終閲覧", "既読位置")
+        } else {
+            ("更新日時", "状態")
+        };
+        let mut menu_state = DetailsColumnMenuState::from_settings(&self.settings, column_set);
+        let mut toggle_requested = false;
         let max_height =
             (ui.ctx().content_rect().height() - DETAILS_COLUMN_MENU_SCREEN_MARGIN).max(1.0);
         draw_details_column_menu_layout(ui, max_height, |pane, ui| match pane {
             DetailsColumnMenuPane::Columns => {
+                if show_mode_toggle {
+                    toggle_requested |= ui.button(mode_toggle_label).clicked();
+                    ui.separator();
+                }
                 ui.label(egui::RichText::new(columns_heading).strong());
                 ui.separator();
                 let mut name_visible = true;
@@ -12821,139 +13145,70 @@ impl App {
 
                 // 名前列の幅: 既定は残り幅へ自動調整。OFF にすると現在の幅で固定し、横スクロールで
                 // 全列を確認できる。境界ドラッグでも自動的に固定幅へ切り替わる。
-                let mut name_auto = self.settings.details_name_width_auto;
-                if ui
-                    .checkbox(&mut name_auto, "名前の幅を自動調整")
+                ui.checkbox(&mut menu_state.name_width_auto, "名前の幅を自動調整")
                     .on_hover_text(
                         "OFF にすると現在の名前列幅で固定します (境界ドラッグでも固定されます)",
-                    )
-                    .changed()
-                {
-                    Self::cancel_details_best_fit_job(ui.ctx());
-                    if name_auto {
-                        self.settings.details_name_width_auto = true;
-                        self.settings.details_name_width = DetailsColumn::Name.default_width();
-                    } else {
-                        self.settings.details_name_width_auto = false;
-                        self.settings.details_name_width = self
-                            .last_details_name_width
-                            .clamp(DetailsColumn::Name.min_width(), 800.0);
-                    }
-                    self.settings.save();
-                    ui.ctx().request_repaint();
-                }
+                    );
 
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_preview, "プレビュー")
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_rating, "★")
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_tags, "タグ")
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_kind, "種類")
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_page_count, "ページ数")
+                ui.checkbox(&mut menu_state.show_preview, "プレビュー");
+                ui.checkbox(&mut menu_state.show_rating, "★");
+                ui.checkbox(&mut menu_state.show_tags, "タグ");
+                ui.checkbox(&mut menu_state.show_kind, "種類");
+                ui.checkbox(&mut menu_state.show_page_count, "ページ数")
                     .on_hover_text(
                         "ZIP / PDF / 画像のみフォルダのページ数をバックグラウンドで読み込みます",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_size, "サイズ")
-                    .changed();
-                // 読書履歴ビューでは「更新日時」列を最終閲覧、「状態」列を既読位置に転用するため、
-                // 列表示メニューのラベルもヘッダ・行表示と揃える。
-                let (modified_label, state_label) = if self.items_are_reading_history_view {
-                    ("最終閲覧", "既読位置")
-                } else {
-                    ("更新日時", "状態")
-                };
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_modified, modified_label)
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_state, state_label)
-                    .changed();
+                    );
+                ui.checkbox(&mut menu_state.show_size, "サイズ");
+                ui.checkbox(&mut menu_state.show_modified, modified_label);
+                ui.checkbox(&mut menu_state.show_state, state_label);
 
                 ui.separator();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_created, "作成日時")
-                    .on_hover_text("ファイルシステムの作成日時をバックグラウンドで読み込みます")
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.details_show_image_dimensions,
-                        "画像解像度",
-                    )
-                    .on_hover_text("必要な値をバックグラウンドで読み込みます")
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_video_duration, "長さ")
-                    .on_hover_text("動画・音声の長さをバックグラウンドで読み込みます")
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.details_show_video_dimensions,
-                        "動画解像度",
-                    )
-                    .on_hover_text("動画の解像度をバックグラウンドで読み込みます")
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.details_show_video_codec, "コーデック")
-                    .on_hover_text("動画・音声のコーデックをバックグラウンドで読み込みます")
-                    .changed();
+                ui.checkbox(&mut menu_state.show_created, "作成日時")
+                    .on_hover_text("ファイルシステムの作成日時をバックグラウンドで読み込みます");
+                ui.checkbox(&mut menu_state.show_image_dimensions, "画像解像度")
+                    .on_hover_text("必要な値をバックグラウンドで読み込みます");
+                ui.checkbox(&mut menu_state.show_video_duration, "長さ")
+                    .on_hover_text("動画・音声の長さをバックグラウンドで読み込みます");
+                ui.checkbox(&mut menu_state.show_video_dimensions, "動画解像度")
+                    .on_hover_text("動画の解像度をバックグラウンドで読み込みます");
+                ui.checkbox(&mut menu_state.show_video_codec, "コーデック")
+                    .on_hover_text("動画・音声のコーデックをバックグラウンドで読み込みます");
             }
             DetailsColumnMenuPane::Format => {
-                ui.label(egui::RichText::new(format_heading).strong());
+                ui.label(egui::RichText::new("書式 (すべての表示で共通)").strong());
                 ui.separator();
                 ui.label("サイズ表示");
-                for &mode in crate::settings::DetailsSizeDisplayMode::all() {
-                    changed |= ui
-                        .radio_value(
-                            &mut self.settings.details_size_display_mode,
-                            mode,
-                            mode.label(),
-                        )
-                        .changed();
+                for &mode in DetailsSizeDisplayMode::all() {
+                    ui.radio_value(&mut menu_state.size_display_mode, mode, mode.label());
                 }
 
                 ui.separator();
                 ui.label("日時");
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.details_timestamp_show_seconds,
-                        "秒まで表示",
-                    )
-                    .changed();
+                ui.checkbox(&mut menu_state.timestamp_show_seconds, "秒まで表示");
 
                 ui.separator();
                 ui.label("行表示");
                 for &style in DetailsRowStyle::all() {
-                    changed |= ui
-                        .radio_value(&mut self.settings.details_row_style, style, style.label())
-                        .changed();
+                    ui.radio_value(&mut menu_state.row_style, style, style.label());
                 }
             }
         });
 
-        if changed {
+        let changes = menu_state.apply(&mut self.settings, column_set, current_name_width);
+        // details_selection_bar_mode は環境設定ダイアログ所有のため、ダイアログを開いたまま
+        // ここで切り替えた後に OK を押すと prepare_preferences_settings_for_commit が保持する
+        // snapshot 側の値へ戻る。ほかの環境設定所有フィールドと同じ意図した優先順位である。
+        let mode_changed =
+            toggle_requested && toggle_details_selection_bar_mode_from_menu(&mut self.settings);
+        if changes.any() || mode_changed {
             Self::cancel_details_best_fit_job(ui.ctx());
-            let new_lazy = (
-                self.settings.details_show_page_count,
-                self.settings.details_show_created,
-                self.settings.details_show_image_dimensions,
-                self.settings.details_show_video_duration,
-                self.settings.details_show_video_dimensions,
-                self.settings.details_show_video_codec,
-            );
-            if old_lazy != new_lazy {
+            if changes.lazy_columns || mode_changed {
                 self.invalidate_details_meta_requirements();
             }
-            self.reset_details_sort_if_hidden();
-            self.rebuild_details_order();
+            if changes.columns && column_set != DetailsColumnSet::DedicatedBar {
+                self.reset_details_sort_if_hidden();
+                self.rebuild_details_order();
+            }
             self.settings.save();
             ui.ctx().request_repaint();
         }
@@ -15097,6 +15352,7 @@ mod compute_cell_size_tests {
             content_revision: 13,
             total_rows,
             column: DetailsColumn::Name,
+            column_set: DetailsColumnSet::Details,
             view_kind: DetailsBestFitViewKind::Normal,
             book_sort_locked: false,
             header_title: "名前".to_owned(),
@@ -15116,6 +15372,142 @@ mod compute_cell_size_tests {
             measured_rows: 0,
             batches: 0,
         }
+    }
+
+    #[test]
+    fn details_column_menu_heading_covers_every_mode_and_origin() {
+        let origins = [
+            DetailsColumnMenuOrigin::DetailsListHeader,
+            DetailsColumnMenuOrigin::ThumbnailSelectionBar,
+            DetailsColumnMenuOrigin::DetailsSelectionBar,
+        ];
+        for mode in [
+            DetailsSelectionBarMode::SameAsDetails,
+            DetailsSelectionBarMode::Unknown,
+        ] {
+            for origin in origins {
+                assert_eq!(
+                    details_column_menu_heading(mode, origin),
+                    "一覧と下部情報バー共通"
+                );
+            }
+        }
+        for mode in [
+            DetailsSelectionBarMode::Dedicated,
+            DetailsSelectionBarMode::Hidden,
+        ] {
+            assert_eq!(
+                details_column_menu_heading(mode, DetailsColumnMenuOrigin::DetailsListHeader),
+                "一覧・サムネイル表示の下部情報バー"
+            );
+            assert_eq!(
+                details_column_menu_heading(mode, DetailsColumnMenuOrigin::ThumbnailSelectionBar,),
+                "一覧・サムネイル表示の下部情報バー"
+            );
+            assert_eq!(
+                details_column_menu_heading(mode, DetailsColumnMenuOrigin::DetailsSelectionBar),
+                "詳細表示の下部情報バー専用"
+            );
+        }
+    }
+
+    #[test]
+    fn details_column_menu_targets_left_set_and_keeps_format_shared() {
+        let mut settings = crate::settings::Settings::default();
+        settings.details_show_tags = false;
+        settings.details_show_size = true;
+        settings.details_selection_bar_show_tags = false;
+        settings.details_selection_bar_show_size = false;
+        settings.details_selection_bar_name_width_auto = false;
+        settings.details_size_display_mode = DetailsSizeDisplayMode::FixedKb;
+        settings.details_timestamp_show_seconds = true;
+        settings.details_row_style = DetailsRowStyle::Stripe;
+
+        let mut state =
+            DetailsColumnMenuState::from_settings(&settings, DetailsColumnSet::DedicatedBar);
+        assert!(!state.show_tags);
+        assert!(!state.show_size);
+        assert!(!state.name_width_auto);
+        assert_eq!(state.size_display_mode, DetailsSizeDisplayMode::FixedKb);
+        assert!(state.timestamp_show_seconds);
+        assert_eq!(state.row_style, DetailsRowStyle::Stripe);
+
+        state.show_tags = true;
+        state.show_created = true;
+        state.name_width_auto = true;
+        state.size_display_mode = DetailsSizeDisplayMode::FixedMb;
+        state.timestamp_show_seconds = false;
+        state.row_style = DetailsRowStyle::Plain;
+        let changes = state.apply(&mut settings, DetailsColumnSet::DedicatedBar, 321.0);
+
+        assert!(changes.columns);
+        assert!(changes.lazy_columns);
+        assert!(changes.format);
+        assert!(settings.details_selection_bar_show_tags);
+        assert!(settings.details_selection_bar_show_created);
+        assert!(settings.details_selection_bar_name_width_auto);
+        assert!(!settings.details_show_tags, "セット A の左列は変更しない");
+        assert!(
+            !settings.details_show_created,
+            "セット A の左列は変更しない"
+        );
+        assert_eq!(
+            settings.details_size_display_mode,
+            DetailsSizeDisplayMode::FixedMb,
+            "右列の書式は対象がセット C でもセット A へ保存する"
+        );
+        assert!(!settings.details_timestamp_show_seconds);
+        assert_eq!(settings.details_row_style, DetailsRowStyle::Plain);
+
+        settings.details_selection_bar_show_tags = false;
+        let mut shared =
+            DetailsColumnMenuState::from_settings(&settings, DetailsColumnSet::SharedBar);
+        assert!(!shared.show_tags);
+        shared.show_tags = true;
+        let shared_changes = shared.apply(&mut settings, DetailsColumnSet::SharedBar, 180.0);
+        assert!(shared_changes.columns);
+        assert!(settings.details_show_tags);
+        assert!(
+            !settings.details_selection_bar_show_tags,
+            "セット A の編集でセット C の左列は変更しない"
+        );
+    }
+
+    #[test]
+    fn details_selection_bar_menu_toggle_copies_when_entering_dedicated() {
+        let mut settings = crate::settings::Settings::default();
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
+        settings.details_show_tags = false;
+        settings.details_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::Size,
+            width: 234.0,
+        }];
+        settings.details_selection_bar_show_tags = true;
+        settings.details_selection_bar_column_widths.clear();
+
+        assert!(toggle_details_selection_bar_mode_from_menu(&mut settings));
+        assert_eq!(
+            settings.details_selection_bar_mode,
+            DetailsSelectionBarMode::Dedicated
+        );
+        assert!(!settings.details_selection_bar_show_tags);
+        assert_eq!(
+            settings.details_selection_bar_column_widths,
+            settings.details_column_widths
+        );
+
+        assert!(toggle_details_selection_bar_mode_from_menu(&mut settings));
+        assert_eq!(
+            settings.details_selection_bar_mode,
+            DetailsSelectionBarMode::SameAsDetails
+        );
+        settings.details_column_widths[0].width = 345.0;
+        settings.details_selection_bar_column_widths.clear();
+        assert!(toggle_details_selection_bar_mode_from_menu(&mut settings));
+        assert_eq!(
+            settings.details_selection_bar_column_widths, settings.details_column_widths,
+            "メニューから専用設定へ入り直すたびセット A を再コピーする"
+        );
     }
 
     #[test]
@@ -15220,6 +15612,7 @@ mod compute_cell_size_tests {
         let mut settings = minimal_details_settings();
         assert!(set_details_column_width(
             &mut settings,
+            DetailsColumnSet::Details,
             DetailsColumn::Size,
             220.0
         ));
@@ -15532,6 +15925,95 @@ mod compute_cell_size_tests {
     }
 
     #[test]
+    fn apply_details_best_fit_width_writes_only_the_target_set() {
+        let mut app = setup_app_for_test();
+        app.settings.details_name_width_auto = true;
+        app.settings.details_selection_bar_name_width_auto = true;
+        app.settings.details_column_widths.clear();
+        app.settings.details_selection_bar_column_widths.clear();
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.apply_details_best_fit_width(
+                    ui,
+                    DetailsColumnSet::DedicatedBar,
+                    DetailsColumn::Name,
+                    260.0,
+                );
+                app.apply_details_best_fit_width(
+                    ui,
+                    DetailsColumnSet::SharedBar,
+                    DetailsColumn::Tags,
+                    180.0,
+                );
+            });
+        });
+
+        assert!(app.settings.details_name_width_auto);
+        assert!(!app.settings.details_selection_bar_name_width_auto);
+        assert!(app.settings.details_selection_bar_name_width > 260.0);
+        assert!(app.settings.details_selection_bar_column_widths.is_empty());
+        assert!(
+            app.settings
+                .details_column_widths
+                .iter()
+                .any(|entry| { entry.column == DetailsColumnId::Tags && entry.width > 180.0 })
+        );
+    }
+
+    #[test]
+    fn selection_bar_only_draw_loop_advances_best_fit_job() {
+        let mut app = setup_app_for_test();
+        app.settings.grid_view_mode = GridViewMode::Thumbnail;
+        let row_count = DETAILS_BEST_FIT_ROWS_PER_FRAME * 3 + 1;
+        app.items = (0..row_count)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\Pictures\row-{idx}.png"))))
+            .collect();
+        app.image_metas = vec![None; row_count];
+        app.visible_indices = (0..row_count).collect();
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::Name,
+                    DetailsColumnSet::SharedBar,
+                    false,
+                );
+            });
+        });
+        let started_next_row = ctx
+            .data(|data| {
+                data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
+                    .flatten()
+            })
+            .expect("multi-frame job remains after the first batch")
+            .next_row;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(800.0, App::DETAILS_HEADER_H),
+                    egui::Sense::hover(),
+                );
+                app.draw_details_header_static(ui, rect, DetailsColumnSet::SharedBar);
+            });
+        });
+        let advanced_next_row = ctx
+            .data(|data| {
+                data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
+                    .flatten()
+            })
+            .expect("bar-only frame keeps the unfinished job")
+            .next_row;
+
+        assert_eq!(started_next_row, DETAILS_BEST_FIT_ROWS_PER_FRAME);
+        assert_eq!(advanced_next_row, DETAILS_BEST_FIT_ROWS_PER_FRAME * 2);
+    }
+
+    #[test]
     fn details_best_fit_name_width_measures_current_rows() {
         let mut app = setup_app_for_test();
         app.settings.grid_view_mode = GridViewMode::Details;
@@ -15550,7 +16032,12 @@ mod compute_cell_size_tests {
         ));
         let _ = ctx.run(raw_input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::Name,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
 
@@ -15584,7 +16071,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::Name,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
         assert!(
@@ -15638,7 +16130,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::Name,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
         let mut expected = 0.0;
@@ -15678,7 +16175,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(ui, DetailsColumn::Name, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::Name,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
         app.items_generation = app.items_generation.wrapping_add(1);
@@ -15708,7 +16210,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let rating_key = app.details_best_fit_job_key(ui, DetailsColumn::Rating, false);
+                let rating_key = app.details_best_fit_job_key(
+                    ui,
+                    DetailsColumn::Rating,
+                    DetailsColumnSet::Details,
+                    false,
+                );
                 let (rating_width, rating_dynamic) =
                     app.details_best_fit_seed_width(ui, &rating_key);
                 let five_stars = App::details_best_fit_measure(
@@ -15719,13 +16226,22 @@ mod compute_cell_size_tests {
                 assert!(!rating_dynamic);
                 assert!(rating_width >= five_stars);
 
-                let tags_key = app.details_best_fit_job_key(ui, DetailsColumn::Tags, false);
+                let tags_key = app.details_best_fit_job_key(
+                    ui,
+                    DetailsColumn::Tags,
+                    DetailsColumnSet::Details,
+                    false,
+                );
                 let (_, tags_dynamic) = app.details_best_fit_seed_width(ui, &tags_key);
                 assert!(tags_dynamic, "タグは現在一覧の動的値を全行測る");
 
                 app.items_are_bookmark_view = true;
-                let bookmark_state_key =
-                    app.details_best_fit_job_key(ui, DetailsColumn::State, false);
+                let bookmark_state_key = app.details_best_fit_job_key(
+                    ui,
+                    DetailsColumn::State,
+                    DetailsColumnSet::Details,
+                    false,
+                );
                 let (_, bookmark_state_dynamic) =
                     app.details_best_fit_seed_width(ui, &bookmark_state_key);
                 assert!(
@@ -15735,8 +16251,12 @@ mod compute_cell_size_tests {
 
                 app.items_are_bookmark_view = false;
                 app.items_are_reading_history_view = true;
-                let history_state_key =
-                    app.details_best_fit_job_key(ui, DetailsColumn::State, false);
+                let history_state_key = app.details_best_fit_job_key(
+                    ui,
+                    DetailsColumn::State,
+                    DetailsColumnSet::Details,
+                    false,
+                );
                 let (_, history_state_dynamic) =
                     app.details_best_fit_seed_width(ui, &history_state_key);
                 assert!(
@@ -15767,7 +16287,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(ui, DetailsColumn::Tags, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::Tags,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
 
@@ -15840,7 +16365,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(ui, DetailsColumn::VideoCodec, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::VideoCodec,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
 
@@ -15913,7 +16443,12 @@ mod compute_cell_size_tests {
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(ui, DetailsColumn::Tags, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::Tags,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
         app.details_cell_content_revisions.video_meta = app
@@ -15978,7 +16513,12 @@ mod compute_cell_size_tests {
                     state.clone(),
                     egui::TextStyle::Body.resolve(ui.style()),
                 );
-                app.start_details_best_fit_job(ui, DetailsColumn::State, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::State,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
 
@@ -16025,7 +16565,12 @@ mod compute_cell_size_tests {
                     state.clone(),
                     egui::TextStyle::Body.resolve(ui.style()),
                 );
-                app.start_details_best_fit_job(ui, DetailsColumn::State, false);
+                app.start_details_best_fit_job(
+                    ui,
+                    DetailsColumn::State,
+                    DetailsColumnSet::Details,
+                    false,
+                );
             });
         });
 
@@ -16302,6 +16847,20 @@ mod compute_cell_size_tests {
     }
 
     #[test]
+    fn details_best_fit_job_key_distinguishes_target_column_set() {
+        let details = best_fit_test_key(250);
+        let mut dedicated = details.clone();
+        dedicated.column_set = DetailsColumnSet::DedicatedBar;
+
+        assert_ne!(details, dedicated);
+        let mut job = DetailsBestFitJob {
+            key: details,
+            ..best_fit_test_job(250)
+        };
+        assert_eq!(job.next_batch(&dedicated), DetailsBestFitBatch::Stale);
+    }
+
+    #[test]
     fn details_best_fit_rejects_generation_sort_filter_font_and_dpi_changes() {
         let mut job = best_fit_test_job(250);
         let base = job.key.clone();
@@ -16346,11 +16905,15 @@ mod compute_cell_size_tests {
     fn set_details_name_width_switches_to_fixed_and_is_idempotent() {
         let mut settings = crate::settings::Settings::default();
         assert!(settings.details_name_width_auto);
-        assert!(set_details_name_width(&mut settings, 210.0));
+        assert!(set_details_name_width(
+            &mut settings,
+            DetailsColumnSet::Details,
+            210.0
+        ));
         assert!(!settings.details_name_width_auto, "固定モードへ切替");
         assert!((settings.details_name_width - 210.0).abs() < 0.01);
         assert!(
-            !set_details_name_width(&mut settings, 210.0),
+            !set_details_name_width(&mut settings, DetailsColumnSet::Details, 210.0),
             "同値なら変更なし"
         );
     }

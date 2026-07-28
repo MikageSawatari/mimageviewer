@@ -411,7 +411,15 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   読み替え、それぞれ最終閲覧日時と `12 / 120` のような既読位置を別々の列に表示する。
   プレビューアイコンにホバーすると、その 1 件だけサムネイルを読み込み、メインウィンドウ外の
   画面内に収まるツールチップで表示する
-- 詳細一覧ヘッダの右クリックメニューから、`名前` 以外の既定列と追加列を表示/非表示にできる。
+- 詳細一覧ヘッダと下部情報バーのヘッダの右クリックメニューから、`名前` 以外の既定列と追加列を
+  表示/非表示にできる。詳細表示中の下部情報バーが専用設定を使う場合、そのバーから開いたメニューの
+  左列は専用設定を編集し、詳細一覧ヘッダとサムネイル表示中の下部情報バーは一覧側の設定を編集する。
+  左列の見出しは、共通設定なら `一覧と下部情報バー共通`、専用設定の一覧側なら
+  `一覧・サムネイル表示の下部情報バー`、専用設定の詳細表示バー側なら
+  `詳細表示の下部情報バー専用` とする。右列の見出しは常に
+  `書式 (すべての表示で共通)` とし、サイズ表示・日時・行表示は専用設定でも一覧側と共有する。
+  詳細表示の下部情報バーから開いたメニューでは、バーを消す選択肢を出さず、
+  `一覧と同じ設定にする` / `専用の設定にする` をその場で切り替えられる。
   同じメニューでサイズ列の表示単位を `最適` (既定) / `固定: バイト` / `固定: KB` /
   `固定: MB` から選べる。固定表示では整数部を 3 桁カンマ区切りにする。
   同じメニューの日時セクションで `秒まで表示` を切り替えられる。
@@ -422,7 +430,9 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   音声には解像度がないため `動画解像度` 列は空欄になる。
   画像は既存のフルスクリーンキャッシュ / サムネイルカタログ / 画像ヘッダ probe、
   動画・音声は FFmpeg probe、作成日時はファイルシステム metadata を worker でバックグラウンド取得する
-- 詳細一覧ヘッダの右端をドラッグすると列幅を変更できる。列境界をダブルクリックすると、
+- 詳細一覧ヘッダと下部情報バーのヘッダの列右端をドラッグすると、現在その面が使う設定の列幅を
+  変更できる。下部情報バーには列の並べ替えドラッグとソートクリックを付けない。どちらのヘッダでも
+  列境界をダブルクリックすると、
   ヘッダと現在の一覧全体の内容に合わせた最適幅へ変更する。大量一覧では UI を止めないよう、
   1 frame 最大 192 行ずつ分割計測する。計測開始から一覧 identity、sort/filter 順、view kind、
   font/style/DPI が変わった処理は破棄する。タグまたは遅延メタの対象列の表示内容世代が変わった
@@ -1369,7 +1379,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `details_timestamp_show_seconds` | bool | false | 詳細表示モードの更新日時 / 作成日時を秒まで表示するか |
 | `details_row_style` | DetailsRowStyle | Separator | 詳細表示モードの行表示。`Separator` は DPI 対応の行区切り線のみ、`Stripe` は交互背景色のみ、`SeparatorAndStripe` は両方、`Plain` はどちらも描画しない |
 | `details_column_order` | Vec\<DetailsColumnId\> | [] | セット A (詳細一覧 + サムネイル表示時の下部情報バー) の列順。空なら既定順。列ヘッダの横ドラッグで更新される |
-| `details_column_widths` | Vec\<DetailsColumnWidth\> | [] | セット A の列幅。`名前` 以外を列ヘッダ右端ドラッグで更新する |
+| `details_column_widths` | Vec\<DetailsColumnWidth\> | [] | セット A の列幅。詳細一覧またはセット A を使う下部情報バーの列ヘッダ右端ドラッグ / best-fit で更新する |
 | `details_name_width_auto` | bool | true | セット A で `名前` 列を残り幅へ自動調整するか。`false` で `details_name_width` を固定幅として使う。`名前` 列右端ドラッグ / ヘッダ右クリックで切替 |
 | `details_name_width` | f32 | 140.0 | セット A の固定幅モード時に使う `名前` 列幅 (px) |
 | `details_show_preview` | bool | true | 詳細表示モードで左端のプレビューアイコン列を表示するか |
@@ -1387,7 +1397,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `details_show_video_codec` | bool | false | 詳細表示モードで遅延ロード列 `コーデック` を表示するか。動画・音声の両方でコーデックを取得する |
 | `details_selection_bar_mode` | DetailsSelectionBarMode | SameAsDetails | 詳細表示中の下部情報バー (セット C) の扱い。`SameAsDetails` はセット A を読む、`Dedicated` は専用セット C を読む、`Hidden` はバーを確保せず遅延メタデータも要求しない。未知値は sanitize で `SameAsDetails` に正規化する。非 `Dedicated` から `Dedicated` へ切り替わるたび、その時点のセット A をセット C へ複製する |
 | `details_selection_bar_column_order` | Vec\<DetailsColumnId\> | [] | セット C 専用の列順。空なら既定順。プレビュー列は順序や表示設定にかかわらずバーでは除外する |
-| `details_selection_bar_column_widths` | Vec\<DetailsColumnWidth\> | [] | セット C 専用の列幅 |
+| `details_selection_bar_column_widths` | Vec\<DetailsColumnWidth\> | [] | セット C 専用の列幅。詳細表示中の専用下部情報バーの列ヘッダ右端ドラッグ / best-fit で更新する |
 | `details_selection_bar_name_width_auto` | bool | true | セット C で `名前` 列を残り幅へ自動調整するか |
 | `details_selection_bar_name_width` | f32 | 140.0 | セット C の固定幅モード時に使う `名前` 列幅 (px) |
 | `details_selection_bar_show_preview` | bool | true | セット C のプレビュー列表示値。セット複製の完全性のため保持するが、バー描画では常に自動除外する |
@@ -1406,7 +1416,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `facet_filter` | FacetFilter | default | スマートフィルタ条件。種類・拡張子・タグ・日付・サイズ・状態・AI モデル・生成ツールなど。場所条件はセッション中の一時状態で、フォルダ / ZIP / PDF / 仮想ビューの移動時に解除し、設定には保存しない。絞り込み中に ZIP/PDF/フォルダなどのコンテナへ入ると親階層の条件を一時退避し、内側では別条件を設定できる。Backspace などで親階層へ戻ると退避した条件を復元する |
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16）。`thumb_aspect_auto = false` のときに使われる。Auto モード時もこの値は手動値として保持され、Manual に戻すと復活する。 |
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダおよび安定したブックマーク仮想一覧ごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。ブックマーク一覧は非同期再構築前の空一覧段階から前回値を復元し、毎回 `1:1` を経由しない。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
-| `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報をツールチップ / 下部情報バーのどこへ出すか。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。下部情報バーはグリッドの `CentralPanel` より先に「ヘッダ + カーソル位置の 1 行 + solid 横スクロールバー専用レーン」の高さを予約し、データ行は選択やアイテム操作を受け付けない。サムネイル表示時は常にセット A、詳細表示時は `details_selection_bar_mode` に従ってセット A / C / 非表示を選ぶ。A/C ともプレビュー列は自動除外する。実際に表示する遅延列だけ、ツールチップ設定に関係なく選択中の 1 件をバックグラウンドで読み込む |
+| `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報をツールチップ / 下部情報バーのどこへ出すか。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。下部情報バーはグリッドの `CentralPanel` より先に「ヘッダ + カーソル位置の 1 行 + solid 横スクロールバー専用レーン」の高さを予約し、データ行は選択やアイテム操作を受け付けない。サムネイル表示時は常にセット A、詳細表示時は `details_selection_bar_mode` に従ってセット A / C / 非表示を選ぶ。A/C ともプレビュー列は自動除外する。バーのヘッダは列幅ドラッグ、一覧全体を母集団にした best-fit、編集対象に応じた右クリック列メニューを持つが、ソートと列順ドラッグは持たない。詳細表示のバーのメニューでは A / C をその場で切り替えられる。実際に表示する遅延列だけ、ツールチップ設定に関係なく選択中の 1 件をバックグラウンドで読み込む |
 | `grid_click_selection_mode` | GridClickSelectionMode | Check | サムネイル / 詳細表示に共通のクリック選択方式。`Check` は通常 / 空白クリックで既存チェックを維持し、Shift 範囲を追加する。`Explorer` は通常クリックで単一選択、空白クリックで全解除、Ctrl で個別トグル、Shift でアンカーからの範囲へ置換する。未知値は sanitize で `Check` に正規化する |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
