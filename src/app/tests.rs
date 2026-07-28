@@ -3393,7 +3393,7 @@ mod same_name_zip_preference_tests {
 
 #[cfg(test)]
 mod phase_c_key_tests {
-    use super::phase_c_support::setup_app;
+    use super::phase_c_support::{AppTestEnv, setup_app};
     use super::*;
 
     fn grid_key_nav(
@@ -3416,6 +3416,45 @@ mod phase_c_key_tests {
         let nav = app.handle_keyboard(&ctx);
         let _ = ctx.end_pass();
         nav
+    }
+
+    fn setup_grid_cursor_wrap_app() -> AppTestEnv {
+        let mut app = setup_app();
+        app.settings.grid_cols = 2;
+        app.settings.grid_cursor_wrap = true;
+        app.items = (0..5)
+            .map(|index| GridItem::Image(PathBuf::from(format!("C:/Pictures/{index}.jpg"))))
+            .collect();
+        app.image_metas = vec![None; app.items.len()];
+        app.thumbnails = (0..app.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.selected = Some(app.items.len() - 1);
+        app
+    }
+
+    #[test]
+    fn grid_cursor_wrap_shift_down_at_end_clamps_range_selection() {
+        let mut app = setup_grid_cursor_wrap_app();
+        let last = app.items.len() - 1;
+
+        let nav = grid_key_nav(&mut app, egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+
+        assert!(nav.is_none());
+        assert_eq!(app.selected, Some(last));
+        assert_eq!(app.checked, std::collections::HashSet::from([last]));
+    }
+
+    #[test]
+    fn grid_cursor_wrap_plain_down_at_end_wraps_to_start() {
+        let mut app = setup_grid_cursor_wrap_app();
+
+        let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::ArrowDown);
+
+        assert!(nav.is_none());
+        assert_eq!(app.selected, Some(0));
+        assert!(app.checked.is_empty());
     }
 
     /// ベースライン: 新規 App はどの検索バーも開いていないこと。

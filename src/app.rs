@@ -30476,6 +30476,10 @@ impl App {
                 cols.max(1)
             };
             let page_items = visible_rows.max(1) * nav_cols;
+            let shift = ctx.input(|i| i.modifiers.shift);
+            // Shift+矢印の範囲チェックは下で線形区間として扱う。端をループさせると
+            // 隣接する 1 回の移動で一覧全体が範囲に入るため、Shift 中だけ従来どおりクランプする。
+            let cursor_wrap = self.settings.grid_cursor_wrap && !shift;
 
             // 画面上の表示順で移動し、raw index に変換する。
             // Ctrl+矢印はフォルダ移動に使うので、通常カーソル移動から除外
@@ -30491,13 +30495,7 @@ impl App {
                 None
             };
             let new_vis_pos = if let Some(direction) = cursor_direction {
-                grid_cursor_nav_target_pos(
-                    vis_pos,
-                    vi_len,
-                    nav_cols,
-                    direction,
-                    self.settings.grid_cursor_wrap,
-                )
+                grid_cursor_nav_target_pos(vis_pos, vi_len, nav_cols, direction, cursor_wrap)
             } else if home {
                 Some(0)
             } else if end {
@@ -30510,7 +30508,6 @@ impl App {
                 None
             };
 
-            let shift = ctx.input(|i| i.modifiers.shift);
             let new_sel = new_vis_pos.and_then(|vp| vi.get(vp).copied());
 
             if let Some(s) = new_sel {
