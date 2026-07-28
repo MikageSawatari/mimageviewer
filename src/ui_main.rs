@@ -628,14 +628,61 @@ fn show_sticky_context_menu(response: &egui::Response, add_contents: impl FnOnce
 
 fn draw_sticky_settings_menu_header(ui: &mut egui::Ui, title: &str) {
     ui.set_min_width(220.0);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(title).strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    // A bare right-to-left child consumes the popup's entire remaining available width, so the
+    // header alone decided the popup width: the toolbar submenu grew to the screen edge (~605px)
+    // and egui gave up on placing it beside its parent item, dropping it on top of the entries
+    // below instead. Bound the row to the width the menu has already claimed so the close button
+    // stays right-aligned without the header widening anything. Menus that want to be wide
+    // (place / tag facets) call `set_width` before this and keep their own width.
+    let row_size = egui::vec2(ui.min_size().x, ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(
+        row_size,
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
             if ui.small_button("×").on_hover_text("閉じる").clicked() {
                 ui.close();
             }
-        });
-    });
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(title).strong());
+            });
+        },
+    );
+}
+
+#[cfg(test)]
+mod sticky_settings_menu_header_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn header_width_does_not_follow_available_screen_width() {
+        use egui_kittest::Harness;
+
+        let measured_width = Arc::new(Mutex::new(None));
+        let measured_width_in_ui = measured_width.clone();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 180.0))
+            .build(move |ctx| {
+                let area = egui::Area::new(egui::Id::new("sticky_settings_menu_header_test"))
+                    .fixed_pos(egui::pos2(0.0, 0.0))
+                    .movable(false)
+                    .show(ctx, |ui| {
+                        draw_sticky_settings_menu_header(ui, "表示するセクション");
+                    });
+                *measured_width_in_ui.lock().unwrap() = Some(area.response.rect.width());
+            });
+        harness.run();
+
+        let width = measured_width.lock().unwrap().expect("header was rendered");
+        assert!(
+            width >= 220.0,
+            "header was narrower than its minimum: {width}"
+        );
+        assert!(
+            width <= 280.0,
+            "header consumed the 800px available width: {width}"
+        );
+    }
 }
 
 fn draw_tag_view_menu_section(
@@ -4005,13 +4052,6 @@ impl App {
                                         }
                                     }
                                 });
-                                // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
-                                // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
-                                // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
-                                // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
-                                ui.menu_button("ツールバー", |ui| {
-                                    self.draw_toolbar_visibility_menu(ui, true);
-                                });
                                 ui.separator();
                                 for &command in settings_menu_commands {
                                     match command {
@@ -4100,6 +4140,16 @@ impl App {
                                         _ => {}
                                     }
                                 }
+                                ui.separator();
+                                // このサブメニューは最後に置く。左右に収まらず親項目の下へ開く場合でも、
+                                // 後続の設定項目を覆わないための防御であり、上のサブメニュー群へ移さない。
+                                // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
+                                // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
+                                // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
+                                // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
+                                ui.menu_button("ツールバー", |ui| {
+                                    self.draw_toolbar_visibility_menu(ui, true);
+                                });
                                 // VST3 関連の設定は環境設定→VST3 プラグインページに集約。
                                 // 専用メニューは重複なので持たない (= ユーザー要望 2026-04)。
                                 // 動画再生中はホバーバー / ツールバーの VST ボタンから
