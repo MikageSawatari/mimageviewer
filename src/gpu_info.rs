@@ -1,7 +1,9 @@
 //! GPU (DXGI) 情報の取得ヘルパー。
 //!
 //! 主目的はプライマリ GPU の VRAM 容量を取得し、
-//! サムネイル VRAM 上限を % 指定で計算できるようにすること (段階 D)。
+//! mImageViewer 全体の VRAM 上限を % 指定で計算できるようにすること。
+
+pub(crate) const FALLBACK_VRAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// GPU ベンダー識別。TensorRT 設定の gating に使用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,8 +270,14 @@ fn sm_from_description(desc: &str) -> Option<u32> {
 ///
 /// VRAM の取得失敗時は 4 GiB を仮定する保守的フォールバックを使う。
 pub fn vram_cap_from_percent(percent: u32) -> u64 {
-    const FALLBACK_VRAM_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
-    let total = query_primary_gpu_vram_bytes().unwrap_or(FALLBACK_VRAM_BYTES);
+    vram_cap_from_percent_for_total(percent, query_primary_gpu_vram_bytes())
+}
+
+pub(crate) fn vram_cap_from_percent_for_total(
+    percent: u32,
+    detected_vram_bytes: Option<u64>,
+) -> u64 {
+    let total = detected_vram_bytes.unwrap_or(FALLBACK_VRAM_BYTES);
     total.saturating_mul(percent as u64) / 100
 }
 

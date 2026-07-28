@@ -2979,14 +2979,16 @@ pub struct Settings {
     /// 段階 B: サムネイル先読みの前方ページ数（現在位置より後に保持するページ数）
     #[serde(default = "default_thumb_next_pages")]
     pub thumb_next_pages: u32,
-    /// 段階 D: サムネイル GPU 使用量の上限 (プライマリ GPU の総 VRAM に対する %)。
+    /// mImageViewer 全体の GPU 使用量上限 (プライマリ GPU の総 VRAM に対する %)。
     /// 0 で無制限。
     ///
-    /// ページ単位先読みで枚数は有界化されるが、巨大セル × 多ページ設定で
-    /// 想定外に増えるケースへの安全ネット。超過時は keep_range を縮める。
-    /// 実機の VRAM を DXGI で取得し、この % 倍を実上限とする。
-    #[serde(default = "default_thumb_vram_cap_percent")]
-    pub thumb_vram_cap_percent: u32,
+    /// 一覧とフルスクリーン表示へ現在のモードに応じて内部配分し、テクスチャ保持範囲の
+    /// 安全ネットにする。永続キーはリリース済みの旧名を維持する。
+    #[serde(
+        rename = "thumb_vram_cap_percent",
+        default = "default_gpu_memory_percent"
+    )]
+    pub gpu_memory_percent: u32,
     /// 段階 E: アイドル時にキャッシュから復元されたサムネイルを
     /// 元画像から再デコードして高画質化する。
     ///
@@ -4370,7 +4372,7 @@ fn default_thumb_prev_pages() -> u32 {
 fn default_thumb_next_pages() -> u32 {
     4
 }
-fn default_thumb_vram_cap_percent() -> u32 {
+fn default_gpu_memory_percent() -> u32 {
     50
 }
 fn default_folder_thumb_sort() -> SortOrder {
@@ -4628,7 +4630,7 @@ impl Default for Settings {
             indexer_speed_profile: IndexerSpeedProfile::default(),
             thumb_prev_pages: default_thumb_prev_pages(),
             thumb_next_pages: default_thumb_next_pages(),
-            thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
+            gpu_memory_percent: default_gpu_memory_percent(),
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_tooltip_show_filename: true,
@@ -7437,7 +7439,7 @@ mod tests {
         assert!(!s.archive_convert_without_dialog);
         assert_eq!(s.thumb_prev_pages, 2);
         assert_eq!(s.thumb_next_pages, 4);
-        assert_eq!(s.thumb_vram_cap_percent, 50);
+        assert_eq!(s.gpu_memory_percent, 50);
         assert!(s.thumb_idle_upgrade);
         assert_eq!(s.spread_page_gap_px, 4);
         assert_eq!(s.continuous_reading_gap_px, 20);
@@ -7509,6 +7511,25 @@ mod tests {
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
         assert_eq!(s.text_contrast, TextContrast::Standard);
+    }
+
+    #[test]
+    fn gpu_memory_percent_reads_and_writes_released_persisted_key() {
+        let mut persisted = serde_json::to_value(Settings::default()).unwrap();
+        let object = persisted.as_object_mut().unwrap();
+        object.insert("thumb_vram_cap_percent".to_string(), 37u64.into());
+        assert!(!object.contains_key("gpu_memory_percent"));
+
+        let loaded: Settings = serde_json::from_value(persisted).unwrap();
+        assert_eq!(loaded.gpu_memory_percent, 37);
+
+        let saved = serde_json::to_value(loaded).unwrap();
+        let saved = saved.as_object().unwrap();
+        assert_eq!(
+            saved.get("thumb_vram_cap_percent").and_then(|v| v.as_u64()),
+            Some(37)
+        );
+        assert!(!saved.contains_key("gpu_memory_percent"));
     }
 
     #[test]

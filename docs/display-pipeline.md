@@ -106,7 +106,7 @@ lossless WebP として分離保存する。保存先は `<data_dir>/edit_previe
 元画像と各編集 DB は変更しない。
 読み込み worker は保存サイズを品質原本として残したまま、現在の `display_px` へ下地と
 全注釈レイヤーを Lanczos3 で同一寸法へ縮小してから合成する。UI / GPU には表示寸法の
-画像だけを渡し、ページ数ベースの eviction と VRAM 上限見積もりを実際のテクスチャ寸法と一致させる。
+画像だけを渡し、ページ数ベースの eviction と共有 VRAM 会計を実際のテクスチャ寸法に一致させる。
 透過境界は `Color32` の premultiplied alpha を保ったまま縮小し、WebP 保存の直前だけ
 straight alpha へ戻す。これにより Normal 注釈や透過画像の縁に透明黒が混じることを防ぐ。
 
@@ -1022,7 +1022,9 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 
 連結読み (`draw_fs_continuous_reading`) は、`SpreadMode` のページ構成 (単ページ / 見開き)
 を表示ユニットとして縦または横へ仮想配置する。巨大キャンバスは作らず、各ユニットの表示矩形を
-スクロール位置から毎フレーム計算し、GPU に保持するのは可視範囲と前後少数ページだけにする。
+スクロール位置から毎フレーム計算する。描画対象はマージン 0 の厳密可視ユニットだけに保ち、
+final pipeline の処理対象には前後 1 ユニットの準備帯も加える。準備帯は描画にも可視ページ数上限の
+判定にも含めない。GPU に保持するのは可視範囲と前後少数ページだけにする。
 同時可視ページ数は最大 16 ページ程度、`fs_cache` の連結読み用 keep set は最大 20 ページ程度に
 抑え、推定総テクセル数でも追加の安全弁をかける。推定にはrawだけでなく、erase、local-adjust、
 conceal、edit、final composite、comic、補正の完全mip chainをTextureId重複排除つきで含め、
@@ -1033,10 +1035,11 @@ conceal、edit、final composite、comic、補正の完全mip chainをTextureId�
 これにより表紙だけ横幅いっぱいに拡大されず、後続の見開きページと同じ倍率で読める。
 表示トリムが有効なページは、各ページの見える bbox だけをユニット幅/高さとページ間 gap の基準にし、
 描画時も同じ bbox を UV に使う。見開きユニットでは左右の見える端が `spread_page_gap_px` で並ぶ。
-final composite / comic composite は可視ページ単位で扱い、キャッシュ済みの最終テクスチャは
-即描画する。未生成ページだけを 1 フレーム 1 枚ずつ final pipeline に流し、現在ページが
-キャッシュ済みの場合は次の可視未生成ページへ処理枠を回すことで、スクロール中の大量 GPU
-アップロードを避けつつ画面端から表示品質を追従させる。連結表示自身が 16ms 後の再描画を
+final composite / comic composite は厳密可視ページと準備帯を処理対象にし、キャッシュ済みの
+最終テクスチャは厳密可視ページだけへ即描画する。未生成ページだけを 1 フレーム 1 枚ずつ final
+pipeline に流し、現在ページがキャッシュ済みの場合は viewport 中心に近い未生成ページ、続いて
+画面外の準備帯へ処理枠を回す。これによりスクロール中の大量 GPU アップロードを避けつつ、
+次ユニットが可視になる前に final composite の生成を始める。連結表示自身が 16ms 後の再描画を
 所有するのは、live な raw decode / upload backlog、解決済みページの次候補、または保存済み
 編集マーカーを同期的に整理して状態が進んだ場合だけとする。`resolve_fs_processed_texture` の
 `None` には raw 読込失敗や worker 起動失敗などの終端状態も含まれるため、`None` だけを根拠に

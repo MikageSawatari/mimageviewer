@@ -4836,11 +4836,11 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 
     ui.add_space(12.0);
-    ui.label(egui::RichText::new("AI アップスケール結果の保持").strong());
+    ui.label(egui::RichText::new("AI アップスケール結果の保持 (CPU メモリ)").strong());
     ui.add_space(4.0);
     ui.label(
         "フルスクリーンを閉じた後も、完了済みの AI アップスケール / ノイズ除去結果を\n\
-         メモリに残す上限です。どちらかを 0 にすると保持しません。",
+         CPU メモリ (RAM) に残す上限です。どちらかを 0 にすると保持しません。",
     );
     ui.add_space(4.0);
 
@@ -4856,7 +4856,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
     });
     ui.horizontal(|ui| {
-        ui.label("最大メモリ:");
+        ui.label("最大 CPU メモリ (RAM):");
         ui.add(
             egui::DragValue::new(&mut s.retained_final_ai_cache_max_mib)
                 .range(
@@ -4958,27 +4958,27 @@ pub(super) fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
         None => "取得失敗 (4 GiB 仮定)".to_string(),
     };
     ui.label(format!(
-        "サムネイル GPU メモリ上限 (安全ネット):\n\
-         超過時は先読み範囲を自動的に縮小します。\n\
+        "mImageViewer 全体の GPU メモリ上限:\n\
+         一覧とフルスクリーン表示へ、現在の表示に合わせて自動配分します。\n\
          検出した GPU の VRAM: {vram_label}",
     ));
 
     ui.horizontal(|ui| {
         ui.label("上限:");
         ui.add(
-            egui::Slider::new(&mut s.thumb_vram_cap_percent, 0..=100u32)
+            egui::Slider::new(&mut s.gpu_memory_percent, 0..=100u32)
                 .step_by(5.0)
                 .suffix(" %"),
         );
     });
 
-    let pct = s.thumb_vram_cap_percent;
+    let pct = s.gpu_memory_percent;
     let text = if pct == 0 {
         "  ↑ 0% = 無制限 (推奨しない)".to_string()
     } else {
         let cap_mib = crate::gpu_info::vram_cap_from_percent(pct) / (1024 * 1024);
         format!(
-            "  ↑ VRAM の {}% = 約 {} MiB を上限とします (推奨: 50%)",
+            "  ↑ VRAM の {}% = 約 {} MiB をアプリ全体の上限とします (推奨: 50%)",
             pct, cap_mib
         )
     };

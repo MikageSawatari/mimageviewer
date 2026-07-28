@@ -392,7 +392,11 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 
 - `thumb_prev_pages`（デフォルト 2）/ `thumb_next_pages`（デフォルト 4）ページ分のサムネイルを GPU メモリに保持
 - 範囲外のサムネイルは `Evicted` 状態にして TextureHandle を drop → VRAM 解放
-- `thumb_vram_cap_percent`（デフォルト 50%）で GPU メモリ使用量の安全ネット
+- `thumb_vram_cap_percent`（デフォルト 50%）は永続キー名を互換維持したまま、mImageViewer
+  全体が使ってよい GPU メモリの割合を表す。一覧ではサムネイルへ 80%、フルスクリーン表示系へ
+  20%、フルスクリーン中は逆に配分する。0% は無制限
+- フルスクリーン中もサムネイル保持帯は凍結した一覧スクロール位置ではなく現在ページへ追従し、
+  一覧へ戻る位置の周辺を温める。モード切替専用の全破棄は行わず、配分変更の結果として自然に縮退する
 
 ### 3.5 詳細表示モード
 
@@ -1469,12 +1473,12 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 |--------|-----|---------|------|
 | `thumb_prev_pages` | u32 | 2 | サムネイル先読み（前方ページ数） |
 | `thumb_next_pages` | u32 | 4 | サムネイル先読み（後方ページ数） |
-| `thumb_vram_cap_percent` | u32 | 50 | GPU メモリ上限（VRAM の %） |
+| `thumb_vram_cap_percent` | u32 | 50 | mImageViewer 全体の GPU メモリ上限（VRAM の %）。Rust 側では `gpu_memory_percent` として扱うが、既存 settings.db 互換のため永続キー名は維持する。0 で無制限 |
 | `thumb_idle_upgrade` | bool | true | アイドル時にキャッシュ由来サムネイルを高画質化 |
 | `prefetch_back` | usize | 4 | フルスクリーン先読み（前方枚数） |
 | `prefetch_forward` | usize | 12 | フルスクリーン先読み（後方枚数） |
 | `retained_final_ai_cache_max_entries` | usize | 10 | フルスクリーンを閉じた後も保持する final AI 結果 (アップスケール / ノイズ除去後 pixels) の最大枚数。`0` で保持しない。環境設定では 0〜20 |
-| `retained_final_ai_cache_max_mib` | u64 | 512 | 上記保持キャッシュの CPU メモリ上限 (MiB)。`0` で保持しない。環境設定では 0〜8192 MB。枚数とメモリのどちらかを超えると LRU で古い結果から破棄する |
+| `retained_final_ai_cache_max_mib` | u64 | 512 | 上記保持キャッシュの **CPU メモリ (RAM)** 上限 (MiB)。GPU メモリ予算には含めない。`0` で保持しない。環境設定では 0〜8192 MB。枚数とメモリのどちらかを超えると LRU で古い結果から破棄する |
 
 ### 8.4 その他
 

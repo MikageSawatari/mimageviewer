@@ -87,6 +87,48 @@ pub(crate) fn decide_prefetch_allowed(
     PrefetchDecision::Allow { reason }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalEffectPrefetchAdmission {
+    Allow,
+    NotInKeepSet,
+    OverLowWatermark,
+}
+
+impl FinalEffectPrefetchAdmission {
+    pub(crate) fn blocked_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Allow => None,
+            Self::NotInKeepSet => Some("not_in_keep_set"),
+            Self::OverLowWatermark => Some("over_low_watermark"),
+        }
+    }
+}
+
+/// final-effect の先読み対象を viewer mode、連結読み keep-set、texel LOW 水位から判定する。
+/// ページ送りでは keep-set / 水位を参照せず従来の AI 先読み対象を維持する。連結読みは
+/// keep-set 内だけを許可し、準備帯は LOW 水位をバイパス、それ以外は LOW 未満に限定する。
+pub(crate) fn should_prefetch_final_effect(
+    reading_is_paged: bool,
+    continuous_keep_set: &std::collections::HashSet<usize>,
+    idx: usize,
+    in_prepare_band: bool,
+    continuous_loaded_texels: usize,
+    continuous_low_watermark: Option<usize>,
+) -> FinalEffectPrefetchAdmission {
+    if reading_is_paged {
+        return FinalEffectPrefetchAdmission::Allow;
+    }
+    if !continuous_keep_set.contains(&idx) {
+        return FinalEffectPrefetchAdmission::NotInKeepSet;
+    }
+    if in_prepare_band || continuous_low_watermark.is_none_or(|low| continuous_loaded_texels < low)
+    {
+        FinalEffectPrefetchAdmission::Allow
+    } else {
+        FinalEffectPrefetchAdmission::OverLowWatermark
+    }
+}
+
 /// 先読み対象を距離順・forward 先で交互配置: +1, -1, +2, -2, +3, -3, …
 /// 同距離の組では forward (次ページ方向) が先。片側が尽きたら反対側だけ続く。
 /// fs_cache / AI アップスケール / サムネイルグリッド の全先読みで方針統一。

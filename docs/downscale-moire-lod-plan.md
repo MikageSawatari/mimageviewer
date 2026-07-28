@@ -85,10 +85,15 @@ invalidation、CPU resize は発生しない。mipmap 非対象 texture、`PostF
 - texture cache の invalidation は従来どおり `TextureHandle` 単位。再 upload 時に mip chain も
   一緒に作り直されるため、LOD 専用の世代管理は追加しない。
 - `PostFilter::Nearest` は level 0 + nearest sampler のままとし、意図したドット表示を守る。
-- 連結読みの320M texel上限は、raw staticの完全なmip chainに加え、同時保持するerase、
-  local-adjust（レイヤー比較previewを含む）、conceal、edit、final composite、comic、補正textureも
-  TextureIdで重複排除して見積もる。これらの編集cacheはkeep-set evictionにも追従する。
-  animated frameは従来どおりlevel 0だけを数える。
+- 連結読みの texel 予算は、mImageViewer 全体の VRAM pool をフルスクリーン中の表示系へ 80%
+  配分し、RGBA8 の 4 byte/texel で割った値を HIGH、HIGH の 75% を LOW とする。raw static の
+  完全な mip chain に加え、同時保持する erase、local-adjust（レイヤー比較 preview を含む）、
+  conceal、edit、final composite、comic、補正 texture も `TextureId` で重複排除して実寸計上する。
+  HIGH 超過時だけ非可視 keep-set を遠い側から外し、LOW 以下まで退去する。投機的な final-effect
+  先読みは使用量が LOW 未満のときだけ許可する。ただし厳密可視の前後 1 ユニットの準備帯と
+  可視ページは水位をバイパスし、texel trim の退去候補からも除外する。これらの編集 cache は
+  keep-set eviction にも追従し、animated frame は従来どおり level 0 だけを数える。0% 設定では
+  HIGH/LOW を設けず、この texel trim と投機的先読みの水位判定を無効化する。
 - 表示トリムは画像全体から生成したmipを部分UVで描く。強い縮小時は、切り落とした余白色が
   境界の低LOD texelへ混ざる可能性があるが、通常は画面上1〜2px程度であり、専用crop textureの
   キャッシュ複雑化を避けるためv2.7.0では既知制約として受容する。
@@ -116,7 +121,7 @@ invalidation、CPU resize は発生しない。mipmap 非対象 texture、`PostF
 - 360度パノラマの経度シームを画面中央へ置いても、シーム沿いだけ粗いmipによる縦線・ぼけが
   出ないこと。
 - 水平cropされた部分パノラマを広角表示しても、欠落領域へ画像の反対端が混ざらないこと。
-- 連結読みの320M texel上限が完全なmip chainと後段表示textureを含むこと。
+- 連結読みの texel 集計が完全な mip chain と後段表示 texture を含み、共有 pool 由来の HIGH 超過で LOW (HIGH の 75%) 以下まで退去すること。
 - `Nearest`、animated image、動画、サムネイルの挙動が変わらないこと。
 - 旧 `downscale2x` / `downscale4x` を含む保存設定が `None` でロードできること。
 

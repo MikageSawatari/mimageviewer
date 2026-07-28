@@ -18,7 +18,7 @@
 | PDF メタ catch-up / 隣接 prefetch | `std::thread` (常駐、`pdf-meta-catchup`) | 1 | `pdf_meta` テーブルへの背景書き込みを統括 (v1.0.0)。WebP cache hit で render_page を skip した PDF (= アップグレードユーザーの既存サムネ) の `pdf_meta` 補完 (`MetaOnly`、low lane) と、`load_pdf_as_folder` 直後の ±1 隣接 PDF の page 0 render + WebP 温め (`NeighborPrefetch`、high lane) を、`CatchupQueue` 経由でシリアル処理する。重複は pending HashSet で dedup、low → high の優先昇格あり |
 | Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる |
 | AI 推論 (final pipeline) | `std::thread` (`final-ai-worker`, 常駐) + 優先度キュー (`AiJobQueue`) + 共有 mpsc | 1 | final AI (upscale/denoise) を `AiJob` キューから逐次処理。`AiRuntime` の sessions Mutex が全推論を直列化するため worker は 1 本で十分。**モデルロード (`load_model`) / 推論を worker スレッド上で実行し、UI スレッドは sessions ロックに触らない** (= per-job spawn だった旧設計の「UI THREAD HANG: 推論ロック飢餓」を解消、§3.2.1)。優先度は Display(表示中ページ, LIFO) → Prefetch(先読み, FIFO) |
-| カラー化 / 最終エフェクト | `std::thread` (`miv-final-effect-{idx}` / `miv-final-effect-prefetch-{idx}`、要求ごとの短命 worker) + 個別 mpsc | 表示要求 + 背景先読み最大 1 本 | final AI / sharpen 後の `ColorImage` に、モノクロ系判定、スクリーントーン濃淡変換、階調カラー LUT、ポストフィルタを順に適用する。AI と共通の前後枚数で非表示ページも 1 枚ずつ先読みし、色調補正・smart sharpen も worker 上で行う。先読み／表示開始時とも無着色の provisional texture を upload せず、完成結果だけを `final_composite_cache` へ upload する。表示要求が先読み中の同じ key に来た場合は job を昇格して再利用し、同一 viewer のページ送りでは完成まで直前ページを holdover する。連結読みでは keep-set 内の各表示済みページがページ別 transition texture を持ち、raw source 差し替えや incomplete → complete 再合成で live final が一時的に消えても黒い読込表示へ戻さない。complete final の GPU 登録後に差し替え、keep-set 離脱時は旧 texture も破棄する。ページ入場だけでは完成 cache / pending を破棄しない。別 key の表示要求、設定変更、keep-set 除外、context close / drop では `Arc<AtomicBool>` を立て、`items_generation` と composite key が一致する結果だけを採用する。pending map とページ別 transition は viewer context の swap / park と一緒に所有権移動するため、別ウィンドウの要求や表示を誤って共有しない |
+| カラー化 / 最終エフェクト | `std::thread` (`miv-final-effect-{idx}` / `miv-final-effect-prefetch-{idx}`、要求ごとの短命 worker) + 個別 mpsc | 表示要求 + 背景先読み最大 1 本 | final AI / sharpen 後の `ColorImage` に、モノクロ系判定、スクリーントーン濃淡変換、階調カラー LUT、ポストフィルタを順に適用する。AI と共通の前後枚数を候補にし、ページ送りでは従来どおり、連結読みでは `fs_vertical_cache_keep_set` との積に絞り、実テクスチャ会計が共有 pool 由来の LOW 未満のときだけ遠方ページを先読みする。厳密可視の前後 1 ユニットの準備帯は LOW をバイパスして非表示ページを 1 枚ずつ先行処理し、色調補正・smart sharpen も worker 上で行う。可視ページの表示要求は水位をバイパスする。先読み／表示開始時とも無着色の provisional texture を upload せず、完成結果だけを `final_composite_cache` へ upload する。表示要求が先読み中の同じ key に来た場合は job を昇格して再利用し、同一 viewer のページ送りでは完成まで直前ページを holdover する。連結読みでは keep-set 内の各表示済みページがページ別 transition texture を持ち、raw source 差し替えや incomplete → complete 再合成で live final が一時的に消えても黒い読込表示へ戻さない。complete final の GPU 登録後に差し替え、keep-set 離脱時は旧 texture も破棄する。ページ入場だけでは完成 cache / pending を破棄しない。別 key の表示要求、設定変更、keep-set 除外、context close / drop では `Arc<AtomicBool>` を立て、`items_generation` と composite key が一致する結果だけを採用する。pending map とページ別 transition は viewer context の swap / park と一緒に所有権移動するため、別ウィンドウの要求や表示を誤って共有しない |
 | edit materialization (local / conceal) | `std::thread` (`local-adjust-render` / `conceal-materialize`、要求ごとの短命 worker) + idx 別 mpsc | viewer context 内で idx ごとに最新 1 本。可視ページが複数なら別 idx は並行し得る | source 解像度 edit chain の lazy LocalAdjust DB / JSON load、mask resize、local compose、および Conceal DB read、deflate / JSON decode、shape raster、conceal compose を UI thread 外で行う。local と conceal は同じ `local_adjust_pending[idx]` slot を共有し、後段が必要な local 完了前に conceal を誤った下位 source へ合成しない。CPU 結果だけを返し、generation / key を UI 側で検証した後、共通予算で 1 フレーム 1 枚だけ GPU upload する。詳細は §3.2.2 |
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
 | Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
@@ -532,13 +532,31 @@ mImageViewer は 2 つのリストを使い分ける:
 - `egui_ctx.load_texture` でアップロードするコマ数を MAX_TEXTURES_PER_FRAME=8 に制限
 - 超過分は `texture_backlog` に積んで次フレーム以降に処理
 
-### 4.3 VRAM キャップ
+### 4.3 共有 VRAM pool と会計
 
-- `gpu_info.rs` で取得した VRAM 量から動的にテクスチャ上限バイト数を決定
-- 超過しそうなら visible slice (display list 上の区間) を両端から狭める (古い側から evict)
+- `gpu_info.rs` で検出した VRAM に `gpu_memory_percent` を掛け、mImageViewer 全体で 1 つの
+  pool を作る。検出失敗時は 4 GiB を仮定し、設定 0% は無制限として上限を作らない
+- 一覧中はサムネイル 80% / フルスクリーン表示系 20%、フルスクリーン中は 20% / 80% とする。
+  比率は内部定数であり、モード移行時に専用の全破棄は行わない
+- 連結読みの HIGH はフルスクリーン配分 byte を RGBA8 の 4 byte/texel で割った値、LOW は
+  HIGH の 75%。HIGH 超過でだけ trim を開始し、可視ページと準備帯を除く遠方 unit を LOW
+  以下まで外す。無制限時は HIGH/LOW と trim/admission の両方を無効化する
+- サムネイル保持帯はモード別のサムネイル配分を使い、ロード済み texture の実寸が上限を
+  超えた場合に display list 上の区間を縮める。フルスクリーン中の中心は一覧のスクロール位置
+  ではなく `fullscreen_idx` に追従する
 
-新しいテクスチャキャッシュ (例: 将来の補正 LUT プレビュー) を追加する時は、
-この退去ロジックにも登録すること。
+`app/vram_accounting.rs` は `fs_cache` から表示系の各派生 cache、連結 transition、
+`thumbnails` / `thumb_textures` / `thumb_adjust_tex` までを横断する。推定表示サイズではなく
+`TextureHandle::size()` と完全な mip chain を使い、同じ `TextureId` は cache をまたいでも
+1 回だけ数える。チェック柄・スタンプ・font preview など小さく有界な texture は対象外とする。
+
+`--perf-log` が有効な場合だけ、約 1 秒に 1 回 `gpu.vram_accounting` を記録する。イベントには
+モード、全 texel/byte、共有 pool と両配分の上限、無制限フラグ、および subsystem ごとの
+texel/byte を含める。会計のための I/O・decode・GPU readback は行わず、UI thread 上では既存の
+handle metadata を走査するだけに限定する。
+
+新しいテクスチャキャッシュを追加する時は、会計対象か小さく有界な対象外かを決め、対象なら
+accountant と所有モードの配分へ登録すること。
 
 ---
 
@@ -906,7 +924,7 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 
 - `input`  — ユーザー入力 (seq が振られる唯一のカテゴリ)
 - `frame`  — 毎フレーム begin。`n` はフレーム番号
-- `fs`     — フルスクリーン画像: `load_begin` / `decode_begin` / `decode_end` / `ready` / `paint`。`final_effect_worker` は `worker_ms` に加えて `colorize_check_ms` / `colorize_apply_ms`、各補正段、`clamp_ms` / `load_texture_ms`、`colorize_applied`、方式・設定スケール・長辺換算後の実効スケール、`prefetch` / `complete` を記録する
+- `fs`     — フルスクリーン画像: `load_begin` / `decode_begin` / `decode_end` / `ready` / `paint`。`final_effect_worker` は `worker_ms` に加えて `colorize_check_ms` / `colorize_apply_ms`、各補正段、`clamp_ms` / `load_texture_ms`、`colorize_applied`、方式・設定スケール・長辺換算後の実効スケール、`prefetch` / `complete` を記録する。完成済み final composite を drop 後 30 秒以内に同じ key で再生成した場合は `final_effect_recompute` に `idx` / `age_ms` / `drop_reason` / 窓内・累計件数を記録し、窓内 8 件超では 30 秒に 1 回だけ通常ログへ警告する。先読み admission の拒否は `final_effect_prefetch_blocked` に `idx` / `reason` (`not_in_keep_set` または `over_low_watermark`) / `loaded_texels` / `low_watermark` を記録する。同じ idx・理由は 1 秒に 1 回へ間引き、理由変更時は即時記録する
 - `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`。アイドル高画質化の最終判定は `idle_upgrade_enqueue` / `idle_upgrade_ineligible` に `key` / `idx` / `items_gen` を載せ、同一状態の反復を検出できるようにする
 - `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `inproc_*` / `enumerate_send`
 - `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`

@@ -1443,6 +1443,47 @@ fn interleaved_prefetch_targets_boundary_cases() {
 }
 
 #[test]
+fn final_effect_prefetch_admission_reports_each_condition() {
+    let empty = std::collections::HashSet::new();
+    assert_eq!(
+        should_prefetch_final_effect(true, &empty, 42, false, 100, Some(100)),
+        FinalEffectPrefetchAdmission::Allow
+    );
+
+    let keep_set = std::collections::HashSet::from([2]);
+    assert_eq!(
+        should_prefetch_final_effect(false, &keep_set, 2, false, 99, Some(100)),
+        FinalEffectPrefetchAdmission::Allow
+    );
+    assert_eq!(
+        should_prefetch_final_effect(false, &keep_set, 3, true, 99, Some(100)),
+        FinalEffectPrefetchAdmission::NotInKeepSet
+    );
+    assert_eq!(
+        should_prefetch_final_effect(false, &keep_set, 2, false, 100, Some(100)),
+        FinalEffectPrefetchAdmission::OverLowWatermark
+    );
+}
+
+#[test]
+fn final_effect_prepare_band_bypasses_low_but_not_keep_set() {
+    let keep_set = std::collections::HashSet::from([2]);
+    assert_eq!(
+        should_prefetch_final_effect(false, &keep_set, 2, true, 100, Some(100)),
+        FinalEffectPrefetchAdmission::Allow
+    );
+    assert_eq!(
+        should_prefetch_final_effect(false, &keep_set, 3, true, 100, Some(100)),
+        FinalEffectPrefetchAdmission::NotInKeepSet
+    );
+    assert_eq!(
+        should_prefetch_final_effect(false, &keep_set, 2, false, usize::MAX, None),
+        FinalEffectPrefetchAdmission::Allow,
+        "unlimited mode must disable the LOW admission gate"
+    );
+}
+
+#[test]
 fn next_video_search_uses_display_order_and_skips_non_video_items() {
     use crate::grid_item::GridItem;
 
@@ -11013,6 +11054,34 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn thumbnail_retention_anchor_follows_fullscreen_index() {
+        let visible_indices = [2, 5, 9, 14, 20];
+
+        assert_eq!(
+            thumbnail_retention_anchor_position(&visible_indices, 1, None),
+            1
+        );
+        assert_eq!(
+            thumbnail_retention_anchor_position(&visible_indices, 1, Some(14)),
+            3,
+            "fullscreen retention must follow the current page instead of frozen grid scroll"
+        );
+        assert_eq!(
+            thumbnail_retention_anchor_position(&visible_indices, 1, Some(99)),
+            1,
+            "filtered-out fullscreen pages fall back to the grid anchor"
+        );
+    }
+
+    #[test]
+    fn thumbnail_keep_bounds_preserve_anchor_and_forward_bias() {
+        assert_eq!(thumbnail_keep_bounds_for_count(0, 10, 5, 6), (3, 9));
+        assert_eq!(thumbnail_keep_bounds_for_count(0, 10, 0, 6), (0, 6));
+        assert_eq!(thumbnail_keep_bounds_for_count(0, 10, 9, 6), (4, 10));
+        assert_eq!(thumbnail_keep_bounds_for_count(3, 8, 5, 1), (5, 6));
+    }
+
+    #[test]
     fn update_keep_range_enqueue_requests_repaints_before_tail() {
         use crate::grid_item::GridItem;
         use std::sync::{
@@ -18795,6 +18864,94 @@ mod pipeline_cache_refactor_tests {
         }
     }
 
+    #[test]
+    fn final_effect_recompute_tracker_counts_only_recent_completed_same_key() {
+        let base = std::time::Instant::now();
+        let key = FinalCompositeKey {
+            edit_key: EditResultKey {
+                idx: 3,
+                source_gen: 4,
+                erase_mask_gen: 5,
+                local_gen: 6,
+                conceal_mask_gen: 7,
+                conceal_gen: 8,
+            },
+            params_hash: 9,
+            bg: 10,
+        };
+        let other_key = FinalCompositeKey {
+            edit_key: EditResultKey {
+                idx: 11,
+                ..key.edit_key
+            },
+            ..key
+        };
+        let mut tracker = FinalCompositeDropTracker::default();
+
+        tracker.record_drop(key, false, base, "incomplete");
+        assert!(
+            tracker
+                .observe_spawn(key, base + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+
+        tracker.record_drop(key, true, base, "keep_set_evict");
+        assert!(
+            tracker
+                .observe_spawn(other_key, base + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+        let observed = tracker
+            .observe_spawn(key, base + std::time::Duration::from_secs(2))
+            .expect("same completed key inside the window must count");
+        assert_eq!(observed.age_ms, 2_000);
+        assert_eq!(observed.drop_reason, "keep_set_evict");
+        assert_eq!(observed.count_in_window, 1);
+        assert_eq!(observed.total_count, 1);
+
+        assert!(
+            tracker
+                .observe_spawn(
+                    key,
+                    base + FINAL_EFFECT_RECOMPUTE_WINDOW + std::time::Duration::from_millis(1),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn final_effect_prefetch_block_log_emits_on_reason_change_or_interval() {
+        let base = std::time::Instant::now();
+        let mut log = FinalEffectPrefetchBlockLog::default();
+
+        assert!(log.observe(3, FinalEffectPrefetchAdmission::NotInKeepSet, base));
+        assert!(!log.observe(
+            3,
+            FinalEffectPrefetchAdmission::NotInKeepSet,
+            base + std::time::Duration::from_millis(999)
+        ));
+        assert!(log.observe(
+            3,
+            FinalEffectPrefetchAdmission::OverLowWatermark,
+            base + std::time::Duration::from_millis(999)
+        ));
+        assert!(log.observe(
+            3,
+            FinalEffectPrefetchAdmission::OverLowWatermark,
+            base + std::time::Duration::from_millis(1_999)
+        ));
+        assert!(!log.observe(
+            3,
+            FinalEffectPrefetchAdmission::Allow,
+            base + std::time::Duration::from_millis(2_000)
+        ));
+        assert!(log.observe(
+            3,
+            FinalEffectPrefetchAdmission::OverLowWatermark,
+            base + std::time::Duration::from_millis(2_001)
+        ));
+    }
+
     fn insert_edit_and_final_cache(
         app: &mut App,
         ctx: &egui::Context,
@@ -22128,7 +22285,7 @@ mod pipeline_cache_refactor_tests {
         app.adjustment_page_params.insert(target, params.clone());
         let final_key = app.final_composite_key_for_pixels(edit_key, source.size, &params);
 
-        app.prefetch_final_effects(&ctx, current);
+        app.prefetch_final_effects(&ctx, current, None);
         assert!(
             !app.final_composite_cache.contains_key(&final_key),
             "background prefetch must not upload a provisional monochrome texture"
@@ -22196,7 +22353,7 @@ mod pipeline_cache_refactor_tests {
         app.adjustment_page_params.insert(target, params.clone());
         let final_key = app.final_composite_key_for_pixels(edit_key, source.size, &params);
 
-        app.prefetch_final_effects(&ctx, current);
+        app.prefetch_final_effects(&ctx, current, None);
         let original_cancel = Arc::clone(
             &app.final_effect_pending
                 .get(&final_key)

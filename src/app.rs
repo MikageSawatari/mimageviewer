@@ -45,6 +45,52 @@ fn folder_media_sort_order(
     }
 }
 
+/// 一覧中の保持帯の基準位置。フルスクリーン中は凍結した一覧スクロール位置ではなく、
+/// 現在ページへ追従する。フィルタ変更などで現在ページが display list にない場合だけ
+/// 一覧側の位置へ戻す。
+fn thumbnail_retention_anchor_position(
+    visible_indices: &[usize],
+    grid_visible_first: usize,
+    fullscreen_idx: Option<usize>,
+) -> usize {
+    if visible_indices.is_empty() {
+        return 0;
+    }
+    let grid_visible_first = grid_visible_first.min(visible_indices.len() - 1);
+    fullscreen_idx
+        .and_then(|idx| visible_indices.binary_search(&idx).ok())
+        .unwrap_or(grid_visible_first)
+}
+
+/// 指定枚数へ保持帯を縮める。現在位置を必ず含め、従来どおり前方を約 2/3、後方を
+/// 約 1/3 優先する。端では余った枠を反対側へ回す。
+fn thumbnail_keep_bounds_for_count(
+    desired_start: usize,
+    desired_end: usize,
+    anchor: usize,
+    max_items: usize,
+) -> (usize, usize) {
+    if desired_start >= desired_end {
+        return (desired_start, desired_start);
+    }
+    let anchor = anchor.clamp(desired_start, desired_end - 1);
+    let max_items = max_items
+        .max(1)
+        .min(desired_end.saturating_sub(desired_start));
+    let back_capacity = anchor.saturating_sub(desired_start);
+    let forward_capacity = desired_end.saturating_sub(anchor);
+
+    let mut back = (max_items / 3).min(back_capacity);
+    let mut forward = max_items.saturating_sub(back).min(forward_capacity);
+    let mut remaining = max_items.saturating_sub(back + forward);
+    let add_back = remaining.min(back_capacity.saturating_sub(back));
+    back += add_back;
+    remaining -= add_back;
+    forward += remaining.min(forward_capacity.saturating_sub(forward));
+
+    (anchor - back, anchor + forward)
+}
+
 mod cache_ops;
 mod color_filter;
 #[cfg(windows)]
@@ -67,6 +113,7 @@ mod subfolder_expansion;
 pub(crate) mod top_level_grid_view;
 #[cfg(windows)]
 mod viewer_session;
+mod vram_accounting;
 #[cfg(test)]
 pub(crate) use startup_ops::{
     startup_file_should_open_fullscreen, startup_openable_should_auto_fullscreen,
@@ -105,8 +152,9 @@ use metadata_ops::{
 #[cfg(test)]
 pub(crate) use prefetch_policy::BlockReason;
 pub(crate) use prefetch_policy::{
-    AllowReason, PREFETCH_BACKSTOP, PREFETCH_IDLE_THRESHOLD, PrefetchDecision,
-    decide_prefetch_allowed, interleaved_prefetch_targets,
+    AllowReason, FinalEffectPrefetchAdmission, PREFETCH_BACKSTOP, PREFETCH_IDLE_THRESHOLD,
+    PrefetchDecision, decide_prefetch_allowed, interleaved_prefetch_targets,
+    should_prefetch_final_effect,
 };
 #[cfg(windows)]
 use viewer_session::ViewerSession;
@@ -2220,7 +2268,7 @@ struct ViewerContextBundle {
     final_ai_cache: std::collections::HashMap<FinalAiKey, FinalAiEntry>,
     final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
     final_ai_failed: std::collections::HashSet<FinalAiKey>,
-    final_composite_cache: std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    final_composite_cache: FinalCompositeCache,
     final_effect_pending: std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
     adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
@@ -2488,7 +2536,7 @@ impl ViewerContextBundle {
             final_ai_cache: std::collections::HashMap::new(),
             final_ai_pending: std::collections::HashMap::new(),
             final_ai_failed: std::collections::HashSet::new(),
-            final_composite_cache: std::collections::HashMap::new(),
+            final_composite_cache: FinalCompositeCache::default(),
             final_effect_pending: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
             erase_result_cache: std::collections::HashMap::new(),
@@ -5207,6 +5255,247 @@ pub(crate) struct FinalCompositeKey {
     pub(crate) edit_key: EditResultKey,
     pub(crate) params_hash: u64,
     pub(crate) bg: u8,
+}
+
+const FINAL_EFFECT_PREFETCH_BLOCK_LOG_CAPACITY: usize = 256;
+const FINAL_EFFECT_PREFETCH_BLOCK_LOG_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct FinalEffectPrefetchBlockLogState {
+    reason: &'static str,
+    last_emitted_at: std::time::Instant,
+}
+
+#[derive(Default)]
+struct FinalEffectPrefetchBlockLog {
+    states: std::collections::HashMap<usize, FinalEffectPrefetchBlockLogState>,
+    lru: std::collections::VecDeque<usize>,
+}
+
+impl FinalEffectPrefetchBlockLog {
+    fn observe(
+        &mut self,
+        idx: usize,
+        admission: FinalEffectPrefetchAdmission,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(reason) = admission.blocked_reason() else {
+            self.states.remove(&idx);
+            if let Some(pos) = self.lru.iter().position(|candidate| *candidate == idx) {
+                self.lru.remove(pos);
+            }
+            return false;
+        };
+        let should_emit = self.states.get(&idx).is_none_or(|previous| {
+            previous.reason != reason
+                || now.saturating_duration_since(previous.last_emitted_at)
+                    >= FINAL_EFFECT_PREFETCH_BLOCK_LOG_INTERVAL
+        });
+        if !should_emit {
+            return false;
+        }
+        if let Some(pos) = self.lru.iter().position(|candidate| *candidate == idx) {
+            self.lru.remove(pos);
+        }
+        self.states.insert(
+            idx,
+            FinalEffectPrefetchBlockLogState {
+                reason,
+                last_emitted_at: now,
+            },
+        );
+        self.lru.push_back(idx);
+        while self.lru.len() > FINAL_EFFECT_PREFETCH_BLOCK_LOG_CAPACITY {
+            if let Some(oldest) = self.lru.pop_front() {
+                self.states.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
+const FINAL_COMPOSITE_DROP_TRACKER_CAPACITY: usize = 256;
+const FINAL_EFFECT_RECOMPUTE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+const FINAL_EFFECT_RECOMPUTE_WARNING_THRESHOLD: usize = 8;
+
+#[derive(Clone, Copy)]
+struct FinalCompositeDropRecord {
+    dropped_at: std::time::Instant,
+    reason: &'static str,
+}
+
+struct FinalEffectRecomputeObservation {
+    age_ms: u64,
+    drop_reason: &'static str,
+    count_in_window: usize,
+    total_count: u64,
+    warn: bool,
+}
+
+#[derive(Default)]
+struct FinalCompositeDropTracker {
+    dropped_complete: std::collections::HashMap<FinalCompositeKey, FinalCompositeDropRecord>,
+    lru: std::collections::VecDeque<FinalCompositeKey>,
+    recomputes: std::collections::VecDeque<std::time::Instant>,
+    total_recomputes: u64,
+    last_warning_at: Option<std::time::Instant>,
+}
+
+impl FinalCompositeDropTracker {
+    fn record_drop(
+        &mut self,
+        key: FinalCompositeKey,
+        complete: bool,
+        dropped_at: std::time::Instant,
+        reason: &'static str,
+    ) {
+        if !complete {
+            return;
+        }
+        if let Some(pos) = self.lru.iter().position(|candidate| *candidate == key) {
+            self.lru.remove(pos);
+        }
+        self.dropped_complete
+            .insert(key, FinalCompositeDropRecord { dropped_at, reason });
+        self.lru.push_back(key);
+        while self.lru.len() > FINAL_COMPOSITE_DROP_TRACKER_CAPACITY {
+            if let Some(oldest) = self.lru.pop_front() {
+                self.dropped_complete.remove(&oldest);
+            }
+        }
+    }
+
+    fn observe_spawn(
+        &mut self,
+        key: FinalCompositeKey,
+        now: std::time::Instant,
+    ) -> Option<FinalEffectRecomputeObservation> {
+        let record = self.dropped_complete.get(&key).copied()?;
+        let Some(age) = now.checked_duration_since(record.dropped_at) else {
+            return None;
+        };
+        if age > FINAL_EFFECT_RECOMPUTE_WINDOW {
+            self.dropped_complete.remove(&key);
+            if let Some(pos) = self.lru.iter().position(|candidate| *candidate == key) {
+                self.lru.remove(pos);
+            }
+            return None;
+        }
+
+        while self.recomputes.front().is_some_and(|started_at| {
+            now.checked_duration_since(*started_at)
+                .is_some_and(|elapsed| elapsed > FINAL_EFFECT_RECOMPUTE_WINDOW)
+        }) {
+            self.recomputes.pop_front();
+        }
+        self.recomputes.push_back(now);
+        self.total_recomputes = self.total_recomputes.saturating_add(1);
+        let count_in_window = self.recomputes.len();
+        let warn = count_in_window > FINAL_EFFECT_RECOMPUTE_WARNING_THRESHOLD
+            && self.last_warning_at.is_none_or(|last_warning| {
+                now.checked_duration_since(last_warning)
+                    .is_some_and(|elapsed| elapsed >= FINAL_EFFECT_RECOMPUTE_WINDOW)
+            });
+        if warn {
+            self.last_warning_at = Some(now);
+        }
+        Some(FinalEffectRecomputeObservation {
+            age_ms: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+            drop_reason: record.reason,
+            count_in_window,
+            total_count: self.total_recomputes,
+            warn,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FinalCompositeCache {
+    entries: std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    dropped: FinalCompositeDropTracker,
+}
+
+impl FinalCompositeCache {
+    fn retain_with_drop_reason(
+        &mut self,
+        reason: &'static str,
+        mut keep: impl FnMut(&FinalCompositeKey, &mut FinalCompositeEntry) -> bool,
+    ) {
+        // 検出は perf-log 有効時だけでなく常時動かす。この退行は「アプリがただ遅い」
+        // ようにしか見えずユーザーが観測できないため、通常起動でも警告まで到達させる。
+        // 空の `Vec::new()` は確保しないので、drop が無いフレームの追加コストは無い。
+        let mut dropped = Vec::new();
+        self.entries.retain(|key, entry| {
+            let retain = keep(key, entry);
+            if !retain && entry.complete {
+                dropped.push(*key);
+            }
+            retain
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for key in dropped {
+            self.dropped.record_drop(key, true, now, reason);
+        }
+    }
+
+    fn remove_with_drop_reason(
+        &mut self,
+        key: &FinalCompositeKey,
+        reason: &'static str,
+    ) -> Option<FinalCompositeEntry> {
+        let removed = self.entries.remove(key);
+        if removed.as_ref().is_some_and(|entry| entry.complete) {
+            self.dropped
+                .record_drop(*key, true, std::time::Instant::now(), reason);
+        }
+        removed
+    }
+
+    fn clear_with_drop_reason(&mut self, reason: &'static str) {
+        let dropped = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| entry.complete.then_some(*key))
+            .collect::<Vec<_>>();
+        if !dropped.is_empty() {
+            let now = std::time::Instant::now();
+            for key in dropped {
+                self.dropped.record_drop(key, true, now, reason);
+            }
+        }
+        self.entries.clear();
+    }
+
+    fn observe_spawn(&mut self, key: FinalCompositeKey) -> Option<FinalEffectRecomputeObservation> {
+        self.dropped.observe_spawn(key, std::time::Instant::now())
+    }
+}
+
+impl std::ops::Deref for FinalCompositeCache {
+    type Target = std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for FinalCompositeCache {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
+impl<'a> IntoIterator for &'a FinalCompositeCache {
+    type Item = (&'a FinalCompositeKey, &'a FinalCompositeEntry);
+    type IntoIter = std::collections::hash_map::Iter<'a, FinalCompositeKey, FinalCompositeEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
 }
 
 pub(crate) struct FinalCompositeEntry {
@@ -9194,8 +9483,7 @@ pub struct App {
     /// active detached viewer 宛ての結果を drain した場合はここへ一時退避する。
     pub(crate) final_ai_result_backlog: Vec<FinalAiResult>,
     /// 最終 composite cache。AdjustParams 全項目 + AI + post_filter 適用後。
-    pub(crate) final_composite_cache:
-        std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    pub(crate) final_composite_cache: FinalCompositeCache,
     /// カラー化を含む最終表示エフェクト worker。viewer context ごとに所有する。
     pub(crate) final_effect_pending:
         std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
@@ -10002,9 +10290,13 @@ pub struct App {
     pub(crate) perf_last_frame_begin: Option<std::time::Instant>,
     /// 最後に perf::flush() した時刻。約 1 秒に 1 回フラッシュする。
     pub(crate) perf_last_flush: Option<std::time::Instant>,
+    /// 全 GPU テクスチャ会計を約 1 秒に 1 回へ間引く perf-log 専用時刻。
+    last_vram_accounting_at: Option<std::time::Instant>,
     /// 直近フレームでフルスクリーンが描画した (idx, texture_id, input_seq)。
     /// 変化を検出したフレームで `fs.paint` イベントを発火する。
     pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
+    /// final-effect 先読み拒否を idx / 理由ごとに 1 秒へ間引く perf-log 専用状態。
+    final_effect_prefetch_block_log: FinalEffectPrefetchBlockLog,
 
     /// 動画再生位置の自動保存タイマ (5 秒間隔)。
     pub(crate) video_resume_last_save: Option<std::time::Instant>,
@@ -11443,7 +11735,7 @@ impl App {
             ai_job_queue: None,
             final_ai_rx: None,
             final_ai_result_backlog: Vec::new(),
-            final_composite_cache: std::collections::HashMap::new(),
+            final_composite_cache: FinalCompositeCache::default(),
             final_effect_pending: std::collections::HashMap::new(),
             local_adjust_pending: std::collections::HashMap::new(),
             local_adjust_layer_bypass_cache: std::collections::HashMap::new(),
@@ -11687,8 +11979,10 @@ impl App {
             frame_counter: 0,
             last_edit_materialize_upload_frame: u64::MAX,
             perf_last_frame_begin: None,
+            last_vram_accounting_at: None,
             perf_last_flush: None,
             fs_painted_last: None,
+            final_effect_prefetch_block_log: FinalEffectPrefetchBlockLog::default(),
             video_resume_last_save: None,
             #[cfg(windows)]
             video_resume_thumb_last_request: std::collections::HashMap::new(),
@@ -28715,7 +29009,12 @@ impl App {
         // スクロール位置が vis_count を超えるとき (フィルタ直後の縮退ケース) は末尾に寄せる。
         // さらに vis_count=0 は冒頭で早期 return 済みなのでここでは 1 以上。
         let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
-        let vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
+        let grid_vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
+        let vis_first = thumbnail_retention_anchor_position(
+            &self.visible_indices,
+            grid_vis_first,
+            self.fullscreen_idx,
+        );
 
         let prev_pages = self.settings.thumb_prev_pages as usize;
         let next_pages = self.settings.thumb_next_pages as usize;
@@ -28725,31 +29024,58 @@ impl App {
             .saturating_add((1 + next_pages) * items_per_page)
             .min(vis_count);
 
-        // ── 段階 D: VRAM 安全ネット ──────────────────────────────────
-        // display_px から 1 枚あたりの推定バイト数を算出し、cap を超えそうなら
-        // visible slice を vis_first 中心に縮小する (前方 2/3 優先、後方 1/3)。
-        // 上限は "プライマリ GPU VRAM × 設定 %" (0 で無制限)。
+        // ── 共有 VRAM pool: サムネイル保持帯 ───────────────────────────
+        // モード別のサムネイル配分を超えている場合だけ、実 texture 寸法と TextureId
+        // 重複排除で保持帯を縮める。未ロード項目は 0 texel なので先読み要求自体は許可し、
+        // texture が載った後の次フレームで自然に配分へ収束する。現在位置は常に残す。
         let mut vis_keep_start_capped = vis_keep_start;
-        let cap_percent = self.settings.thumb_vram_cap_percent;
-        if cap_percent > 0 {
-            let est_per_thumb: u64 = (current_display_px as u64)
-                .saturating_mul(current_display_px as u64)
-                .saturating_mul(4);
-            let cap_bytes = crate::gpu_info::vram_cap_from_percent(cap_percent);
-            if est_per_thumb > 0 {
-                let max_items = (cap_bytes / est_per_thumb).max(1) as usize;
-                let desired = vis_keep_end.saturating_sub(vis_keep_start);
-                if max_items < desired {
-                    let half_back = max_items / 3;
-                    let half_forward = max_items - half_back;
-                    vis_keep_start_capped = vis_first.saturating_sub(half_back);
-                    vis_keep_end = vis_first.saturating_add(half_forward).min(vis_count);
+        let budget = self.vram_pool_budget();
+        if let Some(cap_bytes) = budget.thumbnail_bytes {
+            let cap_texels = crate::vram_budget::rgba8_bytes_to_texels(cap_bytes);
+            let desired = vis_keep_end.saturating_sub(vis_keep_start);
+            if desired > 0 {
+                let texture_texels_for_bounds = |start: usize, end: usize| {
+                    let indices = self
+                        .visible_indices
+                        .get(start..end)
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied()
+                        .collect::<HashSet<_>>();
+                    self.thumbnail_texture_texels_for_indices(&indices)
+                };
+                let desired_texels = texture_texels_for_bounds(vis_keep_start, vis_keep_end);
+                if desired_texels > cap_texels {
+                    let mut chosen =
+                        thumbnail_keep_bounds_for_count(vis_keep_start, vis_keep_end, vis_first, 1);
+                    let mut low = 1usize;
+                    let mut high = desired;
+                    while low <= high {
+                        let count = low + (high - low) / 2;
+                        let bounds = thumbnail_keep_bounds_for_count(
+                            vis_keep_start,
+                            vis_keep_end,
+                            vis_first,
+                            count,
+                        );
+                        if count == 1 || texture_texels_for_bounds(bounds.0, bounds.1) <= cap_texels
+                        {
+                            chosen = bounds;
+                            low = count.saturating_add(1);
+                        } else {
+                            high = count.saturating_sub(1);
+                        }
+                    }
+                    vis_keep_start_capped = chosen.0;
+                    vis_keep_end = chosen.1;
                     crate::logger::log(format!(
-                        "  VRAM cap hit: desired={desired} max_items={max_items} \
-                         (display_px={current_display_px} est/thumb={} MB cap={} MB @ {}%)",
-                        est_per_thumb / (1024 * 1024),
+                        "  VRAM thumbnail band reduced: mode={} desired={} kept={} \
+                         loaded={} MiB cap={} MiB",
+                        self.vram_budget_mode().as_str(),
+                        desired,
+                        vis_keep_end.saturating_sub(vis_keep_start_capped),
+                        crate::vram_budget::rgba8_texels_to_bytes(desired_texels) / (1024 * 1024),
                         cap_bytes / (1024 * 1024),
-                        cap_percent,
                     ));
                 }
             }
@@ -47442,10 +47768,49 @@ impl App {
         }
     }
 
+    fn record_final_effect_prefetch_admission(
+        &mut self,
+        idx: usize,
+        admission: FinalEffectPrefetchAdmission,
+        loaded_texels: usize,
+        low_watermark: usize,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !self
+            .final_effect_prefetch_block_log
+            .observe(idx, admission, now)
+        {
+            return;
+        }
+        let Some(reason) = admission.blocked_reason() else {
+            return;
+        };
+        crate::perf::event(
+            "fs",
+            "final_effect_prefetch_blocked",
+            None,
+            self.input_seq,
+            &[
+                ("idx", (idx as u64).into()),
+                ("reason", reason.into()),
+                ("loaded_texels", (loaded_texels as u64).into()),
+                ("low_watermark", (low_watermark as u64).into()),
+            ],
+        );
+    }
+
     /// カラー化を含む final composite の先読み。AI と同じ前後枚数を使い、
     /// 非表示ページは CPU pixels だけを worker へ渡す。完了時の GPU upload は
     /// `poll_final_effects` の 1 結果として行い、ページ移動時は完成 texture が即 hit する。
-    fn prefetch_final_effects(&mut self, ctx: &egui::Context, current_idx: usize) {
+    pub(crate) fn prefetch_final_effects(
+        &mut self,
+        ctx: &egui::Context,
+        current_idx: usize,
+        continuous_prepare_set: Option<&std::collections::HashSet<usize>>,
+    ) {
         if self.post_filter_bypassed
             || self
                 .final_effect_pending
@@ -47454,7 +47819,36 @@ impl App {
         {
             return;
         }
+        let reading_is_paged = self.reading_flow.is_paged();
+        let continuous_loaded_texels = if reading_is_paged {
+            0
+        } else {
+            self.continuous_reading_loaded_texels()
+        };
+        let continuous_low_watermark = if reading_is_paged {
+            None
+        } else {
+            self.vram_pool_budget().fullscreen_watermarks().low_texels
+        };
         for idx in self.ai_prefetch_targets(current_idx) {
+            let in_prepare_band = continuous_prepare_set.is_some_and(|set| set.contains(&idx));
+            let admission = should_prefetch_final_effect(
+                reading_is_paged,
+                &self.fs_vertical_cache_keep_set,
+                idx,
+                in_prepare_band,
+                continuous_loaded_texels,
+                continuous_low_watermark,
+            );
+            self.record_final_effect_prefetch_admission(
+                idx,
+                admission,
+                continuous_loaded_texels,
+                continuous_low_watermark.unwrap_or(0),
+            );
+            if admission != FinalEffectPrefetchAdmission::Allow {
+                continue;
+            }
             let params = self.effective_params(idx).clone();
             let creative_lut = (!params.creative_lut.is_identity())
                 .then(|| {
@@ -47535,8 +47929,11 @@ impl App {
         // 背景 final-effect は現在ページの ensure 経路に依存せず、fullscreen work
         // セクション自体で回収する。ensure 側の poll はコピー / 書き出し等の入口用に残す。
         self.poll_final_effects(ctx);
-        // AI を使わないページもあるため、カラー化先読みは AI pending gate の外で進める。
-        self.prefetch_final_effects(ctx, current_idx);
+        // ページ送りのカラー化先読みは従来どおりここで回す。連結読みは描画レイアウトが
+        // 算出した準備帯を渡す必要があるため `draw_fs_continuous_reading` から起動する。
+        if self.reading_flow.is_paged() {
+            self.prefetch_final_effects(ctx, current_idx, None);
+        }
         // 現在ページの AI が走っている間 (= cancel されていない pending あり) は
         // 先読みしない。旧設計 `current_done && empty` 条件と同等。
         if self.has_uncancelled_final_ai_pending() {
@@ -48715,7 +49112,7 @@ impl App {
         self.final_ai_cache.retain(|key, _| key.edit_key.idx != idx);
         self.final_ai_failed.retain(|key| key.edit_key.idx != idx);
         self.final_composite_cache
-            .retain(|key, _| key.edit_key.idx != idx);
+            .retain_with_drop_reason("pipeline_invalidate_idx", |key, _| key.edit_key.idx != idx);
         if clear_retained {
             self.clear_retained_final_ai_for_idx(idx);
         }
@@ -48733,7 +49130,8 @@ impl App {
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
         self.cancel_all_final_effects();
-        self.final_composite_cache.clear();
+        self.final_composite_cache
+            .clear_with_drop_reason("pipeline_invalidate_all");
         self.comic_cache.clear();
         self.cancel_all_comic_bakes();
     }
@@ -48746,7 +49144,8 @@ impl App {
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
         self.cancel_all_final_effects();
-        self.final_composite_cache.clear();
+        self.final_composite_cache
+            .clear_with_drop_reason("session_close");
         self.comic_cache.clear();
         self.cancel_all_comic_bakes();
     }
@@ -51495,7 +51894,8 @@ impl App {
         let had_updates = !completed.is_empty() || !disconnected.is_empty();
         for key in disconnected {
             self.final_effect_pending.remove(&key);
-            self.final_composite_cache.remove(&key);
+            self.final_composite_cache
+                .remove_with_drop_reason(&key, "worker_disconnected");
         }
         for (key, result) in completed {
             let Some(pending) = self.final_effect_pending.remove(&key) else {
@@ -51605,7 +52005,8 @@ impl App {
                     }
                 }
                 FinalEffectResult::Cancelled => {
-                    self.final_composite_cache.remove(&key);
+                    self.final_composite_cache
+                        .remove_with_drop_reason(&key, "worker_cancelled");
                 }
             }
         }
@@ -51694,6 +52095,36 @@ impl App {
             });
         match spawn_result {
             Ok(_) => {
+                if let Some(recompute) = self.final_composite_cache.observe_spawn(key) {
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "final_effect_recompute",
+                            None,
+                            self.input_seq,
+                            &[
+                                ("idx", (key.edit_key.idx as u64).into()),
+                                ("age_ms", recompute.age_ms.into()),
+                                ("drop_reason", recompute.drop_reason.into()),
+                                ("window_count", (recompute.count_in_window as u64).into()),
+                                ("total_count", recompute.total_count.into()),
+                                ("prefetch", prefetch.into()),
+                            ],
+                        );
+                    }
+                    // 警告は perf-log 無効でも出す (通常起動での退行検知が F の主目的)。
+                    if recompute.warn {
+                        crate::logger::log(format!(
+                            "[final-effect] completed composite recomputation exceeded threshold \
+                             idx={} window_count={} total_count={} age_ms={} drop_reason={}",
+                            key.edit_key.idx,
+                            recompute.count_in_window,
+                            recompute.total_count,
+                            recompute.age_ms,
+                            recompute.drop_reason,
+                        ));
+                    }
+                }
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
@@ -51713,7 +52144,8 @@ impl App {
                     "[final-effect] worker spawn failed idx={} error={error}",
                     key.edit_key.idx
                 ));
-                self.final_composite_cache.remove(&key);
+                self.final_composite_cache
+                    .remove_with_drop_reason(&key, "worker_spawn_failed");
                 false
             }
         }
@@ -52906,9 +53338,10 @@ impl App {
                     if live_pending {
                         self.final_ai_cache.insert(key, entry);
                         self.cancel_final_effects_for_idx(key.edit_key.idx);
-                        self.final_composite_cache.retain(|cache_key, entry| {
-                            cache_key.edit_key != key.edit_key || entry.complete
-                        });
+                        self.final_composite_cache.retain_with_drop_reason(
+                            "final_ai_ready_incomplete",
+                            |cache_key, entry| cache_key.edit_key != key.edit_key || entry.complete,
+                        );
                         repaint = true;
                     } else if retained_stored {
                         crate::logger::log(format!(
@@ -52984,7 +53417,9 @@ impl App {
         self.final_ai_failed
             .retain(|key| keep_set.contains(&key.edit_key.idx));
         self.final_composite_cache
-            .retain(|key, _| keep_set.contains(&key.edit_key.idx));
+            .retain_with_drop_reason("keep_set_evict", |key, _| {
+                keep_set.contains(&key.edit_key.idx)
+            });
         let items_generation = self.items_generation;
         self.continuous_page_transitions.retain(|idx, entry| {
             keep_set.contains(idx) && entry.items_generation == items_generation
@@ -54733,7 +55168,7 @@ impl App {
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
         self.final_composite_cache
-            .retain(|key, _| key.edit_key.idx != idx);
+            .retain_with_drop_reason("final_stage_invalidate", |key, _| key.edit_key.idx != idx);
         // comic は final composite を下地にするので連動破棄 + 進行中 bake も cancel
         // (clear_final_pipeline_caches_for_idx と同じ理由)。
         self.comic_cache.remove(&idx);
@@ -54952,7 +55387,9 @@ impl App {
         let Some(key) = self.metadata_cache_key(idx) else {
             self.cancel_final_effects_for_idx(idx);
             self.final_composite_cache
-                .retain(|cache_key, _| cache_key.edit_key.idx != idx);
+                .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
+                    cache_key.edit_key.idx != idx
+                });
             self.comic_cache.remove(&idx);
             return;
         };
@@ -54960,7 +55397,9 @@ impl App {
         *slot = slot.saturating_add(1);
         self.cancel_final_effects_for_idx(idx);
         self.final_composite_cache
-            .retain(|cache_key, _| cache_key.edit_key.idx != idx);
+            .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
+                cache_key.edit_key.idx != idx
+            });
         // comic は final composite を下地にするので連動破棄 (Codex P2)。
         self.comic_cache.remove(&idx);
     }
@@ -59183,6 +59622,9 @@ impl eframe::App for App {
         let t_poll = frame_t0.elapsed();
 
         self.update_keep_range_and_requests(ctx, frame_t0);
+        // 会計はここで出す。update の tail はフルスクリーン中に early return で
+        // 飛ばされるため、tail に置くと「測りたいフルスクリーン中」だけ欠測する。
+        self.emit_vram_accounting_if_due(std::time::Instant::now());
         let t_keep = frame_t0.elapsed();
 
         // keep_range が確定した直後に可視範囲分のタグ prewarm を push。
@@ -60546,6 +60988,7 @@ impl eframe::App for App {
         if visible_video_thumb_pending {
             reasons.push("visible_video_thumb_pending");
         }
+
         if self.pdf_enumerate_pending.is_some() {
             reasons.push("pdf_enumerate_pending");
         }

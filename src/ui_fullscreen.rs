@@ -704,13 +704,12 @@ const CONTINUOUS_READING_WHEEL_REFERENCE_DELTA: f32 = 120.0;
 const VERTICAL_READING_PAGE_SCROLL_FRAC: f32 = 0.85;
 /// 連結読み: 同時に画面に入るページ数の上限。
 const VERTICAL_READING_MAX_VISIBLE_PAGES: usize = 16;
+/// 連結読み: 厳密可視ユニットの前後で final pipeline を先行準備する幅。
+const VERTICAL_READING_PREPARE_BAND_UNITS: usize = 1;
 /// 連結読み: 可視範囲の前後に保持する先読みページ数。
 const VERTICAL_READING_PREFETCH_PAD: usize = 2;
 /// 連結読み: fs_cache に残すページ数上限。
 const VERTICAL_READING_MAX_CACHE_PAGES: usize = 20;
-/// 連結読み: raw + 後段表示キャッシュに残すテクスチャの推定総 texel 数上限。
-/// mipmap 対象は完全な chain を含め、同じ TextureId の clone は重複計上しない。
-const VERTICAL_READING_MAX_CACHE_TEXELS: usize = 320_000_000;
 /// 連結読み: final composite / comic 合成を新規生成するページ数の 1 フレーム上限。
 const VERTICAL_READING_PROCESSED_UPLOADS_PER_FRAME: usize = 1;
 /// ズームが 1.0 とみなせるしきい値
@@ -720,42 +719,45 @@ const TRANSFORM_EPSILON: f32 = 0.001;
 /// パンがゼロとみなせるしきい値（length_sq）
 const PAN_EPSILON_SQ: f32 = 0.25;
 
-fn texture_size_texels(size: [usize; 2], mipmapped: bool) -> usize {
-    let width = u32::try_from(size[0].max(1)).unwrap_or(u32::MAX);
-    let height = u32::try_from(size[1].max(1)).unwrap_or(u32::MAX);
-    if mipmapped {
-        usize::try_from(egui_wgpu::mip_chain_texel_count(width, height)).unwrap_or(usize::MAX)
-    } else {
-        size[0].max(1).saturating_mul(size[1].max(1))
+/// 共有 pool 由来の HIGH を超えた場合だけ trim を開始し、遠い非可視 unit を何個外せば
+/// LOW 以下に到達するかを返す。候補が足りなければ全候補を返し、可視 unit と準備帯は
+/// 呼び出し側で除外する。0% (無制限) では HIGH/LOW が `None` なので trim を無効化する。
+fn vertical_reading_texel_trim_plan(
+    loaded_texels: usize,
+    removable_texels: impl IntoIterator<Item = usize>,
+    watermarks: crate::vram_budget::VramWatermarks,
+) -> (usize, usize) {
+    let (Some(high_texels), Some(low_texels)) = (watermarks.high_texels, watermarks.low_texels)
+    else {
+        return (0, loaded_texels);
+    };
+    if loaded_texels <= high_texels {
+        return (0, loaded_texels);
     }
-}
-
-fn add_texture_texels(
-    seen: &mut std::collections::HashSet<egui::TextureId>,
-    total: &mut usize,
-    texture: &egui::TextureHandle,
-    mipmapped: bool,
-) {
-    if seen.insert(texture.id()) {
-        *total = total.saturating_add(texture_size_texels(texture.size(), mipmapped));
-    }
-}
-
-fn add_fs_cache_entry_texels(
-    seen: &mut std::collections::HashSet<egui::TextureId>,
-    total: &mut usize,
-    entry: &FsCacheEntry,
-) {
-    match entry {
-        FsCacheEntry::Static { tex, .. } => add_texture_texels(seen, total, tex, true),
-        FsCacheEntry::Animated { frames, .. } => {
-            for (texture, _) in frames {
-                add_texture_texels(seen, total, texture, false);
-            }
+    let mut remaining = loaded_texels;
+    let mut remove_count = 0usize;
+    for texels in removable_texels {
+        remaining = remaining.saturating_sub(texels);
+        remove_count += 1;
+        if remaining <= low_texels {
+            break;
         }
-        FsCacheEntry::Failed | FsCacheEntry::Video { .. } => {}
     }
+    (remove_count, remaining)
 }
+
+fn vertical_reading_trim_removable_positions(
+    keep_positions: &[usize],
+    visible_positions: &std::collections::HashSet<usize>,
+    prepare_positions: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    keep_positions
+        .iter()
+        .copied()
+        .filter(|pos| !visible_positions.contains(pos) && !prepare_positions.contains(pos))
+        .collect()
+}
+
 /// バー内ボタンのサイズ
 pub(crate) const BAR_BUTTON_SIZE: f32 = 32.0;
 /// バー内ボタンの上下マージン
@@ -3468,6 +3470,31 @@ fn vertical_reading_visible_positions(
             let bottom = page_center_y + height * 0.5;
             (bottom >= 0.0 && top <= viewport_h).then_some(pos)
         })
+        .collect()
+}
+
+fn vertical_reading_prepare_positions(
+    unit_count: usize,
+    visible_positions: &[usize],
+    band_units: usize,
+) -> Vec<usize> {
+    if unit_count == 0 || visible_positions.is_empty() || band_units == 0 {
+        return Vec::new();
+    }
+    let mut visible = visible_positions
+        .iter()
+        .copied()
+        .filter(|&pos| pos < unit_count)
+        .collect::<Vec<_>>();
+    visible.sort_unstable();
+    visible.dedup();
+    let (Some(&first_visible), Some(&last_visible)) = (visible.first(), visible.last()) else {
+        return Vec::new();
+    };
+    let first_prepare = first_visible.saturating_sub(band_units);
+    let last_prepare = last_visible.saturating_add(band_units).min(unit_count - 1);
+    (first_prepare..=last_prepare)
+        .filter(|pos| visible.binary_search(pos).is_err())
         .collect()
 }
 
@@ -15406,63 +15433,15 @@ impl App {
         base
     }
 
-    fn vertical_reading_loaded_texels(&self, idx: usize) -> usize {
-        let mut seen = std::collections::HashSet::new();
-        let mut total = 0usize;
+    fn vertical_reading_keep_set_loaded_texels(
+        &self,
+        keep_set: &std::collections::HashSet<usize>,
+    ) -> usize {
+        self.fullscreen_texture_texels_for_indices(keep_set)
+    }
 
-        if let Some(entry) = self.fs_cache.get(&idx) {
-            add_fs_cache_entry_texels(&mut seen, &mut total, entry);
-        }
-        if let Some(entry) = self.adjustment_cache.get(&idx) {
-            add_fs_cache_entry_texels(&mut seen, &mut total, entry);
-        }
-        for (key, entry) in &self.erase_result_cache {
-            if key.idx == idx {
-                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-            }
-        }
-        for (key, entry) in &self.local_adjust_cache {
-            if key.idx == idx {
-                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-            }
-        }
-        for (key, entry) in &self.local_adjust_layer_bypass_cache {
-            if key.result_key.idx == idx {
-                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-            }
-        }
-        for (key, entry) in &self.local_adjust_prefix_preview_cache {
-            if key.result_key.idx == idx {
-                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-            }
-        }
-        if let Some(entry) = self.conceal_cache.get(&idx) {
-            add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-        }
-        for (key, entry) in &self.edit_result_cache {
-            if key.idx == idx
-                && let Some(texture) = entry.texture.as_ref()
-            {
-                add_texture_texels(&mut seen, &mut total, texture, true);
-            }
-        }
-        for (key, entry) in &self.final_composite_cache {
-            if key.edit_key.idx == idx {
-                // Nearest の level-0 texture もここでは完全 chain として保守的に見積もる。
-                // TextureHandle から sampler options は取得できず、過大見積もりは安全側になる。
-                add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-            }
-        }
-        if let Some(entry) = self.comic_cache.get(&idx) {
-            add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-        }
-        if let Some(entry) = self.continuous_page_transitions.get(&idx)
-            && entry.items_generation == self.items_generation
-        {
-            add_texture_texels(&mut seen, &mut total, &entry.texture, true);
-        }
-
-        total
+    pub(crate) fn continuous_reading_loaded_texels(&self) -> usize {
+        self.vertical_reading_keep_set_loaded_texels(&self.fs_vertical_cache_keep_set)
     }
 
     fn continuous_visible_page_count(
@@ -15610,10 +15589,64 @@ impl App {
         Some((pages, visible_positions, offsets, scroll_range))
     }
 
+    fn continuous_reading_pages_for_positions(
+        &mut self,
+        image_rect: egui::Rect,
+        units: &[ContinuousReadingUnitSpec],
+        positions: &[usize],
+        offsets: &[f32],
+        prefer_processed: bool,
+    ) -> Vec<VerticalReadingPage> {
+        let flow = self.reading_flow;
+        let fallback = egui::vec2(image_rect.width().max(1.0), image_rect.height().max(1.0));
+        let zoom = self.fs_zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        let mut pages = Vec::new();
+        for &list_pos in positions {
+            let (Some(unit), Some(&offset)) = (units.get(list_pos), offsets.get(list_pos)) else {
+                continue;
+            };
+            let size = self.continuous_unit_size_for_flow(
+                unit,
+                flow,
+                image_rect,
+                zoom,
+                fallback,
+                prefer_processed,
+            );
+            let unit_center = if flow.is_horizontal() {
+                let sign = if self.reading_direction == crate::settings::ReadingDirection::Rtl {
+                    -1.0
+                } else {
+                    1.0
+                };
+                egui::pos2(
+                    image_rect.center().x + sign * (offset - self.fs_vertical_scroll),
+                    image_rect.center().y + self.fs_pan.y,
+                )
+            } else {
+                egui::pos2(
+                    image_rect.center().x + self.fs_pan.x,
+                    image_rect.center().y - self.fs_vertical_scroll + offset,
+                )
+            };
+            let unit_rect =
+                egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
+            for (idx, rect, content_bbox) in continuous_reading_page_rects(unit_rect, &size) {
+                pages.push(VerticalReadingPage {
+                    idx,
+                    rect,
+                    content_bbox,
+                });
+            }
+        }
+        pages
+    }
+
     fn update_continuous_reading_prefetch_window(
         &mut self,
         units: &[ContinuousReadingUnitSpec],
         visible_positions: &[usize],
+        prepare_positions: &[usize],
     ) {
         if units.is_empty() {
             return;
@@ -15665,12 +15698,24 @@ impl App {
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>();
+        let prepare_set = prepare_positions
+            .iter()
+            .copied()
+            .filter(|pos| *pos < units.len() && !visible_set.contains(pos))
+            .collect::<std::collections::HashSet<_>>();
 
         let mut candidates = (keep_start..=keep_end).collect::<Vec<_>>();
         candidates.sort_by(|a, b| {
-            let a_visible = visible_set.contains(a);
-            let b_visible = visible_set.contains(b);
-            b_visible.cmp(&a_visible).then_with(|| {
+            let priority = |pos: &usize| {
+                if visible_set.contains(pos) {
+                    0
+                } else if prepare_set.contains(pos) {
+                    1
+                } else {
+                    2
+                }
+            };
+            priority(a).cmp(&priority(b)).then_with(|| {
                 (*a as f32 - center_pos)
                     .abs()
                     .partial_cmp(&(*b as f32 - center_pos).abs())
@@ -15682,7 +15727,10 @@ impl App {
         let mut keep_page_count = 0usize;
         for pos in candidates {
             let page_count = units[pos].pages.len();
-            if visible_set.contains(&pos) || keep_page_count + page_count <= max_cache_pages {
+            if visible_set.contains(&pos)
+                || prepare_set.contains(&pos)
+                || keep_page_count + page_count <= max_cache_pages
+            {
                 keep_page_count += page_count;
                 keep_positions.push(pos);
             }
@@ -15702,31 +15750,41 @@ impl App {
             }
         }
 
-        let mut loaded_texels: usize = keep_set
-            .iter()
-            .map(|&idx| self.vertical_reading_loaded_texels(idx))
-            .sum();
-        if loaded_texels > VERTICAL_READING_MAX_CACHE_TEXELS {
-            let mut removable = keep_positions
-                .iter()
-                .copied()
-                .filter(|pos| !visible_set.contains(pos))
-                .collect::<Vec<_>>();
+        let loaded_texels = self.vertical_reading_keep_set_loaded_texels(&keep_set);
+        let watermarks = self.vram_pool_budget().fullscreen_watermarks();
+        if watermarks
+            .high_texels
+            .is_some_and(|high| loaded_texels > high)
+        {
+            let mut removable = vertical_reading_trim_removable_positions(
+                &keep_positions,
+                &visible_set,
+                &prepare_set,
+            );
             removable.sort_by(|a, b| {
                 (*b as f32 - center_pos)
                     .abs()
                     .partial_cmp(&(*a as f32 - center_pos).abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            for pos in removable {
-                for &idx in &units[pos].pages {
-                    if keep_set.remove(&idx) {
-                        loaded_texels =
-                            loaded_texels.saturating_sub(self.vertical_reading_loaded_texels(idx));
-                    }
+
+            let mut simulated_keep_set = keep_set.clone();
+            let mut simulated_texels = loaded_texels;
+            let removable_texels = removable.iter().map(|&pos| {
+                for idx in &units[pos].pages {
+                    simulated_keep_set.remove(idx);
                 }
-                if loaded_texels <= VERTICAL_READING_MAX_CACHE_TEXELS {
-                    break;
+                let remaining_texels =
+                    self.vertical_reading_keep_set_loaded_texels(&simulated_keep_set);
+                let removed_texels = simulated_texels.saturating_sub(remaining_texels);
+                simulated_texels = remaining_texels;
+                removed_texels
+            });
+            let (remove_count, _) =
+                vertical_reading_texel_trim_plan(loaded_texels, removable_texels, watermarks);
+            for pos in removable.into_iter().take(remove_count) {
+                for &idx in &units[pos].pages {
+                    keep_set.remove(&idx);
                 }
             }
         }
@@ -15890,7 +15948,29 @@ impl App {
             return;
         };
         self.slideshow_scroll_range_cache = Some((fs_idx, scroll_range.0, scroll_range.1));
-        self.update_continuous_reading_prefetch_window(&units, &visible_positions);
+        let prepare_positions = vertical_reading_prepare_positions(
+            units.len(),
+            &visible_positions,
+            VERTICAL_READING_PREPARE_BAND_UNITS,
+        );
+        self.update_continuous_reading_prefetch_window(
+            &units,
+            &visible_positions,
+            &prepare_positions,
+        );
+
+        let prepare_pages = self.continuous_reading_pages_for_positions(
+            image_rect,
+            &units,
+            &prepare_positions,
+            &offsets,
+            prefer_processed_layout,
+        );
+        let prepare_page_set = prepare_pages
+            .iter()
+            .map(|page| page.idx)
+            .collect::<std::collections::HashSet<_>>();
+        self.prefetch_final_effects(ctx, fs_idx, Some(&prepare_page_set));
 
         let bg_tex = if self.fs_transparent_bg_mode == 2 {
             self.ensure_checker_texture(ctx);
@@ -15906,12 +15986,25 @@ impl App {
         let process_indices = if original_preview_active {
             std::collections::HashSet::new()
         } else {
+            let mut process_pages = pages.clone();
+            process_pages.extend(prepare_pages.iter().copied());
             self.vertical_reading_process_indices(
-                &pages,
+                &process_pages,
                 self.fullscreen_idx.unwrap_or(fs_idx),
                 image_rect,
             )
         };
+        if !original_preview_active
+            && let Some(page) = prepare_pages
+                .iter()
+                .find(|page| process_indices.contains(&page.idx))
+            && !self
+                .final_effect_pending
+                .keys()
+                .any(|key| key.edit_key.idx == page.idx)
+        {
+            let _ = self.resolve_fs_processed_texture(ctx, page.idx, false);
+        }
         let has_deferred_processed = !original_preview_active
             && pages.iter().any(|page| {
                 !process_indices.contains(&page.idx)
@@ -25942,11 +26035,50 @@ mod tests {
     }
 
     #[test]
-    fn mipmapped_texture_texel_estimate_counts_complete_chain() {
-        assert_eq!(texture_size_texels([1, 1], true), 1);
-        assert_eq!(texture_size_texels([4, 3], true), 15);
-        assert_eq!(texture_size_texels([4, 3], false), 12);
-        assert_eq!(texture_size_texels([3, 1], true), 4);
+    fn vertical_reading_prepare_positions_are_not_texel_trim_candidates() {
+        let keep_positions = vec![0, 1, 2, 3, 4];
+        let visible = std::collections::HashSet::from([2]);
+        let prepare = std::collections::HashSet::from([1, 3]);
+
+        assert_eq!(
+            vertical_reading_trim_removable_positions(&keep_positions, &visible, &prepare),
+            vec![0, 4]
+        );
+    }
+
+    #[test]
+    fn vertical_reading_texel_hysteresis_starts_above_high_and_trims_to_low() {
+        let watermarks = crate::vram_budget::VramWatermarks {
+            high_texels: Some(320_000_000),
+            low_texels: Some(240_000_000),
+        };
+        assert_eq!(
+            vertical_reading_texel_trim_plan(320_000_000, [usize::MAX], watermarks),
+            (0, 320_000_000)
+        );
+
+        let page_texels = 30_000_000;
+        let (remove_count, remaining) = vertical_reading_texel_trim_plan(
+            320_000_001,
+            [page_texels, page_texels, page_texels],
+            watermarks,
+        );
+        assert_eq!(remove_count, 3);
+        assert!(320_000_001 - page_texels * 2 > 240_000_000);
+        assert!(remaining <= 240_000_000);
+    }
+
+    #[test]
+    fn vertical_reading_texel_trim_is_disabled_for_unlimited_pool() {
+        let watermarks = crate::vram_budget::VramWatermarks {
+            high_texels: None,
+            low_texels: None,
+        };
+
+        assert_eq!(
+            vertical_reading_texel_trim_plan(usize::MAX, [usize::MAX, usize::MAX], watermarks,),
+            (0, usize::MAX)
+        );
     }
 
     #[test]
@@ -26008,7 +26140,10 @@ mod tests {
         );
 
         // 4x4 の完全chainは 16+4+1=21 texel。独立した5 textureをすべて数える。
-        assert_eq!(app.vertical_reading_loaded_texels(idx), 5 * 21);
+        assert_eq!(
+            app.vertical_reading_keep_set_loaded_texels(&std::collections::HashSet::from([idx])),
+            5 * 21
+        );
     }
 
     #[test]
@@ -26025,6 +26160,39 @@ mod tests {
             vec![2]
         );
         assert_eq!(vertical_reading_nearest_position(&offsets, 110.0), Some(2));
+    }
+
+    #[test]
+    fn vertical_reading_prepare_positions_expand_and_clamp() {
+        assert_eq!(
+            vertical_reading_prepare_positions(6, &[2, 3], VERTICAL_READING_PREPARE_BAND_UNITS),
+            vec![1, 4]
+        );
+        assert_eq!(
+            vertical_reading_prepare_positions(6, &[0], VERTICAL_READING_PREPARE_BAND_UNITS),
+            vec![1]
+        );
+        assert_eq!(
+            vertical_reading_prepare_positions(6, &[5], VERTICAL_READING_PREPARE_BAND_UNITS),
+            vec![4]
+        );
+        assert!(vertical_reading_prepare_positions(0, &[0], 1).is_empty());
+        assert!(vertical_reading_prepare_positions(6, &[], 1).is_empty());
+    }
+
+    #[test]
+    fn vertical_reading_prepare_band_does_not_change_draw_positions() {
+        let offsets = [0.0, 120.0, 240.0];
+        let heights = [100.0, 100.0, 100.0];
+        let draw_positions = vertical_reading_visible_positions(&offsets, &heights, 120.0, 100.0);
+        let prepare_positions = vertical_reading_prepare_positions(
+            offsets.len(),
+            &draw_positions,
+            VERTICAL_READING_PREPARE_BAND_UNITS,
+        );
+
+        assert_eq!(draw_positions, vec![1]);
+        assert_eq!(prepare_positions, vec![0, 2]);
     }
 
     #[test]

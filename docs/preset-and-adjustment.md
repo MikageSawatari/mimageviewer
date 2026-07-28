@@ -329,15 +329,22 @@ final AI のアップスケール結果へ処理する場合も、アップス�
 
 カラー化とトーン変換は大画像で重くなるため、`final_effect_pending` のページ／viewer context
 単位 worker で処理する。環境設定の「AI・カラー化の先読み」で指定した前後枚数について、
-非表示ページも `final_composite_cache` まで 1 枚ずつ背景生成する。先読み開始時は白黒の
-provisional texture を GPU upload せず、完成結果だけを upload するため、完成済みページへの
-移動では白黒→カラーの差し替えを挟まない。先読み中の同じページを表示した場合は worker を
+ページ送りは従来どおり全候補を使う。連結読みでは候補を `fs_vertical_cache_keep_set` との積に絞り、
+共有 pool 由来の実テクスチャ使用量が LOW 未満のときだけ worker を起動する。LOW 以上では遠方の投機的生成を
+止めるが、厳密可視範囲の前後 1 ユニットに置く準備帯は LOW 水位をバイパスする。準備帯は
+texel トリムの退去候補からも除外し、遠方の raw を代わりに落とす。可視ページは表示経路から
+従来どおり水位をバイパスして生成する。対象ページは `final_composite_cache` まで 1 枚ずつ背景生成する。
+先読み開始時は白黒の provisional texture を
+GPU upload せず、完成結果だけを upload するため、完成済みページへの移動では白黒→カラーの
+差し替えを挟まない。先読み中の同じページを表示した場合は worker を
 cancel / 再起動せず表示用へ昇格し、完成までは直前ページを holdover する。カラー化待ちのページは
 生画像やサムネイルへフォールバックしない。ページ入場そのものでは完成済み final composite や
 進行中 worker を無効化せず、設定変更、AI 結果到着、cache eviction のときだけ不要な背景 worker を
 cancel する。`FinalCompositeKey` と items 世代が一致する完了結果だけを採用する。
 `--perf-log` の `fs.final_effect_worker` はカラー化判定／適用、前後の補正段、CPU画像準備、
 texture登録を分けて記録し、`scripts/analyze_perf.py <log> colorize` で解像度・方式別に集計できる。
+先読みを開始しなかった場合は `fs.final_effect_prefetch_blocked` に keep-set 外または LOW 水位超過の
+理由と現在 texel 数を記録し、同じ idx・理由は 1 秒に 1 回へ間引く。
 GPU上限内の完成 `Arc<ColorImage>` は `egui::ImageData` へ同じ `Arc` を渡し、texture登録前の
 全画素cloneを行わない。上限超過時だけ `clamp_for_gpu` の縮小結果を新しい `Arc` にする。
 PDF の Z ズーム再描画などで表示中ページの source が高解像度版へ差し替わる場合も、差し替え直前の
@@ -842,7 +849,7 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | スライダードラッグ中 | 残す | 毎フレーム final composite のみ再生成 | **抑制** (描画時 `adjusted_tex = None`) | edit 系 pending は触らない |
 | スライダー release (true→false 遷移) | 残す | (変化なし) | ドラッグ中に色調が動いたときだけ**全クリア** → visible 優先で再生成 (`thumb_adjust_drag_color_dirty`)。シャープ化のみのドラッグでは温存 | — |
 | フォルダ切替 | 全クリア | 全クリア | **全クリア** + `thumb_pixels` も全クリア | pending をキャンセル |
-| keep_range からの eviction | 該当 idx の edit/final を evict | 該当 idx の final を evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 |
+| keep_range / 連結読み keep-set からの eviction (texel は共有 pool 由来の HIGH 超過で発火し LOW まで退去) | 該当 idx の edit/final を evict | 該当 idx の final を evict | 該当 idx のみクリア + `thumb_pixels` も drop | keep-set 外の final-effect / final AI pending を cancel |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | **クリアしない** | — |
 | 消しゴムマスク変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | erase/local/conceal/final pending をキャンセル |
 | 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 永続編集 preview を非同期削除し、完了通知で該当サムネイルも Evicted。編集終了時に再生成 | local / downstream conceal / final pending をキャンセル |
