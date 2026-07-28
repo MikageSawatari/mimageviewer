@@ -50,6 +50,8 @@ const SELECTION_INFO_BAR_CONTENT_HEIGHT: f32 = 58.0;
 const DETAILS_BEST_FIT_ROWS_PER_FRAME: usize = 192;
 const DETAILS_BEST_FIT_HORIZONTAL_PADDING: f32 = 14.0;
 const DETAILS_BEST_FIT_MAX_WIDTH: f32 = 800.0;
+// ScrollArea 本体の外にある popup frame と、上下の配置余白を合わせて確保する。
+const DETAILS_COLUMN_MENU_SCREEN_MARGIN: f32 = 48.0;
 const DETAILS_LAYOUT_DEBUG_ENV: &str = "MIV_DETAILS_LAYOUT_DEBUG";
 const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [86, 86, 86],
@@ -11723,9 +11725,12 @@ impl App {
                 egui::Stroke::new(1.0, stroke_color),
             );
         }
-        response.context_menu(|ui| {
-            self.draw_details_column_context_menu(ui);
-        });
+        self.show_details_column_context_menu(
+            ui,
+            &response,
+            "表示する列",
+            "書式 (すべての表示で共通)",
+        );
     }
 
     fn details_best_fit_job_id() -> egui::Id {
@@ -12229,40 +12234,53 @@ impl App {
             } else {
                 response.hover_tip("詳細情報の読み込み完了後に並べ替えできます")
             };
-            response.context_menu(|ui| {
-                self.draw_details_column_context_menu(ui);
-            });
+            self.show_details_column_context_menu(
+                ui,
+                &response,
+                "表示する列",
+                "書式 (すべての表示で共通)",
+            );
         }
     }
 
-    fn draw_details_column_context_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label("表示する列");
-        ui.separator();
-        let mut name_visible = true;
-        ui.add_enabled(false, egui::Checkbox::new(&mut name_visible, "名前"));
+    fn details_column_context_menu_tracker_id() -> egui::Id {
+        egui::Id::new("details_column_context_menu_tracker")
+    }
 
-        // 名前列の幅: 既定は残り幅へ自動調整。OFF にすると現在の幅で固定し、横スクロールで
-        // 全列を確認できる。境界ドラッグでも自動的に固定幅へ切り替わる。
-        let mut name_auto = self.settings.details_name_width_auto;
-        if ui
-            .checkbox(&mut name_auto, "名前の幅を自動調整")
-            .on_hover_text("OFF にすると現在の名前列幅で固定します (境界ドラッグでも固定されます)")
-            .changed()
-        {
-            Self::cancel_details_best_fit_job(ui.ctx());
-            if name_auto {
-                self.settings.details_name_width_auto = true;
-                self.settings.details_name_width = DetailsColumn::Name.default_width();
-            } else {
-                self.settings.details_name_width_auto = false;
-                self.settings.details_name_width = self
-                    .last_details_name_width
-                    .clamp(DetailsColumn::Name.min_width(), 800.0);
-            }
-            self.settings.save();
-            ui.ctx().request_repaint();
+    pub(crate) fn details_column_context_menu_is_open(ctx: &egui::Context) -> bool {
+        let popup_id = ctx
+            .data(|data| data.get_temp::<egui::Id>(Self::details_column_context_menu_tracker_id()));
+        popup_id.is_some_and(|popup_id| egui::Popup::is_id_open(ctx, popup_id))
+    }
+
+    fn show_details_column_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        columns_heading: &str,
+        format_heading: &str,
+    ) {
+        response.context_menu(|ui| {
+            self.draw_details_column_context_menu(ui, columns_heading, format_heading);
+        });
+        let popup_id = egui::Popup::default_response_id(response);
+        if egui::Popup::is_id_open(ui.ctx(), popup_id) {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(Self::details_column_context_menu_tracker_id(), popup_id);
+            });
         }
+        // 詳細一覧ヘッダはグローバルな grid wheel 処理より後で描かれるため、
+        // app.rs 側はこの popup の wheel だけここまで保持する。ScrollArea が処理した後、
+        // raw input を消費して背面の詳細行へ通さない。
+        suppress_menu_button_wheel_passthrough(ui.ctx(), response);
+    }
 
+    fn draw_details_column_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        columns_heading: &str,
+        format_heading: &str,
+    ) {
         let old_lazy = (
             self.settings.details_show_page_count,
             self.settings.details_show_created,
@@ -12272,95 +12290,148 @@ impl App {
             self.settings.details_show_video_codec,
         );
         let mut changed = false;
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_preview, "プレビュー")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_rating, "★")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_tags, "タグ")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_kind, "種類")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_page_count, "ページ数")
-            .on_hover_text("ZIP / PDF / 画像のみフォルダのページ数をバックグラウンドで読み込みます")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_size, "サイズ")
-            .changed();
-        // 読書履歴ビューでは「更新日時」列を最終閲覧、「状態」列を既読位置に転用するため、
-        // 列表示メニューのラベルもヘッダ・行表示と揃える。
-        let (modified_label, state_label) = if self.items_are_reading_history_view {
-            ("最終閲覧", "既読位置")
-        } else {
-            ("更新日時", "状態")
-        };
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_modified, modified_label)
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_state, state_label)
-            .changed();
+        let max_height =
+            (ui.ctx().content_rect().height() - DETAILS_COLUMN_MENU_SCREEN_MARGIN).max(1.0);
+        egui::ScrollArea::vertical()
+            .max_height(max_height)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(columns_heading).strong());
+                        ui.separator();
+                        let mut name_visible = true;
+                        ui.add_enabled(false, egui::Checkbox::new(&mut name_visible, "名前"));
 
-        ui.separator();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_created, "作成日時")
-            .on_hover_text("ファイルシステムの作成日時をバックグラウンドで読み込みます")
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.settings.details_show_image_dimensions,
-                "画像解像度",
-            )
-            .on_hover_text("必要な値をバックグラウンドで読み込みます")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_video_duration, "長さ")
-            .on_hover_text("動画・音声の長さをバックグラウンドで読み込みます")
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.settings.details_show_video_dimensions,
-                "動画解像度",
-            )
-            .on_hover_text("動画の解像度をバックグラウンドで読み込みます")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.settings.details_show_video_codec, "コーデック")
-            .on_hover_text("動画・音声のコーデックをバックグラウンドで読み込みます")
-            .changed();
+                        // 名前列の幅: 既定は残り幅へ自動調整。OFF にすると現在の幅で固定し、横スクロールで
+                        // 全列を確認できる。境界ドラッグでも自動的に固定幅へ切り替わる。
+                        let mut name_auto = self.settings.details_name_width_auto;
+                        if ui
+                            .checkbox(&mut name_auto, "名前の幅を自動調整")
+                            .on_hover_text(
+                                "OFF にすると現在の名前列幅で固定します (境界ドラッグでも固定されます)",
+                            )
+                            .changed()
+                        {
+                            Self::cancel_details_best_fit_job(ui.ctx());
+                            if name_auto {
+                                self.settings.details_name_width_auto = true;
+                                self.settings.details_name_width =
+                                    DetailsColumn::Name.default_width();
+                            } else {
+                                self.settings.details_name_width_auto = false;
+                                self.settings.details_name_width = self
+                                    .last_details_name_width
+                                    .clamp(DetailsColumn::Name.min_width(), 800.0);
+                            }
+                            self.settings.save();
+                            ui.ctx().request_repaint();
+                        }
 
-        ui.separator();
-        ui.label("サイズ表示");
-        for &mode in crate::settings::DetailsSizeDisplayMode::all() {
-            changed |= ui
-                .radio_value(
-                    &mut self.settings.details_size_display_mode,
-                    mode,
-                    mode.label(),
-                )
-                .changed();
-        }
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_preview, "プレビュー")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_rating, "★")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_tags, "タグ")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_kind, "種類")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_page_count, "ページ数")
+                            .on_hover_text(
+                                "ZIP / PDF / 画像のみフォルダのページ数をバックグラウンドで読み込みます",
+                            )
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_size, "サイズ")
+                            .changed();
+                        // 読書履歴ビューでは「更新日時」列を最終閲覧、「状態」列を既読位置に転用するため、
+                        // 列表示メニューのラベルもヘッダ・行表示と揃える。
+                        let (modified_label, state_label) = if self.items_are_reading_history_view {
+                            ("最終閲覧", "既読位置")
+                        } else {
+                            ("更新日時", "状態")
+                        };
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_modified, modified_label)
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_state, state_label)
+                            .changed();
 
-        ui.separator();
-        ui.label("日時");
-        changed |= ui
-            .checkbox(
-                &mut self.settings.details_timestamp_show_seconds,
-                "秒まで表示",
-            )
-            .changed();
+                        ui.separator();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_created, "作成日時")
+                            .on_hover_text(
+                                "ファイルシステムの作成日時をバックグラウンドで読み込みます",
+                            )
+                            .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.details_show_image_dimensions,
+                                "画像解像度",
+                            )
+                            .on_hover_text("必要な値をバックグラウンドで読み込みます")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_video_duration, "長さ")
+                            .on_hover_text("動画・音声の長さをバックグラウンドで読み込みます")
+                            .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.details_show_video_dimensions,
+                                "動画解像度",
+                            )
+                            .on_hover_text("動画の解像度をバックグラウンドで読み込みます")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.details_show_video_codec, "コーデック")
+                            .on_hover_text("動画・音声のコーデックをバックグラウンドで読み込みます")
+                            .changed();
+                    });
 
-        ui.separator();
-        ui.label("行表示");
-        for &style in DetailsRowStyle::all() {
-            changed |= ui
-                .radio_value(&mut self.settings.details_row_style, style, style.label())
-                .changed();
-        }
+                    ui.separator();
+
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(format_heading).strong());
+                        ui.separator();
+                        ui.label("サイズ表示");
+                        for &mode in crate::settings::DetailsSizeDisplayMode::all() {
+                            changed |= ui
+                                .radio_value(
+                                    &mut self.settings.details_size_display_mode,
+                                    mode,
+                                    mode.label(),
+                                )
+                                .changed();
+                        }
+
+                        ui.separator();
+                        ui.label("日時");
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.details_timestamp_show_seconds,
+                                "秒まで表示",
+                            )
+                            .changed();
+
+                        ui.separator();
+                        ui.label("行表示");
+                        for &style in DetailsRowStyle::all() {
+                            changed |= ui
+                                .radio_value(
+                                    &mut self.settings.details_row_style,
+                                    style,
+                                    style.label(),
+                                )
+                                .changed();
+                        }
+                    });
+                });
+            });
 
         if changed {
             Self::cancel_details_best_fit_job(ui.ctx());

@@ -60826,7 +60826,12 @@ impl eframe::App for App {
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
         // wheel が背面のサムネイル一覧にも通り抜ける。
-        self.suppress_popup_wheel_before_grid(ctx);
+        // 詳細一覧ヘッダの列メニューだけは render_grid 内でこの後に描かれるため、一覧処理を
+        // スキップしつつ raw wheel を残し、メニュー内 ScrollArea の処理後に消費する。
+        let details_column_menu_open = Self::details_column_context_menu_is_open(ctx);
+        if !details_column_menu_open {
+            self.suppress_popup_wheel_before_grid(ctx);
+        }
         // フォルダツリーの ScrollArea を描いた frame でも raw wheel input は残り得る。
         // ポインタが SidePanel の実矩形内なら、内容が短くツリー側にスクロール余地がない
         // 場合も含めて背面グリッドへ適用しない。矩形外では従来どおりグリッドを動かす。
@@ -60836,7 +60841,7 @@ impl eframe::App for App {
                 folder_pane_rect,
                 ctx.pointer_latest_pos(),
             );
-        if !folder_pane_blocks_grid_scroll {
+        if !folder_pane_blocks_grid_scroll && !details_column_menu_open {
             self.process_scroll(ctx);
         }
 
