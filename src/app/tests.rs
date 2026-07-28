@@ -17261,6 +17261,7 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
+        let old_tex_id = old_tex.id();
 
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/book/02.7z")));
@@ -17321,6 +17322,24 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             app.fs_nav_holdover_tex_for_draw().is_none(),
             "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
+        );
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "表示可否の一時判定ではなく texture handle の破棄をラッチにする"
+        );
+        assert!(
+            app.fs_nav_is_locked(),
+            "描画ラッチと入力抑止 lock の解除タイミングは独立してよい"
+        );
+
+        // Reproduce the transient empty display resolution during an AI-final swap.
+        // Once the new page has been selected, the old-folder holdover must not return.
+        app.thumbnails = vec![ThumbnailState::Pending];
+        let resurfaced = app.fs_nav_holdover_tex_for_draw();
+        assert!(
+            resurfaced.is_none(),
+            "old holdover resurfaced after the new page was shown: old_tex_id={old_tex_id:?}, selected={:?}",
+            resurfaced.as_ref().map(egui::TextureHandle::id)
         );
     }
 

@@ -230,10 +230,12 @@ no-op 案内は段階を分ける:
   画像系 / native 動画 / Ctrl+S / Ctrl+G が同じ優先順位を使う。
 - Ctrl+↑↓ の遷移中に保持する `fs_holdover_tex` は、旧 target と新 target の間の
   真っ黒/白フラッシュを避けるための一時表示であり、新しい `fullscreen_idx` が
-  active になった後の実ページ fallback には使わない。新 target のタイトル/パスが
-  表示されている間に旧 ZIP/7z の画像だけが残ると現在地を誤認するため、
-  `fs_nav_holdover_tex_for_draw` で draw 可否を判定し、PDF/ZIP enumerate defer
-  (`fullscreen_idx == None`) の待機窓だけ旧画像を表示する。
+  active になった後の実ページ fallback には使わない。新 target の full / final /
+  edit / thumbnail を一度でも表示候補に選んだ時点で `fs_holdover_tex` を破棄して
+  一方向にラッチし、その後の一時的な表示解決 `None` で旧 target を復活させない。
+  PDF/ZIP enumerate defer (`fullscreen_idx == None`) の間だけは、新 target の表示物が
+  まだ存在しないため旧画像を待機表示してよい。入力抑止 lock の解除は
+  `poll_fs_nav_lock` が別に所有する。
 - Ctrl+↑↓ の移動先が未変換 RAR/7z/LZH で、設定により確認なし自動変換できる場合は、
   `ArchiveConvertState::deferred_fullscreen` でフルスクリーン復帰意図を保持する。
   変換中も holdover を維持し、変換後の cache ZIP 読み込み完了で通常の

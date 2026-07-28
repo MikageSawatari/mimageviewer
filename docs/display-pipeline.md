@@ -287,15 +287,30 @@ ui_fullscreen.rs::render_fullscreen_viewport
 
 Ctrl+↑↓ のフォルダ横断では、遷移開始時に `fs_holdover_tex` へ旧ページのテクスチャを
 保持する。これはページごとの fallback ではなく、直前に見ていた**ビュー単位**の hold である。
+この producer は `capture_fs_nav_holdover` であり、カラー化の有無とは無関係に作動する。
+`capture_colorize_page_transition_holdover` / `capture_colorize_source_reload_holdover` は
+同じ field を使う別 producer だが、こちらだけがカラー化条件で gate される。
 `fs_nav_holdover_tex_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
 gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`image_rect` に
 1 枚だけ中央 contain フィットで重ねる。移動先ページの回転、表示トリム
 (`content_bbox`)、透過背景スタイルは適用しない。
 
+フォルダ横断後、新しい `items_generation` のページで full / final / edit / thumbnail の
+いずれかを一度でも表示候補に選べたら、`fs_nav_holdover_tex_for_draw` は
+`fs_holdover_tex` の handle 自体を破棄して一方向にラッチする。入力抑止用の
+`fs_nav_locked_gen` は `poll_fs_nav_lock` が別途解除するため、両者の寿命は同一でなくてよい。
+AI final の invalidation / install の過渡フレームで表示解決が再び `None` になっても、
+旧フォルダの handle は既に存在せず、nav holdover が復活することはない。
+
 フルスクリーン画像領域の合成順は、ページ画像 → ページ単位の編集オーバーレイ
 (消しゴム / クロップ / キャプチャ領域 / ルーペ) → ビュー単位の nav holdover →
 インジケータ / HUD / パネルとする。nav holdover は直前に見ていたビュー全体なので、
 移動先ページの編集矩形を旧ビューの上に重ねないよう、編集オーバーレイより後に描く。
+
+`--perf-log` 診断では `fs.paint` に `source` / `idx` / `items_generation` /
+`texture_id` を記録する。表示済みの同じ idx が解決不能へ落ちた遷移は
+`fs.texture_choice` (`source=none_after_paint`) として 1 回だけ記録し、nav holdover /
+continuous transition が実際に選ばれた場合も同イベントへ `branch` と source を残す。
 
 フルスクリーンの先読み対象は、`items` 全体ではなく `visible_indices` 由来の display list から
 作る。★フィルタや Ctrl+F で一覧が疎になっているときも、スライドショー / 前後移動と同じ

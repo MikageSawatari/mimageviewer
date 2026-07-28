@@ -43,6 +43,12 @@ use crate::ui_helpers::{HoverTipExt, open_external_player};
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
 
+enum FsNavHoldoverDecision {
+    Unavailable,
+    TargetReady,
+    Draw(egui::TextureHandle),
+}
+
 fn compare_indicator_size(width: u32, height: u32) -> Option<(u32, u32)> {
     if width == 0 || height == 0 {
         return None;
@@ -2105,6 +2111,114 @@ impl App {
             && self.effective_params(idx).colorize.is_enabled()
     }
 
+    /// Perf trace 用に、実際に選ばれた fullscreen テクスチャの所有元を特定する。
+    /// 通常時は呼ばれず、perf ログ有効時の診断だけで cache lookup を行う。
+    fn fs_texture_source_for_trace(
+        &self,
+        idx: usize,
+        texture: &egui::TextureHandle,
+    ) -> &'static str {
+        let texture_id = texture.id();
+        if self
+            .current_comic_composite_texture(idx)
+            .is_some_and(|tex| tex.id() == texture_id)
+        {
+            return "final_comic_composite";
+        }
+        if self
+            .current_final_composite_texture(idx)
+            .is_some_and(|tex| tex.id() == texture_id)
+        {
+            return "final_composite";
+        }
+        if self
+            .current_edit_result_texture(idx)
+            .is_some_and(|tex| tex.id() == texture_id)
+        {
+            return "edit";
+        }
+        if self.conceal_cache.get(&idx).is_some_and(|entry| {
+            entry.generation == self.conceal_generation && entry.texture.id() == texture_id
+        }) {
+            return "conceal";
+        }
+        if self
+            .current_local_adjust_texture(idx)
+            .is_some_and(|tex| tex.id() == texture_id)
+        {
+            return "local_adjust";
+        }
+        if self
+            .current_erase_result_texture(idx)
+            .is_some_and(|tex| tex.id() == texture_id)
+        {
+            return "erase";
+        }
+        if self.fs_cache.get(&idx).is_some_and(|entry| match entry {
+            FsCacheEntry::Static { tex, .. } => tex.id() == texture_id,
+            FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            } => frames
+                .get(*current_frame)
+                .is_some_and(|(tex, _)| tex.id() == texture_id),
+            FsCacheEntry::Video { .. } | FsCacheEntry::Failed => false,
+        }) {
+            return "fs_cache";
+        }
+        if self.thumbnails.get(idx).is_some_and(|thumbnail| {
+            matches!(thumbnail, ThumbnailState::Loaded { tex, .. } if tex.id() == texture_id)
+        }) {
+            return "thumbnail";
+        }
+        "processed_other"
+    }
+
+    /// `perf` JSONL に「その描画で実際に選んだ供給元」を残す。
+    /// 通常実行では `perf::is_enabled()` の早期 return だけで、ログ I/O は発生しない。
+    fn trace_fs_texture_choice(
+        &self,
+        branch: &'static str,
+        source: &'static str,
+        idx: Option<usize>,
+        texture: &egui::TextureHandle,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let key = idx.and_then(|idx| self.perf_item_key(idx));
+        crate::perf::event(
+            "fs",
+            "texture_choice",
+            key.as_deref(),
+            self.input_seq,
+            &[
+                ("branch", serde_json::Value::from(branch)),
+                ("source", serde_json::Value::from(source)),
+                (
+                    "idx",
+                    idx.map(|idx| serde_json::Value::from(idx as u64))
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                (
+                    "items_generation",
+                    serde_json::Value::from(self.items_generation),
+                ),
+                (
+                    "locked_generation",
+                    self.fs_nav_locked_gen
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                (
+                    "texture_id",
+                    serde_json::Value::from(format!("{:?}", texture.id())),
+                ),
+            ],
+        );
+    }
+
     /// 同一 viewer 内のページ送りで、次ページのカラー化が未完了だった場合にだけ使う
     /// 直前ページの holdover を取得する。フォルダ移動用 nav lock が所有中の holdover は
     /// 上書きしない。
@@ -2378,9 +2492,9 @@ impl App {
     /// `fs_holdover_tex` は旧ページの見た目を一時的に残すビュー単位の状態。
     /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ 1 枚だけ
     /// contain オーバーレイする。
-    pub(crate) fn fs_nav_holdover_tex_for_draw(&self) -> Option<egui::TextureHandle> {
+    fn fs_nav_holdover_decision(&self) -> FsNavHoldoverDecision {
         let Some(locked_gen) = self.fs_nav_locked_gen else {
-            return None;
+            return FsNavHoldoverDecision::Unavailable;
         };
         if let Some(idx) = self.fullscreen_idx
             && self.items_generation > locked_gen
@@ -2398,10 +2512,37 @@ impl App {
             let new_content_ready = self.resolve_fs_display_tex(idx, true).is_some();
             let new_content_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
             if new_content_ready || new_content_failed {
-                return None;
+                return FsNavHoldoverDecision::TargetReady;
             }
         }
-        self.fs_holdover_tex.clone()
+        self.fs_holdover_tex
+            .clone()
+            .map(FsNavHoldoverDecision::Draw)
+            .unwrap_or(FsNavHoldoverDecision::Unavailable)
+    }
+
+    /// 描画直前の呼び出しでは `TargetReady` を一方向ラッチへ変換する。
+    /// readiness probe は `fs_nav_holdover_tex_without_latching` を使い、実描画前に
+    /// handle を破棄しない。
+    pub(crate) fn fs_nav_holdover_tex_for_draw(&mut self) -> Option<egui::TextureHandle> {
+        match self.fs_nav_holdover_decision() {
+            FsNavHoldoverDecision::TargetReady => {
+                // 一方向ラッチ: 新 generation の表示物を選べた描画フレームで旧フォルダの
+                // texture handle 自体を破棄する。AI final の差し替えで次フレームの
+                // resolve が一時的に None へ戻っても、旧画像を再選択できなくする。
+                self.fs_holdover_tex = None;
+                None
+            }
+            FsNavHoldoverDecision::Draw(texture) => Some(texture),
+            FsNavHoldoverDecision::Unavailable => None,
+        }
+    }
+
+    fn fs_nav_holdover_tex_without_latching(&self) -> Option<egui::TextureHandle> {
+        match self.fs_nav_holdover_decision() {
+            FsNavHoldoverDecision::Draw(texture) => Some(texture),
+            FsNavHoldoverDecision::Unavailable | FsNavHoldoverDecision::TargetReady => None,
+        }
     }
 
     /// nav ロックと holdover を強制解除する。`poll_fs_nav_lock` の通常解除条件
@@ -6914,6 +7055,14 @@ impl App {
             let mut cancel = false;
             // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
             let holdover = self.fs_nav_holdover_tex_for_draw();
+            if let Some(handle) = holdover.as_ref() {
+                self.trace_fs_texture_choice(
+                    "deferred_keep_alive",
+                    "nav_holdover",
+                    self.fullscreen_idx,
+                    handle,
+                );
+            }
             #[cfg(windows)]
             let keep_alive_window_id = self.active_detached_hwnd_window_id();
             #[cfg(windows)]
@@ -7089,10 +7238,24 @@ impl App {
             "keepalive_backstop",
         );
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
-        let tex = self
+        let live_tex = self
             .fullscreen_idx
-            .and_then(|idx| self.resolve_fs_display_tex(idx, true))
-            .or_else(|| self.fs_nav_holdover_tex_for_draw());
+            .and_then(|idx| self.resolve_fs_display_tex(idx, true));
+        // live が選べたフレームでも draw gate を必ず評価し、旧 holdover の
+        // 一方向ラッチを backstop 経路にも適用する。
+        let holdover = self.fs_nav_holdover_tex_for_draw();
+        let (tex, texture_source) = if let Some(live_tex) = live_tex {
+            let source = if crate::perf::is_enabled() {
+                self.fullscreen_idx.map_or("processed_other", |idx| {
+                    self.fs_texture_source_for_trace(idx, &live_tex)
+                })
+            } else {
+                "live_display"
+            };
+            (Some(live_tex), source)
+        } else {
+            (holdover, "nav_holdover")
+        };
         // 保険 (Codex #3): live ページも holdover も無い (fullscreen_idx=None && tex=None) なら、
         // 描くべき中身が無い = もはや生かす意味のない空ウィンドウ。session close 漏れなどで
         // ここに来ても、空の小窓を描き続けない (= 閉じられない症状の二重防止)。正規の
@@ -7110,6 +7273,14 @@ impl App {
             tex.is_some(),
             self.detached_viewer_host_debug_state()
         ));
+        if let Some(handle) = tex.as_ref() {
+            self.trace_fs_texture_choice(
+                "detached_backstop",
+                texture_source,
+                self.fullscreen_idx,
+                handle,
+            );
+        }
         let backstop_window_id = self.active_detached_session.map(|s| s.window_id);
         let hwnd_before = backstop_window_id.and_then(|window_id| {
             self.detached_window_hwnd_snapshot_before_show(
@@ -7172,6 +7343,14 @@ impl App {
     #[cfg(windows)]
     fn render_embedded_fs_nav_holdover(&mut self, ctx: &egui::Context) {
         let holdover = self.fs_nav_holdover_tex_for_draw();
+        if let Some(handle) = holdover.as_ref() {
+            self.trace_fs_texture_choice(
+                "embedded_deferred",
+                "nav_holdover",
+                self.fullscreen_idx,
+                handle,
+            );
+        }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         let escape_pressed = !self.ime_input_active()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -7229,7 +7408,15 @@ impl App {
     /// 背面のグリッドが見えないようにする。
     #[cfg(windows)]
     pub(crate) fn render_still_fullscreen_viewport_enter_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_nav_holdover_tex_for_draw();
+        let holdover = self.fs_nav_holdover_tex_without_latching();
+        if let Some(handle) = holdover.as_ref() {
+            self.trace_fs_texture_choice(
+                "viewport_enter",
+                "nav_holdover",
+                self.fullscreen_idx,
+                handle,
+            );
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
@@ -7466,7 +7653,7 @@ impl App {
                 cache_state,
                 thumb_ready,
                 self.fs_pending.contains_key(&fs_idx),
-                self.fs_nav_holdover_tex_for_draw().is_some(),
+                self.fs_nav_holdover_tex_without_latching().is_some(),
             )
         } else {
             (false, "not-detached", false, false, false)
@@ -8019,7 +8206,11 @@ impl App {
                                     // seq はエントリ自身の `load_seq` を使う (self.input_seq だと
                                     // paint 時点で別操作に更新されていて load→ready→paint の相関が崩れる)。
                                     if crate::perf::is_enabled()
-                                        && let Some(tex) = state.tex.as_ref()
+                                        && let Some(tex) = Self::fs_display_texture_choice(
+                                            state.is_video,
+                                            state.tex.as_ref(),
+                                            state.thumb_tex.as_ref(),
+                                        )
                                     {
                                         let cur_id = tex.id();
                                         let prev = self.fs_painted_last;
@@ -8034,12 +8225,32 @@ impl App {
                                                 .get(&fs_idx)
                                                 .map(|e| e.load_seq())
                                                 .unwrap_or(0);
+                                            let source = self
+                                                .fs_texture_source_for_trace(fs_idx, tex);
                                             crate::perf::event(
                                                 "fs",
                                                 "paint",
                                                 key.as_deref(),
                                                 entry_seq,
-                                                &[("idx", serde_json::Value::from(fs_idx))],
+                                                &[
+                                                    ("idx", serde_json::Value::from(fs_idx)),
+                                                    (
+                                                        "items_generation",
+                                                        serde_json::Value::from(
+                                                            self.items_generation,
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "source",
+                                                        serde_json::Value::from(source),
+                                                    ),
+                                                    (
+                                                        "texture_id",
+                                                        serde_json::Value::from(format!(
+                                                            "{:?}", cur_id
+                                                        )),
+                                                    ),
+                                                ],
                                             );
                                             self.fs_painted_last = Some((fs_idx, cur_id, entry_seq));
                                         }
@@ -8450,6 +8661,12 @@ impl App {
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
                         // 移動先ページの矩形を旧ビューの上に重ねない。
                         if let Some(holdover) = self.fs_nav_holdover_tex_for_draw() {
+                            self.trace_fs_texture_choice(
+                                "fullscreen_overlay",
+                                "nav_holdover",
+                                Some(fs_idx),
+                                &holdover,
+                            );
                             paint_fs_nav_holdover_overlay(ui.painter(), image_rect, &holdover);
                         }
 
@@ -9370,6 +9587,38 @@ impl App {
         let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
         let tex = self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active);
+        if crate::perf::is_enabled()
+            && tex.is_none()
+            && matches!(self.fs_painted_last, Some((painted_idx, _, _)) if painted_idx == fs_idx)
+        {
+            // 「一度 paint 済みの同じ idx が None へ落ちた」遷移だけを 1 回記録する。
+            // 毎フレームの resolver trace は perf log を埋めるので、既存の paint
+            // transition tracker を None に戻して再 paint まで間引く。
+            let key = self.perf_item_key(fs_idx);
+            crate::perf::event(
+                "fs",
+                "texture_choice",
+                key.as_deref(),
+                self.input_seq,
+                &[
+                    ("branch", serde_json::Value::from("resolve_processed")),
+                    ("source", serde_json::Value::from("none_after_paint")),
+                    ("idx", serde_json::Value::from(fs_idx as u64)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                    (
+                        "locked_generation",
+                        self.fs_nav_locked_gen
+                            .map(serde_json::Value::from)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    ("texture_id", serde_json::Value::Null),
+                ],
+            );
+            self.fs_painted_last = None;
+        }
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
 
@@ -16121,6 +16370,19 @@ impl App {
                 allow_thumbnail,
                 page.content_bbox,
             ) {
+                if crate::perf::is_enabled()
+                    && let Some(handle) = display_tex.as_ref()
+                    && self
+                        .continuous_page_transition_texture(page.idx)
+                        .is_some_and(|transition| transition.id() == handle.id())
+                {
+                    self.trace_fs_texture_choice(
+                        "continuous_page",
+                        "continuous_transition",
+                        Some(page.idx),
+                        handle,
+                    );
+                }
                 self.fullscreen_page_layout.push(transform);
             }
         }
