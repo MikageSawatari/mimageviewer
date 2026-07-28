@@ -2567,6 +2567,15 @@ impl App {
         self.fs_zoom_pdf_rerender_idx = None;
     }
 
+    /// TextEdit / IME がキーを所有したときはズームだけ解除し、Z の押下ラッチは維持する。
+    /// キーイベントを消費しないため編集対象へ `z` を渡せ、フォーカス解除時に押しっぱなしの Z を
+    /// 新しい rising edge として再発火させない。
+    fn fs_zoom_reset_for_text_input(&mut self) {
+        let z_was_down = self.fs_zoom_z_was_down;
+        self.fs_zoom_reset();
+        self.fs_zoom_z_was_down = z_was_down;
+    }
+
     /// 一時状態 (照準中 + エッジ検出) だけリセットする。確定済みズーム (`fs_zoom_active`) は残す。
     /// フォーカス喪失 / モーダル表示でキー処理を飛ばす直前に呼び、復帰時に Z 離しが誤って
     /// ズーム確定したり stale エッジが残ったりするのを防ぐ (Codex P2)。
@@ -10597,6 +10606,8 @@ impl App {
         if self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
             && (fullscreen_text_input_active || self.book_bookmark_title_edit.is_some())
         {
+            // TextEdit へ Z 自体は渡しつつ、フォーカス移動前のズーム状態だけを残さない。
+            self.fs_zoom_reset_for_text_input();
             return action;
         }
 
