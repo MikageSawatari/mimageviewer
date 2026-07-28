@@ -556,6 +556,46 @@ impl SelectionInfoDisplayMode {
 }
 
 // -----------------------------------------------------------------------
+// 詳細表示時の下部情報バー
+// -----------------------------------------------------------------------
+
+/// 詳細表示中の下部情報バーが参照する列設定。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に
+/// 既存動作の `SameAsDetails` へ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DetailsSelectionBarMode {
+    #[default]
+    SameAsDetails,
+    Dedicated,
+    Hidden,
+    #[serde(other)]
+    Unknown,
+}
+
+impl DetailsSelectionBarMode {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::SameAsDetails => "一覧と同じ設定",
+            Self::Dedicated => "専用の設定",
+            Self::Hidden => "表示しない",
+            Self::Unknown => unreachable!("normalized details selection-bar mode"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::SameAsDetails, Self::Dedicated, Self::Hidden]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::SameAsDetails,
+            mode => mode,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // フルスクリーン左右パネルの表示方法
 // -----------------------------------------------------------------------
 
@@ -2831,6 +2871,47 @@ pub struct Settings {
     /// 固定幅モード時の名前列幅 (px)。`details_name_width_auto` が `false` のときだけ参照。
     #[serde(default = "default_details_name_width")]
     pub details_name_width: f32,
+    /// 詳細表示中の下部情報バーが参照する列設定。
+    #[serde(default)]
+    pub details_selection_bar_mode: DetailsSelectionBarMode,
+    /// 詳細表示中の下部情報バー専用の列順。空なら既定順。
+    #[serde(default)]
+    pub details_selection_bar_column_order: Vec<DetailsColumnId>,
+    /// 詳細表示中の下部情報バー専用の列幅。
+    #[serde(default)]
+    pub details_selection_bar_column_widths: Vec<DetailsColumnWidth>,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_preview: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_rating: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_tags: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_kind: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_page_count: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_size: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_modified: bool,
+    #[serde(default)]
+    pub details_selection_bar_show_created: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_state: bool,
+    #[serde(default)]
+    pub details_selection_bar_show_image_dimensions: bool,
+    #[serde(default)]
+    pub details_selection_bar_show_video_duration: bool,
+    #[serde(default)]
+    pub details_selection_bar_show_video_dimensions: bool,
+    #[serde(default)]
+    pub details_selection_bar_show_video_codec: bool,
+    /// 専用設定で名前列を残り幅へ自動調整するか。
+    #[serde(default = "default_true")]
+    pub details_selection_bar_name_width_auto: bool,
+    /// 専用設定の固定幅モード時に使う名前列幅 (px)。
+    #[serde(default = "default_details_name_width")]
+    pub details_selection_bar_name_width: f32,
     #[serde(default)]
     pub facet_filter: FacetFilter,
     /// ユーザーが手動で選んだ比率。Auto モードでも **書き換えない**
@@ -4590,6 +4671,24 @@ impl Default for Settings {
             details_show_video_duration: false,
             details_show_video_dimensions: false,
             details_show_video_codec: false,
+            details_selection_bar_mode: DetailsSelectionBarMode::SameAsDetails,
+            details_selection_bar_column_order: Vec::new(),
+            details_selection_bar_column_widths: Vec::new(),
+            details_selection_bar_show_preview: true,
+            details_selection_bar_show_rating: true,
+            details_selection_bar_show_tags: true,
+            details_selection_bar_show_kind: true,
+            details_selection_bar_show_page_count: true,
+            details_selection_bar_show_size: true,
+            details_selection_bar_show_modified: true,
+            details_selection_bar_show_created: false,
+            details_selection_bar_show_state: true,
+            details_selection_bar_show_image_dimensions: false,
+            details_selection_bar_show_video_duration: false,
+            details_selection_bar_show_video_dimensions: false,
+            details_selection_bar_show_video_codec: false,
+            details_selection_bar_name_width_auto: true,
+            details_selection_bar_name_width: default_details_name_width(),
             facet_filter: FacetFilter::default(),
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
@@ -5957,6 +6056,30 @@ impl Settings {
         }
     }
 
+    /// 詳細一覧の列設定一式を、詳細表示中の下部情報バー専用設定へ複製する。
+    ///
+    /// モードは変更しない。モード遷移を所有する呼び出し側が、専用設定へ切り替わる
+    /// 境界でこのメソッドを呼ぶ。
+    pub fn copy_details_columns_to_selection_bar(&mut self) {
+        self.details_selection_bar_column_order = self.details_column_order.clone();
+        self.details_selection_bar_column_widths = self.details_column_widths.clone();
+        self.details_selection_bar_show_preview = self.details_show_preview;
+        self.details_selection_bar_show_rating = self.details_show_rating;
+        self.details_selection_bar_show_tags = self.details_show_tags;
+        self.details_selection_bar_show_kind = self.details_show_kind;
+        self.details_selection_bar_show_page_count = self.details_show_page_count;
+        self.details_selection_bar_show_size = self.details_show_size;
+        self.details_selection_bar_show_modified = self.details_show_modified;
+        self.details_selection_bar_show_created = self.details_show_created;
+        self.details_selection_bar_show_state = self.details_show_state;
+        self.details_selection_bar_show_image_dimensions = self.details_show_image_dimensions;
+        self.details_selection_bar_show_video_duration = self.details_show_video_duration;
+        self.details_selection_bar_show_video_dimensions = self.details_show_video_dimensions;
+        self.details_selection_bar_show_video_codec = self.details_show_video_codec;
+        self.details_selection_bar_name_width_auto = self.details_name_width_auto;
+        self.details_selection_bar_name_width = self.details_name_width;
+    }
+
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
@@ -6152,12 +6275,15 @@ impl Settings {
         self.restore_details_page_count_after_load();
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
+        sanitize_details_column_order(&mut self.details_selection_bar_column_order);
+        sanitize_details_column_widths(&mut self.details_selection_bar_column_widths);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         // grid_cursor_wrap は bool のため不正値を持たない。旧設定の欠落は serde default で
         // false に補い、sanitize では読み込んだ ON/OFF をそのまま維持する。
         self.selection_info_display_mode = self.selection_info_display_mode.normalized();
+        self.details_selection_bar_mode = self.details_selection_bar_mode.normalized();
         self.fullscreen_side_panel_mode = self.fullscreen_side_panel_mode.normalized();
         // 手編集や移行で非有限 / 範囲外の名前列幅が混入しても安全にする
         // (列幅と同じ 40.0..=800.0 へ clamp。実行時もレイアウト側で clamp するが二重に守る)。
@@ -6165,6 +6291,12 @@ impl Settings {
             self.details_name_width = default_details_name_width();
         } else {
             self.details_name_width = self.details_name_width.clamp(40.0, 800.0);
+        }
+        if !self.details_selection_bar_name_width.is_finite() {
+            self.details_selection_bar_name_width = default_details_name_width();
+        } else {
+            self.details_selection_bar_name_width =
+                self.details_selection_bar_name_width.clamp(40.0, 800.0);
         }
         self.normalize_tag_settings();
         self.normalize_facet_tag_filter();
@@ -6267,6 +6399,26 @@ impl Settings {
         self.details_show_video_duration = src.details_show_video_duration;
         self.details_show_video_dimensions = src.details_show_video_dimensions;
         self.details_show_video_codec = src.details_show_video_codec;
+        self.details_selection_bar_column_order = src.details_selection_bar_column_order.clone();
+        self.details_selection_bar_column_widths = src.details_selection_bar_column_widths.clone();
+        self.details_selection_bar_name_width_auto = src.details_selection_bar_name_width_auto;
+        self.details_selection_bar_name_width = src.details_selection_bar_name_width;
+        self.details_selection_bar_show_preview = src.details_selection_bar_show_preview;
+        self.details_selection_bar_show_rating = src.details_selection_bar_show_rating;
+        self.details_selection_bar_show_tags = src.details_selection_bar_show_tags;
+        self.details_selection_bar_show_kind = src.details_selection_bar_show_kind;
+        self.details_selection_bar_show_page_count = src.details_selection_bar_show_page_count;
+        self.details_selection_bar_show_size = src.details_selection_bar_show_size;
+        self.details_selection_bar_show_modified = src.details_selection_bar_show_modified;
+        self.details_selection_bar_show_created = src.details_selection_bar_show_created;
+        self.details_selection_bar_show_state = src.details_selection_bar_show_state;
+        self.details_selection_bar_show_image_dimensions =
+            src.details_selection_bar_show_image_dimensions;
+        self.details_selection_bar_show_video_duration =
+            src.details_selection_bar_show_video_duration;
+        self.details_selection_bar_show_video_dimensions =
+            src.details_selection_bar_show_video_dimensions;
+        self.details_selection_bar_show_video_codec = src.details_selection_bar_show_video_codec;
         self.facet_filter = src.facet_filter.clone();
         self.thumb_aspect = src.thumb_aspect;
         self.sort_order = src.sort_order;
@@ -6571,6 +6723,89 @@ mod tests {
             (actual - expected).abs() < 1.0e-6,
             "actual={actual} expected={expected}"
         );
+    }
+
+    fn assert_selection_bar_columns_match_details(settings: &Settings) {
+        assert_eq!(
+            settings.details_selection_bar_column_order,
+            settings.details_column_order
+        );
+        assert_eq!(
+            settings.details_selection_bar_column_widths,
+            settings.details_column_widths
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_preview,
+            settings.details_show_preview
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_rating,
+            settings.details_show_rating
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_tags,
+            settings.details_show_tags
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_kind,
+            settings.details_show_kind
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_page_count,
+            settings.details_show_page_count
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_size,
+            settings.details_show_size
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_modified,
+            settings.details_show_modified
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_created,
+            settings.details_show_created
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_state,
+            settings.details_show_state
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_image_dimensions,
+            settings.details_show_image_dimensions
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_video_duration,
+            settings.details_show_video_duration
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_video_dimensions,
+            settings.details_show_video_dimensions
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_video_codec,
+            settings.details_show_video_codec
+        );
+        assert_eq!(
+            settings.details_selection_bar_name_width_auto,
+            settings.details_name_width_auto
+        );
+        assert_f32_close(
+            settings.details_selection_bar_name_width,
+            settings.details_name_width,
+        );
+    }
+
+    fn selection_bar_data_value(settings: &Settings) -> serde_json::Value {
+        let mut object = serde_json::to_value(settings)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        object.retain(|key, _| {
+            key.starts_with("details_selection_bar_") && key != "details_selection_bar_mode"
+        });
+        serde_json::Value::Object(object)
     }
 
     #[test]
@@ -6908,6 +7143,158 @@ mod tests {
             loaded.selection_info_display_mode,
             SelectionInfoDisplayMode::Tooltip
         );
+    }
+
+    #[test]
+    fn details_selection_bar_roundtrips_json() {
+        let mut original = Settings::default();
+        original.details_selection_bar_mode = DetailsSelectionBarMode::Dedicated;
+        original.details_selection_bar_column_order = vec![
+            DetailsColumnId::Kind,
+            DetailsColumnId::Name,
+            DetailsColumnId::Size,
+        ];
+        original.details_selection_bar_column_widths = vec![
+            DetailsColumnWidth {
+                column: DetailsColumnId::Kind,
+                width: 123.0,
+            },
+            DetailsColumnWidth {
+                column: DetailsColumnId::Size,
+                width: 234.0,
+            },
+        ];
+        original.details_selection_bar_show_preview = false;
+        original.details_selection_bar_show_rating = false;
+        original.details_selection_bar_show_tags = false;
+        original.details_selection_bar_show_kind = false;
+        original.details_selection_bar_show_page_count = false;
+        original.details_selection_bar_show_size = false;
+        original.details_selection_bar_show_modified = false;
+        original.details_selection_bar_show_created = true;
+        original.details_selection_bar_show_state = false;
+        original.details_selection_bar_show_image_dimensions = true;
+        original.details_selection_bar_show_video_duration = true;
+        original.details_selection_bar_show_video_dimensions = true;
+        original.details_selection_bar_show_video_codec = true;
+        original.details_selection_bar_name_width_auto = false;
+        original.details_selection_bar_name_width = 321.0;
+
+        let value = serde_json::to_value(&original).unwrap();
+        let loaded: Settings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            loaded.details_selection_bar_mode,
+            DetailsSelectionBarMode::Dedicated
+        );
+        assert_eq!(
+            loaded.details_selection_bar_column_order,
+            original.details_selection_bar_column_order
+        );
+        assert_eq!(
+            loaded.details_selection_bar_column_widths,
+            original.details_selection_bar_column_widths
+        );
+        assert!(!loaded.details_selection_bar_show_preview);
+        assert!(!loaded.details_selection_bar_show_rating);
+        assert!(!loaded.details_selection_bar_show_tags);
+        assert!(!loaded.details_selection_bar_show_kind);
+        assert!(!loaded.details_selection_bar_show_page_count);
+        assert!(!loaded.details_selection_bar_show_size);
+        assert!(!loaded.details_selection_bar_show_modified);
+        assert!(loaded.details_selection_bar_show_created);
+        assert!(!loaded.details_selection_bar_show_state);
+        assert!(loaded.details_selection_bar_show_image_dimensions);
+        assert!(loaded.details_selection_bar_show_video_duration);
+        assert!(loaded.details_selection_bar_show_video_dimensions);
+        assert!(loaded.details_selection_bar_show_video_codec);
+        assert!(!loaded.details_selection_bar_name_width_auto);
+        assert_f32_close(loaded.details_selection_bar_name_width, 321.0);
+    }
+
+    #[test]
+    fn details_selection_bar_sanitize_normalizes_unknown_mode_order_and_widths() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"details_selection_bar_mode":"FutureMode"}"#).unwrap();
+        assert_eq!(
+            loaded.details_selection_bar_mode,
+            DetailsSelectionBarMode::Unknown
+        );
+        loaded.details_selection_bar_column_order = vec![
+            DetailsColumnId::Size,
+            DetailsColumnId::Size,
+            DetailsColumnId::Name,
+        ];
+        loaded.details_selection_bar_column_widths = vec![
+            DetailsColumnWidth {
+                column: DetailsColumnId::Name,
+                width: 400.0,
+            },
+            DetailsColumnWidth {
+                column: DetailsColumnId::Size,
+                width: 900.0,
+            },
+        ];
+        loaded.details_selection_bar_name_width = 900.0;
+
+        loaded.sanitize();
+
+        assert_eq!(
+            loaded.details_selection_bar_mode,
+            DetailsSelectionBarMode::SameAsDetails
+        );
+        assert_eq!(
+            loaded.details_selection_bar_column_order[0],
+            DetailsColumnId::Preview
+        );
+        assert_eq!(
+            loaded
+                .details_selection_bar_column_order
+                .iter()
+                .filter(|column| **column == DetailsColumnId::Size)
+                .count(),
+            1
+        );
+        assert_eq!(
+            loaded.details_selection_bar_column_order.len(),
+            DetailsColumnId::default_order().len()
+        );
+        assert_eq!(loaded.details_selection_bar_column_widths.len(), 1);
+        assert_eq!(
+            loaded.details_selection_bar_column_widths[0].column,
+            DetailsColumnId::Size
+        );
+        assert_f32_close(loaded.details_selection_bar_column_widths[0].width, 800.0);
+        assert_f32_close(loaded.details_selection_bar_name_width, 800.0);
+    }
+
+    #[test]
+    fn copy_details_columns_to_selection_bar_copies_complete_set() {
+        let mut settings = Settings::default();
+        settings.details_column_order = vec![DetailsColumnId::Size, DetailsColumnId::Name];
+        settings.details_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::Size,
+            width: 177.0,
+        }];
+        settings.details_show_preview = false;
+        settings.details_show_rating = false;
+        settings.details_show_tags = false;
+        settings.details_show_kind = false;
+        settings.details_show_page_count = false;
+        settings.details_show_size = false;
+        settings.details_show_modified = false;
+        settings.details_show_created = true;
+        settings.details_show_state = false;
+        settings.details_show_image_dimensions = true;
+        settings.details_show_video_duration = true;
+        settings.details_show_video_dimensions = true;
+        settings.details_show_video_codec = true;
+        settings.details_name_width_auto = false;
+        settings.details_name_width = 288.0;
+
+        settings.copy_details_columns_to_selection_bar();
+
+        assert_selection_bar_columns_match_details(&settings);
     }
 
     #[test]
@@ -7679,6 +8066,54 @@ mod tests {
                 maximized: true,
             })
         );
+    }
+
+    #[test]
+    fn overwrite_non_preferences_inherits_selection_bar_columns_but_keeps_edited_mode() {
+        let mut edited = Settings::default();
+        edited.details_selection_bar_mode = DetailsSelectionBarMode::Dedicated;
+        edited.details_selection_bar_column_order = vec![DetailsColumnId::Name];
+        edited.details_selection_bar_column_widths.clear();
+        edited.details_selection_bar_show_size = true;
+        edited.details_selection_bar_name_width = 111.0;
+
+        let mut live = Settings::default();
+        live.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
+        live.details_selection_bar_column_order =
+            vec![DetailsColumnId::Kind, DetailsColumnId::Name];
+        live.details_selection_bar_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::Kind,
+            width: 199.0,
+        }];
+        live.details_selection_bar_show_size = false;
+        live.details_selection_bar_show_video_codec = true;
+        live.details_selection_bar_name_width_auto = false;
+        live.details_selection_bar_name_width = 333.0;
+        let expected_live_data = selection_bar_data_value(&live);
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(
+            edited.details_selection_bar_mode,
+            DetailsSelectionBarMode::Dedicated,
+            "the preferences-edited mode must remain on the snapshot"
+        );
+        assert_eq!(selection_bar_data_value(&edited), expected_live_data);
+        assert_eq!(
+            edited.details_selection_bar_column_order,
+            vec![DetailsColumnId::Kind, DetailsColumnId::Name]
+        );
+        assert_eq!(
+            edited.details_selection_bar_column_widths,
+            vec![DetailsColumnWidth {
+                column: DetailsColumnId::Kind,
+                width: 199.0,
+            }]
+        );
+        assert!(!edited.details_selection_bar_show_size);
+        assert!(edited.details_selection_bar_show_video_codec);
+        assert!(!edited.details_selection_bar_name_width_auto);
+        assert_f32_close(edited.details_selection_bar_name_width, 333.0);
     }
 
     /// 旧設定 (`ai_upscale_skip_px` のみ、新フィールドなし) は `N x N` として
@@ -9833,6 +10268,57 @@ mod tests {
                 loaded.last_seen_version.as_deref(),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+        }
+
+        #[test]
+        fn details_selection_bar_settings_db_roundtrip() {
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.details_selection_bar_mode = DetailsSelectionBarMode::Dedicated;
+            settings.details_selection_bar_column_order = DetailsColumnId::default_order()
+                .iter()
+                .rev()
+                .copied()
+                .collect();
+            settings.details_selection_bar_column_widths = vec![
+                DetailsColumnWidth {
+                    column: DetailsColumnId::Kind,
+                    width: 123.0,
+                },
+                DetailsColumnWidth {
+                    column: DetailsColumnId::Size,
+                    width: 234.0,
+                },
+            ];
+            settings.details_selection_bar_show_preview = false;
+            settings.details_selection_bar_show_rating = false;
+            settings.details_selection_bar_show_tags = false;
+            settings.details_selection_bar_show_kind = false;
+            settings.details_selection_bar_show_page_count = false;
+            settings.details_selection_bar_show_size = false;
+            settings.details_selection_bar_show_modified = false;
+            settings.details_selection_bar_show_created = true;
+            settings.details_selection_bar_show_state = false;
+            settings.details_selection_bar_show_image_dimensions = true;
+            settings.details_selection_bar_show_video_duration = true;
+            settings.details_selection_bar_show_video_dimensions = true;
+            settings.details_selection_bar_show_video_codec = true;
+            settings.details_selection_bar_name_width_auto = false;
+            settings.details_selection_bar_name_width = 345.0;
+            let expected_data = selection_bar_data_value(&settings);
+
+            settings.save();
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+
+            assert_eq!(
+                loaded.details_selection_bar_mode,
+                DetailsSelectionBarMode::Dedicated
+            );
+            assert_eq!(selection_bar_data_value(&loaded), expected_data);
         }
 
         /// `thumb_aspect_auto` の save→load ラウンドトリップ。

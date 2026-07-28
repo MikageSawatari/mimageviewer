@@ -1155,6 +1155,29 @@ fn dir_size_bytes(dir: &std::path::Path) -> u64 {
 
 // ── メインダイアログ ────────────────────────────────────────────
 
+fn prepare_preferences_settings_for_commit(
+    edited: &mut crate::settings::Settings,
+    live: &mut crate::settings::Settings,
+) {
+    let old_details_selection_bar_mode = live.details_selection_bar_mode.normalized();
+    let new_details_selection_bar_mode = edited.details_selection_bar_mode.normalized();
+
+    edited.overwrite_non_preferences_from(live);
+
+    // セット C は上の移送対象なので、スナップショット上で先に複製すると live 値で
+    // 上書きされて消える。旧 live → 新 snapshot が Dedicated へ入る遷移だけ、移送後に複製する。
+    edited.details_selection_bar_mode = new_details_selection_bar_mode;
+    if old_details_selection_bar_mode != crate::settings::DetailsSelectionBarMode::Dedicated
+        && new_details_selection_bar_mode == crate::settings::DetailsSelectionBarMode::Dedicated
+    {
+        edited.copy_details_columns_to_selection_bar();
+    }
+
+    edited.reading_history_limit = edited
+        .reading_history_limit
+        .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
+}
+
 impl App {
     fn preferences_dialog_has_unsaved_changes(&self) -> bool {
         let Some(state) = self.pref_state.as_ref() else {
@@ -1503,14 +1526,7 @@ impl App {
                 // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
                 // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
                 // Settings に追加した場合はここにも追記が必要。
-                state
-                    .settings
-                    .overwrite_non_preferences_from(&mut self.settings);
-
-                state.settings.reading_history_limit = state
-                    .settings
-                    .reading_history_limit
-                    .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
+                prepare_preferences_settings_for_commit(&mut state.settings, &mut self.settings);
                 self.settings = state.settings;
                 if old_creative_luts != self.settings.creative_luts {
                     if self
@@ -2418,6 +2434,33 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 mod tests {
     use super::*;
 
+    fn assert_selection_bar_matches_details(settings: &crate::settings::Settings) {
+        assert_eq!(
+            settings.details_selection_bar_column_order,
+            settings.details_column_order
+        );
+        assert_eq!(
+            settings.details_selection_bar_column_widths,
+            settings.details_column_widths
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_size,
+            settings.details_show_size
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_created,
+            settings.details_show_created
+        );
+        assert_eq!(
+            settings.details_selection_bar_name_width_auto,
+            settings.details_name_width_auto
+        );
+        assert_eq!(
+            settings.details_selection_bar_name_width,
+            settings.details_name_width
+        );
+    }
+
     #[test]
     fn preferences_scroll_generation_changes_only_on_page_switch() {
         let mut generation = 7;
@@ -2450,5 +2493,85 @@ mod tests {
             .expect("general category should exist");
         assert_eq!(general.page, Some(PreferencesPage::General));
         assert!(!general.children.contains(&PreferencesPage::Font));
+    }
+
+    #[test]
+    fn preferences_commit_copies_live_details_columns_after_non_preference_merge() {
+        let mut live = crate::settings::Settings::default();
+        live.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::SameAsDetails;
+        live.details_column_order = vec![
+            crate::settings::DetailsColumnId::Kind,
+            crate::settings::DetailsColumnId::Name,
+        ];
+        live.details_column_widths = vec![crate::settings::DetailsColumnWidth {
+            column: crate::settings::DetailsColumnId::Kind,
+            width: 215.0,
+        }];
+        live.details_show_size = false;
+        live.details_show_created = true;
+        live.details_name_width_auto = false;
+        live.details_name_width = 287.0;
+        live.details_selection_bar_column_order = vec![crate::settings::DetailsColumnId::Name];
+        live.details_selection_bar_name_width = 99.0;
+
+        // ダイアログを開いた時点の snapshot は古い A/C を持つが、モードだけ Dedicated に編集。
+        let mut edited = crate::settings::Settings::default();
+        edited.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::Dedicated;
+
+        prepare_preferences_settings_for_commit(&mut edited, &mut live);
+
+        assert_eq!(
+            edited.details_selection_bar_mode,
+            crate::settings::DetailsSelectionBarMode::Dedicated
+        );
+        assert_selection_bar_matches_details(&edited);
+        assert_eq!(
+            edited.details_selection_bar_column_order[0],
+            crate::settings::DetailsColumnId::Kind,
+            "copy must use the latest live A after non-preference fields are merged"
+        );
+    }
+
+    #[test]
+    fn preferences_commit_reentering_dedicated_mode_overwrites_previous_bar_columns() {
+        let mut live = crate::settings::Settings::default();
+        live.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::Dedicated;
+        live.details_selection_bar_column_order = vec![crate::settings::DetailsColumnId::Name];
+        live.details_selection_bar_name_width = 111.0;
+
+        let mut shared = live.clone();
+        shared.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::SameAsDetails;
+        prepare_preferences_settings_for_commit(&mut shared, &mut live);
+        assert_eq!(
+            shared.details_selection_bar_column_order,
+            vec![crate::settings::DetailsColumnId::Name],
+            "leaving Dedicated must preserve C"
+        );
+
+        shared.details_column_order = vec![
+            crate::settings::DetailsColumnId::Size,
+            crate::settings::DetailsColumnId::Name,
+        ];
+        shared.details_column_widths = vec![crate::settings::DetailsColumnWidth {
+            column: crate::settings::DetailsColumnId::Size,
+            width: 246.0,
+        }];
+        shared.details_name_width_auto = false;
+        shared.details_name_width = 333.0;
+        shared.details_selection_bar_column_order = vec![crate::settings::DetailsColumnId::Kind];
+        shared.details_selection_bar_name_width = 77.0;
+
+        let mut dedicated_again = shared.clone();
+        dedicated_again.details_selection_bar_mode =
+            crate::settings::DetailsSelectionBarMode::Dedicated;
+        prepare_preferences_settings_for_commit(&mut dedicated_again, &mut shared);
+
+        assert_selection_bar_matches_details(&dedicated_again);
+        assert_eq!(
+            dedicated_again.details_selection_bar_column_order[0],
+            crate::settings::DetailsColumnId::Size,
+            "re-entering Dedicated must overwrite stale C from the latest A"
+        );
+        assert_eq!(dedicated_again.details_selection_bar_name_width, 333.0);
     }
 }

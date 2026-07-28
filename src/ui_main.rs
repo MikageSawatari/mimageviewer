@@ -16,9 +16,9 @@ use crate::app::{
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
 use crate::settings::{
-    DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSortKey, FacetCalendarDate,
-    FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode,
-    GridClickSelectionMode, GridViewMode,
+    DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSelectionBarMode, DetailsSortKey,
+    FacetCalendarDate, FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset,
+    FacetTagMode, GridClickSelectionMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -1006,8 +1006,9 @@ pub(crate) enum DetailsColumn {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetailsColumnSet {
-    All,
-    TextOnly,
+    Details,
+    SharedBar,
+    DedicatedBar,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1117,7 +1118,38 @@ impl DetailsBestFitJob {
 
 impl DetailsColumnSet {
     fn includes(self, column: DetailsColumn) -> bool {
-        self == Self::All || column != DetailsColumn::Preview
+        self == Self::Details || column != DetailsColumn::Preview
+    }
+
+    fn column_order<'a>(self, settings: &'a crate::settings::Settings) -> &'a [DetailsColumnId] {
+        match self {
+            Self::Details | Self::SharedBar => &settings.details_column_order,
+            Self::DedicatedBar => &settings.details_selection_bar_column_order,
+        }
+    }
+
+    fn column_widths<'a>(
+        self,
+        settings: &'a crate::settings::Settings,
+    ) -> &'a [DetailsColumnWidth] {
+        match self {
+            Self::Details | Self::SharedBar => &settings.details_column_widths,
+            Self::DedicatedBar => &settings.details_selection_bar_column_widths,
+        }
+    }
+
+    fn name_width_auto(self, settings: &crate::settings::Settings) -> bool {
+        match self {
+            Self::Details | Self::SharedBar => settings.details_name_width_auto,
+            Self::DedicatedBar => settings.details_selection_bar_name_width_auto,
+        }
+    }
+
+    fn name_width(self, settings: &crate::settings::Settings) -> f32 {
+        match self {
+            Self::Details | Self::SharedBar => settings.details_name_width,
+            Self::DedicatedBar => settings.details_selection_bar_name_width,
+        }
     }
 }
 
@@ -1229,22 +1261,53 @@ impl DetailsColumn {
         )
     }
 
-    fn visible(self, settings: &crate::settings::Settings) -> bool {
+    fn visible(self, settings: &crate::settings::Settings, column_set: DetailsColumnSet) -> bool {
+        let dedicated = column_set == DetailsColumnSet::DedicatedBar;
         match self {
-            Self::Preview => settings.details_show_preview,
+            Self::Preview => {
+                if dedicated {
+                    settings.details_selection_bar_show_preview
+                } else {
+                    settings.details_show_preview
+                }
+            }
             Self::Name => true,
-            Self::Rating => settings.details_show_rating,
-            Self::Tags => settings.details_show_tags,
-            Self::Kind => settings.details_show_kind,
-            Self::PageCount => settings.details_show_page_count,
-            Self::Size => settings.details_show_size,
-            Self::Modified => settings.details_show_modified,
-            Self::Created => settings.details_show_created,
-            Self::State => settings.details_show_state,
-            Self::ImageDimensions => settings.details_show_image_dimensions,
-            Self::VideoDuration => settings.details_show_video_duration,
-            Self::VideoDimensions => settings.details_show_video_dimensions,
-            Self::VideoCodec => settings.details_show_video_codec,
+            Self::Rating => dedicated
+                .then_some(settings.details_selection_bar_show_rating)
+                .unwrap_or(settings.details_show_rating),
+            Self::Tags => dedicated
+                .then_some(settings.details_selection_bar_show_tags)
+                .unwrap_or(settings.details_show_tags),
+            Self::Kind => dedicated
+                .then_some(settings.details_selection_bar_show_kind)
+                .unwrap_or(settings.details_show_kind),
+            Self::PageCount => dedicated
+                .then_some(settings.details_selection_bar_show_page_count)
+                .unwrap_or(settings.details_show_page_count),
+            Self::Size => dedicated
+                .then_some(settings.details_selection_bar_show_size)
+                .unwrap_or(settings.details_show_size),
+            Self::Modified => dedicated
+                .then_some(settings.details_selection_bar_show_modified)
+                .unwrap_or(settings.details_show_modified),
+            Self::Created => dedicated
+                .then_some(settings.details_selection_bar_show_created)
+                .unwrap_or(settings.details_show_created),
+            Self::State => dedicated
+                .then_some(settings.details_selection_bar_show_state)
+                .unwrap_or(settings.details_show_state),
+            Self::ImageDimensions => dedicated
+                .then_some(settings.details_selection_bar_show_image_dimensions)
+                .unwrap_or(settings.details_show_image_dimensions),
+            Self::VideoDuration => dedicated
+                .then_some(settings.details_selection_bar_show_video_duration)
+                .unwrap_or(settings.details_show_video_duration),
+            Self::VideoDimensions => dedicated
+                .then_some(settings.details_selection_bar_show_video_dimensions)
+                .unwrap_or(settings.details_show_video_dimensions),
+            Self::VideoCodec => dedicated
+                .then_some(settings.details_selection_bar_show_video_codec)
+                .unwrap_or(settings.details_show_video_codec),
         }
     }
 
@@ -1283,13 +1346,14 @@ struct DetailsHeaderDrag {
 
 fn details_ordered_columns(
     settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
     include_hidden: bool,
 ) -> Vec<DetailsColumn> {
     let mut ordered = Vec::with_capacity(DetailsColumn::all().len());
-    let source: Vec<DetailsColumnId> = if settings.details_column_order.is_empty() {
+    let source: Vec<DetailsColumnId> = if column_set.column_order(settings).is_empty() {
         DetailsColumnId::default_order().to_vec()
     } else {
-        settings.details_column_order.clone()
+        column_set.column_order(settings).to_vec()
     };
     for id in source {
         let col = DetailsColumn::from_id(id);
@@ -1304,7 +1368,7 @@ fn details_ordered_columns(
     }
     ordered
         .into_iter()
-        .filter(|col| include_hidden || col.visible(settings))
+        .filter(|col| include_hidden || col.visible(settings, column_set))
         .collect()
 }
 
@@ -1313,17 +1377,32 @@ fn details_column_is_visible(
     column_set: DetailsColumnSet,
     column: DetailsColumn,
 ) -> bool {
-    column_set.includes(column) && column.visible(settings)
+    column_set.includes(column) && column.visible(settings, column_set)
 }
 
 fn details_visible_columns(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
 ) -> Vec<DetailsColumn> {
-    details_ordered_columns(settings, false)
+    details_ordered_columns(settings, column_set, false)
         .into_iter()
         .filter(|column| details_column_is_visible(settings, column_set, *column))
         .collect()
+}
+
+fn selection_info_bottom_bar_is_hidden(settings: &crate::settings::Settings) -> bool {
+    settings.grid_view_mode == GridViewMode::Details
+        && settings.details_selection_bar_mode.normalized() == DetailsSelectionBarMode::Hidden
+}
+
+fn selection_info_bottom_bar_column_set(settings: &crate::settings::Settings) -> DetailsColumnSet {
+    if settings.grid_view_mode == GridViewMode::Details
+        && settings.details_selection_bar_mode.normalized() == DetailsSelectionBarMode::Dedicated
+    {
+        DetailsColumnSet::DedicatedBar
+    } else {
+        DetailsColumnSet::SharedBar
+    }
 }
 
 pub(crate) fn selection_info_bottom_bar_shows_column(
@@ -1331,7 +1410,12 @@ pub(crate) fn selection_info_bottom_bar_shows_column(
     column: DetailsColumn,
 ) -> bool {
     settings.selection_info_display_mode.shows_bottom_bar()
-        && details_column_is_visible(settings, DetailsColumnSet::TextOnly, column)
+        && !selection_info_bottom_bar_is_hidden(settings)
+        && details_column_is_visible(
+            settings,
+            selection_info_bottom_bar_column_set(settings),
+            column,
+        )
 }
 
 fn selection_info_bar_contains_pos(
@@ -1343,12 +1427,16 @@ fn selection_info_bar_contains_pos(
         .is_some_and(|(rect, pos)| rect.contains(pos))
 }
 
-fn details_column_width(settings: &crate::settings::Settings, col: DetailsColumn) -> f32 {
+fn details_column_width(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    col: DetailsColumn,
+) -> f32 {
     if col == DetailsColumn::Name {
         return col.default_width();
     }
-    settings
-        .details_column_widths
+    column_set
+        .column_widths(settings)
         .iter()
         .find(|entry| entry.column == col.id())
         .map(|entry| entry.width)
@@ -1384,9 +1472,12 @@ fn set_details_column_width(
 }
 
 /// 固定幅モード時の名前列幅 (clamp 済み)。
-fn details_name_fixed_width(settings: &crate::settings::Settings) -> f32 {
-    settings
-        .details_name_width
+fn details_name_fixed_width(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> f32 {
+    column_set
+        .name_width(settings)
         .clamp(DetailsColumn::Name.min_width(), 800.0)
 }
 
@@ -1732,7 +1823,7 @@ fn log_details_layout_debug(ctx: &egui::Context, sample: DetailsLayoutDebugSampl
             let width = if column == DetailsColumn::Name {
                 sample.name_w
             } else {
-                details_column_width(sample.settings, column)
+                details_column_width(sample.settings, sample.column_set, column)
             };
             format!("{column:?}:{width:.6}")
         })
@@ -1776,7 +1867,7 @@ fn log_details_layout_debug(ctx: &egui::Context, sample: DetailsLayoutDebugSampl
         sample.viewport_h_est,
         sample.predicted_vscroll,
         sample.gutter,
-        sample.settings.details_name_width_auto,
+        sample.column_set.name_width_auto(sample.settings),
         sample.fixed_columns_w,
         columns_avail,
         sample.name_w,
@@ -1815,11 +1906,14 @@ impl DetailsRowData {
     }
 }
 
-fn details_fixed_columns_width(settings: &crate::settings::Settings) -> f32 {
-    details_ordered_columns(settings, false)
+fn details_fixed_columns_width(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> f32 {
+    details_ordered_columns(settings, column_set, false)
         .into_iter()
         .filter(|col| *col != DetailsColumn::Name)
-        .map(|col| details_column_width(settings, col))
+        .map(|col| details_column_width(settings, column_set, col))
         .sum()
 }
 
@@ -1828,18 +1922,19 @@ fn details_layout(
     gutter: f32,
     pixels_per_point: f32,
     settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
 ) -> DetailsLayout {
-    let fixed = details_fixed_columns_width(settings);
+    let fixed = details_fixed_columns_width(settings, column_set);
     let columns_avail = (avail_w - gutter).max(0.0);
-    let auto_fits = settings.details_name_width_auto
-        && columns_avail >= fixed + DetailsColumn::Name.default_width();
+    let name_width_auto = column_set.name_width_auto(settings);
+    let auto_fits = name_width_auto && columns_avail >= fixed + DetailsColumn::Name.default_width();
     let rounding_slack = details_layout_right_guard(pixels_per_point);
     let name_w = if auto_fits {
         (columns_avail - fixed - rounding_slack).max(DetailsColumn::Name.min_width())
-    } else if settings.details_name_width_auto {
+    } else if name_width_auto {
         DetailsColumn::Name.default_width()
     } else {
-        details_name_fixed_width(settings)
+        details_name_fixed_width(settings, column_set)
     };
     let columns_w = name_w + fixed;
     // Leave one physical pixel of slack when auto-fit has enough room. At UI
@@ -1868,10 +1963,10 @@ fn details_content_width_for_column_set(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
 ) -> f32 {
-    let omitted_width: f32 = details_ordered_columns(settings, false)
+    let omitted_width: f32 = details_ordered_columns(settings, column_set, false)
         .into_iter()
         .filter(|column| !column_set.includes(*column))
-        .map(|column| details_column_width(settings, column))
+        .map(|column| details_column_width(settings, column_set, column))
         .sum();
     (full_pane_width - omitted_width).max(DetailsColumn::Name.min_width())
 }
@@ -1886,12 +1981,12 @@ fn details_column_rects_for_columns(
         .iter()
         .copied()
         .filter(|col| *col != DetailsColumn::Name)
-        .map(|col| details_column_width(settings, col))
+        .map(|col| details_column_width(settings, column_set, col))
         .sum();
-    let name_width = if settings.details_name_width_auto {
+    let name_width = if column_set.name_width_auto(settings) {
         (rect.width() - fixed).max(DetailsColumn::Name.default_width())
     } else {
-        details_name_fixed_width(settings)
+        details_name_fixed_width(settings, column_set)
     };
     let specs = columns
         .into_iter()
@@ -1899,7 +1994,7 @@ fn details_column_rects_for_columns(
             let width = if col == DetailsColumn::Name {
                 name_width
             } else {
-                details_column_width(settings, col)
+                details_column_width(settings, column_set, col)
             };
             (col, width)
         })
@@ -1922,7 +2017,7 @@ fn details_column_rects(
     rect: egui::Rect,
     settings: &crate::settings::Settings,
 ) -> Vec<(DetailsColumn, egui::Rect)> {
-    details_column_rects_for_columns(rect, settings, DetailsColumnSet::All)
+    details_column_rects_for_columns(rect, settings, DetailsColumnSet::Details)
 }
 
 fn details_column_at_x(
@@ -1960,7 +2055,7 @@ fn reorder_details_column(
     if dragged == target {
         return false;
     }
-    let mut columns = details_ordered_columns(settings, true);
+    let mut columns = details_ordered_columns(settings, DetailsColumnSet::Details, true);
     let Some(from_pos) = columns.iter().position(|col| *col == dragged) else {
         return false;
     };
@@ -11513,7 +11608,13 @@ impl App {
             } else {
                 0.0
             };
-            let layout = details_layout(layout_avail_w, gutter, pixels_per_point, &self.settings);
+            let layout = details_layout(
+                layout_avail_w,
+                gutter,
+                pixels_per_point,
+                &self.settings,
+                DetailsColumnSet::Details,
+            );
             let policy = details_horizontal_scroll_policy(
                 horizontal_source_rect,
                 layout.extent,
@@ -11642,7 +11743,7 @@ impl App {
                                 idx,
                                 row,
                                 spread_pair_cursor_idx == Some(idx),
-                                DetailsColumnSet::All,
+                                DetailsColumnSet::Details,
                                 false,
                                 true,
                             ) {
@@ -11682,7 +11783,7 @@ impl App {
                 pane_w: layout.pane_w,
                 layout_extent: layout.extent,
                 requested_extent: horizontal_policy.scroll_extent,
-                column_set: DetailsColumnSet::All,
+                column_set: DetailsColumnSet::Details,
                 outer_inner_rect: horizontal_output.inner_rect,
                 outer_content_size: horizontal_output.content_size,
                 outer_state: horizontal_output.state,
@@ -12316,7 +12417,8 @@ impl App {
             return;
         };
 
-        if !details_visible_columns(&self.settings, DetailsColumnSet::All).contains(&job.key.column)
+        if !details_visible_columns(&self.settings, DetailsColumnSet::Details)
+            .contains(&job.key.column)
         {
             return;
         }
@@ -12482,7 +12584,8 @@ impl App {
             egui::Stroke::new(1.0, stroke_color),
         );
 
-        let columns = details_column_rects_for_columns(rect, &self.settings, DetailsColumnSet::All);
+        let columns =
+            details_column_rects_for_columns(rect, &self.settings, DetailsColumnSet::Details);
         let header_drag_id = ui.id().with("details_header_drag_state");
         for (col, col_rect) in columns.iter().copied() {
             let mut header_hit = col_rect;
@@ -12624,7 +12727,8 @@ impl App {
                             col_rect.width() + resize_response.drag_delta().x,
                         )
                     } else {
-                        let current = details_column_width(&self.settings, col);
+                        let current =
+                            details_column_width(&self.settings, DetailsColumnSet::Details, col);
                         set_details_column_width(
                             &mut self.settings,
                             col,
@@ -13848,11 +13952,13 @@ impl App {
         self.selection_info_bar_rect = None;
         if self.viewer_session_blocks_main_window()
             || !self.settings.selection_info_display_mode.shows_bottom_bar()
+            || selection_info_bottom_bar_is_hidden(&self.settings)
             || self.items_are_drive_list
         {
             return;
         }
 
+        let column_set = selection_info_bottom_bar_column_set(&self.settings);
         let selected_idx = self.selected.filter(|&idx| self.items.get(idx).is_some());
         let available_before = ctx.available_rect();
         let scroll_style = details_scroll_style();
@@ -13867,20 +13973,24 @@ impl App {
                     details_horizontal_viewport_capacity(source_rect, pixels_per_point)
                         .min(avail_w)
                         .max(1.0);
-                let full_layout =
-                    details_layout(layout_avail_w, 0.0, pixels_per_point, &self.settings);
+                let full_layout = details_layout(
+                    layout_avail_w,
+                    0.0,
+                    pixels_per_point,
+                    &self.settings,
+                    column_set,
+                );
                 let content_w = details_content_width_for_column_set(
                     full_layout.pane_w,
                     &self.settings,
-                    DetailsColumnSet::TextOnly,
+                    column_set,
                 );
                 let avail_h = ui.available_height().max(0.0);
-                let fixed_columns_w: f32 =
-                    details_visible_columns(&self.settings, DetailsColumnSet::TextOnly)
-                        .into_iter()
-                        .filter(|column| *column != DetailsColumn::Name)
-                        .map(|column| details_column_width(&self.settings, column))
-                        .sum();
+                let fixed_columns_w: f32 = details_visible_columns(&self.settings, column_set)
+                    .into_iter()
+                    .filter(|column| *column != DetailsColumn::Name)
+                    .map(|column| details_column_width(&self.settings, column_set, column))
+                    .sum();
                 let horizontal_policy = details_horizontal_scroll_policy(
                     source_rect,
                     content_w,
@@ -13899,25 +14009,14 @@ impl App {
                             egui::vec2(content_w, Self::DETAILS_HEADER_H),
                             egui::Sense::hover(),
                         );
-                        self.draw_details_header_static(
-                            ui,
-                            header_rect,
-                            DetailsColumnSet::TextOnly,
-                        );
+                        self.draw_details_header_static(ui, header_rect, column_set);
                         let (row_rect, _) = ui.allocate_exact_size(
                             egui::vec2(content_w, Self::DETAILS_ROW_H),
                             egui::Sense::hover(),
                         );
                         if let Some(idx) = selected_idx {
                             let _ = self.draw_details_row(
-                                ui,
-                                row_rect,
-                                idx,
-                                0,
-                                false,
-                                DetailsColumnSet::TextOnly,
-                                true,
-                                false,
+                                ui, row_rect, idx, 0, false, column_set, true, false,
                             );
                         }
                         ui.spacing_mut().item_spacing.y = old_spacing_y;
@@ -13946,7 +14045,7 @@ impl App {
                         pane_w: content_w,
                         layout_extent: content_w,
                         requested_extent: horizontal_policy.scroll_extent,
-                        column_set: DetailsColumnSet::TextOnly,
+                        column_set,
                         outer_inner_rect: output.inner_rect,
                         outer_content_size: output.content_size,
                         outer_state: output.state,
@@ -15126,7 +15225,7 @@ mod compute_cell_size_tests {
         ));
 
         // avail が狭くても、保存済みの広い列のために pane は名前列既定幅 + その列幅まで広がる。
-        let layout = details_layout(200.0, 0.0, 1.0, &settings);
+        let layout = details_layout(200.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
         assert_eq!(layout.pane_w, DetailsColumn::Name.default_width() + 220.0);
         assert_eq!(layout.extent, layout.pane_w, "gutter 0 なら extent == pane");
     }
@@ -15136,7 +15235,7 @@ mod compute_cell_size_tests {
         // 名前列が残り幅を埋める通常ケース。縦バー gutter と丸め余白を引いて収める。
         let settings = minimal_details_settings(); // Name + Size(92)
         let gutter = 10.0;
-        let layout = details_layout(600.0, gutter, 1.0, &settings);
+        let layout = details_layout(600.0, gutter, 1.0, &settings, DetailsColumnSet::Details);
         assert!((layout.extent - 599.0).abs() < 0.01);
         assert!(
             (layout.pane_w - (600.0 - gutter - 1.0)).abs() < 0.01,
@@ -15151,7 +15250,7 @@ mod compute_cell_size_tests {
     #[test]
     fn details_layout_without_gutter_leaves_one_physical_pixel() {
         let settings = minimal_details_settings();
-        let layout = details_layout(600.0, 0.0, 1.0, &settings);
+        let layout = details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
         assert!((layout.extent - 599.0).abs() < 0.01);
         assert!((layout.pane_w - 599.0).abs() < 0.01);
     }
@@ -15160,7 +15259,13 @@ mod compute_cell_size_tests {
     fn details_layout_rounding_slack_covers_pixel_and_header_stroke() {
         let settings = minimal_details_settings();
         for pixels_per_point in [0.8_f32, 0.9, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
-            let layout = details_layout(600.0, 10.0, pixels_per_point, &settings);
+            let layout = details_layout(
+                600.0,
+                10.0,
+                pixels_per_point,
+                &settings,
+                DetailsColumnSet::Details,
+            );
             let device_pixel_gap = (600.0 - layout.extent) * pixels_per_point;
             let expected_gap = 1.0_f32.max(0.5 * pixels_per_point);
             assert!(
@@ -15179,7 +15284,13 @@ mod compute_cell_size_tests {
                 egui::Rect::from_min_size(egui::pos2(8.0, 100.0), egui::vec2(avail_w, 600.0));
             let layout_avail_w =
                 details_horizontal_viewport_capacity(viewport, pixels_per_point).min(avail_w);
-            let layout = details_layout(layout_avail_w, 10.0, pixels_per_point, &settings);
+            let layout = details_layout(
+                layout_avail_w,
+                10.0,
+                pixels_per_point,
+                &settings,
+                DetailsColumnSet::Details,
+            );
             let policy = details_horizontal_scroll_policy(
                 viewport,
                 layout.extent,
@@ -15256,15 +15367,20 @@ mod compute_cell_size_tests {
                 egui::Rect::from_min_size(egui::pos2(8.0, 0.0), egui::vec2(avail_w, 400.0));
             let mut settings = minimal_details_settings();
             settings.details_name_width_auto = false;
-            let fixed = details_fixed_columns_width(&settings);
+            let fixed = details_fixed_columns_width(&settings, DetailsColumnSet::Details);
             let layout_avail_w =
                 details_horizontal_viewport_capacity(viewport, pixels_per_point).min(avail_w);
             let fitting_name =
                 layout_avail_w - gutter - details_layout_right_guard(pixels_per_point) - fixed;
             settings.details_name_width = fitting_name;
 
-            let fitting_layout =
-                details_layout(layout_avail_w, gutter, pixels_per_point, &settings);
+            let fitting_layout = details_layout(
+                layout_avail_w,
+                gutter,
+                pixels_per_point,
+                &settings,
+                DetailsColumnSet::Details,
+            );
             let fitting_policy = details_horizontal_scroll_policy(
                 viewport,
                 fitting_layout.extent,
@@ -15278,8 +15394,13 @@ mod compute_cell_size_tests {
             );
 
             settings.details_name_width = fitting_name + 2.0 / pixels_per_point;
-            let overflow_layout =
-                details_layout(layout_avail_w, gutter, pixels_per_point, &settings);
+            let overflow_layout = details_layout(
+                layout_avail_w,
+                gutter,
+                pixels_per_point,
+                &settings,
+                DetailsColumnSet::Details,
+            );
             let overflow_policy = details_horizontal_scroll_policy(
                 viewport,
                 overflow_layout.extent,
@@ -15310,8 +15431,13 @@ mod compute_cell_size_tests {
                             let layout_avail_w =
                                 details_horizontal_viewport_capacity(viewport, pixels_per_point)
                                     .min(avail_w);
-                            let layout =
-                                details_layout(layout_avail_w, gutter, pixels_per_point, &settings);
+                            let layout = details_layout(
+                                layout_avail_w,
+                                gutter,
+                                pixels_per_point,
+                                &settings,
+                                DetailsColumnSet::Details,
+                            );
                             let policy = details_horizontal_scroll_policy(
                                 viewport,
                                 layout.extent,
@@ -15358,7 +15484,13 @@ mod compute_cell_size_tests {
                     let layout_avail_w =
                         details_horizontal_viewport_capacity(viewport, effective_ppp)
                             .min(viewport.width());
-                    let layout = details_layout(layout_avail_w, 10.0, effective_ppp, &settings);
+                    let layout = details_layout(
+                        layout_avail_w,
+                        10.0,
+                        effective_ppp,
+                        &settings,
+                        DetailsColumnSet::Details,
+                    );
                     let policy = details_horizontal_scroll_policy(
                         viewport,
                         layout.extent,
@@ -15680,7 +15812,13 @@ mod compute_cell_size_tests {
         });
 
         assert!(
-            (details_column_width(&app.settings, DetailsColumn::Tags) - expected).abs() < 0.01,
+            (details_column_width(
+                &app.settings,
+                DetailsColumnSet::Details,
+                DetailsColumn::Tags,
+            ) - expected)
+                .abs()
+                < 0.01,
             "再走査後は1 batch目へ遅れて届いたタグも収める"
         );
     }
@@ -15747,7 +15885,12 @@ mod compute_cell_size_tests {
         });
 
         assert!(
-            (details_column_width(&app.settings, DetailsColumn::VideoCodec) - expected).abs()
+            (details_column_width(
+                &app.settings,
+                DetailsColumnSet::Details,
+                DetailsColumn::VideoCodec,
+            ) - expected)
+                .abs()
                 < 0.01,
             "遅延メタ到着前後の幅を混ぜず、安定世代を全行再走査する"
         );
@@ -15842,8 +15985,11 @@ mod compute_cell_size_tests {
         assert!(state.contains("12345 ページ"));
         assert!(state.ends_with("見つかりません"));
         assert!(
-            details_column_width(&app.settings, DetailsColumn::State)
-                >= (measured + DETAILS_BEST_FIT_HORIZONTAL_PADDING).ceil()
+            details_column_width(
+                &app.settings,
+                DetailsColumnSet::Details,
+                DetailsColumn::State,
+            ) >= (measured + DETAILS_BEST_FIT_HORIZONTAL_PADDING).ceil()
         );
     }
 
@@ -15885,8 +16031,11 @@ mod compute_cell_size_tests {
 
         assert_eq!(app.details_state_text(0), state);
         assert!(
-            details_column_width(&app.settings, DetailsColumn::State)
-                >= (measured + DETAILS_BEST_FIT_HORIZONTAL_PADDING).ceil()
+            details_column_width(
+                &app.settings,
+                DetailsColumnSet::Details,
+                DetailsColumn::State,
+            ) >= (measured + DETAILS_BEST_FIT_HORIZONTAL_PADDING).ceil()
         );
     }
 
@@ -15903,7 +16052,7 @@ mod compute_cell_size_tests {
         ];
 
         assert_eq!(
-            details_visible_columns(&settings, DetailsColumnSet::TextOnly),
+            details_visible_columns(&settings, DetailsColumnSet::SharedBar),
             vec![
                 DetailsColumn::Kind,
                 DetailsColumn::Size,
@@ -15916,18 +16065,18 @@ mod compute_cell_size_tests {
     fn bottom_bar_text_columns_keep_details_widths() {
         let mut settings = minimal_details_settings();
         settings.details_show_preview = true;
-        let full_layout = details_layout(600.0, 0.0, 1.0, &settings);
+        let full_layout = details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::SharedBar);
         let text_width = details_content_width_for_column_set(
             full_layout.pane_w,
             &settings,
-            DetailsColumnSet::TextOnly,
+            DetailsColumnSet::SharedBar,
         );
         let full_rect =
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(full_layout.pane_w, 24.0));
         let text_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
         let full = details_column_rects(full_rect, &settings);
         let text =
-            details_column_rects_for_columns(text_rect, &settings, DetailsColumnSet::TextOnly);
+            details_column_rects_for_columns(text_rect, &settings, DetailsColumnSet::SharedBar);
 
         for (column, rect) in text {
             let full_width = full
@@ -15940,11 +16089,148 @@ mod compute_cell_size_tests {
     }
 
     #[test]
+    fn details_selection_bar_mode_selects_shared_or_dedicated_visible_columns() {
+        let mut settings = minimal_details_settings();
+        settings.grid_view_mode = GridViewMode::Details;
+        settings.details_show_size = true;
+        settings.details_column_order = vec![DetailsColumnId::Size, DetailsColumnId::Name];
+
+        settings.details_selection_bar_show_preview = false;
+        settings.details_selection_bar_show_rating = false;
+        settings.details_selection_bar_show_tags = false;
+        settings.details_selection_bar_show_kind = true;
+        settings.details_selection_bar_show_page_count = false;
+        settings.details_selection_bar_show_size = false;
+        settings.details_selection_bar_show_modified = false;
+        settings.details_selection_bar_show_created = false;
+        settings.details_selection_bar_show_state = false;
+        settings.details_selection_bar_show_image_dimensions = false;
+        settings.details_selection_bar_show_video_duration = false;
+        settings.details_selection_bar_show_video_dimensions = false;
+        settings.details_selection_bar_show_video_codec = false;
+        settings.details_selection_bar_column_order =
+            vec![DetailsColumnId::Kind, DetailsColumnId::Name];
+
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
+        let shared_set = selection_info_bottom_bar_column_set(&settings);
+        assert_eq!(shared_set, DetailsColumnSet::SharedBar);
+        assert_eq!(
+            details_visible_columns(&settings, shared_set),
+            vec![DetailsColumn::Size, DetailsColumn::Name]
+        );
+
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::Dedicated;
+        let dedicated_set = selection_info_bottom_bar_column_set(&settings);
+        assert_eq!(dedicated_set, DetailsColumnSet::DedicatedBar);
+        assert_eq!(
+            details_visible_columns(&settings, dedicated_set),
+            vec![DetailsColumn::Kind, DetailsColumn::Name]
+        );
+
+        settings.grid_view_mode = GridViewMode::Thumbnail;
+        assert_eq!(
+            selection_info_bottom_bar_column_set(&settings),
+            DetailsColumnSet::SharedBar,
+            "thumbnail bars always keep set A"
+        );
+    }
+
+    #[test]
+    fn details_selection_bar_rects_use_mode_specific_order_and_widths() {
+        let mut settings = minimal_details_settings();
+        settings.grid_view_mode = GridViewMode::Details;
+        settings.details_show_size = true;
+        settings.details_column_order = vec![DetailsColumnId::Size, DetailsColumnId::Name];
+        settings.details_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::Size,
+            width: 111.0,
+        }];
+        settings.details_name_width_auto = false;
+        settings.details_name_width = 150.0;
+
+        settings.details_selection_bar_show_preview = false;
+        settings.details_selection_bar_show_rating = false;
+        settings.details_selection_bar_show_tags = false;
+        settings.details_selection_bar_show_kind = true;
+        settings.details_selection_bar_show_page_count = false;
+        settings.details_selection_bar_show_size = false;
+        settings.details_selection_bar_show_modified = false;
+        settings.details_selection_bar_show_created = false;
+        settings.details_selection_bar_show_state = false;
+        settings.details_selection_bar_show_image_dimensions = false;
+        settings.details_selection_bar_show_video_duration = false;
+        settings.details_selection_bar_show_video_dimensions = false;
+        settings.details_selection_bar_show_video_codec = false;
+        settings.details_selection_bar_column_order =
+            vec![DetailsColumnId::Kind, DetailsColumnId::Name];
+        settings.details_selection_bar_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::Kind,
+            width: 222.0,
+        }];
+        settings.details_selection_bar_name_width_auto = false;
+        settings.details_selection_bar_name_width = 333.0;
+
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
+        let shared = details_column_rects_for_columns(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(261.0, 24.0)),
+            &settings,
+            selection_info_bottom_bar_column_set(&settings),
+        );
+        assert_eq!(
+            shared.iter().map(|(column, _)| *column).collect::<Vec<_>>(),
+            vec![DetailsColumn::Size, DetailsColumn::Name]
+        );
+        assert!((shared[0].1.width() - 111.0).abs() < 0.01);
+        assert!((shared[1].1.width() - 150.0).abs() < 0.01);
+
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::Dedicated;
+        let dedicated = details_column_rects_for_columns(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(555.0, 24.0)),
+            &settings,
+            selection_info_bottom_bar_column_set(&settings),
+        );
+        assert_eq!(
+            dedicated
+                .iter()
+                .map(|(column, _)| *column)
+                .collect::<Vec<_>>(),
+            vec![DetailsColumn::Kind, DetailsColumn::Name]
+        );
+        assert!((dedicated[0].1.width() - 222.0).abs() < 0.01);
+        assert!((dedicated[1].1.width() - 333.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn hidden_details_selection_bar_suppresses_lazy_column_requests() {
+        let mut settings = minimal_details_settings();
+        settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
+        settings.grid_view_mode = GridViewMode::Details;
+        settings.details_show_size = true;
+        settings.details_selection_bar_show_size = true;
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::Hidden;
+
+        assert!(!selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::Size
+        ));
+
+        settings.grid_view_mode = GridViewMode::Thumbnail;
+        assert!(selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::Size
+        ));
+        assert!(!selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::Preview
+        ));
+    }
+
+    #[test]
     fn details_layout_fixed_name_overflows_into_horizontal_scroll() {
         let mut settings = minimal_details_settings();
         settings.details_name_width_auto = false;
         settings.details_name_width = 500.0;
-        let layout = details_layout(300.0, 10.0, 1.0, &settings);
+        let layout = details_layout(300.0, 10.0, 1.0, &settings, DetailsColumnSet::Details);
         assert!((layout.name_w - 500.0).abs() < 0.01, "固定幅を尊重");
         assert!(
             layout.extent > 300.0,
@@ -15957,9 +16243,10 @@ mod compute_cell_size_tests {
         let mut settings = minimal_details_settings();
         settings.details_name_width_auto = false;
         settings.details_name_width = 120.0;
-        let layout = details_layout(600.0, 10.0, 1.0, &settings);
+        let layout = details_layout(600.0, 10.0, 1.0, &settings, DetailsColumnSet::Details);
         assert!((layout.name_w - 120.0).abs() < 0.01);
-        let columns_w = layout.name_w + details_fixed_columns_width(&settings);
+        let columns_w =
+            layout.name_w + details_fixed_columns_width(&settings, DetailsColumnSet::Details);
         assert!(
             columns_w < layout.pane_w,
             "固定名前列が pane より狭いと右側に余白が残る"

@@ -625,7 +625,20 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             });
     });
     ui.label(
-        "ツールチップは選択行の下に表示します。下部情報バーは詳細表示と同じ列構成で、ヘッダと選択中の 1 行をウィンドウ下部に表示します。",
+        "ツールチップは選択行の下に表示します。下部情報バーはヘッダと選択中の 1 行をウィンドウ下部に表示します。",
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label("詳細表示時の下部情報バー:");
+        egui::ComboBox::from_id_salt("details_selection_bar_mode")
+            .selected_text(s.details_selection_bar_mode.label())
+            .show_ui(ui, |ui| {
+                for &mode in crate::settings::DetailsSelectionBarMode::all() {
+                    ui.selectable_value(&mut s.details_selection_bar_mode, mode, mode.label());
+                }
+            });
+    });
+    ui.small(
+        "サムネイル表示では一覧と同じ列設定を使います。詳細表示では、一覧と同じ設定・専用の設定・表示しないを選べます。",
     );
     ui.label("ツールチップに表示する項目:");
     ui.add_space(4.0);
