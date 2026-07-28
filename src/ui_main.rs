@@ -4003,8 +4003,14 @@ impl App {
                                         }
                                     }
                                 });
+                                // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
+                                // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
+                                // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
+                                // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
+                                ui.menu_button("ツールバー", |ui| {
+                                    self.draw_toolbar_visibility_menu(ui, true);
+                                });
                                 ui.separator();
-                                let mut toolbar_menu_drawn = false;
                                 for &command in settings_menu_commands {
                                     match command {
                                         MenuCommandId::SettingsThumbnailCache => {
@@ -4083,17 +4089,6 @@ impl App {
                                             }
                                         }
                                         MenuCommandId::SettingsPreferences => {
-                                            if !toolbar_menu_drawn {
-                                                ui.separator();
-                                                // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
-                                                // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
-                                                // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
-                                                // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
-                                                ui.menu_button("ツールバー", |ui| {
-                                                    self.draw_toolbar_visibility_menu(ui, true);
-                                                });
-                                                toolbar_menu_drawn = true;
-                                            }
                                             if ui.button(&settings_preferences_menu_label).clicked()
                                             {
                                                 self.show_preferences = true;
@@ -4102,16 +4097,6 @@ impl App {
                                         }
                                         _ => {}
                                     }
-                                }
-                                if !toolbar_menu_drawn {
-                                    ui.separator();
-                                    // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
-                                    // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
-                                    // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
-                                    // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
-                                    ui.menu_button("ツールバー", |ui| {
-                                        self.draw_toolbar_visibility_menu(ui, true);
-                                    });
                                 }
                                 // VST3 関連の設定は環境設定→VST3 プラグインページに集約。
                                 // 専用メニューは重複なので持たない (= ユーザー要望 2026-04)。
