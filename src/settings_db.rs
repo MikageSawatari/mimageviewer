@@ -2877,6 +2877,7 @@ mod tests {
         let mut s = Settings::default();
         s.grid_cols = 7;
         s.grid_click_selection_mode = crate::settings::GridClickSelectionMode::Explorer;
+        s.grid_cursor_wrap = true;
         s.ui_scale_factor = 1.5;
         s.thumb_quality = 88;
         s.last_folder = Some(PathBuf::from(r"C:\Users\test\Pictures"));
@@ -3010,6 +3011,7 @@ mod tests {
             loaded.grid_click_selection_mode,
             crate::settings::GridClickSelectionMode::Explorer
         );
+        assert!(loaded.grid_cursor_wrap);
         let video_slot = loaded.video_preset_slots.slots[0]
             .as_ref()
             .expect("video preset slot restored from settings_kv");

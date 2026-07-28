@@ -4,7 +4,10 @@ use eframe::egui;
 
 #[cfg(windows)]
 use super::ViewerPresentation;
-use super::{App, FolderNavMode, GridContainerOpenMode, GridScrollIntent};
+use super::{
+    App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridScrollIntent,
+    grid_cursor_nav_target_pos,
+};
 use crate::adjustment::PostFilter;
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
@@ -5557,8 +5560,15 @@ impl App {
             .iter()
             .position(|&idx| idx == sel)
             .unwrap_or(0);
-        let new_pos =
-            gamepad_grid_nav_target_pos(vis_pos, vi_len, cols, visible_rows, details_mode, dir);
+        let new_pos = gamepad_grid_nav_target_pos(
+            vis_pos,
+            vi_len,
+            cols,
+            visible_rows,
+            details_mode,
+            self.settings.grid_cursor_wrap,
+            dir,
+        );
         let Some(new_sel) = display_order.get(new_pos).copied() else {
             return;
         };
@@ -6183,6 +6193,7 @@ fn gamepad_grid_nav_target_pos(
     cols: usize,
     visible_rows: usize,
     details_mode: bool,
+    wrap: bool,
     dir: PadDir,
 ) -> usize {
     if vi_len == 0 {
@@ -6192,20 +6203,28 @@ fn gamepad_grid_nav_target_pos(
     if details_mode {
         let page_items = visible_rows.max(1);
         match dir {
-            PadDir::Right => (vis_pos + page_items).min(last_pos),
-            PadDir::Left => vis_pos.saturating_sub(page_items),
-            PadDir::Down => (vis_pos + 1).min(last_pos),
-            PadDir::Up => vis_pos.saturating_sub(1),
-        }
-    } else {
-        let cols = cols.max(1);
-        match dir {
-            PadDir::Right => (vis_pos + 1).min(last_pos),
-            PadDir::Left => vis_pos.saturating_sub(1),
-            PadDir::Down => (vis_pos + cols).min(last_pos),
-            PadDir::Up => vis_pos.saturating_sub(cols),
+            // 詳細表示の左右は 1 アイテム移動ではなくページ移動なので、ループ設定の
+            // 対象外として従来どおり端でクランプする。
+            PadDir::Right => return vis_pos.saturating_add(page_items).min(last_pos),
+            PadDir::Left => return vis_pos.saturating_sub(page_items),
+            PadDir::Down | PadDir::Up => {}
         }
     }
+
+    let direction = match dir {
+        PadDir::Right => GridCursorDirection::Right,
+        PadDir::Left => GridCursorDirection::Left,
+        PadDir::Down => GridCursorDirection::Down,
+        PadDir::Up => GridCursorDirection::Up,
+    };
+    grid_cursor_nav_target_pos(
+        vis_pos,
+        vi_len,
+        if details_mode { 1 } else { cols },
+        direction,
+        wrap,
+    )
+    .unwrap_or(0)
 }
 
 const REPEAT_BUTTONS: [PadButton; 6] = [
@@ -7079,11 +7098,11 @@ mod tests {
     #[test]
     fn details_grid_gamepad_up_down_move_one_row() {
         assert_eq!(
-            gamepad_grid_nav_target_pos(10, 30, 5, 12, true, PadDir::Down),
+            gamepad_grid_nav_target_pos(10, 30, 5, 12, true, false, PadDir::Down),
             11
         );
         assert_eq!(
-            gamepad_grid_nav_target_pos(10, 30, 5, 12, true, PadDir::Up),
+            gamepad_grid_nav_target_pos(10, 30, 5, 12, true, false, PadDir::Up),
             9
         );
     }
@@ -7137,11 +7156,11 @@ mod tests {
     #[test]
     fn details_grid_gamepad_left_right_move_by_visible_rows() {
         assert_eq!(
-            gamepad_grid_nav_target_pos(10, 30, 5, 8, true, PadDir::Right),
+            gamepad_grid_nav_target_pos(10, 30, 5, 8, true, false, PadDir::Right),
             18
         );
         assert_eq!(
-            gamepad_grid_nav_target_pos(10, 30, 5, 8, true, PadDir::Left),
+            gamepad_grid_nav_target_pos(10, 30, 5, 8, true, false, PadDir::Left),
             2
         );
     }
@@ -7149,12 +7168,28 @@ mod tests {
     #[test]
     fn thumbnail_grid_gamepad_preserves_grid_geometry() {
         assert_eq!(
-            gamepad_grid_nav_target_pos(5, 30, 5, 8, false, PadDir::Right),
+            gamepad_grid_nav_target_pos(5, 30, 5, 8, false, false, PadDir::Right),
             6
         );
         assert_eq!(
-            gamepad_grid_nav_target_pos(5, 30, 5, 8, false, PadDir::Down),
+            gamepad_grid_nav_target_pos(5, 30, 5, 8, false, false, PadDir::Down),
             10
+        );
+    }
+
+    #[test]
+    fn gamepad_grid_wrap_applies_to_steps_but_not_details_pages() {
+        assert_eq!(
+            gamepad_grid_nav_target_pos(29, 30, 5, 8, false, true, PadDir::Right),
+            0
+        );
+        assert_eq!(
+            gamepad_grid_nav_target_pos(29, 30, 5, 8, true, true, PadDir::Down),
+            0
+        );
+        assert_eq!(
+            gamepad_grid_nav_target_pos(29, 30, 5, 8, true, true, PadDir::Right),
+            29
         );
     }
 

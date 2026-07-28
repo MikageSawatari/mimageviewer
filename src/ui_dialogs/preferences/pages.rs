@@ -608,6 +608,9 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "チェック方式は通常クリックや空白クリックで既存チェックを維持します。\n\
          エクスプローラー方式は通常クリックや空白クリックで選択を置き換え、Ctrl / Shift クリックで複数選択します。",
     );
+    ui.add_space(6.0);
+    ui.checkbox(&mut s.grid_cursor_wrap, "カーソル移動をループする");
+    ui.small("先頭で↑、末尾で↓を押したとき、反対の端へ移動します。");
 
     ui.add_space(12.0);
     ui.label(egui::RichText::new("選択情報の表示").strong());

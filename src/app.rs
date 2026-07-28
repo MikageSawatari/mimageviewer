@@ -7320,6 +7320,171 @@ pub(crate) enum GridScrollIntent {
     Bottom,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridCursorDirection {
+    Right,
+    Left,
+    Down,
+    Up,
+}
+
+/// 表示順上のカーソル位置から、矢印 1 回分の移動先を返す純関数。
+/// `wrap` が false のときは従来どおり端でクランプし、true の上下移動では
+/// 同じ列の反対端にある最後の有効セルを選ぶ。
+pub(crate) fn grid_cursor_nav_target_pos(
+    vis_pos: usize,
+    len: usize,
+    cols: usize,
+    direction: GridCursorDirection,
+    wrap: bool,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+
+    let last = len - 1;
+    let vis_pos = vis_pos.min(last);
+    let cols = cols.max(1);
+    let target = if !wrap {
+        match direction {
+            GridCursorDirection::Right => vis_pos.saturating_add(1).min(last),
+            GridCursorDirection::Left => vis_pos.saturating_sub(1),
+            GridCursorDirection::Down => vis_pos.saturating_add(cols).min(last),
+            GridCursorDirection::Up => vis_pos.saturating_sub(cols),
+        }
+    } else {
+        match direction {
+            GridCursorDirection::Right => {
+                if vis_pos < last {
+                    vis_pos + 1
+                } else {
+                    0
+                }
+            }
+            GridCursorDirection::Left => {
+                if vis_pos > 0 {
+                    vis_pos - 1
+                } else {
+                    last
+                }
+            }
+            GridCursorDirection::Down => vis_pos
+                .checked_add(cols)
+                .filter(|&candidate| candidate <= last)
+                .unwrap_or(vis_pos % cols),
+            GridCursorDirection::Up if vis_pos >= cols => vis_pos - cols,
+            GridCursorDirection::Up => {
+                let last_row_start = last / cols * cols;
+                let candidate = last_row_start
+                    .checked_add(vis_pos)
+                    .filter(|&candidate| candidate <= last);
+                if let Some(candidate) = candidate {
+                    candidate
+                } else {
+                    last_row_start - cols + vis_pos
+                }
+            }
+        }
+    };
+    Some(target)
+}
+
+#[cfg(test)]
+mod grid_cursor_nav_tests {
+    use super::{GridCursorDirection, grid_cursor_nav_target_pos};
+
+    #[test]
+    fn wrapped_single_column_cycles_between_ends() {
+        assert_eq!(
+            grid_cursor_nav_target_pos(0, 5, 1, GridCursorDirection::Up, true),
+            Some(4)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(4, 5, 1, GridCursorDirection::Down, true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn wrapped_multi_column_vertical_move_preserves_column() {
+        assert_eq!(
+            grid_cursor_nav_target_pos(9, 12, 4, GridCursorDirection::Down, true),
+            Some(1)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(1, 12, 4, GridCursorDirection::Up, true),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn wrapped_up_avoids_missing_cells_in_incomplete_last_row() {
+        assert_eq!(
+            grid_cursor_nav_target_pos(2, 10, 4, GridCursorDirection::Up, true),
+            Some(6)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(3, 10, 4, GridCursorDirection::Up, true),
+            Some(7)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(6, 10, 4, GridCursorDirection::Down, true),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn wrapped_horizontal_move_cycles_between_ends() {
+        assert_eq!(
+            grid_cursor_nav_target_pos(4, 5, 3, GridCursorDirection::Right, true),
+            Some(0)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(0, 5, 3, GridCursorDirection::Left, true),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn disabled_wrap_keeps_existing_clamp_behavior() {
+        assert_eq!(
+            grid_cursor_nav_target_pos(4, 5, 3, GridCursorDirection::Right, false),
+            Some(4)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(0, 5, 3, GridCursorDirection::Left, false),
+            Some(0)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(3, 5, 3, GridCursorDirection::Down, false),
+            Some(4)
+        );
+        assert_eq!(
+            grid_cursor_nav_target_pos(1, 5, 3, GridCursorDirection::Up, false),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn empty_and_single_item_lists_are_safe() {
+        assert_eq!(
+            grid_cursor_nav_target_pos(0, 0, 4, GridCursorDirection::Down, true),
+            None
+        );
+        for direction in [
+            GridCursorDirection::Right,
+            GridCursorDirection::Left,
+            GridCursorDirection::Down,
+            GridCursorDirection::Up,
+        ] {
+            assert_eq!(
+                grid_cursor_nav_target_pos(0, 1, 4, direction, true),
+                Some(0)
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum MetadataTransferTagDbReleaseState {
     #[default]
@@ -30314,14 +30479,25 @@ impl App {
 
             // 画面上の表示順で移動し、raw index に変換する。
             // Ctrl+矢印はフォルダ移動に使うので、通常カーソル移動から除外
-            let new_vis_pos = if right && !ctrl_held && !alt_held {
-                Some((vis_pos + 1).min(vi_len - 1))
+            let cursor_direction = if right && !ctrl_held && !alt_held {
+                Some(GridCursorDirection::Right)
             } else if left && !ctrl_held && !alt_held {
-                Some(vis_pos.saturating_sub(1))
+                Some(GridCursorDirection::Left)
             } else if down && !ctrl_held && !alt_held {
-                Some((vis_pos + nav_cols).min(vi_len - 1))
+                Some(GridCursorDirection::Down)
             } else if up && !ctrl_held && !alt_held {
-                Some(vis_pos.saturating_sub(nav_cols))
+                Some(GridCursorDirection::Up)
+            } else {
+                None
+            };
+            let new_vis_pos = if let Some(direction) = cursor_direction {
+                grid_cursor_nav_target_pos(
+                    vis_pos,
+                    vi_len,
+                    nav_cols,
+                    direction,
+                    self.settings.grid_cursor_wrap,
+                )
             } else if home {
                 Some(0)
             } else if end {
