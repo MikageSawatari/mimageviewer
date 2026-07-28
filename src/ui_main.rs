@@ -54,6 +54,9 @@ const DETAILS_BEST_FIT_MAX_WIDTH: f32 = 800.0;
 const DETAILS_COLUMN_MENU_SCREEN_MARGIN: f32 = 48.0;
 const DETAILS_COLUMN_MENU_COLUMNS_WIDTH: f32 = 240.0;
 const DETAILS_COLUMN_MENU_FORMAT_WIDTH: f32 = 200.0;
+// 自動サイズ popup の初回だけ使う。実測値は次フレームから menu 固有 Id に保持する。
+const DETAILS_COLUMN_MENU_INITIAL_CONTENT_HEIGHT: f32 = 420.0;
+const DETAILS_COLUMN_MENU_CONTENT_HEIGHT_ID: u64 = 0xD37A_115C_01_u64;
 const DETAILS_LAYOUT_DEBUG_ENV: &str = "MIV_DETAILS_LAYOUT_DEBUG";
 const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [86, 86, 86],
@@ -3202,46 +3205,184 @@ mod grid_right_drag_start_selection_tests {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct DetailsColumnMenuLayout {
+    pane_rects: [egui::Rect; 2],
+    #[cfg(test)]
+    viewport_rect: egui::Rect,
+    #[cfg(test)]
+    content_size: egui::Vec2,
+    #[cfg(test)]
+    scroll_offset: egui::Vec2,
+}
+
 fn draw_details_column_menu_layout(
     ui: &mut egui::Ui,
     max_height: f32,
     mut draw_pane: impl FnMut(DetailsColumnMenuPane, &mut egui::Ui),
-) -> [egui::Rect; 2] {
-    egui::ScrollArea::vertical()
-        .max_height(max_height)
-        .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let columns = ui.allocate_ui_with_layout(
-                    egui::vec2(DETAILS_COLUMN_MENU_COLUMNS_WIDTH, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_width(DETAILS_COLUMN_MENU_COLUMNS_WIDTH);
-                        draw_pane(DetailsColumnMenuPane::Columns, ui);
-                    },
-                );
+) -> DetailsColumnMenuLayout {
+    let content_height_id = ui.make_persistent_id(DETAILS_COLUMN_MENU_CONTENT_HEIGHT_ID);
+    let memoized_content_height = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<f32>(content_height_id))
+        .unwrap_or(DETAILS_COLUMN_MENU_INITIAL_CONTENT_HEIGHT);
+    let body_height = memoized_content_height.min(max_height).max(1.0);
+    // ScrollArea は max_height より先に親 Ui の available height で縮むため、画面予算と
+    // 実測 content height の小さい方を親領域として明示確保する。
+    let output = ui
+        .allocate_ui_with_layout(
+            egui::vec2(0.0, body_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(body_height)
+                    .auto_shrink([true, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            let columns = ui.allocate_ui_with_layout(
+                                egui::vec2(DETAILS_COLUMN_MENU_COLUMNS_WIDTH, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_width(DETAILS_COLUMN_MENU_COLUMNS_WIDTH);
+                                    draw_pane(DetailsColumnMenuPane::Columns, ui);
+                                },
+                            );
 
-                ui.separator();
+                            ui.separator();
 
-                let format = ui.allocate_ui_with_layout(
-                    egui::vec2(DETAILS_COLUMN_MENU_FORMAT_WIDTH, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_width(DETAILS_COLUMN_MENU_FORMAT_WIDTH);
-                        draw_pane(DetailsColumnMenuPane::Format, ui);
-                    },
-                );
+                            let format = ui.allocate_ui_with_layout(
+                                egui::vec2(DETAILS_COLUMN_MENU_FORMAT_WIDTH, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_width(DETAILS_COLUMN_MENU_FORMAT_WIDTH);
+                                    draw_pane(DetailsColumnMenuPane::Format, ui);
+                                },
+                            );
 
-                [columns.response.rect, format.response.rect]
-            })
-            .inner
-        })
-        .inner
+                            [columns.response.rect, format.response.rect]
+                        })
+                        .inner
+                    })
+            },
+        )
+        .inner;
+    let pane_rects = output.inner;
+    // 中央の縦 separator は確保済み body height まで伸びる。空白を memo へ混ぜないよう、
+    // ScrollArea の content_size ではなく左右 pane 自身の高さを次フレームへ渡す。
+    let measured_content_height = pane_rects[0].height().max(pane_rects[1].height());
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(content_height_id, measured_content_height);
+    });
+    if (measured_content_height - memoized_content_height).abs() > 0.5 {
+        ui.ctx().request_repaint();
+    }
+    DetailsColumnMenuLayout {
+        pane_rects,
+        #[cfg(test)]
+        viewport_rect: output.inner_rect,
+        #[cfg(test)]
+        content_size: output.content_size,
+        #[cfg(test)]
+        scroll_offset: output.state.offset,
+    }
 }
 
 #[cfg(test)]
 mod details_column_context_menu_layout_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    fn draw_height_test_menu(pane: DetailsColumnMenuPane, ui: &mut egui::Ui) {
+        let row_count = match pane {
+            DetailsColumnMenuPane::Columns => 18,
+            DetailsColumnMenuPane::Format => 8,
+        };
+        for index in 0..row_count {
+            ui.label(index.to_string());
+        }
+    }
+
+    #[test]
+    fn tall_screen_shows_the_full_menu_without_scrolling() {
+        use egui_kittest::Harness;
+
+        let measured = Arc::new(Mutex::new(None));
+        let measured_in_ui = Arc::clone(&measured);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 900.0))
+            .build(move |ctx| {
+                let area = egui::Area::new(egui::Id::new(0xD37A_11_u64))
+                    .fixed_pos(egui::pos2(0.0, 0.0))
+                    .movable(false)
+                    .default_size(egui::vec2(500.0, 120.0))
+                    .layout(egui::Layout::top_down_justified(egui::Align::Min))
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .show(ui, |ui| {
+                                draw_details_column_menu_layout(
+                                    ui,
+                                    900.0 - DETAILS_COLUMN_MENU_SCREEN_MARGIN,
+                                    draw_height_test_menu,
+                                )
+                            })
+                            .inner
+                    });
+                *measured_in_ui.lock().unwrap() = Some(area.inner);
+            });
+        harness.run_steps(3);
+
+        let layout = measured.lock().unwrap().unwrap();
+        let content_height = layout
+            .pane_rects
+            .iter()
+            .map(egui::Rect::height)
+            .fold(0.0, f32::max);
+        assert!(layout.viewport_rect.height() + 1.0 >= content_height);
+        assert!((layout.viewport_rect.height() - content_height).abs() <= 1.0);
+        assert!(layout.content_size.y <= layout.viewport_rect.height() + 1.0);
+    }
+
+    #[test]
+    fn short_screen_bounds_the_menu_and_keeps_it_scrollable() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let measured = Arc::new(Mutex::new(None));
+        let measured_in_ui = Arc::clone(&measured);
+        let max_height = 200.0 - DETAILS_COLUMN_MENU_SCREEN_MARGIN;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 200.0))
+            .build(move |ctx| {
+                let area = egui::Area::new(egui::Id::new(0xD37A_12_u64))
+                    .fixed_pos(egui::pos2(0.0, 0.0))
+                    .movable(false)
+                    .default_size(egui::vec2(500.0, 500.0))
+                    .layout(egui::Layout::top_down_justified(egui::Align::Min))
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .show(ui, |ui| {
+                                draw_details_column_menu_layout(
+                                    ui,
+                                    max_height,
+                                    draw_height_test_menu,
+                                )
+                            })
+                            .inner
+                    });
+                *measured_in_ui.lock().unwrap() = Some(area.inner);
+            });
+        harness.run_steps(3);
+
+        let layout = measured.lock().unwrap().unwrap();
+        assert!(layout.viewport_rect.height() <= max_height + 1.0);
+        assert!(layout.content_size.y > layout.viewport_rect.height() + 1.0);
+
+        let last_label = 17_u64.to_string();
+        harness.get_by_label(&last_label).scroll_to_me();
+        harness.run_steps(2);
+        let scrolled_layout = measured.lock().unwrap().unwrap();
+        assert!(scrolled_layout.scroll_offset.y > 1.0);
+    }
 
     #[test]
     fn menu_width_is_bounded_and_columns_are_side_by_side() {
@@ -3311,7 +3452,7 @@ mod details_column_context_menu_layout_tests {
                             }
                         })
                     });
-                *measured_in_ui.lock().unwrap() = Some((area.response.rect, area.inner));
+                *measured_in_ui.lock().unwrap() = Some((area.response.rect, area.inner.pane_rects));
             });
         harness.run_steps(3);
 

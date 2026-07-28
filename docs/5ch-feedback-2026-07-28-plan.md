@@ -343,6 +343,36 @@ popup の利用可能幅をそのまま受け、左列内の `ui.separator()` �
 実測する。列幅を外して利用可能幅へ追従すると、今回と同じく左列が 1200px 側へ伸び、このテストが
 失敗する。S6 で同じメニューを分岐するときも、メニュー直下の利用可能幅を列 UI へ渡さないこと。
 
+### 実機フィードバック後の高さ補正 (2026-07-28)
+
+2 列表示後、ウィンドウに十分な高さがある環境でも縦スクロールバーが出て全項目を一度に確認
+できない退行が見つかった。原因は egui 0.33.3 の `ScrollArea::begin` が外枠サイズを
+`ui.available_rect_before_wrap().size().at_most(max_size)` で決めることにある。
+自動サイズの menu popup 内では親 `Ui` の `available_height()` が中身より小さい値になり得るため、
+画面高から求めた `ScrollArea::max_height` が十分でも、親の利用可能高が先に上限となっていた。
+
+対処は 2 パス計測とした。menu 固有の `egui::Id` へ左右 pane の実高さを temp data として memo し、
+初回だけ 420px を使う。次フレーム以降は `min(memo, 画面予算)` を
+`allocate_ui_with_layout` で親領域として明示確保し、その中へ同じ高さの `ScrollArea` を置く。
+高さ方向は `auto_shrink` を無効にして親領域を使い切らせる一方、横方向は従来どおり内容幅へ
+縮めて 2 列の幅回帰を避ける。中央の縦 separator は確保した高さまで伸びるため、memo には
+`ScrollArea::content_size` ではなく左右 pane の最大高を使う。これにより、中身が短い場合は次の
+フレームで実高まで縮み、画面予算を超える場合だけ scrollbar が残る。
+
+高さの番人として次を追加した。
+
+- `details_column_context_menu_layout_tests::tall_screen_shows_the_full_menu_without_scrolling`:
+  900px 画面と、小さく評価された自動サイズ popup 親を再現する。viewport が左右 pane の実高を
+  覆ってほぼ同じ高さとなり、content が viewport を超えないことを確認する。親
+  `available_height()` へ直接 `ScrollArea` を置く旧実装では viewport 106px / content 321px となり
+  失敗する。
+- `details_column_context_menu_layout_tests::short_screen_bounds_the_menu_and_keeps_it_scrollable`:
+  200px 画面では viewport が画面予算 152px 以内、content が viewport より高いことに加え、末尾を
+  `scroll_to_me` した後の offset が増えることを確認する。
+
+S6 で同じメニューの内容を分岐して高さが変わっても、pane 実測値を memo する所有境界と、
+画面予算を唯一の最大高とする契約を維持すること。
+
 ---
 
 ## S6. 下部情報バーの表示項目をサムネイル表示 / 詳細表示で分ける
