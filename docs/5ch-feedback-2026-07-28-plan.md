@@ -351,27 +351,40 @@ popup の利用可能幅をそのまま受け、左列内の `ui.separator()` �
 自動サイズの menu popup 内では親 `Ui` の `available_height()` が中身より小さい値になり得るため、
 画面高から求めた `ScrollArea::max_height` が十分でも、親の利用可能高が先に上限となっていた。
 
-対処は 2 パス計測とした。menu 固有の `egui::Id` へ左右 pane の実高さを temp data として memo し、
-初回だけ 420px を使う。次フレーム以降は `min(memo, 画面予算)` を
-`allocate_ui_with_layout` で親領域として明示確保し、その中へ同じ高さの `ScrollArea` を置く。
-高さ方向は `auto_shrink` を無効にして親領域を使い切らせる一方、横方向は従来どおり内容幅へ
-縮めて 2 列の幅回帰を避ける。中央の縦 separator は確保した高さまで伸びるため、memo には
-`ScrollArea::content_size` ではなく左右 pane の最大高を使う。これにより、中身が短い場合は次の
-フレームで実高まで縮み、画面予算を超える場合だけ scrollbar が残る。
+最初の対処は 2 パス計測とした。menu 固有の `egui::Id` へ実高さを temp data として memo し、
+初回だけ 420px を使う。次フレーム以降は memo を `allocate_ui_with_layout` で親領域として明示確保し、
+その中へ同じ高さの `ScrollArea` を置く。高さ方向は `auto_shrink` を無効にして親領域を使い切らせる
+一方、横方向は従来どおり内容幅へ縮めて 2 列の幅回帰を避ける。
+
+ただし、中央に `ui.separator()` を置いたまま左右 pane の最大高を memo した版では、十分な高さでも
+ほぼ全高の scrollbar が残った。OS 125% + アプリ UI 130%、popup y=0.3pt の再現条件で実測すると、
+左右 pane 最大高と viewport は 347.78125pt だが、horizontal layout の available height まで伸びた
+separator と ScrollArea content は 348.31250pt だった。差は 0.53125pt で、separator の伸長分と
+完全に一致した。末尾 `item_spacing.y` や ScrollArea 内側 margin の追加寄与はなかった。
+
+最終形では、中央に `egui::Separator::default()` と同じ 6pt 幅だけを高さ 0 の gap として予約する。
+左右 pane を描いて矩形を実測した後、gap 中央へ
+`ui.visuals().widgets.noninteractive.bg_stroke` を使った `Painter::vline` を、両 pane の上端から最大下端
+まで描く。線は content 高の決定に参加しないため、memo は `ScrollAreaOutput::content_size.y` そのもの
+を使える。親領域の高さは
+`min(memo + 2 device px / effective pixels_per_point, 画面予算)` とし、端の物理 pixel 丸めにも余裕を
+持たせる。画面予算は従来どおり
+`content_rect().height() - DETAILS_COLUMN_MENU_SCREEN_MARGIN` であり、これを超える場合だけ scrollbar を
+残す。
 
 高さの番人として次を追加した。
 
 - `details_column_context_menu_layout_tests::tall_screen_shows_the_full_menu_without_scrolling`:
-  900px 画面と、小さく評価された自動サイズ popup 親を再現する。viewport が左右 pane の実高を
-  覆ってほぼ同じ高さとなり、content が viewport を超えないことを確認する。親
-  `available_height()` へ直接 `ScrollArea` を置く旧実装では viewport 106px / content 321px となり
-  失敗する。
+  900px 画面、小さく評価された自動サイズ popup 親、OS 125% + UI 130%、小数 popup 座標を再現する。
+  `content_size.y <= viewport_rect.height() + 0.5` を直接検証する。左右 pane 最大高を memo し中央に
+  伸長 separator を置く修正前実装では content 348.31250pt / viewport 347.78125pt となり失敗する。
 - `details_column_context_menu_layout_tests::short_screen_bounds_the_menu_and_keeps_it_scrollable`:
   200px 画面では viewport が画面予算 152px 以内、content が viewport より高いことに加え、末尾を
   `scroll_to_me` した後の offset が増えることを確認する。
 
-S6 で同じメニューの内容を分岐して高さが変わっても、pane 実測値を memo する所有境界と、
-画面予算を唯一の最大高とする契約を維持すること。
+S6 で同じメニューの内容を分岐して高さが変わっても、layout に参加しない中央線、ScrollArea の実
+content 高を memo する所有境界、2 device px の丸め余裕、画面予算を唯一の最大高とする契約を
+維持すること。
 
 ---
 
