@@ -2998,6 +2998,10 @@ pub struct Settings {
     /// 表示プレビューだけ縮小し、保存/コピー/比較/書き出しはフル解像度のまま。
     #[serde(default = "default_text_preview_scale")]
     pub text_preview_scale: u32,
+    /// テキスト注釈オブジェクト移動時に、他オブジェクトの端・中央・等間隔位置へ
+    /// 吸着してスマートガイドを表示するか。既存動作を維持するため既定 ON。
+    #[serde(default = "default_true")]
+    pub text_smart_snap_enabled: bool,
     /// サムネイルキャッシュの WebP 品質 (1–100)
     #[serde(default = "default_thumb_quality")]
     pub thumb_quality: u8,
@@ -4713,6 +4717,7 @@ impl Default for Settings {
             grid_display_order: GridDisplayOrder::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
+            text_smart_snap_enabled: true,
             thumb_quality: default_thumb_quality(),
             cache_policy: CachePolicy::default(),
             cache_threshold_ms: default_cache_threshold_ms(),
@@ -6493,6 +6498,7 @@ impl Settings {
         // テキスト編集中プレビュー解像度 (環境設定外の Ctrl+T 左パネルで編集)。環境設定 OK の
         // 全体差し替えで巻き戻らないよう live 値を引き継ぐ (Codex P3)。
         self.text_preview_scale = src.text_preview_scale;
+        self.text_smart_snap_enabled = src.text_smart_snap_enabled;
         self.thumb_quality = src.thumb_quality;
         // ── 静止画 mipmap LOD (画像補正→フィルタでライブ編集) ──
         self.image_mipmap_lod_bias = src.image_mipmap_lod_bias;
@@ -7773,6 +7779,18 @@ mod tests {
     fn missing_show_hidden_files_defaults_to_false() {
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert!(!loaded.show_hidden_files);
+    }
+
+    #[test]
+    fn text_smart_snap_defaults_on_and_roundtrips_off() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(loaded.text_smart_snap_enabled);
+
+        let mut selected = Settings::default();
+        selected.text_smart_snap_enabled = false;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+        assert!(!restored.text_smart_snap_enabled);
     }
 
     #[test]

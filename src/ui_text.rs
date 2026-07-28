@@ -1081,24 +1081,40 @@ fn distribute_text_objects(
     changed
 }
 
-fn move_text_selection_with_guides(
+fn text_drag_snapping_enabled(setting_enabled: bool, alt_held: bool) -> bool {
+    setting_enabled && !alt_held
+}
+
+fn move_text_selection_to_raw_delta_with_guides(
     objects: &mut [AnnotationObject],
     selected_ids: &[u64],
-    dx: f32,
-    dy: f32,
+    raw_delta: (f32, f32),
+    applied_delta: (f32, f32),
     fonts: Option<&FontSet>,
     threshold: f32,
+    snapping_enabled: bool,
 ) -> (bool, TextSmartGuides) {
     let selected: HashSet<u64> = selected_ids.iter().copied().collect();
-    if selected.is_empty() || (dx == 0.0 && dy == 0.0) {
+    if selected.is_empty() {
         return (false, TextSmartGuides::default());
     }
-    for o in objects.iter_mut().filter(|o| selected.contains(&o.id)) {
-        translate_object(o, dx, dy);
-        set_window_position_free(o);
+
+    // 現在の実配置 (前フレームの吸着補正込み) を、ドラッグ開始点からの raw delta が示す
+    // 未吸着の論理位置へ戻す。補正を raw delta へフィードバックしないことが不変条件。
+    let logical_dx = raw_delta.0 - applied_delta.0;
+    let logical_dy = raw_delta.1 - applied_delta.1;
+    let mut changed = logical_dx != 0.0 || logical_dy != 0.0;
+    if changed {
+        for o in objects.iter_mut().filter(|o| selected.contains(&o.id)) {
+            translate_object(o, logical_dx, logical_dy);
+            set_window_position_free(o);
+        }
+    }
+    if !snapping_enabled {
+        return (changed, TextSmartGuides::default());
     }
     let Some(group) = selected_alignment_bounds(objects, selected_ids, fonts) else {
-        return (true, TextSmartGuides::default());
+        return (changed, TextSmartGuides::default());
     };
     let others: Vec<egui::Rect> = objects
         .iter()
@@ -1193,8 +1209,32 @@ fn move_text_selection_with_guides(
         for o in objects.iter_mut().filter(|o| selected.contains(&o.id)) {
             translate_object(o, correction_x, correction_y);
         }
+        changed = true;
     }
-    (true, guides)
+    (changed, guides)
+}
+
+#[cfg(test)]
+fn move_text_selection_with_guides(
+    objects: &mut [AnnotationObject],
+    selected_ids: &[u64],
+    dx: f32,
+    dy: f32,
+    fonts: Option<&FontSet>,
+    threshold: f32,
+) -> (bool, TextSmartGuides) {
+    if dx == 0.0 && dy == 0.0 {
+        return (false, TextSmartGuides::default());
+    }
+    move_text_selection_to_raw_delta_with_guides(
+        objects,
+        selected_ids,
+        (dx, dy),
+        (0.0, 0.0),
+        fonts,
+        threshold,
+        true,
+    )
 }
 
 // ── 変形ハンドル (回転 / サイズ / しっぽ) ─ ラボ `*_handle_points` 等を移植 ─────
@@ -2466,6 +2506,7 @@ impl App {
                             kind,
                             start: pos,
                             start_pivot: o.pivot,
+                            start_img: img,
                             start_half_extents: handle_half_extents(o, fonts.as_deref())
                                 .map(|(half_extents, _)| half_extents),
                             start_rotation_rad: o.rotation_rad,
@@ -2484,18 +2525,33 @@ impl App {
                     let img = view.screen_to_image(pos);
                     let symmetric_corner_resize = modifier_held_via_os(ModKind::Ctrl);
                     let preserve_aspect_corner_resize = modifier_held_via_os(ModKind::Shift);
+                    let snapping_enabled = text_drag_snapping_enabled(
+                        self.settings.text_smart_snap_enabled,
+                        modifier_held_via_os(ModKind::Alt),
+                    );
                     let changed = if matches!(drag.kind, TextDragKind::Move) {
                         let (changed, guides) = self
                             .comic_docs
                             .get_mut(&key)
                             .map(|objs| {
-                                move_text_selection_with_guides(
+                                let applied_delta = objs
+                                    .iter()
+                                    .find(|object| object.id == drag.id)
+                                    .map(|object| {
+                                        (
+                                            object.pivot.0 - drag.start_pivot.0,
+                                            object.pivot.1 - drag.start_pivot.1,
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                move_text_selection_to_raw_delta_with_guides(
                                     objs,
                                     &self.text_selected_ids,
-                                    img.0 - drag.last_img.0,
-                                    img.1 - drag.last_img.1,
+                                    (img.0 - drag.start_img.0, img.1 - drag.start_img.1),
+                                    applied_delta,
                                     fonts.as_deref(),
                                     6.0 / view.scale.max(1e-3),
+                                    snapping_enabled,
                                 )
                             })
                             .unwrap_or_default();
@@ -2919,6 +2975,8 @@ impl App {
         // 取り出し、変更要求はローカルに溜めて closure 後に適用する。
         let current_preview_scale = self.settings.text_preview_scale.clamp(1, 8);
         let mut preview_scale_req: Option<u32> = None;
+        let initial_smart_snap_enabled = self.settings.text_smart_snap_enabled;
+        let mut smart_snap_enabled = initial_smart_snap_enabled;
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::new("text_panel"))
@@ -3089,6 +3147,7 @@ impl App {
                                     &mut selected_ids,
                                     &mut selection_anchor,
                                     &mut changed,
+                                    &mut smart_snap_enabled,
                                 );
                             });
                         ui.separator();
@@ -3338,6 +3397,10 @@ impl App {
                 self.settings.save();
                 ctx.request_repaint();
             }
+        }
+        if smart_snap_enabled != initial_smart_snap_enabled {
+            self.settings.text_smart_snap_enabled = smart_snap_enabled;
+            self.settings.save();
         }
         if close {
             self.reset_text_mode();
@@ -6484,12 +6547,19 @@ fn object_list_rows_ui(
     selected_ids: &mut Vec<u64>,
     selection_anchor: &mut Option<u64>,
     changed: &mut bool,
+    smart_snap_enabled: &mut bool,
 ) {
-    ui.label(
-        egui::RichText::new(format!("オブジェクト ({})", objects.len()))
-            .strong()
-            .color(egui::Color32::WHITE),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("オブジェクト ({})", objects.len()))
+                .strong()
+                .color(egui::Color32::WHITE),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.checkbox(smart_snap_enabled, "吸着")
+                .on_hover_text("移動中にほかの注釈の端・中央・等間隔位置へ吸着します");
+        });
+    });
     if objects.is_empty() {
         ui.label(
             egui::RichText::new("「追加」からテキスト・吹き出し・ウィンドウを作成してください。")
@@ -9579,6 +9649,77 @@ mod tests {
     }
 
     #[test]
+    fn slow_group_drag_releases_snap_after_raw_delta_exceeds_threshold() {
+        let mut objects = vec![
+            stamp_object(1, (53.0, 20.0), 20.0, 5.0),
+            stamp_object(2, (100.0, 20.0), 20.0, 5.0),
+        ];
+
+        let start_x = objects[0].pivot.0;
+        for raw_x in 1..=14 {
+            let applied_x = objects[0].pivot.0 - start_x;
+            let _ = move_text_selection_to_raw_delta_with_guides(
+                &mut objects,
+                &[1],
+                (raw_x as f32, 0.0),
+                (applied_x, 0.0),
+                None,
+                6.0,
+                true,
+            );
+        }
+
+        assert_eq!(objects[0].pivot.0, 67.0);
+    }
+
+    fn assert_no_smart_guides(guides: TextSmartGuides) {
+        assert!(guides.vertical.is_none());
+        assert!(guides.horizontal.is_none());
+        assert!(guides.equal_horizontal.is_none());
+        assert!(guides.equal_vertical.is_none());
+    }
+
+    #[test]
+    fn group_move_snap_setting_off_has_no_correction_or_guides() {
+        let mut objects = vec![
+            stamp_object(1, (53.0, 20.0), 20.0, 5.0),
+            stamp_object(2, (100.0, 20.0), 20.0, 5.0),
+        ];
+        let (changed, guides) = move_text_selection_to_raw_delta_with_guides(
+            &mut objects,
+            &[1],
+            (1.0, 0.0),
+            (0.0, 0.0),
+            None,
+            6.0,
+            text_drag_snapping_enabled(false, false),
+        );
+        assert!(changed);
+        assert_eq!(objects[0].pivot.0, 54.0);
+        assert_no_smart_guides(guides);
+    }
+
+    #[test]
+    fn group_move_alt_override_has_no_correction_or_guides() {
+        let mut objects = vec![
+            stamp_object(1, (53.0, 20.0), 20.0, 5.0),
+            stamp_object(2, (100.0, 20.0), 20.0, 5.0),
+        ];
+        let (changed, guides) = move_text_selection_to_raw_delta_with_guides(
+            &mut objects,
+            &[1],
+            (1.0, 0.0),
+            (0.0, 0.0),
+            None,
+            6.0,
+            text_drag_snapping_enabled(true, true),
+        );
+        assert!(changed);
+        assert_eq!(objects[0].pivot.0, 54.0);
+        assert_no_smart_guides(guides);
+    }
+
+    #[test]
     fn group_move_releases_message_window_position_preset() {
         let window = MessageWindowObject {
             position: WindowPosition::Top,
@@ -10915,6 +11056,7 @@ mod tests {
             kind: TextDragKind::Corner(2),
             start: egui::pos2(0.0, 0.0),
             start_pivot: (100.0, 100.0),
+            start_img: (0.0, 0.0),
             start_half_extents: Some((40.0, 20.0)),
             start_rotation_rad: 0.0,
             last_img: (0.0, 0.0),
@@ -10954,6 +11096,7 @@ mod tests {
             kind: TextDragKind::Corner(2),
             start: egui::pos2(0.0, 0.0),
             start_pivot: (100.0, 100.0),
+            start_img: (0.0, 0.0),
             start_half_extents: Some((40.0, 40.0)),
             start_rotation_rad: 0.0,
             last_img: (0.0, 0.0),
@@ -10990,6 +11133,7 @@ mod tests {
             kind: TextDragKind::Rotate,
             start: egui::pos2(0.0, 0.0),
             start_pivot: (100.0, 100.0),
+            start_img: (0.0, 0.0),
             start_half_extents: Some((50.0, 30.0)),
             start_rotation_rad: 0.0,
             last_img: (0.0, 0.0),
@@ -11020,6 +11164,7 @@ mod tests {
             kind: TextDragKind::Corner(2),
             start: egui::pos2(0.0, 0.0),
             start_pivot: (100.0, 100.0),
+            start_img: (0.0, 0.0),
             start_half_extents: Some((40.0, 20.0)),
             start_rotation_rad: 0.0,
             last_img: (0.0, 0.0),

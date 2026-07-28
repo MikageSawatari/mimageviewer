@@ -4883,12 +4883,16 @@ pub(crate) struct TextDrag {
     /// press 時のオブジェクト pivot (canonical ソース px)。四隅リサイズを
     /// 毎フレーム開始状態から再計算するための不変スナップショット。
     pub start_pivot: (f32, f32),
+    /// press 時のポインタ画像座標 (canonical ソース px)。Move の未吸着論理位置を
+    /// ドラッグ開始点からの raw delta で再構築するための不変スナップショット。
+    pub start_img: (f32, f32),
     /// press 時の half extents。Bubble / MessageWindow / Stamp の四隅リサイズで使う。
     /// 寸法を導出できないドラッグでは `None`。
     pub start_half_extents: Option<(f32, f32)>,
     /// press 時の回転角。四隅リサイズの局所座標系をドラッグ中に固定する。
     pub start_rotation_rad: f32,
-    /// 直近のポインタ画像座標 (canonical ソース px)。Move の差分計算に使う。
+    /// 直近のポインタ画像座標 (canonical ソース px)。クリック確定と Move 以外の
+    /// 変形ハンドルに使う。吸着 Move の位置計算は `start_img` を正本にする。
     pub last_img: (f32, f32),
     /// 閾値を超えて実ドラッグに移行したか。これが立つまで変形を適用しない
     /// (= 単なるクリックでハンドルが微小に動く / 不要保存が出るのを防ぐ。
