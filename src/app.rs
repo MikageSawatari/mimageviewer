@@ -30300,6 +30300,21 @@ impl App {
 
         if self
             .keymap
+            .consume_action(ctx, KeyAction::GridOpenPreferences)
+        {
+            self.show_preferences = true;
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridOpenOperationCustomize)
+        {
+            self.show_operation_customize = true;
+            return None;
+        }
+
+        if self
+            .keymap
             .consume_action(ctx, KeyAction::GridToggleStackMode)
         {
             self.toggle_stack_mode();

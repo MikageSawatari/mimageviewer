@@ -212,6 +212,8 @@
 # GridColumnCount10.1 = Alt+0 ; サムネイル列数を10列にする
 # GridColumnCount10.2 = Alt+Numpad0 ; サムネイル列数を10列にする
 # GridToggleDetailsView = Alt+- ; サムネイル一覧と詳細一覧を切り替える
+# GridOpenPreferences = none ; 環境設定を開く
+# GridOpenOperationCustomize = none ; 操作カスタマイズを開く
 # GridAdjustSlot1.1 = Ctrl+1 ; 補正プリセットスロット1を適用する
 # GridAdjustSlot1.2 = Ctrl+Numpad1 ; 補正プリセットスロット1を適用する
 # GridAdjustSlot2.1 = Ctrl+2 ; 補正プリセットスロット2を適用する

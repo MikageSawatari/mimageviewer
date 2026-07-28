@@ -1318,6 +1318,8 @@ pub enum KeyAction {
     GridColumnCount9,
     GridColumnCount10,
     GridToggleDetailsView,
+    GridOpenPreferences,
+    GridOpenOperationCustomize,
     GridAdjustSlot1,
     GridAdjustSlot2,
     GridAdjustSlot3,
@@ -1736,6 +1738,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridColumnCount9,
     KeyAction::GridColumnCount10,
     KeyAction::GridToggleDetailsView,
+    KeyAction::GridOpenPreferences,
+    KeyAction::GridOpenOperationCustomize,
     KeyAction::GridAdjustSlot1,
     KeyAction::GridAdjustSlot2,
     KeyAction::GridAdjustSlot3,
@@ -2466,13 +2470,13 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::SettingsOperationCustomize,
         parent: TopMenuId::Settings,
         label: "操作カスタマイズ…",
-        action: None,
+        action: Some(KeyAction::GridOpenOperationCustomize),
     },
     MenuCommandSpec {
         id: MenuCommandId::SettingsPreferences,
         parent: TopMenuId::Settings,
         label: "環境設定…",
-        action: None,
+        action: Some(KeyAction::GridOpenPreferences),
     },
     MenuCommandSpec {
         id: MenuCommandId::HelpOpenManual,
@@ -3217,6 +3221,8 @@ impl KeyAction {
             GridColumnCount9 => "GridColumnCount9",
             GridColumnCount10 => "GridColumnCount10",
             GridToggleDetailsView => "GridToggleDetailsView",
+            GridOpenPreferences => "GridOpenPreferences",
+            GridOpenOperationCustomize => "GridOpenOperationCustomize",
             GridAdjustSlot1 => "GridAdjustSlot1",
             GridAdjustSlot2 => "GridAdjustSlot2",
             GridAdjustSlot3 => "GridAdjustSlot3",
@@ -3757,6 +3763,8 @@ impl KeyAction {
             GridColumnCount9 => "サムネイル列数を9列にする",
             GridColumnCount10 => "サムネイル列数を10列にする",
             GridToggleDetailsView => "サムネイル一覧と詳細一覧を切り替える",
+            GridOpenPreferences => "環境設定を開く",
+            GridOpenOperationCustomize => "操作カスタマイズを開く",
             GridAdjustSlot1 => "補正プリセットスロット1を適用する",
             GridAdjustSlot2 => "補正プリセットスロット2を適用する",
             GridAdjustSlot3 => "補正プリセットスロット3を適用する",
@@ -4178,6 +4186,8 @@ impl KeyAction {
             | GridColumnCount9
             | GridColumnCount10
             | GridToggleDetailsView
+            | GridOpenPreferences
+            | GridOpenOperationCustomize
             | GridAdjustSlot1
             | GridAdjustSlot2
             | GridAdjustSlot3
@@ -4555,6 +4565,8 @@ impl KeyAction {
             | GridColumnCount9
             | GridColumnCount10
             | GridToggleDetailsView
+            | GridOpenPreferences
+            | GridOpenOperationCustomize
             | GridAdjustSlot1
             | GridAdjustSlot2
             | GridAdjustSlot3
@@ -4967,6 +4979,7 @@ impl KeyAction {
             GridColumnCount9 => alt_digit_pair(Num9, Numpad9),
             GridColumnCount10 => alt_digit_pair(Num0, Numpad0),
             GridToggleDetailsView => ChordList::one(Chord::alt(Minus)),
+            GridOpenPreferences | GridOpenOperationCustomize => ChordList::EMPTY,
             GridAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
             GridAdjustSlot2 => ctrl_digit_pair(Num2, Numpad2),
             GridAdjustSlot3 => ctrl_digit_pair(Num3, Numpad3),
@@ -7246,6 +7259,8 @@ mod tests {
             "ToggleMaximize".to_string(),
             "MinimizeWindow".to_string(),
             "CloseFullscreen".to_string(),
+            "OpenPreferences".to_string(),
+            "OpenOperationCustomize".to_string(),
             "GridToggleDetails".to_string(),
             "GridToggleCheck".to_string(),
             "GridSelectAll".to_string(),
@@ -8043,6 +8058,28 @@ mod tests {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
+    }
+
+    #[test]
+    fn grid_settings_dialog_actions_are_default_unassigned_and_catalog_backed() {
+        for action in [
+            KeyAction::GridOpenPreferences,
+            KeyAction::GridOpenOperationCustomize,
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert!(action.default_chords().is_empty());
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+        }
+        assert_eq!(
+            menu_command_spec(MenuCommandId::SettingsPreferences).and_then(|spec| spec.action),
+            Some(KeyAction::GridOpenPreferences)
+        );
+        assert_eq!(
+            menu_command_spec(MenuCommandId::SettingsOperationCustomize)
+                .and_then(|spec| spec.action),
+            Some(KeyAction::GridOpenOperationCustomize)
+        );
     }
 
     #[test]

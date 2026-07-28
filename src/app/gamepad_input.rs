@@ -4803,6 +4803,14 @@ impl App {
                 self.apply_ring_pin_representative_thumb(ctx, context);
                 None
             }
+            RingActionId::OpenPreferences if context == RingShortcutContext::Grid => {
+                self.show_preferences = true;
+                None
+            }
+            RingActionId::OpenOperationCustomize if context == RingShortcutContext::Grid => {
+                self.show_operation_customize = true;
+                None
+            }
             RingActionId::GridToggleDetails if context == RingShortcutContext::Grid => {
                 self.toggle_grid_details_view();
                 None

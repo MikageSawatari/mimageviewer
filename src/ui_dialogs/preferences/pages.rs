@@ -1282,6 +1282,8 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridOpenSelectedAsPage => RingActionId::GridOpenSelectedAsPage,
         KeyAction::GridOpenSelectedAsList => RingActionId::GridOpenSelectedAsList,
         KeyAction::GridToggleDetailsView => RingActionId::GridToggleDetails,
+        KeyAction::GridOpenPreferences => RingActionId::OpenPreferences,
+        KeyAction::GridOpenOperationCustomize => RingActionId::OpenOperationCustomize,
         KeyAction::GridToggleMaximize => RingActionId::ToggleMaximize,
         KeyAction::GridColumnCount1 => RingActionId::GridColumnCount1,
         KeyAction::GridColumnCount2 => RingActionId::GridColumnCount2,
@@ -7468,8 +7470,10 @@ fn open_in_explorer(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AI_SIZE_LIMIT_OPTIONS, natural_operation_label_cmp};
+    use super::{AI_SIZE_LIMIT_OPTIONS, natural_operation_label_cmp, ring_bindings_for_key_action};
     use crate::app::MAX_TEXTURE_DIM;
+    use crate::keymap::KeyAction;
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
     /// render-to-target 後も最終 AI / composite は `MAX_TEXTURE_DIM` 以下に保つ。
@@ -7509,6 +7513,21 @@ mod tests {
                 "サムネイル列数を9列に",
                 "サムネイル列数を10列に",
             ]
+        );
+    }
+
+    #[test]
+    fn settings_dialog_key_actions_map_to_grid_ring_actions() {
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::GridOpenPreferences),
+            vec![(RingShortcutContext::Grid, RingActionId::OpenPreferences)]
+        );
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::GridOpenOperationCustomize),
+            vec![(
+                RingShortcutContext::Grid,
+                RingActionId::OpenOperationCustomize,
+            )]
         );
     }
 }

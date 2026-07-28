@@ -534,6 +534,8 @@ pub enum RingActionId {
     CloseMainWindow,
     QuitApplication,
     CloseFullscreen,
+    OpenPreferences,
+    OpenOperationCustomize,
     CycleFavorite,
     OpenFavorite1,
     OpenFavorite2,
@@ -924,6 +926,8 @@ impl RingActionId {
             Self::CloseMainWindow => "close_main_window",
             Self::QuitApplication => "quit_application",
             Self::CloseFullscreen => "close_fullscreen",
+            Self::OpenPreferences => "open_preferences",
+            Self::OpenOperationCustomize => "open_operation_customize",
             Self::CycleFavorite => "cycle_favorite",
             Self::OpenFavorite1
             | Self::OpenFavorite2
@@ -1063,6 +1067,8 @@ impl RingActionId {
             "close_main_window" => Self::CloseMainWindow,
             "quit_application" => Self::QuitApplication,
             "close_fullscreen" => Self::CloseFullscreen,
+            "open_preferences" => Self::OpenPreferences,
+            "open_operation_customize" => Self::OpenOperationCustomize,
             "cycle_favorite" => Self::CycleFavorite,
             "open_location_drive_list" => Self::OpenLocationDriveList,
             "open_location_reading_history" => Self::OpenLocationReadingHistory,
@@ -1171,6 +1177,8 @@ impl RingActionId {
                 RingShortcutContext::VideoFullscreen => "動画フルスクリーンを閉じる",
                 RingShortcutContext::Grid => "閉じる",
             },
+            Self::OpenPreferences => "環境設定を開く",
+            Self::OpenOperationCustomize => "操作カスタマイズを開く",
             Self::CycleFavorite => "お気に入り巡回",
             Self::OpenFavorite1
             | Self::OpenFavorite2
@@ -1297,6 +1305,8 @@ impl RingActionId {
                     | Self::MinimizeWindow
                     | Self::CloseMainWindow
                     | Self::QuitApplication
+                    | Self::OpenPreferences
+                    | Self::OpenOperationCustomize
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::CycleFavorite
@@ -1413,6 +1423,8 @@ impl RingActionId {
                 Self::MinimizeWindow,
                 Self::CloseMainWindow,
                 Self::QuitApplication,
+                Self::OpenPreferences,
+                Self::OpenOperationCustomize,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
                 Self::CycleFavorite,
@@ -2891,6 +2903,39 @@ mod tests {
             RingActionId::ToggleMaximize.label_for_context(RingShortcutContext::Grid),
             "ウィンドウ最大化/復元"
         );
+    }
+
+    #[test]
+    fn settings_dialog_actions_round_trip_and_are_grid_only() {
+        let samples = [
+            (
+                RingActionId::OpenPreferences,
+                "open_preferences",
+                "環境設定を開く",
+            ),
+            (
+                RingActionId::OpenOperationCustomize,
+                "open_operation_customize",
+                "操作カスタマイズを開く",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            for context in [
+                RingShortcutContext::ImageFullscreen,
+                RingShortcutContext::VideoFullscreen,
+            ] {
+                assert!(!action.is_valid_for_context(context));
+                assert!(!RingActionId::available_for_context(context).contains(&action));
+            }
+        }
     }
 
     #[test]
