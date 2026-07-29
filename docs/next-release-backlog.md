@@ -213,6 +213,7 @@
 
 ### 1.27 presenter スレッドが UI スレッドの窓の子 HWND を所有したままブロックする
 
+- 構造修正の設計: [Native video HWND ownership / pump 分離計画](native-video-window-thread-plan.md)。
 - 出典: 2026-07-29 のハング解析 (`cdb -pv` で両スレッドのスタックを実測)。
 - 症状: 動画をフルスクリーンで開いた直後に窓を閉じる / 切り替えると、アプリ全体が
   完全に固まる。CPU はほぼ 0 で、`panic.log` に `UI THREAD HANG suspected` が 10 秒ごとに
