@@ -2447,10 +2447,10 @@ impl App {
         }
         if let Some(texture) = self.ensure_final_composite_texture(ctx, idx) {
             // nav lock 無しの holdover は同一フォルダ内ページ送り / 同一ページの
-            // source 解像度更新用。AI 待ちの incomplete composite は後で一度破棄
-            // されるため、その texture を次の holdover として維持する。真の完成結果が
-            // 届いた時点だけ解放する。フォルダ移動用 holdover は poll_fs_nav_lock が
-            // items generation と合わせて解放する。
+            // source 解像度更新用。AI 待ちの incomplete composite も次の表示候補として
+            // 維持し、真の完成結果が届いた時点だけ解放する。AI Ready 後の同一 key
+            // 再合成は cache entry 自体を残して差し替える。フォルダ移動用 holdover は
+            // poll_fs_nav_lock が items generation と合わせて解放する。
             if self.fs_nav_locked_gen.is_none() && self.fullscreen_idx == Some(idx) {
                 if self.final_composite_texture_is_complete(idx, &texture) {
                     self.fs_holdover_tex = None;

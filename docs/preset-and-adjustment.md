@@ -722,7 +722,10 @@ AI を無駄に再実行してしまう)。
 7. GPU upload (`final_composite_cache`)
 
 の順で最終表示を作る。AI 未完了中は色調補正済み (+シャープ化済み) の画像を暫定表示し、
-AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛け直して再合成する。
+AI 完了時は未完了の final composite を表示用に残したまま AI 後の画像へ掛け直して再合成する。
+再合成結果は同じ `FinalCompositeKey` へ `insert` され、暫定 entry を上書きするため、キャッシュ
+欠落による黒画面を挟まない。`complete=false` は表示だけに利用でき、コピー / 書き出しと nav lock
+解除は従来どおり `complete=true` を待つ。
 `final_ai_cache` が miss しても `retained_final_ai_cache` が hit した場合は、その entry を
 `final_ai_cache` に戻してから同じ合成経路に入る。保持 LRU は `close_fullscreen()` や
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
@@ -869,6 +872,11 @@ folder nav close でも呼ばれるため保持 LRU には触らない。AI 機�
 `poll_prefetch` の raw decode 取り込みは `fs_cache` の再構築なので、live cache
 (`edit_result_cache` / `final_ai_cache` / `final_composite_cache`) は旧世代分を捨てるが、
 session またぎの retained final AI は残す。
+
+`FinalAiResult::Ready` の取り込みはパラメータ変更や世代更新による cache invalidation ではない。
+同じ edit key の AI 待ち `final_composite_cache` entry は削除せず、進行中の旧 final-effect job
+だけを cancel する。次の `ensure_final_composite_texture` が AI pixels から同一 key の完成 job を
+開始し、その間は既存の incomplete texture を表示へ返す。完成時は同一 key を上書きする。
 
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
 `local_adjust_cache` / `conceal_cache[idx]` / `edit_result_cache` / final cache を stale 化する。

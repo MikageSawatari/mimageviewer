@@ -5505,7 +5505,8 @@ impl<'a> IntoIterator for &'a FinalCompositeCache {
 pub(crate) struct FinalCompositeEntry {
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) texture: egui::TextureHandle,
-    /// false は AI 完了待ち中の暫定プレビュー。AI が届いたら同じ key を上書きする。
+    /// false は AI 完了待ち中の暫定プレビュー。AI 到着後の再合成中も表示用に保持し、
+    /// 完成結果が届いたら同じ key を上書きする。
     pub(crate) complete: bool,
 }
 
@@ -52226,17 +52227,23 @@ impl App {
             .final_effect_pending
             .get(&key)
             .is_some_and(|pending| pending.output_complete == output_complete);
-        if let Some(entry) = self
+        let existing_texture = self
             .final_composite_cache
             .get(&key)
-            .filter(|entry| entry.complete)
+            .map(|entry| entry.texture.clone());
+        if self
+            .final_composite_cache
+            .get(&key)
+            .is_some_and(|entry| entry.complete)
         {
-            return Some(entry.texture.clone());
+            return existing_texture;
         }
 
         // 表示要求は背景先読みより優先する。同じ key の先読みは投資を捨てず、
         // 白黒の provisional texture を公開せず、その worker を表示用へ昇格する。
-        // 完成までの描画は viewer 側が前ページの holdover を使う。
+        // そのページ用の cache がまだ無ければ、完成までの描画は viewer 側が前ページの
+        // holdover を使う。AI 待ちのカラー化済み incomplete entry が既にある場合だけ、
+        // 再合成中もその texture を返し、完成結果の同一 key insert で原子的に差し替える。
         self.cancel_prefetch_final_effects_except(reuse_prefetch.then_some(key));
         if !reuse_prefetch {
             self.cancel_final_effects_for_idx(key.edit_key.idx);
@@ -52246,7 +52253,7 @@ impl App {
                 pending.prefetch = false;
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            return None;
+            return existing_texture;
         }
 
         let job = FinalEffectJob {
@@ -52264,7 +52271,7 @@ impl App {
             post_filter: params.post_filter,
         };
         let _ = self.spawn_final_effect_job(ctx, key, job, output_complete, false);
-        None
+        existing_texture
     }
 
     fn spawn_final_effect_job(
@@ -53534,10 +53541,6 @@ impl App {
                     if live_pending {
                         self.final_ai_cache.insert(key, entry);
                         self.cancel_final_effects_for_idx(key.edit_key.idx);
-                        self.final_composite_cache.retain_with_drop_reason(
-                            "final_ai_ready_incomplete",
-                            |cache_key, entry| cache_key.edit_key != key.edit_key || entry.complete,
-                        );
                         repaint = true;
                     } else if retained_stored {
                         crate::logger::log(format!(

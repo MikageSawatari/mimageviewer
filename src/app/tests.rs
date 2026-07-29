@@ -19795,11 +19795,245 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// AI 待ちの incomplete final は表示可能なカラー化結果だが、AI 完了時に一度
-    /// live cache から外れる。真の complete が届くまでは provisional texture 自体を
-    /// holdover に昇格し、再合成の谷間にも黒画面へ落ちないこと。
+    /// AI Ready は同じ edit key の incomplete final を消さない。表示 consumer は
+    /// カラー化済み texture を取り続ける一方、nav lock と pixel output は complete を
+    /// 引き続き要求し、完成 worker の同一 key insert が entry を増やさず上書きする。
     #[test]
-    fn colorize_holdover_survives_incomplete_final_ai_replacement() {
+    fn final_ai_ready_keeps_incomplete_colorized_composite_until_atomic_replacement() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/colorize-ai-pending.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+
+        let edit_image = egui::ColorImage::filled([2, 2], egui::Color32::from_gray(120));
+        let edit_pixels = Arc::new(edit_image.clone());
+        let edit_key = dummy_edit_key(&app, idx);
+        let edit_texture = ctx.load_texture(
+            "colorize_ai_pending_edit",
+            edit_image,
+            egui::TextureOptions::LINEAR,
+        );
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::clone(&edit_pixels),
+                texture: Some(edit_texture),
+            },
+        );
+
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.colorize.mode = ColorizeMode::AllImages;
+        params.upscale_model = Some("realesr_general_v3".to_string());
+        app.adjustment_page_params.insert(idx, params.clone());
+        let ai_key = app
+            .final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
+            .expect("AI-enabled params must produce a final AI key");
+        let final_key = app.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
+        let provisional_pixels = Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_rgb(120, 100, 80),
+        ));
+        let provisional = ctx.load_texture(
+            "colorize_ai_provisional",
+            (*provisional_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let provisional_id = provisional.id();
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::clone(&provisional_pixels),
+                texture: provisional,
+                complete: false,
+            },
+        );
+        let entry_count = app.final_composite_cache.len();
+
+        let (final_ai_tx, final_ai_rx) = std::sync::mpsc::channel();
+        app.final_ai_rx = Some(final_ai_rx);
+        let (pending, _cancel) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(ai_key, pending);
+        final_ai_tx
+            .send(FinalAiResult::Ready {
+                job_id: 0,
+                key: ai_key,
+                retained_key: None,
+                retained_epoch: 0,
+                source_size: edit_pixels.size,
+                image: egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(140, 130, 120)),
+                used_upscale: true,
+            })
+            .unwrap();
+
+        app.poll_final_ai(&ctx);
+
+        let displayed = app
+            .current_final_composite_texture(idx)
+            .expect("AI Ready must keep the incomplete colorized texture");
+        assert_eq!(displayed.id(), provisional_id);
+        assert_eq!(
+            app.resolve_fs_display_tex(idx, true)
+                .map(|texture| texture.id()),
+            Some(provisional_id),
+            "the fullscreen display resolver must not fall into the colorize black-frame gate"
+        );
+        assert!(
+            !app.current_final_composite_is_complete(idx),
+            "an AI-incomplete display texture must not release the navigation lock"
+        );
+        assert!(
+            app.ensure_final_composite_pixels_with_key(&ctx, idx)
+                .is_none(),
+            "copy/export consumers must continue waiting for the completed composite"
+        );
+        assert_eq!(
+            app.current_final_composite_texture(idx)
+                .map(|texture| texture.id()),
+            Some(provisional_id),
+            "starting the AI-driven final-effect rebuild must keep returning the cached texture"
+        );
+        assert_eq!(app.final_composite_cache.len(), entry_count);
+
+        // 実 worker を決定論的な completion result に置き換える。replacement 待ちでも
+        // incomplete entry は同じ key に残っている。
+        app.cancel_final_effects_for_idx(idx);
+        let complete_pixels = Arc::new(egui::ColorImage::filled(
+            [4, 4],
+            egui::Color32::from_rgb(130, 110, 90),
+        ));
+        let (final_effect_tx, final_effect_rx) = std::sync::mpsc::channel();
+        final_effect_tx
+            .send(FinalEffectResult::Ready {
+                pixels: Arc::clone(&complete_pixels),
+                elapsed_ms: 0.0,
+                timing: FinalEffectTiming::default(),
+            })
+            .unwrap();
+        let items_generation = app.items_generation;
+        app.final_effect_pending.insert(
+            final_key,
+            FinalEffectPending {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: final_effect_rx,
+                items_generation,
+                output_complete: true,
+                nearest_sampler: false,
+                prefetch: false,
+            },
+        );
+        app.poll_final_effects(&ctx);
+
+        let complete_entry = app
+            .final_composite_cache
+            .get(&final_key)
+            .expect("the completed composite must replace the same key");
+        assert!(complete_entry.complete);
+        assert!(Arc::ptr_eq(&complete_entry.pixels, &complete_pixels));
+        assert_ne!(complete_entry.texture.id(), provisional_id);
+        assert_eq!(
+            app.final_composite_cache.len(),
+            entry_count,
+            "same-key completion must overwrite instead of growing the cache"
+        );
+        assert!(
+            app.current_final_composite_is_complete(idx),
+            "the replacement must become visible to completed-only consumers"
+        );
+    }
+
+    /// 同一 key の表示済み entry が無い新規ページでは、final-effect worker を開始しても
+    /// provisional texture を返さない。既存 incomplete entry がある場合だけ、通常 spawn と
+    /// prefetch 昇格のどちらもその texture を返す。
+    #[test]
+    fn start_final_effect_worker_returns_only_an_existing_same_key_texture() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/colorize-worker-entry-gate.jpg");
+        let edit_key = dummy_edit_key(&app, idx);
+        let source = Arc::new(egui::ColorImage::filled(
+            [8, 8],
+            egui::Color32::from_gray(128),
+        ));
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.colorize.mode = ColorizeMode::AllImages;
+        let final_key = app.final_composite_key_for_pixels(edit_key, source.size, &params);
+
+        let first =
+            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), false);
+        assert!(
+            first.is_none(),
+            "a page with no same-key composite must keep using the viewer holdover"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "starting a new worker must not publish the uncolorized source"
+        );
+        app.cancel_final_effects_for_idx(idx);
+
+        let cached_pixels = Arc::new(egui::ColorImage::filled(
+            [8, 8],
+            egui::Color32::from_rgb(100, 90, 80),
+        ));
+        let cached_texture = ctx.load_texture(
+            "colorize_worker_existing_incomplete",
+            (*cached_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let cached_id = cached_texture.id();
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: cached_pixels,
+                texture: cached_texture,
+                complete: false,
+            },
+        );
+
+        let spawned =
+            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), true);
+        assert_eq!(
+            spawned.map(|texture| texture.id()),
+            Some(cached_id),
+            "a replacement spawn must return the same-key incomplete texture"
+        );
+        assert!(app.final_effect_pending.contains_key(&final_key));
+        app.cancel_final_effects_for_idx(idx);
+
+        let (prefetch_tx, prefetch_rx) = std::sync::mpsc::channel();
+        let items_generation = app.items_generation;
+        app.final_effect_pending.insert(
+            final_key,
+            FinalEffectPending {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: prefetch_rx,
+                items_generation,
+                output_complete: true,
+                nearest_sampler: false,
+                prefetch: true,
+            },
+        );
+        let reused =
+            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), true);
+        assert_eq!(
+            reused.map(|texture| texture.id()),
+            Some(cached_id),
+            "promoting a matching prefetch must keep the same-key cached appearance visible"
+        );
+        assert!(
+            app.final_effect_pending
+                .get(&final_key)
+                .is_some_and(|pending| !pending.prefetch),
+            "the matching prefetch must still be promoted instead of restarted"
+        );
+        drop(prefetch_tx);
+        app.cancel_final_effects_for_idx(idx);
+    }
+
+    /// display-only holdover は、source reload など別の明示的な cache 無効化が
+    /// incomplete 表示の直後に起きても、次の complete まで表示を橋渡しする。
+    #[test]
+    fn colorize_holdover_survives_explicit_incomplete_final_invalidation() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/colorize-ai-pending.jpg");
@@ -19849,7 +20083,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.remove(&final_key);
         let during_rebuild = app
             .resolve_fs_processed_texture(&ctx, idx, false)
-            .expect("provisional holdover should bridge the AI-driven final rebuild");
+            .expect("provisional holdover should bridge an explicit cache invalidation");
         assert_eq!(during_rebuild.id(), provisional_id);
 
         app.cancel_final_effects_for_idx(idx);
@@ -19963,7 +20197,7 @@ mod pipeline_cache_refactor_tests {
             app.continuous_page_transition_texture(idx)
                 .map(|texture| texture.id()),
             Some(provisional_id),
-            "AI-driven rebuild must not expose loading after the incomplete final disappears"
+            "explicit invalidation must not expose loading after the incomplete final disappears"
         );
 
         let complete_pixels = Arc::new(egui::ColorImage::filled(

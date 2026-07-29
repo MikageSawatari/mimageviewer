@@ -751,6 +751,12 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 5. フォールバック: サムネイル (低解像度)
 ```
 
+AI 待ちの `complete=false` final composite も表示専用の候補である。final AI が到着しても
+同一 `FinalCompositeKey` の entry は消さず、AI 後の final-effect worker が完成するまで
+カラー化済みの暫定 texture を表示し続ける。完成結果の `insert` が同じ key を上書きするため、
+表示はキャッシュ欠落を挟まず原子的に差し替わる。コピー / 書き出しと nav lock 解除は従来どおり
+`complete=true` だけを受け付ける。
+
 ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
 `continuous_page_transition_texture` → サムネイル → `読込中...` である。
 `fs_holdover_tex` はこの優先順位には入らず、上記のビュー単位 overlay としてだけ描く。
@@ -1150,7 +1156,8 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
      PDF の Z ズーム再描画など、同じ表示ページの source 解像度が更新される場合は、旧世代の
      完成済み texture を display-only holdover に退避してから live cache を無効化し、
      新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
-     次の holdover として維持し、`complete=true` の final だけが holdover を解放する。
+     final AI 到着後も同一 key の cache entry として維持し、AI 後の完成結果で直接上書きする。
+     `complete=true` の final だけが holdover / nav lock を解放する。
    ↓
 10. Creative 3D LUT
    → 環境設定で登録した `.cube` を適用量付きで最終表示へ適用する。
@@ -1214,7 +1221,9 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   最終合成 alpha にだけ使うため、なじませ幅を変えても参照パッチ自体は変化しない。
 - **AI アップスケール/デノイズ**: final pipeline の別スレッドで推論。完了時に
   `final_ai_cache` に pixels と `used_upscale` を格納し、未完了の
-  `final_composite_cache` を捨てて再合成する。
+  `final_composite_cache` を表示用に残したまま同一 key で再合成する。final-effect worker
+  完了時の `insert` が未完了 entry を上書きするため、再合成中も直前のカラー化済み表示が
+  継続する。
 - **AI 結果の保持 LRU**: 完了済みの final AI pixels は `retained_final_ai_cache` にも
   `metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で保持する。entry には
   smart sharpen 判定用の `used_upscale` も保持する。通常の
