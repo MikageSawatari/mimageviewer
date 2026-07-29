@@ -5521,7 +5521,7 @@ pub(crate) struct ContinuousPageTransition {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ColorizeMonoSummary {
-    pub(crate) source: egui::TextureId,
+    pub(crate) edit_key: EditResultKey,
     pub(crate) p95_residual: f32,
 }
 
@@ -50691,7 +50691,7 @@ impl App {
         None
     }
 
-    fn current_edit_result_key(&self, idx: usize) -> EditResultKey {
+    pub(crate) fn current_edit_result_key(&self, idx: usize) -> EditResultKey {
         EditResultKey {
             idx,
             source_gen: self.input_generation.get(&idx).copied().unwrap_or(0),
@@ -57268,12 +57268,13 @@ impl App {
         }
     }
 
-    /// raw Static 画素から、許容値に依存しない近モノクロ要約を少しずつ作る。
+    /// cache 済み edit result 画素から、許容値に依存しない近モノクロ要約を少しずつ作る。
     ///
     /// この処理は UI thread 上の純 CPU 計算だが、1 frame 4 件までに分割する。
     /// 現在ページを最優先にし、同じ frame に `poll_prefetch` が複数回呼ばれても
-    /// 全 viewer context 合算で予算を超えない。TextureId が変わった entry と
-    /// `fs_cache` から消えた entry は retain で同時に除去する。
+    /// 全 viewer context 合算で予算を超えない。source / 編集世代を含む EditResultKey が
+    /// 変わった entry と `edit_result_cache` から消えた entry は同時に除去する。
+    /// producer 自身は edit result を新規生成せず、既存 cache だけを読む。
     pub(crate) fn reconcile_colorize_mono_summaries(&mut self) -> usize {
         let Some(fullscreen_idx) = self.fullscreen_idx else {
             return 0;
@@ -57283,45 +57284,46 @@ impl App {
         }
         self.colorize_mono_summary_last_reconcile_frame = self.frame_counter;
 
-        let fs_cache = &self.fs_cache;
-        self.colorize_mono_summary_cache.retain(|idx, summary| {
-            matches!(
-                fs_cache.get(idx),
-                Some(FsCacheEntry::Static { tex, .. }) if tex.id() == summary.source
-            )
-        });
-
-        let needs_summary = |idx: usize| {
-            matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Static { .. }))
-                && !self.colorize_mono_summary_cache.contains_key(&idx)
-        };
-        let mut candidates = Vec::new();
-        if needs_summary(fullscreen_idx) {
-            candidates.push(fullscreen_idx);
-        }
-        let mut remaining = self
-            .fs_cache
+        let current_edit_keys = self
+            .edit_result_cache
             .keys()
             .copied()
-            .filter(|idx| *idx != fullscreen_idx && needs_summary(*idx))
+            .filter(|key| *key == self.current_edit_result_key(key.idx))
+            .collect::<std::collections::HashSet<_>>();
+        self.colorize_mono_summary_cache.retain(|idx, summary| {
+            summary.edit_key.idx == *idx && current_edit_keys.contains(&summary.edit_key)
+        });
+
+        let needs_summary = |edit_key: EditResultKey| {
+            current_edit_keys.contains(&edit_key)
+                && !self.colorize_mono_summary_cache.contains_key(&edit_key.idx)
+        };
+        let current_edit_key = self.current_edit_result_key(fullscreen_idx);
+        let mut candidates = Vec::new();
+        if needs_summary(current_edit_key) {
+            candidates.push(current_edit_key);
+        }
+        let mut remaining = current_edit_keys
+            .iter()
+            .copied()
+            .filter(|key| key.idx != fullscreen_idx && needs_summary(*key))
             .collect::<Vec<_>>();
-        remaining.sort_unstable();
+        remaining.sort_unstable_by_key(|key| key.idx);
         candidates.extend(remaining);
 
         let mut computed = 0;
-        for idx in candidates
+        for edit_key in candidates
             .into_iter()
             .take(COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME)
         {
-            let Some(FsCacheEntry::Static { tex, pixels, .. }) = self.fs_cache.get(&idx) else {
+            let Some(entry) = self.edit_result_cache.get(&edit_key) else {
                 continue;
             };
-            let source = tex.id();
-            let p95_residual = crate::colorize::near_monochrome_p95_residual(pixels);
+            let p95_residual = crate::colorize::near_monochrome_p95_residual(&entry.pixels);
             self.colorize_mono_summary_cache.insert(
-                idx,
+                edit_key.idx,
                 ColorizeMonoSummary {
-                    source,
+                    edit_key,
                     p95_residual,
                 },
             );

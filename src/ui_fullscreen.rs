@@ -2121,13 +2121,18 @@ impl App {
             crate::colorize::ColorizeMode::Disabled => false,
             crate::colorize::ColorizeMode::AllImages => true,
             crate::colorize::ColorizeMode::MonochromeOnly => {
-                let Some(FsCacheEntry::Static { tex, .. }) = self.fs_cache.get(&idx) else {
+                if !params.is_color_identity() {
                     return true;
-                };
+                }
+                // final AI は復元・拡大処理であり、入力の近モノクロ性を反転させない前提で扱う。
+                let edit_key = self.current_edit_result_key(idx);
+                if !self.edit_result_cache.contains_key(&edit_key) {
+                    return true;
+                }
                 let Some(summary) = self.colorize_mono_summary_cache.get(&idx) else {
                     return true;
                 };
-                if summary.source != tex.id() {
+                if summary.edit_key != edit_key {
                     return true;
                 }
                 crate::colorize::is_near_monochrome_residual(

@@ -759,17 +759,24 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 
 `colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
 待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
-`AllImages` は常に gate し、`MonochromeOnly` は raw `FsCacheEntry::Static` の近モノクロ要約
-（主成分軸からの p95 直交残差）が現在の `mono_tolerance` 以下のページだけを gate する。
-カラー画像でカラー化が no-op になるページは raw / edit / thumbnail fallback を許可する。
+`AllImages` は常に gate する。`MonochromeOnly` の高速パスは色調補正が identity の場合だけ使い、
+`edit_result_cache`（raw → erase → local_adjust → conceal）の画素から作った近モノクロ要約
+（主成分軸からの p95 直交残差）が現在の `mono_tolerance` を超えるページでは gate を外す。
+これにより編集レイヤーが raw の chroma を落とした場合も、worker が見る入力と同じ編集結果を
+基準にできる。色調補正が非 identity なら、その後の adjusted 画素が別物になるため安全側に gate
+する。final AI は復元・拡大処理で入力の近モノクロ性を反転させないものとして扱う。
+この条件を満たすカラー画像でカラー化が no-op になるページだけ、raw / edit / thumbnail fallback
+を許可する。
 ただし Creative LUT がロード済みで有効なら、カラー化対象外のカラーページでも LUT 未適用画素を
 一瞬見せないため必ず gate する。post_filter 単独は同期合成なので gate 対象にしない。
 
-近モノクロ要約は `idx → { TextureId, p95_residual }` で memo 化し、`poll_prefetch` の末尾から
-1 frame 最大 4 件、現在の `fullscreen_idx` 最優先で計算する。`TextureId` が raw source identity
-なので、再デコード / PDF 再レンダ後は明示的な設定 invalidation を追加せず stale 判定できる。
-memo miss または `TextureId` 不一致は安全側の `true` とし、要約が完成するまで従来どおり
-生画像へフォールバックしない。`fs_cache` から消えた entry は次の reconcile で memo からも落とす。
+近モノクロ要約は `idx → { EditResultKey, p95_residual }` で memo 化し、`poll_prefetch` の末尾から
+1 frame 最大 4 件、現在の `fullscreen_idx` 最優先で計算する。producer は既存の
+`edit_result_cache` entry だけを走査し、重い編集合成を新規生成しない。`EditResultKey` は source
+generation と erase / local-adjust / conceal の各編集世代を含むため、再デコード、PDF 再レンダ、
+編集操作のいずれでも自然に stale になる。memo miss、現在 key の edit result 不在、または
+`EditResultKey` 不一致は安全側の `true` とし、要約が完成するまで従来どおり生画像へ
+フォールバックしない。`edit_result_cache` から消えた entry は次の reconcile で memo からも落とす。
 
 ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
 `continuous_page_transition_texture` → サムネイル → `読込中...` である。

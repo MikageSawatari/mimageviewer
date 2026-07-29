@@ -20299,7 +20299,23 @@ mod pipeline_cache_refactor_tests {
         ));
     }
 
-    fn install_colorize_summary_source(
+    fn install_colorize_summary_edit_result(
+        app: &mut App,
+        idx: usize,
+        image: egui::ColorImage,
+    ) -> EditResultKey {
+        let edit_key = dummy_edit_key(app, idx);
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::new(image),
+                texture: None,
+            },
+        );
+        edit_key
+    }
+
+    fn install_raw_static_source(
         app: &mut App,
         ctx: &egui::Context,
         idx: usize,
@@ -20327,7 +20343,6 @@ mod pipeline_cache_refactor_tests {
 
     #[test]
     fn colorize_display_gate_matches_mode_and_page_summary() {
-        let ctx = egui::Context::default();
         let mut app = setup_app();
         let mono_idx = push_image(&mut app, "C:/pics/gate-mono.jpg");
         let color_idx = push_image(&mut app, "C:/pics/gate-color.jpg");
@@ -20348,8 +20363,8 @@ mod pipeline_cache_refactor_tests {
                 })
                 .collect(),
         );
-        install_colorize_summary_source(&mut app, &ctx, mono_idx, "gate_mono", mono);
-        install_colorize_summary_source(&mut app, &ctx, color_idx, "gate_color", color);
+        install_colorize_summary_edit_result(&mut app, mono_idx, mono);
+        install_colorize_summary_edit_result(&mut app, color_idx, color);
         app.fullscreen_idx = Some(mono_idx);
         assert_eq!(app.reconcile_colorize_mono_summaries(), 2);
 
@@ -20366,7 +20381,6 @@ mod pipeline_cache_refactor_tests {
 
     #[test]
     fn colorize_display_gate_is_conservative_on_missing_or_stale_summary() {
-        let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/gate-stale.jpg");
         let image = egui::ColorImage::new(
@@ -20379,7 +20393,7 @@ mod pipeline_cache_refactor_tests {
                 })
                 .collect(),
         );
-        install_colorize_summary_source(&mut app, &ctx, idx, "gate_stale_old", image.clone());
+        install_colorize_summary_edit_result(&mut app, idx, image.clone());
         app.fullscreen_idx = Some(idx);
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
 
@@ -20387,26 +20401,173 @@ mod pipeline_cache_refactor_tests {
         assert_eq!(app.reconcile_colorize_mono_summaries(), 1);
         assert!(!app.colorize_display_requires_final_effect(idx));
 
-        install_colorize_summary_source(&mut app, &ctx, idx, "gate_stale_new", image);
+        app.local_adjust_generation.insert(idx, 1);
+        install_colorize_summary_edit_result(&mut app, idx, image);
         assert!(app.colorize_display_requires_final_effect(idx));
     }
 
     #[test]
-    fn colorize_summary_reconcile_honors_budget_and_prioritizes_fullscreen() {
+    fn colorize_display_gate_uses_chroma_reduced_edit_result() {
         let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/gate-local-desaturate.jpg");
+        let raw = egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| match value % 4 {
+                    0 => egui::Color32::RED,
+                    1 => egui::Color32::GREEN,
+                    2 => egui::Color32::BLUE,
+                    _ => egui::Color32::YELLOW,
+                })
+                .collect(),
+        );
+        let layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "desaturate",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
+                saturation: -100.0,
+                ..Default::default()
+            }),
+        );
+        let raw_rgba = crate::capture::color_image_to_rgba(&raw);
+        let edited = local_adjust_core::apply_layers(
+            local_adjust_core::RgbaImageRef {
+                width: raw.size[0],
+                height: raw.size[1],
+                pixels: &raw_rgba,
+            },
+            std::slice::from_ref(&layer),
+        )
+        .unwrap();
+        let edited =
+            egui::ColorImage::from_rgba_unmultiplied([edited.width, edited.height], &edited.pixels);
+        assert!(!crate::colorize::is_near_monochrome(&raw, 12));
+        assert!(crate::colorize::is_near_monochrome(&edited, 12));
+
+        install_raw_static_source(&mut app, &ctx, idx, "gate_local_desaturate_raw", raw);
+        app.set_local_adjust_layers_for_idx_memory_only(idx, vec![layer]);
+        install_colorize_summary_edit_result(&mut app, idx, edited);
+        app.fullscreen_idx = Some(idx);
+        set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
+
+        assert_eq!(app.reconcile_colorize_mono_summaries(), 1);
+        assert!(app.colorize_display_requires_final_effect(idx));
+    }
+
+    #[test]
+    fn colorize_display_gate_is_conservative_for_non_identity_color_adjustment() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/gate-color-adjustment.jpg");
+        let color = egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| {
+                    [
+                        egui::Color32::RED,
+                        egui::Color32::GREEN,
+                        egui::Color32::BLUE,
+                    ][value % 3]
+                })
+                .collect(),
+        );
+        install_colorize_summary_edit_result(&mut app, idx, color);
+        app.fullscreen_idx = Some(idx);
+        set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
+        assert_eq!(app.reconcile_colorize_mono_summaries(), 1);
+        assert!(!app.colorize_display_requires_final_effect(idx));
+
+        let mut params = app.effective_params(idx).clone();
+        params.saturation = -100.0;
+        assert!(!params.is_color_identity());
+        app.adjustment_page_params.insert(idx, params);
+        assert!(app.colorize_display_requires_final_effect(idx));
+    }
+
+    #[test]
+    fn colorize_summary_edit_key_stales_on_edit_and_source_generation_changes() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/gate-edit-key-stale.jpg");
+        let color = || {
+            egui::ColorImage::new(
+                [8, 8],
+                (0..64)
+                    .map(|value| {
+                        [
+                            egui::Color32::RED,
+                            egui::Color32::GREEN,
+                            egui::Color32::BLUE,
+                        ][value % 3]
+                    })
+                    .collect(),
+            )
+        };
+        let initial_key = install_colorize_summary_edit_result(&mut app, idx, color());
+        app.fullscreen_idx = Some(idx);
+        set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
+        assert_eq!(app.reconcile_colorize_mono_summaries(), 1);
+        assert_eq!(
+            app.colorize_mono_summary_cache.get(&idx).unwrap().edit_key,
+            initial_key
+        );
+        assert!(!app.colorize_display_requires_final_effect(idx));
+
+        app.bump_local_adjust_generation(idx);
+        let edited_key = install_colorize_summary_edit_result(&mut app, idx, color());
+        assert_ne!(edited_key, initial_key);
+        assert!(app.colorize_display_requires_final_effect(idx));
+        app.frame_counter = app.frame_counter.wrapping_add(1);
+        assert_eq!(app.reconcile_colorize_mono_summaries(), 1);
+        assert!(!app.colorize_display_requires_final_effect(idx));
+
+        app.bump_input_generation_for_fs_cache_reload(idx);
+        let regenerated_key = install_colorize_summary_edit_result(&mut app, idx, color());
+        assert_ne!(regenerated_key, edited_key);
+        assert!(app.colorize_display_requires_final_effect(idx));
+    }
+
+    #[test]
+    fn colorize_summary_reconcile_skips_missing_edit_result_without_materializing() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/gate-no-edit-result.jpg");
+        install_raw_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "gate_no_edit_result_raw",
+            egui::ColorImage::filled([8, 8], egui::Color32::RED),
+        );
+        app.set_local_adjust_layers_for_idx_memory_only(
+            idx,
+            vec![local_adjust_core::LocalAdjustmentLayer::new(
+                "pending-local-adjust",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
+                    saturation: -100.0,
+                    ..Default::default()
+                }),
+            )],
+        );
+        app.fullscreen_idx = Some(idx);
+
+        assert!(app.edit_result_cache.is_empty());
+        assert!(app.local_adjust_pending.is_empty());
+        assert_eq!(app.reconcile_colorize_mono_summaries(), 0);
+        assert!(app.edit_result_cache.is_empty());
+        assert!(app.local_adjust_pending.is_empty());
+        assert!(app.colorize_mono_summary_cache.is_empty());
+    }
+
+    #[test]
+    fn colorize_summary_reconcile_honors_budget_and_prioritizes_fullscreen() {
         let mut app = setup_app();
         let mut indices = Vec::new();
         for number in 0..6 {
             let idx = push_image(&mut app, &format!("C:/pics/summary-{number}.jpg"));
             let image =
                 egui::ColorImage::filled([8, 8], egui::Color32::from_gray(40 + number * 20));
-            install_colorize_summary_source(
-                &mut app,
-                &ctx,
-                idx,
-                &format!("summary_{number}"),
-                image,
-            );
+            install_colorize_summary_edit_result(&mut app, idx, image);
             indices.push(idx);
         }
         let current = *indices.last().unwrap();
@@ -20429,17 +20590,14 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
-    fn colorize_summary_reconcile_prunes_removed_sources() {
-        let ctx = egui::Context::default();
+    fn colorize_summary_reconcile_prunes_removed_edit_results() {
         let mut app = setup_app();
         let current = push_image(&mut app, "C:/pics/summary-current.jpg");
         let removed = push_image(&mut app, "C:/pics/summary-removed.jpg");
-        for (idx, label) in [(current, "summary_current"), (removed, "summary_removed")] {
-            install_colorize_summary_source(
+        for idx in [current, removed] {
+            install_colorize_summary_edit_result(
                 &mut app,
-                &ctx,
                 idx,
-                label,
                 egui::ColorImage::filled([8, 8], egui::Color32::GRAY),
             );
         }
@@ -20447,7 +20605,7 @@ mod pipeline_cache_refactor_tests {
         assert_eq!(app.reconcile_colorize_mono_summaries(), 2);
         assert!(app.colorize_mono_summary_cache.contains_key(&removed));
 
-        app.fs_cache.remove(&removed);
+        app.edit_result_cache.retain(|key, _| key.idx != removed);
         app.frame_counter = app.frame_counter.wrapping_add(1);
         assert_eq!(app.reconcile_colorize_mono_summaries(), 0);
         assert!(!app.colorize_mono_summary_cache.contains_key(&removed));
@@ -20470,7 +20628,7 @@ mod pipeline_cache_refactor_tests {
                 })
                 .collect(),
         );
-        install_colorize_summary_source(&mut app, &ctx, idx, "gate_creative_lut", image);
+        install_colorize_summary_edit_result(&mut app, idx, image);
         app.fullscreen_idx = Some(idx);
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
         assert_eq!(app.reconcile_colorize_mono_summaries(), 1);
