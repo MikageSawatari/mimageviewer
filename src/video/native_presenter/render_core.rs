@@ -953,10 +953,31 @@ struct SourceKeyedMutexAcquire {
 struct KeyedMutexReadGuard {
     mutex: IDXGIKeyedMutex,
     released_to_reader: Option<Arc<AtomicBool>>,
+    armed: bool,
+}
+
+impl KeyedMutexReadGuard {
+    /// Keep a successfully copied frame reusable by handing reader key 1
+    /// directly back to the next presenter read. Once the frame is displaced
+    /// and its pool slot becomes free, the producer observes
+    /// `released_to_reader=true` and recovers writer key 0.
+    fn release_to_reader(mut self) -> Result<(), String> {
+        let result = unsafe { self.mutex.ReleaseSync(1) };
+        if result.is_ok() {
+            if let Some(released) = &self.released_to_reader {
+                released.store(true, Ordering::Release);
+            }
+            self.armed = false;
+        }
+        result.map_err(|error| format!("source keyed mutex reader release failed: {error:?}"))
+    }
 }
 
 impl Drop for KeyedMutexReadGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         unsafe {
             let _ = self.mutex.ReleaseSync(0);
         }
@@ -2461,7 +2482,7 @@ impl NativeRenderCore {
                 metrics.keyed_mutex_ms = keyed_mutex_t0.elapsed().as_secs_f64() * 1000.0;
                 metrics.keyed_mutex_cast_ms = keyed_mutex.cast_ms;
                 metrics.keyed_mutex_acquire_ms = keyed_mutex.acquire_ms;
-                let _keyed_mutex_guard = keyed_mutex.guard;
+                let keyed_mutex_guard = keyed_mutex.guard;
                 let src_probe = if probe_this_frame {
                     Some(self.sample_texture_pixel(&src, "source")?)
                 } else {
@@ -2533,6 +2554,9 @@ impl NativeRenderCore {
                 } else {
                     "d3d11_shared"
                 };
+                if let Some(guard) = keyed_mutex_guard {
+                    guard.release_to_reader()?;
+                }
             }
         }
         // フレームコピー (UpdateSubresource / CopySubresourceRegion) を GPU タイムライン上で
@@ -3352,6 +3376,7 @@ impl NativeRenderCore {
             guard: Some(KeyedMutexReadGuard {
                 mutex,
                 released_to_reader,
+                armed: true,
             }),
             cast_ms,
             acquire_ms,
@@ -8475,6 +8500,14 @@ mod tests {
             ctx.style().visuals.text_color(),
             crate::os_theme::dark_visuals(crate::settings::TextContrast::Standard).text_color()
         );
+    }
+
+    #[test]
+    fn retained_frame_releases_reader_key_without_rearm_acquire() {
+        let source = include_str!("render_core.rs");
+        let forbidden_rearm_acquire = ["Acquire", "Sync(0"].concat();
+        assert!(source.contains("self.mutex.ReleaseSync(1)"));
+        assert!(!source.contains(&forbidden_rearm_acquire));
     }
 
     #[test]

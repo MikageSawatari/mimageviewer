@@ -305,7 +305,37 @@ stale なまま返してしまう** (= 動画切替直後に前動画のフレ�
 `texture_gen` が必ず異なるので、別エントリとして開き直す。これは `fence` 側の `fence_gen`
 (同じ handle 値再利用問題への既存対策) と完全に同じ思想。
 
-#### present 済みフレームの遅延解放 (`present_retire`)
+#### native output の最新フレーム所有 (`FramePresentationState`)
+
+`run_native_video_output` は最近のフレームを native output context 内の単一 typed state で
+所有する。
+
+- `Empty`: 再利用できるフレームがない
+- `Hidden { frame }`: presenter 非表示中に保持する最新フレーム。grade 変更では再提示しない
+- `Visible { frame, fence }`: 最後に表示した再提示可能なフレーム。`fence` は別フレームへ
+  置換されて retire へ移るときだけ使う
+
+`source.queue` は時刻選択前の未提示フレームだけを保持し、`present_retire` は廃棄待ちだけを
+保持する。grade 変更の再提示と placement switch の prime は typed state だけを参照し、
+`present_retire` や `source.queue` を「最後に表示したフレーム」として推測しない。新フレームの
+提示成功時は旧 `Visible` を retire へ移し、新フレームを唯一の `Visible` にする。source switch /
+close でも同じ state を drain するため、別 source の最近フレームは fallback に残らない。
+
+GPU frame は producer が writer key 0 で書き、`ReleaseSync(1)` で reader へ渡す。render は
+`AcquireSync(1)` で読み取ったあと、成功したコピーでは **そのまま `ReleaseSync(1)`** して
+reader-ready に保つ。したがって held frame の再提示に `AcquireSync(0)` を追加する必要はない。
+フレームが `Visible` / `Hidden` から外れて pool slot の `in_use` が false になると、既存の
+`released_to_reader` を見た producer 側 `acquire_shared_output` が
+`recover_shared_output_keyed_mutex` で key 1 を回収して writer key 0 へ戻す。driver 内で
+時間上限を保証できない acquire を pump thread へ持ち込まず、render thread にも再 arm 用の
+追加 acquire を置かない。
+
+grade command は前回 snapshot と render に影響する adjustment / 選択 LUT を比較し、差分があり
+かつ state が `Visible` のときだけ 1 回再提示する。`Empty` / `Hidden` と同一 grade では要求を
+立てないため、一時停止中に無条件の present / repaint loop は発生しない。通常 fullscreen と
+detached の可視 presenter は同じ native output context を通り、App-global な再提示 flag は持たない。
+
+#### 置換済みフレームの遅延解放 (`present_retire`)
 
 presenter の `CopySubresourceRegion` は **非同期** (GPU コマンドキューに積むだけ) なので、
 `present` 直後に `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot の `in_use` が
@@ -313,8 +343,9 @@ presenter の `CopySubresourceRegion` は **非同期** (GPU コマンドキュ�
 GPU コピーがまだ source texture を読み終えていないと、別フレームの内容が混入する
 (2026-05-15、別動画フレームの 1 枚混入)。
 
-対策として `run_native_video_output` は present 済みの `VideoFrame` を即 drop せず、
-`present_retire` リングバッファに `(VideoFrame, copy_fence_value)` で保持する。presenter は
+対策として `run_native_video_output` は新 `Visible` に置換された旧 `VideoFrame` を即 drop
+せず、廃棄待ち専用の `present_retire` リングバッファに
+`(VideoFrame, copy_fence_value)` で保持する。presenter は
 自前の `ID3D11Fence` (`copy_fence`) を持ち、`copy_frame_into_backbuffer` のコピー後に
 `Signal` して値を進める (`outcome.copy_fence_value`)。`present_retire` は
 `presenter.copy_fence_completed_value()` がその値へ到達した = **コピーが GPU 上で完了した**
@@ -325,8 +356,9 @@ fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 
 (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、深さキャップ
 `NATIVE_PRESENT_RETIRE_CAP = 4` のみで解放する (= 時間ベースに縮退、旧挙動と等価)。キャップは
 fence が万一 stall したときの上限も兼ねるが、**stall 時のフットプリント (= 共有出力プール
-16 slot のうち retire が占める数) を 4 に抑える**ことで、decoder の in-flight (~10-15) と
-合わせてもプールに余裕が残るようにしている (2026-05-15 に 8 から 4 へ縮小: cap=8 では
+16 slot のうち retire が占める数) を 4 に抑える**。typed state が最新 frame 1 slot を
+保持しても残り 11 slot を decoder / channel / source queue の in-flight に使える
+(2026-05-15 に 8 から 4 へ縮小: cap=8 では
 stall 時にプール枯渇 → CPU readback フォールバック → スパイラル悪化の実害があったため)。
 `fullscreen_present` perf イベントの `retire_queue_len` で長さを観測できる (fence が
 効いていれば通常 1〜3)。
@@ -1676,7 +1708,9 @@ always-new 窓と同じく no-op として扱う。
   動画用 top-level HWND へはフォールバックしない。
 - pump が hidden な新 window を生成し、render (`run_native_video_output` in
   [src/video/mod.rs](../src/video/mod.rs)) が新 core へ状態 (再生位置 / overlay / VST /
-  checked / SAR) と利用可能な現 frame を prime する。`TargetReady` 後に pump が新 HWND を
+  checked / SAR) と `FramePresentationState` が所有する現 frame を prime する。
+  `present_retire` / `source.queue` は prime fallback に使わない。prime 失敗時は typed state を
+  旧 core 側に保持したまま staging を破棄する。`TargetReady` 後に pump が新 HWND を
   publish して旧 HWND を破棄し、`PlacementSwitched` を `request_id` 付きで返す。
   attach/state restore/prime の失敗は staging だけを破棄して旧 host/core を維持し、
   `PlacementSwitchFailed` を返す。
@@ -1788,6 +1822,11 @@ D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{vi
   数百 ms の無音が入る。hide/show だけならオーディオリングは無停止。
 - **exit race を避ける**。presenter HWND を生かすことで、hide→show の順序と owner / focus guard の
   再取得を決定的に扱える。
+
+hide 中の最新映像は native output context の `FramePresentationState::Hidden` が 1 枚だけ
+所有する。新フレームを選択すると旧 `Hidden` を producer-side recovery へ返し、show 時は同じ
+frame を最新 grade で present して `Visible` へ移してから HWND を表示する。grade 変更は hidden
+中に再提示しない。
 
 hide 中は HUD overlay HWND も明示 hide し、overlay tick / cursor polling / HUD raise burst を
 抑止する。音声モードの owner 同期・focus guard・`ensure_native_video_front` は

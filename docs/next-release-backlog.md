@@ -157,60 +157,6 @@
   viewport lifecycle への対応が要る。detached リワークとの調整も必要
   ([detached-rework-plan.md](detached-rework-plan.md) §2 / §11)。
 - 規模 / 優先度: Large / P2 candidate。
-### 1.25 一時停止中に動画フィルタを変えても画面へ反映されない
-
-- 出典: v2.8.1 検討中のユーザー報告 (2026-07-26)。動画を一時停止した状態で色調補正 /
-  Creative LUT を操作しても絵が変わらず、再生を再開して初めて反映される。静止させて
-  パラメータの効きを見比べたいケース (微調整・前後比較) で機能しない。
-- 原因 (コード確認済み): `NativeVideoPresenter::set_video_grade`
-  ([src/video/native_presenter/mod.rs:3226](../src/video/native_presenter/mod.rs)) は grade 定数バッファと
-  Creative LUT テクスチャを更新するだけで、present を行わない。実際に絵へ乗るのは
-  `VideoGradePipeline::draw` が走る次の `present()` = 次のデコード済みフレームを提示する
-  ときなので、新しいフレームが来ない一時停止中は画面が更新されない。
-- 対応案 (2026-07-26 の領域監査で訂正): **`present_retire.back()` を再 present する形では
-  直せない。** 当初案は誤りだったので採用しない。理由:
-  - `present_retire` は「最後に表示したフレーム」ではなく、**GPU コピー完了までの廃棄待ち
-    キュー**。表示内容の永続的な所有者ではない。
-  - GPU decode 経路のフレームは一度 present すると keyed mutex guard が `ReleaseSync(0)` で
-    writer key へ戻る。次の `present` は `AcquireSync(1)` を要求するが、producer が
-    key=1 へ release するのは reader へ最初に渡すときだけで、held frame は pool slot を
-    占有したままなので再 arm されない。つまり **再 present 自体が失敗する**。
-  - 正しい方向は、native output context が `Empty / Hidden{frame} / Visible{frame, fence}` の
-    単一 typed state を所有し、`present_retire` は廃棄待ち専用として残すこと。
-    GPU frame を Visible として再利用するには、present 後に keyed mutex を reader key=1 へ
-    再 arm する処理も要る。新フレーム提示時に旧 Visible を retire へ移す。
-  - 現在は `present_retire` / `hidden_latest_frame` / `source.queue` の 3 つが「使えそうな
-    最近のフレーム」を部分的に表現しており、この分離が本項と 1.26 の共通原因になっている。
-- 注意:
-  - 再提示は grade 変更を検知したときだけにする。一時停止中に無条件の present ループを
-    回すと `docs/idle-health-check.md` の静止時 repaint 検査に引っかかる。
-  - hidden presenter 中は表示がないので再提示しない (show 時に最新 grade で初回 present
-    されるため症状が出ない)。音声のみの再生も対象外。
-  - 通常フルスクリーンと detached の可視 presenter は同じ問題を共有する。detached 側へ
-    App-global の bool や geometry state を足す形にはせず、native output context 内に閉じる。
-  - ⚠ **presenter スレッドで keyed mutex の `AcquireSync` を呼んではならない** (2026-07-29 に
-    実測したデッドロックの制約。1.27 参照)。再 arm が必要なら、`reset_unpresented_shared_output`
-    と同じく `released_to_reader` を立てるだけにして、実際の key 回復は producer 側の
-    `acquire_shared_output` (`recover_shared_output_keyed_mutex`) に任せる。
-- 規模 / 優先度: Medium / P2 candidate。1.26 と同じ構造修正で一緒に解消する。
-
-### 1.26 一時停止中の placement 切替で新ウィンドウの prime が失敗する
-
-- 出典: v2.8.1 開発中の領域監査 (2026-07-26、コード確認済み・実機未確認)。
-- 症状: 一時停止や EOF などで `source.queue` が空の状態で placement を作り直すと、
-  GPU decode 経路では新 presenter の prime が失敗する。コードは prime の成否に関わらず
-  新ウィンドウを表示する ([src/video/mod.rs:3113](../src/video/mod.rs)) ため、次のフレームが
-  来るまで黒または未初期化の表示になり得る。一時停止のままなら継続する。
-- 原因 (コード確認済み): fallback が `present_retire.back()` を新 presenter へ渡すが
-  ([src/video/mod.rs:3079](../src/video/mod.rs))、既に一度 present された GPU frame は
-  keyed mutex が writer key に戻っており `AcquireSync(1)` が通らない (詳細は 1.25 の対応案)。
-  `hidden_latest_frame` と `source.queue.front()` は未 present なので key=1 のままで、
-  この問題はない。CPU frame にも keyed mutex がないので再提示できる。
-  つまり **「既に一度 present された GPU frame」だけが踏む**。
-- 対応: 1.25 と同じ `FramePresentationState` への集約で一緒に直す。個別の再 arm 分岐を
-  fallback 経路にだけ足す形にはしない。
-- 規模 / 優先度: 1.25 と同一作業 / P2 candidate。
-
 ### 1.27 presenter スレッドが UI スレッドの窓の子 HWND を所有したままブロックする
 
 - 構造修正の設計: [Native video HWND ownership / pump 分離計画](native-video-window-thread-plan.md)。
@@ -238,8 +184,9 @@
      所有しない。Win32 の原則 (窓を持つスレッドはメッセージを回す) に沿う。
   2. presenter スレッドで**ブロックし得る呼び出しを一切行わない**ことを保証する。
      現実的には難しく、1 のほうが構造的。
-- 暫定の運用制約: presenter スレッドで keyed mutex の `AcquireSync` を呼ばない
-  (1.25 / `reset_unpresented_shared_output` のコメント参照)。
+- Stage 4 後の運用制約: pump thread では GPU API を呼ばない。held frame の再提示にも
+  re-arm 用 `AcquireSync` を追加せず、reader key の維持と producer 側回復を使う
+  (`docs/video-architecture.md` の `FramePresentationState` 節参照)。
 - 規模 / 優先度: Medium〜Large / **P1** (ハード ハングのため)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査

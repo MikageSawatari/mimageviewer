@@ -701,6 +701,12 @@ Windows test。
 単独 gate: pure sequence/property tests、fake delayed render tests、source/placement integration
 tests。
 
+> 2026-07-30 追記: Stage 4 の production cutover 後、§1.25/§1.26 の frame ownership slice は
+> リワーク外の構造修正として先行実装した。native output context の
+> `FramePresentationState` が paused grade refresh / placement prime の共通 source になり、
+> re-arm 用 `AcquireSync` は追加せず producer-side key recovery へ接続した。これは Stage 6 の
+> source/EOF/device-loss 全 lifecycle hardening が完了したことを意味しない。
+
 ### Stage 7: legacy path 除去、health detection、最終実機 gate
 
 変わるもの:
@@ -867,8 +873,10 @@ root cause は特定の `AcquireSync` call ではなく、`run_native_video_outp
   failure/close を同じ state machine で扱う。
 - deliberate render stall の自動 test が「pump/parent destroy は進む」を直接検証する。
 
-このため、revert 済みの `rearm_presented_shared_output` を戻す/避けることとも、§1.25 の暫定
-`AcquireSync` 運用制約とも独立した構造修正である。
+このため、Stage 4 自体は revert 済みの `rearm_presented_shared_output` を戻す/避けることとも
+独立した構造修正である。その後の 2026-07-30 frame ownership 修正も追加の re-arm
+`AcquireSync` ではなく reader key 維持 + producer-side recovery を採用し、この ownership
+boundary を維持した。
 
 ### 9.3 実装時の §11 記録草案
 
