@@ -13,7 +13,7 @@
 //!         ▼
 //!  decoder thread → UI thread (channel 経由)
 //!         ▼
-//!  NativeVideoPresenter が `OpenSharedHandle` で取得 → 自身の swap chain backbuffer に copy
+//!  NativeRenderCore が `OpenSharedHandle` で取得 → 自身の swap chain backbuffer に copy
 //! ```
 //!
 //! HW デコードできない場合 (= GpuVideoDevice 未作成 / D3D11VA 失敗) は

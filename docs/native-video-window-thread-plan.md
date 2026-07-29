@@ -442,6 +442,58 @@ Stage 1 の意図的な未達 / 後続:
 単独 gate: compile-fail/thread-affinity tests、既存 presenter tests、`cargo check`。この時点では
 P1 は未修正だが production regression はない。
 
+#### Stage 2 実装結果 (2026-07-29)
+
+実際の分離:
+
+- `src/video/native_window_host.rs` の `NativeWindowHost` が presenter/HUD の HWND RAII owner、
+  visibility、placement geometry、region、z-order、focus/IME/cursor mutation を所有する。
+  HUD の実装は `src/video/native_window_host/hud_window.rs` へ移し、
+  `PresenterOnly` / `PresenterAndHud` の sum type で topology を一つに集約した。
+- `src/video/native_presenter/render_core.rs` の `NativeRenderCore` が D3D11/DXGI/DComp、swap chain、
+  GPU present と overlay 描画を所有する。`native_presenter/mod.rs` は facade と
+  `overlay_draw` の module 宣言だけを残す。
+- 両型の生成・呼び出しは `run_native_video_output` と DComp presenter test の現行
+  `native-video-presenter` thread 上で直列のまま。production thread 数と lifecycle は変えていない。
+
+型/module 境界:
+
+- `NativeWindowHost`、`NativeVideoWindow`、`HudOverlayWindow` は
+  `PhantomData<Rc<()>>` で `!Send + !Sync`。各 owner は creation `ThreadId` を保持し、
+  HWND access/mutation と `Drop` で owner-thread assertion を通す。
+- render config へ渡すのは private HWND field を持つ非所有 `NativeRenderTargets` lease だけ。
+  lease は DComp target binding と read-only query に限定し、raw HWND、RAII owner、
+  `ShowWindow` / `SetWindowPos` / `DestroyWindow` / focus / IME / cursor mutation を公開しない。
+- focus/IME/cursor は `NativeWindowIntent`、HUD hit-region は値 snapshot として render から返し、
+  同じ loop 反復で host が適用する。render source へ mutation API が再流入していないことは
+  source-boundary assertion test で固定した。
+
+compile-fail gate は `trybuild` を追加せず、assertion test 形式を採用した。
+`NativeWindowHost` と下位 owner の negative trait assertion、private target field、render source の
+forbidden-capability assertion を組み合わせる。creation-thread 外操作は affinity assertion の panic を
+別 thread から捕捉する unit test で固定する。
+
+分離時に確認した、まだ境界を跨ぐ現行箇所 (Stage 4/5 見積もり。Stage 2 では挙動を変えない):
+
+1. `run_native_video_output` は wndproc event drain、host mutation、render call を一つの loop で直列実行し、
+   pump/render channel、epoch 付き attach/detach、reducer は未接続。
+2. opaque target lease 経由の DComp attach に加え、DPI、cursor client 座標、focus/foreground の
+   synchronous read は render 起点のまま。Stage 4/5 では pump event/snapshot と intent に寄せる。
+3. main-window child resize subclass は global child HWND publish と `SWP_ASYNCWINDOWPOS` を使う既存経路のまま。
+   専用 pump cutover 時に host registry/request へ統合する必要がある。
+4. `hwnd_out` / `hud_hwnd_out` による App/VST への HWND publish と VST owner の
+   fire-and-forget handoff は現行のまま。owner-applied ack/anchor は Stage 5。
+5. per-window `post_quit_on_destroy` / stale `WM_QUIT` discard は現行 lifecycle のまま。
+   typed pump shutdown への置換は Stage 4。
+
+Stage 3 へ持ち越すもの:
+
+- disposable pump thread と別 render thread の実 HWND/DComp attach-present-detach harness。
+- deliberate render stall 中の pump ping/resize/close/parent destroy の bounded-time gate。
+- GPU/driver、HWND reuse、DPI/monitor、DComp target recreate matrix の実機記録。
+
+P1 hang、production pump/render 分離、channel/reducer、VST owner ack はこの Stage 2 では未修正。
+
 ### Stage 3: test-only two-thread spike
 
 変わるもの:

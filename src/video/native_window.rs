@@ -188,8 +188,11 @@ impl NativeVideoWindowConfig {
     }
 }
 
-pub struct NativeVideoWindow {
+pub(crate) struct NativeVideoWindow {
     hwnd: HWND,
+    generation: u64,
+    owner_thread: std::thread::ThreadId,
+    _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 struct WindowState {
@@ -326,7 +329,16 @@ unsafe extern "system" fn in_window_resize_subclass_proc(
 }
 
 impl NativeVideoWindow {
-    pub fn create(config: NativeVideoWindowConfig) -> Result<Self, String> {
+    #[track_caller]
+    fn assert_owner_thread(&self) {
+        assert_eq!(
+            std::thread::current().id(),
+            self.owner_thread,
+            "NativeVideoWindow operation ran on a non-owner thread"
+        );
+    }
+
+    pub(crate) fn create(config: NativeVideoWindowConfig) -> Result<Self, String> {
         register_native_video_window_class()?;
         if matches!(config.mode, NativeVideoWindowMode::Child { .. }) && config.owner_hwnd == 0 {
             return Err(
@@ -473,15 +485,27 @@ impl NativeVideoWindow {
             } else if !config.initially_visible {
                 log_window_state("created-hidden", hwnd);
             }
-            Ok(Self { hwnd })
+            Ok(Self {
+                hwnd,
+                generation: config.generation,
+                owner_thread: std::thread::current().id(),
+                _not_send_or_sync: std::marker::PhantomData,
+            })
         }
     }
 
-    pub fn hwnd(&self) -> HWND {
+    pub(crate) fn hwnd(&self) -> HWND {
+        self.assert_owner_thread();
         self.hwnd
     }
 
-    pub fn show_and_raise(&self) -> bool {
+    pub(crate) fn generation(&self) -> u64 {
+        self.assert_owner_thread();
+        self.generation
+    }
+
+    pub(crate) fn show_and_raise(&self) -> bool {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return false;
         }
@@ -497,7 +521,8 @@ impl NativeVideoWindow {
         raised
     }
 
-    pub fn show_no_activate(&self) -> bool {
+    pub(crate) fn show_no_activate(&self) -> bool {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return false;
         }
@@ -524,7 +549,8 @@ impl NativeVideoWindow {
     /// ウィンドウを非表示にする (`SW_HIDE`)。破棄はせず、後で `show_and_raise` /
     /// `show_no_activate` で再表示できる (Inc 7 hidden presenter: 動画→音声モード中は
     /// presenter ウィンドウを hide して egui 音楽ビューを見せる)。
-    pub fn hide(&self) -> bool {
+    pub(crate) fn hide(&self) -> bool {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return false;
         }
@@ -539,7 +565,8 @@ impl NativeVideoWindow {
         true
     }
 
-    pub fn destroy(&mut self) {
+    pub(crate) fn destroy(&mut self) {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return;
         }
@@ -566,7 +593,8 @@ impl NativeVideoWindow {
     /// Plan B のウィンドウ / 全画面トグルで旧 presenter ウィンドウを破棄するとき、
     /// presenter スレッドのメッセージループを `WM_QUIT` で誤って終了させないために
     /// 使う。`DestroyWindow` の前に `WindowState.post_quit_on_destroy` を落とす。
-    pub fn destroy_silent(&mut self) {
+    pub(crate) fn destroy_silent(&mut self) {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return;
         }

@@ -1,6 +1,6 @@
 //! D3D11 full-frame tone and Creative LUT pass for the native video presenter.
 //!
-//! The identity path in `NativeVideoPresenter` continues to use its original
+//! The identity path in `NativeRenderCore` continues to use its original
 //! copy/upload implementation. This pipeline is created lazily only when at
 //! least one adjustment is active.
 

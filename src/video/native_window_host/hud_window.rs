@@ -85,7 +85,7 @@ use crate::video::native_window::{
 };
 
 /// HUD overlay HWND の生成設定。
-pub struct HudOverlayConfig {
+pub(super) struct HudOverlayConfig {
     /// HUD の owner として設定する HWND (= 通常は presenter HWND)。
     /// 同じ owner の sibling として、VST GUI HWND と並ぶ z-order group に入る。
     pub owner_hwnd: HWND,
@@ -122,7 +122,7 @@ pub struct HudOverlayConfig {
 /// drag 中 (= egui `pointer.any_down() && wants_pointer_input`) のフレームは
 /// `regions` を `[画面全体]` に置換して drag を維持する。
 #[derive(Default, Clone)]
-pub struct HudInteractiveRegions {
+pub(super) struct HudInteractiveRegions {
     pub regions: Vec<RECT>,
 }
 
@@ -141,7 +141,7 @@ impl HudInteractiveRegions {
 /// `DestroyWindow` は HWND 作成スレッドで呼ぶ必要があり、wndproc も同じスレッドで
 /// dispatch されるため、別スレッドへの move は禁止する (Codex CP2 P2 反映)。
 /// CP4 以降も presenter thread で生成・所有・破棄する設計を維持する。
-pub struct HudOverlayWindow {
+pub(super) struct HudOverlayWindow {
     hwnd: HWND,
     /// `WindowState` の raw pointer。実際のライフサイクル管理は wndproc
     /// (`WM_NCCREATE` → `WM_NCDESTROY` で `Box::into_raw` / `Box::from_raw`)。
@@ -152,6 +152,8 @@ pub struct HudOverlayWindow {
     /// で済むよう responsibility をこの API に集約、Codex CP2 P3 反映)。
     /// `None` の初期値は `create` 直後の空 region 状態に対応する hash で上書きされる。
     last_regions_hash: Option<u64>,
+    owner_thread: std::thread::ThreadId,
+    _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 // HWND と `*mut WindowState` を持つため `Send`/`Sync` は自動 derive されない。
@@ -159,7 +161,16 @@ pub struct HudOverlayWindow {
 // `unsafe impl Send` は **付けない**。
 
 impl HudOverlayWindow {
-    pub fn create(cfg: HudOverlayConfig) -> Result<Self, String> {
+    #[track_caller]
+    fn assert_owner_thread(&self) {
+        assert_eq!(
+            std::thread::current().id(),
+            self.owner_thread,
+            "HudOverlayWindow operation ran on a non-owner thread"
+        );
+    }
+
+    pub(super) fn create(cfg: HudOverlayConfig) -> Result<Self, String> {
         register_window_class()?;
         unsafe {
             let hmodule =
@@ -261,17 +272,21 @@ impl HudOverlayWindow {
                 hwnd,
                 _state_ptr: state_ptr,
                 last_regions_hash: initial_hash,
+                owner_thread: std::thread::current().id(),
+                _not_send_or_sync: std::marker::PhantomData,
             })
         }
     }
 
-    pub fn hwnd(&self) -> HWND {
+    pub(super) fn hwnd(&self) -> HWND {
+        self.assert_owner_thread();
         self.hwnd
     }
 
     /// 同じサイズ / 位置への resize は no-op (= `SetWindowPos` を毎フレーム呼ばない)。
     /// `MirrorHudGeometry` 経路から呼ばれる。
-    pub fn set_geometry(&self, x: i32, y: i32, w: u32, h: u32) {
+    pub(super) fn set_geometry(&self, x: i32, y: i32, w: u32, h: u32) {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return;
         }
@@ -294,7 +309,8 @@ impl HudOverlayWindow {
     /// `SW_SHOWNA` は foreground を奪わずに表示する (= `WS_EX_NOACTIVATE` の意図と整合)。
     /// region は `SetWindowRgn` 状態が保持されるので、show 後の次フレームの
     /// `apply_regions` (hash gate) が現行 UI rect を再適用する。
-    pub fn set_visible(&self, visible: bool) {
+    pub(super) fn set_visible(&self, visible: bool) {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return;
         }
@@ -304,7 +320,8 @@ impl HudOverlayWindow {
     }
 
     /// HUD HWND を VST GUI より前面に上げ直す。retry burst の各回で呼ばれる。
-    pub fn raise_to_top(&self) {
+    pub(super) fn raise_to_top(&self) {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return;
         }
@@ -330,7 +347,8 @@ impl HudOverlayWindow {
     ///
     /// 共有 `regions: Arc<Mutex<HudInteractiveRegions>>` (= `WM_NCHITTEST`
     /// フェイルセーフ用) の更新は呼び出し側の責務 (`NativeEguiOverlay::run` 末尾)。
-    pub fn apply_regions(&mut self, regions: &[RECT]) {
+    pub(super) fn apply_regions(&mut self, regions: &[RECT]) {
+        self.assert_owner_thread();
         if self.hwnd.0.is_null() {
             return;
         }
@@ -351,6 +369,7 @@ impl HudOverlayWindow {
 
 impl Drop for HudOverlayWindow {
     fn drop(&mut self) {
+        self.assert_owner_thread();
         if !self.hwnd.0.is_null() {
             unsafe {
                 if IsWindow(Some(self.hwnd)).as_bool() {
@@ -487,7 +506,7 @@ fn apply_window_region(hwnd: HWND, regions: &[RECT]) -> bool {
 
 /// CP9 実機 debug: `RECT` slice hash を外部から呼べる版 (`presenter::publish_hud_regions`
 /// の重複抑制用)。内部 `hash_regions` と同じ実装。
-pub(crate) fn hash_regions_for_debug(regions: &[RECT]) -> u64 {
+pub(super) fn hash_regions_for_debug(regions: &[RECT]) -> u64 {
     hash_regions(regions)
 }
 

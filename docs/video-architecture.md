@@ -4,7 +4,7 @@ mimageviewer の動画インライン再生機能の設計指針と内部構造�
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
 撤回経緯は本書末尾の「Appendix: Phase 2 撤回理由」を参照。
 
-> ⚠️ **動画 HUD UI は `src/video/native_presenter/{mod.rs,overlay_draw.rs}` で描画される**。
+> ⚠️ **動画 HUD UI は `src/video/native_presenter/{render_core.rs,overlay_draw.rs}` で描画される**。
 > `src/ui_fullscreen.rs` の動画関連コードは error / loading 表示と shortcut 経路のみ active で、
 > HUD 描画コードは旧版の残骸 (v0.9.0 で native presenter に移行)。新規 UI 機能を追加する際は
 > `native_presenter` 側に書くこと。詳細は本書「採用アーキテクチャ」節と「ファイル責務」節を参照。
@@ -38,7 +38,8 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
     └─ 失敗: 動画は SW decode + CPU upload に fallback (decoder 内部で完結)
 
 [動画フルスクリーン open]
-  NativeVideoPresenter (独立 HWND + DComp visual tree) を生成
+  NativeWindowHost が presenter/HUD HWND を生成
+  NativeRenderCore が opaque target lease に DComp visual tree + swap chain を attach
   decoder thread → video_tx → native_output thread が pull → 自前 swap chain に present
 ```
 
@@ -60,7 +61,7 @@ native presenter の表示先は `NativeVideoPlacement` を正本にする。
 
 F12 の detached mode 切替や表示中動画の host migration は
 `NativeVideoOutputCommand::SwitchPlacement` で行う。decoder / audio / clock は保持し、
-presenter HWND + DComp target だけを作り直して `PlacementSwitched` / `PlacementSwitchFailed`
+`NativeWindowHost` + `NativeRenderCore` target だけを作り直して `PlacementSwitched` / `PlacementSwitchFailed`
 を App へ返す。旧 `SwitchWindowMode(bool)` / `WindowModeSwitched` は互換経路として残すが、
 新規の判断は `NativeVideoPlacement` に寄せる。
 
@@ -83,7 +84,7 @@ VST3 プラグイン GUI がフルスクリーン動画再生中も最前面に�
 Windows の owner rule (= owned は owner より常に手前) で、presenter HWND の DComp tree に
 描画された HUD バー / シークバー / hover thumbnail は VST GUI の裏に潜る regression を抱えていた。
 
-**解決策**: HUD overlay を独立 top-level HWND `HudOverlayWindow` (`src/video/native_presenter/hud_window.rs`)
+**解決策**: HUD overlay を独立 top-level HWND `HudOverlayWindow` (`src/video/native_window_host/hud_window.rs`)
 として presenter HWND と同じ owner (= presenter HWND 自身) の sibling 配置にし、VST GUI と
 並ぶ z-order group に入れる。両方 `WS_EX_TOPMOST`、HUD を後勝ちで `HWND_TOPMOST` に再アサート
 することで VST より前に出す。
@@ -95,8 +96,8 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   └─ wndproc: key/IME 入力 (presenter focus)   ├─ SetWindowRgn(実 UI rect だけ)
                                                 ├─ wndproc: mouse (region 内のみ)
 [VST GUI HWND] (= bridge process が host)      └─ DComp: egui overlay visual (CP4 で移植)
-  └─ owner = presenter, WS_EX_TOPMOST                ↑ HUD 用 IDCompositionTarget は
-                                                       NativeVideoPresenter で保持
+  └─ owner = presenter, WS_EX_TOPMOST                ↑ HWND owner は NativeWindowHost、
+                                                       HUD DComp target は NativeRenderCore で保持
 最終 z-order (上から):
   HUD overlay HWND (= bars / interactive UI / hover thumbnail)
   VST GUI HWND (= EQ ノブ等)
@@ -112,8 +113,8 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
   を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
   TextEdit を含む overlay ダイアログ表示中は、mIV が foreground に戻っているのに presenter thread の
-  `GetFocus()` が外れている場合も、render tick で rate-limit 付き `claim_foreground(presenter_hwnd)` を
-  再実行して Alt+Tab 復帰後の文字入力 / Ctrl+V を回復する。
+  `GetFocus()` が外れている場合も、render tick が rate-limit 付き focus intent を返し、`NativeWindowHost` が
+  `claim_foreground(presenter_hwnd)` を実行して Alt+Tab 復帰後の文字入力 / Ctrl+V を回復する。
   Backspace / Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
   overlay 側がキーを保持し、Space を文字として入力できるようにする。
@@ -230,7 +231,7 @@ Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源�
 再 open で新倍率を適用するため、短い再生中断は許容する。presenter HWND 自身
 (= video transform / background) には影響させず、VST editor の別 HWND にもアプリ内倍率を掛けない。
 
-**UI フォント / コントラストの同期**: `NativeVideoOutputConfig` → `NativePresenterConfig` は
+**UI フォント / コントラストの同期**: `NativeVideoOutputConfig` → `NativeRenderConfig` は
 `text_contrast` に加えて `UiFontSettings` も保持し、`NativeEguiOverlay` の独立
 `egui::Context` を main UI と同じ font definitions で初期化する。フォント変更は live command を
 追加せず、UI 表示倍率と同様に active presenter を閉じて再 open 時に反映する。メタデータや
@@ -258,7 +259,7 @@ ID3D11Fence::Signal (共有 fence で blit 完了通知)
     ↓
 [ video_tx (bounded mpsc) で UI / native presenter thread へ ]
     ↓
-NativeVideoPresenter (= 独立 HWND を持つ別スレッド)
+NativeWindowHost + NativeRenderCore (= 現行 native-video-presenter thread 上で直列)
     ├─ ID3D11Device::OpenSharedHandle で受信 → ID3D11Texture2D
     ├─ KEYEDMUTEX 取得 + Fence Wait で同期
     ├─ 補正なし: CopyResource → swap chain backbuffer
@@ -341,7 +342,7 @@ swscale (NV12/YUV → RGBA、CPU で 24MB allocation)
     ↓
 [ video_tx (bounded mpsc) で native presenter thread へ ]
     ↓
-NativeVideoPresenter::present (CPU 経路ブランチ)
+NativeRenderCore::present (CPU 経路ブランチ)
     ├─ 補正なし: ID3D11DeviceContext::UpdateSubresource で backbuffer に upload
     └─ 色調 / Creative LUT あり: shader-resource texture へ upload → fullscreen shader
          → Present
@@ -1196,7 +1197,7 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - `WM_KEYDOWN` / `WM_LBUTTONDOWN` / `WM_MOUSEWHEEL` 等を `NativeVideoWindowEvent` enum
   に正規化して内部 channel に push (UI スレッドが受信)
 - `NativeVideoMouseButton` (L/M/R/X1/X2) / `NativeVideoMouseWheelEvent` 等の型は
-  egui の Event との 1:1 翻訳を意図しており、`native_presenter/mod.rs` 側で
+  egui の Event との 1:1 翻訳を意図しており、`native_presenter/render_core.rs` 側で
   `egui::Event` に変換される
 - 他アプリからフォーカスを戻すための左クリックは `WM_MOUSEACTIVATE` で
   `MA_ACTIVATEANDEAT` を返して破棄する。Windows がアクティブ化トリガとなった
@@ -1219,21 +1220,22 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 
 責務は単一 (= 単純な入力 marshalling)。設計上の懸念はなし。
 
-#### `native_presenter/` (`NativeVideoPresenter` + `NativeEguiOverlay`)
+#### `native_window_host` / `native_presenter` (`NativeWindowHost` + `NativeRenderCore`)
 
-フルスクリーン動画用の DirectComposition 経路を一手に引き受ける大型モジュール。
-2026-05-09 の Tier 1 #2 で描画自由関数群を `overlay_draw.rs` に分離し、
-`mod.rs` は D3D11 / DComp / egui overlay state と入力変換を担当する形に整理した。
+Stage 2 (2026-07-29) で HWND ownership と GPU/DComp ownership を module/type で分離した。
+両者はまだ同じ `native-video-presenter` thread で直列実行するが、render core は raw HWND や
+USER32 mutation capability を持たず、opaque target lease と typed window intent だけで host と接続する。
 
 現状の内部構成:
 
 | ファイル / 範囲 | 責務 | 主な型 |
 |---|---|---|
-| `mod.rs` 前半 | 公開型定義 (overlay 状態 / イベント / コマンド) | `NativePresenterConfig`, `NativeVideoPresenter`, `NativeEguiOverlay`, 各種 `NativeOverlay*` 構造体 (15+ 個) |
-| `mod.rs` 中盤 | D3D11 デバイス + swap chain + 共有テクスチャ + keyed mutex + 動画 present | `NativeVideoPresenter` |
-| `mod.rs` 中盤 | 黒背景レイヤ / egui overlay state / wgpu surface 管理 / 入力変換 | `NativeBlackBackground`, `NativeEguiOverlay` |
-| `overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、タイムライン marker / icon 描画 | `NativeOverlay*` 値型 |
-| `mod.rs` 末尾 | wgpu surface format 選択、DPI / egui key 変換、D3D11 test helper | — |
+| `native_window_host.rs` | presenter/HUD topology、visibility/geometry/region/z-order/focus/IME/cursor mutation、thread affinity | `NativeWindowHost`, `NativeRenderTargets`, `NativeWindowIntent` |
+| `native_window_host/hud_window.rs` | HUD HWND RAII owner と wndproc/region mutation | `HudOverlayWindow` |
+| `native_presenter/mod.rs` | render facade と `overlay_draw` module 宣言 | — |
+| `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
+| `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
+| `native_presenter/grade_pipeline.rs` | 色調補正 / Creative LUT shader pipeline | `VideoGradePipeline` |
 
 native overlay から UI thread へ戻るコマンドの App 側 dispatch は
 `src/app/native_video.rs` に分離している。`VideoPlayer` / `NativeVideoOutput` は
@@ -1440,7 +1442,7 @@ transform で anisotropic scale として適用する**:
   の遅い経路) は残してあるが、frame 同梱 SAR が先に反映されるため通常は no-op の safety net。
   mid-stream の SAR 変化は frame 同梱なので自然に追従する (bwdif フィルタも frame.aspect_ratio()
   で keying)。
-- `NativeVideoPresenter::update_video_visual_transform()` は `compute_video_visual_transform()`
+- `NativeRenderCore::update_video_visual_transform()` は `compute_video_visual_transform()`
   helper (純粋関数、unit test 6 件あり) で transform 行列を計算する:
   ```
   display_w = surface_w * sar_num / sar_den
@@ -1510,9 +1512,9 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   D3D11 device 自体は残しつつ、`hw_frames_pool`、`in_use=false` の `shared_output_pool` slot、
   `processor_cache` を解放する。次回動画再生時は通常の acquire 経路で lazy に再作成される。
   VST3 bridge / plugin chain は停止しない。
-- **NativeVideoPresenter** (= `VideoPlayer::open` 時に 1 個生成、`VideoPlayer` Drop で停止):
-  独立 Win32 HWND + 自前 D3D11 swap chain + DComp visual tree を所有。decoder からの
-  VideoFrame を専用 thread で pull → present。
+- **NativeWindowHost / NativeRenderCore** (= `VideoPlayer::open` 時に 1 組生成、`VideoPlayer` Drop で停止):
+  host が presenter/HUD HWND、core が D3D11 swap chain + DComp/GPU resource を所有する。現段階では
+  同じ専用 thread で decoder の `VideoFrame` を pull → present する。
 - **D3d11Frame の所有権**: native presenter thread が channel から受信して自身の Drop
   まで保持。次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する
   (= 描画中の HANDLE が close される race を防ぐ)
@@ -1635,7 +1637,7 @@ always-new 窓と同じく no-op として扱う。
 ### 動画のライブ切り替え (デコーダ保持 placement switch)
 
 動画再生中にモードを切り替えるとき、`source` (デコーダ / 音声 / clock) を生かした
-まま **window + `NativeVideoPresenter` だけを作り直す**。close+reopen 方式 (Plan A)
+まま **`NativeWindowHost` + `NativeRenderCore` だけを作り直す**。close+reopen 方式 (Plan A)
 で起きていた音声途切れ・別フレーム混入を回避するため。
 
 - `toggle_video_window_mode` ([src/app/native_video.rs](../src/app/native_video.rs))
@@ -2031,7 +2033,7 @@ WDDM `GPU Process Memory` performance counter の current process dedicated/shar
 | `switch_source_after_clear` | `SwitchSource` 中 | queue drain + completed retire 解放 + `shared_texture_cache.clear()` 後 | 同上 |
 | `switch_source_attached` | `SwitchSource` 中 | 新 source を presenter に接続した直後 | 同上 |
 | `deferred` | `SwitchSource` 後 | 切替 250ms / 1s / 3s 後の遅延解放確認 | `reason=switch_source_250ms` 等、同上 |
-| `video_surface_swap` | `NativeVideoPresenter::present_with_surface_swap` | 動画解像度変更で swap chain を差し替えた直後 | `surface_width`, `surface_height`, `retired_video_surfaces_len` |
+| `video_surface_swap` | `NativeRenderCore::present_with_surface_swap` | 動画解像度変更で swap chain を差し替えた直後 | `surface_width`, `surface_height`, `retired_video_surfaces_len` |
 | `native_output_drop` / `native_output_drop_join` | `NativeVideoOutput::drop` | detached join 型 shutdown が完了しているかの確認 | `join_ok` (join 後のみ), `pdh_skipped` |
 | `idxgi_trim_invoked` | D3D11VA decoder teardown | `--perf-log` 測定時だけ `IDXGIDevice3::Trim()` を呼んだ直後 | `trim_ok`, `trim_error`, `tracking_ref_released`, `estimated_pool_mib`, `pdh_skipped=true` |
 | `gpu_idle_pools_release` | タスクトレイ格納時 | `GpuVideoDevice::release_idle_pools()` で idle shared output slot / processor cache を解放した結果 | `shared_before_len`, `shared_after_len`, `shared_released_slots`, `shared_released_mib`, `processor_cache_cleared` |
@@ -2207,7 +2209,7 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
   ではなく `presenter.reset_overlay_perf()` を SwitchSource ハンドラから直接呼ぶ。
   既存の `set_overlay_metadata(None)` / `set_overlay_timeline_markers(Vec::new())` などと
   同列のリセット群として扱う。
-- **`update_video_state` の `speed_changed` 経由** (`native_presenter/mod.rs`):
+- **`update_video_state` の `speed_changed` 経由** (`native_presenter/render_core.rs`):
   再生速度変更時。`source_delta_ms / playback_speed` で導出する `effective_interval_ms` が
   変わるので、旧速度ベースのサンプルを混ぜると median が誤った値になる。こちらは
   `perf_history.clear()` を直接書いている既存経路 (= SwitchSource ではないので別経路として
@@ -2261,8 +2263,8 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
 | `engine/` | typed state / readiness / master clock を実装済み | `EngineActor` は `Arc<Mutex<_>>` を UI tick が駆動し、`AvClock` と actor の clock ownership が並存する。専用 actor thread は現行仕様ではない |
 | `decoder.rs` | demux / video / audio の 3 worker、packet/control 分離は安定 | 3 worker の codec、HW、seek、pacing helper が同居し、責務分離点がファイル境界になっていない |
 | `video/mod.rs` | `VideoPlayer` API と native output lifecycle の owner | UI tick event drain、output loop、source swap、native presenter orchestration が集中する |
-| `native_presenter/` | production の必須 presenter。legacy eframe video path は撤去済み | device/surface/presentation、overlay state、入力/HUD policy の責務が `mod.rs` / `overlay_draw.rs` に集中する |
-| `native_window.rs` | Win32 event translation | owner/focus/DPI/input policy まで広がっており、「問題なし」と固定評価できない |
+| `native_window_host` / `native_presenter/` | HWND owner と GPU/DComp core を Stage 2 で分離済み。legacy eframe video path は撤去済み | production pump/render thread と channel/reducer は Stage 4。overlay state/input policy の細分化は後続負債 |
+| `native_window.rs` | presenter HWND wndproc / event translation。RAII owner は `NativeWindowHost` の下位型 | main child resize subclass、`post_quit_on_destroy`、pump cutover は Stage 4 の境界 |
 | `gpu_renderer/` | D3D11/FFmpeg interop と unsafe 境界 | 境界は比較的明確。presenter/decoder との resource lifetime は引き続き横断監査が必要 |
 | `audio.rs` / `dsp/` | device-rate playback、stretch、chain bridge を統合 | pump、RT callback、VST IPC/back-pressure の ownership が近接し、DSP 側も chain/GUI/persistence/hot path が混在する |
 

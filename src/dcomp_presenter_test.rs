@@ -9,11 +9,10 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 
 use crate::video::engine::actor::state_code;
 use crate::video::gpu_renderer::GpuVideoDevice;
-use crate::video::native_presenter::{
-    NativePresentOutcome, NativePresenterConfig, NativeVideoPresenter,
-};
-use crate::video::native_window::{
-    NativeVideoWindow, NativeVideoWindowConfig, NativeVideoWindowMode,
+use crate::video::native_presenter::{NativePresentOutcome, NativeRenderConfig, NativeRenderCore};
+use crate::video::native_window::{NativeVideoWindowConfig, NativeVideoWindowMode};
+use crate::video::native_window_host::{
+    NativeHudWindowRequest, NativeWindowHost, NativeWindowHostConfig,
 };
 
 #[derive(Clone, Debug)]
@@ -106,38 +105,43 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
 pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     let _com = ComApartment::init()?;
     let (event_tx, event_rx) = std::sync::mpsc::channel();
-    let mut window = NativeVideoWindow::create(NativeVideoWindowConfig {
-        mode: NativeVideoWindowMode::Windowed {
-            width: config.width,
-            height: config.height,
+    let mut window = NativeWindowHost::create(NativeWindowHostConfig {
+        window: NativeVideoWindowConfig {
+            mode: NativeVideoWindowMode::Windowed {
+                width: config.width,
+                height: config.height,
+            },
+            owner_hwnd: 0,
+            initially_visible: true,
+            activate_on_show: true,
+            close_on_escape: true,
+            post_quit_on_destroy: true,
+            event_tx: Some(event_tx.clone()),
+            generation: 0,
         },
-        owner_hwnd: 0,
-        initially_visible: true,
-        activate_on_show: true,
-        close_on_escape: true,
-        post_quit_on_destroy: true,
-        event_tx: Some(event_tx),
-        generation: 0,
+        hud: NativeHudWindowRequest::Disabled,
+        event_tx,
     })?;
     let gpu = if config.force_sw {
         None
     } else {
         Some(GpuVideoDevice::new().map_err(|e| e.to_string())?)
     };
-    let mut presenter = NativeVideoPresenter::new(NativePresenterConfig {
-        hwnd: window.hwnd(),
-        width: config.width,
-        height: config.height,
-        test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
-        egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
-        cursor_hide_delay_secs: crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
-        ui_scale: 1.0,
-        text_contrast: crate::settings::TextContrast::Standard,
-        ui_font: crate::settings::UiFontSettings::default(),
-        // CP4: prototype CLI は HUD overlay HWND を作らない (= フォールバック経路で
-        // 従来通り presenter HWND の DComp tree に egui overlay を載せる)。
-        hud_event_tx: None,
-    })?;
+    let (new_presenter, topology, startup_window_intents) =
+        NativeRenderCore::new(NativeRenderConfig {
+            targets: window.render_targets(),
+            width: config.width,
+            height: config.height,
+            test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
+            egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
+            cursor_hide_delay_secs: crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
+            ui_scale: 1.0,
+            text_contrast: crate::settings::TextContrast::Standard,
+            ui_font: crate::settings::UiFontSettings::default(),
+        })?;
+    window = window.retain_render_topology(topology);
+    window.apply_render_intents(&startup_window_intents);
+    let mut presenter = new_presenter;
     if config.pixel_probe_strict {
         presenter.set_pixel_probe(true, true);
     }
