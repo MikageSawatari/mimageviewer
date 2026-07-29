@@ -619,14 +619,19 @@ pub fn spawn_activation_listener(
                         );
                         // placement_slot に hide 時の WINDOWPLACEMENT があれば先に復元し、
                         // DPI 丸めによるサイズ / 位置のズレを回避する (トレイ Open と同じ挙動)。
-                        let used_placement = {
-                            let mut slot = placement_slot.lock().unwrap();
-                            if let Some(p) = slot.take() {
-                                crate::tray::restore_window_placement(hwnd_raw, &p);
-                                true
-                            } else {
-                                false
-                            }
+                        // ⚠ ロックを握ったまま `SetWindowPlacement` を呼ばないこと。対象 HWND は
+                        // UI スレッド所有なので、この呼び出しは UI スレッドがメッセージを
+                        // 処理するまで戻らない。その間に UI スレッドがトレイ格納で同じ
+                        // `placement_slot` を書きに来ると相互待ちになる
+                        // (`tray_integration.rs` の hide 経路)。トレイスレッド側は同じ形で
+                        // 自己デッドロックしていた (2026-07-30 実害)。
+                        // 取り出しだけロック内で行い、guard を落としてから Win32 を呼ぶ。
+                        let saved = placement_slot.lock().unwrap().take();
+                        let used_placement = if let Some(p) = saved {
+                            crate::tray::restore_window_placement(hwnd_raw, &p);
+                            true
+                        } else {
+                            false
                         };
                         unsafe {
                             if !used_placement {

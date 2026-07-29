@@ -383,14 +383,19 @@ fn run_tray_thread(
             // 保存していた配置があれば先に復元 (位置・サイズ + showCmd)。
             // このパスで SetWindowPlacement が showCmd=SW_SHOWNORMAL を含むので
             // 追加の ShowWindow は不要。
-            let used_placement = {
-                let mut slot = placement_slot.lock().unwrap();
-                if let Some(p) = slot.take() {
-                    restore_window_placement(hwnd_raw, &p);
-                    true
-                } else {
-                    false
-                }
+            // ⚠ ロックを握ったまま `SetWindowPlacement` を呼ばないこと。あの API は
+            // カーネルコールバックでこのスレッドのウィンドウプロシージャを呼び戻し、
+            // トレイイベントのハンドラ (= このクロージャ) に再入する。`std::sync::Mutex`
+            // は再入不可なので、そこで自己デッドロックし、以降トレイのクリックも
+            // 右クリックメニューも一切反応しなくなる (2026-07-30 実害。メインウィンドウは
+            // トレイへ格納済みなので復帰手段が無くなる)。
+            // 取り出しだけロック内で行い、guard を落としてから Win32 を呼ぶ。
+            let saved = placement_slot.lock().unwrap().take();
+            let used_placement = if let Some(p) = saved {
+                restore_window_placement(hwnd_raw, &p);
+                true
+            } else {
+                false
             };
             if !used_placement {
                 unsafe {
