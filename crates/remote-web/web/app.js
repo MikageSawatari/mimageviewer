@@ -1,10 +1,13 @@
 import {
   CommandName,
+  FitMode,
   command,
   commandFromKey,
   gridIndexForCommand,
+  nextFitMode,
   reduceViewerTransform,
   viewerTapCommand,
+  viewerImageLayout,
   viewerWheelCommand,
 } from "/command-core.mjs";
 
@@ -36,6 +39,8 @@ const state = {
   entries: [],
   images: [],
   imageIndex: -1,
+  fitMode: FitMode.PAGE,
+  imageInfoCache: new Map(),
   requestController: null,
   virtualGrid: null,
   thumbnailTracker: null,
@@ -283,8 +288,9 @@ function dispatchCommand(requested, meta = {}) {
       handled = true;
     } else if (state.screenContext === "viewer") {
       exitBrowserFullscreen();
-      if (history.state?.viewerFromGrid) {
-        history.back();
+      const viewerDepth = Number(history.state?.viewerDepth) || 0;
+      if (history.state?.viewerFromGrid && viewerDepth > 0) {
+        history.go(-viewerDepth);
       } else {
         history.replaceState(
           { mivRoute: true },
@@ -344,7 +350,23 @@ function dispatchCommand(requested, meta = {}) {
     else if (requested.name === CommandName.LAST_PAGE) {
       handled = changeImageTo(state.images.length - 1);
     } else {
-      handled = Boolean(state.viewer?.execute(requested));
+      let fitMode = null;
+      if (requested.name === CommandName.FIT_CYCLE) {
+        fitMode = nextFitMode(state.fitMode);
+      } else if (requested.name === CommandName.FIT_PAGE) {
+        fitMode = FitMode.PAGE;
+      } else if (requested.name === CommandName.FIT_WIDTH) {
+        fitMode = FitMode.WIDTH;
+      } else if (requested.name === CommandName.FIT_ORIGINAL) {
+        fitMode = FitMode.ORIGINAL;
+      }
+      if (fitMode) {
+        state.fitMode = fitMode;
+        updateViewerImage(performance.now()).catch(renderError);
+        handled = true;
+      } else {
+        handled = Boolean(state.viewer?.execute(requested));
+      }
     }
   }
 
@@ -382,6 +404,7 @@ function executeOpenCommand(payload, meta) {
       mivRoute: true,
       navigatedInApp: true,
       viewerFromGrid: true,
+      viewerDepth: 1,
       returnHash: folderHash(state.favoriteId, state.folderPath),
     },
     "",
@@ -701,10 +724,17 @@ function createGridTile(entry, entryIndex, imageIndexes, thumbnailTracker) {
     });
   });
   const preview = element("span", "tile-preview");
+  const image = document.createElement("img");
+  image.alt = "";
+  image.loading = "lazy";
+  image.decoding = "async";
+  image.dataset.telemetryObserved = "true";
 
   if (entry.kind === "dir") {
     preview.append(textElement("span", "◆", "folder-glyph"));
+    preview.append(image);
     preview.append(textElement("span", "folder", "type-badge"));
+    loadThumbnail(image, entry, thumbnailTracker);
     tile.addEventListener("click", (event) => {
       dispatchCommand(
         command(CommandName.OPEN, {
@@ -718,11 +748,6 @@ function createGridTile(entry, entryIndex, imageIndexes, thumbnailTracker) {
     });
   } else {
     preview.append(textElement("span", "◇", "file-glyph"));
-    const image = document.createElement("img");
-    image.alt = "";
-    image.loading = "lazy";
-    image.decoding = "async";
-    image.dataset.telemetryObserved = "true";
     loadThumbnail(image, entry, thumbnailTracker);
     preview.append(image);
     tile.addEventListener("click", (event) => {
@@ -813,7 +838,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
       detail: "toolbar",
     });
   });
-  updateViewerImage(interactionStartedAt);
+  updateViewerImage(interactionStartedAt).catch(renderError);
 }
 
 function changeImage(delta) {
@@ -827,44 +852,82 @@ function changeImageTo(nextIndex) {
   if (nextIndex === state.imageIndex) return false;
   state.imageIndex = nextIndex;
   const entry = state.images[nextIndex];
-  history.replaceState(
-    { ...(history.state ?? {}), mivRoute: true },
+  const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
+  history.pushState(
+    {
+      ...(history.state ?? {}),
+      mivRoute: true,
+      viewerFromGrid: Boolean(history.state?.viewerFromGrid),
+      viewerDepth,
+    },
     "",
     imageHash(state.favoriteId, entry.path)
   );
-  updateViewerImage(performance.now());
+  updateViewerImage(performance.now()).catch(renderError);
   return true;
 }
 
-function updateViewerImage(interactionStartedAt = performance.now()) {
+async function updateViewerImage(interactionStartedAt = performance.now()) {
   const entry = state.images[state.imageIndex];
+  const viewer = state.viewer;
+  if (!entry || !viewer) return;
   document.title = `${entry.name} — mIV Remote`;
-  const request = imageRequest(entry.path);
-  state.viewer.load({
+  const info = await imageInfo(entry.path);
+  if (state.viewer !== viewer || state.images[state.imageIndex]?.path !== entry.path) return;
+  const request = imageRequest(entry.path, info, viewer.stage);
+  viewer.load({
     name: entry.name,
     request,
+    info,
+    fitMode: state.fitMode,
     index: state.imageIndex,
     count: state.images.length,
     interactionStartedAt,
   });
   const nextEntry = state.images[state.imageIndex + 1];
   if (nextEntry) {
-    const preload = new Image();
-    preload.decoding = "async";
-    preload.src = imageRequest(nextEntry.path).url;
+    imageInfo(nextEntry.path).then((nextInfo) => {
+      if (state.viewer !== viewer) return;
+      const preload = new Image();
+      preload.decoding = "async";
+      preload.src = imageRequest(nextEntry.path, nextInfo, viewer.stage).url;
+    }).catch(() => {});
   }
 }
 
-function imageRequest(path) {
-  const cssWidth = Math.max(320, window.visualViewport?.width ?? window.innerWidth);
+function imageRequest(path, info, stage) {
   const dpr = window.devicePixelRatio || 1;
-  const width = Math.min(4096, Math.ceil(cssWidth * dpr));
+  const layout = viewerImageLayout({
+    mode: state.fitMode,
+    sourceWidth: info.width,
+    sourceHeight: info.height,
+    viewportWidth: stage.clientWidth || window.innerWidth,
+    viewportHeight: stage.clientHeight || window.innerHeight,
+    devicePixelRatio: dpr,
+  });
   return {
-    url: apiUrl("/api/image", { fav: state.favoriteId, path, w: width }),
-    width,
-    cssWidth,
+    url: apiUrl("/api/image", { fav: state.favoriteId, path, w: layout.requestWidth }),
+    width: layout.requestWidth,
+    cssWidth: layout.cssWidth,
     dpr,
+    layout,
+    fitMode: state.fitMode,
   };
+}
+
+function imageInfo(path) {
+  const entry = state.images.find((candidate) => candidate.path === path);
+  const key = `${state.favoriteId}\n${path}\n${entry?.mtime ?? ""}\n${entry?.size ?? ""}`;
+  if (!state.imageInfoCache.has(key)) {
+    const pending = apiJson("/api/image-info", { fav: state.favoriteId, path }).catch(
+      (error) => {
+        state.imageInfoCache.delete(key);
+        throw error;
+      }
+    );
+    state.imageInfoCache.set(key, pending);
+  }
+  return state.imageInfoCache.get(key);
 }
 
 async function loadThumbnail(image, entry, tracker) {
@@ -873,7 +936,10 @@ async function loadThumbnail(image, entry, tracker) {
     path: entry.path,
   });
   try {
-    const response = await observedFetch(url, { credentials: "same-origin" });
+    const response = await observedFetch(url, {
+      credentials: "same-origin",
+      cache: "force-cache",
+    });
     if (!response.ok) {
       image.classList.add("thumb-missing");
       tracker?.settled(entry.path, { notFound: response.status === 404 });
@@ -885,6 +951,7 @@ async function loadThumbnail(image, entry, tracker) {
     try {
       await image.decode();
       await nextFrame();
+      image.classList.add("thumb-ready");
       tracker?.settled(entry.path);
     } finally {
       URL.revokeObjectURL(objectUrl);
@@ -907,6 +974,7 @@ class VirtualGrid {
     this.renderCell = renderCell;
     this.onInitialItems = onInitialItems;
     this.initialItemsReported = false;
+    this.cells = new Map();
     this.columns = 1;
     this.rowHeight = 180;
     this.lastRange = "";
@@ -959,9 +1027,24 @@ class VirtualGrid {
     this.windowElement.style.top = `${firstRow * this.rowHeight + 6}px`;
     const fragment = document.createDocumentFragment();
     for (let index = startIndex; index < endIndex; index += 1) {
-      fragment.append(this.renderCell(this.items[index], index));
+      let cell = this.cells.get(index);
+      if (!cell) {
+        cell = this.renderCell(this.items[index], index);
+        this.cells.set(index, cell);
+      }
+      fragment.append(cell);
     }
     this.windowElement.replaceChildren(fragment);
+    const cacheLimit = Math.max(128, (endIndex - startIndex) * 4);
+    if (this.cells.size > cacheLimit) {
+      const center = (startIndex + endIndex) / 2;
+      const candidates = [...this.cells.keys()]
+        .filter((index) => index < startIndex || index >= endIndex)
+        .sort((left, right) => Math.abs(right - center) - Math.abs(left - center));
+      while (this.cells.size > cacheLimit && candidates.length) {
+        this.cells.delete(candidates.shift());
+      }
+    }
   }
 
   visibleRowCount() {
@@ -997,6 +1080,7 @@ class VirtualGrid {
     cancelAnimationFrame(this.frame);
     this.scroller.removeEventListener("scroll", this.onScroll);
     this.resizeObserver.disconnect();
+    this.cells.clear();
   }
 }
 
@@ -1014,7 +1098,7 @@ class ThumbnailGridTracker {
   begin(items) {
     if (this.destroyed || this.expected) return;
     for (const entry of items) {
-      if (entry.kind === "image") this.pending.add(entry.path);
+      if (entry.kind === "image" || entry.kind === "dir") this.pending.add(entry.path);
     }
     this.expected = this.pending.size;
     if (!this.expected) this.finish();
@@ -1067,7 +1151,10 @@ function menuDefinition(context) {
         [CommandName.NEXT_PAGE, "次の画像", "→ / ↓ / PageDown"],
         [CommandName.ZOOM_IN, "拡大", "+"],
         [CommandName.ZOOM_OUT, "縮小", "−"],
-        [CommandName.ZOOM_RESET, "ズームを戻す", "0"],
+        [CommandName.ZOOM_RESET, "ズームを戻す", "メニュー"],
+        [CommandName.FIT_PAGE, "全体フィット", "0 で切替"],
+        [CommandName.FIT_WIDTH, "幅フィット", "0 で切替"],
+        [CommandName.FIT_ORIGINAL, "原寸 (100%)", "0 で切替"],
         [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
         [CommandName.LAST_PAGE, "最後の画像", "End"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
@@ -1075,7 +1162,8 @@ function menuDefinition(context) {
       ],
       shortcuts: [
         ["前 / 次", "← ↑ PageUp / → ↓ PageDown"],
-        ["ズーム", "+ / − / 0"],
+        ["ズーム", "+ / −"],
+        ["表示モード", "0 (全体 → 幅 → 原寸)"],
         ["操作メニュー", "?"],
         ["先頭 / 最後", "Home / End"],
         ["一覧へ戻る", "Backspace / Enter / Esc"],
@@ -1239,14 +1327,7 @@ class ImageViewer {
     this.resize = () => {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = setTimeout(() => {
-        const entry = state.images[state.imageIndex];
-        if (entry) {
-          this.loadMeasuredImage(
-            imageRequest(entry.path),
-            performance.now(),
-            entry.name
-          );
-        }
+        updateViewerImage(performance.now()).catch(renderError);
       }, 180);
     };
 
@@ -1259,14 +1340,28 @@ class ImageViewer {
     window.addEventListener("resize", this.resize);
   }
 
-  load({ name, request, index, count, interactionStartedAt }) {
+  load({ name, request, info, fitMode, index, count, interactionStartedAt }) {
     this.resetTransform();
+    this.setLayout(fitMode, request.layout, info);
     this.title.textContent = name;
     this.image.alt = name;
     this.counter.textContent = `${index + 1} / ${count}`;
     this.previous.disabled = index === 0;
     this.next.disabled = index === count - 1;
     this.loadMeasuredImage(request, interactionStartedAt, name);
+  }
+
+  setLayout(fitMode, layout, info) {
+    this.fitMode = fitMode;
+    this.stage.dataset.fitMode = fitMode;
+    this.image.style.width = `${layout.cssWidth}px`;
+    this.image.style.height = "auto";
+    this.image.style.maxWidth = "none";
+    this.image.style.maxHeight = "none";
+    this.image.dataset.sourceWidth = String(info.width);
+    this.image.dataset.sourceHeight = String(info.height);
+    this.stage.scrollTop = 0;
+    this.stage.scrollLeft = 0;
   }
 
   async loadMeasuredImage(request, interactionStartedAt, name) {
@@ -1314,6 +1409,7 @@ class ImageViewer {
         requested_width: request.width,
         css_width: roundMs(request.cssWidth),
         device_pixel_ratio: roundMs(request.dpr),
+        fit_mode: request.fitMode,
       };
       enqueueTelemetry(event);
       hudState.lastImage = event;
@@ -1421,6 +1517,11 @@ class ImageViewer {
       this.single.lastX = event.clientX;
       this.single.lastY = event.clientY;
       this.single.moved = true;
+    } else if (this.fitMode === FitMode.WIDTH && this.single && previous) {
+      this.stage.scrollTop -= event.clientY - previous.y;
+      this.single.lastX = event.clientX;
+      this.single.lastY = event.clientY;
+      this.single.moved = true;
     }
   }
 
@@ -1497,6 +1598,16 @@ class ImageViewer {
         source: "mouse",
         detail: "wheel_zoom",
       });
+      return;
+    }
+    if (this.fitMode === FitMode.WIDTH) {
+      const delta =
+        event.deltaMode === 1
+          ? event.deltaY * 16
+          : event.deltaMode === 2
+            ? event.deltaY * this.stage.clientHeight
+            : event.deltaY;
+      this.stage.scrollTop += delta;
       return;
     }
     const delta =

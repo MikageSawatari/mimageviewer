@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 use crate::auth::{AuthDecision, AuthInput, AuthService, PinVerification};
 use crate::diagnostics::{DiagnosticsLogger, RequestLog};
-use crate::store::{Library, StoreError, ThumbnailMissReason};
+use crate::store::{Library, StoreError, ThumbnailLookup, ThumbnailMissReason};
+use crate::thumb_cache::{
+    GENERATED_THUMB_SIZE, ThumbnailService, ThumbnailServiceError, thumbnail_cache_key,
+};
 
 const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
 const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
@@ -25,6 +28,7 @@ const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 pub struct AppState {
     pub auth: AuthService,
     pub library: Library,
+    pub thumb_service: ThumbnailService,
     pub logger: DiagnosticsLogger,
     pub telemetry_limiter: TelemetryLimiter,
     pub request_sequence: AtomicU64,
@@ -180,6 +184,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/api/favorites") => api_favorites(state),
         (Method::Get, "/api/list") => api_list(state, &query),
         (Method::Get, "/api/thumb") => api_thumb(state, &query),
+        (Method::Get, "/api/image-info") => api_image_info(state, &query),
         (Method::Get, "/api/image") => api_image(state, &query),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
         (Method::Get, _) => HttpResponse::text(404, "Not Found"),
@@ -348,18 +353,85 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     let Some((favorite, path)) = favorite_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
     };
-    match state.library.thumbnail(favorite, path) {
-        Ok(bytes) => {
+    match state.library.thumbnail_lookup(favorite, path) {
+        Ok(ThumbnailLookup::Catalog(bytes)) => {
             let blob_bytes = bytes.len();
             HttpResponse::bytes(200, "image/webp", bytes)
                 .with_header("Cache-Control", "private, max-age=60")
                 .with_log_details(json!({
                     "thumb": {
                         "hit": true,
+                        "catalog_hit": true,
+                        "remote_cache_hit": null,
+                        "cache_tier": "catalog",
                         "miss_reason": null,
+                        "generated": false,
                         "blob_bytes": blob_bytes,
                     }
                 }))
+        }
+        Ok(ThumbnailLookup::Generate(source)) => {
+            let key = thumbnail_cache_key(
+                &source.cache_identity,
+                source.mtime_ns,
+                source.size,
+                GENERATED_THUMB_SIZE,
+            );
+            match state.thumb_service.load_or_generate(
+                &key,
+                &source.path,
+                source.mtime_ns,
+                source.size,
+                GENERATED_THUMB_SIZE,
+            ) {
+                Ok(value) => {
+                    let blob_bytes = value.bytes.len();
+                    let generated = value.generation.is_some() && !value.waited_for_generation;
+                    let cache_tier = if value.remote_cache_hit {
+                        "remote"
+                    } else if value.waited_for_generation {
+                        "generated_shared"
+                    } else {
+                        "generated"
+                    };
+                    let miss_reason = (!value.remote_cache_hit).then_some("remote_cache_miss");
+                    HttpResponse::bytes(200, "image/webp", value.bytes.as_ref().clone())
+                        .with_header("Cache-Control", "private, max-age=60")
+                        .with_log_details(json!({
+                            "thumb": {
+                                "hit": value.remote_cache_hit,
+                                "catalog_hit": false,
+                                "remote_cache_hit": value.remote_cache_hit,
+                                "cache_tier": cache_tier,
+                                "miss_reason": miss_reason,
+                                "catalog_miss_reason": source.catalog_miss,
+                                "generated": generated,
+                                "waited_for_generation": value.waited_for_generation,
+                                "blob_bytes": blob_bytes,
+                                "generation": value.generation,
+                            }
+                        }))
+                }
+                Err(ThumbnailServiceError::Decode) => {
+                    HttpResponse::text(415, "Unsupported Media Type").with_log_details(json!({
+                        "thumb": {
+                            "hit": false,
+                            "cache_tier": "generation_failed",
+                            "catalog_miss_reason": source.catalog_miss,
+                            "miss_reason": "decode_failed",
+                            "blob_bytes": 0,
+                        }
+                    }))
+                }
+                Err(ThumbnailServiceError::Db(error)) => {
+                    eprintln!("remote-web: thumbnail cache failed: {error}");
+                    HttpResponse::text(500, "Internal Server Error")
+                }
+                Err(ThumbnailServiceError::Synchronization) => {
+                    eprintln!("remote-web: thumbnail generation synchronization failed");
+                    HttpResponse::text(500, "Internal Server Error")
+                }
+            }
         }
         Err(StoreError::ThumbnailMiss(reason)) => {
             HttpResponse::text(404, "Not Found").with_log_details(thumbnail_miss_details(reason))
@@ -371,6 +443,18 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
                 "blob_bytes": 0,
             }
         })),
+    }
+}
+
+fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+    let Some((favorite, path)) = favorite_and_path(query) else {
+        return HttpResponse::text(400, "Bad Request");
+    };
+    match state.library.image_info(favorite, path) {
+        Ok(value) => HttpResponse::json(&value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "private, max-age=60"),
+        Err(error) => store_error_response(error),
     }
 }
 
@@ -389,7 +473,7 @@ fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     };
 
     match state.library.image(favorite, path, width) {
-        Ok(value) => HttpResponse::bytes(200, "image/webp", value.bytes)
+        Ok(value) => HttpResponse::bytes(200, value.content_type, value.bytes)
             .with_header("Cache-Control", "private, max-age=60")
             .with_log_details(json!({"image": value.metrics})),
         Err(error) => store_error_response(error),
@@ -655,6 +739,12 @@ mod tests {
         AppState {
             auth,
             library: Library::empty_for_test(temp.path().join("cache")),
+            thumb_service: ThumbnailService::open(
+                &temp.path().join("thumb-cache.db"),
+                &[protected.clone()],
+                2,
+            )
+            .unwrap(),
             logger: DiagnosticsLogger::open(
                 &temp.path().join("request.jsonl"),
                 &[protected],

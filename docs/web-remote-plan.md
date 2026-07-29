@@ -39,6 +39,9 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 SQLite は WAL なので「本体が唯一の writer / remote-web は reader」は安全に成立する。
 **この境界を崩す変更を入れないこと。**
 
+PoC の remote-web 専用サムネイルキャッシュはこの表の mIV 永続ストアには含めない診断用成果物で、
+外部パスにだけ書く。settings / catalog の単一 writer 境界は変えない。
+
 ### 2.2 セッションと排他
 
 リモート接続中、本体は「外部から閲覧中 [切断する]」ダイアログを出して**ローカル操作を
@@ -54,7 +57,7 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
 
 | 対象 | 状況 |
 |---|---|
-| サムネイル | `catalog.rs` の `thumbnails` テーブルに **WebP blob** で入っている。再エンコードせず `image/webp` で直返しできる |
+| サムネイル | catalog に存在する WebP (`folderthumb:` を含む) は無変換で返す。ただし個別画像行は通常ほとんど永続化されていないため、欠落時は remote-web 専用キャッシュへオンデマンド生成する |
 | お気に入り | `settings.rs` の `FavoriteEntry` (安定 UUID + root path)。**そのまま公開 allowlist として使う** |
 | 補正・回転・トリム・モザイク・消しゴム・ローカル調整・コミック注釈 | `books::BookPageSource::Composited` + `BakedEditSnapshot` に**ヘッドレス合成が既にある**。入力も File / ZipEntry / PdfPage をカバー済み |
 | AI アップスケール・カラー化 | `page_requires_full_composite` から display-only として**意図的に除外**されている。ヘッドレス経路への追加は**新規作業** |
@@ -103,9 +106,9 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
   バンドラ / TypeScript の採用可否は PoC 完了後に判断する
 - 新規コードは新規ファイルに置く。既存ファイルへの変更は最小のフック点に留める
   (master が 1 日 5,000 行ペースで動くため、衝突面積を構造的に減らす)
-- read-only 不変条件は mIV の settings / catalog 等を変更しないことを指し、PoC の診断ログと認証
-  ファイルだけは `--log` / `--auth-file` で指定した `%APPDATA%\mimageviewer` 配下ではない別パスへ
-  出力する
+- read-only 不変条件は mIV の settings / catalog 等を変更しないことを指す。PoC の診断ログ、認証
+  ファイル、remote-web 専用サムネイルキャッシュだけは `--log` / `--auth-file` / `--thumb-cache`
+  で指定した `%APPDATA%\mimageviewer` および `--data-dir` 配下ではない別パスへ出力する
 
 ## 4. PoC のスコープ (現在のフェーズ)
 
@@ -122,11 +125,17 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
 |---|---|
 | `GET /api/favorites` | お気に入り一覧 (id, 表示名) を JSON で返す |
 | `GET /api/list?fav=<uuid>&path=<rel>` | 指定フォルダの直下を JSON で返す。各要素は種別 (dir / image / video / audio / zip / pdf / other)・表示名・相対パス・サイズ・mtime |
-| `GET /api/thumb?fav=<uuid>&path=<rel>` | catalog DB の WebP blob をそのまま `image/webp` で返す。**再エンコードしない**。キャッシュに無ければ 404 (PoC では生成しない) |
-| `GET /api/image?fav=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。`w` は上限を設ける。長辺基準ではなく表示幅基準 |
+| `GET /api/thumb?fav=<uuid>&path=<rel>` | 画像・フォルダのサムネイルを返す。catalog WebP → remote-web 専用 SQLite → オンデマンド生成の順に参照する |
+| `GET /api/image-info?fav=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
+| `GET /api/image?fav=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
 | `GET /` および静的ファイル | フロントエンドを配信 |
 
 - catalog DB は `catalog::db_path_for` でフォルダごとに解決し、**`mode=ro` で開く**
+- catalog の画像キーと `folderthumb:auto-v2:numeric:d3:<name>` (pin 派生を含む) は無変換で
+  再利用する。catalog miss 時だけ remote-web 専用 SQLite へ生成し、mIV catalog には書かない。
+  専用キーは source path + mtime(ns) + file size + 生成サイズを SHA-256 化する
+- サムネイル生成は HTTP ワーカー間で並列実行するが最大 4 本に制限し、同じキーの生成中は
+  共有 flight + Condvar で待ち合わせて重複デコード / エンコードを防ぐ
 - サムネイルのキーは `grid_item.rs` の既存規約 (`image_full_path_cache_key` /
   `zipdir_cache_key` / `pdf_page_cache_key` 等) に従う。PoC で扱うのは通常の画像ファイルのみ
 - 一覧の走査は `entry.file_type()` を使う (`Path::is_dir()` を per-entry で呼ばない)
@@ -139,8 +148,9 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
 2. **フォルダビュー** — サブフォルダとサムネイルのグリッド。**仮想スクロール必須**
    (数千件で破綻しないこと)。パンくずで上位へ戻れる
 3. **画像ビュー** — タップで全画面。**左右スワイプで前後の画像**。ピンチズーム。
-   タップで UI の表示 / 非表示。端末の向き変更に追従
-4. 画像は `devicePixelRatio` を掛けた実表示幅を `w` に渡す。次の画像を 1 枚先読みする
+   表示モードは全体フィット (既定) / 幅フィット / 原寸 (100%)。端末の向き変更に追従
+4. 元寸法・表示モード・viewport から求めた実描画幅に `devicePixelRatio` を掛けて `w` に渡す。
+   縦長画像の全体フィットで viewport 全幅を要求しない。次の画像を 1 枚先読みする
 
 ### 4.2 PoC の非スコープ
 
@@ -151,9 +161,12 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
 - ZIP / PDF / 動画 / 音声
 - 検索 / ファセット
 - AI アップスケール / カラー化 / 補正の反映
-- サムネイル未生成時のオンデマンド生成
 - exe への埋め込み / 配布 / 本体 UI からの起動 / 接続診断
 - 認証以外のセキュリティ強化 (レート制限・HTTPS 終端など)
+
+オンデマンド生成は当初この非スコープに置いたが、実機ログと catalog DB の直接調査により
+前提が成立しないことが分かったため PoC スコープへ昇格した (§8.2)。これは既存 mIV catalog への
+書き込み解禁ではなく、外部パスの remote-web 専用キャッシュを追加する変更である。
 
 ### 4.3 受け入れ条件
 
@@ -280,7 +293,7 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
 telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳細を記録する。
 
 キーは `docs/keymap.ini.default` の次の既定値へ合わせる。Web に同じ概念がない操作は追加せず、
-ズームの `+` / `-` / `0` だけはブラウザ向けの固定補助キーとする (`FsZoomMode=Z` は本体の
+ズームの `+` / `-` だけはブラウザ向けの固定補助キーとする (`FsZoomMode=Z` は本体の
 長押しズームモードであり、Web の離散ズームとは意味が異なるため割り当てない)。PIN 等の
 テキスト入力中はショートカットを一切発火させない。ボタンとメニューでは通常のキー操作を
 優先し、`Esc` / `?` によるメニュー開閉だけを受け付ける。
@@ -291,7 +304,8 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 | 画像 | `←` / `↑` / `PageUp` | `prev_page` | fullscreen の固定矢印送り / `FsFixedJumpPrevNoRtl` |
 | 画像 | `Home` / `End` | `first_page` / `last_page` | `FsJumpFirst` / `FsJumpLast` |
 | 画像 | `Backspace` / `Enter` / `Esc` | `back` (一覧へ) | `FsBackToList` / `FsClose` / 固定 Esc |
-| 画像 | `+` / `-` / `0` | 拡大 / 縮小 / リセット | Web 固有の固定補助キー |
+| 画像 | `+` / `-` | 拡大 / 縮小 | Web 固有の固定補助キー |
+| 画像 | `0` / `Numpad0` | `fit_cycle` (全体 → 幅 → 原寸) | `FsFitModeCycle.1=0` / `.2=Numpad0` |
 | 一覧 | `←` / `↑` / `→` / `↓` | グリッド選択移動 | グリッドの固定矢印移動 |
 | 一覧 | `Enter` | `open_selected` | `GridOpenSelected` |
 | 一覧 | `Backspace` / `Alt+↑` | `parent_folder` | `GridParentFolder` |
@@ -314,9 +328,10 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 画像領域は `touch-action: none`、`overscroll-behavior: contain`、
 `-webkit-touch-callout: none`、`user-select: none` とする。他の操作ボタンは
 `touch-action: manipulation` とする。iOS Safari の左端スワイプ自体は抑止できないため、
-左端 32px から始まる自前スワイプ判定を無効にし、一覧からビューアを開くときだけ
-`history.pushState`、画像送りは `history.replaceState` を使う。これによりブラウザの「戻る」は
-画像履歴を一枚ずつ戻らず、まずビューアを閉じて一覧へ戻る。
+左端 32px から始まる自前スワイプ判定を無効にする。一覧からビューアを開くときと画像を送る
+たびに `history.pushState` し、ブラウザの「戻る」は画像を 1 枚ずつ遡る。閉じるボタン、メニュー、
+`Backspace` / `Enter` / `Esc` は state に保持した viewer depth を `history.go(-n)` でまとめて戻し、
+何十枚読んだ後でも 1 アクションで一覧へ戻る。
 
 ## 7. PoC レビュー結果 (2026-07-29 / commit `4a68a730`)
 
@@ -352,8 +367,8 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 - **F3 (小)**: catalog の blob が WebP でない行 (旧形式で JPEG が入っている可能性) は 404 に
   なる。実機でサムネイル欠けが多発したらこれを疑う。content-type の出し分けで救える
 - **F4 (解消済み)**: PIN 入力画面へ移行し、`?t=` 認証とリダイレクト自体を廃止した
-- **F5 (計画どおりの省略)**: リサイズ済み画像のサーバ側キャッシュが無く、リクエストごとに
-  フルデコードする。先読み 1 枚でどこまで実用になるかは実機測定の対象
+- **F5 (計画どおりの省略)**: リサイズが必要な画像のサーバ側キャッシュは無く、リクエストごとに
+  フルデコードする。F8 の素通し条件外でどこまで実用になるかは引き続き実機測定の対象
 
 ### 7.3 実機測定時の注意
 
@@ -372,12 +387,22 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 
 - **ボトルネックはデコードではなく WebP エンコード**だった。F5 (リサイズ済み画像の
   サーバ側キャッシュ) を検討する際は、キャッシュすべきは「エンコード済みバイト列」である
-- **F8 (新規・小)**: 要求幅が元画像以上でリサイズが不要、かつ EXIF 回転が identity の場合、
-  元ファイルのバイト列をそのまま返せばサーバ処理をほぼゼロにできる。現在は無条件に
-  デコード → WebP 再エンコードしており、サイズの利得もないまま 70ms 前後を消費している。
-  低コストで効く改善なので、縦串フェーズの早い段階で入れる
-- より大きな画像 (20MP 級) での内訳は未計測。デコード側の比率が上がるはずなので、
-  F5 / F8 の優先度はその実測を見てから最終判断する
+- **F8 (PoC で対応済み)**: 要求幅が元画像以上で、EXIF 回転が identity、かつ JPEG / PNG /
+  WebP / GIF / BMP / AVIF の場合は Content-Type を元形式に合わせてファイルバイトを素通しする。
+  HEIC / RAW 等と回転が必要な画像は従来どおりデコード → リサイズ → WebP 変換する
+- より大きな画像 (20MP 級) での内訳は未計測。F8 の対象外となる縮小時はデコード側の比率が
+  上がるはずなので、F5 の優先度はその実測を見てから最終判断する
+
+### 8.2 catalog サムネイルの実態と PoC スコープ変更
+
+実機ログでは catalog hit 10 件に対して miss 574 件で、miss のほぼすべてが `row_missing` だった。
+直近 40 個の catalog DB を直接調べると 31 個が 0 行で、行がある DB も
+`folderthumb:auto-v2:numeric:d3:<name>` が中心だった。個々の画像サムネイルは主にメモリ上で
+生成・破棄され、永続 catalog に常在するという当初前提は成立しない。
+
+このため §4.2 からオンデマンド生成を外し、参照順を catalog → remote-web 専用 SQLite → 生成に
+変更した。専用 DB の既定はカレントディレクトリの `remote-web-thumbs.db`、変更は
+`--thumb-cache <path>`。mIV の settings / catalog は従来どおりすべて read-only である。
 
 ### 6.5.6 ターゲット端末の確定 (2026-07-29)
 

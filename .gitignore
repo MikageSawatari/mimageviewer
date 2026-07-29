@@ -67,3 +67,6 @@ tests/snapshots/*.old.png
 # remote-web (PoC) runtime artifacts — must never be committed
 /remote-web-auth.json
 /remote-web-log.jsonl
+/remote-web-thumbs.db
+/remote-web-thumbs.db-shm
+/remote-web-thumbs.db-wal

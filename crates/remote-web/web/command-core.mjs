@@ -6,6 +6,10 @@ export const CommandName = Object.freeze({
   ZOOM_IN: "zoom_in",
   ZOOM_OUT: "zoom_out",
   ZOOM_RESET: "zoom_reset",
+  FIT_CYCLE: "fit_cycle",
+  FIT_PAGE: "fit_page",
+  FIT_WIDTH: "fit_width",
+  FIT_ORIGINAL: "fit_original",
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
@@ -24,6 +28,12 @@ export const CommandName = Object.freeze({
   GRID_PAGE_PREV: "grid_page_prev",
   GRID_PAGE_NEXT: "grid_page_next",
   GRID_SELECT: "grid_select",
+});
+
+export const FitMode = Object.freeze({
+  PAGE: "page",
+  WIDTH: "width",
+  ORIGINAL: "original",
 });
 
 export function command(name, payload = {}) {
@@ -60,7 +70,7 @@ export function commandFromKey(input, context) {
     }
     if (plain && ["+", "="].includes(key)) return command(CommandName.ZOOM_IN);
     if (plain && key === "-") return command(CommandName.ZOOM_OUT);
-    if (plain && key === "0") return command(CommandName.ZOOM_RESET);
+    if (plain && key === "0") return command(CommandName.FIT_CYCLE);
     return null;
   }
 
@@ -91,6 +101,45 @@ export function commandFromKey(input, context) {
     }
   }
   return null;
+}
+
+export function nextFitMode(mode) {
+  if (mode === FitMode.PAGE) return FitMode.WIDTH;
+  if (mode === FitMode.WIDTH) return FitMode.ORIGINAL;
+  return FitMode.PAGE;
+}
+
+export function viewerImageLayout({
+  mode,
+  sourceWidth,
+  sourceHeight,
+  viewportWidth,
+  viewportHeight,
+  devicePixelRatio,
+  maxRequestWidth = 32768,
+}) {
+  const width = Math.max(1, Number(sourceWidth) || 1);
+  const height = Math.max(1, Number(sourceHeight) || 1);
+  const availableWidth = Math.max(1, Number(viewportWidth) || 1);
+  const availableHeight = Math.max(1, Number(viewportHeight) || 1);
+  const dpr = Math.max(0.25, Number(devicePixelRatio) || 1);
+  let cssWidth;
+  if (mode === FitMode.ORIGINAL) {
+    cssWidth = width;
+  } else if (mode === FitMode.WIDTH) {
+    cssWidth = availableWidth;
+  } else {
+    cssWidth = Math.min(availableWidth, availableHeight * (width / height));
+  }
+  const requestScale = mode === FitMode.ORIGINAL ? 1 : dpr;
+  return {
+    cssWidth,
+    cssHeight: cssWidth * (height / width),
+    requestWidth: Math.max(
+      1,
+      Math.min(maxRequestWidth, Math.ceil(cssWidth * requestScale))
+    ),
+  };
 }
 
 export function viewerTapCommand(clientX, width) {

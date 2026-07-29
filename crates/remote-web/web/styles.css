@@ -350,6 +350,7 @@ button {
   left: 10px;
   display: grid;
   gap: 12px;
+  contain: layout paint style;
 }
 
 .grid-tile {
@@ -358,17 +359,23 @@ button {
   min-width: 0;
   flex-direction: column;
   padding: 0;
-  border: 1px solid #303642;
+  border: 0;
   border-radius: 14px;
   background: var(--surface);
-  box-shadow: 0 5px 18px rgb(0 0 0 / 18%);
+  background-clip: padding-box;
+  box-shadow: inset 0 0 0 1px #303642, 0 5px 18px rgb(0 0 0 / 18%);
   text-align: left;
   cursor: pointer;
   touch-action: manipulation;
+  contain: layout paint style;
+  content-visibility: auto;
+  contain-intrinsic-size: 156px 168px;
+  animation: none;
+  transition: none;
 }
 
 .grid-tile.grid-active {
-  border-color: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent), 0 5px 18px rgb(0 0 0 / 18%);
   outline: 3px solid rgb(124 196 255 / 28%);
   outline-offset: 1px;
 }
@@ -380,7 +387,8 @@ button {
   min-height: 0;
   flex: 1;
   place-items: center;
-  background: #0b0d11;
+  background: #10141b;
+  contain: layout paint;
 }
 
 .tile-preview > * {
@@ -391,6 +399,14 @@ button {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  background: #10141b;
+  opacity: 0;
+  animation: none;
+  transition: none;
+}
+
+.tile-preview img.thumb-ready {
+  opacity: 1;
 }
 
 .tile-preview img.thumb-missing {
@@ -493,6 +509,23 @@ button {
   -webkit-touch-callout: none;
   -webkit-user-drag: none;
   user-select: none;
+}
+
+.viewer-stage[data-fit-mode="page"] {
+  display: grid;
+  overflow: hidden;
+  place-items: center;
+}
+
+.viewer-stage[data-fit-mode="width"],
+.viewer-stage[data-fit-mode="original"] {
+  display: block;
+  overflow: auto;
+}
+
+.viewer-stage[data-fit-mode="width"] .viewer-image,
+.viewer-stage[data-fit-mode="original"] .viewer-image {
+  margin: 0 auto;
 }
 
 .viewer-ui {

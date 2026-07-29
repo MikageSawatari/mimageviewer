@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 
 import {
   CommandName,
+  FitMode,
   commandFromKey,
   gridIndexForCommand,
   reduceViewerTransform,
   viewerTapCommand,
+  nextFitMode,
+  viewerImageLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
 
@@ -23,7 +26,42 @@ test("viewer keys map to the shared page and menu commands", () => {
   assert.equal(commandFromKey(key("F11"), "viewer").name, CommandName.TOGGLE_FULLSCREEN);
   assert.equal(commandFromKey(key("i"), "viewer"), null);
   assert.equal(commandFromKey(key("+"), "viewer").name, CommandName.ZOOM_IN);
-  assert.equal(commandFromKey(key("0"), "viewer").name, CommandName.ZOOM_RESET);
+  assert.equal(commandFromKey(key("0"), "viewer").name, CommandName.FIT_CYCLE);
+});
+
+test("fit mode cycle and request width use the actual rendered image width", () => {
+  assert.equal(nextFitMode(FitMode.PAGE), FitMode.WIDTH);
+  assert.equal(nextFitMode(FitMode.WIDTH), FitMode.ORIGINAL);
+  assert.equal(nextFitMode(FitMode.ORIGINAL), FitMode.PAGE);
+  const portrait = viewerImageLayout({
+    mode: FitMode.PAGE,
+    sourceWidth: 1000,
+    sourceHeight: 2000,
+    viewportWidth: 1200,
+    viewportHeight: 800,
+    devicePixelRatio: 2,
+  });
+  assert.equal(portrait.cssWidth, 400);
+  assert.equal(portrait.requestWidth, 800);
+  const widthFit = viewerImageLayout({
+    mode: FitMode.WIDTH,
+    sourceWidth: 1000,
+    sourceHeight: 2000,
+    viewportWidth: 1200,
+    viewportHeight: 800,
+    devicePixelRatio: 2,
+  });
+  assert.equal(widthFit.requestWidth, 2400);
+  const original = viewerImageLayout({
+    mode: FitMode.ORIGINAL,
+    sourceWidth: 1000,
+    sourceHeight: 2000,
+    viewportWidth: 1200,
+    viewportHeight: 800,
+    devicePixelRatio: 2,
+  });
+  assert.equal(original.cssWidth, 1000);
+  assert.equal(original.requestWidth, 1000);
 });
 
 test("grid keys mirror parent, history, selection and page defaults", () => {

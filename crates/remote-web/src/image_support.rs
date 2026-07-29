@@ -13,6 +13,23 @@ pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mpg", "mpeg", "mp4", "avi", "
 pub const SUPPORTED_AUDIO_EXTENSIONS: &[&str] =
     &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageProbe {
+    pub raw_width: u32,
+    pub raw_height: u32,
+    pub orientation: u16,
+}
+
+impl ImageProbe {
+    pub fn oriented_dimensions(self) -> (u32, u32) {
+        if matches!(self.orientation, 5..=8) {
+            (self.raw_height, self.raw_width)
+        } else {
+            (self.raw_width, self.raw_height)
+        }
+    }
+}
+
 /// Keep the catalog v2 location convention identical to
 /// `mimageviewer::catalog::db_path_for` without linking the GUI/native runtime.
 pub fn catalog_db_path(cache_dir: &Path, folder_path: &Path) -> PathBuf {
@@ -36,6 +53,44 @@ pub fn decode_oriented(path: &Path) -> Option<DynamicImage> {
         .ok()
         .or_else(|| wic_decode_to_dynamic_image(path))?;
     Some(apply_orientation(image, read_orientation(path)))
+}
+
+pub fn probe_image(path: &Path) -> Option<ImageProbe> {
+    let (raw_width, raw_height) = image::image_dimensions(path)
+        .ok()
+        .or_else(|| wic_image_dimensions(path))?;
+    if raw_width == 0 || raw_height == 0 {
+        return None;
+    }
+    Some(ImageProbe {
+        raw_width,
+        raw_height,
+        orientation: read_orientation(path),
+    })
+}
+
+pub fn passthrough_content_type(
+    path: &Path,
+    probe: ImageProbe,
+    requested_width: u32,
+) -> Option<&'static str> {
+    if probe.orientation != 1 || requested_width < probe.raw_width {
+        return None;
+    }
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
 }
 
 pub fn resize_exact(source: &DynamicImage, width: u32, height: u32) -> DynamicImage {
@@ -119,6 +174,45 @@ fn apply_orientation(image: DynamicImage, orientation: u16) -> DynamicImage {
         7 => image.rotate90().flipv(),
         8 => image.rotate270(),
         _ => image,
+    }
+}
+
+#[cfg(not(windows))]
+fn wic_image_dimensions(_path: &Path) -> Option<(u32, u32)> {
+    None
+}
+
+#[cfg(windows)]
+fn wic_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::core::{GUID, PCWSTR};
+
+    let _com = ComScope::init();
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let wide: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let decoder = factory
+            .CreateDecoderFromFilename(
+                PCWSTR(wide.as_ptr()),
+                Some(&GUID::zeroed()),
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand,
+            )
+            .ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let mut width = 0;
+        let mut height = 0;
+        frame.GetSize(&mut width, &mut height).ok()?;
+        (width > 0 && height > 0).then_some((width, height))
     }
 }
 
@@ -287,6 +381,42 @@ mod tests {
             cache
                 .join("11")
                 .join("115509654a9d88d89064533af04ffe209b0635a1f9865ca8e670734eaa3c5586.db")
+        );
+    }
+
+    #[test]
+    fn passthrough_boundary_requires_full_width_identity_and_browser_format() {
+        let identity = ImageProbe {
+            raw_width: 1200,
+            raw_height: 800,
+            orientation: 1,
+        };
+        assert_eq!(
+            passthrough_content_type(Path::new("page.jpg"), identity, 1200),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            passthrough_content_type(Path::new("page.jpg"), identity, 1199),
+            None
+        );
+        assert_eq!(
+            passthrough_content_type(
+                Path::new("page.jpg"),
+                ImageProbe {
+                    orientation: 6,
+                    ..identity
+                },
+                1200
+            ),
+            None
+        );
+        assert_eq!(
+            passthrough_content_type(Path::new("page.heic"), identity, 1200),
+            None
+        );
+        assert_eq!(
+            passthrough_content_type(Path::new("page.dng"), identity, 1200),
+            None
         );
     }
 }
