@@ -235,6 +235,21 @@
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
 
+### 3.3 final-effect worker 待ちの間、色調補正とシャープを毎フレーム作り直している
+
+- 背景: `ensure_final_composite_texture` は、AI 到着後の再合成待ちの間だけ早期 return 条件
+  (`entry.complete || (ai_ready.is_none() && !ai_failed)`) を外れる。その間は毎フレーム
+  `apply_adjustments_fast` と `apply_final_smart_sharpen` を UI スレッドで走らせ直している。
+  結果は捨てられ、実際に使うのは worker の出力。
+- 影響: 色調補正なし・シャープ 0 の既定では `Arc::clone` だけなのでほぼ無害。色調補正か
+  スマートシャープを使っているユーザーは、AI 切り替え待ちの数秒間フルサイズの CPU パスを
+  毎フレーム払う。大判ページほど重い。
+- 方針: 同一 key の final-effect job が既に pending なら、CPU パスへ入る前に既存 texture を
+  返して抜ける。2026-07-29 の「AI 切替時の黒フレーム」修正で incomplete entry を保持する
+  ようになったため、返すべき texture が常に手元にある。
+- 優先度: P2 (体感ヒッチだが既定設定では出ない)。perf-log で
+  `fs` / `final_composite_build` の連続発火として観測できるはず。
+
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
