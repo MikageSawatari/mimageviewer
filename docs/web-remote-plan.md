@@ -123,7 +123,7 @@ PoC の remote-web 専用サムネイルキャッシュはこの表の mIV 永�
 
 | エンドポイント | 内容 |
 |---|---|
-| `GET /api/favorites` | お気に入り一覧 (id, 表示名) を JSON で返す |
+| `GET /api/favorites` | お気に入り一覧 (id, 表示名) と mIV 設定から解決したタイル高さ比を JSON で返す |
 | `GET /api/list?fav=<uuid>&path=<rel>` | 指定フォルダの直下を JSON で返す。各要素は種別 (dir / image / video / audio / zip / pdf / other)・表示名・相対パス・サイズ・mtime |
 | `GET /api/thumb?fav=<uuid>&path=<rel>` | 画像・フォルダのサムネイルを返す。catalog WebP → remote-web 専用 SQLite → オンデマンド生成の順に参照する |
 | `GET /api/image-info?fav=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
@@ -403,6 +403,32 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 このため §4.2 からオンデマンド生成を外し、参照順を catalog → remote-web 専用 SQLite → 生成に
 変更した。専用 DB の既定はカレントディレクトリの `remote-web-thumbs.db`、変更は
 `--thumb-cache <path>`。mIV の settings / catalog は従来どおりすべて read-only である。
+
+### 8.3 スマートフォンのグリッド寸法と描画 (2026-07-30)
+
+実機では従来の「幅 420px 未満は最小セル幅 128pxを floor で割り、行高は常に 168px」という
+計算により、390px 幅で 2 列・実セル幅約 179px・高さ168pxとなり、mIV のサムネイル比率も
+無視されていた。ちらつき対策として入れた `content-visibility: auto` と固定の
+`contain-intrinsic-size: 156px 168px` も実セル幅とは一致していなかった。ただし行トラックは
+`grid-auto-rows` で明示されていたため、この intrinsic size は横長化の主因ではない。
+WebKit 固有の描画省略経路を残す必要もないため撤去した。上から下へ枠が同化する直接原因は、
+グリッド面が透明で `body` の上端だけ明るい radial gradient を透過していたことだった。
+
+remote-web は settings.db の `thumb_aspect` / `thumb_aspect_auto` を read-only で読み、手動時は
+本体 `ThumbAspect::height_ratio()` と同じ高さ / 幅比を使う。Auto は本体のフォルダごとの一時的な
+`auto_aspect.current` を共有できないため、`App::effective_thumb_aspect` の「Auto 未確定は Square」
+と同じ 1:1 を使う。
+
+列数は利用可能幅 `A`、gap `G`、目標セル幅 `T` から
+`ceil((A + G) / (T + G))` とする。左右 inset を除き、スマートフォンは `T=132px, G=8px`、
+中幅は `T=180px, G=12px`、広幅は `T=210px, G=12px`。Square の例では 390px = 3 列、
+768px = 4 列、1280px = 6 列、1920px = 9 列となる。行高は算出後の実セル幅と高さ比から毎回求め、
+向き変更・リサイズ時に仮想スクロールの row pitch も更新する。
+
+`content-visibility` / `contain-intrinsic-size` は撤去した。ちらつき対策は可視範囲 + overscan のみを
+DOM に置く仮想化、セル DOM の再利用、テーマ色のプレースホルダ、transition 無効、
+`decoding="async"`、`cache: "force-cache"`、`contain: layout paint style` を維持し、グリッド面は
+単色背景にした。
 
 ### 6.5.6 ターゲット端末の確定 (2026-07-29)
 

@@ -157,6 +157,38 @@ export function viewerWheelCommand(deltaY, zoomModifier) {
   return command(deltaY < 0 ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
 }
 
+export function gridLayoutForWidth(containerWidth, aspectHeightRatio) {
+  const width = Math.max(1, Number(containerWidth) || 1);
+  const inset = width >= 900 ? 20 : 10;
+  const availableWidth = Math.max(1, width - inset * 2);
+  const compact = availableWidth < 600;
+  const gap = compact ? 8 : 12;
+  const targetCellWidth = compact ? 132 : availableWidth < 1000 ? 180 : 210;
+  const columns = Math.max(
+    1,
+    Math.ceil((availableWidth + gap) / (targetCellWidth + gap))
+  );
+  const cellWidth = Math.max(
+    1,
+    (availableWidth - gap * (columns - 1)) / columns
+  );
+  const requestedRatio = Number(aspectHeightRatio);
+  const ratio =
+    Number.isFinite(requestedRatio) && requestedRatio > 0
+      ? requestedRatio
+      : 1;
+  const cellHeight = Math.max(32, Math.round(cellWidth * ratio));
+  return {
+    columns,
+    cellWidth,
+    cellHeight,
+    rowPitch: cellHeight + gap,
+    gap,
+    inset,
+    targetCellWidth,
+  };
+}
+
 export function reduceViewerTransform(current, requested) {
   let scale = current.scale;
   let panX = current.panX;

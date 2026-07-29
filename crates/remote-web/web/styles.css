@@ -335,6 +335,7 @@ button {
   overflow: auto;
   min-height: 0;
   flex: 1;
+  background: #111318;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
@@ -368,8 +369,6 @@ button {
   cursor: pointer;
   touch-action: manipulation;
   contain: layout paint style;
-  content-visibility: auto;
-  contain-intrinsic-size: 156px 168px;
   animation: none;
   transition: none;
 }
@@ -770,10 +769,6 @@ button {
     padding-left: 24px;
   }
 
-  .virtual-window {
-    right: 20px;
-    left: 20px;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {

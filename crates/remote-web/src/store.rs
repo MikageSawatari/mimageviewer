@@ -5,7 +5,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use image::GenericImageView;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::diagnostics::duration_ms;
@@ -79,6 +79,7 @@ struct FavoriteRoot {
 #[derive(Serialize)]
 pub struct FavoritesResponse {
     favorites: Vec<FavoriteSummary>,
+    thumb_aspect_height_ratio: f64,
 }
 
 #[derive(Serialize)]
@@ -158,6 +159,37 @@ pub struct Library {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
     cache_dir: PathBuf,
+    thumb_aspect_height_ratio: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+enum StoredThumbAspect {
+    Landscape16x9,
+    Landscape3x2,
+    Landscape4x3,
+    #[default]
+    Square,
+    Portrait3x4,
+    Portrait2x3,
+    Portrait9x16,
+}
+
+fn resolve_thumb_aspect_height_ratio(aspect: StoredThumbAspect, auto: bool) -> f64 {
+    // remote-web does not own mIV's per-folder, transient AutoAspect state.
+    // App::effective_thumb_aspect uses Square whenever Auto is enabled but
+    // current is still unresolved, rather than reusing the stored manual value.
+    if auto {
+        return 1.0;
+    }
+    match aspect {
+        StoredThumbAspect::Landscape16x9 => 9.0 / 16.0,
+        StoredThumbAspect::Landscape3x2 => 2.0 / 3.0,
+        StoredThumbAspect::Landscape4x3 => 3.0 / 4.0,
+        StoredThumbAspect::Square => 1.0,
+        StoredThumbAspect::Portrait3x4 => 4.0 / 3.0,
+        StoredThumbAspect::Portrait2x3 => 3.0 / 2.0,
+        StoredThumbAspect::Portrait9x16 => 16.0 / 9.0,
+    }
 }
 
 impl Library {
@@ -167,12 +199,19 @@ impl Library {
             favorites: Vec::new(),
             by_id: HashMap::new(),
             cache_dir,
+            thumb_aspect_height_ratio: 1.0,
         }
     }
 
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
         let settings_path = data_dir.join("settings.db");
         let conn = open_read_only(&settings_path)?;
+        let thumb_aspect =
+            read_setting_json::<StoredThumbAspect>(&conn, "thumb_aspect")?.unwrap_or_default();
+        let thumb_aspect_auto =
+            read_setting_json::<bool>(&conn, "thumb_aspect_auto")?.unwrap_or(false);
+        let thumb_aspect_height_ratio =
+            resolve_thumb_aspect_height_ratio(thumb_aspect, thumb_aspect_auto);
         let mut stmt = conn.prepare(
             "SELECT id, name, path
              FROM favorites
@@ -205,11 +244,13 @@ impl Library {
             favorites,
             by_id,
             cache_dir: data_dir.join("cache"),
+            thumb_aspect_height_ratio,
         })
     }
 
     pub fn favorites(&self) -> FavoritesResponse {
         FavoritesResponse {
+            thumb_aspect_height_ratio: self.thumb_aspect_height_ratio,
             favorites: self
                 .favorites
                 .iter()
@@ -451,6 +492,20 @@ impl Library {
             .and_then(|idx| self.favorites.get(*idx))
             .ok_or(StoreError::NotFound)
     }
+}
+
+fn read_setting_json<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    key: &str,
+) -> Result<Option<T>, StoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT value FROM settings_kv WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|value| serde_json::from_str(&value).ok()))
 }
 
 fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
@@ -797,6 +852,28 @@ mod tests {
     }
 
     #[test]
+    fn thumb_aspect_resolution_matches_miv_effective_aspect_semantics() {
+        let cases = [
+            (StoredThumbAspect::Landscape16x9, 9.0 / 16.0),
+            (StoredThumbAspect::Landscape3x2, 2.0 / 3.0),
+            (StoredThumbAspect::Landscape4x3, 3.0 / 4.0),
+            (StoredThumbAspect::Square, 1.0),
+            (StoredThumbAspect::Portrait3x4, 4.0 / 3.0),
+            (StoredThumbAspect::Portrait2x3, 3.0 / 2.0),
+            (StoredThumbAspect::Portrait9x16, 16.0 / 9.0),
+        ];
+        for (aspect, expected) in cases {
+            let actual = resolve_thumb_aspect_height_ratio(aspect, false);
+            assert!((actual - expected).abs() < f64::EPSILON);
+        }
+
+        assert_eq!(
+            resolve_thumb_aspect_height_ratio(StoredThumbAspect::Portrait9x16, true),
+            1.0
+        );
+    }
+
+    #[test]
     fn webp_detection_does_not_mislabel_legacy_jpeg() {
         assert!(is_webp(b"RIFF\x10\x00\x00\x00WEBPdata"));
         assert!(!is_webp(b"\xff\xd8\xff\xe0legacy jpeg"));
@@ -843,6 +920,7 @@ mod tests {
             }],
             by_id: HashMap::from([(id, 0)]),
             cache_dir: PathBuf::from("cache"),
+            thumb_aspect_height_ratio: 1.0,
         };
         let json = serde_json::to_string(&library.favorites()).unwrap();
         assert!(json.contains(&id.to_string()));
@@ -878,6 +956,7 @@ mod tests {
             }],
             by_id: HashMap::from([(id, 0)]),
             cache_dir: temp.path().join("cache"),
+            thumb_aspect_height_ratio: 1.0,
         };
         let listing = library.list(id, "").unwrap();
         assert!(
@@ -917,7 +996,15 @@ mod tests {
                     name TEXT NOT NULL,
                     path TEXT NOT NULL,
                     sort_index INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE TABLE settings_kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                 );
+                 INSERT INTO settings_kv (key, value)
+                 VALUES ('thumb_aspect', '\"Landscape3x2\"');
+                 INSERT INTO settings_kv (key, value)
+                 VALUES ('thumb_aspect_auto', 'false');",
             )
             .unwrap();
             conn.execute(
@@ -973,6 +1060,7 @@ mod tests {
         let settings_before = std::fs::read(&settings_path).unwrap();
         let catalog_before = std::fs::read(&catalog_path).unwrap();
         let library = Library::load(&data_dir).unwrap();
+        assert!((library.thumb_aspect_height_ratio - (2.0 / 3.0)).abs() < f64::EPSILON);
 
         let favorites_json = serde_json::to_string(&library.favorites()).unwrap();
         assert!(favorites_json.contains("Fixture"));

@@ -5,6 +5,7 @@ import {
   CommandName,
   FitMode,
   commandFromKey,
+  gridLayoutForWidth,
   gridIndexForCommand,
   reduceViewerTransform,
   viewerTapCommand,
@@ -112,6 +113,22 @@ test("grid navigation uses columns, page rows and clamps to valid entries", () =
     19
   );
   assert.equal(gridIndexForCommand({ ...base, name: CommandName.GRID_FIRST }), 0);
+});
+
+test("grid layout derives columns from target width and applies the tile aspect", () => {
+  const phone = gridLayoutForWidth(390, 1);
+  assert.equal(phone.columns, 3);
+  assert.equal(phone.cellWidth, 118);
+  assert.equal(phone.cellHeight, 118);
+
+  const portraitPhone = gridLayoutForWidth(390, 1.5);
+  assert.equal(portraitPhone.columns, 3);
+  assert.equal(portraitPhone.cellHeight, 177);
+
+  assert.equal(gridLayoutForWidth(768, 1).columns, 4);
+  assert.equal(gridLayoutForWidth(1280, 1).columns, 6);
+  assert.equal(gridLayoutForWidth(1920, 1).columns, 9);
+  assert.equal(gridLayoutForWidth(390, Number.NaN).cellHeight, 118);
 });
 
 test("viewer transform commands dispatch through one pure state transition", () => {

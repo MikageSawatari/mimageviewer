@@ -3,6 +3,7 @@ import {
   FitMode,
   command,
   commandFromKey,
+  gridLayoutForWidth,
   gridIndexForCommand,
   nextFitMode,
   reduceViewerTransform,
@@ -33,6 +34,7 @@ const hudState = {
 const state = {
   authenticated: false,
   favorites: [],
+  thumbAspectHeightRatio: 1,
   favoriteId: null,
   favoriteName: "",
   folderPath: "",
@@ -98,6 +100,11 @@ async function enterAuthenticatedApp() {
   renderLoading("お気に入りを読み込んでいます");
   const data = await apiJson("/api/favorites");
   state.favorites = data.favorites ?? [];
+  state.thumbAspectHeightRatio =
+    Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
+    Number(data.thumb_aspect_height_ratio) > 0
+      ? Number(data.thumb_aspect_height_ratio)
+      : 1;
   if (!location.hash) {
     history.replaceState({ mivRoute: true }, "", "#favorites");
   } else {
@@ -671,7 +678,8 @@ function renderFolder() {
     windowElement,
     state.entries,
     (entry, index) => createGridTile(entry, index, imageIndexes, state.thumbnailTracker),
-    (initialItems) => state.thumbnailTracker?.begin(initialItems)
+    (initialItems) => state.thumbnailTracker?.begin(initialItems),
+    state.thumbAspectHeightRatio
   );
 }
 
@@ -966,17 +974,28 @@ async function loadThumbnail(image, entry, tracker) {
 }
 
 class VirtualGrid {
-  constructor(scroller, space, windowElement, items, renderCell, onInitialItems) {
+  constructor(
+    scroller,
+    space,
+    windowElement,
+    items,
+    renderCell,
+    onInitialItems,
+    aspectHeightRatio
+  ) {
     this.scroller = scroller;
     this.space = space;
     this.windowElement = windowElement;
     this.items = items;
     this.renderCell = renderCell;
     this.onInitialItems = onInitialItems;
+    this.aspectHeightRatio = aspectHeightRatio;
     this.initialItemsReported = false;
     this.cells = new Map();
     this.columns = 1;
-    this.rowHeight = 180;
+    this.rowHeight = 1;
+    this.cellHeight = 1;
+    this.gap = 0;
     this.lastRange = "";
     this.frame = 0;
     this.onScroll = () => this.schedule();
@@ -987,17 +1006,30 @@ class VirtualGrid {
   }
 
   layout() {
-    const width = Math.max(1, this.scroller.clientWidth - 20);
-    const minCellWidth = width < 420 ? 128 : width < 900 ? 148 : 180;
-    const columns = Math.max(1, Math.floor((width + 12) / (minCellWidth + 12)));
-    if (columns !== this.columns) {
-      this.columns = columns;
+    const layout = gridLayoutForWidth(
+      this.scroller.clientWidth,
+      this.aspectHeightRatio
+    );
+    if (
+      layout.columns !== this.columns ||
+      layout.rowPitch !== this.rowHeight
+    ) {
+      this.columns = layout.columns;
+      this.rowHeight = layout.rowPitch;
       this.lastRange = "";
     }
+    this.cellHeight = layout.cellHeight;
+    this.gap = layout.gap;
     const rows = Math.ceil(this.items.length / this.columns);
-    this.space.style.height = `${Math.max(this.scroller.clientHeight, rows * this.rowHeight + 12)}px`;
+    this.space.style.height = `${Math.max(
+      this.scroller.clientHeight,
+      rows * this.rowHeight
+    )}px`;
+    this.windowElement.style.left = `${layout.inset}px`;
+    this.windowElement.style.right = `${layout.inset}px`;
+    this.windowElement.style.gap = `${layout.gap}px`;
     this.windowElement.style.gridTemplateColumns = `repeat(${this.columns}, minmax(0, 1fr))`;
-    this.windowElement.style.gridAutoRows = `${this.rowHeight - 12}px`;
+    this.windowElement.style.gridAutoRows = `${this.cellHeight}px`;
     this.schedule();
   }
 
@@ -1024,7 +1056,7 @@ class VirtualGrid {
       this.initialItemsReported = true;
       this.onInitialItems?.(this.items.slice(startIndex, endIndex));
     }
-    this.windowElement.style.top = `${firstRow * this.rowHeight + 6}px`;
+    this.windowElement.style.top = `${firstRow * this.rowHeight + this.gap / 2}px`;
     const fragment = document.createDocumentFragment();
     for (let index = startIndex; index < endIndex; index += 1) {
       let cell = this.cells.get(index);
