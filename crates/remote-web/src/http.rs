@@ -166,6 +166,9 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     let response = match (method, path) {
         (Method::Get, "/") => static_file(state, "index.html", "text/html; charset=utf-8"),
         (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
+        (Method::Get, "/command-core.mjs") => {
+            static_file(state, "command-core.mjs", "text/javascript; charset=utf-8")
+        }
         (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
         (Method::Get, "/favicon.ico") => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
         (Method::Get, "/api/auth/status") => api_auth_status(state, auth),
@@ -690,6 +693,20 @@ mod tests {
     fn duplicate_security_parameters_are_rejected() {
         let query = parse_query("fav=a&fav=b").unwrap();
         assert!(query_value(&query, "fav").is_err());
+    }
+
+    #[test]
+    fn command_core_module_is_public_for_the_pin_screen_bootstrap() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        std::fs::write(temp.path().join("command-core.mjs"), b"export {};").unwrap();
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/command-core.mjs")
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"export {};");
     }
 
     #[test]

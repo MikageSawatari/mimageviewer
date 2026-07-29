@@ -29,12 +29,15 @@ body {
   background:
     radial-gradient(circle at 15% -10%, #24324a 0, transparent 36rem),
     #111318;
-  overscroll-behavior: none;
+  overscroll-behavior: contain;
 }
 
 button {
   color: inherit;
   font: inherit;
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+  user-select: none;
 }
 
 #telemetry-hud {
@@ -216,11 +219,20 @@ button {
   min-height: 0;
   flex: 1;
   padding: 18px 14px calc(24px + env(safe-area-inset-bottom));
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .hero {
   max-width: 720px;
   margin: 16px auto 24px;
+}
+
+.hero-with-menu {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
 }
 
 .hero h1 {
@@ -355,6 +367,12 @@ button {
   touch-action: manipulation;
 }
 
+.grid-tile.grid-active {
+  border-color: var(--accent);
+  outline: 3px solid rgb(124 196 255 / 28%);
+  outline-offset: 1px;
+}
+
 .tile-preview {
   position: relative;
   display: grid;
@@ -447,7 +465,9 @@ button {
   inset: 0;
   overflow: hidden;
   background: #000;
+  overscroll-behavior: contain;
   touch-action: none;
+  -webkit-touch-callout: none;
   user-select: none;
 }
 
@@ -457,6 +477,10 @@ button {
   inset: 0;
   place-items: center;
   overflow: hidden;
+  overscroll-behavior: contain;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  user-select: none;
 }
 
 .viewer-image {
@@ -466,7 +490,9 @@ button {
   object-fit: contain;
   transform-origin: center;
   will-change: transform;
+  -webkit-touch-callout: none;
   -webkit-user-drag: none;
+  user-select: none;
 }
 
 .viewer-ui {
@@ -497,19 +523,6 @@ button {
   background: linear-gradient(transparent, rgb(0 0 0 / 78%));
 }
 
-.image-viewer.ui-hidden .viewer-ui {
-  pointer-events: none;
-  opacity: 0;
-}
-
-.image-viewer.ui-hidden .viewer-ui.top {
-  transform: translateY(-20px);
-}
-
-.image-viewer.ui-hidden .viewer-ui.bottom {
-  transform: translateY(20px);
-}
-
 .viewer-title {
   overflow: hidden;
   flex: 1;
@@ -528,6 +541,194 @@ button {
 .viewer-button:disabled {
   cursor: default;
   opacity: 0.35;
+}
+
+.command-menu-layer {
+  position: fixed;
+  z-index: 130;
+  display: grid;
+  inset: 0;
+  align-items: end;
+}
+
+.command-menu-layer[hidden] {
+  display: none;
+}
+
+.command-menu-scrim {
+  position: absolute;
+  border: 0;
+  background: rgb(0 0 0 / 58%);
+  cursor: pointer;
+  inset: 0;
+  touch-action: manipulation;
+}
+
+.command-menu {
+  position: relative;
+  display: flex;
+  overflow: auto;
+  width: 100%;
+  max-height: min(78vh, 720px);
+  max-height: min(78dvh, 720px);
+  flex-direction: column;
+  padding: 12px max(16px, env(safe-area-inset-right))
+    max(18px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  border-radius: 22px 22px 0 0;
+  background: rgb(25 28 35 / 97%);
+  box-shadow: 0 -20px 70px rgb(0 0 0 / 38%);
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  backdrop-filter: blur(18px);
+}
+
+.command-menu-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.command-menu-header h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.command-menu-close {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface-raised);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.command-menu-actions {
+  display: grid;
+  margin-top: 12px;
+  gap: 8px;
+}
+
+.command-menu-action {
+  display: flex;
+  min-height: 50px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface-raised);
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.command-menu-action kbd,
+.command-shortcuts dd {
+  color: var(--muted);
+  font: 600 0.76rem/1.35 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  text-align: right;
+}
+
+.command-shortcut-title {
+  margin: 20px 0 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+}
+
+.command-shortcuts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
+  margin: 0;
+  gap: 7px 12px;
+  font-size: 0.8rem;
+}
+
+.command-shortcuts dt,
+.command-shortcuts dd {
+  margin: 0;
+}
+
+.command-shortcuts dt {
+  color: #dce2ec;
+}
+
+:is(button, .grid-tile):focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (hover: hover) {
+  .command-menu-action:hover,
+  .icon-button:hover,
+  .viewer-button:hover {
+    border-color: #667183;
+    background: #2b303c;
+  }
+}
+
+@media (max-width: 767px), (pointer: coarse) {
+  .screen > .topbar {
+    position: fixed;
+    z-index: 10;
+    top: 0;
+    right: 0;
+    display: block;
+    min-height: 0;
+    padding: max(10px, env(safe-area-inset-top))
+      max(10px, env(safe-area-inset-right)) 0 0;
+    border: 0;
+    background: transparent;
+    pointer-events: none;
+    backdrop-filter: none;
+  }
+
+  .screen > .topbar > :not(.menu-trigger) {
+    display: none;
+  }
+
+  .screen > .topbar > .menu-trigger {
+    pointer-events: auto;
+  }
+
+  .image-viewer .viewer-ui {
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+  }
+
+  .image-viewer .viewer-ui.top {
+    transform: translateY(-20px);
+  }
+
+  .image-viewer .viewer-ui.bottom {
+    transform: translateY(20px);
+  }
+}
+
+@media (min-width: 768px) and (pointer: fine) {
+  .command-menu-layer {
+    justify-items: end;
+    align-items: stretch;
+  }
+
+  .command-menu {
+    width: min(390px, 42vw);
+    max-height: none;
+    padding: max(18px, env(safe-area-inset-top))
+      max(20px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) 20px;
+    border-width: 0 0 0 1px;
+    border-radius: 0;
+    box-shadow: -20px 0 70px rgb(0 0 0 / 38%);
+  }
 }
 
 @media (min-width: 900px) {

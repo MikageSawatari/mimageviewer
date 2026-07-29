@@ -272,6 +272,52 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
 - **ホバーでしか到達できない機能を作らない**
 - キー割り当ては mIV 本体の既定に寄せる。操作カスタマイズは初期実装では入れない
 
+### 6.5.6 Web PoC のコマンドと固定キー割り当て
+
+フロントエンドは `PointerEvent`、`keydown`、ホイール、ボタンを直接状態変更へ接続せず、
+すべて `next_page` / `prev_page` / `zoom_in` / `zoom_out` / `zoom_reset` /
+`toggle_menu` / `back` / `parent_folder` / `open` 等の共通コマンドへ変換する。コマンド実行時の
+telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳細を記録する。
+
+キーは `docs/keymap.ini.default` の次の既定値へ合わせる。Web に同じ概念がない操作は追加せず、
+ズームの `+` / `-` / `0` だけはブラウザ向けの固定補助キーとする (`FsZoomMode=Z` は本体の
+長押しズームモードであり、Web の離散ズームとは意味が異なるため割り当てない)。PIN 等の
+テキスト入力中はショートカットを一切発火させない。ボタンとメニューでは通常のキー操作を
+優先し、`Esc` / `?` によるメニュー開閉だけを受け付ける。
+
+| Web の文脈 | キー | コマンド | mIV 本体の対応 |
+|---|---|---|---|
+| 画像 | `→` / `↓` / `PageDown` | `next_page` | fullscreen の固定矢印送り / `FsFixedJumpNextNoRtl` |
+| 画像 | `←` / `↑` / `PageUp` | `prev_page` | fullscreen の固定矢印送り / `FsFixedJumpPrevNoRtl` |
+| 画像 | `Home` / `End` | `first_page` / `last_page` | `FsJumpFirst` / `FsJumpLast` |
+| 画像 | `Backspace` / `Enter` / `Esc` | `back` (一覧へ) | `FsBackToList` / `FsClose` / 固定 Esc |
+| 画像 | `+` / `-` / `0` | 拡大 / 縮小 / リセット | Web 固有の固定補助キー |
+| 一覧 | `←` / `↑` / `→` / `↓` | グリッド選択移動 | グリッドの固定矢印移動 |
+| 一覧 | `Enter` | `open_selected` | `GridOpenSelected` |
+| 一覧 | `Backspace` / `Alt+↑` | `parent_folder` | `GridParentFolder` |
+| 一覧 | `Alt+←` / `Alt+→` | `back` / `forward` | `GridHistoryBack` / `GridHistoryForward` |
+| 一覧 | `PageUp` / `PageDown` | 1 画面分移動 | `GridPagePrev` / `GridPageNext` |
+| 一覧 | `Home` / `End` | 先頭 / 末尾を選択 | `GridMoveFirst` / `GridMoveLast` |
+| 共通 | `F11` | `toggle_fullscreen` | `FsToggleWindowMode` / `GridToggleMaximize` |
+| 共通 | `?` | `toggle_menu` | `HelpShowContextShortcuts` |
+
+入力経路とコマンドの対応は次のとおり。メニュー項目はスマートフォンでは下端シート、
+ノート PC では右サイドパネルになるが、DOM とコマンドは共通で CSS だけを切り替える。
+
+| 入力経路 | 直接操作 | 共通コマンド |
+|---|---|---|
+| touch / pen | 左右 34% のタップ、中央タップ、左右スワイプ、ピンチ、拡大中パン | 前 / 次、メニュー、前 / 次、ズーム、パン |
+| mouse | 左右クリックゾーン、中央クリック、右クリック、通常ホイール、Ctrl/Cmd+ホイール | 前 / 次、メニュー、メニュー、前 / 次、ズーム |
+| keyboard | 上表の固定キー | 対応する同一コマンド |
+| 共通メニュー / ボタン | 各項目のクリックまたはタップ | 対応する同一コマンド |
+
+画像領域は `touch-action: none`、`overscroll-behavior: contain`、
+`-webkit-touch-callout: none`、`user-select: none` とする。他の操作ボタンは
+`touch-action: manipulation` とする。iOS Safari の左端スワイプ自体は抑止できないため、
+左端 32px から始まる自前スワイプ判定を無効にし、一覧からビューアを開くときだけ
+`history.pushState`、画像送りは `history.replaceState` を使う。これによりブラウザの「戻る」は
+画像履歴を一枚ずつ戻らず、まずビューアを閉じて一覧へ戻る。
+
 ## 7. PoC レビュー結果 (2026-07-29 / commit `4a68a730`)
 
 ### 7.1 検証済み

@@ -63,3 +63,7 @@ __pycache__/
 tests/snapshots/*.diff.png
 tests/snapshots/*.new.png
 tests/snapshots/*.old.png
+
+# remote-web (PoC) runtime artifacts — must never be committed
+/remote-web-auth.json
+/remote-web-log.jsonl

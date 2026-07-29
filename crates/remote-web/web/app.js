@@ -1,3 +1,13 @@
+import {
+  CommandName,
+  command,
+  commandFromKey,
+  gridIndexForCommand,
+  reduceViewerTransform,
+  viewerTapCommand,
+  viewerWheelCommand,
+} from "/command-core.mjs";
+
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const TELEMETRY_ENABLED = true;
@@ -30,10 +40,26 @@ const state = {
   virtualGrid: null,
   thumbnailTracker: null,
   viewer: null,
+  commandMenu: null,
+  screenContext: "loading",
+  gridIndex: 0,
   authCountdownTimer: 0,
 };
 
 window.addEventListener("popstate", () => dispatchRoute());
+window.addEventListener("keydown", onGlobalKeyDown);
+
+let recentPointerSource = { source: "mouse", at: 0 };
+window.addEventListener(
+  "pointerdown",
+  (event) => {
+    recentPointerSource = {
+      source: pointerInputSource(event.pointerType),
+      at: performance.now(),
+    };
+  },
+  true
+);
 
 if (TELEMETRY_ENABLED) {
   installTelemetry();
@@ -67,12 +93,17 @@ async function enterAuthenticatedApp() {
   renderLoading("お気に入りを読み込んでいます");
   const data = await apiJson("/api/favorites");
   state.favorites = data.favorites ?? [];
-  if (!location.hash) history.replaceState(null, "", "#favorites");
+  if (!location.hash) {
+    history.replaceState({ mivRoute: true }, "", "#favorites");
+  } else {
+    history.replaceState({ ...(history.state ?? {}), mivRoute: true }, "", location.href);
+  }
   await dispatchRoute();
 }
 
 function renderPinLogin(initialRemainingSeconds = 0) {
   cleanupScreen();
+  state.screenContext = "pin";
   state.authenticated = false;
   telemetryState.authenticated = false;
   hudElement.hidden = true;
@@ -225,13 +256,231 @@ function imageHash(favoriteId, path) {
   return `#image/${favoriteId}/${encodeURIComponent(path)}`;
 }
 
-function navigate(hash) {
+function navigate(hash, routeState = {}) {
   if (location.hash === hash) {
     dispatchRoute();
     return;
   }
-  history.pushState(null, "", hash);
+  history.pushState(
+    { mivRoute: true, navigatedInApp: true, ...routeState },
+    "",
+    hash
+  );
   dispatchRoute();
+}
+
+function dispatchCommand(requested, meta = {}) {
+  if (!requested?.name || !state.authenticated) return false;
+  const source = meta.source ?? "mouse";
+  const context = state.screenContext;
+  let handled = false;
+
+  if (requested.name === CommandName.TOGGLE_MENU) {
+    handled = Boolean(state.commandMenu?.toggle());
+  } else if (requested.name === CommandName.BACK) {
+    if (state.commandMenu?.isOpen()) {
+      state.commandMenu.close();
+      handled = true;
+    } else if (state.screenContext === "viewer") {
+      exitBrowserFullscreen();
+      if (history.state?.viewerFromGrid) {
+        history.back();
+      } else {
+        history.replaceState(
+          { mivRoute: true },
+          "",
+          folderHash(state.favoriteId, state.folderPath)
+        );
+        dispatchRoute();
+      }
+      handled = true;
+    } else if (state.screenContext === "grid") {
+      if (history.state?.navigatedInApp) {
+        history.back();
+      } else {
+        dispatchCommand(command(CommandName.PARENT_FOLDER), {
+          source,
+          detail: "back_fallback",
+          telemetry: false,
+        });
+      }
+      handled = true;
+    }
+  } else if (requested.name === CommandName.FORWARD && state.screenContext === "grid") {
+    history.forward();
+    handled = true;
+  } else if (
+    requested.name === CommandName.PARENT_FOLDER &&
+    state.screenContext === "grid"
+  ) {
+    const target = state.folderPath
+      ? folderHash(state.favoriteId, parentPath(state.folderPath))
+      : "#favorites";
+    navigate(target);
+    handled = true;
+  } else if (requested.name === CommandName.OPEN) {
+    handled = executeOpenCommand(requested.payload, meta);
+  } else if (
+    requested.name === CommandName.OPEN_SELECTED &&
+    state.screenContext === "grid"
+  ) {
+    handled = openGridEntry(state.gridIndex, meta);
+  } else if (requested.name === CommandName.TOGGLE_FULLSCREEN) {
+    toggleBrowserFullscreen();
+    handled = true;
+  } else if (requested.name === CommandName.GRID_SELECT) {
+    const index = Number(requested.payload.index);
+    if (state.screenContext === "grid" && Number.isInteger(index)) {
+      state.gridIndex = clamp(index, 0, Math.max(0, state.entries.length - 1));
+      state.virtualGrid?.focusIndex(state.gridIndex, false);
+      handled = true;
+    }
+  } else if (requested.name.startsWith("grid_") && state.screenContext === "grid") {
+    handled = executeGridNavigation(requested.name);
+  } else if (state.screenContext === "viewer") {
+    if (requested.name === CommandName.NEXT_PAGE) handled = changeImage(1);
+    else if (requested.name === CommandName.PREV_PAGE) handled = changeImage(-1);
+    else if (requested.name === CommandName.FIRST_PAGE) handled = changeImageTo(0);
+    else if (requested.name === CommandName.LAST_PAGE) {
+      handled = changeImageTo(state.images.length - 1);
+    } else {
+      handled = Boolean(state.viewer?.execute(requested));
+    }
+  }
+
+  if (handled && meta.telemetry !== false) {
+    enqueueTelemetry({
+      type: "command",
+      command: requested.name,
+      input_source: source,
+      input_detail: meta.detail ? limitText(meta.detail, 80) : undefined,
+      context,
+    });
+  }
+  return handled;
+}
+
+function executeOpenCommand(payload, meta) {
+  if (payload.kind === "favorite" || payload.kind === "folder") {
+    navigate(folderHash(payload.favoriteId, payload.path ?? ""));
+    return true;
+  }
+  if (
+    payload.kind !== "image" ||
+    !Number.isInteger(payload.imageIndex) ||
+    payload.imageIndex < 0 ||
+    payload.imageIndex >= state.images.length
+  ) {
+    return false;
+  }
+  if (Number.isInteger(payload.entryIndex)) {
+    state.gridIndex = payload.entryIndex;
+  }
+  tryEnterBrowserFullscreen();
+  history.pushState(
+    {
+      mivRoute: true,
+      navigatedInApp: true,
+      viewerFromGrid: true,
+      returnHash: folderHash(state.favoriteId, state.folderPath),
+    },
+    "",
+    imageHash(state.favoriteId, payload.path)
+  );
+  renderImageViewer(payload.imageIndex, meta.at ?? performance.now());
+  return true;
+}
+
+function openGridEntry(index, meta) {
+  const entry = state.entries[index];
+  if (!entry) return false;
+  if (entry.kind === "dir") {
+    return executeOpenCommand(
+      { kind: "folder", favoriteId: state.favoriteId, path: entry.path },
+      meta
+    );
+  }
+  const imageIndex = state.images.findIndex((image) => image.path === entry.path);
+  return executeOpenCommand(
+    { kind: "image", path: entry.path, imageIndex, entryIndex: index },
+    meta
+  );
+}
+
+function executeGridNavigation(name) {
+  if (!state.virtualGrid || !state.entries.length) return false;
+  const nextIndex = gridIndexForCommand({
+    current: state.gridIndex,
+    count: state.entries.length,
+    columns: state.virtualGrid.columns,
+    pageRows: state.virtualGrid.visibleRowCount(),
+    name,
+  });
+  if (nextIndex < 0) return false;
+  state.gridIndex = nextIndex;
+  state.virtualGrid.focusIndex(nextIndex, true);
+  return true;
+}
+
+function onGlobalKeyDown(event) {
+  if (!state.authenticated || event.isComposing) return;
+  if (
+    isCommandInteractiveTarget(event.target) &&
+    !["Escape", "?"].includes(event.key)
+  ) {
+    return;
+  }
+  const requested = commandFromKey(
+    {
+      key: event.key,
+      code: event.code,
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+      repeat: event.repeat,
+      editable: isShortcutBlockedTarget(event.target),
+      menuOpen: Boolean(state.commandMenu?.isOpen()),
+    },
+    state.screenContext
+  );
+  if (!requested) return;
+  event.preventDefault();
+  dispatchCommand(requested, { source: "keyboard", detail: event.key });
+}
+
+function isShortcutBlockedTarget(target) {
+  if (!(target instanceof Element)) return false;
+  return Boolean(
+    target.closest('input, textarea, select, [contenteditable="true"]')
+  );
+}
+
+function isCommandInteractiveTarget(target) {
+  if (!(target instanceof Element) || target.closest(".grid-tile")) return false;
+  return Boolean(target.closest('button, a, [role="menu"]'));
+}
+
+function pointerInputSource(pointerType) {
+  return pointerType === "mouse" ? "mouse" : "touch";
+}
+
+function inputSourceFromEvent(event) {
+  if (event.detail === 0) return "keyboard";
+  if (typeof event.pointerType === "string" && event.pointerType) {
+    return pointerInputSource(event.pointerType);
+  }
+  if (performance.now() - recentPointerSource.at < 1500) {
+    return recentPointerSource.source;
+  }
+  return "mouse";
+}
+
+function menuCommand(event, name, payload = {}) {
+  dispatchCommand(command(name, payload), {
+    source: inputSourceFromEvent(event),
+    detail: "menu",
+  });
 }
 
 function cleanupScreen() {
@@ -243,22 +492,31 @@ function cleanupScreen() {
   state.virtualGrid = null;
   state.thumbnailTracker?.destroy();
   state.thumbnailTracker = null;
+  state.commandMenu?.destroy();
+  state.commandMenu = null;
   state.viewer?.destroy();
   state.viewer = null;
+  state.screenContext = "loading";
   app.replaceChildren();
 }
 
 function renderFavorites() {
   cleanupScreen();
+  state.screenContext = "favorites";
   exitBrowserFullscreen();
   document.title = "mIV Remote";
 
   const screen = element("section", "screen");
   const content = element("div", "page-content");
-  const hero = element("header", "hero");
-  hero.append(
+  const hero = element("header", "hero hero-with-menu");
+  const heroText = element("div");
+  heroText.append(
     textElement("h1", "mIV Remote"),
     textElement("p", "お気に入りから閲覧するフォルダを選んでください。")
+  );
+  hero.append(
+    heroText,
+    createMenuButton("操作メニュー")
   );
   content.append(hero);
 
@@ -276,12 +534,22 @@ function renderFavorites() {
         textElement("span", favorite.name, "favorite-name"),
         textElement("span", "›", "favorite-arrow")
       );
-      button.addEventListener("click", () => navigate(folderHash(favorite.id, "")));
+      button.addEventListener("click", (event) => {
+        dispatchCommand(
+          command(CommandName.OPEN, {
+            kind: "favorite",
+            favoriteId: favorite.id,
+            path: "",
+          }),
+          { source: inputSourceFromEvent(event), detail: "favorite", at: performance.now() }
+        );
+      });
       list.append(button);
     }
     content.append(list);
   }
   screen.append(content);
+  state.commandMenu = new CommandMenu(screen, "favorites");
   app.append(screen);
 }
 
@@ -292,6 +560,9 @@ async function showFolder(favoriteId, path) {
 }
 
 async function loadFolder(favoriteId, path) {
+  const requestedPath = path ?? "";
+  const sameFolder =
+    state.favoriteId === favoriteId && state.folderPath === requestedPath;
   state.requestController?.abort();
   const controller = new AbortController();
   state.requestController = controller;
@@ -314,11 +585,15 @@ async function loadFolder(favoriteId, path) {
     (entry) => entry.kind === "dir" || entry.kind === "image"
   );
   state.images = state.entries.filter((entry) => entry.kind === "image");
+  state.gridIndex = sameFolder
+    ? clamp(state.gridIndex, 0, Math.max(0, state.entries.length - 1))
+    : 0;
 }
 
 function renderFolder() {
   const renderStartedAt = performance.now();
   cleanupScreen();
+  state.screenContext = "grid";
   exitBrowserFullscreen();
   document.title = `${state.favoriteName} — mIV Remote`;
 
@@ -327,15 +602,13 @@ function renderFolder() {
   const back = textElement("button", "‹", "icon-button");
   back.type = "button";
   back.setAttribute("aria-label", "戻る");
-  back.addEventListener("click", () => {
-    const parent = parentPath(state.folderPath);
-    if (state.folderPath) {
-      navigate(folderHash(state.favoriteId, parent));
-    } else {
-      navigate("#favorites");
-    }
+  back.addEventListener("click", (event) => {
+    dispatchCommand(command(CommandName.PARENT_FOLDER), {
+      source: inputSourceFromEvent(event),
+      detail: "toolbar",
+    });
   });
-  topbar.append(back, buildBreadcrumbs());
+  topbar.append(back, buildBreadcrumbs(), createMenuButton("操作メニュー"));
 
   const scroll = element("div", "grid-scroll");
   const space = element("div", "virtual-space");
@@ -343,6 +616,14 @@ function renderFolder() {
   space.append(windowElement);
   scroll.append(space);
   screen.append(topbar, scroll);
+  screen.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    dispatchCommand(command(CommandName.TOGGLE_MENU), {
+      source: "mouse",
+      detail: "contextmenu",
+    });
+  });
+  state.commandMenu = new CommandMenu(screen, "grid");
   app.append(screen);
   state.thumbnailTracker = new ThumbnailGridTracker(
     renderStartedAt,
@@ -366,7 +647,7 @@ function renderFolder() {
     space,
     windowElement,
     state.entries,
-    (entry) => createGridTile(entry, imageIndexes, state.thumbnailTracker),
+    (entry, index) => createGridTile(entry, index, imageIndexes, state.thumbnailTracker),
     (initialItems) => state.thumbnailTracker?.begin(initialItems)
   );
 }
@@ -388,9 +669,16 @@ function buildBreadcrumbs() {
     }
     const button = textElement("button", crumb.label, "crumb");
     button.type = "button";
-    button.addEventListener("click", () =>
-      navigate(folderHash(state.favoriteId, crumb.path))
-    );
+    button.addEventListener("click", (event) => {
+      dispatchCommand(
+        command(CommandName.OPEN, {
+          kind: "folder",
+          favoriteId: state.favoriteId,
+          path: crumb.path,
+        }),
+        { source: inputSourceFromEvent(event), detail: "breadcrumb" }
+      );
+    });
     breadcrumbs.append(button);
   });
   requestAnimationFrame(() => {
@@ -399,18 +687,35 @@ function buildBreadcrumbs() {
   return breadcrumbs;
 }
 
-function createGridTile(entry, imageIndexes, thumbnailTracker) {
+function createGridTile(entry, entryIndex, imageIndexes, thumbnailTracker) {
   const tile = element("button", "grid-tile");
   tile.type = "button";
   tile.title = entry.name;
+  tile.dataset.entryIndex = String(entryIndex);
+  tile.classList.toggle("grid-active", entryIndex === state.gridIndex);
+  tile.addEventListener("focus", () => {
+    dispatchCommand(command(CommandName.GRID_SELECT, { index: entryIndex }), {
+      source: "keyboard",
+      detail: "focus",
+      telemetry: false,
+    });
+  });
   const preview = element("span", "tile-preview");
 
   if (entry.kind === "dir") {
     preview.append(textElement("span", "◆", "folder-glyph"));
     preview.append(textElement("span", "folder", "type-badge"));
-    tile.addEventListener("click", () =>
-      navigate(folderHash(state.favoriteId, entry.path))
-    );
+    tile.addEventListener("click", (event) => {
+      dispatchCommand(
+        command(CommandName.OPEN, {
+          kind: "folder",
+          favoriteId: state.favoriteId,
+          path: entry.path,
+          entryIndex,
+        }),
+        { source: inputSourceFromEvent(event), detail: "grid_tile" }
+      );
+    });
   } else {
     preview.append(textElement("span", "◇", "file-glyph"));
     const image = document.createElement("img");
@@ -420,13 +725,22 @@ function createGridTile(entry, imageIndexes, thumbnailTracker) {
     image.dataset.telemetryObserved = "true";
     loadThumbnail(image, entry, thumbnailTracker);
     preview.append(image);
-    tile.addEventListener("click", () => {
-      const interactionStartedAt = performance.now();
-      tryEnterBrowserFullscreen();
+    tile.addEventListener("click", (event) => {
       const index = imageIndexes.get(entry.path);
       if (index !== undefined) {
-        history.pushState(null, "", imageHash(state.favoriteId, entry.path));
-        renderImageViewer(index, interactionStartedAt);
+        dispatchCommand(
+          command(CommandName.OPEN, {
+            kind: "image",
+            path: entry.path,
+            imageIndex: index,
+            entryIndex,
+          }),
+          {
+            source: inputSourceFromEvent(event),
+            detail: "grid_tile",
+            at: performance.now(),
+          }
+        );
       }
     });
   }
@@ -436,6 +750,7 @@ function createGridTile(entry, imageIndexes, thumbnailTracker) {
 
 function renderImageViewer(index, interactionStartedAt = performance.now()) {
   cleanupScreen();
+  state.screenContext = "viewer";
   state.imageIndex = index;
   const imageEntry = state.images[index];
   document.title = `${imageEntry.name} — mIV Remote`;
@@ -453,7 +768,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   close.type = "button";
   close.setAttribute("aria-label", "フォルダへ戻る");
   const title = textElement("div", imageEntry.name, "viewer-title");
-  top.append(close, title);
+  top.append(close, title, createMenuButton("操作メニュー", "viewer-button"));
 
   const bottom = element("div", "viewer-ui bottom");
   const previous = textElement("button", "‹", "viewer-button");
@@ -465,42 +780,60 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   next.setAttribute("aria-label", "次の画像");
   bottom.append(previous, counter, next);
   viewerRoot.append(stage, top, bottom);
+  state.commandMenu = new CommandMenu(viewerRoot, "viewer", viewerRoot);
   app.append(viewerRoot);
 
   state.viewer = new ImageViewer({
     root: viewerRoot,
+    stage,
     image,
     title,
     counter,
     previous,
     next,
-    onClose: () => navigate(folderHash(state.favoriteId, state.folderPath)),
-    onStep: (delta) => changeImage(delta),
   });
   close.addEventListener("click", (event) => {
     event.stopPropagation();
-    navigate(folderHash(state.favoriteId, state.folderPath));
+    dispatchCommand(command(CommandName.BACK), {
+      source: inputSourceFromEvent(event),
+      detail: "toolbar",
+    });
   });
   previous.addEventListener("click", (event) => {
     event.stopPropagation();
-    changeImage(-1);
+    dispatchCommand(command(CommandName.PREV_PAGE), {
+      source: inputSourceFromEvent(event),
+      detail: "toolbar",
+    });
   });
   next.addEventListener("click", (event) => {
     event.stopPropagation();
-    changeImage(1);
+    dispatchCommand(command(CommandName.NEXT_PAGE), {
+      source: inputSourceFromEvent(event),
+      detail: "toolbar",
+    });
   });
   updateViewerImage(interactionStartedAt);
 }
 
 function changeImage(delta) {
-  const nextIndex = state.imageIndex + delta;
+  return changeImageTo(state.imageIndex + delta);
+}
+
+function changeImageTo(nextIndex) {
   if (nextIndex < 0 || nextIndex >= state.images.length) {
-    return;
+    return false;
   }
+  if (nextIndex === state.imageIndex) return false;
   state.imageIndex = nextIndex;
   const entry = state.images[nextIndex];
-  history.pushState(null, "", imageHash(state.favoriteId, entry.path));
+  history.replaceState(
+    { ...(history.state ?? {}), mivRoute: true },
+    "",
+    imageHash(state.favoriteId, entry.path)
+  );
   updateViewerImage(performance.now());
+  return true;
 }
 
 function updateViewerImage(interactionStartedAt = performance.now()) {
@@ -587,7 +920,7 @@ class VirtualGrid {
 
   layout() {
     const width = Math.max(1, this.scroller.clientWidth - 20);
-    const minCellWidth = width < 420 ? 128 : 148;
+    const minCellWidth = width < 420 ? 128 : width < 900 ? 148 : 180;
     const columns = Math.max(1, Math.floor((width + 12) / (minCellWidth + 12)));
     if (columns !== this.columns) {
       this.columns = columns;
@@ -626,9 +959,38 @@ class VirtualGrid {
     this.windowElement.style.top = `${firstRow * this.rowHeight + 6}px`;
     const fragment = document.createDocumentFragment();
     for (let index = startIndex; index < endIndex; index += 1) {
-      fragment.append(this.renderCell(this.items[index]));
+      fragment.append(this.renderCell(this.items[index], index));
     }
     this.windowElement.replaceChildren(fragment);
+  }
+
+  visibleRowCount() {
+    return Math.max(1, Math.floor(this.scroller.clientHeight / this.rowHeight));
+  }
+
+  focusIndex(index, shouldFocus) {
+    const row = Math.floor(index / this.columns);
+    const top = row * this.rowHeight;
+    const bottom = top + this.rowHeight;
+    let scrolled = false;
+    if (top < this.scroller.scrollTop) {
+      this.scroller.scrollTop = top;
+      scrolled = true;
+    } else if (bottom > this.scroller.scrollTop + this.scroller.clientHeight) {
+      this.scroller.scrollTop = bottom - this.scroller.clientHeight;
+      scrolled = true;
+    }
+    let tile = this.windowElement.querySelector(`[data-entry-index="${index}"]`);
+    if (!tile || scrolled) {
+      this.lastRange = "";
+      this.render();
+      tile = this.windowElement.querySelector(`[data-entry-index="${index}"]`);
+    }
+    for (const tile of this.windowElement.querySelectorAll(".grid-active")) {
+      tile.classList.remove("grid-active");
+    }
+    tile?.classList.add("grid-active");
+    if (shouldFocus) tile?.focus({ preventScroll: true });
   }
 
   destroy() {
@@ -684,16 +1046,170 @@ class ThumbnailGridTracker {
   }
 }
 
+function createMenuButton(label, extraClass = "icon-button") {
+  const button = textElement("button", "☰", `${extraClass} menu-trigger`);
+  button.type = "button";
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-haspopup", "dialog");
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    menuCommand(event, CommandName.TOGGLE_MENU);
+  });
+  return button;
+}
+
+function menuDefinition(context) {
+  if (context === "viewer") {
+    return {
+      title: "画像の操作",
+      actions: [
+        [CommandName.PREV_PAGE, "前の画像", "← / ↑ / PageUp"],
+        [CommandName.NEXT_PAGE, "次の画像", "→ / ↓ / PageDown"],
+        [CommandName.ZOOM_IN, "拡大", "+"],
+        [CommandName.ZOOM_OUT, "縮小", "−"],
+        [CommandName.ZOOM_RESET, "ズームを戻す", "0"],
+        [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
+        [CommandName.LAST_PAGE, "最後の画像", "End"],
+        [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+        [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
+      ],
+      shortcuts: [
+        ["前 / 次", "← ↑ PageUp / → ↓ PageDown"],
+        ["ズーム", "+ / − / 0"],
+        ["操作メニュー", "?"],
+        ["先頭 / 最後", "Home / End"],
+        ["一覧へ戻る", "Backspace / Enter / Esc"],
+        ["全画面", "F11"],
+      ],
+    };
+  }
+  if (context === "grid") {
+    return {
+      title: "一覧の操作",
+      actions: [
+        [CommandName.PARENT_FOLDER, "親フォルダへ", "Backspace / Alt+↑"],
+        [CommandName.BACK, "履歴を戻る", "Alt+← / Esc"],
+        [CommandName.FORWARD, "履歴を進む", "Alt+→"],
+        [CommandName.GRID_FIRST, "先頭へ", "Home"],
+        [CommandName.GRID_LAST, "末尾へ", "End"],
+        [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+      ],
+      shortcuts: [
+        ["項目を移動", "← ↑ → ↓"],
+        ["選択項目を開く", "Enter"],
+        ["親フォルダ", "Backspace / Alt+↑"],
+        ["履歴", "Alt+← / Alt+→ / Esc"],
+        ["1画面移動", "PageUp / PageDown"],
+        ["先頭 / 末尾", "Home / End"],
+        ["操作メニュー", "?"],
+        ["全画面", "F11"],
+      ],
+    };
+  }
+  return {
+    title: "操作",
+    actions: [[CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"]],
+    shortcuts: [
+      ["操作メニュー", "?"],
+      ["全画面", "F11"],
+    ],
+  };
+}
+
+class CommandMenu {
+  constructor(host, context, owner = host) {
+    this.owner = owner;
+    this.opened = false;
+    this.previousFocus = null;
+    const definition = menuDefinition(context);
+    this.root = element("div", "command-menu-layer");
+    this.root.hidden = true;
+
+    const scrim = element("button", "command-menu-scrim");
+    scrim.type = "button";
+    scrim.setAttribute("aria-label", "操作メニューを閉じる");
+    scrim.addEventListener("click", (event) => menuCommand(event, CommandName.TOGGLE_MENU));
+
+    const panel = element("section", "command-menu");
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", definition.title);
+    const header = element("header", "command-menu-header");
+    const close = textElement("button", "×", "command-menu-close");
+    close.type = "button";
+    close.setAttribute("aria-label", "操作メニューを閉じる");
+    close.addEventListener("click", (event) => menuCommand(event, CommandName.TOGGLE_MENU));
+    header.append(textElement("h2", definition.title), close);
+    this.closeButton = close;
+
+    const actions = element("div", "command-menu-actions");
+    actions.setAttribute("role", "menu");
+    for (const [name, label, keys] of definition.actions) {
+      const button = element("button", "command-menu-action");
+      button.type = "button";
+      button.setAttribute("role", "menuitem");
+      button.append(textElement("span", label), textElement("kbd", keys));
+      button.addEventListener("click", (event) => {
+        this.close(false);
+        menuCommand(event, name);
+      });
+      actions.append(button);
+    }
+
+    const shortcutTitle = textElement("h3", "有効なキー", "command-shortcut-title");
+    const shortcuts = element("dl", "command-shortcuts");
+    for (const [label, keys] of definition.shortcuts) {
+      shortcuts.append(textElement("dt", label), textElement("dd", keys));
+    }
+    panel.append(header, actions, shortcutTitle, shortcuts);
+    this.root.append(scrim, panel);
+    host.append(this.root);
+  }
+
+  isOpen() {
+    return this.opened;
+  }
+
+  toggle() {
+    if (this.opened) this.close();
+    else this.open();
+    return true;
+  }
+
+  open() {
+    if (this.opened) return;
+    this.opened = true;
+    this.previousFocus = document.activeElement;
+    this.root.hidden = false;
+    this.owner.classList.add("menu-open");
+    requestAnimationFrame(() => this.closeButton.focus());
+  }
+
+  close(restoreFocus = true) {
+    if (!this.opened) return;
+    this.opened = false;
+    this.root.hidden = true;
+    this.owner.classList.remove("menu-open");
+    if (restoreFocus && this.previousFocus instanceof HTMLElement) {
+      this.previousFocus.focus({ preventScroll: true });
+    }
+  }
+
+  destroy() {
+    this.close(false);
+    this.root.remove();
+  }
+}
+
 class ImageViewer {
-  constructor({ root, image, title, counter, previous, next, onClose, onStep }) {
+  constructor({ root, stage, image, title, counter, previous, next }) {
     this.root = root;
+    this.stage = stage;
     this.image = image;
     this.title = title;
     this.counter = counter;
     this.previous = previous;
     this.next = next;
-    this.onClose = onClose;
-    this.onStep = onStep;
     this.scale = 1;
     this.panX = 0;
     this.panY = 0;
@@ -701,6 +1217,8 @@ class ImageViewer {
     this.single = null;
     this.pinch = null;
     this.pinched = false;
+    this.wheelDelta = 0;
+    this.lastWheelCommandAt = 0;
     this.resizeTimer = 0;
     this.loadSequence = 0;
     this.fetchController = null;
@@ -708,9 +1226,16 @@ class ImageViewer {
 
     this.pointerDown = (event) => this.onPointerDown(event);
     this.pointerMove = (event) => this.onPointerMove(event);
-    this.pointerUp = (event) => this.onPointerUp(event);
+    this.pointerUp = (event) => this.onPointerUp(event, false);
+    this.pointerCancel = (event) => this.onPointerUp(event, true);
     this.wheel = (event) => this.onWheel(event);
-    this.keyDown = (event) => this.onKeyDown(event);
+    this.contextMenu = (event) => {
+      event.preventDefault();
+      dispatchCommand(command(CommandName.TOGGLE_MENU), {
+        source: "mouse",
+        detail: "contextmenu",
+      });
+    };
     this.resize = () => {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = setTimeout(() => {
@@ -725,12 +1250,12 @@ class ImageViewer {
       }, 180);
     };
 
-    root.addEventListener("pointerdown", this.pointerDown);
-    root.addEventListener("pointermove", this.pointerMove);
-    root.addEventListener("pointerup", this.pointerUp);
-    root.addEventListener("pointercancel", this.pointerUp);
-    root.addEventListener("wheel", this.wheel, { passive: false });
-    window.addEventListener("keydown", this.keyDown);
+    stage.addEventListener("pointerdown", this.pointerDown);
+    stage.addEventListener("pointermove", this.pointerMove);
+    stage.addEventListener("pointerup", this.pointerUp);
+    stage.addEventListener("pointercancel", this.pointerCancel);
+    stage.addEventListener("wheel", this.wheel, { passive: false });
+    stage.addEventListener("contextmenu", this.contextMenu);
     window.addEventListener("resize", this.resize);
   }
 
@@ -812,13 +1337,26 @@ class ImageViewer {
     this.applyTransform();
   }
 
+  execute(requested) {
+    const next = reduceViewerTransform(
+      { scale: this.scale, panX: this.panX, panY: this.panY },
+      requested
+    );
+    if (!next) return false;
+    this.scale = next.scale;
+    this.panX = next.panX;
+    this.panY = next.panY;
+    this.applyTransform();
+    return true;
+  }
+
   applyTransform() {
     this.image.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
   }
 
   onPointerDown(event) {
-    if (event.target.closest("button")) return;
-    this.root.setPointerCapture?.(event.pointerId);
+    if (["mouse", "pen"].includes(event.pointerType) && event.button !== 0) return;
+    this.stage.setPointerCapture?.(event.pointerId);
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (this.pointers.size === 1) {
       this.single = {
@@ -827,6 +1365,8 @@ class ImageViewer {
         lastX: event.clientX,
         lastY: event.clientY,
         startedAt: performance.now(),
+        edgeGuarded: event.clientX <= 32,
+        moved: false,
       };
       this.pinched = false;
     } else if (this.pointers.size === 2) {
@@ -851,26 +1391,46 @@ class ImageViewer {
       const [first, second] = [...this.pointers.values()];
       const center = midpoint(first, second);
       const ratio = distance(first, second) / Math.max(1, this.pinch.distance);
-      this.scale = clamp(this.pinch.scale * ratio, 1, 6);
-      this.panX = this.pinch.panX + center.x - this.pinch.center.x;
-      this.panY = this.pinch.panY + center.y - this.pinch.center.y;
-      this.applyTransform();
+      dispatchCommand(
+        command(CommandName.SET_TRANSFORM, {
+          scale: clamp(this.pinch.scale * ratio, 1, 6),
+          panX: this.pinch.panX + center.x - this.pinch.center.x,
+          panY: this.pinch.panY + center.y - this.pinch.center.y,
+        }),
+        {
+          source: pointerInputSource(event.pointerType),
+          detail: "pinch_move",
+          telemetry: false,
+        }
+      );
       return;
     }
 
     if (this.scale > 1.01 && this.single && previous) {
-      this.panX += event.clientX - previous.x;
-      this.panY += event.clientY - previous.y;
+      dispatchCommand(
+        command(CommandName.PAN_BY, {
+          dx: event.clientX - previous.x,
+          dy: event.clientY - previous.y,
+        }),
+        {
+          source: pointerInputSource(event.pointerType),
+          detail: "pan_move",
+          telemetry: false,
+        }
+      );
       this.single.lastX = event.clientX;
       this.single.lastY = event.clientY;
-      this.applyTransform();
+      this.single.moved = true;
     }
   }
 
-  onPointerUp(event) {
+  onPointerUp(event, cancelled) {
     if (!this.pointers.has(event.pointerId)) return;
     const single = this.single;
     this.pointers.delete(event.pointerId);
+    if (this.stage.hasPointerCapture?.(event.pointerId)) {
+      this.stage.releasePointerCapture(event.pointerId);
+    }
 
     if (this.pointers.size === 1) {
       const [remaining] = [...this.pointers.values()];
@@ -880,21 +1440,49 @@ class ImageViewer {
         lastX: remaining.x,
         lastY: remaining.y,
         startedAt: performance.now(),
+        edgeGuarded: false,
+        moved: false,
       };
       this.pinch = null;
       return;
     }
     if (this.pointers.size > 0) return;
 
-    if (!this.pinched && single) {
+    const source = pointerInputSource(event.pointerType);
+    if (!cancelled && !this.pinched && single) {
       const dx = event.clientX - single.startX;
       const dy = event.clientY - single.startY;
       const elapsed = performance.now() - single.startedAt;
-      if (this.scale <= 1.01 && Math.abs(dx) > 52 && Math.abs(dx) > Math.abs(dy) * 1.25) {
-        this.onStep(dx < 0 ? 1 : -1);
-      } else if (Math.hypot(dx, dy) < 12 && elapsed < 450) {
-        this.root.classList.toggle("ui-hidden");
+      if (
+        this.scale <= 1.01 &&
+        !single.edgeGuarded &&
+        Math.abs(dx) > 52 &&
+        Math.abs(dx) > Math.abs(dy) * 1.25
+      ) {
+        dispatchCommand(
+          command(dx < 0 ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE),
+          { source, detail: "swipe" }
+        );
+      } else if (!single.moved && Math.hypot(dx, dy) < 12 && elapsed < 450) {
+        dispatchCommand(viewerTapCommand(event.clientX, this.root.clientWidth), {
+          source,
+          detail: "tap_zone",
+        });
+      } else if (single.moved) {
+        dispatchCommand(command(CommandName.PAN_BY, { dx: 0, dy: 0 }), {
+          source,
+          detail: "pan",
+        });
       }
+    } else if (!cancelled && this.pinched) {
+      dispatchCommand(
+        command(CommandName.SET_TRANSFORM, {
+          scale: this.scale,
+          panX: this.panX,
+          panY: this.panY,
+        }),
+        { source, detail: "pinch" }
+      );
     }
     this.single = null;
     this.pinch = null;
@@ -903,19 +1491,29 @@ class ImageViewer {
 
   onWheel(event) {
     event.preventDefault();
-    const factor = event.deltaY < 0 ? 1.14 : 1 / 1.14;
-    this.scale = clamp(this.scale * factor, 1, 6);
-    if (this.scale === 1) {
-      this.panX = 0;
-      this.panY = 0;
+    const zoomModifier = event.ctrlKey || event.metaKey;
+    if (zoomModifier) {
+      dispatchCommand(viewerWheelCommand(event.deltaY, true), {
+        source: "mouse",
+        detail: "wheel_zoom",
+      });
+      return;
     }
-    this.applyTransform();
-  }
-
-  onKeyDown(event) {
-    if (event.key === "ArrowLeft") this.onStep(-1);
-    if (event.key === "ArrowRight") this.onStep(1);
-    if (event.key === "Escape" && !document.fullscreenElement) this.onClose();
+    const delta =
+      event.deltaMode === 1
+        ? event.deltaY * 16
+        : event.deltaMode === 2
+          ? event.deltaY * this.stage.clientHeight
+          : event.deltaY;
+    this.wheelDelta += delta;
+    const now = performance.now();
+    if (Math.abs(this.wheelDelta) < 48 || now - this.lastWheelCommandAt < 220) return;
+    dispatchCommand(viewerWheelCommand(this.wheelDelta, false), {
+      source: "mouse",
+      detail: "wheel_page",
+    });
+    this.wheelDelta = 0;
+    this.lastWheelCommandAt = now;
   }
 
   destroy() {
@@ -924,12 +1522,12 @@ class ImageViewer {
     this.fetchController?.abort();
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
     this.objectUrl = null;
-    this.root.removeEventListener("pointerdown", this.pointerDown);
-    this.root.removeEventListener("pointermove", this.pointerMove);
-    this.root.removeEventListener("pointerup", this.pointerUp);
-    this.root.removeEventListener("pointercancel", this.pointerUp);
-    this.root.removeEventListener("wheel", this.wheel);
-    window.removeEventListener("keydown", this.keyDown);
+    this.stage.removeEventListener("pointerdown", this.pointerDown);
+    this.stage.removeEventListener("pointermove", this.pointerMove);
+    this.stage.removeEventListener("pointerup", this.pointerUp);
+    this.stage.removeEventListener("pointercancel", this.pointerCancel);
+    this.stage.removeEventListener("wheel", this.wheel);
+    this.stage.removeEventListener("contextmenu", this.contextMenu);
     window.removeEventListener("resize", this.resize);
   }
 }
@@ -963,6 +1561,7 @@ function apiUrl(path, params = {}) {
 
 function renderLoading(message) {
   cleanupScreen();
+  state.screenContext = "loading";
   const status = element("div", "center-status");
   status.append(element("div", "spinner"), textElement("div", message));
   app.append(status);
@@ -971,6 +1570,7 @@ function renderLoading(message) {
 function renderError(error) {
   if (error?.name === "AbortError" || error instanceof AuthenticationRequiredError) return;
   cleanupScreen();
+  state.screenContext = "error";
   const status = element("div", "center-status");
   status.append(
     textElement("div", "表示できません", "error-title"),
@@ -1025,6 +1625,14 @@ function tryEnterBrowserFullscreen() {
 function exitBrowserFullscreen() {
   if (document.fullscreenElement && document.exitFullscreen) {
     document.exitFullscreen().catch(() => {});
+  }
+}
+
+function toggleBrowserFullscreen() {
+  if (document.fullscreenElement) {
+    exitBrowserFullscreen();
+  } else {
+    tryEnterBrowserFullscreen();
   }
 }
 
