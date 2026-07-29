@@ -20957,12 +20957,11 @@ mod pipeline_cache_refactor_tests {
         assert!(app.colorize_display_requires_final_effect(idx));
     }
 
-    /// Creative LUT **だけ**のページは待たせない。ここを gate すると、フォルダ移動の
-    /// nav lock が LUT 合成の完了まで伸び、待機中の Ctrl+↑↓ が
-    /// `handle_fullscreen_ctrl_nav_context` の lock ガードで捨てられる。
-    /// カラー化と併用したときだけ、カラー化待ちに合わせて一緒に待つ。
+    /// Creative LUT **だけ**のページも待たせる。LUT もカラー化と同じ「色が変わる最終段」で、
+    /// 待たないと LUT 未適用の絵が 1 フレーム見えてから色が変わる。
+    /// 待機中の Ctrl+↑↓ は folder-nav の accumulator が受け取るので捨てられない。
     #[test]
-    fn colorize_display_gate_ignores_creative_lut_without_colorize() {
+    fn colorize_display_gate_waits_for_creative_lut_without_colorize() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/gate-creative-lut-only.jpg");
@@ -20998,14 +20997,20 @@ mod pipeline_cache_refactor_tests {
         params.colorize.mode = ColorizeMode::Disabled;
         app.adjustment_page_params.insert(idx, params.clone());
         assert!(
-            !app.colorize_display_requires_final_effect(idx),
-            "a creative LUT on its own must not hold the folder-nav lock"
+            app.colorize_display_requires_final_effect(idx),
+            "a creative LUT alone must still hold back the un-graded frame"
         );
 
-        // カラー化を足すと、LUT 未適用フレームを出さないよう一緒に待つ (従来挙動)。
+        // カラー化を足しても当然待つ。
         params.colorize.mode = ColorizeMode::AllImages;
-        app.adjustment_page_params.insert(idx, params);
+        app.adjustment_page_params.insert(idx, params.clone());
         assert!(app.colorize_display_requires_final_effect(idx));
+
+        // LUT を外してカラー化も無効なら、従来どおり待たない。
+        params.colorize.mode = ColorizeMode::Disabled;
+        params.creative_lut.id = None;
+        app.adjustment_page_params.insert(idx, params);
+        assert!(!app.colorize_display_requires_final_effect(idx));
     }
 
     /// フォルダ横断 nav lock は raw / thumbnail の到着だけでは解除しない。

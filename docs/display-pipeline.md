@@ -783,12 +783,12 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 する。final AI は復元・拡大処理で入力の近モノクロ性を反転させないものとして扱う。
 この条件を満たすカラー画像でカラー化が no-op になるページだけ、raw / edit / thumbnail fallback
 を許可する。
-Creative LUT は**カラー化と併用されているときだけ** gate 条件に加える。カラー化待ちの間に
-LUT 未適用画素を一瞬見せないためで、この組み合わせは元々カラー化側の条件で待っていた。
-**LUT 単独のページは gate しない**。ここまで gate すると、フォルダ移動の nav lock
-(`poll_fs_nav_lock` は complete composite を待つ) を視覚上不要な LUT 合成の完了まで伸ばすためで
-ある。lock 中の Ctrl+↑↓ 自体は 2026-07-29 の入力受付整理後は捨てず、上記 accumulator へ渡す。
-post_filter 単独は同期合成なので gate 対象にしない。
+Creative LUT も**単独で** gate 条件に入れる。LUT もカラー化と同じ「色が変わる最終段」であり、
+待たないと LUT 未適用の絵が 1 フレーム見えてから色が変わる (ユーザー報告 2026-07-29)。
+gate している間の Ctrl+↑↓ は捨てず、folder-nav の accumulator が受け取る
+(`handle_fullscreen_ctrl_nav_context` の lock 分岐と `KeyAction::press_multiplicity`)。
+一度この gate を LUT から外した経緯があるが、当時の症状 (押下が消える) の原因は accumulator 側で、
+別途修正済みである。post_filter 単独は同期合成なので gate 対象にしない。
 
 近モノクロ要約は `idx → { EditResultKey, p95_residual }` で memo 化し、`poll_prefetch` の末尾から
 1 frame 最大 4 件、現在の `fullscreen_idx` 最優先で計算する。producer は既存の

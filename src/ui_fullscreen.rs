@@ -2115,14 +2115,13 @@ impl App {
         }
 
         let params = self.effective_params(idx);
-        // Creative LUT 単独では待たない。LUT だけのページまで gate すると、フォルダ移動の
-        // nav lock を視覚上不要な LUT 合成の完了まで伸ばす。lock 中の Ctrl+↑↓ は
-        // accumulator へ渡すが、元々 LUT は gate 対象外なのでここは従来どおり待たない。
-        if !params.colorize.is_enabled() {
-            return false;
-        }
-        // カラー化と併用されている場合だけ、カラー化待ちの間に LUT 未適用のフレームが
-        // 露出しないよう一緒に待つ。この組み合わせは元々カラー化側の条件で待っていた。
+        // Creative LUT もカラー化と同じ「色が変わる最終段」なので、LUT 単独のページでも待つ。
+        // 待たないと LUT 未適用の絵が 1 フレーム見えてから色が変わる (ユーザー報告 2026-07-29)。
+        //
+        // 待っている間の Ctrl+↑↓ は捨てずに folder-nav の accumulator が受け取る
+        // (`handle_fullscreen_ctrl_nav_context` の lock 分岐と `press_multiplicity`)。
+        // 一度この gate を LUT から外したのは押下が捨てられていたためだが、原因は
+        // accumulator 側にあり別途修正済み。
         if self.creative_lut_requires_final_effect(params) {
             return true;
         }
