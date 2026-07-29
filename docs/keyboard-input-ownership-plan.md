@@ -1,6 +1,6 @@
 # キーボード入力所有権の一元化 (案A) — 実装計画
 
-> ステータス: **設計確定 / S1・S2 完了・S3 以降未着手** (2026-07-29)。実装 = Codex Sol、レビュー = ClaudeCode。
+> ステータス: **設計確定 / S1〜S3 完了・S4 以降未着手** (2026-07-29)。実装 = Codex Sol、レビュー = ClaudeCode。
 > 発端: フルスクリーンのパネル内 `TextEdit` へ入力するとショートカットが発動する / 逆に
 > ショートカットが効かなくなる問題の**度重なる再発**。直近の修正試行 `deb62b92` は
 > `52f2fff9` で revert 済み。
@@ -96,11 +96,32 @@ Win32 `KeyEdge` 経路と egui event fallback の **双方**で同じ ownership 
 |---|---|---|
 | S1 | Keymap の ownership 判定を両経路へ (穴 1) | **完了** `70e19f20`。`consume_action` / `pressed_action` / `key_held_action` / `take_key_hold_edges` / `modifier_held_action` を同じ境界へ統一 |
 | S2 | ブックマークタイトル `TextEdit` をタグ入力と同構造へ (穴 4 の個別対応) | **完了** `6d4aa372`。明示 widget ID / `return_key(None)` / 非 IME Enter の明示 submit / focus 復元 |
-| S3 | `KeyboardOwner` / `TextInputPhase` / `ShortcutPermit` の型と、pass 単位の決定関数を追加 | 純粋な状態遷移として単体テスト可能にする |
+| S3 | `KeyboardOwner` / `TextInputPhase` / `ShortcutPermit` の型と、pass 単位の決定関数を追加 | **完了**。純粋な状態遷移、App の単一 snapshot 収集入口、既存 2 系統の互換投影を導入 |
 | S4 | `Keymap` の全 consume 系を permit 必須へ | 呼び出し側を一斉に移行 |
 | S5 | 生 `consume_key` の呼び出しを permit 経由へ移行 + **ソース監査テスト**で router 外の生 consume を禁止 | 列挙漏れの機械的な再発防止 |
 | S6 | 単行入力の共通部品を作り、各ダイアログ / パネルの `TextEdit` を移行 | 潜在バグの一括解消 |
 | S7 | ドキュメント更新 | `docs/keymap-spec.md`、`CLAUDE.md` の IME 節、本計画書 |
+
+### S3 実装記録
+
+- `src/keyboard_input.rs` に `KeyboardOwner`、`TextInputPhase`、`ShortcutScope`、
+  `ShortcutPermit` と `KeyboardOwnershipSnapshot` を配置した。所有者は egui / App を読まない
+  `decide_keyboard_owner(snapshot: KeyboardOwnershipSnapshot) -> KeyboardOwner` で決定し、viewport と
+  cumulative pass 番号を付けて egui の temporary data へ 1 pass だけキャッシュする。
+- App 側の不純な収集入口は
+  `App::keyboard_ownership_snapshot(&self, ctx: &egui::Context) -> KeyboardOwnershipSnapshot` の 1 本だけ。
+  draft である `BookBookmarkTitleEdit` は読まず、App が持つ唯一の
+  `pending_text_input_focus: Cell<Option<PendingTextInputFocusClaim>>` だけを初回 focus 待ちの根拠にする。
+- `PendingTextInputFocusClaim` は編集開始側が `request_focus` と同時に明示発行する。対象 widget に
+  focus が乗った、別 widget が focus を得た、保存 / cancel / 対象削除などで編集が終わった、または
+  対象 viewport の次 pass を無 focus のまま終えた、のいずれかで解除する。別 viewport の pass は
+  claim を消費も aging もしない。
+- `ShortcutPermit` の field は private とし、`KeyboardOwner::ApplicationShortcut` に対する
+  `KeyboardOwner::shortcut_permit` だけを発行経路にした。consume API への permit 必須化は S4 に残す。
+- `App::shortcuts_blocked_by_text_input` と、S1 で Keymap の Win32 / egui 両経路へ入れた
+  `wants_keyboard_input` 境界を、pass 所有者から各々の既存 blocker 集合へ投影する形へ移行した。
+  App と Keymap の blocker 集合は意図的に別のままである。`PendingFocus` を実際の消費禁止へ反映するのは
+  S4 とし、S3 では既存の答えを変えていない。
 
 ## 4. テストで縛る不変条件
 

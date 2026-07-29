@@ -99,6 +99,7 @@ pub mod io_semaphore;
 pub mod key_debug;
 #[cfg(windows)]
 pub mod key_input;
+pub mod keyboard_input;
 pub mod keymap;
 pub mod known_folders;
 pub mod local_adjust_catalog;

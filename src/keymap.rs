@@ -6159,7 +6159,7 @@ impl Keymap {
 
     pub fn key_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
-        if ctx.wants_keyboard_input() {
+        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -6180,7 +6180,7 @@ impl Keymap {
     /// (idle からの同フレーム 押下+離し) を救うために併用する。修飾キー付きは対象外。
     pub fn take_key_hold_edges(&self, ctx: &egui::Context, action: KeyAction) -> (bool, bool) {
         debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
-        if ctx.wants_keyboard_input() {
+        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return (false, false);
         }
         #[cfg(windows)]
@@ -6253,7 +6253,7 @@ impl Keymap {
 
     pub fn modifier_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
-        if ctx.wants_keyboard_input() {
+        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -6549,7 +6549,7 @@ impl Keymap {
         if chord.key.is_none() {
             return false;
         }
-        if ctx.wants_keyboard_input() {
+        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
         #[cfg(windows)]
@@ -6616,7 +6616,7 @@ impl Keymap {
         chord: Chord,
         allow_repeat: bool,
     ) -> usize {
-        if chord.key.is_none() || ctx.wants_keyboard_input() {
+        if chord.key.is_none() || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return 0;
         }
         #[cfg(windows)]
@@ -6721,7 +6721,7 @@ impl Keymap {
         if chord.key.is_none() {
             return false;
         }
-        if ctx.wants_keyboard_input() {
+        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
         #[cfg(windows)]
@@ -7241,6 +7241,29 @@ mod tests {
             events: vec![key_event(key, modifiers)],
             ..Default::default()
         });
+        cache_test_keyboard_owner(ctx);
+    }
+
+    fn cache_test_keyboard_owner(ctx: &egui::Context) {
+        let focused_widget = ctx.memory(|memory| memory.focused());
+        let owner = crate::keyboard_input::decide_keyboard_owner(
+            crate::keyboard_input::KeyboardOwnershipSnapshot {
+                viewport: ctx.viewport_id(),
+                viewport_focused: true,
+                modal: false,
+                focused_text_input: None,
+                pending_text_input: None,
+                ime_grace: false,
+                focused_ui: ctx
+                    .wants_keyboard_input()
+                    .then_some(focused_widget.unwrap_or(egui::Id::NULL)),
+                shortcut_scope: Some(crate::keyboard_input::ShortcutScope::new(
+                    ctx.viewport_id(),
+                    crate::keyboard_input::ShortcutSurface::Main,
+                )),
+            },
+        );
+        crate::keyboard_input::cache_keyboard_owner(ctx, owner);
     }
 
     fn draw_test_focusable(ctx: &egui::Context, id: &'static str) {
@@ -8850,6 +8873,7 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![ctrl_down_edge(false), ctrl_down_edge(false)]);
 
         assert_eq!(
@@ -8870,6 +8894,7 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![
             ctrl_down_edge(false),
             ctrl_down_edge(false),
@@ -8891,6 +8916,7 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![
             ctrl_down_edge(false),
             ctrl_down_edge(true),
@@ -8912,6 +8938,7 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(false), tab_edge(true), tab_edge(true)]);
 
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
@@ -8927,6 +8954,7 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![
             plain_key_edge(0x53, 0x1f),
             plain_key_edge(0x53, 0x1f),
@@ -9116,6 +9144,7 @@ mod tests {
             ],
             ..Default::default()
         });
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(false), tab_edge(true)]);
 
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
@@ -9135,6 +9164,7 @@ mod tests {
             }],
             ..Default::default()
         });
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(true)]);
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         assert!(ctx.input(|i| i.events.is_empty()));
@@ -9219,6 +9249,7 @@ mod tests {
             events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
             ..Default::default()
         });
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
         assert!(ctx.wants_keyboard_input());
@@ -9249,6 +9280,7 @@ mod tests {
             events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
             ..Default::default()
         });
+        cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
         assert!(ctx.wants_keyboard_input());

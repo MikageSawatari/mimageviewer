@@ -17984,6 +17984,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
 
         ctx.begin_pass(Default::default());
+        let _owner = app.keyboard_owner_for_pass(&ctx);
         crate::key_input::set_test_frame(vec![
             crate::key_input::KeyEdge {
                 virtual_key: 0x28,
@@ -18594,33 +18595,95 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn shortcuts_are_blocked_while_search_text_input_has_focus() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let blocked = |app: &App| {
+            let result = std::cell::Cell::new(false);
+            let _ = ctx.run(Default::default(), |ctx| {
+                result.set(app.shortcuts_blocked_by_text_input(ctx));
+            });
+            result.get()
+        };
         // 全フォーカスフラグが false の初期状態ではブロックされない。
-        assert!(!app.shortcuts_blocked_by_text_input());
+        assert!(!blocked(&app));
         // Ctrl+F バー
         app.search_has_focus = true;
-        assert!(app.shortcuts_blocked_by_text_input());
+        assert!(blocked(&app));
         app.search_has_focus = false;
         // Ctrl+S バー
         app.favsearch.has_focus = true;
-        assert!(app.shortcuts_blocked_by_text_input());
+        assert!(blocked(&app));
         app.favsearch.has_focus = false;
         // Ctrl+G バー (本コミットの修正対象)
         app.global_search.has_focus = true;
         assert!(
-            app.shortcuts_blocked_by_text_input(),
+            blocked(&app),
             "Ctrl+G TextEdit フォーカス中も BS / Enter / Ctrl+C 等を grid に漏らさない"
         );
         app.global_search.has_focus = false;
         // アドレスバー
         app.address_has_focus = true;
-        assert!(app.shortcuts_blocked_by_text_input());
+        assert!(blocked(&app));
         app.address_has_focus = false;
         // 画像色 HEX 入力
         app.color_filter.input_has_focus = true;
         assert!(
-            app.shortcuts_blocked_by_text_input(),
+            blocked(&app),
             "画像色 HEX 入力中も BS / F などを grid ショートカットに漏らさない"
         );
+    }
+
+    #[test]
+    fn keyboard_owner_ignores_bookmark_title_draft_without_a_live_claim() {
+        let mut app = setup_app();
+        app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+            id: 7,
+            title: "draft".to_owned(),
+            request_focus: false,
+        });
+        let ctx = egui::Context::default();
+        let owner = std::cell::Cell::new(crate::keyboard_input::KeyboardOwner::Unclaimed);
+
+        let _ = ctx.run(Default::default(), |ctx| {
+            owner.set(app.keyboard_owner_for_pass(ctx));
+        });
+
+        assert!(matches!(
+            owner.get(),
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_text_focus_claim_expires_after_the_next_unfocused_app_pass() {
+        let app = setup_app();
+        let ctx = egui::Context::default();
+        let widget_id = egui::Id::new("pending-bookmark-title");
+
+        ctx.begin_pass(Default::default());
+        assert!(matches!(
+            app.keyboard_owner_for_pass(&ctx),
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+        ));
+        app.claim_pending_text_input_focus(ctx.viewport_id(), widget_id, ctx.cumulative_pass_nr());
+        let _ = ctx.end_pass();
+
+        ctx.begin_pass(Default::default());
+        assert_eq!(
+            app.keyboard_owner_for_pass(&ctx),
+            crate::keyboard_input::KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id,
+                phase: crate::keyboard_input::TextInputPhase::PendingFocus,
+            }
+        );
+        let _ = ctx.end_pass();
+
+        ctx.begin_pass(Default::default());
+        assert!(matches!(
+            app.keyboard_owner_for_pass(&ctx),
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+        ));
+        let _ = ctx.end_pass();
     }
 
     /// 削除確認ダイアログの文言は対象パスのドライブ種別・ゴミ箱設定で変わるため、
@@ -40429,6 +40492,7 @@ mod file_operation_selection_tests {
             }],
             ..Default::default()
         });
+        let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
         let _ = ctx.end_pass();
 

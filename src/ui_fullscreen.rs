@@ -10672,6 +10672,7 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
+        let _owner = self.keyboard_owner_for_pass(ctx);
         if self.viewer_session_is_detached() {
             return false;
         }
@@ -10896,6 +10897,7 @@ impl App {
         // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
         // 次フレームに持ち越されて誤発火するため (Codex P2)。ブロック中は count を捨てる。
         let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+        let _owner = self.keyboard_owner_for_pass(ctx);
 
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let mut action = FsKeyAction {

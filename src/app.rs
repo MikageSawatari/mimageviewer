@@ -8933,6 +8933,10 @@ pub struct App {
     pub(crate) current_book_bookmarks_request: Option<(u64, String)>,
     /// 左パネルで編集中の本ブックマーク名称。
     pub(crate) book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
+    /// `request_focus` 発行後、対象 viewport の次 pass だけを所有する focus claim。
+    /// draft state は所有権に使わず、対象 focus / 別 focus / 編集終了 / 1 pass 失敗で解除する。
+    pending_text_input_focus:
+        std::cell::Cell<Option<crate::keyboard_input::PendingTextInputFocusClaim>>,
     pub(crate) book_bookmark_request_seq: u64,
     pub(crate) book_bookmark_pending_requests: std::collections::HashSet<u64>,
     /// フルスクリーンで読んだ本の履歴 DB。
@@ -11658,6 +11662,7 @@ impl App {
             current_book_bookmarks_key: None,
             current_book_bookmarks_request: None,
             book_bookmark_title_edit: None,
+            pending_text_input_focus: std::cell::Cell::new(None),
             book_bookmark_request_seq: 0,
             book_bookmark_pending_requests: std::collections::HashSet::new(),
             reading_history_db,
@@ -13055,6 +13060,136 @@ impl App {
         self.ime_last_event_at
             .map(|t| t.elapsed() < std::time::Duration::from_millis(300))
             .unwrap_or(false)
+    }
+
+    /// Gather every App/egui input needed by the pass owner in one place.
+    ///
+    /// This is the only impure ownership entry: the decision function itself
+    /// receives copied bool/id values only. `book_bookmark_title_edit` is
+    /// deliberately not read; only the explicit one-pass focus claim below can
+    /// represent an editor before focus lands. Native presenter text input is
+    /// claimed upstream on its own egui context, so no key from that owner is
+    /// forwarded into this App viewport snapshot.
+    fn keyboard_ownership_snapshot(
+        &self,
+        ctx: &egui::Context,
+    ) -> crate::keyboard_input::KeyboardOwnershipSnapshot {
+        use crate::keyboard_input::{
+            PendingFocusEvent, ShortcutScope, ShortcutSurface, TextInputPhase,
+            transition_pending_focus_claim,
+        };
+
+        let viewport = ctx.viewport_id();
+        let viewport_focused = ctx.input(|input| input.viewport().focused).unwrap_or(true);
+        let focused_widget = ctx.memory(|memory| memory.focused());
+        let pending_transition = transition_pending_focus_claim(
+            self.pending_text_input_focus.get(),
+            PendingFocusEvent::ObservePass {
+                viewport,
+                pass: ctx.cumulative_pass_nr(),
+                focused_widget,
+            },
+        );
+        self.pending_text_input_focus.set(pending_transition.claim);
+        let pending_text_input =
+            pending_transition
+                .ownership
+                .and_then(|(claim_viewport, widget_id, phase)| {
+                    (claim_viewport == viewport && phase == TextInputPhase::PendingFocus)
+                        .then_some(widget_id)
+                });
+        let claimed_focused_text_input =
+            pending_transition
+                .ownership
+                .and_then(|(claim_viewport, widget_id, phase)| {
+                    (claim_viewport == viewport && phase == TextInputPhase::Focused)
+                        .then_some(widget_id)
+                });
+
+        let is_root = viewport == egui::ViewportId::ROOT;
+        let tracked_text_input_focused = is_root
+            && (self.address_has_focus
+                || self.search_has_focus
+                || self.favsearch.has_focus
+                || self.global_search.has_focus
+                || self.tag_view.has_focus
+                || self.color_filter.input_has_focus);
+        let focused_text_input = tracked_text_input_focused
+            .then_some(focused_widget.unwrap_or(egui::Id::NULL))
+            .or(claimed_focused_text_input);
+        let wants_keyboard_input = ctx.wants_keyboard_input();
+        let focused_ui = wants_keyboard_input.then_some(focused_widget.unwrap_or(egui::Id::NULL));
+
+        let fullscreen_surface = !is_root
+            || self.viewer_session_blocks_main_window()
+            || self.fs_nav_deferred_reopen_wait_active();
+        let shortcut_scope = Some(ShortcutScope::new(
+            viewport,
+            if fullscreen_surface {
+                ShortcutSurface::Fullscreen
+            } else {
+                ShortcutSurface::Main
+            },
+        ));
+        let modal = if is_root {
+            self.any_dialog_open()
+        } else {
+            self.any_modal_dialog_open_for_fullscreen_keys()
+        };
+
+        crate::keyboard_input::KeyboardOwnershipSnapshot {
+            viewport,
+            viewport_focused,
+            modal,
+            focused_text_input,
+            pending_text_input,
+            ime_grace: self.ime_input_active(),
+            focused_ui,
+            shortcut_scope,
+        }
+    }
+
+    /// Return the owner already selected for this viewport pass, or collect and
+    /// decide it exactly once when the pass first reaches an input handler.
+    pub(crate) fn keyboard_owner_for_pass(
+        &self,
+        ctx: &egui::Context,
+    ) -> crate::keyboard_input::KeyboardOwner {
+        if let Some(owner) = crate::keyboard_input::cached_keyboard_owner(ctx) {
+            return owner;
+        }
+        let owner =
+            crate::keyboard_input::decide_keyboard_owner(self.keyboard_ownership_snapshot(ctx));
+        crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+        owner
+    }
+
+    pub(crate) fn claim_pending_text_input_focus(
+        &self,
+        viewport: egui::ViewportId,
+        widget_id: egui::Id,
+        issued_pass: u64,
+    ) {
+        self.pending_text_input_focus.set(Some(
+            crate::keyboard_input::PendingTextInputFocusClaim::new(
+                viewport,
+                widget_id,
+                issued_pass,
+            ),
+        ));
+    }
+
+    pub(crate) fn clear_pending_text_input_focus(&self) {
+        let transition = crate::keyboard_input::transition_pending_focus_claim(
+            self.pending_text_input_focus.get(),
+            crate::keyboard_input::PendingFocusEvent::EditingEnded,
+        );
+        self.pending_text_input_focus.set(transition.claim);
+    }
+
+    pub(crate) fn clear_book_bookmark_title_edit(&mut self) {
+        self.book_bookmark_title_edit = None;
+        self.clear_pending_text_input_focus();
     }
 
     /// ダイアログ確定用の Enter が押されたか。IME 変換中は常に false を返す。
@@ -24794,7 +24929,7 @@ impl App {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;
             self.current_book_bookmarks_request = None;
-            self.book_bookmark_title_edit = None;
+            self.clear_book_bookmark_title_edit();
         }
         if changed.timed_bookmarks {
             self.fullscreen_video_marker_cache = None;
@@ -26059,7 +26194,7 @@ impl App {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;
             self.current_book_bookmarks_request = None;
-            self.book_bookmark_title_edit = None;
+            self.clear_book_bookmark_title_edit();
             return;
         };
         let key = crate::book_bookmarks::container_key(&entry.container_path);
@@ -26074,7 +26209,7 @@ impl App {
         // 別の本へ移動した直後に、旧コンテナの行を新しい本の行として一瞬表示しない。
         self.current_book_bookmarks.clear();
         self.current_book_bookmarks_key = None;
-        self.book_bookmark_title_edit = None;
+        self.clear_book_bookmark_title_edit();
         let request_id = self.next_book_bookmark_request_id();
         if let Some(service) = self.book_bookmark_service.as_ref() {
             service.list_for_container(request_id, entry.container_path);
@@ -26114,7 +26249,7 @@ impl App {
                     self.book_bookmark_service = None;
                     self.book_bookmark_pending_requests.clear();
                     self.current_book_bookmarks_request = None;
-                    self.book_bookmark_title_edit = None;
+                    self.clear_book_bookmark_title_edit();
                     self.show_feedback_toast("ブックマークDBとの接続が終了しました".to_string());
                     break;
                 }
@@ -26157,7 +26292,7 @@ impl App {
                             if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
                                 == Some(id)
                             {
-                                self.book_bookmark_title_edit = None;
+                                self.clear_book_bookmark_title_edit();
                             }
                             self.notify_bookmarks_changed();
                             self.show_feedback_toast("ブックマークを削除しました".to_string());
@@ -26180,7 +26315,7 @@ impl App {
                             if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
                                 == Some(id)
                             {
-                                self.book_bookmark_title_edit = None;
+                                self.clear_book_bookmark_title_edit();
                             }
                             if self.items_are_bookmark_view {
                                 self.refresh_bookmark_browser();
@@ -26249,7 +26384,7 @@ impl App {
         self.current_book_bookmarks.clear();
         self.current_book_bookmarks_key = None;
         self.current_book_bookmarks_request = None;
-        self.book_bookmark_title_edit = None;
+        self.clear_book_bookmark_title_edit();
         self.notify_bookmarks_changed();
     }
 
@@ -30265,7 +30400,7 @@ impl App {
             return None;
         }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
-        if self.shortcuts_blocked_by_text_input() {
+        if self.shortcuts_blocked_by_text_input(ctx) {
             return None;
         }
 
@@ -32724,17 +32859,9 @@ impl App {
     /// 数フレーム) に、グリッド側 Ctrl+↑↓ が `FolderNavMode::Grid` で再 enqueue されて
     /// in-flight Fullscreen-mode nav をキャンセルしてしまうのを防ぐため。ユーザーの
     /// 意図はフルスクリーン継続なので、この待ち中はグリッドショートカットを全部抑止する。
-    pub(crate) fn shortcuts_blocked_by_text_input(&self) -> bool {
-        self.viewer_session_blocks_main_window()
-            || self.ime_input_active()
-            || self.fs_nav_deferred_reopen_wait_active()
-            || self.any_dialog_open()
-            || self.address_has_focus
-            || self.search_has_focus
-            || self.favsearch.has_focus
-            || self.global_search.has_focus
-            || self.tag_view.has_focus
-            || self.color_filter.input_has_focus
+    pub(crate) fn shortcuts_blocked_by_text_input(&self, ctx: &egui::Context) -> bool {
+        self.keyboard_owner_for_pass(ctx)
+            .blocks_legacy_main_shortcuts()
     }
 
     fn collect_shell_clipboard_paths(&self) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
@@ -32853,7 +32980,7 @@ impl App {
     /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
     fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !main_focused || self.shortcuts_blocked_by_text_input() {
+        if !main_focused || self.shortcuts_blocked_by_text_input(ctx) {
             return;
         }
 
@@ -59417,6 +59544,10 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
+        // Select and cache the root viewport owner before any shortcut path.
+        // This also ages a root PendingFocus claim on every pass, including
+        // passes that return before the normal keyboard handler.
+        let _keyboard_owner = self.keyboard_owner_for_pass(ctx);
         self.edit_preview_repaint_ctx = Some(ctx.clone());
         if self
             .creative_lut_library

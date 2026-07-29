@@ -8976,6 +8976,10 @@ mod creative_lut_ui_tests {
     }
 }
 
+fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
+    egui::Id::new("book_bookmark_title_edit").with(bookmark_id)
+}
+
 fn draw_bookmark_title_edit(
     ui: &mut egui::Ui,
     bookmark_id: i64,
@@ -8986,7 +8990,7 @@ fn draw_bookmark_title_edit(
 ) -> (egui::Response, bool) {
     let response = ui.add(
         egui::TextEdit::singleline(title)
-            .id(egui::Id::new("book_bookmark_title_edit").with(bookmark_id))
+            .id(book_bookmark_title_edit_widget_id(bookmark_id))
             .desired_width(ui.available_width())
             .hint_text("未設定")
             .return_key(None::<egui::KeyboardShortcut>),
@@ -13138,13 +13142,20 @@ impl App {
                 }
             });
         if let Some(edit) = start_title_edit {
+            self.claim_pending_text_input_focus(
+                ctx.viewport_id(),
+                book_bookmark_title_edit_widget_id(edit.id),
+                ctx.cumulative_pass_nr(),
+            );
             title_edit = Some(edit);
         }
         if cancel_title_edit {
             title_edit = None;
+            self.clear_pending_text_input_focus();
         }
         if let Some((id, title)) = save_title {
             title_edit = None;
+            self.clear_pending_text_input_focus();
             self.set_book_bookmark_title(id, title);
         }
         self.book_bookmark_title_edit = title_edit;
