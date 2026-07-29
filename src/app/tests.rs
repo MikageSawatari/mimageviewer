@@ -19252,6 +19252,114 @@ mod favorite_adjustment_defaults_tests {
     }
 }
 
+#[cfg(test)]
+mod thumbnail_progress_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use crate::grid_item::{GridItem, ThumbnailState};
+    use std::path::PathBuf;
+
+    fn seed_stale_progress_peaks(app: &mut App) {
+        app.requested.clear();
+        app.keep_set.clear();
+        app.texture_backlog.clear();
+        app.progress_normal_peak = 7;
+        app.progress_upgrade_peak = 11;
+    }
+
+    fn assert_progress_peaks_cleared(app: &App) {
+        assert_eq!(app.progress_normal_peak, 0);
+        assert_eq!(app.progress_upgrade_peak, 0);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_clear_in_details_mode() {
+        let mut app = setup_app();
+        seed_stale_progress_peaks(&mut app);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.details_thumb_suppression_applied = true;
+        app.thumbnail_eviction_generation = Some(app.items_generation);
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_progress_peaks_cleared(&app);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_clear_while_delete_pending() {
+        let mut app = setup_app();
+        seed_stale_progress_peaks(&mut app);
+        let (_delete_tx, delete_rx) = std::sync::mpsc::channel();
+        app.delete_pending = Some(crate::delete_worker::DeletePending {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx: delete_rx,
+            total: 0,
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+            purged_pdf_password_paths: Vec::new(),
+            purge_deferred: false,
+        });
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_progress_peaks_cleared(&app);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_clear_when_items_are_empty() {
+        let mut app = setup_app();
+        seed_stale_progress_peaks(&mut app);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.items.clear();
+        app.visible_indices.clear();
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_progress_peaks_cleared(&app);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_track_active_requests_in_fullscreen() {
+        let mut app = setup_app();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/progress/a.jpg")),
+            GridItem::Image(PathBuf::from("c:/progress/b.jpg")),
+        ];
+        app.image_metas = vec![None, None];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.visible_indices = vec![0, 1];
+        app.keep_set = std::collections::HashSet::from([0, 1]);
+        app.requested.clear();
+        app.requested.insert(0, false);
+        app.requested.insert(1, true);
+        app.texture_backlog.clear();
+        app.progress_normal_peak = 0;
+        app.progress_upgrade_peak = 0;
+        app.fullscreen_idx = Some(0);
+        app.last_cell_size = 100.0;
+        app.last_cell_h = 100.0;
+        app.last_viewport_h = 100.0;
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(app.progress_normal_peak, 1);
+        assert_eq!(app.progress_upgrade_peak, 1);
+    }
+}
+
 /// v1.1.0 pipeline refactor: edit-result cache and final-composite cache must
 /// be invalidated on different axes.
 #[cfg(test)]

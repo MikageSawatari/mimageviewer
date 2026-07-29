@@ -29639,11 +29639,7 @@ impl App {
         self.enqueue_idle_upgrades();
         let t5 = frame_t0.elapsed();
 
-        // (4) 進捗ピーク値の更新 (プログレスバー表示用)
-        self.update_progress_peaks();
-        let t6 = frame_t0.elapsed();
-
-        // (5) 固着診断 (5 秒に 1 回): keep_set 内で state が Pending/Evicted
+        // (4) 固着診断 (5 秒に 1 回): keep_set 内で state が Pending/Evicted
         //     なのに `requested` に居座っているエントリを検出する。
         //     正常時は Pending/Evicted なら再エンキューされて Loaded に進むはず。
         //     この状態が続くと、サムネが「読み込み中」のまま永遠に戻らない。
@@ -29680,14 +29676,13 @@ impl App {
             }
         }
 
-        if (t6 - t1).as_millis() > 5 {
+        if (t5 - t1).as_millis() > 5 {
             crate::logger::log(format!(
-                "    [keep detail] evict={:.1}ms scan={:.1}ms lock+push={:.1}ms idle={:.1}ms peaks={:.1}ms",
+                "    [keep detail] evict={:.1}ms scan={:.1}ms lock+push={:.1}ms idle={:.1}ms",
                 (t2 - t1).as_secs_f64() * 1000.0,
                 (t3 - t2).as_secs_f64() * 1000.0,
                 (t4 - t3).as_secs_f64() * 1000.0,
                 (t5 - t4).as_secs_f64() * 1000.0,
-                (t6 - t5).as_secs_f64() * 1000.0,
             ));
         }
 
@@ -29863,6 +29858,19 @@ impl App {
             self.last_promoted_visible_keys = None;
             self.promote_retry_pending = false;
         }
+    }
+
+    /// サムネイル要求と進捗ピークの毎フレーム bookkeeping 境界。
+    ///
+    /// keep-range 更新は詳細表示・削除中・空一覧で早期 return するが、進捗ピークの寿命は
+    /// それらと独立しているため、その後も必ず更新する。
+    fn update_thumbnail_frame_bookkeeping(
+        &mut self,
+        ctx: &egui::Context,
+        frame_t0: std::time::Instant,
+    ) {
+        self.update_keep_range_and_requests(ctx, frame_t0);
+        self.update_progress_peaks();
     }
 
     /// 現フレームの visible 範囲 (strict、prefetch 含まず) に対応する PDF perf_key 集合を返す。
@@ -59979,7 +59987,7 @@ impl eframe::App for App {
         self.poll_fs_nav_lock(ctx);
         let t_poll = frame_t0.elapsed();
 
-        self.update_keep_range_and_requests(ctx, frame_t0);
+        self.update_thumbnail_frame_bookkeeping(ctx, frame_t0);
         // 会計はここで出す。update の tail はフルスクリーン中に early return で
         // 飛ばされるため、tail に置くと「測りたいフルスクリーン中」だけ欠測する。
         self.emit_vram_accounting_if_due(std::time::Instant::now());
