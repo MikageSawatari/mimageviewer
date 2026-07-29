@@ -523,9 +523,10 @@ independent passive window として残す。動画は複数窓化せず、専�
 host 内で presenter raise 要求へ寄せる。同じ raw idx でも item key / generation が変わっている場合は、
 通常どおり再オープンして表示状態を更新する。
 
-detached session で見開き 2 ページ表示中は、メイン一覧の通常カーソルを現在ページに置き、
+F12 linked detached session で見開き 2 ページ表示中は、メイン一覧の通常カーソルを現在ページに置き、
 相方ページがグリッド / 詳細一覧の可視範囲内に描画される場合だけ破線のサブカーソルを重ねる。
-相方がスクロール外なら追加描画は行わない。detached 動画はメインウィンドウを占有しないため、
+相方がスクロール外なら追加描画は行わない。複数ウィンドウモード / independent detached session は
+メイン一覧との見開き連動表示ではないため、破線のサブカーソルを描画しない。detached 動画はメインウィンドウを占有しないため、
 fullscreen / in-window 動画用の main backdrop や black chrome 判定から除外する。
 
 detached window placement は `settings.detached_viewer_window_placement` に保存する。
@@ -1012,6 +1013,8 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする。
 `resolve_spread_pair` は先に表示ユニット列を組み、表紙、横長ページ、末尾端数を単独ユニットにして、
 横長ページの次の縦長ページから通常の見開きペアリングを再開する。
+2 ページのペア化対象は `GridItem::Image` / `ZipImage` / `PdfPage` だけである。
+`Video` / `Audio` はナビゲーション列に含まれる場合も必ず単独表示ユニットにし、静止画との混在でもペア化しない。
 前後移動も同じ表示ユニット列を使い、`FsPageNav::Target(index)` または
 `FsPageNav::Boundary` として解決する。見開き末尾から次へ進む入力を raw page delta に戻さないため、
 内部 index が同じ見開きの片側へ移ることはなく、最初の入力で末尾ヒントを表示する。キー、ホイール、

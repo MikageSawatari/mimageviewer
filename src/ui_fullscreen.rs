@@ -3500,6 +3500,13 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
         .collect()
 }
 
+fn is_spread_pairable_item(item: Option<&GridItem>) -> bool {
+    matches!(
+        item,
+        Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) | Some(GridItem::PdfPage { .. })
+    )
+}
+
 pub(crate) fn navigable_delta_between(
     items: &[GridItem],
     display_order: &[usize],
@@ -3874,21 +3881,43 @@ impl SpreadDisplayUnit {
 
 fn build_spread_display_units(
     nav: &[usize],
+    items: &[GridItem],
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
     fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
     thumbnails: &[ThumbnailState],
 ) -> Vec<SpreadDisplayUnit> {
-    build_spread_display_units_with_landscape(nav, spread_mode, shift_anchor_idx, |idx| {
-        is_landscape(idx, fs_cache, thumbnails)
-    })
+    build_spread_display_units_with_predicates(
+        nav,
+        spread_mode,
+        shift_anchor_idx,
+        |idx| is_landscape(idx, fs_cache, thumbnails),
+        |idx| is_spread_pairable_item(items.get(idx)),
+    )
 }
 
+#[cfg(test)]
 fn build_spread_display_units_with_landscape(
     nav: &[usize],
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
+    is_landscape_idx: impl FnMut(usize) -> bool,
+) -> Vec<SpreadDisplayUnit> {
+    build_spread_display_units_with_predicates(
+        nav,
+        spread_mode,
+        shift_anchor_idx,
+        is_landscape_idx,
+        |_| true,
+    )
+}
+
+fn build_spread_display_units_with_predicates(
+    nav: &[usize],
+    spread_mode: SpreadMode,
+    shift_anchor_idx: Option<usize>,
     mut is_landscape_idx: impl FnMut(usize) -> bool,
+    mut is_pairable_idx: impl FnMut(usize) -> bool,
 ) -> Vec<SpreadDisplayUnit> {
     let mut units = Vec::new();
     let mut pos = 0usize;
@@ -3903,7 +3932,14 @@ fn build_spread_display_units_with_landscape(
         pos = 1;
     }
 
-    append_spread_display_units_until(nav, &mut units, &mut pos, prefix_end, &mut is_landscape_idx);
+    append_spread_display_units_until(
+        nav,
+        &mut units,
+        &mut pos,
+        prefix_end,
+        &mut is_landscape_idx,
+        &mut is_pairable_idx,
+    );
 
     if let Some(anchor_pos) = shift_anchor_pos {
         pos = anchor_pos;
@@ -3913,6 +3949,7 @@ fn build_spread_display_units_with_landscape(
             &mut pos,
             nav.len(),
             &mut is_landscape_idx,
+            &mut is_pairable_idx,
         );
     }
 
@@ -3925,10 +3962,11 @@ fn append_spread_display_units_until(
     pos: &mut usize,
     end_pos: usize,
     is_landscape_idx: &mut impl FnMut(usize) -> bool,
+    is_pairable_idx: &mut impl FnMut(usize) -> bool,
 ) {
     while *pos < end_pos {
         let current = nav[*pos];
-        if is_landscape_idx(current) {
+        if !is_pairable_idx(current) || is_landscape_idx(current) {
             units.push(SpreadDisplayUnit {
                 nav_start: *pos,
                 pages: vec![current],
@@ -3939,7 +3977,7 @@ fn append_spread_display_units_until(
 
         if *pos + 1 < end_pos {
             let partner = nav[*pos + 1];
-            if !is_landscape_idx(partner) {
+            if is_pairable_idx(partner) && !is_landscape_idx(partner) {
                 units.push(SpreadDisplayUnit {
                     nav_start: *pos,
                     pages: vec![current, partner],
@@ -6835,6 +6873,7 @@ impl App {
             let nav = self.get_nav_indices();
             let units = build_spread_display_units(
                 &nav,
+                &self.items,
                 self.spread_mode,
                 self.spread_shift_anchor_idx,
                 &self.fs_cache,
@@ -10400,6 +10439,7 @@ impl App {
         };
         let units = build_spread_display_units(
             &nav,
+            &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
             &self.fs_cache,
@@ -10461,6 +10501,7 @@ impl App {
         }
         let units = build_spread_display_units(
             nav,
+            &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
             &self.fs_cache,
@@ -10490,6 +10531,7 @@ impl App {
         let nav = self.get_nav_indices();
         let units = build_spread_display_units(
             &nav,
+            &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
             &self.fs_cache,
@@ -10497,7 +10539,10 @@ impl App {
         );
         let landscape_flags = nav
             .iter()
-            .map(|&idx| is_landscape(idx, &self.fs_cache, &self.thumbnails))
+            .map(|&idx| {
+                !is_spread_pairable_item(self.items.get(idx))
+                    || is_landscape(idx, &self.fs_cache, &self.thumbnails)
+            })
             .collect::<Vec<_>>();
         spread_offset_nudge_from_units(&nav, &units, fs_idx, dir, &landscape_flags)
     }
@@ -10558,6 +10603,7 @@ impl App {
         let nav = self.get_nav_indices();
         let units = build_spread_display_units(
             &nav,
+            &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
             &self.fs_cache,
@@ -15434,6 +15480,7 @@ impl App {
             image_units.extend(
                 build_spread_display_units(
                     &image_indices,
+                    &self.items,
                     self.spread_mode,
                     self.spread_shift_anchor_idx,
                     &self.fs_cache,

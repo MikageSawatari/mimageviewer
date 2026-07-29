@@ -12031,6 +12031,69 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn spread_videos_are_always_single_display_units() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+
+        let mut app = setup_app();
+        for name in ["video1.mp4", "video2.mp4"] {
+            app.items
+                .push(GridItem::Video(std::path::PathBuf::from(format!(
+                    "c:/clips/{name}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+
+        assert_eq!(app.resolve_spread_pair(0), SpreadPair::Single);
+        assert_eq!(app.resolve_spread_pair(1), SpreadPair::Single);
+    }
+
+    #[test]
+    fn spread_images_and_videos_never_pair_with_each_other() {
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+
+        let mut app = setup_app();
+        app.items.extend([
+            GridItem::Image("c:/mixed/image1.jpg".into()),
+            GridItem::Video("c:/mixed/video1.mp4".into()),
+            GridItem::Image("c:/mixed/image2.jpg".into()),
+        ]);
+        app.thumbnails = vec![ThumbnailState::Pending; 3];
+        app.visible_indices = vec![0, 1, 2];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+
+        for idx in 0..3 {
+            assert_eq!(app.resolve_spread_pair(idx), SpreadPair::Single);
+        }
+    }
+
+    #[test]
+    fn spread_images_still_form_a_double_display_unit() {
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+
+        let mut app = setup_app();
+        app.items.extend([
+            GridItem::Image("c:/pics/image1.jpg".into()),
+            GridItem::Image("c:/pics/image2.jpg".into()),
+        ]);
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.visible_indices = vec![0, 1];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+
+        let expected = SpreadPair::Double { left: 0, right: 1 };
+        assert_eq!(app.resolve_spread_pair(0), expected);
+        assert_eq!(app.resolve_spread_pair(1), expected);
+    }
+
+    #[test]
     fn bug766_spread_pair_resyncs_after_landscape_in_cover_mode() {
         use crate::grid_item::{GridItem, ThumbnailState};
         use crate::settings::SpreadMode;
@@ -37495,7 +37558,24 @@ mod still_window_mode_key_tests {
 
         assert_eq!(app.main_grid_spread_pair_cursor_idx(), Some(right));
 
+        app.settings.detached_viewer_open_images_in_window = true;
+        assert_eq!(app.main_grid_spread_pair_cursor_idx(), None);
+
+        app.settings.detached_viewer_open_images_in_window = false;
         app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert_eq!(app.main_grid_spread_pair_cursor_idx(), None);
+    }
+
+    #[test]
+    fn multi_window_video_has_no_main_grid_spread_pair_cursor() {
+        let mut app = setup_app();
+        let first = push_video(&mut app, r"C:\clips\video1.mp4");
+        let _second = push_video(&mut app, r"C:\clips\video2.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
         assert_eq!(app.main_grid_spread_pair_cursor_idx(), None);
     }
 

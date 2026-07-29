@@ -33495,6 +33495,10 @@ impl App {
         if !self.viewer_session_is_detached() {
             return None;
         }
+        #[cfg(windows)]
+        if self.detached_independent_session_blocks_folder_nav() {
+            return None;
+        }
         let fs_idx = self.fullscreen_idx?;
         match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } if fs_idx == left => {

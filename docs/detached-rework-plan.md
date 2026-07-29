@@ -330,4 +330,4 @@ Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaW
 
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
-| (まだ無し) | | | |
+| 2026-07-29 | 複数ウィンドウ / independent detached session ではメイン一覧の見開き相方カーソルを描画しない | `App::main_grid_spread_pair_cursor_idx` から既存の `detached_independent_session_blocks_folder_nav` を再利用 | 破線カーソルはメイン一覧と同期する F12 linked session 専用の表示であり、独立 session の ownership と矛盾していた。事前分析と Codex のコード裏取りが一致し、新規 bool / Option / detached 述語、viewport / lifecycle 変更を伴わない構造的な表示責務の修正と判断 |
