@@ -512,6 +512,78 @@ P1 hang、production pump/render 分離、channel/reducer、VST owner ack はこ
 DirectComposition の cross-thread target が対象環境で成立しなければ Stage 4 へ進まず、A1 を
 再評価する。
 
+#### Stage 3 実測結果 (2026-07-29)
+
+**結論: 対象の NVIDIA 環境では成立した。** pump 専用 thread が所有する別 thread の child
+HWND に対し、render thread から DirectComposition target と composition swap chain を
+attach し、色 clear、`Present`、`Commit`、`WaitForCommitCompletion`、`DwmFlush` まで成功した。
+render thread を DComp resource 保持中の channel wait で意図的に停止しても、pump の ping、
+resize、close、別 thread 所有 child を持つ parent の destroy はすべて bounded time で完了した。
+停止解除後の `SetRoot(None)`、commit completion、resource drop も成功したため、この実測環境では
+案 B の Stage 4 前提を満たす。production runtime、設定/profile、decoder、実動画は使用していない。
+
+Windows-only harness は `src/video/native_window_thread_spike.rs` に test-only で置き、
+`src/video/mod.rs` から `cfg(all(test, windows))` のときだけ接続した。通常 CI / 通常の
+`cargo test --lib` では hardware gate を走らせないよう `#[ignore]` とし、明示実行時は外側 test が
+同じ test binary を subprocess として起動する。外側 watchdog は 30 秒で subprocess を kill して
+失敗にするため、Win32 / driver call が永久停止しても test runner を無限に止めない。個別 phase は
+3 秒、GPU attach/present/detach は 10 秒で待つ。成功経路では close / parent destroy 後の pump
+barrier、全 HWND の `IsWindow == false`、3 thread の終了を確認した。
+
+実行コマンドと結果:
+
+```powershell
+cargo test -p mimageviewer --lib video::native_window_thread_spike::cross_thread_dcomp_present_remains_pump_independent_when_render_stalls -- --ignored --exact --nocapture
+# 1 passed, child 実測 0.37 s / watchdog 込み 0.47 s
+
+cargo test -p mimageviewer --lib
+# 4454 passed, 0 failed, 19 ignored
+```
+
+最終実測値 (同一 run):
+
+| 検証項目 | 結果 | 実測 / 完了境界 |
+| --- | --- | --- |
+| HWND owner 分離 | 成立 | parent owner thread、pump thread、render thread がすべて別 Win32 thread ID。2 child の owner が pump thread と一致 |
+| cross-thread DComp attach / present | 成立 | case 1: attach 2.709 ms、present + commit completion + `DwmFlush` 26.436 ms。case 2: 1.158 ms / 27.731 ms |
+| render stall 中 pump ping | 成立 | case 1: 0.032 ms、case 2: 0.033 ms |
+| render stall 中 resize | 成立 | child client 320x180 → 384x216、0.672 ms |
+| render stall 中 close | 成立 | pump thread の `WM_CLOSE` → `DestroyWindow` 復帰まで 5.003 ms。復帰後 `IsWindow == false` |
+| render stall 中 parent destroy | 成立 | parent owner thread の `DestroyWindow(parent)` 復帰 4.349 ms、child `WM_NCDESTROY` 後の pump barrier まで 5.003 ms。parent / child とも `IsWindow == false` |
+| HWND 破棄後の DComp detach | 成立 | case 1: 26.329 ms、case 2: 24.432 ms。各 `SetRoot(None)` + commit completion + `DwmFlush` 成功 |
+| test process bounded exit | 成立 | 30 秒 watchdog 内に subprocess が正常終了。全 4 HWND と全 3 worker thread の cleanup を確認 |
+| composed pixel の画素 / 目視検証 | 未検証 | API-level の clear / `Present` / commit completion / `DwmFlush` は成功したが、screen capture / pixel probe は実施していない |
+
+実行環境:
+
+- OS: registry `ProductName = Windows 10 Pro`、`DisplayVersion = 25H2`、build
+  `26200.8875`、`BuildLabEx = 26100.1.amd64fre.ge_release.240331-1435`。
+- DXGI adapter: NVIDIA GeForce RTX 4090、vendor `0x10DE`、device `0x2684`、dedicated VRAM
+  24138 MiB、D3D feature level `0xB100` (11.1)。
+- display driver: `32.0.15.9621`。`IDXGIAdapter::CheckInterfaceSupport(ID3D11Device)` では version
+  を取得できなかったため、同じ adapter 名 / PCI vendor+device に一致する read-only の
+  `HKLM\\SYSTEM\\CurrentControlSet\\Control\\Video\\...\\0000` から採取した。
+
+未検証のまま残る matrix:
+
+| Matrix | 状態 | 未知の内容 / 後続 gate |
+| --- | --- | --- |
+| NVIDIA の別世代 / 別 driver | 未検証 | RTX 4090 + 32.0.15.9621 の 1 点のみ。driver update / downgrade 差は未知 |
+| Intel | 未検証 | machine には Intel Graphics driver も存在するが、この run の hardware D3D device は RTX 4090。Intel adapter 強制選択は未実施 |
+| AMD | 未検証 | adapter / driver とも未実施 |
+| hybrid GPU / adapter 切替 / RDP / WARP | 未検証 | process 中の adapter change、remote session、software adapter は未実施 |
+| DComp target recreate | 部分検証 | 同じ D3D / DComp device で異なる 2 child HWND へ順次 target を作る経路は成功。同一 HWND への detach → target recreate、failure 後 recreate は未検証 |
+| HWND 数値 reuse | 未検証 | 2 HWND は別値。破棄後に同じ raw HWND 値が再利用される case は未発生 |
+| DPI / monitor change | 未検証 | per-monitor DPI change、monitor 間移動、refresh-rate / HDR / MPO 差は未実施 |
+| visible composed pixels | 未検証 | API submission / completion の成立のみ。visible window での画素、ちらつき、色、present cadence は Stage 7 実機 gate に残す |
+| 長時間 / 繰り返し / device lost | 未検証 | 2 lifecycle のみ。大量 recreate、TDR、device removed、DWM restart は未実施 |
+
+設計判断は **Stage 4 へ進んでよい** とする。ただしこれは上記 RTX 4090 環境で案 B の中核前提を
+否定する結果が出なかったという判断であり、全 driver matrix の保証ではない。Stage 4〜7 でも
+GPU vendor / target recreate / HWND reuse / DPI・monitor の未検証欄を gate として保持し、別環境で
+`CreateTargetForHwnd`、`Present`、commit completion、detach、または parent destroy の不成立が
+再現した場合は production fallback を追加せず、Stage 4 cutover を止めて A1 へ設計判断を戻す。
+
 ### Stage 4: 全 placement と HUD を専用 pump へ atomic cutover
 
 変わるもの:

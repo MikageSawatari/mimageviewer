@@ -44,6 +44,8 @@ pub mod native_presenter;
 pub mod native_window;
 #[cfg(windows)]
 pub(crate) mod native_window_host;
+#[cfg(all(test, windows))]
+mod native_window_thread_spike;
 pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;

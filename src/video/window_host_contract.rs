@@ -361,6 +361,8 @@ impl From<WindowHostState> for WindowHostStateKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WindowBackendOperation {
     CreateWindow,
+    PumpMessage,
+    ResizeWindow,
     AttachTarget,
     PrimeTarget,
     DetachTarget,
@@ -1289,9 +1291,12 @@ pub(crate) enum WindowsHarnessPhase {
     WindowCreate,
     TargetAttach,
     FirstPresent,
+    RenderStall,
     PumpPing,
+    WindowResize,
     WindowClose,
     ParentDestroy,
+    TargetDetach,
     RenderThreadStop,
     ThreadJoin,
 }
