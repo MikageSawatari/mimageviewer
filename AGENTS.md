@@ -19,6 +19,13 @@ always-active guidance.
   read `docs/keymap-spec.md` and `docs/key-customization-impl-plan.md`. New
   keyboard operations should go through `KeyAction` / keymap helpers unless the
   operation is intentionally fixed and documented as outside keymap scope.
+- The detached viewer (F12 separate window / multiple windows) is under a
+  structural rework. Read `docs/detached-rework-plan.md` §2 before touching
+  detached predicates or viewport paths. Symptom patches there are prohibited;
+  a structurally correct fix, or another feature's fix that reaches into those
+  paths, is allowed once ClaudeCode and Codex both agree it is not a symptom
+  patch, and the change is recorded in that plan's §11. See CLAUDE.md
+  "Detached viewer リワーク中のルール".
 - On Japanese Windows, PowerShell 5.1 may mojibake UTF-8 files without a BOM.
   When reading repository documents through PowerShell, use
   `Get-Content -Encoding UTF8` explicitly.
