@@ -2,9 +2,12 @@ const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const TELEMETRY_ENABLED = true;
 
+class AuthenticationRequiredError extends Error {}
+
 const telemetryState = {
   queue: [],
   flushing: false,
+  authenticated: false,
 };
 
 const hudState = {
@@ -15,6 +18,7 @@ const hudState = {
 };
 
 const state = {
+  authenticated: false,
   favorites: [],
   favoriteId: null,
   favoriteName: "",
@@ -26,6 +30,7 @@ const state = {
   virtualGrid: null,
   thumbnailTracker: null,
   viewer: null,
+  authCountdownTimer: 0,
 };
 
 window.addEventListener("popstate", () => dispatchRoute());
@@ -38,20 +43,135 @@ if (TELEMETRY_ENABLED) {
 boot();
 
 async function boot() {
-  renderLoading("お気に入りを読み込んでいます");
+  renderLoading("接続を確認しています");
   try {
-    const data = await apiJson("/api/favorites");
-    state.favorites = data.favorites ?? [];
-    if (!location.hash) {
-      history.replaceState(null, "", "#favorites");
+    const response = await fetch("/api/auth/status", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`認証状態を確認できません (HTTP ${response.status})。`);
+    const status = await response.json();
+    if (!status.authenticated) {
+      renderPinLogin(status.lockout_remaining_seconds ?? 0);
+      return;
     }
-    await dispatchRoute();
+    await enterAuthenticatedApp();
   } catch (error) {
     renderError(error);
   }
 }
 
+async function enterAuthenticatedApp() {
+  state.authenticated = true;
+  telemetryState.authenticated = true;
+  renderLoading("お気に入りを読み込んでいます");
+  const data = await apiJson("/api/favorites");
+  state.favorites = data.favorites ?? [];
+  if (!location.hash) history.replaceState(null, "", "#favorites");
+  await dispatchRoute();
+}
+
+function renderPinLogin(initialRemainingSeconds = 0) {
+  cleanupScreen();
+  state.authenticated = false;
+  telemetryState.authenticated = false;
+  hudElement.hidden = true;
+  document.title = "PIN 認証 — mIV Remote";
+
+  const screen = element("section", "pin-screen");
+  const card = element("div", "pin-card");
+  const form = document.createElement("form");
+  form.className = "pin-form";
+  const pin = document.createElement("input");
+  pin.className = "pin-input";
+  pin.type = "password";
+  pin.inputMode = "numeric";
+  pin.autocomplete = "current-password";
+  pin.minLength = 6;
+  pin.required = true;
+  pin.placeholder = "6桁以上の PIN";
+  pin.setAttribute("aria-label", "PIN");
+
+  const forgetLabel = element("label", "pin-forget");
+  const forget = document.createElement("input");
+  forget.type = "checkbox";
+  forgetLabel.append(forget, document.createTextNode("この端末を記憶しない"));
+  const submit = textElement("button", "接続する", "pin-submit");
+  submit.type = "submit";
+  const message = textElement("p", "", "pin-message");
+  form.append(pin, forgetLabel, submit, message);
+  card.append(
+    textElement("h1", "mIV Remote"),
+    textElement("p", "接続用 PIN を入力してください。", "pin-description"),
+    form
+  );
+  screen.append(card);
+  app.append(screen);
+
+  let lockedUntil = performance.now() + Math.max(0, initialRemainingSeconds) * 1000;
+  const updateLockout = () => {
+    const remaining = Math.max(0, Math.ceil((lockedUntil - performance.now()) / 1000));
+    submit.disabled = remaining > 0;
+    pin.disabled = remaining > 0;
+    if (remaining > 0) {
+      message.textContent = `試行回数が上限に達しました。あと ${remaining} 秒お待ちください。`;
+      message.classList.add("error");
+    } else if (message.dataset.lockout === "true") {
+      message.textContent = "再試行できます。";
+      message.classList.remove("error");
+      message.dataset.lockout = "false";
+      pin.focus();
+    }
+  };
+  if (initialRemainingSeconds > 0) message.dataset.lockout = "true";
+  updateLockout();
+  state.authCountdownTimer = window.setInterval(updateLockout, 250);
+  if (!initialRemainingSeconds) window.setTimeout(() => pin.focus(), 0);
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    submit.disabled = true;
+    message.textContent = "確認しています…";
+    message.classList.remove("error");
+    const candidate = pin.value;
+    pin.value = "";
+    try {
+      const response = await fetch("/api/auth/pin", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ pin: candidate, remember: !forget.checked }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (response.ok && result.authenticated) {
+        clearInterval(state.authCountdownTimer);
+        state.authCountdownTimer = 0;
+        hudElement.hidden = !TELEMETRY_ENABLED;
+        await enterAuthenticatedApp();
+        return;
+      }
+      const remaining = Number(result.lockout_remaining_seconds) || 0;
+      if (response.status === 429 && remaining > 0) {
+        lockedUntil = performance.now() + remaining * 1000;
+        message.dataset.lockout = "true";
+        updateLockout();
+      } else {
+        message.textContent = "PIN が違います。確認してもう一度お試しください。";
+        message.classList.add("error");
+        submit.disabled = false;
+        pin.focus();
+      }
+    } catch {
+      message.textContent = "サーバーに接続できませんでした。";
+      message.classList.add("error");
+      submit.disabled = false;
+    }
+  });
+}
+
 async function dispatchRoute() {
+  if (!state.authenticated) return;
   if (!state.favorites.length && location.hash !== "#favorites") {
     return;
   }
@@ -115,6 +235,8 @@ function navigate(hash) {
 }
 
 function cleanupScreen() {
+  clearInterval(state.authCountdownTimer);
+  state.authCountdownTimer = 0;
   state.requestController?.abort();
   state.requestController = null;
   state.virtualGrid?.destroy();
@@ -820,7 +942,10 @@ async function apiJson(path, params = {}, signal) {
     signal,
   });
   if (response.status === 401) {
-    throw new Error("認証できませんでした。起動時に表示された ?t= 付き URL から開き直してください。");
+    state.authenticated = false;
+    telemetryState.authenticated = false;
+    renderPinLogin(0);
+    throw new AuthenticationRequiredError("PIN 認証が必要です。");
   }
   if (!response.ok) {
     throw new Error(`読み込みに失敗しました (HTTP ${response.status})。`);
@@ -844,7 +969,7 @@ function renderLoading(message) {
 }
 
 function renderError(error) {
-  if (error?.name === "AbortError") return;
+  if (error?.name === "AbortError" || error instanceof AuthenticationRequiredError) return;
   cleanupScreen();
   const status = element("div", "center-status");
   status.append(
@@ -966,7 +1091,7 @@ async function observedFetch(url, options = {}) {
 }
 
 function enqueueTelemetry(event) {
-  if (!TELEMETRY_ENABLED) return;
+  if (!TELEMETRY_ENABLED || !telemetryState.authenticated) return;
   telemetryState.queue.push({
     client_event_timestamp_ms: Date.now(),
     ...event,
@@ -977,7 +1102,12 @@ function enqueueTelemetry(event) {
 }
 
 async function flushTelemetry(useBeacon) {
-  if (!telemetryState.queue.length || (!useBeacon && telemetryState.flushing)) return;
+  if (
+    !telemetryState.authenticated ||
+    !telemetryState.queue.length ||
+    (!useBeacon && telemetryState.flushing)
+  )
+    return;
   if (useBeacon && navigator.sendBeacon) {
     while (telemetryState.queue.length) {
       const { events, body } = takeTelemetryPayload();

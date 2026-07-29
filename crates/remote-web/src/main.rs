@@ -1,17 +1,21 @@
 mod auth;
 mod config;
+mod connection_url;
+mod console_qr;
 mod diagnostics;
 mod http;
 mod image_support;
 mod path_guard;
 mod store;
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use auth::AuthToken;
+use auth::{AuthService, AuthToken, load_pin_file, set_pin_file};
 use config::{Config, default_data_dir};
+use connection_url::choose_connection_url;
 use diagnostics::DiagnosticsLogger;
 use http::{AppState, TelemetryLimiter};
 use store::Library;
@@ -26,35 +30,49 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let config = Config::parse()?;
-    let token =
+    let protected_roots = [default_data_dir(), config.data_dir.clone()];
+    if let Some(pin) = config.set_pin.as_deref() {
+        let path = set_pin_file(&config.auth_path, &protected_roots, pin)?;
+        println!("PIN を設定しました: {}", path.display());
+        println!("PIN の平文は保存していません。次回は --set-pin なしで起動してください。");
+        return Ok(());
+    }
+
+    let loaded_auth = load_pin_file(&config.auth_path, &protected_roots)?;
+    let bearer =
         AuthToken::generate().map_err(|error| format!("認証トークンを生成できません: {error}"))?;
-    let logger = DiagnosticsLogger::open(
-        &config.log_path,
-        &[default_data_dir(), config.data_dir.clone()],
-        token.printable(),
-    )?;
+    let auth = AuthService::new(loaded_auth.record, bearer)?;
+    let log_secrets = auth.permanent_log_secrets();
+    let logger = DiagnosticsLogger::open(&config.log_path, &protected_roots, &log_secrets)?;
+    if logger.path() == loaded_auth.path {
+        return Err("--log と --auth-file には別のファイルを指定してください".to_owned());
+    }
     let library = Library::load(&config.data_dir)
         .map_err(|error| format!("settings.db を read-only で読み込めません: {error:?}"))?;
     let address = SocketAddr::new(config.bind, config.port);
+    let connection = choose_connection_url(config.public_url.as_deref(), address)?;
     let server = Arc::new(
         Server::http(address).map_err(|error| format!("HTTP bind に失敗しました: {error}"))?,
     );
 
     println!("mIV remote PoC bind: http://{address}");
     println!("計測ログ: {}", logger.path().display());
-    println!("認証トークン: {}", token.printable());
-    if config.bind.is_unspecified() {
-        println!(
-            "初回 URL: http://<このPCのIP>:{}/?t={}",
-            config.port,
-            token.printable()
-        );
-    } else {
-        println!("初回 URL: http://{address}/?t={}", token.printable());
+    println!("認証ファイル: {}", loaded_auth.path.display());
+    println!("デバッグ用 Bearer トークン: {}", auth.bearer_printable());
+    println!("接続 URL の決定元: {}", connection.source.label());
+    println!(
+        "Cookie Secure 判定: リクエストごと (direct TLS または X-Forwarded-Proto=https の場合のみ ON)"
+    );
+    if let Err(error) = console_qr::print_url_qr(&connection.base) {
+        eprintln!("{error}");
+        println!("接続 URL: {}", connection.base);
     }
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("起動情報をコンソールへ出力できません: {error}"))?;
 
     let state = Arc::new(AppState {
-        token,
+        auth,
         library,
         logger,
         telemetry_limiter: TelemetryLimiter::new(),

@@ -74,11 +74,21 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
 
 ### 3.2 認証
 
-- 起動時に 256bit のランダムトークンを生成する
-- `Authorization: Bearer <token>` を必須にする。初回アクセス用に `?t=<token>` も受け付け、
-  受理後は Cookie (HttpOnly / SameSite=Lax) に載せ替える
-- トークン未一致は 401。エラー本文に内部情報を出さない
-- 比較は定数時間で行う
+- ブラウザ認証にはユーザー設定の **6 文字以上の PIN / パスフレーズ**を使う。
+  `--set-pin <PIN>` で設定・更新し、Argon2id の salt 付き hash とランダムなセッション署名鍵だけを
+  認証ファイルへ永続化する。平文 PIN は保持しない
+- 認証ファイルの既定はカレントディレクトリの `remote-web-auth.json`。`--auth-file` で変更できるが、
+  `%APPDATA%\mimageviewer` および `--data-dir` 配下は拒否する。PIN 未設定時は fail-closed で起動を拒否する
+- PIN 検証は Argon2id の定数時間検証を使う。失敗回数はプロキシ経由で送信元を識別できない場合も
+  効くようサーバ全体で数え、5 回失敗で 30 秒、以後の失敗は解除後に 60 秒、120 秒……と
+  指数バックオフする。失敗時刻・接続元・累積失敗回数を診断ログへ記録する
+- 成功時は HMAC-SHA256 署名付き HttpOnly / SameSite=Lax Cookie を発行する。通常は Max-Age 90 日、
+  「この端末を記憶しない」選択時は Max-Age のないセッション Cookie とする。`Secure` は direct TLS
+  または `X-Forwarded-Proto: https` を検出したリクエストでだけ付ける
+- curl 等の診断用には起動時生成の 256bit `Authorization: Bearer <token>` も残す。Bearer は
+  定数時間比較し、PIN・hash・セッション署名値・Bearer をログへ出さない。認証失敗本文に内部情報を出さない
+- 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
+  `--json` 状態、bind 先の順で決める
 
 ### 3.3 バインドアドレス
 
@@ -93,8 +103,9 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
   バンドラ / TypeScript の採用可否は PoC 完了後に判断する
 - 新規コードは新規ファイルに置く。既存ファイルへの変更は最小のフック点に留める
   (master が 1 日 5,000 行ペースで動くため、衝突面積を構造的に減らす)
-- read-only 不変条件は mIV の settings / catalog 等を変更しないことを指し、PoC の診断ログだけは
-  `--log` で指定した `%APPDATA%\mimageviewer` 配下ではない別パスへ出力する
+- read-only 不変条件は mIV の settings / catalog 等を変更しないことを指し、PoC の診断ログと認証
+  ファイルだけは `--log` / `--auth-file` で指定した `%APPDATA%\mimageviewer` 配下ではない別パスへ
+  出力する
 
 ## 4. PoC のスコープ (現在のフェーズ)
 
@@ -221,12 +232,11 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
   単体サーバにも 6 個の DLL 同居が必要になる) は妥当だが、**master 側で規約が変わっても
   気付けない**。`src/path_key.rs` (約 40 行) と cache key helper を依存ゼロの小クレートに
   切り出し、本体と remote-web の双方が参照する形にする。**次フェーズの冒頭で実施する**
-- **F2 (小)**: セッション Cookie に `Max-Age` が無く、ブラウザを閉じると再認証が必要になる。
-  スマートフォンでの実用性に効くので次フェーズで有効期限付きにする
+- **F2 (解消済み)**: PIN 認証への変更時に、通常のセッション Cookie を Max-Age 90 日とした。
+  端末に残したくない場合は画面からセッション Cookie を選べる
 - **F3 (小)**: catalog の blob が WebP でない行 (旧形式で JPEG が入っている可能性) は 404 に
   なる。実機でサムネイル欠けが多発したらこれを疑う。content-type の出し分けで救える
-- **F4 (小)**: `?t=` 付きリクエストは API パスでも 303 リダイレクトになる。フロントは初回のみ
-  使うため実害なし
+- **F4 (解消済み)**: PIN 入力画面へ移行し、`?t=` 認証とリダイレクト自体を廃止した
 - **F5 (計画どおりの省略)**: リサイズ済み画像のサーバ側キャッシュが無く、リクエストごとに
   フルデコードする。先読み 1 枚でどこまで実用になるかは実機測定の対象
 

@@ -12,17 +12,18 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 use uuid::Uuid;
 
-use crate::auth::{AuthDecision, AuthInput, AuthSource, AuthToken, session_cookie};
+use crate::auth::{AuthDecision, AuthInput, AuthService, PinVerification};
 use crate::diagnostics::{DiagnosticsLogger, RequestLog};
 use crate::store::{Library, StoreError, ThumbnailMissReason};
 
 const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
+const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 
 pub struct AppState {
-    pub token: AuthToken,
+    pub auth: AuthService,
     pub library: Library,
     pub logger: DiagnosticsLogger,
     pub telemetry_limiter: TelemetryLimiter,
@@ -65,6 +66,7 @@ struct HttpResponse {
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
     log_details: Option<Value>,
+    sensitive_values: Vec<String>,
 }
 
 impl HttpResponse {
@@ -75,6 +77,7 @@ impl HttpResponse {
             headers: Vec::new(),
             body,
             log_details: None,
+            sensitive_values: Vec::new(),
         }
     }
 
@@ -103,6 +106,11 @@ impl HttpResponse {
         self.log_details = Some(details);
         self
     }
+
+    fn with_sensitive_value(mut self, value: impl Into<String>) -> Self {
+        self.sensitive_values.push(value.into());
+        self
+    }
 }
 
 pub fn handle(mut request: Request, state: &Arc<AppState>) {
@@ -114,13 +122,16 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
         .as_millis();
     let method = request.method().to_string();
     let raw_url = request.url().to_owned();
+    let proxy_details = request_proxy_details(&request);
     let mut response = route(&mut request, state);
     response
         .headers
         .push(("X-mIV-Request-Id", request_id.to_string()));
     let status = response.status;
     let response_bytes = response.body.len();
-    let details = response.log_details.take();
+    let mut details = response.log_details.take().unwrap_or_else(|| json!({}));
+    details["proxy"] = proxy_details;
+    let sensitive_values = std::mem::take(&mut response.sensitive_values);
     let response_result = respond(request, response);
     state.logger.log_request(RequestLog {
         request_id,
@@ -131,7 +142,8 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
         duration: started_at.elapsed(),
         response_bytes,
         response_write_ok: response_result.is_ok(),
-        details,
+        details: Some(details),
+        sensitive_values,
     });
     if let Err(error) = response_result {
         eprintln!("remote-web: response write failed: {error}");
@@ -141,55 +153,32 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
 fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     let (path, raw_query) = split_url(request.url());
     let query_result = parse_query(raw_query);
-    let authorization = header_value(request, "Authorization");
-    let cookie = header_value(request, "Cookie");
-    let query_token = query_result
-        .as_ref()
-        .ok()
-        .and_then(|query| query_value(query, "t").ok().flatten());
-    let decision = state.token.authorize(AuthInput {
-        authorization,
-        cookie,
-        query_token,
-    });
-
-    let source = match decision {
-        AuthDecision::Authorized(source) => source,
-        AuthDecision::Unauthorized => {
-            return HttpResponse::text(decision.http_status(), "Unauthorized")
-                .with_header("WWW-Authenticate", "Bearer")
-                .with_header("Cache-Control", "no-store")
-                .with_header("X-Content-Type-Options", "nosniff")
-                .with_header("Referrer-Policy", "no-referrer");
-        }
-    };
-
     let query = match query_result {
         Ok(query) => query,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
 
-    if source == AuthSource::Query {
-        let location = url_without_token(path, &query);
-        return HttpResponse::text(303, "See Other")
-            .with_header("Location", location)
-            .with_header("Set-Cookie", session_cookie(&state.token))
-            .with_header("Cache-Control", "no-store")
-            .with_header("X-Content-Type-Options", "nosniff")
-            .with_header("Referrer-Policy", "no-referrer");
-    }
-
     let method = request.method().clone();
+    let auth = state.auth.authorize(AuthInput {
+        authorization: header_value(request, "Authorization"),
+        cookie: header_value(request, "Cookie"),
+    });
     let response = match (method, path) {
+        (Method::Get, "/") => static_file(state, "index.html", "text/html; charset=utf-8"),
+        (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
+        (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
+        (Method::Get, "/favicon.ico") => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
+        (Method::Get, "/api/auth/status") => api_auth_status(state, auth),
+        (Method::Post, "/api/auth/pin") => api_auth_pin(request, state),
+        (_, "/api/auth/status" | "/api/auth/pin") => {
+            HttpResponse::text(405, "Method Not Allowed").with_header("Cache-Control", "no-store")
+        }
+        _ if auth == AuthDecision::Unauthorized => unauthorized(),
         (Method::Get, "/api/favorites") => api_favorites(state),
         (Method::Get, "/api/list") => api_list(state, &query),
         (Method::Get, "/api/thumb") => api_thumb(state, &query),
         (Method::Get, "/api/image") => api_image(state, &query),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
-        (Method::Get, "/") => static_file(state, "index.html", "text/html; charset=utf-8"),
-        (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
-        (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
-        (Method::Get, "/favicon.ico") => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
         (Method::Get, _) => HttpResponse::text(404, "Not Found"),
         (_, "/api/telemetry") => HttpResponse::text(405, "Method Not Allowed")
             .with_header("Allow", "POST")
@@ -202,6 +191,126 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     response
         .with_header("X-Content-Type-Options", "nosniff")
         .with_header("Referrer-Policy", "no-referrer")
+}
+
+fn unauthorized() -> HttpResponse {
+    HttpResponse::text(401, "Unauthorized")
+        .with_header("WWW-Authenticate", "Bearer")
+        .with_header("Cache-Control", "no-store")
+}
+
+fn api_auth_status(state: &AppState, decision: AuthDecision) -> HttpResponse {
+    let remaining = ceil_seconds(state.auth.lockout_remaining());
+    HttpResponse::json(&json!({
+        "authenticated": matches!(decision, AuthDecision::Authorized(_)),
+        "lockout_remaining_seconds": remaining,
+    }))
+    .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+    .with_header("Cache-Control", "no-store")
+}
+
+#[derive(Deserialize)]
+struct PinRequest {
+    pin: String,
+    #[serde(default = "remember_by_default")]
+    remember: bool,
+}
+
+fn remember_by_default() -> bool {
+    true
+}
+
+fn api_auth_pin(request: &mut Request, state: &AppState) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_PIN_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => {
+            return HttpResponse::text(413, "Payload Too Large")
+                .with_header("Cache-Control", "no-store");
+        }
+        Err(BodyReadError::Read) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let input: PinRequest = match serde_json::from_slice(&body) {
+        Ok(input) => input,
+        Err(_) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let secure = request_is_https(request);
+    match state.auth.verify_pin(&input.pin) {
+        PinVerification::Success => {
+            let cookie = state.auth.issue_session_cookie(input.remember, secure);
+            HttpResponse::json(&json!({"authenticated": true}))
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Set-Cookie", cookie.header)
+                .with_header("Cache-Control", "no-store")
+                .with_log_details(json!({
+                    "pin_auth": {
+                        "success": true,
+                        "remember": input.remember,
+                        "cookie_secure": secure,
+                    }
+                }))
+                .with_sensitive_value(input.pin)
+                .with_sensitive_value(cookie.sensitive_value)
+        }
+        PinVerification::Invalid {
+            failure_count,
+            lockout,
+        } => {
+            let remaining = lockout.map_or(0, ceil_seconds);
+            let status = if lockout.is_some() { 429 } else { 401 };
+            let mut response = HttpResponse::bytes(
+                status,
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&json!({
+                    "authenticated": false,
+                    "lockout_remaining_seconds": remaining,
+                }))
+                .unwrap_or_default(),
+            )
+            .with_header("Cache-Control", "no-store")
+            .with_log_details(json!({
+                "pin_auth": {
+                    "success": false,
+                    "failure_count": failure_count,
+                    "lockout_remaining_seconds": remaining,
+                }
+            }))
+            .with_sensitive_value(input.pin);
+            if remaining > 0 {
+                response = response.with_header("Retry-After", remaining.to_string());
+            }
+            response
+        }
+        PinVerification::Locked {
+            failure_count,
+            remaining,
+        } => {
+            let remaining = ceil_seconds(remaining);
+            HttpResponse::bytes(
+                429,
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&json!({
+                    "authenticated": false,
+                    "lockout_remaining_seconds": remaining,
+                }))
+                .unwrap_or_default(),
+            )
+            .with_header("Retry-After", remaining.to_string())
+            .with_header("Cache-Control", "no-store")
+            .with_log_details(json!({
+                "pin_auth": {
+                    "success": false,
+                    "failure_count": failure_count,
+                    "lockout_remaining_seconds": remaining,
+                    "attempt_skipped_during_lockout": true,
+                }
+            }))
+            .with_sensitive_value(input.pin)
+        }
+    }
 }
 
 fn api_favorites(state: &AppState) -> HttpResponse {
@@ -309,13 +418,13 @@ fn api_telemetry(request: &mut Request, state: &AppState) -> HttpResponse {
             .with_header("Retry-After", "5")
             .with_header("Cache-Control", "no-store");
     }
-    let body = match read_limited_body(request) {
+    let body = match read_body_limited(request, MAX_TELEMETRY_BODY_BYTES) {
         Ok(body) => body,
-        Err(TelemetryBodyError::TooLarge) => {
+        Err(BodyReadError::TooLarge) => {
             return HttpResponse::text(413, "Payload Too Large")
                 .with_header("Cache-Control", "no-store");
         }
-        Err(TelemetryBodyError::Read) => {
+        Err(BodyReadError::Read) => {
             return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
         }
     };
@@ -342,26 +451,23 @@ fn api_telemetry(request: &mut Request, state: &AppState) -> HttpResponse {
         .with_log_details(json!({"telemetry": telemetry}))
 }
 
-enum TelemetryBodyError {
+enum BodyReadError {
     TooLarge,
     Read,
 }
 
-fn read_limited_body(request: &mut Request) -> Result<Vec<u8>, TelemetryBodyError> {
-    if request
-        .body_length()
-        .is_some_and(|length| length > MAX_TELEMETRY_BODY_BYTES)
-    {
-        return Err(TelemetryBodyError::TooLarge);
+fn read_body_limited(request: &mut Request, limit: usize) -> Result<Vec<u8>, BodyReadError> {
+    if request.body_length().is_some_and(|length| length > limit) {
+        return Err(BodyReadError::TooLarge);
     }
     let mut body = Vec::new();
     request
         .as_reader()
-        .take((MAX_TELEMETRY_BODY_BYTES + 1) as u64)
+        .take((limit + 1) as u64)
         .read_to_end(&mut body)
-        .map_err(|_| TelemetryBodyError::Read)?;
-    if body.len() > MAX_TELEMETRY_BODY_BYTES {
-        return Err(TelemetryBodyError::TooLarge);
+        .map_err(|_| BodyReadError::Read)?;
+    if body.len() > limit {
+        return Err(BodyReadError::TooLarge);
     }
     Ok(body)
 }
@@ -429,6 +535,60 @@ fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
     })
 }
 
+fn request_is_https(request: &Request) -> bool {
+    request.secure()
+        || header_value(request, "X-Forwarded-Proto")
+            .and_then(|value| value.split(',').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
+}
+
+fn request_proxy_details(request: &Request) -> Value {
+    let forwarded_proto = header_value(request, "X-Forwarded-Proto").map(limit_log_value);
+    let https_source = if request.secure() {
+        "direct_tls"
+    } else if request_is_https(request) {
+        "x_forwarded_proto"
+    } else {
+        "plain_http"
+    };
+    let mut tailscale_user_headers = serde_json::Map::new();
+    for header in request.headers() {
+        let name = header.field.as_str().as_str();
+        if name
+            .get(..15)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Tailscale-User-"))
+        {
+            tailscale_user_headers.insert(
+                name.to_owned(),
+                Value::String(limit_log_value(header.value.as_str())),
+            );
+        }
+    }
+    json!({
+        "remote_addr": request.remote_addr().map(ToString::to_string),
+        "x_forwarded_for": header_value(request, "X-Forwarded-For").map(limit_log_value),
+        "x_forwarded_proto": forwarded_proto,
+        "tailscale_user_headers": tailscale_user_headers,
+        "https_detected": request_is_https(request),
+        "https_source": https_source,
+    })
+}
+
+fn limit_log_value(value: &str) -> String {
+    const MAX_CHARS: usize = 1024;
+    let mut chars = value.chars();
+    let result: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{result}…")
+    } else {
+        result
+    }
+}
+
+fn ceil_seconds(duration: Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
+}
+
 fn split_url(url: &str) -> (&str, &str) {
     url.split_once('?').unwrap_or((url, ""))
 }
@@ -469,33 +629,10 @@ fn query_value<'a>(query: &'a [(String, String)], key: &str) -> Result<Option<&'
     Ok(first)
 }
 
-fn url_without_token(path: &str, query: &[(String, String)]) -> String {
-    let retained = query
-        .iter()
-        .filter(|(key, _)| key != "t")
-        .map(|(key, value)| {
-            format!(
-                "{}={}",
-                encode_query_component(key),
-                encode_query_component(value)
-            )
-        })
-        .collect::<Vec<_>>();
-    if retained.is_empty() {
-        path.to_owned()
-    } else {
-        format!("{path}?{}", retained.join("&"))
-    }
-}
-
-fn encode_query_component(value: &str) -> String {
-    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::COOKIE_NAME;
+    use crate::auth::{AuthService, AuthToken, COOKIE_NAME, load_pin_file, set_pin_file};
     use tiny_http::TestRequest;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -503,13 +640,22 @@ mod tests {
     fn test_state(temp: &tempfile::TempDir) -> AppState {
         let protected = temp.path().join("data");
         std::fs::create_dir_all(&protected).unwrap();
+        let auth_path = temp.path().join("auth.json");
+        set_pin_file(&auth_path, &[protected.clone()], "123456").unwrap();
+        let loaded = load_pin_file(&auth_path, &[protected.clone()]).unwrap();
+        let auth = AuthService::new(
+            loaded.record,
+            AuthToken::from_printable_for_test(TEST_TOKEN),
+        )
+        .unwrap();
+        let log_secrets = auth.permanent_log_secrets();
         AppState {
-            token: AuthToken::from_printable_for_test(TEST_TOKEN),
+            auth,
             library: Library::empty_for_test(temp.path().join("cache")),
             logger: DiagnosticsLogger::open(
                 &temp.path().join("request.jsonl"),
                 &[protected],
-                TEST_TOKEN,
+                &log_secrets,
             )
             .unwrap(),
             telemetry_limiter: TelemetryLimiter::new(),
@@ -518,8 +664,13 @@ mod tests {
         }
     }
 
-    fn cookie_header() -> Header {
-        Header::from_bytes("Cookie", format!("{COOKIE_NAME}={TEST_TOKEN}").as_bytes()).unwrap()
+    fn cookie_header(state: &AppState) -> Header {
+        let cookie = state.auth.issue_session_cookie(true, false);
+        Header::from_bytes(
+            "Cookie",
+            format!("{COOKIE_NAME}={}", cookie.sensitive_value).as_bytes(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -539,20 +690,6 @@ mod tests {
     fn duplicate_security_parameters_are_rejected() {
         let query = parse_query("fav=a&fav=b").unwrap();
         assert!(query_value(&query, "fav").is_err());
-    }
-
-    #[test]
-    fn token_is_removed_from_redirect_location() {
-        let query = parse_query("t=secret&fav=abc&path=A%2FB").unwrap();
-        let location = url_without_token("/api/list", &query);
-        assert!(!location.contains("secret"));
-        assert!(!location.contains("t="));
-        assert!(location.starts_with("/api/list?"));
-    }
-
-    #[test]
-    fn cookie_name_is_not_ambiguous() {
-        assert_eq!(COOKIE_NAME, "miv_remote_token");
     }
 
     #[test]
@@ -581,7 +718,7 @@ mod tests {
         let mut request: Request = TestRequest::new()
             .with_method(Method::Post)
             .with_path("/api/telemetry")
-            .with_header(cookie_header())
+            .with_header(cookie_header(&state))
             .with_header(content_length)
             .with_body(r#"{"events":[]}"#)
             .into();
@@ -596,7 +733,7 @@ mod tests {
         let mut request: Request = TestRequest::new()
             .with_method(Method::Post)
             .with_path("/api/telemetry")
-            .with_header(cookie_header())
+            .with_header(cookie_header(&state))
             .with_body(r#"{"client_timestamp_ms":1,"events":[{"type":"image"}]}"#)
             .into();
         let response = route(&mut request, &state);
@@ -614,7 +751,7 @@ mod tests {
         let mut request: Request = TestRequest::new()
             .with_method(Method::Post)
             .with_path("/api/telemetry")
-            .with_header(cookie_header())
+            .with_header(cookie_header(&state))
             .with_body("not json")
             .into();
         let response = route(&mut request, &state);
@@ -630,5 +767,89 @@ mod tests {
         }
         assert!(!limiter.allow(now));
         assert!(limiter.allow(now + TELEMETRY_WINDOW));
+    }
+
+    #[test]
+    fn pin_login_issues_persistent_cookie_and_authenticates_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let forwarded_proto = Header::from_bytes("X-Forwarded-Proto", "https").unwrap();
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/auth/pin")
+            .with_header(forwarded_proto)
+            .with_body(r#"{"pin":"123456","remember":true}"#)
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 200);
+        let set_cookie = response
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "Set-Cookie")
+            .map(|(_, value)| value)
+            .unwrap();
+        assert!(set_cookie.contains("Max-Age=7776000"));
+        assert!(set_cookie.contains("; Secure"));
+        assert!(!set_cookie.contains("123456"));
+    }
+
+    #[test]
+    fn session_only_pin_login_omits_max_age() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/auth/pin")
+            .with_body(r#"{"pin":"123456","remember":false}"#)
+            .into();
+        let response = route(&mut request, &state);
+        let set_cookie = response
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "Set-Cookie")
+            .map(|(_, value)| value)
+            .unwrap();
+        assert!(!set_cookie.contains("Max-Age"));
+        assert!(!set_cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn failed_pin_attempt_log_contains_count_and_source_but_not_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(test_state(&temp));
+        let request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/auth/pin")
+            .with_body(r#"{"pin":"654321","remember":true}"#)
+            .into();
+        handle(request, &state);
+        let log = std::fs::read_to_string(temp.path().join("request.jsonl")).unwrap();
+        assert!(log.contains(r#""failure_count":1"#));
+        assert!(log.contains(r#""remote_addr":"127.0.0.1:23456""#));
+        assert!(!log.contains("654321"));
+    }
+
+    #[test]
+    fn proxy_headers_and_remote_address_are_exposed_to_request_log_details() {
+        let forwarded_for = Header::from_bytes("X-Forwarded-For", "100.64.0.42").unwrap();
+        let forwarded_proto = Header::from_bytes("X-Forwarded-Proto", "https").unwrap();
+        let tailscale_user =
+            Header::from_bytes("Tailscale-User-Login", "alice@example.com").unwrap();
+        let request: Request = TestRequest::new()
+            .with_remote_addr("127.0.0.1:54321".parse().unwrap())
+            .with_header(forwarded_for)
+            .with_header(forwarded_proto)
+            .with_header(tailscale_user)
+            .into();
+        let details = request_proxy_details(&request);
+        assert_eq!(details["remote_addr"], "127.0.0.1:54321");
+        assert_eq!(details["x_forwarded_for"], "100.64.0.42");
+        assert_eq!(details["x_forwarded_proto"], "https");
+        assert_eq!(
+            details["tailscale_user_headers"]["Tailscale-User-Login"],
+            "alice@example.com"
+        );
+        assert_eq!(details["https_detected"], true);
+        assert_eq!(details["https_source"], "x_forwarded_proto");
     }
 }

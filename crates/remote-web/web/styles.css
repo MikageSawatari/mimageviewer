@@ -61,6 +61,107 @@ button {
   display: none;
 }
 
+.pin-screen {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  overflow: auto;
+  padding:
+    max(22px, env(safe-area-inset-top))
+    max(18px, env(safe-area-inset-right))
+    max(22px, env(safe-area-inset-bottom))
+    max(18px, env(safe-area-inset-left));
+}
+
+.pin-card {
+  width: min(100%, 420px);
+  padding: clamp(24px, 7vw, 38px);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: rgb(25 28 35 / 94%);
+  box-shadow: 0 22px 70px rgb(0 0 0 / 32%);
+}
+
+.pin-card h1 {
+  margin: 0 0 8px;
+  font-size: clamp(2rem, 10vw, 3rem);
+  letter-spacing: -0.045em;
+}
+
+.pin-description {
+  margin: 0 0 24px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.pin-form {
+  display: grid;
+  gap: 16px;
+}
+
+.pin-input {
+  width: 100%;
+  min-height: 58px;
+  padding: 10px 16px;
+  border: 1px solid #505968;
+  border-radius: 14px;
+  outline: none;
+  background: #101218;
+  color: #fff;
+  font: 650 1.35rem/1 system-ui, sans-serif;
+  letter-spacing: 0.08em;
+}
+
+.pin-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgb(124 196 255 / 18%);
+}
+
+.pin-forget {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 11px;
+  color: #d8dde7;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.pin-forget input {
+  width: 22px;
+  height: 22px;
+  accent-color: var(--accent-strong);
+}
+
+.pin-submit {
+  min-height: 56px;
+  border: 0;
+  border-radius: 15px;
+  background: var(--accent-strong);
+  color: #07121d;
+  font-weight: 750;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.pin-submit:disabled,
+.pin-input:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.pin-message {
+  min-height: 2.8em;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.pin-message.error {
+  color: var(--danger);
+}
+
 .screen {
   display: flex;
   height: 100%;
