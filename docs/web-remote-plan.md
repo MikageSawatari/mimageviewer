@@ -189,3 +189,46 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
   撤収は必ず `scripts/safe-worktree-remove.ps1` 経由
 - 本体 (`src/`) に触る変更を入れるときは、master 側の並行作業との衝突を避けるため
   変更点を最小に保ち、本書に触れた範囲を記録する
+
+## 7. PoC レビュー結果 (2026-07-29 / commit `4a68a730`)
+
+### 7.1 検証済み
+
+- **パス境界**: root と候補の双方を canonicalize し、Windows では大文字小文字を無視した
+  **コンポーネント単位**の前方一致で判定している (文字列前方一致による `C:\foo` /
+  `C:\foobar` の取り違えが起きない)。`..` / 絶対パス / ドライブ相対 / UNC を拒否し、
+  junction による脱出のテストもある
+- **認証**: `subtle` による定数時間比較 (長さ比較も定数時間)。**ルーティングより前**に
+  認証しており fail-closed。全応答に `X-Content-Type-Options` / `Referrer-Policy` が付く
+- **静的配信**: URL → ファイル名は完全一致テーブルで、クライアントが与えた文字列を
+  ファイル名に使っていない。静的配信側からの traversal は成立しない
+- **read-only**: `SQLITE_OPEN_READ_ONLY` + `PRAGMA query_only=ON`。書き込みが拒否される
+  ことをテストで確認している
+- **catalog identity**: canonicalize 後の `\\?\` 表記ではなく**論理パス**でキャッシュ DB を
+  引いている。ここを取り違えると全サムネイルが 404 になる箇所で、正しく処理されている
+- **キー規約の一致**: `catalog_db_path` は `catalog::db_path_for` + `path_key::normalize` /
+  `normalize_keep_drive` と、`catalog_image_key` の drive-root 分岐は
+  `use_full_path_cache_keys_for_folder` と一致することを確認済み
+- **鮮度判定**: DB 行の mtime / file_size を実ファイルと突き合わせてから返す
+- `src/` は未変更 (差分は `Cargo.toml` / `Cargo.lock` と新規クレートのみ)。テスト 24 件緑
+
+### 7.2 対応が必要な事項
+
+- **F1 (構造・中)**: 本体 lib に依存せず、catalog のキー規約を remote-web 内に複製している。
+  理由 (FFmpeg の import library リンクにより Windows ローダが exe ロード時に DLL を要求し、
+  単体サーバにも 6 個の DLL 同居が必要になる) は妥当だが、**master 側で規約が変わっても
+  気付けない**。`src/path_key.rs` (約 40 行) と cache key helper を依存ゼロの小クレートに
+  切り出し、本体と remote-web の双方が参照する形にする。**次フェーズの冒頭で実施する**
+- **F2 (小)**: セッション Cookie に `Max-Age` が無く、ブラウザを閉じると再認証が必要になる。
+  スマートフォンでの実用性に効くので次フェーズで有効期限付きにする
+- **F3 (小)**: catalog の blob が WebP でない行 (旧形式で JPEG が入っている可能性) は 404 に
+  なる。実機でサムネイル欠けが多発したらこれを疑う。content-type の出し分けで救える
+- **F4 (小)**: `?t=` 付きリクエストは API パスでも 303 リダイレクトになる。フロントは初回のみ
+  使うため実害なし
+- **F5 (計画どおりの省略)**: リサイズ済み画像のサーバ側キャッシュが無く、リクエストごとに
+  フルデコードする。先読み 1 枚でどこまで実用になるかは実機測定の対象
+
+### 7.3 実機測定時の注意
+
+**必ず release ビルドで測ること。** debug ビルドは画像デコードとリサイズが桁違いに遅く、
+性能の測定値が意味を持たない。
