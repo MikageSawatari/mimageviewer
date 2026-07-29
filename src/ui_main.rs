@@ -1505,8 +1505,16 @@ fn details_shared_preview_hover_text(
     column_set: DetailsColumnSet,
     origin: DetailsColumnMenuOrigin,
 ) -> Option<&'static str> {
-    (column_set == DetailsColumnSet::SharedBar
-        && origin == DetailsColumnMenuOrigin::DetailsSelectionBar)
+    // 下部バーは詳細一覧・サムネイル一覧のどちらでもプレビューを描かない
+    // (`DetailsColumnSet::includes`)。バーから開いたメニューでは、チェックの行き先が
+    // 一覧側であることを伝える。`DetailsSelectionBar` だけを見ていると
+    // サムネイル一覧の `ThumbnailSelectionBar` で説明が出ない (実害あり)。
+    let from_bottom_bar = matches!(
+        origin,
+        DetailsColumnMenuOrigin::DetailsSelectionBar
+            | DetailsColumnMenuOrigin::ThumbnailSelectionBar
+    );
+    (column_set == DetailsColumnSet::SharedBar && from_bottom_bar)
         .then_some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
 }
 
@@ -15782,13 +15790,16 @@ mod compute_cell_size_tests {
             ),
             None
         );
+        // サムネイル一覧の下部バーも同じ説明を出す。ここが漏れていて、実機で
+        // 「サムネイル一覧側だけ説明が出ない」状態になっていた。
         assert_eq!(
             details_shared_preview_hover_text(
                 DetailsColumnSet::SharedBar,
                 DetailsColumnMenuOrigin::ThumbnailSelectionBar,
             ),
-            None
+            Some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
         );
+        // 専用設定はチェック自体が押せないので、無効時の説明が別に出る。
         assert_eq!(
             details_shared_preview_hover_text(
                 DetailsColumnSet::DedicatedBar,
