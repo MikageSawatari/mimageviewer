@@ -139,6 +139,25 @@
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
 
+### 1.22 キー入力を viewport / HWND 単位でルーティングする (案D)
+
+- 出典: 2026-07-29 のキーボード所有権レビュー (Codex Sol 設計レビュー + ClaudeCode)。
+  正本は [keyboard-input-ownership-plan.md](keyboard-input-ownership-plan.md)。本項は同計画の
+  §6「対象外」として切り出したもの。
+- 背景: 現状 Win32 の `KeyEdge` キューは全インストール HWND で共有され、送信元 HWND / viewport を
+  持たない ([src/key_input.rs](../src/key_input.rs))。IME 状態も `App` に 1 組しかなく、
+  各 viewport の入口から更新される。そのため「root ctx はキーボード不要、child ctx は TextEdit
+  編集中、物理キーキューはどちら由来か不明」という組み合わせが成立し得る。
+- 対応案: `KeyEdge` に送信元 HWND / viewport を持たせ、root / fullscreen / detached が
+  **自分由来の edge だけ**を消費する。IME 状態も `ViewportId -> ImeState` へ分離する。
+- 前提: **案A (`KeyboardOwner` / `ShortcutPermit` の単一ゲート) の完了後**に着手する。
+  案A で所有権判定が一元化されていれば、本項は「どの viewport の所有権か」を正しくするだけの
+  変更に縮む。
+- 影響範囲: Windows native 入力、egui viewport、detached / native presenter。HWND 再生成や
+  viewport lifecycle への対応が要る。detached リワークとの調整も必要
+  ([detached-rework-plan.md](detached-rework-plan.md) §2 / §11)。
+- 規模 / 優先度: Large / P2 candidate。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
