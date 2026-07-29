@@ -297,10 +297,26 @@ gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`
 
 フォルダ横断後、新しい `items_generation` のページで full / final / edit / thumbnail の
 いずれかを一度でも表示候補に選べたら、`fs_nav_holdover_tex_for_draw` は
-`fs_holdover_tex` の handle 自体を破棄して一方向にラッチする。入力抑止用の
+`fs_holdover_tex` の handle 自体を破棄して一方向にラッチする。表示確定待ち世代を持つ
 `fs_nav_locked_gen` は `poll_fs_nav_lock` が別途解除するため、両者の寿命は同一でなくてよい。
 AI final の invalidation / install の過渡フレームで表示解決が再び `None` になっても、
 旧フォルダの handle は既に存在せず、nav holdover が復活することはない。
+
+`fs_nav_locked_gen` は入力を拒否する lock ではなく、どの `items_generation` の表示確定まで
+旧ビューの holdover を維持するかを表す presentation generation である。Ctrl+↑↓ と
+Ctrl+PageUp/PageDown は lock 中も、snapshot / Ctrl+G / ZIP tree など副作用を持つ context
+routing へ再入せず、読み取り専用 resolver が DFS 系 request だけを `start_folder_nav` へ渡す。
+表示待ち中に次の DFS を新規開始した場合は handle を再キャプチャせず、locked generation だけを
+現在世代へ進める。これにより中間ページの表示完了が先に届いても、次の folder load 前に
+holdover を解放しない。スライドショー停止、detached session routing、検索分岐、ZIP 内移動は
+最初の入力でだけ実行し、lock 中のリピートでは二重実行しない。
+
+DFS 実行中の同種入力は `start_folder_nav` の単一受付口で
+`pending_folder_nav_steps` へ符号付きで累積し、前後入力は相殺する。追加ステップの上限は
+`MAX_PENDING_NAV = 5`。worker 完了時に `poll_folder_nav` が残数を `FolderNavResult` へ移し、
+その request が起こした folder load の適用成功時だけ次の DFS へ引き渡す。
+`start_loading_items` 自体は従来どおり App 上の accumulator を clear するため、アドレスバー、
+お気に入り、ツリークリックなど無関係なフォルダ切替をまたいで burst が残ることはない。
 
 フルスクリーン画像領域の合成順は、ページ画像 → ページ単位の編集オーバーレイ
 (消しゴム / クロップ / キャプチャ領域 / ルーペ) → ビュー単位の nav holdover →
@@ -770,9 +786,9 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 Creative LUT は**カラー化と併用されているときだけ** gate 条件に加える。カラー化待ちの間に
 LUT 未適用画素を一瞬見せないためで、この組み合わせは元々カラー化側の条件で待っていた。
 **LUT 単独のページは gate しない**。ここまで gate すると、フォルダ移動の nav lock
-(`poll_fs_nav_lock` は complete composite を待つ) が LUT 合成の完了まで伸び、その間の
-Ctrl+↑↓ が `handle_fullscreen_ctrl_nav_context` の lock ガードで捨てられて「押した回数と
-移動数が合わない」実害になる (2026-07-29)。post_filter 単独は同期合成なので gate 対象にしない。
+(`poll_fs_nav_lock` は complete composite を待つ) を視覚上不要な LUT 合成の完了まで伸ばすためで
+ある。lock 中の Ctrl+↑↓ 自体は 2026-07-29 の入力受付整理後は捨てず、上記 accumulator へ渡す。
+post_filter 単独は同期合成なので gate 対象にしない。
 
 近モノクロ要約は `idx → { EditResultKey, p95_residual }` で memo 化し、`poll_prefetch` の末尾から
 1 frame 最大 4 件、現在の `fullscreen_idx` 最優先で計算する。producer は既存の

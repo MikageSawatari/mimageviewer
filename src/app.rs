@@ -4006,6 +4006,12 @@ pub(crate) struct FolderNavPending {
     mode: FolderNavMode,
 }
 
+/// 1 本の DFS が進行している間に受け付ける追加移動数の上限。
+///
+/// キーを離した後まで長く移動し続けないよう、最初に実行中の 1 ステップとは別に
+/// 保持する追加ステップを前後それぞれ 5 件までに制限する。
+const MAX_PENDING_NAV: i32 = 5;
+
 /// 実フォルダを **worker で事前 scan** してから開くための保留状態。
 /// folder pane ナビと detached image open が共有し、`purpose` が結果の適用先と対象 leaf を所有する。
 /// UI スレッドで `scan_directory` (大/遅/ネットワークフォルダで read_dir が数百 ms〜秒) を
@@ -4091,6 +4097,12 @@ pub(crate) struct FolderNavResult {
     pub forward: bool,
     /// 起点モード。
     pub mode: FolderNavMode,
+    /// この DFS が進行している間に同じモードで受け付けた追加ステップ。
+    ///
+    /// 一般の `start_loading_items` は別操作によるフォルダ切替で古い burst を流すため、
+    /// App 上の accumulator を従来どおり clear する。この値だけは完了した folder-nav
+    /// request 自身が所有し、適用成功後に次の DFS へ引き渡す。
+    pub queued_steps: i32,
     /// DFS スレッドで事前走査した `path` の中身、または走査失敗。
     /// 失敗を空一覧として `load_folder` へ適用して catalog を削除しない。
     pub scanned: FolderNavScanResult,
@@ -31105,12 +31117,6 @@ impl App {
         forward: bool,
         mode: FolderNavMode,
     ) {
-        // 連打アキュームレータの上限。キーを離した後に余韻で追加遷移が続くと
-        // 体感上「離したのに動く」違和感になるため、溜められる量を制限する。
-        // 5 なら画像・動画フォルダの load_folder (~100ms/step) で 500ms 弱で drain され、
-        // リピート離脱直後のレスポンスが保たれる。超過分のプレスは捨てる。
-        const MAX_PENDING_NAV: i32 = 5;
-
         if let Some(pending) = self.folder_nav_pending.as_ref() {
             if folder_nav_mode_same_kind(&pending.mode, &mode) {
                 // 既に同一モードで nav 進行中: 連打を累積するだけ
@@ -31127,6 +31133,34 @@ impl App {
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = mode.clone();
         self.spawn_folder_nav(current, forward, mode);
+    }
+
+    /// フルスクリーンの表示待ち lock 中に、既に進行中の DFS が所有する mode を返す。
+    ///
+    /// 入力ハンドラはこの snapshot を `start_folder_nav` へ戻すだけにし、検索・ZIP・
+    /// detached など副作用を持つ context routing をもう一度実行しない。
+    pub(crate) fn inflight_fullscreen_folder_nav_mode(
+        &self,
+        sibling: bool,
+    ) -> Option<FolderNavMode> {
+        let mode = self.folder_nav_pending.as_ref()?.mode.clone();
+        let accepted = if sibling {
+            matches!(&mode, FolderNavMode::SiblingFullscreen)
+        } else {
+            matches!(
+                &mode,
+                FolderNavMode::Fullscreen
+                    | FolderNavMode::Favsearch {
+                        fullscreen: true,
+                        ..
+                    }
+                    | FolderNavMode::SmartFolder {
+                        fullscreen: true,
+                        ..
+                    }
+            )
+        };
+        accepted.then_some(mode)
     }
 
     /// 内部ヘルパー: フォルダ移動ワーカースレッドを spawn する。
@@ -31356,15 +31390,14 @@ impl App {
     }
 
     /// 直前の folder_nav 完了後に呼ぶ。累積ステップが残っていれば次の DFS を連鎖実行。
-    /// モードは直前バーストと同じ (`pending_folder_nav_mode`) を引き継ぐ。
-    fn chain_folder_nav_if_pending(&mut self) {
-        if self.pending_folder_nav_steps == 0 {
+    /// モードと残数は、完了した `FolderNavResult` が所有していた値を引き継ぐ。
+    fn chain_folder_nav_if_pending(&mut self, mut queued_steps: i32, mut mode: FolderNavMode) {
+        if queued_steps == 0 {
             return;
         }
-        let forward = self.pending_folder_nav_steps > 0;
+        let forward = queued_steps > 0;
         // 1 ステップ消費
-        self.pending_folder_nav_steps += if forward { -1 } else { 1 };
-        let mut mode = self.pending_folder_nav_mode.clone();
+        queued_steps += if forward { -1 } else { 1 };
         // mode に応じて「次のステップの起点」は変わる:
         //   Grid / Fullscreen → effective_folder() (変換キャッシュに着地した直後は
         //     current_folder がキャッシュ ZIP を指すため、ユーザー視点の元アーカイブを
@@ -31390,6 +31423,31 @@ impl App {
             _ => self.effective_folder(),
         };
         if let Some(cur) = current {
+            // fullscreen burst の各 folder load は generation を進める。次の DFS が完了する
+            // 前に中間ページが表示確定しても holdover を解放しないよう、同じ lock/texture
+            // を次段の generation へ引き継ぐ。lock の gate 自体は変えない。
+            if self.fs_nav_locked_gen.is_some()
+                && matches!(
+                    &mode,
+                    FolderNavMode::Fullscreen
+                        | FolderNavMode::SiblingFullscreen
+                        | FolderNavMode::SlideshowNext
+                        | FolderNavMode::Favsearch {
+                            fullscreen: true,
+                            ..
+                        }
+                        | FolderNavMode::SmartFolder {
+                            fullscreen: true,
+                            ..
+                        }
+                )
+            {
+                self.fs_nav_locked_gen = Some(self.items_generation);
+            }
+            // `start_loading_items` は無関係な folder change の burst を流すため App 側を
+            // clear する。完了した FolderNavResult が所有していた残数だけを、次の DFS を
+            // spawn する直前に戻すことで、その load 自身の burst だけを継続する。
+            self.pending_folder_nav_steps = queued_steps;
             self.pending_folder_nav_mode = mode.clone();
             self.spawn_folder_nav(cur, forward, mode);
         }
@@ -31666,6 +31724,8 @@ impl App {
         match pending.rx.try_recv() {
             Ok(thread_result) => {
                 let pending = self.folder_nav_pending.take().unwrap();
+                let queued_steps = std::mem::take(&mut self.pending_folder_nav_steps);
+                self.pending_folder_nav_mode = FolderNavMode::Grid;
                 let (path, hit_image_folder) = match thread_result.outcome {
                     Some(o) => (Some(o.path), o.hit_image_folder),
                     None => (None, false),
@@ -31675,17 +31735,21 @@ impl App {
                     hit_image_folder,
                     forward: pending.forward,
                     mode: pending.mode,
+                    queued_steps,
                     scanned: thread_result.scanned,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 let pending = self.folder_nav_pending.take().unwrap();
+                let queued_steps = std::mem::take(&mut self.pending_folder_nav_steps);
+                self.pending_folder_nav_mode = FolderNavMode::Grid;
                 Some(FolderNavResult {
                     path: None,
                     hit_image_folder: false,
                     forward: pending.forward,
                     mode: pending.mode,
+                    queued_steps,
                     scanned: FolderNavScanResult::NotNeeded,
                 })
             }
@@ -31962,6 +32026,9 @@ impl App {
         let apply_t0 = std::time::Instant::now();
         let apply_seq = self.input_seq;
         let apply_mode_tag = result.mode.perf_tag();
+        let continuation_mode = result.mode.clone();
+        let queued_steps = result.queued_steps;
+        let mut continue_burst = true;
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -32207,6 +32274,7 @@ impl App {
                     self.load_folder_nav_target(path, scanned),
                     FolderOpenOutcome::Loaded
                 ) {
+                    continue_burst = false;
                     self.clear_pending_folder_nav_steps();
                     self.release_fs_nav_lock();
                 }
@@ -32239,6 +32307,7 @@ impl App {
                         false,
                     );
                     if reason == "enumerate_defer" {
+                        self.chain_folder_nav_if_pending(queued_steps, continuation_mode.clone());
                         emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
                         return;
                     }
@@ -32288,6 +32357,7 @@ impl App {
                     resume_slideshow,
                 );
                 if reason == "enumerate_defer" {
+                    self.chain_folder_nav_if_pending(queued_steps, continuation_mode.clone());
                     emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
                     return;
                 }
@@ -32343,12 +32413,17 @@ impl App {
                             false,
                         );
                         if reason == "enumerate_defer" {
+                            self.chain_folder_nav_if_pending(
+                                queued_steps,
+                                continuation_mode.clone(),
+                            );
                             emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
                             return;
                         }
                     }
                 } else {
                     // サブツリー外へ出ようとしている → 検索結果の前後へ移動
+                    continue_burst = false;
                     if fullscreen {
                         #[cfg(windows)]
                         let restore_video_tile = self.video_tile_mode_active;
@@ -32390,6 +32465,9 @@ impl App {
                     }
                 }
             }
+        }
+        if continue_burst {
+            self.chain_folder_nav_if_pending(queued_steps, continuation_mode);
         }
         emit_end(apply_t0, apply_seq, apply_mode_tag, "done");
     }
@@ -36479,7 +36557,6 @@ impl App {
                 }
                 if let Some(result) = app.poll_folder_nav() {
                     app.apply_folder_nav_result(ctx, result);
-                    app.chain_folder_nav_if_pending();
                 }
                 let _ = app.poll_detached_physical_folder_open(ctx);
                 app.poll_pdf_enumerate();
@@ -60416,7 +60493,6 @@ impl eframe::App for App {
                     let folder_nav_wins = keyboard_nav.is_none();
                     if folder_nav_wins {
                         self.apply_folder_nav_result(ctx, result);
-                        self.chain_folder_nav_if_pending();
                     }
                 }
                 // Do not paint the main viewport black while the native video
@@ -60469,7 +60545,6 @@ impl eframe::App for App {
                 if let Some(result) = self.poll_folder_nav() {
                     if keyboard_nav.is_none() {
                         self.apply_folder_nav_result(ctx, result);
-                        self.chain_folder_nav_if_pending();
                     }
                 }
                 if self.archive_convert.is_some() {
@@ -61022,8 +61097,6 @@ impl eframe::App for App {
             // (旧実装の `.or()` 短絡と同じ挙動)。
             if let Some(result) = folder_nav_result {
                 self.apply_folder_nav_result(ctx, result);
-                // 累積ステップが残っていれば次の DFS を連鎖起動。
-                self.chain_folder_nav_if_pending();
             }
         } else {
             // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース

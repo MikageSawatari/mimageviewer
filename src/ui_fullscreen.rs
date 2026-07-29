@@ -19,6 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 use eframe::egui;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::adjustment::PostFilter;
@@ -2115,9 +2116,8 @@ impl App {
 
         let params = self.effective_params(idx);
         // Creative LUT 単独では待たない。LUT だけのページまで gate すると、フォルダ移動の
-        // nav lock が LUT 合成の完了まで伸び、その間の Ctrl+↑↓ が
-        // `handle_fullscreen_ctrl_nav_context` の lock ガードで捨てられる (実害あり)。
-        // 元々 LUT は gate 対象外だったので、ここは従来どおりに戻す。
+        // nav lock を視覚上不要な LUT 合成の完了まで伸ばす。lock 中の Ctrl+↑↓ は
+        // accumulator へ渡すが、元々 LUT は gate 対象外なのでここは従来どおり待たない。
         if !params.colorize.is_enabled() {
             return false;
         }
@@ -14223,6 +14223,111 @@ impl App {
         }
     }
 
+    /// 表示確定待ちの nav lock 中に受け付けられる、DFS 系の次リクエストだけを解決する。
+    ///
+    /// 既に DFS が走っている場合は、その request が所有する mode を最優先する。DFS 完了後の
+    /// display-wait 窓では現在の context を読み取り専用で解決する。snapshot / Ctrl+G / ZIP
+    /// tree のように `start_folder_nav` を使わない経路はここでは再実行せず、副作用のある
+    /// context routing へロック中に二度入らない。
+    fn locked_fullscreen_folder_nav_request(
+        &self,
+        sibling: bool,
+    ) -> Option<(PathBuf, crate::app::FolderNavMode)> {
+        if let Some(mode) = self.inflight_fullscreen_folder_nav_mode(sibling) {
+            let current = match &mode {
+                crate::app::FolderNavMode::Favsearch { .. } => {
+                    self.favsearch.nav_stack.last().cloned()
+                }
+                crate::app::FolderNavMode::SmartFolder { state, .. } => Some(
+                    state
+                        .scoped_current()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| {
+                            crate::app::smart_folder::smart_folder_synthetic_path(
+                                state.definition_id,
+                            )
+                        }),
+                ),
+                _ => self.effective_folder(),
+            }?;
+            return Some((current, mode));
+        }
+
+        #[cfg(windows)]
+        if self.detached_physical_folder_nav_available() {
+            return self.effective_folder().map(|current| {
+                (
+                    current,
+                    if sibling {
+                        crate::app::FolderNavMode::SiblingFullscreen
+                    } else {
+                        crate::app::FolderNavMode::Fullscreen
+                    },
+                )
+            });
+        }
+
+        #[cfg(windows)]
+        if self.detached_independent_session_blocks_folder_nav() {
+            return None;
+        }
+
+        if self.is_snapshot_active() {
+            return None;
+        }
+        if sibling {
+            if self.global_search.active
+                || self.favsearch.active
+                || self.show_search_bar
+                || self.items_are_subfolder_expansion_view
+                || self.items_are_smart_folder_view
+            {
+                return None;
+            }
+            return self
+                .effective_folder()
+                .map(|current| (current, crate::app::FolderNavMode::SiblingFullscreen));
+        }
+
+        if self.global_search.active {
+            return None;
+        }
+        if self.favsearch.active {
+            let root = self.favsearch.nav_stack.first().cloned()?;
+            let current = self.favsearch.nav_stack.last().cloned()?;
+            return Some((
+                current,
+                crate::app::FolderNavMode::Favsearch {
+                    root,
+                    fullscreen: true,
+                },
+            ));
+        }
+        if self.show_search_bar || self.items_are_subfolder_expansion_view {
+            return None;
+        }
+        if self.zip_nav.is_some() {
+            return None;
+        }
+        if let Some(state) = self.top_level_grid_view.smart_folder().cloned() {
+            let current = state
+                .scoped_current()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| {
+                    crate::app::smart_folder::smart_folder_synthetic_path(state.definition_id)
+                });
+            return Some((
+                current,
+                crate::app::FolderNavMode::SmartFolder {
+                    state,
+                    fullscreen: true,
+                },
+            ));
+        }
+        self.effective_folder()
+            .map(|current| (current, crate::app::FolderNavMode::Fullscreen))
+    }
+
     pub(crate) fn handle_fullscreen_ctrl_nav_context(
         &mut self,
         ctx: &egui::Context,
@@ -14231,6 +14336,13 @@ impl App {
         native_toast: bool,
     ) {
         if self.fs_nav_is_locked() {
+            if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(false) {
+                // A follow-up accepted during the display-wait window targets the next items
+                // generation. Keep the existing holdover handle, but do not let readiness of
+                // the intermediate page release it before this DFS result is applied.
+                self.fs_nav_locked_gen = Some(self.items_generation);
+                self.start_folder_nav(current, forward, mode);
+            }
             return;
         }
         // 手動 Ctrl+↑↓ (フォルダ移動操作) はスライドショーを止める。成功時は後続の
@@ -14357,6 +14469,10 @@ impl App {
         native_toast: bool,
     ) {
         if self.fs_nav_is_locked() {
+            if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(true) {
+                self.fs_nav_locked_gen = Some(self.items_generation);
+                self.start_folder_nav(current, forward, mode);
+            }
             return;
         }
         self.slideshow_playing = false;

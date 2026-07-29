@@ -1,6 +1,6 @@
 use super::*;
 use crate::archive_converter::ArchiveFormat;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[cfg(windows)]
@@ -17900,6 +17900,233 @@ mod favorite_adjustment_defaults_tests {
                 fullscreen: true,
             },
         ));
+    }
+
+    fn create_folder_nav_burst_fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let temp = tempfile::TempDir::new().expect("create folder-nav fixture root");
+        let folders = (0..count)
+            .map(|index| {
+                let folder = temp.path().join(format!("{index:02}"));
+                std::fs::create_dir_all(&folder).expect("create folder-nav fixture directory");
+                std::fs::write(folder.join("page.jpg"), b"fixture")
+                    .expect("create folder-nav fixture image");
+                folder
+            })
+            .collect();
+        (temp, folders)
+    }
+
+    fn drain_folder_nav_burst_for_test(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.folder_nav_pending.is_some() {
+            if let Some(result) = app.poll_folder_nav() {
+                app.apply_folder_nav_result(ctx, result);
+            } else {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "folder-nav burst did not finish before the test deadline"
+                );
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(app.pending_folder_nav_steps, 0);
+    }
+
+    /// 最初の 1 回を実行中に受け付けた追加 2 回も、成功した folder load 自身の
+    /// `FolderNavResult::queued_steps` から次の DFS へ渡され、合計 3 フォルダ進むこと。
+    #[test]
+    fn folder_nav_burst_three_presses_move_three_folders() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(5);
+        app.current_folder = Some(folders[0].clone());
+
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        assert_eq!(app.pending_folder_nav_steps, 2);
+
+        drain_folder_nav_burst_for_test(&mut app, &ctx);
+        assert!(
+            app.current_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &folders[3])),
+            "3 accepted presses must apply 3 successful folder transitions"
+        );
+    }
+
+    #[test]
+    fn folder_nav_burst_pending_steps_cap_at_five() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(8);
+        app.current_folder = Some(folders[0].clone());
+
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        for _ in 0..10 {
+            app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        }
+        assert_eq!(app.pending_folder_nav_steps, MAX_PENDING_NAV);
+
+        drain_folder_nav_burst_for_test(&mut app, &ctx);
+        assert!(
+            app.current_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &folders[6])),
+            "the initial step plus at most 5 queued steps may be applied"
+        );
+    }
+
+    #[test]
+    fn folder_nav_burst_mixed_directions_cancel_by_sign() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(5);
+        app.current_folder = Some(folders[0].clone());
+
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        app.start_folder_nav(folders[0].clone(), false, FolderNavMode::Grid);
+        assert_eq!(app.pending_folder_nav_steps, 1);
+
+        drain_folder_nav_burst_for_test(&mut app, &ctx);
+        assert!(
+            app.current_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &folders[2])),
+            "forward and backward presses must cancel before the remaining steps are applied"
+        );
+    }
+
+    #[test]
+    fn fullscreen_folder_nav_chain_retargets_holdover_generation_before_next_dfs() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(4);
+        configure_locked_fullscreen_nav_test(&mut app, &folders[0], 21);
+
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Fullscreen);
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Fullscreen);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let first = loop {
+            if let Some(result) = app.poll_folder_nav() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first fullscreen folder-nav step did not finish before the test deadline"
+            );
+            std::thread::yield_now();
+        };
+        app.apply_folder_nav_result(&ctx, first);
+
+        assert!(app.folder_nav_pending.is_some());
+        assert_eq!(
+            app.fs_nav_locked_gen,
+            Some(app.items_generation),
+            "the intermediate page must not release holdover while the next queued DFS is pending"
+        );
+        app.cancel_pending_folder_nav();
+    }
+
+    #[test]
+    fn unrelated_folder_load_flushes_folder_nav_burst() {
+        let mut app = setup_app();
+        let (_temp, folders) = create_folder_nav_burst_fixture(4);
+        app.current_folder = Some(folders[0].clone());
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        app.start_folder_nav(folders[0].clone(), true, FolderNavMode::Grid);
+        let cancel = Arc::clone(&app.folder_nav_pending.as_ref().unwrap().cancel);
+
+        app.load_folder(folders[3].clone());
+
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "grid");
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    fn configure_locked_fullscreen_nav_test(app: &mut App, folder: &Path, generation: u64) {
+        let image = folder.join("page.jpg");
+        app.current_folder = Some(folder.to_path_buf());
+        app.items = vec![GridItem::Image(image)];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.items_generation = generation;
+        app.fs_nav_locked_gen = Some(generation.saturating_sub(1));
+    }
+
+    #[test]
+    fn locked_fullscreen_ctrl_nav_starts_next_request_without_rerunning_press_side_effects() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(3);
+        configure_locked_fullscreen_nav_test(&mut app, &folders[0], 9);
+        app.slideshow_playing = true;
+        let holdover = ctx.load_texture(
+            "locked-folder-nav-holdover",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let holdover_id = holdover.id();
+        app.fs_holdover_tex = Some(holdover);
+
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+
+        assert!(app.folder_nav_pending.is_some());
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen");
+        assert_eq!(app.fs_nav_locked_gen, Some(9));
+        assert_eq!(
+            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            Some(holdover_id),
+            "locked repeat must retain the existing holdover instead of recapturing it"
+        );
+        assert!(
+            app.slideshow_playing,
+            "locked repeat must not re-enter the one-time slideshow-stop side effect"
+        );
+        app.cancel_pending_folder_nav();
+    }
+
+    #[test]
+    fn locked_fullscreen_sibling_nav_starts_sibling_request() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(3);
+        configure_locked_fullscreen_nav_test(&mut app, &folders[1], 12);
+
+        app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+
+        assert!(app.folder_nav_pending.is_some());
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
+        assert_eq!(app.fs_nav_locked_gen, Some(12));
+        app.cancel_pending_folder_nav();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn locked_detached_physical_repeat_only_queues_its_bundle_request() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(3);
+        configure_locked_fullscreen_nav_test(&mut app, &folders[0], 15);
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.slideshow_playing = true;
+
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+
+        assert!(app.folder_nav_pending.is_some());
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen");
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.detached_viewer_independent_active);
+        assert!(app.slideshow_playing);
+        app.cancel_pending_folder_nav();
     }
 
     /// `poll_fs_nav_lock`: items_generation が進んだあとに新ページのサムネが
