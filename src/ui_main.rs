@@ -1501,6 +1501,15 @@ fn details_column_menu_heading(
     }
 }
 
+fn details_shared_preview_hover_text(
+    column_set: DetailsColumnSet,
+    origin: DetailsColumnMenuOrigin,
+) -> Option<&'static str> {
+    (column_set == DetailsColumnSet::SharedBar
+        && origin == DetailsColumnMenuOrigin::DetailsSelectionBar)
+        .then_some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
+}
+
 fn toggle_details_selection_bar_mode_from_menu(settings: &mut crate::settings::Settings) -> bool {
     let old_mode = settings.details_selection_bar_mode.normalized();
     let new_mode = if old_mode == DetailsSelectionBarMode::Dedicated {
@@ -13296,7 +13305,10 @@ impl App {
                     )
                     .on_disabled_hover_text("下部バーはプレビューを表示しません");
                 } else {
-                    ui.checkbox(&mut menu_state.show_preview, "プレビュー");
+                    let response = ui.checkbox(&mut menu_state.show_preview, "プレビュー");
+                    if let Some(text) = details_shared_preview_hover_text(column_set, origin) {
+                        response.on_hover_text(text);
+                    }
                 }
                 ui.checkbox(&mut menu_state.show_rating, "★");
                 ui.checkbox(&mut menu_state.show_tags, "タグ");
@@ -15636,6 +15648,38 @@ mod compute_cell_size_tests {
                 "詳細表示の下部情報バー専用"
             );
         }
+    }
+
+    #[test]
+    fn shared_preview_hover_explains_only_details_bottom_bar_behavior() {
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::SharedBar,
+                DetailsColumnMenuOrigin::DetailsSelectionBar,
+            ),
+            Some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
+        );
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::Details,
+                DetailsColumnMenuOrigin::DetailsListHeader,
+            ),
+            None
+        );
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::SharedBar,
+                DetailsColumnMenuOrigin::ThumbnailSelectionBar,
+            ),
+            None
+        );
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::DedicatedBar,
+                DetailsColumnMenuOrigin::DetailsSelectionBar,
+            ),
+            None
+        );
     }
 
     #[test]
