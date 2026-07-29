@@ -157,7 +157,11 @@ export function viewerWheelCommand(deltaY, zoomModifier) {
   return command(deltaY < 0 ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
 }
 
-export function gridLayoutForWidth(containerWidth, aspectHeightRatio) {
+export function gridLayoutForWidth(
+  containerWidth,
+  aspectHeightRatio,
+  labelHeight = 38
+) {
   const width = Math.max(1, Number(containerWidth) || 1);
   const inset = width >= 900 ? 20 : 10;
   const availableWidth = Math.max(1, width - inset * 2);
@@ -177,16 +181,47 @@ export function gridLayoutForWidth(containerWidth, aspectHeightRatio) {
     Number.isFinite(requestedRatio) && requestedRatio > 0
       ? requestedRatio
       : 1;
-  const cellHeight = Math.max(32, Math.round(cellWidth * ratio));
+  const resolvedLabelHeight = Math.max(1, Math.round(Number(labelHeight) || 38));
+  const previewHeight = Math.max(32, Math.round(cellWidth * ratio));
+  const tileHeight = previewHeight + resolvedLabelHeight;
   return {
     columns,
     cellWidth,
-    cellHeight,
-    rowPitch: cellHeight + gap,
+    previewHeight,
+    labelHeight: resolvedLabelHeight,
+    tileHeight,
+    rowPitch: tileHeight + gap,
     gap,
     inset,
     targetCellWidth,
   };
+}
+
+export function gridScrollExtent(rowCount, rowPitch, viewportHeight) {
+  const rows = Math.max(0, Math.floor(Number(rowCount) || 0));
+  const pitch = Math.max(1, Number(rowPitch) || 1);
+  const viewport = Math.max(0, Number(viewportHeight) || 0);
+  const naturalHeight = rows * pitch;
+  if (naturalHeight <= viewport) {
+    return {
+      naturalHeight,
+      maxOffset: 0,
+      totalHeight: viewport,
+    };
+  }
+  const maxOffset = Math.ceil((naturalHeight - viewport) / pitch) * pitch;
+  return {
+    naturalHeight,
+    maxOffset,
+    totalHeight: maxOffset + viewport,
+  };
+}
+
+export function snappedGridOffset(scrollTop, rowPitch, maxOffset) {
+  const offset = Math.max(0, Number(scrollTop) || 0);
+  const pitch = Math.max(1, Number(rowPitch) || 1);
+  const maximum = Math.max(0, Number(maxOffset) || 0);
+  return Math.max(0, Math.min(maximum, Math.round(offset / pitch) * pitch));
 }
 
 export function reduceViewerTransform(current, requested) {

@@ -4,9 +4,11 @@ import {
   command,
   commandFromKey,
   gridLayoutForWidth,
+  gridScrollExtent,
   gridIndexForCommand,
   nextFitMode,
   reduceViewerTransform,
+  snappedGridOffset,
   viewerTapCommand,
   viewerImageLayout,
   viewerWheelCommand,
@@ -100,11 +102,6 @@ async function enterAuthenticatedApp() {
   renderLoading("お気に入りを読み込んでいます");
   const data = await apiJson("/api/favorites");
   state.favorites = data.favorites ?? [];
-  state.thumbAspectHeightRatio =
-    Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
-    Number(data.thumb_aspect_height_ratio) > 0
-      ? Number(data.thumb_aspect_height_ratio)
-      : 1;
   if (!location.hash) {
     history.replaceState({ mivRoute: true }, "", "#favorites");
   } else {
@@ -609,6 +606,11 @@ async function loadFolder(favoriteId, path) {
   state.favoriteName =
     state.favorites.find((favorite) => favorite.id === favoriteId)?.name ?? "お気に入り";
   state.folderPath = data.path ?? "";
+  state.thumbAspectHeightRatio =
+    Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
+    Number(data.thumb_aspect_height_ratio) > 0
+      ? Number(data.thumb_aspect_height_ratio)
+      : 1;
   // ZIP/PDF/video/audio remain API classifications only in this PoC. The
   // browsing UI intentionally exposes directories and ordinary images.
   state.entries = (data.entries ?? []).filter(
@@ -950,6 +952,7 @@ async function loadThumbnail(image, entry, tracker) {
     });
     if (!response.ok) {
       image.classList.add("thumb-missing");
+      image.parentElement?.classList.remove("thumb-loaded");
       tracker?.settled(entry.path, { notFound: response.status === 404 });
       return;
     }
@@ -959,13 +962,17 @@ async function loadThumbnail(image, entry, tracker) {
     try {
       await image.decode();
       await nextFrame();
+      image.classList.remove("thumb-missing");
       image.classList.add("thumb-ready");
+      image.parentElement?.classList.add("thumb-loaded");
       tracker?.settled(entry.path);
     } finally {
       URL.revokeObjectURL(objectUrl);
     }
   } catch (error) {
+    image.classList.remove("thumb-ready");
     image.classList.add("thumb-missing");
+    image.parentElement?.classList.remove("thumb-loaded");
     tracker?.settled(entry.path);
     recordClientError("image_load_error", error, {
       resource: safeResourcePath(url),
@@ -994,18 +1001,56 @@ class VirtualGrid {
     this.cells = new Map();
     this.columns = 1;
     this.rowHeight = 1;
-    this.cellHeight = 1;
+    this.tileHeight = 1;
+    this.previewHeight = 1;
+    this.labelHeight = 1;
     this.gap = 0;
+    this.maxScrollOffset = 0;
     this.lastRange = "";
     this.frame = 0;
-    this.onScroll = () => this.schedule();
+    this.snapTimer = 0;
+    this.pointerActive = false;
+    this.onScroll = () => {
+      this.schedule();
+      this.scheduleRowSnap();
+    };
+    this.onScrollEnd = () => this.snapToRow();
+    this.onWheel = (event) => this.handleWheel(event);
+    this.onPointerDown = () => {
+      this.pointerActive = true;
+      clearTimeout(this.snapTimer);
+      this.snapTimer = 0;
+    };
+    this.onPointerEnd = () => {
+      this.pointerActive = false;
+      this.scheduleRowSnap();
+    };
     this.resizeObserver = new ResizeObserver(() => this.layout());
     this.scroller.addEventListener("scroll", this.onScroll, { passive: true });
+    this.scroller.addEventListener("scrollend", this.onScrollEnd, {
+      passive: true,
+    });
+    this.scroller.addEventListener("wheel", this.onWheel, { passive: false });
+    this.scroller.addEventListener("pointerdown", this.onPointerDown, {
+      passive: true,
+    });
+    this.scroller.addEventListener("pointerup", this.onPointerEnd, {
+      passive: true,
+    });
+    this.scroller.addEventListener("pointercancel", this.onPointerEnd, {
+      passive: true,
+    });
     this.resizeObserver.observe(this.scroller);
     this.layout();
   }
 
   layout() {
+    const previousColumns = this.columns;
+    const previousRowHeight = this.rowHeight;
+    const anchorIndex =
+      previousRowHeight > 1
+        ? Math.floor(this.scroller.scrollTop / previousRowHeight) * previousColumns
+        : 0;
     const layout = gridLayoutForWidth(
       this.scroller.clientWidth,
       this.aspectHeightRatio
@@ -1018,18 +1063,87 @@ class VirtualGrid {
       this.rowHeight = layout.rowPitch;
       this.lastRange = "";
     }
-    this.cellHeight = layout.cellHeight;
+    this.tileHeight = layout.tileHeight;
+    this.previewHeight = layout.previewHeight;
+    this.labelHeight = layout.labelHeight;
     this.gap = layout.gap;
     const rows = Math.ceil(this.items.length / this.columns);
-    this.space.style.height = `${Math.max(
-      this.scroller.clientHeight,
-      rows * this.rowHeight
-    )}px`;
+    const extent = gridScrollExtent(
+      rows,
+      this.rowHeight,
+      this.scroller.clientHeight
+    );
+    this.maxScrollOffset = extent.maxOffset;
+    this.space.style.height = `${extent.totalHeight}px`;
     this.windowElement.style.left = `${layout.inset}px`;
     this.windowElement.style.right = `${layout.inset}px`;
     this.windowElement.style.gap = `${layout.gap}px`;
+    this.windowElement.style.setProperty(
+      "--grid-preview-height",
+      `${layout.previewHeight}px`
+    );
+    this.windowElement.style.setProperty(
+      "--grid-label-height",
+      `${layout.labelHeight}px`
+    );
     this.windowElement.style.gridTemplateColumns = `repeat(${this.columns}, minmax(0, 1fr))`;
-    this.windowElement.style.gridAutoRows = `${this.cellHeight}px`;
+    this.windowElement.style.gridAutoRows = `${this.tileHeight}px`;
+    if (
+      layout.columns !== previousColumns ||
+      layout.rowPitch !== previousRowHeight
+    ) {
+      const anchorRow = Math.floor(anchorIndex / this.columns);
+      this.scroller.scrollTop = Math.min(
+        this.maxScrollOffset,
+        anchorRow * this.rowHeight
+      );
+    }
+    this.schedule();
+  }
+
+  handleWheel(event) {
+    if (
+      event.ctrlKey ||
+      event.metaKey ||
+      !Number.isFinite(event.deltaY) ||
+      event.deltaY === 0
+    ) {
+      return;
+    }
+    event.preventDefault();
+    clearTimeout(this.snapTimer);
+    this.snapTimer = 0;
+    const current = snappedGridOffset(
+      this.scroller.scrollTop,
+      this.rowHeight,
+      this.maxScrollOffset
+    );
+    const target = current + Math.sign(event.deltaY) * this.rowHeight;
+    this.scroller.scrollTop = Math.max(
+      0,
+      Math.min(this.maxScrollOffset, target)
+    );
+    this.schedule();
+  }
+
+  scheduleRowSnap() {
+    if (this.pointerActive) return;
+    clearTimeout(this.snapTimer);
+    this.snapTimer = window.setTimeout(() => this.snapToRow(), 140);
+  }
+
+  snapToRow() {
+    if (this.pointerActive) return;
+    clearTimeout(this.snapTimer);
+    this.snapTimer = 0;
+    const snapped = snappedGridOffset(
+      this.scroller.scrollTop,
+      this.rowHeight,
+      this.maxScrollOffset
+    );
+    if (Math.abs(this.scroller.scrollTop - snapped) > 0.5) {
+      this.scroller.scrollTop = snapped;
+    }
     this.schedule();
   }
 
@@ -1056,7 +1170,7 @@ class VirtualGrid {
       this.initialItemsReported = true;
       this.onInitialItems?.(this.items.slice(startIndex, endIndex));
     }
-    this.windowElement.style.top = `${firstRow * this.rowHeight + this.gap / 2}px`;
+    this.windowElement.style.top = `${firstRow * this.rowHeight}px`;
     const fragment = document.createDocumentFragment();
     for (let index = startIndex; index < endIndex; index += 1) {
       let cell = this.cells.get(index);
@@ -1092,7 +1206,13 @@ class VirtualGrid {
       this.scroller.scrollTop = top;
       scrolled = true;
     } else if (bottom > this.scroller.scrollTop + this.scroller.clientHeight) {
-      this.scroller.scrollTop = bottom - this.scroller.clientHeight;
+      const firstFullyVisibleRow = Math.ceil(
+        (bottom - this.scroller.clientHeight) / this.rowHeight
+      );
+      this.scroller.scrollTop = Math.min(
+        this.maxScrollOffset,
+        Math.max(0, firstFullyVisibleRow * this.rowHeight)
+      );
       scrolled = true;
     }
     let tile = this.windowElement.querySelector(`[data-entry-index="${index}"]`);
@@ -1110,7 +1230,13 @@ class VirtualGrid {
 
   destroy() {
     cancelAnimationFrame(this.frame);
+    clearTimeout(this.snapTimer);
     this.scroller.removeEventListener("scroll", this.onScroll);
+    this.scroller.removeEventListener("scrollend", this.onScrollEnd);
+    this.scroller.removeEventListener("wheel", this.onWheel);
+    this.scroller.removeEventListener("pointerdown", this.onPointerDown);
+    this.scroller.removeEventListener("pointerup", this.onPointerEnd);
+    this.scroller.removeEventListener("pointercancel", this.onPointerEnd);
     this.resizeObserver.disconnect();
     this.cells.clear();
   }

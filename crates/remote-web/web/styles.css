@@ -346,6 +346,8 @@ button {
 }
 
 .virtual-window {
+  --grid-preview-height: 132px;
+  --grid-label-height: 38px;
   position: absolute;
   right: 10px;
   left: 10px;
@@ -383,8 +385,9 @@ button {
   position: relative;
   display: grid;
   overflow: hidden;
+  height: var(--grid-preview-height);
   min-height: 0;
-  flex: 1;
+  flex: 0 0 var(--grid-preview-height);
   place-items: center;
   background: #10141b;
   contain: layout paint;
@@ -412,6 +415,10 @@ button {
   display: none;
 }
 
+.tile-preview.thumb-loaded :is(.folder-glyph, .file-glyph) {
+  visibility: hidden;
+}
+
 .folder-glyph,
 .file-glyph {
   color: #f6c75d;
@@ -424,7 +431,10 @@ button {
 }
 
 .tile-label {
+  display: block;
   overflow: hidden;
+  height: var(--grid-label-height);
+  flex: 0 0 var(--grid-label-height);
   padding: 9px 10px 11px;
   font-size: 0.82rem;
   line-height: 1.25;

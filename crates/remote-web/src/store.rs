@@ -79,7 +79,6 @@ struct FavoriteRoot {
 #[derive(Serialize)]
 pub struct FavoritesResponse {
     favorites: Vec<FavoriteSummary>,
-    thumb_aspect_height_ratio: f64,
 }
 
 #[derive(Serialize)]
@@ -92,6 +91,7 @@ struct FavoriteSummary {
 pub struct ListResponse {
     favorite_id: Uuid,
     path: String,
+    thumb_aspect_height_ratio: f64,
     entries: Vec<ListEntry>,
 }
 
@@ -159,7 +159,9 @@ pub struct Library {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
     cache_dir: PathBuf,
-    thumb_aspect_height_ratio: f64,
+    thumb_aspect: StoredThumbAspect,
+    thumb_aspect_auto: bool,
+    auto_aspect_cache_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -174,13 +176,7 @@ enum StoredThumbAspect {
     Portrait9x16,
 }
 
-fn resolve_thumb_aspect_height_ratio(aspect: StoredThumbAspect, auto: bool) -> f64 {
-    // remote-web does not own mIV's per-folder, transient AutoAspect state.
-    // App::effective_thumb_aspect uses Square whenever Auto is enabled but
-    // current is still unresolved, rather than reusing the stored manual value.
-    if auto {
-        return 1.0;
-    }
+fn thumb_aspect_height_ratio(aspect: StoredThumbAspect) -> f64 {
     match aspect {
         StoredThumbAspect::Landscape16x9 => 9.0 / 16.0,
         StoredThumbAspect::Landscape3x2 => 2.0 / 3.0,
@@ -192,6 +188,35 @@ fn resolve_thumb_aspect_height_ratio(aspect: StoredThumbAspect, auto: bool) -> f
     }
 }
 
+fn thumb_aspect_from_cache_int(value: i32) -> Option<StoredThumbAspect> {
+    // Keep this explicit mapping in lockstep with src/auto_aspect_cache.rs's
+    // aspect_to_int/aspect_from_int pair. Do not rely on Rust enum layout.
+    match value {
+        0 => Some(StoredThumbAspect::Landscape16x9),
+        1 => Some(StoredThumbAspect::Landscape3x2),
+        2 => Some(StoredThumbAspect::Landscape4x3),
+        3 => Some(StoredThumbAspect::Square),
+        4 => Some(StoredThumbAspect::Portrait3x4),
+        5 => Some(StoredThumbAspect::Portrait2x3),
+        6 => Some(StoredThumbAspect::Portrait9x16),
+        _ => None,
+    }
+}
+
+fn resolve_thumb_aspect_height_ratio(
+    manual: StoredThumbAspect,
+    auto: bool,
+    cached: Option<StoredThumbAspect>,
+) -> f64 {
+    let effective = if auto {
+        // This is App::effective_thumb_aspect's unresolved Auto fallback.
+        cached.unwrap_or(StoredThumbAspect::Square)
+    } else {
+        manual
+    };
+    thumb_aspect_height_ratio(effective)
+}
+
 impl Library {
     #[cfg(test)]
     pub fn empty_for_test(cache_dir: PathBuf) -> Self {
@@ -199,7 +224,9 @@ impl Library {
             favorites: Vec::new(),
             by_id: HashMap::new(),
             cache_dir,
-            thumb_aspect_height_ratio: 1.0,
+            thumb_aspect: StoredThumbAspect::Square,
+            thumb_aspect_auto: false,
+            auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
         }
     }
 
@@ -210,8 +237,6 @@ impl Library {
             read_setting_json::<StoredThumbAspect>(&conn, "thumb_aspect")?.unwrap_or_default();
         let thumb_aspect_auto =
             read_setting_json::<bool>(&conn, "thumb_aspect_auto")?.unwrap_or(false);
-        let thumb_aspect_height_ratio =
-            resolve_thumb_aspect_height_ratio(thumb_aspect, thumb_aspect_auto);
         let mut stmt = conn.prepare(
             "SELECT id, name, path
              FROM favorites
@@ -244,13 +269,14 @@ impl Library {
             favorites,
             by_id,
             cache_dir: data_dir.join("cache"),
-            thumb_aspect_height_ratio,
+            thumb_aspect,
+            thumb_aspect_auto,
+            auto_aspect_cache_path: data_dir.join("auto_aspect_cache.db"),
         })
     }
 
     pub fn favorites(&self) -> FavoritesResponse {
         FavoritesResponse {
-            thumb_aspect_height_ratio: self.thumb_aspect_height_ratio,
             favorites: self
                 .favorites
                 .iter()
@@ -269,6 +295,17 @@ impl Library {
         if !metadata.is_dir() {
             return Err(StoreError::BadRequest);
         }
+        let logical_directory = logical_folder_path(&favorite.path, relative);
+        let cached_aspect = if self.thumb_aspect_auto {
+            read_cached_thumb_aspect(&self.auto_aspect_cache_path, &logical_directory)?
+        } else {
+            None
+        };
+        let thumb_aspect_height_ratio = resolve_thumb_aspect_height_ratio(
+            self.thumb_aspect,
+            self.thumb_aspect_auto,
+            cached_aspect,
+        );
 
         let mut entries = Vec::new();
         let mut scanned_count = 0;
@@ -323,6 +360,7 @@ impl Library {
             response: ListResponse {
                 favorite_id,
                 path: normalize_relative_for_url(relative),
+                thumb_aspect_height_ratio,
                 entries,
             },
             metrics: ListMetrics {
@@ -506,6 +544,40 @@ fn read_setting_json<T: serde::de::DeserializeOwned>(
         )
         .optional()?;
     Ok(raw.and_then(|value| serde_json::from_str(&value).ok()))
+}
+
+fn read_cached_thumb_aspect(
+    cache_path: &Path,
+    logical_folder: &Path,
+) -> Result<Option<StoredThumbAspect>, StoreError> {
+    match std::fs::metadata(cache_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::Io(error)),
+    }
+    let connection = open_read_only(cache_path)?;
+    let folder_key = normalize_keep_drive(logical_folder);
+    let raw = connection
+        .query_row(
+            "SELECT aspect FROM auto_aspect_cache WHERE folder_key = ?1",
+            params![folder_key],
+            |row| row.get::<_, i32>(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(thumb_aspect_from_cache_int))
+}
+
+fn logical_folder_path(root: &Path, relative: &str) -> PathBuf {
+    if relative.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    }
+}
+
+fn normalize_keep_drive(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase().replace('\\', "/")
 }
 
 fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
@@ -852,23 +924,62 @@ mod tests {
     }
 
     #[test]
-    fn thumb_aspect_resolution_matches_miv_effective_aspect_semantics() {
+    fn thumb_aspect_cache_mapping_and_resolution_match_miv_sources() {
         let cases = [
-            (StoredThumbAspect::Landscape16x9, 9.0 / 16.0),
-            (StoredThumbAspect::Landscape3x2, 2.0 / 3.0),
-            (StoredThumbAspect::Landscape4x3, 3.0 / 4.0),
-            (StoredThumbAspect::Square, 1.0),
-            (StoredThumbAspect::Portrait3x4, 4.0 / 3.0),
-            (StoredThumbAspect::Portrait2x3, 3.0 / 2.0),
-            (StoredThumbAspect::Portrait9x16, 16.0 / 9.0),
+            (0, StoredThumbAspect::Landscape16x9, 9.0 / 16.0),
+            (1, StoredThumbAspect::Landscape3x2, 2.0 / 3.0),
+            (2, StoredThumbAspect::Landscape4x3, 3.0 / 4.0),
+            (3, StoredThumbAspect::Square, 1.0),
+            (4, StoredThumbAspect::Portrait3x4, 4.0 / 3.0),
+            (5, StoredThumbAspect::Portrait2x3, 3.0 / 2.0),
+            (6, StoredThumbAspect::Portrait9x16, 16.0 / 9.0),
         ];
-        for (aspect, expected) in cases {
-            let actual = resolve_thumb_aspect_height_ratio(aspect, false);
-            assert!((actual - expected).abs() < f64::EPSILON);
+        for (raw, aspect, expected) in cases {
+            assert_eq!(thumb_aspect_from_cache_int(raw), Some(aspect));
+            let manual = resolve_thumb_aspect_height_ratio(aspect, false, None);
+            let automatic =
+                resolve_thumb_aspect_height_ratio(StoredThumbAspect::Square, true, Some(aspect));
+            assert!((manual - expected).abs() < f64::EPSILON);
+            assert!((automatic - expected).abs() < f64::EPSILON);
         }
-
+        assert_eq!(thumb_aspect_from_cache_int(-1), None);
+        assert_eq!(thumb_aspect_from_cache_int(7), None);
         assert_eq!(
-            resolve_thumb_aspect_height_ratio(StoredThumbAspect::Portrait9x16, true),
+            resolve_thumb_aspect_height_ratio(StoredThumbAspect::Portrait9x16, true, None),
+            1.0
+        );
+        assert_eq!(
+            resolve_thumb_aspect_height_ratio(
+                StoredThumbAspect::Landscape3x2,
+                false,
+                Some(StoredThumbAspect::Portrait9x16),
+            ),
+            2.0 / 3.0
+        );
+    }
+
+    #[test]
+    fn auto_aspect_folder_key_keeps_drive_and_matches_logical_folder() {
+        let root = Path::new(r"C:\Books\Series");
+        assert_eq!(normalize_keep_drive(root), "c:/books/series");
+        assert_eq!(
+            normalize_keep_drive(&logical_folder_path(root, "Volume 01/Pages")),
+            "c:/books/series/volume 01/pages"
+        );
+        assert_eq!(logical_folder_path(root, ""), root);
+    }
+
+    #[test]
+    fn missing_auto_aspect_cache_falls_back_without_creating_a_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_path = temp.path().join("auto_aspect_cache.db");
+        assert_eq!(
+            read_cached_thumb_aspect(&cache_path, Path::new(r"C:\Books\Series")).unwrap(),
+            None
+        );
+        assert!(!cache_path.exists());
+        assert_eq!(
+            resolve_thumb_aspect_height_ratio(StoredThumbAspect::Landscape16x9, true, None),
             1.0
         );
     }
@@ -920,7 +1031,9 @@ mod tests {
             }],
             by_id: HashMap::from([(id, 0)]),
             cache_dir: PathBuf::from("cache"),
-            thumb_aspect_height_ratio: 1.0,
+            thumb_aspect: StoredThumbAspect::Square,
+            thumb_aspect_auto: false,
+            auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
         };
         let json = serde_json::to_string(&library.favorites()).unwrap();
         assert!(json.contains(&id.to_string()));
@@ -956,7 +1069,9 @@ mod tests {
             }],
             by_id: HashMap::from([(id, 0)]),
             cache_dir: temp.path().join("cache"),
-            thumb_aspect_height_ratio: 1.0,
+            thumb_aspect: StoredThumbAspect::Square,
+            thumb_aspect_auto: false,
+            auto_aspect_cache_path: temp.path().join("auto_aspect_cache.db"),
         };
         let listing = library.list(id, "").unwrap();
         assert!(
@@ -1004,7 +1119,7 @@ mod tests {
                  INSERT INTO settings_kv (key, value)
                  VALUES ('thumb_aspect', '\"Landscape3x2\"');
                  INSERT INTO settings_kv (key, value)
-                 VALUES ('thumb_aspect_auto', 'false');",
+                 VALUES ('thumb_aspect_auto', 'true');",
             )
             .unwrap();
             conn.execute(
@@ -1015,6 +1130,35 @@ mod tests {
                     "Fixture",
                     favorite_root.to_string_lossy().as_ref()
                 ],
+            )
+            .unwrap();
+        }
+
+        let auto_aspect_cache_path = data_dir.join("auto_aspect_cache.db");
+        {
+            let conn = Connection::open(&auto_aspect_cache_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE auto_aspect_cache (
+                    folder_key TEXT PRIMARY KEY,
+                    aspect INTEGER NOT NULL,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    eligible_total INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_aspect_cache
+                 (folder_key, aspect, sample_count, eligible_total, updated_at)
+                 VALUES (?1, 0, 12, 20, 1)",
+                params![normalize_keep_drive(&favorite_root)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_aspect_cache
+                 (folder_key, aspect, sample_count, eligible_total, updated_at)
+                 VALUES (?1, 5, 12, 20, 1)",
+                params![normalize_keep_drive(&favorite_root.join("album"))],
             )
             .unwrap();
         }
@@ -1059,8 +1203,8 @@ mod tests {
 
         let settings_before = std::fs::read(&settings_path).unwrap();
         let catalog_before = std::fs::read(&catalog_path).unwrap();
+        let auto_aspect_cache_before = std::fs::read(&auto_aspect_cache_path).unwrap();
         let library = Library::load(&data_dir).unwrap();
-        assert!((library.thumb_aspect_height_ratio - (2.0 / 3.0)).abs() < f64::EPSILON);
 
         let favorites_json = serde_json::to_string(&library.favorites()).unwrap();
         assert!(favorites_json.contains("Fixture"));
@@ -1068,6 +1212,11 @@ mod tests {
 
         let listing = library.list(favorite_id, "").unwrap();
         assert_eq!(listing.response.path, "");
+        assert!((listing.response.thumb_aspect_height_ratio - (9.0 / 16.0)).abs() < f64::EPSILON);
+        let nested_listing = library.list(favorite_id, "album").unwrap();
+        assert!(
+            (nested_listing.response.thumb_aspect_height_ratio - (3.0 / 2.0)).abs() < f64::EPSILON
+        );
         assert!(listing.response.entries.iter().any(|entry| {
             entry.kind == EntryKind::Dir && entry.name == "album" && entry.path == "album"
         }));
@@ -1141,6 +1290,10 @@ mod tests {
 
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
         assert_eq!(std::fs::read(&catalog_path).unwrap(), catalog_before);
+        assert_eq!(
+            std::fs::read(&auto_aspect_cache_path).unwrap(),
+            auto_aspect_cache_before
+        );
     }
 
     #[cfg(windows)]

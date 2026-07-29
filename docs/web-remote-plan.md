@@ -123,8 +123,8 @@ PoC の remote-web 専用サムネイルキャッシュはこの表の mIV 永�
 
 | エンドポイント | 内容 |
 |---|---|
-| `GET /api/favorites` | お気に入り一覧 (id, 表示名) と mIV 設定から解決したタイル高さ比を JSON で返す |
-| `GET /api/list?fav=<uuid>&path=<rel>` | 指定フォルダの直下を JSON で返す。各要素は種別 (dir / image / video / audio / zip / pdf / other)・表示名・相対パス・サイズ・mtime |
+| `GET /api/favorites` | お気に入り一覧 (id, 表示名) を JSON で返す |
+| `GET /api/list?fav=<uuid>&path=<rel>` | 指定フォルダの直下と、そのフォルダでの実効サムネイル高さ比を JSON で返す。各要素は種別 (dir / image / video / audio / zip / pdf / other)・表示名・相対パス・サイズ・mtime |
 | `GET /api/thumb?fav=<uuid>&path=<rel>` | 画像・フォルダのサムネイルを返す。catalog WebP → remote-web 専用 SQLite → オンデマンド生成の順に参照する |
 | `GET /api/image-info?fav=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
 | `GET /api/image?fav=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
@@ -414,21 +414,38 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 WebKit 固有の描画省略経路を残す必要もないため撤去した。上から下へ枠が同化する直接原因は、
 グリッド面が透明で `body` の上端だけ明るい radial gradient を透過していたことだった。
 
-remote-web は settings.db の `thumb_aspect` / `thumb_aspect_auto` を read-only で読み、手動時は
-本体 `ThumbAspect::height_ratio()` と同じ高さ / 幅比を使う。Auto は本体のフォルダごとの一時的な
-`auto_aspect.current` を共有できないため、`App::effective_thumb_aspect` の「Auto 未確定は Square」
-と同じ 1:1 を使う。
+remote-web は settings.db の `thumb_aspect` / `thumb_aspect_auto` を read-only で読む。手動時は
+本体 `ThumbAspect::height_ratio()` と同じ高さ / 幅比を使う。Auto 時はフォルダごとに
+`auto_aspect_cache.db` を **read-only** で引き、行があればその確定値を使い、行または DB が
+無ければ `App::effective_thumb_aspect` の「Auto 未確定は Square」と同じ 1:1 を使う。
+
+`folder_key` は `src/auto_aspect_cache.rs` と同じ `path_key::normalize_keep_drive` 規約、すなわち
+論理フォルダパスのドライブ文字を保持したまま小文字化し、バックスラッシュを `/` に統一する。
+canonicalize 後の `\\?\` パスはキーに使わない。`aspect` INTEGER は本体の明示変換と同じく
+`0=16:9, 1=3:2, 2=4:3, 3=1:1, 4=3:4, 5=2:3, 6=9:16` とする。設定 DB、Auto 比率 DB、
+catalog のいずれにも remote-web から書き込まない。
 
 列数は利用可能幅 `A`、gap `G`、目標セル幅 `T` から
 `ceil((A + G) / (T + G))` とする。左右 inset を除き、スマートフォンは `T=132px, G=8px`、
 中幅は `T=180px, G=12px`、広幅は `T=210px, G=12px`。Square の例では 390px = 3 列、
-768px = 4 列、1280px = 6 列、1920px = 9 列となる。行高は算出後の実セル幅と高さ比から毎回求め、
-向き変更・リサイズ時に仮想スクロールの row pitch も更新する。
+768px = 4 列、1280px = 6 列、1920px = 9 列となる。
+
+列数 `N` の確定後、実セル幅 `C=(A-G×(N-1))/N`、プレビュー高
+`P=round(C×実効高さ比)`、固定ラベル高 `L=38px`、タイル高 `H=P+L`、row pitch `R=H+G`
+の順に一度だけ寸法を確定する。CSS grid の row 高も `H`、プレビューの flex-basis も `P`、
+ラベル高も `L` に固定し、タイル内に未所有の余白を作らない。画面幅・向き変更時は先頭表示 item
+をアンカーに全寸法を再計算する。
+
+仮想スクロールは自然高 `行数×R` から、最大 offset を
+`ceil((自然高-viewport高)/R)×R` にそろえて全体高さを先に確保し、可視行と前後 3 行だけを DOM に
+置く。ホイールは 1 イベント 1 行、タッチ慣性・スクロールバードラッグは `scrollend` または
+140ms の idle 後に最寄りの行へ snap する。
 
 `content-visibility` / `contain-intrinsic-size` は撤去した。ちらつき対策は可視範囲 + overscan のみを
 DOM に置く仮想化、セル DOM の再利用、テーマ色のプレースホルダ、transition 無効、
 `decoding="async"`、`cache: "force-cache"`、`contain: layout paint style` を維持し、グリッド面は
-単色背景にした。
+単色背景にした。プレースホルダのグリフはサムネイル decode 成功時に親へ `thumb-loaded` を付けて
+隠し、HTTP / decode 失敗時だけ表示する。
 
 ### 6.5.6 ターゲット端末の確定 (2026-07-29)
 
