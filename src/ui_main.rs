@@ -12438,27 +12438,36 @@ impl App {
         });
     }
 
+    /// 現在のビューでその列に出す名前。ブックマーク / 読書履歴では同じ列が別の意味を
+    /// 持つので、一覧ヘッダ (`details_header_title`) と列の表示切替メニュー
+    /// (`draw_details_column_context_menu`) の**両方**がここを通る。片方だけ更新すると
+    /// 「一覧には位置と出ているのにメニューには状態しか無い」状態になり、ユーザーが
+    /// 目的の列を見つけられなくなる (実害あり)。
+    fn details_column_view_title(&self, col: DetailsColumn) -> &'static str {
+        if self.items_are_bookmark_view {
+            match col {
+                DetailsColumn::Modified => "登録日時",
+                DetailsColumn::State => "位置",
+                _ => col.title(),
+            }
+        } else if self.items_are_reading_history_view {
+            match col {
+                DetailsColumn::Modified => "最終閲覧",
+                DetailsColumn::State => "既読位置",
+                _ => col.title(),
+            }
+        } else {
+            col.title()
+        }
+    }
+
     fn details_header_title(
         &self,
         col: DetailsColumn,
         book_sort_locked: bool,
         show_sort_indicator: bool,
     ) -> String {
-        let mut base_title = if self.items_are_bookmark_view {
-            match col {
-                DetailsColumn::Modified => "登録日時".to_string(),
-                DetailsColumn::State => "位置".to_string(),
-                _ => col.title().to_string(),
-            }
-        } else if self.items_are_reading_history_view {
-            match col {
-                DetailsColumn::Modified => "最終閲覧".to_string(),
-                DetailsColumn::State => "既読位置".to_string(),
-                _ => col.title().to_string(),
-            }
-        } else {
-            col.title().to_string()
-        };
+        let mut base_title = self.details_column_view_title(col).to_string();
         if col.is_lazy()
             && matches!(
                 self.details_image_dims_state,
@@ -13129,11 +13138,8 @@ impl App {
         } else {
             "専用の設定にする"
         };
-        let (modified_label, state_label) = if self.items_are_reading_history_view {
-            ("最終閲覧", "既読位置")
-        } else {
-            ("更新日時", "状態")
-        };
+        let modified_label = self.details_column_view_title(DetailsColumn::Modified);
+        let state_label = self.details_column_view_title(DetailsColumn::State);
         let mut menu_state = DetailsColumnMenuState::from_settings(&self.settings, column_set);
         let mut toggle_requested = false;
         let max_height =
@@ -14435,6 +14441,68 @@ impl App {
                     ui.add(egui::Label::new(galley));
                 });
             });
+    }
+}
+
+#[cfg(test)]
+mod details_column_view_title_tests {
+    use super::*;
+    use crate::app::setup_app_for_test;
+
+    /// 一覧ヘッダと列の表示切替メニューが同じ列名を出すことを、ビューごとに固定する。
+    /// ブックマーク一覧では「状態」列が「位置」を表示するのに、メニュー側だけ「状態」の
+    /// ままで目的の列を見つけられない不具合があった。
+    #[test]
+    fn bookmark_and_history_views_rename_modified_and_state() {
+        let mut app = setup_app_for_test();
+
+        assert_eq!(
+            app.details_column_view_title(DetailsColumn::Modified),
+            "更新日時"
+        );
+        assert_eq!(app.details_column_view_title(DetailsColumn::State), "状態");
+
+        app.items_are_bookmark_view = true;
+        assert_eq!(
+            app.details_column_view_title(DetailsColumn::Modified),
+            "登録日時"
+        );
+        assert_eq!(app.details_column_view_title(DetailsColumn::State), "位置");
+        // 名前など意味が変わらない列はビューに依存しない。
+        assert_eq!(
+            app.details_column_view_title(DetailsColumn::Name),
+            DetailsColumn::Name.title()
+        );
+
+        app.items_are_bookmark_view = false;
+        app.items_are_reading_history_view = true;
+        assert_eq!(
+            app.details_column_view_title(DetailsColumn::Modified),
+            "最終閲覧"
+        );
+        assert_eq!(
+            app.details_column_view_title(DetailsColumn::State),
+            "既読位置"
+        );
+    }
+
+    /// ヘッダ側 (`details_header_title`) が同じ 1 か所を通ることの回帰テスト。
+    /// 片方だけ直す実装に戻ったらここで落ちる。
+    #[test]
+    fn header_title_uses_the_shared_view_title() {
+        let mut app = setup_app_for_test();
+        app.items_are_bookmark_view = true;
+
+        for col in [
+            DetailsColumn::Modified,
+            DetailsColumn::State,
+            DetailsColumn::Name,
+        ] {
+            assert_eq!(
+                app.details_header_title(col, false, false),
+                app.details_column_view_title(col),
+            );
+        }
     }
 }
 
