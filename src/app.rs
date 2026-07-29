@@ -33310,11 +33310,7 @@ impl App {
             && matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
     }
 
-    pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
-        #[cfg(windows)]
-        if self.active_detached_viewer_context.is_some() {
-            return true;
-        }
+    fn current_viewer_session_is_detached_or_switching(&self) -> bool {
         if self.viewer_session_is_detached() {
             return true;
         }
@@ -33339,8 +33335,73 @@ impl App {
         }
     }
 
+    pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
+        #[cfg(windows)]
+        if self.active_detached_viewer_context.is_some() {
+            return true;
+        }
+        self.current_viewer_session_is_detached_or_switching()
+    }
+
     pub(crate) fn viewer_session_blocks_main_window(&self) -> bool {
-        self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
+        // The main-focus close consumer must use the same current-session lifecycle fact as tray
+        // residency. During a switch to detached, `viewer_presentation` is still the old fullscreen
+        // value until PlacementSwitched arrives; treating that transient as main-blocking would let
+        // ShowWindow focus close the session that tray hide deliberately retained.
+        //
+        // Keep the active detached *sibling* context out of this current-session predicate: the main
+        // context can own its own fullscreen while a media window is mounted separately.
+        self.fullscreen_idx.is_some() && !self.current_viewer_session_is_detached_or_switching()
+    }
+
+    fn reconcile_fullscreen_after_main_focus(
+        &mut self,
+        ctx: &egui::Context,
+        main_viewport_focused: bool,
+        fullscreen_root_key_handled: bool,
+    ) {
+        if !self.viewer_session_blocks_main_window() {
+            return;
+        }
+
+        const FS_FOCUS_GRACE_MS: u128 = 500;
+        if !self.fs_focus_grace_elapsed {
+            self.fs_focus_grace_elapsed = self
+                .fs_opened_at
+                .map(|t| t.elapsed().as_millis() > FS_FOCUS_GRACE_MS)
+                .unwrap_or(true);
+        }
+        #[cfg(windows)]
+        let native_video_presenter_active = self.native_video_presenter_hwnd_for_focus_guard();
+        #[cfg(not(windows))]
+        let native_video_presenter_active = false;
+        #[cfg(windows)]
+        let embedded_still = self.fullscreen_embedded_still_active();
+        #[cfg(not(windows))]
+        let embedded_still = false;
+        if should_close_fullscreen_from_main_focus(
+            self.fs_focus_grace_elapsed,
+            main_viewport_focused,
+            native_video_presenter_active,
+            embedded_still,
+            self.settings.fullscreen_keep_on_app_switch,
+            fullscreen_root_key_handled,
+        ) {
+            crate::logger::log(format!(
+                "fullscreen: main focus guard closing session presentation={:?} detached_lifecycle={}",
+                self.viewer_presentation,
+                self.current_viewer_session_is_detached_or_switching()
+            ));
+            self.close_fullscreen();
+        } else if should_restore_fullscreen_focus_from_main_focus(
+            self.fs_focus_grace_elapsed,
+            main_viewport_focused,
+            embedded_still,
+            self.settings.fullscreen_keep_on_app_switch,
+            fullscreen_root_key_handled,
+        ) {
+            self.restore_fullscreen_focus_from_main(ctx);
+        }
     }
 
     fn main_window_should_draw_export_dialogs(&self) -> bool {
@@ -60485,44 +60546,12 @@ impl eframe::App for App {
         // ただし open_fullscreen() 直後はフルスクリーンビューポートへの
         // ViewportCommand::Focus が反映されるまで数フレームかかるため、
         // 500ms のグレース期間中はチェックをスキップする。
-        const FS_FOCUS_GRACE_MS: u128 = 500;
-        if self.viewer_session_blocks_main_window() {
-            if !self.fs_focus_grace_elapsed {
-                self.fs_focus_grace_elapsed = self
-                    .fs_opened_at
-                    .map(|t| t.elapsed().as_millis() > FS_FOCUS_GRACE_MS)
-                    .unwrap_or(true);
-            }
-            #[cfg(windows)]
-            let native_video_presenter_active = self.native_video_presenter_hwnd_for_focus_guard();
-            #[cfg(not(windows))]
-            let native_video_presenter_active = false;
-            // in-window 静止画フルスクリーンはメインウィンドウ自身に描画している。
-            // メインがフォーカスを持つのは正常状態なので、ここで閉じてはいけない。
-            #[cfg(windows)]
-            let embedded_still = self.fullscreen_embedded_still_active();
-            #[cfg(not(windows))]
-            let embedded_still = false;
-            let main_viewport_focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
-            if should_close_fullscreen_from_main_focus(
-                self.fs_focus_grace_elapsed,
-                main_viewport_focused,
-                native_video_presenter_active,
-                embedded_still,
-                self.settings.fullscreen_keep_on_app_switch,
-                fullscreen_root_key_handled,
-            ) {
-                self.close_fullscreen();
-            } else if should_restore_fullscreen_focus_from_main_focus(
-                self.fs_focus_grace_elapsed,
-                main_viewport_focused,
-                embedded_still,
-                self.settings.fullscreen_keep_on_app_switch,
-                fullscreen_root_key_handled,
-            ) {
-                self.restore_fullscreen_focus_from_main(ctx);
-            }
-        }
+        let main_viewport_focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        self.reconcile_fullscreen_after_main_focus(
+            ctx,
+            main_viewport_focused,
+            fullscreen_root_key_handled,
+        );
 
         if !fullscreen_root_key_handled {
             self.handle_clipboard_shortcuts(ctx);

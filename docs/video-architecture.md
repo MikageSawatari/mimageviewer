@@ -1572,6 +1572,22 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   promotion を決定する。これにより外部追加・削除はメイン一覧へ従来どおり反映しつつ、保持した
   `VideoPlayer` と進行中の typed placement request / completion は drop しない。動画→音声モードと
   detached 音声ファイルも同じ media context ownership に従う。
+- **トレイ復帰フレームの close 経路**: `sync_after_restore()` 先頭の smart-folder editor 遅延確定は
+  presentation 更新または非同期 scan / prepare の開始までで、同期的には session を閉じない。後者の
+  完了時の items 導入は `start_loading_items_inner()` の同じ context promotion 境界へ合流する。
+  同期的に session close へ到達し得るのは上記の外部フォルダ再読込だけである。同じ update の後段では、
+  focus-edge の外部変更確認と folder watcher も同じ再読込境界へ合流し、thumbnail queue 更新は items / viewer
+  lifecycle を変更しない。続いて Win32 `ShowWindow` が main
+  viewport に与えた focus を `reconcile_fullscreen_after_main_focus()` が処理する。この consumer も
+  `current_viewer_session_is_detached_or_switching()` を使い、確定前で `viewer_presentation` が旧
+  fullscreen のままでも、detached host 待ち / placement switch 中を close しない。App-global の
+  `viewer_session_is_detached_or_switching()` は別の active detached context も含むが、main focus 判定は
+  current context だけを見るため、別メディア窓と同時に開いた main fullscreen は従来どおり block
+  する。`poll_video()` の close は明示 close event または native output の terminal close、
+  `cleanup_visible_false` は `fullscreen_idx=None` が既に成立した後の terminal consumer であり、復帰
+  自体を close に変換する producer ではない。cleanup ログの `host=hwnd=0` はログ出力前に
+  `finish_active_detached_session_close()` が runtime を除去した結果なので、それ自体を host-loss 判定に
+  使わない。
 - **NativeWindowHost / NativeRenderCore** (= `VideoPlayer::open` 時に 1 組生成、`VideoPlayer` Drop で停止):
   `native-video-window-pump` 上の host が presenter/HUD HWND と USER32 lifecycle、
   `native-video-render` 上の core が D3D11 swap chain + DComp/GPU resource を所有する。

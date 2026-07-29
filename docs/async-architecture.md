@@ -824,7 +824,9 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
   presenter を維持する。確定済み detached と detached への切替中は
   `viewer_session_is_detached_or_switching()` で同じ維持対象として扱う。復帰時の外部フォルダ変更は
   同じ述語から media context を切り離してから main items へ反映するため、decoder / audio / typed
-  placement completion を閉じない。通常 fullscreen / 通常動画は従来通り tray hide 時に終了する。
+  placement completion を閉じない。さらに `ShowWindow` で main focus が戻る同じ update 後段も、
+  current session の同じ detached / switching 述語から main-blocking を判定し、host 登録待ちの session
+  を通常 fullscreen として閉じない。通常 fullscreen / 通常動画は従来通り tray hide 時に終了する。
 - **UI heartbeat watchdog**: `App::update` は SW_HIDE 中に止まるため、`hide_to_tray` で
   watchdog を suspended にし、復帰時に resume する。これにより正常なトレイ常駐を
   `panic.log` の `UI THREAD HANG suspected` として記録し続けない。detached viewer

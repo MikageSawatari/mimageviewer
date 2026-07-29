@@ -30588,6 +30588,7 @@ mod still_window_mode_key_tests {
     #[cfg(windows)]
     fn tray_restore_external_refresh_preserves_detaching_video_session() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
         let folder = app.tmp.path().join("tray_restore_detaching_video");
         std::fs::create_dir_all(&folder).unwrap();
         let video_path = folder.join("playing.mp4");
@@ -30623,6 +30624,7 @@ mod still_window_mode_key_tests {
 
         assert!(app.viewer_session_is_detached_or_switching());
         app.sync_after_restore();
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
 
         assert!(app.window_visible);
         assert!(
@@ -30637,6 +30639,161 @@ mod still_window_mode_key_tests {
             Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
         ));
         assert!(app.native_video_mode_switch.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_restore_frame_main_focus_preserves_detaching_video_session() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video_path = app.tmp.path().join("tray_restore_focus.mp4");
+        std::fs::write(&video_path, b"video").unwrap();
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.detached_viewer_window_id = Some(121);
+        let now = std::time::Instant::now();
+        app.pending_detached_video_host_switch = Some(DetachedVideoHostSwitchPending {
+            target_presentation: ViewerPresentation::DetachedWindow,
+            activate_on_show: true,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(5),
+        });
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path.clone(),
+                    30.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(121, DetachedSource::Video);
+        app.fs_focus_grace_elapsed = true;
+        app.window_visible = false;
+
+        app.sync_after_restore();
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+        assert!(app.window_visible);
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert!(matches!(
+            app.fs_cache.get(&video),
+            Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
+        ));
+        assert!(app.detached_video_host_switch_pending());
+        assert_eq!(
+            app.detached_window_state(121),
+            Some(DetachedWindowState::Active)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_restore_frame_main_focus_preserves_detached_video_audio_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video_path = app.tmp.path().join("tray_restore_audio_mode.mp4");
+        std::fs::write(&video_path, b"video").unwrap();
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.video_audio_mode = Some(video);
+        app.detached_viewer_window_id = Some(122);
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path.clone(),
+                    30.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(122, DetachedSource::Video);
+        app.fs_focus_grace_elapsed = true;
+        app.window_visible = false;
+
+        app.sync_after_restore();
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert!(app.fs_cache.contains_key(&video));
+        assert_eq!(
+            app.detached_window_state(122),
+            Some(DetachedWindowState::Active)
+        );
+    }
+
+    #[test]
+    fn tray_restore_frame_without_media_remains_grid() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.window_visible = false;
+
+        app.sync_after_restore();
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+        assert!(app.window_visible);
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.fs_cache.is_empty());
+    }
+
+    #[test]
+    fn detached_sibling_does_not_reclassify_current_main_fullscreen() {
+        let mut app = setup_app();
+        let current = push_image(&mut app, r"C:\pics\main.jpg");
+        app.fullscreen_idx = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: ViewerContextBundle::empty(),
+        });
+
+        assert!(
+            app.viewer_session_is_detached_or_switching(),
+            "tray residency must see the detached sibling context"
+        );
+        assert!(
+            app.viewer_session_blocks_main_window(),
+            "the sibling must not reclassify the current main fullscreen as detached"
+        );
+
+        app.active_detached_viewer_context = None;
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        assert!(
+            app.viewer_session_blocks_main_window(),
+            "in-window sessions remain main-blocking"
+        );
+    }
+
+    #[test]
+    fn main_focus_consumer_still_closes_normal_fullscreen_and_in_window_sessions() {
+        for presentation in [
+            ViewerPresentation::Fullscreen,
+            ViewerPresentation::MainWindow,
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let current = push_image(&mut app, r"C:\pics\main.jpg");
+            app.fullscreen_idx = Some(current);
+            app.viewer_presentation = presentation;
+            app.fs_focus_grace_elapsed = true;
+
+            app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+            assert_eq!(
+                app.fullscreen_idx, None,
+                "restored main focus must retain the existing close behavior for {presentation:?}"
+            );
+        }
     }
 
     #[test]
@@ -34937,6 +35094,10 @@ mod still_window_mode_key_tests {
         assert!(
             app.viewer_session_is_detached_or_switching(),
             "the in-flight switch-to-detached frame must keep the detached host viewport alive"
+        );
+        assert!(
+            !app.viewer_session_blocks_main_window(),
+            "the same in-flight detached lifecycle must not let restored main focus close playback"
         );
         assert!(
             !app.native_video_fullscreen_active_for_main_backdrop(),
