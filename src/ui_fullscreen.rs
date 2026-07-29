@@ -2708,15 +2708,6 @@ impl App {
         self.fs_zoom_pdf_rerender_idx = None;
     }
 
-    /// TextEdit / IME がキーを所有したときはズームだけ解除し、Z の押下ラッチは維持する。
-    /// キーイベントを消費しないため編集対象へ `z` を渡せ、フォーカス解除時に押しっぱなしの Z を
-    /// 新しい rising edge として再発火させない。
-    fn fs_zoom_reset_for_text_input(&mut self) {
-        let z_was_down = self.fs_zoom_z_was_down;
-        self.fs_zoom_reset();
-        self.fs_zoom_z_was_down = z_was_down;
-    }
-
     /// 一時状態 (照準中 + エッジ検出) だけリセットする。確定済みズーム (`fs_zoom_active`) は残す。
     /// フォーカス喪失 / モーダル表示でキー処理を飛ばす直前に呼び、復帰時に Z 離しが誤って
     /// ズーム確定したり stale エッジが残ったりするのを防ぐ (Codex P2)。
@@ -10843,23 +10834,6 @@ impl App {
             return action;
         }
 
-        // TextEdit にフォーカスがある / IME 変換中の画像フルスクリーンでは、編集対象へ
-        // Esc・Tab・文字キーを含む全キーを渡す。タグ入力など個々の TextEdit を列挙せず、
-        // egui の一般的な keyboard-input ownership を正本にする。ブックマークのインライン
-        // 編集だけは、Esc を受けた同フレームに egui が focus ownership を手放すため、編集状態も
-        // 含めてフルスクリーン終了への漏出を防ぐ。
-        //
-        // 音楽ビューは従来どおり後段の音楽モーダルとの共通ガードで同じ値を使う。
-        // ここでは画像ページだけを早期 return させ、音楽ビューの既存の処理順を変えない。
-        let fullscreen_text_input_active = ctx.wants_keyboard_input() || self.ime_input_active();
-        if self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
-            && (fullscreen_text_input_active || self.book_bookmark_title_edit.is_some())
-        {
-            // TextEdit へ Z 自体は渡しつつ、フォーカス移動前のズーム状態だけを残さない。
-            self.fs_zoom_reset_for_text_input();
-            return action;
-        }
-
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
         // 無効化され、コンテキスト外なら状態をリセットする。編集モードの early-return より前に
         // 毎フレーム呼び、Z 押しっぱで対象外へ移ったときに状態が残らないようにする。
@@ -11156,7 +11130,8 @@ impl App {
         // (動画は native presenter 側で入力するので同問題は無い)。モーダル表示中は ESC/Space 等の
         // フルスクリーンショートカット (閉じる/再生トグル) も塞いでモーダル操作へ集中させる。
         if fs_music_view_active
-            && (fullscreen_text_input_active
+            && (ctx.wants_keyboard_input()
+                || self.ime_input_active()
                 || self.music_bookmark_modal_open()
                 || self.music_normalize_modal_active(fs_idx))
         {
