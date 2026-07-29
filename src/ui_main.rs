@@ -628,19 +628,30 @@ fn suppress_menu_button_wheel_passthrough(ctx: &egui::Context, response: &egui::
     // egui popup/menu の ScrollArea は wheel を使っても raw input が残ることがある。
     // 背面のサムネイル一覧も同じ frame で描画されるため、menu_button が開いている間は
     // ここで wheel を消費して背面スクロールへの通り抜けを防ぐ。
-    if egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(response)) {
+    if egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(response))
+        || egui::Popup::is_id_open(ctx, sticky_context_menu_id(response))
+    {
         consume_wheel_input(ctx);
     }
 }
 
-fn show_sticky_context_menu(response: &egui::Response, add_contents: impl FnOnce(&mut egui::Ui)) {
+fn sticky_context_menu_id(response: &egui::Response) -> egui::Id {
+    response.id.with("sticky_context_menu")
+}
+
+fn show_sticky_context_menu(
+    response: &egui::Response,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Id {
     // Keep the secondary-click settings menu on a separate popup id from a possible
     // primary-click menu_button on the same response. egui::Popup::context_menu
     // explicitly closes its popup id on primary clicks.
+    let popup_id = sticky_context_menu_id(response);
     let _ = egui::Popup::context_menu(response)
-        .id(response.id.with("sticky_context_menu"))
+        .id(popup_id)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(add_contents);
+    popup_id
 }
 
 fn draw_sticky_settings_menu_header(ui: &mut egui::Ui, title: &str, show_close_button: bool) {
@@ -698,6 +709,65 @@ mod sticky_settings_menu_header_tests {
         assert!(
             width <= 280.0,
             "header consumed the 800px available width: {width}"
+        );
+    }
+
+    #[test]
+    fn sticky_menu_keeps_checkbox_clicks_open_and_closes_explicitly() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let dedicated = Arc::new(Mutex::new(false));
+        let dedicated_in_ui = Arc::clone(&dedicated);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(640.0, 360.0))
+            .build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let response = ui.button("列メニュー");
+                        ui.add_space(360.0);
+                        let _ = ui.button("外側");
+                        show_sticky_context_menu(&response, |ui| {
+                            draw_sticky_settings_menu_header(ui, "列の設定", true);
+                            let mut checked = *dedicated_in_ui.lock().unwrap();
+                            if ui
+                                .checkbox(&mut checked, "以下を専用の設定にする")
+                                .changed()
+                            {
+                                *dedicated_in_ui.lock().unwrap() = checked;
+                            }
+                        });
+                    });
+                });
+            });
+        harness.run();
+
+        harness.get_by_label("列メニュー").click_secondary();
+        harness.run();
+        assert!(harness.query_by_label("以下を専用の設定にする").is_some());
+
+        harness.get_by_label("以下を専用の設定にする").click();
+        harness.run();
+        assert!(*dedicated.lock().unwrap());
+        assert!(
+            harness.query_by_label("以下を専用の設定にする").is_some(),
+            "checkbox click closed a sticky menu"
+        );
+
+        harness.get_by_label("×").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("以下を専用の設定にする").is_none(),
+            "close button left the sticky menu open"
+        );
+
+        harness.get_by_label("列メニュー").click_secondary();
+        harness.run();
+        assert!(harness.query_by_label("以下を専用の設定にする").is_some());
+        harness.get_by_label("外側").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("以下を専用の設定にする").is_none(),
+            "outside click left the sticky menu open"
         );
     }
 }
@@ -3682,6 +3752,24 @@ fn draw_details_column_menu_layout(
     }
 }
 
+fn draw_details_column_menu_with_header(
+    ui: &mut egui::Ui,
+    max_height: f32,
+    draw_pane: impl FnMut(DetailsColumnMenuPane, &mut egui::Ui),
+) -> DetailsColumnMenuLayout {
+    let menu_width = DETAILS_COLUMN_MENU_COLUMNS_WIDTH
+        + DETAILS_COLUMN_MENU_SEPARATOR_WIDTH
+        + DETAILS_COLUMN_MENU_FORMAT_WIDTH
+        + ui.spacing().item_spacing.x * 2.0;
+    // ヘッダを先に描くため、ここで本文 2 ペイン分の幅を確定する。広い親 Ui の
+    // justified layout にヘッダだけが引っ張られて popup が画面幅まで伸びるのを防ぐ。
+    ui.set_width(menu_width);
+    let content_start_y = ui.cursor().min.y;
+    draw_sticky_settings_menu_header(ui, "列の設定", true);
+    let header_height = (ui.cursor().min.y - content_start_y).max(0.0);
+    draw_details_column_menu_layout(ui, (max_height - header_height).max(1.0), draw_pane)
+}
+
 #[cfg(test)]
 mod details_column_context_menu_layout_tests {
     use super::*;
@@ -3690,9 +3778,10 @@ mod details_column_context_menu_layout_tests {
     fn draw_height_test_menu(pane: DetailsColumnMenuPane, ui: &mut egui::Ui) {
         match pane {
             DetailsColumnMenuPane::Columns => {
-                let _ = ui.button("専用の設定にする");
+                let mut dedicated = false;
+                ui.checkbox(&mut dedicated, "以下を専用の設定にする");
                 ui.separator();
-                ui.label(egui::RichText::new("表示する列").strong());
+                ui.label(egui::RichText::new("一覧と下部情報バー共通").strong());
                 ui.separator();
                 let mut checked = true;
                 for label in [
@@ -3759,26 +3848,33 @@ mod details_column_context_menu_layout_tests {
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style())
                             .show(ui, |ui| {
-                                draw_details_column_menu_layout(
+                                draw_details_column_menu_with_header(
                                     ui,
-                                    900.0 - DETAILS_COLUMN_MENU_SCREEN_MARGIN,
+                                    (ctx.content_rect().height()
+                                        - DETAILS_COLUMN_MENU_SCREEN_MARGIN)
+                                        .max(1.0),
                                     draw_height_test_menu,
                                 )
                             })
                             .inner
                     });
-                *measured_in_ui.lock().unwrap() = Some(area.inner);
+                *measured_in_ui.lock().unwrap() =
+                    Some((area.inner, area.response.rect, ctx.content_rect()));
             });
         harness.ctx.options_mut(|options| options.zoom_factor = 1.3);
         harness.run_steps(3);
 
-        let layout = measured.lock().unwrap().unwrap();
+        let (layout, menu_rect, content_rect) = measured.lock().unwrap().unwrap();
         assert!(
             layout.content_size.y <= layout.viewport_rect.height() + 0.5,
             "tall menu still scrolls: content={:?}, viewport={:?}, panes={:?}",
             layout.content_size,
             layout.viewport_rect,
             layout.pane_rects
+        );
+        assert!(
+            menu_rect.bottom() <= content_rect.bottom() + 1.0,
+            "menu including header exceeds the screen: menu={menu_rect:?}, screen={content_rect:?}"
         );
     }
 
@@ -3788,7 +3884,6 @@ mod details_column_context_menu_layout_tests {
 
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
-        let max_height = 200.0 - DETAILS_COLUMN_MENU_SCREEN_MARGIN;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(900.0, 200.0))
             .build(move |ctx| {
@@ -3800,9 +3895,11 @@ mod details_column_context_menu_layout_tests {
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style())
                             .show(ui, |ui| {
-                                draw_details_column_menu_layout(
+                                draw_details_column_menu_with_header(
                                     ui,
-                                    max_height,
+                                    (ctx.content_rect().height()
+                                        - DETAILS_COLUMN_MENU_SCREEN_MARGIN)
+                                        .max(1.0),
                                     draw_height_test_menu,
                                 )
                             })
@@ -3813,7 +3910,7 @@ mod details_column_context_menu_layout_tests {
         harness.run_steps(3);
 
         let layout = measured.lock().unwrap().unwrap();
-        assert!(layout.viewport_rect.height() <= max_height + 1.0);
+        assert!(layout.viewport_rect.height() <= 200.0 - DETAILS_COLUMN_MENU_SCREEN_MARGIN + 1.0);
         assert!(layout.content_size.y > layout.viewport_rect.height() + 1.0);
 
         harness.get_by_label("コーデック").scroll_to_me();
@@ -3837,7 +3934,7 @@ mod details_column_context_menu_layout_tests {
                     .default_size(egui::vec2(1200.0, 650.0))
                     .layout(egui::Layout::top_down_justified(egui::Align::Min))
                     .show(ctx, |ui| {
-                        draw_details_column_menu_layout(ui, 650.0, |pane, ui| match pane {
+                        draw_details_column_menu_with_header(ui, 650.0, |pane, ui| match pane {
                             DetailsColumnMenuPane::Columns => {
                                 ui.label(egui::RichText::new("表示する列").strong());
                                 ui.separator();
@@ -13106,10 +13203,9 @@ impl App {
         origin: DetailsColumnMenuOrigin,
         current_name_width: f32,
     ) {
-        response.context_menu(|ui| {
+        let popup_id = show_sticky_context_menu(response, |ui| {
             self.draw_details_column_context_menu(ui, column_set, origin, current_name_width);
         });
-        let popup_id = egui::Popup::default_response_id(response);
         if egui::Popup::is_id_open(ui.ctx(), popup_id) {
             ui.ctx().data_mut(|data| {
                 data.insert_temp(Self::details_column_context_menu_tracker_id(), popup_id);
@@ -13131,23 +13227,20 @@ impl App {
         let columns_heading =
             details_column_menu_heading(self.settings.details_selection_bar_mode, origin);
         let show_mode_toggle = origin == DetailsColumnMenuOrigin::DetailsSelectionBar;
-        let mode_toggle_label = if self.settings.details_selection_bar_mode.normalized()
-            == DetailsSelectionBarMode::Dedicated
-        {
-            "一覧と同じ設定にする"
-        } else {
-            "専用の設定にする"
-        };
+        let mut dedicated = self.settings.details_selection_bar_mode.normalized()
+            == DetailsSelectionBarMode::Dedicated;
         let modified_label = self.details_column_view_title(DetailsColumn::Modified);
         let state_label = self.details_column_view_title(DetailsColumn::State);
         let mut menu_state = DetailsColumnMenuState::from_settings(&self.settings, column_set);
         let mut toggle_requested = false;
         let max_height =
             (ui.ctx().content_rect().height() - DETAILS_COLUMN_MENU_SCREEN_MARGIN).max(1.0);
-        draw_details_column_menu_layout(ui, max_height, |pane, ui| match pane {
+        draw_details_column_menu_with_header(ui, max_height, |pane, ui| match pane {
             DetailsColumnMenuPane::Columns => {
                 if show_mode_toggle {
-                    toggle_requested |= ui.button(mode_toggle_label).clicked();
+                    toggle_requested |= ui
+                        .checkbox(&mut dedicated, "以下を専用の設定にする")
+                        .changed();
                     ui.separator();
                 }
                 ui.label(egui::RichText::new(columns_heading).strong());
