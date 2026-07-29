@@ -767,8 +767,12 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 する。final AI は復元・拡大処理で入力の近モノクロ性を反転させないものとして扱う。
 この条件を満たすカラー画像でカラー化が no-op になるページだけ、raw / edit / thumbnail fallback
 を許可する。
-ただし Creative LUT がロード済みで有効なら、カラー化対象外のカラーページでも LUT 未適用画素を
-一瞬見せないため必ず gate する。post_filter 単独は同期合成なので gate 対象にしない。
+Creative LUT は**カラー化と併用されているときだけ** gate 条件に加える。カラー化待ちの間に
+LUT 未適用画素を一瞬見せないためで、この組み合わせは元々カラー化側の条件で待っていた。
+**LUT 単独のページは gate しない**。ここまで gate すると、フォルダ移動の nav lock
+(`poll_fs_nav_lock` は complete composite を待つ) が LUT 合成の完了まで伸び、その間の
+Ctrl+↑↓ が `handle_fullscreen_ctrl_nav_context` の lock ガードで捨てられて「押した回数と
+移動数が合わない」実害になる (2026-07-29)。post_filter 単独は同期合成なので gate 対象にしない。
 
 近モノクロ要約は `idx → { EditResultKey, p95_residual }` で memo 化し、`poll_prefetch` の末尾から
 1 frame 最大 4 件、現在の `fullscreen_idx` 最優先で計算する。producer は既存の

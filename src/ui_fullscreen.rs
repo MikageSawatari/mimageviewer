@@ -2114,6 +2114,15 @@ impl App {
         }
 
         let params = self.effective_params(idx);
+        // Creative LUT 単独では待たない。LUT だけのページまで gate すると、フォルダ移動の
+        // nav lock が LUT 合成の完了まで伸び、その間の Ctrl+↑↓ が
+        // `handle_fullscreen_ctrl_nav_context` の lock ガードで捨てられる (実害あり)。
+        // 元々 LUT は gate 対象外だったので、ここは従来どおりに戻す。
+        if !params.colorize.is_enabled() {
+            return false;
+        }
+        // カラー化と併用されている場合だけ、カラー化待ちの間に LUT 未適用のフレームが
+        // 露出しないよう一緒に待つ。この組み合わせは元々カラー化側の条件で待っていた。
         if self.creative_lut_requires_final_effect(params) {
             return true;
         }

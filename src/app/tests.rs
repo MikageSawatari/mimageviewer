@@ -20651,6 +20651,57 @@ mod pipeline_cache_refactor_tests {
         assert!(app.colorize_display_requires_final_effect(idx));
     }
 
+    /// Creative LUT **だけ**のページは待たせない。ここを gate すると、フォルダ移動の
+    /// nav lock が LUT 合成の完了まで伸び、待機中の Ctrl+↑↓ が
+    /// `handle_fullscreen_ctrl_nav_context` の lock ガードで捨てられる。
+    /// カラー化と併用したときだけ、カラー化待ちに合わせて一緒に待つ。
+    #[test]
+    fn colorize_display_gate_ignores_creative_lut_without_colorize() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/gate-creative-lut-only.jpg");
+        let image = egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|v| {
+                    [
+                        egui::Color32::RED,
+                        egui::Color32::GREEN,
+                        egui::Color32::BLUE,
+                    ][v % 3]
+                })
+                .collect(),
+        );
+        install_colorize_summary_edit_result(&mut app, idx, image);
+        app.fullscreen_idx = Some(idx);
+
+        let entries = app.settings.creative_luts.clone();
+        let lut_id = entries.first().unwrap().id;
+        for _ in 0..10_000 {
+            app.creative_lut_library.poll(&entries, &ctx);
+            if app.creative_lut_library.get(Some(lut_id)).is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(app.creative_lut_library.get(Some(lut_id)).is_some());
+
+        let mut params = app.effective_params(idx).clone();
+        params.creative_lut.id = Some(lut_id);
+        params.creative_lut.strength = 1.0;
+        params.colorize.mode = ColorizeMode::Disabled;
+        app.adjustment_page_params.insert(idx, params.clone());
+        assert!(
+            !app.colorize_display_requires_final_effect(idx),
+            "a creative LUT on its own must not hold the folder-nav lock"
+        );
+
+        // カラー化を足すと、LUT 未適用フレームを出さないよう一緒に待つ (従来挙動)。
+        params.colorize.mode = ColorizeMode::AllImages;
+        app.adjustment_page_params.insert(idx, params);
+        assert!(app.colorize_display_requires_final_effect(idx));
+    }
+
     /// フォルダ横断 nav lock は raw / thumbnail の到着だけでは解除しない。
     /// カラー化対象で final pipeline を使う表示では、complete composite が表示可能に
     /// なって初めて旧ページ holdover を解放する。
