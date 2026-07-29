@@ -2699,7 +2699,9 @@ impl App {
             }
         } else {
             if let Some(fs_idx) = self.fullscreen_idx {
-                self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
+                self.fs_holdover_tex = self
+                    .current_fs_tex_for_holdover(fs_idx)
+                    .map(crate::app::FsHoldover::FolderNavigation);
             }
             self.still_fullscreen_viewport_enter_suppress_until =
                 Some(now + std::time::Duration::from_millis(260));

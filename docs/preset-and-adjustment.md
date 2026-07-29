@@ -339,7 +339,8 @@ texel トリムの退去候補からも除外し、遠方の raw を代わりに
 先読み開始時は白黒の provisional texture を
 GPU upload せず、完成結果だけを upload するため、完成済みページへの移動では白黒→カラーの
 差し替えを挟まない。先読み中の同じページを表示した場合は worker を
-cancel / 再起動せず表示用へ昇格し、完成までは直前ページを holdover する。カラー化待ちのページは
+cancel / 再起動せず表示用へ昇格し、ページ単位表示では対象 unit が揃うまで直前の表示 unit を
+holdover する。カラー化待ちのページは
 生画像やサムネイルへフォールバックしない。ページ入場そのものでは完成済み final composite や
 進行中 worker を無効化せず、設定変更、AI 結果到着、cache eviction のときだけ不要な背景 worker を
 cancel する。`FinalCompositeKey` と items 世代が一致する完了結果だけを採用する。
@@ -349,11 +350,15 @@ texture登録を分けて記録し、`scripts/analyze_perf.py <log> colorize` �
 理由と現在 texel 数を記録し、同じ idx・理由は 1 秒に 1 回へ間引く。
 GPU上限内の完成 `Arc<ColorImage>` は `egui::ImageData` へ同じ `Arc` を渡し、texture登録前の
 全画素cloneを行わない。上限超過時だけ `clamp_for_gpu` の縮小結果を新しい `Arc` にする。
-PDF の Z ズーム再描画などで表示中ページの source が高解像度版へ差し替わる場合も、差し替え直前の
-完成済みカラー化 texture を display-only holdover として保持する。旧世代の live cache は通常どおり
-無効化し、新 source の final composite が完成した時点で holdover を解放して置き換える。
-AI 待ちの `complete=false` カラー化結果が先にできた場合は、その結果を次の holdover に昇格して
-AI 完了後の再合成まで維持する。フォルダ横断の nav lock も raw / thumbnail や
+ページ単位表示では holdover を `SpreadDisplayUnit` と同じ粒度で持ち、単ページは 1 枚、見開きは
+画面順の左右 2 枚を 1 つの typed state として保持する。新しい見開きの両ページが揃うまでは旧見開き
+全体を出し続け、片側だけ先に差し替えない。PDF の Z ズーム再描画などで表示中ページの source が
+高解像度版へ差し替わる場合も、差し替え直前の現在表示ユニットを display-only holdover として保持する。
+旧世代の live cache は通常どおり無効化し、新 source の final composite が完成した時点で置き換える。
+AI 待ちの `complete=false` カラー化結果が先にできた場合も表示可能な final-effect 適用済み
+texture として unit の準備完了に使える。同じ unit の source reload が後から起きる場合は、
+差し替え直前の unit（この incomplete texture を含む）を次の holdover として保持する。
+フォルダ横断の nav lock は raw / thumbnail や
 `complete=false` の到着だけでは解放せず、`complete=true` の final composite を待つ。
 連結読みでは単一の nav holdover を使わず、keep-set 内のページごとに直前の表示済み
 カラー化 texture と items 世代を保持する。PDF の再読込や AI 再合成中もそのページだけは
@@ -743,8 +748,8 @@ AI 完了時は未完了の final composite を表示用に残したまま AI �
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
 や AI 機能モード / サイズ上限変更で破棄する。fullscreen close / reopen や PDF の表示解像度更新に伴う
 同じ item の `fs_cache` 再ロードは `bump_input_generation_for_fs_cache_reload` で live cache だけを
-無効化し、保持 LRU は残す。表示中のカラー化済みページなら、無効化前の texture は新しい final
-composite が完成するまで display-only holdover として使う。PDF ページは
+無効化し、保持 LRU は残す。ページ単位表示のカラー化済み unit なら、無効化前の単ページ / 見開き
+texture 群は対象 unit の新しい final composite が揃うまで display-only holdover として使う。PDF ページは
 `retained_final_ai_cache` へ重複保存せず、PDF 専用の
 ページ保持スロットで `Raster` と `FinalAi` を同じ容量枠として扱う。PDF レンダリング後は
 `Raster` を保持し、final AI 完了後は同じ item_key のスロットを `FinalAi` に昇格して

@@ -2239,7 +2239,7 @@ struct ViewerContextBundle {
     cached_nav_indices: Option<Vec<usize>>,
     cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
     fs_nav_locked_gen: Option<u64>,
-    fs_holdover_tex: Option<egui::TextureHandle>,
+    fs_holdover_tex: Option<FsHoldover>,
     fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
     virtual_folder_writeback: Option<VirtualFolderWriteback>,
     pdf_prefetch_grace_until: Option<std::time::Instant>,
@@ -5541,6 +5541,59 @@ pub(crate) struct FinalCompositeEntry {
 pub(crate) struct ContinuousPageTransition {
     pub(crate) texture: egui::TextureHandle,
     pub(crate) items_generation: u64,
+}
+
+/// フルスクリーンの一時表示を 1 フィールドで所有する typed state。
+///
+/// フォルダ横断は従来どおり旧ビューの単一 texture を overlay として保持する。
+/// 同一 viewer 内のカラー化待ちは、旧ページを個別 slot に分けず、画面上の
+/// 1 表示ユニット（単ページまたは見開き）を一体で保持する。
+#[derive(Clone)]
+pub(crate) enum FsHoldover {
+    FolderNavigation(egui::TextureHandle),
+    ColorizeDisplayUnit(ColorizeDisplayUnitHoldover),
+}
+
+impl FsHoldover {
+    pub(crate) fn folder_navigation_texture(&self) -> Option<&egui::TextureHandle> {
+        match self {
+            Self::FolderNavigation(texture) => Some(texture),
+            Self::ColorizeDisplayUnit(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
+        match self {
+            Self::FolderNavigation(texture) => texture.id(),
+            Self::ColorizeDisplayUnit(holdover) => holdover
+                .previous
+                .pages
+                .first()
+                .expect("colorize display unit must contain at least one page")
+                .texture
+                .id(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ColorizeDisplayUnitHoldover {
+    /// `open_fullscreen` 後にこの idx が current である間だけ previous を公開する。
+    pub(crate) target_idx: usize,
+    pub(crate) previous: FsDisplayUnitHoldover,
+}
+
+#[derive(Clone)]
+pub(crate) struct FsDisplayUnitHoldover {
+    /// 画面上の順序。単ページは 1 要素、見開きは [left, right] の 2 要素。
+    pub(crate) pages: Vec<FsDisplayUnitHoldoverPage>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FsDisplayUnitHoldoverPage {
+    pub(crate) idx: usize,
+    pub(crate) texture: egui::TextureHandle,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -10407,11 +10460,10 @@ pub struct App {
     /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
     /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
-    /// ロック中に「現在画面に映っていた」テクスチャを退避しておく場所。
-    /// items 入れ替え (`install_new_items`) で fs_cache が全 drop されても、
-    /// ナビ発火直前に Arc::clone でここに保持しておけば描画パスから参照可能。
-    /// `egui::TextureHandle` は内部 Arc なので clone は refcount inc だけ。
-    pub(crate) fs_holdover_tex: Option<egui::TextureHandle>,
+    /// 旧表示を保持する単一 typed state。`FolderNavigation` は従来どおり旧ビューの
+    /// 1 texture、`ColorizeDisplayUnit` は単ページ / 見開き全体を 1 unit として持つ。
+    /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
+    pub(crate) fs_holdover_tex: Option<FsHoldover>,
 
     /// 仮想フォルダ (PDF/ZIP) 進入時に「最初のページのサムネを完成させたら親 catalog
     /// にも書き戻す」ための write-back ターゲット。`Some` のとき finalize シグナルが
@@ -50577,19 +50629,30 @@ impl App {
     }
 
     /// static source を差し替える直前に、完成済みのカラー化表示を display-only
-    /// holdover へ退避する。単ページは従来の viewer holdover、連結読みはページ別
-    /// transition が所有する。初回ロードでは `resolve_fs_display_tex` が `None` を
-    /// 返すので、既存 holdover は上書きしない。
+    /// holdover へ退避する。ページ単位表示は現在の表示ユニット全体、連結読みは
+    /// 従来どおりページ別 transition が所有する。初回ロードでは
+    /// `resolve_fs_display_tex` が `None` を返すので、既存 holdover は上書きしない。
     pub(crate) fn capture_colorize_source_reload_holdover(&mut self, idx: usize) {
         if self.fs_nav_locked_gen.is_some() || !self.colorize_display_requires_final_effect(idx) {
             return;
         }
         if let Some(texture) = self.resolve_fs_display_tex(idx, false) {
             if self.continuous_page_transition_is_owned_here(idx) {
-                self.set_continuous_page_transition(idx, texture.clone());
+                self.set_continuous_page_transition(idx, texture);
+                return;
             }
-            if self.fullscreen_idx == Some(idx) {
-                self.fs_holdover_tex = Some(texture);
+
+            if self.reading_flow.is_paged()
+                && let Some(fs_idx) = self.fullscreen_idx
+                && self.fs_display_unit_page_indices(fs_idx).contains(&idx)
+                && let Some(previous) = self.capture_fs_display_unit(fs_idx)
+            {
+                self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
+                    ColorizeDisplayUnitHoldover {
+                        target_idx: fs_idx,
+                        previous,
+                    },
+                ));
             }
         }
     }
@@ -52410,11 +52473,6 @@ impl App {
                     );
                     if pending.output_complete {
                         self.continuous_page_transitions.remove(&key.edit_key.idx);
-                        if self.fs_nav_locked_gen.is_none()
-                            && self.fullscreen_idx == Some(key.edit_key.idx)
-                        {
-                            self.fs_holdover_tex = None;
-                        }
                     } else {
                         self.set_continuous_page_transition(key.edit_key.idx, texture);
                     }

@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
-use crate::app::{App, ViewerPresentation};
+use crate::app::{
+    App, ColorizeDisplayUnitHoldover, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
+    ViewerPresentation,
+};
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
     FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform, ZTransformInput,
@@ -2259,21 +2262,128 @@ impl App {
         );
     }
 
-    /// 同一 viewer 内のページ送りで、次ページのカラー化が未完了だった場合にだけ使う
-    /// 直前ページの holdover を取得する。フォルダ移動用 nav lock が所有中の holdover は
-    /// 上書きしない。
+    pub(crate) fn fs_display_unit_page_indices(&mut self, idx: usize) -> Vec<usize> {
+        match self.resolve_spread_pair(idx) {
+            SpreadPair::Single => vec![idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        }
+    }
+
+    pub(crate) fn capture_fs_display_unit(&mut self, idx: usize) -> Option<FsDisplayUnitHoldover> {
+        let page_indices = self.fs_display_unit_page_indices(idx);
+        let mut pages = Vec::with_capacity(page_indices.len());
+        for page_idx in page_indices {
+            let texture = self.resolve_fs_display_tex(page_idx, true)?;
+            pages.push(FsDisplayUnitHoldoverPage {
+                idx: page_idx,
+                texture,
+            });
+        }
+        Some(FsDisplayUnitHoldover { pages })
+    }
+
+    fn clear_colorize_display_unit_holdover(&mut self) {
+        if matches!(
+            self.fs_holdover_tex,
+            Some(FsHoldover::ColorizeDisplayUnit(_))
+        ) {
+            self.fs_holdover_tex = None;
+        }
+    }
+
+    /// 同一 viewer 内のページ送りで、新しい表示ユニットの final-effect 表示が未完了の
+    /// 場合にだけ、直前の単ページまたは見開き全体を 1 unit として取得する。
+    /// フォルダ移動用 nav lock が所有中の holdover は上書きしない。
     pub(crate) fn capture_colorize_page_transition_holdover(&mut self, target_idx: usize) {
         if self.fs_nav_locked_gen.is_some() {
             return;
         }
-        if !self.colorize_display_requires_final_effect(target_idx) {
-            self.fs_holdover_tex = None;
+
+        if !self.reading_flow.is_paged() {
+            self.clear_colorize_display_unit_holdover();
             return;
         }
-        self.fs_holdover_tex = self
-            .fullscreen_idx
-            .filter(|&current_idx| current_idx != target_idx)
-            .and_then(|current_idx| self.resolve_fs_display_tex(current_idx, true));
+
+        let target_pages = self.fs_display_unit_page_indices(target_idx);
+        let target_requires_final = target_pages
+            .iter()
+            .any(|&idx| self.colorize_display_requires_final_effect(idx));
+        let target_ready = target_pages
+            .iter()
+            .all(|&idx| self.resolve_fs_display_tex(idx, true).is_some());
+        if !target_requires_final || target_ready {
+            self.clear_colorize_display_unit_holdover();
+            return;
+        }
+
+        let existing_previous = match self.fs_holdover_tex.as_ref() {
+            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => Some(holdover.previous.clone()),
+            _ => None,
+        };
+        let current_previous = match self.fullscreen_idx {
+            Some(current_idx) if current_idx != target_idx => {
+                self.capture_fs_display_unit(current_idx)
+            }
+            _ => None,
+        };
+        if let Some(previous) = current_previous.or(existing_previous) {
+            self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
+                ColorizeDisplayUnitHoldover {
+                    target_idx,
+                    previous,
+                },
+            ));
+        }
+    }
+
+    /// ページ単位表示の描画確定点で、旧表示ユニットを出すかを原子的に決める。
+    /// 新しい見開きは両ページが表示可能になるまで 1 枚も公開せず、両方が揃った
+    /// フレームで typed state を解放して一括で切り替える。
+    pub(crate) fn colorize_display_unit_holdover_for_draw(
+        &mut self,
+        fs_idx: usize,
+        spread_pair: SpreadPair,
+        original_preview_active: bool,
+    ) -> Option<FsDisplayUnitHoldover> {
+        if !self.reading_flow.is_paged()
+            || self.fs_display_bypasses_final_pipeline(original_preview_active)
+        {
+            return None;
+        }
+
+        let (target_idx, previous) = match self.fs_holdover_tex.as_ref() {
+            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => {
+                (holdover.target_idx, holdover.previous.clone())
+            }
+            _ => return None,
+        };
+        if target_idx != fs_idx {
+            self.clear_colorize_display_unit_holdover();
+            return None;
+        }
+
+        let target_pages = match spread_pair {
+            SpreadPair::Single => vec![fs_idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        if !target_pages
+            .iter()
+            .any(|&idx| self.colorize_display_requires_final_effect(idx))
+        {
+            self.clear_colorize_display_unit_holdover();
+            return None;
+        }
+
+        let target_unit_ready = target_pages.iter().all(|&idx| {
+            self.resolve_fs_display_tex(idx, true).is_some()
+                || matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed))
+        });
+        if target_unit_ready {
+            self.clear_colorize_display_unit_holdover();
+            None
+        } else {
+            Some(previous)
+        }
     }
 
     /// 現在 fullscreen 表示中の画像 (Static) が透過 (alpha<255) を含むか。
@@ -2486,26 +2596,13 @@ impl App {
             return Some(comic);
         }
         if let Some(texture) = self.ensure_final_composite_texture(ctx, idx) {
-            // nav lock 無しの holdover は同一フォルダ内ページ送り / 同一ページの
-            // source 解像度更新用。AI 待ちの incomplete composite も次の表示候補として
-            // 維持し、真の完成結果が届いた時点だけ解放する。AI Ready 後の同一 key
-            // 再合成は cache entry 自体を残して差し替える。フォルダ移動用 holdover は
-            // poll_fs_nav_lock が items generation と合わせて解放する。
-            if self.fs_nav_locked_gen.is_none() && self.fullscreen_idx == Some(idx) {
-                if self.final_composite_texture_is_complete(idx, &texture) {
-                    self.fs_holdover_tex = None;
-                } else if self.colorize_display_requires_final_effect(idx)
-                    && self.fs_holdover_tex.is_some()
-                {
-                    self.fs_holdover_tex = Some(texture.clone());
-                }
-            }
             return Some(texture);
         }
         if self.colorize_display_requires_final_effect(idx) {
-            return (self.fs_nav_locked_gen.is_none() && self.fullscreen_idx == Some(idx))
-                .then(|| self.fs_holdover_tex.clone())
-                .flatten();
+            // raw / edit / thumbnail gate は維持する。ページ単位表示の旧画像はここで
+            // ページ別 fallback にせず、描画確定点で `ColorizeDisplayUnit` 全体を
+            // overlay する。連結読みは従来どおりページ別 transition が所有する。
+            return None;
         }
         self.resolve_fs_pre_overlay_texture(idx)
     }
@@ -2556,7 +2653,9 @@ impl App {
             }
         }
         self.fs_holdover_tex
-            .clone()
+            .as_ref()
+            .and_then(FsHoldover::folder_navigation_texture)
+            .cloned()
             .map(FsNavHoldoverDecision::Draw)
             .unwrap_or(FsNavHoldoverDecision::Unavailable)
     }
@@ -2606,7 +2705,9 @@ impl App {
     /// なるのを防ぐ。`items_generation` のスナップショットは `poll_fs_nav_lock` の
     /// 「items が入れ替わる前にロックを解除しない」判定に使う。
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
-        self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
+        self.fs_holdover_tex = self
+            .current_fs_tex_for_holdover(fs_idx)
+            .map(FsHoldover::FolderNavigation);
         self.fs_nav_locked_gen = Some(self.items_generation);
     }
 
@@ -8534,6 +8635,7 @@ impl App {
                                             left,
                                             right,
                                             state.original_preview_active,
+                                            None,
                                         );
                                         if let crate::app::CompareViewMode::Wipe { fraction } =
                                             compare_mode
@@ -8727,6 +8829,30 @@ impl App {
                         self.draw_fs_loupe_if_active(
                             ui, ctx, image_rect, fs_idx,
                         );
+
+                        // カラー化待ちはページ枠ごとの fallback にせず、旧表示ユニットを
+                        // 黒背景ごと重ねる。見開きは新しい左右が両方揃ったフレームだけ
+                        // typed state を解放するため、新旧ページの混在も片側の黒も出ない。
+                        if let Some(unit) = self.colorize_display_unit_holdover_for_draw(
+                            fs_idx,
+                            spread_pair,
+                            state.original_preview_active,
+                        ) {
+                            for page in &unit.pages {
+                                self.trace_fs_texture_choice(
+                                    "fullscreen_overlay",
+                                    "colorize_display_unit_holdover",
+                                    Some(page.idx),
+                                    &page.texture,
+                                );
+                            }
+                            self.draw_colorize_display_unit_holdover(
+                                ui,
+                                ctx,
+                                image_rect,
+                                &unit,
+                            );
+                        }
 
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
                         // 移動先ページの矩形を旧ビューの上に重ねない。
@@ -9696,8 +9822,8 @@ impl App {
             && tex.is_none()
             && self.colorize_display_requires_final_effect(fs_idx);
         let thumb_tex = if waiting_for_colorize {
-            // 生サムネイルは白黒なので使わない。nav holdover はページ単位の
-            // fallback にせず、ビュー単位の overlay として後段で描く。
+            // 生サムネイルは白黒なので使わない。paged の ColorizeDisplayUnit と
+            // folder-nav holdover はページ別 fallback にせず後段の overlay で描く。
             None
         } else {
             match self.thumbnails.get(fs_idx) {
@@ -18263,6 +18389,73 @@ impl App {
         }
     }
 
+    fn draw_colorize_display_unit_holdover(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        unit: &FsDisplayUnitHoldover,
+    ) {
+        ui.painter()
+            .rect_filled(image_rect, 0.0, egui::Color32::BLACK);
+        match unit.pages.as_slice() {
+            [page] => {
+                let rotation = self.get_rotation(page.idx);
+                let source_size = self
+                    .source_dims_for_idx(page.idx)
+                    .map(|(w, h)| egui::vec2(w, h));
+                let zoom_pan = self.fs_zoom_pan();
+                let free_rotation = self.fs_free_rotation;
+                let fit_mode = self.effective_fullscreen_fit_mode();
+                let fit_scale_limits = self.fullscreen_fit_scale_limits();
+                let content_bbox = if rotation.is_none() {
+                    self.view_trim_single_content_bbox(page.idx)
+                } else {
+                    None
+                };
+                self.fullscreen_page_layout
+                    .begin(FullscreenPageLayoutKind::Single);
+                let transform = {
+                    let bg_style = self.fs_bg_style(ctx);
+                    Self::draw_fs_image(
+                        ui,
+                        image_rect,
+                        page.idx,
+                        source_size,
+                        None,
+                        Some(&page.texture),
+                        None,
+                        false,
+                        false,
+                        false,
+                        rotation,
+                        zoom_pan,
+                        free_rotation,
+                        &bg_style,
+                        "",
+                        false,
+                        fit_mode,
+                        fit_scale_limits,
+                        content_bbox,
+                    )
+                };
+                if let Some(transform) = transform {
+                    self.fullscreen_page_layout.push(transform);
+                }
+            }
+            [left, right] => self.draw_fs_spread(
+                ui,
+                ctx,
+                image_rect,
+                left.idx,
+                right.idx,
+                false,
+                Some((&left.texture, &right.texture)),
+            ),
+            _ => debug_assert!(false, "display unit must contain one or two pages"),
+        }
+    }
+
     /// 見開きモードの2ページ描画。
     /// 2枚の画像を中央に配置し、設定されたページ間隔だけ黒背景を見せる。
     fn draw_fs_spread(
@@ -18273,6 +18466,7 @@ impl App {
         left_idx: usize,
         right_idx: usize,
         original_preview_active: bool,
+        display_override: Option<(&egui::TextureHandle, &egui::TextureHandle)>,
     ) {
         self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
@@ -18311,10 +18505,13 @@ impl App {
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。
         let left_location = self.location_display_for_loading(left_idx);
         let right_location = self.location_display_for_loading(right_idx);
-        let left_display_tex =
-            self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active);
-        let right_display_tex =
-            self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active);
+        let (left_display_tex, right_display_tex) = match display_override {
+            Some((left, right)) => (Some(left.clone()), Some(right.clone())),
+            None => (
+                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active),
+                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active),
+            ),
+        };
         // 透過背景スタイル (bg_style はテクスチャ借用を含むため左右描画の前後で寿命に注意)
         // fs_bg_style は &mut self を要求するため先に解決してから以降は shared borrow に切り替える。
         // 透過画像が見開きの片方だけの場合もあるので両ページに同じ bg を適用する。

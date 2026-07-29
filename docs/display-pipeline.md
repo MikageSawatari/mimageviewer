@@ -285,11 +285,16 @@ ui_fullscreen.rs::render_fullscreen_viewport
 戻さずに、初期 white client / サイズ遷移フラッシュを抑える。
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
 
-Ctrl+↑↓ のフォルダ横断では、遷移開始時に `fs_holdover_tex` へ旧ページのテクスチャを
-保持する。これはページごとの fallback ではなく、直前に見ていた**ビュー単位**の hold である。
-この producer は `capture_fs_nav_holdover` であり、カラー化の有無とは無関係に作動する。
-`capture_colorize_page_transition_holdover` / `capture_colorize_source_reload_holdover` は
-同じ field を使う別 producer だが、こちらだけがカラー化条件で gate される。
+Ctrl+↑↓ のフォルダ横断とページ単位表示のカラー化待ちは、単一 field
+`fs_holdover_tex: Option<FsHoldover>` を共有する。値は typed state で相互排他になっている:
+
+- `FolderNavigation(texture)`: 遷移開始時に旧ページのテクスチャを保持する。ページごとの
+  fallback ではなく、直前に見ていた**ビュー単位**の hold であり、カラー化の有無とは
+  無関係に `capture_fs_nav_holdover` が作る。
+- `ColorizeDisplayUnit { target_idx, previous }`: `previous.pages` に画面順の 1 ページ、または
+  `[left, right]` の見開き 2 ページをまとめて保持する。`capture_colorize_page_transition_holdover` /
+  `capture_colorize_source_reload_holdover` だけがカラー化条件で作る。左右別 slot は持たない。
+
 `fs_nav_holdover_tex_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
 gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`image_rect` に
 1 枚だけ中央 contain フィットで重ねる。移動先ページの回転、表示トリム
@@ -297,7 +302,7 @@ gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`
 
 フォルダ横断後、新しい `items_generation` のページで full / final / edit / thumbnail の
 いずれかを一度でも表示候補に選べたら、`fs_nav_holdover_tex_for_draw` は
-`fs_holdover_tex` の handle 自体を破棄して一方向にラッチする。表示確定待ち世代を持つ
+`FolderNavigation` の handle 自体を破棄して一方向にラッチする。表示確定待ち世代を持つ
 `fs_nav_locked_gen` は `poll_fs_nav_lock` が別途解除するため、両者の寿命は同一でなくてよい。
 AI final の invalidation / install の過渡フレームで表示解決が再び `None` になっても、
 旧フォルダの handle は既に存在せず、nav holdover が復活することはない。
@@ -800,7 +805,10 @@ generation と erase / local-adjust / conceal の各編集世代を含むため�
 
 ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
 `continuous_page_transition_texture` → サムネイル → `読込中...` である。
-`fs_holdover_tex` はこの優先順位には入らず、上記のビュー単位 overlay としてだけ描く。
+`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` は上記のビュー単位 overlay、
+`ColorizeDisplayUnit` はページ画像と編集 overlay の後に、黒背景 + 旧単ページ / 旧見開き全体を
+重ねる。新しい表示ユニットの全ページで final-effect 適用済み表示（または終端の読込失敗）が
+揃った描画フレームだけ state を解放するため、「新しい左 + 古い右」や片側だけ黒にはならない。
 
 Ctrl+↑↓ の nav lock 解放判定も、描画側と同じ
 `fs_display_bypasses_final_pipeline` を使う。通常表示でカラー化が有効なページは
@@ -817,7 +825,9 @@ raw `fs_cache` を直接描くため、Static / Animated またはサムネイ�
 再実装すると、新しい派生レイヤ (消しゴム / 隠蔽加工 / AI など) の横展開漏れが起きる。
 見開きと連結読みも、画面全体で 1 枚を解決するのではなく、描画対象の **各ページ idx**
 についてこの入口を呼び、完成テクスチャが無ければそのページの transition texture /
-サムネイルへ落とす。ルーペも hit-test 後に選ばれたページ idx で同じ入口を呼ぶ。
+サムネイルへ落とす。ただしページ単位の見開きで `ColorizeDisplayUnit` が active な間は、
+各 idx の解決結果を個別公開せず、両方が揃うまで旧 unit overlay が全体を覆う。
+ルーペも hit-test 後に選ばれたページ idx で同じ入口を呼ぶ。
 
 local-adjust / conceal の materialization は worker で進む。必要な local 結果が未完成なら
 conceal は erase / raw を入力にして先へ合成せず `None` を返し、edit / final assembly も
@@ -1079,6 +1089,11 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
    左右ページ矩形を配置する (ズーム/パンは左右ページで共有、ページ間の分割位置は不変)
 4. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
 
+ページ単位表示のカラー化遷移も、この `SpreadDisplayUnit` / `resolve_spread_pair` と同じ境界を
+使う。表紙、末尾端数、横長ページは 1 ページ unit、通常見開きは画面順 2 ページ unit として
+旧表示を保持する。1 ページずらしの `spread_shift_anchor_idx` と LTR/RTL の画面順も同じ resolver
+から得るため、遷移状態だけが別のペアを作ることはない。
+
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。
 見開き中も `rotation_db` の単独ページ回転 (R/L) は左右ページそれぞれに反映する。
 `fs_free_rotation` (Ctrl+ドラッグのフリー回転) は見開きに反映しないため、Ctrl+ドラッグは
@@ -1115,6 +1130,10 @@ processed テクスチャは配置サイズへ反映せず、raw/source のア�
 配置サイズや UV を変えない。
 通常見開き・ページ送り・連結読みは同じ画像表示ユニット列を使うため、横長ページの前後で
 単ページ扱いと一時的なずらしアンカーの扱いがずれない。
+ただし遷移 texture の所有粒度は意図的に異なる。`capture_colorize_page_transition_holdover` は
+`ReadingFlow::Paged` だけを受け付け、連結読みは従来どおり keep-set 内の
+`continuous_page_transitions[idx]` をページ別に使う。スクロールで複数 unit が同時可視になる
+連結読みへ単一の paged holdover を重ねないため、縦 / 横連結の描画挙動は変わらない。
 横連結では `ReadingDirection` により
 左→右 / 右→左の座標符号を反転する。UI で横方向を変更した場合は `SpreadMode` の
 表紙あり/なしを保ったまま LTR/RTL も同期し、ページ単位の見開き方向と横連結方向が
@@ -1193,7 +1212,8 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
      スクリーントーン濃淡変換、カスタム階調 LUT
    → `final_effect_pending` worker。カラー化前の provisional texture は公開しない。
      前後ページは final composite まで先読みし、完成済みならページ移動直後からカラー表示する。
-     先読みが未完了なら直前ページを holdover し、完成後にカラー化済み画像へ直接切り替える。
+     先読みが未完了なら、ページ単位表示では直前の表示ユニット（単ページ / 見開き全体）を
+     holdover し、対象 unit の全ページが揃った後にカラー化済み画像へ一括で切り替える。
      PDF の Z ズーム再描画など、同じ表示ページの source 解像度が更新される場合は、旧世代の
      完成済み texture を display-only holdover に退避してから live cache を無効化し、
      新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
