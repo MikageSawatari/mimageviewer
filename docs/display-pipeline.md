@@ -757,6 +757,20 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 表示はキャッシュ欠落を挟まず原子的に差し替わる。コピー / 書き出しと nav lock 解除は従来どおり
 `complete=true` だけを受け付ける。
 
+`colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
+待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
+`AllImages` は常に gate し、`MonochromeOnly` は raw `FsCacheEntry::Static` の近モノクロ要約
+（主成分軸からの p95 直交残差）が現在の `mono_tolerance` 以下のページだけを gate する。
+カラー画像でカラー化が no-op になるページは raw / edit / thumbnail fallback を許可する。
+ただし Creative LUT がロード済みで有効なら、カラー化対象外のカラーページでも LUT 未適用画素を
+一瞬見せないため必ず gate する。post_filter 単独は同期合成なので gate 対象にしない。
+
+近モノクロ要約は `idx → { TextureId, p95_residual }` で memo 化し、`poll_prefetch` の末尾から
+1 frame 最大 4 件、現在の `fullscreen_idx` 最優先で計算する。`TextureId` が raw source identity
+なので、再デコード / PDF 再レンダ後は明示的な設定 invalidation を追加せず stale 判定できる。
+memo miss または `TextureId` 不一致は安全側の `true` とし、要約が完成するまで従来どおり
+生画像へフォールバックしない。`fs_cache` から消えた entry は次の reconcile で memo からも落とす。
+
 ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
 `continuous_page_transition_texture` → サムネイル → `読込中...` である。
 `fs_holdover_tex` はこの優先順位には入らず、上記のビュー単位 overlay としてだけ描く。

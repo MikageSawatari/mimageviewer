@@ -2060,9 +2060,10 @@ impl App {
         if let Some(tex) = self.current_final_composite_texture(idx) {
             return Some(tex);
         }
-        // カラー化が有効なページでは、raw / edit / thumbnail を「表示可能な代替」
-        // として返さない。final-effect worker の完成前にここへ落ちると、ページ切替時に
-        // 白黒が1フレームだけ露出する。通常ページ送りは別途、直前ページの holdover を使う。
+        // カラー化または Creative LUT で実際に見た目が変わるページでは、raw / edit /
+        // thumbnail を「表示可能な代替」として返さない。final-effect worker の完成前に
+        // ここへ落ちると、ページ切替時に未適用画素が1フレームだけ露出する。
+        // 通常ページ送りは別途、直前ページの holdover を使う。
         if self.colorize_display_requires_final_effect(idx) {
             return None;
         }
@@ -2100,15 +2101,41 @@ impl App {
     }
 
     pub(crate) fn colorize_display_requires_final_effect(&self, idx: usize) -> bool {
-        !self.post_filter_bypassed
-            && !self.fs_entry_is_animated(idx)
-            && matches!(
+        if self.post_filter_bypassed
+            || self.fs_entry_is_animated(idx)
+            || !matches!(
                 self.items.get(idx),
                 Some(GridItem::Image(_))
                     | Some(GridItem::ZipImage { .. })
                     | Some(GridItem::PdfPage { .. })
             )
-            && self.effective_params(idx).colorize.is_enabled()
+        {
+            return false;
+        }
+
+        let params = self.effective_params(idx);
+        if self.creative_lut_requires_final_effect(params) {
+            return true;
+        }
+        match params.colorize.mode {
+            crate::colorize::ColorizeMode::Disabled => false,
+            crate::colorize::ColorizeMode::AllImages => true,
+            crate::colorize::ColorizeMode::MonochromeOnly => {
+                let Some(FsCacheEntry::Static { tex, .. }) = self.fs_cache.get(&idx) else {
+                    return true;
+                };
+                let Some(summary) = self.colorize_mono_summary_cache.get(&idx) else {
+                    return true;
+                };
+                if summary.source != tex.id() {
+                    return true;
+                }
+                crate::colorize::is_near_monochrome_residual(
+                    summary.p95_residual,
+                    params.colorize.mono_tolerance,
+                )
+            }
+        }
     }
 
     /// Perf trace 用に、実際に選ばれた fullscreen テクスチャの所有元を特定する。

@@ -224,15 +224,30 @@ pub struct ColorizePresetSlots {
     pub slots: [Option<ColorizeParams>; 4],
 }
 
-/// 黄ばみ・青みなど一方向の紙色を許容する近モノクロ判定。
+fn required_mono_inliers(sample_count: usize) -> usize {
+    debug_assert!(sample_count > 0);
+    let count = sample_count as f32;
+    let mut required = (count * MONO_INLIER_RATIO).ceil() as usize;
+    while required > 0 && (required - 1) as f32 / count >= MONO_INLIER_RATIO {
+        required -= 1;
+    }
+    while required as f32 / count < MONO_INLIER_RATIO {
+        required += 1;
+    }
+    required
+}
+
+/// 黄ばみ・青みなど一方向の紙色を許容する近モノクロ判定の要約値。
 ///
-/// サンプル RGB の主成分軸を power iteration で求め、軸からの直交距離が
-/// `tolerance` 以下の画素が 95% 以上ならモノクロ系とみなす。純グレーだけでなく、
-/// 黒インクから有色紙へ伸びる 1 次元の色分布を通す。
-pub fn is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
+/// サンプル RGB の主成分軸を power iteration で求め、軸からの直交残差を
+/// 小さい順に並べたとき、従来の「内点が 95% 以上」と同じ最小内点数に対応する
+/// 残差を返す。平均・共分散・主成分軸は許容値に依存しないため、この値は
+/// `mono_tolerance` が変わっても再利用できる。判定不能な極小サンプルや
+/// ほぼ単色な画像は、従来の早期 `true` と等価な `0.0` を返す。
+pub fn near_monochrome_p95_residual(src: &ColorImage) -> f32 {
     let total = src.pixels.len();
     if total == 0 {
-        return true;
+        return 0.0;
     }
     let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
     let samples: Vec<[f32; 3]> = src
@@ -244,7 +259,7 @@ pub fn is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
         .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32])
         .collect();
     if samples.len() < 8 {
-        return true;
+        return 0.0;
     }
 
     let inv_n = 1.0 / samples.len() as f32;
@@ -271,7 +286,7 @@ pub fn is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
 
     let total_variance = covariance[0][0] + covariance[1][1] + covariance[2][2];
     if total_variance <= 1.0 {
-        return true;
+        return 0.0;
     }
     let mut axis = [0.577_350_26_f32; 3];
     for _ in 0..12 {
@@ -282,15 +297,14 @@ pub fn is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
         ];
         let length = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2]).sqrt();
         if length <= 1e-5 {
-            return true;
+            return 0.0;
         }
         axis = [next[0] / length, next[1] / length, next[2] / length];
     }
 
-    let tolerance_sq = f32::from(tolerance).powi(2);
-    let inliers = samples
+    let mut residuals = samples
         .iter()
-        .filter(|sample| {
+        .map(|sample| {
             let d = [
                 sample[0] - mean[0],
                 sample[1] - mean[1],
@@ -299,10 +313,26 @@ pub fn is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
             let projection = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
             let residual_sq =
                 (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
-            residual_sq <= tolerance_sq
+            residual_sq.sqrt()
         })
-        .count();
-    inliers as f32 / samples.len() as f32 >= MONO_INLIER_RATIO
+        .collect::<Vec<_>>();
+    let percentile_index = required_mono_inliers(residuals.len()) - 1;
+    let (_, p95, _) = residuals.select_nth_unstable_by(percentile_index, |a, b| a.total_cmp(b));
+    *p95
+}
+
+/// 許容値に依存しない近モノクロ要約値を、現在の UI 設定と比較する。
+pub fn is_near_monochrome_residual(p95_residual: f32, tolerance: u8) -> bool {
+    p95_residual <= f32::from(tolerance)
+}
+
+/// 黄ばみ・青みなど一方向の紙色を許容する近モノクロ判定。
+///
+/// サンプル RGB の主成分軸からの直交残差が `tolerance` 以下の画素が
+/// 95% 以上ならモノクロ系とみなす。純グレーだけでなく、黒インクから
+/// 有色紙へ伸びる 1 次元の色分布を通す。
+pub fn is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
+    is_near_monochrome_residual(near_monochrome_p95_residual(src), tolerance)
 }
 
 pub fn should_apply(src: &ColorImage, params: &ColorizeParams) -> bool {
@@ -963,6 +993,87 @@ mod tests {
         )
     }
 
+    fn legacy_is_near_monochrome(src: &ColorImage, tolerance: u8) -> bool {
+        let total = src.pixels.len();
+        if total == 0 {
+            return true;
+        }
+        let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
+        let samples: Vec<[f32; 3]> = src
+            .pixels
+            .iter()
+            .step_by(stride)
+            .filter(|pixel| pixel.a() >= 16)
+            .take(MONO_SAMPLE_LIMIT)
+            .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32])
+            .collect();
+        if samples.len() < 8 {
+            return true;
+        }
+
+        let inv_n = 1.0 / samples.len() as f32;
+        let mut mean = [0.0_f32; 3];
+        for sample in &samples {
+            for channel in 0..3 {
+                mean[channel] += sample[channel] * inv_n;
+            }
+        }
+        let mut covariance = [[0.0_f32; 3]; 3];
+        for sample in &samples {
+            let d = [
+                sample[0] - mean[0],
+                sample[1] - mean[1],
+                sample[2] - mean[2],
+            ];
+            for row in 0..3 {
+                for col in 0..3 {
+                    covariance[row][col] += d[row] * d[col] * inv_n;
+                }
+            }
+        }
+
+        let total_variance = covariance[0][0] + covariance[1][1] + covariance[2][2];
+        if total_variance <= 1.0 {
+            return true;
+        }
+        let mut axis = [0.577_350_26_f32; 3];
+        for _ in 0..12 {
+            let next = [
+                covariance[0][0] * axis[0]
+                    + covariance[0][1] * axis[1]
+                    + covariance[0][2] * axis[2],
+                covariance[1][0] * axis[0]
+                    + covariance[1][1] * axis[1]
+                    + covariance[1][2] * axis[2],
+                covariance[2][0] * axis[0]
+                    + covariance[2][1] * axis[1]
+                    + covariance[2][2] * axis[2],
+            ];
+            let length = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2]).sqrt();
+            if length <= 1e-5 {
+                return true;
+            }
+            axis = [next[0] / length, next[1] / length, next[2] / length];
+        }
+
+        let tolerance_sq = f32::from(tolerance).powi(2);
+        let inliers = samples
+            .iter()
+            .filter(|sample| {
+                let d = [
+                    sample[0] - mean[0],
+                    sample[1] - mean[1],
+                    sample[2] - mean[2],
+                ];
+                let projection = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+                let residual_sq =
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
+                residual_sq <= tolerance_sq
+            })
+            .count();
+        inliers as f32 / samples.len() as f32 >= MONO_INLIER_RATIO
+    }
+
     #[test]
     fn legacy_palette_matches_post_filter() {
         let source = image(256, 1, |x, _| Color32::from_gray(x as u8));
@@ -999,6 +1110,38 @@ mod tests {
             _ => Color32::YELLOW,
         });
         assert!(!is_near_monochrome(&colored, 12));
+    }
+
+    #[test]
+    fn p95_residual_comparison_matches_legacy_inlier_ratio() {
+        let cases = [
+            image(64, 64, |x, y| {
+                Color32::from_gray(((x * 3 + y * 2) % 256) as u8)
+            }),
+            image(64, 64, |x, y| match (x / 16 + y / 16) % 4 {
+                0 => Color32::RED,
+                1 => Color32::GREEN,
+                2 => Color32::BLUE,
+                _ => Color32::YELLOW,
+            }),
+            image(64, 64, |x, y| {
+                let v = ((x * 3 + y * 2) % 220) as u8;
+                Color32::from_rgb(v, v.saturating_add(12), v.saturating_add(24))
+            }),
+            image(2, 2, |x, y| {
+                Color32::from_rgb((x * 127) as u8, (y * 127) as u8, 80)
+            }),
+            ColorImage::filled([64, 64], Color32::from_rgb(210, 190, 150)),
+        ];
+
+        for source in cases {
+            let residual = near_monochrome_p95_residual(&source);
+            for tolerance in 0..=u8::MAX {
+                let legacy = legacy_is_near_monochrome(&source, tolerance);
+                assert_eq!(is_near_monochrome_residual(residual, tolerance), legacy);
+                assert_eq!(is_near_monochrome(&source, tolerance), legacy);
+            }
+        }
     }
 
     #[test]

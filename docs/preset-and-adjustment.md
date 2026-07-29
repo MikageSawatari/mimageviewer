@@ -359,6 +359,14 @@ AI 完了後の再合成まで維持する。フォルダ横断の nav lock も 
 外れた場合は raw / final cache と同時に破棄し、表示枚数が多い場合も VRAM 上限を迂回しない。
 サムネイル自体には適用しない。
 
+表示側の final-effect gate は、`AllImages`、または `MonochromeOnly` で raw source が実際に
+近モノクロと判定されたページだけをカラー化待ちにする。判定用には主成分軸からの p95 直交残差を
+`FsCacheEntry::Static` の `TextureId` と組にして memo 化し、許容値変更時は同じ要約を再利用する。
+memo miss / source 不一致は白黒露出を避けるため待機扱いとする。カラー化対象外のカラーページでも
+Creative LUT が有効なら LUT 未適用フレームを出さないため待機し、post_filter 単独は同期合成なので
+待機対象へ加えない。詳細な fallback 契約と 1 frame の計算上限は
+[display-pipeline.md §2.3](display-pipeline.md) を参照。
+
 ### 2.2.1 Creative 3D LUT
 
 環境設定の「表示 > LUT」で組み込みプリセットまたは `LUT_3D_SIZE` を持つユーザー `.cube` を

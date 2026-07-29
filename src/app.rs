@@ -162,6 +162,7 @@ use viewer_session::ViewerSession;
 const MAX_FOLDER_NAV_STACK: usize = 100;
 const MAX_RECENT_FOLDERS: usize = 20;
 const CURRENT_FOLDER_WATCH_DEBOUNCE_MS: u64 = 700;
+const COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME: usize = 4;
 
 #[derive(Clone)]
 pub(crate) struct FolderNavHistorySnapshot {
@@ -5518,6 +5519,12 @@ pub(crate) struct ContinuousPageTransition {
     pub(crate) items_generation: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ColorizeMonoSummary {
+    pub(crate) source: egui::TextureId,
+    pub(crate) p95_residual: f32,
+}
+
 pub(crate) struct FinalEffectPending {
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<FinalEffectResult>,
@@ -7802,6 +7809,9 @@ pub struct App {
     next_detached_viewer_context_serial: u64,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// raw Static 画素の近モノクロ要約。TextureId が source identity を兼ねるため、
+    /// 再デコードや PDF 再レンダ後の古い値は lookup 時に自然に stale になる。
+    pub(crate) colorize_mono_summary_cache: std::collections::HashMap<usize, ColorizeMonoSummary>,
     /// 表示トリムの自動余白カット用の中身 bbox キャッシュ (正規化座標)。
     /// idx → (fs load_seq, pixels ptr, Some(bbox) / None(余白なし))。
     /// `fs_cache` の差し替わりを検出し、古い bbox を使い回さない。
@@ -10452,6 +10462,8 @@ pub struct App {
     pub(crate) last_input_at: Option<std::time::Instant>,
     /// フレーム番号 (update 呼出しのたびに +1)
     pub(crate) frame_counter: u64,
+    /// 近モノクロ要約の同期計算を全 viewer context 合算で 1 frame 1 回に制限する。
+    colorize_mono_summary_last_reconcile_frame: u64,
     /// local / conceal / edit materialization の GPU upload を 1 frame 1 枚に制限する。
     /// pending/cache は ViewerContextBundle 所有だが、frame budget 自体は全 context 共通。
     last_edit_materialize_upload_frame: u64,
@@ -11242,6 +11254,7 @@ impl App {
             fs_pending: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
+            colorize_mono_summary_cache: std::collections::HashMap::new(),
             items_generation: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
@@ -12147,6 +12160,7 @@ impl App {
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
+            colorize_mono_summary_last_reconcile_frame: u64::MAX,
             last_edit_materialize_upload_frame: u64::MAX,
             perf_last_frame_begin: None,
             last_vram_accounting_at: None,
@@ -52274,6 +52288,17 @@ impl App {
         existing_texture
     }
 
+    pub(crate) fn creative_lut_requires_final_effect(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+    ) -> bool {
+        !params.creative_lut.is_identity()
+            && self
+                .creative_lut_library
+                .get(params.creative_lut.id)
+                .is_some()
+    }
+
     fn spawn_final_effect_job(
         &mut self,
         ctx: &egui::Context,
@@ -52402,12 +52427,7 @@ impl App {
         };
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
-        let creative_lut_active = !self.post_filter_bypassed
-            && !params.creative_lut.is_identity()
-            && self
-                .creative_lut_library
-                .get(params.creative_lut.id)
-                .is_some();
+        let creative_lut_active = self.creative_lut_requires_final_effect(params);
         if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
             return self.start_final_effect_worker(ctx, final_key, params, sharpened, complete);
         }
@@ -52625,12 +52645,7 @@ impl App {
         };
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
-        let creative_lut_active = !self.post_filter_bypassed
-            && !params.creative_lut.is_identity()
-            && self
-                .creative_lut_library
-                .get(params.creative_lut.id)
-                .is_some();
+        let creative_lut_active = self.creative_lut_requires_final_effect(&params);
         if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
             return self.start_final_effect_worker(ctx, final_key, &params, sharpened, complete);
         }
@@ -57253,6 +57268,68 @@ impl App {
         }
     }
 
+    /// raw Static 画素から、許容値に依存しない近モノクロ要約を少しずつ作る。
+    ///
+    /// この処理は UI thread 上の純 CPU 計算だが、1 frame 4 件までに分割する。
+    /// 現在ページを最優先にし、同じ frame に `poll_prefetch` が複数回呼ばれても
+    /// 全 viewer context 合算で予算を超えない。TextureId が変わった entry と
+    /// `fs_cache` から消えた entry は retain で同時に除去する。
+    pub(crate) fn reconcile_colorize_mono_summaries(&mut self) -> usize {
+        let Some(fullscreen_idx) = self.fullscreen_idx else {
+            return 0;
+        };
+        if self.colorize_mono_summary_last_reconcile_frame == self.frame_counter {
+            return 0;
+        }
+        self.colorize_mono_summary_last_reconcile_frame = self.frame_counter;
+
+        let fs_cache = &self.fs_cache;
+        self.colorize_mono_summary_cache.retain(|idx, summary| {
+            matches!(
+                fs_cache.get(idx),
+                Some(FsCacheEntry::Static { tex, .. }) if tex.id() == summary.source
+            )
+        });
+
+        let needs_summary = |idx: usize| {
+            matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Static { .. }))
+                && !self.colorize_mono_summary_cache.contains_key(&idx)
+        };
+        let mut candidates = Vec::new();
+        if needs_summary(fullscreen_idx) {
+            candidates.push(fullscreen_idx);
+        }
+        let mut remaining = self
+            .fs_cache
+            .keys()
+            .copied()
+            .filter(|idx| *idx != fullscreen_idx && needs_summary(*idx))
+            .collect::<Vec<_>>();
+        remaining.sort_unstable();
+        candidates.extend(remaining);
+
+        let mut computed = 0;
+        for idx in candidates
+            .into_iter()
+            .take(COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME)
+        {
+            let Some(FsCacheEntry::Static { tex, pixels, .. }) = self.fs_cache.get(&idx) else {
+                continue;
+            };
+            let source = tex.id();
+            let p95_residual = crate::colorize::near_monochrome_p95_residual(pixels);
+            self.colorize_mono_summary_cache.insert(
+                idx,
+                ColorizeMonoSummary {
+                    source,
+                    p95_residual,
+                },
+            );
+            computed += 1;
+        }
+        computed
+    }
+
     /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`
     /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
@@ -57539,6 +57616,9 @@ impl App {
             }
         }
         if repaint {
+            ctx.request_repaint();
+        }
+        if self.reconcile_colorize_mono_summaries() == COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME {
             ctx.request_repaint();
         }
     }
