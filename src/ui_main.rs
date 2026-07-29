@@ -1963,8 +1963,18 @@ fn selection_info_bar_height() -> f32 {
     SELECTION_INFO_BAR_CONTENT_HEIGHT + details_scroll_style().allocated_width()
 }
 
+fn details_grid_available_height_after_selection_bar(
+    available_before: egui::Rect,
+    style: &egui::Style,
+) -> f32 {
+    let remaining_outer_height = (available_before.height() - selection_info_bar_height()).max(0.0);
+    let central_margin_y = egui::Frame::central_panel(style).inner_margin.sum().y;
+    (remaining_outer_height - central_margin_y).max(0.0)
+}
+
 /// 詳細表示の水平レイアウト。縦スクロールバーの gutter を考慮して、ヘッダと行の列が
 /// ぴったり揃い、縦バー出現時に右端列が欠けたり不要な横スクロールバーが出たりしないようにする。
+#[derive(Clone, Copy)]
 struct DetailsLayout {
     /// 名前列の実効幅。
     name_w: f32,
@@ -2346,6 +2356,84 @@ fn details_layout(
         columns_w,
         pane_w,
         extent,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DetailsListLayoutResolution {
+    layout: DetailsLayout,
+    horizontal_policy: DetailsHorizontalScrollPolicy,
+    hbar: f32,
+    viewport_h_est: f32,
+    needs_vscroll: bool,
+    gutter: f32,
+}
+
+fn resolve_details_list_layout(
+    source_rect: egui::Rect,
+    avail_h: f32,
+    item_spacing_y: f32,
+    natural_h: f32,
+    pixels_per_point: f32,
+    settings: &crate::settings::Settings,
+) -> DetailsListLayoutResolution {
+    let scroll_style = details_scroll_style();
+    let avail_w = source_rect.width().max(1.0);
+    let layout_avail_w = details_horizontal_viewport_capacity(source_rect, pixels_per_point)
+        .min(avail_w)
+        .max(1.0);
+    let mut h_overflow = false;
+    let mut settled = None;
+    for _ in 0..3 {
+        let hbar = if h_overflow {
+            scroll_style.allocated_width()
+        } else {
+            0.0
+        };
+        // 境界帯では gutter を多めに確保する方へ倒し、右端列の欠けを避ける。
+        let viewport_h_est =
+            (avail_h - App::DETAILS_HEADER_H - item_spacing_y - hbar - 2.0).max(0.0);
+        let needs_vscroll = natural_h > viewport_h_est;
+        let gutter = if needs_vscroll {
+            scroll_style.allocated_width()
+        } else {
+            0.0
+        };
+        let layout = details_layout(
+            layout_avail_w,
+            gutter,
+            pixels_per_point,
+            settings,
+            DetailsColumnSet::Details,
+        );
+        let horizontal_policy = details_horizontal_scroll_policy(
+            source_rect,
+            layout.extent,
+            layout.columns_w,
+            pixels_per_point,
+        );
+        let stable = horizontal_policy.overflow == h_overflow;
+        h_overflow = horizontal_policy.overflow;
+        settled = Some(DetailsListLayoutResolution {
+            layout,
+            horizontal_policy,
+            hbar,
+            viewport_h_est,
+            needs_vscroll,
+            gutter,
+        });
+        if stable {
+            break;
+        }
+    }
+    settled.expect("details horizontal policy loop always runs")
+}
+
+fn selection_info_bottom_bar_gutter(grid_view_mode: GridViewMode, details_list_gutter: f32) -> f32 {
+    if grid_view_mode == GridViewMode::Details {
+        details_list_gutter
+    } else {
+        0.0
     }
 }
 
@@ -11998,52 +12086,23 @@ impl App {
         // 横方向の要否は egui の丸め後 content_size に任せず、アプリが所有する全列幅を
         // 物理ピクセル右端へ変換して決める。横バーが出ると縦 viewport が縮み、縦バー gutter が
         // 新たに必要になる場合があるため、false -> true の単調な状態を最大 3 回で収束させる。
-        let details_scroll_style = details_scroll_style();
         let pixels_per_point = ui.ctx().pixels_per_point();
-        let layout_avail_w =
-            details_horizontal_viewport_capacity(horizontal_source_rect, pixels_per_point)
-                .min(avail_w)
-                .max(1.0);
-        let mut h_overflow = false;
-        let mut settled = None;
-        for _ in 0..3 {
-            let hbar = if h_overflow {
-                details_scroll_style.allocated_width()
-            } else {
-                0.0
-            };
-            // 境界帯では gutter を多めに確保する方へ倒し、右端列の欠けを避ける。
-            let viewport_h_est =
-                (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - hbar - 2.0)
-                    .max(0.0);
-            let needs_vscroll = natural_h > viewport_h_est;
-            let gutter = if needs_vscroll {
-                details_scroll_style.allocated_width()
-            } else {
-                0.0
-            };
-            let layout = details_layout(
-                layout_avail_w,
-                gutter,
-                pixels_per_point,
-                &self.settings,
-                DetailsColumnSet::Details,
-            );
-            let policy = details_horizontal_scroll_policy(
-                horizontal_source_rect,
-                layout.extent,
-                layout.columns_w,
-                pixels_per_point,
-            );
-            let stable = policy.overflow == h_overflow;
-            h_overflow = policy.overflow;
-            settled = Some((layout, policy, hbar, viewport_h_est, needs_vscroll, gutter));
-            if stable {
-                break;
-            }
-        }
-        let (layout, horizontal_policy, hbar, viewport_h_est, needs_vscroll, gutter) =
-            settled.expect("details horizontal policy loop always runs");
+        let DetailsListLayoutResolution {
+            layout,
+            horizontal_policy,
+            hbar,
+            viewport_h_est,
+            needs_vscroll,
+            gutter,
+        } = resolve_details_list_layout(
+            horizontal_source_rect,
+            avail_h,
+            ui.spacing().item_spacing.y,
+            natural_h,
+            pixels_per_point,
+            &self.settings,
+        );
+        let details_scroll_style = details_scroll_style();
         let content_w = layout.pane_w;
         self.last_details_name_width = layout.name_w;
 
@@ -14375,6 +14434,11 @@ impl App {
         let column_set = selection_info_bottom_bar_column_set(&self.settings);
         let selected_idx = self.selected.filter(|&idx| self.items.get(idx).is_some());
         let available_before = ctx.available_rect();
+        let future_details_avail_h = details_grid_available_height_after_selection_bar(
+            available_before,
+            ctx.style().as_ref(),
+        );
+        let details_natural_h = self.visible_indices.len() as f32 * Self::DETAILS_ROW_H;
         let scroll_style = details_scroll_style();
         let panel = egui::TopBottomPanel::bottom("selection_info_bottom_bar")
             .exact_height(selection_info_bar_height())
@@ -14387,9 +14451,26 @@ impl App {
                     details_horizontal_viewport_capacity(source_rect, pixels_per_point)
                         .min(avail_w)
                         .max(1.0);
+                let details_list_gutter = if self.settings.grid_view_mode == GridViewMode::Details {
+                    resolve_details_list_layout(
+                        source_rect,
+                        future_details_avail_h,
+                        ui.spacing().item_spacing.y,
+                        details_natural_h,
+                        pixels_per_point,
+                        &self.settings,
+                    )
+                    .gutter
+                } else {
+                    0.0
+                };
+                let gutter = selection_info_bottom_bar_gutter(
+                    self.settings.grid_view_mode,
+                    details_list_gutter,
+                );
                 let full_layout = details_layout(
                     layout_avail_w,
-                    0.0,
+                    gutter,
                     pixels_per_point,
                     &self.settings,
                     column_set,
@@ -14403,8 +14484,8 @@ impl App {
                     .sum();
                 let horizontal_policy = details_horizontal_scroll_policy(
                     source_rect,
-                    content_w,
-                    full_layout.name_w + fixed_columns_w,
+                    full_layout.extent,
+                    full_layout.columns_w,
                     pixels_per_point,
                 );
                 let previous_scroll_style = ui.spacing().scroll;
@@ -14449,11 +14530,11 @@ impl App {
                             0.0
                         },
                         predicted_vscroll: false,
-                        gutter: 0.0,
+                        gutter,
                         fixed_columns_w,
                         name_w: full_layout.name_w,
                         pane_w: content_w,
-                        layout_extent: content_w,
+                        layout_extent: full_layout.extent,
                         requested_extent: horizontal_policy.scroll_extent,
                         column_set,
                         outer_inner_rect: output.inner_rect,
@@ -14973,6 +15054,41 @@ mod selection_info_tests {
         let (before, after, central) = measured.unwrap();
         assert!(before - after >= selection_info_bar_height() - 0.5);
         assert!(central <= after + 0.5);
+    }
+
+    #[test]
+    fn bottom_bar_predicts_the_details_grid_available_height() {
+        for screen_height in [180.0_f32, 480.0, 777.25] {
+            let mut app = setup_app_for_test();
+            app.settings.grid_view_mode = GridViewMode::Details;
+            app.settings.selection_info_display_mode =
+                crate::settings::SelectionInfoDisplayMode::BottomBar;
+            let ctx = egui::Context::default();
+            let mut raw_input = egui::RawInput::default();
+            raw_input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, screen_height),
+            ));
+            let mut measured = None;
+
+            let _ = ctx.run(raw_input, |ctx| {
+                let predicted = details_grid_available_height_after_selection_bar(
+                    ctx.available_rect(),
+                    ctx.style().as_ref(),
+                );
+                app.render_selection_info_bar(ctx);
+                let actual = egui::CentralPanel::default()
+                    .show(ctx, |ui| ui.available_height())
+                    .inner;
+                measured = Some((predicted, actual));
+            });
+
+            let (predicted, actual) = measured.unwrap();
+            assert!(
+                (predicted - actual).abs() < 0.01,
+                "screen_height={screen_height}, predicted={predicted}, actual={actual}"
+            );
+        }
     }
 
     #[test]
@@ -16909,6 +17025,206 @@ mod compute_cell_size_tests {
                 DetailsSelectionBarMode::SameAsDetails,
             ),
         ]
+    }
+
+    fn bottom_bar_alignment_settings() -> crate::settings::Settings {
+        let mut settings = minimal_details_settings();
+        settings.grid_view_mode = GridViewMode::Details;
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
+        settings.details_show_preview = true;
+        settings.details_show_kind = true;
+        settings.details_show_size = true;
+        settings.details_show_modified = true;
+        settings.details_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Kind,
+            DetailsColumnId::Size,
+            DetailsColumnId::Modified,
+        ];
+        settings
+    }
+
+    fn details_list_fixture_resolution(
+        settings: &crate::settings::Settings,
+        row_count: usize,
+    ) -> DetailsListLayoutResolution {
+        let source_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 300.0));
+        resolve_details_list_layout(
+            source_rect,
+            300.0,
+            egui::Style::default().spacing.item_spacing.y,
+            row_count as f32 * App::DETAILS_ROW_H,
+            1.0,
+            settings,
+        )
+    }
+
+    fn layout_column_rects(
+        layout: DetailsLayout,
+        settings: &crate::settings::Settings,
+        column_set: DetailsColumnSet,
+    ) -> Vec<(DetailsColumn, egui::Rect)> {
+        details_column_rects_for_columns(
+            egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(layout.pane_w, App::DETAILS_ROW_H),
+            ),
+            settings,
+            column_set,
+        )
+    }
+
+    fn column_rect(rects: &[(DetailsColumn, egui::Rect)], column: DetailsColumn) -> egui::Rect {
+        rects
+            .iter()
+            .find_map(|(candidate, rect)| (*candidate == column).then_some(*rect))
+            .unwrap()
+    }
+
+    fn assert_shared_bar_columns_align(
+        settings: &crate::settings::Settings,
+        resolved: DetailsListLayoutResolution,
+    ) {
+        let bar_gutter = selection_info_bottom_bar_gutter(GridViewMode::Details, resolved.gutter);
+        let bar_layout = details_layout(
+            600.0,
+            bar_gutter,
+            1.0,
+            settings,
+            DetailsColumnSet::SharedBar,
+        );
+        let list_rects = layout_column_rects(resolved.layout, settings, DetailsColumnSet::Details);
+        let bar_rects = layout_column_rects(bar_layout, settings, DetailsColumnSet::SharedBar);
+        for (column, bar_rect) in bar_rects {
+            if column == DetailsColumn::Name {
+                continue;
+            }
+            let list_rect = column_rect(&list_rects, column);
+            assert_eq!(bar_rect, list_rect, "{column:?}");
+        }
+    }
+
+    #[test]
+    fn details_bottom_bar_columns_align_with_scrolling_list() {
+        let settings = bottom_bar_alignment_settings();
+        let resolved = details_list_fixture_resolution(&settings, 20);
+
+        assert!(resolved.needs_vscroll);
+        assert_eq!(resolved.gutter, details_scroll_style().allocated_width());
+        assert_shared_bar_columns_align(&settings, resolved);
+    }
+
+    #[test]
+    fn details_bottom_bar_columns_align_with_short_list_without_gutter() {
+        let settings = bottom_bar_alignment_settings();
+        let resolved = details_list_fixture_resolution(&settings, 2);
+
+        assert!(!resolved.needs_vscroll);
+        assert_eq!(resolved.gutter, 0.0);
+        assert_shared_bar_columns_align(&settings, resolved);
+    }
+
+    #[test]
+    fn details_bottom_bar_tracks_list_gutter_when_rows_grow() {
+        let settings = bottom_bar_alignment_settings();
+        let short = details_list_fixture_resolution(&settings, 2);
+        let long = details_list_fixture_resolution(&settings, 20);
+        let short_bar = details_layout(
+            600.0,
+            selection_info_bottom_bar_gutter(GridViewMode::Details, short.gutter),
+            1.0,
+            &settings,
+            DetailsColumnSet::SharedBar,
+        );
+        let long_bar = details_layout(
+            600.0,
+            selection_info_bottom_bar_gutter(GridViewMode::Details, long.gutter),
+            1.0,
+            &settings,
+            DetailsColumnSet::SharedBar,
+        );
+        let short_list_x = column_rect(
+            &layout_column_rects(short.layout, &settings, DetailsColumnSet::Details),
+            DetailsColumn::Size,
+        )
+        .left();
+        let long_list_x = column_rect(
+            &layout_column_rects(long.layout, &settings, DetailsColumnSet::Details),
+            DetailsColumn::Size,
+        )
+        .left();
+        let short_bar_x = column_rect(
+            &layout_column_rects(short_bar, &settings, DetailsColumnSet::SharedBar),
+            DetailsColumn::Size,
+        )
+        .left();
+        let long_bar_x = column_rect(
+            &layout_column_rects(long_bar, &settings, DetailsColumnSet::SharedBar),
+            DetailsColumn::Size,
+        )
+        .left();
+
+        assert_eq!(short_list_x, short_bar_x);
+        assert_eq!(long_list_x, long_bar_x);
+        assert_eq!(long_list_x - short_list_x, long_bar_x - short_bar_x);
+        assert_eq!(
+            long_list_x - short_list_x,
+            -details_scroll_style().allocated_width()
+        );
+    }
+
+    #[test]
+    fn thumbnail_bottom_bar_never_reserves_details_gutter() {
+        let settings = bottom_bar_alignment_settings();
+        let short = details_list_fixture_resolution(&settings, 2);
+        let long = details_list_fixture_resolution(&settings, 20);
+        let short_gutter = selection_info_bottom_bar_gutter(GridViewMode::Thumbnail, short.gutter);
+        let long_gutter = selection_info_bottom_bar_gutter(GridViewMode::Thumbnail, long.gutter);
+
+        assert_eq!(short_gutter, 0.0);
+        assert_eq!(long_gutter, 0.0);
+        let short_layout = details_layout(
+            600.0,
+            short_gutter,
+            1.0,
+            &settings,
+            DetailsColumnSet::SharedBar,
+        );
+        let long_layout = details_layout(
+            600.0,
+            long_gutter,
+            1.0,
+            &settings,
+            DetailsColumnSet::SharedBar,
+        );
+        assert_eq!(
+            layout_column_rects(short_layout, &settings, DetailsColumnSet::SharedBar),
+            layout_column_rects(long_layout, &settings, DetailsColumnSet::SharedBar)
+        );
+    }
+
+    #[test]
+    fn dedicated_details_bottom_bar_right_edge_matches_list_gutter() {
+        let mut settings = bottom_bar_alignment_settings();
+        settings.copy_details_columns_to_selection_bar();
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::Dedicated;
+        settings.details_selection_bar_show_kind = false;
+        settings.details_selection_bar_show_modified = false;
+        settings.details_selection_bar_column_order =
+            vec![DetailsColumnId::Name, DetailsColumnId::Size];
+        let resolved = details_list_fixture_resolution(&settings, 20);
+        let bar_layout = details_layout(
+            600.0,
+            selection_info_bottom_bar_gutter(GridViewMode::Details, resolved.gutter),
+            1.0,
+            &settings,
+            DetailsColumnSet::DedicatedBar,
+        );
+
+        assert_eq!(resolved.gutter, details_scroll_style().allocated_width());
+        assert_eq!(bar_layout.pane_w, resolved.layout.pane_w);
+        assert_eq!(bar_layout.extent, resolved.layout.extent);
     }
 
     #[test]
