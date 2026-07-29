@@ -37,6 +37,30 @@ button {
   font: inherit;
 }
 
+#telemetry-hud {
+  position: fixed;
+  z-index: 100;
+  right: max(7px, env(safe-area-inset-right));
+  bottom: max(7px, env(safe-area-inset-bottom));
+  max-width: min(68vw, 250px);
+  padding: 7px 9px;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 9px;
+  background: rgb(7 10 14 / 72%);
+  box-shadow: 0 3px 14px rgb(0 0 0 / 28%);
+  color: #e8edf5;
+  font: 600 10px/1.45 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  text-align: left;
+  white-space: pre-line;
+  cursor: pointer;
+  touch-action: manipulation;
+  backdrop-filter: blur(8px);
+}
+
+#telemetry-hud[hidden] {
+  display: none;
+}
+
 .screen {
   display: flex;
   height: 100%;

@@ -8,6 +8,7 @@ pub struct Config {
     pub bind: IpAddr,
     pub port: u16,
     pub data_dir: PathBuf,
+    pub log_path: PathBuf,
     pub web_root: PathBuf,
 }
 
@@ -16,6 +17,7 @@ impl Config {
         let mut bind = IpAddr::from([127, 0, 0, 1]);
         let mut port = DEFAULT_PORT;
         let mut data_dir: Option<PathBuf> = None;
+        let mut log_path = PathBuf::from("remote-web-log.jsonl");
         let mut args = std::env::args_os().skip(1);
 
         while let Some(arg) = args.next() {
@@ -42,6 +44,10 @@ impl Config {
                         args.next().ok_or("--data-dir にはディレクトリが必要です")?,
                     ));
                 }
+                "--log" => {
+                    log_path =
+                        PathBuf::from(args.next().ok_or("--log にはファイルパスが必要です")?);
+                }
                 "--help" | "-h" => return Err(help_text().to_owned()),
                 other => return Err(format!("不明な引数です: {other}\n\n{}", help_text())),
             }
@@ -53,17 +59,19 @@ impl Config {
             bind,
             port,
             data_dir,
+            log_path,
             web_root,
         })
     }
 }
 
-fn default_data_dir() -> PathBuf {
+pub fn default_data_dir() -> PathBuf {
     let appdata = std::env::var_os("APPDATA").unwrap_or_else(|| ".".into());
     PathBuf::from(appdata).join("mimageviewer")
 }
 
 fn help_text() -> &'static str {
-    "mimageviewer-remote [--bind <IP>] [--port <PORT>] [--data-dir <DIR>]\n\
-     既定: --bind 127.0.0.1 --port 8787 --data-dir %APPDATA%\\mimageviewer"
+    "mimageviewer-remote [--bind <IP>] [--port <PORT>] [--data-dir <DIR>] [--log <FILE>]\n\
+     既定: --bind 127.0.0.1 --port 8787 --data-dir %APPDATA%\\mimageviewer \
+     --log .\\remote-web-log.jsonl"
 }

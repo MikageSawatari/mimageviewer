@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod diagnostics;
 mod http;
 mod image_support;
 mod path_guard;
@@ -7,10 +8,12 @@ mod store;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use auth::AuthToken;
-use config::Config;
-use http::AppState;
+use config::{Config, default_data_dir};
+use diagnostics::DiagnosticsLogger;
+use http::{AppState, TelemetryLimiter};
 use store::Library;
 use tiny_http::Server;
 
@@ -23,16 +26,22 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let config = Config::parse()?;
-    let library = Library::load(&config.data_dir)
-        .map_err(|error| format!("settings.db を read-only で読み込めません: {error:?}"))?;
     let token =
         AuthToken::generate().map_err(|error| format!("認証トークンを生成できません: {error}"))?;
+    let logger = DiagnosticsLogger::open(
+        &config.log_path,
+        &[default_data_dir(), config.data_dir.clone()],
+        token.printable(),
+    )?;
+    let library = Library::load(&config.data_dir)
+        .map_err(|error| format!("settings.db を read-only で読み込めません: {error:?}"))?;
     let address = SocketAddr::new(config.bind, config.port);
     let server = Arc::new(
         Server::http(address).map_err(|error| format!("HTTP bind に失敗しました: {error}"))?,
     );
 
     println!("mIV remote PoC bind: http://{address}");
+    println!("計測ログ: {}", logger.path().display());
     println!("認証トークン: {}", token.printable());
     if config.bind.is_unspecified() {
         println!(
@@ -47,6 +56,9 @@ fn run() -> Result<(), String> {
     let state = Arc::new(AppState {
         token,
         library,
+        logger,
+        telemetry_limiter: TelemetryLimiter::new(),
+        request_sequence: AtomicU64::new(1),
         web_root: config.web_root,
     });
     let workers = std::thread::available_parallelism()

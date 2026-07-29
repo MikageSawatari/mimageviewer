@@ -1,18 +1,62 @@
+use std::collections::VecDeque;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::percent_decode_str;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 use uuid::Uuid;
 
 use crate::auth::{AuthDecision, AuthInput, AuthSource, AuthToken, session_cookie};
-use crate::store::{Library, StoreError};
+use crate::diagnostics::{DiagnosticsLogger, RequestLog};
+use crate::store::{Library, StoreError, ThumbnailMissReason};
+
+const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
+const MAX_TELEMETRY_EVENTS: usize = 128;
+const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
+const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 
 pub struct AppState {
     pub token: AuthToken,
     pub library: Library,
+    pub logger: DiagnosticsLogger,
+    pub telemetry_limiter: TelemetryLimiter,
+    pub request_sequence: AtomicU64,
     pub web_root: PathBuf,
+}
+
+pub struct TelemetryLimiter {
+    accepted: Mutex<VecDeque<Instant>>,
+}
+
+impl TelemetryLimiter {
+    pub fn new() -> Self {
+        Self {
+            accepted: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn allow(&self, now: Instant) -> bool {
+        let Ok(mut accepted) = self.accepted.lock() else {
+            return false;
+        };
+        while accepted
+            .front()
+            .is_some_and(|instant| now.duration_since(*instant) >= TELEMETRY_WINDOW)
+        {
+            accepted.pop_front();
+        }
+        if accepted.len() >= TELEMETRY_REQUESTS_PER_WINDOW {
+            return false;
+        }
+        accepted.push_back(now);
+        true
+    }
 }
 
 struct HttpResponse {
@@ -20,6 +64,7 @@ struct HttpResponse {
     content_type: &'static str,
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
+    log_details: Option<Value>,
 }
 
 impl HttpResponse {
@@ -29,6 +74,7 @@ impl HttpResponse {
             content_type,
             headers: Vec::new(),
             body,
+            log_details: None,
         }
     }
 
@@ -52,16 +98,47 @@ impl HttpResponse {
         self.headers.push((name, value.into()));
         self
     }
+
+    fn with_log_details(mut self, details: Value) -> Self {
+        self.log_details = Some(details);
+        self
+    }
 }
 
-pub fn handle(request: Request, state: &Arc<AppState>) {
-    let response = route(&request, state);
-    if let Err(error) = respond(request, response) {
+pub fn handle(mut request: Request, state: &Arc<AppState>) {
+    let request_id = state.request_sequence.fetch_add(1, Ordering::Relaxed);
+    let started_at = Instant::now();
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let method = request.method().to_string();
+    let raw_url = request.url().to_owned();
+    let mut response = route(&mut request, state);
+    response
+        .headers
+        .push(("X-mIV-Request-Id", request_id.to_string()));
+    let status = response.status;
+    let response_bytes = response.body.len();
+    let details = response.log_details.take();
+    let response_result = respond(request, response);
+    state.logger.log_request(RequestLog {
+        request_id,
+        timestamp_unix_ms,
+        method: &method,
+        raw_url: &raw_url,
+        status,
+        duration: started_at.elapsed(),
+        response_bytes,
+        response_write_ok: response_result.is_ok(),
+        details,
+    });
+    if let Err(error) = response_result {
         eprintln!("remote-web: response write failed: {error}");
     }
 }
 
-fn route(request: &Request, state: &AppState) -> HttpResponse {
+fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     let (path, raw_query) = split_url(request.url());
     let query_result = parse_query(raw_query);
     let authorization = header_value(request, "Authorization");
@@ -92,12 +169,6 @@ fn route(request: &Request, state: &AppState) -> HttpResponse {
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
 
-    if request.method() != &Method::Get {
-        return HttpResponse::text(405, "Method Not Allowed")
-            .with_header("Allow", "GET")
-            .with_header("Cache-Control", "no-store");
-    }
-
     if source == AuthSource::Query {
         let location = url_without_token(path, &query);
         return HttpResponse::text(303, "See Other")
@@ -108,16 +179,24 @@ fn route(request: &Request, state: &AppState) -> HttpResponse {
             .with_header("Referrer-Policy", "no-referrer");
     }
 
-    let response = match path {
-        "/api/favorites" => api_favorites(state),
-        "/api/list" => api_list(state, &query),
-        "/api/thumb" => api_thumb(state, &query),
-        "/api/image" => api_image(state, &query),
-        "/" => static_file(state, "index.html", "text/html; charset=utf-8"),
-        "/app.js" => static_file(state, "app.js", "text/javascript; charset=utf-8"),
-        "/styles.css" => static_file(state, "styles.css", "text/css; charset=utf-8"),
-        "/favicon.ico" => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
-        _ => HttpResponse::text(404, "Not Found"),
+    let method = request.method().clone();
+    let response = match (method, path) {
+        (Method::Get, "/api/favorites") => api_favorites(state),
+        (Method::Get, "/api/list") => api_list(state, &query),
+        (Method::Get, "/api/thumb") => api_thumb(state, &query),
+        (Method::Get, "/api/image") => api_image(state, &query),
+        (Method::Post, "/api/telemetry") => api_telemetry(request, state),
+        (Method::Get, "/") => static_file(state, "index.html", "text/html; charset=utf-8"),
+        (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
+        (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
+        (Method::Get, "/favicon.ico") => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
+        (Method::Get, _) => HttpResponse::text(404, "Not Found"),
+        (_, "/api/telemetry") => HttpResponse::text(405, "Method Not Allowed")
+            .with_header("Allow", "POST")
+            .with_header("Cache-Control", "no-store"),
+        _ => HttpResponse::text(405, "Method Not Allowed")
+            .with_header("Allow", "GET")
+            .with_header("Cache-Control", "no-store"),
     };
 
     response
@@ -140,8 +219,10 @@ fn api_list(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         return HttpResponse::text(400, "Bad Request");
     };
     match state.library.list(favorite, path) {
-        Ok(value) => match HttpResponse::json(&value) {
-            Ok(response) => response.with_header("Cache-Control", "no-store"),
+        Ok(value) => match HttpResponse::json(&value.response) {
+            Ok(response) => response
+                .with_header("Cache-Control", "no-store")
+                .with_log_details(json!({"list": value.metrics})),
             Err(error) => {
                 eprintln!("remote-web: list JSON encoding failed: {error}");
                 HttpResponse::text(500, "Internal Server Error")
@@ -156,9 +237,28 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         return HttpResponse::text(400, "Bad Request");
     };
     match state.library.thumbnail(favorite, path) {
-        Ok(bytes) => HttpResponse::bytes(200, "image/webp", bytes)
-            .with_header("Cache-Control", "private, max-age=60"),
-        Err(error) => store_error_response(error),
+        Ok(bytes) => {
+            let blob_bytes = bytes.len();
+            HttpResponse::bytes(200, "image/webp", bytes)
+                .with_header("Cache-Control", "private, max-age=60")
+                .with_log_details(json!({
+                    "thumb": {
+                        "hit": true,
+                        "miss_reason": null,
+                        "blob_bytes": blob_bytes,
+                    }
+                }))
+        }
+        Err(StoreError::ThumbnailMiss(reason)) => {
+            HttpResponse::text(404, "Not Found").with_log_details(thumbnail_miss_details(reason))
+        }
+        Err(error) => store_error_response(error).with_log_details(json!({
+            "thumb": {
+                "hit": false,
+                "miss_reason": "request_error",
+                "blob_bytes": 0,
+            }
+        })),
     }
 }
 
@@ -177,10 +277,93 @@ fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     };
 
     match state.library.image(favorite, path, width) {
-        Ok(bytes) => HttpResponse::bytes(200, "image/webp", bytes)
-            .with_header("Cache-Control", "private, max-age=60"),
+        Ok(value) => HttpResponse::bytes(200, "image/webp", value.bytes)
+            .with_header("Cache-Control", "private, max-age=60")
+            .with_log_details(json!({"image": value.metrics})),
         Err(error) => store_error_response(error),
     }
+}
+
+fn thumbnail_miss_details(reason: ThumbnailMissReason) -> Value {
+    json!({
+        "thumb": {
+            "hit": false,
+            "miss_reason": reason,
+            "blob_bytes": 0,
+        }
+    })
+}
+
+#[derive(Deserialize)]
+struct TelemetryBatch {
+    #[serde(default)]
+    client_timestamp_ms: Option<u64>,
+    #[serde(default)]
+    connection: Option<Value>,
+    events: Vec<Value>,
+}
+
+fn api_telemetry(request: &mut Request, state: &AppState) -> HttpResponse {
+    if !state.telemetry_limiter.allow(Instant::now()) {
+        return HttpResponse::text(429, "Too Many Requests")
+            .with_header("Retry-After", "5")
+            .with_header("Cache-Control", "no-store");
+    }
+    let body = match read_limited_body(request) {
+        Ok(body) => body,
+        Err(TelemetryBodyError::TooLarge) => {
+            return HttpResponse::text(413, "Payload Too Large")
+                .with_header("Cache-Control", "no-store");
+        }
+        Err(TelemetryBodyError::Read) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let batch: TelemetryBatch = match serde_json::from_slice(&body) {
+        Ok(batch) => batch,
+        Err(_) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    if batch.events.len() > MAX_TELEMETRY_EVENTS {
+        return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+    }
+    let event_count = batch.events.len();
+    let mut telemetry = json!({
+        "client_timestamp_ms": batch.client_timestamp_ms,
+        "event_count": event_count,
+        "events": batch.events,
+    });
+    if let Some(connection) = batch.connection {
+        telemetry["connection"] = connection;
+    }
+    HttpResponse::bytes(204, "application/json; charset=utf-8", Vec::new())
+        .with_header("Cache-Control", "no-store")
+        .with_log_details(json!({"telemetry": telemetry}))
+}
+
+enum TelemetryBodyError {
+    TooLarge,
+    Read,
+}
+
+fn read_limited_body(request: &mut Request) -> Result<Vec<u8>, TelemetryBodyError> {
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_TELEMETRY_BODY_BYTES)
+    {
+        return Err(TelemetryBodyError::TooLarge);
+    }
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take((MAX_TELEMETRY_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| TelemetryBodyError::Read)?;
+    if body.len() > MAX_TELEMETRY_BODY_BYTES {
+        return Err(TelemetryBodyError::TooLarge);
+    }
+    Ok(body)
 }
 
 fn favorite_and_path(query: &[(String, String)]) -> Option<(Uuid, &str)> {
@@ -208,6 +391,7 @@ fn store_error_response(error: StoreError) -> HttpResponse {
     match error {
         StoreError::BadRequest => HttpResponse::text(400, "Bad Request"),
         StoreError::NotFound => HttpResponse::text(404, "Not Found"),
+        StoreError::ThumbnailMiss(_) => HttpResponse::text(404, "Not Found"),
         StoreError::Decode => HttpResponse::text(415, "Unsupported Media Type"),
         StoreError::Io(error) => {
             eprintln!("remote-web: filesystem request failed: {error}");
@@ -312,6 +496,31 @@ fn encode_query_component(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::auth::COOKIE_NAME;
+    use tiny_http::TestRequest;
+
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn test_state(temp: &tempfile::TempDir) -> AppState {
+        let protected = temp.path().join("data");
+        std::fs::create_dir_all(&protected).unwrap();
+        AppState {
+            token: AuthToken::from_printable_for_test(TEST_TOKEN),
+            library: Library::empty_for_test(temp.path().join("cache")),
+            logger: DiagnosticsLogger::open(
+                &temp.path().join("request.jsonl"),
+                &[protected],
+                TEST_TOKEN,
+            )
+            .unwrap(),
+            telemetry_limiter: TelemetryLimiter::new(),
+            request_sequence: AtomicU64::new(1),
+            web_root: temp.path().to_owned(),
+        }
+    }
+
+    fn cookie_header() -> Header {
+        Header::from_bytes("Cookie", format!("{COOKIE_NAME}={TEST_TOKEN}").as_bytes()).unwrap()
+    }
 
     #[test]
     fn query_parser_decodes_form_encoding_and_rejects_invalid_utf8() {
@@ -344,5 +553,82 @@ mod tests {
     #[test]
     fn cookie_name_is_not_ambiguous() {
         assert_eq!(COOKIE_NAME, "miv_remote_token");
+    }
+
+    #[test]
+    fn telemetry_rejects_an_unauthenticated_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/telemetry")
+            .with_body(r#"{"events":[]}"#)
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body, b"Unauthorized");
+    }
+
+    #[test]
+    fn telemetry_rejects_a_declared_body_over_64_kib() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let content_length = Header::from_bytes(
+            "Content-Length",
+            (MAX_TELEMETRY_BODY_BYTES + 1).to_string().as_bytes(),
+        )
+        .unwrap();
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/telemetry")
+            .with_header(cookie_header())
+            .with_header(content_length)
+            .with_body(r#"{"events":[]}"#)
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 413);
+    }
+
+    #[test]
+    fn telemetry_accepts_cookie_auth_used_by_send_beacon() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/telemetry")
+            .with_header(cookie_header())
+            .with_body(r#"{"client_timestamp_ms":1,"events":[{"type":"image"}]}"#)
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 204);
+        assert_eq!(response.body.len(), 0);
+        let details = response.log_details.unwrap();
+        assert_eq!(details["telemetry"]["event_count"], 1);
+        assert!(details["telemetry"].get("connection").is_none());
+    }
+
+    #[test]
+    fn telemetry_rejects_invalid_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/telemetry")
+            .with_header(cookie_header())
+            .with_body("not json")
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn telemetry_limiter_caps_requests_per_minute() {
+        let limiter = TelemetryLimiter::new();
+        let now = Instant::now();
+        for _ in 0..TELEMETRY_REQUESTS_PER_WINDOW {
+            assert!(limiter.allow(now));
+        }
+        assert!(!limiter.allow(now));
+        assert!(limiter.allow(now + TELEMETRY_WINDOW));
     }
 }

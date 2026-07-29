@@ -1,4 +1,18 @@
 const app = document.querySelector("#app");
+const hudElement = document.querySelector("#telemetry-hud");
+const TELEMETRY_ENABLED = true;
+
+const telemetryState = {
+  queue: [],
+  flushing: false,
+};
+
+const hudState = {
+  lastImage: null,
+  lastGrid: null,
+  displayDurations: [],
+  errors: [],
+};
 
 const state = {
   favorites: [],
@@ -10,11 +24,17 @@ const state = {
   imageIndex: -1,
   requestController: null,
   virtualGrid: null,
+  thumbnailTracker: null,
   viewer: null,
 };
 
 window.addEventListener("popstate", () => dispatchRoute());
 
+if (TELEMETRY_ENABLED) {
+  installTelemetry();
+} else {
+  hudElement.hidden = true;
+}
 boot();
 
 async function boot() {
@@ -49,7 +69,7 @@ async function dispatchRoute() {
       if (index < 0) {
         throw new Error("画像が見つかりませんでした。");
       }
-      renderImageViewer(index);
+      renderImageViewer(index, performance.now());
       return;
     }
     renderFavorites();
@@ -99,6 +119,8 @@ function cleanupScreen() {
   state.requestController = null;
   state.virtualGrid?.destroy();
   state.virtualGrid = null;
+  state.thumbnailTracker?.destroy();
+  state.thumbnailTracker = null;
   state.viewer?.destroy();
   state.viewer = null;
   app.replaceChildren();
@@ -173,6 +195,7 @@ async function loadFolder(favoriteId, path) {
 }
 
 function renderFolder() {
+  const renderStartedAt = performance.now();
   cleanupScreen();
   exitBrowserFullscreen();
   document.title = `${state.favoriteName} — mIV Remote`;
@@ -199,6 +222,10 @@ function renderFolder() {
   scroll.append(space);
   screen.append(topbar, scroll);
   app.append(screen);
+  state.thumbnailTracker = new ThumbnailGridTracker(
+    renderStartedAt,
+    state.entries.length
+  );
 
   if (!state.entries.length) {
     const empty = textElement(
@@ -207,6 +234,7 @@ function renderFolder() {
       "empty-state center-status"
     );
     scroll.replaceChildren(empty);
+    state.thumbnailTracker.begin([]);
     return;
   }
 
@@ -216,7 +244,8 @@ function renderFolder() {
     space,
     windowElement,
     state.entries,
-    (entry) => createGridTile(entry, imageIndexes)
+    (entry) => createGridTile(entry, imageIndexes, state.thumbnailTracker),
+    (initialItems) => state.thumbnailTracker?.begin(initialItems)
   );
 }
 
@@ -248,7 +277,7 @@ function buildBreadcrumbs() {
   return breadcrumbs;
 }
 
-function createGridTile(entry, imageIndexes) {
+function createGridTile(entry, imageIndexes, thumbnailTracker) {
   const tile = element("button", "grid-tile");
   tile.type = "button";
   tile.title = entry.name;
@@ -266,18 +295,16 @@ function createGridTile(entry, imageIndexes) {
     image.alt = "";
     image.loading = "lazy";
     image.decoding = "async";
-    image.src = apiUrl("/api/thumb", {
-      fav: state.favoriteId,
-      path: entry.path,
-    });
-    image.addEventListener("error", () => image.classList.add("thumb-missing"));
+    image.dataset.telemetryObserved = "true";
+    loadThumbnail(image, entry, thumbnailTracker);
     preview.append(image);
     tile.addEventListener("click", () => {
+      const interactionStartedAt = performance.now();
       tryEnterBrowserFullscreen();
       const index = imageIndexes.get(entry.path);
       if (index !== undefined) {
         history.pushState(null, "", imageHash(state.favoriteId, entry.path));
-        renderImageViewer(index);
+        renderImageViewer(index, interactionStartedAt);
       }
     });
   }
@@ -285,7 +312,7 @@ function createGridTile(entry, imageIndexes) {
   return tile;
 }
 
-function renderImageViewer(index) {
+function renderImageViewer(index, interactionStartedAt = performance.now()) {
   cleanupScreen();
   state.imageIndex = index;
   const imageEntry = state.images[index];
@@ -296,6 +323,7 @@ function renderImageViewer(index) {
   const image = element("img", "viewer-image");
   image.alt = imageEntry.name;
   image.draggable = false;
+  image.dataset.telemetryObserved = "true";
   stage.append(image);
 
   const top = element("div", "viewer-ui top");
@@ -339,7 +367,7 @@ function renderImageViewer(index) {
     event.stopPropagation();
     changeImage(1);
   });
-  updateViewerImage();
+  updateViewerImage(interactionStartedAt);
 }
 
 function changeImage(delta) {
@@ -350,39 +378,80 @@ function changeImage(delta) {
   state.imageIndex = nextIndex;
   const entry = state.images[nextIndex];
   history.pushState(null, "", imageHash(state.favoriteId, entry.path));
-  updateViewerImage();
+  updateViewerImage(performance.now());
 }
 
-function updateViewerImage() {
+function updateViewerImage(interactionStartedAt = performance.now()) {
   const entry = state.images[state.imageIndex];
   document.title = `${entry.name} — mIV Remote`;
+  const request = imageRequest(entry.path);
   state.viewer.load({
     name: entry.name,
-    url: imageUrl(entry.path),
+    request,
     index: state.imageIndex,
     count: state.images.length,
+    interactionStartedAt,
   });
   const nextEntry = state.images[state.imageIndex + 1];
   if (nextEntry) {
     const preload = new Image();
     preload.decoding = "async";
-    preload.src = imageUrl(nextEntry.path);
+    preload.src = imageRequest(nextEntry.path).url;
   }
 }
 
-function imageUrl(path) {
+function imageRequest(path) {
   const cssWidth = Math.max(320, window.visualViewport?.width ?? window.innerWidth);
-  const width = Math.min(4096, Math.ceil(cssWidth * (window.devicePixelRatio || 1)));
-  return apiUrl("/api/image", { fav: state.favoriteId, path, w: width });
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.min(4096, Math.ceil(cssWidth * dpr));
+  return {
+    url: apiUrl("/api/image", { fav: state.favoriteId, path, w: width }),
+    width,
+    cssWidth,
+    dpr,
+  };
+}
+
+async function loadThumbnail(image, entry, tracker) {
+  const url = apiUrl("/api/thumb", {
+    fav: state.favoriteId,
+    path: entry.path,
+  });
+  try {
+    const response = await observedFetch(url, { credentials: "same-origin" });
+    if (!response.ok) {
+      image.classList.add("thumb-missing");
+      tracker?.settled(entry.path, { notFound: response.status === 404 });
+      return;
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    image.src = objectUrl;
+    try {
+      await image.decode();
+      await nextFrame();
+      tracker?.settled(entry.path);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  } catch (error) {
+    image.classList.add("thumb-missing");
+    tracker?.settled(entry.path);
+    recordClientError("image_load_error", error, {
+      resource: safeResourcePath(url),
+    });
+  }
 }
 
 class VirtualGrid {
-  constructor(scroller, space, windowElement, items, renderCell) {
+  constructor(scroller, space, windowElement, items, renderCell, onInitialItems) {
     this.scroller = scroller;
     this.space = space;
     this.windowElement = windowElement;
     this.items = items;
     this.renderCell = renderCell;
+    this.onInitialItems = onInitialItems;
+    this.initialItemsReported = false;
     this.columns = 1;
     this.rowHeight = 180;
     this.lastRange = "";
@@ -428,6 +497,10 @@ class VirtualGrid {
     const range = `${startIndex}:${endIndex}:${this.columns}`;
     if (range === this.lastRange) return;
     this.lastRange = range;
+    if (!this.initialItemsReported) {
+      this.initialItemsReported = true;
+      this.onInitialItems?.(this.items.slice(startIndex, endIndex));
+    }
     this.windowElement.style.top = `${firstRow * this.rowHeight + 6}px`;
     const fragment = document.createDocumentFragment();
     for (let index = startIndex; index < endIndex; index += 1) {
@@ -440,6 +513,52 @@ class VirtualGrid {
     cancelAnimationFrame(this.frame);
     this.scroller.removeEventListener("scroll", this.onScroll);
     this.resizeObserver.disconnect();
+  }
+}
+
+class ThumbnailGridTracker {
+  constructor(startedAt, folderEntryCount) {
+    this.startedAt = startedAt;
+    this.folderEntryCount = folderEntryCount;
+    this.pending = new Set();
+    this.expected = 0;
+    this.notFoundCount = 0;
+    this.completed = false;
+    this.destroyed = false;
+  }
+
+  begin(items) {
+    if (this.destroyed || this.expected) return;
+    for (const entry of items) {
+      if (entry.kind === "image") this.pending.add(entry.path);
+    }
+    this.expected = this.pending.size;
+    if (!this.expected) this.finish();
+  }
+
+  settled(path, { notFound = false } = {}) {
+    if (this.destroyed || this.completed || !this.pending.delete(path)) return;
+    if (notFound) this.notFoundCount += 1;
+    if (!this.pending.size) this.finish();
+  }
+
+  finish() {
+    if (this.destroyed || this.completed) return;
+    this.completed = true;
+    const event = {
+      type: "thumbnail_grid",
+      duration_ms: roundMs(performance.now() - this.startedAt),
+      rendered_count: this.expected,
+      folder_entry_count: this.folderEntryCount,
+      not_found_count: this.notFoundCount,
+    };
+    enqueueTelemetry(event);
+    hudState.lastGrid = event;
+    updateHud();
+  }
+
+  destroy() {
+    this.destroyed = true;
   }
 }
 
@@ -461,6 +580,9 @@ class ImageViewer {
     this.pinch = null;
     this.pinched = false;
     this.resizeTimer = 0;
+    this.loadSequence = 0;
+    this.fetchController = null;
+    this.objectUrl = null;
 
     this.pointerDown = (event) => this.onPointerDown(event);
     this.pointerMove = (event) => this.onPointerMove(event);
@@ -471,7 +593,13 @@ class ImageViewer {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = setTimeout(() => {
         const entry = state.images[state.imageIndex];
-        if (entry) this.setSource(imageUrl(entry.path));
+        if (entry) {
+          this.loadMeasuredImage(
+            imageRequest(entry.path),
+            performance.now(),
+            entry.name
+          );
+        }
       }, 180);
     };
 
@@ -484,18 +612,75 @@ class ImageViewer {
     window.addEventListener("resize", this.resize);
   }
 
-  load({ name, url, index, count }) {
+  load({ name, request, index, count, interactionStartedAt }) {
     this.resetTransform();
     this.title.textContent = name;
     this.image.alt = name;
     this.counter.textContent = `${index + 1} / ${count}`;
     this.previous.disabled = index === 0;
     this.next.disabled = index === count - 1;
-    this.setSource(url);
+    this.loadMeasuredImage(request, interactionStartedAt, name);
   }
 
-  setSource(url) {
-    this.image.src = url;
+  async loadMeasuredImage(request, interactionStartedAt, name) {
+    const sequence = ++this.loadSequence;
+    this.fetchController?.abort();
+    const controller = new AbortController();
+    this.fetchController = controller;
+    const fetchStartedAt = performance.now();
+    let pendingObjectUrl = null;
+    try {
+      const response = await observedFetch(request.url, {
+        signal: controller.signal,
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        throw new Error(`画像取得に失敗しました (HTTP ${response.status})。`);
+      }
+      const blob = await response.blob();
+      const fetchMs = performance.now() - fetchStartedAt;
+      const requestId = response.headers.get("X-mIV-Request-Id");
+      if (sequence !== this.loadSequence) return;
+
+      pendingObjectUrl = URL.createObjectURL(blob);
+      this.image.src = pendingObjectUrl;
+      const decodeStartedAt = performance.now();
+      await this.image.decode();
+      const decodeMs = performance.now() - decodeStartedAt;
+      await nextFrame();
+      if (sequence !== this.loadSequence) {
+        URL.revokeObjectURL(pendingObjectUrl);
+        return;
+      }
+      if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = pendingObjectUrl;
+      pendingObjectUrl = null;
+
+      const event = {
+        type: "image",
+        request_id: requestId,
+        name: limitText(name, 240),
+        fetch_ms: roundMs(fetchMs),
+        bytes: blob.size,
+        decode_ms: roundMs(decodeMs),
+        tap_to_display_ms: roundMs(performance.now() - interactionStartedAt),
+        requested_width: request.width,
+        css_width: roundMs(request.cssWidth),
+        device_pixel_ratio: roundMs(request.dpr),
+      };
+      enqueueTelemetry(event);
+      hudState.lastImage = event;
+      hudState.displayDurations.push(event.tap_to_display_ms);
+      if (hudState.displayDurations.length > 20) hudState.displayDurations.shift();
+      updateHud();
+    } catch (error) {
+      if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
+      if (sequence !== this.loadSequence) return;
+      if (error?.name === "AbortError") return;
+      recordClientError("image_load_error", error, {
+        resource: safeResourcePath(request.url),
+      });
+    }
   }
 
   resetTransform() {
@@ -613,6 +798,10 @@ class ImageViewer {
 
   destroy() {
     clearTimeout(this.resizeTimer);
+    this.loadSequence += 1;
+    this.fetchController?.abort();
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+    this.objectUrl = null;
     this.root.removeEventListener("pointerdown", this.pointerDown);
     this.root.removeEventListener("pointermove", this.pointerMove);
     this.root.removeEventListener("pointerup", this.pointerUp);
@@ -624,7 +813,7 @@ class ImageViewer {
 }
 
 async function apiJson(path, params = {}, signal) {
-  const response = await fetch(apiUrl(path, params), {
+  const response = await observedFetch(apiUrl(path, params), {
     method: "GET",
     credentials: "same-origin",
     headers: { Accept: "application/json" },
@@ -712,4 +901,258 @@ function exitBrowserFullscreen() {
   if (document.fullscreenElement && document.exitFullscreen) {
     document.exitFullscreen().catch(() => {});
   }
+}
+
+function installTelemetry() {
+  hudElement.hidden = false;
+  hudElement.addEventListener("click", () => {
+    hudElement.hidden = true;
+  });
+  updateHud();
+
+  window.addEventListener(
+    "error",
+    (event) => {
+      if (event.target instanceof HTMLImageElement) {
+        if (event.target.dataset.telemetryObserved === "true") return;
+        recordClientError("image_load_error", "<img> load failed", {
+          resource: safeResourcePath(event.target.currentSrc || event.target.src),
+        });
+        return;
+      }
+      recordClientError("window_error", event.error ?? event.message, {
+        resource: safeResourcePath(event.filename),
+        line: event.lineno,
+        column: event.colno,
+      });
+    },
+    true
+  );
+  window.addEventListener("unhandledrejection", (event) => {
+    recordClientError("unhandled_rejection", event.reason);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushTelemetry(true);
+  });
+  window.setInterval(() => {
+    flushTelemetry(false);
+    updateHud();
+  }, 5000);
+}
+
+async function observedFetch(url, options = {}) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    if (error?.name !== "AbortError") {
+      recordClientError("fetch_error", error, {
+        resource: safeResourcePath(url),
+      });
+    }
+    throw error;
+  }
+  if (!response.ok) {
+    recordClientError(
+      "fetch_non_2xx",
+      new Error(`HTTP ${response.status} ${response.statusText}`),
+      {
+        resource: safeResourcePath(url),
+        status: response.status,
+      }
+    );
+  }
+  return response;
+}
+
+function enqueueTelemetry(event) {
+  if (!TELEMETRY_ENABLED) return;
+  telemetryState.queue.push({
+    client_event_timestamp_ms: Date.now(),
+    ...event,
+  });
+  if (telemetryState.queue.length > 200) {
+    telemetryState.queue.splice(0, telemetryState.queue.length - 200);
+  }
+}
+
+async function flushTelemetry(useBeacon) {
+  if (!telemetryState.queue.length || (!useBeacon && telemetryState.flushing)) return;
+  if (useBeacon && navigator.sendBeacon) {
+    while (telemetryState.queue.length) {
+      const { events, body } = takeTelemetryPayload();
+      const accepted = navigator.sendBeacon(
+        "/api/telemetry",
+        new Blob([body], { type: "application/json" })
+      );
+      if (!accepted) {
+        telemetryState.queue.unshift(...events);
+        break;
+      }
+    }
+    return;
+  }
+
+  const { events, body } = takeTelemetryPayload();
+  telemetryState.flushing = true;
+  try {
+    const response = await fetch("/api/telemetry", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    });
+    if (!response.ok && response.status !== 429) {
+      telemetryState.queue.unshift(...events);
+      noteHudError();
+    }
+  } catch {
+    telemetryState.queue.unshift(...events);
+    noteHudError();
+  } finally {
+    telemetryState.flushing = false;
+  }
+}
+
+function takeTelemetryPayload() {
+  const events = telemetryState.queue.splice(0, Math.min(24, telemetryState.queue.length));
+  const payload = {
+    client_timestamp_ms: Date.now(),
+    events,
+  };
+  const connection = connectionInfo();
+  if (connection) payload.connection = connection;
+
+  let body = JSON.stringify(payload);
+  while (new Blob([body]).size > 60 * 1024 && events.length > 1) {
+    telemetryState.queue.unshift(events.pop());
+    body = JSON.stringify(payload);
+  }
+  return { events, body };
+}
+
+function connectionInfo() {
+  const connection =
+    navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (!connection) return null;
+  const info = {};
+  if (typeof connection.effectiveType === "string") {
+    info.effective_type = connection.effectiveType;
+  }
+  if (typeof connection.downlink === "number") info.downlink_mbps = connection.downlink;
+  return Object.keys(info).length ? info : null;
+}
+
+function recordClientError(category, error, extra = {}) {
+  const normalized = normalizeError(error);
+  enqueueTelemetry({
+    type: "error",
+    category,
+    message: normalized.message,
+    stack: normalized.stack,
+    ...extra,
+  });
+  noteHudError();
+}
+
+function normalizeError(error) {
+  const message =
+    error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
+  const stack = error instanceof Error ? error.stack : "";
+  return {
+    message: limitText(redactTokenQuery(message), 800),
+    stack: limitText(
+      redactTokenQuery(stack)
+        .split("\n")
+        .slice(0, 4)
+        .join("\n"),
+      1800
+    ),
+  };
+}
+
+function noteHudError() {
+  hudState.errors.push(Date.now());
+  trimHudErrors();
+  updateHud();
+}
+
+function trimHudErrors() {
+  const cutoff = Date.now() - 60_000;
+  while (hudState.errors[0] < cutoff) hudState.errors.shift();
+}
+
+function updateHud() {
+  if (!TELEMETRY_ENABLED) {
+    hudElement.hidden = true;
+    return;
+  }
+  trimHudErrors();
+  const image = hudState.lastImage;
+  const grid = hudState.lastGrid;
+  const recent = hudState.displayDurations.slice(-7);
+  const lines = ["mIV PoC 計測"];
+  lines.push(
+    image
+      ? `画像 fetch ${formatMs(image.fetch_ms)} / ${formatBytes(image.bytes)}`
+      : "画像 fetch — / —"
+  );
+  lines.push(image ? `decode ${formatMs(image.decode_ms)}` : "decode —");
+  lines.push(
+    grid
+      ? `一覧 ${formatMs(grid.duration_ms)} (${grid.rendered_count}件)`
+      : "一覧 —"
+  );
+  lines.push(
+    recent.length
+      ? `表示中央値(${recent.length}) ${formatMs(median(recent))}`
+      : "表示中央値 —"
+  );
+  lines.push(`error(60s) ${hudState.errors.length}  · tapで隠す`);
+  hudElement.textContent = lines.join("\n");
+}
+
+function safeResourcePath(value) {
+  if (!value) return "";
+  try {
+    return new URL(value, location.origin).pathname;
+  } catch {
+    return limitText(redactTokenQuery(String(value)), 300);
+  }
+}
+
+function redactTokenQuery(value) {
+  return String(value ?? "").replace(/([?&]t=)[^&#\s)]+/gi, "$1[redacted]");
+}
+
+function limitText(value, maxLength) {
+  const text = String(value ?? "");
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength)}…`;
+}
+
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function roundMs(value) {
+  return Math.round(Number(value) * 10) / 10;
+}
+
+function formatMs(value) {
+  return `${Math.round(value)}ms`;
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
+}
+
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
 }

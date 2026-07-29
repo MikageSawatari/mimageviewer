@@ -93,6 +93,8 @@ SQLite は WAL なので「本体が唯一の writer / remote-web は reader」�
   バンドラ / TypeScript の採用可否は PoC 完了後に判断する
 - 新規コードは新規ファイルに置く。既存ファイルへの変更は最小のフック点に留める
   (master が 1 日 5,000 行ペースで動くため、衝突面積を構造的に減らす)
+- read-only 不変条件は mIV の settings / catalog 等を変更しないことを指し、PoC の診断ログだけは
+  `--log` で指定した `%APPDATA%\mimageviewer` 配下ではない別パスへ出力する
 
 ## 4. PoC のスコープ (現在のフェーズ)
 

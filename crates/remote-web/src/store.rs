@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use image::GenericImageView;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::diagnostics::duration_ms;
 use crate::image_support;
 use crate::path_guard::{ResolveError, resolve_existing};
 
@@ -20,6 +21,16 @@ pub enum StoreError {
     Io(std::io::Error),
     Db(rusqlite::Error),
     Decode,
+    ThumbnailMiss(ThumbnailMissReason),
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThumbnailMissReason {
+    DatabaseMissing,
+    RowMissing,
+    MtimeMismatch,
+    NotWebp,
 }
 
 impl From<std::io::Error> for StoreError {
@@ -68,6 +79,18 @@ pub struct ListResponse {
     entries: Vec<ListEntry>,
 }
 
+pub struct ListResult {
+    pub response: ListResponse,
+    pub metrics: ListMetrics,
+}
+
+#[derive(Serialize)]
+pub struct ListMetrics {
+    pub entry_count: usize,
+    pub scanned_count: usize,
+    pub scan_ms: f64,
+}
+
 #[derive(Serialize)]
 pub struct ListEntry {
     kind: EntryKind,
@@ -89,6 +112,24 @@ pub enum EntryKind {
     Other,
 }
 
+pub struct ImageResult {
+    pub bytes: Vec<u8>,
+    pub metrics: ImageMetrics,
+}
+
+#[derive(Serialize)]
+pub struct ImageMetrics {
+    pub source_width: u32,
+    pub source_height: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub requested_width: u32,
+    pub decode_ms: f64,
+    pub resize_ms: f64,
+    pub webp_encode_ms: f64,
+    pub source_bytes: u64,
+}
+
 pub struct Library {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
@@ -96,6 +137,15 @@ pub struct Library {
 }
 
 impl Library {
+    #[cfg(test)]
+    pub fn empty_for_test(cache_dir: PathBuf) -> Self {
+        Self {
+            favorites: Vec::new(),
+            by_id: HashMap::new(),
+            cache_dir,
+        }
+    }
+
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
         let settings_path = data_dir.join("settings.db");
         let conn = open_read_only(&settings_path)?;
@@ -147,7 +197,7 @@ impl Library {
         }
     }
 
-    pub fn list(&self, favorite_id: Uuid, relative: &str) -> Result<ListResponse, StoreError> {
+    pub fn list(&self, favorite_id: Uuid, relative: &str) -> Result<ListResult, StoreError> {
         let favorite = self.favorite(favorite_id)?;
         let directory = resolve_existing(&favorite.path, relative)?;
         let metadata = std::fs::metadata(&directory)?;
@@ -156,8 +206,11 @@ impl Library {
         }
 
         let mut entries = Vec::new();
+        let mut scanned_count = 0;
+        let scan_started = Instant::now();
         for entry_result in std::fs::read_dir(&directory)? {
             let entry = entry_result?;
+            scanned_count += 1;
             // DirEntry::file_type uses the FindFirstFile data on Windows. Do not
             // replace this with per-entry Path::is_dir/is_file calls.
             let file_type = entry.file_type()?;
@@ -191,6 +244,7 @@ impl Library {
                 mtime: mtime_secs(&metadata),
             });
         }
+        let scan_ms = duration_ms(scan_started.elapsed());
 
         entries.sort_by(|left, right| {
             sort_group(left.kind)
@@ -199,17 +253,25 @@ impl Library {
                 .then_with(|| left.name.cmp(&right.name))
         });
 
-        Ok(ListResponse {
-            favorite_id,
-            path: normalize_relative_for_url(relative),
-            entries,
+        let entry_count = entries.len();
+        Ok(ListResult {
+            response: ListResponse {
+                favorite_id,
+                path: normalize_relative_for_url(relative),
+                entries,
+            },
+            metrics: ListMetrics {
+                entry_count,
+                scanned_count,
+                scan_ms,
+            },
         })
     }
 
     pub fn thumbnail(&self, favorite_id: Uuid, relative: &str) -> Result<Vec<u8>, StoreError> {
         let favorite = self.favorite(favorite_id)?;
         let image_path = resolve_existing(&favorite.path, relative)?;
-        require_image_file(&image_path)?;
+        let metadata = require_image_file(&image_path)?;
 
         // Catalog identity follows the configured/logical favorite path. The
         // canonical path above is only for the security boundary and file read;
@@ -220,10 +282,15 @@ impl Library {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(StoreError::NotFound)?;
-        let metadata = std::fs::metadata(&image_path)?;
         let catalog_path = image_support::catalog_db_path(&self.cache_dir, parent);
-        if !catalog_path.try_exists().unwrap_or(false) {
-            return Err(StoreError::NotFound);
+        match catalog_path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(StoreError::ThumbnailMiss(
+                    ThumbnailMissReason::DatabaseMissing,
+                ));
+            }
+            Err(error) => return Err(StoreError::Io(error)),
         }
         let catalog = open_read_only(&catalog_path)?;
         let entry = catalog
@@ -241,12 +308,14 @@ impl Library {
                 },
             )
             .optional()?
-            .ok_or(StoreError::NotFound)?;
+            .ok_or(StoreError::ThumbnailMiss(ThumbnailMissReason::RowMissing))?;
         if entry.0 != mtime_secs(&metadata) || entry.1 != metadata.len() as i64 {
-            return Err(StoreError::NotFound);
+            return Err(StoreError::ThumbnailMiss(
+                ThumbnailMissReason::MtimeMismatch,
+            ));
         }
         if !is_webp(&entry.2) {
-            return Err(StoreError::NotFound);
+            return Err(StoreError::ThumbnailMiss(ThumbnailMissReason::NotWebp));
         }
         Ok(entry.2)
     }
@@ -256,19 +325,43 @@ impl Library {
         favorite_id: Uuid,
         relative: &str,
         requested_width: u32,
-    ) -> Result<Vec<u8>, StoreError> {
+    ) -> Result<ImageResult, StoreError> {
         if requested_width == 0 || requested_width > MAX_IMAGE_WIDTH {
             return Err(StoreError::BadRequest);
         }
         let favorite = self.favorite(favorite_id)?;
         let image_path = resolve_existing(&favorite.path, relative)?;
-        require_image_file(&image_path)?;
+        let metadata = require_image_file(&image_path)?;
 
+        let decode_started = Instant::now();
         let image = image_support::decode_oriented(&image_path).ok_or(StoreError::Decode)?;
+        let decode_ms = duration_ms(decode_started.elapsed());
+        let (source_width, source_height) = image.dimensions();
+
+        let resize_started = Instant::now();
         let resized = resize_to_width(&image, requested_width);
+        let resize_ms = duration_ms(resize_started.elapsed());
+        let (output_width, output_height) = resized.dimensions();
+
+        let encode_started = Instant::now();
         let rgba = resized.to_rgba8();
         let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
-        Ok(encoder.encode(IMAGE_WEBP_QUALITY).to_vec())
+        let bytes = encoder.encode(IMAGE_WEBP_QUALITY).to_vec();
+        let webp_encode_ms = duration_ms(encode_started.elapsed());
+        Ok(ImageResult {
+            bytes,
+            metrics: ImageMetrics {
+                source_width,
+                source_height,
+                output_width,
+                output_height,
+                requested_width,
+                decode_ms,
+                resize_ms,
+                webp_encode_ms,
+                source_bytes: metadata.len(),
+            },
+        })
     }
 
     fn favorite(&self, id: Uuid) -> Result<&FavoriteRoot, StoreError> {
@@ -288,10 +381,10 @@ fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn require_image_file(path: &Path) -> Result<(), StoreError> {
+fn require_image_file(path: &Path) -> Result<std::fs::Metadata, StoreError> {
     let metadata = std::fs::metadata(path)?;
     if metadata.is_file() && classify_path(path) == EntryKind::Image {
-        Ok(())
+        Ok(metadata)
     } else {
         Err(StoreError::NotFound)
     }
@@ -522,7 +615,13 @@ mod tests {
             cache_dir: temp.path().join("cache"),
         };
         let listing = library.list(id, "").unwrap();
-        assert!(listing.entries.iter().all(|entry| entry.name != "escape"));
+        assert!(
+            listing
+                .response
+                .entries
+                .iter()
+                .all(|entry| entry.name != "escape")
+        );
         assert!(matches!(
             library.list(id, "escape"),
             Err(StoreError::NotFound)
@@ -609,13 +708,15 @@ mod tests {
         assert!(!favorites_json.contains(&favorite_root.to_string_lossy().to_string()));
 
         let listing = library.list(favorite_id, "").unwrap();
-        assert_eq!(listing.path, "");
-        assert!(listing.entries.iter().any(|entry| {
+        assert_eq!(listing.response.path, "");
+        assert!(listing.response.entries.iter().any(|entry| {
             entry.kind == EntryKind::Dir && entry.name == "album" && entry.path == "album"
         }));
-        assert!(listing.entries.iter().any(|entry| {
+        assert!(listing.response.entries.iter().any(|entry| {
             entry.kind == EntryKind::Image && entry.name == "page.png" && entry.path == "page.png"
         }));
+        assert_eq!(listing.metrics.entry_count, 2);
+        assert_eq!(listing.metrics.scanned_count, 2);
         assert!(matches!(
             library.list(favorite_id, ".."),
             Err(StoreError::BadRequest)
@@ -626,8 +727,11 @@ mod tests {
             thumbnail
         );
         let resized_webp = library.image(favorite_id, "page.png", 10).unwrap();
-        let resized = image::load_from_memory(&resized_webp).unwrap();
+        let resized = image::load_from_memory(&resized_webp.bytes).unwrap();
         assert_eq!(resized.dimensions(), (10, 5));
+        assert_eq!(resized_webp.metrics.source_width, 40);
+        assert_eq!(resized_webp.metrics.output_width, 10);
+        assert_eq!(resized_webp.metrics.source_bytes, image_metadata.len());
 
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
         assert_eq!(std::fs::read(&catalog_path).unwrap(), catalog_before);
