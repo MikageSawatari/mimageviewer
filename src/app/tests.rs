@@ -23591,6 +23591,12 @@ mod pipeline_cache_refactor_tests {
             app.retained_final_ai_cache.is_empty(),
             "external folder refresh must not reuse retained AI pixels for changed disk content"
         );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("b.png"))),
+            "external folder refresh must still install newly added files without media playback"
+        );
     }
 
     /// AI 処理サイズ上限の変更 (`apply_ai_size_limit_change`) は final AI cache /
@@ -27462,6 +27468,17 @@ mod still_window_mode_key_tests {
         assert!(app.should_promote_active_detached_video_for_main_context_change());
         app.fullscreen_idx = Some(image);
         assert!(!app.should_promote_active_detached_video_for_main_context_change());
+
+        // 動画→音声モードも player / audio pipeline と一緒に detached context へ移る。
+        app.fullscreen_idx = Some(video);
+        app.video_audio_mode = Some(video);
+        assert!(app.promote_active_detached_video_for_main_context_change());
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| active.bundle.video_audio_mode),
+            Some(video)
+        );
     }
 
     /// スタック集約の適用前退避 (2026-07-10 監査): unbundled detached メディア
@@ -30565,6 +30582,61 @@ mod still_window_mode_key_tests {
             app.detached_window_state(session.window_id),
             Some(DetachedWindowState::Active)
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_restore_external_refresh_preserves_detaching_video_session() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("tray_restore_detaching_video");
+        std::fs::create_dir_all(&folder).unwrap();
+        let video_path = folder.join("playing.mp4");
+        let added_path = folder.join("added.jpg");
+        std::fs::write(&video_path, b"video").unwrap();
+        std::fs::write(&added_path, b"image").unwrap();
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.image_metas.push(Some((1, 5)));
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(0);
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.detached_viewer_window_id = Some(120);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 42,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
+        });
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path.clone(),
+                    30.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.window_visible = false;
+
+        assert!(app.viewer_session_is_detached_or_switching());
+        app.sync_after_restore();
+
+        assert!(app.window_visible);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &added_path))
+        );
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        assert_eq!(active.bundle.fullscreen_idx, Some(video));
+        assert!(matches!(
+            active.bundle.fs_cache.get(&video),
+            Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
+        ));
+        assert!(app.native_video_mode_switch.is_some());
     }
 
     #[test]

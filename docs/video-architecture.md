@@ -1564,6 +1564,14 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   D3D11 device 自体は残しつつ、`hw_frames_pool`、`in_use=false` の `shared_output_pool` slot、
   `processor_cache` を解放する。次回動画再生時は通常の acquire 経路で lazy に再作成される。
   VST3 bridge / plugin chain は停止しない。
+- **タスクトレイ常駐と detached session**: 通常の fullscreen / in-window session は格納時に
+  `close_fullscreen()` へ流すが、確定済み detached session と detached への placement switch 中は
+  `viewer_session_is_detached_or_switching()` を共通の維持述語として decoder / audio / clock / native
+  output を保持する。復帰時の `check_external_folder_changes()` が items を再構築する場合も、
+  `start_loading_items()` の main-context change 境界が同じ述語から detached media context への
+  promotion を決定する。これにより外部追加・削除はメイン一覧へ従来どおり反映しつつ、保持した
+  `VideoPlayer` と進行中の typed placement request / completion は drop しない。動画→音声モードと
+  detached 音声ファイルも同じ media context ownership に従う。
 - **NativeWindowHost / NativeRenderCore** (= `VideoPlayer::open` 時に 1 組生成、`VideoPlayer` Drop で停止):
   `native-video-window-pump` 上の host が presenter/HUD HWND と USER32 lifecycle、
   `native-video-render` 上の core が D3D11 swap chain + DComp/GPU resource を所有する。

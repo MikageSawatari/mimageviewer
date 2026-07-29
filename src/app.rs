@@ -37992,7 +37992,11 @@ impl App {
             return false;
         };
         self.active_detached_viewer_context.is_none()
-            && self.viewer_session_is_detached()
+            // Tray residency keeps both committed detached sessions and an in-flight switch to
+            // detached alive. A main-context refresh must use that same lifecycle predicate before
+            // replacing `items`, otherwise `start_loading_items` falls through to
+            // `close_fullscreen` and drops the session that tray hide deliberately retained.
+            && self.viewer_session_is_detached_or_switching()
             && !self.fs_nav_is_locked()
             // 音声もメディア窓を使う (stage-audio / §1.7)。Video 限定だと main の
             // フォルダ移動で detached 音声が promote されず close_fullscreen で
