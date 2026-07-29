@@ -50,6 +50,8 @@ pub mod thumbnail;
 pub mod tile_thumb_cache;
 pub mod tile_thumbnails;
 pub mod upscale;
+#[allow(dead_code)]
+pub(crate) mod window_host_contract;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -260,8 +262,8 @@ struct NativeHoverThumbnailKey {
     rgba_ptr: usize,
 }
 
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeVideoPlacement {
     MainWindowChild,
     FullscreenBorderless,
@@ -269,7 +271,6 @@ pub enum NativeVideoPlacement {
     DetachedWindow,
 }
 
-#[cfg(windows)]
 impl NativeVideoPlacement {
     pub fn is_main_window_child(&self) -> bool {
         matches!(self, Self::MainWindowChild)
@@ -1923,9 +1924,26 @@ fn native_hud_overlay_enabled_for_placement(
     config: &NativeVideoOutputConfig,
     placement: NativeVideoPlacement,
 ) -> bool {
-    config.hud_overlay_enabled
-        && placement.is_fullscreen_borderless()
-        && !native_video_env_flag_disabled("MIV_HUD_OVERLAY")
+    native_hud_overlay_enabled_for_values(
+        config.hud_overlay_enabled,
+        placement,
+        native_video_env_flag_disabled("MIV_HUD_OVERLAY"),
+    )
+}
+
+#[cfg(windows)]
+fn native_hud_overlay_enabled_for_values(
+    hud_overlay_enabled: bool,
+    placement: NativeVideoPlacement,
+    env_disabled: bool,
+) -> bool {
+    let placement_supports_hud = match placement {
+        NativeVideoPlacement::MainWindowChild
+        | NativeVideoPlacement::DetachedViewerChild
+        | NativeVideoPlacement::DetachedWindow => false,
+        NativeVideoPlacement::FullscreenBorderless => true,
+    };
+    hud_overlay_enabled && placement_supports_hud && !env_disabled
 }
 
 #[cfg(windows)]
@@ -7249,6 +7267,88 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn native_video_placement_mapping_is_exhaustive() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum ExpectedMode {
+            Child,
+            Borderless,
+            WindowedAt,
+        }
+
+        let rect = windows::Win32::Foundation::RECT {
+            left: 11,
+            top: 22,
+            right: 333,
+            bottom: 444,
+        };
+        let owner_hwnd = 0x1234_u64;
+        for placement in [
+            super::NativeVideoPlacement::MainWindowChild,
+            super::NativeVideoPlacement::FullscreenBorderless,
+            super::NativeVideoPlacement::DetachedViewerChild,
+            super::NativeVideoPlacement::DetachedWindow,
+        ] {
+            // Exhaustive match: placement 追加時はこの test 自体が compile error になる。
+            let (expected_mode, expected_owner, expected_hud) = match placement {
+                super::NativeVideoPlacement::MainWindowChild => {
+                    (ExpectedMode::Child, owner_hwnd, false)
+                }
+                super::NativeVideoPlacement::FullscreenBorderless => {
+                    (ExpectedMode::Borderless, owner_hwnd, true)
+                }
+                super::NativeVideoPlacement::DetachedViewerChild => {
+                    (ExpectedMode::Child, owner_hwnd, false)
+                }
+                super::NativeVideoPlacement::DetachedWindow => (ExpectedMode::WindowedAt, 0, false),
+            };
+
+            let actual_mode = match super::native_window_mode_for_placement(placement, rect) {
+                super::native_window::NativeVideoWindowMode::Child { rect: actual } => {
+                    assert_eq!(
+                        (actual.left, actual.top, actual.right, actual.bottom),
+                        (rect.left, rect.top, rect.right, rect.bottom)
+                    );
+                    ExpectedMode::Child
+                }
+                super::native_window::NativeVideoWindowMode::Borderless { rect: actual } => {
+                    assert_eq!(
+                        (actual.left, actual.top, actual.right, actual.bottom),
+                        (rect.left, rect.top, rect.right, rect.bottom)
+                    );
+                    ExpectedMode::Borderless
+                }
+                super::native_window::NativeVideoWindowMode::WindowedAt { rect: actual } => {
+                    assert_eq!(
+                        (actual.left, actual.top, actual.right, actual.bottom),
+                        (rect.left, rect.top, rect.right, rect.bottom)
+                    );
+                    ExpectedMode::WindowedAt
+                }
+                super::native_window::NativeVideoWindowMode::Windowed { .. } => {
+                    panic!("placement mapping must not select legacy Windowed mode")
+                }
+            };
+            assert_eq!(actual_mode, expected_mode, "placement={placement:?}");
+            assert_eq!(
+                super::native_window_owner_for_placement(owner_hwnd, placement),
+                expected_owner,
+                "placement={placement:?}"
+            );
+            assert_eq!(
+                super::native_hud_overlay_enabled_for_values(true, placement, false),
+                expected_hud,
+                "placement={placement:?}"
+            );
+            assert!(!super::native_hud_overlay_enabled_for_values(
+                false, placement, false
+            ));
+            assert!(!super::native_hud_overlay_enabled_for_values(
+                true, placement, true
+            ));
+        }
+    }
     #[test]
     fn frame_step_interval_uses_average_fps() {
         let step = super::frame_step_interval_secs(60.0);

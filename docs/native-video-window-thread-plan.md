@@ -374,6 +374,56 @@ atomic cutover にする。child だけを先に切り替えた混在状態を p
 
 単独 gate: reducer/property tests、mapping tests、diagnostics serialization test。
 
+#### Stage 1 実装記録 (2026-07-29)
+
+実装 file は `src/video/window_host_contract.rs` と、既存 mapping を保持したまま exhaustive
+テストを置いた `src/video/mod.rs` である。production の presenter command / event channel、
+HWND、thread spawn には接続していない。
+
+実装した contract / state 型:
+
+- identity / lease: `WindowRequestId`、`WindowEpoch`、`OpaqueWindowId`、
+  `WindowGeneration`、`OpaqueWindowHandle`、`WindowLease`。HWND の数値再利用だけでは
+  current target と一致せず、request + epoch + HWND generation で相関する。
+- ownership: `HostWindowTopology`、`HostWindows` (`PresenterOnly` /
+  `PresenterAndHud`)、`WindowHostSpec`、`HostedWindow`、`StagingWindow`、`PriorHost`、
+  `ClosingHosts`。HUD の有無や staging/closing を bool / `Option` field に分解しない。
+- reducer: `WindowHostState` (`Empty` / `Preparing` / `Visible` / `Hidden` /
+  `Switching` / `Closing` / `Closed`)、`WindowHostCommand`、`WindowHostEvent`、
+  `WindowHostEffect`、`WindowHostTransitionStatus`、`reduce_window_host`。window create は
+  hidden effect に限定し、`TargetReady` 前 publish 禁止、stale request/epoch reject、render
+  ack 不要 close を pure transition で表す。
+- diagnostics: schema version 1 の `NativeWindowDiagnostics`、`DiagnosticThread`、
+  `PumpDiagnostics`、`RenderDiagnostics`、`ProgressStamp`、`RenderOperation`。pump/render
+  thread id、source generation、host state と HWND generation、pump message/command、render
+  operation の開始・完了時刻を serialize できる。
+- Windows harness 語彙: `WindowsHarnessPhase`、`WindowsHarnessTimeout`、
+  `WindowsHarnessInvariant`、`WindowsHarnessError`。Stage 3 の bounded wait / backend error /
+  disconnect / invariant violation を同じ表現で扱う。
+
+追加したテスト:
+
+- `fake_backend_does_not_publish_before_target_ready`
+- `fake_backend_switch_stall_keeps_old_window_and_close_needs_no_render_ack`
+- `stale_epoch_property_rejects_ready_even_when_raw_hwnd_is_reused`
+- `close_property_reaches_closed_from_every_nonterminal_state_without_target_ready`
+- `idempotency_property_duplicate_request_does_not_repeat_effects`
+- `close_cancels_staging_with_the_original_request_identity`
+- `diagnostics_schema_serializes_thread_hwnd_generation_and_progress`
+- `windows_harness_timeout_and_error_vocabulary_is_stable`
+- `native_video_placement_mapping_is_exhaustive` (`NativeVideoPlacement` 4 variant ×
+  mode / owner / HUD の 3 軸 = 12 mapping。HUD request-off / env-disabled も各 placement で確認)
+
+Stage 1 の意図的な未達 / 後続:
+
+- contract、diagnostics、harness 語彙は production 未配線。現行一 thread presenter と runtime
+  thread 数は変更していない。
+- `NativeWindowHost` / `NativeRenderCore` の実体分離、window owner の `!Send`、生成 thread
+  assertion、HUD owner の GPU core からの分離は Stage 2。
+- disposable HWND / DirectComposition の two-thread 実行 harness と実 timeout は Stage 3。
+- production pump/render channel、watchdog/ping、health log、入力/IME/VST/source/EOF の完全な
+  sequence test は各 Stage 4〜7。Stage 1 の fake backend は実 HWND / GPU / driver を検証しない。
+
 ### Stage 2: window owner と render core を module/type で分離
 
 変わるもの:
