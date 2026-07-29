@@ -127,35 +127,6 @@ pub struct D3d11Frame {
 unsafe impl Send for D3d11Frame {}
 
 impl D3d11Frame {
-    /// Re-arm a frame after the native presenter consumed reader key 1 and
-    /// released writer key 0.
-    ///
-    /// A retained visible frame must be reusable by grade refresh and
-    /// placement-prime paths. Acquire writer key 0 and hand reader key 1 back
-    /// without modifying the texture. The frame continues to own the pool slot
-    /// until it is displaced from the native output context.
-    pub fn rearm_presented_shared_output(&mut self) -> Result<(), String> {
-        let Some(mutex) = self.shared_output_keyed_mutex.as_ref() else {
-            return Err("GPU frame has no shared-output keyed mutex for re-arm".to_string());
-        };
-        unsafe {
-            mutex
-                .AcquireSync(0, 10)
-                .map_err(|e| format!("shared-output re-arm AcquireSync(0): {e:?}"))?;
-            if let Err(error) = mutex.ReleaseSync(1) {
-                // Best effort: if the key=1 release failed while we still own
-                // the mutex, return it to writer key 0 so producer recovery is
-                // not left with an acquired mutex.
-                let _ = mutex.ReleaseSync(0);
-                return Err(format!("shared-output re-arm ReleaseSync(1): {error:?}"));
-            }
-        }
-        if let Some(released) = self.shared_output_released_to_reader.as_ref() {
-            released.store(true, Ordering::Release);
-        }
-        Ok(())
-    }
-
     /// Return an unpresented pooled output texture to the producer-side pool.
     ///
     /// Do **not** call `AcquireSync(1)` here. NVIDIA's D3D11 driver can block
