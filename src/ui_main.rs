@@ -1452,7 +1452,9 @@ fn details_ordered_columns(
     }
     ordered
         .into_iter()
-        .filter(|col| include_hidden || col.visible(settings, column_set))
+        .filter(|col| {
+            column_set.includes(*col) && (include_hidden || col.visible(settings, column_set))
+        })
         .collect()
 }
 
@@ -1469,9 +1471,6 @@ fn details_visible_columns(
     column_set: DetailsColumnSet,
 ) -> Vec<DetailsColumn> {
     details_ordered_columns(settings, column_set, false)
-        .into_iter()
-        .filter(|column| details_column_is_visible(settings, column_set, *column))
-        .collect()
 }
 
 fn selection_info_bottom_bar_is_hidden(settings: &crate::settings::Settings) -> bool {
@@ -1693,7 +1692,9 @@ fn set_details_name_width_auto(
         }
         true
     } else {
-        set_details_name_width(settings, column_set, current_name_width)
+        let stored_width =
+            details_stored_name_width_from_effective(settings, column_set, current_name_width);
+        set_details_name_width(settings, column_set, stored_width)
     }
 }
 
@@ -2264,6 +2265,38 @@ fn details_fixed_columns_width(
         .sum()
 }
 
+/// この面では描かないが、元の列セットで表示中の列幅。
+///
+/// 下部バーではプレビュー列を描かない。その幅を空白として予約せず名前列へ移すことで、
+/// 名前より右の列を一覧と同じ x 座標に保つ。
+fn details_omitted_columns_width(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> f32 {
+    DetailsColumn::all()
+        .iter()
+        .copied()
+        .filter(|column| !column_set.includes(*column) && column.visible(settings, column_set))
+        .map(|column| details_column_width(settings, column_set, column))
+        .sum()
+}
+
+fn details_effective_fixed_name_width(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> f32 {
+    details_name_fixed_width(settings, column_set)
+        + details_omitted_columns_width(settings, column_set)
+}
+
+fn details_stored_name_width_from_effective(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    width: f32,
+) -> f32 {
+    width - details_omitted_columns_width(settings, column_set)
+}
+
 fn details_layout(
     avail_w: f32,
     gutter: f32,
@@ -2272,16 +2305,18 @@ fn details_layout(
     column_set: DetailsColumnSet,
 ) -> DetailsLayout {
     let fixed = details_fixed_columns_width(settings, column_set);
+    let omitted = details_omitted_columns_width(settings, column_set);
     let columns_avail = (avail_w - gutter).max(0.0);
     let name_width_auto = column_set.name_width_auto(settings);
-    let auto_fits = name_width_auto && columns_avail >= fixed + DetailsColumn::Name.default_width();
+    let minimum_name_width = DetailsColumn::Name.default_width() + omitted;
+    let auto_fits = name_width_auto && columns_avail >= fixed + minimum_name_width;
     let rounding_slack = details_layout_right_guard(pixels_per_point);
     let name_w = if auto_fits {
         (columns_avail - fixed - rounding_slack).max(DetailsColumn::Name.min_width())
     } else if name_width_auto {
-        DetailsColumn::Name.default_width()
+        minimum_name_width
     } else {
-        details_name_fixed_width(settings, column_set)
+        details_effective_fixed_name_width(settings, column_set)
     };
     let columns_w = name_w + fixed;
     // Leave one physical pixel of slack when auto-fit has enough room. At UI
@@ -2305,17 +2340,8 @@ fn details_layout(
     }
 }
 
-fn details_content_width_for_column_set(
-    full_pane_width: f32,
-    settings: &crate::settings::Settings,
-    column_set: DetailsColumnSet,
-) -> f32 {
-    let omitted_width: f32 = details_ordered_columns(settings, column_set, false)
-        .into_iter()
-        .filter(|column| !column_set.includes(*column))
-        .map(|column| details_column_width(settings, column_set, column))
-        .sum();
-    (full_pane_width - omitted_width).max(DetailsColumn::Name.min_width())
+fn details_content_width_for_column_set(full_pane_width: f32) -> f32 {
+    full_pane_width.max(DetailsColumn::Name.min_width())
 }
 
 fn details_column_rects_for_columns(
@@ -2331,9 +2357,12 @@ fn details_column_rects_for_columns(
         .map(|col| details_column_width(settings, column_set, col))
         .sum();
     let name_width = if column_set.name_width_auto(settings) {
-        (rect.width() - fixed).max(DetailsColumn::Name.default_width())
+        (rect.width() - fixed).max(
+            DetailsColumn::Name.default_width()
+                + details_omitted_columns_width(settings, column_set),
+        )
     } else {
-        details_name_fixed_width(settings, column_set)
+        details_effective_fixed_name_width(settings, column_set)
     };
     let specs = columns
         .into_iter()
@@ -13012,11 +13041,13 @@ impl App {
             // 手動幅変更はユーザーの最新意思。進行中の測定結果で後から上書きしない。
             Self::cancel_details_best_fit_job(ui.ctx());
             let changed = if column == DetailsColumn::Name {
-                set_details_name_width(
-                    &mut self.settings,
+                let effective_width = column_rect.width() + resize_response.drag_delta().x;
+                let stored_width = details_stored_name_width_from_effective(
+                    &self.settings,
                     column_set,
-                    column_rect.width() + resize_response.drag_delta().x,
-                )
+                    effective_width,
+                );
+                set_details_name_width(&mut self.settings, column_set, stored_width)
             } else {
                 let current = details_column_width(&self.settings, column_set, column);
                 set_details_column_width(
@@ -13255,7 +13286,18 @@ impl App {
                         "OFF にすると現在の名前列幅で固定します (境界ドラッグでも固定されます)",
                     );
 
-                ui.checkbox(&mut menu_state.show_preview, "プレビュー");
+                // 下部バーはプレビューを描かない (`DetailsColumnSet::includes`)。専用設定では
+                // この列を ON にしても行き先が無いので、押せない状態にして理由を出す。
+                // 一覧と同じ設定のときは一覧側のプレビューを操作できるので有効のまま。
+                if column_set == DetailsColumnSet::DedicatedBar {
+                    ui.add_enabled(
+                        false,
+                        egui::Checkbox::new(&mut menu_state.show_preview, "プレビュー"),
+                    )
+                    .on_disabled_hover_text("下部バーはプレビューを表示しません");
+                } else {
+                    ui.checkbox(&mut menu_state.show_preview, "プレビュー");
+                }
                 ui.checkbox(&mut menu_state.show_rating, "★");
                 ui.checkbox(&mut menu_state.show_tags, "タグ");
                 ui.checkbox(&mut menu_state.show_kind, "種類");
@@ -14340,11 +14382,7 @@ impl App {
                     &self.settings,
                     column_set,
                 );
-                let content_w = details_content_width_for_column_set(
-                    full_layout.pane_w,
-                    &self.settings,
-                    column_set,
-                );
+                let content_w = details_content_width_for_column_set(full_layout.pane_w);
                 let avail_h = ui.available_height().max(0.0);
                 let fixed_columns_w: f32 = details_visible_columns(&self.settings, column_set)
                     .into_iter()
@@ -16795,30 +16833,168 @@ mod compute_cell_size_tests {
         );
     }
 
+    fn bottom_bar_layout_settings(
+        show_preview: bool,
+        name_width_auto: bool,
+    ) -> crate::settings::Settings {
+        let mut settings = minimal_details_settings();
+        settings.details_show_preview = show_preview;
+        settings.details_show_size = true;
+        settings.details_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Size,
+        ];
+        settings.details_name_width_auto = name_width_auto;
+        // Fixed mode intentionally overflows the 600 px fixture only when preview is ON.
+        // This distinguishes a preview-sized trailing gap from ordinary spare pane width.
+        settings.details_name_width = 500.0;
+        settings.copy_details_columns_to_selection_bar();
+        settings
+    }
+
+    fn bottom_bar_surface_modes() -> [(GridViewMode, DetailsSelectionBarMode); 3] {
+        [
+            (GridViewMode::Details, DetailsSelectionBarMode::Dedicated),
+            (
+                GridViewMode::Details,
+                DetailsSelectionBarMode::SameAsDetails,
+            ),
+            (
+                GridViewMode::Thumbnail,
+                DetailsSelectionBarMode::SameAsDetails,
+            ),
+        ]
+    }
+
     #[test]
     fn bottom_bar_text_columns_keep_details_widths() {
-        let mut settings = minimal_details_settings();
-        settings.details_show_preview = true;
-        let full_layout = details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::SharedBar);
-        let text_width = details_content_width_for_column_set(
-            full_layout.pane_w,
-            &settings,
-            DetailsColumnSet::SharedBar,
-        );
-        let full_rect =
-            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(full_layout.pane_w, 24.0));
-        let text_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
-        let full = details_column_rects(full_rect, &settings);
-        let text =
-            details_column_rects_for_columns(text_rect, &settings, DetailsColumnSet::SharedBar);
+        for name_width_auto in [true, false] {
+            for show_preview in [false, true] {
+                let mut settings = minimal_details_settings();
+                settings.grid_view_mode = GridViewMode::Details;
+                settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
+                settings.details_name_width_auto = name_width_auto;
+                settings.details_show_preview = show_preview;
+                let full_layout =
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::SharedBar);
+                let text_width = details_content_width_for_column_set(full_layout.pane_w);
+                let full_rect = egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(full_layout.pane_w, 24.0),
+                );
+                let text_rect =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
+                let full = details_column_rects(full_rect, &settings);
+                let text = details_column_rects_for_columns(
+                    text_rect,
+                    &settings,
+                    DetailsColumnSet::SharedBar,
+                );
 
-        for (column, rect) in text {
-            let full_width = full
-                .iter()
-                .find(|(candidate, _)| *candidate == column)
-                .map(|(_, rect)| rect.width())
-                .unwrap();
-            assert!((rect.width() - full_width).abs() < 0.01, "{column:?}");
+                for (column, rect) in text {
+                    let full_rect = full
+                        .iter()
+                        .find(|(candidate, _)| *candidate == column)
+                        .map(|(_, rect)| *rect)
+                        .unwrap();
+                    let expected_width = if column == DetailsColumn::Name && show_preview {
+                        full_rect.width()
+                            + details_column_width(
+                                &settings,
+                                DetailsColumnSet::Details,
+                                DetailsColumn::Preview,
+                            )
+                    } else {
+                        full_rect.width()
+                    };
+                    assert!(
+                        (rect.width() - expected_width).abs() < 0.01,
+                        "{column:?}, auto={name_width_auto}, preview={show_preview}"
+                    );
+                    if column != DetailsColumn::Name {
+                        assert_eq!(rect.left(), full_rect.left());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bottom_bar_preview_does_not_leave_trailing_space_across_surfaces() {
+        for name_width_auto in [true, false] {
+            for (grid_view_mode, selection_bar_mode) in bottom_bar_surface_modes() {
+                let mut settings = bottom_bar_layout_settings(true, name_width_auto);
+                settings.grid_view_mode = grid_view_mode;
+                settings.details_selection_bar_mode = selection_bar_mode;
+                let list_layout =
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+                let list_rects = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(list_layout.pane_w, 24.0),
+                    ),
+                    &settings,
+                    DetailsColumnSet::Details,
+                );
+                let column_set = selection_info_bottom_bar_column_set(&settings);
+                let layout = details_layout(600.0, 0.0, 1.0, &settings, column_set);
+                let content_width = details_content_width_for_column_set(layout.pane_w);
+                assert_eq!(content_width, layout.pane_w);
+                let rects = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
+                    &settings,
+                    column_set,
+                );
+                let list_size = list_rects
+                    .iter()
+                    .find(|(column, _)| *column == DetailsColumn::Size)
+                    .unwrap()
+                    .1;
+                let bar_size = rects
+                    .iter()
+                    .find(|(column, _)| *column == DetailsColumn::Size)
+                    .unwrap()
+                    .1;
+                assert_eq!(bar_size, list_size);
+                assert!(
+                    (rects.last().unwrap().1.right() - content_width).abs() < 0.01,
+                    "{grid_view_mode:?}, {selection_bar_mode:?}, auto={name_width_auto}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bottom_bar_preview_off_keeps_existing_layout_across_surfaces() {
+        for name_width_auto in [true, false] {
+            for (grid_view_mode, selection_bar_mode) in bottom_bar_surface_modes() {
+                let mut settings = bottom_bar_layout_settings(false, name_width_auto);
+                settings.grid_view_mode = grid_view_mode;
+                settings.details_selection_bar_mode = selection_bar_mode;
+                let list_layout =
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+                let list = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(list_layout.pane_w, 24.0),
+                    ),
+                    &settings,
+                    DetailsColumnSet::Details,
+                );
+                let column_set = selection_info_bottom_bar_column_set(&settings);
+                let bar_layout = details_layout(600.0, 0.0, 1.0, &settings, column_set);
+                let content_width = details_content_width_for_column_set(bar_layout.pane_w);
+                let bar = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
+                    &settings,
+                    column_set,
+                );
+                assert_eq!(
+                    bar, list,
+                    "{grid_view_mode:?}, {selection_bar_mode:?}, auto={name_width_auto}"
+                );
+            }
         }
     }
 
@@ -17104,6 +17280,24 @@ mod compute_cell_size_tests {
         assert!(
             !set_details_name_width(&mut settings, DetailsColumnSet::Details, 210.0),
             "同値なら変更なし"
+        );
+    }
+
+    #[test]
+    fn bottom_bar_effective_name_width_maps_back_to_stored_width() {
+        let mut settings = minimal_details_settings();
+        settings.details_show_preview = true;
+        settings.details_name_width_auto = false;
+        settings.details_name_width = 210.0;
+        let effective = details_effective_fixed_name_width(&settings, DetailsColumnSet::SharedBar);
+        assert_eq!(effective, 244.0);
+        assert_eq!(
+            details_stored_name_width_from_effective(
+                &settings,
+                DetailsColumnSet::SharedBar,
+                effective,
+            ),
+            210.0
         );
     }
 
