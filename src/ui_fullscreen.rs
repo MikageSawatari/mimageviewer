@@ -11531,8 +11531,14 @@ impl App {
             !esc && enter_consume_ok && self.keymap.consume_action(ctx, KeyAction::FsClose);
         let esc = esc || fs_close_key;
         // 左右キーは上下と分離して処理（RTL 反転のため）
-        let ctrl_d = self.keymap.consume_action(ctx, KeyAction::FsCtrlNavNext);
-        let ctrl_u = self.keymap.consume_action(ctx, KeyAction::FsCtrlNavPrev);
+        let ctrl_d_count = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsCtrlNavNext);
+        let ctrl_u_count = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsCtrlNavPrev);
+        let ctrl_d = ctrl_d_count > 0;
+        let ctrl_u = ctrl_u_count > 0;
         // Ctrl+←/→: 見開き「1 ページずらし」(応急補正)。Single モードでは 1 ページ移動に
         // フォールバックする。動画は Ctrl+←/→ が 30 秒シークなので画像 (= !is_video_fs) のみ消費。
         let ctrl_left = !is_video_fs
@@ -11555,8 +11561,12 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftNext);
-        let ctrl_page_down = self.keymap.consume_action(ctx, KeyAction::FsSiblingNext);
-        let ctrl_page_up = self.keymap.consume_action(ctx, KeyAction::FsSiblingPrev);
+        let ctrl_page_down_count = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsSiblingNext);
+        let ctrl_page_up_count = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsSiblingPrev);
         // PageUp/Down のスクロール用 consume も、実際に連続描画している条件
         // (continuous_reading_active_for_idx) に揃える。reading_flow だけで判定すると、
         // 非対応アイテム/解析/比較中に PageUp/Down を消費しておきながら無反応 (デッドキー) になる。
@@ -12726,25 +12736,35 @@ impl App {
             );
             return action;
         }
-        if ctrl_d {
+        // Preserve the historical conflict rule: when both directions are present in one
+        // frame, the backward action (consumed second above) wins. Cardinality applies only
+        // to repeated presses of that selected chord; opposite directions are not netted.
+        let ctrl_nav_delta = if ctrl_u_count > 0 {
+            -(ctrl_u_count as i32)
+        } else {
+            ctrl_d_count as i32
+        };
+        if ctrl_nav_delta != 0 {
             crate::logger::log(format!(
-                "[input-nav] source=fullscreen-egui action=ctrl_nav_forward fs_idx={fs_idx} \
-                 ctrl_down={ctrl_d} mouse_forward={mouse_forward} browser_forward={browser_forward}"
+                "[input-nav] source=fullscreen-egui action={} fs_idx={fs_idx} \
+                 ctrl_down_count={ctrl_d_count} ctrl_up_count={ctrl_u_count} \
+                 mouse_back={mouse_back} mouse_forward={mouse_forward} \
+                 browser_back={browser_back} browser_forward={browser_forward}",
+                if ctrl_nav_delta > 0 {
+                    "ctrl_nav_forward"
+                } else {
+                    "ctrl_nav_back"
+                }
             ));
-            action.ctrl_nav = Some(1);
+            action.ctrl_nav = Some(ctrl_nav_delta);
         }
-        if ctrl_u {
-            crate::logger::log(format!(
-                "[input-nav] source=fullscreen-egui action=ctrl_nav_back fs_idx={fs_idx} \
-                 ctrl_up={ctrl_u} mouse_back={mouse_back} browser_back={browser_back}"
-            ));
-            action.ctrl_nav = Some(-1);
-        }
-        if ctrl_page_down {
-            action.sibling_nav = Some(1);
-        }
-        if ctrl_page_up {
-            action.sibling_nav = Some(-1);
+        let sibling_nav_delta = if ctrl_page_up_count > 0 {
+            -(ctrl_page_up_count as i32)
+        } else {
+            ctrl_page_down_count as i32
+        };
+        if sibling_nav_delta != 0 {
+            action.sibling_nav = Some(sibling_nav_delta);
         }
         if page_next {
             action.page_nav = self.spread_page_nav(1);
@@ -14654,9 +14674,13 @@ impl App {
         // 実際の close_fullscreen / load_folder / open_fullscreen は
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
-            self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
+            for _ in 0..delta.unsigned_abs() {
+                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
+            }
         } else if let Some(delta) = sibling_nav {
-            self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
+            for _ in 0..delta.unsigned_abs() {
+                self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
+            }
         } else if let Some(nav) = mouse_nav {
             self.mouse_ring_nav = Some(nav);
         } else if !close_fs && !close_to_page_list {

@@ -92,6 +92,31 @@ consume する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させ�
 `docs/key-customization-impl-plan.md` の「新しいキー操作を追加するとき」に従って
 `docs/keymap.ini.default` まで更新する。固定扱いにする入力は、この文書の該当節に理由を残す。
 
+## 同一フレームの物理押下数
+
+Windows の `KeySlot` 経路は Win32 key-down edge をフレーム単位で取り込む。累積可能と
+明示した離散操作では、同一フレームに同じ chord の non-repeat edge が複数届いても
+**1 回の物理押下を 1 回の Action 発火として数える**。選択は
+`KeyAction::press_multiplicity()` の `EachPhysicalPress` に集約し、呼び出し側は
+`Keymap::consume_action_press_count()` が返す回数を既存の typed request / accumulator へ渡す。
+
+`EachPhysicalPress` にできるのは、同じ方向へ 1 step ずつ進むように反復の意味が明確で、
+順番どおりの複数実行が安全であり、下流に明示的な累積上限がある操作だけとする。現在の対象は
+`FsCtrlNavPrev` / `FsCtrlNavNext` / `FsSiblingPrev` / `FsSiblingNext`。これらは既存の
+folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。トグル、削除などの破壊的操作、
+ダイアログ表示、設定変更、単発の保存処理は `SinglePerFrame` のままにし、同一フレームの
+複数 edge を回数分発火させない。ページ送り系は、固定矢印入力、見開き単位、連結読みスクロール、
+割合ジャンプで 1 step の意味が異なるため、共通の回数適用規則を定めるまでは対象外とする。
+
+キーリピート (`edge.repeat`) の意味は従来どおり。repeat 許可 Action でも、長い 1 フレームに
+溜まった repeat edge は最大 1 回へまとめ、同じフレームに non-repeat edge があれば物理押下数を
+優先する。no-repeat Action は repeat edge を消費するが発火させない。これにより、キーを離した後に
+溜まった repeat 分だけナビゲーションが続く余韻を増やさない。
+
+edge の寿命は 1 フレームのままにする。Action が消費しなかった edge は次の `begin_frame()` で
+破棄し、後のフレームへ持ち越さない。無制限の backlog を作って「押していないのに後から動く」
+挙動を避けるため、`begin_frame()` の `frame.clear()` は維持する。
+
 ## 固定入力 / KeyAction 対象外の整理
 
 操作カスタマイズの一覧に出すものは、原則として `KeyAction` 化された離散ショートカットだけにする。

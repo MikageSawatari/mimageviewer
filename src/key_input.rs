@@ -148,11 +148,40 @@ pub fn frame_had_key_down() -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConsumeKeyDownResult {
-    pub matched: bool,
-    pub triggered: bool,
+    pub matched_count: usize,
+    pub triggered_count: usize,
 }
 
 pub fn consume_key_down_with_result<F>(allow_repeat: bool, mut predicate: F) -> ConsumeKeyDownResult
+where
+    F: FnMut(KeyEdge) -> bool,
+{
+    consume_key_down_inner(allow_repeat, false, &mut predicate)
+}
+
+/// Consume every matching key-down edge from the current frame and return how
+/// many action triggers they represent.
+///
+/// Non-repeat edges retain their physical cardinality. Auto-repeat edges keep
+/// the historical per-frame behavior: when repeats are allowed they contribute
+/// at most one trigger, and only when this frame has no matching physical press.
+/// This prevents a long frame from turning accumulated OS repeats into delayed
+/// navigation after the key is released.
+pub fn consume_all_key_down_with_result<F>(
+    allow_repeat: bool,
+    mut predicate: F,
+) -> ConsumeKeyDownResult
+where
+    F: FnMut(KeyEdge) -> bool,
+{
+    consume_key_down_inner(allow_repeat, true, &mut predicate)
+}
+
+fn consume_key_down_inner<F>(
+    allow_repeat: bool,
+    consume_all: bool,
+    predicate: &mut F,
+) -> ConsumeKeyDownResult
 where
     F: FnMut(KeyEdge) -> bool,
 {
@@ -160,22 +189,35 @@ where
         .lock()
         .map(|mut guard| {
             let mut result = ConsumeKeyDownResult::default();
+            let mut physical_press_count = 0;
+            let mut matched_repeat = false;
             let mut index = 0;
             while index < guard.frame.len() {
                 let edge = guard.frame[index];
                 if edge.pressed && predicate(edge) {
-                    result.matched = true;
-                    if allow_repeat || !edge.repeat {
-                        result.triggered = true;
+                    result.matched_count += 1;
+                    if edge.repeat {
+                        matched_repeat = true;
+                    } else {
+                        physical_press_count += 1;
                     }
                     guard.frame.remove(index);
-                    if allow_repeat {
+                    if !consume_all && allow_repeat {
                         break;
                     }
                 } else {
                     index += 1;
                 }
             }
+            result.triggered_count = if consume_all {
+                if physical_press_count > 0 {
+                    physical_press_count
+                } else {
+                    usize::from(allow_repeat && matched_repeat)
+                }
+            } else {
+                usize::from(physical_press_count > 0 || (allow_repeat && matched_repeat))
+            };
             result
         })
         .unwrap_or_default()
@@ -185,7 +227,7 @@ pub fn consume_key_down<F>(allow_repeat: bool, predicate: F) -> bool
 where
     F: FnMut(KeyEdge) -> bool,
 {
-    consume_key_down_with_result(allow_repeat, predicate).triggered
+    consume_key_down_with_result(allow_repeat, predicate).triggered_count > 0
 }
 
 #[cfg(test)]
@@ -205,6 +247,9 @@ pub fn clear_test_frame() {
         guard.frame_had_key_down = false;
     }
 }
+
+#[cfg(test)]
+pub(crate) static TEST_INPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn pressed_key_down<F>(predicate: F) -> bool
 where
@@ -334,7 +379,10 @@ unsafe extern "system" fn main_key_input_subclass_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyEdge, ReturnKeyState};
+    use super::{
+        KeyEdge, ReturnKeyState, TEST_INPUT_LOCK, begin_frame, consume_key_down, pressed_key_down,
+        set_test_frame,
+    };
 
     fn return_edge(extended: bool, pressed: bool) -> KeyEdge {
         KeyEdge {
@@ -380,5 +428,42 @@ mod tests {
 
         assert!(!state.is_down(false));
         assert!(!state.is_down(true));
+    }
+
+    #[test]
+    fn unconsumed_frame_edges_expire_at_next_begin_frame() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        set_test_frame(vec![
+            KeyEdge {
+                virtual_key: 0x28,
+                scan_code: 0x50,
+                extended: true,
+                pressed: true,
+                repeat: false,
+                ctrl: true,
+                shift: false,
+                alt: false,
+            },
+            KeyEdge {
+                virtual_key: 0x28,
+                scan_code: 0x50,
+                extended: true,
+                pressed: true,
+                repeat: false,
+                ctrl: true,
+                shift: false,
+                alt: false,
+            },
+        ]);
+
+        assert!(consume_key_down(true, |edge| edge.virtual_key == 0x28));
+        assert!(pressed_key_down(|edge| edge.virtual_key == 0x28));
+
+        begin_frame();
+
+        assert!(!pressed_key_down(|edge| edge.virtual_key == 0x28));
     }
 }

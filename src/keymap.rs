@@ -81,6 +81,13 @@ pub enum KeyTrigger {
     KeyHold,
 }
 
+/// How many times a press action may dispatch from one frame's physical edges.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PressMultiplicity {
+    SinglePerFrame,
+    EachPhysicalPress,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum BindingPolicy {
     FullChord,
@@ -4828,6 +4835,19 @@ impl KeyAction {
         }
     }
 
+    /// Actions whose repeated physical presses are safe and meaningful as
+    /// cumulative steps opt in here. Toggles, dialogs, destructive operations,
+    /// and other one-shot commands remain single-dispatch by default.
+    pub fn press_multiplicity(self) -> PressMultiplicity {
+        use KeyAction::*;
+        match self {
+            FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
+                PressMultiplicity::EachPhysicalPress
+            }
+            _ => PressMultiplicity::SinglePerFrame,
+        }
+    }
+
     pub fn default_chords(self) -> ChordList {
         use KeyAction::*;
         use KeySlot::*;
@@ -6012,6 +6032,35 @@ impl Keymap {
         None
     }
 
+    /// Consume a press action while preserving the cardinality declared by
+    /// `KeyAction::press_multiplicity`.
+    ///
+    /// The default policy is deliberately single-dispatch, so callers cannot
+    /// accidentally multiply toggles or destructive actions by using this API.
+    pub fn consume_action_press_count(&self, ctx: &egui::Context, action: KeyAction) -> usize {
+        debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        if action.press_multiplicity() == PressMultiplicity::SinglePerFrame {
+            return usize::from(self.consume_action(ctx, action));
+        }
+
+        let mut count = 0usize;
+        for chord in self.effective_chords(action) {
+            let chord_count = self.consume_chord_press_count(ctx, chord, true);
+            if chord_count == 0 {
+                continue;
+            }
+            count = count.saturating_add(chord_count);
+            #[cfg(windows)]
+            crate::key_debug::record_consumed_action(
+                action,
+                action.context(),
+                chord,
+                "consume_press_count",
+            );
+        }
+        count
+    }
+
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         if let Some(chords) = self.overrides.get(&action) {
@@ -6509,7 +6558,7 @@ impl Keymap {
                 let result = crate::key_input::consume_key_down_with_result(allow_repeat, |edge| {
                     chord.matches_key_edge(edge)
                 });
-                if result.matched {
+                if result.matched_count > 0 {
                     // The Win32 KeySlot queue and egui event queue describe the same physical
                     // press. Claim both at this ownership boundary so direct widget readers do
                     // not see the shortcut too. For no-repeat actions, matching repeat events
@@ -6518,7 +6567,7 @@ impl Keymap {
                     Self::remove_matching_egui_key_presses(ctx, chord, allow_repeat);
                     Self::cancel_claimed_tab_focus_traversal(ctx, chord);
                 }
-                return result.triggered;
+                return result.triggered_count > 0;
             }
         }
         let (triggered, matched) = ctx.input_mut(|i| {
@@ -6561,6 +6610,64 @@ impl Keymap {
         triggered
     }
 
+    fn consume_chord_press_count(
+        &self,
+        ctx: &egui::Context,
+        chord: Chord,
+        allow_repeat: bool,
+    ) -> usize {
+        if chord.key.is_none() || ctx.wants_keyboard_input() {
+            return 0;
+        }
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active() && crate::key_input::frame_had_key_down() {
+            let result = crate::key_input::consume_all_key_down_with_result(allow_repeat, |edge| {
+                chord.matches_key_edge(edge)
+            });
+            if result.matched_count > 0 {
+                Self::remove_all_matching_egui_key_presses(ctx, chord);
+                Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+            }
+            return result.triggered_count;
+        }
+
+        let (physical_press_count, matched_repeat, matched) = ctx.input_mut(|i| {
+            let mut physical_press_count = 0usize;
+            let mut matched_repeat = false;
+            let mut matched = false;
+            i.events.retain(|event| {
+                let matches = matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if chord.matches_egui(*key, *modifiers)
+                );
+                if !matches {
+                    return true;
+                }
+                matched = true;
+                if matches!(event, egui::Event::Key { repeat: true, .. }) {
+                    matched_repeat = true;
+                } else {
+                    physical_press_count += 1;
+                }
+                false
+            });
+            (physical_press_count, matched_repeat, matched)
+        });
+        if matched {
+            Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+        }
+        if physical_press_count > 0 {
+            physical_press_count
+        } else {
+            usize::from(allow_repeat && matched_repeat)
+        }
+    }
+
     fn cancel_claimed_tab_focus_traversal(ctx: &egui::Context, chord: Chord) {
         if chord.key == Some(KeyName::Tab) {
             crate::egui_focus_policy::cancel_tab_focus_traversal(ctx);
@@ -6590,6 +6697,22 @@ impl Keymap {
                     removed = true;
                 }
                 false
+            });
+        });
+    }
+
+    fn remove_all_matching_egui_key_presses(ctx: &egui::Context, chord: Chord) {
+        ctx.input_mut(|i| {
+            i.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if chord.matches_egui(*key, *modifiers)
+                )
             });
         });
     }
@@ -7096,8 +7219,8 @@ mod tests {
 
     #[cfg(windows)]
     fn native_video_shortcut_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .expect("native video shortcut test lock poisoned")
     }
@@ -7143,16 +7266,32 @@ mod tests {
 
     #[cfg(windows)]
     fn plain_key_edge(virtual_key: u32, scan_code: u16) -> crate::key_input::KeyEdge {
+        key_edge(virtual_key, scan_code, false, false, false)
+    }
+
+    #[cfg(windows)]
+    fn key_edge(
+        virtual_key: u32,
+        scan_code: u16,
+        extended: bool,
+        ctrl: bool,
+        repeat: bool,
+    ) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
             virtual_key,
             scan_code,
-            extended: false,
+            extended,
             pressed: true,
-            repeat: false,
-            ctrl: false,
+            repeat,
+            ctrl,
             shift: false,
             alt: false,
         }
+    }
+
+    #[cfg(windows)]
+    fn ctrl_down_edge(repeat: bool) -> crate::key_input::KeyEdge {
+        key_edge(0x28, 0x50, true, true, repeat)
     }
 
     #[cfg(windows)]
@@ -8672,6 +8811,132 @@ mod tests {
             Some(Chord::ctrl(KeyName::G))
         );
         assert!(KeyAction::FsLocalAdjustMode.is_user_facing());
+    }
+
+    #[test]
+    fn press_multiplicity_selects_only_cumulative_fullscreen_folder_navigation() {
+        for action in [
+            KeyAction::FsCtrlNavPrev,
+            KeyAction::FsCtrlNavNext,
+            KeyAction::FsSiblingPrev,
+            KeyAction::FsSiblingNext,
+        ] {
+            assert_eq!(
+                action.press_multiplicity(),
+                PressMultiplicity::EachPhysicalPress,
+                "{action:?}"
+            );
+        }
+        for action in [
+            KeyAction::FsSlideshow,
+            KeyAction::FsPageNext,
+            KeyAction::FsFixedJumpNext,
+            KeyAction::GridTreeFolderNext,
+            KeyAction::GridDelete,
+        ] {
+            assert_eq!(
+                action.press_multiplicity(),
+                PressMultiplicity::SinglePerFrame,
+                "{action:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn counted_action_consumes_two_same_frame_physical_presses() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        crate::key_input::set_test_frame(vec![ctrl_down_edge(false), ctrl_down_edge(false)]);
+
+        assert_eq!(
+            keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+            2
+        );
+        assert!(!crate::key_input::pressed_key_down(
+            |edge| edge.virtual_key == 0x28
+        ));
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn counted_action_consumes_three_same_frame_physical_presses() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        crate::key_input::set_test_frame(vec![
+            ctrl_down_edge(false),
+            ctrl_down_edge(false),
+            ctrl_down_edge(false),
+        ]);
+
+        assert_eq!(
+            keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+            3
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn counted_action_coalesces_same_frame_auto_repeats() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        crate::key_input::set_test_frame(vec![
+            ctrl_down_edge(false),
+            ctrl_down_edge(true),
+            ctrl_down_edge(true),
+        ]);
+
+        assert_eq!(
+            keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+            1
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_repeat_action_does_not_retrigger_from_repeat_edges() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        crate::key_input::set_test_frame(vec![tab_edge(false), tab_edge(true), tab_edge(true)]);
+
+        assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn single_dispatch_action_stays_once_with_two_same_frame_presses() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        crate::key_input::set_test_frame(vec![
+            plain_key_edge(0x53, 0x1f),
+            plain_key_edge(0x53, 0x1f),
+        ]);
+
+        assert_eq!(
+            keymap.consume_action_press_count(&ctx, KeyAction::FsSlideshow),
+            1
+        );
+        let _ = ctx.end_pass();
     }
 
     #[test]

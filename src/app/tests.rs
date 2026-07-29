@@ -17916,6 +17916,16 @@ mod favorite_adjustment_defaults_tests {
         (temp, folders)
     }
 
+    #[cfg(windows)]
+    struct ClearFolderNavTestKeyFrame;
+
+    #[cfg(windows)]
+    impl Drop for ClearFolderNavTestKeyFrame {
+        fn drop(&mut self) {
+            crate::key_input::clear_test_frame();
+        }
+    }
+
     fn drain_folder_nav_burst_for_test(app: &mut App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.folder_nav_pending.is_some() {
@@ -17952,6 +17962,75 @@ mod favorite_adjustment_defaults_tests {
                 .as_ref()
                 .is_some_and(|current| crate::folder_tree::path_eq(current, &folders[3])),
             "3 accepted presses must apply 3 successful folder transitions"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_frame_two_ctrl_down_edges_move_two_fullscreen_folders() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _clear = ClearFolderNavTestKeyFrame;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_temp, folders) = create_folder_nav_burst_fixture(4);
+        app.current_folder = Some(folders[0].clone());
+        app.items = vec![GridItem::Image(folders[0].join("page.jpg"))];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+
+        ctx.begin_pass(Default::default());
+        crate::key_input::set_test_frame(vec![
+            crate::key_input::KeyEdge {
+                virtual_key: 0x28,
+                scan_code: 0x50,
+                extended: true,
+                pressed: true,
+                repeat: false,
+                ctrl: true,
+                shift: false,
+                alt: false,
+            },
+            crate::key_input::KeyEdge {
+                virtual_key: 0x28,
+                scan_code: 0x50,
+                extended: true,
+                pressed: true,
+                repeat: false,
+                ctrl: true,
+                shift: false,
+                alt: false,
+            },
+        ]);
+        let press_count = app
+            .keymap
+            .consume_action_press_count(&ctx, crate::keymap::KeyAction::FsCtrlNavNext);
+        let _ = ctx.end_pass();
+        assert_eq!(press_count, 2);
+
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            Some(press_count as i32),
+            None,
+            None,
+            crate::ui_fullscreen::FsPageNav::None,
+            None,
+            0,
+        );
+        assert_eq!(app.pending_folder_nav_steps, 1);
+
+        drain_folder_nav_burst_for_test(&mut app, &ctx);
+        assert!(
+            app.current_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &folders[2])),
+            "two same-frame physical presses must apply two fullscreen folder transitions"
         );
     }
 
