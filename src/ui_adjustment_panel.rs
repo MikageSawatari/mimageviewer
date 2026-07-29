@@ -8976,6 +8976,47 @@ mod creative_lut_ui_tests {
     }
 }
 
+fn draw_bookmark_title_edit(
+    ui: &mut egui::Ui,
+    bookmark_id: i64,
+    title: &mut String,
+    request_focus: &mut bool,
+    enter_pressed: bool,
+    ime_active: bool,
+) -> (egui::Response, bool) {
+    let response = ui.add(
+        egui::TextEdit::singleline(title)
+            .id(egui::Id::new("book_bookmark_title_edit").with(bookmark_id))
+            .desired_width(ui.available_width())
+            .hint_text("未設定")
+            .return_key(None::<egui::KeyboardShortcut>),
+    );
+    let restore_focus_for_ime_key = ime_active
+        && response.lost_focus()
+        && ui.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter | egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+    if *request_focus {
+        response.request_focus();
+        *request_focus = false;
+    } else if restore_focus_for_ime_key {
+        response.request_focus();
+        *request_focus = true;
+        ui.ctx().request_repaint();
+    }
+    let submit = response.has_focus() && enter_pressed;
+    (response, submit)
+}
+
 fn bookmark_row_should_jump(
     row_contains_pointer: bool,
     primary_clicked: bool,
@@ -8994,6 +9035,158 @@ mod bookmark_panel_input_tests {
         assert!(!bookmark_row_should_jump(true, true, true));
         assert!(!bookmark_row_should_jump(false, true, false));
         assert!(!bookmark_row_should_jump(true, false, false));
+    }
+}
+
+#[cfg(test)]
+mod bookmark_title_edit_tests {
+    use super::draw_bookmark_title_edit;
+
+    fn key_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn draw_editor(
+        ctx: &egui::Context,
+        title: &mut String,
+        request_focus: &mut bool,
+        enter_pressed: bool,
+        ime_active: bool,
+    ) -> (egui::Id, bool) {
+        let mut output = None;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let (response, submit) =
+                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed, ime_active);
+            output = Some((response.id, submit));
+        });
+        output.expect("bookmark title editor response")
+    }
+
+    fn ime_commit_and_enter_input() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("\u{3042}".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Commit("\u{3042}".to_owned())),
+                key_event(egui::Key::Enter),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ime_commit_and_enter_keep_bookmark_title_focus() {
+        let ctx = egui::Context::default();
+        let mut title = String::new();
+        let mut request_focus = true;
+        let _ = ctx.run(Default::default(), |ctx| {
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+        });
+
+        let mut editor_id = None;
+        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
+            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false, true).0);
+        });
+
+        assert_eq!(title, "\u{3042}");
+        assert_eq!(ctx.memory(|memory| memory.focused()), editor_id);
+    }
+
+    #[test]
+    fn text_after_ime_commit_enter_is_appended_to_bookmark_title() {
+        let ctx = egui::Context::default();
+        let mut title = String::new();
+        let mut request_focus = true;
+        let _ = ctx.run(Default::default(), |ctx| {
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+        });
+        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, true);
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Text("\u{7d9a}".to_owned())],
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+            },
+        );
+
+        assert_eq!(title, "\u{3042}\u{7d9a}");
+    }
+
+    #[test]
+    fn plain_enter_submits_bookmark_title_once() {
+        let ctx = egui::Context::default();
+        let mut title = String::from("title");
+        let mut request_focus = true;
+        let mut submit_count = 0;
+        let _ = ctx.run(Default::default(), |ctx| {
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::Enter)],
+                ..Default::default()
+            },
+            |ctx| {
+                if draw_editor(ctx, &mut title, &mut request_focus, true, false).1 {
+                    submit_count += 1;
+                }
+            },
+        );
+        let _ = ctx.run(Default::default(), |ctx| {
+            if draw_editor(ctx, &mut title, &mut request_focus, false, false).1 {
+                submit_count += 1;
+            }
+        });
+
+        assert_eq!(submit_count, 1);
+    }
+
+    fn editor_id_for_row_order(order: &[i64], target: i64) -> egui::Id {
+        let ctx = egui::Context::default();
+        let mut title = String::new();
+        let mut request_focus = false;
+        let mut editor_id = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for row_id in order {
+                    if *row_id == target {
+                        editor_id = Some(
+                            draw_bookmark_title_edit(
+                                ui,
+                                *row_id,
+                                &mut title,
+                                &mut request_focus,
+                                false,
+                                false,
+                            )
+                            .0
+                            .id,
+                        );
+                    } else {
+                        let _ = ui.button(format!("row-{row_id}"));
+                    }
+                }
+            });
+        });
+        editor_id.expect("target bookmark row")
+    }
+
+    #[test]
+    fn bookmark_title_widget_id_survives_row_add_delete_and_reorder() {
+        let original = editor_id_for_row_order(&[1, 42, 3], 42);
+        assert_eq!(original, editor_id_for_row_order(&[9, 1, 42, 3], 42));
+        assert_eq!(original, editor_id_for_row_order(&[42, 3], 42));
+        assert_eq!(original, editor_id_for_row_order(&[3, 1, 42], 42));
     }
 }
 
@@ -12784,6 +12977,8 @@ impl App {
             return;
         }
 
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let ime_active = self.ime_input_active();
         let mut remove_id = None;
         let mut jump_to = None;
         let mut title_edit = self.book_bookmark_title_edit.take();
@@ -12852,14 +13047,17 @@ impl App {
                                     let edit = title_edit
                                         .as_mut()
                                         .expect("matching book bookmark title edit");
-                                    let response = ui.add(
-                                        egui::TextEdit::singleline(&mut edit.title)
-                                            .desired_width(ui.available_width())
-                                            .hint_text("未設定"),
+                                    let (_, submit_title) = draw_bookmark_title_edit(
+                                        ui,
+                                        bookmark.id,
+                                        &mut edit.title,
+                                        &mut edit.request_focus,
+                                        enter_pressed,
+                                        ime_active,
                                     );
-                                    if edit.request_focus {
-                                        response.request_focus();
-                                        edit.request_focus = false;
+                                    if submit_title {
+                                        save_title = Some((bookmark.id, edit.title.clone()));
+                                        control_clicked = true;
                                     }
                                     ui.horizontal(|ui| {
                                         if ui.small_button("保存").clicked() {
