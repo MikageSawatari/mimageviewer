@@ -2931,10 +2931,9 @@ impl App {
             "[native-video] placement switch failed (target={target_presentation:?}); \
              pending cleared (settings was never persisted, no revert needed)"
         ));
-        // **主対象は「detached 再生中の再親付け rebuild 失敗」**。detached child は
-        // post_quit_on_destroy=false なので、再親付け rebuild が失敗すると旧 (host teardown で
-        // 死にかけの) child を抱えたまま WM_QUIT でも回収されず stuck する。そこで再親付けを
-        // 再要求し、poll が現 host で rebuild を再試行する (host が確定できなければ sync が
+        // **主対象は「detached 再生中の再親付け rebuild 失敗」**。Stage 4 の二相 switch は
+        // failure 時に旧 host を維持するため、再親付けを再要求して registry の target と
+        // production pump の active host を収束させる (host が確定できなければ sync が
         // no-op で待機、session 終了で applicability が落ちて自然に破棄される)。
         //
         // 一方 **初回 main→detached の switch 失敗** は、mode_switch を上で None にした後
@@ -3582,7 +3581,9 @@ impl App {
             // 内部処理イベント (presenter thread が直接消費する)。UI には届かない想定。
             crate::video::native_window::NativeVideoWindowEvent::GeometryChanged { .. } => {}
             crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
-            | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud => {}
+            | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud
+            | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim
+            | crate::video::native_window::NativeVideoWindowEvent::Destroyed => {}
         }
     }
 

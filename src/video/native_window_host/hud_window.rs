@@ -10,7 +10,7 @@
 //!
 //! ## 入力モデル (2 層)
 //!
-//! - **Mouse** は HUD wndproc が region 内で受けて `event_tx` に流す。region 外は
+//! - **Mouse** は HUD wndproc が region 内で受けて bounded event route に流す。region 外は
 //!   `SetWindowRgn` で物理的に「存在しない」領域として穴を開けているので、OS が
 //!   下層 (VST or presenter) に直接 mouse を配送する (= クロスプロセスでも安定)。
 //! - **Keyboard / IME** は HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。
@@ -21,13 +21,13 @@
 //! `apply_regions` が呼ばれるたびに `SetWindowRgn` で HUD HWND の物理形状を更新。
 //! 含めるのは **実際にクリック可能な UI rect だけ** (= activation zone は含めない、
 //! 含めると上端 / 下端に VST のノブやメニューが重なったとき入力を奪うため)。
-//! 活性化 (= hover で bar を表示する判定) は presenter thread の cursor polling で
+//! 活性化 (= hover で bar を表示する判定) は pump observation を render が評価し、
 //! synthetic pointer を流すことで実現する。
 //!
 //! ## Wndproc 概要
 //!
 //! - `WM_MOUSEMOVE` / `WM_*BUTTONDOWN/UP` / `WM_MOUSEWHEEL` / `WM_MOUSELEAVE`:
-//!   既存の `native_window.rs` 内 helper で `NativeVideoWindowEvent` に変換 → `event_tx`。
+//!   既存の `native_window.rs` 内 helper で `NativeVideoWindowEvent` に変換して enqueue する。
 //!   idle auto-hide 中の cursor 復帰は **Wheel / Button のみ** ここで即時に行う。`WM_MOUSEMOVE`
 //!   は navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変) move を含むため
 //!   ここでは復帰せず、実カーソル移動の判定と復帰は overlay の位置ゲート
@@ -35,7 +35,8 @@
 //! - `WM_LBUTTONDOWN` / `WM_RBUTTONDOWN` / `WM_MBUTTONDOWN`:
 //!   1. down event 送出
 //!   2. `held_buttons |= bit` (capture 成否に関係なく必ず tracking、Codex 11 P1 #1)
-//!   3. `claim_foreground(focus_hwnd)` で presenter HWND に foreground/focus を戻す
+//!   3. `RequestFocusClaim` を pump へ enqueue し、dispatch 後に presenter HWND へ
+//!      foreground/focus を戻す
 //!   4. `SetCapture(hud_hwnd)` で region 外の up も拾えるようにする
 //!   5. `GetCapture() != hud_hwnd` (= capture 失敗) なら synthetic up + held_buttons clear
 //!      で egui の `pointer.any_down()` が stuck しないようにする
@@ -47,12 +48,11 @@
 //! - `WM_NCHITTEST`: regions に含まれれば `HTCLIENT`、それ以外は `HTTRANSPARENT`
 //!   (region 外は `SetWindowRgn` で穴になっているため通常メッセージは来ないが念のため)。
 //! - `WM_WINDOWPOSCHANGING`: `WINDOWPOS::hwndInsertAfter` が自分より前を指す変更を
-//!   検知したら `event_tx.send(RequestRaiseHud)` で raise 要求を流す (best-effort
-//!   safety net、主経路は z-order 操作後 hook と presenter polling)。
+//!   検知したら bounded route へ `RequestRaiseHud` を流す (best-effort
+//!   safety net、主経路は z-order 操作後 hook と pump observation)。
 //! - `WM_DPICHANGED`: `DpiChanged { dpi, suggested_rect }` を発火。
 
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -82,6 +82,7 @@ use windows::core::w;
 use crate::video::native_window::{
     NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
     NativeVideoMouseEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
+    NativeVideoWindowEventSink,
 };
 
 /// HUD overlay HWND の生成設定。
@@ -89,11 +90,6 @@ pub(super) struct HudOverlayConfig {
     /// HUD の owner として設定する HWND (= 通常は presenter HWND)。
     /// 同じ owner の sibling として、VST GUI HWND と並ぶ z-order group に入る。
     pub owner_hwnd: HWND,
-    /// Focus handoff / IME context lookup の対象。常に presenter HWND を渡す。
-    /// (HUD 自身は `WS_EX_NOACTIVATE` で focus を取らないため、HUD 上での
-    /// mouse-down では `focus_hwnd` を foreground に戻すことで keyboard/IME を
-    /// presenter の wndproc 経路に維持する。)
-    pub focus_hwnd: HWND,
     /// HUD HWND の初期 screen 座標 (Codex CP7 P1 #2 反映)。
     /// presenter HWND の `GetWindowRect` で取得した位置を渡す。`(0, 0)` ハードコードだと
     /// secondary monitor / 負座標 monitor で fullscreen presenter が動いているときに
@@ -102,9 +98,9 @@ pub(super) struct HudOverlayConfig {
     pub y: i32,
     pub width: u32,
     pub height: u32,
-    /// HUD wndproc が拾った mouse / WM_DPICHANGED / raise 要求を流すチャネル。
-    /// presenter thread が `try_recv` する想定。
-    pub event_tx: Sender<NativeVideoWindowEvent>,
+    /// HUD wndproc が拾った mouse / WM_DPICHANGED / raise 要求を流す bounded route。
+    /// pump/render がそれぞれの endpoint から drain する。
+    pub event_sink: NativeVideoWindowEventSink,
     /// Region 共有用。`apply_regions` から書き込み、wndproc の `WM_NCHITTEST` が
     /// 読み出す (region 自体は `SetWindowRgn` 経由で OS に渡しているので
     /// `WM_NCHITTEST` まで届く mouse はほぼないが、フェイルセーフ)。
@@ -112,7 +108,7 @@ pub(super) struct HudOverlayConfig {
     /// 実機修正 (2026-05-12 Codex P2 #6 反映): cursor が直前 frame で `SetCursor(None)` で
     /// 非表示にされたかどうか。HUD wndproc の **Wheel / Button** ハンドラで参照し、`true` なら
     /// `IDC_ARROW` を明示復帰、`false` なら何もせず last set cursor (= egui setting) を維持。
-    /// presenter が `update_cursor_icon` で毎フレーム書き込む。`WM_MOUSEMOVE` では参照しない
+    /// pump が render の cursor intent 適用時に書き込む。`WM_MOUSEMOVE` では参照しない
     /// (2026-06-06: zero-delta move でカーソルが復活する事象を防ぐため。詳細は wndproc コメント)。
     pub cursor_was_hidden: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -140,7 +136,7 @@ impl HudInteractiveRegions {
 /// **作成スレッド所有**: `HudOverlayWindow` は `Send`/`Sync` を実装しない。
 /// `DestroyWindow` は HWND 作成スレッドで呼ぶ必要があり、wndproc も同じスレッドで
 /// dispatch されるため、別スレッドへの move は禁止する (Codex CP2 P2 反映)。
-/// CP4 以降も presenter thread で生成・所有・破棄する設計を維持する。
+/// Stage 4 以降は専用 pump thread で生成・所有・破棄する。
 pub(super) struct HudOverlayWindow {
     hwnd: HWND,
     /// `WindowState` の raw pointer。実際のライフサイクル管理は wndproc
@@ -176,12 +172,10 @@ impl HudOverlayWindow {
             let hmodule =
                 GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW for HUD: {e:?}"))?;
             let state = Box::new(WindowState {
-                event_tx: cfg.event_tx,
+                event_sink: cfg.event_sink,
                 regions: cfg.regions,
                 cursor_was_hidden: cfg.cursor_was_hidden,
-                focus_hwnd: cfg.focus_hwnd,
                 held_buttons: 0,
-                last_claim_foreground_at: None,
                 mouse_tracking: false,
                 last_mouse_move_log_at: None,
             });
@@ -397,19 +391,13 @@ const BTN_MIDDLE: u8 = 1 << 2;
 const BTN_X1: u8 = 1 << 3;
 const BTN_X2: u8 = 1 << 4;
 
-/// `claim_foreground` の rate limit (直近 100ms 以内なら skip、Codex 5 P1 #2)。
-const FOREGROUND_HANDOFF_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
 struct WindowState {
-    event_tx: Sender<NativeVideoWindowEvent>,
+    event_sink: NativeVideoWindowEventSink,
     regions: Arc<std::sync::Mutex<HudInteractiveRegions>>,
     cursor_was_hidden: Arc<std::sync::atomic::AtomicBool>,
-    focus_hwnd: HWND,
     /// 現在押下中のマウスボタン (`BTN_*` の OR)。`WM_CAPTURECHANGED` 等で残っていたら
     /// synthetic up を補完する。
     held_buttons: u8,
-    /// 直近の `claim_foreground` 発火時刻。レート制限用。
-    last_claim_foreground_at: Option<std::time::Instant>,
     /// `TrackMouseEvent(TME_LEAVE)` 登録済みフラグ。
     mouse_tracking: bool,
     /// CP9 実機 debug: HUD wndproc が WM_MOUSEMOVE を log した直近時刻。100ms 周期で
@@ -594,24 +582,6 @@ fn track_mouse_leave(hwnd: HWND, state: &mut WindowState) {
     state.mouse_tracking = true;
 }
 
-/// `claim_foreground(focus_hwnd)` を呼ぶ。レート制限あり。
-fn try_claim_foreground(state: &mut WindowState) {
-    let now = std::time::Instant::now();
-    if let Some(prev) = state.last_claim_foreground_at {
-        if now.duration_since(prev) < FOREGROUND_HANDOFF_MIN_INTERVAL {
-            return;
-        }
-    }
-    state.last_claim_foreground_at = Some(now);
-    let raw = state.focus_hwnd.0 as u64;
-    if raw == 0 {
-        return;
-    }
-    let report = crate::video::native_window::claim_foreground(raw);
-    // 記録のみ (perf-log との整合: claim_foreground 内部で log を出す)。
-    let _ = report;
-}
-
 /// 現在 held_buttons に残っているボタンの synthetic up を補完し、`MouseLeave` も流す。
 /// `WM_CAPTURECHANGED` / `WM_CANCELMODE` / `WM_DESTROY` 共通 cleanup。
 fn emit_synthetic_button_cleanup(state: &mut WindowState) {
@@ -619,7 +589,7 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
     state.held_buttons = 0;
 
     if (held & BTN_LEFT) != 0 {
-        let _ = state.event_tx.send(NativeVideoWindowEvent::MouseButton(
+        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
             NativeVideoMouseButtonEvent {
                 button: NativeVideoMouseButton::Left,
                 down: false,
@@ -632,7 +602,7 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
         ));
     }
     if (held & BTN_RIGHT) != 0 {
-        let _ = state.event_tx.send(NativeVideoWindowEvent::MouseButton(
+        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
             NativeVideoMouseButtonEvent {
                 button: NativeVideoMouseButton::Right,
                 down: false,
@@ -645,7 +615,7 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
         ));
     }
     if (held & BTN_MIDDLE) != 0 {
-        let _ = state.event_tx.send(NativeVideoWindowEvent::MouseButton(
+        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
             NativeVideoMouseButtonEvent {
                 button: NativeVideoMouseButton::Middle,
                 down: false,
@@ -658,7 +628,7 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
         ));
     }
     if (held & BTN_X1) != 0 {
-        let _ = state.event_tx.send(NativeVideoWindowEvent::MouseButton(
+        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
             NativeVideoMouseButtonEvent {
                 button: NativeVideoMouseButton::Extra1,
                 down: false,
@@ -671,7 +641,7 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
         ));
     }
     if (held & BTN_X2) != 0 {
-        let _ = state.event_tx.send(NativeVideoWindowEvent::MouseButton(
+        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
             NativeVideoMouseButtonEvent {
                 button: NativeVideoMouseButton::Extra2,
                 down: false,
@@ -778,7 +748,7 @@ unsafe extern "system" fn hud_wnd_proc(
                 // 済みカーソルが復活してしまう (2026-06-06)。実カーソル移動時の復帰は overlay の
                 // 位置ゲート (`push_native_event` / `cursor_move_is_activity`) が `cursor_hidden=false`
                 // にし、presenter の `update_cursor_icon` が `SetCursor(IDC_ARROW)` で駆動する。
-                // render loop は `sleep_until_message` で mouse message に即 wake するので遅延は無い。
+                // pump は render の sleep/present と独立して mouse message を dispatch する。
                 // Wheel / Button (下記) は明確なユーザー操作なので即時復帰させる。
                 let event = NativeVideoMouseEvent {
                     x: signed_low_word(lparam.0),
@@ -801,8 +771,8 @@ unsafe extern "system" fn hud_wnd_proc(
                         ));
                     }
                 }
-                let _ = state
-                    .event_tx
+                state
+                    .event_sink
                     .send(NativeVideoWindowEvent::MouseMove(event));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -827,8 +797,8 @@ unsafe extern "system" fn hud_wnd_proc(
                     shift: mouse_shift(wparam),
                     ctrl: mouse_ctrl(wparam),
                 };
-                let _ = state
-                    .event_tx
+                state
+                    .event_sink
                     .send(NativeVideoWindowEvent::MouseWheel(event));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -885,8 +855,8 @@ unsafe extern "system" fn hud_wnd_proc(
                         dbl,
                     ));
                 }
-                // 1. down/up event を `event_tx` に流す。
-                let _ = state.event_tx.send(NativeVideoWindowEvent::MouseButton(
+                // 1. down/up event を bounded route に流す。
+                state.event_sink.send(NativeVideoWindowEvent::MouseButton(
                     NativeVideoMouseButtonEvent {
                         button,
                         down,
@@ -901,8 +871,10 @@ unsafe extern "system" fn hud_wnd_proc(
                 if down {
                     // 2. capture 成否に関係なく必ず tracking (Codex 11 P1 #1)。
                     state.held_buttons |= bit;
-                    // 3. claim_foreground (= presenter HWND に focus を戻す、レート制限あり)。
-                    try_claim_foreground(state);
+                    // 3. focus handoff は wndproc 内で実行せず pump task に enqueue する。
+                    state
+                        .event_sink
+                        .send(NativeVideoWindowEvent::RequestFocusClaim);
                     // 4. SetCapture(hud_hwnd) で region 外の up も拾えるようにする。
                     let prev_capture = unsafe { SetCapture(hwnd) };
                     let _ = prev_capture;
@@ -944,7 +916,7 @@ unsafe extern "system" fn hud_wnd_proc(
             // pathological case として、mouse driver が HUD HWND へ `SendMessage(WM_APPCOMMAND, ...)`
             // を直接送ってくる経路がありうる (= HUD は sibling top-level なので親への
             // 自動 forward は起きない)。その際にも UI 側にナビゲーションを届けるため、
-            // ここで合成 KeyDown(0xA6/0xA7) に変換して event_tx に流す
+            // ここで合成 KeyDown(0xA6/0xA7) に変換して bounded route に流す
             // (= presenter 側のハンドラと同一の経路、Codex P2)。
             let cmd_word = ((lparam.0 >> 16) & 0xFFFF) as u32;
             let app_command = cmd_word & 0xFFF;
@@ -956,8 +928,8 @@ unsafe extern "system" fn hud_wnd_proc(
             if let Some(vk) = synth_vk
                 && let Some(state) = window_state(hwnd)
             {
-                let _ = state
-                    .event_tx
+                state
+                    .event_sink
                     .send(NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
                         virtual_key: vk,
                         scan_code: 0,
@@ -1009,7 +981,9 @@ unsafe extern "system" fn hud_wnd_proc(
                     let raw = insert_after.0 as isize;
                     if raw == 0 || raw == -1 {
                         if let Some(state) = window_state(hwnd) {
-                            let _ = state.event_tx.send(NativeVideoWindowEvent::RequestRaiseHud);
+                            state
+                                .event_sink
+                                .send(NativeVideoWindowEvent::RequestRaiseHud);
                         }
                     }
                 }
@@ -1031,7 +1005,7 @@ unsafe extern "system" fn hud_wnd_proc(
                 RECT::default()
             };
             if let Some(state) = window_state(hwnd) {
-                let _ = state.event_tx.send(NativeVideoWindowEvent::DpiChanged {
+                state.event_sink.send(NativeVideoWindowEvent::DpiChanged {
                     dpi,
                     suggested_rect,
                 });

@@ -10,7 +10,10 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use crate::video::engine::actor::state_code;
 use crate::video::gpu_renderer::GpuVideoDevice;
 use crate::video::native_presenter::{NativePresentOutcome, NativeRenderConfig, NativeRenderCore};
-use crate::video::native_window::{NativeVideoWindowConfig, NativeVideoWindowMode};
+use crate::video::native_window::{
+    NativeVideoWindowConfig, NativeVideoWindowEventSink, NativeVideoWindowMode,
+    native_window_event_route,
+};
 use crate::video::native_window_host::{
     NativeHudWindowRequest, NativeWindowHost, NativeWindowHostConfig,
 };
@@ -104,7 +107,9 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
 
 pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     let _com = ComApartment::init()?;
-    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let overflow_fault = Arc::new(AtomicBool::new(false));
+    let (event_route, event_rx) = native_window_event_route(256, overflow_fault);
+    let event_sink = NativeVideoWindowEventSink::new(0, 0, event_route.clone(), event_route);
     let mut window = NativeWindowHost::create(NativeWindowHostConfig {
         window: NativeVideoWindowConfig {
             mode: NativeVideoWindowMode::Windowed {
@@ -115,12 +120,11 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             initially_visible: true,
             activate_on_show: true,
             close_on_escape: true,
-            post_quit_on_destroy: true,
-            event_tx: Some(event_tx.clone()),
+            event_sink: Some(event_sink.clone()),
             generation: 0,
         },
         hud: NativeHudWindowRequest::Disabled,
-        event_tx,
+        event_sink,
     })?;
     let gpu = if config.force_sw {
         None
@@ -132,6 +136,8 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             targets: window.render_targets(),
             width: config.width,
             height: config.height,
+            os_pixels_per_point: window.os_pixels_per_point(),
+            initial_observation: window.observe(),
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
             egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
             cursor_hide_delay_secs: crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
@@ -234,9 +240,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     {
         quit = crate::video::native_window::pump_thread_messages();
         let mut native_events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            native_events.push(event);
-        }
+        native_events.extend(event_rx.drain().into_iter().map(|event| event.event));
         if !native_events.is_empty() {
             presenter.handle_window_events(&native_events)?;
         }

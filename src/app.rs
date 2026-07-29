@@ -10733,12 +10733,11 @@ pub struct App {
     /// z-order を調整する (= 動画再生中だけ手前)。
     #[cfg(windows)]
     pub(crate) vst3_was_fullscreen: bool,
-    /// CP7: `DspBridge::hud_raise_hook` 経由で発火された raise 要求を受ける channel。
-    /// hook クロージャが unbounded `mpsc::send(())` するだけの非ブロッキング処理で、
-    /// App.update で `try_iter` で drain → 1 件以上来てれば `VideoPlayer::request_hud_raise()`
-    /// を 1 回だけ呼ぶ (= coalesce)。
+    /// CP7: `DspBridge::hud_raise_hook` 経由で発火された raise 要求の latest-value latch。
+    /// hook は `true` を store するだけで非ブロッキング。App.update が swap(false) し、
+    /// 1 回以上来ていれば `VideoPlayer::request_hud_raise()` を 1 回だけ呼ぶ (= coalesce)。
     #[cfg(windows)]
-    pub(crate) hud_raise_rx: std::sync::mpsc::Receiver<()>,
+    pub(crate) hud_raise_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// ★固定 (Snapshot Lock) 機能の現在状態。`Some` なら active、`None` なら inactive。
     /// 設計: [docs/star-lock-snapshot-design.md](../docs/star-lock-snapshot-design.md)
@@ -11142,7 +11141,7 @@ impl App {
         let creative_lut_library =
             crate::creative_lut::CreativeLutLibrary::new(&settings.creative_luts);
 
-        let mut app = Self {
+        let app = Self {
             address: String::new(),
             current_folder: None,
             navigation_scope: ViewerNavigationScope::Main,
@@ -12273,14 +12272,7 @@ impl App {
             #[cfg(windows)]
             vst3_was_fullscreen: false,
             #[cfg(windows)]
-            hud_raise_rx: {
-                // CP7: 仮の placeholder channel (= 即解放される)。実体の channel は
-                // 下の post-init ブロックで作り直して `dsp_bridge.set_hud_raise_hook` も登録する。
-                // (Default impl の struct literal 中では他 field を参照できないので、
-                // 構築後にもう一度書き換える。)
-                let (_, rx) = std::sync::mpsc::channel::<()>();
-                rx
-            },
+            hud_raise_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // ★固定 (Snapshot Lock) は起動時 inactive。
             // settings.db には書かない (= app 再起動で消える、設計どおり)。
             snapshot: None,
@@ -12290,15 +12282,12 @@ impl App {
 
         #[cfg(windows)]
         {
-            // CP7: hud_raise hook を `dsp_bridge` に登録し、hook → mpsc channel → App.update
-            // の経路を確立する。tx は move closure 内に取り込み、rx を App field に上書き。
-            let (hud_tx, hud_rx) = std::sync::mpsc::channel::<()>();
-            app.hud_raise_rx = hud_rx;
+            // Stage 4: VST worker → App の高頻度 raise は latest-value latch で coalesce
+            // する。unbounded queue を作らず、hook は lock/wait なしで返る。
+            let hud_raise_pending = std::sync::Arc::clone(&app.hud_raise_pending);
             app.dsp_bridge
                 .set_hud_raise_hook(std::sync::Arc::new(move || {
-                    // unbounded mpsc の `send` は非ブロッキング (= worker thread から呼ばれて
-                    // も block しない、Codex プラン Step 10)。
-                    let _ = hud_tx.send(());
+                    hud_raise_pending.store(true, std::sync::atomic::Ordering::Release);
                 }));
         }
 
@@ -60541,14 +60530,15 @@ impl eframe::App for App {
         self.sync_native_video_iconic_thumbnail();
         #[cfg(windows)]
         {
-            // CP7: `DspBridge::hud_raise_hook` から流れてきた raise 要求を drain して
-            // 1 件以上来てれば fullscreen 中の VideoPlayer に 1 回だけ `request_hud_raise` を呼ぶ
-            // (= coalesce、Codex プラン Step 10)。`try_iter().count()` で要素を消費して個数を取る。
-            let pending = self.hud_raise_rx.try_iter().count();
+            // CP7/Stage 4: `DspBridge::hud_raise_hook` の latest-value latch を consume し、
+            // 1 件以上来ていれば fullscreen 中の VideoPlayer に 1 回だけ raise を要求する。
+            let pending = self
+                .hud_raise_pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
             // Inc 7 hidden presenter: 音声モード中は presenter (+ HUD) が hide されている
             // ので raise 要求は無視する (HUD teardown 済み)。7e の VST ホスト表示中は presenter を
             // un-hide して HUD も出しているので raise を許可する。
-            if pending > 0 && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some()) {
+            if pending && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some()) {
                 if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         player.request_hud_raise();

@@ -905,7 +905,10 @@ fn window_created(
             spec: expected_spec,
             visibility,
         } if state_request == request && expected_epoch == epoch => {
-            if expected_spec != spec {
+            let supported_hud_fallback = expected_spec.placement == spec.placement
+                && expected_spec.topology == HostWindowTopology::PresenterAndHud
+                && spec.topology == HostWindowTopology::PresenterOnly;
+            if expected_spec != spec && !supported_hud_fallback {
                 return WindowHostTransition::new(
                     state,
                     vec![WindowHostEffect::DestroyOrphan { host: event_host }],
@@ -1546,6 +1549,49 @@ mod tests {
                 .filter(|effect| matches!(effect, WindowHostEffect::Publish { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn requested_hud_topology_accepts_presenter_only_backend_fallback() {
+        let opened = reduce_window_host(
+            WindowHostState::Empty,
+            WindowHostInput::Command(open_visible(1, 10)),
+        );
+        let actual_spec = spec(
+            NativeVideoPlacement::FullscreenBorderless,
+            HostWindowTopology::PresenterOnly,
+        );
+        let created = reduce_window_host(
+            opened.state,
+            WindowHostInput::Event(WindowHostEvent::WindowCreated {
+                request: WindowRequestId(1),
+                epoch: WindowEpoch(10),
+                spec: actual_spec,
+                windows: HostWindows::PresenterOnly {
+                    presenter: OpaqueWindowHandle {
+                        id: OpaqueWindowId(0x1234),
+                        generation: WindowGeneration(10),
+                    },
+                },
+            }),
+        );
+        assert_eq!(created.status, WindowHostTransitionStatus::Applied);
+        assert!(matches!(
+            created.state,
+            WindowHostState::Preparing {
+                staging: StagingWindow::Created {
+                    host: HostedWindow { spec, .. },
+                    ..
+                },
+                ..
+            } if spec == actual_spec
+        ));
+        assert!(
+            created
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, WindowHostEffect::AttachTarget { .. }))
         );
     }
 

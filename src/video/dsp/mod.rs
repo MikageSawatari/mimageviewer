@@ -169,7 +169,7 @@ pub struct DspBridge {
     /// HUD overlay を最前面に上げ直す要求を流すフック。App が `set_hud_raise_hook`
     /// で登録し、各 z-order op (`set_all_guis_topmost` / `set_all_guis_visible_blocking`
     /// / `set_all_guis_app_active` / `send_chain_z_order` 等) の末尾で発火する。
-    /// hook 側は unbounded mpsc に `send` するだけの非ブロッキング処理を行う。
+    /// hook 側は App-owned latest-value latch を更新するだけの非ブロッキング処理を行う。
     hud_raise_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// チェーン再構築の単調世代カウンタ (Codex R-VST-001 / T21、2026-05-16)。
     ///
@@ -339,8 +339,8 @@ impl DspBridge {
     }
 
     /// HUD raise hook を登録する。引数のクロージャは `set_all_guis_topmost` 等の
-    /// 末尾で発火される。クロージャ側は unbounded mpsc に `send` するだけの
-    /// 非ブロッキング処理を行うこと (worker thread から呼ばれる可能性があるため)。
+    /// 末尾で発火される。クロージャ側は latest-value latch の更新だけを行い、
+    /// 非ブロッキングで返ること (worker thread から呼ばれる可能性があるため)。
     #[allow(dead_code)]
     pub fn set_hud_raise_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         if let Ok(mut slot) = self.hud_raise_hook.lock() {
