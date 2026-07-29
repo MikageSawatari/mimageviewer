@@ -70,3 +70,7 @@ tests/snapshots/*.old.png
 /remote-web-thumbs.db
 /remote-web-thumbs.db-shm
 /remote-web-thumbs.db-wal
+
+# remote-web (PoC) console logs
+/remote-web-console.log
+/remote-web-console.err.log
