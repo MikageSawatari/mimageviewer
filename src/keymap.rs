@@ -6110,6 +6110,9 @@ impl Keymap {
 
     pub fn key_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        if ctx.wants_keyboard_input() {
+            return false;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             return chords
                 .iter()
@@ -6128,6 +6131,9 @@ impl Keymap {
     /// (idle からの同フレーム 押下+離し) を救うために併用する。修飾キー付きは対象外。
     pub fn take_key_hold_edges(&self, ctx: &egui::Context, action: KeyAction) -> (bool, bool) {
         debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        if ctx.wants_keyboard_input() {
+            return (false, false);
+        }
         #[cfg(windows)]
         if crate::key_input::is_frame_active() {
             let chords: Vec<Chord> = if let Some(chords) = self.overrides.get(&action) {
@@ -6198,6 +6204,9 @@ impl Keymap {
 
     pub fn modifier_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
+        if ctx.wants_keyboard_input() {
+            return false;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             return chords
                 .iter()
@@ -6491,11 +6500,11 @@ impl Keymap {
         if chord.key.is_none() {
             return false;
         }
+        if ctx.wants_keyboard_input() {
+            return false;
+        }
         #[cfg(windows)]
         if crate::key_input::is_frame_active() {
-            if ctx.wants_keyboard_input() {
-                return false;
-            }
             if crate::key_input::frame_had_key_down() {
                 let result = crate::key_input::consume_key_down_with_result(allow_repeat, |edge| {
                     chord.matches_key_edge(edge)
@@ -6589,11 +6598,11 @@ impl Keymap {
         if chord.key.is_none() {
             return false;
         }
+        if ctx.wants_keyboard_input() {
+            return false;
+        }
         #[cfg(windows)]
         if crate::key_input::is_frame_active() {
-            if ctx.wants_keyboard_input() {
-                return false;
-            }
             if crate::key_input::frame_had_key_down() {
                 return crate::key_input::pressed_key_down(|edge| chord.matches_key_edge(edge));
             }
@@ -8693,6 +8702,135 @@ mod tests {
         let _ = ctx.end_pass();
     }
 
+    #[test]
+    fn consume_action_keeps_egui_event_when_keyboard_is_owned_without_win32_frame() {
+        #[cfg(windows)]
+        let _serial = native_video_shortcut_test_guard();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        let text_id = egui::Id::new("keymap_owned_fallback_text");
+        let mut text = String::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
+                    .request_focus();
+            });
+        });
+
+        begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
+        assert!(ctx.wants_keyboard_input());
+        assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn consume_action_keeps_win32_and_egui_input_when_keyboard_is_owned() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        let text_id = egui::Id::new("keymap_owned_win32_text");
+        let mut text = String::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
+                    .request_focus();
+            });
+        });
+
+        begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
+        crate::key_input::set_test_frame(vec![plain_key_edge(0x54, 0x14)]);
+        assert!(ctx.wants_keyboard_input());
+        assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert!(crate::key_input::pressed_key_down(
+            |edge| edge.virtual_key == 0x54
+        ));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn consume_action_still_consumes_egui_event_without_keyboard_owner() {
+        #[cfg(windows)]
+        let _serial = native_video_shortcut_test_guard();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
+
+        assert!(!ctx.wants_keyboard_input());
+        assert!(keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
+        assert!(ctx.input(|input| input.events.is_empty()));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn pressed_action_ignores_egui_event_when_keyboard_is_owned_without_win32_frame() {
+        #[cfg(windows)]
+        let _serial = native_video_shortcut_test_guard();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        let text_id = egui::Id::new("keymap_owned_pressed_text");
+        let mut text = String::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
+                    .request_focus();
+            });
+        });
+
+        begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
+        assert!(ctx.wants_keyboard_input());
+        assert!(!keymap.pressed_action(&ctx, KeyAction::FsPostFilterNext));
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn key_hold_edges_keep_egui_event_when_keyboard_is_owned_without_win32_frame() {
+        #[cfg(windows)]
+        let _serial = native_video_shortcut_test_guard();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        let text_id = egui::Id::new("keymap_owned_hold_text");
+        let mut text = String::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
+                    .request_focus();
+            });
+        });
+
+        begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::NONE);
+        assert!(ctx.wants_keyboard_input());
+        assert_eq!(
+            keymap.take_key_hold_edges(&ctx, KeyAction::FsZoomMode),
+            (false, false)
+        );
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        let _ = ctx.end_pass();
+    }
     #[cfg(windows)]
     #[test]
     fn no_repeat_tab_claims_win32_and_egui_events_without_focus_traversal_leak() {
