@@ -8799,6 +8799,7 @@ impl App {
 
         let show = match self.details_image_dims_state {
             LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::NotRequested
             | LazyColumnState::Cancelled => true,
             LazyColumnState::Ready { failed } => failed > 0,
@@ -8820,6 +8821,15 @@ impl App {
                             ui.label("詳細情報を読み込み準備中");
                         }
                         LazyColumnState::Loading { done, total } => {
+                            ui.label(format!(
+                                "詳細情報を読み込み中 {}/{}   遅延列 {}/{}",
+                                done, total, done, total
+                            ));
+                            if ui.small_button("停止").clicked() {
+                                self.cancel_details_meta_loading();
+                            }
+                        }
+                        LazyColumnState::Reconciling { done, total, .. } => {
                             ui.label(format!(
                                 "詳細情報を読み込み中 {}/{}   遅延列 {}/{}",
                                 done, total, done, total
@@ -9139,6 +9149,12 @@ impl App {
                 ui.label("AIメタデータを読み込み準備中");
             }
             LazyColumnState::Loading { done, total } => {
+                ui.label(format!("AIメタデータを読み込み中 {done}/{total}"));
+                if ui.small_button("停止").clicked() {
+                    self.cancel_details_meta_loading();
+                }
+            }
+            LazyColumnState::Reconciling { done, total, .. } => {
                 ui.label(format!("AIメタデータを読み込み中 {done}/{total}"));
                 if ui.small_button("停止").clicked() {
                     self.cancel_details_meta_loading();
@@ -12673,7 +12689,9 @@ impl App {
         if col.is_lazy()
             && matches!(
                 self.details_image_dims_state,
-                LazyColumnState::Loading { .. } | LazyColumnState::NotRequested
+                LazyColumnState::Loading { .. }
+                    | LazyColumnState::Reconciling { .. }
+                    | LazyColumnState::NotRequested
             )
         {
             base_title.push_str(" ...");
@@ -15140,6 +15158,61 @@ mod selection_info_tests {
         let (before, after) = measured.unwrap();
         assert!((after.top() - before.top()).abs() < 0.01);
         assert!(before.bottom() - after.bottom() >= 24.5);
+    }
+
+    #[test]
+    fn details_lazy_status_reserves_bottom_while_reconciling_jobs() {
+        let mut app = setup_app_for_test();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_page_count = true;
+        app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.details_image_dims_state = LazyColumnState::Reconciling {
+            done: 2,
+            total: 2,
+            failed: 0,
+        };
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let mut measured = None;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            let before = ctx.available_rect();
+            app.render_details_lazy_status_bar(ctx);
+            let after = ctx.available_rect();
+            measured = Some((before, after));
+        });
+
+        let (before, after) = measured.unwrap();
+        assert!((after.top() - before.top()).abs() < 0.01);
+        assert!(before.bottom() - after.bottom() >= 24.5);
+    }
+
+    #[test]
+    fn details_lazy_status_keeps_failed_ready_session_visible() {
+        let mut app = setup_app_for_test();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_page_count = true;
+        app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.details_image_dims_state = LazyColumnState::Ready { failed: 2 };
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let mut bottom_delta = 0.0;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            let before = ctx.available_rect();
+            app.render_details_lazy_status_bar(ctx);
+            bottom_delta = before.bottom() - ctx.available_rect().bottom();
+        });
+
+        assert!(bottom_delta >= 24.5);
     }
 
     #[test]

@@ -43918,6 +43918,184 @@ fn page_count_only_target_is_staged_unless_explicitly_allowed() {
 }
 
 #[test]
+fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\first.cbz")),
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\second.cbz")),
+        ],
+        vec![Some((1, 10)), Some((2, 20))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_show_created = false;
+    app.settings.details_show_image_dimensions = false;
+    app.settings.details_show_video_duration = false;
+    app.settings.details_show_video_dimensions = false;
+    app.settings.details_show_video_codec = false;
+    app.details_tag_prewarm_indices = vec![0];
+    let first_key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        first_key,
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 10,
+            page_count: Some(10),
+            page_count_checked: true,
+            ..Default::default()
+        },
+    );
+    app.details_image_dims_state = LazyColumnState::Loading { done: 1, total: 1 };
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(DetailsMetaEvent::Finished {
+        generation: app.items_generation,
+        failed: 0,
+    })
+    .unwrap();
+    app.details_meta_pending = Some(DetailsMetaPending {
+        visible_revision: app.details_lazy_visible_revision,
+        selection_target_key: None,
+        normal_target_keys: Default::default(),
+        cancel: Default::default(),
+        rx,
+    });
+    let ctx = egui::Context::default();
+
+    app.poll_details_meta_load(&ctx);
+
+    assert!(app.details_meta_pending.is_none());
+    assert!(matches!(
+        app.details_image_dims_state,
+        LazyColumnState::Reconciling { .. }
+    ));
+
+    // 同じフレームの詳細一覧描画でスクロール先が可視 + 先読み範囲になった想定。
+    // worker の Finished を Ready として公開せず、そのまま次ジョブへ接続する。
+    app.details_tag_prewarm_indices = vec![1];
+    app.reconcile_details_lazy_session_after_grid(&ctx);
+
+    assert!(app.details_meta_pending.is_some());
+    assert!(matches!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { .. }
+    ));
+}
+
+#[test]
+fn details_lazy_session_completes_after_post_grid_scope_is_satisfied() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.details_tag_prewarm_indices = vec![0];
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 10,
+            page_count: Some(10),
+            page_count_checked: true,
+            ..Default::default()
+        },
+    );
+    app.details_image_dims_state = LazyColumnState::Reconciling {
+        done: 1,
+        total: 1,
+        failed: 0,
+    };
+
+    app.reconcile_details_lazy_session_after_grid(&egui::Context::default());
+
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Ready { failed: 0 }
+    );
+    assert!(app.details_meta_pending.is_none());
+}
+
+#[test]
+fn details_lazy_session_cancel_resume_preserves_cache_and_revision() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 10,
+            page_count: Some(10),
+            page_count_checked: true,
+            ..Default::default()
+        },
+    );
+    app.details_image_dims_state = LazyColumnState::Reconciling {
+        done: 1,
+        total: 1,
+        failed: 0,
+    };
+    let revision = app.details_lazy_visible_revision;
+
+    app.cancel_details_meta_loading();
+    assert_eq!(app.details_image_dims_state, LazyColumnState::Cancelled);
+    app.resume_details_meta_loading();
+
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert_eq!(app.details_lazy_visible_revision, revision);
+    assert_eq!(app.details_lazy_meta.len(), 1);
+}
+
+#[test]
+fn installing_new_folder_items_starts_new_details_lazy_session() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\NewFolder\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn post_filter_visible_scope_starts_new_details_lazy_session() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\filtered-out.cbz")),
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\filtered-in.cbz")),
+        ],
+        vec![Some((1, 10)), Some((2, 20))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.visible_indices = vec![1];
+    app.details_order = vec![1];
+    app.details_tag_prewarm_indices = vec![1];
+
+    app.reconcile_details_lazy_session_after_grid(&egui::Context::default());
+
+    assert!(app.details_meta_pending.is_some());
+    assert!(matches!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { .. }
+    ));
+}
+
+#[test]
 fn image_folder_page_count_is_available_without_auto_open() {
     let mut app = phase_c_support::setup_app();
     app.settings.auto_fullscreen_zip_pdf = false;

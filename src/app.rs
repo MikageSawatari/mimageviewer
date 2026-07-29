@@ -4146,8 +4146,20 @@ pub(crate) struct MetadataLoadResult {
 pub(crate) enum LazyColumnState {
     Disabled,
     NotRequested,
-    Loading { done: usize, total: usize },
-    Ready { failed: usize },
+    Loading {
+        done: usize,
+        total: usize,
+    },
+    /// 現ジョブは完了したが、描画後の可視 + 先読み範囲に次ジョブが必要かを
+    /// まだ照合していない走査セッション。ジョブ境界を Ready として公開しない。
+    Reconciling {
+        done: usize,
+        total: usize,
+        failed: usize,
+    },
+    Ready {
+        failed: usize,
+    },
     Cancelled,
 }
 
@@ -4157,7 +4169,7 @@ impl LazyColumnState {
     }
 
     fn is_loading(self) -> bool {
-        matches!(self, Self::Loading { .. })
+        matches!(self, Self::Loading { .. } | Self::Reconciling { .. })
     }
 }
 
@@ -8589,7 +8601,8 @@ pub struct App {
     details_meta_pending: Option<DetailsMetaPending>,
     /// 詳細遅延列の対象集合 revision。フィルタ変更で進め、古い worker 完了時に再要求する。
     details_lazy_visible_revision: u64,
-    /// 画像解像度列の readiness。列全体が Ready になるまでソート/フィルタは無効。
+    /// 詳細遅延メタの走査セッション状態。`details_meta_pending` は個々の worker job を所有し、
+    /// この state は連続 job をまたいで Ready になるまでソート/フィルタを無効にする。
     pub(crate) details_image_dims_state: LazyColumnState,
     /// AI モデル/生成ツール facet をユーザーが開いたか、条件が有効なときに遅延メタを読む。
     pub(crate) ai_model_facet_requested: bool,
@@ -40111,6 +40124,68 @@ impl App {
         }
     }
 
+    fn details_page_count_uses_visible_stages(&self) -> bool {
+        self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.settings.details_show_page_count
+            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+    }
+
+    fn details_visible_page_count_needs_load(&self) -> bool {
+        self.details_tag_prewarm_indices.iter().copied().any(|idx| {
+            self.lazy_load_page_count_for_idx(idx)
+                && self
+                    .details_lazy_meta_for_idx(idx)
+                    .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta))
+        })
+    }
+
+    fn finish_details_lazy_session(&mut self, failed: usize) {
+        self.details_image_dims_state = LazyColumnState::Ready { failed };
+        self.prune_details_lazy_meta_cache();
+        if self.facet_ai_filter_active() {
+            let ready_state = self.details_image_dims_state;
+            self.rebuild_visible_indices();
+            self.details_image_dims_state = ready_state;
+        }
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && matches!(
+                self.settings.details_sort_key,
+                crate::settings::DetailsSortKey::PageCount
+                    | crate::settings::DetailsSortKey::ImageDimensions
+                    | crate::settings::DetailsSortKey::Created
+                    | crate::settings::DetailsSortKey::VideoDuration
+                    | crate::settings::DetailsSortKey::VideoDimensions
+                    | crate::settings::DetailsSortKey::VideoCodec
+            )
+        {
+            self.rebuild_details_order();
+        }
+    }
+
+    /// 詳細一覧の描画で可視 + 先読み範囲が確定した後、ジョブではなく走査セッションを
+    /// 完了できるか判定する。未取得ページ数があれば同じセッションの次ジョブを開始し、
+    /// 無ければここだけが staged page-count セッションを Ready にする。
+    pub(crate) fn reconcile_details_lazy_session_after_grid(&mut self, ctx: &egui::Context) {
+        if !self.details_page_count_uses_visible_stages() {
+            return;
+        }
+
+        let failed = match self.details_image_dims_state {
+            LazyColumnState::Reconciling { failed, .. } => Some(failed),
+            LazyColumnState::Ready { .. } if self.details_visible_page_count_needs_load() => None,
+            _ => return,
+        };
+
+        if self.details_visible_page_count_needs_load() {
+            self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+            self.start_details_meta_load(ctx);
+        } else if let Some(failed) = failed {
+            self.finish_details_lazy_session(failed);
+            ctx.request_repaint();
+        }
+    }
+
     pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
         if !self.details_lazy_columns_visible() {
             if let Some(pending) = self.details_meta_pending.take() {
@@ -40127,15 +40202,9 @@ impl App {
 
         // ページ数ソート以外は画面外の全コンテナを開かず、可視範囲 + 先読み範囲だけを
         // 段階取得する。前の範囲が Ready でもスクロール先に未取得行があれば次ジョブを開始。
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+        if self.details_page_count_uses_visible_stages()
             && matches!(self.details_image_dims_state, LazyColumnState::Ready { .. })
-            && self.details_tag_prewarm_indices.iter().copied().any(|idx| {
-                self.lazy_load_page_count_for_idx(idx)
-                    && self
-                        .details_lazy_meta_for_idx(idx)
-                        .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta))
-            })
+            && self.details_visible_page_count_needs_load()
         {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -40217,7 +40286,9 @@ impl App {
                 && self.selection_info_needs_lazy_meta_request()
                 && !matches!(
                     self.details_image_dims_state,
-                    LazyColumnState::NotRequested | LazyColumnState::Loading { .. }
+                    LazyColumnState::NotRequested
+                        | LazyColumnState::Loading { .. }
+                        | LazyColumnState::Reconciling { .. }
                 )
             {
                 self.details_lazy_visible_revision =
@@ -40271,25 +40342,18 @@ impl App {
                         .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
                     self.details_meta_pending = None;
                     if revision_matches {
-                        self.details_image_dims_state = LazyColumnState::Ready { failed };
-                        self.prune_details_lazy_meta_cache();
-                        if self.facet_ai_filter_active() {
-                            let ready_state = self.details_image_dims_state;
-                            self.rebuild_visible_indices();
-                            self.details_image_dims_state = ready_state;
-                        }
-                        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-                            && matches!(
-                                self.settings.details_sort_key,
-                                crate::settings::DetailsSortKey::PageCount
-                                    | crate::settings::DetailsSortKey::ImageDimensions
-                                    | crate::settings::DetailsSortKey::Created
-                                    | crate::settings::DetailsSortKey::VideoDuration
-                                    | crate::settings::DetailsSortKey::VideoDimensions
-                                    | crate::settings::DetailsSortKey::VideoCodec
-                            )
-                        {
-                            self.rebuild_details_order();
+                        if self.details_page_count_uses_visible_stages() {
+                            let total = match self.details_image_dims_state {
+                                LazyColumnState::Loading { total, .. } => total,
+                                _ => 0,
+                            };
+                            self.details_image_dims_state = LazyColumnState::Reconciling {
+                                done: total,
+                                total,
+                                failed,
+                            };
+                        } else {
+                            self.finish_details_lazy_session(failed);
                         }
                     } else {
                         self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -40609,6 +40673,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40632,6 +40697,7 @@ impl App {
             LazyColumnState::Ready { .. } => "...".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40671,6 +40737,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40705,6 +40772,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40726,6 +40794,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40751,6 +40820,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40896,22 +40966,7 @@ impl App {
             .count();
 
         if total == 0 || targets.is_empty() {
-            self.details_image_dims_state = LazyColumnState::Ready {
-                failed: cached_failed,
-            };
-            if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-                && matches!(
-                    self.settings.details_sort_key,
-                    crate::settings::DetailsSortKey::PageCount
-                        | crate::settings::DetailsSortKey::ImageDimensions
-                        | crate::settings::DetailsSortKey::Created
-                        | crate::settings::DetailsSortKey::VideoDuration
-                        | crate::settings::DetailsSortKey::VideoDimensions
-                        | crate::settings::DetailsSortKey::VideoCodec
-                )
-            {
-                self.rebuild_details_order();
-            }
+            self.finish_details_lazy_session(cached_failed);
             return;
         }
 
@@ -61150,6 +61205,7 @@ impl eframe::App for App {
         let t_pre_grid = frame_t0.elapsed();
         let grid_nav = self.render_grid(ctx);
         let t_grid = frame_t0.elapsed();
+        self.reconcile_details_lazy_session_after_grid(ctx);
         #[cfg(windows)]
         self.log_main_flash_probe(
             "main_ui_drawn",
