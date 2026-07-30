@@ -992,11 +992,15 @@ impl App {
                                 .color(ui.visuals().weak_text_color()),
                         );
                         ui.add_space(4.0);
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut state.password_input)
-                                .password(true)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("パスワード"),
+                        let resp = crate::ime_focus::add_singleline(
+                            ui,
+                            &mut state.password_input,
+                            None,
+                            |edit| {
+                                edit.password(true)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("パスワード")
+                            },
                         );
                         if !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
                             resp.request_focus();

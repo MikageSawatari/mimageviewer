@@ -404,44 +404,6 @@
   現行 UI / 入力経路からは参照しない。
 - 規模 / リスク: Medium / 中。動画系の手動確認を含めて別タスクで扱う。
 
-### 4.2 IME 変換中の TextEdit フォーカス復帰漏れ (Enter / Tab)
-
-- 出典: 5ch mImageViewer 専用スレ レス 136-137 (2026-07-31)。v2.9.0 で
-  Windows 11 + Microsoft IME 使用時、アドレスバーで変換確定 Enter または候補選択 Tab を
-  押すと入力フォーカスが外れる。ユーザー手元でも再現済み。タグ入力画面などでも Tab 側の
-  処理漏れが疑われる (Enter は効く箇所あり)。
-- 現状整理:
-  - `App::dialog_enter_pressed` / `dialog_escape_pressed` は IME 中の Enter / Escape を
-    アプリ側の確定・キャンセルとして拾わないためのガードであり、`TextEdit` が
-    `lost_focus()` した後に戻す責務は持たない。
-  - アドレスバー (`src/ui_main.rs` の folder bar) は `dialog_enter_pressed` を使っており、
-    IME 確定 Enter でフォルダ移動は走らないが、`lost_focus()` 時の `request_focus()` が
-    無いためフォーカスだけ失われる。
-  - `egui_focus_policy.rs` は TextEdit 中の通常 Tab traversal を許可する設計・テストに
-    なっている。このため IME 候補選択の Tab も egui のフォーカス移動として処理され得る。
-  - ブックマーク名編集、フルスクリーンタグピッカー、動画 overlay の一部には
-    `ime_active && lost_focus()` でフォーカスを戻す個別処理があるが、対象キーが
-    Enter / Escape のみだったり、メイン画面上部のアドレスバー / 検索 / タグビューへ
-    横展開されていなかったりする。
-- 修正方針:
-  1. `IME 中に Enter / Escape / Tab 由来で TextEdit が lost_focus したら focus を戻す`
-     ための共通 helper を追加する。単純な `ime_active && lost_focus` だけだと、IME 中に
-     マウスで別 UI へ移る操作まで奪う可能性があるため、キーイベント種別も見る。
-  2. アドレスバー、現在地検索、コンテナ検索、タグビュー検索、グローバル検索、タグ付け
-     ダイアログ、ブックマーク名編集、フルスクリーンタグピッカー、動画 overlay のタグ入力に
-     同じ helper を適用する。既存の `dialog_enter_pressed` / `dialog_escape_pressed` は
-     アプリ操作抑止として維持する。
-  3. 通常の TextEdit 間 Tab 移動は維持し、IME 入力中だけフォーカス復帰させる。
-     `egui_focus_policy` の「TextEdit 中 Tab は traversal 許可」テストを壊さず、
-     IME 中 Tab の回帰テストを別途追加する。
-  4. `CLAUDE.md` または入力系設計メモへ、IME 対応対象キーに Tab を含める注意を追記する。
-- 確認項目:
-  - アドレスバーで日本語変換中に Enter 確定してもフォーカスが残る。
-  - アドレスバー / タグビュー検索 / 検索バーで IME 候補選択 Tab を押してもフォーカスが残る。
-  - IME 非入力時は通常の Tab で TextEdit 間フォーカス移動できる。
-  - 入力欄フォーカス中にグリッドの Enter / Tab / Esc 系ショートカットが漏れない。
-- 規模 / 優先度: Small〜Medium / P2。IME の実機確認が必要。
-
 ## 5. リリース前確認 / 依存更新
 
 ### 5.1 ネイティブ依存

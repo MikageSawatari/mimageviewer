@@ -1350,15 +1350,12 @@ pub(crate) fn draw_native_bookmark_title_editor(
                             .color(egui::Color32::from_rgb(238, 238, 238)),
                     );
                     ui.add_space(6.0);
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut state.title)
-                            .desired_width(dialog_w - 24.0)
-                            .hint_text("未設定"),
+                    let _response = crate::ime_focus::add_singleline(
+                        ui,
+                        &mut state.title,
+                        Some(&mut state.request_focus),
+                        |edit| edit.desired_width(dialog_w - 24.0).hint_text("未設定"),
                     );
-                    if state.request_focus {
-                        response.request_focus();
-                        state.request_focus = false;
-                    }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("保存").clicked() {
@@ -4159,7 +4156,6 @@ fn draw_native_tag_picker_panel(
     tag_picker_focus_request: &mut bool,
     tag_picker_recent_tab: &mut bool,
     tag_picker_enter_pressed: bool,
-    tag_picker_ime_active: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     ui.horizontal(|ui| {
@@ -4208,7 +4204,6 @@ fn draw_native_tag_picker_panel(
         tag_picker_focus_request,
         tag_picker_recent_tab,
         tag_picker_enter_pressed,
-        tag_picker_ime_active,
         commands,
         &mut close_after_apply,
     );
@@ -4241,44 +4236,22 @@ fn draw_native_tag_picker(
     focus_request: &mut bool,
     recent_tab: &mut bool,
     enter_pressed: bool,
-    ime_active: bool,
     commands: &mut Vec<NativeOverlayCommand>,
     close_after_apply: &mut bool,
 ) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
-        let input_resp = ui.add_sized(
-            [174.0, 22.0],
-            egui::TextEdit::singleline(input)
-                .hint_text("タグを検索/入力")
-                .return_key(None::<egui::KeyboardShortcut>),
+        let input_resp = crate::ime_focus::add_sized_singleline(
+            ui,
+            egui::vec2(174.0, 22.0),
+            input,
+            Some(focus_request),
+            |edit| {
+                edit.hint_text("タグを検索/入力")
+                    .return_key(None::<egui::KeyboardShortcut>)
+            },
         );
-        // IME 変換確定/キャンセルの Enter/Escape で TextEdit のフォーカスが外れることが
-        // ある (Windows IME)。そのフレームに合わせてフォーカスを取り戻す
-        // (静止画右パネルの `restore_focus_for_ime_key` と同方針)。
-        let restore_focus_for_ime_key = ime_active
-            && input_resp.lost_focus()
-            && ui.input(|i| {
-                i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::Enter | egui::Key::Escape,
-                            pressed: true,
-                            ..
-                        }
-                    )
-                })
-            });
-        if *focus_request {
-            input_resp.request_focus();
-            *focus_request = false;
-        } else if restore_focus_for_ime_key {
-            input_resp.request_focus();
-            *focus_request = true;
-            ui.ctx().request_repaint();
-        }
         let normalized = crate::tags_db::normalize_tag_display_name(input.trim());
         let valid = native_tag_input_valid(&normalized);
         let add_clicked = ui.add_enabled(valid, egui::Button::new("付ける")).clicked();
@@ -4459,7 +4432,6 @@ pub(super) fn draw_native_metadata_panel(
     tag_picker_recent_tab: &mut bool,
     tag_picker_enter_pressed: bool,
     tag_picker_escape_pressed: bool,
-    tag_picker_ime_active: bool,
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
 ) {
@@ -4704,7 +4676,6 @@ pub(super) fn draw_native_metadata_panel(
                             tag_picker_focus_request,
                             tag_picker_recent_tab,
                             tag_picker_enter_pressed,
-                            tag_picker_ime_active,
                             commands,
                         );
                         return;

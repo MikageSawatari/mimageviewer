@@ -6314,7 +6314,6 @@ impl NativeEguiOverlay {
                     &mut self.tag_picker_recent_tab,
                     tag_picker_enter_pressed,
                     tag_picker_escape_pressed,
-                    tag_picker_ime_active,
                     &mut commands,
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
                 );

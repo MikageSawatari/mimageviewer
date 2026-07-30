@@ -257,11 +257,9 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
     ui.horizontal(|ui| {
         ui.label("絞り込み:");
-        ui.add(
-            egui::TextEdit::singleline(&mut state.ui_font_filter)
-                .desired_width(210.0)
-                .hint_text("フォント名"),
-        );
+        crate::ime_focus::add_singleline(ui, &mut state.ui_font_filter, None, |edit| {
+            edit.desired_width(210.0).hint_text("フォント名")
+        });
         let import_busy = state.ui_font_import_rx.is_some();
         if ui
             .add_enabled(!import_busy, egui::Button::new("フォントファイルを追加…"))
@@ -381,10 +379,12 @@ pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesStat
             ui.horizontal_wrapped(|ui| {
                 ui.label("指定フォルダ:");
                 let edit_width = (ui.available_width() - 120.0).clamp(180.0, 420.0);
-                let mut output = egui::TextEdit::singleline(&mut state.startup_folder_path_input)
-                    .desired_width(edit_width)
-                    .hint_text("例: D:\\Images")
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut state.startup_folder_path_input,
+                    None,
+                    |edit| edit.desired_width(edit_width).hint_text("例: D:\\Images"),
+                );
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -772,10 +772,15 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label("保存先フォルダ");
     ui.horizontal_wrapped(|ui| {
         let edit_width = (ui.available_width() - 190.0).clamp(180.0, 360.0);
-        let mut output = egui::TextEdit::singleline(&mut state.capture_output_dir_input)
-            .desired_width(edit_width)
-            .hint_text(crate::capture::default_output_dir().display().to_string())
-            .show(ui);
+        let mut output = crate::ime_focus::show_singleline(
+            ui,
+            &mut state.capture_output_dir_input,
+            None,
+            |edit| {
+                edit.desired_width(edit_width)
+                    .hint_text(crate::capture::default_output_dir().display().to_string())
+            },
+        );
         let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
             ui,
             &mut output,
@@ -924,11 +929,9 @@ fn command_filter_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.horizontal_wrapped(|ui| {
         ui.label("検索:");
         ui.label("操作");
-        ui.add(
-            egui::TextEdit::singleline(&mut state.command_filter)
-                .desired_width(220.0)
-                .hint_text("操作名 / 説明 / 場所"),
-        );
+        crate::ime_focus::add_singleline(ui, &mut state.command_filter, None, |edit| {
+            edit.desired_width(220.0).hint_text("操作名 / 説明 / 場所")
+        });
         ui.label("キー");
         ui.add(
             egui::TextEdit::singleline(&mut state.command_key_filter)
@@ -4695,10 +4698,11 @@ pub(super) fn page_book(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label("本棚の保存先");
     ui.horizontal_wrapped(|ui| {
         let edit_width = (ui.available_width() - 190.0).clamp(180.0, 360.0);
-        let mut output = egui::TextEdit::singleline(&mut state.book_root_input)
-            .desired_width(edit_width)
-            .hint_text(crate::books::default_books_root().display().to_string())
-            .show(ui);
+        let mut output =
+            crate::ime_focus::show_singleline(ui, &mut state.book_root_input, None, |edit| {
+                edit.desired_width(edit_width)
+                    .hint_text(crate::books::default_books_root().display().to_string())
+            });
         let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
             ui,
             &mut output,
@@ -5957,11 +5961,9 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
             } else {
                 ui.horizontal(|ui| {
                     ui.label("表示名:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut entry.name)
-                            .desired_width(220.0)
-                            .hint_text("LUT名"),
-                    );
+                    crate::ime_focus::add_singleline(ui, &mut entry.name, None, |edit| {
+                        edit.desired_width(220.0).hint_text("LUT名")
+                    });
                     if ui.button("登録解除").clicked() {
                         remove = Some(index);
                     }
@@ -6413,10 +6415,10 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label("検索:");
-        let mut output = egui::TextEdit::singleline(&mut state.vst3_filter)
-            .hint_text("プラグイン名…")
-            .desired_width(f32::INFINITY)
-            .show(ui);
+        let mut output =
+            crate::ime_focus::show_singleline(ui, &mut state.vst3_filter, None, |edit| {
+                edit.hint_text("プラグイン名…").desired_width(f32::INFINITY)
+            });
         crate::ui_helpers::singleline_text_edit_context_menu(
             ui,
             &mut output,

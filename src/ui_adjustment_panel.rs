@@ -9013,37 +9013,14 @@ fn draw_bookmark_title_edit(
     title: &mut String,
     request_focus: &mut bool,
     enter_pressed: bool,
-    ime_active: bool,
 ) -> (egui::Response, bool) {
-    let response = ui.add(
-        egui::TextEdit::singleline(title)
-            .id(book_bookmark_title_edit_widget_id(bookmark_id))
-            .desired_width(ui.available_width())
+    let available_width = ui.available_width();
+    let response = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
+        edit.id(book_bookmark_title_edit_widget_id(bookmark_id))
+            .desired_width(available_width)
             .hint_text("未設定")
-            .return_key(None::<egui::KeyboardShortcut>),
-    );
-    let restore_focus_for_ime_key = ime_active
-        && response.lost_focus()
-        && ui.input(|input| {
-            input.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Enter | egui::Key::Escape,
-                        pressed: true,
-                        ..
-                    }
-                )
-            })
-        });
-    if *request_focus {
-        response.request_focus();
-        *request_focus = false;
-    } else if restore_focus_for_ime_key {
-        response.request_focus();
-        *request_focus = true;
-        ui.ctx().request_repaint();
-    }
+            .return_key(None::<egui::KeyboardShortcut>)
+    });
     let submit = response.has_focus() && enter_pressed;
     (response, submit)
 }
@@ -9088,12 +9065,11 @@ mod bookmark_title_edit_tests {
         title: &mut String,
         request_focus: &mut bool,
         enter_pressed: bool,
-        ime_active: bool,
     ) -> (egui::Id, bool) {
         let mut output = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             let (response, submit) =
-                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed, ime_active);
+                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
             output = Some((response.id, submit));
         });
         output.expect("bookmark title editor response")
@@ -9117,12 +9093,12 @@ mod bookmark_title_edit_tests {
         let mut title = String::new();
         let mut request_focus = true;
         let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
 
         let mut editor_id = None;
         let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false, true).0);
+            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false).0);
         });
 
         assert_eq!(title, "\u{3042}");
@@ -9135,10 +9111,10 @@ mod bookmark_title_edit_tests {
         let mut title = String::new();
         let mut request_focus = true;
         let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
         let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, true);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
         let _ = ctx.run(
             egui::RawInput {
@@ -9146,7 +9122,7 @@ mod bookmark_title_edit_tests {
                 ..Default::default()
             },
             |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
             },
         );
 
@@ -9160,7 +9136,7 @@ mod bookmark_title_edit_tests {
         let mut request_focus = true;
         let mut submit_count = 0;
         let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
         let _ = ctx.run(
             egui::RawInput {
@@ -9168,13 +9144,13 @@ mod bookmark_title_edit_tests {
                 ..Default::default()
             },
             |ctx| {
-                if draw_editor(ctx, &mut title, &mut request_focus, true, false).1 {
+                if draw_editor(ctx, &mut title, &mut request_focus, true).1 {
                     submit_count += 1;
                 }
             },
         );
         let _ = ctx.run(Default::default(), |ctx| {
-            if draw_editor(ctx, &mut title, &mut request_focus, false, false).1 {
+            if draw_editor(ctx, &mut title, &mut request_focus, false).1 {
                 submit_count += 1;
             }
         });
@@ -9197,7 +9173,6 @@ mod bookmark_title_edit_tests {
                                 *row_id,
                                 &mut title,
                                 &mut request_focus,
-                                false,
                                 false,
                             )
                             .0
@@ -12402,11 +12377,12 @@ impl App {
                 .show(ctx, |ui| {
                     crate::os_theme::apply_dark_ui(ui);
                     ui.horizontal(|ui| {
-                        ui.add_sized(
+                        crate::ime_focus::add_sized_singleline(
+                            ui,
                             egui::vec2((ui.available_width() - 32.0).max(120.0), 24.0),
-                            egui::TextEdit::singleline(effect_query)
-                                .hint_text("効果名で検索")
-                                .desired_width(f32::INFINITY),
+                            effect_query,
+                            None,
+                            |edit| edit.hint_text("効果名で検索").desired_width(f32::INFINITY),
                         );
                         if ui
                             .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
@@ -13009,7 +12985,6 @@ impl App {
         }
 
         let enter_pressed = self.dialog_enter_pressed(ctx);
-        let ime_active = self.ime_input_active();
         let mut remove_id = None;
         let mut jump_to = None;
         let mut title_edit = self.book_bookmark_title_edit.take();
@@ -13084,7 +13059,6 @@ impl App {
                                         &mut edit.title,
                                         &mut edit.request_focus,
                                         enter_pressed,
-                                        ime_active,
                                     );
                                     if submit_title {
                                         save_title = Some((bookmark.id, edit.title.clone()));
@@ -14299,11 +14273,10 @@ impl App {
                 let key_label = crate::adjustment::slot_key_label(slot_idx);
                 ui.label(format!("スロット {} に保存する名前を入力:", key_label));
                 ui.add_space(4.0);
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut name_input)
-                        .desired_width(240.0)
-                        .hint_text("例: 漫画モノクロ / スキャン補正"),
-                );
+                let resp = crate::ime_focus::add_singleline(ui, &mut name_input, None, |edit| {
+                    edit.desired_width(240.0)
+                        .hint_text("例: 漫画モノクロ / スキャン補正")
+                });
                 if !resp.has_focus() && !resp.lost_focus() {
                     resp.request_focus();
                 }

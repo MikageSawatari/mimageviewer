@@ -89,6 +89,7 @@ pub mod global_search;
 mod global_search_ui;
 pub mod gpu_info;
 pub mod grid_item;
+mod ime_focus;
 pub mod indexer_manager;
 pub mod indexer_progress;
 pub mod indexer_supervisor;

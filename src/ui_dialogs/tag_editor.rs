@@ -93,11 +93,12 @@ impl App {
                                         egui::RichText::new(number_label).monospace().weak(),
                                     );
 
-                                    let resp = ui.add_sized(
-                                        [200.0, 20.0],
-                                        egui::TextEdit::singleline(
-                                            &mut self.tag_editor_draft[i].name,
-                                        ),
+                                    let resp = crate::ime_focus::add_sized_singleline(
+                                        ui,
+                                        egui::vec2(200.0, 20.0),
+                                        &mut self.tag_editor_draft[i].name,
+                                        None,
+                                        |edit| edit,
                                     );
                                     // Enter で次行 or 追加行作成 (未実装、v1.1 検討)
                                     let _ = resp;

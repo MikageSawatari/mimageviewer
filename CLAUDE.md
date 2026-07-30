@@ -399,6 +399,12 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
   直近 300ms 以内の Ime イベント有無の OR で判定。300ms グレースは Windows IME で
   `Ime::Disabled` と `Key::Escape` が別フレームに届くケースを吸収するため。
 
+上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
+single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
+Enter / Escape / **Tab** による focus loss の復帰と IME 候補選択中の Tab traversal 抑止を所有する。
+raw TextEdit は理由付き allowlist を検査する unit test で禁止している。TSF を採用しない理由、
+IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](src/ime_focus.rs) の helper doc comment を参照。
+
 **ビューポート別のイベントキュー**:
 egui の `show_viewport_immediate` は独立したイベントキューを持つ。メインビューポートと
 フルスクリーンビューポートは別キュー。IME 状態はビューポートごとに追跡が必要なので、

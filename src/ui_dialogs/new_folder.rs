@@ -55,11 +55,15 @@ impl App {
                 ui.label(format!("作成先: {}", parent.display()));
                 ui.add_space(4.0);
 
-                let resp = ui.add_enabled(
+                let resp = crate::ime_focus::add_enabled_singleline(
+                    ui,
                     !pending,
-                    egui::TextEdit::singleline(&mut self.new_folder_input)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(DEFAULT_NEW_FOLDER_NAME),
+                    &mut self.new_folder_input,
+                    None,
+                    |edit| {
+                        edit.desired_width(f32::INFINITY)
+                            .hint_text(DEFAULT_NEW_FOLDER_NAME)
+                    },
                 );
                 if !pending && !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
                     resp.request_focus();

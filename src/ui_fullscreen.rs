@@ -22771,10 +22771,11 @@ impl App {
                 ui.label(&state.source_label);
                 ui.add_space(6.0);
                 ui.label("ファイル名");
-                let mut basename_output = egui::TextEdit::singleline(&mut state.basename)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("出力ファイル名")
-                    .show(ui);
+                let mut basename_output =
+                    crate::ime_focus::show_singleline(ui, &mut state.basename, None, |edit| {
+                        edit.desired_width(f32::INFINITY)
+                            .hint_text("出力ファイル名")
+                    });
                 crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut basename_output,
@@ -22793,11 +22794,12 @@ impl App {
                 ui.horizontal(|ui| {
                     let buttons_width = 144.0;
                     let edit_width = (ui.available_width() - buttons_width).max(180.0);
-                    let mut output_dir_output =
-                        egui::TextEdit::singleline(&mut state.output_dir_text)
-                            .desired_width(edit_width)
-                            .hint_text("保存先フォルダ")
-                            .show(ui);
+                    let mut output_dir_output = crate::ime_focus::show_singleline(
+                        ui,
+                        &mut state.output_dir_text,
+                        None,
+                        |edit| edit.desired_width(edit_width).hint_text("保存先フォルダ"),
+                    );
                     crate::ui_helpers::singleline_text_edit_context_menu(
                         ui,
                         &mut output_dir_output,

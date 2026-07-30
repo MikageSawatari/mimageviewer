@@ -86,6 +86,9 @@ Windows の egui 経路では、KeySlot でショートカットを所有した�
 consume する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
+IME 変換中の <kbd>Tab</kbd> は候補選択キーなので、`ime_focus` が対象 TextEdit の focus-lock を
+有効にして traversal を止める。IME 非入力時はこの lock を外し、TextEdit 間の通常 Tab traversal を
+そのまま許可する。Enter / Escape / Tab による IME focus 復帰と keymap の操作発火抑止は別責務である。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、

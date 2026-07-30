@@ -5428,7 +5428,12 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("新しい本");
-                    ui.text_edit_singleline(&mut self.book_manager_new_name);
+                    crate::ime_focus::add_singleline(
+                        ui,
+                        &mut self.book_manager_new_name,
+                        None,
+                        |edit| edit,
+                    );
                     let name = crate::books::normalize_book_name(&self.book_manager_new_name);
                     let can_create = !name.trim().is_empty() && self.book_op_pending.is_none();
                     if ui
@@ -5479,8 +5484,11 @@ impl App {
                                             .book_manager_rename_inputs
                                             .entry(row.name.clone())
                                             .or_insert_with(|| row.name.clone());
-                                        ui.add(
-                                            egui::TextEdit::singleline(input).desired_width(220.0),
+                                        crate::ime_focus::add_singleline(
+                                            ui,
+                                            input,
+                                            None,
+                                            |edit| edit.desired_width(220.0),
                                         );
                                         let new_name = crate::books::normalize_book_name(input);
                                         let can_rename = !new_name.is_empty()
@@ -9386,12 +9394,16 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("検索:");
-                        let mut output =
-                            egui::TextEdit::singleline(&mut self.facet_tag_search_query)
-                                .hint_text("#タグ")
-                                .desired_width(150.0)
-                                .min_size(egui::vec2(150.0, 20.0))
-                                .show(ui);
+                        let mut output = crate::ime_focus::show_singleline(
+                            ui,
+                            &mut self.facet_tag_search_query,
+                            None,
+                            |edit| {
+                                edit.hint_text("#タグ")
+                                    .desired_width(150.0)
+                                    .min_size(egui::vec2(150.0, 20.0))
+                            },
+                        );
                         let _ = crate::ui_helpers::singleline_text_edit_context_menu(
                             ui,
                             &mut output,
@@ -10951,9 +10963,12 @@ impl App {
                                         .desired_width(f32::INFINITY),
                                 )
                             } else {
-                                let mut output = egui::TextEdit::singleline(&mut self.address)
-                                    .desired_width(f32::INFINITY)
-                                    .show(ui);
+                                let mut output = crate::ime_focus::show_singleline(
+                                    ui,
+                                    &mut self.address,
+                                    None,
+                                    |edit| edit.desired_width(f32::INFINITY),
+                                );
                                 crate::ui_helpers::singleline_text_edit_context_menu(
                                     ui,
                                     &mut output,
@@ -11075,13 +11090,8 @@ impl App {
         // §4.1.2: ZIP 表示中は検索対象をファイル名フィルタに固定する。
         let zip_view = self.grid_is_zip_entries();
 
-        // Enter は **raw** で読む。`dialog_enter_pressed` は IME 変換直後 300ms の
-        // グレース中も false を返すため、日本語で「おはよう[Enter]」と確定兼送信した
-        // ケースで検索が走らず、代わりにグリッドの Enter ショートカット (フルスクリーン)
-        // が走ってしまう。ここでは `response.lost_focus()` が Tab / クリック外しでも
-        // true になる性質を raw Enter との AND で打ち消し、"Enter でフォーカスを失った"
-        // ときだけ execute_search を呼ぶ。search_query は IME Commit で既に確定済み。
-        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        // IME 変換確定の Enter は送信に使わず、確定後の通常 Enter だけを検索実行に使う。
+        let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let local_search_label = self
             .keymap
@@ -11093,11 +11103,18 @@ impl App {
                     "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
                 ));
-                let mut output = egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text(r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#)
-                    .desired_width(320.0)
-                    .min_size(egui::vec2(320.0, 20.0))
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.search_query,
+                    Some(&mut self.search_focus_request),
+                    |edit| {
+                        edit.hint_text(
+                            r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#,
+                        )
+                        .desired_width(320.0)
+                        .min_size(egui::vec2(320.0, 20.0))
+                    },
+                );
                 let _menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -11105,17 +11122,11 @@ impl App {
                 );
                 let response = output.response;
 
-                // フォーカスリクエスト
-                if self.search_focus_request {
-                    self.search_focus_request = false;
-                    response.request_focus();
-                }
-
                 // フォーカス状態を追跡
                 self.search_has_focus = response.has_focus();
 
-                // Enter で検索実行 (IME 変換確定の Enter も同じ扱い)
-                if response.lost_focus() && raw_enter_pressed {
+                // Enter で検索実行 (IME 変換確定の Enter は除外)
+                if response.lost_focus() && enter_pressed {
                     self.execute_search(ctx);
                     // フォーカスを外してカーソルキーでグリッド操作できるようにする
                     response.surrender_focus();
@@ -11262,9 +11273,7 @@ impl App {
         if !self.favsearch.active {
             return;
         }
-        // Ctrl+F 側と同じく raw Enter で判定する (IME 変換確定の Enter も送信扱い)。
-        // `response.lost_focus()` と AND することで Tab / クリック外しの誤発火は弾ける。
-        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
@@ -11274,11 +11283,18 @@ impl App {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
-                let mut output = egui::TextEdit::singleline(&mut self.favsearch.query)
-                    .hint_text(r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#)
-                    .desired_width(320.0)
-                    .min_size(egui::vec2(320.0, 20.0))
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.favsearch.query,
+                    Some(&mut self.favsearch.focus_request),
+                    |edit| {
+                        edit.hint_text(
+                            r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#,
+                        )
+                        .desired_width(320.0)
+                        .min_size(egui::vec2(320.0, 20.0))
+                    },
+                );
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -11286,18 +11302,14 @@ impl App {
                 );
                 let response = output.response;
 
-                if self.favsearch.focus_request {
-                    self.favsearch.focus_request = false;
-                    response.request_focus();
-                }
                 self.favsearch.has_focus = response.has_focus();
 
                 // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                // Enter で確定的に再実行 (IME 変換確定の Enter も同じ扱い)
-                if response.lost_focus() && raw_enter_pressed {
+                // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
+                if response.lost_focus() && enter_pressed {
                     query_changed = true;
                 }
 
@@ -11514,7 +11526,6 @@ impl App {
             return;
         }
 
-        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
@@ -11526,11 +11537,16 @@ impl App {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");
-                let mut output = egui::TextEdit::singleline(&mut self.tag_view.query)
-                    .hint_text("#タグ")
-                    .desired_width(260.0)
-                    .min_size(egui::vec2(260.0, 20.0))
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.tag_view.query,
+                    Some(&mut self.tag_view.focus_request),
+                    |edit| {
+                        edit.hint_text("#タグ")
+                            .desired_width(260.0)
+                            .min_size(egui::vec2(260.0, 20.0))
+                    },
+                );
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -11538,21 +11554,11 @@ impl App {
                 );
                 let response = output.response;
 
-                if self.tag_view.focus_request {
-                    self.tag_view.focus_request = false;
-                    response.request_focus();
-                }
                 self.tag_view.has_focus = response.has_focus();
 
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                if response.lost_focus() && raw_enter_pressed {
-                    response.request_focus();
-                    self.tag_view.focus_request = true;
-                    self.tag_view.has_focus = true;
-                }
-
                 let (pinned, recent, popular) = self.tag_view_menu_sections();
                 ui.menu_button("一覧▼", |ui| {
                     ui.set_min_width(260.0);

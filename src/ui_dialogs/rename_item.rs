@@ -70,10 +70,12 @@ impl App {
                         &self.rename_input,
                     ));
                 } else {
-                    let resp = ui.add_enabled(
+                    let resp = crate::ime_focus::add_enabled_singleline(
+                        ui,
                         !pending,
-                        egui::TextEdit::singleline(&mut self.rename_input)
-                            .desired_width(f32::INFINITY),
+                        &mut self.rename_input,
+                        None,
+                        |edit| edit.desired_width(f32::INFINITY),
                     );
                     if !pending && self.rename_initial_selection_pending {
                         resp.request_focus();

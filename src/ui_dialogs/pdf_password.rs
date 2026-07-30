@@ -39,11 +39,15 @@ impl crate::app::App {
                 ui.add_space(4.0);
 
                 // パスワード入力欄
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.pdf_password_input)
-                        .password(true)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("パスワード"),
+                let resp = crate::ime_focus::add_singleline(
+                    ui,
+                    &mut self.pdf_password_input,
+                    None,
+                    |edit| {
+                        edit.password(true)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("パスワード")
+                    },
                 );
                 // 初回フォーカス
                 if !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {

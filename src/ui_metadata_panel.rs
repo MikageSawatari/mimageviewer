@@ -268,7 +268,6 @@ impl App {
         let mut set_folder_rating: Option<u8> = None;
         let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
-        let tag_picker_ime_active = self.ime_input_active();
         if self.fullscreen_tag_picker_open && tag_picker_escape_pressed {
             self.fullscreen_tag_picker_open = false;
             self.fullscreen_tag_picker_input.clear();
@@ -303,7 +302,6 @@ impl App {
                         &mut self.fullscreen_tag_picker_focus_request,
                         &mut self.fullscreen_tag_picker_recent_tab,
                         tag_picker_enter_pressed,
-                        tag_picker_ime_active,
                         &mut set_tag,
                     );
                     return;
@@ -552,7 +550,6 @@ impl App {
         let mut searched_tag: Option<String> = None;
         let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
-        let tag_picker_ime_active = self.ime_input_active();
         if self.fullscreen_tag_picker_open && tag_picker_escape_pressed {
             self.fullscreen_tag_picker_open = false;
             self.fullscreen_tag_picker_input.clear();
@@ -573,7 +570,6 @@ impl App {
                 &mut self.fullscreen_tag_picker_focus_request,
                 &mut self.fullscreen_tag_picker_recent_tab,
                 tag_picker_enter_pressed,
-                tag_picker_ime_active,
                 &mut set_tag,
             );
         } else {
@@ -1057,7 +1053,6 @@ fn draw_fullscreen_tag_picker_panel(
     picker_focus_request: &mut bool,
     picker_recent_tab: &mut bool,
     enter_pressed: bool,
-    ime_active: bool,
     set_tag: &mut Option<(String, bool, Vec<TagTarget>)>,
 ) {
     let selected_idx = picker_row_key
@@ -1117,7 +1112,6 @@ fn draw_fullscreen_tag_picker_panel(
         picker_focus_request,
         picker_recent_tab,
         enter_pressed,
-        ime_active,
         set_tag,
         &mut close_after_apply,
     );
@@ -1154,41 +1148,22 @@ fn draw_fullscreen_tag_picker(
     focus_request: &mut bool,
     recent_tab: &mut bool,
     enter_pressed: bool,
-    ime_active: bool,
     set_tag: &mut Option<(String, bool, Vec<TagTarget>)>,
     close_after_apply: &mut bool,
 ) {
     ui.add_space(5.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("タグ:").size(12.0).color(DIM_COLOR));
-        let input_resp = ui.add_sized(
-            [180.0, 22.0],
-            egui::TextEdit::singleline(input)
-                .hint_text("タグを検索/入力")
-                .return_key(None::<egui::KeyboardShortcut>),
+        let input_resp = crate::ime_focus::add_sized_singleline(
+            ui,
+            egui::vec2(180.0, 22.0),
+            input,
+            Some(focus_request),
+            |edit| {
+                edit.hint_text("タグを検索/入力")
+                    .return_key(None::<egui::KeyboardShortcut>)
+            },
         );
-        let restore_focus_for_ime_key = ime_active
-            && input_resp.lost_focus()
-            && ui.input(|i| {
-                i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::Enter | egui::Key::Escape,
-                            pressed: true,
-                            ..
-                        }
-                    )
-                })
-            });
-        if *focus_request {
-            input_resp.request_focus();
-            *focus_request = false;
-        } else if restore_focus_for_ime_key {
-            input_resp.request_focus();
-            *focus_request = true;
-            ui.ctx().request_repaint();
-        }
         let normalized = crate::tags_db::normalize_tag_display_name(input.trim());
         let valid = tag_panel_input_valid(&normalized);
         let add_clicked = ui.add_enabled(valid, egui::Button::new("付ける")).clicked();
