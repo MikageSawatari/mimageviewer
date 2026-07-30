@@ -96,6 +96,16 @@ multi-window 化後、fullscreen / detached PDF の `fs_load` はメイングリ
 `context_epoch=0` に固定する。ライフサイクルは既存の `fs_pending` cancel token が持つ。
 grid thumbnail / `thumb_loader` 経路の epoch 運用は従来どおり維持する。
 
+### 2026-07-30: fullscreen display target は epoch 所有権を変えない
+
+`start_fs_load` の初回 PDF render は 4096px 固定ではなく、各 viewer context が持つ
+`PdfDisplayTarget` (実 viewport の論理サイズ × `pixels_per_point` + fit mode) を pool request に
+焼き付ける。PDF worker は同じ open/render job で得るページ寸法・回転・content type から実際の
+長辺を解決するため、UI 側に解析待ち状態を追加しない。fullscreen / detached / in-window の
+request は引き続き `context_epoch=0`、cancel と結果 ownership は各 `fs_pending` / bundle が持つ。
+サムネイルの 647px request、priority/normal queue、epoch prune の意味論は変更しない。
+perf log の `pool_recv` には解決後の `render_w` / `render_h` / `render_long_px` を記録する。
+
 ### Codex P1-3 / round 2 P1-2 対応: Interrupted の取り扱いは PDF render 経路に限定
 
 `load_one_cached` ([thumb_loader.rs:1820](../src/thumb_loader.rs)) で失敗時の処理:

@@ -516,7 +516,9 @@ cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解�
 ```rust
 match grid_item {
     GridItem::PdfPage { .. } => {
-        // PDF ワーカーで 4096px 描画
+        // 実 viewport の logical size×ppp を PDF ワーカーへ渡す。
+        // worker 内でページ縦横比/content_type を解析し、必要長辺×1.10、
+        // raster native、8192 上限の順で初回解像度を確定する。
     }
     GridItem::ZipImage { zip_path, entry_name } => {
         // ZIP から bytes 読み出し → image::load_from_memory → 失敗時 WIC ストリームフォールバック
@@ -531,6 +533,12 @@ match grid_item {
     _ => { /* それ以外はフルスクリーン対象外 */ }
 }
 ```
+
+PDF の `start_fs_load` は描画先 context が確定するまで開始しない。これにより専用
+fullscreen viewport、detached window、in-window がそれぞれの実 inner size / DPI を使う。
+サムネイル側の長辺 647 は変更しない。初回後の zoom は同じ display-fit 長辺を基準に
+`request_pdf_rerender` が再レンダし、raster は埋め込み原稿の native 寸法を超えない。
+表示 trim bbox が初回結果から判明した場合は、bbox の実表示密度が不足するときだけ追加レンダする。
 
 **ZipImage でできないことリスト**:
 

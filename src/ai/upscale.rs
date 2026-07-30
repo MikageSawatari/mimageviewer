@@ -187,28 +187,10 @@ pub fn upscale_target_size_for_max_dim(
     (target_w, target_h)
 }
 
-/// PDF ラスターページの「現行レンダ寸法が、native 再レンダ後の AI 入力寸法より十分
-/// 大きい」かを判定する純関数 (GitHub issue #1)。= 「現行 (4096px 等) のまま AI を流すと、
-/// native 再レンダ後に捨てられる / 重すぎる」状態の中核数式 (ズーム・in-flight・副作用は
-/// 呼び出し側 `App::pdf_native_downscale_pending` が足す)。
-///
-/// 背景: PDF 初回フルスクリーンは content_type 未解析のため 4096px 固定でレンダされ
-/// (`start_fs_load`)、final AI はレンダ後のピクセルサイズで判定する。よって native が
-/// サイズ上限内 (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095)
-/// では AI がスキップ (既定 2048 上限) されるか、約 11.5MP を AI に流す (高負荷上限)。
-///
-/// 真 = 「native 寸法で AI が効く」**かつ**「現行レンダ長辺 > 実 native target 長辺 ×1.1」:
-/// - cur が範囲外 (既定 2048 上限で 4096px → 2812×4095) → AI を効かせるため native 化必須。
-/// - cur が範囲内でも native target より大きい (高負荷上限 4096 で 2812×4095 も AI 対象) →
-///   native (= 埋め込み原寸) へ落としてから AI する方が軽く高品質 (Codex P2)。
-///
-/// **実 native target 長辺** = `max(native_long, render_min_long)`。`render_min_long` は
-/// `request_pdf_rerender` の `target_px` clamp 下限 (`pdf_loader::PDF_RENDER_MIN_LONG_PX`
-/// = 256)。raw native (例 100×200) で比べると、実レンダが 256px に持ち上がるため
-/// `256 > 200×1.1` で永久に真のままになり先読みが収束しない (Codex 再々レビュー P2)。
-/// `1.1` 倍は `request_pdf_rerender` の dedup (ratio 0.9..=1.1) と一致し、収束後 (cur≈
-/// target) は false。非 AI 利用時 (両方 OFF → `ai_at_native` が false) も false。
-pub fn pdf_render_exceeds_native_ai_target(
+/// PDF raster の現行表示レンダが、AI 入力に使う native 寸法へ収束済みかを判定する。
+/// 初回は viewport-fit のため native より小さい場合も、大きい場合もあり得る。どちらも
+/// そのまま AI へ流すと native 再レンダ完了時に捨てるため、±10% の外なら保留する。
+pub fn pdf_render_differs_from_native_ai_target(
     native_w: u32,
     native_h: u32,
     cur_w: u32,
@@ -217,7 +199,6 @@ pub fn pdf_render_exceeds_native_ai_target(
     upscale_limit: AiProcessSizeLimit,
     denoise_on: bool,
     denoise_limit: AiProcessSizeLimit,
-    render_min_long: u32,
 ) -> bool {
     let ai_at_native = ai_would_apply_at_dims(
         native_w,
@@ -227,10 +208,10 @@ pub fn pdf_render_exceeds_native_ai_target(
         denoise_on,
         denoise_limit,
     );
-    // 実レンダ target 長辺 (clamp 下限を反映)。
-    let native_target_long = native_w.max(native_h).max(render_min_long);
+    let native_target_long = native_w.max(native_h).max(1);
     let cur_long = cur_w.max(cur_h);
-    ai_at_native && cur_long as f32 > native_target_long as f32 * 1.1
+    let ratio = cur_long as f32 / native_target_long as f32;
+    ai_at_native && !(0.9..=1.1).contains(&ratio)
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
@@ -1117,15 +1098,13 @@ mod tests {
         ));
     }
 
-    const MIN: u32 = crate::pdf_loader::PDF_RENDER_MIN_LONG_PX; // 256
-
     /// GitHub issue #1 中核ケース: native (824x1200, range 内) を 4096px でレンダした
     /// 結果 (2812x4095, range 外) → AI ON なら native へ落とすべき (true)。
     #[test]
     fn exceeds_when_ai_on_and_cur_over_limit() {
         let limit = AiProcessSizeLimit::square(2048);
-        assert!(pdf_render_exceeds_native_ai_target(
-            824, 1200, 2812, 4095, true, limit, false, limit, MIN,
+        assert!(pdf_render_differs_from_native_ai_target(
+            824, 1200, 2812, 4095, true, limit, false, limit,
         ));
     }
 
@@ -1135,8 +1114,8 @@ mod tests {
     #[test]
     fn exceeds_when_cur_in_range_but_larger_than_native() {
         let limit = AiProcessSizeLimit::square(4096);
-        assert!(pdf_render_exceeds_native_ai_target(
-            824, 1200, 2812, 4095, true, limit, false, limit, MIN,
+        assert!(pdf_render_differs_from_native_ai_target(
+            824, 1200, 2812, 4095, true, limit, false, limit,
         ));
     }
 
@@ -1144,8 +1123,8 @@ mod tests {
     #[test]
     fn not_exceeds_when_ai_off() {
         let limit = AiProcessSizeLimit::square(2048);
-        assert!(!pdf_render_exceeds_native_ai_target(
-            824, 1200, 2812, 4095, false, limit, false, limit, MIN,
+        assert!(!pdf_render_differs_from_native_ai_target(
+            824, 1200, 2812, 4095, false, limit, false, limit,
         ));
     }
 
@@ -1154,8 +1133,8 @@ mod tests {
     fn not_exceeds_when_native_over_limit() {
         let limit = AiProcessSizeLimit::square(2048);
         // native 3000x4000 は短辺 3000 ≥ 2048 で range 外。
-        assert!(!pdf_render_exceeds_native_ai_target(
-            3000, 4000, 3000, 4000, true, limit, true, limit, MIN,
+        assert!(!pdf_render_differs_from_native_ai_target(
+            3000, 4000, 3000, 4000, true, limit, true, limit,
         ));
     }
 
@@ -1163,25 +1142,27 @@ mod tests {
     #[test]
     fn not_exceeds_when_already_native() {
         let limit = AiProcessSizeLimit::square(2048);
-        assert!(!pdf_render_exceeds_native_ai_target(
-            824, 1200, 824, 1200, true, limit, false, limit, MIN,
+        assert!(!pdf_render_differs_from_native_ai_target(
+            824, 1200, 824, 1200, true, limit, false, limit,
         ));
     }
 
-    /// Codex 再々レビュー P2 (256px clamp): native 100x200 の実レンダ target 長辺は
-    /// `max(200, 256) = 256`。収束後の cur は 128x256 になるので、raw native (200) と
-    /// 比べると `256 > 200×1.1` で永久に true のままになるが、`render_min_long` を
-    /// 反映すれば `256 > 256×1.1` は false で正しく収束する。4096px 時のみ true。
     #[test]
-    fn min_clamp_lets_tiny_native_converge() {
+    fn tiny_native_converges_at_native_cap() {
         let limit = AiProcessSizeLimit::square(2048);
-        // 4096px レンダ中 → 落とすべき。
-        assert!(pdf_render_exceeds_native_ai_target(
-            100, 200, 2048, 4096, true, limit, false, limit, MIN,
+        assert!(pdf_render_differs_from_native_ai_target(
+            100, 200, 2048, 4096, true, limit, false, limit,
         ));
-        // 実 target (128x256) へ落ちたら収束 (= false)。MIN を無視すると true になり退行。
-        assert!(!pdf_render_exceeds_native_ai_target(
-            100, 200, 128, 256, true, limit, false, limit, MIN,
+        assert!(!pdf_render_differs_from_native_ai_target(
+            100, 200, 100, 200, true, limit, false, limit,
+        ));
+    }
+
+    #[test]
+    fn display_fit_smaller_than_native_defers_ai_until_native_rerender() {
+        let limit = AiProcessSizeLimit::square(4096);
+        assert!(pdf_render_differs_from_native_ai_target(
+            2400, 3600, 1584, 2376, true, limit, false, limit,
         ));
     }
 }

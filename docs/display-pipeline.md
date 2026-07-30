@@ -346,8 +346,9 @@ continuous transition が実際に選ばれた場合も同イベントへ `branc
           ├─ GridItem::ZipImage   → zip_loader で bytes 読み出し → image::load_from_memory
           │                          → 失敗時 WIC ストリームフォールバック (SHCreateMemStream)
           │                          → bytes から EXIF Orientation 適用
-          └─ GridItem::PdfPage    → pdf_loader::render_page (4096px、PDF ワーカープロセス)
-                                     ※zoom 分析モードの時はさらに高解像度で再レンダリング
+          └─ GridItem::PdfPage    → pdf_loader::render_page_for_display
+                                     (実 viewport×ppp、PDF ワーカープロセス)
+                                     ※zoom 時は倍率に応じて再レンダリング
 
 アニメーション:
   ├─ .gif      → fs_animation::decode_gif_frames (通常画像のみ)
@@ -362,6 +363,25 @@ Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示�
 これは edit/final cache key が idx + generation ベースで、フレーム番号を含まないため、
 1 フレームを派生キャッシュに入れると以後の `current_frame` 更新が画面へ出ず
 アニメーションが停止して見えるため。
+
+PDF 初回レンダは、描画先の `fullscreen_media_rect` の論理 point 寸法へ、その
+viewport context の effective `pixels_per_point` (OS DPI × UI scale) を掛けて物理 viewport
+`(Vw, Vh)` を作る。ページ寸法 `(Pw, Ph)` は PDF worker が content type と同じ PDFium
+open 内で取得し、ページ全体表示なら
+`S = min(Vw / Pw, Vh / Ph)`、`target_long = ceil(max(Pw, Ph) × S × 1.10)` とする。
+横幅 / 縦幅 fit はそれぞれ `Vw / Pw` / `Vh / Ph`、90°/270° 回転時はページ軸を交換する。
+1.10 は丸め・filter・1-frame の layout 差で等倍表示を眠くしないための品質余裕である。
+
+- raster-only PDF は同じ worker 内で判明した埋め込み画像の native 長辺を絶対上限にする。
+- 全経路の上限は 8192。100% 原寸 / no-downscale は従来の表示密度を下げないよう
+  vector の最低長辺 4096 を維持し、raster native 上限は常に優先する。
+- `start_fs_load` は実 viewport が確定する前の PDF を enqueue しない。fullscreen、detached、
+  in-window の各 context は同じ typed display target を所有し、先読みもそれを再利用する。
+- 自動 / 手動の表示 trim bbox は初回 raster 到着後に確定する。bbox 部分が viewport へ fit した
+  ときの必要 texel 密度を同じ式で再計算し、不足する場合だけ priority 再レンダする。
+- zoom 再レンダは display-fit 長辺を基準に倍率を掛け、8192 と raster native で clamp する。
+  AI が必要な raster は display-fit が native より小さい場合も大きい場合も native へ収束させ、
+  その間の final AI / AI 先読みを保留する。
 WebP は `ANIM` chunk の背景色を `WebPDecoder::set_background_color` に渡してから
 展開する。`image-webp` は dispose-to-background の処理を持つが、背景色未設定のままだと
 dispose が実質 no-op になり、透明差分フレームで前フレームの軌跡が残る。
@@ -683,8 +703,8 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   no-op になる。final AI / 旧 AI 経路とも判定は `ai::upscale::should_process_rect`。
 - `apply_adjustments_fast` は pointwise 変換なので入力サイズを保つ → 入力が 8192 以内
   ならば出力も 8192 以内。`edit_result_cache` / final AI 結果を入力に取るので成立する。
-- 消しゴム (MI-GAN) / PDF 再レンダ (`request_pdf_rerender` の `.clamp(256, 8192)`) も
-  同じ上限を尊重する。
+- 消しゴム (MI-GAN) / PDF 再レンダも同じ 8192 上限を尊重する。PDF vector は長辺
+  256 以上、raster は native 上限を優先するため極小原稿では 256 未満になり得る。
 - GIF / APNG / WebP アニメーションは `fs_animation::clamp_rgba_frame_for_gpu` で各フレームを
   `MAX_TEXTURE_DIM` 以下に縮めてから `ColorImage` 化する (巨大 animated 画像で
   `ctx.load_texture` が panic するのを防ぐ安全網)。
@@ -1302,7 +1322,8 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   `Raster` として保持し、その後 final AI が完了したら同じページスロットを `FinalAi` に昇格して
   raster pixels を解放する。この PDF ページスロットと汎用保持 LRU は同じ枚数 / MiB 予算で
   合算 LRU 退去される。再表示時に `FinalAi` が条件一致すれば PDF worker を起こさず、AI pixels
-  から `final_composite_cache` を直接復元する。
+  から `final_composite_cache` を直接復元する。`Raster` lookup は固定 4096 ではなく、現在の
+  display target と保持 raster の縦横比から必要長辺を再計算し、±10% 内だけを再利用する。
   外部変更や AI 設定変更で retained epoch が進んでいた場合、その orphan 結果は store 時に捨てる。
   汎用保持 LRU の store / hit /
   miss / skip / evict / clear は `mimageviewer.log` に `[AI] Retained final AI ...`
@@ -1353,7 +1374,7 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
 | 処理 | Image | ZipImage | PdfPage | Video |
 | --- | --- | --- | --- | --- |
 | サムネイルデコード | image/turbojpeg/WIC | image::load_from_memory | PDFium ワーカー | Shell API (別スレッド) |
-| フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で 4096px | なし (サムネのみ) |
+| フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で実 viewport×ppp に fit (raster は native 上限) | なし (サムネのみ) |
 | EXIF Orientation | ✅ path から読む | ✅ bytes から読む | ❌ | — |
 | アニメーション | GIF/APNG/WebP ✅ | WebP ✅ | ❌ | — |
 | 回転 (rotation_db) | ✅ | ✅ (path+entry キー) | ✅ (path+page キー) | — |

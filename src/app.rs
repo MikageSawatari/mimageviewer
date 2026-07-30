@@ -2169,6 +2169,8 @@ struct ViewerContextBundle {
     input_generation: std::collections::HashMap<usize, u64>,
     fs_pending:
         std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
+    fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
     fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
     fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
     items_generation: u64,
@@ -2452,6 +2454,7 @@ impl ViewerContextBundle {
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
+            fs_pdf_display_target: None,
             fs_early_dims: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
             items_generation: 0,
@@ -8140,6 +8143,10 @@ pub struct App {
     pub(crate) fs_pending:
         std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
 
+    /// fullscreen / detached / in-window の実 viewport と effective ppp から得た
+    /// PDF 初回レンダターゲット。viewer context と一緒に swap する。
+    pub(crate) fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
+
     /// fs_load ワーカーがヘッダ解析だけで取得した先行寸法 (fullscreen 用)。
     /// `FsLoadResult::DimsOnly` を受信すると登録され、本体 (`Static` など) で
     /// fs_cache が埋まったら削除される。ホバーバーはデコード完了前でも
@@ -11548,6 +11555,7 @@ impl App {
             view_trim_db,
             input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
+            fs_pdf_display_target: None,
             fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
             colorize_mono_summary_cache: std::collections::HashMap::new(),
@@ -13759,6 +13767,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
             items_generation,
@@ -13984,6 +13993,7 @@ impl App {
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
         swap_field!(fs_pending);
+        swap_field!(fs_pdf_display_target);
         swap_field!(fs_early_dims);
         swap_field!(fs_upload_backlog);
         swap_field!(items_generation);
@@ -37627,6 +37637,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
             items_generation,
@@ -37805,6 +37816,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
             fs_open_intent_from_grid,
@@ -40006,6 +40018,9 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.capture_region_selection = None;
+        if self.fullscreen_idx.is_none() {
+            self.fs_pdf_display_target = None;
+        }
         self.fullscreen_idx = Some(idx);
         // 音声以外を開いたら音楽ビュー (Inc 3b/4) の状態を破棄する。フルスクリーン内で
         // 音声→画像/動画へ移動しても draw_fs_music_view は呼ばれず、放置すると旧音声の解析
@@ -46186,6 +46201,22 @@ impl App {
             _ => return,
         };
         let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
+        let pdf_display_request = if pdf_page.is_some() {
+            // PDF は実際に描く viewport が確定するまで enqueue しない。専用 fullscreen、
+            // detached、in-window は別々の egui context / ppp を持ち得るため、推測値で
+            // 先行すると初回だけ過大・過小レンダになる。
+            let Some(viewport) = self.fs_pdf_display_target else {
+                return;
+            };
+            let rotation = self.get_rotation(idx);
+            let swap_page_axes = matches!(
+                rotation,
+                crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270
+            );
+            Some((viewport, swap_page_axes))
+        } else {
+            None
+        };
 
         if pdf_page.is_some() {
             if self.has_retained_pdf_final_ai_for_current_params(idx) {
@@ -46194,9 +46225,13 @@ impl App {
                 ));
                 return;
             }
-            if let Some((pixels, source_dims)) =
-                self.lookup_retained_pdf_page_raster(idx, 4096, "start_fs_load")
-            {
+            let (viewport, swap_page_axes) = pdf_display_request.unwrap();
+            if let Some((pixels, source_dims)) = self.lookup_retained_pdf_page_raster_for_display(
+                idx,
+                viewport,
+                swap_page_axes,
+                "start_fs_load",
+            ) {
                 self.enqueue_retained_pdf_page_raster_result(
                     idx,
                     pixels,
@@ -46371,12 +46406,13 @@ impl App {
 
             // PDF ページの場合はラスタライズ
             if let Some(page_num) = pdf_page {
-                let target_px = 4096u32;
+                let (viewport, swap_page_axes) = pdf_display_request.unwrap();
                 let mut pdf_exit = "pdf_ok";
-                match crate::pdf_loader::render_page(
+                match crate::pdf_loader::render_page_for_display(
                     &path,
                     page_num,
-                    target_px,
+                    viewport,
+                    swap_page_axes,
                     pdf_password.as_deref(),
                     Some(cancel.clone()),
                     pdf_priority,
@@ -46767,6 +46803,71 @@ impl App {
         });
     }
 
+    fn pdf_display_render_long_edge_for_idx(
+        &mut self,
+        idx: usize,
+        content_type: Option<crate::pdf_loader::PdfPageContentType>,
+        content_bbox: Option<egui::Rect>,
+    ) -> Option<u32> {
+        let viewport = self.fs_pdf_display_target?;
+        let (page_w, page_h) = match content_type {
+            Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => (w as f32, h as f32),
+            _ => match self.fs_cache.get(&idx) {
+                Some(FsCacheEntry::Static { pixels, .. }) => {
+                    (pixels.size[0] as f32, pixels.size[1] as f32)
+                }
+                _ => return None,
+            },
+        };
+        let rotation = self.get_rotation(idx);
+        let swap_page_axes = matches!(
+            rotation,
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270
+        );
+        let content_type = content_type.unwrap_or(crate::pdf_loader::PdfPageContentType::Vector);
+        Some(match content_bbox {
+            Some(bbox) => crate::pdf_loader::display_render_long_edge_for_content_bbox(
+                viewport,
+                page_w,
+                page_h,
+                swap_page_axes,
+                content_type,
+                bbox.width(),
+                bbox.height(),
+            ),
+            None => crate::pdf_loader::display_render_long_edge(
+                viewport,
+                page_w,
+                page_h,
+                swap_page_axes,
+                content_type,
+            ),
+        })
+    }
+
+    pub(crate) fn ensure_pdf_display_resolution(
+        &mut self,
+        idx: usize,
+        content_bbox: Option<egui::Rect>,
+    ) {
+        let content_type = match self.items.get(idx) {
+            Some(GridItem::PdfPage { content_type, .. }) => *content_type,
+            _ => return,
+        };
+        let cached_long = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.size[0].max(pixels.size[1]) as u32,
+            _ => return,
+        };
+        let Some(target_px) =
+            self.pdf_display_render_long_edge_for_idx(idx, content_type, content_bbox)
+        else {
+            return;
+        };
+        if (cached_long as f32) < (target_px as f32 * 0.9) {
+            self.request_pdf_rerender_at_target(idx, target_px, true);
+        }
+    }
+
     /// PDF ページをズーム倍率に応じた解像度で非同期再レンダリングする。
     ///
     /// ワーカーに直接リクエストを送り、結果は `poll_pdf_rerender` で受け取る。
@@ -46775,50 +46876,60 @@ impl App {
     /// `priority=false`: AI 先読み用の非表示ページ native 再レンダ (通常レーン、
     /// visible の再レンダ / UI ナビを妨げない)。
     pub(crate) fn request_pdf_rerender(&mut self, idx: usize, zoom: f32, priority: bool) {
-        let (pdf_path, page_num, password, content_type) = match self.items.get(idx) {
+        let content_type = match self.items.get(idx) {
+            Some(GridItem::PdfPage { content_type, .. }) => *content_type,
+            _ => return,
+        };
+
+        // ズーム基準は初回と同じ実 viewport×ppp。これにより初回を小さくしても、
+        // ズーム時は倍率に応じて従来どおり再レンダされる。AI が native 入力を必要とする
+        // raster だけは native を基準にし、全 raster で原稿長辺を絶対上限にする。
+        let ai_native_long = match content_type {
+            Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => {
+                let native_long = w.max(h);
+                let params = self.effective_params(idx);
+                let ai_needs_native = (self.effective_upscale_request(params).is_some()
+                    && crate::ai::upscale::should_process_rect(
+                        w,
+                        h,
+                        self.settings.ai_upscale_limit(),
+                    ))
+                    || (self.effective_denoise_request(params).is_some()
+                        && crate::ai::upscale::should_process_rect(
+                            w,
+                            h,
+                            self.settings.ai_denoise_limit(),
+                        ));
+                ai_needs_native.then_some(native_long)
+            }
+            _ => None,
+        };
+        let (base_px, native_cap) = if let Some(native_long) = ai_native_long {
+            (native_long, Some(native_long))
+        } else {
+            let content_bbox = self.pdf_content_bbox_for_display_idx(idx);
+            let display_base_px = self
+                .pdf_display_render_long_edge_for_idx(idx, content_type, content_bbox)
+                .unwrap_or(4096);
+            let native_cap = content_type.and_then(|content_type| content_type.native_long_edge());
+            (display_base_px, native_cap)
+        };
+        let target_px = crate::pdf_loader::zoom_render_long_edge(base_px, zoom, native_cap);
+
+        self.request_pdf_rerender_at_target(idx, target_px, priority);
+    }
+
+    fn request_pdf_rerender_at_target(&mut self, idx: usize, target_px: u32, priority: bool) {
+        let (pdf_path, page_num, password) = match self.items.get(idx) {
             Some(GridItem::PdfPage {
-                pdf_path,
-                page_num,
-                content_type,
+                pdf_path, page_num, ..
             }) => (
                 pdf_path.clone(),
                 *page_num,
                 self.pdf_current_password.clone(),
-                *content_type,
             ),
             _ => return,
         };
-
-        // 上限 8192: これ以上大きいとテクスチャメモリが巨大になりクラッシュする
-        // (8192px 正方形 ≈ 256 MB RGBA、16384px ≈ 1 GB)
-        // ラスターページでネイティブ解像度が AI 処理対象 (アップスケール / デノイズ
-        // いずれかのサイズ上限内) の場合のみ原寸基準でレンダリング。それ以外は従来通り
-        // 4096px 基準。final AI はレンダ後のピクセルサイズで判定するため、4096 固定の
-        // ままだと上限内の原寸ページでも AI がスキップされる。デノイズ側の上限も見るのは
-        // Codex P2 指摘 (アップスケール上限だけ見ると、デノイズのみ範囲内のページが
-        // 4096 でレンダされてデノイズが掛からない)。
-        let base_px = match content_type {
-            Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => {
-                let native_long = w.max(h);
-                let in_ai_range =
-                    crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit())
-                        || crate::ai::upscale::should_process_rect(
-                            w,
-                            h,
-                            self.settings.ai_denoise_limit(),
-                        );
-                if in_ai_range {
-                    native_long as f32
-                } else {
-                    4096.0
-                }
-            }
-            _ => 4096.0, // Vector or not yet analyzed
-        };
-        let target_px = ((base_px * zoom) as u32).clamp(
-            crate::pdf_loader::PDF_RENDER_MIN_LONG_PX,
-            crate::pdf_loader::PDF_RENDER_MAX_LONG_PX,
-        );
 
         if self.has_retained_pdf_final_ai_for_current_params(idx) {
             crate::logger::log(format!(
@@ -46913,7 +47024,7 @@ impl App {
     /// 先読みウィンドウを更新する。
     /// settings の prefetch_back / prefetch_forward に従って先読みを開始し、
     /// ウィンドウ外のキャッシュ・読み込みを破棄する。
-    fn update_prefetch_window(&mut self, current_idx: usize) {
+    pub(crate) fn update_prefetch_window(&mut self, current_idx: usize) {
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return;
@@ -47411,6 +47522,7 @@ impl App {
 
         self.reset_fs_side_panel_runtime_for_file_change();
         self.fullscreen_idx = None;
+        self.fs_pdf_display_target = None;
         // `close_fullscreen` is also used as a generic teardown from
         // `start_loading_items`, even when no viewer is open.  Refreshing the
         // bookmark surface in that path creates a loop:
@@ -48749,8 +48861,8 @@ impl App {
             if self.has_uncancelled_final_ai_pending() {
                 return;
             }
-            // Raster PDF が「現行 4096px レンダ → 表示時 native 再レンダ」になるページは、
-            // 4096px に AI 先読みを流しても native 再レンダで捨てられる (GitHub issue #1)。
+            // Raster PDF の現行 display-fit 結果が AI 用 native 入力と異なるページは、
+            // 現行結果に AI 先読みを流しても native 再レンダで捨てられる。
             // 代わりに native 再レンダを **通常レーンで先に起動** (visible を妨げない) し、
             // AI 先読みは native 着地まで保留する。これで画像の先読みと同様、移動時に
             // native + final AI が揃って即表示できる。
@@ -51645,6 +51757,44 @@ impl App {
         }
     }
 
+    fn lookup_retained_pdf_page_raster_for_display(
+        &mut self,
+        idx: usize,
+        viewport: crate::pdf_loader::PdfDisplayTarget,
+        swap_page_axes: bool,
+        reason: &str,
+    ) -> Option<(Arc<egui::ColorImage>, [usize; 2])> {
+        let dimensions = self
+            .retained_pdf_page_key_for(idx)
+            .and_then(|key| self.retained_pdf_page_cache.get(&key))
+            .and_then(|entry| match &entry.kind {
+                RetainedPdfPageCacheKind::Raster { pixels, .. } => {
+                    Some((pixels.size[0] as f32, pixels.size[1] as f32))
+                }
+                RetainedPdfPageCacheKind::FinalAi { .. } => None,
+            });
+        let content_type = match self.items.get(idx) {
+            Some(GridItem::PdfPage {
+                content_type: Some(content_type),
+                ..
+            }) => *content_type,
+            _ => crate::pdf_loader::PdfPageContentType::Vector,
+        };
+        let target_px = dimensions.map_or_else(
+            || viewport.width_px.max(viewport.height_px),
+            |(w, h)| {
+                crate::pdf_loader::display_render_long_edge(
+                    viewport,
+                    w,
+                    h,
+                    swap_page_axes,
+                    content_type,
+                )
+            },
+        );
+        self.lookup_retained_pdf_page_raster(idx, target_px, reason)
+    }
+
     fn lookup_retained_pdf_page_raster(
         &mut self,
         idx: usize,
@@ -53196,9 +53346,8 @@ impl App {
                 (Arc::clone(&adjusted), true, false)
             }
             (Some(key), None) => {
-                // Raster PDF が native 再レンダ待ち/進行中 (現行 4096px) のときは、捨てる
-                // 4096px AI (高負荷上限では ~11.5MP) を流さず native 着地まで保留する
-                // (GitHub issue #1, Codex P2)。暫定 (color-adjusted) を complete=false で
+                // Raster PDF が native 再レンダ待ち/進行中なら、捨てる display-fit 結果へ
+                // AI を流さず native 着地まで保留する。暫定 (color-adjusted) を complete=false で
                 // 見せ、native 着地 → bump_input_generation → 再合成で AI 起動。fs_pending の
                 // native 再レンダが repaint を維持するので保留は次フレームで再評価される。
                 let ai_will_arrive = if self.display_should_defer_final_ai(idx) {
@@ -54496,19 +54645,15 @@ impl App {
         }
     }
 
-    /// 指定 PDF ラスターページが「native 寸法は AI 範囲内なのに 4096px 固定レンダで現行が
-    /// native より大きい」状態なら、native 解像度へ再レンダして final AI を起動する
-    /// (GitHub issue #1)。`idx` は fs_idx に限らず、**見開き相方・連続表示の可視ページ**にも
-    /// 個別に適用する (それらも `resolve_fs_processed_texture` で final AI 対象のため)。
+    /// 指定 PDF raster の display-fit レンダが AI 入力用 native 寸法と異なるなら、
+    /// native 解像度へ再レンダして final AI を起動する。`idx` は fs_idx に限らず、
+    /// 見開き相方・連続表示の可視ページにも個別に適用する。
     ///
-    /// PDF 初回フルスクリーンは content_type 未解析のため `start_fs_load` が 4096px 固定で
-    /// レンダし、final AI はレンダ後のピクセルサイズで判定する。よって native がサイズ上限内
-    /// (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095) では AI が
-    /// スキップ (既定 2048 上限) されるか、約 11.5MP を AI に流す (高負荷上限)。本 reconcile を
-    /// 毎フレーム評価することで「初回表示で AI ON」「開いてサイズ確認後に AI を ON」の両方を
-    /// 拾い、かつ高負荷上限でも native (原寸) へ落としてから AI する。
+    /// 初回 display-fit は native より小さい場合があり、native 上限に当たれば同寸にもなる。
+    /// AI は原稿 native を入力契約とするため、どちらの差も毎フレーム reconcile し、
+    /// 「初回から AI ON」「表示後に AI ON」の両方で破棄予定 raster に AI を流さない。
     ///
-    /// 判定 (`should_native_rerender_pdf_for_ai` = `pdf_native_downscale_pending(t, t)`) は
+    /// 判定 (`should_native_rerender_pdf_for_ai` = `pdf_native_rerender_pending(t, t)`) は
     /// ページ個別 `effective_params(idx)` で AI 有効性を見るので、AI 設定が fs_idx と異なる
     /// 相方ページでも正しい。in-flight 中 / ズーム中 / 収束後は false を返してループや無駄な
     /// 再レンダを防ぐ。
@@ -54547,22 +54692,19 @@ impl App {
         Some((*w, *h, cur_w, cur_h, upscale_on, denoise_on))
     }
 
-    /// PDF ラスターページが「現行レンダ (4096px 等) のままで、native 再レンダ後の AI 入力
-    /// 寸法より十分大きい」状態か = 「native へ置換予定 / 置換中」(GitHub issue #1)。
-    /// この間は、現行レンダに final AI を流しても native 着地で捨てる / 重すぎる。
-    /// 中核数式は純関数 `ai::upscale::pdf_render_exceeds_native_ai_target`
-    /// (`PDF_RENDER_MIN_LONG_PX` で実レンダ target 長辺に補正)。ここでは 2 つのゲートを足す:
+    /// 現行 display-fit レンダが native AI 入力と異なり、置換予定 / 置換中か。
+    /// 中核数式は純関数 `ai::upscale::pdf_render_differs_from_native_ai_target`。
+    /// ここでは 2 つのゲートを足す:
     ///
     /// - `respect_zoom`: true なら `fs_zoom != 1` で false (表示中ページは現ズーム基準で
     ///   レンダされ native へは落とさない)。先読みページは fit で開かれる前提なので false。
     /// - `gate_in_flight`: true なら再レンダ進行中 (`fs_pending`) は false (再キック抑止)。
-    ///   AI 保留判定では false にして進行中も「保留」を維持する (進行中に 4096px へ AI を
-    ///   流さない)。
+    ///   AI 保留判定では false にして進行中も保留を維持する。
     ///
     /// 用途別:
     /// - KICK (`should_native_rerender_pdf_for_ai`) = `(respect_zoom, gate_in_flight)=(t,t)`
     /// - 表示経路の AI 保留 = `(t, f)` / 先読みの AI 保留・再レンダ起動 = `(f, f)`
-    fn pdf_native_downscale_pending(
+    fn pdf_native_rerender_pending(
         &self,
         idx: usize,
         respect_zoom: bool,
@@ -54579,7 +54721,7 @@ impl App {
         if gate_in_flight && self.fs_pending.contains_key(&idx) {
             return false;
         }
-        crate::ai::upscale::pdf_render_exceeds_native_ai_target(
+        crate::ai::upscale::pdf_render_differs_from_native_ai_target(
             native_w,
             native_h,
             cur_w,
@@ -54588,27 +54730,26 @@ impl App {
             self.settings.ai_upscale_limit(),
             denoise_on,
             self.settings.ai_denoise_limit(),
-            crate::pdf_loader::PDF_RENDER_MIN_LONG_PX,
         )
     }
 
     /// `maybe_native_rerender_pdf_for_ai` の判定部 (KICK、副作用なし、テスト用に分離)。
     /// 表示中ページ向けに `fs_zoom` と in-flight ガード込み。
     pub(crate) fn should_native_rerender_pdf_for_ai(&self, idx: usize) -> bool {
-        self.pdf_native_downscale_pending(idx, true, true)
+        self.pdf_native_rerender_pending(idx, true, true)
     }
 
     /// AI 先読み用: 非表示ページの現行レンダに AI を流すと native 着地で捨てるため保留すべきか。
     /// ズーム非依存 (先読みは fit で開かれる)・in-flight 非ガード (再レンダ中も保留継続)。
     pub(crate) fn pdf_prefetch_should_defer_ai(&self, idx: usize) -> bool {
-        self.pdf_native_downscale_pending(idx, false, false)
+        self.pdf_native_rerender_pending(idx, false, false)
     }
 
     /// 表示経路用: 表示中ページの現行レンダ (native へ置換予定/置換中) に final AI を
     /// 流すべきでないか。`fs_zoom` を尊重 (ズーム中は native へ落とさないので保留しない)、
-    /// in-flight は非ガード (native 再レンダ進行中も保留継続して 4096px に AI を流さない)。
+    /// in-flight は非ガード (native 再レンダ進行中も保留継続)。
     pub(crate) fn display_should_defer_final_ai(&self, idx: usize) -> bool {
-        self.pdf_native_downscale_pending(idx, true, false)
+        self.pdf_native_rerender_pending(idx, true, false)
     }
 
     /// 右上フィードバック表示を設定する (既定の表示時間)。
@@ -60668,8 +60809,8 @@ impl eframe::App for App {
                 }
                 _ => None,
             };
-            // PDF ラスターページが「native は AI 範囲内なのに 4096px レンダで現行が native
-            // より大きい」状態なら native 解像度へ再レンダして AI を起動する (issue #1)。
+            // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
+            // 解像度へ再レンダして AI を起動する。
             // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
             // 判定自体はページ個別 effective_params なので、見開き相方・連続表示の可視
             // ページ (= ui_fullscreen が final AI をかける全ページ) にも個別に適用する。

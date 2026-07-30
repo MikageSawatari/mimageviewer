@@ -8133,6 +8133,74 @@ impl App {
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
                         let full_rect = ui.max_rect();
+                        // 初回 PDF raster は描画先の実 inner rect と、この ctx 固有の
+                        // effective ppp が揃ってから開始する。これで fullscreen viewport、
+                        // detached window、in-window のいずれも OS DPI + UI scale を含む。
+                        let pdf_fit_mode = self.pdf_display_fit_mode();
+                        let pdf_analysis_active = self.analysis_mode
+                            && !is_spread_double
+                            && !self.is_panorama_mode_active(fs_idx);
+                        let pdf_media_rect = if pdf_analysis_active {
+                            analysis_image_rect(full_rect)
+                        } else {
+                            self.fullscreen_media_rect(full_rect, fs_idx, state.is_video)
+                        };
+                        let pdf_display_target = crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+                            pdf_media_rect.width(),
+                            pdf_media_rect.height(),
+                            ctx.pixels_per_point(),
+                            pdf_fit_mode,
+                        );
+                        let pdf_target_changed =
+                            self.fs_pdf_display_target != Some(pdf_display_target);
+                        self.fs_pdf_display_target = Some(pdf_display_target);
+
+                        let pdf_partner = match spread_pair {
+                            SpreadPair::Double { left, right } => {
+                                Some(if left == fs_idx { right } else { left })
+                            }
+                            SpreadPair::Single => None,
+                        };
+                        let current_is_pdf = matches!(
+                            self.items.get(fs_idx),
+                            Some(GridItem::PdfPage { .. })
+                        );
+                        let partner_is_pdf = pdf_partner.is_some_and(|idx| {
+                            matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
+                        });
+                        let pdf_current_bbox = current_is_pdf
+                            .then(|| self.pdf_content_bbox_for_display_idx(fs_idx))
+                            .flatten();
+                        let pdf_partner_bbox = pdf_partner
+                            .filter(|&idx| {
+                                matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
+                            })
+                            .and_then(|idx| self.pdf_content_bbox_for_display_idx(idx));
+
+                        if current_is_pdf {
+                            if !self.fs_cache.contains_key(&fs_idx)
+                                && !self.fs_pending.contains_key(&fs_idx)
+                            {
+                                self.start_fs_load(fs_idx);
+                            }
+                            self.ensure_pdf_display_resolution(fs_idx, pdf_current_bbox);
+                        }
+                        if let Some(partner) = pdf_partner {
+                            if matches!(self.items.get(partner), Some(GridItem::PdfPage { .. })) {
+                                if !self.fs_cache.contains_key(&partner)
+                                    && !self.fs_pending.contains_key(&partner)
+                                {
+                                    self.start_fs_load(partner);
+                                }
+                                self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
+                            }
+                        }
+                        if pdf_target_changed
+                            && (current_is_pdf || partner_is_pdf)
+                            && self.reading_flow.is_paged()
+                        {
+                            self.update_prefetch_window(fs_idx);
+                        }
                         let input_t0 = std::time::Instant::now();
 
                         // ── キー入力 ──
@@ -15511,6 +15579,10 @@ impl App {
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_free_rotation = 0.0;
+        let pdf_fit_mode = self.pdf_display_fit_mode();
+        if let Some(target) = self.fs_pdf_display_target.as_mut() {
+            target.fit_mode = pdf_fit_mode;
+        }
         self.maybe_rerender_pdf(1.0);
         if matches!(
             self.settings.fullscreen_fit_mode,
@@ -15524,6 +15596,58 @@ impl App {
         self.settings
             .fullscreen_fit_mode
             .effective_for_flow(self.reading_flow)
+    }
+
+    fn pdf_display_fit_mode(&self) -> crate::pdf_loader::PdfDisplayFitMode {
+        if self.settings.fullscreen_fit_no_downscale {
+            return crate::pdf_loader::PdfDisplayFitMode::Original;
+        }
+        match self.effective_fullscreen_fit_mode() {
+            FullscreenFitMode::Page | FullscreenFitMode::MarginFit => {
+                crate::pdf_loader::PdfDisplayFitMode::Page
+            }
+            FullscreenFitMode::Width => crate::pdf_loader::PdfDisplayFitMode::Width,
+            FullscreenFitMode::Height => crate::pdf_loader::PdfDisplayFitMode::Height,
+            FullscreenFitMode::Original => crate::pdf_loader::PdfDisplayFitMode::Original,
+        }
+    }
+
+    pub(crate) fn pdf_content_bbox_for_display_idx(&mut self, idx: usize) -> Option<egui::Rect> {
+        if !self.get_rotation(idx).is_none() {
+            return None;
+        }
+        match self.resolve_visible_spread_pair(idx) {
+            SpreadPair::Single => self.view_trim_single_content_bbox(idx),
+            SpreadPair::Double { left, right } => {
+                let left_rot = self.get_rotation(left);
+                let right_rot = self.get_rotation(right);
+                let (left_bbox, right_bbox) = if left_rot.is_none() && right_rot.is_none() {
+                    self.view_trim_spread_content_bboxes(left, right)
+                } else {
+                    (
+                        left_rot
+                            .is_none()
+                            .then(|| {
+                                self.view_trim_spread_content_bbox(
+                                    left,
+                                    crate::view_trim::ViewTrimSpreadSide::Left,
+                                )
+                            })
+                            .flatten(),
+                        right_rot
+                            .is_none()
+                            .then(|| {
+                                self.view_trim_spread_content_bbox(
+                                    right,
+                                    crate::view_trim::ViewTrimSpreadSide::Right,
+                                )
+                            })
+                            .flatten(),
+                    )
+                };
+                if idx == left { left_bbox } else { right_bbox }
+            }
+        }
     }
 
     fn fullscreen_fit_scale_limits(&self) -> FullscreenFitScaleLimits {

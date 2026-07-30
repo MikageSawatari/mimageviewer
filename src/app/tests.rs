@@ -15966,9 +15966,15 @@ mod favorite_adjustment_defaults_tests {
         // global_preset でアップスケール ON → effective_params 経由で再レンダ要。
         app.settings.global_preset.upscale_model = Some("auto".to_string());
         assert!(app.should_native_rerender_pdf_for_ai(idx));
-        // 表示経路の AI 保留判定 (display_should_defer = respect_zoom, no in-flight gate) も
-        // 同じく true (4096px に final AI を流さない)。
+        // 表示経路の AI 保留判定も同じく true (破棄予定 raster に final AI を流さない)。
         assert!(app.display_should_defer_final_ai(idx));
+
+        // 新しい初回 viewport-fit が native より小さい場合も、AI は native 入力へ
+        // 収束するまで保留する。
+        set_cur(&mut app, 50, 100, &dummy_tex);
+        assert!(app.should_native_rerender_pdf_for_ai(idx));
+        assert!(app.display_should_defer_final_ai(idx));
+        set_cur(&mut app, 100, 4000, &dummy_tex);
 
         // Codex P1: ページ個別設定で AI OFF にすると、global が ON でも再レンダしない
         // (= 見開き相方ページが個別に AI OFF のとき final AI も走らないのと一致)。
@@ -15998,9 +16004,8 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.should_native_rerender_pdf_for_ai(idx));
         app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(2048));
 
-        // 収束: native 100x200 の実レンダ着地は 256px clamp 後の 128x256 (raw native では
-        // ない、Codex 再々レビュー P2)。ここで再レンダ不要に収束する。
-        set_cur(&mut app, 128, 256, &dummy_tex);
+        // 収束: raster native 上限を 256px 下限より優先し、100x200 原寸へ着地する。
+        set_cur(&mut app, 100, 200, &dummy_tex);
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
         assert!(!app.display_should_defer_final_ai(idx));
     }
@@ -16071,10 +16076,10 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.details_warm_image_dims(0), Some((321, 654)));
     }
 
-    /// GitHub issue #1 / Codex P2 (AI 先読み): 非表示 Raster PDF の 4096px レンダに AI を
-    /// 流すと表示時 native 再レンダで捨てるため、native 着地まで AI 先読みを保留する。
+    /// 非表示 Raster PDF の display-fit レンダに AI を流すと native 再レンダで捨てるため、
+    /// native 着地まで AI 先読みを保留する。
     /// `pdf_prefetch_should_defer_ai` は should_native と違いズーム / in-flight を見ず、
-    /// 「cur が native より十分大きい間」true を返す (native 再レンダ中も保留継続)。
+    /// 「cur が native と異なる間」true を返す (native 再レンダ中も保留継続)。
     #[test]
     fn pdf_prefetch_defers_ai_until_native() {
         use crate::ai::ModelKind;
@@ -16124,6 +16129,11 @@ mod favorite_adjustment_defaults_tests {
         app.settings.global_preset.upscale_model = Some("auto".to_string());
         assert!(app.pdf_prefetch_should_defer_ai(idx));
 
+        // viewport-fit が native より小さい場合も、捨てられる AI 先読みを保留する。
+        set_cur(&mut app, 50, 100, &dummy_tex);
+        assert!(app.pdf_prefetch_should_defer_ai(idx));
+        set_cur(&mut app, 100, 4000, &dummy_tex);
+
         // 高負荷上限 (4096) でも cur (100x4000) > native → 保留して native へ落とす (P2)。
         app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(4096));
         assert!(app.pdf_prefetch_should_defer_ai(idx));
@@ -16135,9 +16145,8 @@ mod favorite_adjustment_defaults_tests {
             Some(ModelKind::DenoiseRealplksr.as_str().to_string());
         assert!(app.pdf_prefetch_should_defer_ai(idx));
 
-        // native 着地: 実レンダは 256px clamp 後の 128x256 (Codex 再々レビュー P2: raw
-        // native 100x200 を着地扱いにすると 256>200×1.1 で永久保留になる退行)。保留解除。
-        set_cur(&mut app, 128, 256, &dummy_tex);
+        // native 着地で保留解除。
+        set_cur(&mut app, 100, 200, &dummy_tex);
         assert!(!app.pdf_prefetch_should_defer_ai(idx));
     }
 
