@@ -375,6 +375,40 @@
   (待ち時間そのものを縮める側の作業)。
 - 規模 / 優先度: Small / P2 candidate (体感の問題だが、動いていないと誤解させる)。
 
+### 3.5 フォルダ移動の holdover が見開きの片ページしか保持しない
+
+- 出典: v2.9.0 公開後のユーザー報告 (2026-07-31)。カラー化した見開きを表示中に
+  `Ctrl+↓` で次フォルダへ移ると、**一瞬「見開きの片方だけ」が画面いっぱいに出てから**
+  次フォルダの画像に変わる。
+- 原因は特定済み。**カラー化固有ではなく、見開き + フォルダ移動なら常に起きる**。
+  カラー化は次ページの合成待ちで holdover が長く残るため、目に見えるようになる。
+  - [ui_fullscreen.rs](../src/ui_fullscreen.rs) の `capture_fs_nav_holdover(fs_idx)` は
+    `current_fs_tex_for_holdover(fs_idx)` = **アンカーページ 1 枚だけ**を掴んで
+    `FsHoldover::FolderNavigation(texture)` にする。
+  - 描画側は同ファイルの `fs_nav_holdover_decision` の doc が明言するとおり
+    「`image_rect` 全体へ **1 枚だけ** contain オーバーレイする」。よって見開きだった画面が、
+    移動の瞬間に片ページだけの表示へ替わり、しかも全面に contain されるので**拡大もされる**。
+- **v2.9.0 の退行ではない**。`eabd69f2` (カラー化待ちの holdover を表示ユニット一体で保持)
+  はカラー化側だけを直し、`FsHoldover` の doc コメントで「フォルダ横断は従来どおり旧ビューの
+  単一 texture を overlay として保持する」と、この非対称を意図的に残している。
+  ただし bisect はしていない。
+- 対応方針: **holdover の中身を「画面に出ていた表示ユニット」に統一する**。器は既にある
+  ([app.rs](../src/app.rs) の `FsDisplayUnitHoldover` = 画面順の `pages: Vec<{idx, texture}>`、
+  単ページなら 1 要素・見開きなら 2 要素)。2 つの variant が違うのは *保持する理由* (フォルダ
+  移動か、カラー化待ちか) であって *保持すべき中身* ではない。
+- 着手時の注意:
+  - **解除条件は統合しない**。カラー化側は `target_idx` が current の間だけ、フォルダ移動側は
+    `fs_nav_locked_gen` + 新ページの readiness で解除する。ここは別のままにする
+  - 描画側は 1 枚 contain 前提なので、1〜2 ページを旧レイアウトで並べる経路が要る
+  - items 入れ替えで旧 `fs_cache` は落ちるが、保持しているのは `TextureHandle` なので
+    ユニット化しても寿命は同じ (カラー化側が既にそうしている)
+  - 兄弟経路の確認: 単ページ (現状どおりであること)、連結読み (この経路を通るか未確認)、
+    detached / 複数ウィンドウ、`Ctrl+PageUp/Down` など `capture_fs_nav_holdover` を呼ぶ他の入口
+    ([ui_fullscreen.rs](../src/ui_fullscreen.rs) に 6 箇所ある)
+- 関連: §3.4 と同じ「カラー化待ちが見える」系だが別物 (あちらは手掛かりが無い話、
+  こちらは holdover の中身が欠けている話)。
+- 規模 / 優先度: Small〜Medium / P2 candidate。
+
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
