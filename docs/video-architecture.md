@@ -330,6 +330,16 @@ frame を毎 loop 全件 drain する。seek serial を検証したうえで途�
 `Visible` にして即時再提示する。通常の visible playback は従来どおり queue cap と decoder
 back-pressure を使う。
 
+可視状態の正本は window-pump thread の typed `WindowHostState` であり、pump は適用済み状態を
+output-lifetime の `NativePresenterVisibility` に publish する。App の show 完了判定と render loop の
+visible pacing / hidden drain はこの同じ projection を読む。render-local の可変 bool は持たない。
+`SwitchSource` が交換するのは source-lifetime の `PresenterSourceState` (receiver / clock / duration /
+epoch) だけで、hidden のまま何回交換しても output-lifetime の visibility は維持される。
+visibility request は適用の有無にかかわらず 1 request : 1 completion とする。すでに Hidden の host へ
+再度 hide を要求した場合、typed reducer は native `SW_HIDE` を繰り返さず
+`ConfirmVisibility` を返し、pump は通常の適用と同じ `VisibilityApplied` を返す。source-swap 完了時の
+音声モード再確立が冪等な hide になっても、render thread は completion 待ちから必ず復帰する。
+
 GPU frame は producer が writer key 0 で書き、`ReleaseSync(1)` で reader へ渡す。render は
 `AcquireSync(1)` で読み取ったあと、成功したコピーでは **そのまま `ReleaseSync(1)`** して
 reader-ready に保つ。したがって held frame の再提示に `AcquireSync(0)` を追加する必要はない。
@@ -1877,6 +1887,12 @@ presenter の source だけを差し替える keep-audio-mode の source-swap �
 動画でも映像を出さずに音声モードのまま連続再生する。**VST は引き継ぐ**。動画→音声モードでも
 VST チェーンは `dsp_bridge` 共有で維持され、音声モード中に VST GUI を出すときだけ hidden
 presenter を一時的に un-hide して VST ホスト化する (音効果自体は元から通っている)。
+
+この source-swap では pump-owned の `WindowHostState` と、その output-lifetime projection
+`NativePresenterVisibility` は交換しない。新 source の `video_rx` も最初の source と同じ hidden
+drain policy を直ちに使うため、seek 直後を含め `video_tx` の back-pressure で demux EOF を塞がない。
+swap 完了後の音声モード再確立は hide を再要求するが、Hidden→Hidden でも pump が completion を返す。
+音声モード終了時だけ typed show transition が projection を visible に戻す。
 
 実装の詳細な段階計画 (10 ステップ)・Codex 設計レビュー履歴は
 [music-integration-plan.md](music-integration-plan.md) § 5.7 を参照。

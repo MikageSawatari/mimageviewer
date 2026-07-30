@@ -25,9 +25,9 @@ use super::window_host_contract::{
     reduce_window_host,
 };
 use super::{
-    NativeOutputEventSender, NativeVideoOutputConfig, NativeVideoOutputEvent, NativeVideoPlacement,
-    native_hud_overlay_enabled_for_placement, native_window_mode_for_placement,
-    native_window_owner_for_placement,
+    NativeOutputEventSender, NativePresenterVisibility, NativeVideoOutputConfig,
+    NativeVideoOutputEvent, NativeVideoPlacement, native_hud_overlay_enabled_for_placement,
+    native_window_mode_for_placement, native_window_owner_for_placement,
 };
 
 const CONTROL_CAPACITY: usize = 64;
@@ -265,7 +265,7 @@ pub(crate) struct NativeWindowPumpSpawn {
     pub(crate) hwnd_out: Arc<AtomicU64>,
     pub(crate) hud_hwnd_out: Arc<AtomicU64>,
     pub(crate) closed: Arc<AtomicBool>,
-    pub(crate) presenter_hidden: Arc<AtomicBool>,
+    pub(crate) presenter_visibility: NativePresenterVisibility,
     pub(crate) source_epoch: Arc<AtomicU64>,
     pub(crate) ui_event_tx: NativeOutputEventSender,
     pub(crate) init_error: Arc<Mutex<Option<String>>>,
@@ -321,7 +321,7 @@ struct PumpRuntime {
     hwnd_out: Arc<AtomicU64>,
     hud_hwnd_out: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
-    presenter_hidden: Arc<AtomicBool>,
+    presenter_visibility: NativePresenterVisibility,
     source_epoch: Arc<AtomicU64>,
     ui_event_tx: NativeOutputEventSender,
     init_error: Arc<Mutex<Option<String>>>,
@@ -359,7 +359,7 @@ impl PumpRuntime {
             hwnd_out: spawn.hwnd_out,
             hud_hwnd_out: spawn.hud_hwnd_out,
             closed: spawn.closed,
-            presenter_hidden: spawn.presenter_hidden,
+            presenter_visibility: spawn.presenter_visibility,
             source_epoch: spawn.source_epoch,
             ui_event_tx: spawn.ui_event_tx,
             init_error: spawn.init_error,
@@ -551,6 +551,9 @@ impl PumpRuntime {
             WindowHostEffect::ApplyVisibility { host, visibility } => {
                 self.apply_visibility(host, visibility)
             }
+            WindowHostEffect::ConfirmVisibility { host, visibility } => {
+                self.confirm_visibility(host, visibility)
+            }
             WindowHostEffect::Destroy { host } | WindowHostEffect::DestroyOrphan { host } => {
                 self.destroy_host(host)
             }
@@ -706,11 +709,11 @@ impl PumpRuntime {
             WindowVisibility::Visible => {
                 let _ = window.show_for_placement(placement.activate_on_show, placement.placement);
                 window.set_hud_window_visible(true);
-                self.presenter_hidden.store(false, Ordering::Release);
+                self.presenter_visibility.publish_hidden(false);
             }
             WindowVisibility::Hidden => {
                 let _ = window.hide();
-                self.presenter_hidden.store(true, Ordering::Release);
+                self.presenter_visibility.publish_hidden(true);
             }
         }
         self.hwnd_out
@@ -738,14 +741,33 @@ impl PumpRuntime {
                     let _ =
                         window.show_for_placement(placement.activate_on_show, placement.placement);
                     window.set_hud_window_visible(true);
-                    self.presenter_hidden.store(false, Ordering::Release);
                 }
                 WindowVisibility::Hidden => {
                     let _ = window.hide();
-                    self.presenter_hidden.store(true, Ordering::Release);
                 }
             }
         }
+        self.publish_visibility_confirmation(host, visibility)
+    }
+
+    fn confirm_visibility(
+        &mut self,
+        host: HostedWindow,
+        visibility: WindowVisibility,
+    ) -> Result<(), String> {
+        self.publish_visibility_confirmation(host, visibility)
+    }
+
+    fn publish_visibility_confirmation(
+        &mut self,
+        host: HostedWindow,
+        visibility: WindowVisibility,
+    ) -> Result<(), String> {
+        // WindowHostState is authoritative. Re-publish its projection before the
+        // acknowledgement so App and render observe the confirmed state even for
+        // an idempotent request that performs no native show/hide operation.
+        self.presenter_visibility
+            .publish_hidden(visibility == WindowVisibility::Hidden);
         self.send_lifecycle(PumpLifecycleEvent::VisibilityApplied {
             epoch: host.epoch.0,
             visible: visibility == WindowVisibility::Visible,
@@ -813,7 +835,7 @@ impl PumpRuntime {
         }
         self.hwnd_out.store(0, Ordering::Release);
         self.hud_hwnd_out.store(0, Ordering::Release);
-        self.presenter_hidden.store(false, Ordering::Release);
+        self.presenter_visibility.publish_hidden(false);
         self.closed.store(true, Ordering::Release);
         let _ = self.send_lifecycle(PumpLifecycleEvent::Shutdown);
         self.quitting = true;
@@ -1139,7 +1161,7 @@ mod tests {
         let hwnd_out = Arc::new(AtomicU64::new(0));
         let hud_out = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
-        let hidden = Arc::new(AtomicBool::new(false));
+        let presenter_visibility = NativePresenterVisibility::new_visible();
         let source_epoch = Arc::new(AtomicU64::new(0));
         let init_error = Arc::new(Mutex::new(None));
         let channel_fault = Arc::new(AtomicBool::new(false));
@@ -1177,7 +1199,7 @@ mod tests {
             hwnd_out: Arc::clone(&hwnd_out),
             hud_hwnd_out: hud_out,
             closed: Arc::clone(&closed),
-            presenter_hidden: hidden,
+            presenter_visibility,
             source_epoch,
             ui_event_tx: ui_tx,
             init_error: Arc::clone(&init_error),

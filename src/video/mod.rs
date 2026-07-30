@@ -809,8 +809,8 @@ enum NativeVideoOutputCommand {
     /// 入り、present() を呼ばず drain + frame selection + present 成功時 bookkeeping だけを
     /// 続けて最新フレームを hold する (音声は無改変 = 無中断)。`visible=true` = hold して
     /// いたフレームを 1 回 present してから show_and_raise で復帰する。処理後に presenter
-    /// スレッドが共有 atomic (`NativeVideoOutput.presenter_hidden`) を更新し、App が
-    /// exit 完了 (= ウィンドウ再表示済み) を検知できるようにする。
+    /// pump が typed `WindowHostState` 適用後に output-lifetime の
+    /// `NativePresenterVisibility` を更新し、render と App が同じ状態を参照できるようにする。
     // App (bin 専属) からのみ構築される。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
     SetWindowVisible {
@@ -830,6 +830,37 @@ enum FramePresentationState<F> {
     Empty,
     Hidden { frame: F },
     Visible { frame: F, fence: u64 },
+}
+
+/// Pump-published native presenter visibility.
+///
+/// `WindowHostState` on the window-pump thread is the authority. Both the App and
+/// render loop keep a clone of this projection; neither maintains an independent
+/// hidden/visible flag. In particular, replacing `PresenterSourceState` must not
+/// replace or reset this output-lifetime state.
+#[cfg(any(windows, test))]
+#[derive(Clone)]
+struct NativePresenterVisibility {
+    hidden: Arc<AtomicBool>,
+}
+
+#[cfg(any(windows, test))]
+impl NativePresenterVisibility {
+    fn new_visible() -> Self {
+        Self {
+            hidden: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.hidden.load(Ordering::Acquire)
+    }
+
+    /// Publish the visibility after the pump has applied the matching typed
+    /// `WindowHostState` transition.
+    fn publish_hidden(&self, hidden: bool) {
+        self.hidden.store(hidden, Ordering::Release);
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -1111,13 +1142,13 @@ pub(crate) struct NativeVideoOutput {
     hud_hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
-    /// Inc 7 hidden presenter: presenter ウィンドウが hide (consume-and-hold) 中かを示す
-    /// 共有フラグ。pump が typed visibility command 適用後に更新し、App
-    /// (`exit_video_audio_mode` の async 待ち) が「show 完了 = 再表示済み」を検知する。
-    /// 初期値 false (= 通常の可視 presenter)。
+    /// Inc 7 hidden presenter: pump の typed `WindowHostState` が所有する実際の可視状態を
+    /// output lifetime で公開する projection。render の consume policy と App
+    /// (`exit_video_audio_mode` の async 待ち) は同じ値を読み、source switch では交換しない。
+    /// 初期値 visible。
     /// App (bin 専属) からのみ読まれる。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
-    presenter_hidden: Arc<AtomicBool>,
+    presenter_visibility: NativePresenterVisibility,
     perf_overlay_visible: Arc<AtomicBool>,
     /// app/native_video.rs (bin 専属) からのみ参照されるため lib build では dead に見える。
     #[allow(dead_code)]
@@ -1160,7 +1191,7 @@ impl NativeVideoOutput {
             hud_hwnd: Arc::new(AtomicU64::new(0)),
             first_presented: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
-            presenter_hidden: Arc::new(AtomicBool::new(false)),
+            presenter_visibility: NativePresenterVisibility::new_visible(),
             perf_overlay_visible: Arc::new(AtomicBool::new(false)),
             source_epoch: Arc::new(AtomicU64::new(0)),
             committed_generation: AtomicU64::new(0),
@@ -1196,7 +1227,7 @@ impl NativeVideoOutput {
         let hud_hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
-        let presenter_hidden = Arc::new(AtomicBool::new(false));
+        let presenter_visibility = NativePresenterVisibility::new_visible();
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let source_epoch = Arc::new(AtomicU64::new(0));
         let initial_vst3_available = config.vst3_available;
@@ -1211,6 +1242,7 @@ impl NativeVideoOutput {
         let thread_first_presented = Arc::clone(&first_presented);
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
         let thread_init_error = Arc::clone(&init_error);
+        let thread_presenter_visibility = presenter_visibility.clone();
         let pump = match native_window_pump::spawn_native_window_pump(
             native_window_pump::NativeWindowPumpSpawn {
                 config: config.clone(),
@@ -1218,7 +1250,7 @@ impl NativeVideoOutput {
                 hwnd_out: Arc::clone(&hwnd),
                 hud_hwnd_out: Arc::clone(&hud_hwnd),
                 closed: Arc::clone(&closed),
-                presenter_hidden: Arc::clone(&presenter_hidden),
+                presenter_visibility: presenter_visibility.clone(),
                 source_epoch: Arc::clone(&source_epoch),
                 ui_event_tx: event_tx.clone(),
                 init_error: Arc::clone(&init_error),
@@ -1253,6 +1285,7 @@ impl NativeVideoOutput {
                         thread_cancel,
                         thread_first_presented,
                         thread_perf_overlay_visible,
+                        thread_presenter_visibility,
                         dynamic,
                         audio_diagnostics,
                         &pump_render,
@@ -1289,7 +1322,7 @@ impl NativeVideoOutput {
             hud_hwnd,
             first_presented,
             closed,
-            presenter_hidden,
+            presenter_visibility,
             perf_overlay_visible,
             source_epoch,
             committed_generation: AtomicU64::new(0),
@@ -1342,7 +1375,7 @@ impl NativeVideoOutput {
     /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
     pub(crate) fn is_presenter_hidden(&self) -> bool {
-        self.presenter_hidden.load(Ordering::Acquire)
+        self.presenter_visibility.is_hidden()
     }
 
     /// pump/render thread 内で起きた fatal init error を 1 度だけ取り出す。
@@ -2488,6 +2521,7 @@ fn run_native_video_output(
     cancel: Arc<AtomicBool>,
     first_presented_out: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
+    presenter_visibility: NativePresenterVisibility,
     dynamic: Arc<crate::video::decoder::VideoDynamicState>,
     audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     window_pump: &native_window_pump::NativeWindowPumpRenderClient,
@@ -2706,10 +2740,8 @@ fn run_native_video_output(
     /// 30fps で約 270ms 分 = pacing 上は十分。これは visible の display pacing 専用で、
     /// hidden は EOF まで decoder を進めるため全件 drain する。
     const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
-    // Inc 7 hidden presenter (動画→音声モード): `SetWindowVisible{visible:false}` で
-    // presenter を「consume-and-hold」モードに入れる。hidden 中は present() を呼ばず、
-    // typed state の `Hidden` が最新フレームを 1 枚だけ所有する。
-    let mut presenter_hidden = false;
+    // Inc 7 hidden presenter (動画→音声モード): pump が公開する可視状態を consume policy の
+    // 唯一の正本にする。source swap はこの output-lifetime state を交換しない。
     let mut hidden_frame_scratch = Vec::with_capacity(MAX_NATIVE_SOURCE_QUEUE.saturating_mul(2));
     emit_native_vram_trace(
         "native_presenter_started",
@@ -3085,7 +3117,6 @@ fn run_native_video_output(
                             true,
                             &cancel,
                         )?;
-                        presenter_hidden = false;
                         crate::logger::log(
                             "[native-video] presenter show requested (audio-mode exit)".to_string(),
                         );
@@ -3100,7 +3131,6 @@ fn run_native_video_output(
                             false,
                             &cancel,
                         )?;
-                        presenter_hidden = true;
                         frame_output.hide();
                         crate::logger::log(
                             "[native-video] presenter hidden (audio-mode enter)".to_string(),
@@ -3245,7 +3275,7 @@ fn run_native_video_output(
                                 "[native-video] same placement resize failed: {err}"
                             )),
                         }
-                        if presenter_hidden {
+                        if presenter_visibility.is_hidden() {
                             let hidden_present = if frame_output.is_hidden() {
                                 frame_output
                                     .frame()
@@ -3279,7 +3309,6 @@ fn run_native_video_output(
                                 true,
                                 &cancel,
                             )?;
-                            presenter_hidden = false;
                         }
                         send_native_output_event(
                             &ui_event_tx,
@@ -3451,7 +3480,6 @@ fn run_native_video_output(
                     cur_owner_hwnd = owner_hwnd;
                     window_observation = attach.observation;
                     presenter.set_window_observation(window_observation);
-                    presenter_hidden = false;
                     native_events.clear();
                     last_cursor_poll = None;
                     last_native_mouse_at = None;
@@ -3542,6 +3570,7 @@ fn run_native_video_output(
             }
         }
 
+        let presenter_hidden = presenter_visibility.is_hidden();
         let cursor_poll_due = !presenter_hidden
             && last_cursor_poll
                 .map(|time| now.duration_since(time) >= Duration::from_millis(50))
@@ -4184,6 +4213,10 @@ fn run_native_video_output(
                     (
                         "waiting_for_first_frame",
                         serde_json::Value::from(waiting_for_first_frame),
+                    ),
+                    (
+                        "presenter_hidden",
+                        serde_json::Value::from(presenter_hidden),
                     ),
                     (
                         "source_queue_len",
