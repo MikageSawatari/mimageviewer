@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
 use image::GenericImageView;
+use mimageviewer_ipc::RemoteEntry;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -258,6 +259,20 @@ impl Library {
                 })
                 .collect(),
         }
+    }
+
+    /// 本体 IPC の応答にも remote-web 側の同じ allowlist を重ねる多重防御。
+    /// UUID 不明、絶対 / traversal path、または junction による root 外脱出を除外する。
+    pub fn retain_allowed_remote_entries(&self, entries: &mut Vec<RemoteEntry>) {
+        entries.retain(|entry| {
+            let Ok(id) = Uuid::parse_str(&entry.favorite_id) else {
+                return false;
+            };
+            let Ok(favorite) = self.favorite(id) else {
+                return false;
+            };
+            resolve_existing(&favorite.path, &entry.relative_path).is_ok()
+        });
     }
 
     pub fn list(&self, favorite_id: Uuid, relative: &str) -> Result<ListResult, StoreError> {

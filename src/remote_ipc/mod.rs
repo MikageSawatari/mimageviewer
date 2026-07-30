@@ -1,3 +1,4 @@
+mod collections;
 mod path_guard;
 mod thumbnail;
 

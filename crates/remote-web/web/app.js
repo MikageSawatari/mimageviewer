@@ -88,6 +88,11 @@ const hudState = {
 const state = {
   authenticated: false,
   favorites: [],
+  home: { places: [], smart_folders: [] },
+  homeLoadError: "",
+  homeTab: "places",
+  collection: null,
+  gridReturnHash: "#home/places",
   thumbAspectHeightRatio: 1,
   favoriteId: null,
   favoriteName: "",
@@ -155,8 +160,16 @@ async function enterAuthenticatedApp() {
   renderLoading("お気に入りを読み込んでいます");
   const data = await apiJson("/api/favorites");
   state.favorites = data.favorites ?? [];
+  try {
+    state.home = await apiJson("/api/home");
+    state.homeLoadError = "";
+  } catch (error) {
+    state.home = { places: [], smart_folders: [] };
+    state.homeLoadError =
+      error instanceof Error ? error.message : "mIV 本体から一覧を取得できませんでした。";
+  }
   if (!location.hash) {
-    history.replaceState({ mivRoute: true }, "", "#favorites");
+    history.replaceState({ mivRoute: true }, "", "#home/places");
   } else {
     history.replaceState({ ...(history.state ?? {}), mivRoute: true }, "", location.href);
   }
@@ -265,11 +278,16 @@ function renderPinLogin(initialRemainingSeconds = 0) {
 
 async function dispatchRoute() {
   if (!state.authenticated) return;
-  if (!state.favorites.length && location.hash !== "#favorites") {
-    return;
-  }
   const route = parseRoute(location.hash);
   try {
+    if (route.kind === "home") {
+      renderHome(route.tab);
+      return;
+    }
+    if (route.kind === "collection") {
+      await showCollection(route);
+      return;
+    }
     if (route.kind === "folder") {
       await showFolder(route.favoriteId, route.path);
       return;
@@ -285,19 +303,36 @@ async function dispatchRoute() {
       renderImageViewer(index, performance.now());
       return;
     }
-    renderFavorites();
+    renderHome("places");
   } catch (error) {
     renderError(error);
   }
 }
 
 function parseRoute(hash) {
-  if (!hash || hash === "#favorites") {
-    return { kind: "favorites" };
+  if (!hash) {
+    return { kind: "home", tab: "places" };
+  }
+  if (hash === "#favorites") {
+    return { kind: "home", tab: "favorites" };
+  }
+  const home = hash.match(/^#home\/(favorites|smart|places)$/);
+  if (home) {
+    return { kind: "home", tab: home[1] };
+  }
+  const collection = hash.match(
+    /^#collection\/(reading_history|bookmarks|bookshelf|rating|smart)(?:\/([^/]+))?$/
+  );
+  if (collection) {
+    return {
+      kind: "collection",
+      collectionKind: collection[1],
+      value: collection[2] ?? "",
+    };
   }
   const match = hash.match(/^#(folder|image)\/([^/]+)\/(.*)$/);
   if (!match) {
-    return { kind: "favorites" };
+    return { kind: "home", tab: "places" };
   }
   try {
     return {
@@ -306,8 +341,16 @@ function parseRoute(hash) {
       path: decodeURIComponent(match[3]),
     };
   } catch {
-    return { kind: "favorites" };
+    return { kind: "home", tab: "places" };
   }
+}
+
+function homeHash(tab) {
+  return `#home/${tab}`;
+}
+
+function collectionHash(kind, value = "") {
+  return `#collection/${kind}${value ? `/${encodeURIComponent(value)}` : ""}`;
 }
 
 function folderHash(favoriteId, path) {
@@ -376,9 +419,11 @@ function dispatchCommand(requested, meta = {}) {
     requested.name === CommandName.PARENT_FOLDER &&
     state.screenContext === "grid"
   ) {
-    const target = state.folderPath
-      ? folderHash(state.favoriteId, parentPath(state.folderPath))
-      : "#favorites";
+    const target = state.collection
+      ? state.gridReturnHash
+      : state.folderPath
+        ? folderHash(state.favoriteId, parentPath(state.folderPath))
+        : homeHash("favorites");
     navigate(target);
     handled = true;
   } else if (requested.name === CommandName.OPEN) {
@@ -452,6 +497,15 @@ function executeOpenCommand(payload, meta) {
   ) {
     return false;
   }
+  if (state.collection) {
+    tryEnterBrowserFullscreen();
+    navigate(imageHash(payload.favoriteId, payload.path), {
+      viewerFromGrid: true,
+      viewerDepth: 1,
+      returnHash: location.hash,
+    });
+    return true;
+  }
   if (Number.isInteger(payload.entryIndex)) {
     state.gridIndex = payload.entryIndex;
   }
@@ -474,15 +528,20 @@ function executeOpenCommand(payload, meta) {
 function openGridEntry(index, meta) {
   const entry = state.entries[index];
   if (!entry) return false;
-  if (entry.kind === "dir") {
+  const favoriteId = entry.favorite_id ?? state.favoriteId;
+  const path = entryPath(entry);
+  if (entryIsFolder(entry)) {
     return executeOpenCommand(
-      { kind: "folder", favoriteId: state.favoriteId, path: entry.path },
+      { kind: "folder", favoriteId, path },
       meta
     );
   }
-  const imageIndex = state.images.findIndex((image) => image.path === entry.path);
+  if (entry.kind !== "image") return false;
+  const imageIndex = state.images.findIndex(
+    (image) => entryIdentity(image) === entryIdentity(entry)
+  );
   return executeOpenCommand(
-    { kind: "image", path: entry.path, imageIndex, entryIndex: index },
+    { kind: "image", favoriteId, path, imageIndex, entryIndex: index },
     meta
   );
 }
@@ -581,9 +640,11 @@ function cleanupScreen() {
   app.replaceChildren();
 }
 
-function renderFavorites() {
+function renderHome(tab = "places") {
   cleanupScreen();
-  state.screenContext = "favorites";
+  state.screenContext = "home";
+  state.homeTab = ["favorites", "smart", "places"].includes(tab) ? tab : "places";
+  state.collection = null;
   exitBrowserFullscreen();
   document.title = "mIV Remote";
 
@@ -593,45 +654,183 @@ function renderFavorites() {
   const heroText = element("div");
   heroText.append(
     textElement("h1", "mIV Remote"),
-    textElement("p", "お気に入りから閲覧するフォルダを選んでください。")
+    textElement("p", "読みたい場所を選んでください。")
   );
   hero.append(
     heroText,
     createMenuButton("操作メニュー")
   );
-  content.append(hero);
-
-  if (!state.favorites.length) {
-    content.append(
-      textElement("p", "お気に入りが登録されていません。", "empty-state")
-    );
-  } else {
-    const list = element("div", "favorite-list");
-    for (const favorite of state.favorites) {
-      const button = element("button", "favorite-card");
-      button.type = "button";
-      button.append(
-        textElement("span", "◆", "favorite-icon"),
-        textElement("span", favorite.name, "favorite-name"),
-        textElement("span", "›", "favorite-arrow")
-      );
-      button.addEventListener("click", (event) => {
-        dispatchCommand(
-          command(CommandName.OPEN, {
-            kind: "favorite",
-            favoriteId: favorite.id,
-            path: "",
-          }),
-          { source: inputSourceFromEvent(event), detail: "favorite", at: performance.now() }
-        );
-      });
-      list.append(button);
-    }
-    content.append(list);
-  }
+  content.append(hero, createHomeTabs(state.homeTab));
+  if (state.homeTab === "favorites") renderFavoriteTab(content);
+  else if (state.homeTab === "smart") renderSmartFolderTab(content);
+  else renderPlacesTab(content);
   screen.append(content);
-  state.commandMenu = new CommandMenu(screen, "favorites");
+  state.commandMenu = new CommandMenu(screen, "home");
   app.append(screen);
+}
+
+function createHomeTabs(active) {
+  const tabs = element("nav", "home-tabs");
+  tabs.setAttribute("aria-label", "ホームの表示切替");
+  for (const [id, label] of [
+    ["favorites", "お気に入り"],
+    ["smart", "スマートフォルダ"],
+    ["places", "場所"],
+  ]) {
+    const button = textElement("button", label, "home-tab");
+    button.type = "button";
+    button.classList.toggle("active", id === active);
+    button.setAttribute("aria-current", id === active ? "page" : "false");
+    button.addEventListener("click", () => navigate(homeHash(id)));
+    tabs.append(button);
+  }
+  return tabs;
+}
+
+function renderFavoriteTab(content) {
+  if (!state.favorites.length) {
+    content.append(textElement("p", "お気に入りが登録されていません。", "empty-state"));
+    return;
+  }
+  const list = element("div", "favorite-list");
+  for (const favorite of state.favorites) {
+    const button = homeCard("◆", favorite.name);
+    button.addEventListener("click", (event) => {
+      dispatchCommand(
+        command(CommandName.OPEN, {
+          kind: "favorite",
+          favoriteId: favorite.id,
+          path: "",
+        }),
+        { source: inputSourceFromEvent(event), detail: "favorite", at: performance.now() }
+      );
+    });
+    list.append(button);
+  }
+  content.append(list);
+}
+
+function renderSmartFolderTab(content) {
+  if (state.homeLoadError) {
+    content.append(ipcUnavailableMessage());
+    return;
+  }
+  const definitions = state.home.smart_folders ?? [];
+  if (!definitions.length) {
+    content.append(textElement("p", "スマートフォルダが登録されていません。", "empty-state"));
+    return;
+  }
+  const list = element("div", "favorite-list");
+  for (const definition of definitions) {
+    const button = homeCard("◇", definition.name);
+    button.addEventListener("click", () => {
+      navigate(collectionHash("smart", definition.id), {
+        returnHash: homeHash("smart"),
+      });
+    });
+    list.append(button);
+  }
+  content.append(list);
+}
+
+function renderPlacesTab(content) {
+  if (state.homeLoadError) {
+    content.append(ipcUnavailableMessage());
+    return;
+  }
+  const list = element("div", "favorite-list place-list");
+  for (const place of state.home.places ?? []) {
+    if (place.kind === "rating") {
+      const group = element("section", "rating-card");
+      group.append(
+        textElement("span", "★", "favorite-icon"),
+        textElement("span", place.name, "favorite-name")
+      );
+      const stars = element("div", "rating-stars");
+      for (let rating = 5; rating >= 1; rating -= 1) {
+        const button = textElement("button", `★${rating}`, "rating-star-button");
+        button.type = "button";
+        button.addEventListener("click", () =>
+          navigate(collectionHash("rating", String(rating)), {
+            returnHash: homeHash("places"),
+          })
+        );
+        stars.append(button);
+      }
+      group.append(stars);
+      list.append(group);
+      continue;
+    }
+    const icon = {
+      reading_history: "↻",
+      bookshelf: "▥",
+      bookmarks: "🔖",
+    }[place.kind] ?? "◇";
+    const button = homeCard(icon, place.name);
+    button.addEventListener("click", () =>
+      navigate(collectionHash(place.kind), { returnHash: homeHash("places") })
+    );
+    list.append(button);
+  }
+  if (!list.childElementCount) {
+    list.append(textElement("p", "表示する場所がありません。", "empty-state"));
+  }
+  content.append(list);
+}
+
+function homeCard(icon, name) {
+  const button = element("button", "favorite-card");
+  button.type = "button";
+  button.append(
+    textElement("span", icon, "favorite-icon"),
+    textElement("span", name, "favorite-name"),
+    textElement("span", "›", "favorite-arrow")
+  );
+  return button;
+}
+
+function ipcUnavailableMessage() {
+  const status = element("div", "home-ipc-error");
+  status.append(
+    textElement("strong", "mIV 本体が起動していません"),
+    textElement("p", "mIV を --remote-ipc 付きで起動すると、この一覧を利用できます。")
+  );
+  return status;
+}
+
+async function showCollection(route) {
+  renderLoading("一覧を読み込んでいます");
+  const params = collectionRequestParams(route);
+  const data = await apiJson("/api/collection", params);
+  state.collection = {
+    kind: route.collectionKind,
+    value: route.value,
+    title: data.title ?? "一覧",
+  };
+  state.gridReturnHash =
+    route.collectionKind === "smart" ? homeHash("smart") : homeHash("places");
+  state.favoriteId = null;
+  state.favoriteName = data.title ?? "一覧";
+  state.folderPath = "";
+  state.thumbAspectHeightRatio =
+    Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
+    Number(data.thumb_aspect_height_ratio) > 0
+      ? Number(data.thumb_aspect_height_ratio)
+      : 1;
+  state.entries = data.entries ?? [];
+  state.images = state.entries.filter((entry) => entry.kind === "image");
+  state.gridIndex = 0;
+  renderFolder();
+}
+
+function collectionRequestParams(route) {
+  if (route.collectionKind === "rating") {
+    return { kind: "rating", stars: route.value };
+  }
+  if (route.collectionKind === "smart") {
+    return { kind: "smart_folder", id: route.value };
+  }
+  return { kind: route.collectionKind };
 }
 
 async function showFolder(favoriteId, path) {
@@ -656,6 +855,8 @@ async function loadFolder(favoriteId, path) {
     return;
   }
   state.requestController = null;
+  state.collection = null;
+  state.gridReturnHash = homeHash("favorites");
   state.favoriteId = favoriteId;
   state.favoriteName =
     state.favorites.find((favorite) => favorite.id === favoriteId)?.name ?? "お気に入り";
@@ -681,7 +882,7 @@ function renderFolder() {
   cleanupScreen();
   state.screenContext = "grid";
   exitBrowserFullscreen();
-  document.title = `${state.favoriteName} — mIV Remote`;
+  document.title = `${state.collection?.title ?? state.favoriteName} — mIV Remote`;
 
   const screen = element("section", "screen");
   const topbar = element("header", "topbar");
@@ -689,7 +890,7 @@ function renderFolder() {
   back.type = "button";
   back.setAttribute("aria-label", "戻る");
   back.addEventListener("click", (event) => {
-    dispatchCommand(command(CommandName.PARENT_FOLDER), {
+    dispatchCommand(command(state.collection ? CommandName.BACK : CommandName.PARENT_FOLDER), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
@@ -730,7 +931,9 @@ function renderFolder() {
     return;
   }
 
-  const imageIndexes = new Map(state.images.map((entry, index) => [entry.path, index]));
+  const imageIndexes = new Map(
+    state.images.map((entry, index) => [entryIdentity(entry), index])
+  );
   state.virtualGrid = new VirtualGrid(
     scroll,
     space,
@@ -746,6 +949,10 @@ function renderFolder() {
 function buildBreadcrumbs() {
   const breadcrumbs = element("nav", "breadcrumbs");
   breadcrumbs.setAttribute("aria-label", "パンくず");
+  if (state.collection) {
+    breadcrumbs.append(textElement("h1", state.collection.title));
+    return breadcrumbs;
+  }
   const segments = state.folderPath ? state.folderPath.split("/") : [];
   const crumbs = [{ label: state.favoriteName, path: "" }];
   let accumulated = "";
@@ -804,7 +1011,8 @@ function createGridTile(
   image.decoding = "async";
   image.dataset.telemetryObserved = "true";
 
-  if (entry.kind === "dir") {
+  const favoriteId = entry.favorite_id ?? state.favoriteId;
+  if (entryIsFolder(entry)) {
     preview.append(textElement("span", "◆", "folder-glyph"));
     preview.append(image);
     preview.append(textElement("span", "folder", "type-badge"));
@@ -813,8 +1021,8 @@ function createGridTile(
       dispatchCommand(
         command(CommandName.OPEN, {
           kind: "folder",
-          favoriteId: state.favoriteId,
-          path: entry.path,
+          favoriteId,
+          path: entryPath(entry),
           entryIndex,
         }),
         { source: inputSourceFromEvent(event), detail: "grid_tile" }
@@ -823,14 +1031,18 @@ function createGridTile(
   } else {
     preview.append(textElement("span", "◇", "file-glyph"));
     preview.append(image);
+    if (entry.kind !== "image") {
+      preview.append(textElement("span", entryTypeLabel(entry.kind), "type-badge"));
+    }
     bindThumbnail(image, entry, thumbnailTracker, cellWidth);
-    tile.addEventListener("click", (event) => {
-      const index = imageIndexes.get(entry.path);
+    if (entry.kind === "image") tile.addEventListener("click", (event) => {
+      const index = imageIndexes.get(entryIdentity(entry));
       if (index !== undefined) {
         dispatchCommand(
           command(CommandName.OPEN, {
             kind: "image",
-            path: entry.path,
+            favoriteId,
+            path: entryPath(entry),
             imageIndex: index,
             entryIndex,
           }),
@@ -843,8 +1055,38 @@ function createGridTile(
       }
     });
   }
-  tile.append(preview, textElement("span", entry.name, "tile-label"));
+  if (entry.detail || entry.rating) {
+    preview.append(
+      textElement("span", entry.detail ?? `★${entry.rating}`, "entry-detail-badge")
+    );
+  }
+  const label = textElement("span", entry.name, "tile-label");
+  if (entry.detail) label.title = `${entry.name} — ${entry.detail}`;
+  tile.append(preview, label);
   return tile;
+}
+
+function entryPath(entry) {
+  return entry.relative_path ?? entry.path ?? "";
+}
+
+function entryIdentity(entry) {
+  return `${entry.favorite_id ?? state.favoriteId ?? ""}\n${entryPath(entry)}`;
+}
+
+function entryIsFolder(entry) {
+  return entry.kind === "dir" || entry.kind === "folder";
+}
+
+function entryTypeLabel(kind) {
+  return {
+    video: "video",
+    audio: "audio",
+    zip: "zip",
+    pdf: "pdf",
+    archive: "archive",
+    other: "file",
+  }[kind] ?? kind;
 }
 
 function renderImageViewer(index, interactionStartedAt = performance.now()) {
@@ -1008,7 +1250,7 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
   disposeThumbnailBinding(image);
   const generation = (Number(image._thumbnailGeneration) || 0) + 1;
   image._thumbnailGeneration = generation;
-  image._thumbnailPath = entry.path;
+  image._thumbnailPath = entryIdentity(entry);
   image.classList.remove("thumb-ready", "thumb-missing", "thumb-retry-exhausted");
   image.parentElement?.classList.remove("thumb-loaded");
   image.parentElement?.removeAttribute("data-retry-exhausted");
@@ -1061,9 +1303,10 @@ function clearThumbnailServiceNotice() {
 }
 
 async function loadThumbnail(image, entry, tracker, generation, targetPx, signal) {
+  const bindingKey = entryIdentity(entry);
   const url = apiUrl("/api/thumb", {
-    fav: state.favoriteId,
-    path: entry.path,
+    fav: entry.favorite_id ?? state.favoriteId,
+    path: entryPath(entry),
     w: targetPx,
   });
   try {
@@ -1078,19 +1321,19 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
           detail.message || "mIV 本体が起動していません。"
         );
       }
-      if (!thumbnailResponseIsCurrent(image, generation, entry.path)) return;
+      if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) return;
       image.classList.add("thumb-missing");
       image.classList.toggle("thumb-retry-exhausted", exhausted);
       if (exhausted) {
         image.parentElement?.setAttribute("data-retry-exhausted", "true");
       }
       image.parentElement?.classList.remove("thumb-loaded");
-      tracker?.settled(entry.path, { notFound: response.status === 404 });
+      tracker?.settled(bindingKey, { notFound: response.status === 404 });
       return;
     }
     const blob = await response.blob();
     const objectUrl = URL.createObjectURL(blob);
-    if (!thumbnailResponseIsCurrent(image, generation, entry.path)) {
+    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) {
       URL.revokeObjectURL(objectUrl);
       return;
     }
@@ -1099,7 +1342,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     image.src = objectUrl;
     await image.decode();
     await nextFrame();
-    if (!thumbnailResponseIsCurrent(image, generation, entry.path)) {
+    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) {
       URL.revokeObjectURL(objectUrl);
       if (image._thumbnailObjectUrl === objectUrl) image._thumbnailObjectUrl = null;
       return;
@@ -1109,10 +1352,10 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     image.classList.add("thumb-ready");
     image.parentElement?.classList.add("thumb-loaded");
     clearThumbnailServiceNotice();
-    tracker?.settled(entry.path);
+    tracker?.settled(bindingKey);
   } catch (error) {
     if (error?.name === "AbortError") return;
-    if (!thumbnailResponseIsCurrent(image, generation, entry.path)) return;
+    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) return;
     image.classList.remove("thumb-ready");
     image.classList.add("thumb-missing");
     image.classList.toggle("thumb-retry-exhausted", Boolean(error?.retryExhausted));
@@ -1120,7 +1363,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
       image.parentElement?.setAttribute("data-retry-exhausted", "true");
     }
     image.parentElement?.classList.remove("thumb-loaded");
-    tracker?.settled(entry.path);
+    tracker?.settled(bindingKey);
     recordClientError("image_load_error", error, {
       resource: safeResourcePath(url),
     });
@@ -1493,7 +1736,7 @@ class ThumbnailGridTracker {
   begin(items) {
     if (this.destroyed || this.expected) return;
     for (const entry of items) {
-      if (entry.kind === "image" || entry.kind === "dir") this.pending.add(entry.path);
+      this.pending.add(entryIdentity(entry));
     }
     this.expected = this.pending.size;
     if (!this.expected) this.finish();
@@ -2086,9 +2329,9 @@ function renderError(error) {
       "status-detail"
     )
   );
-  const home = textElement("button", "お気に入りへ戻る", "icon-button");
+  const home = textElement("button", "ホームへ戻る", "icon-button");
   home.type = "button";
-  home.addEventListener("click", () => navigate("#favorites"));
+  home.addEventListener("click", () => navigate(homeHash("places")));
   status.append(home);
   app.append(status);
 }

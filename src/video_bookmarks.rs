@@ -107,6 +107,17 @@ impl VideoBookmarkDb {
         Self::open_at(&path)
     }
 
+    /// 横断ビューの読み出し専用 worker 用。スキーマ作成を行わない。
+    pub fn open_readonly() -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            Self::db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self { conn })
+    }
+
     /// 指定パスの DB を開く。明示メタ情報転送 worker / test 用。
     pub fn open_at(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {

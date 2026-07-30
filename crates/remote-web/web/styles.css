@@ -255,6 +255,84 @@ button {
   gap: 12px;
 }
 
+.home-tabs {
+  display: grid;
+  max-width: 720px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0 auto 18px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: rgb(17 20 27 / 82%);
+}
+
+.home-tab {
+  min-height: 46px;
+  padding: 8px 6px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--muted);
+  font-size: clamp(0.76rem, 3.2vw, 0.92rem);
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.home-tab.active {
+  background: var(--surface-raised);
+  box-shadow: 0 3px 12px rgb(0 0 0 / 22%);
+  color: #fff;
+}
+
+.place-list {
+  padding-bottom: 18px;
+}
+
+.rating-card {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px 15px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: linear-gradient(145deg, #242936, #1b1f28);
+  box-shadow: 0 12px 36px rgb(0 0 0 / 18%);
+}
+
+.rating-stars {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.rating-star-button {
+  min-height: 44px;
+  padding: 7px 3px;
+  border: 1px solid #4b5260;
+  border-radius: 11px;
+  background: #1a1e27;
+  color: #ffd76e;
+  cursor: pointer;
+}
+
+.home-ipc-error {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 18px;
+  border: 1px solid rgb(255 190 90 / 30%);
+  border-radius: 16px;
+  background: #302619;
+  color: #ffe0a8;
+  line-height: 1.55;
+}
+
+.home-ipc-error p {
+  margin: 7px 0 0;
+  color: #d9c39e;
+}
+
 .favorite-card {
   display: grid;
   width: 100%;
@@ -476,6 +554,22 @@ button {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.entry-detail-badge {
+  position: absolute;
+  bottom: 7px;
+  left: 7px;
+  overflow: hidden;
+  max-width: calc(100% - 14px);
+  padding: 4px 7px;
+  border-radius: 7px;
+  background: rgb(7 10 14 / 82%);
+  color: #f1f4f9;
+  font-size: 0.68rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .center-status {

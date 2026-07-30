@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -52,6 +52,120 @@ pub struct ThumbnailRequest {
     pub target_px: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HomeRequest;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SmartFolderSummary {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceKind {
+    ReadingHistory,
+    Rating,
+    Bookshelf,
+    Bookmarks,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PlaceSummary {
+    pub kind: PlaceKind,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HomePayload {
+    pub smart_folders: Vec<SmartFolderSummary>,
+    pub places: Vec<PlaceSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum HomeResponse {
+    Success(HomePayload),
+    Error(CollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CollectionRequest {
+    pub kind: CollectionKind,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CollectionKind {
+    ReadingHistory,
+    Rating { stars: u8 },
+    Bookshelf,
+    Bookmarks,
+    SmartFolder { definition_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteEntryKind {
+    Folder,
+    Image,
+    Video,
+    Audio,
+    Zip,
+    Pdf,
+    Archive,
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteEntry {
+    pub favorite_id: String,
+    /// お気に入り root からの相対パス。絶対パスはこの型に載せない。
+    pub relative_path: String,
+    pub name: String,
+    pub kind: RemoteEntryKind,
+    pub detail: Option<String>,
+    pub progress_current: Option<u64>,
+    pub progress_total: Option<u64>,
+    pub rating: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CollectionPayload {
+    pub title: String,
+    pub thumb_aspect_height_ratio: f64,
+    pub entries: Vec<RemoteEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum CollectionResponse {
+    Success(CollectionPayload),
+    Error(CollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CollectionError {
+    pub code: CollectionErrorCode,
+    pub message: String,
+}
+
+impl CollectionError {
+    pub fn new(code: CollectionErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionErrorCode {
+    BadRequest,
+    NotFound,
+    Busy,
+    Internal,
+}
+
 /// 1 本の長寿命接続上で要求と応答を対応付ける識別子。
 pub type RequestId = u64;
 
@@ -62,29 +176,45 @@ pub enum ClientMessage {
         id: RequestId,
         request: ThumbnailRequest,
     },
+    Home {
+        id: RequestId,
+        request: HomeRequest,
+    },
+    Collection {
+        id: RequestId,
+        request: CollectionRequest,
+    },
 }
 
 impl ClientMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::Thumbnail { id, .. } => *id,
+            Self::Thumbnail { id, .. } | Self::Home { id, .. } | Self::Collection { id, .. } => *id,
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Thumbnail {
         id: RequestId,
         response: ThumbnailResponse,
     },
+    Home {
+        id: RequestId,
+        response: HomeResponse,
+    },
+    Collection {
+        id: RequestId,
+        response: CollectionResponse,
+    },
 }
 
 impl ServerMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::Thumbnail { id, .. } => *id,
+            Self::Thumbnail { id, .. } | Self::Home { id, .. } | Self::Collection { id, .. } => *id,
         }
     }
 }
@@ -212,6 +342,34 @@ mod tests {
         let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn collection_message_keeps_only_favorite_identity_and_relative_path() {
+        let expected = ServerMessage::Collection {
+            id: 77,
+            response: CollectionResponse::Success(CollectionPayload {
+                title: "最近読んだ本".to_owned(),
+                thumb_aspect_height_ratio: 1.0,
+                entries: vec![RemoteEntry {
+                    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                    relative_path: "books/volume-1".to_owned(),
+                    name: "volume-1".to_owned(),
+                    kind: RemoteEntryKind::Folder,
+                    detail: Some("3 / 20 ページ".to_owned()),
+                    progress_current: Some(3),
+                    progress_total: Some(20),
+                    rating: None,
+                }],
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        let decoded: ServerMessage =
+            read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+        assert_eq!(decoded, expected);
+        let encoded = String::from_utf8(bytes[4..].to_vec()).unwrap();
+        assert!(!encoded.contains(r"C:\\"));
     }
 
     #[test]

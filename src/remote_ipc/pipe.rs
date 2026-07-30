@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use mimageviewer_ipc::{
-    ClientHello, ClientMessage, MAX_CONTROL_FRAME_BYTES, PIPE_NAME, PROTOCOL_VERSION, RequestId,
-    ServerMessage, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
-    negotiate, read_frame, write_frame,
+    ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
+    HomeResponse, MAX_CONTROL_FRAME_BYTES, PIPE_NAME, PROTOCOL_VERSION, ServerMessage,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
@@ -22,6 +22,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::core::PCWSTR;
 
+use super::collections::CollectionEngine;
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
@@ -32,8 +33,7 @@ const WORK_QUEUE_CAPACITY: usize = 256;
 
 enum Work {
     Request {
-        id: RequestId,
-        request: ThumbnailRequest,
+        message: ClientMessage,
         reply: mpsc::Sender<ServerMessage>,
     },
     Stop,
@@ -65,17 +65,19 @@ impl ServerGuard {
         }
 
         let worker_count = settings.parallelism.thread_count().clamp(1, 8);
-        let engine = Arc::new(ThumbnailEngine::new(settings));
+        let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
+        let collection_engine = Arc::new(CollectionEngine::new(settings));
         let (work_tx, work_rx) = mpsc::sync_channel::<Work>(WORK_QUEUE_CAPACITY);
         let work_rx = Arc::new(Mutex::new(work_rx));
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let work_rx = Arc::clone(&work_rx);
-            let engine = Arc::clone(&engine);
+            let thumbnail_engine = Arc::clone(&thumbnail_engine);
+            let collection_engine = Arc::clone(&collection_engine);
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("remote-thumb-{index}"))
-                    .spawn(move || worker_loop(&work_rx, &engine))
+                    .spawn(move || worker_loop(&work_rx, &thumbnail_engine, &collection_engine))
                     .map_err(|error| format!("remote IPC worker を開始できません: {error}"))?,
             );
         }
@@ -140,7 +142,11 @@ impl Drop for ServerGuard {
     }
 }
 
-fn worker_loop(work_rx: &Mutex<mpsc::Receiver<Work>>, engine: &ThumbnailEngine) {
+fn worker_loop(
+    work_rx: &Mutex<mpsc::Receiver<Work>>,
+    thumbnail_engine: &ThumbnailEngine,
+    collection_engine: &CollectionEngine,
+) {
     let context = WorkerContext::open();
     loop {
         let work = {
@@ -148,9 +154,22 @@ fn worker_loop(work_rx: &Mutex<mpsc::Receiver<Work>>, engine: &ThumbnailEngine) 
             receiver.recv()
         };
         match work {
-            Ok(Work::Request { id, request, reply }) => {
-                let response = engine.handle(request, &context);
-                let _ = reply.send(ServerMessage::Thumbnail { id, response });
+            Ok(Work::Request { message, reply }) => {
+                let response = match message {
+                    ClientMessage::Thumbnail { id, request } => ServerMessage::Thumbnail {
+                        id,
+                        response: thumbnail_engine.handle(request, &context),
+                    },
+                    ClientMessage::Home { id, .. } => ServerMessage::Home {
+                        id,
+                        response: collection_engine.home(),
+                    },
+                    ClientMessage::Collection { id, request } => ServerMessage::Collection {
+                        id,
+                        response: collection_engine.collection(request),
+                    },
+                };
+                let _ = reply.send(response);
             }
             Ok(Work::Stop) | Err(_) => break,
         }
@@ -282,33 +301,49 @@ fn handle_connection(mut pipe: PipeStream, work_tx: mpsc::SyncSender<Work>) {
                 break;
             }
         };
-        match message {
-            ClientMessage::Thumbnail { id, request } => {
-                // queue が満杯ならここで待つ。接続を切断したり、要求を捨てたりしない。
-                if send_with_backpressure(
-                    &work_tx,
-                    Work::Request {
-                        id,
-                        request,
-                        reply: reply_tx.clone(),
-                    },
-                )
-                .is_err()
-                {
-                    let _ = reply_tx.send(ServerMessage::Thumbnail {
-                        id,
-                        response: ThumbnailResponse::Error(ThumbnailError::new(
-                            ThumbnailErrorCode::Internal,
-                            "mIV 本体のサムネイルワーカーが停止しています",
-                        )),
-                    });
-                    break;
-                }
-            }
+        let stopped = service_stopped_response(&message);
+        // queue が満杯ならここで待つ。接続を切断したり、要求を捨てたりしない。
+        if send_with_backpressure(
+            &work_tx,
+            Work::Request {
+                message,
+                reply: reply_tx.clone(),
+            },
+        )
+        .is_err()
+        {
+            let _ = reply_tx.send(stopped);
+            break;
         }
     }
     drop(reply_tx);
     let _ = writer.join();
+}
+
+fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
+    match message {
+        ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
+            id: *id,
+            response: ThumbnailResponse::Error(ThumbnailError::new(
+                ThumbnailErrorCode::Internal,
+                "mIV 本体のサムネイルワーカーが停止しています",
+            )),
+        },
+        ClientMessage::Home { id, .. } => ServerMessage::Home {
+            id: *id,
+            response: HomeResponse::Error(CollectionError::new(
+                CollectionErrorCode::Internal,
+                "mIV 本体の集約ビューワーカーが停止しています",
+            )),
+        },
+        ClientMessage::Collection { id, .. } => ServerMessage::Collection {
+            id: *id,
+            response: CollectionResponse::Error(CollectionError::new(
+                CollectionErrorCode::Internal,
+                "mIV 本体の集約ビューワーカーが停止しています",
+            )),
+        },
+    }
 }
 
 fn send_with_backpressure<T>(

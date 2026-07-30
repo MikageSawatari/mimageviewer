@@ -37,6 +37,15 @@ impl ComicDb {
         Self::open_at(&Self::db_path())
     }
 
+    pub fn open_readonly() -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            Self::db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self { conn })
+    }
+
     /// 任意のパスで DB を開く。テスト・統合テスト用。
     pub fn open_at(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
@@ -54,7 +63,7 @@ impl ComicDb {
         Ok(Self { conn })
     }
 
-    fn db_path() -> PathBuf {
+    pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("comic.db")
     }
 

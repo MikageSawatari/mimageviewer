@@ -23,6 +23,73 @@ pub(super) struct ResolvedFavoritePath {
     pub logical: PathBuf,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct FavoriteRelativePath {
+    pub favorite_id: String,
+    pub relative_path: String,
+}
+
+/// 既存の絶対 path を、最も深く一致するお気に入り root と相対 path に写像する。
+/// canonical path 同士で比較するため junction / symlink で root 外へ出た項目は返さない。
+pub(super) fn map_existing_to_favorite(
+    favorites: &[FavoriteEntry],
+    candidate: &Path,
+) -> Option<FavoriteRelativePath> {
+    let canonical = std::fs::canonicalize(candidate).ok()?;
+    let mut best: Option<(usize, &FavoriteEntry, PathBuf)> = None;
+    for favorite in favorites {
+        let root = std::fs::canonicalize(&favorite.path).ok()?;
+        if !path_starts_with(&canonical, &root) {
+            continue;
+        }
+        let depth = root.components().count();
+        if best
+            .as_ref()
+            .is_none_or(|(best_depth, _, _)| depth > *best_depth)
+        {
+            best = Some((depth, favorite, root));
+        }
+    }
+    let (_, favorite, root) = best?;
+    let relative = components_after_root(&canonical, &root)?;
+    let relative_path = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(FavoriteRelativePath {
+        favorite_id: favorite.id.to_string(),
+        relative_path,
+    })
+}
+
+fn components_after_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        let path_component = path_components.next()?;
+        if !component_eq(path_component, root_component) {
+            return None;
+        }
+    }
+    Some(path_components.collect())
+}
+
+#[cfg(windows)]
+fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
+    left == right
+}
+
 pub(super) fn resolve_existing(
     favorites: &[FavoriteEntry],
     favorite_id: &str,
@@ -187,6 +254,26 @@ mod tests {
             ),
             Err(ResolveError::EscapesFavorite)
         );
+    }
+
+    #[test]
+    fn maps_only_existing_favorite_members_to_relative_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let nested = root.join("album");
+        let outside = temp.path().join("outside.jpg");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("page.jpg"), b"x").unwrap();
+        std::fs::write(&outside, b"x").unwrap();
+        let favorite = favorite(&root);
+
+        let mapped =
+            map_existing_to_favorite(std::slice::from_ref(&favorite), &nested.join("page.jpg"))
+                .unwrap();
+        assert_eq!(mapped.favorite_id, favorite.id.to_string());
+        assert_eq!(mapped.relative_path, "album/page.jpg");
+        assert!(!Path::new(&mapped.relative_path).is_absolute());
+        assert!(map_existing_to_favorite(&[favorite], &outside).is_none());
     }
 
     #[cfg(windows)]

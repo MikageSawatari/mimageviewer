@@ -398,6 +398,16 @@ impl BookBookmarkDb {
         Ok(Self { conn })
     }
 
+    fn open_readonly(path: &Path) -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(3))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self { conn })
+    }
+
     fn init_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS book_bookmarks (
@@ -1297,6 +1307,11 @@ pub fn migrate_paths_at(
 /// 横断一覧 worker 用の全件読み出し。UI スレッドから直接呼ばないこと。
 pub fn load_all_from_disk() -> Result<Vec<BookBookmark>, rusqlite::Error> {
     BookBookmarkDb::open()?.list_all()
+}
+
+/// リモート集約ビューなどの読み出し専用 worker 用。DB を作成・更新しない。
+pub fn load_all_from_disk_readonly() -> Result<Vec<BookBookmark>, rusqlite::Error> {
+    BookBookmarkDb::open_readonly(&db_path())?.list_all()
 }
 
 /// 横断一覧の削除 worker 用。元コンテナやページは一切操作しない。

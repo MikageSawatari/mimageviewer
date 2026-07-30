@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mimageviewer_ipc::{CollectionErrorCode, CollectionKind};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -180,6 +181,8 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         }
         _ if auth == AuthDecision::Unauthorized => unauthorized(),
         (Method::Get, "/api/favorites") => api_favorites(state),
+        (Method::Get, "/api/home") => api_home(state),
+        (Method::Get, "/api/collection") => api_collection(state, &query),
         (Method::Get, "/api/list") => api_list(state, &query),
         (Method::Get, "/api/thumb") => api_thumb(state, &query),
         (Method::Get, "/api/image-info") => api_image_info(state, &query),
@@ -329,6 +332,142 @@ fn api_favorites(state: &AppState) -> HttpResponse {
     }
 }
 
+fn api_home(state: &AppState) -> HttpResponse {
+    let started = Instant::now();
+    match state.thumbnail_client.home() {
+        Ok(result) => HttpResponse::json(&result.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store")
+            .with_log_details(json!({
+                "collection": {
+                    "kind": "home",
+                    "ipc_status": "ok",
+                    "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                    "ipc_retry_count": result.retry_count,
+                    "ipc_retry_statuses": result.retry_statuses,
+                    "ipc_connection_id": result.connection_id,
+                }
+            })),
+        Err(failure) => collection_ipc_error_response(failure, started.elapsed(), "home"),
+    }
+}
+
+fn api_collection(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+    let kind_name = match required_query_value(query, "kind") {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let kind = match kind_name {
+        "reading_history" => CollectionKind::ReadingHistory,
+        "bookmarks" => CollectionKind::Bookmarks,
+        "bookshelf" => CollectionKind::Bookshelf,
+        "rating" => {
+            let stars = match required_query_value(query, "stars")
+                .and_then(|value| value.parse::<u8>().map_err(|_| ()))
+            {
+                Ok(stars @ 1..=5) => stars,
+                _ => return HttpResponse::text(400, "Bad Request"),
+            };
+            CollectionKind::Rating { stars }
+        }
+        "smart_folder" => {
+            let definition_id = match required_query_value(query, "id") {
+                Ok(value) if Uuid::parse_str(value).is_ok() => value.to_owned(),
+                _ => return HttpResponse::text(400, "Bad Request"),
+            };
+            CollectionKind::SmartFolder { definition_id }
+        }
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    let started = Instant::now();
+    match state.thumbnail_client.collection(kind) {
+        Ok(mut result) => {
+            state
+                .library
+                .retain_allowed_remote_entries(&mut result.value.entries);
+            let entry_count = result.value.entries.len();
+            HttpResponse::json(&result.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+                .with_log_details(json!({
+                    "collection": {
+                        "kind": kind_name,
+                        "entry_count": entry_count,
+                        "ipc_status": "ok",
+                        "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                        "ipc_retry_count": result.retry_count,
+                        "ipc_retry_statuses": result.retry_statuses,
+                        "ipc_connection_id": result.connection_id,
+                    }
+                }))
+        }
+        Err(failure) => collection_ipc_error_response(failure, started.elapsed(), kind_name),
+    }
+}
+
+fn collection_ipc_error_response(
+    failure: crate::ipc_client::ClientFailure,
+    elapsed: Duration,
+    kind: &str,
+) -> HttpResponse {
+    let ipc_status = failure.error.ipc_status();
+    let protocol_stage = failure
+        .error
+        .protocol_failure()
+        .map(|detail| detail.stage.to_owned());
+    let protocol_error_kind = failure
+        .error
+        .protocol_failure()
+        .map(|detail| detail.kind.to_owned());
+    let (status, code, message) = match failure.error {
+        IpcClientError::Unavailable(_) => (
+            503,
+            "miv_not_running",
+            "mIV 本体が起動していません。mIV を --remote-ipc 付きで起動してください。".to_owned(),
+        ),
+        IpcClientError::VersionMismatch { client, server } => (
+            503,
+            "protocol_version_mismatch",
+            format!(
+                "mIV 本体と remote-web の IPC 版が一致しません (remote-web={client}, mIV={server})。"
+            ),
+        ),
+        IpcClientError::Protocol(_) => (
+            502,
+            "ipc_protocol_error",
+            "mIV 本体との通信に失敗しました。".to_owned(),
+        ),
+        IpcClientError::CollectionRemote(error) => {
+            let status = match error.code {
+                CollectionErrorCode::BadRequest => 400,
+                CollectionErrorCode::NotFound => 404,
+                CollectionErrorCode::Busy => 503,
+                CollectionErrorCode::Internal => 500,
+            };
+            (status, "miv_collection_error", error.message)
+        }
+        IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
+    };
+    HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({"error": code, "message": message})).unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "collection": {
+            "kind": kind,
+            "ipc_status": ipc_status,
+            "ipc_ms": crate::diagnostics::duration_ms(elapsed),
+            "ipc_retry_count": failure.retry_count,
+            "ipc_retry_statuses": failure.retry_statuses,
+            "ipc_stage": protocol_stage,
+            "ipc_error_kind": protocol_error_kind,
+            "entry_count": 0,
+        }
+    }))
+}
+
 fn api_list(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     let Some((favorite, path)) = favorite_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
@@ -450,6 +589,7 @@ fn ipc_error_response(
             };
             (status, "miv_thumbnail_error", remote.message)
         }
+        IpcClientError::CollectionRemote(remote) => (500, "miv_thumbnail_error", remote.message),
     };
     let body = serde_json::to_vec(&json!({"error": code, "message": message}))
         .unwrap_or_else(|_| b"{\"error\":\"ipc_error\"}".to_vec());

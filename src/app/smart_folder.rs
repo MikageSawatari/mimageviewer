@@ -1090,6 +1090,65 @@ fn load_edit_key_sets(
     Ok(result)
 }
 
+fn load_edit_key_sets_readonly(
+    wanted: &std::collections::BTreeSet<crate::settings::FacetEditFlag>,
+    local_adjust: std::collections::BTreeSet<String>,
+) -> Result<SmartEditKeySets, String> {
+    use crate::settings::FacetEditFlag;
+    let mut result = SmartEditKeySets {
+        local_adjust,
+        ..SmartEditKeySets::default()
+    };
+    if (wanted.contains(&FacetEditFlag::Adjustment)
+        || wanted.contains(&FacetEditFlag::AiAdjustment))
+        && crate::adjustment_db::AdjustmentDb::db_path()
+            .try_exists()
+            .unwrap_or(false)
+    {
+        result.adjustment = crate::adjustment_db::AdjustmentDb::open_readonly()
+            .map_err(|error| format!("補正 DB を読み込めませんでした: {error}"))?
+            .load_page_param_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Mask)
+        && crate::mask_db::MaskDb::db_path()
+            .try_exists()
+            .unwrap_or(false)
+    {
+        result.mask = crate::mask_db::MaskDb::open_readonly()
+            .map_err(|error| format!("消しゴム DB を読み込めませんでした: {error}"))?
+            .load_all_mask_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Conceal)
+        && crate::conceal_db::ConcealDb::db_path()
+            .try_exists()
+            .unwrap_or(false)
+    {
+        result.conceal =
+            crate::conceal_db::ConcealDb::open_readonly(&crate::conceal_db::ConcealDb::db_path())
+                .map_err(|error| format!("隠蔽加工 DB を読み込めませんでした: {error}"))?
+                .load_all_conceal_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Annotation)
+        && crate::comic_db::ComicDb::db_path()
+            .try_exists()
+            .unwrap_or(false)
+    {
+        result.annotation = crate::comic_db::ComicDb::open_readonly()
+            .map_err(|error| format!("注釈 DB を読み込めませんでした: {error}"))?
+            .load_all_comic_keys();
+    }
+    if wanted.contains(&FacetEditFlag::Rotation)
+        && crate::rotation_db::RotationDb::db_path()
+            .try_exists()
+            .unwrap_or(false)
+    {
+        result.rotation = crate::rotation_db::RotationDb::open_readonly()
+            .map_err(|error| format!("回転 DB を読み込めませんでした: {error}"))?
+            .load_rotated_keys();
+    }
+    Ok(result)
+}
+
 struct SmartEntrySortKey {
     display_row: usize,
     name: crate::filename_sort::SortNameKey,
@@ -1284,6 +1343,7 @@ fn evaluate_smart_folder_membership(
     load_local_adjust: bool,
     reused_metadata: Option<&ReusedSmartFolderMetadata>,
     archive_cache_db: Option<&crate::archive_cache::ArchiveCacheDb>,
+    read_only: bool,
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SmartFolderPrepareEvent>,
 ) -> Result<Option<EvaluatedSmartFolderMembership>, String> {
@@ -1311,7 +1371,13 @@ fn evaluate_smart_folder_membership(
         });
 
     let mut ratings = HashMap::new();
-    if !reuse_metadata && load_ratings {
+    if !reuse_metadata
+        && load_ratings
+        && (!read_only
+            || crate::rating_db::RatingDb::db_path()
+                .try_exists()
+                .unwrap_or(false))
+    {
         report(SmartFolderPhase::Ratings, 0);
         let db = crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
             .map_err(|error| format!("レーティング DB を読み込めませんでした: {error}"))?;
@@ -1328,7 +1394,13 @@ fn evaluate_smart_folder_membership(
     }
 
     let mut tags = HashMap::new();
-    if !reuse_metadata && load_tags {
+    if !reuse_metadata
+        && load_tags
+        && (!read_only
+            || crate::tags_db::TagsDb::db_path()
+                .try_exists()
+                .unwrap_or(false))
+    {
         report(SmartFolderPhase::Tags, 0);
         let db = crate::tags_db::TagsDb::open_readonly(&crate::tags_db::TagsDb::db_path())
             .map_err(|error| format!("タグ DB を読み込めませんでした: {error}"))?;
@@ -1345,7 +1417,13 @@ fn evaluate_smart_folder_membership(
     }
 
     let mut local_adjust = HashSet::new();
-    if !reuse_metadata && load_local_adjust {
+    if !reuse_metadata
+        && load_local_adjust
+        && (!read_only
+            || crate::local_adjust_db::LocalAdjustDb::db_path()
+                .try_exists()
+                .unwrap_or(false))
+    {
         report(SmartFolderPhase::Adjustments, 0);
         let db = crate::local_adjust_db::LocalAdjustDb::open_readonly(
             &crate::local_adjust_db::LocalAdjustDb::db_path(),
@@ -1371,6 +1449,8 @@ fn evaluate_smart_folder_membership(
         .collect::<std::collections::BTreeSet<_>>();
     let edit_keys = if reuse_metadata {
         SmartEditKeySets::default()
+    } else if read_only {
+        load_edit_key_sets_readonly(&wanted_edit_flags, local_adjust.iter().cloned().collect())?
     } else {
         load_edit_key_sets(&wanted_edit_flags, local_adjust.iter().cloned().collect())?
     };
@@ -1385,7 +1465,11 @@ fn evaluate_smart_folder_membership(
         crate::bookmark_browser::BookmarkPresence::default()
     } else {
         report(SmartFolderPhase::Bookmarks, 0);
-        crate::bookmark_browser::load_presence()?
+        if read_only {
+            crate::bookmark_browser::load_presence_readonly()?
+        } else {
+            crate::bookmark_browser::load_presence()?
+        }
     };
     let mut converted_archive_paths = reused_metadata
         .map(|metadata| metadata.converted_archive_cache_paths.clone())
@@ -1537,6 +1621,7 @@ fn prepare_smart_folder(
             load_local_adjust,
             reused_metadata.as_deref(),
             resources.archive_cache_db.as_deref(),
+            false,
             cancel,
             tx,
         )?
@@ -1961,6 +2046,7 @@ fn count_smart_folder_results(
         load_local_adjust,
         None,
         archive_cache_db.as_deref(),
+        false,
         cancel,
         tx,
     )?
@@ -2270,6 +2356,131 @@ fn smart_folder_definition_needs_result_count(
                 || rule.filter.include_untagged
                 || !rule.filter.edits.is_empty())
     })
+}
+
+/// remote IPC がスマートフォルダの既存 scan / metadata filter / sort を再利用するための
+/// 読み出し専用 read model。絶対 path はこの crate 内だけで保持し、IPC 化する前に
+/// `remote_ipc::path_guard` のお気に入り境界へ写像する。
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteSmartFolderEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: SmartFolderEntryKind,
+    pub(crate) rating: Option<u8>,
+}
+
+/// UI の `open_smart_folder` と同じ候補走査・保存条件評価・表示順を、IPC worker 上で
+/// 同期的に最後まで構築する。UI thread からは呼ばない。
+pub(crate) fn build_remote_smart_folder_entries(
+    settings: &crate::settings::Settings,
+    definition: crate::settings::SmartFolderDefinition,
+) -> Result<Vec<RemoteSmartFolderEntry>, String> {
+    if active_rules(&definition).is_empty() {
+        return Ok(Vec::new());
+    }
+    let cancel = AtomicBool::new(false);
+    let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(
+        settings.indexer_speed_profile.io_permits().max(1),
+    );
+    let activity_gate = crate::activity_gate::ActivityGate::new(0);
+    let (scan_tx, _scan_rx) = mpsc::channel();
+    let scanned = scan_smart_folder(
+        definition,
+        SmartFolderScanOptions::from(settings),
+        &cancel,
+        &io_sem,
+        &activity_gate,
+        &scan_tx,
+    )
+    .ok_or_else(|| "スマートフォルダの走査が中断されました".to_owned())?;
+    let snapshot = scanned.snapshot;
+    let load_ratings = smart_folder_definition_uses_metadata(
+        &snapshot.definition,
+        SmartFolderMetadataDependency::Rating,
+    );
+    let load_tags = smart_folder_definition_uses_metadata(
+        &snapshot.definition,
+        SmartFolderMetadataDependency::Tags,
+    );
+    let load_local_adjust = smart_folder_definition_uses_metadata(
+        &snapshot.definition,
+        SmartFolderMetadataDependency::Edits,
+    );
+    let (prepare_tx, _prepare_rx) = mpsc::channel();
+    let archive_cache = if crate::archive_cache::db_path()
+        .try_exists()
+        .unwrap_or(false)
+    {
+        crate::archive_cache::ArchiveCacheDb::open_readonly().ok()
+    } else {
+        None
+    };
+    let membership = evaluate_smart_folder_membership(
+        &snapshot,
+        &HashSet::new(),
+        load_ratings,
+        load_tags,
+        load_local_adjust,
+        None,
+        archive_cache.as_ref(),
+        true,
+        &cancel,
+        &prepare_tx,
+    )?
+    .ok_or_else(|| "スマートフォルダの評価が中断されました".to_owned())?;
+
+    let sort = settings.sort_order;
+    let display_order = settings.grid_display_order.normalized();
+    let grouping = snapshot.definition.grouping;
+    let sort_keys = build_smart_entry_sort_keys(
+        &snapshot.entries,
+        &membership.included,
+        sort,
+        &display_order,
+    );
+    let sorted_positions = super::recursive_snapshot_scan::cancelable_sorted_indices(
+        membership.included.len(),
+        &cancel,
+        |a_position, b_position| {
+            let a = &snapshot.entries[membership.included[a_position]];
+            let b = &snapshot.entries[membership.included[b_position]];
+            let ak = &sort_keys[a_position];
+            let bk = &sort_keys[b_position];
+            let within = || {
+                sort.compare_name_keys(&ak.name, a.mtime, &bk.name, b.mtime)
+                    .then_with(|| a.path.cmp(&b.path))
+            };
+            ak.display_row
+                .cmp(&bk.display_row)
+                .then_with(|| match grouping {
+                    crate::settings::SubfolderExpansionOrder::Flat => within()
+                        .then_with(|| a.source_order.cmp(&b.source_order))
+                        .then_with(|| ak.relative_parent.compare_file_name(&bk.relative_parent)),
+                    crate::settings::SubfolderExpansionOrder::FolderGrouped => a
+                        .source_order
+                        .cmp(&b.source_order)
+                        .then_with(|| ak.relative_parent.compare_file_name(&bk.relative_parent))
+                        .then_with(within),
+                })
+        },
+        |_| {},
+    )
+    .ok_or_else(|| "スマートフォルダの並べ替えが中断されました".to_owned())?;
+
+    Ok(sorted_positions
+        .into_iter()
+        .map(|position| {
+            let entry_index = membership.included[position];
+            let entry = &snapshot.entries[entry_index];
+            RemoteSmartFolderEntry {
+                path: entry.path.clone(),
+                kind: entry.kind,
+                rating: membership
+                    .ratings
+                    .get(&membership.keys[entry_index])
+                    .copied(),
+            }
+        })
+        .collect())
 }
 
 impl App {

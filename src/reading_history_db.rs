@@ -97,6 +97,17 @@ impl ReadingHistoryDb {
         Self::open_at(Self::db_path())
     }
 
+    /// 集約ビューなどの読み出し専用 worker 用。DB を作成・更新しない。
+    pub fn open_readonly() -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            Self::db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(Duration::from_secs(3))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self { conn })
+    }
+
     fn open_at(path: PathBuf) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -122,7 +133,7 @@ impl ReadingHistoryDb {
         Ok(Self { conn })
     }
 
-    fn db_path() -> PathBuf {
+    pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("reading_history.db")
     }
 

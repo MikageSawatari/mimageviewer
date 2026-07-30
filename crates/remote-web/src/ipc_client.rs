@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
-    ClientHello, ClientMessage, FrameError, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
-    PIPE_NAME, PROTOCOL_VERSION, RequestId, ServerMessage, ThumbnailError, ThumbnailErrorCode,
-    ThumbnailRequest, ThumbnailResponse, read_frame, write_frame,
+    ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionKind,
+    CollectionPayload, CollectionRequest, CollectionResponse, FrameError, HomePayload, HomeRequest,
+    HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PIPE_NAME, PROTOCOL_VERSION,
+    RequestId, ServerMessage, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest,
+    ThumbnailResponse, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -24,6 +26,13 @@ pub struct ThumbnailClient {
 
 pub struct ThumbnailSuccess {
     pub bytes: Vec<u8>,
+    pub retry_count: u32,
+    pub retry_statuses: Vec<String>,
+    pub connection_id: u64,
+}
+
+pub struct IpcSuccess<T> {
+    pub value: T,
     pub retry_count: u32,
     pub retry_statuses: Vec<String>,
     pub connection_id: u64,
@@ -61,12 +70,14 @@ pub enum ClientError {
     VersionMismatch { client: u32, server: u32 },
     Protocol(ProtocolFailure),
     Remote(ThumbnailError),
+    CollectionRemote(CollectionError),
 }
 
 impl ClientError {
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::Unavailable(_) | Self::Protocol(_))
             || matches!(self, Self::Remote(error) if error.code == ThumbnailErrorCode::Busy)
+            || matches!(self, Self::CollectionRemote(error) if error.code == CollectionErrorCode::Busy)
     }
 
     pub fn ipc_status(&self) -> String {
@@ -84,6 +95,13 @@ impl ClientError {
                 ThumbnailErrorCode::GenerationFailed => "miv_generation_failed",
                 ThumbnailErrorCode::Busy => "miv_busy",
                 ThumbnailErrorCode::Internal => "miv_internal",
+            }
+            .to_owned(),
+            Self::CollectionRemote(error) => match error.code {
+                CollectionErrorCode::BadRequest => "miv_collection_bad_request",
+                CollectionErrorCode::NotFound => "miv_collection_not_found",
+                CollectionErrorCode::Busy => "miv_collection_busy",
+                CollectionErrorCode::Internal => "miv_collection_internal",
             }
             .to_owned(),
         }
@@ -115,6 +133,13 @@ impl fmt::Display for ClientError {
                 error.stage, error.kind, error.detail
             ),
             Self::Remote(error) => write!(f, "mIV 本体が要求を拒否しました: {}", error.message),
+            Self::CollectionRemote(error) => {
+                write!(
+                    f,
+                    "mIV 本体が集約ビュー要求を拒否しました: {}",
+                    error.message
+                )
+            }
         }
     }
 }
@@ -148,9 +173,27 @@ impl ThumbnailClient {
             let connection = self.get_connection()?;
             let connection_id = connection.id;
             let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            match connection.request(id, request.clone()) {
-                Ok(ThumbnailResponse::Success { webp_bytes }) => Ok((webp_bytes, connection_id)),
-                Ok(ThumbnailResponse::Error(error)) => Err(ClientError::Remote(error)),
+            match connection.request(
+                id,
+                ClientMessage::Thumbnail {
+                    id,
+                    request: request.clone(),
+                },
+            ) {
+                Ok(ServerMessage::Thumbnail {
+                    response: ThumbnailResponse::Success { webp_bytes },
+                    ..
+                }) => Ok((webp_bytes, connection_id)),
+                Ok(ServerMessage::Thumbnail {
+                    response: ThumbnailResponse::Error(error),
+                    ..
+                }) => Err(ClientError::Remote(error)),
+                Ok(_) => Err(ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "thumbnail request received another response type",
+                ))),
                 Err(error) => {
                     self.invalidate_connection(connection_id);
                     Err(ClientError::Protocol(error))
@@ -164,6 +207,116 @@ impl ThumbnailClient {
                  retry_statuses,
              }| ThumbnailSuccess {
                 bytes,
+                retry_count,
+                retry_statuses,
+                connection_id,
+            },
+        )
+        .map_err(|failure| ClientFailure {
+            error: failure.error,
+            retry_count: failure.retry_count,
+            retry_statuses: failure.retry_statuses,
+        })
+    }
+
+    pub fn home(&self) -> Result<IpcSuccess<HomePayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::Home {
+            id,
+            request: HomeRequest,
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::Home {
+                response: HomeResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::Home {
+                response: HomeResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::CollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "home request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn collection(
+        &self,
+        kind: CollectionKind,
+    ) -> Result<IpcSuccess<CollectionPayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::Collection {
+            id,
+            request: CollectionRequest { kind: kind.clone() },
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::Collection {
+                response: CollectionResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::Collection {
+                response: CollectionResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::CollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "collection request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    fn collection_request(
+        &self,
+        request: impl Fn(RequestId) -> ClientMessage,
+    ) -> Result<IpcSuccess<ServerMessage>, ClientFailure> {
+        run_with_retry(|| {
+            let connection = self.get_connection()?;
+            let connection_id = connection.id;
+            let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            match connection.request(id, request(id)) {
+                Ok(response) => Ok((response, connection_id)),
+                Err(error) => {
+                    self.invalidate_connection(connection_id);
+                    Err(ClientError::Protocol(error))
+                }
+            }
+        })
+        .map(
+            |RetrySuccess {
+                 value: (value, connection_id),
+                 retry_count,
+                 retry_statuses,
+             }| IpcSuccess {
+                value,
                 retry_count,
                 retry_statuses,
                 connection_id,
@@ -224,7 +377,7 @@ fn handshake(pipe: &mut PipeStream) -> Result<(), ClientError> {
     Ok(())
 }
 
-type PendingReply = mpsc::SyncSender<Result<ThumbnailResponse, ProtocolFailure>>;
+type PendingReply = mpsc::SyncSender<Result<ServerMessage, ProtocolFailure>>;
 
 #[derive(Default)]
 struct PendingRequests {
@@ -261,7 +414,7 @@ impl PendingRequests {
             .remove(&id)
     }
 
-    fn resolve(&self, id: RequestId, response: ThumbnailResponse) -> bool {
+    fn resolve(&self, id: RequestId, response: ServerMessage) -> bool {
         self.remove(id)
             .is_some_and(|reply| reply.send(Ok(response)).is_ok())
     }
@@ -319,8 +472,8 @@ impl Connection {
     fn request(
         &self,
         id: RequestId,
-        request: ThumbnailRequest,
-    ) -> Result<ThumbnailResponse, ProtocolFailure> {
+        request: ClientMessage,
+    ) -> Result<ServerMessage, ProtocolFailure> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.pending.register(id, reply_tx, &self.broken)?;
         let write_result = {
@@ -328,7 +481,7 @@ impl Connection {
                 .writer
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            write_frame(&mut *writer, &ClientMessage::Thumbnail { id, request })
+            write_frame(&mut *writer, &request)
         };
         if let Err(error) = write_result {
             self.pending.remove(id);
@@ -367,21 +520,18 @@ impl Connection {
                     return;
                 }
             };
-            match message {
-                ServerMessage::Thumbnail { id, response } => {
-                    if !self.pending.resolve(id, response) {
-                        self.fail(
-                            protocol_failure(
-                                "response_route",
-                                "unknown_request_id",
-                                None,
-                                format!("response id {id} has no pending request"),
-                            ),
-                            true,
-                        );
-                        return;
-                    }
-                }
+            let id = message.id();
+            if !self.pending.resolve(id, message) {
+                self.fail(
+                    protocol_failure(
+                        "response_route",
+                        "unknown_request_id",
+                        None,
+                        format!("response id {id} has no pending request"),
+                    ),
+                    true,
+                );
+                return;
             }
         }
     }
@@ -646,23 +796,33 @@ mod tests {
 
         assert!(pending.resolve(
             20,
-            ThumbnailResponse::Success {
-                webp_bytes: vec![2]
+            ServerMessage::Thumbnail {
+                id: 20,
+                response: ThumbnailResponse::Success {
+                    webp_bytes: vec![2]
+                }
             }
         ));
         assert!(pending.resolve(
             10,
-            ThumbnailResponse::Success {
-                webp_bytes: vec![1]
+            ServerMessage::Thumbnail {
+                id: 10,
+                response: ThumbnailResponse::Success {
+                    webp_bytes: vec![1]
+                }
             }
         ));
         assert!(matches!(
             first_rx.recv().unwrap(),
-            Ok(ThumbnailResponse::Success { webp_bytes }) if webp_bytes == vec![1]
+            Ok(ServerMessage::Thumbnail {
+                response: ThumbnailResponse::Success { webp_bytes }, ..
+            }) if webp_bytes == vec![1]
         ));
         assert!(matches!(
             second_rx.recv().unwrap(),
-            Ok(ThumbnailResponse::Success { webp_bytes }) if webp_bytes == vec![2]
+            Ok(ServerMessage::Thumbnail {
+                response: ThumbnailResponse::Success { webp_bytes }, ..
+            }) if webp_bytes == vec![2]
         ));
     }
 
@@ -793,7 +953,9 @@ mod tests {
             let first: ClientMessage = read_frame(&mut pipe, MAX_CONTROL_FRAME_BYTES).unwrap();
             let second: ClientMessage = read_frame(&mut pipe, MAX_CONTROL_FRAME_BYTES).unwrap();
             for message in [second, first] {
-                let ClientMessage::Thumbnail { id, request } = message;
+                let ClientMessage::Thumbnail { id, request } = message else {
+                    panic!("unexpected request type")
+                };
                 let marker = request.relative_path.as_bytes()[0];
                 write_frame(
                     &mut pipe,

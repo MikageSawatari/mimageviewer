@@ -149,6 +149,18 @@ impl ArchiveCacheDb {
         })
     }
 
+    pub fn open_readonly() -> rusqlite::Result<Self> {
+        let conn = Connection::open_with_flags(
+            db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            convert_lock: Mutex::new(()),
+        })
+    }
+
     /// 変換 worker は write + record を始める前にこの guard を取り、完了まで保持する。
     /// maintenance (`delete_entry` / `clear_all`) は同じ lock を取るため、変換中は待つ。
     /// 呼び出し側で poisoned 時は内側を取り出す — key は「記録欠落」ではなく「直列化」。

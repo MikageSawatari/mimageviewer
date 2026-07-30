@@ -140,6 +140,29 @@ pub(crate) fn load_presence() -> Result<BookmarkPresence, String> {
     Ok(BookmarkPresence::from_rows(media_keys, books))
 }
 
+pub(crate) fn load_presence_readonly() -> Result<BookmarkPresence, String> {
+    let media_keys = if crate::video_bookmarks::VideoBookmarkDb::db_path()
+        .try_exists()
+        .unwrap_or(false)
+    {
+        crate::video_bookmarks::VideoBookmarkDb::open_readonly()
+            .and_then(|db| db.list_all_path_keys())
+            .map_err(|error| format!("動画・音声ブックマーク DB を読み込めませんでした: {error}"))?
+    } else {
+        HashSet::new()
+    };
+    let books = if crate::book_bookmarks::db_path()
+        .try_exists()
+        .unwrap_or(false)
+    {
+        crate::book_bookmarks::load_all_from_disk_readonly()
+            .map_err(|error| format!("本ブックマーク DB を読み込めませんでした: {error}"))?
+    } else {
+        Vec::new()
+    };
+    Ok(BookmarkPresence::from_rows(media_keys, books))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MediaFilter {
     #[default]
@@ -454,8 +477,32 @@ pub fn spawn_build() -> BookmarkBrowserPending {
 }
 
 fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::Error> {
+    build_rows_with_access(cancel, false)
+}
+
+/// remote IPC の read model 用。mIV の bookmark view と同じ行構築・並び順を使いつつ、
+/// DB はすべて read-only で開く。
+pub fn build_rows_readonly() -> Result<Vec<BookmarkBrowserRow>, rusqlite::Error> {
+    build_rows_with_access(&AtomicBool::new(false), true)
+}
+
+fn build_rows_with_access(
+    cancel: &AtomicBool,
+    read_only: bool,
+) -> Result<Vec<BookmarkBrowserRow>, rusqlite::Error> {
     let mut rows = Vec::new();
-    let media = crate::video_bookmarks::VideoBookmarkDb::open()?.list_all_global()?;
+    let media = if read_only {
+        if crate::video_bookmarks::VideoBookmarkDb::db_path()
+            .try_exists()
+            .unwrap_or(false)
+        {
+            crate::video_bookmarks::VideoBookmarkDb::open_readonly()?.list_all_global()?
+        } else {
+            Vec::new()
+        }
+    } else {
+        crate::video_bookmarks::VideoBookmarkDb::open()?.list_all_global()?
+    };
     for bookmark in media {
         if cancel.load(Ordering::Relaxed) {
             return Ok(Vec::new());
@@ -492,9 +539,18 @@ fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::
             missing,
         });
     }
-    let archive_cache = crate::archive_cache::ArchiveCacheDb::open().ok();
+    let archive_cache = if read_only {
+        crate::archive_cache::ArchiveCacheDb::open_readonly().ok()
+    } else {
+        crate::archive_cache::ArchiveCacheDb::open().ok()
+    };
     let mut book_missing_cache = HashMap::new();
-    for bookmark in crate::book_bookmarks::load_all_from_disk()? {
+    let book_bookmarks = if read_only {
+        crate::book_bookmarks::load_all_from_disk_readonly()?
+    } else {
+        crate::book_bookmarks::load_all_from_disk()?
+    };
+    for bookmark in book_bookmarks {
         if cancel.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }

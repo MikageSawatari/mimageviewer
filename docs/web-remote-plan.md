@@ -533,9 +533,9 @@ response read / decode error になる。これは mIV ログに write failure �
 502 になること、reload ごとに成功分だけ catalog が温まることと一致する。
 `ERROR_PIPE_BUSY` を含む connect 失敗は 503、worker queue 満杯も明示 503 なので、この 2 つは
 502 の直接原因ではなかった。pipe の `Write::flush` は `FlushFileBuffers` を呼ぶ実装へ直した。
-是正後の protocol v2 は 1 本の長寿命 duplex 接続上で
-`ClientMessage::Thumbnail { id, request }` / `ServerMessage::Thumbnail { id, response }`
-を多重化する。remote-web は pending 要求を id で解決し、接続断では全 pending を失敗させて
+是正後の protocol v3 は 1 本の長寿命 duplex 接続上で
+`Thumbnail` / `Home` / `Collection` の各 request / response を共通の request id で多重化する。
+remote-web は pending 要求を id で解決し、接続断では全 pending を失敗させて
 自動再接続する。本体は 4 pipe instance を accept 待ちとして先に用意し、1 本を受け付けた直後に
 補充する。worker queue 満杯時は接続を切らず、queue に空きができるまで受信側を backpressure
 する。診断ログには `ipc_stage` / `ipc_error_kind` / `ipc_os_error` /
@@ -567,3 +567,35 @@ Web 独自探索を持たず `thumb_loader::process_load_request` 内の
 
 PoC の目的は「実回線で実用になるか」の確認だったが、**設計前提の誤りを実装が深くなる前に
 発見できた**点が最大の収穫となった。縦串フェーズを IPC から始める根拠でもある。
+
+## 10. ホームと読み取り専用の集約ビュー (2026-07-31)
+
+ホームは「お気に入り」「スマートフォルダ」「場所」の 3 タブとする。「場所」を初期表示にし、
+本体の `show_location_*` 設定で表示対象になっている場合は「読書履歴」を先頭に置く。これにより
+起動後 1 タップで「この前の続きを読む」一覧へ到達できる。ブックマークには本体側にも専用の
+非表示設定がないため常に表示する。場所タブには読書履歴、レーティング ★1〜5、本棚、
+ブックマークだけを載せ、ドライブ、デスクトップ、ピクチャ、ダウンロードは載せない。
+
+スマートフォルダの定義一覧と、読書履歴・レーティング・本棚・ブックマーク・スマートフォルダの
+評価結果は本体 IPC から取得する。remote-web は DB の集約条件や並び順を再実装しない。
+本体側は次の既存 read model / evaluator を利用する。
+
+- 読書履歴: `ReadingHistoryDb::list_recent`
+- レーティング: `RatingDb::list_by_stars` → `rating_view::rating_row_to_view_row` →
+  `rating_view::sort_rows(RatedAtDesc)`
+- ブックマーク: `bookmark_browser::build_rows_readonly` で既存の行構築と
+  `BookmarkViewSort::CreatedAtDesc` を共有する。内部 DB だけ read-only open に切り替える
+- スマートフォルダ: `app::smart_folder` の候補走査、metadata filter、表示順計算をそのまま使う
+- 本棚: `Settings::books_root_path` に対して `books::list_books` を使う
+
+IPC の `RemoteEntry` は `favorite_id`、お気に入り root からの `relative_path`、表示名、種別、
+進捗・レーティング等の表示用メタデータだけを持つ。候補の絶対 path は本体内で canonicalize し、
+最も深く一致するお気に入り root へ写像する。どのお気に入りにも属さない項目、欠落項目、
+junction / symlink で root 外へ出る項目は IPC 応答を作る前に除外する。remote-web も受信後に
+UUID、相対 path、canonical containment を再検証する。したがって集約 DB にお気に入り外の履歴や
+レーティングが含まれていてもブラウザへは出ない。
+
+HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加する。集約一覧の通常画像・
+フォルダは既存 `/api/thumb?fav=<UUID>&path=<relative>&w=<px>` をそのまま使う。ZIP / PDF / 動画・
+音声・変換アーカイブはこの増分では一覧に種別付きで表示するまでとし、中身の閲覧や再生、
+読書履歴・レーティング・ブックマーク等への書き込みは後続のセッションロック設計と一緒に行う。
