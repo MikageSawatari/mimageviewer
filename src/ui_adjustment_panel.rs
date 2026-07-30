@@ -7854,13 +7854,27 @@ fn draw_colorize_settings(
             .size(SECTION_FONT)
             .color(ui.visuals().text_color()),
     );
+    // `ColorizeMode` は「OFF かどうか」と「どの画像に適用するか」を 1 つの enum で兼ねるので、
+    // OFF にした時点で対象の選択が消える。有効な間の値をセッション内に控えておき、ON に戻す
+    // ときに復元する。有効な間は毎フレーム上書きするため、スロット読み込みなど UI 以外の
+    // 書き手が mode を変えても追随し、控えが実態からずれない (= 対象の正本は常に mode)。
+    let restore_mode_id = egui::Id::new("colorize_last_enabled_mode");
+    if params.colorize.mode != ColorizeMode::Disabled {
+        let mode = params.colorize.mode;
+        ui.data_mut(|data| data.insert_temp(restore_mode_id, mode));
+    }
+    let restore_mode = ui
+        .data(|data| data.get_temp::<ColorizeMode>(restore_mode_id))
+        .filter(|mode| *mode != ColorizeMode::Disabled)
+        .unwrap_or(ColorizeMode::MonochromeOnly);
+
     let mut enabled = params.colorize.is_enabled();
     if ui
         .checkbox(&mut enabled, "モノクロ画像を階調カラー化")
         .changed()
     {
         params.colorize.mode = if enabled {
-            ColorizeMode::MonochromeOnly
+            restore_mode
         } else {
             ColorizeMode::Disabled
         };
@@ -7869,7 +7883,13 @@ fn draw_colorize_settings(
 
     let controls_enabled = params.colorize.is_enabled();
     ui.add_enabled_ui(controls_enabled, |ui| {
-        let mut only_monochrome = params.colorize.mode != ColorizeMode::AllImages;
+        // OFF 中は mode が対象を語れないので、復元される予定の値を映す。そうしないと
+        // 「全画像に適用」で切ったのにチェックが入って見え、ON に戻した瞬間に外れる。
+        let displayed_mode = match params.colorize.mode {
+            ColorizeMode::Disabled => restore_mode,
+            mode => mode,
+        };
+        let mut only_monochrome = displayed_mode != ColorizeMode::AllImages;
         if ui
             .checkbox(&mut only_monochrome, "モノクロ系画像だけに適用")
             .on_hover_text(
