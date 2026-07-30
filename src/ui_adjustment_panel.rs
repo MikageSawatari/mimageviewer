@@ -7885,7 +7885,11 @@ fn draw_colorize_settings(
             };
             changed = true;
         }
-        if params.colorize.mode == ColorizeMode::MonochromeOnly {
+        // 表示条件は `mode` ではなく、いま描いたチェックボックスの状態に合わせる。
+        // `mode` は OFF と「全画像に適用」を 1 つの enum で兼ねているため、`MonochromeOnly`
+        // で判定するとカラー化を切った瞬間にこの行だけ消えて、下のパネル内容が動く。
+        // チェックが入って見えている以上、その設定行は出したまま無効化するのが筋。
+        if only_monochrome {
             ui.horizontal(|ui| {
                 ui.label("色味の許容量");
                 if params.colorize.mono_tolerance != 12
