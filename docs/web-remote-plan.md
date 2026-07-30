@@ -525,6 +525,23 @@ IPC の型と版数は GUI / native runtime 非依存の `crates/remote-ipc` に
 本体は `--remote-ipc` がある場合だけローカル named pipe を開き、受信と生成を UI thread 外の
 上限制御された worker で処理する。同名 pipe が既に存在する場合は二重起動せずエラーを記録する。
 
+実機初回測定では 1 要求 1 接続だったため、571 要求中 274 件が接続成立後の
+`ipc_protocol_error` になった。直接原因は、旧 server の `PipeStream::flush` が空実装のまま、
+応答 `WriteFile` の直後に `DisconnectNamedPipe` していたことだった。サーバ側 write が pipe
+buffer への書き込みに成功しても、client が読む前に切断すると応答が欠損し、client 側だけが
+response read / decode error になる。これは mIV ログに write failure が無いこと、生成所要時間後に
+502 になること、reload ごとに成功分だけ catalog が温まることと一致する。
+`ERROR_PIPE_BUSY` を含む connect 失敗は 503、worker queue 満杯も明示 503 なので、この 2 つは
+502 の直接原因ではなかった。pipe の `Write::flush` は `FlushFileBuffers` を呼ぶ実装へ直した。
+是正後の protocol v2 は 1 本の長寿命 duplex 接続上で
+`ClientMessage::Thumbnail { id, request }` / `ServerMessage::Thumbnail { id, response }`
+を多重化する。remote-web は pending 要求を id で解決し、接続断では全 pending を失敗させて
+自動再接続する。本体は 4 pipe instance を accept 待ちとして先に用意し、1 本を受け付けた直後に
+補充する。worker queue 満杯時は接続を切らず、queue に空きができるまで受信側を backpressure
+する。診断ログには `ipc_stage` / `ipc_error_kind` / `ipc_os_error` /
+`ipc_retry_count` / `ipc_retry_statuses` / `ipc_connection_id` を残し、次回測定では
+復旧した一時エラーを含めて失敗段階を直接集計できる。
+
 `ThumbnailRequest { favorite_id, relative_path, target_px }` は本体側で再度 allowlist と canonical
 path containment を検証する。通常画像とフォルダ代表は `thumb_loader::process_load_request`
 (`load_one_cached`) へ渡し、catalog 参照、DCT / WIC / Susie、回転 DB、利用者のサイズ・画質、
@@ -536,6 +553,15 @@ path containment を検証する。通常画像とフォルダ代表は `thumb_l
 `miv_not_running` を返し、フロントは「mIV 本体が起動していません」と画面内に表示する。
 仮想グリッドの tile は binding 世代と相対 path を応答時に照合し、破棄時は fetch を abort する。
 これにより scroll で detach / 再表示された tile に古い in-flight 応答を適用しない。
+ブラウザからのサムネイル HTTP 要求は同時 6 件に制限し、ネットワーク失敗・502・一時的な 503
+だけを 200 / 400 / 800 ms の指数 backoff で最大 3 回再試行する。404 / 422 と protocol 版不一致は
+再試行しない。上限到達時は tile に「再試行上限」を表示する。
+
+旧 remote-web 生成経路が記録した `representative_missing` 50 件は、IPC 移管前の
+2026-07-31 00:24–00:25 (JST) の記録であり、移管後ログには 0 件だった。移管後のフォルダ代表は
+Web 独自探索を持たず `thumb_loader::process_load_request` 内の
+`resolve_folder_thumb_image` (本体 UI と同じ sort / depth / pin 条件) を使う。その resolver が
+代表を返さない場合は `NotFound` (HTTP 404) として明示し、通常画像の生成失敗 (422) と区別する。
 
 ### 9.4 この発見の位置づけ
 

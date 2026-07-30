@@ -13,6 +13,7 @@ import {
   nextFitMode,
   snappedGridOffset,
   thumbnailBindingMatches,
+  thumbnailRetryDecision,
   viewerImageLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
@@ -163,6 +164,30 @@ test("thumbnail responses apply only to the tile generation and item that reques
   assert.equal(thumbnailBindingMatches(4, "album/a.jpg", 4, "album/a.jpg"), true);
   assert.equal(thumbnailBindingMatches(5, "album/a.jpg", 4, "album/a.jpg"), false);
   assert.equal(thumbnailBindingMatches(4, "album/b.jpg", 4, "album/a.jpg"), false);
+});
+
+test("thumbnail retry policy retries only transient failures with a bounded backoff", () => {
+  assert.deepEqual(thumbnailRetryDecision(502, "ipc_protocol_error", 0), {
+    retry: true,
+    exhausted: false,
+    delayMs: 200,
+  });
+  assert.deepEqual(thumbnailRetryDecision(503, "miv_not_running", 2), {
+    retry: true,
+    exhausted: false,
+    delayMs: 800,
+  });
+  assert.deepEqual(thumbnailRetryDecision(502, "ipc_protocol_error", 3), {
+    retry: false,
+    exhausted: true,
+    delayMs: 0,
+  });
+  assert.equal(thumbnailRetryDecision(404, "not_found", 0).retry, false);
+  assert.equal(thumbnailRetryDecision(422, "generation_failed", 0).retry, false);
+  assert.equal(
+    thumbnailRetryDecision(503, "protocol_version_mismatch", 0).retry,
+    false
+  );
 });
 
 test("viewer transform commands dispatch through one pure state transition", () => {

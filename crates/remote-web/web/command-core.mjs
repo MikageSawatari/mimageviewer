@@ -236,6 +236,32 @@ export function thumbnailBindingMatches(
   );
 }
 
+export function thumbnailRetryDecision(
+  status,
+  errorCode,
+  retryCount,
+  maxRetries = 3
+) {
+  const numericStatus = Number(status) || 0;
+  const transient =
+    numericStatus === 0 ||
+    numericStatus === 502 ||
+    (numericStatus === 503 && errorCode !== "protocol_version_mismatch");
+  if (!transient) {
+    return { retry: false, exhausted: false, delayMs: 0 };
+  }
+  const retries = Math.max(0, Math.floor(Number(retryCount) || 0));
+  const maximum = Math.max(0, Math.floor(Number(maxRetries) || 0));
+  if (retries >= maximum) {
+    return { retry: false, exhausted: true, delayMs: 0 };
+  }
+  return {
+    retry: true,
+    exhausted: false,
+    delayMs: Math.min(4000, 200 * 2 ** retries),
+  };
+}
+
 export function reduceViewerTransform(current, requested) {
   let scale = current.scale;
   let panX = current.panX;

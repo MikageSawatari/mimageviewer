@@ -280,10 +280,20 @@ impl ThumbnailEngine {
             .find_map(|message| (!message.finalized && !message.canceled).then_some(message.image))
             .flatten()
             .ok_or_else(|| {
-                error_response(
-                    ThumbnailErrorCode::GenerationFailed,
-                    "mIV 本体でサムネイルを生成できませんでした",
-                )
+                if is_folder {
+                    // process_load_request 内の本体共通 resolve_folder_thumb_image が
+                    // None を返した結果。Web 独自探索ではなく、本体 UI と同じ条件で
+                    // 代表画像が無いことを 404 として区別する。
+                    error_response(
+                        ThumbnailErrorCode::NotFound,
+                        "フォルダ内に代表サムネイルが見つかりません",
+                    )
+                } else {
+                    error_response(
+                        ThumbnailErrorCode::GenerationFailed,
+                        "mIV 本体でサムネイルを生成できませんでした",
+                    )
+                }
             })?;
 
         let mut image = color_image_to_dynamic(&color_image).ok_or_else(|| {

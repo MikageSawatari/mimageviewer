@@ -10,6 +10,7 @@ import {
   reduceViewerTransform,
   snappedGridOffset,
   thumbnailBindingMatches,
+  thumbnailRetryDecision,
   viewerTapCommand,
   viewerImageLayout,
   viewerWheelCommand,
@@ -18,8 +19,58 @@ import {
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const TELEMETRY_ENABLED = true;
+const THUMBNAIL_MAX_CONCURRENCY = 6;
 
 class AuthenticationRequiredError extends Error {}
+
+class RequestLimiter {
+  constructor(limit) {
+    this.limit = Math.max(1, Number(limit) || 1);
+    this.active = 0;
+    this.queue = [];
+  }
+
+  run(task, signal) {
+    return new Promise((resolve, reject) => {
+      const entry = { task, signal, resolve, reject, abort: null };
+      entry.abort = () => {
+        const index = this.queue.indexOf(entry);
+        if (index >= 0) this.queue.splice(index, 1);
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        reject(error);
+      };
+      if (signal?.aborted) {
+        entry.abort();
+        return;
+      }
+      signal?.addEventListener("abort", entry.abort, { once: true });
+      this.queue.push(entry);
+      this.drain();
+    });
+  }
+
+  drain() {
+    while (this.active < this.limit && this.queue.length) {
+      const entry = this.queue.shift();
+      if (entry.signal?.aborted) {
+        entry.abort();
+        continue;
+      }
+      entry.signal?.removeEventListener("abort", entry.abort);
+      this.active += 1;
+      Promise.resolve()
+        .then(entry.task)
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          this.active -= 1;
+          this.drain();
+        });
+    }
+  }
+}
+
+const thumbnailRequestLimiter = new RequestLimiter(THUMBNAIL_MAX_CONCURRENCY);
 
 const telemetryState = {
   queue: [],
@@ -958,8 +1009,9 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
   const generation = (Number(image._thumbnailGeneration) || 0) + 1;
   image._thumbnailGeneration = generation;
   image._thumbnailPath = entry.path;
-  image.classList.remove("thumb-ready", "thumb-missing");
+  image.classList.remove("thumb-ready", "thumb-missing", "thumb-retry-exhausted");
   image.parentElement?.classList.remove("thumb-loaded");
+  image.parentElement?.removeAttribute("data-retry-exhausted");
   const controller = new AbortController();
   image._thumbnailController = controller;
   const targetPx = clamp(
@@ -1015,13 +1067,9 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     w: targetPx,
   });
   try {
-    const response = await observedFetch(url, {
-      credentials: "same-origin",
-      cache: "force-cache",
-      signal,
-    });
+    const result = await fetchThumbnailWithRetry(url, signal);
+    const { response, detail, exhausted } = result;
     if (!response.ok) {
-      const detail = await response.json().catch(() => ({}));
       if (
         response.status === 503 &&
         ["miv_not_running", "protocol_version_mismatch"].includes(detail.error)
@@ -1032,6 +1080,10 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
       }
       if (!thumbnailResponseIsCurrent(image, generation, entry.path)) return;
       image.classList.add("thumb-missing");
+      image.classList.toggle("thumb-retry-exhausted", exhausted);
+      if (exhausted) {
+        image.parentElement?.setAttribute("data-retry-exhausted", "true");
+      }
       image.parentElement?.classList.remove("thumb-loaded");
       tracker?.settled(entry.path, { notFound: response.status === 404 });
       return;
@@ -1052,7 +1104,8 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
       if (image._thumbnailObjectUrl === objectUrl) image._thumbnailObjectUrl = null;
       return;
     }
-    image.classList.remove("thumb-missing");
+    image.classList.remove("thumb-missing", "thumb-retry-exhausted");
+    image.parentElement?.removeAttribute("data-retry-exhausted");
     image.classList.add("thumb-ready");
     image.parentElement?.classList.add("thumb-loaded");
     clearThumbnailServiceNotice();
@@ -1062,12 +1115,101 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     if (!thumbnailResponseIsCurrent(image, generation, entry.path)) return;
     image.classList.remove("thumb-ready");
     image.classList.add("thumb-missing");
+    image.classList.toggle("thumb-retry-exhausted", Boolean(error?.retryExhausted));
+    if (error?.retryExhausted) {
+      image.parentElement?.setAttribute("data-retry-exhausted", "true");
+    }
     image.parentElement?.classList.remove("thumb-loaded");
     tracker?.settled(entry.path);
     recordClientError("image_load_error", error, {
       resource: safeResourcePath(url),
     });
   }
+}
+
+async function fetchThumbnailWithRetry(url, signal) {
+  let retryCount = 0;
+  while (true) {
+    let response;
+    try {
+      response = await thumbnailRequestLimiter.run(
+        () =>
+          observedFetch(url, {
+            credentials: "same-origin",
+            cache: "force-cache",
+            signal,
+          }),
+        signal
+      );
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      const decision = thumbnailRetryDecision(0, "network_error", retryCount);
+      if (!decision.retry) {
+        error.retryExhausted = decision.exhausted;
+        error.retryCount = retryCount;
+        throw error;
+      }
+      enqueueTelemetry({
+        type: "thumbnail_retry",
+        status: 0,
+        retry_count: retryCount + 1,
+      });
+      await abortableDelay(decision.delayMs, signal);
+      retryCount += 1;
+      continue;
+    }
+
+    if (response.ok) {
+      return { response, detail: {}, retryCount, exhausted: false };
+    }
+    const detail = await response.clone().json().catch(() => ({}));
+    const decision = thumbnailRetryDecision(
+      response.status,
+      detail.error,
+      retryCount
+    );
+    if (!decision.retry) {
+      return {
+        response,
+        detail,
+        retryCount,
+        exhausted: decision.exhausted,
+      };
+    }
+    enqueueTelemetry({
+      type: "thumbnail_retry",
+      status: response.status,
+      error: detail.error,
+      retry_count: retryCount + 1,
+    });
+    response.body?.cancel().catch(() => {});
+    await abortableDelay(decision.delayMs, signal);
+    retryCount += 1;
+  }
+}
+
+function abortableDelay(delayMs, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new Error("Aborted");
+      error.name = "AbortError";
+      reject(error);
+      return;
+    }
+    const timer = window.setTimeout(done, delayMs);
+    function done() {
+      signal?.removeEventListener("abort", aborted);
+      resolve();
+    }
+    function aborted() {
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
+      const error = new Error("Aborted");
+      error.name = "AbortError";
+      reject(error);
+    }
+    signal?.addEventListener("abort", aborted, { once: true });
+  });
 }
 
 class VirtualGrid {

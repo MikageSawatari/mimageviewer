@@ -365,31 +365,56 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         .thumbnail_client
         .thumbnail(&favorite.to_string(), path, target_px)
     {
-        Ok(bytes) => {
+        Ok(result) => {
             let ipc_ms = crate::diagnostics::duration_ms(started.elapsed());
-            let blob_bytes = bytes.len();
-            HttpResponse::bytes(200, "image/webp", bytes)
+            let blob_bytes = result.bytes.len();
+            HttpResponse::bytes(200, "image/webp", result.bytes)
                 .with_header("Cache-Control", "private, max-age=60")
                 .with_log_details(json!({
                     "thumb": {
                         "cache_tier": "miv_ipc",
                         "ipc_status": "ok",
                         "ipc_ms": ipc_ms,
+                        "ipc_retry_count": result.retry_count,
+                        "ipc_retry_statuses": result.retry_statuses,
+                        "ipc_connection_id": result.connection_id,
                         "target_px": target_px,
                         "blob_bytes": blob_bytes,
                     }
                 }))
         }
-        Err(error) => ipc_error_response(error, started.elapsed(), target_px),
+        Err(failure) => ipc_error_response(
+            failure.error,
+            failure.retry_count,
+            failure.retry_statuses,
+            started.elapsed(),
+            target_px,
+        ),
     }
 }
 
-fn ipc_error_response(error: IpcClientError, elapsed: Duration, target_px: u32) -> HttpResponse {
+fn ipc_error_response(
+    error: IpcClientError,
+    retry_count: u32,
+    retry_statuses: Vec<String>,
+    elapsed: Duration,
+    target_px: u32,
+) -> HttpResponse {
     use mimageviewer_ipc::ThumbnailErrorCode;
 
     let ipc_ms = crate::diagnostics::duration_ms(elapsed);
+    let ipc_status = error.ipc_status();
+    let protocol_stage = error
+        .protocol_failure()
+        .map(|failure| failure.stage.to_owned());
+    let protocol_error_kind = error
+        .protocol_failure()
+        .map(|failure| failure.kind.to_owned());
+    let protocol_os_error = error
+        .protocol_failure()
+        .and_then(|failure| failure.os_error);
     let (status, code, message) = match error {
-        IpcClientError::Unavailable => (
+        IpcClientError::Unavailable(_) => (
             503,
             "miv_not_running",
             "mIV 本体が起動していません。mIV を --remote-ipc 付きで起動してください。".to_owned(),
@@ -402,7 +427,10 @@ fn ipc_error_response(error: IpcClientError, elapsed: Duration, target_px: u32) 
             ),
         ),
         IpcClientError::Protocol(detail) => {
-            eprintln!("remote-web: thumbnail IPC protocol error: {detail}");
+            eprintln!(
+                "remote-web: thumbnail IPC error stage={} kind={} os_error={:?}",
+                detail.stage, detail.kind, detail.os_error
+            );
             (
                 502,
                 "ipc_protocol_error",
@@ -430,8 +458,13 @@ fn ipc_error_response(error: IpcClientError, elapsed: Duration, target_px: u32) 
         .with_log_details(json!({
             "thumb": {
                 "cache_tier": "miv_ipc",
-                "ipc_status": code,
+                "ipc_status": ipc_status,
                 "ipc_ms": ipc_ms,
+                "ipc_retry_count": retry_count,
+                "ipc_retry_statuses": retry_statuses,
+                "ipc_stage": protocol_stage,
+                "ipc_error_kind": protocol_error_kind,
+                "ipc_os_error": protocol_os_error,
                 "target_px": target_px,
                 "blob_bytes": 0,
             }
@@ -791,15 +824,35 @@ mod tests {
 
     #[test]
     fn disconnected_thumbnail_ipc_returns_a_user_visible_service_error() {
-        let response =
-            ipc_error_response(IpcClientError::Unavailable, Duration::from_millis(12), 256);
+        let response = ipc_error_response(
+            IpcClientError::Unavailable(crate::ipc_client::ProtocolFailure::new(
+                "connect",
+                "not_found",
+                Some(2),
+                "not found",
+            )),
+            2,
+            vec![
+                "connect_not_found".to_owned(),
+                "connect_not_found".to_owned(),
+            ],
+            Duration::from_millis(12),
+            256,
+        );
         assert_eq!(response.status, 503);
         assert_eq!(response.content_type, "application/json; charset=utf-8");
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["error"], "miv_not_running");
         assert!(body["message"].as_str().unwrap().contains("mIV 本体"));
         let details = response.log_details.unwrap();
-        assert_eq!(details["thumb"]["ipc_status"], "miv_not_running");
+        assert_eq!(details["thumb"]["ipc_status"], "connect_not_found");
+        assert_eq!(details["thumb"]["ipc_retry_count"], 2);
+        assert_eq!(
+            details["thumb"]["ipc_retry_statuses"],
+            json!(["connect_not_found", "connect_not_found"])
+        );
+        assert_eq!(details["thumb"]["ipc_stage"], "connect");
+        assert_eq!(details["thumb"]["ipc_error_kind"], "not_found");
         assert_eq!(details["thumb"]["target_px"], 256);
     }
 

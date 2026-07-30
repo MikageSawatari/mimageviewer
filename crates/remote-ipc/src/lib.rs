@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -50,6 +50,43 @@ pub struct ThumbnailRequest {
     /// お気に入り root からの相対パス。絶対パスはプロトコルに載せない。
     pub relative_path: String,
     pub target_px: u32,
+}
+
+/// 1 本の長寿命接続上で要求と応答を対応付ける識別子。
+pub type RequestId = u64;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMessage {
+    Thumbnail {
+        id: RequestId,
+        request: ThumbnailRequest,
+    },
+}
+
+impl ClientMessage {
+    pub fn id(&self) -> RequestId {
+        match self {
+            Self::Thumbnail { id, .. } => *id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    Thumbnail {
+        id: RequestId,
+        response: ThumbnailResponse,
+    },
+}
+
+impl ServerMessage {
+    pub fn id(&self) -> RequestId {
+        match self {
+            Self::Thumbnail { id, .. } => *id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -162,16 +199,51 @@ mod tests {
 
     #[test]
     fn thumbnail_message_round_trips_through_a_length_delimited_frame() {
-        let expected = ThumbnailRequest {
-            favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-            relative_path: "album/page.jpg".to_owned(),
-            target_px: 384,
+        let expected = ClientMessage::Thumbnail {
+            id: 42,
+            request: ThumbnailRequest {
+                favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                relative_path: "album/page.jpg".to_owned(),
+                target_px: 384,
+            },
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &expected).unwrap();
-        let actual: ThumbnailRequest =
+        let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn multiplexed_responses_keep_their_request_ids() {
+        let first = ServerMessage::Thumbnail {
+            id: 9,
+            response: ThumbnailResponse::Success {
+                webp_bytes: vec![1, 2, 3],
+            },
+        };
+        let second = ServerMessage::Thumbnail {
+            id: 4,
+            response: ThumbnailResponse::Error(ThumbnailError::new(
+                ThumbnailErrorCode::NotFound,
+                "missing",
+            )),
+        };
+        let mut first_bytes = Vec::new();
+        write_frame(&mut first_bytes, &first).unwrap();
+        let mut bytes = first_bytes.clone();
+        write_frame(&mut bytes, &second).unwrap();
+        let decoded_first: ServerMessage =
+            read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+        let decoded_second: ServerMessage = read_frame(
+            &mut bytes[first_bytes.len()..].as_ref(),
+            MAX_RESPONSE_FRAME_BYTES,
+        )
+        .unwrap();
+        assert_eq!(decoded_first.id(), 9);
+        assert_eq!(decoded_second.id(), 4);
+        assert_eq!(decoded_first, first);
+        assert_eq!(decoded_second, second);
     }
 
     #[test]
