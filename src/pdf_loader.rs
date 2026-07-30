@@ -410,6 +410,9 @@ fn core_enumerate(
 //     Enumerate (1): [2B path_len][path_utf8][2B pw_len][pw_utf8]
 //     Render    (2): [2B path_len][path_utf8][4B page_num][4B target_px][2B pw_len][pw_utf8]
 //     Shutdown  (3): (no payload)
+//     DisplayRender (5):
+//       [2B path_len][path_utf8][4B page_num][4B viewport_w][4B viewport_h]
+//       [1B fit_mode][1B swap_page_axes][2B pw_len][pw_utf8]
 //
 // レスポンス (worker → main):
 //   [4B msg_len LE][1B status][payload]
@@ -424,6 +427,7 @@ const MSG_SHUTDOWN: u8 = 3;
 /// PDF document info (Title / Author / Subject / Keywords) を返す。
 /// 全文検索インデクサが PDF メタ情報を ingest するために使う (§16 step 17)。
 const MSG_GET_INFO: u8 = 4;
+const MSG_DISPLAY_RENDER: u8 = 5;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 
@@ -477,18 +481,34 @@ fn encode_get_info_request(path: &Path, password: Option<&str>) -> Vec<u8> {
 fn encode_render_request(
     path: &Path,
     page_num: u32,
-    target_px: u32,
+    target: PdfRenderTarget,
     password: Option<&str>,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
-    buf.push(MSG_RENDER);
+    buf.push(match target {
+        PdfRenderTarget::LongEdge(_) => MSG_RENDER,
+        PdfRenderTarget::Display { .. } => MSG_DISPLAY_RENDER,
+    });
     let path_lossy = path.to_string_lossy();
     let path_bytes = path_lossy.as_bytes();
     let pw_bytes = password.unwrap_or("").as_bytes();
     buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(path_bytes);
     buf.extend_from_slice(&page_num.to_le_bytes());
-    buf.extend_from_slice(&target_px.to_le_bytes());
+    match target {
+        PdfRenderTarget::LongEdge(target_px) => {
+            buf.extend_from_slice(&target_px.to_le_bytes());
+        }
+        PdfRenderTarget::Display {
+            viewport,
+            swap_page_axes,
+        } => {
+            buf.extend_from_slice(&viewport.width_px.to_le_bytes());
+            buf.extend_from_slice(&viewport.height_px.to_le_bytes());
+            buf.push(viewport.fit_mode.protocol_tag());
+            buf.push(u8::from(swap_page_axes));
+        }
+    }
     buf.extend_from_slice(&(pw_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(pw_bytes);
     buf
@@ -530,6 +550,36 @@ fn decode_path_and_password(payload: &[u8]) -> std::io::Result<(PathBuf, Option<
     Ok((PathBuf::from(path_str), password, remaining))
 }
 
+fn decode_display_render_target(after_path: &[u8]) -> std::io::Result<(PdfRenderTarget, &[u8])> {
+    let viewport = PdfDisplayTarget {
+        width_px: u32::from_le_bytes(after_path[4..8].try_into().unwrap()),
+        height_px: u32::from_le_bytes(after_path[8..12].try_into().unwrap()),
+        fit_mode: PdfDisplayFitMode::from_protocol_tag(after_path[12])?,
+    };
+    if after_path[13] > 1 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok((
+        PdfRenderTarget::Display {
+            viewport,
+            swap_page_axes: after_path[13] == 1,
+        },
+        &after_path[14..],
+    ))
+}
+
+fn decode_render_target(
+    msg_type: u8,
+    after_path: &[u8],
+) -> std::io::Result<(PdfRenderTarget, &[u8])> {
+    if msg_type == MSG_RENDER {
+        let target_px = u32::from_le_bytes(after_path[4..8].try_into().unwrap());
+        Ok((PdfRenderTarget::LongEdge(target_px), &after_path[8..]))
+    } else {
+        decode_display_render_target(after_path)
+    }
+}
+
 fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
     if data.is_empty() {
         return Err(std::io::Error::new(
@@ -544,9 +594,8 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             let (path, password, _) = decode_path_and_password(payload)?;
             Ok(DecodedRequest::Enumerate { path, password })
         }
-        MSG_RENDER => {
-            // Render: [path][page_num(4B)][target_px(4B)][password]
-            // path_len(2B) + path + page_num + target_px の後にパスワード
+        MSG_RENDER | MSG_DISPLAY_RENDER => {
+            // Render: [path][page_num(4B)][target fields][password]
             if payload.len() < 2 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -554,7 +603,8 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
                 ));
             }
             let path_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-            if payload.len() < 2 + path_len + 8 + 2 {
+            let target_len = if msg_type == MSG_RENDER { 4 } else { 10 };
+            if payload.len() < 2 + path_len + 4 + target_len + 2 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "render request truncated",
@@ -565,9 +615,7 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             let after_path = &payload[2 + path_len..];
             let page_num =
                 u32::from_le_bytes([after_path[0], after_path[1], after_path[2], after_path[3]]);
-            let target_px =
-                u32::from_le_bytes([after_path[4], after_path[5], after_path[6], after_path[7]]);
-            let pw_payload = &after_path[8..];
+            let (target, pw_payload) = decode_render_target(msg_type, after_path)?;
             let pw_len = u16::from_le_bytes([pw_payload[0], pw_payload[1]]) as usize;
             let password = if pw_len > 0 && pw_payload.len() >= 2 + pw_len {
                 Some(
@@ -581,7 +629,7 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             Ok(DecodedRequest::Render {
                 path: PathBuf::from(path_str),
                 page_num,
-                target_px,
+                target,
                 password,
             })
         }
@@ -605,7 +653,7 @@ enum DecodedRequest {
     Render {
         path: PathBuf,
         page_num: u32,
-        target_px: u32,
+        target: PdfRenderTarget,
         password: Option<String>,
     },
     GetInfo {
@@ -680,9 +728,9 @@ pub fn run_worker_process() {
             DecodedRequest::Render {
                 path,
                 page_num,
-                target_px,
+                target,
                 password,
-            } => match ipc_render(&pdfium, &path, page_num, target_px, password.as_deref()) {
+            } => match ipc_render(&pdfium, &path, page_num, target, password.as_deref()) {
                 Ok(resp) => {
                     let _ = write_msg(&mut stdout, &resp);
                 }
@@ -780,11 +828,11 @@ fn ipc_render(
     pdfium: &Pdfium,
     path: &Path,
     page_num: u32,
-    target_px: u32,
+    target: PdfRenderTarget,
     password: Option<&str>,
 ) -> std::io::Result<Vec<u8>> {
     let (img, content_type, page_count) =
-        core_render_with_count(pdfium, path, page_num, target_px, password)?;
+        core_render_with_count(pdfium, path, page_num, target, password)?;
     let rgba = img.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
@@ -816,7 +864,7 @@ fn core_render_with_count(
     pdfium: &Pdfium,
     path: &Path,
     page_num: u32,
-    target_px: u32,
+    target: PdfRenderTarget,
     password: Option<&str>,
 ) -> std::io::Result<(image::DynamicImage, PdfPageContentType, u32)> {
     let doc = pdfium
@@ -830,6 +878,7 @@ fn core_render_with_count(
     let content_type = analyze_page_content(&page);
     let page_w = page.width().value;
     let page_h = page.height().value;
+    let target_px = resolve_render_target_long_edge(target, page_w, page_h, content_type);
     let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
     let render_config = PdfRenderConfig::new()
         .set_target_width(tw as i32)
@@ -1697,7 +1746,7 @@ enum WorkerRequest {
     Render {
         path: PathBuf,
         page_num: u32,
-        target_px: u32,
+        target: PdfRenderTarget,
         password: Option<String>,
         cancel: Option<Arc<AtomicBool>>,
         reply: mpsc::Sender<std::io::Result<RenderResult>>,
@@ -1846,7 +1895,7 @@ impl PdfWorker {
             WorkerRequest::Render {
                 path,
                 page_num,
-                target_px,
+                target,
                 password,
                 cancel,
                 reply,
@@ -1855,7 +1904,7 @@ impl PdfWorker {
                     return;
                 }
                 let result =
-                    core_render_with_count(pdfium, &path, page_num, target_px, password.as_deref())
+                    core_render_with_count(pdfium, &path, page_num, target, password.as_deref())
                         .map(|(image, content_type, page_count)| RenderResult {
                             image,
                             content_type,
@@ -1930,6 +1979,76 @@ impl PdfWorker {
 // 公開データ型
 // -----------------------------------------------------------------------
 
+/// 初回 PDF ラスタライズで再現する表示倍率。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfDisplayFitMode {
+    Page,
+    Width,
+    Height,
+    Original,
+}
+
+impl PdfDisplayFitMode {
+    fn protocol_tag(self) -> u8 {
+        match self {
+            Self::Page => 0,
+            Self::Width => 1,
+            Self::Height => 2,
+            Self::Original => 3,
+        }
+    }
+
+    fn from_protocol_tag(tag: u8) -> std::io::Result<Self> {
+        match tag {
+            0 => Ok(Self::Page),
+            1 => Ok(Self::Width),
+            2 => Ok(Self::Height),
+            3 => Ok(Self::Original),
+            _ => Err(std::io::ErrorKind::InvalidData.into()),
+        }
+    }
+}
+
+/// PDF の表示先を物理ピクセルで表した初回レンダターゲット。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfDisplayTarget {
+    pub width_px: u32,
+    pub height_px: u32,
+    pub fit_mode: PdfDisplayFitMode,
+}
+
+impl PdfDisplayTarget {
+    /// egui の論理 point と effective pixels-per-point から実ピクセルを得る。
+    pub fn from_logical_size(
+        width_points: f32,
+        height_points: f32,
+        pixels_per_point: f32,
+        fit_mode: PdfDisplayFitMode,
+    ) -> Self {
+        let ppp = pixels_per_point.max(0.01);
+        Self {
+            width_px: (width_points.max(1.0) * ppp).ceil() as u32,
+            height_px: (height_points.max(1.0) * ppp).ceil() as u32,
+            fit_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfRenderTarget {
+    LongEdge(u32),
+    Display {
+        viewport: PdfDisplayTarget,
+        swap_page_axes: bool,
+    },
+}
+
+/// 丸め、フィルタ、1-frame のレイアウト差で等倍表示が眠くならないための余裕。
+const PDF_DISPLAY_RENDER_HEADROOM: f32 = 1.10;
+/// 100% 原寸 / no-downscale は raster 長辺が表示寸法にもなるため、従来の見え方と
+/// サンプル密度を下げない最低値。raster native 上限はこの後に優先する。
+const PDF_ORIGINAL_RENDER_MIN_LONG_PX: u32 = 4096;
+
 /// PDF ページのコンテンツ種別。
 /// ラスター画像のみで構成されるページ (スキャン PDF) と、
 /// ベクター要素 (テキスト・パス等) を含むページを区別する。
@@ -1942,14 +2061,61 @@ pub enum PdfPageContentType {
 }
 
 impl PdfPageContentType {
-    /// レンダリング基準解像度 (長辺ピクセル数) を返す。
-    /// ラスターページは画像の原寸、ベクターページは固定 4096px。
-    pub fn base_render_px(&self) -> f32 {
+    pub fn native_long_edge(self) -> Option<u32> {
         match self {
-            Self::Raster { w, h } => (*w).max(*h) as f32,
-            Self::Vector => 4096.0,
+            Self::Raster { w, h } => Some(w.max(h)),
+            Self::Vector => None,
         }
     }
+}
+
+/// 表示先、ページ縦横比、回転、content type から初回レンダ長辺を決める。
+pub fn display_render_long_edge(
+    viewport: PdfDisplayTarget,
+    page_w: f32,
+    page_h: f32,
+    swap_page_axes: bool,
+    content_type: PdfPageContentType,
+) -> u32 {
+    resolve_render_target_long_edge(
+        PdfRenderTarget::Display {
+            viewport,
+            swap_page_axes,
+        },
+        page_w,
+        page_h,
+        content_type,
+    )
+}
+
+/// 表示 trim 後の bbox が分かっている場合に、見える領域の texel 密度から必要長辺を求める。
+pub fn display_render_long_edge_for_content_bbox(
+    viewport: PdfDisplayTarget,
+    page_w: f32,
+    page_h: f32,
+    swap_page_axes: bool,
+    content_type: PdfPageContentType,
+    bbox_width: f32,
+    bbox_height: f32,
+) -> u32 {
+    resolve_display_target_long_edge(
+        viewport,
+        page_w,
+        page_h,
+        swap_page_axes,
+        content_type,
+        Some((bbox_width, bbox_height)),
+    )
+}
+
+/// fit 解像度をズーム倍率へ追従させ、GPU 上限と raster native 上限を適用する。
+pub fn zoom_render_long_edge(base_px: u32, zoom: f32, native_cap: Option<u32>) -> u32 {
+    let scaled = ((base_px.max(1) as f32) * zoom.max(0.01)).ceil() as u32;
+    let mut target = scaled.clamp(PDF_RENDER_MIN_LONG_PX, PDF_RENDER_MAX_LONG_PX);
+    if let Some(native_long) = native_cap {
+        target = target.min(native_long.max(1));
+    }
+    target
 }
 
 /// PDF ページ render の結果一式 (v1.0.0)。
@@ -2124,6 +2290,56 @@ pub fn render_page(
     // `AbortOnCancel`。詳細は `CancelWaitPolicy` の doc コメント参照。
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
+    render_page_target(
+        pdf_path,
+        page_num,
+        PdfRenderTarget::LongEdge(target_px),
+        password,
+        cancel,
+        priority,
+        context_epoch,
+        cancel_policy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_page_for_display(
+    pdf_path: &Path,
+    page_num: u32,
+    viewport: PdfDisplayTarget,
+    swap_page_axes: bool,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    priority: JobPriority,
+    context_epoch: u64,
+    cancel_policy: CancelWaitPolicy,
+) -> std::io::Result<RenderResult> {
+    render_page_target(
+        pdf_path,
+        page_num,
+        PdfRenderTarget::Display {
+            viewport,
+            swap_page_axes,
+        },
+        password,
+        cancel,
+        priority,
+        context_epoch,
+        cancel_policy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_page_target(
+    pdf_path: &Path,
+    page_num: u32,
+    target: PdfRenderTarget,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    priority: JobPriority,
+    context_epoch: u64,
+    cancel_policy: CancelWaitPolicy,
+) -> std::io::Result<RenderResult> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
@@ -2134,6 +2350,15 @@ pub fn render_page(
     let perf_enabled = crate::perf::is_enabled();
     let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
     let t0 = std::time::Instant::now();
+    let (target_px, target_kind, viewport_w, viewport_h) = match target {
+        PdfRenderTarget::LongEdge(long) => (long, "long_edge", 0, 0),
+        PdfRenderTarget::Display { viewport, .. } => (
+            viewport.width_px.max(viewport.height_px),
+            "display",
+            viewport.width_px,
+            viewport.height_px,
+        ),
+    };
 
     let pool = get_pool();
     if pool.worker_count > 0 {
@@ -2147,13 +2372,16 @@ pub fn render_page(
                 &[
                     ("page", serde_json::Value::from(page_num)),
                     ("target_px", serde_json::Value::from(target_px)),
+                    ("target_kind", serde_json::Value::from(target_kind)),
+                    ("viewport_w", serde_json::Value::from(viewport_w)),
+                    ("viewport_h", serde_json::Value::from(viewport_h)),
                     ("busy", serde_json::Value::from(busy_count)),
                     ("total", serde_json::Value::from(pool.worker_count)),
                     ("priority", serde_json::Value::from(format!("{priority:?}"))),
                 ],
             );
         }
-        let req = encode_render_request(pdf_path, page_num, target_px, password);
+        let req = encode_render_request(pdf_path, page_num, target, password);
         let resp = pool.execute(
             &req,
             cancel.as_ref(),
@@ -2165,6 +2393,14 @@ pub fn render_page(
         let result = PdfWorkerPool::parse_render_response(&resp);
         if perf_enabled {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let (render_w, render_h, render_long_px) = result
+                .as_ref()
+                .map(|result| {
+                    let w = result.image.width();
+                    let h = result.image.height();
+                    (w, h, w.max(h))
+                })
+                .unwrap_or((0, 0, 0));
             crate::perf::event(
                 "pdf",
                 "pool_recv",
@@ -2173,6 +2409,9 @@ pub fn render_page(
                 &[
                     ("page", serde_json::Value::from(page_num)),
                     ("rtt_ms", serde_json::Value::from(ms)),
+                    ("render_w", serde_json::Value::from(render_w)),
+                    ("render_h", serde_json::Value::from(render_h)),
+                    ("render_long_px", serde_json::Value::from(render_long_px)),
                     ("ok", serde_json::Value::from(result.is_ok())),
                 ],
             );
@@ -2194,7 +2433,7 @@ pub fn render_page(
     let _ = get_worker().tx.send(WorkerRequest::Render {
         path: pdf_path.to_path_buf(),
         page_num,
-        target_px,
+        target,
         password: password.map(String::from),
         cancel,
         reply: tx,
@@ -2233,10 +2472,8 @@ pub fn check_password_needed(pdf_path: &Path) -> PdfAccessStatus {
 // 公開 API — 非同期版 (UI スレッド用)
 // -----------------------------------------------------------------------
 
-/// PDF レンダ結果の長辺ピクセル下限 (`request_pdf_rerender` の `target_px` clamp 下限)。
-/// native が極小 (例 100x200) でも実レンダ長辺はこの値まで持ち上がるため、AI 用の
-/// native 収束判定は raw native ではなく `max(native_long, この値)` を実 target とする
-/// (GitHub issue #1, Codex P2: そうしないと小 PDF で先読みが永久保留になる)。
+/// vector / 明示長辺レンダの長辺ピクセル下限。raster の display/zoom 経路では
+/// native 上限を優先するため、極小原稿はこの値を下回り得る。
 pub const PDF_RENDER_MIN_LONG_PX: u32 = 256;
 /// PDF レンダ結果の長辺ピクセル上限 (テクスチャメモリ保護、`target_px` clamp 上限)。
 pub const PDF_RENDER_MAX_LONG_PX: u32 = 8192;
@@ -2265,7 +2502,7 @@ pub fn render_page_async(
     let _ = sender.send(WorkerRequest::Render {
         path: pdf_path.to_path_buf(),
         page_num,
-        target_px,
+        target: PdfRenderTarget::LongEdge(target_px),
         password: password.map(String::from),
         cancel: Some(Arc::clone(&cancel)),
         reply: tx,
@@ -2387,6 +2624,66 @@ pub fn check_password_async(pdf_path: &Path) -> mpsc::Receiver<PdfAccessStatus> 
 // 内部ユーティリティ
 // -----------------------------------------------------------------------
 
+fn resolve_render_target_long_edge(
+    target: PdfRenderTarget,
+    page_w: f32,
+    page_h: f32,
+    content_type: PdfPageContentType,
+) -> u32 {
+    let PdfRenderTarget::Display {
+        viewport,
+        swap_page_axes,
+    } = target
+    else {
+        let PdfRenderTarget::LongEdge(long) = target else {
+            unreachable!()
+        };
+        return long.max(1);
+    };
+    resolve_display_target_long_edge(viewport, page_w, page_h, swap_page_axes, content_type, None)
+}
+
+fn resolve_display_target_long_edge(
+    viewport: PdfDisplayTarget,
+    page_w: f32,
+    page_h: f32,
+    swap_page_axes: bool,
+    content_type: PdfPageContentType,
+    content_bbox_size: Option<(f32, f32)>,
+) -> u32 {
+    let page_w = page_w.max(1.0);
+    let page_h = page_h.max(1.0);
+    let (bbox_w, bbox_h) = content_bbox_size.unwrap_or((1.0, 1.0));
+    let visible_w = page_w * bbox_w.clamp(0.001, 1.0);
+    let visible_h = page_h * bbox_h.clamp(0.001, 1.0);
+    let (page_w, page_h, visible_w, visible_h) = if swap_page_axes {
+        (page_h, page_w, visible_h, visible_w)
+    } else {
+        (page_w, page_h, visible_w, visible_h)
+    };
+    let viewport_w = viewport.width_px.max(1) as f32;
+    let viewport_h = viewport.height_px.max(1) as f32;
+    let long = page_w.max(page_h);
+
+    let required = match viewport.fit_mode {
+        PdfDisplayFitMode::Page => long * (viewport_w / visible_w).min(viewport_h / visible_h),
+        PdfDisplayFitMode::Width => long * viewport_w / visible_w,
+        PdfDisplayFitMode::Height => long * viewport_h / visible_h,
+        PdfDisplayFitMode::Original => viewport_w.max(viewport_h),
+    };
+    let mut target_px = (required * PDF_DISPLAY_RENDER_HEADROOM).ceil() as u32;
+    target_px = target_px.clamp(PDF_RENDER_MIN_LONG_PX, PDF_RENDER_MAX_LONG_PX);
+    if matches!(viewport.fit_mode, PdfDisplayFitMode::Original) {
+        target_px = target_px.max(PDF_ORIGINAL_RENDER_MIN_LONG_PX);
+    }
+    if let Some(native_long) = content_type.native_long_edge() {
+        // スキャン原稿より大きく rasterize しても情報は増えない。極小原稿では
+        // 256px 下限より native 上限を優先する。
+        target_px = target_px.min(native_long.max(1));
+    }
+    target_px
+}
+
 /// PDF ページのポイント寸法を target ピクセルにフィットさせる。
 fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
     let long = w.max(h);
@@ -2407,6 +2704,144 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vector_target() -> PdfPageContentType {
+        PdfPageContentType::Vector
+    }
+
+    #[test]
+    fn display_target_uses_physical_pixels_for_monitor_and_window_dpi() {
+        let monitor =
+            PdfDisplayTarget::from_logical_size(3840.0, 2160.0, 1.0, PdfDisplayFitMode::Page);
+        let scaled_monitor =
+            PdfDisplayTarget::from_logical_size(1920.0, 1080.0, 2.0, PdfDisplayFitMode::Page);
+        assert_eq!(monitor, scaled_monitor);
+        assert_eq!(
+            display_render_long_edge(monitor, 595.0, 842.0, false, vector_target()),
+            2376
+        );
+
+        let window =
+            PdfDisplayTarget::from_logical_size(1200.0, 800.0, 1.5, PdfDisplayFitMode::Page);
+        assert_eq!(
+            display_render_long_edge(window, 600.0, 900.0, false, vector_target()),
+            1320
+        );
+    }
+
+    #[test]
+    fn display_target_never_exceeds_raster_native_or_global_limit() {
+        let viewport = PdfDisplayTarget {
+            width_px: 7680,
+            height_px: 4320,
+            fit_mode: PdfDisplayFitMode::Width,
+        };
+        assert_eq!(
+            display_render_long_edge(
+                viewport,
+                600.0,
+                900.0,
+                false,
+                PdfPageContentType::Raster { w: 824, h: 1200 },
+            ),
+            1200
+        );
+        assert_eq!(
+            display_render_long_edge(viewport, 100.0, 10_000.0, false, vector_target()),
+            PDF_RENDER_MAX_LONG_PX
+        );
+    }
+
+    #[test]
+    fn display_target_accounts_for_quarter_turn_rotation() {
+        let viewport = PdfDisplayTarget {
+            width_px: 1600,
+            height_px: 900,
+            fit_mode: PdfDisplayFitMode::Page,
+        };
+        let normal = display_render_long_edge(viewport, 600.0, 900.0, false, vector_target());
+        let rotated = display_render_long_edge(viewport, 600.0, 900.0, true, vector_target());
+        assert_eq!(normal, 990);
+        assert_eq!(rotated, 1485);
+    }
+
+    #[test]
+    fn display_target_raises_resolution_for_visible_trim_bbox() {
+        let viewport = PdfDisplayTarget {
+            width_px: 3840,
+            height_px: 2160,
+            fit_mode: PdfDisplayFitMode::Page,
+        };
+        assert_eq!(
+            display_render_long_edge_for_content_bbox(
+                viewport,
+                595.0,
+                842.0,
+                false,
+                vector_target(),
+                0.8,
+                0.5,
+            ),
+            4752
+        );
+    }
+
+    #[test]
+    fn original_size_path_never_drops_below_previous_long_edge() {
+        let viewport = PdfDisplayTarget {
+            width_px: 1920,
+            height_px: 1080,
+            fit_mode: PdfDisplayFitMode::Original,
+        };
+        assert_eq!(
+            display_render_long_edge(viewport, 600.0, 900.0, false, vector_target()),
+            4096
+        );
+    }
+
+    #[test]
+    fn zoom_rerender_scales_from_display_base_and_keeps_caps() {
+        assert_eq!(zoom_render_long_edge(2376, 1.5, None), 3564);
+        assert_eq!(zoom_render_long_edge(6000, 2.0, None), 8192);
+        assert_eq!(zoom_render_long_edge(2376, 2.0, Some(3000)), 3000);
+        assert_eq!(zoom_render_long_edge(120, 1.0, Some(120)), 120);
+    }
+
+    #[test]
+    fn display_render_request_ipc_roundtrip_preserves_viewport_and_fit() {
+        let viewport = PdfDisplayTarget {
+            width_px: 3840,
+            height_px: 2160,
+            fit_mode: PdfDisplayFitMode::Height,
+        };
+        let encoded = encode_render_request(
+            Path::new("sample.pdf"),
+            7,
+            PdfRenderTarget::Display {
+                viewport,
+                swap_page_axes: true,
+            },
+            Some("secret"),
+        );
+        match decode_request(&encoded).unwrap() {
+            DecodedRequest::Render {
+                page_num,
+                target:
+                    PdfRenderTarget::Display {
+                        viewport: actual,
+                        swap_page_axes,
+                    },
+                password,
+                ..
+            } => {
+                assert_eq!(page_num, 7);
+                assert_eq!(actual, viewport);
+                assert!(swap_page_axes);
+                assert_eq!(password.as_deref(), Some("secret"));
+            }
+            _ => panic!("unexpected decoded request"),
+        }
+    }
 
     #[test]
     fn pdf_document_info_as_search_text_joins_fields() {

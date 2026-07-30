@@ -455,6 +455,13 @@ pub(crate) enum WindowHostEffect {
         host: HostedWindow,
         visibility: WindowVisibility,
     },
+    /// Confirm that an idempotent visibility request already matches the active host.
+    /// The backend must emit the same completion acknowledgement as ApplyVisibility,
+    /// but must not repeat the native show/hide operation.
+    ConfirmVisibility {
+        host: HostedWindow,
+        visibility: WindowVisibility,
+    },
     Destroy {
         host: HostedWindow,
     },
@@ -541,6 +548,18 @@ impl WindowHostTransition {
 
     fn ignored(state: WindowHostState, status: WindowHostTransitionStatus) -> Self {
         Self::new(state, Vec::new(), status)
+    }
+
+    fn confirmed_visibility(
+        state: WindowHostState,
+        host: HostedWindow,
+        visibility: WindowVisibility,
+    ) -> Self {
+        Self::new(
+            state,
+            vec![WindowHostEffect::ConfirmVisibility { host, visibility }],
+            WindowHostTransitionStatus::IgnoredIdempotent,
+        )
     }
 
     fn rejected(state: WindowHostState, error: WindowHostContractError) -> Self {
@@ -714,10 +733,7 @@ fn set_visibility(
             visibility: old_visibility,
         } if staging.epoch() == epoch => {
             if old_visibility == visibility {
-                return WindowHostTransition::ignored(
-                    state,
-                    WindowHostTransitionStatus::IgnoredIdempotent,
-                );
+                return WindowHostTransition::confirmed_visibility(state, old, visibility);
             }
             WindowHostTransition::applied(
                 WindowHostState::Switching {
@@ -734,10 +750,7 @@ fn set_visibility(
         }
         WindowHostState::Visible { request, host } if host.epoch == epoch => {
             if visibility == WindowVisibility::Visible {
-                return WindowHostTransition::ignored(
-                    state,
-                    WindowHostTransitionStatus::IgnoredIdempotent,
-                );
+                return WindowHostTransition::confirmed_visibility(state, host, visibility);
             }
             WindowHostTransition::applied(
                 WindowHostState::Hidden { request, host },
@@ -746,10 +759,7 @@ fn set_visibility(
         }
         WindowHostState::Hidden { request, host } if host.epoch == epoch => {
             if visibility == WindowVisibility::Hidden {
-                return WindowHostTransition::ignored(
-                    state,
-                    WindowHostTransitionStatus::IgnoredIdempotent,
-                );
+                return WindowHostTransition::confirmed_visibility(state, host, visibility);
             }
             WindowHostTransition::applied(
                 WindowHostState::Visible { request, host },
@@ -905,7 +915,10 @@ fn window_created(
             spec: expected_spec,
             visibility,
         } if state_request == request && expected_epoch == epoch => {
-            if expected_spec != spec {
+            let supported_hud_fallback = expected_spec.placement == spec.placement
+                && expected_spec.topology == HostWindowTopology::PresenterAndHud
+                && spec.topology == HostWindowTopology::PresenterOnly;
+            if expected_spec != spec && !supported_hud_fallback {
                 return WindowHostTransition::new(
                     state,
                     vec![WindowHostEffect::DestroyOrphan { host: event_host }],
@@ -1550,6 +1563,49 @@ mod tests {
     }
 
     #[test]
+    fn requested_hud_topology_accepts_presenter_only_backend_fallback() {
+        let opened = reduce_window_host(
+            WindowHostState::Empty,
+            WindowHostInput::Command(open_visible(1, 10)),
+        );
+        let actual_spec = spec(
+            NativeVideoPlacement::FullscreenBorderless,
+            HostWindowTopology::PresenterOnly,
+        );
+        let created = reduce_window_host(
+            opened.state,
+            WindowHostInput::Event(WindowHostEvent::WindowCreated {
+                request: WindowRequestId(1),
+                epoch: WindowEpoch(10),
+                spec: actual_spec,
+                windows: HostWindows::PresenterOnly {
+                    presenter: OpaqueWindowHandle {
+                        id: OpaqueWindowId(0x1234),
+                        generation: WindowGeneration(10),
+                    },
+                },
+            }),
+        );
+        assert_eq!(created.status, WindowHostTransitionStatus::Applied);
+        assert!(matches!(
+            created.state,
+            WindowHostState::Preparing {
+                staging: StagingWindow::Created {
+                    host: HostedWindow { spec, .. },
+                    ..
+                },
+                ..
+            } if spec == actual_spec
+        ));
+        assert!(
+            created
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, WindowHostEffect::AttachTarget { .. }))
+        );
+    }
+
+    #[test]
     fn fake_backend_switch_stall_keeps_old_window_and_close_needs_no_render_ack() {
         let mut backend = FakeWindowBackend::new(FakeRenderMode::ReadyImmediately);
         let state = backend.dispatch_and_drain(
@@ -1753,6 +1809,63 @@ mod tests {
         );
         assert!(duplicate.effects.is_empty());
         assert_eq!(duplicate.state, first.state);
+    }
+
+    #[test]
+    fn hidden_source_swap_rearm_confirms_each_idempotent_visibility_request() {
+        let host = presenter(
+            1,
+            10,
+            0x1234,
+            40,
+            NativeVideoPlacement::FullscreenBorderless,
+        );
+        let mut state = WindowHostState::Hidden {
+            request: WindowRequestId(1),
+            host,
+        };
+
+        // Each source-swap completion re-arms audio mode with another hide request.
+        // The HWND stays hidden, but the render thread still needs a completion for
+        // every request so it can resume draining the replacement source receiver.
+        for _source_epoch in 1..=3 {
+            let transition = reduce_window_host(
+                state,
+                WindowHostInput::Command(WindowHostCommand::SetVisibility {
+                    epoch: host.epoch,
+                    visibility: WindowVisibility::Hidden,
+                }),
+            );
+            assert_eq!(
+                transition.status,
+                WindowHostTransitionStatus::IgnoredIdempotent
+            );
+            assert_eq!(
+                transition.effects,
+                vec![WindowHostEffect::ConfirmVisibility {
+                    host,
+                    visibility: WindowVisibility::Hidden,
+                }]
+            );
+            state = transition.state;
+        }
+
+        let show = reduce_window_host(
+            state,
+            WindowHostInput::Command(WindowHostCommand::SetVisibility {
+                epoch: host.epoch,
+                visibility: WindowVisibility::Visible,
+            }),
+        );
+        assert_eq!(show.status, WindowHostTransitionStatus::Applied);
+        assert!(matches!(show.state, WindowHostState::Visible { .. }));
+        assert_eq!(
+            show.effects,
+            vec![WindowHostEffect::ApplyVisibility {
+                host,
+                visibility: WindowVisibility::Visible,
+            }]
+        );
     }
 
     #[test]

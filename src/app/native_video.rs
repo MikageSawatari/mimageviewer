@@ -789,10 +789,6 @@ impl App {
             .fullscreen_idx
             .is_some_and(|idx| self.video_audio_mode_hides_native_presenter_for(idx))
         {
-            crate::logger::log(
-                "[video-audio] skip detached host resync while hidden presenter audio mode is active"
-                    .to_string(),
-            );
             return true;
         }
         if self.native_video_mode_switch.is_some() {
@@ -1531,6 +1527,12 @@ impl App {
             ignore_resume,
             None,
         );
+        // 音声モードを維持する source swap は、decoder event を engine が取り込む前に
+        // audio-only ファイルと同じ readiness 要件へ切り替える。presenter は引き続き
+        // hidden consume-and-hold だが、再生開始は FirstFrameReady に依存しない。
+        if audio_mode_after_swap {
+            new_player.set_media_visual_mode(music_core::MediaVisualMode::Music);
+        }
         new_player.attach_native_output(native_output);
         let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
         new_player.switch_native_source(payload);
@@ -2699,7 +2701,9 @@ impl App {
             }
         } else {
             if let Some(fs_idx) = self.fullscreen_idx {
-                self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
+                self.fs_holdover_tex = self
+                    .current_fs_tex_for_holdover(fs_idx)
+                    .map(crate::app::FsHoldover::FolderNavigation);
             }
             self.still_fullscreen_viewport_enter_suppress_until =
                 Some(now + std::time::Duration::from_millis(260));
@@ -2931,10 +2935,9 @@ impl App {
             "[native-video] placement switch failed (target={target_presentation:?}); \
              pending cleared (settings was never persisted, no revert needed)"
         ));
-        // **主対象は「detached 再生中の再親付け rebuild 失敗」**。detached child は
-        // post_quit_on_destroy=false なので、再親付け rebuild が失敗すると旧 (host teardown で
-        // 死にかけの) child を抱えたまま WM_QUIT でも回収されず stuck する。そこで再親付けを
-        // 再要求し、poll が現 host で rebuild を再試行する (host が確定できなければ sync が
+        // **主対象は「detached 再生中の再親付け rebuild 失敗」**。Stage 4 の二相 switch は
+        // failure 時に旧 host を維持するため、再親付けを再要求して registry の target と
+        // production pump の active host を収束させる (host が確定できなければ sync が
         // no-op で待機、session 終了で applicability が落ちて自然に破棄される)。
         //
         // 一方 **初回 main→detached の switch 失敗** は、mode_switch を上で None にした後
@@ -3582,7 +3585,9 @@ impl App {
             // 内部処理イベント (presenter thread が直接消費する)。UI には届かない想定。
             crate::video::native_window::NativeVideoWindowEvent::GeometryChanged { .. } => {}
             crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
-            | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud => {}
+            | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud
+            | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim
+            | crate::video::native_window::NativeVideoWindowEvent::Destroyed => {}
         }
     }
 
@@ -7497,6 +7502,7 @@ impl App {
         // 次フレームには egui 音楽ビューが描かれ、presenter ウィンドウが隠れても穴が空かない
         // (むしろ 1 フレーム映像が残るだけで視覚的に自然)。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_media_visual_mode(music_core::MediaVisualMode::Music);
             player.set_native_window_visible(false);
         }
         ctx.request_repaint();
@@ -7547,6 +7553,11 @@ impl App {
                 "[video-audio] exit fs_idx={fs_idx} ignored: source-swap in flight (retry after swap)"
             ));
             return;
+        }
+        // ここからは動画表示へ復帰する操作。再 Buffering が起きた場合も通常の動画と同じく
+        // FirstFrameReady を待つよう、presenter の show/re-place より先に要件を戻す。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_media_visual_mode(music_core::MediaVisualMode::Video);
         }
         self.reset_video_audio_side_panel_sessions(fs_idx);
         // saw_hidden を「今 hidden か」でシードする (Codex P2 検証): 音声モードでは presenter は既に
@@ -7725,6 +7736,7 @@ impl App {
             )
         });
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get_mut(&fs_idx) {
+            player.set_media_visual_mode(music_core::MediaVisualMode::Video);
             let pos = player.position().max(0.0);
             let _ = player.take_native_output();
             player.seek(pos);

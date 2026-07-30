@@ -164,6 +164,55 @@ fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn checked_selection_overlay_label(checked_count: usize) -> Option<String> {
+    (checked_count > 0).then(|| format!("{checked_count} 件"))
+}
+
+/// オーバーレイの下地色。文字と枠は `warn_fg_color` を載せるので、それが読める明度にする。
+/// 白い一覧の上で埋もれないことが目的なので、`Frame::popup` の既定 fill は使わない。
+fn checked_selection_overlay_fill(dark_mode: bool) -> egui::Color32 {
+    match dark_mode {
+        false => egui::Color32::from_rgb(255, 243, 209),
+        true => egui::Color32::from_rgb(66, 50, 20),
+    }
+}
+
+/// チェック件数をメイン一覧の右上へ表示する。「選択解除」が押されたら true を返す。
+fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> bool {
+    let Some(count_label) = checked_selection_overlay_label(checked_count) else {
+        return false;
+    };
+    let top_offset = ctx.available_rect().top() + 8.0;
+    let mut clear_clicked = false;
+    egui::Area::new(egui::Id::new("checked_selection_count_overlay"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top_offset))
+        .show(ctx, |ui| {
+            let accent = ui.visuals().warn_fg_color;
+            egui::Frame::popup(ui.style())
+                .fill(checked_selection_overlay_fill(ui.visuals().dark_mode))
+                .stroke(egui::Stroke::new(1.5, accent))
+                .show(ui, |ui| {
+                    // Area の幅は自動なので、中央寄せ系のレイアウトは available_width を
+                    // 画面端まで取ってしまう。縦積みだけに留める。
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("チェック").color(accent));
+                        ui.label(
+                            egui::RichText::new(count_label)
+                                .strong()
+                                .size(18.0)
+                                .color(accent),
+                        );
+                        clear_clicked = ui
+                            .button("選択解除")
+                            .on_hover_text("チェックをすべて解除 (Ctrl+D)")
+                            .clicked();
+                    });
+                });
+        });
+    clear_clicked
+}
+
 /// 📌 ボタン描画用の状態スナップショット。`render_address_bar` 入口で 1 度算出する。
 pub(crate) struct FolderPinButtonState {
     /// ボタンを enable にして良いか (false なら disabled + tooltip 表示)
@@ -1452,7 +1501,9 @@ fn details_ordered_columns(
     }
     ordered
         .into_iter()
-        .filter(|col| include_hidden || col.visible(settings, column_set))
+        .filter(|col| {
+            column_set.includes(*col) && (include_hidden || col.visible(settings, column_set))
+        })
         .collect()
 }
 
@@ -1469,9 +1520,6 @@ fn details_visible_columns(
     column_set: DetailsColumnSet,
 ) -> Vec<DetailsColumn> {
     details_ordered_columns(settings, column_set, false)
-        .into_iter()
-        .filter(|column| details_column_is_visible(settings, column_set, *column))
-        .collect()
 }
 
 fn selection_info_bottom_bar_is_hidden(settings: &crate::settings::Settings) -> bool {
@@ -1500,6 +1548,23 @@ fn details_column_menu_heading(
     } else {
         "一覧・サムネイル表示の下部情報バー"
     }
+}
+
+fn details_shared_preview_hover_text(
+    column_set: DetailsColumnSet,
+    origin: DetailsColumnMenuOrigin,
+) -> Option<&'static str> {
+    // 下部バーは詳細一覧・サムネイル一覧のどちらでもプレビューを描かない
+    // (`DetailsColumnSet::includes`)。バーから開いたメニューでは、チェックの行き先が
+    // 一覧側であることを伝える。`DetailsSelectionBar` だけを見ていると
+    // サムネイル一覧の `ThumbnailSelectionBar` で説明が出ない (実害あり)。
+    let from_bottom_bar = matches!(
+        origin,
+        DetailsColumnMenuOrigin::DetailsSelectionBar
+            | DetailsColumnMenuOrigin::ThumbnailSelectionBar
+    );
+    (column_set == DetailsColumnSet::SharedBar && from_bottom_bar)
+        .then_some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
 }
 
 fn toggle_details_selection_bar_mode_from_menu(settings: &mut crate::settings::Settings) -> bool {
@@ -1693,7 +1758,9 @@ fn set_details_name_width_auto(
         }
         true
     } else {
-        set_details_name_width(settings, column_set, current_name_width)
+        let stored_width =
+            details_stored_name_width_from_effective(settings, column_set, current_name_width);
+        set_details_name_width(settings, column_set, stored_width)
     }
 }
 
@@ -1953,8 +2020,18 @@ fn selection_info_bar_height() -> f32 {
     SELECTION_INFO_BAR_CONTENT_HEIGHT + details_scroll_style().allocated_width()
 }
 
+fn details_grid_available_height_after_selection_bar(
+    available_before: egui::Rect,
+    style: &egui::Style,
+) -> f32 {
+    let remaining_outer_height = (available_before.height() - selection_info_bar_height()).max(0.0);
+    let central_margin_y = egui::Frame::central_panel(style).inner_margin.sum().y;
+    (remaining_outer_height - central_margin_y).max(0.0)
+}
+
 /// 詳細表示の水平レイアウト。縦スクロールバーの gutter を考慮して、ヘッダと行の列が
 /// ぴったり揃い、縦バー出現時に右端列が欠けたり不要な横スクロールバーが出たりしないようにする。
+#[derive(Clone, Copy)]
 struct DetailsLayout {
     /// 名前列の実効幅。
     name_w: f32,
@@ -2264,6 +2341,38 @@ fn details_fixed_columns_width(
         .sum()
 }
 
+/// この面では描かないが、元の列セットで表示中の列幅。
+///
+/// 下部バーではプレビュー列を描かない。その幅を空白として予約せず名前列へ移すことで、
+/// 名前より右の列を一覧と同じ x 座標に保つ。
+fn details_omitted_columns_width(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> f32 {
+    DetailsColumn::all()
+        .iter()
+        .copied()
+        .filter(|column| !column_set.includes(*column) && column.visible(settings, column_set))
+        .map(|column| details_column_width(settings, column_set, column))
+        .sum()
+}
+
+fn details_effective_fixed_name_width(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> f32 {
+    details_name_fixed_width(settings, column_set)
+        + details_omitted_columns_width(settings, column_set)
+}
+
+fn details_stored_name_width_from_effective(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    width: f32,
+) -> f32 {
+    width - details_omitted_columns_width(settings, column_set)
+}
+
 fn details_layout(
     avail_w: f32,
     gutter: f32,
@@ -2272,16 +2381,18 @@ fn details_layout(
     column_set: DetailsColumnSet,
 ) -> DetailsLayout {
     let fixed = details_fixed_columns_width(settings, column_set);
+    let omitted = details_omitted_columns_width(settings, column_set);
     let columns_avail = (avail_w - gutter).max(0.0);
     let name_width_auto = column_set.name_width_auto(settings);
-    let auto_fits = name_width_auto && columns_avail >= fixed + DetailsColumn::Name.default_width();
+    let minimum_name_width = DetailsColumn::Name.default_width() + omitted;
+    let auto_fits = name_width_auto && columns_avail >= fixed + minimum_name_width;
     let rounding_slack = details_layout_right_guard(pixels_per_point);
     let name_w = if auto_fits {
         (columns_avail - fixed - rounding_slack).max(DetailsColumn::Name.min_width())
     } else if name_width_auto {
-        DetailsColumn::Name.default_width()
+        minimum_name_width
     } else {
-        details_name_fixed_width(settings, column_set)
+        details_effective_fixed_name_width(settings, column_set)
     };
     let columns_w = name_w + fixed;
     // Leave one physical pixel of slack when auto-fit has enough room. At UI
@@ -2305,17 +2416,86 @@ fn details_layout(
     }
 }
 
-fn details_content_width_for_column_set(
-    full_pane_width: f32,
+#[derive(Clone, Copy)]
+struct DetailsListLayoutResolution {
+    layout: DetailsLayout,
+    horizontal_policy: DetailsHorizontalScrollPolicy,
+    hbar: f32,
+    viewport_h_est: f32,
+    needs_vscroll: bool,
+    gutter: f32,
+}
+
+fn resolve_details_list_layout(
+    source_rect: egui::Rect,
+    avail_h: f32,
+    item_spacing_y: f32,
+    natural_h: f32,
+    pixels_per_point: f32,
     settings: &crate::settings::Settings,
-    column_set: DetailsColumnSet,
-) -> f32 {
-    let omitted_width: f32 = details_ordered_columns(settings, column_set, false)
-        .into_iter()
-        .filter(|column| !column_set.includes(*column))
-        .map(|column| details_column_width(settings, column_set, column))
-        .sum();
-    (full_pane_width - omitted_width).max(DetailsColumn::Name.min_width())
+) -> DetailsListLayoutResolution {
+    let scroll_style = details_scroll_style();
+    let avail_w = source_rect.width().max(1.0);
+    let layout_avail_w = details_horizontal_viewport_capacity(source_rect, pixels_per_point)
+        .min(avail_w)
+        .max(1.0);
+    let mut h_overflow = false;
+    let mut settled = None;
+    for _ in 0..3 {
+        let hbar = if h_overflow {
+            scroll_style.allocated_width()
+        } else {
+            0.0
+        };
+        // 境界帯では gutter を多めに確保する方へ倒し、右端列の欠けを避ける。
+        let viewport_h_est =
+            (avail_h - App::DETAILS_HEADER_H - item_spacing_y - hbar - 2.0).max(0.0);
+        let needs_vscroll = natural_h > viewport_h_est;
+        let gutter = if needs_vscroll {
+            scroll_style.allocated_width()
+        } else {
+            0.0
+        };
+        let layout = details_layout(
+            layout_avail_w,
+            gutter,
+            pixels_per_point,
+            settings,
+            DetailsColumnSet::Details,
+        );
+        let horizontal_policy = details_horizontal_scroll_policy(
+            source_rect,
+            layout.extent,
+            layout.columns_w,
+            pixels_per_point,
+        );
+        let stable = horizontal_policy.overflow == h_overflow;
+        h_overflow = horizontal_policy.overflow;
+        settled = Some(DetailsListLayoutResolution {
+            layout,
+            horizontal_policy,
+            hbar,
+            viewport_h_est,
+            needs_vscroll,
+            gutter,
+        });
+        if stable {
+            break;
+        }
+    }
+    settled.expect("details horizontal policy loop always runs")
+}
+
+fn selection_info_bottom_bar_gutter(grid_view_mode: GridViewMode, details_list_gutter: f32) -> f32 {
+    if grid_view_mode == GridViewMode::Details {
+        details_list_gutter
+    } else {
+        0.0
+    }
+}
+
+fn details_content_width_for_column_set(full_pane_width: f32) -> f32 {
+    full_pane_width.max(DetailsColumn::Name.min_width())
 }
 
 fn details_column_rects_for_columns(
@@ -2331,9 +2511,12 @@ fn details_column_rects_for_columns(
         .map(|col| details_column_width(settings, column_set, col))
         .sum();
     let name_width = if column_set.name_width_auto(settings) {
-        (rect.width() - fixed).max(DetailsColumn::Name.default_width())
+        (rect.width() - fixed).max(
+            DetailsColumn::Name.default_width()
+                + details_omitted_columns_width(settings, column_set),
+        )
     } else {
-        details_name_fixed_width(settings, column_set)
+        details_effective_fixed_name_width(settings, column_set)
     };
     let specs = columns
         .into_iter()
@@ -6327,6 +6510,22 @@ impl App {
         }
     }
 
+    // ── 選択件数 ─────────────────────────────────────────────────────
+
+    /// チェック済みがある間だけ、メイン一覧の右上に件数と解除操作を表示する。
+    pub(crate) fn render_checked_selection_overlay(&mut self, ctx: &egui::Context) {
+        let checked_count = self.checked.len();
+        if checked_count == 0 {
+            return;
+        }
+        if self.viewer_session_blocks_main_window() || self.any_dialog_open() {
+            return;
+        }
+        if show_checked_selection_overlay(ctx, checked_count) {
+            self.checked.clear();
+        }
+    }
+
     // ── 進捗バー ─────────────────────────────────────────────────────
 
     /// 進捗バーオーバーレイ（左下フローティング）を描画する。
@@ -8665,6 +8864,7 @@ impl App {
 
         let show = match self.details_image_dims_state {
             LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::NotRequested
             | LazyColumnState::Cancelled => true,
             LazyColumnState::Ready { failed } => failed > 0,
@@ -8686,6 +8886,15 @@ impl App {
                             ui.label("詳細情報を読み込み準備中");
                         }
                         LazyColumnState::Loading { done, total } => {
+                            ui.label(format!(
+                                "詳細情報を読み込み中 {}/{}   遅延列 {}/{}",
+                                done, total, done, total
+                            ));
+                            if ui.small_button("停止").clicked() {
+                                self.cancel_details_meta_loading();
+                            }
+                        }
+                        LazyColumnState::Reconciling { done, total, .. } => {
                             ui.label(format!(
                                 "詳細情報を読み込み中 {}/{}   遅延列 {}/{}",
                                 done, total, done, total
@@ -9005,6 +9214,12 @@ impl App {
                 ui.label("AIメタデータを読み込み準備中");
             }
             LazyColumnState::Loading { done, total } => {
+                ui.label(format!("AIメタデータを読み込み中 {done}/{total}"));
+                if ui.small_button("停止").clicked() {
+                    self.cancel_details_meta_loading();
+                }
+            }
+            LazyColumnState::Reconciling { done, total, .. } => {
                 ui.label(format!("AIメタデータを読み込み中 {done}/{total}"));
                 if ui.small_button("停止").clicked() {
                     self.cancel_details_meta_loading();
@@ -11960,52 +12175,23 @@ impl App {
         // 横方向の要否は egui の丸め後 content_size に任せず、アプリが所有する全列幅を
         // 物理ピクセル右端へ変換して決める。横バーが出ると縦 viewport が縮み、縦バー gutter が
         // 新たに必要になる場合があるため、false -> true の単調な状態を最大 3 回で収束させる。
-        let details_scroll_style = details_scroll_style();
         let pixels_per_point = ui.ctx().pixels_per_point();
-        let layout_avail_w =
-            details_horizontal_viewport_capacity(horizontal_source_rect, pixels_per_point)
-                .min(avail_w)
-                .max(1.0);
-        let mut h_overflow = false;
-        let mut settled = None;
-        for _ in 0..3 {
-            let hbar = if h_overflow {
-                details_scroll_style.allocated_width()
-            } else {
-                0.0
-            };
-            // 境界帯では gutter を多めに確保する方へ倒し、右端列の欠けを避ける。
-            let viewport_h_est =
-                (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - hbar - 2.0)
-                    .max(0.0);
-            let needs_vscroll = natural_h > viewport_h_est;
-            let gutter = if needs_vscroll {
-                details_scroll_style.allocated_width()
-            } else {
-                0.0
-            };
-            let layout = details_layout(
-                layout_avail_w,
-                gutter,
-                pixels_per_point,
-                &self.settings,
-                DetailsColumnSet::Details,
-            );
-            let policy = details_horizontal_scroll_policy(
-                horizontal_source_rect,
-                layout.extent,
-                layout.columns_w,
-                pixels_per_point,
-            );
-            let stable = policy.overflow == h_overflow;
-            h_overflow = policy.overflow;
-            settled = Some((layout, policy, hbar, viewport_h_est, needs_vscroll, gutter));
-            if stable {
-                break;
-            }
-        }
-        let (layout, horizontal_policy, hbar, viewport_h_est, needs_vscroll, gutter) =
-            settled.expect("details horizontal policy loop always runs");
+        let DetailsListLayoutResolution {
+            layout,
+            horizontal_policy,
+            hbar,
+            viewport_h_est,
+            needs_vscroll,
+            gutter,
+        } = resolve_details_list_layout(
+            horizontal_source_rect,
+            avail_h,
+            ui.spacing().item_spacing.y,
+            natural_h,
+            pixels_per_point,
+            &self.settings,
+        );
+        let details_scroll_style = details_scroll_style();
         let content_w = layout.pane_w;
         self.last_details_name_width = layout.name_w;
 
@@ -12568,7 +12754,9 @@ impl App {
         if col.is_lazy()
             && matches!(
                 self.details_image_dims_state,
-                LazyColumnState::Loading { .. } | LazyColumnState::NotRequested
+                LazyColumnState::Loading { .. }
+                    | LazyColumnState::Reconciling { .. }
+                    | LazyColumnState::NotRequested
             )
         {
             base_title.push_str(" ...");
@@ -13012,11 +13200,13 @@ impl App {
             // 手動幅変更はユーザーの最新意思。進行中の測定結果で後から上書きしない。
             Self::cancel_details_best_fit_job(ui.ctx());
             let changed = if column == DetailsColumn::Name {
-                set_details_name_width(
-                    &mut self.settings,
+                let effective_width = column_rect.width() + resize_response.drag_delta().x;
+                let stored_width = details_stored_name_width_from_effective(
+                    &self.settings,
                     column_set,
-                    column_rect.width() + resize_response.drag_delta().x,
-                )
+                    effective_width,
+                );
+                set_details_name_width(&mut self.settings, column_set, stored_width)
             } else {
                 let current = details_column_width(&self.settings, column_set, column);
                 set_details_column_width(
@@ -13255,7 +13445,21 @@ impl App {
                         "OFF にすると現在の名前列幅で固定します (境界ドラッグでも固定されます)",
                     );
 
-                ui.checkbox(&mut menu_state.show_preview, "プレビュー");
+                // 下部バーはプレビューを描かない (`DetailsColumnSet::includes`)。専用設定では
+                // この列を ON にしても行き先が無いので、押せない状態にして理由を出す。
+                // 一覧と同じ設定のときは一覧側のプレビューを操作できるので有効のまま。
+                if column_set == DetailsColumnSet::DedicatedBar {
+                    ui.add_enabled(
+                        false,
+                        egui::Checkbox::new(&mut menu_state.show_preview, "プレビュー"),
+                    )
+                    .on_disabled_hover_text("下部バーはプレビューを表示しません");
+                } else {
+                    let response = ui.checkbox(&mut menu_state.show_preview, "プレビュー");
+                    if let Some(text) = details_shared_preview_hover_text(column_set, origin) {
+                        response.on_hover_text(text);
+                    }
+                }
                 ui.checkbox(&mut menu_state.show_rating, "★");
                 ui.checkbox(&mut menu_state.show_tags, "タグ");
                 ui.checkbox(&mut menu_state.show_kind, "種類");
@@ -14321,6 +14525,11 @@ impl App {
         let column_set = selection_info_bottom_bar_column_set(&self.settings);
         let selected_idx = self.selected.filter(|&idx| self.items.get(idx).is_some());
         let available_before = ctx.available_rect();
+        let future_details_avail_h = details_grid_available_height_after_selection_bar(
+            available_before,
+            ctx.style().as_ref(),
+        );
+        let details_natural_h = self.visible_indices.len() as f32 * Self::DETAILS_ROW_H;
         let scroll_style = details_scroll_style();
         let panel = egui::TopBottomPanel::bottom("selection_info_bottom_bar")
             .exact_height(selection_info_bar_height())
@@ -14333,18 +14542,31 @@ impl App {
                     details_horizontal_viewport_capacity(source_rect, pixels_per_point)
                         .min(avail_w)
                         .max(1.0);
+                let details_list_gutter = if self.settings.grid_view_mode == GridViewMode::Details {
+                    resolve_details_list_layout(
+                        source_rect,
+                        future_details_avail_h,
+                        ui.spacing().item_spacing.y,
+                        details_natural_h,
+                        pixels_per_point,
+                        &self.settings,
+                    )
+                    .gutter
+                } else {
+                    0.0
+                };
+                let gutter = selection_info_bottom_bar_gutter(
+                    self.settings.grid_view_mode,
+                    details_list_gutter,
+                );
                 let full_layout = details_layout(
                     layout_avail_w,
-                    0.0,
+                    gutter,
                     pixels_per_point,
                     &self.settings,
                     column_set,
                 );
-                let content_w = details_content_width_for_column_set(
-                    full_layout.pane_w,
-                    &self.settings,
-                    column_set,
-                );
+                let content_w = details_content_width_for_column_set(full_layout.pane_w);
                 let avail_h = ui.available_height().max(0.0);
                 let fixed_columns_w: f32 = details_visible_columns(&self.settings, column_set)
                     .into_iter()
@@ -14353,8 +14575,8 @@ impl App {
                     .sum();
                 let horizontal_policy = details_horizontal_scroll_policy(
                     source_rect,
-                    content_w,
-                    full_layout.name_w + fixed_columns_w,
+                    full_layout.extent,
+                    full_layout.columns_w,
                     pixels_per_point,
                 );
                 let previous_scroll_style = ui.spacing().scroll;
@@ -14399,11 +14621,11 @@ impl App {
                             0.0
                         },
                         predicted_vscroll: false,
-                        gutter: 0.0,
+                        gutter,
                         fixed_columns_w,
                         name_w: full_layout.name_w,
                         pane_w: content_w,
-                        layout_extent: content_w,
+                        layout_extent: full_layout.extent,
                         requested_extent: horizontal_policy.scroll_extent,
                         column_set,
                         outer_inner_rect: output.inner_rect,
@@ -14926,6 +15148,41 @@ mod selection_info_tests {
     }
 
     #[test]
+    fn bottom_bar_predicts_the_details_grid_available_height() {
+        for screen_height in [180.0_f32, 480.0, 777.25] {
+            let mut app = setup_app_for_test();
+            app.settings.grid_view_mode = GridViewMode::Details;
+            app.settings.selection_info_display_mode =
+                crate::settings::SelectionInfoDisplayMode::BottomBar;
+            let ctx = egui::Context::default();
+            let mut raw_input = egui::RawInput::default();
+            raw_input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, screen_height),
+            ));
+            let mut measured = None;
+
+            let _ = ctx.run(raw_input, |ctx| {
+                let predicted = details_grid_available_height_after_selection_bar(
+                    ctx.available_rect(),
+                    ctx.style().as_ref(),
+                );
+                app.render_selection_info_bar(ctx);
+                let actual = egui::CentralPanel::default()
+                    .show(ctx, |ui| ui.available_height())
+                    .inner;
+                measured = Some((predicted, actual));
+            });
+
+            let (predicted, actual) = measured.unwrap();
+            assert!(
+                (predicted - actual).abs() < 0.01,
+                "screen_height={screen_height}, predicted={predicted}, actual={actual}"
+            );
+        }
+    }
+
+    #[test]
     fn details_scrollbars_reserve_space_instead_of_covering_rows() {
         let scroll = details_scroll_style();
         assert!(!scroll.floating);
@@ -14966,6 +15223,61 @@ mod selection_info_tests {
         let (before, after) = measured.unwrap();
         assert!((after.top() - before.top()).abs() < 0.01);
         assert!(before.bottom() - after.bottom() >= 24.5);
+    }
+
+    #[test]
+    fn details_lazy_status_reserves_bottom_while_reconciling_jobs() {
+        let mut app = setup_app_for_test();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_page_count = true;
+        app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.details_image_dims_state = LazyColumnState::Reconciling {
+            done: 2,
+            total: 2,
+            failed: 0,
+        };
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let mut measured = None;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            let before = ctx.available_rect();
+            app.render_details_lazy_status_bar(ctx);
+            let after = ctx.available_rect();
+            measured = Some((before, after));
+        });
+
+        let (before, after) = measured.unwrap();
+        assert!((after.top() - before.top()).abs() < 0.01);
+        assert!(before.bottom() - after.bottom() >= 24.5);
+    }
+
+    #[test]
+    fn details_lazy_status_keeps_failed_ready_session_visible() {
+        let mut app = setup_app_for_test();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_page_count = true;
+        app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.details_image_dims_state = LazyColumnState::Ready { failed: 2 };
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let mut bottom_delta = 0.0;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            let before = ctx.available_rect();
+            app.render_details_lazy_status_bar(ctx);
+            bottom_delta = before.bottom() - ctx.available_rect().bottom();
+        });
+
+        assert!(bottom_delta >= 24.5);
     }
 
     #[test]
@@ -15598,6 +15910,41 @@ mod compute_cell_size_tests {
                 "詳細表示の下部情報バー専用"
             );
         }
+    }
+
+    #[test]
+    fn shared_preview_hover_explains_only_details_bottom_bar_behavior() {
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::SharedBar,
+                DetailsColumnMenuOrigin::DetailsSelectionBar,
+            ),
+            Some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
+        );
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::Details,
+                DetailsColumnMenuOrigin::DetailsListHeader,
+            ),
+            None
+        );
+        // サムネイル一覧の下部バーも同じ説明を出す。ここが漏れていて、実機で
+        // 「サムネイル一覧側だけ説明が出ない」状態になっていた。
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::SharedBar,
+                DetailsColumnMenuOrigin::ThumbnailSelectionBar,
+            ),
+            Some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
+        );
+        // 専用設定はチェック自体が押せないので、無効時の説明が別に出る。
+        assert_eq!(
+            details_shared_preview_hover_text(
+                DetailsColumnSet::DedicatedBar,
+                DetailsColumnMenuOrigin::DetailsSelectionBar,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -16795,30 +17142,368 @@ mod compute_cell_size_tests {
         );
     }
 
-    #[test]
-    fn bottom_bar_text_columns_keep_details_widths() {
+    fn bottom_bar_layout_settings(
+        show_preview: bool,
+        name_width_auto: bool,
+    ) -> crate::settings::Settings {
         let mut settings = minimal_details_settings();
+        settings.details_show_preview = show_preview;
+        settings.details_show_size = true;
+        settings.details_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Size,
+        ];
+        settings.details_name_width_auto = name_width_auto;
+        // Fixed mode intentionally overflows the 600 px fixture only when preview is ON.
+        // This distinguishes a preview-sized trailing gap from ordinary spare pane width.
+        settings.details_name_width = 500.0;
+        settings.copy_details_columns_to_selection_bar();
+        settings
+    }
+
+    fn bottom_bar_surface_modes() -> [(GridViewMode, DetailsSelectionBarMode); 3] {
+        [
+            (GridViewMode::Details, DetailsSelectionBarMode::Dedicated),
+            (
+                GridViewMode::Details,
+                DetailsSelectionBarMode::SameAsDetails,
+            ),
+            (
+                GridViewMode::Thumbnail,
+                DetailsSelectionBarMode::SameAsDetails,
+            ),
+        ]
+    }
+
+    fn bottom_bar_alignment_settings() -> crate::settings::Settings {
+        let mut settings = minimal_details_settings();
+        settings.grid_view_mode = GridViewMode::Details;
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
         settings.details_show_preview = true;
-        let full_layout = details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::SharedBar);
-        let text_width = details_content_width_for_column_set(
-            full_layout.pane_w,
+        settings.details_show_kind = true;
+        settings.details_show_size = true;
+        settings.details_show_modified = true;
+        settings.details_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Kind,
+            DetailsColumnId::Size,
+            DetailsColumnId::Modified,
+        ];
+        settings
+    }
+
+    fn details_list_fixture_resolution(
+        settings: &crate::settings::Settings,
+        row_count: usize,
+    ) -> DetailsListLayoutResolution {
+        let source_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 300.0));
+        resolve_details_list_layout(
+            source_rect,
+            300.0,
+            egui::Style::default().spacing.item_spacing.y,
+            row_count as f32 * App::DETAILS_ROW_H,
+            1.0,
+            settings,
+        )
+    }
+
+    fn layout_column_rects(
+        layout: DetailsLayout,
+        settings: &crate::settings::Settings,
+        column_set: DetailsColumnSet,
+    ) -> Vec<(DetailsColumn, egui::Rect)> {
+        details_column_rects_for_columns(
+            egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(layout.pane_w, App::DETAILS_ROW_H),
+            ),
+            settings,
+            column_set,
+        )
+    }
+
+    fn column_rect(rects: &[(DetailsColumn, egui::Rect)], column: DetailsColumn) -> egui::Rect {
+        rects
+            .iter()
+            .find_map(|(candidate, rect)| (*candidate == column).then_some(*rect))
+            .unwrap()
+    }
+
+    fn assert_shared_bar_columns_align(
+        settings: &crate::settings::Settings,
+        resolved: DetailsListLayoutResolution,
+    ) {
+        let bar_gutter = selection_info_bottom_bar_gutter(GridViewMode::Details, resolved.gutter);
+        let bar_layout = details_layout(
+            600.0,
+            bar_gutter,
+            1.0,
+            settings,
+            DetailsColumnSet::SharedBar,
+        );
+        let list_rects = layout_column_rects(resolved.layout, settings, DetailsColumnSet::Details);
+        let bar_rects = layout_column_rects(bar_layout, settings, DetailsColumnSet::SharedBar);
+        for (column, bar_rect) in bar_rects {
+            if column == DetailsColumn::Name {
+                continue;
+            }
+            let list_rect = column_rect(&list_rects, column);
+            assert_eq!(bar_rect, list_rect, "{column:?}");
+        }
+    }
+
+    #[test]
+    fn details_bottom_bar_columns_align_with_scrolling_list() {
+        let settings = bottom_bar_alignment_settings();
+        let resolved = details_list_fixture_resolution(&settings, 20);
+
+        assert!(resolved.needs_vscroll);
+        assert_eq!(resolved.gutter, details_scroll_style().allocated_width());
+        assert_shared_bar_columns_align(&settings, resolved);
+    }
+
+    #[test]
+    fn details_bottom_bar_columns_align_with_short_list_without_gutter() {
+        let settings = bottom_bar_alignment_settings();
+        let resolved = details_list_fixture_resolution(&settings, 2);
+
+        assert!(!resolved.needs_vscroll);
+        assert_eq!(resolved.gutter, 0.0);
+        assert_shared_bar_columns_align(&settings, resolved);
+    }
+
+    #[test]
+    fn details_bottom_bar_tracks_list_gutter_when_rows_grow() {
+        let settings = bottom_bar_alignment_settings();
+        let short = details_list_fixture_resolution(&settings, 2);
+        let long = details_list_fixture_resolution(&settings, 20);
+        let short_bar = details_layout(
+            600.0,
+            selection_info_bottom_bar_gutter(GridViewMode::Details, short.gutter),
+            1.0,
             &settings,
             DetailsColumnSet::SharedBar,
         );
-        let full_rect =
-            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(full_layout.pane_w, 24.0));
-        let text_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
-        let full = details_column_rects(full_rect, &settings);
-        let text =
-            details_column_rects_for_columns(text_rect, &settings, DetailsColumnSet::SharedBar);
+        let long_bar = details_layout(
+            600.0,
+            selection_info_bottom_bar_gutter(GridViewMode::Details, long.gutter),
+            1.0,
+            &settings,
+            DetailsColumnSet::SharedBar,
+        );
+        let short_list_x = column_rect(
+            &layout_column_rects(short.layout, &settings, DetailsColumnSet::Details),
+            DetailsColumn::Size,
+        )
+        .left();
+        let long_list_x = column_rect(
+            &layout_column_rects(long.layout, &settings, DetailsColumnSet::Details),
+            DetailsColumn::Size,
+        )
+        .left();
+        let short_bar_x = column_rect(
+            &layout_column_rects(short_bar, &settings, DetailsColumnSet::SharedBar),
+            DetailsColumn::Size,
+        )
+        .left();
+        let long_bar_x = column_rect(
+            &layout_column_rects(long_bar, &settings, DetailsColumnSet::SharedBar),
+            DetailsColumn::Size,
+        )
+        .left();
 
-        for (column, rect) in text {
-            let full_width = full
-                .iter()
-                .find(|(candidate, _)| *candidate == column)
-                .map(|(_, rect)| rect.width())
-                .unwrap();
-            assert!((rect.width() - full_width).abs() < 0.01, "{column:?}");
+        assert_eq!(short_list_x, short_bar_x);
+        assert_eq!(long_list_x, long_bar_x);
+        assert_eq!(long_list_x - short_list_x, long_bar_x - short_bar_x);
+        assert_eq!(
+            long_list_x - short_list_x,
+            -details_scroll_style().allocated_width()
+        );
+    }
+
+    #[test]
+    fn thumbnail_bottom_bar_never_reserves_details_gutter() {
+        let settings = bottom_bar_alignment_settings();
+        let short = details_list_fixture_resolution(&settings, 2);
+        let long = details_list_fixture_resolution(&settings, 20);
+        let short_gutter = selection_info_bottom_bar_gutter(GridViewMode::Thumbnail, short.gutter);
+        let long_gutter = selection_info_bottom_bar_gutter(GridViewMode::Thumbnail, long.gutter);
+
+        assert_eq!(short_gutter, 0.0);
+        assert_eq!(long_gutter, 0.0);
+        let short_layout = details_layout(
+            600.0,
+            short_gutter,
+            1.0,
+            &settings,
+            DetailsColumnSet::SharedBar,
+        );
+        let long_layout = details_layout(
+            600.0,
+            long_gutter,
+            1.0,
+            &settings,
+            DetailsColumnSet::SharedBar,
+        );
+        assert_eq!(
+            layout_column_rects(short_layout, &settings, DetailsColumnSet::SharedBar),
+            layout_column_rects(long_layout, &settings, DetailsColumnSet::SharedBar)
+        );
+    }
+
+    #[test]
+    fn dedicated_details_bottom_bar_right_edge_matches_list_gutter() {
+        let mut settings = bottom_bar_alignment_settings();
+        settings.copy_details_columns_to_selection_bar();
+        settings.details_selection_bar_mode = DetailsSelectionBarMode::Dedicated;
+        settings.details_selection_bar_show_kind = false;
+        settings.details_selection_bar_show_modified = false;
+        settings.details_selection_bar_column_order =
+            vec![DetailsColumnId::Name, DetailsColumnId::Size];
+        let resolved = details_list_fixture_resolution(&settings, 20);
+        let bar_layout = details_layout(
+            600.0,
+            selection_info_bottom_bar_gutter(GridViewMode::Details, resolved.gutter),
+            1.0,
+            &settings,
+            DetailsColumnSet::DedicatedBar,
+        );
+
+        assert_eq!(resolved.gutter, details_scroll_style().allocated_width());
+        assert_eq!(bar_layout.pane_w, resolved.layout.pane_w);
+        assert_eq!(bar_layout.extent, resolved.layout.extent);
+    }
+
+    #[test]
+    fn bottom_bar_text_columns_keep_details_widths() {
+        for name_width_auto in [true, false] {
+            for show_preview in [false, true] {
+                let mut settings = minimal_details_settings();
+                settings.grid_view_mode = GridViewMode::Details;
+                settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
+                settings.details_name_width_auto = name_width_auto;
+                settings.details_show_preview = show_preview;
+                let full_layout =
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::SharedBar);
+                let text_width = details_content_width_for_column_set(full_layout.pane_w);
+                let full_rect = egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(full_layout.pane_w, 24.0),
+                );
+                let text_rect =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
+                let full = details_column_rects(full_rect, &settings);
+                let text = details_column_rects_for_columns(
+                    text_rect,
+                    &settings,
+                    DetailsColumnSet::SharedBar,
+                );
+
+                for (column, rect) in text {
+                    let full_rect = full
+                        .iter()
+                        .find(|(candidate, _)| *candidate == column)
+                        .map(|(_, rect)| *rect)
+                        .unwrap();
+                    let expected_width = if column == DetailsColumn::Name && show_preview {
+                        full_rect.width()
+                            + details_column_width(
+                                &settings,
+                                DetailsColumnSet::Details,
+                                DetailsColumn::Preview,
+                            )
+                    } else {
+                        full_rect.width()
+                    };
+                    assert!(
+                        (rect.width() - expected_width).abs() < 0.01,
+                        "{column:?}, auto={name_width_auto}, preview={show_preview}"
+                    );
+                    if column != DetailsColumn::Name {
+                        assert_eq!(rect.left(), full_rect.left());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bottom_bar_preview_does_not_leave_trailing_space_across_surfaces() {
+        for name_width_auto in [true, false] {
+            for (grid_view_mode, selection_bar_mode) in bottom_bar_surface_modes() {
+                let mut settings = bottom_bar_layout_settings(true, name_width_auto);
+                settings.grid_view_mode = grid_view_mode;
+                settings.details_selection_bar_mode = selection_bar_mode;
+                let list_layout =
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+                let list_rects = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(list_layout.pane_w, 24.0),
+                    ),
+                    &settings,
+                    DetailsColumnSet::Details,
+                );
+                let column_set = selection_info_bottom_bar_column_set(&settings);
+                let layout = details_layout(600.0, 0.0, 1.0, &settings, column_set);
+                let content_width = details_content_width_for_column_set(layout.pane_w);
+                assert_eq!(content_width, layout.pane_w);
+                let rects = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
+                    &settings,
+                    column_set,
+                );
+                let list_size = list_rects
+                    .iter()
+                    .find(|(column, _)| *column == DetailsColumn::Size)
+                    .unwrap()
+                    .1;
+                let bar_size = rects
+                    .iter()
+                    .find(|(column, _)| *column == DetailsColumn::Size)
+                    .unwrap()
+                    .1;
+                assert_eq!(bar_size, list_size);
+                assert!(
+                    (rects.last().unwrap().1.right() - content_width).abs() < 0.01,
+                    "{grid_view_mode:?}, {selection_bar_mode:?}, auto={name_width_auto}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bottom_bar_preview_off_keeps_existing_layout_across_surfaces() {
+        for name_width_auto in [true, false] {
+            for (grid_view_mode, selection_bar_mode) in bottom_bar_surface_modes() {
+                let mut settings = bottom_bar_layout_settings(false, name_width_auto);
+                settings.grid_view_mode = grid_view_mode;
+                settings.details_selection_bar_mode = selection_bar_mode;
+                let list_layout =
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+                let list = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(list_layout.pane_w, 24.0),
+                    ),
+                    &settings,
+                    DetailsColumnSet::Details,
+                );
+                let column_set = selection_info_bottom_bar_column_set(&settings);
+                let bar_layout = details_layout(600.0, 0.0, 1.0, &settings, column_set);
+                let content_width = details_content_width_for_column_set(bar_layout.pane_w);
+                let bar = details_column_rects_for_columns(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
+                    &settings,
+                    column_set,
+                );
+                assert_eq!(
+                    bar, list,
+                    "{grid_view_mode:?}, {selection_bar_mode:?}, auto={name_width_auto}"
+                );
+            }
         }
     }
 
@@ -17108,6 +17793,24 @@ mod compute_cell_size_tests {
     }
 
     #[test]
+    fn bottom_bar_effective_name_width_maps_back_to_stored_width() {
+        let mut settings = minimal_details_settings();
+        settings.details_show_preview = true;
+        settings.details_name_width_auto = false;
+        settings.details_name_width = 210.0;
+        let effective = details_effective_fixed_name_width(&settings, DetailsColumnSet::SharedBar);
+        assert_eq!(effective, 244.0);
+        assert_eq!(
+            details_stored_name_width_from_effective(
+                &settings,
+                DetailsColumnSet::SharedBar,
+                effective,
+            ),
+            210.0
+        );
+    }
+
+    #[test]
     fn details_column_rects_fixed_name_uses_saved_width() {
         let mut settings = minimal_details_settings();
         settings.details_name_width_auto = false;
@@ -17378,6 +18081,77 @@ mod toolbar_reorder_tests {
         let order = vec![TS::Cols, TS::Aspect, TS::Sort, TS::Tags];
         let got = reorder_toolbar_section(&order, TS::Sort, Some(TS::Cols), None).unwrap();
         assert_eq!(got, vec![TS::Sort, TS::Cols, TS::Aspect, TS::Tags]);
+    }
+}
+
+#[cfg(test)]
+mod checked_selection_overlay_tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn checked_selection_overlay_is_absent_when_no_items_are_checked() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(|ctx| {
+                let _ = show_checked_selection_overlay(ctx, 0);
+            });
+
+        harness.run();
+        assert!(harness.query_by_label("チェック").is_none());
+        assert!(harness.query_by_label("選択解除").is_none());
+    }
+
+    #[test]
+    fn checked_selection_overlay_shows_the_exact_checked_count() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(|ctx| {
+                let _ = show_checked_selection_overlay(ctx, 1);
+            });
+
+        harness.run();
+        assert!(harness.query_by_label("チェック").is_some());
+        assert!(harness.query_by_label("1 件").is_some());
+    }
+
+    #[test]
+    fn checked_selection_overlay_click_requests_deselect() {
+        let clicked = Arc::new(AtomicBool::new(false));
+        let clicked_in_ui = Arc::clone(&clicked);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(move |ctx| {
+                if show_checked_selection_overlay(ctx, 2) {
+                    clicked_in_ui.store(true, Ordering::Relaxed);
+                }
+            });
+
+        harness.get_by_label("選択解除").click();
+        harness.run();
+        assert!(clicked.load(Ordering::Relaxed));
+    }
+
+    /// 件数表示そのものは押しても解除しない。解除操作はボタンだけが持つ。
+    #[test]
+    fn checked_selection_overlay_count_text_does_not_deselect() {
+        let clicked = Arc::new(AtomicBool::new(false));
+        let clicked_in_ui = Arc::clone(&clicked);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(move |ctx| {
+                if show_checked_selection_overlay(ctx, 2) {
+                    clicked_in_ui.store(true, Ordering::Relaxed);
+                }
+            });
+
+        harness.get_by_label("2 件").click();
+        harness.run();
+        assert!(!clicked.load(Ordering::Relaxed));
     }
 }
 

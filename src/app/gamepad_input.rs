@@ -1805,7 +1805,7 @@ impl App {
                 && !self.export_crop_mode
                 && !self.text_mode;
         }
-        !self.shortcuts_blocked_by_text_input() && !ctx.is_popup_open()
+        !self.shortcuts_blocked_by_text_input(ctx) && !ctx.is_popup_open()
     }
 
     fn reset_gamepad_continuous_steps(&mut self, now: Instant) {

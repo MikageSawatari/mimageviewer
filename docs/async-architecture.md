@@ -810,18 +810,20 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
   `hide_to_tray` から `ActivityGate::set_paused(true)`。既存の `wait_until_idle` は
   paused 中ループブロックし、`show_from_tray` で解除されると通常動作に戻る。
   **cancel は paused を貫通** させる (アプリ終了時に supervisor スレッドが固まらないため)。
-- **動画 / GPU リソース解放**: `hide_to_tray` はまず
-  `release_media_session_for_tray` で fullscreen / video セッションを
-  `close_fullscreen()` 経路へ流す。これにより再生位置保存、`VideoPlayer` /
-  `NativeVideoOutput` drop、source-swap pending、VST3 owner、ノーマライズ状態の
-  cleanup を通常の Esc 終了と同じ順序で行う。その後 `App::release_gpu_resources` が
-  `thumbnails[*] = Evicted` や `fs_cache.clear()` 等で残りの `TextureHandle` を drop し、
-  Windows では `GpuVideoDevice::release_idle_pools()` で D3D11VA frames pool / idle
-  shared output pool / video processor cache も空にする。VST3 bridge / plugin chain は
-  復帰遅延と状態巻き戻りを避けるため停止しない。ウィンドウ復帰後は通常ロード経路で再取得。
-  例外として detached viewer session が開いている場合は、close-to-tray でも
-  `close_fullscreen()` を呼ばず、active `fs_cache` / viewer 用 upload backlog / native
-  presenter を維持する。通常 fullscreen / 通常動画は従来通り tray hide 時に終了する。
+- **media pause / GPU リソース解放**: `hide_to_tray` は `SW_HIDE` より先に
+  `pause_media_playback_for_tray` を呼ぶ。mounted `fs_cache`、active detached bundle、全 ParkedLive
+  bundle が所有する `FsCacheEntry::Video` のうち再生 intent がある player へ Pause を送り、動画、
+  動画→音声モード、単体音楽の clock と音声を同じ transport state machine で止める。各 owner の現在位置は
+  live player と `video_resume_positions` の両方に保持する。mounted context で再生中だった session と
+  detached / switching context は pause 済み player / native output を保持し、格納前から非再生だった通常
+  session は従来の `close_fullscreen()` cleanup を通す。その後 `App::release_gpu_resources` は media entry
+  以外の `TextureHandle` を drop し、Windows では `GpuVideoDevice::release_idle_pools()` で D3D11VA
+  frames pool / idle shared output pool / video processor cache を空にする。VST3 bridge / plugin chain は
+  停止しない。
+- **media restore**: `sync_after_restore(ctx)` は Play を送らず、保持中の mounted fullscreen media surface
+  に既存 focus grace / focus restore を再適用するだけである。したがって復帰後は pause のままで、ユーザーの
+  Play 操作が同じ位置から再開する。復帰時の外部フォルダ変更と main-focus consumer は既存の
+  detached / switching 述語を共有し、paused context と typed placement completion を閉じない。
 - **UI heartbeat watchdog**: `App::update` は SW_HIDE 中に止まるため、`hide_to_tray` で
   watchdog を suspended にし、復帰時に resume する。これにより正常なトレイ常駐を
   `panic.log` の `UI THREAD HANG suspected` として記録し続けない。detached viewer
@@ -928,6 +930,9 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 - `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`。アイドル高画質化の最終判定は `idle_upgrade_enqueue` / `idle_upgrade_ineligible` に `key` / `idx` / `items_gen` を載せ、同一状態の反復を検出できるようにする
 - `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `inproc_*` / `enumerate_send`
 - `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`
+- `ui`     — UI フレーム: `tail_repaint` / `slow_frame_breakdown` / `pre_grid_breakdown`。
+  `pre_grid_breakdown` は `n` / `total_ms` と、検索・お気に入り・タグ・ファセット・遅延状態・
+  下部情報・フォルダペイン・選択 overlay・scroll routing・stack reconcile の各 `*_ms` を持つ
 - `folder_pane` — 左フォルダツリーペイン: `scan_subfolders` (子ディレクトリ列挙の ms / 件数 / cancel)
 
 ### 7.4 解析
@@ -940,6 +945,7 @@ python scripts/analyze_perf.py <path>/perf_events.jsonl latency   # seq → read
 python scripts/analyze_perf.py <path>/perf_events.jsonl priority  # 優先度違反検出
 python scripts/analyze_perf.py <path>/perf_events.jsonl thumbs    # decode 時間分布
 python scripts/analyze_perf.py <path>/perf_events.jsonl colorize  # カラー化の解像度・方式別時間
+python scripts/analyze_perf.py <path>/perf_events.jsonl pre-grid  # グリッド直前の要素別時間
 python scripts/analyze_perf.py <path>/perf_events.jsonl dump 42   # 特定 seq の全イベント
 python scripts/analyze_perf.py <path>/perf_events.jsonl timeline  # ガントチャート (matplotlib)
 python scripts/analyze_perf.py <path>/perf_events.jsonl idle-health --start-t 10 --end-t 25

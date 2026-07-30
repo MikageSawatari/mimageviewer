@@ -7854,13 +7854,27 @@ fn draw_colorize_settings(
             .size(SECTION_FONT)
             .color(ui.visuals().text_color()),
     );
+    // `ColorizeMode` は「OFF かどうか」と「どの画像に適用するか」を 1 つの enum で兼ねるので、
+    // OFF にした時点で対象の選択が消える。有効な間の値をセッション内に控えておき、ON に戻す
+    // ときに復元する。有効な間は毎フレーム上書きするため、スロット読み込みなど UI 以外の
+    // 書き手が mode を変えても追随し、控えが実態からずれない (= 対象の正本は常に mode)。
+    let restore_mode_id = egui::Id::new("colorize_last_enabled_mode");
+    if params.colorize.mode != ColorizeMode::Disabled {
+        let mode = params.colorize.mode;
+        ui.data_mut(|data| data.insert_temp(restore_mode_id, mode));
+    }
+    let restore_mode = ui
+        .data(|data| data.get_temp::<ColorizeMode>(restore_mode_id))
+        .filter(|mode| *mode != ColorizeMode::Disabled)
+        .unwrap_or(ColorizeMode::MonochromeOnly);
+
     let mut enabled = params.colorize.is_enabled();
     if ui
         .checkbox(&mut enabled, "モノクロ画像を階調カラー化")
         .changed()
     {
         params.colorize.mode = if enabled {
-            ColorizeMode::MonochromeOnly
+            restore_mode
         } else {
             ColorizeMode::Disabled
         };
@@ -7869,7 +7883,13 @@ fn draw_colorize_settings(
 
     let controls_enabled = params.colorize.is_enabled();
     ui.add_enabled_ui(controls_enabled, |ui| {
-        let mut only_monochrome = params.colorize.mode != ColorizeMode::AllImages;
+        // OFF 中は mode が対象を語れないので、復元される予定の値を映す。そうしないと
+        // 「全画像に適用」で切ったのにチェックが入って見え、ON に戻した瞬間に外れる。
+        let displayed_mode = match params.colorize.mode {
+            ColorizeMode::Disabled => restore_mode,
+            mode => mode,
+        };
+        let mut only_monochrome = displayed_mode != ColorizeMode::AllImages;
         if ui
             .checkbox(&mut only_monochrome, "モノクロ系画像だけに適用")
             .on_hover_text(
@@ -7885,7 +7905,11 @@ fn draw_colorize_settings(
             };
             changed = true;
         }
-        if params.colorize.mode == ColorizeMode::MonochromeOnly {
+        // 表示条件は `mode` ではなく、いま描いたチェックボックスの状態に合わせる。
+        // `mode` は OFF と「全画像に適用」を 1 つの enum で兼ねているため、`MonochromeOnly`
+        // で判定するとカラー化を切った瞬間にこの行だけ消えて、下のパネル内容が動く。
+        // チェックが入って見えている以上、その設定行は出したまま無効化するのが筋。
+        if only_monochrome {
             ui.horizontal(|ui| {
                 ui.label("色味の許容量");
                 if params.colorize.mono_tolerance != 12
@@ -7938,210 +7962,213 @@ fn draw_colorize_settings(
             changed = true;
         }
         dragging |= response.dragged();
-    });
 
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new("カラー化プリセット")
-            .size(SECTION_FONT)
-            .color(ui.visuals().text_color()),
-    );
-    for palette in [
-        ColorizePalette::Legacy4Color,
-        ColorizePalette::LegacySkin,
-        ColorizePalette::Custom,
-    ] {
-        if ui
-            .radio_value(&mut params.colorize.palette, palette, palette.label())
-            .changed()
-        {
-            changed = true;
-        }
-    }
-
-    ui.add_space(8.0);
-    draw_colorize_gradient_preview(ui, &params.colorize);
-
-    if params.colorize.palette == ColorizePalette::Custom {
-        ui.add_space(6.0);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("制御点（暗部 → 明部）")
+            egui::RichText::new("カラー化プリセット")
                 .size(SECTION_FONT)
                 .color(ui.visuals().text_color()),
-        )
-        .on_hover_text("各色の「強さ」が、その色の担当範囲と隣接色への補間カーブを決めます。");
-        let mut remove_index = None;
-        let mut move_action = None;
-        let point_count = params.colorize.control_points.len();
-        for index in 0..point_count {
-            ui.horizontal(|ui| {
-                ui.label(format!("{}", index + 1));
-                let point = &mut params.colorize.control_points[index];
-                if ui.color_edit_button_srgb(&mut point.color).changed() {
-                    changed = true;
-                }
-                ui.label("強さ");
-                let response = ui.add(
-                    egui::DragValue::new(&mut point.strength)
-                        .range(0.0..=10.0)
-                        .speed(0.05),
-                );
-                if response.changed() {
-                    changed = true;
-                }
-                dragging |= response.dragged();
-                if ui
-                    .add_enabled(index > 0, egui::Button::new("↑").small())
-                    .clicked()
-                {
-                    move_action = Some((index, index - 1));
-                }
-                if ui
-                    .add_enabled(index + 1 < point_count, egui::Button::new("↓").small())
-                    .clicked()
-                {
-                    move_action = Some((index, index + 1));
-                }
-                if ui
-                    .add_enabled(point_count > 2, egui::Button::new("×").small())
-                    .on_hover_text("この制御点を削除")
-                    .clicked()
-                {
-                    remove_index = Some(index);
-                }
-            });
+        );
+        for palette in [
+            ColorizePalette::Legacy4Color,
+            ColorizePalette::LegacySkin,
+            ColorizePalette::Custom,
+        ] {
+            if ui
+                .radio_value(&mut params.colorize.palette, palette, palette.label())
+                .changed()
+            {
+                changed = true;
+            }
         }
-        if let Some((from, to)) = move_action {
-            params.colorize.control_points.swap(from, to);
-            changed = true;
-        } else if let Some(index) = remove_index {
-            params.colorize.control_points.remove(index);
-            changed = true;
-        }
-        if ui
-            .add_enabled(
-                params.colorize.control_points.len() < 10,
-                egui::Button::new("＋ 制御点を追加").small(),
-            )
-            .clicked()
-        {
-            let color = params
-                .colorize
-                .control_points
-                .last()
-                .map(|point| point.color)
-                .unwrap_or([255, 255, 255]);
-            params
-                .colorize
-                .control_points
-                .push(ColorizeControlPoint::new(color, 1.0));
-            changed = true;
-        }
-    }
 
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label("元画像の明るさを保持");
-        if params.colorize.luminance_weight != 100
-            && ui
-                .small_button("↩")
-                .on_hover_text("デフォルトの 100% に戻す")
+        ui.add_space(8.0);
+        draw_colorize_gradient_preview(ui, &params.colorize);
+
+        if params.colorize.palette == ColorizePalette::Custom {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("制御点（暗部 → 明部）")
+                    .size(SECTION_FONT)
+                    .color(ui.visuals().text_color()),
+            )
+            .on_hover_text("各色の「強さ」が、その色の担当範囲と隣接色への補間カーブを決めます。");
+            let mut remove_index = None;
+            let mut move_action = None;
+            let point_count = params.colorize.control_points.len();
+            for index in 0..point_count {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}", index + 1));
+                    let point = &mut params.colorize.control_points[index];
+                    if ui.color_edit_button_srgb(&mut point.color).changed() {
+                        changed = true;
+                    }
+                    ui.label("強さ");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut point.strength)
+                            .range(0.0..=10.0)
+                            .speed(0.05),
+                    );
+                    if response.changed() {
+                        changed = true;
+                    }
+                    dragging |= response.dragged();
+                    if ui
+                        .add_enabled(index > 0, egui::Button::new("↑").small())
+                        .clicked()
+                    {
+                        move_action = Some((index, index - 1));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < point_count, egui::Button::new("↓").small())
+                        .clicked()
+                    {
+                        move_action = Some((index, index + 1));
+                    }
+                    if ui
+                        .add_enabled(point_count > 2, egui::Button::new("×").small())
+                        .on_hover_text("この制御点を削除")
+                        .clicked()
+                    {
+                        remove_index = Some(index);
+                    }
+                });
+            }
+            if let Some((from, to)) = move_action {
+                params.colorize.control_points.swap(from, to);
+                changed = true;
+            } else if let Some(index) = remove_index {
+                params.colorize.control_points.remove(index);
+                changed = true;
+            }
+            if ui
+                .add_enabled(
+                    params.colorize.control_points.len() < 10,
+                    egui::Button::new("＋ 制御点を追加").small(),
+                )
                 .clicked()
-        {
-            params.colorize.luminance_weight = 100;
-            changed = true;
+            {
+                let color = params
+                    .colorize
+                    .control_points
+                    .last()
+                    .map(|point| point.color)
+                    .unwrap_or([255, 255, 255]);
+                params
+                    .colorize
+                    .control_points
+                    .push(ColorizeControlPoint::new(color, 1.0));
+                changed = true;
+            }
         }
-    });
-    let mut luminance_weight = params.colorize.luminance_weight as f32;
-    let response = ui.add(
-        egui::Slider::new(&mut luminance_weight, 0.0..=100.0)
-            .step_by(1.0)
-            .suffix("%"),
-    );
-    if response.changed() {
-        params.colorize.luminance_weight = luminance_weight as u8;
-        changed = true;
-    }
-    dragging |= response.dragged();
 
-    ui.add_space(10.0);
-    ui.separator();
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new("スクリーントーン濃淡変換")
-            .size(SECTION_FONT)
-            .color(ui.visuals().text_color()),
-    );
-    for method in ToneDensityMethod::ALL {
-        if ui
-            .radio_value(&mut params.colorize.tone_method, *method, method.label())
-            .on_hover_text(method.description())
-            .changed()
-        {
-            changed = true;
-        }
-    }
-    ui.label(
-        egui::RichText::new(params.colorize.tone_method.description())
-            .size(SECTION_FONT - 1.0)
-            .weak(),
-    );
-    if params.colorize.tone_method != ToneDensityMethod::Off {
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("検出スケール（長辺比）");
-            if (params.colorize.tone_radius - 1.0).abs() > 0.001
+            ui.label("元画像の明るさを保持");
+            if params.colorize.luminance_weight != 100
                 && ui
                     .small_button("↩")
-                    .on_hover_text("デフォルトに戻す")
+                    .on_hover_text("デフォルトの 100% に戻す")
                     .clicked()
             {
-                params.colorize.tone_radius = 1.0;
+                params.colorize.luminance_weight = 100;
                 changed = true;
             }
         });
-        let response = ui
-            .add(
-                egui::Slider::new(&mut params.colorize.tone_radius, 0.1..=4.0)
-                    .step_by(0.1)
-                    .fixed_decimals(1),
-            )
-            .on_hover_text(
-                "長辺 2048px の画像を基準にした値です。\n\
-             実際の検出半径は画像の長辺に比例するため、AIアップスケール前後でも\n\
-             同じ絵柄上ではほぼ同じ範囲を検出します。",
-            );
-        if response.changed() {
-            changed = true;
-        }
-        dragging |= response.dragged();
-
-        ui.horizontal(|ui| {
-            ui.label("変換の強さ");
-            if params.colorize.tone_strength != 100
-                && ui
-                    .small_button("↩")
-                    .on_hover_text("デフォルトに戻す")
-                    .clicked()
-            {
-                params.colorize.tone_strength = 100;
-                changed = true;
-            }
-        });
-        let mut strength = params.colorize.tone_strength as f32;
+        let mut luminance_weight = params.colorize.luminance_weight as f32;
         let response = ui.add(
-            egui::Slider::new(&mut strength, 0.0..=100.0)
+            egui::Slider::new(&mut luminance_weight, 0.0..=100.0)
                 .step_by(1.0)
                 .suffix("%"),
         );
         if response.changed() {
-            params.colorize.tone_strength = strength as u8;
+            params.colorize.luminance_weight = luminance_weight as u8;
             changed = true;
         }
         dragging |= response.dragged();
-    }
 
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("スクリーントーン濃淡変換")
+                .size(SECTION_FONT)
+                .color(ui.visuals().text_color()),
+        );
+        for method in ToneDensityMethod::ALL {
+            if ui
+                .radio_value(&mut params.colorize.tone_method, *method, method.label())
+                .on_hover_text(method.description())
+                .changed()
+            {
+                changed = true;
+            }
+        }
+        ui.label(
+            egui::RichText::new(params.colorize.tone_method.description())
+                .size(SECTION_FONT - 1.0)
+                .weak(),
+        );
+        if params.colorize.tone_method != ToneDensityMethod::Off {
+            ui.horizontal(|ui| {
+                ui.label("検出スケール（長辺比）");
+                if (params.colorize.tone_radius - 1.0).abs() > 0.001
+                    && ui
+                        .small_button("↩")
+                        .on_hover_text("デフォルトに戻す")
+                        .clicked()
+                {
+                    params.colorize.tone_radius = 1.0;
+                    changed = true;
+                }
+            });
+            let response = ui
+                .add(
+                    egui::Slider::new(&mut params.colorize.tone_radius, 0.1..=4.0)
+                        .step_by(0.1)
+                        .fixed_decimals(1),
+                )
+                .on_hover_text(
+                    "長辺 2048px の画像を基準にした値です。\n\
+             実際の検出半径は画像の長辺に比例するため、AIアップスケール前後でも\n\
+             同じ絵柄上ではほぼ同じ範囲を検出します。",
+                );
+            if response.changed() {
+                changed = true;
+            }
+            dragging |= response.dragged();
+
+            ui.horizontal(|ui| {
+                ui.label("変換の強さ");
+                if params.colorize.tone_strength != 100
+                    && ui
+                        .small_button("↩")
+                        .on_hover_text("デフォルトに戻す")
+                        .clicked()
+                {
+                    params.colorize.tone_strength = 100;
+                    changed = true;
+                }
+            });
+            let mut strength = params.colorize.tone_strength as f32;
+            let response = ui.add(
+                egui::Slider::new(&mut strength, 0.0..=100.0)
+                    .step_by(1.0)
+                    .suffix("%"),
+            );
+            if response.changed() {
+                params.colorize.tone_strength = strength as u8;
+                changed = true;
+            }
+            dragging |= response.dragged();
+        }
+    });
+
+    // 保存スロットだけはゲートの外に置く。読み込みは `*params = saved` でカラー化の
+    // ON/OFF ごと差し替えるので、OFF のときにこそ「保存済みの設定で ON にする」入口に
+    // なる。ここを一緒に無効化すると、その入口が消える。
     let slot_result = draw_colorize_preset_slots(ui, &mut params.colorize, slots);
     changed |= slot_result.0;
     settings_changed |= slot_result.1;
@@ -8976,6 +9003,10 @@ mod creative_lut_ui_tests {
     }
 }
 
+fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
+    egui::Id::new("book_bookmark_title_edit").with(bookmark_id)
+}
+
 fn draw_bookmark_title_edit(
     ui: &mut egui::Ui,
     bookmark_id: i64,
@@ -8986,7 +9017,7 @@ fn draw_bookmark_title_edit(
 ) -> (egui::Response, bool) {
     let response = ui.add(
         egui::TextEdit::singleline(title)
-            .id(egui::Id::new("book_bookmark_title_edit").with(bookmark_id))
+            .id(book_bookmark_title_edit_widget_id(bookmark_id))
             .desired_width(ui.available_width())
             .hint_text("未設定")
             .return_key(None::<egui::KeyboardShortcut>),
@@ -13138,13 +13169,20 @@ impl App {
                 }
             });
         if let Some(edit) = start_title_edit {
+            self.claim_pending_text_input_focus(
+                ctx.viewport_id(),
+                book_bookmark_title_edit_widget_id(edit.id),
+                ctx.cumulative_pass_nr(),
+            );
             title_edit = Some(edit);
         }
         if cancel_title_edit {
             title_edit = None;
+            self.clear_pending_text_input_focus();
         }
         if let Some((id, title)) = save_title {
             title_edit = None;
+            self.clear_pending_text_input_focus();
             self.set_book_bookmark_title(id, title);
         }
         self.book_bookmark_title_edit = title_edit;

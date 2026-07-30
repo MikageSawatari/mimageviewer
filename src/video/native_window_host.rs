@@ -17,7 +17,9 @@ use windows::Win32::UI::Input::Ime::{
     CANDIDATEFORM, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow,
     ImmSetCompositionWindow,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetCapture, SetFocus, VK_LBUTTON,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetWindowRect, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_NO,
     IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDC_WAIT, LoadCursorW, SWP_NOACTIVATE, SWP_NOZORDER,
@@ -26,9 +28,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::NativeVideoPlacement;
 use super::native_window::{
-    ForegroundClaimReport, NativeVideoWindow, NativeVideoWindowConfig, NativeVideoWindowEvent,
+    ForegroundClaimReport, NativeVideoWindow, NativeVideoWindowConfig, NativeVideoWindowEventSink,
 };
-use super::window_host_contract::HostWindowTopology;
+use super::window_host_contract::{
+    HostWindowTopology, HostWindows, OpaqueWindowHandle, OpaqueWindowId, WindowGeneration,
+};
 
 mod hud_window;
 
@@ -41,7 +45,7 @@ pub(crate) enum NativeHudWindowRequest {
 pub(crate) struct NativeWindowHostConfig {
     pub(crate) window: NativeVideoWindowConfig,
     pub(crate) hud: NativeHudWindowRequest,
-    pub(crate) event_tx: std::sync::mpsc::Sender<NativeVideoWindowEvent>,
+    pub(crate) event_sink: NativeVideoWindowEventSink,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +75,34 @@ pub(crate) enum NativeRenderTargets {
         presenter: NativeRenderTarget,
         hud: NativeRenderTarget,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeRenderTargetTransfer {
+    presenter: (u64, u64),
+    hud: Option<(u64, u64)>,
+}
+
+impl NativeRenderTargetTransfer {
+    pub(crate) fn into_targets(self) -> NativeRenderTargets {
+        let presenter = NativeRenderTarget::new(
+            HWND(self.presenter.0 as usize as *mut _),
+            self.presenter.1,
+            NativeRenderTargetRole::Presenter,
+        );
+        if let Some((raw, generation)) = self.hud {
+            NativeRenderTargets::PresenterAndHud {
+                presenter,
+                hud: NativeRenderTarget::new(
+                    HWND(raw as usize as *mut _),
+                    generation,
+                    NativeRenderTargetRole::Hud,
+                ),
+            }
+        } else {
+            NativeRenderTargets::PresenterOnly { presenter }
+        }
+    }
 }
 
 impl NativeRenderTargets {
@@ -133,6 +165,33 @@ pub(crate) struct NativeFocusState {
     pub(crate) foreground_is_current_process: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeWindowObservation {
+    pub(crate) cursor_client_position: Option<[i32; 2]>,
+    pub(crate) cursor_within_client: bool,
+    pub(crate) focus: NativeFocusState,
+    pub(crate) global_lbutton_down: bool,
+    pub(crate) has_hud: bool,
+    pub(crate) hud_has_capture: bool,
+}
+
+impl Default for NativeWindowObservation {
+    fn default() -> Self {
+        Self {
+            cursor_client_position: None,
+            cursor_within_client: true,
+            focus: NativeFocusState {
+                target_id: 0,
+                thread_focus_id: 0,
+                foreground_is_current_process: false,
+            },
+            global_lbutton_down: false,
+            has_hud: false,
+            hud_has_capture: false,
+        }
+    }
+}
+
 impl NativeRenderTarget {
     fn new(hwnd: HWND, generation: u64, role: NativeRenderTargetRole) -> Self {
         Self {
@@ -151,56 +210,6 @@ impl NativeRenderTarget {
         device: &IDCompositionDevice,
     ) -> windows::core::Result<IDCompositionTarget> {
         unsafe { device.CreateTargetForHwnd(self.hwnd, true) }
-    }
-
-    pub(crate) fn os_pixels_per_point(self) -> f32 {
-        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        let value = dpi as f32 / 96.0;
-        if value.is_finite() && value > 0.0 {
-            value
-        } else {
-            1.0
-        }
-    }
-
-    pub(crate) fn cursor_client_position(self) -> Option<POINT> {
-        unsafe {
-            let mut point = POINT::default();
-            if GetCursorPos(&mut point).is_err() || !ScreenToClient(self.hwnd, &mut point).as_bool()
-            {
-                return None;
-            }
-            Some(point)
-        }
-    }
-
-    pub(crate) fn cursor_within_client_or_true(self) -> bool {
-        unsafe {
-            let Some(point) = self.cursor_client_position() else {
-                return true;
-            };
-            let mut rect = RECT::default();
-            if GetClientRect(self.hwnd, &mut rect).is_err() {
-                return true;
-            }
-            point.x >= rect.left
-                && point.x < rect.right
-                && point.y >= rect.top
-                && point.y < rect.bottom
-        }
-    }
-
-    pub(crate) fn focus_state(self) -> NativeFocusState {
-        NativeFocusState {
-            target_id: self.hwnd.0 as usize as u64,
-            thread_focus_id: super::native_window::thread_focus_hwnd(),
-            foreground_is_current_process:
-                super::native_window::foreground_belongs_to_current_process_strict(),
-        }
-    }
-
-    pub(crate) fn foreground_id(self) -> u64 {
-        super::native_window::foreground_hwnd()
     }
 }
 
@@ -273,12 +282,11 @@ impl NativeWindowHost {
                 };
                 let hud_config = hud_window::HudOverlayConfig {
                     owner_hwnd: presenter_hwnd,
-                    focus_hwnd: presenter_hwnd,
                     x,
                     y,
                     width,
                     height,
-                    event_tx: config.event_tx,
+                    event_sink: config.event_sink,
                     regions: Arc::clone(&regions),
                     cursor_was_hidden: Arc::clone(&cursor_was_hidden),
                 };
@@ -355,6 +363,86 @@ impl NativeWindowHost {
         }
     }
 
+    pub(crate) fn render_target_transfer(&self) -> NativeRenderTargetTransfer {
+        self.assert_owner_thread();
+        let targets = self.render_targets();
+        let presenter = targets.presenter();
+        let hud = targets.hud();
+        NativeRenderTargetTransfer {
+            presenter: (presenter.hwnd.0 as usize as u64, presenter.generation),
+            hud: hud.map(|target| (target.hwnd.0 as usize as u64, target.generation)),
+        }
+    }
+
+    pub(crate) fn contract_windows(&self) -> HostWindows {
+        self.assert_owner_thread();
+        let presenter = OpaqueWindowHandle {
+            id: OpaqueWindowId(self.presenter().hwnd().0 as usize as u64),
+            generation: WindowGeneration(self.presenter().generation()),
+        };
+        match &self.windows {
+            NativeOwnedWindows::PresenterOnly { .. } => HostWindows::PresenterOnly { presenter },
+            NativeOwnedWindows::PresenterAndHud { hud, .. } => HostWindows::PresenterAndHud {
+                presenter,
+                hud: OpaqueWindowHandle {
+                    id: OpaqueWindowId(hud.hwnd().0 as usize as u64),
+                    generation: WindowGeneration(self.presenter().generation()),
+                },
+            },
+        }
+    }
+
+    pub(crate) fn os_pixels_per_point(&self) -> f32 {
+        self.assert_owner_thread();
+        let dpi = unsafe { GetDpiForWindow(self.presenter().hwnd()) };
+        let value = dpi as f32 / 96.0;
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            1.0
+        }
+    }
+
+    pub(crate) fn observe(&self) -> NativeWindowObservation {
+        self.assert_owner_thread();
+        let hwnd = self.presenter().hwnd();
+        let mut point = POINT::default();
+        let cursor_client_position = unsafe {
+            if GetCursorPos(&mut point).is_ok() && ScreenToClient(hwnd, &mut point).as_bool() {
+                Some([point.x, point.y])
+            } else {
+                None
+            }
+        };
+        let cursor_within_client = unsafe {
+            let mut rect = RECT::default();
+            match (
+                cursor_client_position,
+                GetClientRect(hwnd, &mut rect).is_ok(),
+            ) {
+                (Some([x, y]), true) => {
+                    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+                }
+                _ => true,
+            }
+        };
+        NativeWindowObservation {
+            cursor_client_position,
+            cursor_within_client,
+            focus: NativeFocusState {
+                target_id: hwnd.0 as usize as u64,
+                thread_focus_id: super::native_window::thread_focus_hwnd(),
+                foreground_is_current_process:
+                    super::native_window::foreground_belongs_to_current_process_strict(),
+            },
+            global_lbutton_down: unsafe {
+                (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0
+            },
+            has_hud: self.has_hud(),
+            hud_has_capture: self.hud_has_capture(),
+        }
+    }
+
     pub(crate) fn retain_render_topology(self, topology: HostWindowTopology) -> Self {
         self.assert_owner_thread();
         let Self {
@@ -395,10 +483,6 @@ impl NativeWindowHost {
     pub(crate) fn hwnd(&self) -> HWND {
         self.assert_owner_thread();
         self.presenter().hwnd()
-    }
-
-    pub(crate) fn presenter_target(&self) -> NativeRenderTarget {
-        self.render_targets().presenter()
     }
 
     pub(crate) fn hud_hwnd(&self) -> u64 {
@@ -455,8 +539,8 @@ impl NativeWindowHost {
         for intent in intents {
             match *intent {
                 NativeWindowIntent::ClaimTextInputFocus => {
-                    let focus_state = self.presenter_target().focus_state();
-                    let foreground_hwnd = self.presenter_target().foreground_id();
+                    let focus_state = self.observe().focus;
+                    let foreground_hwnd = super::native_window::foreground_hwnd();
                     let report =
                         super::native_window::claim_foreground(self.hwnd().0 as usize as u64);
                     let post_thread_focus_hwnd = super::native_window::thread_focus_hwnd();
@@ -584,11 +668,6 @@ impl NativeWindowHost {
         self.presenter_mut().destroy();
     }
 
-    pub(crate) fn destroy_silent(&mut self) {
-        self.assert_owner_thread();
-        self.presenter_mut().destroy_silent();
-    }
-
     pub(crate) fn set_hud_window_visible(&self, visible: bool) {
         self.assert_owner_thread();
         if let NativeOwnedWindows::PresenterAndHud { hud, .. } = &self.windows {
@@ -622,7 +701,7 @@ impl NativeWindowHost {
             return false;
         }
         let editor_hwnds = match self.editor_hwnds_snapshot.as_ref() {
-            Some(snapshot) => match snapshot.read() {
+            Some(snapshot) => match snapshot.try_read() {
                 Ok(guard) => guard.clone(),
                 Err(_) => return false,
             },
@@ -836,6 +915,14 @@ mod tests {
     assert_not_impl_any!(NativeVideoWindow: Sync);
     assert_not_impl_any!(hud_window::HudOverlayWindow: Send);
     assert_not_impl_any!(hud_window::HudOverlayWindow: Sync);
+    assert_not_impl_any!(NativeRenderTargets: Send);
+    assert_not_impl_any!(NativeRenderTargets: Sync);
+
+    #[test]
+    fn opaque_render_target_transfer_is_send_without_exposing_window_capabilities() {
+        fn assert_send<T: Send>() {}
+        assert_send::<NativeRenderTargetTransfer>();
+    }
 
     #[test]
     fn window_thread_affinity_rejects_non_owner_thread() {
@@ -859,6 +946,11 @@ mod tests {
             "ImmSetCompositionWindow(",
             "ImmSetCandidateWindow(",
             "LoadCursorW(",
+            "GetCursorPos(",
+            "GetFocus(",
+            "GetForegroundWindow(",
+            "GetAsyncKeyState(",
+            "GetCapture(",
             "claim_foreground(",
             "NativeVideoWindow::create",
             "HudOverlayWindow",

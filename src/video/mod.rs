@@ -44,6 +44,8 @@ pub mod native_presenter;
 pub mod native_window;
 #[cfg(windows)]
 pub(crate) mod native_window_host;
+#[cfg(windows)]
+mod native_window_pump;
 #[cfg(all(test, windows))]
 mod native_window_thread_spike;
 pub mod normalize_scanner;
@@ -289,9 +291,8 @@ impl NativeVideoPlacement {
     }
 
     /// detached viewer (F12 別ウィンドウ) の子として重ねる placement か。
-    /// この child の host (egui detached viewport) は main⇔detached 切替をまたぐと
-    /// 作り直されるため、host teardown で child が道連れ死しても presenter スレッドを
-    /// 殺さないよう `post_quit_on_destroy=false` にする (詳細は下の window 生成箇所)。
+    /// pump はこの分類を parent/client rect と host registry の選択に使う。window 単位の
+    /// destroy は pump lifetime を終わらせず、終了は typed Shutdown が所有する。
     pub fn is_detached_viewer_child(&self) -> bool {
         matches!(self, Self::DetachedViewerChild)
     }
@@ -527,6 +528,121 @@ pub enum NativeVideoOutputEvent {
     CancelNormalizeScan,
 }
 
+#[cfg(windows)]
+const OUTPUT_EVENT_LATEST_MOUSE_MOVE: usize = 0;
+#[cfg(windows)]
+const OUTPUT_EVENT_LATEST_SEEK_THUMBNAIL: usize = 1;
+#[cfg(windows)]
+const OUTPUT_EVENT_LATEST_VST_PANEL_POS: usize = 2;
+#[cfg(windows)]
+const OUTPUT_EVENT_LATEST_SLOTS: usize = 3;
+
+#[cfg(windows)]
+fn native_output_event_latest_slot(event: &NativeVideoOutputEvent) -> Option<usize> {
+    match event {
+        NativeVideoOutputEvent::Window(native_window::NativeVideoWindowEvent::MouseMove(_)) => {
+            Some(OUTPUT_EVENT_LATEST_MOUSE_MOVE)
+        }
+        NativeVideoOutputEvent::RequestSeekThumbnail { .. } => {
+            Some(OUTPUT_EVENT_LATEST_SEEK_THUMBNAIL)
+        }
+        NativeVideoOutputEvent::SetVst3PanelPos { .. } => Some(OUTPUT_EVENT_LATEST_VST_PANEL_POS),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+struct SequencedNativeOutputEvent {
+    sequence: u64,
+    source_epoch: u64,
+    event: NativeVideoOutputEvent,
+}
+
+#[cfg(windows)]
+struct NativeOutputEventBusShared {
+    next_sequence: AtomicU64,
+    latest: Mutex<Vec<Option<SequencedNativeOutputEvent>>>,
+    overflow_fault: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct NativeOutputEventSender {
+    lossless_tx: crossbeam_channel::Sender<SequencedNativeOutputEvent>,
+    shared: Arc<NativeOutputEventBusShared>,
+}
+
+#[cfg(windows)]
+struct NativeOutputEventReceiver {
+    lossless_rx: crossbeam_channel::Receiver<SequencedNativeOutputEvent>,
+    shared: Arc<NativeOutputEventBusShared>,
+}
+
+#[cfg(windows)]
+fn native_output_event_bus(
+    capacity: usize,
+    overflow_fault: Arc<AtomicBool>,
+) -> (NativeOutputEventSender, NativeOutputEventReceiver) {
+    let (lossless_tx, lossless_rx) = crossbeam_channel::bounded(capacity);
+    let shared = Arc::new(NativeOutputEventBusShared {
+        next_sequence: AtomicU64::new(1),
+        latest: Mutex::new((0..OUTPUT_EVENT_LATEST_SLOTS).map(|_| None).collect()),
+        overflow_fault,
+    });
+    (
+        NativeOutputEventSender {
+            lossless_tx,
+            shared: Arc::clone(&shared),
+        },
+        NativeOutputEventReceiver {
+            lossless_rx,
+            shared,
+        },
+    )
+}
+
+#[cfg(windows)]
+impl NativeOutputEventSender {
+    pub(crate) fn send(&self, source_epoch: u64, event: NativeVideoOutputEvent) {
+        let sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let queued = SequencedNativeOutputEvent {
+            sequence,
+            source_epoch,
+            event,
+        };
+        if let Some(slot) = native_output_event_latest_slot(&queued.event) {
+            match self.shared.latest.lock() {
+                Ok(mut latest) => latest[slot] = Some(queued),
+                Err(_) => self.shared.overflow_fault.store(true, Ordering::Release),
+            }
+            return;
+        }
+        match self.lossless_tx.try_send(queued) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(_))
+            | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.shared.overflow_fault.store(true, Ordering::Release)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl NativeOutputEventReceiver {
+    fn drain(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+        let mut events: Vec<_> = self.lossless_rx.try_iter().collect();
+        match self.shared.latest.lock() {
+            Ok(mut latest) => events.extend(latest.iter_mut().filter_map(Option::take)),
+            Err(_) => self.shared.overflow_fault.store(true, Ordering::Release),
+        }
+        events.sort_unstable_by_key(|event| event.sequence);
+        events
+            .into_iter()
+            .map(|event| (event.source_epoch, event.event))
+            .collect()
+    }
+}
+
 /// [`VideoPlayer::seek_relative`] の結果。
 /// 境界 (先頭 / 末尾) に達して実シークを発行しなかったケースを呼び出し側が
 /// 検出し、トースト表示に振り替えるために使う。
@@ -676,16 +792,16 @@ enum NativeVideoOutputCommand {
         state: crate::video::normalize_types::NormalizeOverlayState,
     },
     /// HUD overlay HWND を VST GUI より前面に上げ直す。VST z-order 操作後の hook、
-    /// presenter thread の cursor polling (activation zone 検知)、HUD wndproc の
-    /// `WM_WINDOWPOSCHANGING` などから発火される。presenter thread が pop して
+    /// render の cursor observation 評価 (activation zone 検知)、HUD wndproc の
+    /// `WM_WINDOWPOSCHANGING` などから発火される。pump が pop して
     /// 即時 → 16ms → 64ms の short retry burst で `SetWindowPos(hud, HWND_TOPMOST, ...)`
     /// を呼ぶ (VST IPC が非同期で z-order を動かしても拾えるように)。
     RaiseHudToTop,
-    /// native presenter HWND を presenter thread 側で前面・foreground に戻す。
+    /// native presenter HWND を pump thread 側で前面・foreground に戻す。
     ///
     /// PrintScreen / Snipping Tool などで一度 foreground が外部プロセスへ移ったあと、
     /// egui 側の黒 backdrop が presenter HWND より前に残ることがある。UI thread から
-    /// `SetWindowPos` / `SetForegroundWindow` すると DWM / presenter thread 待ちで
+    /// `SetWindowPos` / `SetForegroundWindow` すると DWM / HWND owner 待ちで
     /// 固まるリスクがあるため、command 経由で HWND 所有スレッドに再アサートさせる。
     RaisePresenterToFront,
     /// Inc 7 hidden presenter (動画→音声モード): presenter ウィンドウと HUD overlay を
@@ -693,13 +809,262 @@ enum NativeVideoOutputCommand {
     /// 入り、present() を呼ばず drain + frame selection + present 成功時 bookkeeping だけを
     /// 続けて最新フレームを hold する (音声は無改変 = 無中断)。`visible=true` = hold して
     /// いたフレームを 1 回 present してから show_and_raise で復帰する。処理後に presenter
-    /// スレッドが共有 atomic (`NativeVideoOutput.presenter_hidden`) を更新し、App が
-    /// exit 完了 (= ウィンドウ再表示済み) を検知できるようにする。
+    /// pump が typed `WindowHostState` 適用後に output-lifetime の
+    /// `NativePresenterVisibility` を更新し、render と App が同じ状態を参照できるようにする。
     // App (bin 専属) からのみ構築される。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
     SetWindowVisible {
         visible: bool,
     },
+}
+
+/// The native output context's single owner of the most recent frame.
+///
+/// A successfully presented GPU frame is released back to reader key 1 by
+/// `NativeRenderCore`, so both `Hidden` and `Visible` frames can be presented
+/// again without a render-thread re-arm acquire. `Visible::fence` belongs to
+/// the core that last copied the frame and is used only after that frame is
+/// displaced into the disposal-only retire queue.
+#[cfg(any(windows, test))]
+enum FramePresentationState<F> {
+    Empty,
+    Hidden { frame: F },
+    Visible { frame: F, fence: u64 },
+}
+
+/// Pump-published native presenter visibility.
+///
+/// `WindowHostState` on the window-pump thread is the authority. Both the App and
+/// render loop keep a clone of this projection; neither maintains an independent
+/// hidden/visible flag. In particular, replacing `PresenterSourceState` must not
+/// replace or reset this output-lifetime state.
+#[cfg(any(windows, test))]
+#[derive(Clone)]
+struct NativePresenterVisibility {
+    hidden: Arc<AtomicBool>,
+}
+
+#[cfg(any(windows, test))]
+impl NativePresenterVisibility {
+    fn new_visible() -> Self {
+        Self {
+            hidden: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.hidden.load(Ordering::Acquire)
+    }
+
+    /// Publish the visibility after the pump has applied the matching typed
+    /// `WindowHostState` transition.
+    fn publish_hidden(&self, hidden: bool) {
+        self.hidden.store(hidden, Ordering::Release);
+    }
+}
+
+#[cfg(any(windows, test))]
+enum DisplacedPresentation<F> {
+    Hidden { frame: F },
+    Visible { frame: F, fence: u64 },
+}
+
+#[cfg(any(windows, test))]
+impl<F> FramePresentationState<F> {
+    fn replace_hidden(&mut self, frame: F) -> Option<DisplacedPresentation<F>> {
+        let previous = std::mem::replace(self, Self::Hidden { frame });
+        Self::into_displaced(previous)
+    }
+
+    fn replace_visible(&mut self, frame: F, fence: u64) -> Option<DisplacedPresentation<F>> {
+        let previous = std::mem::replace(self, Self::Visible { frame, fence });
+        Self::into_displaced(previous)
+    }
+
+    fn hide(&mut self) {
+        let previous = std::mem::replace(self, Self::Empty);
+        *self = match previous {
+            Self::Visible { frame, .. } | Self::Hidden { frame } => Self::Hidden { frame },
+            Self::Empty => Self::Empty,
+        };
+    }
+
+    fn frame(&self) -> Option<&F> {
+        match self {
+            Self::Empty => None,
+            Self::Hidden { frame } | Self::Visible { frame, .. } => Some(frame),
+        }
+    }
+
+    fn visible_frame(&self) -> Option<&F> {
+        match self {
+            Self::Visible { frame, .. } => Some(frame),
+            Self::Empty | Self::Hidden { .. } => None,
+        }
+    }
+
+    fn mark_current_visible(&mut self, fence: u64) -> bool {
+        let previous = std::mem::replace(self, Self::Empty);
+        match previous {
+            Self::Empty => false,
+            Self::Hidden { frame } | Self::Visible { frame, .. } => {
+                *self = Self::Visible { frame, fence };
+                true
+            }
+        }
+    }
+
+    fn take_displaced(&mut self) -> Option<DisplacedPresentation<F>> {
+        let previous = std::mem::replace(self, Self::Empty);
+        Self::into_displaced(previous)
+    }
+
+    fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
+        render_grade_changed && matches!(self, Self::Visible { .. })
+    }
+
+    fn is_hidden(&self) -> bool {
+        matches!(self, Self::Hidden { .. })
+    }
+
+    #[cfg(test)]
+    fn is_visible(&self) -> bool {
+        matches!(self, Self::Visible { .. })
+    }
+
+    fn into_displaced(state: Self) -> Option<DisplacedPresentation<F>> {
+        match state {
+            Self::Empty => None,
+            Self::Hidden { frame } => Some(DisplacedPresentation::Hidden { frame }),
+            Self::Visible { frame, fence } => Some(DisplacedPresentation::Visible { frame, fence }),
+        }
+    }
+}
+
+#[cfg(windows)]
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 27;
+
+#[cfg(windows)]
+fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
+    match command {
+        NativeVideoOutputCommand::SetHoverThumbnail { .. } => Some(0),
+        NativeVideoOutputCommand::SetHoverPreviewPinned { .. } => Some(1),
+        NativeVideoOutputCommand::SetTimelineMarkers { .. } => Some(2),
+        NativeVideoOutputCommand::SetJumpEntries { .. } => Some(3),
+        NativeVideoOutputCommand::SetVideoGrade { .. } => Some(4),
+        NativeVideoOutputCommand::SetMetadata { .. } => Some(5),
+        NativeVideoOutputCommand::SetSidePanelState { .. } => Some(6),
+        NativeVideoOutputCommand::SetLoopEnabled { .. } => Some(7),
+        NativeVideoOutputCommand::SetLoopMode { .. } => Some(8),
+        NativeVideoOutputCommand::SetContinuousMode { .. } => Some(9),
+        NativeVideoOutputCommand::SetVst3Available { .. } => Some(10),
+        NativeVideoOutputCommand::SetHudDimmed { .. } => Some(11),
+        NativeVideoOutputCommand::SetTextContrast { .. } => Some(12),
+        NativeVideoOutputCommand::SetChecked { .. } => Some(13),
+        NativeVideoOutputCommand::SetVideoCompact { .. } => Some(14),
+        NativeVideoOutputCommand::SetVideoSar { .. } => Some(15),
+        NativeVideoOutputCommand::SetVst3Panel { .. } => Some(16),
+        NativeVideoOutputCommand::SetPlaybackStatus { .. } => Some(17),
+        NativeVideoOutputCommand::SetTileOverlay { .. } => Some(18),
+        NativeVideoOutputCommand::SetRingPickerOverlay { .. } => Some(19),
+        NativeVideoOutputCommand::SetRingGuideOverlay { .. } => Some(20),
+        NativeVideoOutputCommand::SetNavigationPreview { .. } => Some(21),
+        NativeVideoOutputCommand::MarkCursorActivity => Some(22),
+        NativeVideoOutputCommand::RequestOverlayRender => Some(23),
+        NativeVideoOutputCommand::SetNormalizeOverlayState { .. } => Some(24),
+        NativeVideoOutputCommand::RaiseHudToTop => Some(25),
+        NativeVideoOutputCommand::RaisePresenterToFront => Some(26),
+        NativeVideoOutputCommand::ResetSidePanelSession
+        | NativeVideoOutputCommand::ShowToast { .. }
+        | NativeVideoOutputCommand::SwitchSource { .. }
+        | NativeVideoOutputCommand::SwitchPlacement { .. }
+        | NativeVideoOutputCommand::SetWindowVisible { .. } => None,
+    }
+}
+
+#[cfg(windows)]
+struct SequencedNativeCommand {
+    sequence: u64,
+    command: NativeVideoOutputCommand,
+}
+
+#[cfg(windows)]
+struct NativeCommandBusShared {
+    next_sequence: AtomicU64,
+    latest: Mutex<Vec<Option<SequencedNativeCommand>>>,
+    overflow_fault: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct NativeCommandSender {
+    lossless_tx: crossbeam_channel::Sender<SequencedNativeCommand>,
+    shared: Arc<NativeCommandBusShared>,
+}
+
+#[cfg(windows)]
+struct NativeCommandReceiver {
+    lossless_rx: crossbeam_channel::Receiver<SequencedNativeCommand>,
+    shared: Arc<NativeCommandBusShared>,
+}
+
+#[cfg(windows)]
+fn native_command_bus(
+    capacity: usize,
+    overflow_fault: Arc<AtomicBool>,
+) -> (NativeCommandSender, NativeCommandReceiver) {
+    let (lossless_tx, lossless_rx) = crossbeam_channel::bounded(capacity);
+    let shared = Arc::new(NativeCommandBusShared {
+        next_sequence: AtomicU64::new(1),
+        latest: Mutex::new((0..NATIVE_COMMAND_LATEST_SLOTS).map(|_| None).collect()),
+        overflow_fault,
+    });
+    (
+        NativeCommandSender {
+            lossless_tx,
+            shared: Arc::clone(&shared),
+        },
+        NativeCommandReceiver {
+            lossless_rx,
+            shared,
+        },
+    )
+}
+
+#[cfg(windows)]
+impl NativeCommandSender {
+    fn send(&self, command: NativeVideoOutputCommand) -> Result<(), ()> {
+        let sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let queued = SequencedNativeCommand { sequence, command };
+        if let Some(slot) = native_command_latest_slot(&queued.command) {
+            match self.shared.latest.lock() {
+                Ok(mut latest) => latest[slot] = Some(queued),
+                Err(_) => self.shared.overflow_fault.store(true, Ordering::Release),
+            }
+            return Ok(());
+        }
+        match self.lossless_tx.try_send(queued) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(_))
+            | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.shared.overflow_fault.store(true, Ordering::Release);
+                Err(())
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl NativeCommandReceiver {
+    fn drain(&self) -> Vec<NativeVideoOutputCommand> {
+        let mut commands: Vec<_> = self.lossless_rx.try_iter().collect();
+        match self.shared.latest.lock() {
+            Ok(mut latest) => commands.extend(latest.iter_mut().filter_map(Option::take)),
+            Err(_) => self.shared.overflow_fault.store(true, Ordering::Release),
+        }
+        commands.sort_unstable_by_key(|command| command.sequence);
+        commands.into_iter().map(|queued| queued.command).collect()
+    }
 }
 
 #[cfg(windows)]
@@ -771,55 +1136,62 @@ pub(crate) struct NativeVideoOutput {
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
-    /// presenter thread が `HudOverlayWindow::create` 成功後に store、
+    /// pump thread が `HudOverlayWindow::create` 成功後に store、
     /// fullscreen 終了 / 失敗時は 0 に戻す。App が `dsp_bridge.set_hud_hwnd(...)`
     /// で bridge にも教える経路で参照する (= raise allowlist の「mIV 既知 HWND」判定)。
     hud_hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
-    /// Inc 7 hidden presenter: presenter ウィンドウが hide (consume-and-hold) 中かを示す
-    /// 共有フラグ。presenter スレッドが `SetWindowVisible` 処理後に更新し、App
-    /// (`exit_video_audio_mode` の async 待ち) が「show 完了 = 再表示済み」を検知する。
-    /// 初期値 false (= 通常の可視 presenter)。
+    /// Inc 7 hidden presenter: pump の typed `WindowHostState` が所有する実際の可視状態を
+    /// output lifetime で公開する projection。render の consume policy と App
+    /// (`exit_video_audio_mode` の async 待ち) は同じ値を読み、source switch では交換しない。
+    /// 初期値 visible。
     /// App (bin 専属) からのみ読まれる。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
-    presenter_hidden: Arc<AtomicBool>,
+    presenter_visibility: NativePresenterVisibility,
     perf_overlay_visible: Arc<AtomicBool>,
     /// app/native_video.rs (bin 専属) からのみ参照されるため lib build では dead に見える。
     #[allow(dead_code)]
     source_epoch: Arc<AtomicU64>,
     /// App 側が「信頼する」現在の presenter placement 世代。`PlacementSwitched` を
     /// 受けるたびに単調非減少で進め、これより古い世代の close を stale として棄却する。
-    /// presenter thread とは共有しない (App = UI thread 専用) が、fast-swap の
+    /// pump/render threads とは共有しない (App = UI thread 専用) が、fast-swap の
     /// `take/attach_native_output` で presenter と一緒に運ばれるため lifetime 正しい。
     #[allow(dead_code)]
     committed_generation: AtomicU64,
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     last_text_contrast_strong: AtomicBool,
-    command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
-    event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(u64, NativeVideoOutputEvent)>>,
+    command_tx: NativeCommandSender,
+    event_rx: std::sync::Mutex<NativeOutputEventReceiver>,
     /// Presenter thread 内で起きた fatal init error (`CoInitializeEx` /
     /// `NativeWindowHost::create` / `NativeRenderCore::new` 失敗) を
     /// VideoPlayer に伝えるための one-shot ストレージ。
     /// `take_init_error` で 1 度だけ取り出し、`VideoPlayer.error` に転写する。
     init_error: Arc<Mutex<Option<String>>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    threads: Option<NativeVideoOutputThreads>,
+}
+
+#[cfg(windows)]
+struct NativeVideoOutputThreads {
+    render: std::thread::JoinHandle<()>,
+    pump: std::thread::JoinHandle<()>,
 }
 
 #[cfg(windows)]
 impl NativeVideoOutput {
     #[cfg(test)]
     pub(crate) fn disconnected_for_test() -> Self {
-        let (command_tx, _command_rx) = std::sync::mpsc::channel();
-        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let channel_fault = Arc::new(AtomicBool::new(false));
+        let (command_tx, _command_rx) = native_command_bus(8, Arc::clone(&channel_fault));
+        let (_event_tx, event_rx) = native_output_event_bus(8, channel_fault);
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             hwnd: Arc::new(AtomicU64::new(0)),
             hud_hwnd: Arc::new(AtomicU64::new(0)),
             first_presented: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
-            presenter_hidden: Arc::new(AtomicBool::new(false)),
+            presenter_visibility: NativePresenterVisibility::new_visible(),
             perf_overlay_visible: Arc::new(AtomicBool::new(false)),
             source_epoch: Arc::new(AtomicU64::new(0)),
             committed_generation: AtomicU64::new(0),
@@ -829,7 +1201,7 @@ impl NativeVideoOutput {
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error: Arc::new(Mutex::new(None)),
-            thread: None,
+            threads: None,
         }
     }
 
@@ -855,73 +1227,92 @@ impl NativeVideoOutput {
         let hud_hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
-        let presenter_hidden = Arc::new(AtomicBool::new(false));
+        let presenter_visibility = NativePresenterVisibility::new_visible();
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let source_epoch = Arc::new(AtomicU64::new(0));
         let initial_vst3_available = config.vst3_available;
         let initial_checked = config.checked;
         let initial_text_contrast_strong =
             matches!(config.text_contrast, crate::settings::TextContrast::Strong);
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let channel_fault = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = native_output_event_bus(512, Arc::clone(&channel_fault));
+        let (command_tx, command_rx) = native_command_bus(512, Arc::clone(&channel_fault));
         let init_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let thread_cancel = Arc::clone(&cancel);
-        let thread_hwnd = Arc::clone(&hwnd);
-        let thread_hud_hwnd = Arc::clone(&hud_hwnd);
         let thread_first_presented = Arc::clone(&first_presented);
-        let thread_closed = Arc::clone(&closed);
-        let thread_presenter_hidden = Arc::clone(&presenter_hidden);
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
         let thread_init_error = Arc::clone(&init_error);
-        let thread = match std::thread::Builder::new()
-            .name("native-video-presenter".into())
+        let thread_presenter_visibility = presenter_visibility.clone();
+        let pump = match native_window_pump::spawn_native_window_pump(
+            native_window_pump::NativeWindowPumpSpawn {
+                config: config.clone(),
+                cancel: Arc::clone(&cancel),
+                hwnd_out: Arc::clone(&hwnd),
+                hud_hwnd_out: Arc::clone(&hud_hwnd),
+                closed: Arc::clone(&closed),
+                presenter_visibility: presenter_visibility.clone(),
+                source_epoch: Arc::clone(&source_epoch),
+                ui_event_tx: event_tx.clone(),
+                init_error: Arc::clone(&init_error),
+                channel_fault: Arc::clone(&channel_fault),
+            },
+        ) {
+            Ok(pump) => pump,
+            Err(err) => {
+                crate::logger::log(format!("[native-video] failed to spawn window pump: {err}"));
+                return None;
+            }
+        };
+        let native_window_pump::NativeWindowPumpThread {
+            render: pump_render,
+            join: pump_join,
+        } = pump;
+        let render = match std::thread::Builder::new()
+            .name("native-video-render".into())
             .spawn(move || {
-                if let Err(err) = run_native_video_output(
-                    video_rx,
-                    clock,
-                    engine_event_tx,
-                    displayed_frame_seq,
-                    last_displayed_pts_bits,
-                    frame_step_active,
-                    duration_secs_bits,
-                    config,
-                    command_rx,
-                    event_tx,
-                    thread_cancel,
-                    Arc::clone(&thread_hwnd),
-                    Arc::clone(&thread_hud_hwnd),
-                    thread_first_presented,
-                    Arc::clone(&thread_closed),
-                    thread_presenter_hidden,
-                    thread_perf_overlay_visible,
-                    dynamic,
-                    audio_diagnostics,
-                ) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_native_video_output(
+                        video_rx,
+                        clock,
+                        engine_event_tx,
+                        displayed_frame_seq,
+                        last_displayed_pts_bits,
+                        frame_step_active,
+                        duration_secs_bits,
+                        config,
+                        command_rx,
+                        event_tx,
+                        thread_cancel,
+                        thread_first_presented,
+                        thread_perf_overlay_visible,
+                        thread_presenter_visibility,
+                        dynamic,
+                        audio_diagnostics,
+                        &pump_render,
+                    )
+                }));
+                let error = match result {
+                    Ok(Ok(())) => return,
+                    Ok(Err(err)) => err,
+                    Err(_) => "native video render thread panicked".to_string(),
+                };
+                {
+                    let err = error;
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
-                    // run_native_video_output が Err で抜けた = init 失敗または run 中の致命的
-                    // エラー。VideoPlayer 側に必ず通知できるよう、init_error にメッセージを
-                    // 保存してから closed=true を立てる。
-                    //
-                    // ⚠ publish 順序が重要: `init_error` 書き込み → `closed.store(true, Release)`
-                    // の順にしないと、UI thread が `closed.load(Acquire)=true` を観測した時点で
-                    // `init_error` がまだ書かれておらず、エラー toast が出ないレースが起きる
-                    // (Codex P3 指摘)。Release/Acquire ペアで closed=true 観測後の init_error
-                    // 読み出しを happens-before に乗せる。
                     if let Ok(mut slot) = thread_init_error.lock() {
                         if slot.is_none() {
-                            *slot = Some(format!(
-                                "ネイティブ動画プレゼンターの初期化に失敗しました: {err}"
-                            ));
+                            *slot = Some(format!("native video render fault: {err}"));
                         }
                     }
-                    thread_hwnd.store(0, Ordering::Release);
-                    thread_hud_hwnd.store(0, Ordering::Release);
-                    thread_closed.store(true, Ordering::Release);
+                    pump_render.render_fault(u64::MAX - 1, err);
                 }
             }) {
-            Ok(thread) => thread,
+            Ok(render) => render,
             Err(err) => {
-                crate::logger::log(format!("[native-video] failed to spawn presenter: {err}"));
+                cancel.store(true, Ordering::Release);
+                crate::logger::log(format!(
+                    "[native-video] failed to spawn render thread: {err}"
+                ));
                 return None;
             }
         };
@@ -931,7 +1322,7 @@ impl NativeVideoOutput {
             hud_hwnd,
             first_presented,
             closed,
-            presenter_hidden,
+            presenter_visibility,
             perf_overlay_visible,
             source_epoch,
             committed_generation: AtomicU64::new(0),
@@ -941,7 +1332,10 @@ impl NativeVideoOutput {
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error,
-            thread: Some(thread),
+            threads: Some(NativeVideoOutputThreads {
+                render,
+                pump: pump_join,
+            }),
         })
     }
 
@@ -950,7 +1344,7 @@ impl NativeVideoOutput {
     }
 
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
-    /// presenter thread が `HudOverlayWindow::create` 成功時に store する。
+    /// pump thread が `HudOverlayWindow::create` 成功時に store する。
     /// HUD HWND が生成されていない (フォールバック経路) なら 0。
     pub(crate) fn hud_hwnd(&self) -> u64 {
         self.hud_hwnd.load(Ordering::Acquire)
@@ -965,9 +1359,8 @@ impl NativeVideoOutput {
     }
 
     /// Inc 7 hidden presenter: presenter ウィンドウ (+ HUD overlay) の表示 / 非表示を
-    /// 要求する。command を送ったあと `WM_NULL` を post して presenter スレッドの
-    /// アイドル待ち (`sleep_until_message`) を即座に起こす。App は `is_presenter_hidden`
-    /// で反映完了 (= show 済み) をポーリングする。
+    /// 要求する。App は `is_presenter_hidden` で pump の typed visibility ack 反映完了
+    /// (= show 済み) をポーリングする。
     /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
     pub(crate) fn set_window_visible(&self, visible: bool) {
@@ -982,10 +1375,10 @@ impl NativeVideoOutput {
     /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
     pub(crate) fn is_presenter_hidden(&self) -> bool {
-        self.presenter_hidden.load(Ordering::Acquire)
+        self.presenter_visibility.is_hidden()
     }
 
-    /// presenter thread 内で起きた fatal init error を 1 度だけ取り出す。
+    /// pump/render thread 内で起きた fatal init error を 1 度だけ取り出す。
     /// VideoPlayer::tick が毎フレーム pull し、Some なら `self.error` に転写して
     /// UI に赤字エラーを表示させる。
     fn take_init_error(&self) -> Option<String> {
@@ -1240,9 +1633,9 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::RequestOverlayRender);
     }
 
-    /// CP7: HUD overlay HWND を最前面に上げ直す要求を presenter thread に送る。
+    /// CP7: HUD overlay HWND を最前面に上げ直す要求を render orchestration に送る。
     /// `DspBridge::hud_raise_hook` 経由で発火された全 z-order 変更操作に対する応答。
-    /// presenter thread 側で 200ms 抑制 + retry burst (即時/16ms/64ms) で処理される。
+    /// pump 側で retry burst (即時/16ms/50ms) として処理される。
     fn request_hud_raise(&self) {
         let _ = self
             .command_tx
@@ -1268,11 +1661,7 @@ impl NativeVideoOutput {
         let Ok(rx) = self.event_rx.lock() else {
             return Vec::new();
         };
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        events
+        rx.drain()
     }
 }
 
@@ -1286,15 +1675,19 @@ impl Drop for NativeVideoOutput {
             false,
         );
         self.cancel.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
+        if let Some(threads) = self.threads.take() {
             match std::thread::Builder::new()
                 .name("native-video-output-drop-join".to_string())
                 .spawn(move || {
-                    let join_ok = thread.join().is_ok();
+                    let pump_join_ok = threads.pump.join().is_ok();
+                    let render_join_ok = threads.render.join().is_ok();
                     crate::gpu_info::emit_vram_trace(
                         "native_output_drop_join",
-                        "after_presenter_thread_join",
-                        &[("join_ok", serde_json::Value::from(join_ok))],
+                        "after_native_video_threads_join",
+                        &[
+                            ("pump_join_ok", serde_json::Value::from(pump_join_ok)),
+                            ("render_join_ok", serde_json::Value::from(render_join_ok)),
+                        ],
                     );
                 }) {
                 Ok(_) => {}
@@ -1509,6 +1902,154 @@ fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFr
     queue.clear();
 }
 
+/// Hidden native presenters do not pace frames against the display clock. Drain both the
+/// already-paced queue and the decoder channel so the decoder can continue through demux EOF.
+///
+/// `drained` is caller-owned scratch storage; production reuses it for the lifetime of the
+/// presenter thread. The caller still validates seek serials and reduces the batch to the one
+/// latest `FramePresentationState::Hidden` owner.
+#[cfg(any(windows, test))]
+fn drain_hidden_available_frames<F>(
+    queue: &mut std::collections::VecDeque<F>,
+    receiver: &crossbeam_channel::Receiver<F>,
+    drained: &mut Vec<F>,
+) -> usize {
+    drained.clear();
+    drained.extend(queue.drain(..));
+    while let Ok(frame) = receiver.try_recv() {
+        drained.push(frame);
+    }
+    drained.len()
+}
+
+// Fence-stall fallback cap. The shared pool also retains at most one typed
+// Visible/Hidden frame, so retire stays bounded independently of the current
+// presentation owner.
+#[cfg(windows)]
+const NATIVE_PRESENT_RETIRE_CAP: usize = 4;
+
+/// Native-output-local ownership for the current frame and frames whose
+/// asynchronous presenter copy is awaiting disposal.
+///
+/// `presentation` is the only recent-frame source. `present_retire` never
+/// supplies a frame for presentation; it only delays drop until the copy fence
+/// completes (or the bounded fallback cap is reached).
+#[cfg(windows)]
+struct NativeFrameOutputContext {
+    presentation: FramePresentationState<VideoFrame>,
+    present_retire: std::collections::VecDeque<(VideoFrame, u64)>,
+}
+
+#[cfg(windows)]
+impl NativeFrameOutputContext {
+    fn new() -> Self {
+        Self {
+            presentation: FramePresentationState::Empty,
+            present_retire: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn retire_len(&self) -> usize {
+        self.present_retire.len()
+    }
+
+    fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
+        self.presentation
+            .should_represent_for_grade_change(render_grade_changed)
+    }
+
+    fn hide(&mut self) {
+        self.presentation.hide();
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.presentation.is_hidden()
+    }
+
+    fn frame(&self) -> Option<&VideoFrame> {
+        self.presentation.frame()
+    }
+
+    fn visible_frame(&self) -> Option<&VideoFrame> {
+        self.presentation.visible_frame()
+    }
+
+    fn mark_current_visible(&mut self, fence: u64) -> bool {
+        self.presentation.mark_current_visible(fence)
+    }
+
+    fn hold_hidden(&mut self, frame: VideoFrame) {
+        let displaced = self.presentation.replace_hidden(frame);
+        self.dispose_displaced(displaced);
+    }
+
+    fn commit_presented(&mut self, frame: VideoFrame, fence: u64) {
+        let displaced = self.presentation.replace_visible(frame, fence);
+        self.dispose_displaced(displaced);
+    }
+
+    fn clear_current(&mut self) {
+        let displaced = self.presentation.take_displaced();
+        self.dispose_displaced(displaced);
+    }
+
+    fn retire_completed(&mut self, completed: Option<u64>) {
+        if let Some(completed) = completed {
+            while self
+                .present_retire
+                .front()
+                .is_some_and(|(_, value)| *value != 0 && *value <= completed)
+            {
+                self.present_retire.pop_front();
+            }
+        }
+        self.enforce_retire_cap();
+    }
+
+    fn invalidate_retire_fence_prefix(&mut self, count: usize) {
+        for entry in self.present_retire.iter_mut().take(count) {
+            entry.1 = 0;
+        }
+    }
+
+    fn dispose_displaced(&mut self, displaced: Option<DisplacedPresentation<VideoFrame>>) {
+        match displaced {
+            Some(DisplacedPresentation::Hidden { frame }) => {
+                native_reset_unpresented_frame(frame);
+            }
+            Some(DisplacedPresentation::Visible { frame, fence }) => {
+                self.present_retire.push_back((frame, fence));
+                self.enforce_retire_cap();
+            }
+            None => {}
+        }
+    }
+
+    fn enforce_retire_cap(&mut self) {
+        while self.present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
+            self.present_retire.pop_front();
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn video_grade_render_changed(
+    previous: &crate::creative_lut::VideoGradeSnapshot,
+    next: &crate::creative_lut::VideoGradeSnapshot,
+) -> bool {
+    if previous.adjustments != next.adjustments {
+        return true;
+    }
+    if next.adjustments.creative_lut.is_identity() {
+        return false;
+    }
+    match (&previous.lut, &next.lut) {
+        (Some(previous), Some(next)) => !std::sync::Arc::ptr_eq(previous, next),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 #[cfg(windows)]
 fn emit_native_vram_trace(
     kind: &str,
@@ -1654,16 +2195,16 @@ fn try_send_native_first_frame_ready(
 
 #[cfg(windows)]
 fn send_native_output_event(
-    tx: &std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
+    tx: &NativeOutputEventSender,
     source_epoch: u64,
     event: NativeVideoOutputEvent,
 ) {
-    let _ = tx.send((source_epoch, event));
+    tx.send(source_epoch, event);
 }
 
 #[cfg(windows)]
 fn send_native_overlay_command(
-    tx: &std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
+    tx: &NativeOutputEventSender,
     source_epoch: u64,
     generation: u64,
     command: crate::video::native_presenter::NativeOverlayCommand,
@@ -1824,6 +2365,148 @@ fn native_hud_overlay_enabled_for_values(
 }
 
 #[cfg(windows)]
+struct NativeWindowAttach {
+    targets: crate::video::native_window_host::NativeRenderTargets,
+    width: u32,
+    height: u32,
+    pixels_per_point: f32,
+    observation: crate::video::native_window_host::NativeWindowObservation,
+}
+
+#[cfg(windows)]
+fn wait_for_native_window_attach(
+    pump: &native_window_pump::NativeWindowPumpRenderClient,
+    request: u64,
+    epoch: u64,
+    cancel: &AtomicBool,
+) -> Result<NativeWindowAttach, String> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("native window attach cancelled".to_string());
+        }
+        match pump.recv_lifecycle_timeout(std::time::Duration::from_millis(10)) {
+            Ok(native_window_pump::PumpLifecycleEvent::Attach {
+                request: actual_request,
+                epoch: actual_epoch,
+                targets,
+                width,
+                height,
+                pixels_per_point,
+                observation,
+            }) if actual_request == request && actual_epoch == epoch => {
+                return Ok(NativeWindowAttach {
+                    targets: targets.into_targets(),
+                    width,
+                    height,
+                    pixels_per_point,
+                    observation,
+                });
+            }
+            Ok(native_window_pump::PumpLifecycleEvent::Fault { message, .. }) => {
+                return Err(message);
+            }
+            Ok(native_window_pump::PumpLifecycleEvent::Shutdown) => {
+                return Err("native window pump shut down during attach".to_string());
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("native window pump disconnected during attach".to_string());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_native_window_published(
+    pump: &native_window_pump::NativeWindowPumpRenderClient,
+    request: u64,
+    epoch: u64,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("native window publish cancelled".to_string());
+        }
+        match pump.recv_lifecycle_timeout(std::time::Duration::from_millis(10)) {
+            Ok(native_window_pump::PumpLifecycleEvent::Published {
+                request: actual_request,
+                epoch: actual_epoch,
+            }) if actual_request == request && actual_epoch == epoch => return Ok(()),
+            Ok(native_window_pump::PumpLifecycleEvent::Fault { message, .. }) => {
+                return Err(message);
+            }
+            Ok(native_window_pump::PumpLifecycleEvent::Shutdown) => {
+                return Err("native window pump shut down during publish".to_string());
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("native window pump disconnected during publish".to_string());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_native_window_resize(
+    pump: &native_window_pump::NativeWindowPumpRenderClient,
+    epoch: u64,
+    cancel: &AtomicBool,
+) -> Result<(u32, u32), String> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("native window resize cancelled".to_string());
+        }
+        match pump.recv_lifecycle_timeout(std::time::Duration::from_millis(10)) {
+            Ok(native_window_pump::PumpLifecycleEvent::Resized {
+                epoch: actual_epoch,
+                width,
+                height,
+            }) if actual_epoch == epoch => return Ok((width, height)),
+            Ok(native_window_pump::PumpLifecycleEvent::Fault { message, .. }) => {
+                return Err(message);
+            }
+            Ok(native_window_pump::PumpLifecycleEvent::Shutdown) => {
+                return Err("native window pump shut down during resize".to_string());
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("native window pump disconnected during resize".to_string());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_native_window_visibility(
+    pump: &native_window_pump::NativeWindowPumpRenderClient,
+    epoch: u64,
+    visible: bool,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("native window visibility cancelled".to_string());
+        }
+        match pump.recv_lifecycle_timeout(std::time::Duration::from_millis(10)) {
+            Ok(native_window_pump::PumpLifecycleEvent::VisibilityApplied {
+                epoch: actual_epoch,
+                visible: actual_visible,
+            }) if actual_epoch == epoch && actual_visible == visible => return Ok(()),
+            Ok(native_window_pump::PumpLifecycleEvent::Fault { request, message }) => {
+                return Err(format!("window request {request} failed: {message}"));
+            }
+            Ok(native_window_pump::PumpLifecycleEvent::Shutdown) => {
+                return Err("native window pump shut down during visibility".to_string());
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("native window pump disconnected during visibility".to_string());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 fn run_native_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
     clock: Arc<AvClock>,
@@ -1833,64 +2516,43 @@ fn run_native_video_output(
     frame_step_active: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
-    command_rx: std::sync::mpsc::Receiver<NativeVideoOutputCommand>,
-    ui_event_tx: std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
+    command_rx: NativeCommandReceiver,
+    ui_event_tx: NativeOutputEventSender,
     cancel: Arc<AtomicBool>,
-    hwnd_out: Arc<AtomicU64>,
-    hud_hwnd_out: Arc<AtomicU64>,
     first_presented_out: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    presenter_hidden_out: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
+    presenter_visibility: NativePresenterVisibility,
     dynamic: Arc<crate::video::decoder::VideoDynamicState>,
     audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
+    window_pump: &native_window_pump::NativeWindowPumpRenderClient,
 ) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
     let _com = NativeComApartment::init()?;
     let width = (config.rect.right - config.rect.left).max(1) as u32;
     let height = (config.rect.bottom - config.rect.top).max(1) as u32;
-    // placement switch で window を rebuild するたびに +1 する presenter 世代。
-    // 初回 window は世代 1。close イベント (`CloseFullscreen` / `CloseRequested`) に
-    // この値を焼き込み、App 側が「現世代より古い close」を stale として棄却する。
     let mut cur_generation: u64 = 1;
-    let (presenter_event_tx, presenter_event_rx) = std::sync::mpsc::channel();
-    let hud_overlay_enabled = native_hud_overlay_enabled_for_placement(&config, config.placement);
-    let mut window = crate::video::native_window_host::NativeWindowHost::create(
-        crate::video::native_window_host::NativeWindowHostConfig {
-            window: crate::video::native_window::NativeVideoWindowConfig {
-                mode: native_window_mode_for_placement(config.placement, config.rect),
-                owner_hwnd: native_window_owner_for_placement(config.owner_hwnd, config.placement),
-                initially_visible: false,
-                activate_on_show: config.activate_on_show,
-                close_on_escape: false,
-                // detached-viewer-child host teardown must not end this presenter loop.
-                post_quit_on_destroy: !config.placement.is_detached_viewer_child(),
-                event_tx: Some(presenter_event_tx.clone()),
-                generation: cur_generation,
-            },
-            hud: if hud_overlay_enabled {
-                crate::video::native_window_host::NativeHudWindowRequest::Enabled { width, height }
-            } else {
-                crate::video::native_window_host::NativeHudWindowRequest::Disabled
-            },
-            event_tx: presenter_event_tx.clone(),
-        },
-    )?;
-    if cancel.load(Ordering::Acquire) {
-        window.destroy();
-        closed.store(true, Ordering::Release);
-        crate::logger::log(
-            "[native-video] fullscreen presenter startup cancelled before init".to_string(),
-        );
-        return Ok(());
-    }
+    let mut next_window_epoch = cur_generation;
+    let mut cur_window_request: u64 = 1;
+    window_pump.open(native_window_pump::PumpPlacementRequest {
+        request: cur_window_request,
+        epoch: cur_generation,
+        placement: config.placement,
+        owner_hwnd: config.owner_hwnd,
+        rect: config.rect,
+        activate_on_show: config.activate_on_show,
+        initially_visible: true,
+    })?;
+    let initial_attach =
+        wait_for_native_window_attach(&window_pump, cur_window_request, cur_generation, &cancel)?;
     let (new_presenter, topology, startup_window_intents) =
-        match crate::video::native_presenter::NativeRenderCore::new(
+        crate::video::native_presenter::NativeRenderCore::new(
             crate::video::native_presenter::NativeRenderConfig {
-                targets: window.render_targets(),
-                width,
-                height,
+                targets: initial_attach.targets,
+                width: initial_attach.width,
+                height: initial_attach.height,
+                os_pixels_per_point: initial_attach.pixels_per_point,
+                initial_observation: initial_attach.observation,
                 test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
                 egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
                 cursor_hide_delay_secs: config.cursor_hide_delay_secs,
@@ -1898,37 +2560,15 @@ fn run_native_video_output(
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
             },
-        ) {
-            Ok(init) => init,
-            Err(err) => {
-                hwnd_out.store(0, Ordering::Release);
-                hud_hwnd_out.store(0, Ordering::Release);
-                window.destroy();
-                return Err(err);
-            }
-        };
-    window = window.retain_render_topology(topology);
-    window.apply_render_intents(&startup_window_intents);
+        )?;
     let mut presenter = new_presenter;
     if cancel.load(Ordering::Acquire) {
         first_presented_out.store(false, Ordering::Release);
-        hwnd_out.store(0, Ordering::Release);
-        hud_hwnd_out.store(0, Ordering::Release);
-        window.destroy();
-        closed.store(true, Ordering::Release);
-        crate::logger::log(
-            "[native-video] fullscreen presenter startup cancelled before show".to_string(),
-        );
+        window_pump.shutdown(cur_window_request.saturating_add(1));
         return Ok(());
     }
-    // CP7: cursor polling の raise allowlist 判定で使う state を presenter に渡す。
-    // `editor_hwnds_snapshot` が `None` のときは raise 判定で常に false (= polling では
-    // raise 起動しない、ただし click-through 自体は SetWindowRgn で機能する)。
-    window.set_editor_hwnds_snapshot(config.editor_hwnds_snapshot.clone());
-    window.set_main_hwnd_for_raise_check(config.main_hwnd_for_raise);
     crate::logger::log(format!(
-        "[native-video] presenter initialized hidden hwnd=0x{:x} placement={} rect=({},{} {}x{}) sync_interval={}",
-        window.hwnd().0 as usize,
+        "[native-video] render initialized placement={} rect=({},{} {}x{}) sync_interval={}",
         config.placement.label(),
         config.rect.left,
         config.rect.top,
@@ -1936,7 +2576,6 @@ fn run_native_video_output(
         height,
         config.sync_interval
     ));
-    let mut presenter_window_published = false;
     // Plan B: viewer presentation 切替 (`SwitchPlacement`) で presenter を作り直す
     // とき、新 presenter に再適用するための現行状態。`config.*` は初期値しか持たない
     // ため、command で更新されうる値はここで追跡する。
@@ -1964,78 +2603,20 @@ fn run_native_video_output(
     let mut cur_video_compact: Option<bool> = None;
     let mut cur_fallback_file_name = config.fallback_file_name.clone();
     let mut cur_video_grade = config.video_grade.clone();
-    fn publish_presenter_window(
-        window: &crate::video::native_window_host::NativeWindowHost,
-        hwnd_out: &Arc<AtomicU64>,
-        hud_hwnd_out: &Arc<AtomicU64>,
-        config: &NativeVideoOutputConfig,
-        placement: NativeVideoPlacement,
-        width: u32,
-        height: u32,
-        run_started: Instant,
-        reason: &'static str,
-        published: &mut bool,
-    ) {
-        if *published {
-            return;
-        }
-        let shown = window.show_for_placement(config.activate_on_show, placement);
-        hwnd_out.store(window.hwnd().0 as usize as u64, Ordering::Release);
-        hud_hwnd_out.store(window.hud_hwnd(), Ordering::Release);
-        *published = true;
-        crate::logger::log(format!(
-            "[native-video] presenter started hwnd=0x{:x} shown={} reason={} elapsed_ms={:.1} placement={} rect=({},{} {}x{}) sync_interval={}",
-            window.hwnd().0 as usize,
-            shown,
-            reason,
-            run_started.elapsed().as_secs_f64() * 1000.0,
-            config.placement.label(),
-            config.rect.left,
-            config.rect.top,
-            width,
-            height,
-            config.sync_interval
-        ));
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "native_presenter",
-                "window_publish",
-                None,
-                0,
-                &[
-                    ("shown", serde_json::Value::from(shown)),
-                    ("reason", serde_json::Value::from(reason)),
-                    (
-                        "elapsed_ms",
-                        serde_json::Value::from(run_started.elapsed().as_secs_f64() * 1000.0),
-                    ),
-                    ("width", serde_json::Value::from(width as i64)),
-                    ("height", serde_json::Value::from(height as i64)),
-                ],
-            );
-        }
-    }
-
     fn sync_hud_regions(
-        window: &mut crate::video::native_window_host::NativeWindowHost,
+        window_pump: &native_window_pump::NativeWindowPumpRenderClient,
+        epoch: u64,
         presenter: &crate::video::native_presenter::NativeRenderCore,
         outcome: &crate::video::native_presenter::NativeOverlayInputOutcome,
     ) {
-        let empty_regions = [];
-        let regions = if presenter.fullscreen_overlay_active()
-            && window.has_hud()
-            && !window.foreground_allows_hud_raise(false)
-        {
-            &empty_regions[..]
-        } else {
-            &outcome.hud_regions
-        };
-        window.apply_render_intents(&outcome.window_intents);
-        window.apply_hud_regions(
-            regions,
-            presenter.overlay_toast_active(),
-            presenter.hud_debug_description(regions),
-        );
+        window_pump.publish_visual(native_window_pump::NativeWindowVisualUpdate {
+            epoch,
+            window_intents: outcome.window_intents.clone(),
+            hud_regions: Some(outcome.hud_regions.clone()),
+            toast_active: presenter.overlay_toast_active(),
+            fullscreen_overlay_active: presenter.fullscreen_overlay_active(),
+            debug_description: presenter.hud_debug_description(&outcome.hud_regions),
+        });
     }
 
     let run_started = Instant::now();
@@ -2062,7 +2643,7 @@ fn run_native_video_output(
             clock.is_seeking(),
             clock.current_seek_serial(),
         ) {
-            Ok(outcome) => sync_hud_regions(&mut window, &presenter, &outcome),
+            Ok(outcome) => sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome),
             Err(err) => crate::logger::log(format!(
                 "[native-video] initial tile overlay render failed: {err}"
             )),
@@ -2087,28 +2668,19 @@ fn run_native_video_output(
             clock.is_seeking(),
             clock.current_seek_serial(),
         ) {
-            Ok(outcome) => sync_hud_regions(&mut window, &presenter, &outcome),
+            Ok(outcome) => sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome),
             Err(err) => crate::logger::log(format!(
                 "[native-video] initial preparing overlay render failed: {err}"
             )),
         }
     }
-    publish_presenter_window(
-        &window,
-        &hwnd_out,
-        &hud_hwnd_out,
-        &config,
-        cur_placement,
-        width,
-        height,
-        run_started,
-        if config.initial_tile_overlay {
-            "initial-tile-overlay"
-        } else {
-            "initial-overlay"
-        },
-        &mut presenter_window_published,
-    );
+    window_pump.target_ready(
+        cur_window_request,
+        cur_generation,
+        topology,
+        startup_window_intents,
+    )?;
+    wait_for_native_window_published(&window_pump, cur_window_request, cur_generation, &cancel)?;
     // 音声のみ native シェル (Inc 6 ②-1): 映像 first frame が永久に来ないので、window を
     // publish できた時点で presenter を「表示準備完了」とみなす。これをしないと
     // `native_presenter_pending()` (= `!first_presented`) が永久に true のままになり、
@@ -2139,44 +2711,13 @@ fn run_native_video_output(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or(run_started);
     let mut vram_trace_deadlines: Vec<(Instant, &'static str)> = Vec::new();
-    // CP6: cursor polling 用 state。HUD 経路 (= CP7 で hud_event_tx=Some) のときだけ
+    // CP6: cursor polling 用 state。HUD topology があるときだけ
     // 機能する。フォールバック経路では `presenter.cursor_polling_tick` が早期 return。
     let mut last_cursor_poll: Option<Instant> = None;
-    // in-window モード: 親 (main HWND) のクライアントサイズを毎ループ監視し、
-    // 変化したら child presenter HWND を貼り直すための直近サイズ state。child は
-    // 親の移動・最小化には自動追従するが、リサイズには自動追従しないため。
-    let mut last_parent_client_size: (u32, u32) = (width, height);
     let mut last_native_mouse_at: Option<Instant> = None;
     let mut pointer_present_synthetic: bool = false;
-    // CP6: HUD raise の retry burst スケジュール。`RaiseHudToTop` command / `RequestRaiseHud`
-    // event / cursor polling activation zone 検知のいずれかから `schedule_hud_raise_burst` を
-    // 呼ぶことで push される。各 deadline 到来時に `presenter.raise_hud_to_top()` を呼ぶ。
-    // 即時/16ms 後/64ms 後の 3 連発で非同期 VST z-order 操作を確実に拾う。
-    let mut hud_raise_deadlines: Vec<Instant> = Vec::with_capacity(4);
-    let mut last_hud_raise_at: Option<Instant> = None;
+    let mut window_observation = initial_attach.observation;
     let startup_probe_until = run_started + Duration::from_secs(5);
-
-    // CP6 (Codex 再 P2 反映): 全経路で coalesce + timestamp 更新を統一する helper。
-    // 直近 200ms 以内に raise burst を起動済みなら skip (= 連続トリガーで burst が
-    // 重複しないように)、起動した場合は 即時 + 16ms + 64ms の 3 deadline を push し、
-    // `last_at` を `now` に更新する。`RaiseHudToTop` / `RequestRaiseHud` / polling の
-    // 全経路でこの helper を呼ぶ。
-    fn schedule_hud_raise_burst(
-        now: Instant,
-        deadlines: &mut Vec<Instant>,
-        last_at: &mut Option<Instant>,
-    ) {
-        let recent = last_at
-            .map(|t| now.duration_since(t) < Duration::from_millis(200))
-            .unwrap_or(false);
-        if recent {
-            return;
-        }
-        deadlines.push(now);
-        deadlines.push(now + Duration::from_millis(16));
-        deadlines.push(now + Duration::from_millis(64));
-        *last_at = Some(now);
-    }
     let mut last_startup_probe = run_started
         .checked_sub(Duration::from_millis(250))
         .unwrap_or(run_started);
@@ -2186,54 +2727,28 @@ fn run_native_video_output(
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     let mut pending_navigation_preview_clear_at: Option<Instant> = None;
     const NAVIGATION_PREVIEW_CLEAR_DELAY: Duration = Duration::from_millis(40);
-    // present 済みの VideoFrame を遅延解放するためのリングバッファ。
-    // presenter の `CopySubresourceRegion` は非同期 (GPU に積むだけ) なので、present 直後に
-    // `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot が即 producer に再利用され、
-    // presenter 側のコピーが source texture を読み終える前に上書きされうる (= 別フレーム
-    // 混入。2026-05-15 frame 114)。
-    //
-    // 各エントリは `(VideoFrame, copy_fence_value)`。presenter は frame コピー後に自前の
-    // copy fence を `Signal` し、その値を `outcome.copy_fence_value` で返す。ここでは
-    // `presenter.copy_fence_completed_value()` がその値へ到達した (= コピーが GPU 上で
-    // 完了した) フレームだけを解放する。これにより「presenter のコピー完了後に共有出力
-    // slot を返す」ことが保証され、時間ベースのヒューリスティックではなくなる。
-    //
-    // fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 失敗
-    // (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、
-    // `NATIVE_PRESENT_RETIRE_CAP` の depth キャップのみで解放する (時間ベースに縮退)。
-    // キャップは fence が万一 stall したときの上限も兼ねる (= 共有プール枯渇の防止)。
-    let mut present_retire: std::collections::VecDeque<(VideoFrame, u64)> =
-        std::collections::VecDeque::new();
-    // cap は **fence stall 時のフォールバック上限**。fence が機能していれば retire は
-    // 通常 1〜3 で推移するのでこの値は影響しないが、stall すると `cap` 個の slot が
-    // 共有出力プールから占有される。プールは 24 slot、decoder in-flight が ~10-15 なので
-    // cap=4 で残 ~5-10 slot 余裕、cap=8 だと ~1-6 まで圧迫されて rapid swap 時にプール
-    // 枯渇 → CPU readback フォールバック → スパイラル悪化 (2026-05-15 報告)。
-    // 前回検証で frame 114 の混入が止まることが確認された cap=4 を採用する (fence の
-    // 真のゲート効果は変わらず、stall 時のフットプリントだけ旧来比へ戻す)。
-    const NATIVE_PRESENT_RETIRE_CAP: usize = 4;
+    // The current frame and disposal-only retire queue have one output-local
+    // owner. `source.queue` remains an unpresented pacing queue and is never a
+    // placement/grade fallback.
+    let mut frame_output = NativeFrameOutputContext::new();
     /// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
     /// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
     /// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
     /// pool / cache 合算で adapter memory が枯渇し wgpu OOM していた。queue を 8 で
     /// cap し、超えたら decoder 側に back-pressure を返す (= video_tx (cap=8) が満杯に
     /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
-    /// 30fps で約 270ms 分 = pacing 上は十分。
+    /// 30fps で約 270ms 分 = pacing 上は十分。これは visible の display pacing 専用で、
+    /// hidden は EOF まで decoder を進めるため全件 drain する。
     const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
-    // Inc 7 hidden presenter (動画→音声モード): `SetWindowVisible{visible:false}` で
-    // presenter を「consume-and-hold」モードに入れる。hidden 中は present() を呼ばず
-    // (frame-latency waitable の 100ms 待ちを避ける)、drain + frame selection + present
-    // 成功時 bookkeeping だけ続けて最新フレームを `hidden_latest_frame` に保持する。
-    // show 時にこのフレームを 1 回 present してから再表示する。音声 routing は全経路で
-    // 無改変なので音は途切れない。
-    let mut presenter_hidden = false;
-    let mut hidden_latest_frame: Option<VideoFrame> = None;
+    // Inc 7 hidden presenter (動画→音声モード): pump が公開する可視状態を consume policy の
+    // 唯一の正本にする。source swap はこの output-lifetime state を交換しない。
+    let mut hidden_frame_scratch = Vec::with_capacity(MAX_NATIVE_SOURCE_QUEUE.saturating_mul(2));
     emit_native_vram_trace(
         "native_presenter_started",
         "after_presenter_init",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
@@ -2249,9 +2764,29 @@ fn run_native_video_output(
             }
         }
 
-        if crate::video::native_window::pump_thread_messages() {
-            closed.store(true, Ordering::Release);
-            break;
+        if let Some(observation) = window_pump.take_observation()
+            && observation.epoch == cur_generation
+        {
+            window_observation = observation.value;
+            presenter.set_window_observation(window_observation);
+        }
+        loop {
+            match window_pump.try_recv_lifecycle() {
+                Ok(native_window_pump::PumpLifecycleEvent::Fault { message, .. }) => {
+                    return Err(message);
+                }
+                Ok(native_window_pump::PumpLifecycleEvent::Detached { epoch })
+                    if epoch == cur_generation =>
+                {
+                    return Ok(());
+                }
+                Ok(native_window_pump::PumpLifecycleEvent::Shutdown) => return Ok(()),
+                Ok(_) => {}
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    return Err("native window pump lifecycle disconnected".to_string());
+                }
+            }
         }
         let now = Instant::now();
         if crate::perf::is_enabled() {
@@ -2261,7 +2796,7 @@ fn run_native_video_output(
                     "native_loop_1hz",
                     &source,
                     &presenter,
-                    present_retire.len(),
+                    frame_output.retire_len(),
                 );
                 last_vram_trace = now;
             }
@@ -2274,7 +2809,7 @@ fn run_native_video_output(
                         reason,
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                 } else {
                     i += 1;
@@ -2312,8 +2847,7 @@ fn run_native_video_output(
             startup_probe_count = startup_probe_count.saturating_add(1);
             let first_presented = first_presented_out.load(Ordering::Acquire);
             let displayed_seq = source.displayed_frame_seq.load(Ordering::Acquire);
-            let foreground_current_process =
-                crate::video::native_window::foreground_belongs_to_current_process();
+            let foreground_current_process = window_observation.focus.foreground_is_current_process;
             let source_queue_len = source.queue.len();
             let source_video_rx_len = source.video_rx.len();
             let source_serial = source.clock.current_seek_serial();
@@ -2332,7 +2866,6 @@ fn run_native_video_output(
                 source_queue_len,
                 source_video_rx_len
             ));
-            crate::video::native_window::log_state(window.hwnd().0 as u64, "startup-probe");
             if crate::perf::is_enabled() {
                 crate::perf::event(
                     "native_presenter",
@@ -2376,7 +2909,7 @@ fn run_native_video_output(
         }
         let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
-        while let Ok(command) = command_rx.try_recv() {
+        for command in command_rx.drain() {
             match command {
                 NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
                     presenter.set_overlay_hover_thumbnail(thumbnail);
@@ -2391,11 +2924,37 @@ fn run_native_video_output(
                     presenter.set_overlay_jump_entries(entries);
                 }
                 NativeVideoOutputCommand::SetVideoGrade { grade } => {
+                    let render_grade_changed = video_grade_render_changed(&cur_video_grade, &grade);
                     cur_video_grade = grade;
-                    if let Err(error) = presenter.set_video_grade(cur_video_grade.clone()) {
-                        crate::logger::log(format!(
+                    match presenter.set_video_grade(cur_video_grade.clone()) {
+                        Ok(()) => {
+                            // A grade command is the only paused-state refresh trigger.
+                            // Empty, Hidden, and render-equivalent snapshots stay idle.
+                            if frame_output.should_represent_for_grade_change(render_grade_changed)
+                            {
+                                let refresh = frame_output
+                                    .visible_frame()
+                                    .map(|frame| presenter.present(frame, config.sync_interval));
+                                match refresh {
+                                    Some(Ok(outcome)) => {
+                                        debug_assert!(
+                                            frame_output
+                                                .mark_current_visible(outcome.copy_fence_value)
+                                        );
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Some(Err(error)) => crate::logger::log(format!(
+                                        "[native-video] grade refresh present failed: {error}"
+                                    )),
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(error) => crate::logger::log(format!(
                             "[native-video] Creative LUT shader update failed: {error}"
-                        ));
+                        )),
                     }
                 }
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
@@ -2510,31 +3069,10 @@ fn run_native_video_output(
                     presenter.set_overlay_normalize_state(state);
                 }
                 NativeVideoOutputCommand::RaiseHudToTop => {
-                    // CP6: HUD overlay HWND を最前面に上げ直す要求。
-                    // 即時/16ms/64ms の short retry burst で `SetWindowPos(HUD, HWND_TOPMOST)`
-                    // を呼ぶ (VST 側 IPC が非同期で z-order を動かしても拾えるように)。
-                    // 全経路で coalesce + 200ms 抑制を効かせるため helper 経由 (再 P2 反映)。
-                    schedule_hud_raise_burst(
-                        Instant::now(),
-                        &mut hud_raise_deadlines,
-                        &mut last_hud_raise_at,
-                    );
+                    window_pump.raise_hud(cur_generation)?;
                 }
                 NativeVideoOutputCommand::RaisePresenterToFront => {
-                    let hwnd = window.hwnd().0 as usize as u64;
-                    let (z_ok, report) = window.raise_presenter_to_front();
-                    crate::logger::log(format!(
-                        "[native-video] presenter recover foreground hwnd=0x{hwnd:x} \
-                         z_order={} foreground=0x{:x} post=0x{:x} attach={} \
-                         set_foreground={} set_active={} set_focus={}",
-                        z_ok,
-                        report.foreground_hwnd,
-                        report.post_foreground_hwnd,
-                        report.attach_thread_input_ok,
-                        report.set_foreground_ok,
-                        report.set_active_ok,
-                        report.set_focus_ok,
-                    ));
+                    window_pump.raise_presenter(cur_generation)?;
                 }
                 NativeVideoOutputCommand::SetWindowVisible { visible } => {
                     if visible {
@@ -2542,48 +3080,58 @@ fn run_native_video_output(
                         // フレームを 1 回 present してから再表示する。これで音声モード中に
                         // seek していても正しい位置の映像で復帰し、hide 前の古いフレームが
                         // 一瞬見える flash を防ぐ。present は通常経路と同じ retire 管理を通す。
-                        if let Some(frame) = hidden_latest_frame.take() {
-                            match presenter.present(&frame, config.sync_interval) {
+                        let hidden_present = if frame_output.is_hidden() {
+                            frame_output.frame().map(|frame| {
+                                (
+                                    frame.pts_secs,
+                                    presenter.present(frame, config.sync_interval),
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some((pts, result)) = hidden_present {
+                            match result {
                                 Ok(outcome) => {
                                     source
                                         .last_displayed_pts_bits
-                                        .store(frame.pts_secs.to_bits(), Ordering::Release);
-                                    present_retire.push_back((frame, outcome.copy_fence_value));
-                                    if let Some(completed) = presenter.copy_fence_completed_value()
-                                    {
-                                        while present_retire.front().is_some_and(|(_, value)| {
-                                            *value != 0 && *value <= completed
-                                        }) {
-                                            present_retire.pop_front();
-                                        }
-                                    }
-                                    while present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
-                                        present_retire.pop_front();
-                                    }
+                                        .store(pts.to_bits(), Ordering::Release);
+                                    debug_assert!(
+                                        frame_output.mark_current_visible(outcome.copy_fence_value)
+                                    );
+                                    frame_output
+                                        .retire_completed(presenter.copy_fence_completed_value());
                                 }
                                 Err(err) => {
                                     crate::logger::log(format!(
                                         "[native-video] hidden-show present failed: {err}"
                                     ));
-                                    native_reset_unpresented_frame(frame);
+                                    frame_output.clear_current();
                                 }
                             }
                         }
-                        let shown =
-                            window.show_for_placement(config.activate_on_show, cur_placement);
-                        window.set_hud_window_visible(true);
-                        presenter_hidden = false;
-                        presenter_hidden_out.store(false, Ordering::Release);
-                        crate::logger::log(format!(
-                            "[native-video] presenter shown from hidden (audio-mode exit) shown={shown}"
-                        ));
+                        window_pump.set_visibility(cur_generation, true)?;
+                        wait_for_native_window_visibility(
+                            window_pump,
+                            cur_generation,
+                            true,
+                            &cancel,
+                        )?;
+                        crate::logger::log(
+                            "[native-video] presenter show requested (audio-mode exit)".to_string(),
+                        );
                     } else {
                         // Inc 7 hidden presenter hide (動画→音声モード): presenter ウィンドウと
                         // HUD overlay を隠す。以降の present ループは consume-and-hold に入り、
                         // present() を呼ばず最新フレームだけ hold する (音声は無中断)。
-                        let _ = window.hide();
-                        presenter_hidden = true;
-                        presenter_hidden_out.store(true, Ordering::Release);
+                        window_pump.set_visibility(cur_generation, false)?;
+                        wait_for_native_window_visibility(
+                            window_pump,
+                            cur_generation,
+                            false,
+                            &cancel,
+                        )?;
+                        frame_output.hide();
                         crate::logger::log(
                             "[native-video] presenter hidden (audio-mode enter)".to_string(),
                         );
@@ -2595,28 +3143,18 @@ fn run_native_video_output(
                         "before_drain_old_source",
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                     native_drain_unpresented_queue(&mut source.queue);
-                    // Inc 7 hidden presenter (Codex #4、音声モード連続再生 EOF): hidden 中の
-                    // source-swap では旧 source の hold フレームを破棄する。残すと B の first
-                    // hidden frame 到達前に「動画へ戻る」(SetWindowVisible(true)) を押したとき、
-                    // 前 source (A) の古いフレームを present してしまう。破棄後は B の hidden
-                    // first-frame が hidden_latest_frame を埋め直す。presenter_hidden=false の
-                    // 通常 source-swap には影響しない (hidden_latest_frame は常に None)。
-                    if presenter_hidden && let Some(prev) = hidden_latest_frame.take() {
-                        native_reset_unpresented_frame(prev);
-                    }
+                    // The current typed frame belongs to the old source. Visible frames
+                    // move to the disposal queue; Hidden frames return to producer-side
+                    // recovery without becoming a fallback for the new source.
+                    frame_output.clear_current();
                     // present_retire の OLD source 由来エントリのうち fence が完了したものを
                     // 解放する (rapid swap で旧 slot が retire に滞留して共有出力プールを
                     // 圧迫するのを防ぐ)。fence ゲート付きなので未完コピーは解放しない (安全)。
                     if let Some(completed) = presenter.copy_fence_completed_value() {
-                        while present_retire
-                            .front()
-                            .is_some_and(|(_, value)| *value != 0 && *value <= completed)
-                        {
-                            present_retire.pop_front();
-                        }
+                        frame_output.retire_completed(Some(completed));
                     }
                     // 旧 source の `shared_texture_cache` (presenter 側 D3D11 共有 texture
                     // キャッシュ、4K で 32 MB/枚) を即時破棄し adapter memory を解放する
@@ -2628,7 +3166,7 @@ fn run_native_video_output(
                         "after_drain_retire_and_shared_cache_clear",
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     cur_fallback_file_name = payload.fallback_file_name.clone();
@@ -2638,7 +3176,7 @@ fn run_native_video_output(
                         "after_new_source_attached",
                         &source,
                         &presenter,
-                        present_retire.len(),
+                        frame_output.retire_len(),
                     );
                     let switch_trace_now = Instant::now();
                     vram_trace_deadlines.push((
@@ -2696,7 +3234,6 @@ fn run_native_video_output(
                     }
                     if source.source_epoch > 0 {
                         native_events.clear();
-                        while presenter_event_rx.try_recv().is_ok() {}
                     }
                     if show_preparing_overlay {
                         // The new player will resend fresh overlay content; keep the
@@ -2720,454 +3257,312 @@ fn run_native_video_output(
                     activate_on_show,
                 } => {
                     if placement == cur_placement && owner_hwnd == cur_owner_hwnd {
-                        // 同一モードでも rect が変わることがある (detached viewer の
-                        // 仮想フルスクリーン切替など)。window と presenter surface は
-                        // 更新し、App が pending を解除できるよう成功イベントを返す。
-                        let (new_width, new_height) = window.resize_to_rect(placement, new_rect);
-                        window.set_hud_geometry(new_rect.left, new_rect.top, new_width, new_height);
+                        window_pump.resize(cur_generation, placement, new_rect)?;
+                        let (new_width, new_height) =
+                            wait_for_native_window_resize(&window_pump, cur_generation, &cancel)?;
                         match presenter.resize(new_width, new_height) {
-                            Ok(intents) => window.apply_render_intents(&intents),
+                            Ok(intents) => window_pump.publish_visual(
+                                native_window_pump::NativeWindowVisualUpdate {
+                                    epoch: cur_generation,
+                                    window_intents: intents,
+                                    hud_regions: None,
+                                    toast_active: presenter.overlay_toast_active(),
+                                    fullscreen_overlay_active: false,
+                                    debug_description: None,
+                                },
+                            ),
                             Err(err) => crate::logger::log(format!(
-                                "[native-video] same placement resize_to({new_width}x{new_height}) failed: {err}"
+                                "[native-video] same placement resize failed: {err}"
                             )),
                         }
-                        if placement.is_child_window() {
-                            last_parent_client_size = (new_width, new_height);
-                        }
-                        // Inc 7 hidden presenter (Codex P3): 同一 placement の rect 変更を伴う exit
-                        // (音声モード中にウィンドウ resize / fullscreen のモニタ rect 変更をしてから
-                        // 戻る) では、resize 後に hold フレームで present してから window を show して
-                        // hidden を抜ける (rebuild 分岐と同じ役割)。`presenter_hidden=false` のとき
-                        // (= 通常動画の detached 仮想フルスクリーン resize 等) はこのブロックを skip
-                        // するのでバイト等価。
-                        if presenter_hidden {
-                            if let Some(frame) = hidden_latest_frame.take() {
-                                // fence=0: この present の GPU コピー完了まで depth cap で保持 (P1 同様)。
-                                let _ = presenter.present(&frame, config.sync_interval);
-                                present_retire.push_back((frame, 0));
+                        if presenter_visibility.is_hidden() {
+                            let hidden_present = if frame_output.is_hidden() {
+                                frame_output
+                                    .frame()
+                                    .map(|frame| presenter.present(frame, config.sync_interval))
+                            } else {
+                                None
+                            };
+                            if let Some(result) = hidden_present {
+                                match result {
+                                    Ok(outcome) => {
+                                        debug_assert!(
+                                            frame_output
+                                                .mark_current_visible(outcome.copy_fence_value)
+                                        );
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        crate::logger::log(format!(
+                                            "[native-video] same-placement show present failed: {error}"
+                                        ));
+                                        frame_output.clear_current();
+                                    }
+                                }
                             }
-                            let shown = window.show_for_placement(activate_on_show, placement);
-                            window.set_hud_window_visible(true);
-                            presenter_hidden = false;
-                            presenter_hidden_out.store(false, Ordering::Release);
-                            crate::logger::log(format!(
-                                "[native-video] presenter un-hidden via same-placement resize \
-                                 (audio-mode exit) shown={shown}"
-                            ));
+                            window_pump.set_visibility(cur_generation, true)?;
+                            wait_for_native_window_visibility(
+                                window_pump,
+                                cur_generation,
+                                true,
+                                &cancel,
+                            )?;
                         }
-                        // 同一 placement の rect 更新は window を rebuild しないので世代は
-                        // 据え置き (= detached resize で close 抑止が誤発火しない)。
-                        let _ = ui_event_tx.send((
+                        send_native_output_event(
+                            &ui_event_tx,
                             source.source_epoch,
                             NativeVideoOutputEvent::PlacementSwitched {
                                 request_id,
                                 placement,
                                 generation: cur_generation,
                             },
-                        ));
-                    } else {
-                        let new_width = (new_rect.right - new_rect.left).max(1) as u32;
-                        let new_height = (new_rect.bottom - new_rect.top).max(1) as u32;
-                        let new_mode = native_window_mode_for_placement(placement, new_rect);
-                        // window を rebuild するので presenter 世代を進める。旧 HWND から
-                        // 遅れて届く close は旧世代のまま → App が棄却できる。単調増加を
-                        // 保つため saturating (wrap して 0 に戻すと live window の close が
-                        // 永久 stale 化する; u64::MAX 到達は現実には起きない)。
-                        cur_generation = cur_generation.saturating_add(1);
-                        let new_hud_enabled =
-                            native_hud_overlay_enabled_for_placement(&config, placement);
-                        let new_window_result =
-                            crate::video::native_window_host::NativeWindowHost::create(
-                                crate::video::native_window_host::NativeWindowHostConfig {
-                                    window: crate::video::native_window::NativeVideoWindowConfig {
-                                        mode: new_mode,
-                                        owner_hwnd: native_window_owner_for_placement(
-                                            owner_hwnd, placement,
-                                        ),
-                                        initially_visible: false,
-                                        activate_on_show,
-                                        close_on_escape: false,
-                                        // detached-viewer-child は host teardown の巻き添え
-                                        // WM_QUIT で presenter を殺さない (初回生成箇所と同じ理由)。
-                                        post_quit_on_destroy: !placement.is_detached_viewer_child(),
-                                        event_tx: Some(presenter_event_tx.clone()),
-                                        generation: cur_generation,
-                                    },
-                                    hud: if new_hud_enabled {
-                                        crate::video::native_window_host::NativeHudWindowRequest::Enabled {
-                                            width: new_width,
-                                            height: new_height,
-                                        }
-                                    } else {
-                                        crate::video::native_window_host::NativeHudWindowRequest::Disabled
-                                    },
-                                    event_tx: presenter_event_tx.clone(),
-                                },
-                            );
-                        match new_window_result {
-                            Ok(mut new_window) => {
-                                let new_presenter_result =
-                                    crate::video::native_presenter::NativeRenderCore::new(
-                                        crate::video::native_presenter::NativeRenderConfig {
-                                            targets: new_window.render_targets(),
-                                            width: new_width,
-                                            height: new_height,
-                                            test_overlay: std::env::var_os(
-                                                "MIV_NATIVE_VIDEO_TEST_OVERLAY",
-                                            )
-                                            .is_some(),
-                                            egui_overlay: native_video_env_flag_enabled(
-                                                "MIV_NATIVE_VIDEO_EGUI_OVERLAY",
-                                                true,
-                                            ),
-                                            cursor_hide_delay_secs: config.cursor_hide_delay_secs,
-                                            ui_scale: cur_ui_scale,
-                                            text_contrast: cur_text_contrast,
-                                            ui_font: config.ui_font.clone(),
-                                        },
-                                    );
-                                match new_presenter_result {
-                                    Ok((mut new_presenter, topology, startup_window_intents)) => {
-                                        new_window = new_window.retain_render_topology(topology);
-                                        new_window.apply_render_intents(&startup_window_intents);
-                                        new_window.set_editor_hwnds_snapshot(
-                                            config.editor_hwnds_snapshot.clone(),
-                                        );
-                                        new_window.set_main_hwnd_for_raise_check(
-                                            config.main_hwnd_for_raise,
-                                        );
-                                        // 新 presenter に現行状態を再適用する。
-                                        new_presenter.set_overlay_vst3_available(
-                                            cur_vst3_available
-                                                && placement.is_fullscreen_borderless(),
-                                        );
-                                        if let Err(error) =
-                                            new_presenter.set_video_grade(cur_video_grade.clone())
-                                        {
-                                            crate::logger::log(format!(
-                                                "[native-video] Creative LUT shader restore failed: {error}"
-                                            ));
-                                        }
-                                        new_presenter.set_overlay_hud_dimmed(cur_hud_dimmed);
-                                        new_presenter.set_overlay_checked(cur_checked);
-                                        new_presenter.set_overlay_fallback_file_name(
-                                            cur_fallback_file_name.clone(),
-                                        );
-                                        if let Some((sar_num, sar_den)) = cur_sar {
-                                            if let Err(err) =
-                                                new_presenter.set_video_sar(sar_num, sar_den)
-                                            {
-                                                crate::logger::log(format!(
-                                                    "[native-video] switch mode: \
-                                                     set_video_sar failed: {err}"
-                                                ));
-                                            }
-                                        }
-                                        // **review #12 対応**: loop / continuous / compact は
-                                        // App 側がユーザー操作時にしか push しないため、
-                                        // ここで再適用しないと新 presenter は default に戻る。
-                                        // (旧実装は continuous=Disabled / loop=Off / compact=false
-                                        // で起動して、ユーザーが次に該当ボタンを触るまで
-                                        // 表示が古い設定と乖離していた)。
-                                        if let Some(enabled) = cur_loop_enabled {
-                                            new_presenter.set_overlay_loop_enabled(enabled);
-                                        }
-                                        if let Some(mode) = cur_loop_mode {
-                                            new_presenter.set_overlay_loop_mode(mode);
-                                        }
-                                        if let Some(mode) = cur_continuous_mode {
-                                            new_presenter.set_overlay_continuous_mode(mode);
-                                        }
-                                        if let Some(compact) = cur_video_compact {
-                                            if let Err(err) =
-                                                new_presenter.set_video_compact(compact)
-                                            {
-                                                crate::logger::log(format!(
-                                                    "[native-video] switch mode: \
-                                                     set_video_compact failed: {err}"
-                                                ));
-                                            }
-                                        }
-                                        // 表示前に overlay の再生状態を流し込んで描画させる
-                                        // (Codex P2: これをしないと新 overlay は既定状態
-                                        // = `first_frame_presented=false` で 1 フレーム
-                                        // 「準備中」HUD が出てしまう)。metadata / markers は
-                                        // App が毎フレーム再送するので 1 フレーム後に追従。
-                                        new_presenter.set_overlay_playback_status(
-                                            first_presented_out.load(Ordering::Acquire),
-                                            None,
-                                            crate::video::avio_progress::PreparingStatus {
-                                                phase:
-                                                    crate::video::avio_progress::prep_phase::DONE,
-                                                bytes_read: 0,
-                                                file_size: 0,
-                                            },
-                                        );
-                                        match new_presenter.tick_overlay_video_state(
-                                            source.clock.now_secs(),
-                                            f64::from_bits(
-                                                source.duration_secs_bits.load(Ordering::Acquire),
-                                            ),
-                                            source.clock.is_playing(),
-                                            source.clock.volume(),
-                                            source.clock.is_muted(),
-                                            source.clock.limiter_ceiling_hit_seq(),
-                                            source.clock.playback_speed(),
-                                            source.frame_step_active.load(Ordering::Acquire),
-                                            source.clock.is_seeking(),
-                                            source.clock.current_seek_serial(),
-                                        ) {
-                                            Ok(outcome) => sync_hud_regions(
-                                                &mut new_window,
-                                                &new_presenter,
-                                                &outcome,
-                                            ),
-                                            Err(err) => crate::logger::log(format!(
-                                                "[native-video] switch mode: \
-                                                 overlay prime render failed: {err}"
-                                            )),
-                                        }
-                                        // 表示前に 1 フレーム present して新ウィンドウを
-                                        // 現在フレームで埋める (黒画面 / 別フレーム混入の
-                                        // 防止 = Codex #3 二段階スワップの prime 相当)。
-                                        let primed = if let Some(frame) = hidden_latest_frame.take()
-                                        {
-                                            // Inc 7 hidden presenter からの exit (placement 変更を
-                                            // 伴う SwitchPlacement 復帰): consume-and-hold で保持して
-                                            // いた最新フレームで新 presenter を prime する。hidden 中は
-                                            // present していないので present_retire / source.queue は
-                                            // 空 / stale。prime の GPU コピー完了まで frame を保持する
-                                            // ため present_retire へ積むが、**fence 値は 0** にする
-                                            // (Codex P1): この直後の retire 掃除は旧 presenter の
-                                            // `copy_fence_completed_value()` で pop するので、新 presenter
-                                            // の fence 値 (別 timeline) を入れると、旧完了値との大小比較で
-                                            // GPU コピー未完了の frame を誤解放し得る。fence=0 は旧 fence
-                                            // 掃除の対象外 (`*value != 0` gate) で、下の zero-out と同義に
-                                            // depth cap でのみ解放される (= 数フレーム後、新 presenter の
-                                            // コピー完了後)。
-                                            let ok = new_presenter
-                                                .present(&frame, config.sync_interval)
-                                                .is_ok();
-                                            if ok {
-                                                present_retire.push_back((frame, 0));
-                                            } else {
-                                                native_reset_unpresented_frame(frame);
-                                            }
-                                            ok
-                                        } else if let Some((frame, _)) = present_retire.back() {
-                                            new_presenter
-                                                .present(frame, config.sync_interval)
-                                                .is_ok()
-                                        } else if let Some(frame) = source.queue.front() {
-                                            new_presenter
-                                                .present(frame, config.sync_interval)
-                                                .is_ok()
-                                        } else {
-                                            false
-                                        };
-                                        // 旧 present_retire を旧 presenter の copy fence で
-                                        // 解決してから旧 presenter を破棄する (Codex #2、
-                                        // fence は presenter 固有)。未完了分はキャップ
-                                        // (NATIVE_PRESENT_RETIRE_CAP) で数フレーム内に
-                                        // 自然解放される。
-                                        if let Some(completed) =
-                                            presenter.copy_fence_completed_value()
-                                        {
-                                            while present_retire
-                                                .front()
-                                                .is_some_and(|(_, v)| *v != 0 && *v <= completed)
-                                            {
-                                                present_retire.pop_front();
-                                            }
-                                        }
-                                        // window / presenter をスワップ。
-                                        let mut old_window =
-                                            std::mem::replace(&mut window, new_window);
-                                        let old_presenter =
-                                            std::mem::replace(&mut presenter, new_presenter);
-                                        // 新ウィンドウを表示。旧ウィンドウはまだ生きて
-                                        // いるので、ここまで旧フレームが見えたまま
-                                        // (= 表示ギャップなし)。
-                                        let shown =
-                                            window.show_for_placement(activate_on_show, placement);
-                                        // hwnd を旧→新へ publish (0 を経由しないので
-                                        // App 側の cloak 判定が誤発火しない = Codex #5)。
-                                        hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
-                                        hud_hwnd_out.store(window.hud_hwnd(), Ordering::Release);
-                                        presenter_window_published = true;
-                                        // 旧ウィンドウは WM_QUIT を出さずに破棄する
-                                        // (Codex #1: post_quit_on_destroy を落とさないと
-                                        // presenter ループ自体が終了してしまう)。
-                                        old_window.destroy_silent();
-                                        drop(old_presenter);
-                                        if crate::video::native_window::discard_pending_quit_messages_for_host_switch() {
-                                            crate::logger::log(
-                                                "[native-video] discarded stale WM_QUIT after placement host switch"
-                                                    .to_string(),
-                                            );
-                                        }
-                                        // 残った present_retire エントリは旧 presenter の
-                                        // copy fence で採番されている。新 presenter の
-                                        // fence timeline とは無関係なので fence 値を 0
-                                        // (= 「fence 未追跡、depth cap でのみ解放」) に
-                                        // 上書きする (Codex P1)。旧 presenter は drop 済みで
-                                        // そのコピーは完了しているため、cap
-                                        // (NATIVE_PRESENT_RETIRE_CAP) で数フレーム内に
-                                        // 安全に解放される。
-                                        for entry in present_retire.iter_mut() {
-                                            entry.1 = 0;
-                                        }
-                                        cur_placement = placement;
-                                        cur_owner_hwnd = owner_hwnd;
-                                        last_parent_client_size = (new_width, new_height);
-                                        // Inc 7 hidden presenter: placement 変更を伴う exit
-                                        // (SwitchPlacement 経由の復帰) では rebuild + show で
-                                        // hidden モードを抜ける。hold フレームは上の prime で消費済み。
-                                        if presenter_hidden {
-                                            presenter_hidden = false;
-                                            presenter_hidden_out.store(false, Ordering::Release);
-                                            crate::logger::log(
-                                                "[native-video] presenter un-hidden via placement \
-                                                 switch (audio-mode exit)"
-                                                    .to_string(),
-                                            );
-                                        }
-                                        // 旧ウィンドウ由来の stale な native event /
-                                        // HUD raise / cursor polling 状態を破棄する
-                                        // (Codex #6: source_epoch が同じため epoch
-                                        // チェックでは弾けない)。
-                                        native_events.clear();
-                                        while presenter_event_rx.try_recv().is_ok() {}
-                                        hud_raise_deadlines.clear();
-                                        last_hud_raise_at = None;
-                                        last_cursor_poll = None;
-                                        last_native_mouse_at = None;
-                                        pointer_present_synthetic = false;
-                                        crate::logger::log(format!(
-                                            "[native-video] placement switched \
-                                             placement={} hwnd=0x{:x} \
-                                             {new_width}x{new_height} shown={shown} \
-                                             primed={primed} request={request_id} \
-                                             generation={cur_generation}",
-                                            placement.label(),
-                                            window.hwnd().0 as usize,
-                                        ));
-                                        let _ = ui_event_tx.send((
-                                            source.source_epoch,
-                                            NativeVideoOutputEvent::PlacementSwitched {
-                                                request_id,
-                                                placement,
-                                                generation: cur_generation,
-                                            },
-                                        ));
-                                    }
-                                    Err(err) => {
-                                        let mut nw = new_window;
-                                        nw.destroy_silent();
-                                        crate::logger::log(format!(
-                                            "[native-video] placement switch aborted: \
-                                             presenter rebuild failed: {err}"
-                                        ));
-                                        let _ = ui_event_tx.send((
-                                            source.source_epoch,
-                                            NativeVideoOutputEvent::PlacementSwitchFailed {
-                                                request_id,
-                                            },
-                                        ));
-                                    }
-                                }
-                            }
+                        );
+                        continue;
+                    }
+
+                    next_window_epoch = next_window_epoch.saturating_add(1);
+                    let candidate_epoch = next_window_epoch;
+                    cur_window_request = cur_window_request.saturating_add(1);
+                    let host_request = cur_window_request;
+                    window_pump.switch(native_window_pump::PumpPlacementRequest {
+                        request: host_request,
+                        epoch: candidate_epoch,
+                        placement,
+                        owner_hwnd,
+                        rect: new_rect,
+                        activate_on_show,
+                        initially_visible: true,
+                    })?;
+                    let attach = wait_for_native_window_attach(
+                        &window_pump,
+                        host_request,
+                        candidate_epoch,
+                        &cancel,
+                    )?;
+                    let new_presenter_result =
+                        crate::video::native_presenter::NativeRenderCore::new(
+                            crate::video::native_presenter::NativeRenderConfig {
+                                targets: attach.targets,
+                                width: attach.width,
+                                height: attach.height,
+                                os_pixels_per_point: attach.pixels_per_point,
+                                initial_observation: attach.observation,
+                                test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY")
+                                    .is_some(),
+                                egui_overlay: native_video_env_flag_enabled(
+                                    "MIV_NATIVE_VIDEO_EGUI_OVERLAY",
+                                    true,
+                                ),
+                                cursor_hide_delay_secs: config.cursor_hide_delay_secs,
+                                ui_scale: cur_ui_scale,
+                                text_contrast: cur_text_contrast,
+                                ui_font: config.ui_font.clone(),
+                            },
+                        );
+                    let (mut new_presenter, topology, startup_window_intents) =
+                        match new_presenter_result {
+                            Ok(value) => value,
                             Err(err) => {
+                                window_pump.target_failed(host_request, candidate_epoch)?;
                                 crate::logger::log(format!(
-                                    "[native-video] placement switch aborted: \
-                                     window create failed: {err}"
+                                    "[native-video] placement switch target failed: {err}"
                                 ));
-                                let _ = ui_event_tx.send((
+                                send_native_output_event(
+                                    &ui_event_tx,
                                     source.source_epoch,
                                     NativeVideoOutputEvent::PlacementSwitchFailed { request_id },
-                                ));
+                                );
+                                continue;
                             }
+                        };
+                    let prepare_result = (|| -> Result<_, String> {
+                        new_presenter.set_overlay_vst3_available(
+                            cur_vst3_available && placement.is_fullscreen_borderless(),
+                        );
+                        new_presenter.set_video_grade(cur_video_grade.clone())?;
+                        new_presenter.set_overlay_audio_only(config.audio_only);
+                        new_presenter.set_overlay_hud_dimmed(cur_hud_dimmed);
+                        new_presenter.set_overlay_checked(cur_checked);
+                        new_presenter
+                            .set_overlay_fallback_file_name(cur_fallback_file_name.clone());
+                        if let Some((num, den)) = cur_sar {
+                            new_presenter.set_video_sar(num, den)?;
                         }
-                    }
+                        if let Some(enabled) = cur_loop_enabled {
+                            new_presenter.set_overlay_loop_enabled(enabled);
+                        }
+                        if let Some(mode) = cur_loop_mode {
+                            new_presenter.set_overlay_loop_mode(mode);
+                        }
+                        if let Some(mode) = cur_continuous_mode {
+                            new_presenter.set_overlay_continuous_mode(mode);
+                        }
+                        if let Some(compact) = cur_video_compact {
+                            new_presenter.set_video_compact(compact)?;
+                        }
+                        new_presenter.set_overlay_playback_status(
+                            first_presented_out.load(Ordering::Acquire),
+                            None,
+                            crate::video::avio_progress::PreparingStatus {
+                                phase: crate::video::avio_progress::prep_phase::DONE,
+                                bytes_read: 0,
+                                file_size: 0,
+                            },
+                        );
+                        let overlay_outcome = new_presenter.tick_overlay_video_state(
+                            source.clock.now_secs(),
+                            f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
+                            source.clock.is_playing(),
+                            source.clock.volume(),
+                            source.clock.is_muted(),
+                            source.clock.limiter_ceiling_hit_seq(),
+                            source.clock.playback_speed(),
+                            source.frame_step_active.load(Ordering::Acquire),
+                            source.clock.is_seeking(),
+                            source.clock.current_seek_serial(),
+                        )?;
+                        // The typed presentation state is the only prime source.
+                        // On failure it stays owned by the old core/host so a rejected
+                        // switch cannot destroy the paused-frame fallback.
+                        let primed = if let Some(frame) = frame_output.frame() {
+                            let outcome = new_presenter.present(frame, config.sync_interval)?;
+                            debug_assert!(
+                                frame_output.mark_current_visible(outcome.copy_fence_value)
+                            );
+                            true
+                        } else {
+                            false
+                        };
+                        Ok((primed, overlay_outcome))
+                    })();
+                    let (primed, overlay_outcome) = match prepare_result {
+                        Ok(value) => value,
+                        Err(err) => {
+                            window_pump.target_failed(host_request, candidate_epoch)?;
+                            crate::logger::log(format!(
+                                "[native-video] placement switch prime failed; old host retained: {err}"
+                            ));
+                            send_native_output_event(
+                                &ui_event_tx,
+                                source.source_epoch,
+                                NativeVideoOutputEvent::PlacementSwitchFailed { request_id },
+                            );
+                            continue;
+                        }
+                    };
+                    sync_hud_regions(
+                        &window_pump,
+                        candidate_epoch,
+                        &new_presenter,
+                        &overlay_outcome,
+                    );
+                    frame_output.retire_completed(presenter.copy_fence_completed_value());
+                    let old_retire_len = frame_output.retire_len();
+                    window_pump.target_ready(
+                        host_request,
+                        candidate_epoch,
+                        topology,
+                        startup_window_intents,
+                    )?;
+                    wait_for_native_window_published(
+                        &window_pump,
+                        host_request,
+                        candidate_epoch,
+                        &cancel,
+                    )?;
+                    let old_presenter = std::mem::replace(&mut presenter, new_presenter);
+                    drop(old_presenter);
+                    frame_output.invalidate_retire_fence_prefix(old_retire_len);
+                    cur_generation = candidate_epoch;
+                    cur_placement = placement;
+                    cur_owner_hwnd = owner_hwnd;
+                    window_observation = attach.observation;
+                    presenter.set_window_observation(window_observation);
+                    native_events.clear();
+                    last_cursor_poll = None;
+                    last_native_mouse_at = None;
+                    pointer_present_synthetic = false;
+                    crate::logger::log(format!(
+                        "[native-video] placement switched placement={} {}x{} primed={} request={} generation={}",
+                        placement.label(),
+                        attach.width,
+                        attach.height,
+                        primed,
+                        request_id,
+                        cur_generation,
+                    ));
+                    send_native_output_event(
+                        &ui_event_tx,
+                        source.source_epoch,
+                        NativeVideoOutputEvent::PlacementSwitched {
+                            request_id,
+                            placement,
+                            generation: cur_generation,
+                        },
+                    );
                 }
             }
         }
-        // in-window モード: event drain の直前に親 (main HWND) クライアント矩形を
-        // 見て child を貼り直す。child は親のリサイズに自動追従しないため毎ループ
-        // 監視する。**drain の直前**に置くことで、SetWindowPos が同期発火させる
-        // WM_WINDOWPOSCHANGED → GeometryChanged を同じループ反復で drain・処理でき、
-        // resize 追従の 1 反復ぶんの遅延を無くす (maximize の「1 つ前」対策)。
-        if cur_placement.is_child_window() {
-            last_parent_client_size =
-                window.reflow_child_to_parent_client(cur_owner_hwnd, last_parent_client_size);
-        }
         native_events.clear();
-        while let Ok(event) = presenter_event_rx.try_recv() {
-            native_events.push(event);
-        }
+        native_events.extend(
+            window_pump
+                .drain_window_events()
+                .into_iter()
+                .filter(|envelope| {
+                    envelope.epoch == cur_generation && envelope.generation == cur_generation
+                })
+                .map(|envelope| envelope.event),
+        );
 
-        // CP6: 本物の `MouseMove` を観測したら synthetic polling を 80ms 抑制するため
-        // に `last_native_mouse_at` を更新。CP8 で扱う `GeometryChanged` / `DpiChanged` /
-        // CP6 の `RequestRaiseHud` も同じループでハンドリングする。
         let now = Instant::now();
         for event in &native_events {
             use crate::video::native_window::NativeVideoWindowEvent as NEvt;
             match event {
                 NEvt::MouseMove(_) => {
                     last_native_mouse_at = Some(now);
-                    // Codex CP6 再 P3 反映: 本物 mouse 観測でフラグをクリア。これにより
-                    // 後で client rect 外に出たときに「直前 synthetic 由来か?」が正しく
-                    // 判定でき、native `WM_MOUSELEAVE` と二重で synthetic `MouseLeave` を
-                    // 流さない。
                     pointer_present_synthetic = false;
                 }
                 NEvt::MouseLeave => {
-                    // 本物 leave 観測でも synthetic 状態をクリア (二重 leave 防止)。
                     pointer_present_synthetic = false;
                 }
-                NEvt::RequestRaiseHud => {
-                    // HUD wndproc 由来の `WM_WINDOWPOSCHANGING` での safety net。
-                    // 全経路で coalesce + 200ms 抑制を効かせるため helper 経由 (再 P2 反映)。
-                    schedule_hud_raise_burst(now, &mut hud_raise_deadlines, &mut last_hud_raise_at);
-                }
-                NEvt::GeometryChanged { x, y, w, h, .. } => {
-                    // CP8: presenter HWND の `WM_WINDOWPOSCHANGED` で発火される。
-                    // HUD HWND の位置・サイズを presenter に追従させる。
-                    window.set_hud_geometry(*x, *y, *w, *h);
-                    // wgpu surface も新サイズに resize (size 同一なら presenter 側で no-op)。
-                    match presenter.resize(*w, *h) {
-                        Ok(intents) => window.apply_render_intents(&intents),
-                        Err(err) => crate::logger::log(format!(
-                            "[native-video] CP8 GeometryChanged resize_to({w}x{h}) failed: {err}"
-                        )),
+                NEvt::GeometryChanged { w, h, .. } => match presenter.resize(*w, *h) {
+                    Ok(intents) => {
+                        window_pump.publish_visual(native_window_pump::NativeWindowVisualUpdate {
+                            epoch: cur_generation,
+                            window_intents: intents,
+                            hud_regions: None,
+                            toast_active: presenter.overlay_toast_active(),
+                            fullscreen_overlay_active: false,
+                            debug_description: None,
+                        })
                     }
-                }
+                    Err(err) => crate::logger::log(format!(
+                        "[native-video] GeometryChanged resize_to({w}x{h}) failed: {err}"
+                    )),
+                },
                 NEvt::DpiChanged {
                     dpi,
                     suggested_rect,
                 } => {
-                    // CP8: HUD HWND の `WM_DPICHANGED` を受けて以下を実行:
-                    //   1. overlay の pixels_per_point を `(dpi / 96.0) * ui_scale` で更新
-                    //   2. HUD HWND を `suggested_rect` で移動・リサイズ
-                    //   3. **overlay surface のみ** を新サイズで resize (= `resize_overlay_surface_only`)。
-                    //      presenter 全体 (background / video transform / swap chain) はここでは触らない
-                    //      (Codex CP8 P2 反映)。presenter HWND が同じ monitor にあれば presenter HWND
-                    //      の `WM_DPICHANGED` でも同じ処理が走る (= 別経路で video 側も別途 resize)。
-                    //   4. 次フレームの egui run 末で region が新 ppp で再計算される (= apply_regions)
                     let ppp = (*dpi as f32 / 96.0).max(0.5);
                     presenter.set_overlay_pixels_per_point(ppp);
                     let rect_w = (suggested_rect.right - suggested_rect.left).max(1) as u32;
                     let rect_h = (suggested_rect.bottom - suggested_rect.top).max(1) as u32;
-                    window.set_hud_geometry(
-                        suggested_rect.left,
-                        suggested_rect.top,
-                        rect_w,
-                        rect_h,
-                    );
                     match presenter.resize_overlay_surface_only(rect_w, rect_h) {
-                        Ok(intents) => window.apply_render_intents(&intents),
+                        Ok(intents) => window_pump.publish_visual(
+                            native_window_pump::NativeWindowVisualUpdate {
+                                epoch: cur_generation,
+                                window_intents: intents,
+                                hud_regions: None,
+                                toast_active: presenter.overlay_toast_active(),
+                                fullscreen_overlay_active: false,
+                                debug_description: None,
+                            },
+                        ),
                         Err(err) => crate::logger::log(format!(
-                            "[native-video] CP8 DpiChanged resize_overlay_surface_only({rect_w}x{rect_h}) failed: {err}"
+                            "[native-video] DpiChanged overlay resize failed: {err}"
                         )),
                     }
                 }
@@ -3175,53 +3570,19 @@ fn run_native_video_output(
             }
         }
 
-        // CP6: 50ms 周期 cursor polling。`presenter.cursor_polling_tick` が
-        // 「raise を要求するか」を返す。raise 必要なら helper 経由で retry burst を
-        // 起動 (= helper 内で 200ms 抑制も効かせる)。
-        // Inc 7 hidden presenter: hide 中は cursor polling / HUD raise を止める
-        // (ウィンドウ非表示なので activation zone / raise は不要 + z-order を触らない)。
+        let presenter_hidden = presenter_visibility.is_hidden();
         let cursor_poll_due = !presenter_hidden
             && last_cursor_poll
-                .map(|t| now.duration_since(t) >= Duration::from_millis(50))
+                .map(|time| now.duration_since(time) >= Duration::from_millis(50))
                 .unwrap_or(true);
         if cursor_poll_due {
             last_cursor_poll = Some(now);
-            let raise_needed = presenter.cursor_polling_tick(
-                window.presenter_target(),
-                window.has_hud(),
-                window.hud_has_capture(),
-                last_native_mouse_at,
-                &mut pointer_present_synthetic,
-            );
+            let raise_needed =
+                presenter.cursor_polling_tick(last_native_mouse_at, &mut pointer_present_synthetic);
             if raise_needed {
-                schedule_hud_raise_burst(now, &mut hud_raise_deadlines, &mut last_hud_raise_at);
+                window_pump.raise_hud(cur_generation)?;
             }
         }
-
-        // CP6: HUD raise retry burst の deadline 到来分を実行。
-        // helper でしか push されないので時系列順で並ぶが、複数 burst が連続発火する
-        // ケースは 200ms 抑制で潰れる。retain で deadline 到来分を全部実行 + 削除。
-        //
-        // **Codex CP7 P1 #1 反映**: `try_raise_hud_to_top(presenter_hwnd)` を呼ぶことで、
-        // command / event / polling のすべての raise 経路で `foreground_allows_hud_raise`
-        // を通す。VST popup / file dialog / mIV 設定ダイアログが foreground のとき
-        // raise が skip される。`raise_hud_to_top()` (allowlist 判定なし) を直接呼んで
-        // はいけない (= popup 埋葬の regression を起こす)。
-        if presenter_hidden {
-            // Inc 7 hidden presenter: hide 中は raise burst を発火しない。溜まった
-            // deadline は show 後に自然に処理されるが、hidden の間は z-order を触らない。
-            hud_raise_deadlines.retain(|deadline| *deadline > now);
-        } else {
-            hud_raise_deadlines.retain(|deadline| {
-                if *deadline <= now {
-                    let _ = window.try_raise_hud_to_top();
-                    false // 削除
-                } else {
-                    true // 残す
-                }
-            });
-        }
-
         if !native_events.is_empty() {
             presenter.update_overlay_video_state(
                 source.clock.now_secs(),
@@ -3237,7 +3598,7 @@ fn run_native_video_output(
             );
             let overlay_routing = match presenter.handle_window_events(&native_events) {
                 Ok(outcome) => {
-                    sync_hud_regions(&mut window, &presenter, &outcome);
+                    sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome);
                     for command in outcome.commands {
                         let event_epoch = source.source_epoch;
                         match command {
@@ -3733,7 +4094,7 @@ fn run_native_video_output(
                 source.clock.current_seek_serial(),
             ) {
                 Ok(outcome) => {
-                    sync_hud_regions(&mut window, &presenter, &outcome);
+                    sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome);
                     for command in outcome.commands {
                         send_native_overlay_command(
                             &ui_event_tx,
@@ -3758,28 +4119,61 @@ fn run_native_video_output(
             source.pending_first_frame_event = None;
             source.last_present_source_pts = None;
         }
-        // `video_rx` を drain して `source.queue` に積む。Codex 助言 (2026-05-15) で、
-        // queue が `MAX_NATIVE_SOURCE_QUEUE` を超えた時点で drain を **停止**する。
-        // 旧コードは `video_rx` を空になるまで drain して queue を 23 frame まで
-        // 肥大化させ、shared pool + cache + retired_video_surfaces 合算で adapter memory
-        // を枯渇させ wgpu OOM を発生させていた。drain を止めると `video_tx` (cap=8) が
-        // 満杯になり、decoder 側で `try_send` 失敗 → 古い frame を drop または park
-        // することで自然な back-pressure が成立する。
-        while source.queue.len() < MAX_NATIVE_SOURCE_QUEUE {
-            let Ok(frame) = source.video_rx.try_recv() else {
-                break;
-            };
-            if frame.seek_serial < clock_serial {
-                native_reset_unpresented_frame(frame);
-                continue;
+        let mut latest_hidden_frame: Option<VideoFrame> = None;
+        if presenter_hidden {
+            // A hidden presenter has no display pacing consumer. Applying the visible queue cap
+            // here fills both source.queue and decoder video_tx, preventing the video decoder
+            // from reaching demux EOF while audio and the wall clock keep advancing. Drain every
+            // frame already available and reduce the batch to the newest valid frame; the typed
+            // Hidden state remains the sole long-lived owner.
+            drain_hidden_available_frames(
+                &mut source.queue,
+                &source.video_rx,
+                &mut hidden_frame_scratch,
+            );
+            for frame in hidden_frame_scratch.drain(..) {
+                if frame.seek_serial < clock_serial {
+                    native_reset_unpresented_frame(frame);
+                    continue;
+                }
+                if frame.seek_serial > source.last_seen_serial {
+                    if let Some(previous) = latest_hidden_frame.take() {
+                        native_reset_unpresented_frame(previous);
+                    }
+                    source.last_seen_serial = frame.seek_serial;
+                    source.first_frame_event_last_epoch = None;
+                    source.pending_first_frame_event = None;
+                    source.last_present_source_pts = None;
+                }
+                if let Some(previous) = latest_hidden_frame.replace(frame) {
+                    native_reset_unpresented_frame(previous);
+                }
             }
-            if frame.seek_serial > source.last_seen_serial {
-                native_drain_unpresented_queue(&mut source.queue);
-                source.last_seen_serial = frame.seek_serial;
-                source.first_frame_event_last_epoch = None;
-                source.pending_first_frame_event = None;
-                source.last_present_source_pts = None;
+        } else {
+            // Visible playback remains display-paced. Stop draining when source.queue reaches
+            // `MAX_NATIVE_SOURCE_QUEUE`: this bounds shared GPU-frame ownership and lets the
+            // decoder's existing full-channel policy provide back-pressure.
+            while source.queue.len() < MAX_NATIVE_SOURCE_QUEUE {
+                let Ok(frame) = source.video_rx.try_recv() else {
+                    break;
+                };
+                if frame.seek_serial < clock_serial {
+                    native_reset_unpresented_frame(frame);
+                    continue;
+                }
+                if frame.seek_serial > source.last_seen_serial {
+                    native_drain_unpresented_queue(&mut source.queue);
+                    source.last_seen_serial = frame.seek_serial;
+                    source.first_frame_event_last_epoch = None;
+                    source.pending_first_frame_event = None;
+                    source.last_present_source_pts = None;
+                }
+                source.queue.push_back(frame);
             }
+        }
+        if let Some(frame) = latest_hidden_frame {
+            debug_assert!(presenter_hidden);
+            debug_assert!(source.queue.is_empty());
             source.queue.push_back(frame);
         }
 
@@ -3821,6 +4215,10 @@ fn run_native_video_output(
                         serde_json::Value::from(waiting_for_first_frame),
                     ),
                     (
+                        "presenter_hidden",
+                        serde_json::Value::from(presenter_hidden),
+                    ),
+                    (
                         "source_queue_len",
                         serde_json::Value::from(source.queue.len() as i64),
                     ),
@@ -3837,11 +4235,15 @@ fn run_native_video_output(
                 ],
             );
         }
-        if !source.clock.is_playing() && !source.clock.is_seeking() && !waiting_for_first_frame {
+        if !presenter_hidden
+            && !source.clock.is_playing()
+            && !source.clock.is_seeking()
+            && !waiting_for_first_frame
+        {
             source.last_present_wall = None;
             source.last_present_source_pts = None;
             // message 対応待機: 一時停止中でもリサイズ等のメッセージで即起床する。
-            crate::video::native_window::sleep_until_message(8);
+            std::thread::sleep(Duration::from_millis(8));
             continue;
         }
 
@@ -3854,15 +4256,26 @@ fn run_native_video_output(
                 seek_serial: f.seek_serial,
             })
             .collect();
-        let selection = frame_selection::select_frame_for_present(
-            &candidates,
-            now,
-            source.clock.current_seek_serial(),
-            source.last_seen_serial,
-            waiting_for_first_frame,
-            source.clock.is_seeking(),
-            clock::DISPLAY_LEAD_TOLERANCE_SECS,
-        );
+        let selection = if presenter_hidden {
+            frame_selection::FrameSelection {
+                actions: if candidates.is_empty() {
+                    Vec::new()
+                } else {
+                    debug_assert_eq!(candidates.len(), 1);
+                    vec![frame_selection::PopAction::Display]
+                },
+            }
+        } else {
+            frame_selection::select_frame_for_present(
+                &candidates,
+                now,
+                source.clock.current_seek_serial(),
+                source.last_seen_serial,
+                waiting_for_first_frame,
+                source.clock.is_seeking(),
+                clock::DISPLAY_LEAD_TOLERANCE_SECS,
+            )
+        };
         drop(candidates);
         let mut latest_renderable: Option<VideoFrame> = None;
         let mut late_drop_delta = 0u32;
@@ -3947,11 +4360,8 @@ fn run_native_video_output(
                     source.clock.set_fallback_anchor(pts);
                     source.clock.clear_seek_target_override(serial);
                 }
-                // 最新フレームを 1 枚だけ hold し、前回 hold を解放する (共有出力 slot を
-                // 溜め込まない)。show 時にこれを present してから再表示する。
-                if let Some(prev) = hidden_latest_frame.replace(frame) {
-                    native_reset_unpresented_frame(prev);
-                }
+                // 最新フレームを typed Hidden state が 1 枚だけ所有する。
+                frame_output.hold_hidden(frame);
                 continue;
             }
             let present_t0 = Instant::now();
@@ -4093,20 +4503,6 @@ fn run_native_video_output(
                         last_summary_log = Instant::now();
                     }
                     source.displayed_frame_seq.fetch_add(1, Ordering::Release);
-                    if !presenter_window_published {
-                        publish_presenter_window(
-                            &window,
-                            &hwnd_out,
-                            &hud_hwnd_out,
-                            &config,
-                            cur_placement,
-                            width,
-                            height,
-                            run_started,
-                            "first-present",
-                            &mut presenter_window_published,
-                        );
-                    }
                     let first_present_for_source =
                         !first_presented_out.swap(true, Ordering::AcqRel);
                     // Keep the deferred-navigation preview covering the old source until
@@ -4126,10 +4522,6 @@ fn run_native_video_output(
                             serial,
                             present_t0.duration_since(run_started).as_secs_f64() * 1000.0
                         ));
-                        crate::video::native_window::log_state(
-                            window.hwnd().0 as u64,
-                            "first-present",
-                        );
                     }
                     let should_emit_first_frame_ready =
                         source.first_frame_event_last_epoch != Some(serial);
@@ -4207,7 +4599,7 @@ fn run_native_video_output(
                                     ),
                                     (
                                         "retire_queue_len",
-                                        serde_json::Value::from(present_retire.len() as i64),
+                                        serde_json::Value::from(frame_output.retire_len() as i64),
                                     ),
                                     (
                                         "queue_len",
@@ -4267,37 +4659,23 @@ fn run_native_video_output(
                             );
                         }
                     }
-                    // present 済みフレームを遅延解放する。詳細は `present_retire` 宣言箇所
-                    // のコメント参照。
-                    present_retire.push_back((frame, outcome.copy_fence_value));
-                    // copy fence が到達したフレームを解放する (= GPU コピー完了を保証)。
-                    // `value == 0` (fence 未作成 / Signal 失敗) は fence ゲートでは扱わず、
-                    // 下の depth キャップに委ねる。
-                    if let Some(completed) = presenter.copy_fence_completed_value() {
-                        while present_retire
-                            .front()
-                            .is_some_and(|(_, value)| *value != 0 && *value <= completed)
-                        {
-                            present_retire.pop_front();
-                        }
-                    }
-                    // 安全キャップ: fence 未作成 / stall 時の上限。これを超えたら強制解放。
-                    while present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
-                        present_retire.pop_front();
-                    }
+                    // The displayed frame becomes the sole reusable Visible frame.
+                    // Its predecessor moves to the disposal-only retire queue.
+                    frame_output.commit_presented(frame, outcome.copy_fence_value);
+                    frame_output.retire_completed(presenter.copy_fence_completed_value());
                 }
                 Err(err) => {
                     crate::logger::log(format!("[native-video] present failed: {err}"));
                     native_reset_unpresented_frame(frame);
-                    crate::video::native_window::sleep_until_message(16);
+                    std::thread::sleep(Duration::from_millis(16));
                 }
             }
         } else {
             let wait_ms = if config.audio_only {
                 // 音声のみ native シェル (Inc 6 ②-1): 映像フレームが永久に来ないので、
                 // frame pacing 用の 1ms スピンではなく HUD periodic tick (250ms) に十分な
-                // 16ms で休む。`sleep_until_message` なので mouse/resize 等の WM では即起床し
-                // 入力応答性は保たれる。
+                // 16ms で休む。HWND message pump は独立 owner thread が継続するため、
+                // render のこの待機が mouse/resize dispatch を止めることはない。
                 16u64
             } else {
                 let speed = source.clock.playback_speed().max(clock::MIN_PLAYBACK_SPEED);
@@ -4309,16 +4687,18 @@ fn run_native_video_output(
             };
             // message 対応待機: フレーム待ちのアイドル中でもリサイズ等のメッセージで
             // 即起床し、presenter ループが素早く WM を処理できるようにする。
-            crate::video::native_window::sleep_until_message(wait_ms as u32);
+            std::thread::sleep(Duration::from_millis(wait_ms));
         }
     }
 
+    frame_output.clear_current();
+    frame_output.retire_completed(presenter.copy_fence_completed_value());
     emit_native_vram_trace(
         "native_presenter_exit_begin",
         "before_exit_drain",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
     native_drain_unpresented_queue(&mut source.queue);
     emit_native_vram_trace(
@@ -4326,7 +4706,7 @@ fn run_native_video_output(
         "after_exit_drain",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
     source.present_stats.emit_summary(run_started.elapsed());
     crate::logger::log(format!(
@@ -4352,21 +4732,14 @@ fn run_native_video_output(
         );
     }
     first_presented_out.store(false, Ordering::Release);
-    hwnd_out.store(0, Ordering::Release);
-    // T27 (Claude R3-7): cancel 経路 (line 1335, 1346) は hud_hwnd_out=0 をクリアするが、
-    // 正常終了 (= WM_QUIT loop exit) では従来クリアし忘れていた。destroy 済 stale HUD
-    // HWND が `dsp_bridge.set_hud_hwnd(...)` で渡されたままになり、raise allowlist に
-    // 数フレーム残って次の動画開始直後の foreground 切替を阻害していた。
-    hud_hwnd_out.store(0, Ordering::Release);
     emit_native_vram_trace(
         "native_presenter_before_destroy",
-        "before_window_destroy",
+        "before_render_drop",
         &source,
         &presenter,
-        present_retire.len(),
+        frame_output.retire_len(),
     );
-    window.destroy();
-    closed.store(true, Ordering::Release);
+    window_pump.shutdown(cur_window_request.saturating_add(1));
     crate::logger::log("[native-video] fullscreen presenter stopped".to_string());
     Ok(())
 }
@@ -4438,6 +4811,12 @@ fn frame_step_waiting_for_display(
     pending_step_base.is_some()
         && issued_display_seq != FRAME_STEP_NO_PENDING_SEQ
         && issued_display_seq == current_display_seq
+}
+
+fn eof_freeze_position(known_duration_secs: Option<f64>, current_secs: f64) -> f64 {
+    known_duration_secs
+        .filter(|duration| *duration > 0.0)
+        .unwrap_or_else(|| current_secs.max(0.0))
 }
 
 impl VideoPlayer {
@@ -5060,6 +5439,12 @@ impl VideoPlayer {
     /// `EngineActor::autoplay_intent` の doc コメント参照)。
     pub fn intent_playing(&self) -> bool {
         self.engine.lock().unwrap().autoplay_intent()
+    }
+
+    /// 再生時に提供する視覚モードを engine readiness へ反映する。
+    /// Video は従来どおり初回映像提示を待ち、Music は音声バッファを再生開始条件にする。
+    pub(crate) fn set_media_visual_mode(&self, mode: music_core::MediaVisualMode) {
+        self.engine.lock().unwrap().set_media_visual_mode(mode);
     }
 
     pub fn playback_speed(&self) -> f64 {
@@ -6406,12 +6791,10 @@ impl VideoPlayer {
                     // EofReached を発火していると engine.state が Playing のまま残り、
                     // tick が無限に回り続ける退行になる。`duration_secs == 0` の場合は
                     // 現在位置 (= AvClock.now_secs) で freeze する。
-                    let duration_for_eof = self
-                        .info
-                        .as_ref()
-                        .map(|info| info.duration_secs)
-                        .filter(|d| *d > 0.0)
-                        .unwrap_or_else(|| self.clock.now_secs().max(0.0));
+                    let duration_for_eof = eof_freeze_position(
+                        self.info.as_ref().map(|info| info.duration_secs),
+                        self.clock.now_secs(),
+                    );
                     let mut g = self.engine.lock().unwrap();
                     let cur_epoch = g.current_seek_epoch();
                     g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
@@ -6588,12 +6971,10 @@ impl VideoPlayer {
                 // AvClock freeze(duration) + playing=false を atomic に確定する。
                 // native 経路と同じ理由・処理 (詳細はそちらの doc コメント参照)。
                 // duration_secs == 0 の fallback も同じ。
-                let duration_for_eof = self
-                    .info
-                    .as_ref()
-                    .map(|info| info.duration_secs)
-                    .filter(|d| *d > 0.0)
-                    .unwrap_or_else(|| self.clock.now_secs().max(0.0));
+                let duration_for_eof = eof_freeze_position(
+                    self.info.as_ref().map(|info| info.duration_secs),
+                    self.clock.now_secs(),
+                );
                 let mut g = self.engine.lock().unwrap();
                 let cur_epoch = g.current_seek_epoch();
                 g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
@@ -7077,6 +7458,131 @@ fn dummy_audio_rx() -> crossbeam_channel::Receiver<decoder::AudioFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn video_grade_render_change_ignores_overlay_only_snapshot_fields() {
+        let previous = crate::creative_lut::VideoGradeSnapshot::default();
+        let mut next = crate::creative_lut::VideoGradeSnapshot::default();
+        next.slots = vec![Some("renamed slot".to_string())].into();
+        assert!(!super::video_grade_render_changed(&previous, &next));
+
+        next.adjustments.brightness = 1.0;
+        assert!(super::video_grade_render_changed(&previous, &next));
+    }
+
+    #[test]
+    fn frame_presentation_new_visible_retires_previous_visible() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("first", 7).is_none());
+
+        let displaced = state
+            .replace_visible("second", 11)
+            .expect("previous visible frame must be displaced");
+        match displaced {
+            super::DisplacedPresentation::Visible { frame, fence } => {
+                assert_eq!(frame, "first");
+                assert_eq!(fence, 7);
+            }
+            super::DisplacedPresentation::Hidden { .. } => {
+                panic!("visible replacement must retire a visible frame")
+            }
+        }
+        assert!(state.is_visible());
+    }
+
+    #[test]
+    fn frame_presentation_grade_change_requests_only_visible_represent() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(!state.should_represent_for_grade_change(true));
+
+        assert!(state.replace_hidden("hidden").is_none());
+        assert!(state.is_hidden());
+        assert!(!state.should_represent_for_grade_change(true));
+
+        let _ = state.replace_visible("visible", 3);
+        assert!(state.should_represent_for_grade_change(true));
+    }
+
+    #[test]
+    fn frame_presentation_unchanged_grade_does_not_request_idle_present() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("visible", 5).is_none());
+        assert!(!state.should_represent_for_grade_change(false));
+    }
+
+    #[test]
+    fn frame_presentation_hide_preserves_frame_without_represent_request() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("visible", 13).is_none());
+
+        state.hide();
+
+        assert!(state.is_hidden());
+        assert!(!state.should_represent_for_grade_change(true));
+        assert_eq!(state.frame(), Some(&"visible"));
+    }
+
+    #[test]
+    fn hidden_presenter_drains_decoder_channel_and_holds_latest_frame() {
+        let mut paced_queue = std::collections::VecDeque::from([0, 1, 2, 3, 4, 5, 6, 7]);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        for frame in 8..16 {
+            tx.try_send(frame).expect("fill decoder video channel");
+        }
+        let mut drained = Vec::new();
+
+        assert_eq!(
+            super::drain_hidden_available_frames(&mut paced_queue, &rx, &mut drained),
+            16
+        );
+        assert!(paced_queue.is_empty());
+        assert!(rx.is_empty());
+        tx.try_send(16)
+            .expect("hidden drain must release decoder channel capacity");
+
+        let mut state = super::FramePresentationState::Empty;
+        let mut displaced = Vec::new();
+        for frame in drained {
+            if let Some(previous) = state.replace_hidden(frame) {
+                match previous {
+                    super::DisplacedPresentation::Hidden { frame } => displaced.push(frame),
+                    super::DisplacedPresentation::Visible { .. } => {
+                        panic!("hidden burst must not create visible presentation ownership")
+                    }
+                }
+            }
+        }
+        assert_eq!(state.frame(), Some(&15));
+        assert_eq!(displaced, (0..15).collect::<Vec<_>>());
+        assert!(state.mark_current_visible(19));
+        assert!(state.is_visible());
+        assert_eq!(state.visible_frame(), Some(&15));
+    }
+
+    #[test]
+    fn audio_mode_eof_freeze_does_not_exceed_known_duration() {
+        let overrun_clock = 273.0;
+        let duration = 264.0;
+
+        assert_eq!(
+            super::eof_freeze_position(Some(duration), overrun_clock),
+            duration
+        );
+        assert!(
+            super::eof_freeze_position(Some(duration), overrun_clock) <= duration,
+            "native EOF must freeze the position display at the media duration"
+        );
+    }
+
+    #[test]
+    fn frame_presentation_failed_prime_keeps_visible_fallback() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(state.replace_visible("paused", 17).is_none());
+
+        assert_eq!(state.frame(), Some(&"paused"));
+        assert!(state.is_visible());
+        assert_eq!(state.visible_frame(), Some(&"paused"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn child_presenter_focus_requires_activation() {
@@ -7176,6 +7682,111 @@ mod tests {
             ));
         }
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_command_bus_coalesces_hud_state_and_keeps_actions_lossless() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_command_bus(8, std::sync::Arc::clone(&fault));
+        tx.send(super::NativeVideoOutputCommand::SetChecked { checked: false })
+            .unwrap();
+        tx.send(super::NativeVideoOutputCommand::ShowToast {
+            text: "first".to_string(),
+            centered: false,
+            linger: None,
+        })
+        .unwrap();
+        tx.send(super::NativeVideoOutputCommand::SetChecked { checked: true })
+            .unwrap();
+        tx.send(super::NativeVideoOutputCommand::ShowToast {
+            text: "second".to_string(),
+            centered: false,
+            linger: None,
+        })
+        .unwrap();
+
+        let commands = rx.drain();
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(
+            commands[0],
+            super::NativeVideoOutputCommand::ShowToast { ref text, .. } if text == "first"
+        ));
+        assert!(matches!(
+            commands[1],
+            super::NativeVideoOutputCommand::SetChecked { checked: true }
+        ));
+        assert!(matches!(
+            commands[2],
+            super::NativeVideoOutputCommand::ShowToast { ref text, .. } if text == "second"
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_output_event_bus_coalesces_mouse_and_keeps_key_lossless() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(8, std::sync::Arc::clone(&fault));
+        tx.send(
+            9,
+            super::NativeVideoOutputEvent::Window(
+                crate::video::native_window::NativeVideoWindowEvent::MouseMove(
+                    crate::video::native_window::NativeVideoMouseEvent {
+                        x: 1,
+                        y: 2,
+                        shift: false,
+                        ctrl: false,
+                    },
+                ),
+            ),
+        );
+        tx.send(
+            9,
+            super::NativeVideoOutputEvent::Window(
+                crate::video::native_window::NativeVideoWindowEvent::MouseMove(
+                    crate::video::native_window::NativeVideoMouseEvent {
+                        x: 30,
+                        y: 40,
+                        shift: false,
+                        ctrl: false,
+                    },
+                ),
+            ),
+        );
+        tx.send(
+            9,
+            super::NativeVideoOutputEvent::Window(
+                crate::video::native_window::NativeVideoWindowEvent::KeyDown(
+                    crate::video::native_window::NativeVideoKeyEvent {
+                        virtual_key: 0x41,
+                        scan_code: 0,
+                        extended: false,
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        repeat: false,
+                    },
+                ),
+            ),
+        );
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].1,
+            super::NativeVideoOutputEvent::Window(
+                crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse)
+            ) if mouse.x == 30 && mouse.y == 40
+        ));
+        assert!(matches!(
+            events[1].1,
+            super::NativeVideoOutputEvent::Window(
+                crate::video::native_window::NativeVideoWindowEvent::KeyDown(_)
+            )
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     #[test]
     fn frame_step_interval_uses_average_fps() {
         let step = super::frame_step_interval_secs(60.0);

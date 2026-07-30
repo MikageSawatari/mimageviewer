@@ -285,11 +285,16 @@ ui_fullscreen.rs::render_fullscreen_viewport
 戻さずに、初期 white client / サイズ遷移フラッシュを抑える。
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
 
-Ctrl+↑↓ のフォルダ横断では、遷移開始時に `fs_holdover_tex` へ旧ページのテクスチャを
-保持する。これはページごとの fallback ではなく、直前に見ていた**ビュー単位**の hold である。
-この producer は `capture_fs_nav_holdover` であり、カラー化の有無とは無関係に作動する。
-`capture_colorize_page_transition_holdover` / `capture_colorize_source_reload_holdover` は
-同じ field を使う別 producer だが、こちらだけがカラー化条件で gate される。
+Ctrl+↑↓ のフォルダ横断とページ単位表示のカラー化待ちは、単一 field
+`fs_holdover_tex: Option<FsHoldover>` を共有する。値は typed state で相互排他になっている:
+
+- `FolderNavigation(texture)`: 遷移開始時に旧ページのテクスチャを保持する。ページごとの
+  fallback ではなく、直前に見ていた**ビュー単位**の hold であり、カラー化の有無とは
+  無関係に `capture_fs_nav_holdover` が作る。
+- `ColorizeDisplayUnit { target_idx, previous }`: `previous.pages` に画面順の 1 ページ、または
+  `[left, right]` の見開き 2 ページをまとめて保持する。`capture_colorize_page_transition_holdover` /
+  `capture_colorize_source_reload_holdover` だけがカラー化条件で作る。左右別 slot は持たない。
+
 `fs_nav_holdover_tex_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
 gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`image_rect` に
 1 枚だけ中央 contain フィットで重ねる。移動先ページの回転、表示トリム
@@ -297,7 +302,7 @@ gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`
 
 フォルダ横断後、新しい `items_generation` のページで full / final / edit / thumbnail の
 いずれかを一度でも表示候補に選べたら、`fs_nav_holdover_tex_for_draw` は
-`fs_holdover_tex` の handle 自体を破棄して一方向にラッチする。表示確定待ち世代を持つ
+`FolderNavigation` の handle 自体を破棄して一方向にラッチする。表示確定待ち世代を持つ
 `fs_nav_locked_gen` は `poll_fs_nav_lock` が別途解除するため、両者の寿命は同一でなくてよい。
 AI final の invalidation / install の過渡フレームで表示解決が再び `None` になっても、
 旧フォルダの handle は既に存在せず、nav holdover が復活することはない。
@@ -341,8 +346,9 @@ continuous transition が実際に選ばれた場合も同イベントへ `branc
           ├─ GridItem::ZipImage   → zip_loader で bytes 読み出し → image::load_from_memory
           │                          → 失敗時 WIC ストリームフォールバック (SHCreateMemStream)
           │                          → bytes から EXIF Orientation 適用
-          └─ GridItem::PdfPage    → pdf_loader::render_page (4096px、PDF ワーカープロセス)
-                                     ※zoom 分析モードの時はさらに高解像度で再レンダリング
+          └─ GridItem::PdfPage    → pdf_loader::render_page_for_display
+                                     (実 viewport×ppp、PDF ワーカープロセス)
+                                     ※zoom 時は倍率に応じて再レンダリング
 
 アニメーション:
   ├─ .gif      → fs_animation::decode_gif_frames (通常画像のみ)
@@ -357,6 +363,25 @@ Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示�
 これは edit/final cache key が idx + generation ベースで、フレーム番号を含まないため、
 1 フレームを派生キャッシュに入れると以後の `current_frame` 更新が画面へ出ず
 アニメーションが停止して見えるため。
+
+PDF 初回レンダは、描画先の `fullscreen_media_rect` の論理 point 寸法へ、その
+viewport context の effective `pixels_per_point` (OS DPI × UI scale) を掛けて物理 viewport
+`(Vw, Vh)` を作る。ページ寸法 `(Pw, Ph)` は PDF worker が content type と同じ PDFium
+open 内で取得し、ページ全体表示なら
+`S = min(Vw / Pw, Vh / Ph)`、`target_long = ceil(max(Pw, Ph) × S × 1.10)` とする。
+横幅 / 縦幅 fit はそれぞれ `Vw / Pw` / `Vh / Ph`、90°/270° 回転時はページ軸を交換する。
+1.10 は丸め・filter・1-frame の layout 差で等倍表示を眠くしないための品質余裕である。
+
+- raster-only PDF は同じ worker 内で判明した埋め込み画像の native 長辺を絶対上限にする。
+- 全経路の上限は 8192。100% 原寸 / no-downscale は従来の表示密度を下げないよう
+  vector の最低長辺 4096 を維持し、raster native 上限は常に優先する。
+- `start_fs_load` は実 viewport が確定する前の PDF を enqueue しない。fullscreen、detached、
+  in-window の各 context は同じ typed display target を所有し、先読みもそれを再利用する。
+- 自動 / 手動の表示 trim bbox は初回 raster 到着後に確定する。bbox 部分が viewport へ fit した
+  ときの必要 texel 密度を同じ式で再計算し、不足する場合だけ priority 再レンダする。
+- zoom 再レンダは display-fit 長辺を基準に倍率を掛け、8192 と raster native で clamp する。
+  AI が必要な raster は display-fit が native より小さい場合も大きい場合も native へ収束させ、
+  その間の final AI / AI 先読みを保留する。
 WebP は `ANIM` chunk の背景色を `WebPDecoder::set_background_color` に渡してから
 展開する。`image-webp` は dispose-to-background の処理を持つが、背景色未設定のままだと
 dispose が実質 no-op になり、透明差分フレームで前フレームの軌跡が残る。
@@ -678,8 +703,8 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   no-op になる。final AI / 旧 AI 経路とも判定は `ai::upscale::should_process_rect`。
 - `apply_adjustments_fast` は pointwise 変換なので入力サイズを保つ → 入力が 8192 以内
   ならば出力も 8192 以内。`edit_result_cache` / final AI 結果を入力に取るので成立する。
-- 消しゴム (MI-GAN) / PDF 再レンダ (`request_pdf_rerender` の `.clamp(256, 8192)`) も
-  同じ上限を尊重する。
+- 消しゴム (MI-GAN) / PDF 再レンダも同じ 8192 上限を尊重する。PDF vector は長辺
+  256 以上、raster は native 上限を優先するため極小原稿では 256 未満になり得る。
 - GIF / APNG / WebP アニメーションは `fs_animation::clamp_rgba_frame_for_gpu` で各フレームを
   `MAX_TEXTURE_DIM` 以下に縮めてから `ColorImage` 化する (巨大 animated 画像で
   `ctx.load_texture` が panic するのを防ぐ安全網)。
@@ -800,7 +825,10 @@ generation と erase / local-adjust / conceal の各編集世代を含むため�
 
 ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
 `continuous_page_transition_texture` → サムネイル → `読込中...` である。
-`fs_holdover_tex` はこの優先順位には入らず、上記のビュー単位 overlay としてだけ描く。
+`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` は上記のビュー単位 overlay、
+`ColorizeDisplayUnit` はページ画像と編集 overlay の後に、黒背景 + 旧単ページ / 旧見開き全体を
+重ねる。新しい表示ユニットの全ページで final-effect 適用済み表示（または終端の読込失敗）が
+揃った描画フレームだけ state を解放するため、「新しい左 + 古い右」や片側だけ黒にはならない。
 
 Ctrl+↑↓ の nav lock 解放判定も、描画側と同じ
 `fs_display_bypasses_final_pipeline` を使う。通常表示でカラー化が有効なページは
@@ -817,7 +845,9 @@ raw `fs_cache` を直接描くため、Static / Animated またはサムネイ�
 再実装すると、新しい派生レイヤ (消しゴム / 隠蔽加工 / AI など) の横展開漏れが起きる。
 見開きと連結読みも、画面全体で 1 枚を解決するのではなく、描画対象の **各ページ idx**
 についてこの入口を呼び、完成テクスチャが無ければそのページの transition texture /
-サムネイルへ落とす。ルーペも hit-test 後に選ばれたページ idx で同じ入口を呼ぶ。
+サムネイルへ落とす。ただしページ単位の見開きで `ColorizeDisplayUnit` が active な間は、
+各 idx の解決結果を個別公開せず、両方が揃うまで旧 unit overlay が全体を覆う。
+ルーペも hit-test 後に選ばれたページ idx で同じ入口を呼ぶ。
 
 local-adjust / conceal の materialization は worker で進む。必要な local 結果が未完成なら
 conceal は erase / raw を入力にして先へ合成せず `None` を返し、edit / final assembly も
@@ -1079,6 +1109,11 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
    左右ページ矩形を配置する (ズーム/パンは左右ページで共有、ページ間の分割位置は不変)
 4. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
 
+ページ単位表示のカラー化遷移も、この `SpreadDisplayUnit` / `resolve_spread_pair` と同じ境界を
+使う。表紙、末尾端数、横長ページは 1 ページ unit、通常見開きは画面順 2 ページ unit として
+旧表示を保持する。1 ページずらしの `spread_shift_anchor_idx` と LTR/RTL の画面順も同じ resolver
+から得るため、遷移状態だけが別のペアを作ることはない。
+
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。
 見開き中も `rotation_db` の単独ページ回転 (R/L) は左右ページそれぞれに反映する。
 `fs_free_rotation` (Ctrl+ドラッグのフリー回転) は見開きに反映しないため、Ctrl+ドラッグは
@@ -1115,6 +1150,10 @@ processed テクスチャは配置サイズへ反映せず、raw/source のア�
 配置サイズや UV を変えない。
 通常見開き・ページ送り・連結読みは同じ画像表示ユニット列を使うため、横長ページの前後で
 単ページ扱いと一時的なずらしアンカーの扱いがずれない。
+ただし遷移 texture の所有粒度は意図的に異なる。`capture_colorize_page_transition_holdover` は
+`ReadingFlow::Paged` だけを受け付け、連結読みは従来どおり keep-set 内の
+`continuous_page_transitions[idx]` をページ別に使う。スクロールで複数 unit が同時可視になる
+連結読みへ単一の paged holdover を重ねないため、縦 / 横連結の描画挙動は変わらない。
 横連結では `ReadingDirection` により
 左→右 / 右→左の座標符号を反転する。UI で横方向を変更した場合は `SpreadMode` の
 表紙あり/なしを保ったまま LTR/RTL も同期し、ページ単位の見開き方向と横連結方向が
@@ -1193,7 +1232,8 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
      スクリーントーン濃淡変換、カスタム階調 LUT
    → `final_effect_pending` worker。カラー化前の provisional texture は公開しない。
      前後ページは final composite まで先読みし、完成済みならページ移動直後からカラー表示する。
-     先読みが未完了なら直前ページを holdover し、完成後にカラー化済み画像へ直接切り替える。
+     先読みが未完了なら、ページ単位表示では直前の表示ユニット（単ページ / 見開き全体）を
+     holdover し、対象 unit の全ページが揃った後にカラー化済み画像へ一括で切り替える。
      PDF の Z ズーム再描画など、同じ表示ページの source 解像度が更新される場合は、旧世代の
      完成済み texture を display-only holdover に退避してから live cache を無効化し、
      新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
@@ -1282,7 +1322,8 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   `Raster` として保持し、その後 final AI が完了したら同じページスロットを `FinalAi` に昇格して
   raster pixels を解放する。この PDF ページスロットと汎用保持 LRU は同じ枚数 / MiB 予算で
   合算 LRU 退去される。再表示時に `FinalAi` が条件一致すれば PDF worker を起こさず、AI pixels
-  から `final_composite_cache` を直接復元する。
+  から `final_composite_cache` を直接復元する。`Raster` lookup は固定 4096 ではなく、現在の
+  display target と保持 raster の縦横比から必要長辺を再計算し、±10% 内だけを再利用する。
   外部変更や AI 設定変更で retained epoch が進んでいた場合、その orphan 結果は store 時に捨てる。
   汎用保持 LRU の store / hit /
   miss / skip / evict / clear は `mimageviewer.log` に `[AI] Retained final AI ...`
@@ -1333,7 +1374,7 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
 | 処理 | Image | ZipImage | PdfPage | Video |
 | --- | --- | --- | --- | --- |
 | サムネイルデコード | image/turbojpeg/WIC | image::load_from_memory | PDFium ワーカー | Shell API (別スレッド) |
-| フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で 4096px | なし (サムネのみ) |
+| フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で実 viewport×ppp に fit (raster は native 上限) | なし (サムネのみ) |
 | EXIF Orientation | ✅ path から読む | ✅ bytes から読む | ❌ | — |
 | アニメーション | GIF/APNG/WebP ✅ | WebP ✅ | ❌ | — |
 | 回転 (rotation_db) | ✅ | ✅ (path+entry キー) | ✅ (path+page キー) | — |

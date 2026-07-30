@@ -1130,6 +1130,24 @@ impl App {
             let f = ((p.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
             seek_to = Some(f * dur);
         }
+        // ホバー表現も動画 native HUD に揃える (実機 FB 2026-07-30): 左右矢印カーソルと、
+        // シーク行内に閉じた赤い縦線。色・太さ・上下 4.0 の余白は render_core.rs の動画
+        // シークバーと同値。音声にはシーク先サムネが無いので preview パネルは持たない。
+        if interactive && seek_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            if dur > 0.0
+                && let Some(p) = seek_resp.hover_pos()
+            {
+                let hx = p.x.clamp(bar_rect.left(), bar_rect.right());
+                painter.line_segment(
+                    [
+                        egui::pos2(hx, hud_rect.top() + 4.0),
+                        egui::pos2(hx, hud_rect.top() + seek_row_h - 4.0),
+                    ],
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
+                );
+            }
+        }
 
         // ── コントロール行: 左クラスタ ──
         // 並び順・グループ間隔・左端揃えを動画 native HUD に完全一致させる (Inc 7 ③ 実機 FB):

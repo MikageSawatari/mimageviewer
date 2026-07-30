@@ -122,17 +122,30 @@ else {
     $Launched = $true
 }
 
-$ReadyDeadline = (Get-Date).AddSeconds(15)
-while (-not (Test-Path -LiteralPath $PerfLog)) {
+# Wait for a perf log the measured process actually wrote. Existence alone is not
+# enough: APPDATA keeps the previous session's perf_events.jsonl, so on every run
+# after the first one a stale file is already there when Start-Process returns,
+# the wait loop exits immediately, and the freshness test reads the old timestamp
+# before the new process has even initialised.
+$PerfFreshFloor = $Process.StartTime.AddSeconds(-2)
+$ReadyDeadline = (Get-Date).AddSeconds(30)
+while ($true) {
+    if ((Test-Path -LiteralPath $PerfLog) -and
+        (Get-Item -LiteralPath $PerfLog).LastWriteTime -ge $PerfFreshFloor) {
+        break
+    }
     if ((Get-Date) -ge $ReadyDeadline) {
+        if (Test-Path -LiteralPath $PerfLog) {
+            throw ("perf log is still the previous session's: $PerfLog`n" +
+                "The measured process wrote nothing. A running mImageViewer " +
+                "(installed, tray-resident, or a dev build) owns the single-instance " +
+                "mutex, so the process started here forwards its arguments and exits. " +
+                "Close every mImageViewer, then retry.")
+        }
         throw "perf log was not created: $PerfLog"
     }
     $Process = Get-LiveProcess -Id $Process.Id
     Start-Sleep -Milliseconds 200
-}
-$PerfInfo = Get-Item -LiteralPath $PerfLog
-if ($PerfInfo.LastWriteTime -lt $Process.StartTime.AddSeconds(-2)) {
-    throw "perf log predates process start; launch this process with --perf-log"
 }
 
 Write-Host ""

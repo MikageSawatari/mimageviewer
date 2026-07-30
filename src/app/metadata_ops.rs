@@ -376,7 +376,8 @@ pub(super) fn run_metadata_load(
 
 pub(super) fn run_details_meta_load(
     generation: u64,
-    targets: Vec<DetailsMetaTarget>,
+    visible_targets: Vec<DetailsMetaTarget>,
+    background_targets: Vec<DetailsMetaTarget>,
     initial_done: usize,
     initial_failed: usize,
     total: usize,
@@ -384,13 +385,25 @@ pub(super) fn run_details_meta_load(
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DetailsMetaEvent>,
+    priority_rx: mpsc::Receiver<Vec<DetailsMetaTarget>>,
     page_count_config: DetailsPageCountConfig,
 ) {
     const SLOW_AI_METADATA_ITEM_MS: f64 = 100.0;
 
     let perf_on = crate::perf::is_enabled();
     let worker_t0 = perf_on.then(std::time::Instant::now);
-    let target_count = targets.len();
+    let target_count = visible_targets.len() + background_targets.len();
+    let processed_len = visible_targets
+        .iter()
+        .chain(background_targets.iter())
+        .map(|target| target.idx)
+        .max()
+        .map_or(0, |max_idx| max_idx.saturating_add(1));
+    let mut processed = vec![DetailsLazyFieldFlags::default(); processed_len];
+    let mut failed_indices = vec![false; processed_len];
+    let mut priority_targets = std::collections::VecDeque::new();
+    let mut visible_targets = std::collections::VecDeque::from(visible_targets);
+    let mut background_targets = std::collections::VecDeque::from(background_targets);
     let mut done = initial_done;
     let mut failed = initial_failed;
     let mut ai_targets = 0usize;
@@ -417,10 +430,43 @@ pub(super) fn run_details_meta_load(
     > = std::collections::HashMap::new();
     let mut container_catalogs = ContainerCatalogCache::new(8);
 
-    for target in targets {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
+
+        while let Ok(targets) = priority_rx.try_recv() {
+            for target in targets {
+                if target.idx >= processed.len() {
+                    processed.resize(target.idx + 1, DetailsLazyFieldFlags::default());
+                    failed_indices.resize(target.idx + 1, false);
+                }
+                let mut remaining = target.clone();
+                remaining.remove_processed_fields(processed[target.idx]);
+                if remaining.requested_fields().any() {
+                    priority_targets.push_back(target);
+                }
+            }
+        }
+        let Some(mut target) = priority_targets
+            .pop_front()
+            .or_else(|| visible_targets.pop_front())
+            .or_else(|| background_targets.pop_front())
+        else {
+            break;
+        };
+        if target.idx >= processed.len() {
+            processed.resize(target.idx + 1, DetailsLazyFieldFlags::default());
+            failed_indices.resize(target.idx + 1, false);
+        }
+        target.remove_processed_fields(processed[target.idx]);
+        let requested_fields = target.requested_fields();
+        if !requested_fields.any() {
+            continue;
+        }
+        // priority duplicate と元の background target が同じ field を要求しても 1 回だけ処理する。
+        // page-count のように後から追加された field は同じ idx でも落とさず差分だけ処理する。
+        processed[target.idx].merge(requested_fields);
 
         let mut created_at = None;
         let mut ai_metadata_checked = false;
@@ -701,9 +747,12 @@ pub(super) fn run_details_meta_load(
             && matches!(target.item, GridItem::Video(_) | GridItem::Audio(_))
             && video_probe.is_none();
         let created_at_failed = target.load_created_at && created_at.is_none();
-        failed += usize::from(
-            page_count_failed || image_dims_failed || video_meta_failed || created_at_failed,
-        );
+        let item_failed =
+            page_count_failed || image_dims_failed || video_meta_failed || created_at_failed;
+        if item_failed && !failed_indices[target.idx] {
+            failed += 1;
+            failed_indices[target.idx] = true;
+        }
         let (video_duration_secs, video_dims, video_codec) = video_probe
             .map(|probe| (probe.duration_secs, probe.dims, probe.codec))
             .unwrap_or((None, None, None));
@@ -919,6 +968,7 @@ mod relative_page_tests {
             return;
         }
         let target = DetailsMetaTarget {
+            idx: 0,
             key: "relative-page".to_string(),
             item,
             relative_page_provenance: Some(provenance),
@@ -940,6 +990,7 @@ mod relative_page_tests {
         run_details_meta_load(
             1,
             vec![target],
+            Vec::new(),
             0,
             0,
             1,
@@ -947,6 +998,7 @@ mod relative_page_tests {
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
+            mpsc::channel().1,
             DetailsPageCountConfig {
                 fingerprint: 0,
                 image_folder_options: None,
@@ -1677,6 +1729,7 @@ mod tests {
         write_zip_with_nested_images(&path);
         let source_size = std::fs::metadata(&path).unwrap().len() as i64;
         let target = DetailsMetaTarget {
+            idx: 0,
             key: crate::adjustment_db::normalize_path(&path),
             item: GridItem::ZipFile(path.clone()),
             relative_page_provenance: None,
@@ -1767,6 +1820,7 @@ mod tests {
         assert!(expected > 0);
         let source_size = std::fs::metadata(&path).unwrap().len() as i64;
         let target = DetailsMetaTarget {
+            idx: 0,
             key: crate::adjustment_db::normalize_path(&path),
             item: GridItem::ConvertibleArchive {
                 path: path.clone(),
@@ -1824,12 +1878,90 @@ mod tests {
         );
     }
 
+    fn no_io_details_target(idx: usize) -> DetailsMetaTarget {
+        DetailsMetaTarget {
+            idx,
+            key: format!("target-{idx}"),
+            item: GridItem::Folder(PathBuf::from(format!(r"C:\Smart\folder-{idx}"))),
+            relative_page_provenance: None,
+            source_mtime: 1,
+            source_size: 1,
+            catalog_folder: None,
+            catalog_key: None,
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: false,
+            load_created_at: false,
+            // Folder は AI metadata の I/O 対象外なので、worker queue の順序だけを検証できる。
+            load_ai_metadata: true,
+            load_image_dims: false,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Low,
+        }
+    }
+
+    #[test]
+    fn details_meta_worker_prioritizes_visible_without_dropping_background_targets() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let background_targets = (0..3).map(no_io_details_target).collect::<Vec<_>>();
+        let mut priority_target = background_targets[2].clone();
+        priority_target.priority = crate::io_semaphore::IoPriority::Normal;
+        priority_target.load_ai_metadata = false;
+        priority_target.load_video_meta = true;
+        let (priority_tx, priority_rx) = mpsc::channel();
+        priority_tx.send(vec![priority_target]).unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        run_details_meta_load(
+            11,
+            Vec::new(),
+            background_targets,
+            0,
+            0,
+            3,
+            temp.path().join("cache"),
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            priority_rx,
+            DetailsPageCountConfig {
+                fingerprint: 0,
+                image_folder_options: None,
+                pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            },
+        );
+
+        let events = rx.into_iter().collect::<Vec<_>>();
+        let item_events = events
+            .iter()
+            .filter_map(|event| match event {
+                DetailsMetaEvent::Item { key, loaded, .. } => Some((key.as_str(), *loaded)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            item_events.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            ["target-2", "target-0", "target-1", "target-2"]
+        );
+        assert!(item_events[0].1.video_meta);
+        assert!(item_events[3].1.ai_metadata);
+        assert!(matches!(
+            events.last(),
+            Some(DetailsMetaEvent::Finished {
+                generation: 11,
+                failed: 0
+            })
+        ));
+    }
+
     #[test]
     fn staged_metadata_job_preserves_existing_page_count() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("book.zip");
         std::fs::write(&path, b"metadata-only").unwrap();
         let target = DetailsMetaTarget {
+            idx: 0,
             key: crate::adjustment_db::normalize_path(&path),
             item: GridItem::ZipFile(path),
             relative_page_provenance: None,
@@ -1851,6 +1983,7 @@ mod tests {
         run_details_meta_load(
             7,
             vec![target],
+            Vec::new(),
             0,
             0,
             1,
@@ -1858,6 +1991,7 @@ mod tests {
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
+            mpsc::channel().1,
             DetailsPageCountConfig {
                 fingerprint: 0,
                 image_folder_options: None,

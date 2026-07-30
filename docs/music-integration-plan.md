@@ -332,7 +332,8 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
   consume するが、`present()` が frame-latency waitable を最大 100ms 待つので、hidden 時は
   **consume-and-hold** にする＝`present()` は呼ばず、drain + frame selection は継続して最新 1 枚を
   `hidden_latest_frame` に hold。**present 成功時の再生状態更新（FirstFrameReady / last_displayed_pts_bits /
-  seek override clear）は hidden 中も実行**（でないと音声モード中 seek で engine が映像 ready 待ちに戻る）。
+  seek override clear）は hidden 中も実行**する。なお 2026-07-30 の readiness 修正後、FirstFrameReady は
+  hidden 音声モードの再生開始条件ではなく、位置・復帰表示用 bookkeeping として維持する。
   show 時は hold フレームを 1 回 present してから `show_and_raise()`。
 - **owner-sync ゲート**（Codex Q2）: `ensure_native_video_front` 冒頭 + `poll_video` 末尾の
   `set_existing_guis_owner_to_hwnd` + `hud_raise_rx` drain + `native_video_presenter_hwnd_for_focus_guard`
@@ -341,8 +342,8 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
   明示 hide、overlay tick / cursor polling / HUD raise burst を抑止。perf overlay は show 時に history reset。
 - **`video_output_disabled`（7a）+ engine の `effective_has_video`（#5 修正）は削除**（未リリース、この方式では
   映像を止めないので不要）。ただし audio-only ファイル用の `has_video=false` + ReadinessLatch video gate は残す。
-  #5（音声モード seek で停止）は「映像を生かすので seek 後 FirstFrameReady が来る」で解消（consume-and-hold が
-  present 成功時 bookkeeping を出す前提）。
+  #5（音声モード seek で停止）は当初「映像を生かすので seek 後 FirstFrameReady が来る」で解消したが、
+  2026-07-30 に `MediaVisualMode::Music` から音声のみの readiness を導出する形へ一般化した。
 - **10 ステップ実装計画**（Codex）: (1)`NativeVideoOutputCommand::SetWindowVisible{visible,request_id}` + ack
   event (2)`NativeVideoOutput::set_window_visible()` + `PostMessage(WM_NULL)` wake (3)presenter loop に
   `presenter_hidden` + `hidden_latest_frame` (4)hidden 中も drain + frame selection 継続 + present 成功時
@@ -368,14 +369,16 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
     bookkeeping（`last_displayed_pts_bits` / `displayed_frame_seq` / `first_presented` / FirstFrameReady /
     seek override clear）を実行、最新 1 枚を `hidden_latest_frame` に hold（前回 hold は
     `native_reset_unpresented_frame` で解放）。cursor polling / HUD raise burst / periodic overlay tick は
-    `!presenter_hidden` で抑止。
+    `!presenter_hidden` で抑止。2026-07-30 以降、これは位置・復帰表示のための bookkeeping であり、
+    Buffering→Playing は hidden presenter の FirstFrameReady に依存しない。
   - **owner-sync ゲート**（step 6）: `ensure_native_video_front` / poll_video VST owner 同期 /
     `native_video_presenter_hwnd_for_focus_guard` / hud_raise drain を `video_audio_mode.is_some()` で
     「presenter 非アクティブ扱い」にして、現行 detach 方式（hwnd=0）と同じ挙動を再現。
   - **step 9（`video_output_disabled` 7a + `effective_has_video` #5 削除）実施済み（2026-07-05）**。
     enter/exit が `set_video_output_disabled` を呼ばなくなったので flag は常に false = demux gate / readiness
-    latch とも **inert（通常動画とバイト等価）**。この方式は映像を止めず、seek 後の FirstFrameReady は生きた
-    presenter の consume-and-hold が発行するので `effective_has_video` の OFF 経路は不要だった。削除内容:
+    latch とも **inert（通常動画とバイト等価）**。2026-07-30 には既存 `MediaVisualMode` を
+    `ReadinessRequirements` へ正規化し、Video は従来の映像+音声要件、Music は音声要件で判定する形へ
+    一般化したため、`effective_has_video` のような runtime 映像 OFF flag は引き続き不要。削除内容:
     ① decoder.rs = `VideoDynamicState::video_output_disabled` field + `drain_or_discard_pending_video_packets`
     helper（3 呼び出し元は `drain_pending_video_packets` へ直結、empty-guard は `while let` no-op と等価で冗長）
     + `run_decoder` の per-iteration snapshot と video-packet discard 分岐 + `send_audio_packet_with_video_drain`

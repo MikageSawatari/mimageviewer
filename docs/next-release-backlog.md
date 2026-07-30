@@ -157,60 +157,6 @@
   viewport lifecycle への対応が要る。detached リワークとの調整も必要
   ([detached-rework-plan.md](detached-rework-plan.md) §2 / §11)。
 - 規模 / 優先度: Large / P2 candidate。
-### 1.25 一時停止中に動画フィルタを変えても画面へ反映されない
-
-- 出典: v2.8.1 検討中のユーザー報告 (2026-07-26)。動画を一時停止した状態で色調補正 /
-  Creative LUT を操作しても絵が変わらず、再生を再開して初めて反映される。静止させて
-  パラメータの効きを見比べたいケース (微調整・前後比較) で機能しない。
-- 原因 (コード確認済み): `NativeVideoPresenter::set_video_grade`
-  ([src/video/native_presenter/mod.rs:3226](../src/video/native_presenter/mod.rs)) は grade 定数バッファと
-  Creative LUT テクスチャを更新するだけで、present を行わない。実際に絵へ乗るのは
-  `VideoGradePipeline::draw` が走る次の `present()` = 次のデコード済みフレームを提示する
-  ときなので、新しいフレームが来ない一時停止中は画面が更新されない。
-- 対応案 (2026-07-26 の領域監査で訂正): **`present_retire.back()` を再 present する形では
-  直せない。** 当初案は誤りだったので採用しない。理由:
-  - `present_retire` は「最後に表示したフレーム」ではなく、**GPU コピー完了までの廃棄待ち
-    キュー**。表示内容の永続的な所有者ではない。
-  - GPU decode 経路のフレームは一度 present すると keyed mutex guard が `ReleaseSync(0)` で
-    writer key へ戻る。次の `present` は `AcquireSync(1)` を要求するが、producer が
-    key=1 へ release するのは reader へ最初に渡すときだけで、held frame は pool slot を
-    占有したままなので再 arm されない。つまり **再 present 自体が失敗する**。
-  - 正しい方向は、native output context が `Empty / Hidden{frame} / Visible{frame, fence}` の
-    単一 typed state を所有し、`present_retire` は廃棄待ち専用として残すこと。
-    GPU frame を Visible として再利用するには、present 後に keyed mutex を reader key=1 へ
-    再 arm する処理も要る。新フレーム提示時に旧 Visible を retire へ移す。
-  - 現在は `present_retire` / `hidden_latest_frame` / `source.queue` の 3 つが「使えそうな
-    最近のフレーム」を部分的に表現しており、この分離が本項と 1.26 の共通原因になっている。
-- 注意:
-  - 再提示は grade 変更を検知したときだけにする。一時停止中に無条件の present ループを
-    回すと `docs/idle-health-check.md` の静止時 repaint 検査に引っかかる。
-  - hidden presenter 中は表示がないので再提示しない (show 時に最新 grade で初回 present
-    されるため症状が出ない)。音声のみの再生も対象外。
-  - 通常フルスクリーンと detached の可視 presenter は同じ問題を共有する。detached 側へ
-    App-global の bool や geometry state を足す形にはせず、native output context 内に閉じる。
-  - ⚠ **presenter スレッドで keyed mutex の `AcquireSync` を呼んではならない** (2026-07-29 に
-    実測したデッドロックの制約。1.27 参照)。再 arm が必要なら、`reset_unpresented_shared_output`
-    と同じく `released_to_reader` を立てるだけにして、実際の key 回復は producer 側の
-    `acquire_shared_output` (`recover_shared_output_keyed_mutex`) に任せる。
-- 規模 / 優先度: Medium / P2 candidate。1.26 と同じ構造修正で一緒に解消する。
-
-### 1.26 一時停止中の placement 切替で新ウィンドウの prime が失敗する
-
-- 出典: v2.8.1 開発中の領域監査 (2026-07-26、コード確認済み・実機未確認)。
-- 症状: 一時停止や EOF などで `source.queue` が空の状態で placement を作り直すと、
-  GPU decode 経路では新 presenter の prime が失敗する。コードは prime の成否に関わらず
-  新ウィンドウを表示する ([src/video/mod.rs:3113](../src/video/mod.rs)) ため、次のフレームが
-  来るまで黒または未初期化の表示になり得る。一時停止のままなら継続する。
-- 原因 (コード確認済み): fallback が `present_retire.back()` を新 presenter へ渡すが
-  ([src/video/mod.rs:3079](../src/video/mod.rs))、既に一度 present された GPU frame は
-  keyed mutex が writer key に戻っており `AcquireSync(1)` が通らない (詳細は 1.25 の対応案)。
-  `hidden_latest_frame` と `source.queue.front()` は未 present なので key=1 のままで、
-  この問題はない。CPU frame にも keyed mutex がないので再提示できる。
-  つまり **「既に一度 present された GPU frame」だけが踏む**。
-- 対応: 1.25 と同じ `FramePresentationState` への集約で一緒に直す。個別の再 arm 分岐を
-  fallback 経路にだけ足す形にはしない。
-- 規模 / 優先度: 1.25 と同一作業 / P2 candidate。
-
 ### 1.27 presenter スレッドが UI スレッドの窓の子 HWND を所有したままブロックする
 
 - 構造修正の設計: [Native video HWND ownership / pump 分離計画](native-video-window-thread-plan.md)。
@@ -238,9 +184,78 @@
      所有しない。Win32 の原則 (窓を持つスレッドはメッセージを回す) に沿う。
   2. presenter スレッドで**ブロックし得る呼び出しを一切行わない**ことを保証する。
      現実的には難しく、1 のほうが構造的。
-- 暫定の運用制約: presenter スレッドで keyed mutex の `AcquireSync` を呼ばない
-  (1.25 / `reset_unpresented_shared_output` のコメント参照)。
+- Stage 4 後の運用制約: pump thread では GPU API を呼ばない。held frame の再提示にも
+  re-arm 用 `AcquireSync` を追加せず、reader key の維持と producer 側回復を使う
+  (`docs/video-architecture.md` の `FramePresentationState` 節参照)。
 - 規模 / 優先度: Medium〜Large / **P1** (ハード ハングのため)。
+
+### 1.28 トレイ格納をまたいで再生を継続し、復帰で動画を再開する
+
+- 出典: 2026-07-30 のユーザー実機検証。**v2.9.0 では「格納時に一時停止」で出荷した**
+  (復帰の瞬間に止まる不自然さを消すことを優先)。将来ここへ再挑戦したい、というユーザー要望。
+- ほしい挙動: トレイ常駐中も再生を続け (少なくとも音声)、復帰したら動画表示も再開する。
+  複数ウィンドウで画像を見ているときは各ウィンドウが復元されるので、動画も同様に戻るのが望ましい。
+
+#### 2026-07-30 に判明していること (ゼロから調べ直さないこと)
+
+- **トレイ格納中、native presenter は実際に破棄されている。** ログの
+  `presenter stopped: native window visibility cancelled` がそれ。音声だけは別系統で
+  鳴り続けるため「再生が続いている」ように見えていた。
+- 復帰時に `poll_video` の `native_presenter_closed()` 終端処理が `close_fullscreen()` を
+  呼ぶ。これは破棄済みという**実態に即した**動作であって、単体では誤りではない。
+- 同じ症状で先に 2 本の経路を潰してある。**再挑戦時に元へ戻さないこと**:
+  - `5f2e37b5` `check_external_folder_changes` → items 再読み込み → detached context
+    promotion 失敗 → close
+  - `43dec1a2` `ShowWindow` による main focus → focus guard が
+    「detached host 登録待ちの `viewer_presentation` が旧 `Fullscreen` のまま」を
+    通常 fullscreen と誤認 → close
+
+#### 有望な方向
+
+**トレイ格納を「破棄」ではなく「hidden presenter」として扱う。**
+
+`d3545b0c` で hidden presenter は pacing queue と decoder channel を drain し、最新 1 枚を
+`Hidden { frame }` に保持するようになった。したがって hidden のままならパイプラインは
+健全に回り、EOF も通常どおり流れる。復帰は「音声モード → 動画表示へ戻す」と同じ経路に
+なり、その仕組みは既にある (placement 切替も `primed=true` で presenter を作り直せている)。
+
+確認が要る点:
+
+- 親 (detached host / メイン窓) を `SW_HIDE` した状態で、子の presenter 窓を生かしたまま
+  にできるか。`native window visibility cancelled` を出している箇所が、意図的な資源節約
+  なのか副作用なのかを先に特定する
+- 格納中の GPU / VRAM 保持コストが許容できるか (§1.9 の parked 窓の資源制御と関係する)
+- 復帰時に音声クロックへ映像を同期し直す必要があるか
+
+#### 注意
+
+- **実機確認が必須の領域**。通常フルスクリーン / in-window / F12 別窓 / 複数ウィンドウ /
+  音声モードの組み合わせで確認する。2026-07-30 はこの領域で 3 回続けて原因を外している
+  (推測で 1 経路ずつ塞ぐと当たらない。**close へ至る道を先に列挙**すること)
+- 出荷済みの「格納時に一時停止」を変えることになるので、挙動変更としてユーザー判断を取る
+- 規模 / 優先度: Medium / P2 candidate。
+
+### 1.29 F12 別ウィンドウがトレイ復帰で戻ってこない
+
+- 出典: 2026-07-30 のユーザー実機検証 (v2.9.0 出荷判定時)。**致命的ではないと判断して
+  v2.9.0 はこのまま出荷**、次版以降で直す、というユーザー合意。
+- 症状: F12 で動画を別ウィンドウへ切り離した状態でメインウィンドウをトレイへ格納し、
+  再表示すると **メインウィンドウは戻るが別ウィンドウは出てこない**。
+  メインウィンドウで再生している (切り離していない) 場合は正常に戻る。
+- §1.28 の「格納時に一時停止」(`2ee2807f`) はメイン窓側の presenter を対象にした変更で、
+  detached 側の窓そのものを復元する経路は別にある。**§1.28 とは別の欠陥として扱う**
+  (向こうは「再生が続くか」、こちらは「窓が戻るか」)。
+- 着手時の確認事項:
+  - 格納時に detached セッションがどの終端経路を通ったか。`d2d17a0c` で
+    `finish_active_detached_session_close` が runtime 撤去まで所有するようになったので、
+    「セッションは閉じたが窓を作り直す側が居ない」のか「窓は残っているが `SW_HIDE` から
+    戻していない」のかをまず切り分ける
+  - 復帰時に復元されるのは何か。画像の複数ウィンドウは復元されるので、その復元経路と
+    動画 detached の差分を並べる
+- **CLAUDE.md の detached 凍結ルール対象**。症状パッチ (復帰後に窓を作り直す retry 等) を
+  入れず、[detached-rework-plan.md](detached-rework-plan.md) §2 の BA 番号へ対応付けてから
+  着手する。
+- 規模 / 優先度: Small〜Medium / P2 candidate。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
@@ -334,6 +349,32 @@
 - 優先度: P2 (体感ヒッチだが既定設定では出ない)。perf-log で
   `fs` / `final_composite_build` の連続発火として観測できるはず。
 
+### 3.4 カラー化待ちの間、画面が「止まっている」ようにしか見えない
+
+- 出典: 2026-07-30 のユーザー実機検証 (v2.9.0 出荷判定時)。**この版はこのまま出荷**、
+  次版の頭で入れる合意。
+- 症状: カラー化 ON でホイールを数ページ送ると、合成が終わるまで前のページが出たままで、
+  何も起きていないように見える。しばらくしてカラー化済みのページが現れる。
+- **待つこと自体は仕様**。白黒とカラーの切り替わりを見せないのは確定要件なので、
+  暫定表示で埋める方向の解決はしない。足りないのは「作業中である」という手掛かりだけ。
+- 退行ではない: 待ちの構造は v2.8.0 のカラー化出荷時から同じで、v2.9.0 は
+  §1 の VRAM 予算一本化 (`32494ef6`) で先読み成功率を 11% → 64% へ上げており、
+  待ち時間はむしろ短くなっている。
+- 実装の当て所は既にある。**新しいフラグを足す必要はない**:
+  - トリガ = `App::fs_holdover_tex` が `FsHoldover::ColorizeDisplayUnit(_)`
+    ([src/app.rs](../src/app.rs) の `enum FsHoldover`)。これが立っている間が厳密に
+    「カラー化待ちで前の表示ユニットを保持している」状態
+  - 描画 = `draw_stamp_embed_overlay` ([src/ui_fullscreen.rs](../src/ui_fullscreen.rs)) と
+    同じ中央の暗いラウンド矩形 + テキストで足りる
+- 決める必要があるのは 2 点。どちらも実機で回さないと決まらない:
+  - **表示までの遅延**。即時に出すとページ送りのたびにチラついて逆効果になる。
+    300〜500ms 程度から始めて実機で詰める
+  - **連結読みの扱い**。連結読みはこの holdover 経路を通らないので、同じ手掛かりを
+    どこに出すかは別途決める。見開きは holdover が表示ユニット単位なのでそのまま乗る
+- 関連: [final-composite-budget-thrash-plan.md](final-composite-budget-thrash-plan.md)
+  (待ち時間そのものを縮める側の作業)。
+- 規模 / 優先度: Small / P2 candidate (体感の問題だが、動いていないと誤解させる)。
+
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
@@ -406,6 +447,34 @@
     `scripts/test-full.ps1` が完走し、launcher のテストも省略されないこと。
 - 規模 / 優先度: Small〜Medium / P2。いずれも製品 runtime の品質問題ではなく、
   同一 worktree で複数セッションを使うリリース運用とクリーン再現性の改善。
+
+### 5.4 idle health の video-pin シナリオが手順どおりでも成立しない
+
+- 出典: v2.9.0 リリース前確認 (2026-07-30)。`static-foreground` / `static-background` は
+  PASS したが、`video-pin-background` は 3 回続けて
+  「動画ピン由来の `thumb.idle_upgrade_ineligible` が準備・測定区間に無く、シナリオ成立を
+  確認できません」で FAIL。**製品側の異常ではないと判断してリリースした**。
+- 判断の根拠 (次に見るときのために残す):
+  - 3 回とも測定区間は「完全 sleep・perf event 0 件・CPU one-core ratio 0.004〜0.006」。
+    このシナリオが探している「静止中に 1 コアを使い続けるループ」は起きていない
+  - 同じセッションの perf ログには `idle_upgrade_ineligible` が **2 件実在**した
+    (最後は t=531.7)。失敗した測定窓 (t=330..345 / t=406..421) の外で発生している
+  - 同セッションの `idle_upgrade_enqueue` は 52 件。大半のタイルは upgrade 対象で、
+    `ineligible` になるのは稀 = ゲートは出にくい方のイベントを必須にしている
+- 疑わしい点 (未確認、着手時に切り分ける):
+  - アイドル高画質化のパスが走るまでの遅延と、evidence 窓 (Enter 前の準備開始〜測定終了) が
+    噛み合っていない。準備中に開き直しても、判定が下りるのが窓の後になる可能性
+  - `ineligible` は「完成済み派生キャッシュがある」ときにしか出ない。ピンを作った直後は
+    その場で生成された新しいサムネイルなので `from_cache` が立たず、そもそも候補にならない
+    ことがある。キャッシュから読み直される状態 (再起動後など) を要求する必要があるかも
+  - ゲートのメッセージが「動画ピン由来の」と言い切るのに、実際の判定は cat/kind だけで
+    ピン由来かを見ていない ([analyze_perf.py](../scripts/analyze_perf.py) の
+    `require_idle_upgrade_ineligible`)。成立条件と検査条件がずれている
+- 直す方向: セットアップ成立の判定を、出にくい 1 イベントの有無ではなく「対象 key の
+  タイルが keep 範囲に入ったこと」で取る。あわせて手順書 ([idle-health-check.md](idle-health-check.md))
+  に、ピン作成直後では成立しない条件を書く。
+- 規模 / 優先度: Small / P2。検査ハーネスの問題で製品挙動ではないが、毎リリース必須の
+  チェックが「必ず落ちる」状態だと、本物の退行を見落とす。
 
 ---
 

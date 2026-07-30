@@ -607,6 +607,61 @@ GPU vendor / target recreate / HWND reuse / DPI・monitor の未検証欄を gat
 単独 gate: placement matrix、parent-destroy-under-render-stall test、input/IME event routing test、
 portable smoke。ここで初めて P1 の ownership invariant が production で成立する。
 
+#### Stage 4 実装記録 (2026-07-29)
+
+production cutover:
+
+- `native-video-window-pump` が `NativeWindowHost` reducer と全 placement の presenter/HUD HWND
+  を所有し、create、message dispatch、visibility/geometry/region/z-order/focus/IME/cursor mutation、
+  publish、destroy を行う。`native-video-render` は `NativeRenderCore`、D3D/DXGI/DComp target、
+  overlay GPU resource、frame queue/present を所有する。
+- pump→render の attach は private な整数 descriptor だけを持つ `NativeRenderTargetTransfer` を
+  bounded lifecycle channel で渡し、render thread 上で opaque `NativeRenderTargets` lease に戻す。
+  `NativeWindowHost` / `NativeVideoWindow` / `HudOverlayWindow` / `NativeRenderTargets` の
+  `!Send + !Sync` と render source の USER32 capability ban は緩めていない。
+- placement switch は reducer の `CreateHidden → AttachTarget → TargetReady → Publish →
+  Destroy(old) → DetachTarget(old)` を production に接続した。新 core の状態復元、overlay prime、
+  利用可能な現 frame の prime のいずれかが失敗した場合は `TargetFailed` で staging host だけを
+  破棄し、旧 host/core と App の committed placement を維持する。
+- wndproc は generation/epoch stamp 付き event の decode/enqueue に限定した。mouse move、
+  geometry/DPI、HUD raise、render→pump visual/observation、App/render の高頻度 HUD state は
+  latest-value slot で coalesce する。wndproc→render の slot は atomic pointer swap であり、
+  HWND owner は drain 側の mutex を待たない。close、key、text、IME commit/preedit、button/wheel/leave/
+  destroy、placement/source/action は bounded lossless channel を使い、満杯・切断は silent drop
+  ではなく session quarantine fault にする。
+- 従来の VST worker→App HUD raise 用 unbounded `mpsc` も `AtomicBool` latest-value latch に
+  置換し、VST hook は lock/wait なしの store、App は frame ごとの swap で coalesce する。
+- 個別 HWND の `WM_DESTROY` は `Destroyed(epoch)` だけを reducer に通知する。
+  `post_quit_on_destroy` は削除し、typed `Shutdown` / `Close` reducer が全 pump-owned HWND の
+  destroy を完了した後に限り pump 自身へ最終 `WM_QUIT` を post する。pump は render stop ack
+  や join を待たず、Drop の detached join helper も pump join を render join より先に行う。
+- render の error/panic は `RenderFault` として pump へ非同期通知し、`BackendFault` close と
+  `native video session quarantined` error に収束させる。driver call が永続停止した場合も UI/pump
+  と HWND close は進み、停止した render thread/GPU resource は process 終了まで再利用しない。
+
+追加した単独 gate は `native_video_placement_mapping_is_exhaustive`、
+`window_event_sink_coalesces_mouse_and_keeps_key_ime_lossless`、
+`lossless_window_event_overflow_is_an_explicit_session_fault`、
+`native_command_bus_coalesces_hud_state_and_keeps_actions_lossless`、
+`native_output_event_bus_coalesces_mouse_and_keeps_key_lossless`、
+`requested_hud_topology_accepts_presenter_only_backend_fallback`、および実 HWND/DComp を production
+pump/render 経路で使う ignored watchdog test
+`production_parent_destroy_remains_bounded_during_render_stall`。最後の test は render thread に
+`NativeRenderCore` を保持したまま停止させ、別 thread owner の親 HWND を破棄して parent destroy
+と pump join が各 2 秒未満、親/child HWND がともに無効になることを 30 秒 subprocess watchdog
+付きで検証する。2026-07-29 の Stage 3 対象環境 (Windows 10 Pro 25H2 / RTX 4090 /
+driver 32.0.15.9621) で production gate は通過した。
+
+Stage 5 の VST owner-applied ack/hidden anchor、Stage 6 の source/EOF 全 sequence、Stage 7 の
+health watchdog は予定どおり未実装。Stage 4 は既存の fire-and-forget VST owner policy と
+decoder/audio/frame queue ownership を変更していない。
+
+自動検証は `cargo fmt`、`cargo test -p mimageviewer --lib` (4497 passed / 20 ignored)、
+`cargo test --test ui_snapshot` (22 passed、snapshot 差分なし)、上記 production stall test が成功。
+`prepare-portable-smoke.ps1` による portable release build と disposable data directory 作成も成功した。
+対話 portable smoke は Computer Use の mImageViewer 利用承認が得られるまで未完了であり、
+この gate が通る前に Stage 4 commit を作らない。
+
 ### Stage 5: VST owner handoff と focus/IME 境界を堅牢化
 
 変わるもの:
@@ -646,11 +701,24 @@ Windows test。
 単独 gate: pure sequence/property tests、fake delayed render tests、source/placement integration
 tests。
 
+> 2026-07-30 追記: Stage 4 の production cutover 後、§1.25/§1.26 の frame ownership slice は
+> リワーク外の構造修正として先行実装した。native output context の
+> `FramePresentationState` が paused grade refresh / placement prime の共通 source になり、
+> re-arm 用 `AcquireSync` は追加せず producer-side key recovery へ接続した。これは Stage 6 の
+> source/EOF/device-loss 全 lifecycle hardening が完了したことを意味しない。
+>
+> 2026-07-30 追記: hidden consume-and-hold の frame drain slice も先行修正した。hidden は
+> visible の pacing queue cap を使わず、到着済み frame を全件消費して最新 1 枚だけを typed
+> `Hidden` state に残す。これにより video decoder が demux EOF まで進む。window lifecycle、
+> source generation、EOF policy は結合せず、Stage 6 の全 sequence / failure hardening は引き続き
+> 未完了である。
+
 ### Stage 7: legacy path 除去、health detection、最終実機 gate
 
 変わるもの:
 
-- 一 thread の window-owning presenter path と `post_quit_on_destroy` compatibility code を削除する。
+- Stage 4 で削除済みの一 thread production path / `post_quit_on_destroy` が再流入していないことを
+  source/type gate で固定し、Stage 3 spike など test-only harness の残置方針を確定する。
 - HWND owner assertion と §7.3 の health watchdog/log を常時有効にする。
 - `video-architecture.md`、detached plan §11、必要な release notes を更新する。
 - full automated gate と最小の実機確認を行う。
@@ -811,17 +879,19 @@ root cause は特定の `AcquireSync` call ではなく、`run_native_video_outp
   failure/close を同じ state machine で扱う。
 - deliberate render stall の自動 test が「pump/parent destroy は進む」を直接検証する。
 
-このため、revert 済みの `rearm_presented_shared_output` を戻す/避けることとも、§1.25 の暫定
-`AcquireSync` 運用制約とも独立した構造修正である。
+このため、Stage 4 自体は revert 済みの `rearm_presented_shared_output` を戻す/避けることとも
+独立した構造修正である。その後の 2026-07-30 frame ownership 修正も追加の re-arm
+`AcquireSync` ではなく reader key 維持 + producer-side recovery を採用し、この ownership
+boundary を維持した。
 
 ### 9.3 実装時の §11 記録草案
 
-設計だけの現時点では §11 に実装済みとして記録しない。Stage 4 の cutover 前に ClaudeCode と
-Codex が §2 適合を再確認し、実装 commit と実測結果を用いて次の内容を追記する。
+Stage 4 の cutover は ClaudeCode と Codex が §2 適合を再確認したうえで実装し、
+detached plan §11 に次の内容を反映した。
 
 | 日付 | 変更 | 触った範囲 | 凍結ルール適合理由 | 検証 |
 | --- | --- | --- | --- | --- |
-| YYYY-MM-DD | native video HWND pump と GPU render thread を分離。全 placement/HUD の create/pump/destroy を専用 pump 所有へ移し、`post_quit_on_destroy` を typed lifecycle に置換 | `src/video/mod.rs`、`src/video/native_window.rs`、`src/video/native_presenter/*`、App→native output command/host lease boundary。detached viewport/rect/focus model 自体は変更しない | root cause である「HWND owner が unbounded GPU wait を実行」を全 placement で不可能にする。rect heuristic、viewport recreate、App-global detached flag、delay/retry を追加せず、既存 host registry と placement owner を read-only 入力として使うため症状パッチではない | reducer/type tests、render-stall parent-destroy Windows test、全 placement/hidden/EOF/VST tests、portable smoke、実機5項目 |
+| 2026-07-29 | native video HWND pump と GPU render thread を分離。全 placement/HUD の create/pump/destroy を専用 pump 所有へ移し、`post_quit_on_destroy` を typed lifecycle に置換 | `src/video/mod.rs`、`src/video/native_window_pump.rs`、`src/video/native_window.rs`、`src/video/native_window_host.rs`、`src/video/native_window_host/hud_window.rs`、`src/video/native_presenter/render_core.rs`、`src/video/window_host_contract.rs`、`src/app/native_video.rs`、`src/app.rs`、`src/video/dsp/mod.rs`。detached viewport/rect/focus model 自体は変更しない | root cause である「HWND owner が unbounded GPU wait を実行」を全 placement で不可能にする。rect heuristic、viewport recreate、App-global detached flag、delay/retry を追加せず、既存 host registry と placement owner を read-only 入力として使うため症状パッチではない | reducer/type/channel tests、production render-stall parent-destroy Windows test、lib/UI snapshot、portable smoke、実機5項目 |
 
 記録には実際に変更した file、Stage、commit、未解決 risk、DirectComposition cross-thread spike の
 対象 GPU/Windows build も添える。

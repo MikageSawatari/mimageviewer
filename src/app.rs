@@ -2169,6 +2169,8 @@ struct ViewerContextBundle {
     input_generation: std::collections::HashMap<usize, u64>,
     fs_pending:
         std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
+    fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
     fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
     fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
     items_generation: u64,
@@ -2239,7 +2241,7 @@ struct ViewerContextBundle {
     cached_nav_indices: Option<Vec<usize>>,
     cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
     fs_nav_locked_gen: Option<u64>,
-    fs_holdover_tex: Option<egui::TextureHandle>,
+    fs_holdover_tex: Option<FsHoldover>,
     fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
     virtual_folder_writeback: Option<VirtualFolderWriteback>,
     pdf_prefetch_grace_until: Option<std::time::Instant>,
@@ -2452,6 +2454,7 @@ impl ViewerContextBundle {
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
+            fs_pdf_display_target: None,
             fs_early_dims: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
             items_generation: 0,
@@ -4146,8 +4149,20 @@ pub(crate) struct MetadataLoadResult {
 pub(crate) enum LazyColumnState {
     Disabled,
     NotRequested,
-    Loading { done: usize, total: usize },
-    Ready { failed: usize },
+    Loading {
+        done: usize,
+        total: usize,
+    },
+    /// 現ジョブは完了したが、描画後の可視 + 先読み範囲に次ジョブが必要かを
+    /// まだ照合していない走査セッション。ジョブ境界を Ready として公開しない。
+    Reconciling {
+        done: usize,
+        total: usize,
+        failed: usize,
+    },
+    Ready {
+        failed: usize,
+    },
     Cancelled,
 }
 
@@ -4157,7 +4172,7 @@ impl LazyColumnState {
     }
 
     fn is_loading(self) -> bool {
-        matches!(self, Self::Loading { .. })
+        matches!(self, Self::Loading { .. } | Self::Reconciling { .. })
     }
 }
 
@@ -4168,6 +4183,12 @@ impl Default for LazyColumnState {
 }
 
 const DETAILS_LAZY_META_STALE_CAP: usize = 50_000;
+/// 詳細遅延メタの target 構築を UI thread で 1 frame に進める上限。
+///
+/// 50 万件の smart folder でも全件 clone + 判定を 1 frame に集中させず、約 1us/item の
+/// 実機報告なら 4ms 前後の slice へ抑える。走査 session は cursor を保持し、scroll 時は
+/// worker の priority queue だけを更新するため先頭から数え直さない。
+const DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME: usize = 4_096;
 
 #[derive(Clone, Default)]
 pub(crate) struct DetailsLazyMeta {
@@ -4234,13 +4255,27 @@ impl DetailsLazyMeta {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct DetailsLazyFieldFlags {
     page_count: bool,
     created_at: bool,
     ai_metadata: bool,
     image_dims: bool,
     video_meta: bool,
+}
+
+impl DetailsLazyFieldFlags {
+    fn any(self) -> bool {
+        self.page_count || self.created_at || self.ai_metadata || self.image_dims || self.video_meta
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.page_count |= other.page_count;
+        self.created_at |= other.created_at;
+        self.ai_metadata |= other.ai_metadata;
+        self.image_dims |= other.image_dims;
+        self.video_meta |= other.video_meta;
+    }
 }
 
 /// 詳細列の表示文字列が変化した世代。
@@ -4289,7 +4324,66 @@ struct DetailsMetaPending {
     selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<DetailsMetaEvent>,
+    phase: DetailsMetaPendingPhase,
+}
+
+enum DetailsMetaPendingPhase {
+    Planning(DetailsMetaTargetPlan),
+    Loading {
+        rx: mpsc::Receiver<DetailsMetaEvent>,
+        priority_tx: mpsc::Sender<Vec<DetailsMetaTarget>>,
+    },
+}
+
+enum DetailsMetaScanOrder {
+    Explicit {
+        indices: Vec<usize>,
+        cursor: usize,
+    },
+    CurrentGrid {
+        cursor: usize,
+        len: usize,
+        order_revision: u64,
+    },
+}
+
+impl DetailsMetaScanOrder {
+    fn scanned(&self) -> usize {
+        match self {
+            Self::Explicit { cursor, .. } | Self::CurrentGrid { cursor, .. } => *cursor,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Explicit { indices, .. } => indices.len(),
+            Self::CurrentGrid { len, .. } => *len,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.scanned() >= self.len()
+    }
+
+    fn is_incremental(&self) -> bool {
+        matches!(self, Self::CurrentGrid { .. })
+    }
+}
+
+struct DetailsMetaTargetPlan {
+    generation: u64,
+    order: DetailsMetaScanOrder,
+    visible_near: HashSet<usize>,
+    load_all_page_counts: bool,
+    ai_facet_load: bool,
+    page_count_config: DetailsPageCountConfig,
+    visible_targets: Vec<DetailsMetaTarget>,
+    background_targets: Vec<DetailsMetaTarget>,
+    cached_done: usize,
+    cached_failed: usize,
+    total: usize,
+    scan_slices: usize,
+    scan_started_at: Option<std::time::Instant>,
 }
 
 fn details_meta_reprioritize_candidate(
@@ -4340,6 +4434,7 @@ enum DetailsMetaEvent {
 
 #[derive(Clone)]
 struct DetailsMetaTarget {
+    idx: usize,
     key: String,
     item: GridItem,
     relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
@@ -4356,6 +4451,26 @@ struct DetailsMetaTarget {
     load_image_dims: bool,
     load_video_meta: bool,
     priority: crate::io_semaphore::IoPriority,
+}
+
+impl DetailsMetaTarget {
+    fn requested_fields(&self) -> DetailsLazyFieldFlags {
+        DetailsLazyFieldFlags {
+            page_count: self.load_page_count,
+            created_at: self.load_created_at,
+            ai_metadata: self.load_ai_metadata,
+            image_dims: self.load_image_dims,
+            video_meta: self.load_video_meta,
+        }
+    }
+
+    fn remove_processed_fields(&mut self, processed: DetailsLazyFieldFlags) {
+        self.load_page_count &= !processed.page_count;
+        self.load_created_at &= !processed.created_at;
+        self.load_ai_metadata &= !processed.ai_metadata;
+        self.load_image_dims &= !processed.image_dims;
+        self.load_video_meta &= !processed.video_meta;
+    }
 }
 
 #[derive(Clone)]
@@ -4648,6 +4763,222 @@ use crate::thumb_loader::{
     encode_and_save_with_source_dims, is_jpeg_entry, process_load_request,
     read_exif_orientation_from_bytes,
 };
+
+const PRE_GRID_PERF_STAGE_COUNT: usize = 14;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreGridPerfStage {
+    SearchBar,
+    FavSearchBar,
+    GlobalSearchBar,
+    TagViewBar,
+    FacetFilterBar,
+    DetailsLazyStatusBar,
+    SelectionInfoBar,
+    FolderPane,
+    CheckedSelectionOverlay,
+    DetailsColumnMenuCheck,
+    PopupWheelSuppression,
+    FolderPaneScrollGuard,
+    ProcessScroll,
+    StackReconcile,
+}
+
+impl PreGridPerfStage {
+    const ALL: [Self; PRE_GRID_PERF_STAGE_COUNT] = [
+        Self::SearchBar,
+        Self::FavSearchBar,
+        Self::GlobalSearchBar,
+        Self::TagViewBar,
+        Self::FacetFilterBar,
+        Self::DetailsLazyStatusBar,
+        Self::SelectionInfoBar,
+        Self::FolderPane,
+        Self::CheckedSelectionOverlay,
+        Self::DetailsColumnMenuCheck,
+        Self::PopupWheelSuppression,
+        Self::FolderPaneScrollGuard,
+        Self::ProcessScroll,
+        Self::StackReconcile,
+    ];
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::SearchBar => "search",
+            Self::FavSearchBar => "favsearch",
+            Self::GlobalSearchBar => "global_search",
+            Self::TagViewBar => "tag_view",
+            Self::FacetFilterBar => "facet",
+            Self::DetailsLazyStatusBar => "details_status",
+            Self::SelectionInfoBar => "selection_info",
+            Self::FolderPane => "folder_pane",
+            Self::CheckedSelectionOverlay => "checked_overlay",
+            Self::DetailsColumnMenuCheck => "column_menu_check",
+            Self::PopupWheelSuppression => "popup_wheel",
+            Self::FolderPaneScrollGuard => "scroll_guard",
+            Self::ProcessScroll => "scroll",
+            Self::StackReconcile => "stack_reconcile",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreGridPerfRecorder {
+    started_at: std::time::Instant,
+    last_mark_at: std::time::Instant,
+    stage_ms: [f64; PRE_GRID_PERF_STAGE_COUNT],
+    next_stage: usize,
+}
+
+impl PreGridPerfRecorder {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            last_mark_at: started_at,
+            stage_ms: [0.0; PRE_GRID_PERF_STAGE_COUNT],
+            next_stage: 0,
+        }
+    }
+
+    fn mark(&mut self, stage: PreGridPerfStage) {
+        debug_assert_eq!(stage as usize, self.next_stage);
+        let now = std::time::Instant::now();
+        self.stage_ms[stage as usize] =
+            now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.last_mark_at = now;
+        self.next_stage += 1;
+    }
+
+    fn finish(
+        self,
+        details_column_menu_open: bool,
+        folder_pane_blocks_grid_scroll: bool,
+    ) -> PreGridPerfBreakdown {
+        debug_assert_eq!(self.next_stage, PRE_GRID_PERF_STAGE_COUNT);
+        PreGridPerfBreakdown {
+            total_ms: self
+                .last_mark_at
+                .duration_since(self.started_at)
+                .as_secs_f64()
+                * 1000.0,
+            stage_ms: self.stage_ms,
+            details_column_menu_open,
+            popup_wheel_suppression_ran: !details_column_menu_open,
+            folder_pane_blocks_grid_scroll,
+            process_scroll_ran: !folder_pane_blocks_grid_scroll && !details_column_menu_open,
+        }
+    }
+}
+
+#[inline]
+fn pre_grid_perf_start_with(
+    perf_on: bool,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<PreGridPerfRecorder> {
+    perf_on.then(now).map(PreGridPerfRecorder::new)
+}
+
+#[inline]
+fn mark_pre_grid_perf(recorder: &mut Option<PreGridPerfRecorder>, stage: PreGridPerfStage) {
+    if let Some(recorder) = recorder {
+        recorder.mark(stage);
+    }
+}
+
+#[derive(Debug)]
+struct PreGridPerfBreakdown {
+    total_ms: f64,
+    stage_ms: [f64; PRE_GRID_PERF_STAGE_COUNT],
+    details_column_menu_open: bool,
+    popup_wheel_suppression_ran: bool,
+    folder_pane_blocks_grid_scroll: bool,
+    process_scroll_ran: bool,
+}
+
+impl PreGridPerfBreakdown {
+    const EVENT_FIELDS: [(&'static str, PreGridPerfStage); PRE_GRID_PERF_STAGE_COUNT] = [
+        ("search_bar_ms", PreGridPerfStage::SearchBar),
+        ("favsearch_bar_ms", PreGridPerfStage::FavSearchBar),
+        ("global_search_bar_ms", PreGridPerfStage::GlobalSearchBar),
+        ("tag_view_bar_ms", PreGridPerfStage::TagViewBar),
+        ("facet_filter_bar_ms", PreGridPerfStage::FacetFilterBar),
+        (
+            "details_lazy_status_bar_ms",
+            PreGridPerfStage::DetailsLazyStatusBar,
+        ),
+        ("selection_info_bar_ms", PreGridPerfStage::SelectionInfoBar),
+        ("folder_pane_ms", PreGridPerfStage::FolderPane),
+        (
+            "checked_selection_overlay_ms",
+            PreGridPerfStage::CheckedSelectionOverlay,
+        ),
+        (
+            "details_column_menu_check_ms",
+            PreGridPerfStage::DetailsColumnMenuCheck,
+        ),
+        (
+            "popup_wheel_suppression_ms",
+            PreGridPerfStage::PopupWheelSuppression,
+        ),
+        (
+            "folder_pane_scroll_guard_ms",
+            PreGridPerfStage::FolderPaneScrollGuard,
+        ),
+        ("process_scroll_ms", PreGridPerfStage::ProcessScroll),
+        ("stack_reconcile_ms", PreGridPerfStage::StackReconcile),
+    ];
+
+    fn emit(&self, frame_number: u64) {
+        let mut extras = Vec::with_capacity(PRE_GRID_PERF_STAGE_COUNT + 6);
+        extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        for (field, stage) in Self::EVENT_FIELDS {
+            extras.push((
+                field,
+                serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+        }
+        extras.push((
+            "details_column_menu_open",
+            serde_json::Value::from(self.details_column_menu_open),
+        ));
+        extras.push((
+            "popup_wheel_suppression_ran",
+            serde_json::Value::from(self.popup_wheel_suppression_ran),
+        ));
+        extras.push((
+            "folder_pane_blocks_grid_scroll",
+            serde_json::Value::from(self.folder_pane_blocks_grid_scroll),
+        ));
+        extras.push((
+            "process_scroll_ran",
+            serde_json::Value::from(self.process_scroll_ran),
+        ));
+        crate::perf::event("ui", "pre_grid_breakdown", None, 0, &extras);
+    }
+
+    fn dominant_summary(&self) -> String {
+        let mut first = (PreGridPerfStage::SearchBar, f64::NEG_INFINITY);
+        let mut second = first;
+        for stage in PreGridPerfStage::ALL {
+            let candidate = (stage, self.stage_ms[stage as usize]);
+            if candidate.1 > first.1 {
+                second = first;
+                first = candidate;
+            } else if candidate.1 > second.1 {
+                second = candidate;
+            }
+        }
+        format!(
+            "{}:{:.1}ms,{}:{:.1}ms",
+            first.0.short_label(),
+            first.1,
+            second.0.short_label(),
+            second.1
+        )
+    }
+}
 
 /// 消しゴムモードのツール種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5529,6 +5860,59 @@ pub(crate) struct FinalCompositeEntry {
 pub(crate) struct ContinuousPageTransition {
     pub(crate) texture: egui::TextureHandle,
     pub(crate) items_generation: u64,
+}
+
+/// フルスクリーンの一時表示を 1 フィールドで所有する typed state。
+///
+/// フォルダ横断は従来どおり旧ビューの単一 texture を overlay として保持する。
+/// 同一 viewer 内のカラー化待ちは、旧ページを個別 slot に分けず、画面上の
+/// 1 表示ユニット（単ページまたは見開き）を一体で保持する。
+#[derive(Clone)]
+pub(crate) enum FsHoldover {
+    FolderNavigation(egui::TextureHandle),
+    ColorizeDisplayUnit(ColorizeDisplayUnitHoldover),
+}
+
+impl FsHoldover {
+    pub(crate) fn folder_navigation_texture(&self) -> Option<&egui::TextureHandle> {
+        match self {
+            Self::FolderNavigation(texture) => Some(texture),
+            Self::ColorizeDisplayUnit(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
+        match self {
+            Self::FolderNavigation(texture) => texture.id(),
+            Self::ColorizeDisplayUnit(holdover) => holdover
+                .previous
+                .pages
+                .first()
+                .expect("colorize display unit must contain at least one page")
+                .texture
+                .id(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ColorizeDisplayUnitHoldover {
+    /// `open_fullscreen` 後にこの idx が current である間だけ previous を公開する。
+    pub(crate) target_idx: usize,
+    pub(crate) previous: FsDisplayUnitHoldover,
+}
+
+#[derive(Clone)]
+pub(crate) struct FsDisplayUnitHoldover {
+    /// 画面上の順序。単ページは 1 要素、見開きは [left, right] の 2 要素。
+    pub(crate) pages: Vec<FsDisplayUnitHoldoverPage>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FsDisplayUnitHoldoverPage {
+    pub(crate) idx: usize,
+    pub(crate) texture: egui::TextureHandle,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7218,6 +7602,21 @@ fn viewer_context_media_teardown_plan(
 }
 
 #[cfg(windows)]
+fn pause_viewer_context_bundle_media_for_tray(bundle: &ViewerContextBundle) -> usize {
+    let mut paused = 0;
+    for entry in bundle.fs_cache.values() {
+        let FsCacheEntry::Video { player, .. } = entry else {
+            continue;
+        };
+        if player.intent_playing() {
+            player.set_playing(false);
+            paused += 1;
+        }
+    }
+    paused
+}
+
+#[cfg(windows)]
 fn apply_viewer_context_media_resume_updates(
     map: &mut std::collections::HashMap<String, f64>,
     updates: &[ViewerContextMediaResumeUpdate],
@@ -7858,6 +8257,10 @@ pub struct App {
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
     pub(crate) fs_pending:
         std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+
+    /// fullscreen / detached / in-window の実 viewport と effective ppp から得た
+    /// PDF 初回レンダターゲット。viewer context と一緒に swap する。
+    pub(crate) fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
 
     /// fs_load ワーカーがヘッダ解析だけで取得した先行寸法 (fullscreen 用)。
     /// `FsLoadResult::DimsOnly` を受信すると登録され、本体 (`Static` など) で
@@ -8589,7 +8992,8 @@ pub struct App {
     details_meta_pending: Option<DetailsMetaPending>,
     /// 詳細遅延列の対象集合 revision。フィルタ変更で進め、古い worker 完了時に再要求する。
     details_lazy_visible_revision: u64,
-    /// 画像解像度列の readiness。列全体が Ready になるまでソート/フィルタは無効。
+    /// 詳細遅延メタの走査セッション状態。`details_meta_pending` は個々の worker job を所有し、
+    /// この state は連続 job をまたいで Ready になるまでソート/フィルタを無効にする。
     pub(crate) details_image_dims_state: LazyColumnState,
     /// AI モデル/生成ツール facet をユーザーが開いたか、条件が有効なときに遅延メタを読む。
     pub(crate) ai_model_facet_requested: bool,
@@ -8933,6 +9337,10 @@ pub struct App {
     pub(crate) current_book_bookmarks_request: Option<(u64, String)>,
     /// 左パネルで編集中の本ブックマーク名称。
     pub(crate) book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
+    /// `request_focus` 発行後、対象 viewport の次 pass だけを所有する focus claim。
+    /// draft state は所有権に使わず、対象 focus / 別 focus / 編集終了 / 1 pass 失敗で解除する。
+    pending_text_input_focus:
+        std::cell::Cell<Option<crate::keyboard_input::PendingTextInputFocusClaim>>,
     pub(crate) book_bookmark_request_seq: u64,
     pub(crate) book_bookmark_pending_requests: std::collections::HashSet<u64>,
     /// フルスクリーンで読んだ本の履歴 DB。
@@ -10390,11 +10798,10 @@ pub struct App {
     /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
     /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
-    /// ロック中に「現在画面に映っていた」テクスチャを退避しておく場所。
-    /// items 入れ替え (`install_new_items`) で fs_cache が全 drop されても、
-    /// ナビ発火直前に Arc::clone でここに保持しておけば描画パスから参照可能。
-    /// `egui::TextureHandle` は内部 Arc なので clone は refcount inc だけ。
-    pub(crate) fs_holdover_tex: Option<egui::TextureHandle>,
+    /// 旧表示を保持する単一 typed state。`FolderNavigation` は従来どおり旧ビューの
+    /// 1 texture、`ColorizeDisplayUnit` は単ページ / 見開き全体を 1 unit として持つ。
+    /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
+    pub(crate) fs_holdover_tex: Option<FsHoldover>,
 
     /// 仮想フォルダ (PDF/ZIP) 進入時に「最初のページのサムネを完成させたら親 catalog
     /// にも書き戻す」ための write-back ターゲット。`Some` のとき finalize シグナルが
@@ -10729,12 +11136,11 @@ pub struct App {
     /// z-order を調整する (= 動画再生中だけ手前)。
     #[cfg(windows)]
     pub(crate) vst3_was_fullscreen: bool,
-    /// CP7: `DspBridge::hud_raise_hook` 経由で発火された raise 要求を受ける channel。
-    /// hook クロージャが unbounded `mpsc::send(())` するだけの非ブロッキング処理で、
-    /// App.update で `try_iter` で drain → 1 件以上来てれば `VideoPlayer::request_hud_raise()`
-    /// を 1 回だけ呼ぶ (= coalesce)。
+    /// CP7: `DspBridge::hud_raise_hook` 経由で発火された raise 要求の latest-value latch。
+    /// hook は `true` を store するだけで非ブロッキング。App.update が swap(false) し、
+    /// 1 回以上来ていれば `VideoPlayer::request_hud_raise()` を 1 回だけ呼ぶ (= coalesce)。
     #[cfg(windows)]
-    pub(crate) hud_raise_rx: std::sync::mpsc::Receiver<()>,
+    pub(crate) hud_raise_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// ★固定 (Snapshot Lock) 機能の現在状態。`Some` なら active、`None` なら inactive。
     /// 設計: [docs/star-lock-snapshot-design.md](../docs/star-lock-snapshot-design.md)
@@ -11138,7 +11544,7 @@ impl App {
         let creative_lut_library =
             crate::creative_lut::CreativeLutLibrary::new(&settings.creative_luts);
 
-        let mut app = Self {
+        let app = Self {
             address: String::new(),
             current_folder: None,
             navigation_scope: ViewerNavigationScope::Main,
@@ -11264,6 +11670,7 @@ impl App {
             view_trim_db,
             input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
+            fs_pdf_display_target: None,
             fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
             colorize_mono_summary_cache: std::collections::HashMap::new(),
@@ -11658,6 +12065,7 @@ impl App {
             current_book_bookmarks_key: None,
             current_book_bookmarks_request: None,
             book_bookmark_title_edit: None,
+            pending_text_input_focus: std::cell::Cell::new(None),
             book_bookmark_request_seq: 0,
             book_bookmark_pending_requests: std::collections::HashSet::new(),
             reading_history_db,
@@ -12268,14 +12676,7 @@ impl App {
             #[cfg(windows)]
             vst3_was_fullscreen: false,
             #[cfg(windows)]
-            hud_raise_rx: {
-                // CP7: 仮の placeholder channel (= 即解放される)。実体の channel は
-                // 下の post-init ブロックで作り直して `dsp_bridge.set_hud_raise_hook` も登録する。
-                // (Default impl の struct literal 中では他 field を参照できないので、
-                // 構築後にもう一度書き換える。)
-                let (_, rx) = std::sync::mpsc::channel::<()>();
-                rx
-            },
+            hud_raise_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // ★固定 (Snapshot Lock) は起動時 inactive。
             // settings.db には書かない (= app 再起動で消える、設計どおり)。
             snapshot: None,
@@ -12285,15 +12686,12 @@ impl App {
 
         #[cfg(windows)]
         {
-            // CP7: hud_raise hook を `dsp_bridge` に登録し、hook → mpsc channel → App.update
-            // の経路を確立する。tx は move closure 内に取り込み、rx を App field に上書き。
-            let (hud_tx, hud_rx) = std::sync::mpsc::channel::<()>();
-            app.hud_raise_rx = hud_rx;
+            // Stage 4: VST worker → App の高頻度 raise は latest-value latch で coalesce
+            // する。unbounded queue を作らず、hook は lock/wait なしで返る。
+            let hud_raise_pending = std::sync::Arc::clone(&app.hud_raise_pending);
             app.dsp_bridge
                 .set_hud_raise_hook(std::sync::Arc::new(move || {
-                    // unbounded mpsc の `send` は非ブロッキング (= worker thread から呼ばれて
-                    // も block しない、Codex プラン Step 10)。
-                    let _ = hud_tx.send(());
+                    hud_raise_pending.store(true, std::sync::atomic::Ordering::Release);
                 }));
         }
 
@@ -13057,6 +13455,136 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// Gather every App/egui input needed by the pass owner in one place.
+    ///
+    /// This is the only impure ownership entry: the decision function itself
+    /// receives copied bool/id values only. `book_bookmark_title_edit` is
+    /// deliberately not read; only the explicit one-pass focus claim below can
+    /// represent an editor before focus lands. Native presenter text input is
+    /// claimed upstream on its own egui context, so no key from that owner is
+    /// forwarded into this App viewport snapshot.
+    fn keyboard_ownership_snapshot(
+        &self,
+        ctx: &egui::Context,
+    ) -> crate::keyboard_input::KeyboardOwnershipSnapshot {
+        use crate::keyboard_input::{
+            PendingFocusEvent, ShortcutScope, ShortcutSurface, TextInputPhase,
+            transition_pending_focus_claim,
+        };
+
+        let viewport = ctx.viewport_id();
+        let viewport_focused = ctx.input(|input| input.viewport().focused).unwrap_or(true);
+        let focused_widget = ctx.memory(|memory| memory.focused());
+        let pending_transition = transition_pending_focus_claim(
+            self.pending_text_input_focus.get(),
+            PendingFocusEvent::ObservePass {
+                viewport,
+                pass: ctx.cumulative_pass_nr(),
+                focused_widget,
+            },
+        );
+        self.pending_text_input_focus.set(pending_transition.claim);
+        let pending_text_input =
+            pending_transition
+                .ownership
+                .and_then(|(claim_viewport, widget_id, phase)| {
+                    (claim_viewport == viewport && phase == TextInputPhase::PendingFocus)
+                        .then_some(widget_id)
+                });
+        let claimed_focused_text_input =
+            pending_transition
+                .ownership
+                .and_then(|(claim_viewport, widget_id, phase)| {
+                    (claim_viewport == viewport && phase == TextInputPhase::Focused)
+                        .then_some(widget_id)
+                });
+
+        let is_root = viewport == egui::ViewportId::ROOT;
+        let tracked_text_input_focused = is_root
+            && (self.address_has_focus
+                || self.search_has_focus
+                || self.favsearch.has_focus
+                || self.global_search.has_focus
+                || self.tag_view.has_focus
+                || self.color_filter.input_has_focus);
+        let focused_text_input = tracked_text_input_focused
+            .then_some(focused_widget.unwrap_or(egui::Id::NULL))
+            .or(claimed_focused_text_input);
+        let wants_keyboard_input = ctx.wants_keyboard_input();
+        let focused_ui = wants_keyboard_input.then_some(focused_widget.unwrap_or(egui::Id::NULL));
+
+        let fullscreen_surface = !is_root
+            || self.viewer_session_blocks_main_window()
+            || self.fs_nav_deferred_reopen_wait_active();
+        let shortcut_scope = Some(ShortcutScope::new(
+            viewport,
+            if fullscreen_surface {
+                ShortcutSurface::Fullscreen
+            } else {
+                ShortcutSurface::Main
+            },
+        ));
+        let modal = if is_root {
+            self.any_dialog_open()
+        } else {
+            self.any_modal_dialog_open_for_fullscreen_keys()
+        };
+
+        crate::keyboard_input::KeyboardOwnershipSnapshot {
+            viewport,
+            viewport_focused,
+            modal,
+            focused_text_input,
+            pending_text_input,
+            ime_grace: self.ime_input_active(),
+            focused_ui,
+            shortcut_scope,
+        }
+    }
+
+    /// Return the owner already selected for this viewport pass, or collect and
+    /// decide it exactly once when the pass first reaches an input handler.
+    pub(crate) fn keyboard_owner_for_pass(
+        &self,
+        ctx: &egui::Context,
+    ) -> crate::keyboard_input::KeyboardOwner {
+        if let Some(owner) = crate::keyboard_input::cached_keyboard_owner(ctx) {
+            return owner;
+        }
+        let owner =
+            crate::keyboard_input::decide_keyboard_owner(self.keyboard_ownership_snapshot(ctx));
+        crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+        owner
+    }
+
+    pub(crate) fn claim_pending_text_input_focus(
+        &self,
+        viewport: egui::ViewportId,
+        widget_id: egui::Id,
+        issued_pass: u64,
+    ) {
+        self.pending_text_input_focus.set(Some(
+            crate::keyboard_input::PendingTextInputFocusClaim::new(
+                viewport,
+                widget_id,
+                issued_pass,
+            ),
+        ));
+    }
+
+    pub(crate) fn clear_pending_text_input_focus(&self) {
+        let transition = crate::keyboard_input::transition_pending_focus_claim(
+            self.pending_text_input_focus.get(),
+            crate::keyboard_input::PendingFocusEvent::EditingEnded,
+        );
+        self.pending_text_input_focus.set(transition.claim);
+    }
+
+    pub(crate) fn clear_book_bookmark_title_edit(&mut self) {
+        self.book_bookmark_title_edit = None;
+        self.clear_pending_text_input_focus();
+    }
+
     /// ダイアログ確定用の Enter が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_enter_pressed(&self, ctx: &egui::Context) -> bool {
         !self.ime_input_active() && ctx.input(|i| i.key_pressed(egui::Key::Enter))
@@ -13354,6 +13882,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
             items_generation,
@@ -13579,6 +14108,7 @@ impl App {
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
         swap_field!(fs_pending);
+        swap_field!(fs_pdf_display_target);
         swap_field!(fs_early_dims);
         swap_field!(fs_upload_backlog);
         swap_field!(items_generation);
@@ -24794,7 +25324,7 @@ impl App {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;
             self.current_book_bookmarks_request = None;
-            self.book_bookmark_title_edit = None;
+            self.clear_book_bookmark_title_edit();
         }
         if changed.timed_bookmarks {
             self.fullscreen_video_marker_cache = None;
@@ -26059,7 +26589,7 @@ impl App {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;
             self.current_book_bookmarks_request = None;
-            self.book_bookmark_title_edit = None;
+            self.clear_book_bookmark_title_edit();
             return;
         };
         let key = crate::book_bookmarks::container_key(&entry.container_path);
@@ -26074,7 +26604,7 @@ impl App {
         // 別の本へ移動した直後に、旧コンテナの行を新しい本の行として一瞬表示しない。
         self.current_book_bookmarks.clear();
         self.current_book_bookmarks_key = None;
-        self.book_bookmark_title_edit = None;
+        self.clear_book_bookmark_title_edit();
         let request_id = self.next_book_bookmark_request_id();
         if let Some(service) = self.book_bookmark_service.as_ref() {
             service.list_for_container(request_id, entry.container_path);
@@ -26114,7 +26644,7 @@ impl App {
                     self.book_bookmark_service = None;
                     self.book_bookmark_pending_requests.clear();
                     self.current_book_bookmarks_request = None;
-                    self.book_bookmark_title_edit = None;
+                    self.clear_book_bookmark_title_edit();
                     self.show_feedback_toast("ブックマークDBとの接続が終了しました".to_string());
                     break;
                 }
@@ -26157,7 +26687,7 @@ impl App {
                             if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
                                 == Some(id)
                             {
-                                self.book_bookmark_title_edit = None;
+                                self.clear_book_bookmark_title_edit();
                             }
                             self.notify_bookmarks_changed();
                             self.show_feedback_toast("ブックマークを削除しました".to_string());
@@ -26180,7 +26710,7 @@ impl App {
                             if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
                                 == Some(id)
                             {
-                                self.book_bookmark_title_edit = None;
+                                self.clear_book_bookmark_title_edit();
                             }
                             if self.items_are_bookmark_view {
                                 self.refresh_bookmark_browser();
@@ -26249,7 +26779,7 @@ impl App {
         self.current_book_bookmarks.clear();
         self.current_book_bookmarks_key = None;
         self.current_book_bookmarks_request = None;
-        self.book_bookmark_title_edit = None;
+        self.clear_book_bookmark_title_edit();
         self.notify_bookmarks_changed();
     }
 
@@ -29639,11 +30169,7 @@ impl App {
         self.enqueue_idle_upgrades();
         let t5 = frame_t0.elapsed();
 
-        // (4) 進捗ピーク値の更新 (プログレスバー表示用)
-        self.update_progress_peaks();
-        let t6 = frame_t0.elapsed();
-
-        // (5) 固着診断 (5 秒に 1 回): keep_set 内で state が Pending/Evicted
+        // (4) 固着診断 (5 秒に 1 回): keep_set 内で state が Pending/Evicted
         //     なのに `requested` に居座っているエントリを検出する。
         //     正常時は Pending/Evicted なら再エンキューされて Loaded に進むはず。
         //     この状態が続くと、サムネが「読み込み中」のまま永遠に戻らない。
@@ -29680,14 +30206,13 @@ impl App {
             }
         }
 
-        if (t6 - t1).as_millis() > 5 {
+        if (t5 - t1).as_millis() > 5 {
             crate::logger::log(format!(
-                "    [keep detail] evict={:.1}ms scan={:.1}ms lock+push={:.1}ms idle={:.1}ms peaks={:.1}ms",
+                "    [keep detail] evict={:.1}ms scan={:.1}ms lock+push={:.1}ms idle={:.1}ms",
                 (t2 - t1).as_secs_f64() * 1000.0,
                 (t3 - t2).as_secs_f64() * 1000.0,
                 (t4 - t3).as_secs_f64() * 1000.0,
                 (t5 - t4).as_secs_f64() * 1000.0,
-                (t6 - t5).as_secs_f64() * 1000.0,
             ));
         }
 
@@ -29863,6 +30388,19 @@ impl App {
             self.last_promoted_visible_keys = None;
             self.promote_retry_pending = false;
         }
+    }
+
+    /// サムネイル要求と進捗ピークの毎フレーム bookkeeping 境界。
+    ///
+    /// keep-range 更新は詳細表示・削除中・空一覧で早期 return するが、進捗ピークの寿命は
+    /// それらと独立しているため、その後も必ず更新する。
+    fn update_thumbnail_frame_bookkeeping(
+        &mut self,
+        ctx: &egui::Context,
+        frame_t0: std::time::Instant,
+    ) {
+        self.update_keep_range_and_requests(ctx, frame_t0);
+        self.update_progress_peaks();
     }
 
     /// 現フレームの visible 範囲 (strict、prefetch 含まず) に対応する PDF perf_key 集合を返す。
@@ -30257,7 +30795,7 @@ impl App {
             return None;
         }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
-        if self.shortcuts_blocked_by_text_input() {
+        if self.shortcuts_blocked_by_text_input(ctx) {
             return None;
         }
 
@@ -32716,17 +33254,9 @@ impl App {
     /// 数フレーム) に、グリッド側 Ctrl+↑↓ が `FolderNavMode::Grid` で再 enqueue されて
     /// in-flight Fullscreen-mode nav をキャンセルしてしまうのを防ぐため。ユーザーの
     /// 意図はフルスクリーン継続なので、この待ち中はグリッドショートカットを全部抑止する。
-    pub(crate) fn shortcuts_blocked_by_text_input(&self) -> bool {
-        self.viewer_session_blocks_main_window()
-            || self.ime_input_active()
-            || self.fs_nav_deferred_reopen_wait_active()
-            || self.any_dialog_open()
-            || self.address_has_focus
-            || self.search_has_focus
-            || self.favsearch.has_focus
-            || self.global_search.has_focus
-            || self.tag_view.has_focus
-            || self.color_filter.input_has_focus
+    pub(crate) fn shortcuts_blocked_by_text_input(&self, ctx: &egui::Context) -> bool {
+        self.keyboard_owner_for_pass(ctx)
+            .blocks_legacy_main_shortcuts()
     }
 
     fn collect_shell_clipboard_paths(&self) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
@@ -32845,7 +33375,7 @@ impl App {
     /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
     fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !main_focused || self.shortcuts_blocked_by_text_input() {
+        if !main_focused || self.shortcuts_blocked_by_text_input(ctx) {
             return;
         }
 
@@ -33121,11 +33651,7 @@ impl App {
             && matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
     }
 
-    pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
-        #[cfg(windows)]
-        if self.active_detached_viewer_context.is_some() {
-            return true;
-        }
+    fn current_viewer_session_is_detached_or_switching(&self) -> bool {
         if self.viewer_session_is_detached() {
             return true;
         }
@@ -33150,8 +33676,97 @@ impl App {
         }
     }
 
+    pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
+        #[cfg(windows)]
+        if self.active_detached_viewer_context.is_some() {
+            return true;
+        }
+        self.current_viewer_session_is_detached_or_switching()
+    }
+
     pub(crate) fn viewer_session_blocks_main_window(&self) -> bool {
-        self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
+        // The main-focus close consumer must use the same current-session lifecycle fact as tray
+        // residency. During a switch to detached, `viewer_presentation` is still the old fullscreen
+        // value until PlacementSwitched arrives; treating that transient as main-blocking would let
+        // ShowWindow focus close the session that tray hide deliberately retained.
+        //
+        // Keep the active detached *sibling* context out of this current-session predicate: the main
+        // context can own its own fullscreen while a media window is mounted separately.
+        self.fullscreen_idx.is_some() && !self.current_viewer_session_is_detached_or_switching()
+    }
+
+    fn reconcile_fullscreen_after_main_focus(
+        &mut self,
+        ctx: &egui::Context,
+        main_viewport_focused: bool,
+        fullscreen_root_key_handled: bool,
+    ) {
+        if !self.viewer_session_blocks_main_window() {
+            return;
+        }
+
+        const FS_FOCUS_GRACE_MS: u128 = 500;
+        if !self.fs_focus_grace_elapsed {
+            self.fs_focus_grace_elapsed = self
+                .fs_opened_at
+                .map(|t| t.elapsed().as_millis() > FS_FOCUS_GRACE_MS)
+                .unwrap_or(true);
+        }
+        #[cfg(windows)]
+        let native_video_presenter_active = self.native_video_presenter_hwnd_for_focus_guard();
+        #[cfg(not(windows))]
+        let native_video_presenter_active = false;
+        #[cfg(windows)]
+        let embedded_still = self.fullscreen_embedded_still_active();
+        #[cfg(not(windows))]
+        let embedded_still = false;
+        if should_close_fullscreen_from_main_focus(
+            self.fs_focus_grace_elapsed,
+            main_viewport_focused,
+            native_video_presenter_active,
+            embedded_still,
+            self.settings.fullscreen_keep_on_app_switch,
+            fullscreen_root_key_handled,
+        ) {
+            crate::logger::log(format!(
+                "fullscreen: main focus guard closing session presentation={:?} detached_lifecycle={}",
+                self.viewer_presentation,
+                self.current_viewer_session_is_detached_or_switching()
+            ));
+            self.close_fullscreen();
+        } else if should_restore_fullscreen_focus_from_main_focus(
+            self.fs_focus_grace_elapsed,
+            main_viewport_focused,
+            embedded_still,
+            self.settings.fullscreen_keep_on_app_switch,
+            fullscreen_root_key_handled,
+        ) {
+            self.restore_fullscreen_focus_from_main(ctx);
+        }
+    }
+
+    /// トレイ復帰イベントで、保持中の通常 fullscreen media surface を再び前面化する。
+    /// tray 専用の状態は持たず、現在 mount されている media owner だけを見る。
+    /// 再生 transport には触れないため、格納時に pause した intent と位置はそのまま残る。
+    pub(crate) fn restore_media_surface_after_tray(&mut self, ctx: &egui::Context) {
+        if self.current_viewer_session_is_detached_or_switching()
+            || !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
+        {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        if !matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. })) {
+            return;
+        }
+
+        // ShowWindow(main) の直後は fullscreen/native surface への Focus/raise が非同期で
+        // 反映される。open 直後と同じ既存 grace を再始動して、その反映前に main-focus
+        // guard が session を閉じないようにする。
+        self.fs_focus_grace_elapsed = false;
+        self.fs_opened_at = Some(std::time::Instant::now());
+        self.restore_fullscreen_focus_from_main(ctx);
     }
 
     fn main_window_should_draw_export_dialogs(&self) -> bool {
@@ -35140,6 +35755,24 @@ impl App {
                 );
             }
         }
+    }
+
+    /// トレイ格納時に mount 外の active detached / ParkedLive media transport も止める。
+    /// bundle が所有する既存 VideoPlayer だけを対象にし、detached runtime は変更しない。
+    #[cfg(windows)]
+    pub(crate) fn pause_detached_media_playback_for_tray(&self) -> usize {
+        let active = self
+            .active_detached_viewer_context
+            .as_ref()
+            .map(|active| pause_viewer_context_bundle_media_for_tray(&active.bundle))
+            .unwrap_or(0);
+        let parked = self
+            .detached_image_windows
+            .iter()
+            .filter_map(|window| window.paused_bundle.as_deref())
+            .map(pause_viewer_context_bundle_media_for_tray)
+            .sum::<usize>();
+        active + parked
     }
 
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
@@ -37161,6 +37794,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
             items_generation,
@@ -37339,6 +37973,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
             fs_open_intent_from_grid,
@@ -37803,7 +38438,11 @@ impl App {
             return false;
         };
         self.active_detached_viewer_context.is_none()
-            && self.viewer_session_is_detached()
+            // Tray residency keeps both committed detached sessions and an in-flight switch to
+            // detached alive. A main-context refresh must use that same lifecycle predicate before
+            // replacing `items`, otherwise `start_loading_items` falls through to
+            // `close_fullscreen` and drops the session that tray hide deliberately retained.
+            && self.viewer_session_is_detached_or_switching()
             && !self.fs_nav_is_locked()
             // 音声もメディア窓を使う (stage-audio / §1.7)。Video 限定だと main の
             // フォルダ移動で detached 音声が promote されず close_fullscreen で
@@ -39536,6 +40175,9 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.capture_region_selection = None;
+        if self.fullscreen_idx.is_none() {
+            self.fs_pdf_display_target = None;
+        }
         self.fullscreen_idx = Some(idx);
         // 音声以外を開いたら音楽ビュー (Inc 3b/4) の状態を破棄する。フルスクリーン内で
         // 音声→画像/動画へ移動しても draw_fs_music_view は呼ばれず、放置すると旧音声の解析
@@ -39987,6 +40629,68 @@ impl App {
         }
     }
 
+    fn details_page_count_uses_visible_stages(&self) -> bool {
+        self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.settings.details_show_page_count
+            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+    }
+
+    fn details_visible_page_count_needs_load(&self) -> bool {
+        self.details_tag_prewarm_indices.iter().copied().any(|idx| {
+            self.lazy_load_page_count_for_idx(idx)
+                && self
+                    .details_lazy_meta_for_idx(idx)
+                    .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta))
+        })
+    }
+
+    fn finish_details_lazy_session(&mut self, failed: usize) {
+        self.details_image_dims_state = LazyColumnState::Ready { failed };
+        self.prune_details_lazy_meta_cache();
+        if self.facet_ai_filter_active() {
+            let ready_state = self.details_image_dims_state;
+            self.rebuild_visible_indices();
+            self.details_image_dims_state = ready_state;
+        }
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && matches!(
+                self.settings.details_sort_key,
+                crate::settings::DetailsSortKey::PageCount
+                    | crate::settings::DetailsSortKey::ImageDimensions
+                    | crate::settings::DetailsSortKey::Created
+                    | crate::settings::DetailsSortKey::VideoDuration
+                    | crate::settings::DetailsSortKey::VideoDimensions
+                    | crate::settings::DetailsSortKey::VideoCodec
+            )
+        {
+            self.rebuild_details_order();
+        }
+    }
+
+    /// 詳細一覧の描画で可視 + 先読み範囲が確定した後、ジョブではなく走査セッションを
+    /// 完了できるか判定する。未取得ページ数があれば同じセッションの次ジョブを開始し、
+    /// 無ければここだけが staged page-count セッションを Ready にする。
+    pub(crate) fn reconcile_details_lazy_session_after_grid(&mut self, ctx: &egui::Context) {
+        if !self.details_page_count_uses_visible_stages() {
+            return;
+        }
+
+        let failed = match self.details_image_dims_state {
+            LazyColumnState::Reconciling { failed, .. } => Some(failed),
+            LazyColumnState::Ready { .. } if self.details_visible_page_count_needs_load() => None,
+            _ => return,
+        };
+
+        if self.details_visible_page_count_needs_load() {
+            self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+            self.start_details_meta_load(ctx);
+        } else if let Some(failed) = failed {
+            self.finish_details_lazy_session(failed);
+            ctx.request_repaint();
+        }
+    }
+
     pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
         if !self.details_lazy_columns_visible() {
             if let Some(pending) = self.details_meta_pending.take() {
@@ -40001,31 +40705,36 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
+        // filter / 表示集合変更は target membership を変える。scroll は revision を変えないので、
+        // この境界でだけ plan / worker を破棄して新しい走査 session を開始する。
+        let requirements_stale = self
+            .details_meta_pending
+            .as_ref()
+            .is_some_and(|pending| pending.visible_revision != self.details_lazy_visible_revision);
+        if requirements_stale {
+            if let Some(pending) = self.details_meta_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+            ctx.request_repaint();
+        }
+
         // ページ数ソート以外は画面外の全コンテナを開かず、可視範囲 + 先読み範囲だけを
         // 段階取得する。前の範囲が Ready でもスクロール先に未取得行があれば次ジョブを開始。
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+        if self.details_page_count_uses_visible_stages()
             && matches!(self.details_image_dims_state, LazyColumnState::Ready { .. })
-            && self.details_tag_prewarm_indices.iter().copied().any(|idx| {
-                self.lazy_load_page_count_for_idx(idx)
-                    && self
-                        .details_lazy_meta_for_idx(idx)
-                        .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta))
-            })
+            && self.details_visible_page_count_needs_load()
         {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
-        // ZIP/PDF のページ数は画像寸法より1件あたりのI/Oが重い。大きくスクロールして
-        // 現在の可視近傍が起動時の Normal 優先集合と完全に離れたら、完了済みcacheを
-        // 保ったまま worker を組み直して新しい可視行を先に処理する。少しずつの
-        // スクロールは集合が重なるため再起動しない。大きなドラッグ中も既存の
-        // prefetch idle gate を共有し、静止するまでは cancel / respawn しない。
+        // 大きく scroll して可視近傍が移ったら、全件 plan / worker を作り直さず、現在の
+        // 可視 target だけを priority queue へ差し込む。idle gate は従来どおり共有する。
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && self.details_meta_pending.is_some()
         {
-            let current_visible: HashSet<String> = self
+            let current_visible_order: Vec<usize> = self
                 .details_tag_prewarm_indices
                 .iter()
                 .copied()
@@ -40035,6 +40744,12 @@ impl App {
                             .details_lazy_meta_for_idx(idx)
                             .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
                 })
+                .collect();
+            let current_visible_indices: HashSet<usize> =
+                current_visible_order.iter().copied().collect();
+            let current_visible: HashSet<String> = current_visible_indices
+                .iter()
+                .copied()
                 .filter_map(|idx| self.details_lazy_cache_key(idx))
                 .collect();
             let reprioritize_candidate =
@@ -40063,12 +40778,36 @@ impl App {
                 }
             }
             if reprioritize {
-                if let Some(pending) = self.details_meta_pending.take() {
-                    pending.cancel.store(true, Ordering::Relaxed);
+                let priority_targets: Vec<DetailsMetaTarget> = current_visible_order
+                    .iter()
+                    .copied()
+                    .filter_map(|idx| {
+                        self.details_meta_target_for_idx(idx, &current_visible_indices, true)
+                    })
+                    .collect();
+                let priority_count = priority_targets.len();
+                if let Some(pending) = self.details_meta_pending.as_mut() {
+                    pending.normal_target_keys = current_visible;
+                    match &mut pending.phase {
+                        DetailsMetaPendingPhase::Planning(plan) => {
+                            plan.visible_near = current_visible_indices;
+                        }
+                        DetailsMetaPendingPhase::Loading { priority_tx, .. } => {
+                            if !priority_targets.is_empty() {
+                                let _ = priority_tx.send(priority_targets);
+                            }
+                        }
+                    }
                 }
-                self.details_lazy_visible_revision =
-                    self.details_lazy_visible_revision.wrapping_add(1);
-                self.details_image_dims_state = LazyColumnState::NotRequested;
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "details_meta",
+                        "priority_update",
+                        None,
+                        self.items_generation,
+                        &[("targets", serde_json::Value::from(priority_count))],
+                    );
+                }
                 ctx.request_repaint();
             }
         }
@@ -40093,7 +40832,9 @@ impl App {
                 && self.selection_info_needs_lazy_meta_request()
                 && !matches!(
                     self.details_image_dims_state,
-                    LazyColumnState::NotRequested | LazyColumnState::Loading { .. }
+                    LazyColumnState::NotRequested
+                        | LazyColumnState::Loading { .. }
+                        | LazyColumnState::Reconciling { .. }
                 )
             {
                 self.details_lazy_visible_revision =
@@ -40102,10 +40843,15 @@ impl App {
             }
         }
 
+        self.advance_details_meta_target_plan(ctx);
+
         let mut disconnected = false;
         loop {
             let event = match self.details_meta_pending.as_ref() {
-                Some(pending) => match pending.rx.try_recv() {
+                Some(DetailsMetaPending {
+                    phase: DetailsMetaPendingPhase::Loading { rx, .. },
+                    ..
+                }) => match rx.try_recv() {
                     Ok(event) => Some(event),
                     Err(mpsc::TryRecvError::Empty) => None,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -40113,6 +40859,10 @@ impl App {
                         None
                     }
                 },
+                Some(DetailsMetaPending {
+                    phase: DetailsMetaPendingPhase::Planning(_),
+                    ..
+                }) => None,
                 None => None,
             };
             let Some(event) = event else {
@@ -40147,25 +40897,18 @@ impl App {
                         .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
                     self.details_meta_pending = None;
                     if revision_matches {
-                        self.details_image_dims_state = LazyColumnState::Ready { failed };
-                        self.prune_details_lazy_meta_cache();
-                        if self.facet_ai_filter_active() {
-                            let ready_state = self.details_image_dims_state;
-                            self.rebuild_visible_indices();
-                            self.details_image_dims_state = ready_state;
-                        }
-                        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-                            && matches!(
-                                self.settings.details_sort_key,
-                                crate::settings::DetailsSortKey::PageCount
-                                    | crate::settings::DetailsSortKey::ImageDimensions
-                                    | crate::settings::DetailsSortKey::Created
-                                    | crate::settings::DetailsSortKey::VideoDuration
-                                    | crate::settings::DetailsSortKey::VideoDimensions
-                                    | crate::settings::DetailsSortKey::VideoCodec
-                            )
-                        {
-                            self.rebuild_details_order();
+                        if self.details_page_count_uses_visible_stages() {
+                            let total = match self.details_image_dims_state {
+                                LazyColumnState::Loading { total, .. } => total,
+                                _ => 0,
+                            };
+                            self.details_image_dims_state = LazyColumnState::Reconciling {
+                                done: total,
+                                total,
+                                failed,
+                            };
+                        } else {
+                            self.finish_details_lazy_session(failed);
                         }
                     } else {
                         self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -40485,6 +41228,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40508,6 +41252,7 @@ impl App {
             LazyColumnState::Ready { .. } => "...".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40547,6 +41292,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40581,6 +41327,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40602,6 +41349,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40627,6 +41375,7 @@ impl App {
             LazyColumnState::Ready { .. } => "-".to_string(),
             LazyColumnState::NotRequested
             | LazyColumnState::Loading { .. }
+            | LazyColumnState::Reconciling { .. }
             | LazyColumnState::Cancelled => "...".to_string(),
         }
     }
@@ -40689,115 +41438,275 @@ impl App {
             )),
             pdf_passwords: self.pdf_passwords.clone(),
         };
-        let (order, visible_near): (Vec<usize>, HashSet<usize>) = if selection_info_only {
+        let (order, visible_near) = if selection_info_only {
             let order: Vec<usize> = self.selection_info_lazy_target_idx().into_iter().collect();
-            let visible_near = order.iter().copied().collect();
-            (order, visible_near)
+            let visible_near: HashSet<usize> = order.iter().copied().collect();
+            (
+                DetailsMetaScanOrder::Explicit {
+                    indices: order,
+                    cursor: 0,
+                },
+                visible_near,
+            )
         } else if visible_page_count_stage_only {
             let mut order = self.details_tag_prewarm_indices.to_vec();
             order.sort_unstable();
-            let visible_near = order.iter().copied().collect();
-            (order, visible_near)
+            let visible_near: HashSet<usize> = order.iter().copied().collect();
+            (
+                DetailsMetaScanOrder::Explicit {
+                    indices: order,
+                    cursor: 0,
+                },
+                visible_near,
+            )
         } else {
             (
-                self.current_grid_order().to_vec(),
+                DetailsMetaScanOrder::CurrentGrid {
+                    cursor: 0,
+                    len: self.current_grid_order().len(),
+                    order_revision: self.details_order_revision,
+                },
                 self.details_tag_prewarm_indices.iter().copied().collect(),
             )
         };
-        let mut visible_targets = Vec::new();
-        let mut background_targets = Vec::new();
-        let mut cached_done = 0usize;
-        let mut cached_failed = 0usize;
-        let mut total = 0usize;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.details_meta_pending = Some(DetailsMetaPending {
+            visible_revision: self.details_lazy_visible_revision,
+            selection_target_key: selection_info_only
+                .then(|| self.selection_info_lazy_target_key())
+                .flatten(),
+            normal_target_keys: visible_near
+                .iter()
+                .filter_map(|&idx| self.details_lazy_cache_key(idx))
+                .collect(),
+            cancel,
+            phase: DetailsMetaPendingPhase::Planning(DetailsMetaTargetPlan {
+                generation,
+                order,
+                visible_near,
+                load_all_page_counts,
+                ai_facet_load,
+                page_count_config,
+                visible_targets: Vec::new(),
+                background_targets: Vec::new(),
+                cached_done: 0,
+                cached_failed: 0,
+                total: 0,
+                scan_slices: 0,
+                scan_started_at: crate::perf::is_enabled().then(std::time::Instant::now),
+            }),
+        });
+        self.advance_details_meta_target_plan(ctx);
+    }
 
-        for idx in order {
-            if !self.details_item_requires_lazy_meta(idx) {
-                continue;
-            }
-            if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-                if self.details_lazy_meta_satisfies_idx(idx, meta) {
-                    total += 1;
-                    cached_done += 1;
-                    cached_failed += usize::from(
-                        meta.page_count_failed
-                            || meta.image_dims_failed
-                            || meta.video_meta_failed
-                            || meta.created_at_failed,
-                    );
-                    continue;
-                }
-            }
-            if let Some(target) = self.details_meta_target_for_idx(
-                idx,
-                &visible_near,
-                load_all_page_counts || visible_near.contains(&idx),
-            ) {
-                total += 1;
-                if target.priority >= crate::io_semaphore::IoPriority::Normal {
-                    visible_targets.push(target);
-                } else {
-                    background_targets.push(target);
-                }
-            }
+    /// 全件対象の遅延列でも target 構築を 1 frame の予算内で進める。
+    /// Explicit は selection / 可視 page-count の小集合なので従来どおり同一 frame で完了する。
+    fn advance_details_meta_target_plan(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.details_meta_pending.take() else {
+            return;
+        };
+        if !matches!(&pending.phase, DetailsMetaPendingPhase::Planning(_)) {
+            self.details_meta_pending = Some(pending);
+            return;
         }
+        let DetailsMetaPending {
+            visible_revision,
+            selection_target_key,
+            normal_target_keys,
+            cancel,
+            phase,
+        } = pending;
+        let DetailsMetaPendingPhase::Planning(mut plan) = phase else {
+            unreachable!();
+        };
 
-        let normal_target_keys: HashSet<String> = visible_targets
-            .iter()
-            .map(|target| target.key.clone())
-            .collect();
-        let normal_targets = visible_targets.len();
-        let low_targets = background_targets.len();
-        visible_targets.extend(background_targets);
-        let targets = visible_targets;
-        let target_count = targets.len();
-        let ai_targets = targets
-            .iter()
-            .filter(|target| target.load_ai_metadata)
-            .count();
-        let created_targets = targets
-            .iter()
-            .filter(|target| target.load_created_at)
-            .count();
-        let page_count_targets = targets
-            .iter()
-            .filter(|target| target.load_page_count)
-            .count();
-        let image_dim_targets = targets
-            .iter()
-            .filter(|target| target.load_image_dims)
-            .count();
-        let video_meta_targets = targets
-            .iter()
-            .filter(|target| target.load_video_meta)
-            .count();
-
-        if total == 0 || targets.is_empty() {
-            self.details_image_dims_state = LazyColumnState::Ready {
-                failed: cached_failed,
-            };
-            if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-                && matches!(
-                    self.settings.details_sort_key,
-                    crate::settings::DetailsSortKey::PageCount
-                        | crate::settings::DetailsSortKey::ImageDimensions
-                        | crate::settings::DetailsSortKey::Created
-                        | crate::settings::DetailsSortKey::VideoDuration
-                        | crate::settings::DetailsSortKey::VideoDimensions
-                        | crate::settings::DetailsSortKey::VideoCodec
-                )
-            {
-                self.rebuild_details_order();
-            }
+        let order_stale = matches!(
+            plan.order,
+            DetailsMetaScanOrder::CurrentGrid { order_revision, .. }
+                if order_revision != self.details_order_revision
+        );
+        if plan.generation != self.items_generation
+            || visible_revision != self.details_lazy_visible_revision
+            || order_stale
+        {
+            cancel.store(true, Ordering::Relaxed);
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+            ctx.request_repaint();
             return;
         }
 
-        self.details_image_dims_state = LazyColumnState::Loading {
-            done: cached_done,
-            total,
+        let scan_budget = if plan.order.is_incremental() {
+            DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME
+        } else {
+            usize::MAX
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let slice_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+        let slice_start = plan.order.scanned();
+        for _ in 0..scan_budget {
+            let idx = match &mut plan.order {
+                DetailsMetaScanOrder::Explicit { indices, cursor } => {
+                    let Some(idx) = indices.get(*cursor).copied() else {
+                        break;
+                    };
+                    *cursor += 1;
+                    idx
+                }
+                DetailsMetaScanOrder::CurrentGrid { cursor, len, .. } => {
+                    if *cursor >= *len {
+                        break;
+                    }
+                    let Some(idx) = self.current_grid_order().get(*cursor).copied() else {
+                        break;
+                    };
+                    *cursor += 1;
+                    idx
+                }
+            };
+
+            if !self.details_item_requires_lazy_meta(idx) {
+                continue;
+            }
+            if let Some(meta) = self.details_lazy_meta_for_idx(idx)
+                && self.details_lazy_meta_satisfies_idx(idx, meta)
+            {
+                plan.total += 1;
+                plan.cached_done += 1;
+                plan.cached_failed += usize::from(
+                    meta.page_count_failed
+                        || meta.image_dims_failed
+                        || meta.video_meta_failed
+                        || meta.created_at_failed,
+                );
+                continue;
+            }
+            if let Some(target) = self.details_meta_target_for_idx(
+                idx,
+                &plan.visible_near,
+                plan.load_all_page_counts || plan.visible_near.contains(&idx),
+            ) {
+                plan.total += 1;
+                if target.priority >= crate::io_semaphore::IoPriority::Normal {
+                    plan.visible_targets.push(target);
+                } else {
+                    plan.background_targets.push(target);
+                }
+            }
+        }
+        plan.scan_slices += 1;
+        let slice_items = plan.order.scanned().saturating_sub(slice_start);
+        let scan_complete = plan.order.is_complete();
+        if let Some(t0) = slice_t0 {
+            crate::perf::event(
+                "details_meta",
+                "target_scan_slice",
+                None,
+                plan.generation,
+                &[
+                    ("items", serde_json::Value::from(slice_items)),
+                    ("scanned", serde_json::Value::from(plan.order.scanned())),
+                    ("order_items", serde_json::Value::from(plan.order.len())),
+                    ("slices", serde_json::Value::from(plan.scan_slices)),
+                    ("complete", serde_json::Value::from(scan_complete)),
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
+
+        if !scan_complete {
+            self.details_image_dims_state = LazyColumnState::Loading {
+                done: plan.cached_done,
+                total: plan.total,
+            };
+            self.details_meta_pending = Some(DetailsMetaPending {
+                visible_revision,
+                selection_target_key,
+                normal_target_keys,
+                cancel,
+                phase: DetailsMetaPendingPhase::Planning(plan),
+            });
+            ctx.request_repaint();
+            return;
+        }
+
+        self.launch_details_meta_worker(ctx, visible_revision, selection_target_key, cancel, plan);
+    }
+
+    fn launch_details_meta_worker(
+        &mut self,
+        ctx: &egui::Context,
+        visible_revision: u64,
+        selection_target_key: Option<String>,
+        cancel: Arc<AtomicBool>,
+        plan: DetailsMetaTargetPlan,
+    ) {
+        let target_count = plan.visible_targets.len() + plan.background_targets.len();
+        if plan.total == 0 || target_count == 0 {
+            self.finish_details_lazy_session(plan.cached_failed);
+            return;
+        }
+
+        // target plan 中に scroll した場合も、起動時点の可視範囲を worker の先頭へ差し込む。
+        // 元の background target は idx bitmap で重複排除され、全件走査 cursor は巻き戻さない。
+        let current_visible_order: Vec<usize> = self
+            .details_tag_prewarm_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                self.details_item_requires_lazy_meta(idx)
+                    && self
+                        .details_lazy_meta_for_idx(idx)
+                        .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
+            })
+            .collect();
+        let current_visible_indices: HashSet<usize> =
+            current_visible_order.iter().copied().collect();
+        let initial_priority_targets: Vec<DetailsMetaTarget> = current_visible_order
+            .iter()
+            .copied()
+            .filter_map(|idx| self.details_meta_target_for_idx(idx, &current_visible_indices, true))
+            .collect();
+        let normal_target_keys = initial_priority_targets
+            .iter()
+            .map(|target| target.key.clone())
+            .collect();
+
+        let normal_targets = plan.visible_targets.len();
+        let low_targets = plan.background_targets.len();
+        let all_targets = plan
+            .visible_targets
+            .iter()
+            .chain(plan.background_targets.iter());
+        let ai_targets = all_targets
+            .clone()
+            .filter(|target| target.load_ai_metadata)
+            .count();
+        let created_targets = all_targets
+            .clone()
+            .filter(|target| target.load_created_at)
+            .count();
+        let page_count_targets = all_targets
+            .clone()
+            .filter(|target| target.load_page_count)
+            .count();
+        let image_dim_targets = all_targets
+            .clone()
+            .filter(|target| target.load_image_dims)
+            .count();
+        let video_meta_targets = all_targets.filter(|target| target.load_video_meta).count();
+
+        self.details_image_dims_state = LazyColumnState::Loading {
+            done: plan.cached_done,
+            total: plan.total,
+        };
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
+        let (priority_tx, priority_rx) = mpsc::channel();
+        if !initial_priority_targets.is_empty() {
+            let _ = priority_tx.send(initial_priority_targets);
+        }
         let cache_dir = crate::catalog::default_cache_dir();
         let io_sem = self
             .indexer_manager
@@ -40808,23 +41717,36 @@ impl App {
                     self.settings.indexer_speed_profile.io_permits().max(1),
                 ))
             });
-        let selection_target_key = if selection_info_only {
-            targets.first().map(|target| target.key.clone())
-        } else {
-            None
-        };
 
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "details_meta",
+                "target_scan_done",
+                None,
+                plan.generation,
+                &[
+                    ("items", serde_json::Value::from(plan.order.scanned())),
+                    ("slices", serde_json::Value::from(plan.scan_slices)),
+                    (
+                        "ms",
+                        serde_json::Value::from(
+                            plan.scan_started_at
+                                .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+                                .unwrap_or(0.0),
+                        ),
+                    ),
+                ],
+            );
+            crate::perf::event(
+                "details_meta",
                 "load_start",
                 None,
-                generation,
+                plan.generation,
                 &[
                     ("targets", serde_json::Value::from(target_count)),
-                    ("total", serde_json::Value::from(total)),
-                    ("cached_done", serde_json::Value::from(cached_done)),
-                    ("cached_failed", serde_json::Value::from(cached_failed)),
+                    ("total", serde_json::Value::from(plan.total)),
+                    ("cached_done", serde_json::Value::from(plan.cached_done)),
+                    ("cached_failed", serde_json::Value::from(plan.cached_failed)),
                     ("normal_targets", serde_json::Value::from(normal_targets)),
                     ("low_targets", serde_json::Value::from(low_targets)),
                     ("ai_targets", serde_json::Value::from(ai_targets)),
@@ -40841,7 +41763,7 @@ impl App {
                         "video_meta_targets",
                         serde_json::Value::from(video_meta_targets),
                     ),
-                    ("ai_facet_load", serde_json::Value::from(ai_facet_load)),
+                    ("ai_facet_load", serde_json::Value::from(plan.ai_facet_load)),
                     (
                         "grid_mode",
                         serde_json::Value::from(match self.settings.grid_view_mode {
@@ -40857,26 +41779,28 @@ impl App {
             .name("details-meta-load".to_string())
             .spawn(move || {
                 run_details_meta_load(
-                    generation,
-                    targets,
-                    cached_done,
-                    cached_failed,
-                    total,
+                    plan.generation,
+                    plan.visible_targets,
+                    plan.background_targets,
+                    plan.cached_done,
+                    plan.cached_failed,
+                    plan.total,
                     cache_dir,
                     io_sem,
                     cancel_w,
                     tx,
-                    page_count_config,
+                    priority_rx,
+                    plan.page_count_config,
                 );
             })
             .ok();
 
         self.details_meta_pending = Some(DetailsMetaPending {
-            visible_revision: self.details_lazy_visible_revision,
+            visible_revision,
             selection_target_key,
             normal_target_keys,
             cancel,
-            rx,
+            phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
         });
         ctx.request_repaint();
     }
@@ -41084,6 +42008,7 @@ impl App {
             return None;
         }
         Some(DetailsMetaTarget {
+            idx,
             key,
             item,
             relative_page_provenance: self.relative_page_provenance_for_idx(idx),
@@ -45403,6 +46328,8 @@ impl App {
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)
         );
+        // 音声ファイルは動画の hidden 音声モードと同じ readiness 要件を使う。
+        player.set_media_visual_mode(music_core::MediaVisualMode::Music);
         player.set_playback_speed(self.video_playback_speed);
         if self.video_session_muted {
             player.set_muted(true);
@@ -45672,6 +46599,22 @@ impl App {
             _ => return,
         };
         let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
+        let pdf_display_request = if pdf_page.is_some() {
+            // PDF は実際に描く viewport が確定するまで enqueue しない。専用 fullscreen、
+            // detached、in-window は別々の egui context / ppp を持ち得るため、推測値で
+            // 先行すると初回だけ過大・過小レンダになる。
+            let Some(viewport) = self.fs_pdf_display_target else {
+                return;
+            };
+            let rotation = self.get_rotation(idx);
+            let swap_page_axes = matches!(
+                rotation,
+                crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270
+            );
+            Some((viewport, swap_page_axes))
+        } else {
+            None
+        };
 
         if pdf_page.is_some() {
             if self.has_retained_pdf_final_ai_for_current_params(idx) {
@@ -45680,9 +46623,13 @@ impl App {
                 ));
                 return;
             }
-            if let Some((pixels, source_dims)) =
-                self.lookup_retained_pdf_page_raster(idx, 4096, "start_fs_load")
-            {
+            let (viewport, swap_page_axes) = pdf_display_request.unwrap();
+            if let Some((pixels, source_dims)) = self.lookup_retained_pdf_page_raster_for_display(
+                idx,
+                viewport,
+                swap_page_axes,
+                "start_fs_load",
+            ) {
                 self.enqueue_retained_pdf_page_raster_result(
                     idx,
                     pixels,
@@ -45857,12 +46804,13 @@ impl App {
 
             // PDF ページの場合はラスタライズ
             if let Some(page_num) = pdf_page {
-                let target_px = 4096u32;
+                let (viewport, swap_page_axes) = pdf_display_request.unwrap();
                 let mut pdf_exit = "pdf_ok";
-                match crate::pdf_loader::render_page(
+                match crate::pdf_loader::render_page_for_display(
                     &path,
                     page_num,
-                    target_px,
+                    viewport,
+                    swap_page_axes,
                     pdf_password.as_deref(),
                     Some(cancel.clone()),
                     pdf_priority,
@@ -46253,6 +47201,71 @@ impl App {
         });
     }
 
+    fn pdf_display_render_long_edge_for_idx(
+        &mut self,
+        idx: usize,
+        content_type: Option<crate::pdf_loader::PdfPageContentType>,
+        content_bbox: Option<egui::Rect>,
+    ) -> Option<u32> {
+        let viewport = self.fs_pdf_display_target?;
+        let (page_w, page_h) = match content_type {
+            Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => (w as f32, h as f32),
+            _ => match self.fs_cache.get(&idx) {
+                Some(FsCacheEntry::Static { pixels, .. }) => {
+                    (pixels.size[0] as f32, pixels.size[1] as f32)
+                }
+                _ => return None,
+            },
+        };
+        let rotation = self.get_rotation(idx);
+        let swap_page_axes = matches!(
+            rotation,
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270
+        );
+        let content_type = content_type.unwrap_or(crate::pdf_loader::PdfPageContentType::Vector);
+        Some(match content_bbox {
+            Some(bbox) => crate::pdf_loader::display_render_long_edge_for_content_bbox(
+                viewport,
+                page_w,
+                page_h,
+                swap_page_axes,
+                content_type,
+                bbox.width(),
+                bbox.height(),
+            ),
+            None => crate::pdf_loader::display_render_long_edge(
+                viewport,
+                page_w,
+                page_h,
+                swap_page_axes,
+                content_type,
+            ),
+        })
+    }
+
+    pub(crate) fn ensure_pdf_display_resolution(
+        &mut self,
+        idx: usize,
+        content_bbox: Option<egui::Rect>,
+    ) {
+        let content_type = match self.items.get(idx) {
+            Some(GridItem::PdfPage { content_type, .. }) => *content_type,
+            _ => return,
+        };
+        let cached_long = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.size[0].max(pixels.size[1]) as u32,
+            _ => return,
+        };
+        let Some(target_px) =
+            self.pdf_display_render_long_edge_for_idx(idx, content_type, content_bbox)
+        else {
+            return;
+        };
+        if (cached_long as f32) < (target_px as f32 * 0.9) {
+            self.request_pdf_rerender_at_target(idx, target_px, true);
+        }
+    }
+
     /// PDF ページをズーム倍率に応じた解像度で非同期再レンダリングする。
     ///
     /// ワーカーに直接リクエストを送り、結果は `poll_pdf_rerender` で受け取る。
@@ -46261,50 +47274,60 @@ impl App {
     /// `priority=false`: AI 先読み用の非表示ページ native 再レンダ (通常レーン、
     /// visible の再レンダ / UI ナビを妨げない)。
     pub(crate) fn request_pdf_rerender(&mut self, idx: usize, zoom: f32, priority: bool) {
-        let (pdf_path, page_num, password, content_type) = match self.items.get(idx) {
+        let content_type = match self.items.get(idx) {
+            Some(GridItem::PdfPage { content_type, .. }) => *content_type,
+            _ => return,
+        };
+
+        // ズーム基準は初回と同じ実 viewport×ppp。これにより初回を小さくしても、
+        // ズーム時は倍率に応じて従来どおり再レンダされる。AI が native 入力を必要とする
+        // raster だけは native を基準にし、全 raster で原稿長辺を絶対上限にする。
+        let ai_native_long = match content_type {
+            Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => {
+                let native_long = w.max(h);
+                let params = self.effective_params(idx);
+                let ai_needs_native = (self.effective_upscale_request(params).is_some()
+                    && crate::ai::upscale::should_process_rect(
+                        w,
+                        h,
+                        self.settings.ai_upscale_limit(),
+                    ))
+                    || (self.effective_denoise_request(params).is_some()
+                        && crate::ai::upscale::should_process_rect(
+                            w,
+                            h,
+                            self.settings.ai_denoise_limit(),
+                        ));
+                ai_needs_native.then_some(native_long)
+            }
+            _ => None,
+        };
+        let (base_px, native_cap) = if let Some(native_long) = ai_native_long {
+            (native_long, Some(native_long))
+        } else {
+            let content_bbox = self.pdf_content_bbox_for_display_idx(idx);
+            let display_base_px = self
+                .pdf_display_render_long_edge_for_idx(idx, content_type, content_bbox)
+                .unwrap_or(4096);
+            let native_cap = content_type.and_then(|content_type| content_type.native_long_edge());
+            (display_base_px, native_cap)
+        };
+        let target_px = crate::pdf_loader::zoom_render_long_edge(base_px, zoom, native_cap);
+
+        self.request_pdf_rerender_at_target(idx, target_px, priority);
+    }
+
+    fn request_pdf_rerender_at_target(&mut self, idx: usize, target_px: u32, priority: bool) {
+        let (pdf_path, page_num, password) = match self.items.get(idx) {
             Some(GridItem::PdfPage {
-                pdf_path,
-                page_num,
-                content_type,
+                pdf_path, page_num, ..
             }) => (
                 pdf_path.clone(),
                 *page_num,
                 self.pdf_current_password.clone(),
-                *content_type,
             ),
             _ => return,
         };
-
-        // 上限 8192: これ以上大きいとテクスチャメモリが巨大になりクラッシュする
-        // (8192px 正方形 ≈ 256 MB RGBA、16384px ≈ 1 GB)
-        // ラスターページでネイティブ解像度が AI 処理対象 (アップスケール / デノイズ
-        // いずれかのサイズ上限内) の場合のみ原寸基準でレンダリング。それ以外は従来通り
-        // 4096px 基準。final AI はレンダ後のピクセルサイズで判定するため、4096 固定の
-        // ままだと上限内の原寸ページでも AI がスキップされる。デノイズ側の上限も見るのは
-        // Codex P2 指摘 (アップスケール上限だけ見ると、デノイズのみ範囲内のページが
-        // 4096 でレンダされてデノイズが掛からない)。
-        let base_px = match content_type {
-            Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => {
-                let native_long = w.max(h);
-                let in_ai_range =
-                    crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit())
-                        || crate::ai::upscale::should_process_rect(
-                            w,
-                            h,
-                            self.settings.ai_denoise_limit(),
-                        );
-                if in_ai_range {
-                    native_long as f32
-                } else {
-                    4096.0
-                }
-            }
-            _ => 4096.0, // Vector or not yet analyzed
-        };
-        let target_px = ((base_px * zoom) as u32).clamp(
-            crate::pdf_loader::PDF_RENDER_MIN_LONG_PX,
-            crate::pdf_loader::PDF_RENDER_MAX_LONG_PX,
-        );
 
         if self.has_retained_pdf_final_ai_for_current_params(idx) {
             crate::logger::log(format!(
@@ -46399,7 +47422,7 @@ impl App {
     /// 先読みウィンドウを更新する。
     /// settings の prefetch_back / prefetch_forward に従って先読みを開始し、
     /// ウィンドウ外のキャッシュ・読み込みを破棄する。
-    fn update_prefetch_window(&mut self, current_idx: usize) {
+    pub(crate) fn update_prefetch_window(&mut self, current_idx: usize) {
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return;
@@ -46897,6 +47920,7 @@ impl App {
 
         self.reset_fs_side_panel_runtime_for_file_change();
         self.fullscreen_idx = None;
+        self.fs_pdf_display_target = None;
         // `close_fullscreen` is also used as a generic teardown from
         // `start_loading_items`, even when no viewer is open.  Refreshing the
         // bookmark surface in that path creates a loop:
@@ -48235,8 +49259,8 @@ impl App {
             if self.has_uncancelled_final_ai_pending() {
                 return;
             }
-            // Raster PDF が「現行 4096px レンダ → 表示時 native 再レンダ」になるページは、
-            // 4096px に AI 先読みを流しても native 再レンダで捨てられる (GitHub issue #1)。
+            // Raster PDF の現行 display-fit 結果が AI 用 native 入力と異なるページは、
+            // 現行結果に AI 先読みを流しても native 再レンダで捨てられる。
             // 代わりに native 再レンダを **通常レーンで先に起動** (visible を妨げない) し、
             // AI 先読みは native 着地まで保留する。これで画像の先読みと同様、移動時に
             // native + final AI が揃って即表示できる。
@@ -50398,19 +51422,30 @@ impl App {
     }
 
     /// static source を差し替える直前に、完成済みのカラー化表示を display-only
-    /// holdover へ退避する。単ページは従来の viewer holdover、連結読みはページ別
-    /// transition が所有する。初回ロードでは `resolve_fs_display_tex` が `None` を
-    /// 返すので、既存 holdover は上書きしない。
+    /// holdover へ退避する。ページ単位表示は現在の表示ユニット全体、連結読みは
+    /// 従来どおりページ別 transition が所有する。初回ロードでは
+    /// `resolve_fs_display_tex` が `None` を返すので、既存 holdover は上書きしない。
     pub(crate) fn capture_colorize_source_reload_holdover(&mut self, idx: usize) {
         if self.fs_nav_locked_gen.is_some() || !self.colorize_display_requires_final_effect(idx) {
             return;
         }
         if let Some(texture) = self.resolve_fs_display_tex(idx, false) {
             if self.continuous_page_transition_is_owned_here(idx) {
-                self.set_continuous_page_transition(idx, texture.clone());
+                self.set_continuous_page_transition(idx, texture);
+                return;
             }
-            if self.fullscreen_idx == Some(idx) {
-                self.fs_holdover_tex = Some(texture);
+
+            if self.reading_flow.is_paged()
+                && let Some(fs_idx) = self.fullscreen_idx
+                && self.fs_display_unit_page_indices(fs_idx).contains(&idx)
+                && let Some(previous) = self.capture_fs_display_unit(fs_idx)
+            {
+                self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
+                    ColorizeDisplayUnitHoldover {
+                        target_idx: fs_idx,
+                        previous,
+                    },
+                ));
             }
         }
     }
@@ -51118,6 +52153,44 @@ impl App {
         } else {
             false
         }
+    }
+
+    fn lookup_retained_pdf_page_raster_for_display(
+        &mut self,
+        idx: usize,
+        viewport: crate::pdf_loader::PdfDisplayTarget,
+        swap_page_axes: bool,
+        reason: &str,
+    ) -> Option<(Arc<egui::ColorImage>, [usize; 2])> {
+        let dimensions = self
+            .retained_pdf_page_key_for(idx)
+            .and_then(|key| self.retained_pdf_page_cache.get(&key))
+            .and_then(|entry| match &entry.kind {
+                RetainedPdfPageCacheKind::Raster { pixels, .. } => {
+                    Some((pixels.size[0] as f32, pixels.size[1] as f32))
+                }
+                RetainedPdfPageCacheKind::FinalAi { .. } => None,
+            });
+        let content_type = match self.items.get(idx) {
+            Some(GridItem::PdfPage {
+                content_type: Some(content_type),
+                ..
+            }) => *content_type,
+            _ => crate::pdf_loader::PdfPageContentType::Vector,
+        };
+        let target_px = dimensions.map_or_else(
+            || viewport.width_px.max(viewport.height_px),
+            |(w, h)| {
+                crate::pdf_loader::display_render_long_edge(
+                    viewport,
+                    w,
+                    h,
+                    swap_page_axes,
+                    content_type,
+                )
+            },
+        );
+        self.lookup_retained_pdf_page_raster(idx, target_px, reason)
     }
 
     fn lookup_retained_pdf_page_raster(
@@ -52231,11 +53304,6 @@ impl App {
                     );
                     if pending.output_complete {
                         self.continuous_page_transitions.remove(&key.edit_key.idx);
-                        if self.fs_nav_locked_gen.is_none()
-                            && self.fullscreen_idx == Some(key.edit_key.idx)
-                        {
-                            self.fs_holdover_tex = None;
-                        }
                     } else {
                         self.set_continuous_page_transition(key.edit_key.idx, texture);
                     }
@@ -52676,9 +53744,8 @@ impl App {
                 (Arc::clone(&adjusted), true, false)
             }
             (Some(key), None) => {
-                // Raster PDF が native 再レンダ待ち/進行中 (現行 4096px) のときは、捨てる
-                // 4096px AI (高負荷上限では ~11.5MP) を流さず native 着地まで保留する
-                // (GitHub issue #1, Codex P2)。暫定 (color-adjusted) を complete=false で
+                // Raster PDF が native 再レンダ待ち/進行中なら、捨てる display-fit 結果へ
+                // AI を流さず native 着地まで保留する。暫定 (color-adjusted) を complete=false で
                 // 見せ、native 着地 → bump_input_generation → 再合成で AI 起動。fs_pending の
                 // native 再レンダが repaint を維持するので保留は次フレームで再評価される。
                 let ai_will_arrive = if self.display_should_defer_final_ai(idx) {
@@ -53976,19 +55043,15 @@ impl App {
         }
     }
 
-    /// 指定 PDF ラスターページが「native 寸法は AI 範囲内なのに 4096px 固定レンダで現行が
-    /// native より大きい」状態なら、native 解像度へ再レンダして final AI を起動する
-    /// (GitHub issue #1)。`idx` は fs_idx に限らず、**見開き相方・連続表示の可視ページ**にも
-    /// 個別に適用する (それらも `resolve_fs_processed_texture` で final AI 対象のため)。
+    /// 指定 PDF raster の display-fit レンダが AI 入力用 native 寸法と異なるなら、
+    /// native 解像度へ再レンダして final AI を起動する。`idx` は fs_idx に限らず、
+    /// 見開き相方・連続表示の可視ページにも個別に適用する。
     ///
-    /// PDF 初回フルスクリーンは content_type 未解析のため `start_fs_load` が 4096px 固定で
-    /// レンダし、final AI はレンダ後のピクセルサイズで判定する。よって native がサイズ上限内
-    /// (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095) では AI が
-    /// スキップ (既定 2048 上限) されるか、約 11.5MP を AI に流す (高負荷上限)。本 reconcile を
-    /// 毎フレーム評価することで「初回表示で AI ON」「開いてサイズ確認後に AI を ON」の両方を
-    /// 拾い、かつ高負荷上限でも native (原寸) へ落としてから AI する。
+    /// 初回 display-fit は native より小さい場合があり、native 上限に当たれば同寸にもなる。
+    /// AI は原稿 native を入力契約とするため、どちらの差も毎フレーム reconcile し、
+    /// 「初回から AI ON」「表示後に AI ON」の両方で破棄予定 raster に AI を流さない。
     ///
-    /// 判定 (`should_native_rerender_pdf_for_ai` = `pdf_native_downscale_pending(t, t)`) は
+    /// 判定 (`should_native_rerender_pdf_for_ai` = `pdf_native_rerender_pending(t, t)`) は
     /// ページ個別 `effective_params(idx)` で AI 有効性を見るので、AI 設定が fs_idx と異なる
     /// 相方ページでも正しい。in-flight 中 / ズーム中 / 収束後は false を返してループや無駄な
     /// 再レンダを防ぐ。
@@ -54027,22 +55090,19 @@ impl App {
         Some((*w, *h, cur_w, cur_h, upscale_on, denoise_on))
     }
 
-    /// PDF ラスターページが「現行レンダ (4096px 等) のままで、native 再レンダ後の AI 入力
-    /// 寸法より十分大きい」状態か = 「native へ置換予定 / 置換中」(GitHub issue #1)。
-    /// この間は、現行レンダに final AI を流しても native 着地で捨てる / 重すぎる。
-    /// 中核数式は純関数 `ai::upscale::pdf_render_exceeds_native_ai_target`
-    /// (`PDF_RENDER_MIN_LONG_PX` で実レンダ target 長辺に補正)。ここでは 2 つのゲートを足す:
+    /// 現行 display-fit レンダが native AI 入力と異なり、置換予定 / 置換中か。
+    /// 中核数式は純関数 `ai::upscale::pdf_render_differs_from_native_ai_target`。
+    /// ここでは 2 つのゲートを足す:
     ///
     /// - `respect_zoom`: true なら `fs_zoom != 1` で false (表示中ページは現ズーム基準で
     ///   レンダされ native へは落とさない)。先読みページは fit で開かれる前提なので false。
     /// - `gate_in_flight`: true なら再レンダ進行中 (`fs_pending`) は false (再キック抑止)。
-    ///   AI 保留判定では false にして進行中も「保留」を維持する (進行中に 4096px へ AI を
-    ///   流さない)。
+    ///   AI 保留判定では false にして進行中も保留を維持する。
     ///
     /// 用途別:
     /// - KICK (`should_native_rerender_pdf_for_ai`) = `(respect_zoom, gate_in_flight)=(t,t)`
     /// - 表示経路の AI 保留 = `(t, f)` / 先読みの AI 保留・再レンダ起動 = `(f, f)`
-    fn pdf_native_downscale_pending(
+    fn pdf_native_rerender_pending(
         &self,
         idx: usize,
         respect_zoom: bool,
@@ -54059,7 +55119,7 @@ impl App {
         if gate_in_flight && self.fs_pending.contains_key(&idx) {
             return false;
         }
-        crate::ai::upscale::pdf_render_exceeds_native_ai_target(
+        crate::ai::upscale::pdf_render_differs_from_native_ai_target(
             native_w,
             native_h,
             cur_w,
@@ -54068,27 +55128,26 @@ impl App {
             self.settings.ai_upscale_limit(),
             denoise_on,
             self.settings.ai_denoise_limit(),
-            crate::pdf_loader::PDF_RENDER_MIN_LONG_PX,
         )
     }
 
     /// `maybe_native_rerender_pdf_for_ai` の判定部 (KICK、副作用なし、テスト用に分離)。
     /// 表示中ページ向けに `fs_zoom` と in-flight ガード込み。
     pub(crate) fn should_native_rerender_pdf_for_ai(&self, idx: usize) -> bool {
-        self.pdf_native_downscale_pending(idx, true, true)
+        self.pdf_native_rerender_pending(idx, true, true)
     }
 
     /// AI 先読み用: 非表示ページの現行レンダに AI を流すと native 着地で捨てるため保留すべきか。
     /// ズーム非依存 (先読みは fit で開かれる)・in-flight 非ガード (再レンダ中も保留継続)。
     pub(crate) fn pdf_prefetch_should_defer_ai(&self, idx: usize) -> bool {
-        self.pdf_native_downscale_pending(idx, false, false)
+        self.pdf_native_rerender_pending(idx, false, false)
     }
 
     /// 表示経路用: 表示中ページの現行レンダ (native へ置換予定/置換中) に final AI を
     /// 流すべきでないか。`fs_zoom` を尊重 (ズーム中は native へ落とさないので保留しない)、
-    /// in-flight は非ガード (native 再レンダ進行中も保留継続して 4096px に AI を流さない)。
+    /// in-flight は非ガード (native 再レンダ進行中も保留継続)。
     pub(crate) fn display_should_defer_final_ai(&self, idx: usize) -> bool {
-        self.pdf_native_downscale_pending(idx, true, false)
+        self.pdf_native_rerender_pending(idx, true, false)
     }
 
     /// 右上フィードバック表示を設定する (既定の表示時間)。
@@ -59409,6 +60468,10 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
+        // Select and cache the root viewport owner before any shortcut path.
+        // This also ages a root PendingFocus claim on every pass, including
+        // passes that return before the normal keyboard handler.
+        let _keyboard_owner = self.keyboard_owner_for_pass(ctx);
         self.edit_preview_repaint_ctx = Some(ctx.clone());
         if self
             .creative_lut_library
@@ -59549,7 +60612,7 @@ impl eframe::App for App {
                     crate::logger::log(
                         "tray: detected external ShowWindow — running sync_after_restore",
                     );
-                    self.sync_after_restore();
+                    self.sync_after_restore(ctx);
                 } else if !is_visible_now && self.window_visible {
                     let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
                     self.window_visible = false;
@@ -59567,7 +60630,7 @@ impl eframe::App for App {
 
             // 設定変更反映 + メニューイベントをポーリング + 閉じるボタンの乗っ取り。
             self.sync_tray_with_settings(ctx);
-            self.poll_tray_events();
+            self.poll_tray_events(ctx);
             if self.maybe_intercept_close(ctx) {
                 return;
             }
@@ -59979,7 +61042,7 @@ impl eframe::App for App {
         self.poll_fs_nav_lock(ctx);
         let t_poll = frame_t0.elapsed();
 
-        self.update_keep_range_and_requests(ctx, frame_t0);
+        self.update_thumbnail_frame_bookkeeping(ctx, frame_t0);
         // 会計はここで出す。update の tail はフルスクリーン中に early return で
         // 飛ばされるため、tail に置くと「測りたいフルスクリーン中」だけ欠測する。
         self.emit_vram_accounting_if_due(std::time::Instant::now());
@@ -60144,8 +61207,8 @@ impl eframe::App for App {
                 }
                 _ => None,
             };
-            // PDF ラスターページが「native は AI 範囲内なのに 4096px レンダで現行が native
-            // より大きい」状態なら native 解像度へ再レンダして AI を起動する (issue #1)。
+            // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
+            // 解像度へ再レンダして AI を起動する。
             // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
             // 判定自体はページ個別 effective_params なので、見開き相方・連続表示の可視
             // ページ (= ui_fullscreen が final AI をかける全ページ) にも個別に適用する。
@@ -60240,44 +61303,12 @@ impl eframe::App for App {
         // ただし open_fullscreen() 直後はフルスクリーンビューポートへの
         // ViewportCommand::Focus が反映されるまで数フレームかかるため、
         // 500ms のグレース期間中はチェックをスキップする。
-        const FS_FOCUS_GRACE_MS: u128 = 500;
-        if self.viewer_session_blocks_main_window() {
-            if !self.fs_focus_grace_elapsed {
-                self.fs_focus_grace_elapsed = self
-                    .fs_opened_at
-                    .map(|t| t.elapsed().as_millis() > FS_FOCUS_GRACE_MS)
-                    .unwrap_or(true);
-            }
-            #[cfg(windows)]
-            let native_video_presenter_active = self.native_video_presenter_hwnd_for_focus_guard();
-            #[cfg(not(windows))]
-            let native_video_presenter_active = false;
-            // in-window 静止画フルスクリーンはメインウィンドウ自身に描画している。
-            // メインがフォーカスを持つのは正常状態なので、ここで閉じてはいけない。
-            #[cfg(windows)]
-            let embedded_still = self.fullscreen_embedded_still_active();
-            #[cfg(not(windows))]
-            let embedded_still = false;
-            let main_viewport_focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
-            if should_close_fullscreen_from_main_focus(
-                self.fs_focus_grace_elapsed,
-                main_viewport_focused,
-                native_video_presenter_active,
-                embedded_still,
-                self.settings.fullscreen_keep_on_app_switch,
-                fullscreen_root_key_handled,
-            ) {
-                self.close_fullscreen();
-            } else if should_restore_fullscreen_focus_from_main_focus(
-                self.fs_focus_grace_elapsed,
-                main_viewport_focused,
-                embedded_still,
-                self.settings.fullscreen_keep_on_app_switch,
-                fullscreen_root_key_handled,
-            ) {
-                self.restore_fullscreen_focus_from_main(ctx);
-            }
-        }
+        let main_viewport_focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        self.reconcile_fullscreen_after_main_focus(
+            ctx,
+            main_viewport_focused,
+            fullscreen_root_key_handled,
+        );
 
         if !fullscreen_root_key_handled {
             self.handle_clipboard_shortcuts(ctx);
@@ -60402,14 +61433,15 @@ impl eframe::App for App {
         self.sync_native_video_iconic_thumbnail();
         #[cfg(windows)]
         {
-            // CP7: `DspBridge::hud_raise_hook` から流れてきた raise 要求を drain して
-            // 1 件以上来てれば fullscreen 中の VideoPlayer に 1 回だけ `request_hud_raise` を呼ぶ
-            // (= coalesce、Codex プラン Step 10)。`try_iter().count()` で要素を消費して個数を取る。
-            let pending = self.hud_raise_rx.try_iter().count();
+            // CP7/Stage 4: `DspBridge::hud_raise_hook` の latest-value latch を consume し、
+            // 1 件以上来ていれば fullscreen 中の VideoPlayer に 1 回だけ raise を要求する。
+            let pending = self
+                .hud_raise_pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
             // Inc 7 hidden presenter: 音声モード中は presenter (+ HUD) が hide されている
             // ので raise 要求は無視する (HUD teardown 済み)。7e の VST ホスト表示中は presenter を
             // un-hide して HUD も出しているので raise を許可する。
-            if pending > 0 && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some()) {
+            if pending && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some()) {
                 if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         player.request_hud_raise();
@@ -60970,26 +62002,45 @@ impl eframe::App for App {
         }
         let t_toolbar_input = frame_t0.elapsed();
 
+        let perf_on = crate::perf::is_enabled();
+        let mut pre_grid_perf = pre_grid_perf_start_with(perf_on, std::time::Instant::now);
+
         // ── 検索バー ─────────────────────────────────────────────────
         self.render_search_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::SearchBar);
 
         // ── お気に入り検索バー (ツールバー直下の 2 行目相当) ─────────
         self.render_favsearch_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FavSearchBar);
 
         // ── Ctrl+G グローバルメタ検索バー (docs §10.3) ────────────────
         self.render_global_search_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::GlobalSearchBar);
 
         // ── Ctrl+T タグビュー ───────────────────────────────────────
         self.render_tag_view_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::TagViewBar);
 
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
         self.render_facet_filter_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FacetFilterBar);
         self.render_details_lazy_status_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::DetailsLazyStatusBar);
 
         // 下部情報バーは CentralPanel のグリッドより先に確保する。egui が残り領域を
         // render_grid へ渡すため、last_viewport_h と仮想スクロール範囲にも反映される。
         self.render_selection_info_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::SelectionInfoBar);
         let (folder_pane_nav, folder_pane_rect) = self.render_folder_pane(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FolderPane);
+
+        // チェック件数は一覧の右上へ常時表示する。Foreground Area をグリッドより先に
+        // 登録し、解除クリックが背面セルの選択操作へ漏れないようにする。
+        self.render_checked_selection_overlay(ctx);
+        mark_pre_grid_perf(
+            &mut pre_grid_perf,
+            PreGridPerfStage::CheckedSelectionOverlay,
+        );
 
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
@@ -60997,9 +62048,11 @@ impl eframe::App for App {
         // 詳細一覧ヘッダの列メニューだけは render_grid 内でこの後に描かれるため、一覧処理を
         // スキップしつつ raw wheel を残し、メニュー内 ScrollArea の処理後に消費する。
         let details_column_menu_open = Self::details_column_context_menu_is_open(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::DetailsColumnMenuCheck);
         if !details_column_menu_open {
             self.suppress_popup_wheel_before_grid(ctx);
         }
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::PopupWheelSuppression);
         // フォルダツリーの ScrollArea を描いた frame でも raw wheel input は残り得る。
         // ポインタが SidePanel の実矩形内なら、内容が短くツリー側にスクロール余地がない
         // 場合も含めて背面グリッドへ適用しない。矩形外では従来どおりグリッドを動かす。
@@ -61009,18 +62062,25 @@ impl eframe::App for App {
                 folder_pane_rect,
                 ctx.pointer_latest_pos(),
             );
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FolderPaneScrollGuard);
         if !folder_pane_blocks_grid_scroll && !details_column_menu_open {
             self.process_scroll(ctx);
         }
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::ProcessScroll);
 
         // ファイル名スタック: フラット読書フルスクリーンを閉じたら集約グリッドへ戻す
         // (render_grid の直前で reconcile して、閉じた瞬間に集約表示が出るようにする)。
         self.stack_reconcile_after_fullscreen_close();
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::StackReconcile);
+        let pre_grid_perf = pre_grid_perf.map(|recorder| {
+            recorder.finish(details_column_menu_open, folder_pane_blocks_grid_scroll)
+        });
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();
         let grid_nav = self.render_grid(ctx);
         let t_grid = frame_t0.elapsed();
+        self.reconcile_details_lazy_session_after_grid(ctx);
         #[cfg(windows)]
         self.log_main_flash_probe(
             "main_ui_drawn",
@@ -61479,8 +62539,12 @@ impl eframe::App for App {
         // フレーム計測: 8 ms (≈120 fps) 超えた場合のみログに出力
         let frame_total = frame_t0.elapsed();
         if frame_total.as_millis() > 8 {
+            let pre_grid_dominant = pre_grid_perf
+                .as_ref()
+                .map(|breakdown| format!("  pg_top={}", breakdown.dominant_summary()))
+                .unwrap_or_default();
             crate::logger::log(format!(
-                "  [SLOW FRAME] {:.1}ms  poll={:.1}ms keep={:.1}ms pre_grid={:.1}ms grid={:.1}ms  backlog={} requested={}",
+                "  [SLOW FRAME] {:.1}ms  poll={:.1}ms keep={:.1}ms pre_grid={:.1}ms grid={:.1}ms  backlog={} requested={}{}",
                 frame_total.as_secs_f64() * 1000.0,
                 t_poll.as_secs_f64() * 1000.0,
                 (t_keep - t_poll).as_secs_f64() * 1000.0,
@@ -61488,7 +62552,11 @@ impl eframe::App for App {
                 (t_grid - t_pre_grid).as_secs_f64() * 1000.0,
                 self.texture_backlog.len(),
                 self.requested.len(),
+                pre_grid_dominant,
             ));
+        }
+        if let Some(pre_grid_perf) = pre_grid_perf.as_ref() {
+            pre_grid_perf.emit(self.frame_counter);
         }
         if crate::perf::is_enabled() && frame_total.as_millis() > 30 {
             let video_playing = self

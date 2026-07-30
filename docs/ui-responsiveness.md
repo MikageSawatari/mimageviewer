@@ -244,6 +244,29 @@ TextureIdで重複排除して見積もり、補正レイヤーの比較preview�
 詳細は `docs/file-drag-drop-design.md` §6.2。perf ログを汚さないよう、実行は
 `update` 末尾 (frame_total 計測の後) に置いている。
 
+### 4.3 大量一覧の target 構築も分割し、scroll では再走査しない
+
+2026-07-30 の実機報告では、50 万件のスマートフォルダを詳細表示した状態で scroll を始めると
+約 0.5 秒 UI が停止した。遅延列 worker 自体は非同期だったが、起動前の
+`App::start_details_meta_load` が UI thread で表示順 50 万件を clone し、要件判定・cache lookup・
+target clone を全件に行っていた。さらに可視優先範囲が移るたび worker を cancel / respawn し、
+この O(N) 構築を繰り返していた。
+
+詳細遅延メタでは次の不変条件を使う。
+
+- `DetailsMetaPendingPhase::Planning` が表示順 cursor と構築済み target を所有し、UI thread は
+  **1 frame 最大 4,096 件**だけ進める。50 万件なら 1 frame に 50 万件ではなく最大 4,096 件、
+  全 session では 50 万件を一度だけ exact に走査する。
+- scroll は対象集合 revision を変えず、100ms idle gate 後に現在の可視 target（通常は約 175 件以下）
+  だけを既存 worker の priority channel へ送る。target plan の cursor は 0 へ戻さない。
+- worker は idx ごとの取得済み field 集合を持つ。同じ target の二重 I/O は避ける一方、画面外で
+  作成日時を取得後に可視化されてページ数が追加要求された場合は、未取得 field だけを処理する。
+- items generation、表示集合 / filter revision、列要件の変更では旧 plan / worker を cancel して
+  新しい session を作る。表示順が planning 中に変わった場合も旧 cursor を別順序へ流用しない。
+- `--perf-log` では `details_meta.target_scan_slice`（slice 件数 / 累計 / ms）、
+  `target_scan_done`（session 総件数 / slice 数 / wall ms）、`priority_update`（可視 target 件数）を
+  記録する。scroll のたびに `target_scan_done.items=500000` が増えていないことを確認する。
+
 ---
 
 ## 5. 既知のパターン: Ctrl+↑↓ 引っかかり (2026-04 解決済み)
@@ -332,11 +355,52 @@ JIT コンパイル + 初回テクスチャアップロードがある。`t=0.98
 $Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
 python scripts\analyze_perf.py $Perf startup   # 起動時間ブレークダウン
 python scripts\analyze_perf.py $Perf nav       # Ctrl+↑↓ 区間別統計
+python scripts\analyze_perf.py $Perf pre-grid  # グリッド直前のバー/ペイン/scroll 内訳
 python scripts\analyze_perf.py $Perf hitches --ms 100  # 100ms 超フレームギャップ
 python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベント列
 ```
 
-### 7.1 判定基準
+### 7.1 `pre_grid` 区間の内訳
+
+`App::update` の `t_toolbar_input` 直後から `t_pre_grid` 直前までは、perf 有効時に
+`cat="ui"`, `kind="pre_grid_breakdown"` をメイン UI フレームごとに 1 件出す。`n` は
+フレーム番号、`total_ms` はこの区間全体で、内訳は次の属性に入る。
+
+| 属性 | 対象処理 |
+| --- | --- |
+| `search_bar_ms` | `render_search_bar` |
+| `favsearch_bar_ms` | `render_favsearch_bar` |
+| `global_search_bar_ms` | `render_global_search_bar` |
+| `tag_view_bar_ms` | `render_tag_view_bar` |
+| `facet_filter_bar_ms` | `render_facet_filter_bar` |
+| `details_lazy_status_bar_ms` | `render_details_lazy_status_bar` |
+| `selection_info_bar_ms` | `render_selection_info_bar` |
+| `folder_pane_ms` | `render_folder_pane` |
+| `checked_selection_overlay_ms` | `render_checked_selection_overlay` |
+| `details_column_menu_check_ms` | 詳細列コンテキストメニューの open 判定 |
+| `popup_wheel_suppression_ms` | `suppress_popup_wheel_before_grid` の条件判定と実行 |
+| `folder_pane_scroll_guard_ms` | フォルダペイン hover によるグリッド scroll 抑止判定 |
+| `process_scroll_ms` | `process_scroll` の条件判定と実行 |
+| `stack_reconcile_ms` | `stack_reconcile_after_fullscreen_close` |
+
+条件分岐の状態は `details_column_menu_open`, `popup_wheel_suppression_ran`,
+`folder_pane_blocks_grid_scroll`, `process_scroll_ran` で判別できる。通常ログの SLOW FRAME には
+perf 有効時だけ内訳上位 2 件を `pg_top=folder_pane:12.3ms,scroll:2.1ms` のように付記する。
+
+```powershell
+python scripts\analyze_perf.py $Perf pre-grid
+python scripts\analyze_perf.py $Perf pre-grid --min-ms 8
+```
+
+`pre-grid` は各属性の mean / p50 / p95 / max / 全 `total_ms` に対する比率と、遅い
+10 フレームの上位 2 項目を出す。既存 SLOW FRAME 行の `pre_grid` は `t_keep` から
+`t_pre_grid` までの広い値であり、このイベントの `total_ms` はその末尾にある
+`t_toolbar_input` から `t_pre_grid` まで（既存 `ui.slow_frame_breakdown.bars_ms` 相当）である。
+
+計測開始と各境界の `Instant::now()` は `crate::perf::is_enabled()` が true の場合だけ実行する。
+false のときは recorder を作らず、イベント属性の `Vec` や通常ログの `pg_top` 文字列も作らない。
+
+### 7.2 判定基準
 
 問題なしとみなせる目安 (2026-04 実測を基準):
 
@@ -348,7 +412,7 @@ python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベン
 
 悪化した場合は `hitches` の直前 nav イベントで原因区間を特定し、§4 チェックリストを通す。
 
-### 7.2 静止中・背面表示中の健全性
+### 7.3 静止中・背面表示中の健全性
 
 `hitches` は遅いフレームを探すため、短い処理を高速で再投入して CPU 1 コアとログを消費する
 ループは別検査にする。release verification binary を `--perf-log` 付きで起動し、PowerShell
@@ -365,7 +429,7 @@ python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベン
 [idle-health-check.md](idle-health-check.md) を参照する。新しい polling / retry / idle work を
 追加するときは、同じ安定状態を複数回評価して最終的に work 0 へ収束する単体テストも追加する。
 
-### 7.3 UI フォント設定
+### 7.4 UI フォント設定
 
 v2.7.0 の UI フォント設定では、`fontdb::Database::load_system_fonts`、font file 読み込み、
 TTC/OTC face ごとの glyph coverage 判定、`ab_glyph` プレビュー生成、egui font definitions の

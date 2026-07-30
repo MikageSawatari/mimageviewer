@@ -40,6 +40,7 @@ use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::native_window_host::{
     NativeCursorIcon, NativeRenderTarget, NativeRenderTargets, NativeWindowIntent,
+    NativeWindowObservation,
 };
 use crate::video::window_host_contract::HostWindowTopology;
 
@@ -120,6 +121,8 @@ pub struct NativeRenderConfig {
     pub(crate) targets: NativeRenderTargets,
     pub width: u32,
     pub height: u32,
+    pub(crate) os_pixels_per_point: f32,
+    pub(crate) initial_observation: NativeWindowObservation,
     pub test_overlay: bool,
     pub egui_overlay: bool,
     pub cursor_hide_delay_secs: f32,
@@ -155,6 +158,7 @@ pub struct NativeRenderCore {
     backbuffer: Option<ID3D11Texture2D>,
     test_overlay: Option<NativeTestOverlay>,
     egui_overlay: Option<NativeEguiOverlay>,
+    window_observation: NativeWindowObservation,
     _overlay_composition_target: NativeOverlayCompositionTarget,
     /// 実機修正 (2026-05-12 P1 #3): 直近 LBUTTON down が検出された時刻。
     /// external_drag 判定に 100ms の delay を入れることで「short click」を
@@ -269,8 +273,8 @@ struct NativeEguiOverlay {
     egui_ctx: egui::Context,
     /// Opaque DComp/DPI target lease. It carries no window lifecycle capability.
     _dcomp_target_lease: NativeRenderTarget,
-    /// Presenter input endpoint used for focus/IME read-through operations.
-    focus_target: NativeRenderTarget,
+    /// Pump-owned USER32 state, copied as a value snapshot.
+    window_observation: NativeWindowObservation,
     /// テキスト入力ダイアログ表示中に presenter HWND へ focus を戻した時刻。
     /// HUD HWND は `WS_EX_NOACTIVATE` なので、別アプリから mIV に戻っただけでは
     /// OS focus が main/HUD 側に残り、presenter wndproc に key/IME が来ない場合がある。
@@ -433,8 +437,8 @@ struct NativeEguiOverlay {
     /// ClickToShow の開いたパネルを Escape で閉じた入力 batch を App へ流さないための印。
     side_panel_escape_consumed: bool,
     /// 実機修正 (2026-05-12): 外部 drag (= HUD region 外で left button down 中、典型的には VST window
-    /// のドラッグ) を検出するフラグ。`NativeRenderCore::cursor_polling_tick` で `GetAsyncKeyState
-    /// (VK_LBUTTON)` の結果と egui の `pointer.any_down()` の差から判定して set する。
+    /// のドラッグ) を検出するフラグ。pump が配る global left-button snapshot と
+    /// egui の `pointer.any_down()` の差から判定して set する。
     /// true の間、`top_bar_visible()` / `hud_visible()` / `right_panel_visible()` 等の hover 判定を
     /// 強制 false にして、bar / panel が出ないようにする (= VST 上端帯にドラッグしても hover 表示で
     /// VST 入力が奪われないようにする)。
@@ -949,10 +953,31 @@ struct SourceKeyedMutexAcquire {
 struct KeyedMutexReadGuard {
     mutex: IDXGIKeyedMutex,
     released_to_reader: Option<Arc<AtomicBool>>,
+    armed: bool,
+}
+
+impl KeyedMutexReadGuard {
+    /// Keep a successfully copied frame reusable by handing reader key 1
+    /// directly back to the next presenter read. Once the frame is displaced
+    /// and its pool slot becomes free, the producer observes
+    /// `released_to_reader=true` and recovers writer key 0.
+    fn release_to_reader(mut self) -> Result<(), String> {
+        let result = unsafe { self.mutex.ReleaseSync(1) };
+        if result.is_ok() {
+            if let Some(released) = &self.released_to_reader {
+                released.store(true, Ordering::Release);
+            }
+            self.armed = false;
+        }
+        result.map_err(|error| format!("source keyed mutex reader release failed: {error:?}"))
+    }
 }
 
 impl Drop for KeyedMutexReadGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         unsafe {
             let _ = self.mutex.ReleaseSync(0);
         }
@@ -1433,7 +1458,9 @@ impl NativeOverlayInputRouting {
             // 内部処理イベント (presenter thread が直接消費する)。UI 転送しない。
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
-            | NativeEvent::RequestRaiseHud => false,
+            | NativeEvent::RequestRaiseHud
+            | NativeEvent::RequestFocusClaim
+            | NativeEvent::Destroyed => false,
         }
     }
 }
@@ -1648,9 +1675,10 @@ impl NativeRenderCore {
                         hud_root,
                         None,
                         hud_target,
-                        presenter_target,
                         config.width,
                         config.height,
+                        config.os_pixels_per_point,
+                        config.initial_observation,
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
                         config.text_contrast,
@@ -1704,9 +1732,10 @@ impl NativeRenderCore {
                         &root_visual,
                         Some(&video_visual),
                         presenter_target,
-                        presenter_target,
                         config.width,
                         config.height,
+                        config.os_pixels_per_point,
+                        config.initial_observation,
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
                         config.text_contrast,
@@ -1843,6 +1872,7 @@ impl NativeRenderCore {
                 backbuffer: None,
                 test_overlay,
                 egui_overlay,
+                window_observation: config.initial_observation,
                 _overlay_composition_target: overlay_composition_target,
                 lbutton_down_since: None,
                 fence_cache: None,
@@ -2452,7 +2482,7 @@ impl NativeRenderCore {
                 metrics.keyed_mutex_ms = keyed_mutex_t0.elapsed().as_secs_f64() * 1000.0;
                 metrics.keyed_mutex_cast_ms = keyed_mutex.cast_ms;
                 metrics.keyed_mutex_acquire_ms = keyed_mutex.acquire_ms;
-                let _keyed_mutex_guard = keyed_mutex.guard;
+                let keyed_mutex_guard = keyed_mutex.guard;
                 let src_probe = if probe_this_frame {
                     Some(self.sample_texture_pixel(&src, "source")?)
                 } else {
@@ -2524,6 +2554,9 @@ impl NativeRenderCore {
                 } else {
                     "d3d11_shared"
                 };
+                if let Some(guard) = keyed_mutex_guard {
+                    guard.release_to_reader()?;
+                }
             }
         }
         // フレームコピー (UpdateSubresource / CopySubresourceRegion) を GPU タイムライン上で
@@ -2601,6 +2634,13 @@ impl NativeRenderCore {
             .unwrap_or(false)
     }
 
+    pub(crate) fn set_window_observation(&mut self, observation: NativeWindowObservation) {
+        self.window_observation = observation;
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.window_observation = observation;
+        }
+    }
+
     /// **overlay (egui_wgpu) の surface だけ** を resize する。
     /// presenter 全体 (= background / video transform / swap chain) は触らない。
     ///
@@ -2627,8 +2667,8 @@ impl NativeRenderCore {
     /// HUD HWND が無い (= フォールバック経路) なら何もせず `false`。
     ///
     /// 役割:
-    ///   1. `GetCursorPos` + `ScreenToClient(presenter_hwnd)` で cursor の presenter 座標を取得。
-    ///   2. presenter HWND の client rect 範囲チェック (= 別モニターに移ったケースは弾く):
+    ///   1. pump の `NativeWindowObservation` から cursor の presenter 座標を取得。
+    ///   2. pump が観測した client rect 範囲チェック (= 別モニターに移ったケースは弾く):
     ///      範囲外なら一度だけ synthetic `MouseLeave` を流して以降何もしない。
     ///   3. 範囲内: 直近 80ms 以内に HUD/presenter wndproc 経由の本物 `WM_MOUSEMOVE` が
     ///      届いていなければ synthetic `MouseMove` を overlay の `push_native_event` に流す
@@ -2638,16 +2678,11 @@ impl NativeRenderCore {
     ///      raise を要求する (= 戻り値 true)。判定不能なら false で skip。
     pub(crate) fn cursor_polling_tick(
         &mut self,
-        presenter_target: NativeRenderTarget,
-        has_hud: bool,
-        hud_has_capture: bool,
         last_native_mouse_at: Option<std::time::Instant>,
         pointer_present_synthetic: &mut bool,
     ) -> bool {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-
         // 実機修正 (2026-05-12): 外部 drag 検出。
-        // `GetAsyncKeyState(VK_LBUTTON)` の最上位 bit が立っていれば左ボタン押下中。
+        // pump snapshot で global left button が down なら左ボタン押下中。
         // ただし HUD region 内クリックは egui の `pointer.any_down()` でも true になる
         // (= 内部 drag、e.g. seek bar の drag)。両方の差分で「HUD 外で down している」
         // = 外部 drag (e.g. VST window のドラッグ) を判定する。
@@ -2664,8 +2699,8 @@ impl NativeRenderCore {
         // external_drag は false のまま (= bar 表示維持)。100ms 経過後も DOWN 継続中で
         // egui に any_down が伝わっていなければ「真の外部 drag」と判定する。
         // 通常 click は数 ms ~ 数十 ms で UP するので、この delay で click は誤検出されない。
-        let global_lbutton_down =
-            unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+        let observation = self.window_observation;
+        let global_lbutton_down = observation.global_lbutton_down;
         let egui_pointer_down = self
             .egui_overlay
             .as_ref()
@@ -2688,7 +2723,7 @@ impl NativeRenderCore {
         let external_drag = global_lbutton_down
             && !egui_pointer_down
             && lbutton_down_long_enough
-            && !hud_has_capture;
+            && !observation.hud_has_capture;
         if let Some(overlay) = self.egui_overlay.as_mut() {
             if overlay.external_drag_in_progress != external_drag {
                 overlay.external_drag_in_progress = external_drag;
@@ -2698,14 +2733,17 @@ impl NativeRenderCore {
         }
 
         // HUD HWND が無い経路 (= CP4 フォールバック / CP7 で flip 前) は polling 不要。
-        if !has_hud {
+        if !observation.has_hud {
             return false;
         }
-        let Some(pt) = presenter_target.cursor_client_position() else {
+        let Some([x, y]) = observation.cursor_client_position else {
             return false;
         };
-        let in_range =
-            pt.x >= 0 && pt.y >= 0 && (pt.x as u32) < self.width && (pt.y as u32) < self.height;
+        let in_range = observation.cursor_within_client
+            && x >= 0
+            && y >= 0
+            && (x as u32) < self.width
+            && (y as u32) < self.height;
 
         if !in_range {
             // 範囲外: overlay に残っている pointer_pos を 1 度だけ clear して終了。
@@ -2745,20 +2783,20 @@ impl NativeRenderCore {
         let needs_synthetic_move = self
             .egui_overlay
             .as_ref()
-            .is_some_and(|overlay| overlay.needs_synthetic_pointer_move(pt.x, pt.y));
+            .is_some_and(|overlay| overlay.needs_synthetic_pointer_move(x, y));
         if !recent_native && needs_synthetic_move {
             if hud_debug_enabled() {
                 crate::logger::log(format!(
                     "[HUD-DEBUG] polling synthetic MouseMove x={} y={} (no native mouse in 80ms)",
-                    pt.x, pt.y
+                    x, y
                 ));
             }
             if let Some(overlay) = self.egui_overlay.as_mut() {
                 overlay.push_native_event(
                     crate::video::native_window::NativeVideoWindowEvent::MouseMove(
                         crate::video::native_window::NativeVideoMouseEvent {
-                            x: pt.x,
-                            y: pt.y,
+                            x,
+                            y,
                             shift: false,
                             ctrl: false,
                         },
@@ -2780,7 +2818,7 @@ impl NativeRenderCore {
             .unwrap_or(1.0);
         let top_band_px = (76.0_f32 * ppp).round() as i32;
         let bottom_band_top = self.height as i32 - (220.0_f32 * ppp).round() as i32;
-        let in_activation_zone = pt.y < top_band_px || pt.y >= bottom_band_top;
+        let in_activation_zone = y < top_band_px || y >= bottom_band_top;
         if !in_activation_zone {
             return false;
         }
@@ -3338,6 +3376,7 @@ impl NativeRenderCore {
             guard: Some(KeyedMutexReadGuard {
                 mutex,
                 released_to_reader,
+                armed: true,
             }),
             cast_ms,
             acquire_ms,
@@ -3686,9 +3725,10 @@ impl NativeEguiOverlay {
         root_visual: &IDCompositionVisual,
         after_visual: Option<&IDCompositionVisual>,
         dcomp_target: NativeRenderTarget,
-        focus_target: NativeRenderTarget,
         width: u32,
         height: u32,
+        os_pixels_per_point: f32,
+        window_observation: NativeWindowObservation,
         cursor_hide_delay_secs: f32,
         ui_scale: f32,
         text_contrast: crate::settings::TextContrast,
@@ -3742,8 +3782,7 @@ impl NativeEguiOverlay {
         configure_overlay_fonts(&egui_ctx, &ui_font);
         configure_overlay_style(&egui_ctx, text_contrast);
         let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
-        let pixels_per_point =
-            effective_overlay_pixels_per_point(dcomp_target.os_pixels_per_point(), ui_scale);
+        let pixels_per_point = effective_overlay_pixels_per_point(os_pixels_per_point, ui_scale);
         let cursor_hide_delay_secs =
             crate::settings::clamp_fullscreen_cursor_hide_delay_secs(cursor_hide_delay_secs);
         let this = Self {
@@ -3762,7 +3801,7 @@ impl NativeEguiOverlay {
             renderer,
             egui_ctx,
             _dcomp_target_lease: dcomp_target,
-            focus_target,
+            window_observation,
             last_text_input_focus_claim_at: None,
             started_at: Instant::now(),
             pending_events: Vec::new(),
@@ -4291,6 +4330,9 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::MouseLeave => {
+                if self.window_observation.has_hud && self.window_observation.cursor_within_client {
+                    return;
+                }
                 self.pointer_pos = None;
                 self.pending_events.push(egui::Event::PointerGone);
                 self.dirty = true;
@@ -4300,7 +4342,9 @@ impl NativeEguiOverlay {
             // 内部処理イベント (presenter thread が直接消費する)。overlay には流さない。
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
-            | NativeEvent::RequestRaiseHud => {}
+            | NativeEvent::RequestRaiseHud
+            | NativeEvent::RequestFocusClaim
+            | NativeEvent::Destroyed => {}
         }
     }
 
@@ -5579,7 +5623,7 @@ impl NativeEguiOverlay {
             return None;
         }
 
-        let focus_state = self.focus_target.focus_state();
+        let focus_state = self.window_observation.focus;
         let target_hwnd = focus_state.target_id;
         let thread_focus_hwnd = focus_state.thread_focus_id;
         let foreground_is_current_process = focus_state.foreground_is_current_process;
@@ -7860,7 +7904,7 @@ impl NativeEguiOverlay {
     /// cursor 管理を止める判定に使う。取得失敗時は true (= 従来どおり管理を継続) に
     /// 倒す。fullscreen では focus_hwnd がモニタ全面なので常に true。
     fn cursor_within_focus_window(&self) -> bool {
-        self.focus_target.cursor_within_client_or_true()
+        self.window_observation.cursor_within_client
     }
 
     fn resolve_cursor_icon(cursor_icon: egui::CursorIcon) -> NativeCursorIcon {
@@ -8456,6 +8500,14 @@ mod tests {
             ctx.style().visuals.text_color(),
             crate::os_theme::dark_visuals(crate::settings::TextContrast::Standard).text_color()
         );
+    }
+
+    #[test]
+    fn retained_frame_releases_reader_key_without_rearm_acquire() {
+        let source = include_str!("render_core.rs");
+        let forbidden_rearm_acquire = ["Acquire", "Sync(0"].concat();
+        assert!(source.contains("self.mutex.ReleaseSync(1)"));
+        assert!(!source.contains(&forbidden_rearm_acquire));
     }
 
     #[test]

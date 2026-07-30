@@ -24,6 +24,10 @@ pub struct VersionHighlights {
     pub highlights: &'static [HighlightItem],
 }
 
+/// 一覧のクリック選択をエクスプローラー方式へ切り替える告知エントリの版。
+/// テーブルと移行判定が別々の版文字列を持たないための単一の定義元。
+pub const GRID_CLICK_SELECTION_EXPLORER_VERSION: &str = "2.9.0";
+
 /// バージョン文字列を `(major, minor, patch)` に緩くパースする。
 /// `v` 接頭辞と `-pre` / `+meta` 接尾辞は無視する。パースできなければ `None`
 /// (= 呼び出し側は fail-safe にスキップする)。
@@ -82,6 +86,14 @@ pub fn highlights_to_show<'a>(
         .collect();
     out.sort_by_key(|e| parse_version(e.version).unwrap_or((0, 0, 0)));
     out
+}
+
+/// v2.9.0 の告知と同じ更新範囲に入った初回起動かを返す。
+/// 独自の版比較は持たず、実際に表示対象となるエントリ集合から直接導出する。
+pub fn grid_click_selection_explorer_upgrade_required(prev: Option<&str>, current: &str) -> bool {
+    highlights_to_show(prev, current, table())
+        .iter()
+        .any(|entry| entry.version == GRID_CLICK_SELECTION_EXPLORER_VERSION)
 }
 
 /// 指定バージョン (= 通常は現行版) のエントリを返す。ヘルプメニューからの再表示用。
@@ -424,6 +436,46 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: GRID_CLICK_SELECTION_EXPLORER_VERSION,
+        must_read: &[
+            HighlightItem {
+                title: "クリックで以前のチェックを解除します",
+                body: "一覧で項目をクリックすると、それまでのチェックが解除され、クリックした項目だけが\
+                       選ばれるようになりました（エクスプローラーと同じ動作）。従来の動作に戻すには、\
+                       環境設定の「表示 → サムネイル → 一覧のクリック選択」で「チェック方式」を選べます。",
+            },
+            HighlightItem {
+                title: "画像補正はまず「その場所の標準」に効きます",
+                body: "個別設定を持たないページで補正スライダーを動かすと、そのページだけでなく、\
+                       その場所の標準が変わり、同じ標準を使うページすべてに反映されます。\
+                       このページだけに効かせたいときは、パネル上部の適用範囲で「このページ」を選びます。\
+                       お気に入りごとに標準を分けたいときは「このお気に入り用に標準を分ける」を有効にします。",
+            },
+        ],
+        highlights: &[
+            HighlightItem {
+                title: "連結読みでも左パネルが使えます",
+                body: "スクロールしながら読んでいる途中でも、画像補正・表示トリミング・ブックマークを\
+                       開けます。編集対象のページは枠で示します。",
+            },
+            HighlightItem {
+                title: "詳細表示の下部バーに独自の列",
+                body: "下部バーに出す列を、一覧と同じ列・専用の列・非表示から選べます。\
+                       列の追加や幅の調整はバーからもできます。",
+            },
+            HighlightItem {
+                title: "動画にも画像補正の保存スロット",
+                body: "明るさや Creative LUT などの設定をスロットへ保存し、\
+                       Ctrl+1〜Ctrl+0 で呼び出せます。",
+            },
+            HighlightItem {
+                title: "PDF のページ表示が速くなりました",
+                body: "表示に必要な大きさでページを描くようにしました。\
+                       CPU のコア数が少ない環境ほど効果があります。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]
@@ -543,6 +595,45 @@ mod tests {
             Some("2.2.0")
         );
         assert_eq!(latest_not_newer_than("garbage", T).map(|e| e.version), None);
+    }
+
+    #[test]
+    fn v2_9_grid_selection_upgrade_uses_the_highlight_selection_condition() {
+        for (prev, current) in [
+            (None, "2.9.0"),
+            (Some("2.8.0"), "2.8.1"),
+            (Some("2.8.0"), "2.9.0"),
+            (Some("2.8.0"), "3.0.0"),
+            (Some("2.9.0"), "3.0.0"),
+            (Some("3.0.0"), "2.9.0"),
+            (Some("invalid"), "2.9.0"),
+        ] {
+            let highlight_selected = highlights_to_show(prev, current, table())
+                .iter()
+                .any(|entry| entry.version == GRID_CLICK_SELECTION_EXPLORER_VERSION);
+            assert_eq!(
+                grid_click_selection_explorer_upgrade_required(prev, current),
+                highlight_selected,
+                "prev={prev:?}, current={current}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_9_0_must_read_entry() {
+        let entries = for_version(GRID_CLICK_SELECTION_EXPLORER_VERSION, table());
+        assert_eq!(versions(&entries), [GRID_CLICK_SELECTION_EXPLORER_VERSION]);
+        let entry = entries[0];
+        // 選択方式の一度きりの切替はこの must_read の存在で告知される (settings.rs の移行判定と
+        // 対になる)。同じバージョンに別の must_read が増えても壊れないよう、件数ではなく
+        // 「その項目があること」を固定する。
+        let selection_notice = entry
+            .must_read
+            .iter()
+            .find(|item| item.title.contains("チェックを解除"))
+            .expect("v2.9.0 must announce the grid click selection switch");
+        assert!(selection_notice.body.contains("エクスプローラーと同じ動作"));
+        assert!(selection_notice.body.contains("チェック方式"));
     }
 
     #[test]

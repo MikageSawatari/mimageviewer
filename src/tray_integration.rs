@@ -14,8 +14,27 @@ fn should_close_fullscreen_for_tray(
     fs_cache_has_video: bool,
     native_video_pending: bool,
     detached_viewer_session: bool,
+    current_media_was_playing: bool,
 ) -> bool {
-    !detached_viewer_session && (fullscreen_open || fs_cache_has_video || native_video_pending)
+    !detached_viewer_session
+        && !current_media_was_playing
+        && (fullscreen_open || fs_cache_has_video || native_video_pending)
+}
+
+fn pause_video_players_for_tray<'a>(
+    entries: impl Iterator<Item = &'a crate::fs_animation::FsCacheEntry>,
+) -> usize {
+    let mut paused = 0;
+    for entry in entries {
+        let crate::fs_animation::FsCacheEntry::Video { player, .. } = entry else {
+            continue;
+        };
+        if player.intent_playing() {
+            player.set_playing(false);
+            paused += 1;
+        }
+    }
+    paused
 }
 
 impl App {
@@ -129,6 +148,11 @@ impl App {
         if !self.window_visible {
             return;
         }
+        // Win32 が main / owned windows を隠すより先に transport を止める。VideoPlayer の
+        // Pause は playback transport / audio / clock を同じ状態機械で止め、現在位置を保持する。
+        // 動画→音声モードと音楽ファイルも同じ FsCacheEntry::Video を所有するため、
+        // 表示形態ごとの分岐や tray 専用フラグは要らない。
+        let current_media_was_playing = self.pause_media_playback_for_tray();
         let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
         self.window_visible = false;
         crate::set_ui_heartbeat_suspended(
@@ -157,10 +181,9 @@ impl App {
             }
         }
 
-        // 動画 / フルスクリーンの実セッションは、単なる fs_cache.clear ではなく
-        // close_fullscreen 経路で閉じる。これにより再生位置保存、native presenter、
-        // source-swap pending、VST3 owner、ノーマライズ状態の後片付けを一括で通す。
-        self.release_media_session_for_tray();
+        // 再生中だった media session は pause 済みの player / presenter を維持する。
+        // 非 media または再生中でなかった通常 fullscreen は従来どおり close する。
+        self.release_media_session_for_tray(current_media_was_playing);
 
         // I/O throttle: 他アプリへの帯域影響を抑える
         if let Some(mgr) = self.indexer_manager.as_ref() {
@@ -190,7 +213,7 @@ impl App {
     /// タスクトレイから復帰した後の **App 側事後処理**。
     /// トレイスレッドの OpenRequested 経路と、外部 ShowWindow 検出経路 (アクティベーション
     /// リスナー等) の両方から呼ばれる。
-    pub(crate) fn sync_after_restore(&mut self) {
+    pub(crate) fn sync_after_restore(&mut self, ctx: &egui::Context) {
         if self.window_visible {
             return;
         }
@@ -208,15 +231,34 @@ impl App {
         // 外部 (ComfyUI 等) がトレイ常駐中に current_folder へファイルを追加していたら
         // 自動で反映する。stat 1 回の軽量チェックで、変化が無ければ no-op。
         self.check_external_folder_changes();
+        // tray hide が保持した fullscreen media は pause のまま surface だけ復帰させる。
+        // Play は送らず、main-focus guard が復帰フレームで close する競合だけを既存の
+        // focus grace / focus restore 経路で避ける。
+        self.restore_media_surface_after_tray(ctx);
         crate::logger::log("tray: App state synced after restore");
     }
 
-    /// トレイ格納時に、動画 / フルスクリーン表示が握っている重いリソースを解放する。
-    ///
-    /// `release_gpu_resources` の `fs_cache.clear()` だけでも `VideoPlayer` は drop されるが、
-    /// フルスクリーン状態機械の cleanup を通らないと native presenter の退避状態や
-    /// normalize UI state などが残りうる。既存のフルスクリーン終了経路へ寄せる。
-    fn release_media_session_for_tray(&mut self) {
+    /// トレイ格納時に、全 viewer context の再生 transport を明示的に一時停止する。
+    /// `VideoPlayer::set_playing(false)` は engine clock の現在位置を保持する。
+    pub(crate) fn pause_media_playback_for_tray(&mut self) -> bool {
+        let current_paused = pause_video_players_for_tray(self.fs_cache.values());
+        #[cfg(windows)]
+        let detached_paused = self.pause_detached_media_playback_for_tray();
+        #[cfg(not(windows))]
+        let detached_paused = 0;
+        self.save_all_video_resume_positions();
+        #[cfg(windows)]
+        self.save_detached_video_resume_positions_for_exit();
+        if current_paused + detached_paused > 0 {
+            crate::logger::log(format!(
+                "tray: paused media before residency; current={current_paused} detached={detached_paused}"
+            ));
+        }
+        current_paused > 0
+    }
+
+    /// pause 後に、保持対象ではない従来の fullscreen session だけを閉じる。
+    fn release_media_session_for_tray(&mut self, current_media_was_playing: bool) {
         let fs_cache_has_video = self
             .fs_cache
             .values()
@@ -234,6 +276,7 @@ impl App {
             fs_cache_has_video,
             native_video_pending,
             self.viewer_session_is_detached_or_switching(),
+            current_media_was_playing,
         ) {
             crate::logger::log(format!(
                 "tray: closing fullscreen/media session before residency \
@@ -241,9 +284,15 @@ impl App {
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
             self.close_fullscreen();
+        } else if current_media_was_playing {
+            crate::logger::log(format!(
+                "tray: keeping paused media session for resume after residency \
+                 fullscreen={:?} fs_video={} native_pending={}",
+                self.fullscreen_idx, fs_cache_has_video, native_video_pending
+            ));
         } else if self.viewer_session_is_detached_or_switching() {
             crate::logger::log(format!(
-                "tray: keeping detached viewer session alive during residency \
+                "tray: keeping existing detached viewer session during residency \
                  fullscreen={:?} fs_video={} native_pending={}",
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
@@ -276,8 +325,24 @@ impl App {
             );
             return;
         }
-        // フルスクリーン画像キャッシュ (最大サイズ源、20MP RGBA ≈ 80MB/枚)
-        self.fs_cache.clear();
+        // フルスクリーン画像キャッシュ (最大サイズ源、20MP RGBA ≈ 80MB/枚)。
+        // 再生中に tray へ入った media session は pause 済みの VideoPlayer を保持し、
+        // それ以外の texture entry は従来どおり解放する。
+        let paused_media_entries = self
+            .fs_cache
+            .values()
+            .filter(|entry| matches!(entry, crate::fs_animation::FsCacheEntry::Video { .. }))
+            .count();
+        if paused_media_entries == 0 {
+            self.fs_cache.clear();
+        } else {
+            self.fs_cache.retain(|_, entry| {
+                matches!(entry, crate::fs_animation::FsCacheEntry::Video { .. })
+            });
+            crate::logger::log(format!(
+                "tray: retained {paused_media_entries} paused media player(s) while releasing GPU caches"
+            ));
+        }
         #[cfg(windows)]
         if let Some(device) = self.gpu_video_device.as_ref() {
             device.release_idle_pools();
@@ -384,7 +449,7 @@ impl App {
     /// トレイスレッド側が先に Win32 操作 (`ShowWindow` / `PostMessage(WM_CLOSE)` 等) と
     /// 共有 Arc 経由の状態反転 (`activity_gate` / `io_sem`) を済ませているので、
     /// ここでは App 側の状態同期と設定永続化だけ行う。
-    pub(crate) fn poll_tray_events(&mut self) {
+    pub(crate) fn poll_tray_events(&mut self, ctx: &egui::Context) {
         // borrow 分離: 先にイベントを drain してから self のメソッドを呼ぶ。
         let events: Vec<TrayEvent> = {
             let Some(tc) = self.tray_controller.as_ref() else {
@@ -399,7 +464,7 @@ impl App {
         for ev in events {
             match ev {
                 TrayEvent::OpenRequested => {
-                    self.sync_after_restore();
+                    self.sync_after_restore(ctx);
                 }
                 TrayEvent::TogglePauseRequested { .. } => {
                     // 設定反映・保存・tooltip 更新は下の reconcile で一括処理する
@@ -426,26 +491,48 @@ mod tests {
 
     #[test]
     fn tray_residency_closes_fullscreen_sessions() {
-        assert!(should_close_fullscreen_for_tray(true, false, false, false));
+        assert!(should_close_fullscreen_for_tray(
+            true, false, false, false, false
+        ));
     }
 
     #[test]
     fn tray_residency_closes_video_resources_without_fullscreen_flag() {
-        assert!(should_close_fullscreen_for_tray(false, true, false, false));
-        assert!(should_close_fullscreen_for_tray(false, false, true, false));
+        assert!(should_close_fullscreen_for_tray(
+            false, true, false, false, false
+        ));
+        assert!(should_close_fullscreen_for_tray(
+            false, false, true, false, false
+        ));
     }
 
     #[test]
     fn tray_residency_leaves_plain_grid_sessions_open() {
         assert!(!should_close_fullscreen_for_tray(
-            false, false, false, false
+            false, false, false, false, false
         ));
     }
 
     #[test]
     fn tray_residency_keeps_detached_viewer_sessions_open() {
-        assert!(!should_close_fullscreen_for_tray(true, false, false, true));
-        assert!(!should_close_fullscreen_for_tray(false, true, false, true));
-        assert!(!should_close_fullscreen_for_tray(false, false, true, true));
+        assert!(!should_close_fullscreen_for_tray(
+            true, false, false, true, false
+        ));
+        assert!(!should_close_fullscreen_for_tray(
+            false, true, false, true, false
+        ));
+        assert!(!should_close_fullscreen_for_tray(
+            false, false, true, true, false
+        ));
+    }
+
+    #[test]
+    fn tray_residency_keeps_playing_media_session_after_pause() {
+        assert!(!should_close_fullscreen_for_tray(
+            true, true, false, false, true
+        ));
+        assert!(!should_close_fullscreen_for_tray(
+            false, true, false, false, true
+        ));
     }
 }

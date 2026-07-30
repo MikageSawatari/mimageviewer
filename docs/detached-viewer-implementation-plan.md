@@ -74,11 +74,10 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 - メイン一覧のカーソル同期だけでは、最小化中の別ウィンドウを勝手に復元したり、他アプリの手前へ出したりしない。
 - 最小化・最大化・サイズ変更・移動・`×` は通常の Windows 操作として使えるようにする。
 - メインウィンドウの最小化とは連動しない。動画だけ残して再生する用途を許容する。
-- アプリ終了時は別ウィンドウも終了する。ただし「閉じるとタスクトレイへ入る」設定で実際にはアプリ終了しない場合は、別ウィンドウと再生を継続する。
+- アプリ終了時は別ウィンドウも終了する。ただし「閉じるとタスクトレイへ入る」設定で実際にはアプリ終了しない場合は、別ウィンドウの session と再生位置を保持し、再生 transport は格納前に pause する。復帰後は自動再生せず、Play で同じ位置から再開する。
 - 位置・サイズは保存する。復元時は現在のモニター構成に対して画面外へ出ないよう補正する。
 
-注意: close-to-tray の既存経路は `release_media_session_for_tray()` / `release_gpu_resources()` / UI heartbeat suspend が load-bearing だったため、detached session が開いている場合だけ session と event pump を維持する明示分岐を入れている。
-通常の最小化と close-to-tray は別扱いにする。通常最小化では detached window を維持する。close-to-tray では、detached session が開いている場合だけ media session を閉じず、detached 表示のために必要な update / repaint / event pump と `fs_cache` を維持する。
+注意: close-to-tray の既存経路は `pause_media_playback_for_tray()` / `release_media_session_for_tray()` / `release_gpu_resources()` / UI heartbeat suspend が load-bearing である。通常の最小化と close-to-tray は別扱いにし、通常最小化では detached window の既存動作を変えない。close-to-tray では mounted / active detached / ParkedLive の media transport を同じ経路で pause する。detached session は既存 owner と event pump を維持し、再生中だった mounted session も pause 済み `VideoPlayer` を保持する。格納前から非再生だった通常 session の close は従来どおり。
 
 ## 3. 状態モデル
 

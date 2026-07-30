@@ -18,66 +18,36 @@
 >   安全網として残す。`final_ai_cache` entry は pixels と `used_upscale` を持ち、
 >   smart sharpen のスキップ判定はサイズ比較ではなく `used_upscale` を使う。
 > - 2x モデル追加・ノイズ除去の原寸適用は本書記載どおり未実装。
-> - **(旧・既知の制限 → v1.3.1 で解消、GitHub issue #1)**: PDF ページの初回フルスクリーン
->   レンダは content_type 未解析のため 4096px 固定 (`start_fs_load`)。final AI はレンダ
->   後のピクセルサイズで判定するので、ラスターページでも初回表示では AI が掛からなかった
->   (旧しきい値 2048 でも同じ。Codex P2 指摘、実装前からの既存挙動)。当初はズーム操作で
->   `request_pdf_rerender` がサイズ上限内のラスターページを native 解像度で再レンダした
->   時点でしか AI が効かず、「content_type 解析後の自動再レンダは PDF pool 負荷との
->   トレードオフがありスコープ外」としていた。**v1.3.1 で毎フレームの reconcile を追加**:
->   `App::update` の `maybe_native_rerender_pdf_for_ai` が、対象ページが「native は
->   サイズ上限内なのに現行レンダ寸法が native より十分大きい」なら
->   `request_pdf_rerender(idx, 1.0)` で native へ再レンダする。content_type 到着時
->   (初回表示で AI ON) に加え、**開いてサイズ確認後に U/N キーで AI を ON にする
->   issue 本文のシナリオ**も毎フレーム評価で拾う。
->   - **対象ページ範囲 (Codex 再レビュー P1)**: fs_idx だけでなく **見開き相方ページ +
->     連続表示の可視ページ (`fs_vertical_cache_keep_set`)** にも適用する。これらも
->     `ui_fullscreen` が `resolve_fs_processed_texture` で final AI をかけるため、片側だけ
->     native 化すると相方が 4096px のまま AI skip になる。AI 有効判定は cache 済み
->     `ai_upscale_enabled` ではなく **ページ個別 `effective_params(idx)` →
->     `effective_upscale_request` / `effective_denoise_request`** (= `maybe_start_final_ai`
->     と同じ) で行うので、ページ個別 AI 設定が異なる相方ページでも final AI ゲートと一致する。
->   - **高負荷上限でも native へ落とす (Codex 再レビュー P2)**: 条件は
->     `ai_at_native && cur_long > native_long * 1.1`。`!ai_at_cur` ではないので、上限を
->     `4096` にして現行 4096px レンダ (例 2812×4095 ≈ 11.5MP) も「AI 対象」になるケースでも、
->     より小さい native (例 824×1200 ≈ 1MP) へ落としてから AI する。PDFium の補間アップ
->     スケール出力を AI に流すより軽く・高品質。`1.1` 倍は `request_pdf_rerender` の dedup と
->     一致し、収束後 (cur≈native) は false で毎フレーム呼んでもループ・無駄打ちなし。
->   判定は純関数 `ai::upscale::pdf_needs_native_rerender_for_ai` (in-flight 中 / ズーム中 /
->   収束後は false。単体テスト + app 配線テストあり)。fit 表示 (zoom≈1.0) のみ・1 ページ
->   1 回 (収束) なので pool 負荷は限定的。非 AI 利用時 (AI 設定 OFF → `ai_at_native` が false)
->   は再レンダせず 4096px 表示を維持する (range 内ラスターを常に native へ落とすと表示解像度が
->   下がるため「設定 ON」を AND 条件にしている)。
->   - **AI 先読みを画像と同等にする (Codex 再々レビュー P2)**: 非表示の先読みページ
->     (`ai_prefetch_targets`) も Raster PDF なら、`prefetch_final_ai` が
->     `pdf_prefetch_should_defer_ai` で「現行 4096px に AI を流しても表示時 native 再レンダで
->     捨てる」状態を検出し、**native 再レンダを通常レーンで先に起動 + AI 先読みを native
->     着地まで保留**する。これで移動時に native + final AI が揃って画像同様に即表示できる
->     (4096px への無駄 AI も回避)。`pdf_prefetch_should_defer_ai` は visible 判定と違い
->     **ズーム / in-flight を見ない** (先読みページは fit で開かれる前提、再レンダ中も保留
->     継続)。native 再レンダの優先度: `request_pdf_rerender(idx, zoom, priority)` で
->     **visible/ズーム = priority レーン、先読み = 通常レーン** に振り分け (PDF worker は
->     priority を先に drain するので、先読みの native 再レンダが visible の再レンダや UI
->     ナビ enumerate を妨げない)。トレードオフ: 初回パスでネイバーは 4096px→native の 2 回
->     レンダ (= 画像が neighbor を decode する分の PDF 版。通常レーン・小サイズ・1 回収束)。
->   - **表示経路でも 4096px AI を保留 (Codex 4th P2)**: 非表示先読みだけでなく、表示中ページ
->     でも native 再レンダ待ち/進行中は捨てる 4096px (高負荷上限で ~11.5MP) final AI を
->     流さない。`ensure_final_composite_texture` が `display_should_defer_final_ai` で保留し、
->     暫定 (color-adjusted) を complete=false で見せて native 着地後に AI 起動する。保留時は
->     native 再レンダを priority レーンで保証起動 (reconcile 対象外経路でのハング防止、
->     in-flight 中は二重起動しない)。KICK / 表示保留 / 先読み保留の 3 判定は
->     `App::pdf_native_downscale_pending(idx, respect_zoom, gate_in_flight)` に統一
->     ((t,t)/(t,f)/(f,f))。中核数式は純関数 `ai::upscale::pdf_render_exceeds_native_ai_target`。
->   - **256px clamp の収束 (Codex 4th P2)**: `request_pdf_rerender` は `target_px` を
->     `[PDF_RENDER_MIN_LONG_PX(=256), PDF_RENDER_MAX_LONG_PX(=8192)]` に clamp するので、
->     native 100×200 の実レンダ着地は長辺 256 (128×256)。収束判定を raw `native_long(200)`
->     で見ると `256 > 200×1.1` で永久に「再レンダ要/AI 保留」のままになり、極小 Raster PDF で
->     先読みが効かなくなる。純関数に `render_min_long` を渡し **実 target 長辺
->     `max(native_long, 256)`** と比較して収束させる (テスト `min_clamp_lets_tiny_native_converge`)。
->   - **スコープ**: 対象は `PdfPageContentType::Raster` のページ。可視テキスト / パス /
->     シェーディングを含むページは `Vector` 判定 (`pdf_loader::analyze_page_content`) で
->     4096px 固定のまま AI 対象外 (透明 OCR テキストは `is_visible_text` が無視するので
->     スキャン PDF は Raster のまま対象)。ベクター混在ページの AI 化は別途要検討。
+> - **PDF 初回表示の更新 (2026-07-30)**: `start_fs_load` の 4096px 固定は廃止した。
+>   UI が実 viewport の論理サイズと `pixels_per_point`、fit mode を
+>   `PdfDisplayTarget` として渡し、PDF worker がページ寸法・回転・content type を解析した
+>   同じ job 内で必要長辺を決める。fit 比率に 10% の品質余裕を加え、8192px で上限を取り、
+>   Raster はさらに native 長辺で上限を取る。サムネイルの 647px は変更しない。
+>   物理原寸 / no-downscale は Vector の従来 sample density を落とさないよう 4096px を下限にする
+>   (Raster の native 上限が優先)。ズーム再レンダは初回 display target を基準に従来どおり拡大する。
+> - **Raster PDF の native AI reconcile (v1.3.1、2026-07-30 更新)**:
+>   `App::update` の `maybe_native_rerender_pdf_for_ai` は、AI 対象 Raster の現行レンダが
+>   native と 10% より大きくても小さくても `request_pdf_rerender` で native へ収束させる。
+>   これにより display-fit 初回レンダが native 未満になった場合も、AI は補間済み表示結果ではなく
+>   native 原稿へ適用される。開いた後に U/N キーで AI を ON にする経路も毎フレーム評価で拾う。
+>   - 対象は fs_idx、見開き相方、連続表示の可視ページ (`fs_vertical_cache_keep_set`)。
+>     AI 有効判定はページ個別 `effective_params(idx)` から求め、final AI ゲートと一致させる。
+>   - 判定は純関数 `ai::upscale::pdf_render_differs_from_native_ai_target` と App 側の
+>     `pdf_native_rerender_pending` に集約する。native 比 0.9 未満または 1.1 超なら未収束とし、
+>     native 到着後は false になる。Raster の native 上限は 256px 下限より優先するため、
+>     極小原稿も raw native 寸法へ収束し、AI 保留ループを作らない。
+>   - **AI 先読み**: 非表示の Raster PDF は `pdf_prefetch_should_defer_ai` が、現行 display
+>     レンダと native が未収束なら native 再レンダを通常レーンで先に起動し、AI を保留する。
+>     visible / zoom は priority、先読みは通常レーンという既存の振り分けを維持する。
+>     display target が native より小さい場合も大きい場合も、捨てる中間結果へ AI を流さない。
+>   - **表示経路の AI 保留**: `ensure_final_composite_texture` は未収束なら暫定
+>     color-adjusted 結果を `complete=false` で表示し、native 着地後に final AI を起動する。
+>     KICK / 表示保留 / 先読み保留は `App::pdf_native_rerender_pending` の同じ不変条件を使い、
+>     in-flight 中の二重起動を避ける。
+>   - **スコープ**: AI 対象は `PdfPageContentType::Raster`。可視テキスト / パス /
+>     シェーディングを含むページは `Vector` 判定 (`pdf_loader::analyze_page_content`) で AI 対象外。
+>     透明 OCR テキストは `is_visible_text` が無視するため、スキャン PDF は Raster のまま対象。
+>     Vector も初回表示は display target で描画するが、ベクター混在ページの AI 化は別途要検討。
 > - **メモリ過大ガードは意図的に持たない** (2026-06-10 ユーザー判断、Codex P2 への回答):
 >   空きメモリ量に応じて AI 適用可否を変えると挙動が予測できなくなるため、判定は
 >   サイズ上限のみで決定的にする。旧方式では 4x 全面出力の累積 f32 4 面 + 最終

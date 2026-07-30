@@ -1,5 +1,6 @@
 use super::*;
 use crate::archive_converter::ArchiveFormat;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -56,6 +57,21 @@ fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
     ] {
         assert_eq!(settings_boot_problem_source(source), None);
     }
+}
+
+#[test]
+fn pre_grid_perf_timer_does_not_read_clock_when_disabled() {
+    let clock_called = Cell::new(false);
+    let mut recorder = pre_grid_perf_start_with(false, || {
+        clock_called.set(true);
+        std::time::Instant::now()
+    });
+    for stage in PreGridPerfStage::ALL {
+        mark_pre_grid_perf(&mut recorder, stage);
+    }
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
 }
 
 #[test]
@@ -15950,9 +15966,15 @@ mod favorite_adjustment_defaults_tests {
         // global_preset でアップスケール ON → effective_params 経由で再レンダ要。
         app.settings.global_preset.upscale_model = Some("auto".to_string());
         assert!(app.should_native_rerender_pdf_for_ai(idx));
-        // 表示経路の AI 保留判定 (display_should_defer = respect_zoom, no in-flight gate) も
-        // 同じく true (4096px に final AI を流さない)。
+        // 表示経路の AI 保留判定も同じく true (破棄予定 raster に final AI を流さない)。
         assert!(app.display_should_defer_final_ai(idx));
+
+        // 新しい初回 viewport-fit が native より小さい場合も、AI は native 入力へ
+        // 収束するまで保留する。
+        set_cur(&mut app, 50, 100, &dummy_tex);
+        assert!(app.should_native_rerender_pdf_for_ai(idx));
+        assert!(app.display_should_defer_final_ai(idx));
+        set_cur(&mut app, 100, 4000, &dummy_tex);
 
         // Codex P1: ページ個別設定で AI OFF にすると、global が ON でも再レンダしない
         // (= 見開き相方ページが個別に AI OFF のとき final AI も走らないのと一致)。
@@ -15982,9 +16004,8 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.should_native_rerender_pdf_for_ai(idx));
         app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(2048));
 
-        // 収束: native 100x200 の実レンダ着地は 256px clamp 後の 128x256 (raw native では
-        // ない、Codex 再々レビュー P2)。ここで再レンダ不要に収束する。
-        set_cur(&mut app, 128, 256, &dummy_tex);
+        // 収束: raster native 上限を 256px 下限より優先し、100x200 原寸へ着地する。
+        set_cur(&mut app, 100, 200, &dummy_tex);
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
         assert!(!app.display_should_defer_final_ai(idx));
     }
@@ -16006,7 +16027,7 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        app.fs_holdover_tex = Some(holdover);
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
         // capture 時点の generation を lock。その後フォルダ移動で items_generation が進む。
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.items_generation = app.items_generation.wrapping_add(1);
@@ -16055,10 +16076,10 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.details_warm_image_dims(0), Some((321, 654)));
     }
 
-    /// GitHub issue #1 / Codex P2 (AI 先読み): 非表示 Raster PDF の 4096px レンダに AI を
-    /// 流すと表示時 native 再レンダで捨てるため、native 着地まで AI 先読みを保留する。
+    /// 非表示 Raster PDF の display-fit レンダに AI を流すと native 再レンダで捨てるため、
+    /// native 着地まで AI 先読みを保留する。
     /// `pdf_prefetch_should_defer_ai` は should_native と違いズーム / in-flight を見ず、
-    /// 「cur が native より十分大きい間」true を返す (native 再レンダ中も保留継続)。
+    /// 「cur が native と異なる間」true を返す (native 再レンダ中も保留継続)。
     #[test]
     fn pdf_prefetch_defers_ai_until_native() {
         use crate::ai::ModelKind;
@@ -16108,6 +16129,11 @@ mod favorite_adjustment_defaults_tests {
         app.settings.global_preset.upscale_model = Some("auto".to_string());
         assert!(app.pdf_prefetch_should_defer_ai(idx));
 
+        // viewport-fit が native より小さい場合も、捨てられる AI 先読みを保留する。
+        set_cur(&mut app, 50, 100, &dummy_tex);
+        assert!(app.pdf_prefetch_should_defer_ai(idx));
+        set_cur(&mut app, 100, 4000, &dummy_tex);
+
         // 高負荷上限 (4096) でも cur (100x4000) > native → 保留して native へ落とす (P2)。
         app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(4096));
         assert!(app.pdf_prefetch_should_defer_ai(idx));
@@ -16119,9 +16145,8 @@ mod favorite_adjustment_defaults_tests {
             Some(ModelKind::DenoiseRealplksr.as_str().to_string());
         assert!(app.pdf_prefetch_should_defer_ai(idx));
 
-        // native 着地: 実レンダは 256px clamp 後の 128x256 (Codex 再々レビュー P2: raw
-        // native 100x200 を着地扱いにすると 256>200×1.1 で永久保留になる退行)。保留解除。
-        set_cur(&mut app, 128, 256, &dummy_tex);
+        // native 着地で保留解除。
+        set_cur(&mut app, 100, 200, &dummy_tex);
         assert!(!app.pdf_prefetch_should_defer_ai(idx));
     }
 
@@ -17338,7 +17363,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
-        app.fs_holdover_tex = Some(old_tex);
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(old_tex));
 
         assert!(
             app.fs_nav_holdover_tex_for_draw().is_some(),
@@ -17420,7 +17445,7 @@ mod favorite_adjustment_defaults_tests {
 
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
-        app.fs_holdover_tex = Some(old_tex);
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(old_tex));
         app.fullscreen_idx = None;
         app.items_generation = locked_gen + 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
@@ -17984,6 +18009,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
 
         ctx.begin_pass(Default::default());
+        let _owner = app.keyboard_owner_for_pass(&ctx);
         crate::key_input::set_test_frame(vec![
             crate::key_input::KeyEdge {
                 virtual_key: 0x28,
@@ -18152,7 +18178,7 @@ mod favorite_adjustment_defaults_tests {
             egui::TextureOptions::LINEAR,
         );
         let holdover_id = holdover.id();
-        app.fs_holdover_tex = Some(holdover);
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
 
         app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
 
@@ -18160,7 +18186,9 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen");
         assert_eq!(app.fs_nav_locked_gen, Some(9));
         assert_eq!(
-            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            app.fs_holdover_tex
+                .as_ref()
+                .map(FsHoldover::primary_texture_id),
             Some(holdover_id),
             "locked repeat must retain the existing holdover instead of recapturing it"
         );
@@ -18237,7 +18265,7 @@ mod favorite_adjustment_defaults_tests {
         // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
         let lock_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(lock_gen);
-        app.fs_holdover_tex = Some(dummy_tex.clone());
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
 
         // ① items_generation が進んでいない (= まだナビが完了していない) →
         //    現ページが Loaded でもロック解除されない (主要バグの回帰防止)。
@@ -18256,7 +18284,7 @@ mod favorite_adjustment_defaults_tests {
         // ③ フルスクリーン抜け (fs_idx None) でも、items_generation 進行が必要。
         //    そうしないとナビ最中の close_fullscreen 経路で誤解除される。
         app.fs_nav_locked_gen = Some(app.items_generation);
-        app.fs_holdover_tex = Some(dummy_tex.clone());
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
         app.fullscreen_idx = None;
         app.poll_fs_nav_lock(&ctx);
         assert!(
@@ -18293,7 +18321,7 @@ mod favorite_adjustment_defaults_tests {
         // ナビ発火時に lock + holdover を確保した状態を再現。
         let lock_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(lock_gen);
-        app.fs_holdover_tex = Some(dummy_tex.clone());
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
         // close_fullscreen → load_pdf_as_folder → placeholder install と進んで、
         // fullscreen_idx は None、items_generation は進んだが、async enumerate は
         // まだ pending という状態。
@@ -18594,33 +18622,95 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn shortcuts_are_blocked_while_search_text_input_has_focus() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let blocked = |app: &App| {
+            let result = std::cell::Cell::new(false);
+            let _ = ctx.run(Default::default(), |ctx| {
+                result.set(app.shortcuts_blocked_by_text_input(ctx));
+            });
+            result.get()
+        };
         // 全フォーカスフラグが false の初期状態ではブロックされない。
-        assert!(!app.shortcuts_blocked_by_text_input());
+        assert!(!blocked(&app));
         // Ctrl+F バー
         app.search_has_focus = true;
-        assert!(app.shortcuts_blocked_by_text_input());
+        assert!(blocked(&app));
         app.search_has_focus = false;
         // Ctrl+S バー
         app.favsearch.has_focus = true;
-        assert!(app.shortcuts_blocked_by_text_input());
+        assert!(blocked(&app));
         app.favsearch.has_focus = false;
         // Ctrl+G バー (本コミットの修正対象)
         app.global_search.has_focus = true;
         assert!(
-            app.shortcuts_blocked_by_text_input(),
+            blocked(&app),
             "Ctrl+G TextEdit フォーカス中も BS / Enter / Ctrl+C 等を grid に漏らさない"
         );
         app.global_search.has_focus = false;
         // アドレスバー
         app.address_has_focus = true;
-        assert!(app.shortcuts_blocked_by_text_input());
+        assert!(blocked(&app));
         app.address_has_focus = false;
         // 画像色 HEX 入力
         app.color_filter.input_has_focus = true;
         assert!(
-            app.shortcuts_blocked_by_text_input(),
+            blocked(&app),
             "画像色 HEX 入力中も BS / F などを grid ショートカットに漏らさない"
         );
+    }
+
+    #[test]
+    fn keyboard_owner_ignores_bookmark_title_draft_without_a_live_claim() {
+        let mut app = setup_app();
+        app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+            id: 7,
+            title: "draft".to_owned(),
+            request_focus: false,
+        });
+        let ctx = egui::Context::default();
+        let owner = std::cell::Cell::new(crate::keyboard_input::KeyboardOwner::Unclaimed);
+
+        let _ = ctx.run(Default::default(), |ctx| {
+            owner.set(app.keyboard_owner_for_pass(ctx));
+        });
+
+        assert!(matches!(
+            owner.get(),
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_text_focus_claim_expires_after_the_next_unfocused_app_pass() {
+        let app = setup_app();
+        let ctx = egui::Context::default();
+        let widget_id = egui::Id::new("pending-bookmark-title");
+
+        ctx.begin_pass(Default::default());
+        assert!(matches!(
+            app.keyboard_owner_for_pass(&ctx),
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+        ));
+        app.claim_pending_text_input_focus(ctx.viewport_id(), widget_id, ctx.cumulative_pass_nr());
+        let _ = ctx.end_pass();
+
+        ctx.begin_pass(Default::default());
+        assert_eq!(
+            app.keyboard_owner_for_pass(&ctx),
+            crate::keyboard_input::KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id,
+                phase: crate::keyboard_input::TextInputPhase::PendingFocus,
+            }
+        );
+        let _ = ctx.end_pass();
+
+        ctx.begin_pass(Default::default());
+        assert!(matches!(
+            app.keyboard_owner_for_pass(&ctx),
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+        ));
+        let _ = ctx.end_pass();
     }
 
     /// 削除確認ダイアログの文言は対象パスのドライブ種別・ゴミ箱設定で変わるため、
@@ -19252,12 +19342,121 @@ mod favorite_adjustment_defaults_tests {
     }
 }
 
+#[cfg(test)]
+mod thumbnail_progress_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use crate::grid_item::{GridItem, ThumbnailState};
+    use std::path::PathBuf;
+
+    fn seed_stale_progress_peaks(app: &mut App) {
+        app.requested.clear();
+        app.keep_set.clear();
+        app.texture_backlog.clear();
+        app.progress_normal_peak = 7;
+        app.progress_upgrade_peak = 11;
+    }
+
+    fn assert_progress_peaks_cleared(app: &App) {
+        assert_eq!(app.progress_normal_peak, 0);
+        assert_eq!(app.progress_upgrade_peak, 0);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_clear_in_details_mode() {
+        let mut app = setup_app();
+        seed_stale_progress_peaks(&mut app);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.details_thumb_suppression_applied = true;
+        app.thumbnail_eviction_generation = Some(app.items_generation);
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_progress_peaks_cleared(&app);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_clear_while_delete_pending() {
+        let mut app = setup_app();
+        seed_stale_progress_peaks(&mut app);
+        let (_delete_tx, delete_rx) = std::sync::mpsc::channel();
+        app.delete_pending = Some(crate::delete_worker::DeletePending {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx: delete_rx,
+            total: 0,
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+            purged_pdf_password_paths: Vec::new(),
+            purge_deferred: false,
+        });
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_progress_peaks_cleared(&app);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_clear_when_items_are_empty() {
+        let mut app = setup_app();
+        seed_stale_progress_peaks(&mut app);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.items.clear();
+        app.visible_indices.clear();
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_progress_peaks_cleared(&app);
+    }
+
+    #[test]
+    fn thumbnail_progress_peaks_track_active_requests_in_fullscreen() {
+        let mut app = setup_app();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/progress/a.jpg")),
+            GridItem::Image(PathBuf::from("c:/progress/b.jpg")),
+        ];
+        app.image_metas = vec![None, None];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.visible_indices = vec![0, 1];
+        app.keep_set = std::collections::HashSet::from([0, 1]);
+        app.requested.clear();
+        app.requested.insert(0, false);
+        app.requested.insert(1, true);
+        app.texture_backlog.clear();
+        app.progress_normal_peak = 0;
+        app.progress_upgrade_peak = 0;
+        app.fullscreen_idx = Some(0);
+        app.last_cell_size = 100.0;
+        app.last_cell_h = 100.0;
+        app.last_viewport_h = 100.0;
+
+        app.update_thumbnail_frame_bookkeeping(
+            &egui::Context::default(),
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(app.progress_normal_peak, 1);
+        assert_eq!(app.progress_upgrade_peak, 1);
+    }
+}
+
 /// v1.1.0 pipeline refactor: edit-result cache and final-composite cache must
 /// be invalidated on different axes.
 #[cfg(test)]
 mod pipeline_cache_refactor_tests {
     use crate::adjustment::PostFilter;
     use crate::colorize::ColorizeMode;
+    use crate::ui_fullscreen::SpreadPair;
 
     use super::phase_c_support::setup_app;
     use super::*;
@@ -19278,6 +19477,22 @@ mod pipeline_cache_refactor_tests {
         });
         app.thumbnails.push(ThumbnailState::Pending);
         app.items.len() - 1
+    }
+
+    fn single_colorize_holdover(
+        target_idx: usize,
+        page_idx: usize,
+        texture: egui::TextureHandle,
+    ) -> FsHoldover {
+        FsHoldover::ColorizeDisplayUnit(ColorizeDisplayUnitHoldover {
+            target_idx,
+            previous: FsDisplayUnitHoldover {
+                pages: vec![FsDisplayUnitHoldoverPage {
+                    idx: page_idx,
+                    texture,
+                }],
+            },
+        })
     }
 
     fn dummy_edit_key(app: &App, idx: usize) -> EditResultKey {
@@ -19434,6 +19649,191 @@ mod pipeline_cache_refactor_tests {
             },
         );
         (edit_key, final_key)
+    }
+
+    fn insert_display_final(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) -> egui::TextureId {
+        let (_, final_key) = insert_edit_and_final_cache(app, ctx, idx, label);
+        app.final_composite_cache
+            .get(&final_key)
+            .expect("display final fixture must exist")
+            .texture
+            .id()
+    }
+
+    #[test]
+    fn paged_spread_colorize_transition_holds_previous_unit_until_both_target_pages_are_ready() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for page in 0..4 {
+            push_image(&mut app, &format!("C:/pics/spread-colorize-{page}.jpg"));
+        }
+        app.rebuild_visible_indices();
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
+        app.fullscreen_idx = Some(0);
+
+        let old_left = insert_display_final(&mut app, &ctx, 0, "spread_old_left");
+        let old_right = insert_display_final(&mut app, &ctx, 1, "spread_old_right");
+        let target_left = insert_display_final(&mut app, &ctx, 2, "spread_target_left");
+
+        app.capture_colorize_page_transition_holdover(2);
+        app.fullscreen_idx = Some(2);
+        let target_pair = app.resolve_spread_pair(2);
+        assert_eq!(target_pair, SpreadPair::Double { left: 2, right: 3 });
+
+        let held = app
+            .colorize_display_unit_holdover_for_draw(2, target_pair, false)
+            .expect("one missing target page must keep the whole previous spread");
+        assert_eq!(
+            held.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            held.pages
+                .iter()
+                .map(|page| page.texture.id())
+                .collect::<Vec<_>>(),
+            vec![old_left, old_right],
+            "both old pages must remain visible as one display unit"
+        );
+        assert_eq!(
+            app.resolve_fs_display_tex(2, true)
+                .map(|texture| texture.id()),
+            Some(target_left),
+            "the ready target page may exist in cache but must not be published alone"
+        );
+        assert!(
+            app.resolve_fs_display_tex(3, true).is_none(),
+            "the missing colorized partner remains gated instead of falling back to raw"
+        );
+
+        let target_right = insert_display_final(&mut app, &ctx, 3, "spread_target_right");
+        assert!(
+            app.colorize_display_unit_holdover_for_draw(2, target_pair, false)
+                .is_none(),
+            "the old spread must be released only when both target pages are ready"
+        );
+        assert!(app.fs_holdover_tex.is_none());
+        assert_eq!(
+            [2, 3].map(|idx| app.resolve_fs_display_tex(idx, true).unwrap().id()),
+            [target_left, target_right]
+        );
+    }
+
+    #[test]
+    fn paged_single_colorize_transition_keeps_single_page_holdover_behavior() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let old_idx = push_image(&mut app, "C:/pics/single-colorize-old.jpg");
+        let target_idx = push_image(&mut app, "C:/pics/single-colorize-target.jpg");
+        app.rebuild_visible_indices();
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
+        app.fullscreen_idx = Some(old_idx);
+        let old_texture = insert_display_final(&mut app, &ctx, old_idx, "single_old");
+
+        app.capture_colorize_page_transition_holdover(target_idx);
+        app.fullscreen_idx = Some(target_idx);
+        let held = app
+            .colorize_display_unit_holdover_for_draw(target_idx, SpreadPair::Single, false)
+            .expect("single-page colorize wait should retain the previous page");
+        assert_eq!(held.pages.len(), 1);
+        assert_eq!(held.pages[0].idx, old_idx);
+        assert_eq!(held.pages[0].texture.id(), old_texture);
+
+        insert_display_final(&mut app, &ctx, target_idx, "single_target");
+        assert!(
+            app.colorize_display_unit_holdover_for_draw(target_idx, SpreadPair::Single, false,)
+                .is_none()
+        );
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
+    #[test]
+    fn paged_colorize_disabled_switches_without_waiting_for_display_unit() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for page in 0..4 {
+            push_image(&mut app, &format!("C:/pics/spread-plain-{page}.jpg"));
+        }
+        app.rebuild_visible_indices();
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.settings.global_preset.colorize.mode = ColorizeMode::Disabled;
+        app.fullscreen_idx = Some(0);
+        insert_display_final(&mut app, &ctx, 0, "plain_old_left");
+        insert_display_final(&mut app, &ctx, 1, "plain_old_right");
+
+        app.capture_colorize_page_transition_holdover(2);
+
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "without a final-effect gate, paged navigation must switch immediately"
+        );
+    }
+
+    #[test]
+    fn continuous_colorize_navigation_does_not_create_paged_display_unit_holdover() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let old_idx = push_image(&mut app, "C:/pics/continuous-old.jpg");
+        let target_idx = push_image(&mut app, "C:/pics/continuous-target.jpg");
+        app.rebuild_visible_indices();
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
+        app.fullscreen_idx = Some(old_idx);
+        insert_display_final(&mut app, &ctx, old_idx, "continuous_old");
+
+        app.capture_colorize_page_transition_holdover(target_idx);
+
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "continuous reading keeps using its page-scoped transition map"
+        );
+    }
+
+    #[test]
+    fn colorize_display_unit_resolution_follows_cover_shift_rtl_and_landscape_boundaries() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for page in 0..8 {
+            push_image(&mut app, &format!("C:/pics/unit-boundary-{page}.jpg"));
+        }
+        app.rebuild_visible_indices();
+        let landscape = ctx.load_texture(
+            "unit_boundary_landscape",
+            egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[3] = ThumbnailState::Loaded {
+            tex: landscape,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((2, 1)),
+        };
+
+        app.spread_mode = crate::settings::SpreadMode::LtrCover;
+        assert_eq!(app.fs_display_unit_page_indices(0), vec![0]);
+        assert_eq!(app.fs_display_unit_page_indices(1), vec![1, 2]);
+        assert_eq!(app.fs_display_unit_page_indices(3), vec![3]);
+        assert_eq!(app.fs_display_unit_page_indices(4), vec![4, 5]);
+
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        assert_eq!(app.fs_display_unit_page_indices(1), vec![2, 1]);
+
+        app.spread_mode = crate::settings::SpreadMode::LtrCover;
+        app.spread_shift_anchor_idx = Some(5);
+        assert_eq!(app.fs_display_unit_page_indices(4), vec![4]);
+        assert_eq!(app.fs_display_unit_page_indices(5), vec![5, 6]);
+        assert_eq!(app.fs_display_unit_page_indices(7), vec![7]);
     }
 
     #[test]
@@ -20034,7 +20434,9 @@ mod pipeline_cache_refactor_tests {
         app.poll_prefetch(&ctx);
 
         assert_eq!(
-            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            app.fs_holdover_tex
+                .as_ref()
+                .map(FsHoldover::primary_texture_id),
             Some(expected_texture_id),
             "capture must happen before sync adjustment invalidates the old final composite"
         );
@@ -20060,13 +20462,15 @@ mod pipeline_cache_refactor_tests {
             egui::TextureOptions::LINEAR,
         );
         let existing_id = existing.id();
-        app.fs_holdover_tex = Some(existing);
+        app.fs_holdover_tex = Some(single_colorize_holdover(idx, idx, existing));
 
         app.capture_colorize_source_reload_holdover(idx);
         app.bump_input_generation_for_fs_cache_reload(idx);
 
         assert_eq!(
-            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            app.fs_holdover_tex
+                .as_ref()
+                .map(FsHoldover::primary_texture_id),
             Some(existing_id),
             "a reload without a completed current final must leave the existing holdover untouched"
         );
@@ -20088,14 +20492,16 @@ mod pipeline_cache_refactor_tests {
             egui::TextureOptions::LINEAR,
         );
         let existing_id = existing.id();
-        app.fs_holdover_tex = Some(existing);
+        app.fs_holdover_tex = Some(single_colorize_holdover(current_idx, current_idx, existing));
         populate_all_idx_caches(&mut app, &ctx, prefetched_idx, "prefetched_reload");
 
         app.capture_colorize_source_reload_holdover(prefetched_idx);
         app.bump_input_generation_for_fs_cache_reload(prefetched_idx);
 
         assert_eq!(
-            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
+            app.fs_holdover_tex
+                .as_ref()
+                .map(FsHoldover::primary_texture_id),
             Some(existing_id),
             "a non-current page reload must not mutate the current viewer holdover"
         );
@@ -20374,23 +20780,29 @@ mod pipeline_cache_refactor_tests {
             egui::ColorImage::filled([1, 1], egui::Color32::from_rgb(40, 50, 60)),
             egui::TextureOptions::LINEAR,
         );
-        app.fs_holdover_tex = Some(old_holdover);
+        app.fs_holdover_tex = Some(single_colorize_holdover(idx, idx, old_holdover));
 
         let displayed = app
             .resolve_fs_processed_texture(&ctx, idx, false)
             .expect("incomplete colorized composite should be displayable");
         assert_eq!(displayed.id(), provisional_id);
-        assert_eq!(
-            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
-            Some(provisional_id),
-            "incomplete replacement becomes the next holdover instead of releasing it"
+        assert!(
+            app.colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+                .is_none(),
+            "a displayable colorized replacement atomically releases the older unit"
         );
 
+        app.capture_colorize_source_reload_holdover(idx);
         app.final_composite_cache.remove(&final_key);
+        assert!(
+            app.resolve_fs_processed_texture(&ctx, idx, false).is_none(),
+            "the page resolver must not expose a per-page holdover fallback"
+        );
         let during_rebuild = app
-            .resolve_fs_processed_texture(&ctx, idx, false)
-            .expect("provisional holdover should bridge an explicit cache invalidation");
-        assert_eq!(during_rebuild.id(), provisional_id);
+            .colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+            .expect("the captured display unit should bridge an explicit cache invalidation");
+        assert_eq!(during_rebuild.pages.len(), 1);
+        assert_eq!(during_rebuild.pages[0].texture.id(), provisional_id);
 
         app.cancel_final_effects_for_idx(idx);
         let complete_pixels = Arc::new(egui::ColorImage::filled(
@@ -20417,8 +20829,13 @@ mod pipeline_cache_refactor_tests {
             .expect("complete final should replace the holdover");
         assert_eq!(displayed.id(), complete_id);
         assert!(
+            app.colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+                .is_none(),
+            "the ready target unit must release the old unit at the draw boundary"
+        );
+        assert!(
             app.fs_holdover_tex.is_none(),
-            "only a complete final composite releases the colorize holdover"
+            "the ready target display releases the colorize unit holdover"
         );
     }
 
@@ -20598,11 +21015,11 @@ mod pipeline_cache_refactor_tests {
                 load_seq: 1,
             },
         );
-        app.fs_holdover_tex = Some(ctx.load_texture(
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(ctx.load_texture(
             format!("{label}_holdover"),
             egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
             egui::TextureOptions::LINEAR,
-        ));
+        )));
     }
 
     fn install_colorize_summary_edit_result(
@@ -23199,6 +23616,12 @@ mod pipeline_cache_refactor_tests {
             app.retained_final_ai_cache.is_empty(),
             "external folder refresh must not reuse retained AI pixels for changed disk content"
         );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("b.png"))),
+            "external folder refresh must still install newly added files without media playback"
+        );
     }
 
     /// AI 処理サイズ上限の変更 (`apply_ai_size_limit_change`) は final AI cache /
@@ -23451,7 +23874,7 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
-    fn opening_colorize_target_preserves_prefetched_composite_and_captures_holdover() {
+    fn opening_colorize_target_uses_ready_prefetched_composite_without_holdover() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let current = push_image(&mut app, "C:/pics/open-prefetch-001.jpg");
@@ -23476,7 +23899,6 @@ mod pipeline_cache_refactor_tests {
             (*current_pixels).clone(),
             egui::TextureOptions::LINEAR,
         );
-        let current_texture_id = current_texture.id();
         app.final_composite_cache.insert(
             current_key,
             FinalCompositeEntry {
@@ -23538,10 +23960,9 @@ mod pipeline_cache_refactor_tests {
             app.final_composite_cache.contains_key(&target_final_key),
             "page open must not discard a completed colorize prefetch"
         );
-        assert_eq!(
-            app.fs_holdover_tex.as_ref().map(egui::TextureHandle::id),
-            Some(current_texture_id),
-            "page navigation must retain the previous completed frame until target display resolves"
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "a ready target display must switch immediately without retaining the old page"
         );
     }
 
@@ -25486,6 +25907,27 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
+    fn install_playing_test_media(app: &mut App, idx: usize, path: PathBuf, position_secs: f64) {
+        let player = crate::video::VideoPlayer::disconnected_for_test(path, position_secs);
+        player.set_playing(true);
+        assert!(player.intent_playing());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+    }
+
+    fn assert_test_media_paused_at(app: &App, idx: usize, position_secs: f64) {
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
+            panic!("test media player was dropped");
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), position_secs);
+    }
+
     fn parked_bundle_snapshot(
         ctx: &egui::Context,
         id: u64,
@@ -25613,6 +26055,23 @@ mod still_window_mode_key_tests {
             parked_live_window_id: owner,
             audio_mode_after_swap: false,
         }
+    }
+
+    #[cfg(windows)]
+    fn install_video_audio_player_with_native_output(app: &mut App, idx: usize) {
+        let GridItem::Video(path) = app.items[idx].clone() else {
+            unreachable!()
+        };
+        let mut player = crate::video::VideoPlayer::disconnected_for_test(path, 0.0);
+        player.set_media_visual_mode(music_core::MediaVisualMode::Music);
+        player.attach_native_output(crate::video::NativeVideoOutput::disconnected_for_test());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: app.input_seq,
+            },
+        );
     }
 
     fn poll_media_navigation_until_done_for_test(app: &mut App, ctx: &egui::Context) {
@@ -25892,7 +26351,7 @@ mod still_window_mode_key_tests {
             });
             bundle.items_generation = 5;
             bundle.fs_nav_locked_gen = Some(4);
-            bundle.fs_holdover_tex = Some(holdover);
+            bundle.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -27072,6 +27531,17 @@ mod still_window_mode_key_tests {
         assert!(app.should_promote_active_detached_video_for_main_context_change());
         app.fullscreen_idx = Some(image);
         assert!(!app.should_promote_active_detached_video_for_main_context_change());
+
+        // 動画→音声モードも player / audio pipeline と一緒に detached context へ移る。
+        app.fullscreen_idx = Some(video);
+        app.video_audio_mode = Some(video);
+        assert!(app.promote_active_detached_video_for_main_context_change());
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| active.bundle.video_audio_mode),
+            Some(video)
+        );
     }
 
     /// スタック集約の適用前退避 (2026-07-10 監査): unbundled detached メディア
@@ -27772,6 +28242,90 @@ mod still_window_mode_key_tests {
             app.video_continuous_last_eof, None,
             "ガードは dedup 記録より前に効く (exit 完了後に同じ EOF を再判定できる)"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_mode_next_navigation_keeps_audio_readiness() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let _previous = push_video(&mut app, r"C:\clips\previous.mp4");
+        let current = push_video(&mut app, r"C:\clips\current.mp4");
+        let next = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(current);
+        app.video_audio_mode = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        install_video_audio_player_with_native_output(&mut app, current);
+
+        app.open_fullscreen_from_fs_navigation(&ctx, next);
+
+        let pending = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .expect("next navigation should queue a hidden-presenter source swap");
+        assert_eq!((pending.from_idx, pending.target_idx), (current, next));
+        assert!(pending.audio_mode_after_swap);
+        assert_eq!(pending.autoplay_override, Some(true));
+        assert!(pending.ignore_resume);
+        assert_eq!(app.fullscreen_idx, Some(next));
+        assert_eq!(app.video_audio_mode, Some(next));
+        assert!(!app.source_swap_keep_audio_mode, "one-shot must be cleared");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_mode_previous_navigation_keeps_audio_readiness() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let previous = push_video(&mut app, r"C:\clips\previous.mp4");
+        let current = push_video(&mut app, r"C:\clips\current.mp4");
+        let _next = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(current);
+        app.video_audio_mode = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        install_video_audio_player_with_native_output(&mut app, current);
+
+        app.open_fullscreen_from_fs_navigation(&ctx, previous);
+
+        let pending = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .expect("previous navigation should queue a hidden-presenter source swap");
+        assert_eq!((pending.from_idx, pending.target_idx), (current, previous));
+        assert!(pending.audio_mode_after_swap);
+        assert_eq!(pending.autoplay_override, Some(true));
+        assert!(pending.ignore_resume);
+        assert_eq!(app.fullscreen_idx, Some(previous));
+        assert_eq!(app.video_audio_mode, Some(previous));
+        assert!(!app.source_swap_keep_audio_mode, "one-shot must be cleared");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_mode_continuous_eof_keeps_audio_readiness() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let current = push_video(&mut app, r"C:\clips\current.mp4");
+        let next = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(current);
+        app.video_audio_mode = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
+        app.video_continuous_last_eof = Some((current, 7));
+        install_video_audio_player_with_native_output(&mut app, current);
+
+        app.apply_video_audio_mode_continuous_eof_target(&ctx, current, 7, Some(next));
+
+        let pending = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .expect("continuous EOF should queue a hidden-presenter source swap");
+        assert_eq!((pending.from_idx, pending.target_idx), (current, next));
+        assert!(pending.audio_mode_after_swap);
+        assert_eq!(pending.autoplay_override, Some(true));
+        assert!(pending.ignore_resume);
+        assert_eq!(app.video_audio_mode, Some(next));
+        assert!(!app.source_swap_keep_audio_mode, "one-shot must be cleared");
     }
 
     #[test]
@@ -30175,6 +30729,411 @@ mod still_window_mode_key_tests {
             app.detached_window_state(session.window_id),
             Some(DetachedWindowState::Active)
         );
+    }
+
+    #[test]
+    fn tray_hide_pauses_mounted_video_presentations_and_resumes_from_same_position() {
+        for (case, presentation) in [
+            ("fullscreen", ViewerPresentation::Fullscreen),
+            ("in_window", ViewerPresentation::MainWindow),
+            ("f12", ViewerPresentation::DetachedWindow),
+        ] {
+            let mut app = setup_app();
+            let path = app.tmp.path().join(format!("tray-{case}.mp4"));
+            let video = push_video(&mut app, path.to_str().unwrap());
+            app.fullscreen_idx = Some(video);
+            app.selected = Some(video);
+            app.viewer_presentation = presentation;
+            if matches!(presentation, ViewerPresentation::DetachedWindow) {
+                app.detached_viewer_window_id = Some(200);
+            }
+            install_playing_test_media(&mut app, video, path.clone(), 30.0);
+
+            assert!(app.pause_media_playback_for_tray());
+            assert_test_media_paused_at(&app, video, 30.0);
+            assert_eq!(app.fullscreen_idx, Some(video));
+            assert_eq!(app.viewer_presentation, presentation);
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&crate::adjustment_db::normalize_path(&path)),
+                Some(&30.0)
+            );
+
+            let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&video) else {
+                unreachable!();
+            };
+            player.set_playing(true);
+            assert!(player.intent_playing());
+            assert_eq!(player.position(), 30.0, "{case} must resume in place");
+        }
+    }
+
+    #[test]
+    fn tray_hide_pauses_video_audio_mode_and_standalone_music() {
+        for (case, standalone_audio) in [("video_audio_mode", false), ("music", true)] {
+            let mut app = setup_app();
+            let extension = if standalone_audio { "flac" } else { "mp4" };
+            let path = app.tmp.path().join(format!("tray-{case}.{extension}"));
+            let media = if standalone_audio {
+                push_audio(&mut app, path.to_str().unwrap())
+            } else {
+                push_video(&mut app, path.to_str().unwrap())
+            };
+            app.fullscreen_idx = Some(media);
+            app.selected = Some(media);
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            if !standalone_audio {
+                app.video_audio_mode = Some(media);
+            }
+            install_playing_test_media(&mut app, media, path.clone(), 42.0);
+
+            assert!(app.pause_media_playback_for_tray());
+            assert_test_media_paused_at(&app, media, 42.0);
+            assert_eq!(
+                app.video_audio_mode,
+                (!standalone_audio).then_some(media),
+                "{case} mode must remain intact while paused"
+            );
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&crate::adjustment_db::normalize_path(&path)),
+                Some(&42.0)
+            );
+
+            let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&media) else {
+                unreachable!();
+            };
+            player.set_playing(true);
+            assert!(player.intent_playing());
+            assert_eq!(player.position(), 42.0, "{case} must resume in place");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_hide_pauses_active_and_parked_detached_media_contexts() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let active_path = PathBuf::from(r"C:\clips\tray-active.mp4");
+        let parked_path = PathBuf::from(r"C:\clips\tray-parked.mp4");
+
+        let mut active = ViewerContextBundle::empty();
+        active.items.push(GridItem::Video(active_path.clone()));
+        active.fullscreen_idx = Some(0);
+        let active_player =
+            crate::video::VideoPlayer::disconnected_for_test(active_path.clone(), 51.0);
+        active_player.set_playing(true);
+        active.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(active_player),
+                load_seq: 0,
+            },
+        );
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: active });
+
+        let mut parked = ViewerContextBundle::empty();
+        parked.items.push(GridItem::Video(parked_path.clone()));
+        parked.fullscreen_idx = Some(0);
+        let parked_player =
+            crate::video::VideoPlayer::disconnected_for_test(parked_path.clone(), 63.0);
+        parked_player.set_playing(true);
+        parked.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(parked_player),
+                load_seq: 0,
+            },
+        );
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 201, parked));
+
+        assert!(
+            !app.pause_media_playback_for_tray(),
+            "the return value describes the mounted context only"
+        );
+        let active = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+            unreachable!();
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), 51.0);
+        let parked = app.detached_image_windows[0]
+            .paused_bundle
+            .as_deref()
+            .unwrap();
+        let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
+            unreachable!();
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), 63.0);
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&active_path)),
+            Some(&51.0)
+        );
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&parked_path)),
+            Some(&63.0)
+        );
+    }
+
+    #[test]
+    fn tray_restore_main_focus_does_not_close_media_paused_on_hide() {
+        for (case, standalone_audio, audio_mode) in [
+            ("video", false, false),
+            ("video_audio_mode", false, true),
+            ("music", true, false),
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let extension = if standalone_audio { "flac" } else { "mp4" };
+            let path = app
+                .tmp
+                .path()
+                .join(format!("tray-restore-{case}.{extension}"));
+            let media = if standalone_audio {
+                push_audio(&mut app, path.to_str().unwrap())
+            } else {
+                push_video(&mut app, path.to_str().unwrap())
+            };
+            app.fullscreen_idx = Some(media);
+            app.selected = Some(media);
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            app.video_audio_mode = audio_mode.then_some(media);
+            app.fs_viewport_shown = true;
+            app.fs_focus_grace_elapsed = true;
+            install_playing_test_media(&mut app, media, path, 75.0);
+
+            assert!(app.pause_media_playback_for_tray());
+            app.window_visible = false;
+            app.sync_after_restore(&ctx);
+            app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(media),
+                "{case} must not be closed on the restore frame"
+            );
+            assert_test_media_paused_at(&app, media, 75.0);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_restore_external_refresh_preserves_detaching_video_session() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("tray_restore_detaching_video");
+        std::fs::create_dir_all(&folder).unwrap();
+        let video_path = folder.join("playing.mp4");
+        let added_path = folder.join("added.jpg");
+        std::fs::write(&video_path, b"video").unwrap();
+        std::fs::write(&added_path, b"image").unwrap();
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.image_metas.push(Some((1, 5)));
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(0);
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.detached_viewer_window_id = Some(120);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 42,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
+        });
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path.clone(),
+                    30.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.window_visible = false;
+
+        assert!(app.viewer_session_is_detached_or_switching());
+        app.sync_after_restore(&ctx);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+        assert!(app.window_visible);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &added_path))
+        );
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        assert_eq!(active.bundle.fullscreen_idx, Some(video));
+        assert!(matches!(
+            active.bundle.fs_cache.get(&video),
+            Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
+        ));
+        assert!(app.native_video_mode_switch.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_restore_frame_main_focus_preserves_detaching_video_session() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video_path = app.tmp.path().join("tray_restore_focus.mp4");
+        std::fs::write(&video_path, b"video").unwrap();
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.detached_viewer_window_id = Some(121);
+        let now = std::time::Instant::now();
+        app.pending_detached_video_host_switch = Some(DetachedVideoHostSwitchPending {
+            target_presentation: ViewerPresentation::DetachedWindow,
+            activate_on_show: true,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(5),
+        });
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path.clone(),
+                    30.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(121, DetachedSource::Video);
+        app.fs_focus_grace_elapsed = true;
+        app.window_visible = false;
+
+        app.sync_after_restore(&ctx);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+        assert!(app.window_visible);
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert!(matches!(
+            app.fs_cache.get(&video),
+            Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
+        ));
+        assert!(app.detached_video_host_switch_pending());
+        assert_eq!(
+            app.detached_window_state(121),
+            Some(DetachedWindowState::Active)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_restore_frame_main_focus_preserves_detached_video_audio_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video_path = app.tmp.path().join("tray_restore_audio_mode.mp4");
+        std::fs::write(&video_path, b"video").unwrap();
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.video_audio_mode = Some(video);
+        app.detached_viewer_window_id = Some(122);
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path.clone(),
+                    30.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(122, DetachedSource::Video);
+        app.fs_focus_grace_elapsed = true;
+        app.window_visible = false;
+
+        app.sync_after_restore(&ctx);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert!(app.fs_cache.contains_key(&video));
+        assert_eq!(
+            app.detached_window_state(122),
+            Some(DetachedWindowState::Active)
+        );
+    }
+
+    #[test]
+    fn tray_restore_frame_without_media_remains_grid() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.window_visible = false;
+
+        app.sync_after_restore(&ctx);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+        assert!(app.window_visible);
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.fs_cache.is_empty());
+    }
+
+    #[test]
+    fn detached_sibling_does_not_reclassify_current_main_fullscreen() {
+        let mut app = setup_app();
+        let current = push_image(&mut app, r"C:\pics\main.jpg");
+        app.fullscreen_idx = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: ViewerContextBundle::empty(),
+        });
+
+        assert!(
+            app.viewer_session_is_detached_or_switching(),
+            "tray residency must see the detached sibling context"
+        );
+        assert!(
+            app.viewer_session_blocks_main_window(),
+            "the sibling must not reclassify the current main fullscreen as detached"
+        );
+
+        app.active_detached_viewer_context = None;
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        assert!(
+            app.viewer_session_blocks_main_window(),
+            "in-window sessions remain main-blocking"
+        );
+    }
+
+    #[test]
+    fn main_focus_consumer_still_closes_normal_fullscreen_and_in_window_sessions() {
+        for presentation in [
+            ViewerPresentation::Fullscreen,
+            ViewerPresentation::MainWindow,
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let current = push_image(&mut app, r"C:\pics\main.jpg");
+            app.fullscreen_idx = Some(current);
+            app.viewer_presentation = presentation;
+            app.fs_focus_grace_elapsed = true;
+
+            app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+            assert_eq!(
+                app.fullscreen_idx, None,
+                "restored main focus must retain the existing close behavior for {presentation:?}"
+            );
+        }
     }
 
     #[test]
@@ -34475,6 +35434,10 @@ mod still_window_mode_key_tests {
         assert!(
             app.viewer_session_is_detached_or_switching(),
             "the in-flight switch-to-detached frame must keep the detached host viewport alive"
+        );
+        assert!(
+            !app.viewer_session_blocks_main_window(),
+            "the same in-flight detached lifecycle must not let restored main focus close playback"
         );
         assert!(
             !app.native_video_fullscreen_active_for_main_backdrop(),
@@ -40321,6 +41284,7 @@ mod file_operation_selection_tests {
             }],
             ..Default::default()
         });
+        let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
         let _ = ctx.end_pass();
 
@@ -43746,6 +44710,327 @@ fn page_count_only_target_is_staged_unless_explicitly_allowed() {
 }
 
 #[test]
+fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\first.cbz")),
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\second.cbz")),
+        ],
+        vec![Some((1, 10)), Some((2, 20))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.settings.details_show_created = false;
+    app.settings.details_show_image_dimensions = false;
+    app.settings.details_show_video_duration = false;
+    app.settings.details_show_video_dimensions = false;
+    app.settings.details_show_video_codec = false;
+    app.details_tag_prewarm_indices = vec![0];
+    let first_key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        first_key,
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 10,
+            page_count: Some(10),
+            page_count_checked: true,
+            ..Default::default()
+        },
+    );
+    app.details_image_dims_state = LazyColumnState::Loading { done: 1, total: 1 };
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(DetailsMetaEvent::Finished {
+        generation: app.items_generation,
+        failed: 0,
+    })
+    .unwrap();
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
+    app.details_meta_pending = Some(DetailsMetaPending {
+        visible_revision: app.details_lazy_visible_revision,
+        selection_target_key: None,
+        normal_target_keys: Default::default(),
+        cancel: Default::default(),
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
+    });
+    let ctx = egui::Context::default();
+
+    app.poll_details_meta_load(&ctx);
+
+    assert!(app.details_meta_pending.is_none());
+    assert!(matches!(
+        app.details_image_dims_state,
+        LazyColumnState::Reconciling { .. }
+    ));
+
+    // 同じフレームの詳細一覧描画でスクロール先が可視 + 先読み範囲になった想定。
+    // worker の Finished を Ready として公開せず、そのまま次ジョブへ接続する。
+    app.details_tag_prewarm_indices = vec![1];
+    app.reconcile_details_lazy_session_after_grid(&ctx);
+
+    assert!(app.details_meta_pending.is_some());
+    assert!(matches!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { .. }
+    ));
+}
+
+#[test]
+fn details_lazy_session_completes_after_post_grid_scope_is_satisfied() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.details_tag_prewarm_indices = vec![0];
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 10,
+            page_count: Some(10),
+            page_count_checked: true,
+            ..Default::default()
+        },
+    );
+    app.details_image_dims_state = LazyColumnState::Reconciling {
+        done: 1,
+        total: 1,
+        failed: 0,
+    };
+
+    app.reconcile_details_lazy_session_after_grid(&egui::Context::default());
+
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Ready { failed: 0 }
+    );
+    assert!(app.details_meta_pending.is_none());
+}
+
+#[test]
+fn details_lazy_session_cancel_resume_preserves_cache_and_revision() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 1,
+            source_size: 10,
+            page_count: Some(10),
+            page_count_checked: true,
+            ..Default::default()
+        },
+    );
+    app.details_image_dims_state = LazyColumnState::Reconciling {
+        done: 1,
+        total: 1,
+        failed: 0,
+    };
+    let revision = app.details_lazy_visible_revision;
+
+    app.cancel_details_meta_loading();
+    assert_eq!(app.details_image_dims_state, LazyColumnState::Cancelled);
+    app.resume_details_meta_loading();
+
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert_eq!(app.details_lazy_visible_revision, revision);
+    assert_eq!(app.details_lazy_meta.len(), 1);
+}
+
+#[test]
+fn installing_new_folder_items_starts_new_details_lazy_session() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+
+    app.install_new_items(
+        vec![GridItem::ZipFile(PathBuf::from(r"C:\NewFolder\book.cbz"))],
+        vec![Some((1, 10))],
+    );
+
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn post_filter_visible_scope_starts_new_details_lazy_session() {
+    let mut app = phase_c_support::setup_app();
+    app.install_new_items(
+        vec![
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\filtered-out.cbz")),
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\filtered-in.cbz")),
+        ],
+        vec![Some((1, 10)), Some((2, 20))],
+    );
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = true;
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.visible_indices = vec![1];
+    app.details_order = vec![1];
+    app.details_tag_prewarm_indices = vec![1];
+
+    app.reconcile_details_lazy_session_after_grid(&egui::Context::default());
+
+    assert!(app.details_meta_pending.is_some());
+    assert!(matches!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { .. }
+    ));
+}
+
+fn install_large_details_created_list(app: &mut App, count: usize) {
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = false;
+    app.settings.details_show_created = true;
+    app.settings.details_show_image_dimensions = false;
+    app.settings.details_show_video_duration = false;
+    app.settings.details_show_video_dimensions = false;
+    app.settings.details_show_video_codec = false;
+    let items = (0..count)
+        .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\Smart\item-{idx:06}.jpg"))))
+        .collect();
+    app.install_new_items(items, vec![Some((1, 1)); count]);
+    app.visible_indices = (0..count).collect();
+    app.details_order = app.visible_indices.clone();
+}
+
+fn details_meta_plan_progress(app: &App) -> (usize, usize, usize) {
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("details meta target plan");
+    let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
+        panic!("large target set must still be in the incremental planning phase");
+    };
+    (plan.order.scanned(), plan.order.len(), plan.scan_slices)
+}
+
+#[test]
+fn large_details_scroll_reprioritizes_without_restarting_full_target_scan() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2 + 17;
+    install_large_details_created_list(&mut app, count);
+    app.details_tag_prewarm_indices = (0..128).collect();
+    let ctx = egui::Context::default();
+
+    app.start_details_meta_load(&ctx);
+
+    assert_eq!(
+        details_meta_plan_progress(&app),
+        (DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME, count, 1)
+    );
+    let revision = app.details_lazy_visible_revision;
+
+    // scrollbar drag 後に一覧末尾が可視になった想定。scroll は target membership revision を
+    // 変えず、既存 cursor の次 slice だけを進める。
+    app.details_tag_prewarm_indices = (count - 128..count).collect();
+    app.last_prefetch_scroll_at = None;
+    app.poll_details_meta_load(&ctx);
+
+    assert_eq!(
+        details_meta_plan_progress(&app),
+        (DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2, count, 2)
+    );
+    assert_eq!(app.details_lazy_visible_revision, revision);
+    let pending = app.details_meta_pending.as_ref().unwrap();
+    let tail_key = app.details_lazy_cache_key(count - 1).unwrap();
+    assert!(pending.normal_target_keys.contains(&tail_key));
+}
+
+#[test]
+fn details_target_plan_rebuilds_after_filter_changes() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2 + 17;
+    install_large_details_created_list(&mut app, count);
+    app.details_tag_prewarm_indices = (0..128).collect();
+    let ctx = egui::Context::default();
+    app.start_details_meta_load(&ctx);
+    let old_cancel = Arc::clone(&app.details_meta_pending.as_ref().unwrap().cancel);
+    let old_revision = app.details_lazy_visible_revision;
+
+    let filtered_count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 9;
+    app.search_filter = Some((count - filtered_count..count).collect());
+    app.rebuild_visible_indices();
+    assert_ne!(app.details_lazy_visible_revision, old_revision);
+
+    app.poll_details_meta_load(&ctx);
+
+    assert!(old_cancel.load(Ordering::Relaxed));
+    assert_eq!(
+        details_meta_plan_progress(&app),
+        (DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME, filtered_count, 1)
+    );
+    assert_eq!(
+        app.details_meta_pending.as_ref().unwrap().visible_revision,
+        app.details_lazy_visible_revision
+    );
+}
+
+#[test]
+fn replacing_items_discards_incomplete_details_target_plan() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 9;
+    install_large_details_created_list(&mut app, count);
+    let ctx = egui::Context::default();
+    app.start_details_meta_load(&ctx);
+    let old_generation = app.items_generation;
+    let old_cancel = Arc::clone(&app.details_meta_pending.as_ref().unwrap().cancel);
+
+    install_large_details_created_list(&mut app, count + 1);
+
+    assert!(old_cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_ne!(app.items_generation, old_generation);
+    app.start_details_meta_load(&ctx);
+    let DetailsMetaPendingPhase::Planning(plan) = &app.details_meta_pending.as_ref().unwrap().phase
+    else {
+        panic!("replacement list should own a fresh target plan");
+    };
+    assert_eq!(plan.generation, app.items_generation);
+    assert_eq!(plan.order.len(), count + 1);
+}
+
+#[test]
+fn thumbnail_selection_info_keeps_single_target_fast_path() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
+    app.settings.thumb_tooltip_show_created = false;
+    app.settings.details_show_created = true;
+    app.install_new_items(
+        vec![GridItem::Image(PathBuf::from(r"C:\photos\created.jpg"))],
+        vec![Some((1, 1))],
+    );
+    app.selected = Some(0);
+
+    app.start_details_meta_load(&egui::Context::default());
+
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("selection metadata worker");
+    assert!(matches!(
+        pending.phase,
+        DetailsMetaPendingPhase::Loading { .. }
+    ));
+    assert_eq!(pending.selection_target_key, app.details_lazy_cache_key(0));
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { done: 0, total: 1 }
+    );
+}
+
+#[test]
 fn image_folder_page_count_is_available_without_auto_open() {
     let mut app = phase_c_support::setup_app();
     app.settings.auto_fullscreen_zip_pdf = false;
@@ -43864,12 +45149,13 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (_tx, rx) = std::sync::mpsc::channel();
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
         cancel: std::sync::Arc::clone(&cancel),
-        rx,
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
     });
 
     app.set_details_sort_key(crate::settings::DetailsSortKey::Name);
@@ -43952,12 +45238,13 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
         failed: 0,
     })
     .expect("queue old Finished event");
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         visible_revision: old_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
         cancel: std::sync::Arc::clone(&cancel),
-        rx,
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
     });
 
     // 列設定ダイアログで、旧ジョブには含まれていない作成日時列を追加する。

@@ -1,8 +1,10 @@
 use std::ffi::c_void;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-// `GetCursorPos` / `GetClientRect` 等は WindowsAndMessaging から (上の `use` を参照)。
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
@@ -20,7 +22,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect,
+    GetClientRect, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, IsZoomed,
     LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
     PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
@@ -75,7 +77,7 @@ pub enum NativeVideoWindowEvent {
     MouseWheel(NativeVideoMouseWheelEvent),
     MouseLeave,
     /// presenter HWND の `WM_WINDOWPOSCHANGED` で発火。HUD overlay HWND を
-    /// presenter のジオメトリに追従させるために presenter thread が消費する。
+    /// presenter のジオメトリに追従させるために pump thread が消費する。
     /// UI 側には転送しない。
     GeometryChanged {
         x: i32,
@@ -86,15 +88,220 @@ pub enum NativeVideoWindowEvent {
     },
     /// HUD overlay HWND の `WM_DPICHANGED` で発火。`suggested_rect` は
     /// `WM_DPICHANGED` の lparam で渡される新 DPI 用 RECT。
-    /// presenter thread 内で pixels_per_point 更新 + resize + 次フレーム region 再計算に使う。
+    /// pump/render route が pixels_per_point 更新 + resize + 次フレーム region 再計算に使う。
     DpiChanged {
         dpi: u32,
         suggested_rect: RECT,
     },
     /// HUD overlay HWND の `WM_WINDOWPOSCHANGING` で「自分より前に別 window が
-    /// 割り込みそう」を検知したときに送る raise 要求。presenter thread が
-    /// `RaiseHudToTop` に内部変換する。これは best-effort safety net。
+    /// 割り込みそう」を検知したときに送る raise 要求。pump が typed raise task に
+    /// 内部変換する。これは best-effort safety net。
     RequestRaiseHud,
+    /// HUD button-down requested a presenter foreground/focus handoff. The
+    /// wndproc only enqueues this; the pump applies USER32 focus work after
+    /// message dispatch returns.
+    RequestFocusClaim,
+    /// The OS lifetime of this HWND ended. The pump combines this with the
+    /// stamped epoch and closes or loses the host without a render ack.
+    Destroyed,
+}
+
+/// Generation-stamped event sent from a presenter/HUD wndproc.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeVideoWindowEventEnvelope {
+    pub(crate) sequence: u64,
+    pub(crate) epoch: u64,
+    pub(crate) generation: u64,
+    pub(crate) event: NativeVideoWindowEvent,
+}
+
+const WINDOW_EVENT_LATEST_MOUSE_MOVE: usize = 0;
+const WINDOW_EVENT_LATEST_GEOMETRY: usize = 1;
+const WINDOW_EVENT_LATEST_DPI: usize = 2;
+const WINDOW_EVENT_LATEST_RAISE: usize = 3;
+const WINDOW_EVENT_LATEST_SLOTS: usize = 4;
+
+fn native_window_event_latest_slot(event: &NativeVideoWindowEvent) -> Option<usize> {
+    match event {
+        NativeVideoWindowEvent::MouseMove(_) => Some(WINDOW_EVENT_LATEST_MOUSE_MOVE),
+        NativeVideoWindowEvent::GeometryChanged { .. } => Some(WINDOW_EVENT_LATEST_GEOMETRY),
+        NativeVideoWindowEvent::DpiChanged { .. } => Some(WINDOW_EVENT_LATEST_DPI),
+        NativeVideoWindowEvent::RequestRaiseHud => Some(WINDOW_EVENT_LATEST_RAISE),
+        NativeVideoWindowEvent::CloseRequested { .. }
+        | NativeVideoWindowEvent::KeyDown(_)
+        | NativeVideoWindowEvent::KeyUp(_)
+        | NativeVideoWindowEvent::Text(_)
+        | NativeVideoWindowEvent::Ime(_)
+        | NativeVideoWindowEvent::MouseButton(_)
+        | NativeVideoWindowEvent::MouseWheel(_)
+        | NativeVideoWindowEvent::MouseLeave
+        | NativeVideoWindowEvent::RequestFocusClaim
+        | NativeVideoWindowEvent::Destroyed => None,
+    }
+}
+
+struct NativeWindowEventRouteShared {
+    next_sequence: AtomicU64,
+    latest: Vec<LatestWindowEventSlot>,
+    overflow_fault: Arc<AtomicBool>,
+}
+
+/// Lock-free single-value mailbox. Producer and consumer each take ownership
+/// with one atomic swap, so a wndproc never waits for render-side draining.
+struct LatestWindowEventSlot {
+    value: AtomicPtr<NativeVideoWindowEventEnvelope>,
+}
+
+impl LatestWindowEventSlot {
+    fn empty() -> Self {
+        Self {
+            value: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    fn publish(&self, event: NativeVideoWindowEventEnvelope) {
+        let next = Box::into_raw(Box::new(event));
+        let prior = self.value.swap(next, Ordering::AcqRel);
+        if !prior.is_null() {
+            unsafe { drop(Box::from_raw(prior)) };
+        }
+    }
+
+    fn take(&self) -> Option<NativeVideoWindowEventEnvelope> {
+        let value = self.value.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        (!value.is_null()).then(|| unsafe { *Box::from_raw(value) })
+    }
+}
+
+impl Drop for LatestWindowEventSlot {
+    fn drop(&mut self) {
+        let value = *self.value.get_mut();
+        if !value.is_null() {
+            unsafe { drop(Box::from_raw(value)) };
+        }
+    }
+}
+
+/// Non-blocking bounded sender used directly by presenter/HUD wndprocs.
+///
+/// Mouse move, geometry, DPI, and HUD raise are latest-value slots. Close,
+/// key, text, IME, button, wheel, leave, and destroy use a bounded lossless
+/// path. A full path raises an explicit session fault instead of blocking the
+/// HWND owner or silently dropping input.
+#[derive(Clone)]
+pub(crate) struct NativeWindowEventRoute {
+    lossless_tx: crossbeam_channel::Sender<NativeVideoWindowEventEnvelope>,
+    shared: Arc<NativeWindowEventRouteShared>,
+}
+
+pub(crate) struct NativeWindowEventReceiver {
+    lossless_rx: crossbeam_channel::Receiver<NativeVideoWindowEventEnvelope>,
+    shared: Arc<NativeWindowEventRouteShared>,
+}
+
+pub(crate) fn native_window_event_route(
+    lossless_capacity: usize,
+    overflow_fault: Arc<AtomicBool>,
+) -> (NativeWindowEventRoute, NativeWindowEventReceiver) {
+    let (lossless_tx, lossless_rx) = crossbeam_channel::bounded(lossless_capacity);
+    let shared = Arc::new(NativeWindowEventRouteShared {
+        next_sequence: AtomicU64::new(1),
+        latest: (0..WINDOW_EVENT_LATEST_SLOTS)
+            .map(|_| LatestWindowEventSlot::empty())
+            .collect(),
+        overflow_fault,
+    });
+    (
+        NativeWindowEventRoute {
+            lossless_tx,
+            shared: Arc::clone(&shared),
+        },
+        NativeWindowEventReceiver {
+            lossless_rx,
+            shared,
+        },
+    )
+}
+
+impl NativeWindowEventRoute {
+    fn send(&self, mut envelope: NativeVideoWindowEventEnvelope) {
+        envelope.sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if let Some(slot) = native_window_event_latest_slot(&envelope.event) {
+            self.shared.latest[slot].publish(envelope);
+            return;
+        }
+        match self.lossless_tx.try_send(envelope) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(_))
+            | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.shared.overflow_fault.store(true, Ordering::Release)
+            }
+        }
+    }
+}
+
+impl NativeWindowEventReceiver {
+    pub(crate) fn drain(&self) -> Vec<NativeVideoWindowEventEnvelope> {
+        let mut events: Vec<_> = self.lossless_rx.try_iter().collect();
+        events.extend(self.shared.latest.iter().filter_map(|slot| slot.take()));
+        events.sort_unstable_by_key(|event| event.sequence);
+        events
+    }
+}
+
+/// Per-HWND endpoint stored in `GWLP_USERDATA`. WndProc only decodes and
+/// enqueues; the pump and render routes perform work after dispatch returns.
+#[derive(Clone)]
+pub(crate) struct NativeVideoWindowEventSink {
+    epoch: u64,
+    generation: u64,
+    pump_route: NativeWindowEventRoute,
+    render_route: NativeWindowEventRoute,
+}
+
+impl NativeVideoWindowEventSink {
+    pub(crate) fn new(
+        epoch: u64,
+        generation: u64,
+        pump_route: NativeWindowEventRoute,
+        render_route: NativeWindowEventRoute,
+    ) -> Self {
+        Self {
+            epoch,
+            generation,
+            pump_route,
+            render_route,
+        }
+    }
+
+    pub(crate) fn send(&self, event: NativeVideoWindowEvent) {
+        let envelope = NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch: self.epoch,
+            generation: self.generation,
+            event,
+        };
+        if matches!(
+            envelope.event,
+            NativeVideoWindowEvent::CloseRequested { .. }
+                | NativeVideoWindowEvent::GeometryChanged { .. }
+                | NativeVideoWindowEvent::DpiChanged { .. }
+                | NativeVideoWindowEvent::RequestRaiseHud
+                | NativeVideoWindowEvent::RequestFocusClaim
+                | NativeVideoWindowEvent::Destroyed
+        ) {
+            self.pump_route.send(envelope.clone());
+        }
+        if !matches!(
+            envelope.event,
+            NativeVideoWindowEvent::CloseRequested { .. }
+                | NativeVideoWindowEvent::RequestRaiseHud
+                | NativeVideoWindowEvent::RequestFocusClaim
+                | NativeVideoWindowEvent::Destroyed
+        ) {
+            self.render_route.send(envelope);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,8 +371,7 @@ pub struct NativeVideoWindowConfig {
     pub initially_visible: bool,
     pub activate_on_show: bool,
     pub close_on_escape: bool,
-    pub post_quit_on_destroy: bool,
-    pub event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
+    pub(crate) event_sink: Option<NativeVideoWindowEventSink>,
     /// この HWND を生成した presenter placement 世代。placement switch で
     /// window を rebuild するたびに presenter 側で +1 され、`WM_CLOSE` が
     /// `CloseRequested { generation }` に焼き込む。App 側は「現世代より古い
@@ -181,8 +387,7 @@ impl NativeVideoWindowConfig {
             initially_visible: true,
             activate_on_show: true,
             close_on_escape: true,
-            post_quit_on_destroy: true,
-            event_tx: None,
+            event_sink: None,
             generation: 0,
         }
     }
@@ -197,8 +402,7 @@ pub(crate) struct NativeVideoWindow {
 
 struct WindowState {
     close_on_escape: bool,
-    post_quit_on_destroy: bool,
-    event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
+    event_sink: Option<NativeVideoWindowEventSink>,
     ime_preediting: bool,
     /// `NativeVideoWindowConfig.generation` の焼き込み。`WM_CLOSE` で
     /// `CloseRequested { generation }` を stamp するために保持する。
@@ -241,11 +445,11 @@ fn register_native_video_window_class() -> Result<(), String> {
 }
 
 /// in-window モードの presenter child HWND。main window のサブクラスプロシージャが
-/// 親リサイズ時にこの HWND を同期リサイズする。presenter thread が child publish 時に
-/// 登録し、presenter thread 終了時に 0 へクリアする。
+/// 親リサイズ時にこの HWND を同期リサイズする。pump thread が child publish 時に
+/// 登録し、host destroy 時に 0 へクリアする。
 static IN_WINDOW_VIDEO_CHILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// presenter thread から in-window child HWND を登録 / 解除する (`0` で解除)。
+/// pump thread から in-window child HWND を登録 / 解除する (`0` で解除)。
 pub fn set_in_window_video_child(hwnd: u64) {
     IN_WINDOW_VIDEO_CHILD.store(hwnd, std::sync::atomic::Ordering::SeqCst);
 }
@@ -254,7 +458,7 @@ const IN_WINDOW_RESIZE_SUBCLASS_ID: usize = 0x6D69_7631; // "miv1"
 
 /// main window をサブクラス化し、`WM_SIZE` のたびに in-window presenter child を
 /// 親クライアント領域へリサイズする。最大化 / 復元 / リサイズドラッグのすべてで
-/// child が親に追従する (presenter thread の polling と違い、親の `WM_SIZE` を
+/// child が親に追従する (pump の periodic reflow と併用し、親の `WM_SIZE` を
 /// 直接フックするので取りこぼし・遅延がない)。同じ `(proc, id)` の再登録は
 /// `SetWindowSubclass` 側で冪等。
 pub fn install_in_window_resize_subclass(main_hwnd: u64) -> bool {
@@ -279,7 +483,7 @@ fn detached_window_debug_enabled() -> bool {
 
 /// main window サブクラスプロシージャ。`WM_SIZE` を受けたら登録済みの in-window
 /// child を親クライアント領域へリサイズする。`SWP_ASYNCWINDOWPOS` で UI スレッドを
-/// ブロックせずに presenter スレッドへ要求を post する。それ以外のメッセージは素通し。
+/// ブロックせずに child owner pump へ要求を post する。それ以外のメッセージは素通し。
 unsafe extern "system" fn in_window_resize_subclass_proc(
     hwnd: HWND,
     msg: u32,
@@ -440,8 +644,7 @@ impl NativeVideoWindow {
 
             let state = Box::new(WindowState {
                 close_on_escape: config.close_on_escape,
-                post_quit_on_destroy: config.post_quit_on_destroy,
-                event_tx: config.event_tx,
+                event_sink: config.event_sink,
                 ime_preediting: false,
                 generation: config.generation,
             });
@@ -588,25 +791,6 @@ impl NativeVideoWindow {
         }
         self.hwnd = HWND::default();
     }
-
-    /// `destroy()` と同じだが、`WM_DESTROY` で `PostQuitMessage` を出さない。
-    /// Plan B のウィンドウ / 全画面トグルで旧 presenter ウィンドウを破棄するとき、
-    /// presenter スレッドのメッセージループを `WM_QUIT` で誤って終了させないために
-    /// 使う。`DestroyWindow` の前に `WindowState.post_quit_on_destroy` を落とす。
-    pub(crate) fn destroy_silent(&mut self) {
-        self.assert_owner_thread();
-        if self.hwnd.0.is_null() {
-            return;
-        }
-        unsafe {
-            if IsWindow(Some(self.hwnd)).as_bool() {
-                if let Some(state) = window_state_mut(self.hwnd) {
-                    state.post_quit_on_destroy = false;
-                }
-            }
-        }
-        self.destroy();
-    }
 }
 
 pub fn bring_to_front(hwnd_raw: u64) -> bool {
@@ -622,7 +806,7 @@ pub fn bring_to_front(hwnd_raw: u64) -> bool {
     }
 }
 
-/// presenter スレッドの `sleep_until_message` / メッセージループを即時に起こすため、
+/// HWND owner pump のメッセージループを即時に起こすため、
 /// 良性の `WM_NULL` を post する (Inc 7 hidden presenter: hide/show コマンドを
 /// アイドル中の presenter に素早く反映させる)。`WM_NULL` は wndproc で `DefWindowProcW`
 /// に落ちるだけなので副作用は無い。
@@ -856,22 +1040,10 @@ pub fn pump_thread_messages() -> bool {
     quit
 }
 
-/// Host migration 中の旧 HWND 破棄でメッセージキューへ残った `WM_QUIT` だけを捨てる。
-/// 通常の close 経路では呼ばず、placement switch の旧 host teardown 直後に限定する。
-pub fn discard_pending_quit_messages_for_host_switch() -> bool {
-    let mut discarded = false;
-    unsafe {
-        let mut msg = MSG::default();
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-            if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
-                discarded = true;
-                continue;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    discarded
+/// Ends the dedicated pump loop after its typed Shutdown reducer has destroyed
+/// every pump-owned HWND. Individual HWND destruction never calls this.
+pub(crate) fn post_typed_pump_quit() {
+    unsafe { PostQuitMessage(0) };
 }
 
 /// `thread::sleep` の message 対応版。最大 `ms` ミリ秒待つが、呼び出しスレッドの
@@ -957,10 +1129,10 @@ unsafe extern "system" fn wnd_proc(
             }
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
                 let key = native_key_event(wparam, lparam);
                 crate::key_debug::record_native_video_key(key, true);
-                let _ = tx.send(NativeVideoWindowEvent::KeyDown(key));
+                sink.send(NativeVideoWindowEvent::KeyDown(key));
             }
             if wparam.0 as u32 == 0x1B && window_state(hwnd).is_some_and(|s| s.close_on_escape) {
                 unsafe {
@@ -971,10 +1143,10 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
                 let key = native_key_event(wparam, lparam);
                 crate::key_debug::record_native_video_key(key, false);
-                let _ = tx.send(NativeVideoWindowEvent::KeyUp(key));
+                sink.send(NativeVideoWindowEvent::KeyUp(key));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -992,7 +1164,7 @@ unsafe extern "system" fn wnd_proc(
                 _ => None,
             };
             if let Some(vk) = synth_vk
-                && let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref())
+                && let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
             {
                 let key = NativeVideoKeyEvent {
                     virtual_key: vk,
@@ -1004,7 +1176,7 @@ unsafe extern "system" fn wnd_proc(
                     repeat: false,
                 };
                 crate::key_debug::record_native_video_key(key, true);
-                let _ = tx.send(NativeVideoWindowEvent::KeyDown(key));
+                sink.send(NativeVideoWindowEvent::KeyDown(key));
                 // WM_APPCOMMAND の規約: 処理した場合 TRUE を返す。
                 return LRESULT(1);
             }
@@ -1013,9 +1185,9 @@ unsafe extern "system" fn wnd_proc(
         WM_CHAR => {
             if let Some(ch) = char::from_u32(wparam.0 as u32)
                 && !ch.is_control()
-                && let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref())
+                && let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
             {
-                let _ = tx.send(NativeVideoWindowEvent::Text(ch));
+                sink.send(NativeVideoWindowEvent::Text(ch));
             }
             LRESULT(0)
         }
@@ -1076,7 +1248,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_MOUSEMOVE => {
             track_mouse_leave(hwnd);
-            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
                 // CP9 実機 debug: presenter wndproc 経由の mouse は HUD region 外 (= 穴)
                 // のときに来るので、これが頻発しているなら HUD region に問題がある。
                 // 100ms 周期 rate limit で log。
@@ -1097,7 +1269,7 @@ unsafe extern "system" fn wnd_proc(
                         ));
                     }
                 }
-                let _ = tx.send(NativeVideoWindowEvent::MouseMove(native_mouse_event(
+                sink.send(NativeVideoWindowEvent::MouseMove(native_mouse_event(
                     wparam, lparam,
                 )));
             }
@@ -1115,8 +1287,8 @@ unsafe extern "system" fn wnd_proc(
                     let _ = ReleaseCapture();
                 }
             }
-            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                let _ = tx.send(NativeVideoWindowEvent::MouseButton(
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
+                sink.send(NativeVideoWindowEvent::MouseButton(
                     native_mouse_button_event(msg, wparam, lparam),
                 ));
             }
@@ -1133,48 +1305,18 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSEWHEEL => {
-            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                let _ = tx.send(NativeVideoWindowEvent::MouseWheel(
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
+                sink.send(NativeVideoWindowEvent::MouseWheel(
                     native_mouse_wheel_event(hwnd, wparam, lparam),
                 ));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSELEAVE => {
-            // CP9 実機修正: cursor が presenter client rect 内なら MouseLeave を流さない。
-            //
-            // 背景: presenter HWND が `WM_MOUSELEAVE` を受けるのは「cursor が presenter から
-            // 出た」通知。ところが HUD overlay HWND が前面にあると、cursor が HUD region 内に
-            // 入った瞬間に OS から見て「presenter から離脱」になり、WM_MOUSELEAVE が来る。
-            // これを overlay の pointer_pos=None として流すと top_bar_visible=false → region
-            // 縮小 → cursor が region 外に → presenter が再度 mouse 受ける → 振動ループ。
-            //
-            // 真の「cursor が presenter から完全に出た」は cursor polling の client rect 範囲外
-            // 検出で十分カバーされる (CP6 `cursor_polling_tick`)。なので presenter wndproc では
-            // 「実際に画面外/他 window に行ったか」をその場で確認し、内なら流さない。
-            //
-            // HUD HWND がないフォールバック経路では polling 自体が動かないので、その場合は
-            // 従来通り MouseLeave を流す (= cursor が画面外に出たことを overlay に伝える)。
-            // 判定は `GetCursorPos` + `ScreenToClient` で current cursor が presenter client
-            // rect 内かを見る。
-            let cursor_in_client = unsafe {
-                let mut pt = POINT::default();
-                if GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool() {
-                    let mut rc = windows::Win32::Foundation::RECT::default();
-                    if GetClientRect(hwnd, &mut rc).is_ok() {
-                        pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-            if !cursor_in_client {
-                // 真に外に出た → overlay に MouseLeave 流す。
-                if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                    let _ = tx.send(NativeVideoWindowEvent::MouseLeave);
-                }
+            // WndProc は decode/enqueue のみ。HUD HWND へ移っただけの synthetic leave は、
+            // pump の cursor/client observation を受けた render 側で従来どおり抑止する。
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
+                sink.send(NativeVideoWindowEvent::MouseLeave);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1226,8 +1368,8 @@ unsafe extern "system" fn wnd_proc(
                         } else {
                             (w.max(1) as u32, h.max(1) as u32)
                         };
-                        if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                            let _ = tx.send(NativeVideoWindowEvent::GeometryChanged {
+                        if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
+                            sink.send(NativeVideoWindowEvent::GeometryChanged {
                                 x,
                                 y,
                                 w: w_u32,
@@ -1243,9 +1385,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_CLOSE => {
             if let Some(state) = window_state(hwnd)
-                && let Some(tx) = state.event_tx.as_ref()
+                && let Some(sink) = state.event_sink.as_ref()
             {
-                let _ = tx.send(NativeVideoWindowEvent::CloseRequested {
+                sink.send(NativeVideoWindowEvent::CloseRequested {
                     generation: state.generation,
                 });
             }
@@ -1255,10 +1397,8 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            if window_state(hwnd).is_some_and(|s| s.post_quit_on_destroy) {
-                unsafe {
-                    PostQuitMessage(0);
-                }
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
+                sink.send(NativeVideoWindowEvent::Destroyed);
             }
             LRESULT(0)
         }
@@ -1295,8 +1435,8 @@ fn window_state_mut(hwnd: HWND) -> Option<&'static mut WindowState> {
 }
 
 fn send_ime_event(state: &WindowState, event: NativeVideoImeEvent) {
-    if let Some(tx) = state.event_tx.as_ref() {
-        let _ = tx.send(NativeVideoWindowEvent::Ime(event));
+    if let Some(sink) = state.event_sink.as_ref() {
+        sink.send(NativeVideoWindowEvent::Ime(event));
     }
 }
 
@@ -1448,4 +1588,94 @@ fn signed_low_word(value: isize) -> i32 {
 
 fn signed_high_word(value: isize) -> i32 {
     (((value as u32 >> 16) & 0xffff) as i16) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(virtual_key: u32) -> NativeVideoWindowEvent {
+        NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn window_event_sink_coalesces_mouse_and_keeps_key_ime_lossless() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let (render_route, render_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let sink = NativeVideoWindowEventSink::new(7, 7, pump_route, render_route);
+
+        sink.send(key(0x41));
+        sink.send(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(
+            "日本語".to_string(),
+        )));
+        sink.send(NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent {
+            x: 1,
+            y: 2,
+            shift: false,
+            ctrl: false,
+        }));
+        sink.send(NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent {
+            x: 30,
+            y: 40,
+            shift: false,
+            ctrl: false,
+        }));
+        sink.send(NativeVideoWindowEvent::RequestFocusClaim);
+        sink.send(NativeVideoWindowEvent::CloseRequested { generation: 7 });
+
+        let pump = pump_rx.drain();
+        assert_eq!(pump.len(), 2);
+        assert!(matches!(
+            pump[0].event,
+            NativeVideoWindowEvent::RequestFocusClaim
+        ));
+        assert!(matches!(
+            pump[1].event,
+            NativeVideoWindowEvent::CloseRequested { generation: 7 }
+        ));
+
+        let render = render_rx.drain();
+        assert_eq!(render.len(), 3);
+        assert!(matches!(
+            render[0].event,
+            NativeVideoWindowEvent::KeyDown(_)
+        ));
+        assert!(matches!(
+            render[1].event,
+            NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(_))
+        ));
+        assert!(matches!(
+            render[2].event,
+            NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent { x: 30, y: 40, .. })
+        ));
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn lossless_window_event_overflow_is_an_explicit_session_fault() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (route, _rx) = native_window_event_route(1, Arc::clone(&overflow));
+        route.send(NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch: 1,
+            generation: 1,
+            event: key(0x41),
+        });
+        route.send(NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch: 1,
+            generation: 1,
+            event: key(0x42),
+        });
+        assert!(overflow.load(Ordering::Acquire));
+    }
 }

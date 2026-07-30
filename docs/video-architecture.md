@@ -38,10 +38,18 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
     └─ 失敗: 動画は SW decode + CPU upload に fallback (decoder 内部で完結)
 
 [動画フルスクリーン open]
-  NativeWindowHost が presenter/HUD HWND を生成
-  NativeRenderCore が opaque target lease に DComp visual tree + swap chain を attach
-  decoder thread → video_tx → native_output thread が pull → 自前 swap chain に present
+  native-video-window-pump が NativeWindowHost / presenter/HUD HWND を hidden 生成
+  bounded AttachTarget → native-video-render が opaque target lease に DComp visual tree + swap chain を attach
+  bounded TargetReady → pump が新 HWND を publish
+  decoder thread → video_tx → native-video-render が pull → 自前 swap chain に present
 ```
+
+Stage 4 (2026-07-29) 以降、HWND owner と GPU work は別 thread である。
+`native-video-window-pump` は全 placement の create/message dispatch/mutate/destroy と typed
+window-host reducer だけを所有し、GPU ack や render join を同期 wait しない。
+`native-video-render` は D3D/DXGI/DComp、overlay GPU resource、frame selection/present を所有し、
+USER32 read/mutation は行わない。pump が 8ms 周期で採取する cursor/focus/capture snapshot と、
+render が返す focus/IME/cursor intent だけで接続する。
 
 `VideoPlayer::tick(_ctx)` は再生制御 / repaint hint / ホバーサムネイル要求のみ扱う。
 フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
@@ -106,14 +114,14 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 
 **入力 2 層化**:
 
-- **Mouse**: HUD wndproc が region 内で受けて `event_tx` に流す。region 外は `SetWindowRgn` で
+- **Mouse**: HUD wndproc が region 内で受けて bounded event route に enqueue する。region 外は `SetWindowRgn` で
   物理的に「存在しない」領域として穴を空けているので、OS が下層 (VST or presenter) に直接 mouse を
   配送する (= クロスプロセスでも安定)。`HTTRANSPARENT` のクロスプロセス透過には頼らない。
 - **Keyboard / IME**: HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。presenter HWND の
   既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
   を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
-  TextEdit を含む overlay ダイアログ表示中は、mIV が foreground に戻っているのに presenter thread の
-  `GetFocus()` が外れている場合も、render tick が rate-limit 付き focus intent を返し、`NativeWindowHost` が
+  TextEdit を含む overlay ダイアログ表示中は、mIV が foreground に戻っているのに pump observation の
+  thread focus が外れている場合も、render tick が rate-limit 付き focus intent を返し、`NativeWindowHost` が
   `claim_foreground(presenter_hwnd)` を実行して Alt+Tab 復帰後の文字入力 / Ctrl+V を回復する。
   Backspace / Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
@@ -133,7 +141,7 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 viewer-wide な `Settings::video_adjustments` を正本とする。画像補正パネル末尾には動画専用の
 10 個の保存スロットを読込行 / 保存行で表示する。スロット内容は App 側の
 `Settings::video_preset_slots` が正本で、presenter へは `VideoGradeSnapshot` で名前だけを同期するため、
-presenter thread は設定 I/O を行わない。パネル操作は `NativeOverlayCommand` →
+render thread は設定 I/O を行わない。パネル操作は `NativeOverlayCommand` →
 `NativeVideoOutputEvent` で App に戻し、保存または読込後に最新の補正値とスロット名を再同期する。
 `VideoAdjustSlot1..10` の既定 `Ctrl+1〜9` / `Ctrl+0` は映像表示中だけ読込を行い、動画→音声モードでは
 発火させない。新しい動画への source swap では左を presenter 内で閉じ、右も App から false を同期する。
@@ -152,8 +160,9 @@ normalize blocker / tile overlay / seek hover thumbnail / checkmark)。**activat
 非表示時の hover 検出範囲、画面上下端の帯) は region に **含めない** — 含めると bar 非表示時に VST の
 ノブが上下端と重なったとき入力を奪うため。
 
-bar の hover 表示は presenter thread の **50ms 周期 `GetCursorPos` polling** (`cursor_polling_tick`)
-で代替: cursor が presenter HWND client rect 内なら synthetic `MouseMove` を `push_native_event` に流し、
+bar の hover 表示は pump の 8ms latest observation を render が **50ms 周期で評価**
+(`cursor_polling_tick`) して代替する。cursor が presenter HWND client rect 内なら synthetic
+`MouseMove` を `push_native_event` に流し、
 activation zone 内なら HUD raise burst をエンキューする (= VST 手動クリックで HUD が裏に回ったあとの
 復帰経路)。
 
@@ -183,10 +192,9 @@ region 化は passive な source swap 表示なので、カーソルの auto-hid
   forward 前に**全 native event**を `push_native_events` で処理するので、ここが活動判定の権威。
   Button / Wheel は明確なユーザー意図なので無条件に活動扱い。
 - **HUD wndproc**: `WM_MOUSEMOVE` ではカーソルを復帰しない (move は zero-delta のことがあるため)。
-  実カーソル移動時の復帰は overlay ゲートが `cursor_hidden=false` にし、presenter の
-  `update_cursor_icon` が `SetCursor(IDC_ARROW)` を毎フレーム駆動する。render loop は
-  `sleep_until_message` (`MsgWaitForMultipleObjectsEx`/`QS_ALLINPUT`) で mouse message に即 wake する
-  ので復帰遅延は無い。`WM_MOUSEWHEEL` / `WM_*BUTTON*` だけは genuine なので即時復帰
+  実カーソル移動時の復帰は overlay ゲートが `cursor_hidden=false` にし、render が返す cursor
+  intent を pump の `NativeWindowHost` が適用する。pump は render の sleep/present と独立して
+  message dispatch を継続する。`WM_MOUSEWHEEL` / `WM_*BUTTON*` だけは genuine なので即時復帰
   (`restore_cursor_for_mouse_activity`)。`WM_SETCURSOR` は `LRESULT(1)` のみ (DefWindowProc の
   クラスカーソル抑止、実アイコンは `update_cursor_icon` が駆動)。
 - **App**: `handle_native_video_window_event` の `MouseMove` は、forward された move の client 座標が
@@ -204,8 +212,8 @@ region 化は passive な source swap 表示なので、カーソルの auto-hid
 VST z-order 操作の各経路 (`set_all_guis_topmost` / `set_all_guis_visible_blocking` /
 `set_all_guis_app_active` / `send_chain_z_order` / `show_slot_gui` / `hide_slot_gui` /
 `user_hide_slot_gui` / `remove_plugin` / `disable_with_reason`) の末尾で `DspBridge::fire_hud_raise_hook`
-が unbounded mpsc に `send(())` する → App `update` で `try_iter` drain → 1 件以上来てれば fullscreen 中の
-`VideoPlayer::request_hud_raise()` を 1 回呼ぶ (= coalesce) → presenter thread が
+が `AtomicBool` latest-value latch を set → App `update` が `swap(false)` → 1 件以上来てれば fullscreen 中の
+`VideoPlayer::request_hud_raise()` を 1 回呼ぶ (= coalesce) → bounded render command と pump control を経て pump が
 `NativeVideoOutputCommand::RaiseHudToTop` を受けて **即時/16ms/64ms の short retry burst** で
 `SetWindowPos(hud, HWND_TOPMOST)` を呼ぶ (= 非同期 VST IPC の z-order 反映を確実に拾う)。
 
@@ -257,9 +265,9 @@ NT 共有 ID3D11Texture2D (BGRA8、KEYEDMUTEX 付き)
     ↓
 ID3D11Fence::Signal (共有 fence で blit 完了通知)
     ↓
-[ video_tx (bounded mpsc) で UI / native presenter thread へ ]
+[ video_tx (bounded mpsc) で native-video-render thread へ ]
     ↓
-NativeWindowHost + NativeRenderCore (= 現行 native-video-presenter thread 上で直列)
+NativeRenderCore (HWND owner の native-video-window-pump とは分離)
     ├─ ID3D11Device::OpenSharedHandle で受信 → ID3D11Texture2D
     ├─ KEYEDMUTEX 取得 + Fence Wait で同期
     ├─ 補正なし: CopyResource → swap chain backbuffer
@@ -272,8 +280,8 @@ NativeWindowHost + NativeRenderCore (= 現行 native-video-presenter thread 上�
 D3D11 pixel shader を掛ける。したがってカメラ Log 素材の本来の色管理や 10-bit 精度を保証する
 機能ではなく、通常再生できる映像の見た目を変えるプレビュー機能である。
 
-`.cube` のファイル読み込みと parse は App の worker が担当し、presenter command には
-`Arc<CubeLutParams>` と表示用選択肢だけを渡す。presenter thread はファイル I/O を行わない。
+`.cube` のファイル読み込みと parse は App の worker が担当し、render command には
+`Arc<CubeLutParams>` と表示用選択肢だけを渡す。render thread はファイル I/O を行わない。
 補正がすべて既定値なら shader pipeline は遅延生成も実行もせず従来の copy path を維持する。
 補正中は GPU decode の共有テクスチャを SRV として直接 sample し、CPU decode 時だけ再利用可能な
 BGRA8 texture へ upload して同じ shader を通す。LUT table は RGBA32F 3D texture として保持する。
@@ -297,7 +305,56 @@ stale なまま返してしまう** (= 動画切替直後に前動画のフレ�
 `texture_gen` が必ず異なるので、別エントリとして開き直す。これは `fence` 側の `fence_gen`
 (同じ handle 値再利用問題への既存対策) と完全に同じ思想。
 
-#### present 済みフレームの遅延解放 (`present_retire`)
+#### native output の最新フレーム所有 (`FramePresentationState`)
+
+`run_native_video_output` は最近のフレームを native output context 内の単一 typed state で
+所有する。
+
+- `Empty`: 再利用できるフレームがない
+- `Hidden { frame }`: presenter 非表示中に保持する最新フレーム。grade 変更では再提示しない
+- `Visible { frame, fence }`: 最後に表示した再提示可能なフレーム。`fence` は別フレームへ
+  置換されて retire へ移るときだけ使う
+
+`source.queue` は時刻選択前の未提示フレームだけを保持し、`present_retire` は廃棄待ちだけを
+保持する。grade 変更の再提示と placement switch の prime は typed state だけを参照し、
+`present_retire` や `source.queue` を「最後に表示したフレーム」として推測しない。新フレームの
+提示成功時は旧 `Visible` を retire へ移し、新フレームを唯一の `Visible` にする。source switch /
+close でも同じ state を drain するため、別 source の最近フレームは fallback に残らない。
+
+hidden (`動画→音声モード`) は display clock による pacing を行わない。visible 専用の
+`MAX_NATIVE_SOURCE_QUEUE=8` を適用すると `source.queue` と `video_tx=8` が同時に満杯になり、
+video decoder が demux EOF より前で停止するため、hidden 中は既存 queue と `video_rx` の到着済み
+frame を毎 loop 全件 drain する。seek serial を検証したうえで途中 frame を即時解放し、最後の 1 枚
+だけで `Hidden { frame }` を置換する。これにより映像経路が EOF まで進み、ループ OFF では既存の
+`EofReached` が表示位置を既知 duration に凍結する。映像表示へ戻すときは同じ最新 `Hidden` を
+`Visible` にして即時再提示する。通常の visible playback は従来どおり queue cap と decoder
+back-pressure を使う。
+
+可視状態の正本は window-pump thread の typed `WindowHostState` であり、pump は適用済み状態を
+output-lifetime の `NativePresenterVisibility` に publish する。App の show 完了判定と render loop の
+visible pacing / hidden drain はこの同じ projection を読む。render-local の可変 bool は持たない。
+`SwitchSource` が交換するのは source-lifetime の `PresenterSourceState` (receiver / clock / duration /
+epoch) だけで、hidden のまま何回交換しても output-lifetime の visibility は維持される。
+visibility request は適用の有無にかかわらず 1 request : 1 completion とする。すでに Hidden の host へ
+再度 hide を要求した場合、typed reducer は native `SW_HIDE` を繰り返さず
+`ConfirmVisibility` を返し、pump は通常の適用と同じ `VisibilityApplied` を返す。source-swap 完了時の
+音声モード再確立が冪等な hide になっても、render thread は completion 待ちから必ず復帰する。
+
+GPU frame は producer が writer key 0 で書き、`ReleaseSync(1)` で reader へ渡す。render は
+`AcquireSync(1)` で読み取ったあと、成功したコピーでは **そのまま `ReleaseSync(1)`** して
+reader-ready に保つ。したがって held frame の再提示に `AcquireSync(0)` を追加する必要はない。
+フレームが `Visible` / `Hidden` から外れて pool slot の `in_use` が false になると、既存の
+`released_to_reader` を見た producer 側 `acquire_shared_output` が
+`recover_shared_output_keyed_mutex` で key 1 を回収して writer key 0 へ戻す。driver 内で
+時間上限を保証できない acquire を pump thread へ持ち込まず、render thread にも再 arm 用の
+追加 acquire を置かない。
+
+grade command は前回 snapshot と render に影響する adjustment / 選択 LUT を比較し、差分があり
+かつ state が `Visible` のときだけ 1 回再提示する。`Empty` / `Hidden` と同一 grade では要求を
+立てないため、一時停止中に無条件の present / repaint loop は発生しない。通常 fullscreen と
+detached の可視 presenter は同じ native output context を通り、App-global な再提示 flag は持たない。
+
+#### 置換済みフレームの遅延解放 (`present_retire`)
 
 presenter の `CopySubresourceRegion` は **非同期** (GPU コマンドキューに積むだけ) なので、
 `present` 直後に `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot の `in_use` が
@@ -305,8 +362,9 @@ presenter の `CopySubresourceRegion` は **非同期** (GPU コマンドキュ�
 GPU コピーがまだ source texture を読み終えていないと、別フレームの内容が混入する
 (2026-05-15、別動画フレームの 1 枚混入)。
 
-対策として `run_native_video_output` は present 済みの `VideoFrame` を即 drop せず、
-`present_retire` リングバッファに `(VideoFrame, copy_fence_value)` で保持する。presenter は
+対策として `run_native_video_output` は新 `Visible` に置換された旧 `VideoFrame` を即 drop
+せず、廃棄待ち専用の `present_retire` リングバッファに
+`(VideoFrame, copy_fence_value)` で保持する。presenter は
 自前の `ID3D11Fence` (`copy_fence`) を持ち、`copy_frame_into_backbuffer` のコピー後に
 `Signal` して値を進める (`outcome.copy_fence_value`)。`present_retire` は
 `presenter.copy_fence_completed_value()` がその値へ到達した = **コピーが GPU 上で完了した**
@@ -317,8 +375,9 @@ fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 
 (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、深さキャップ
 `NATIVE_PRESENT_RETIRE_CAP = 4` のみで解放する (= 時間ベースに縮退、旧挙動と等価)。キャップは
 fence が万一 stall したときの上限も兼ねるが、**stall 時のフットプリント (= 共有出力プール
-16 slot のうち retire が占める数) を 4 に抑える**ことで、decoder の in-flight (~10-15) と
-合わせてもプールに余裕が残るようにしている (2026-05-15 に 8 から 4 へ縮小: cap=8 では
+16 slot のうち retire が占める数) を 4 に抑える**。typed state が最新 frame 1 slot を
+保持しても残り 11 slot を decoder / channel / source queue の in-flight に使える
+(2026-05-15 に 8 から 4 へ縮小: cap=8 では
 stall 時にプール枯渇 → CPU readback フォールバック → スパイラル悪化の実害があったため)。
 `fullscreen_present` perf イベントの `retire_queue_len` で長さを観測できる (fence が
 効いていれば通常 1〜3)。
@@ -340,7 +399,7 @@ libavfilter bwdif (設定が Auto/On かつ対象フレーム/ストリームの
     ↓
 swscale (NV12/YUV → RGBA、CPU で 24MB allocation)
     ↓
-[ video_tx (bounded mpsc) で native presenter thread へ ]
+[ video_tx (bounded mpsc) で native-video-render thread へ ]
     ↓
 NativeRenderCore::present (CPU 経路ブランチ)
     ├─ 補正なし: ID3D11DeviceContext::UpdateSubresource で backbuffer に upload
@@ -825,7 +884,8 @@ fast-swap 連発時 (= 解像度違い動画をホイールで連射) に `wgpu 
 **`source.queue` の back-pressure**: 旧コードは `video_rx.try_recv()` を空になるまで
 drain して queue に積み込んでいたため queue が 23 frame まで肥大化。`MAX_NATIVE_SOURCE_QUEUE`
 で cap し、超えたら drain を停止することで `video_tx` (cap=8) に逆圧をかける。decoder
-側は `try_send` 失敗で古い frame を drop / 待機して自然に pacing する。
+側は `try_send` 失敗で古い frame を drop / 待機して自然に pacing する。この cap は visible
+playback のみの規則であり、hidden 中は上記の consume-and-hold 全件 drain を使う。
 
 **Paused/Eof 中の GPU 出力前 park** (2026-06-24):
 GPU 経路では `try_gpu_blit_path` 成功後の pacing loop に pause park があるが、この時点では
@@ -1222,20 +1282,32 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 
 #### `native_window_host` / `native_presenter` (`NativeWindowHost` + `NativeRenderCore`)
 
-Stage 2 (2026-07-29) で HWND ownership と GPU/DComp ownership を module/type で分離した。
-両者はまだ同じ `native-video-presenter` thread で直列実行するが、render core は raw HWND や
-USER32 mutation capability を持たず、opaque target lease と typed window intent だけで host と接続する。
+Stage 2 (2026-07-29) で HWND ownership と GPU/DComp ownership を module/type で分離し、
+Stage 4 (同日) で production を専用 `native-video-window-pump` / `native-video-render` の二 thread
+へ切り替えた。render core は raw HWND や USER32 read/mutation capability を公開されず、private
+descriptor から render thread 内で復元する opaque target lease、pump observation、typed window
+intent だけで host と接続する。
 
 現状の内部構成:
 
 | ファイル / 範囲 | 責務 | 主な型 |
 |---|---|---|
+| `native_window_pump.rs` | bounded request/ack、window-host reducer、全 placement の create/pump/publish/destroy、observation/intent 適用、typed shutdown/quarantine | `NativeWindowPumpRenderClient`, `PumpLifecycleEvent`, `PumpPlacementRequest` |
 | `native_window_host.rs` | presenter/HUD topology、visibility/geometry/region/z-order/focus/IME/cursor mutation、thread affinity | `NativeWindowHost`, `NativeRenderTargets`, `NativeWindowIntent` |
 | `native_window_host/hud_window.rs` | HUD HWND RAII owner と wndproc/region mutation | `HudOverlayWindow` |
 | `native_presenter/mod.rs` | render facade と `overlay_draw` module 宣言 | — |
 | `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
 | `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
 | `native_presenter/grade_pipeline.rs` | 色調補正 / Creative LUT shader pipeline | `VideoGradePipeline` |
+
+高頻度の mouse move、geometry/DPI、HUD raise、HUD visual/observation、App→render の HUD state は
+sequence 付き latest-value slot で coalesce する。wndproc の slot は atomic pointer swap、pump の
+visual/observation drain は non-blocking `try_lock` で、HWND owner から render への逆向き wait を作らない。
+close/key/text/IME、button/wheel/leave/destroy、
+placement/source/action と pump lifecycle は bounded lossless channel で運び、満杯または切断時は
+silent drop せず session quarantine にする。placement switch は hidden staging host を作り、render
+の state/overlay/frame prime 後の `TargetReady(epoch)` で初めて publish する。失敗時は
+`TargetFailed(epoch)` が staging だけを破棄し、旧 host/core と committed placement を保持する。
 
 native overlay から UI thread へ戻るコマンドの App 側 dispatch は
 `src/app/native_video.rs` に分離している。`VideoPlayer` / `NativeVideoOutput` は
@@ -1512,17 +1584,43 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   D3D11 device 自体は残しつつ、`hw_frames_pool`、`in_use=false` の `shared_output_pool` slot、
   `processor_cache` を解放する。次回動画再生時は通常の acquire 経路で lazy に再作成される。
   VST3 bridge / plugin chain は停止しない。
+- **タスクトレイ格納時の media pause**: `hide_to_tray()` は Win32 `SW_HIDE` より前に、mounted
+  context、active detached context、全 ParkedLive bundle が所有する既存 `FsCacheEntry::Video` を走査する。
+  再生 intent がある `VideoPlayer` へ `set_playing(false)` を送り、engine transport、音声出力、clock を
+  一緒に pause する。動画、動画→音声モード、単体音楽ファイルは同じ owner / pause 経路を通る。
+  live player の clock / 最終表示 PTS を保持したまま `video_resume_positions` にも保存するため、復帰後の
+  Play は同じ位置から始まる。tray 専用 bool は持たず、自動再生もしない。
+- **tray residency 中の session / cache ownership**: mounted context で再生中だった session は pause 済みの
+  `VideoPlayer` / native output として保持し、それ以外の画像 texture cache は解放する。格納前から再生して
+  いなかった通常 fullscreen / in-window session の close は従来どおり。detached / switching context は
+  既存 lifecycle predicate どおり active / ParkedLive owner に残すが、再生継続ではなく pause 済みである。
+  process-wide D3D11 device と VST3 bridge / plugin chain は残し、idle GPU pool は
+  `GpuVideoDevice::release_idle_pools()` で解放する。
+- **トレイ復帰フレームの close 経路**: `sync_after_restore(ctx)` は Play を送らない。mounted fullscreen media
+  が残っている場合は既存の focus grace / `restore_fullscreen_focus_from_main()` で surface の focus / raise
+  だけを再要求し、同じフレームの main-focus guard が `close_fullscreen()` を実行する競合を避ける。
+  復帰時の `check_external_folder_changes()` が items を再構築する場合は、
+  `start_loading_items()` の main-context change 境界が既存の
+  `viewer_session_is_detached_or_switching()` から detached media context への promotion を決定する。
+  main-focus consumer も `current_viewer_session_is_detached_or_switching()` を使うため、host 待ち / placement
+  switch 中の paused session と typed request を閉じない。これらは前 2 件の lifecycle 述語統一を保つための
+  context ownership であり、トレイ中の再生維持を意味しない。`poll_video()` の close は明示 close event または
+  native output の genuine terminal close に限り、tray restore 自体は terminal producer にならない。
+  `cleanup_visible_false` の `host=hwnd=0` は、ログ出力前に runtime を除去した後の値であり、host-loss 判定には
+  使用しない。
 - **NativeWindowHost / NativeRenderCore** (= `VideoPlayer::open` 時に 1 組生成、`VideoPlayer` Drop で停止):
-  host が presenter/HUD HWND、core が D3D11 swap chain + DComp/GPU resource を所有する。現段階では
-  同じ専用 thread で decoder の `VideoFrame` を pull → present する。
-- **D3d11Frame の所有権**: native presenter thread が channel から受信して自身の Drop
+  `native-video-window-pump` 上の host が presenter/HUD HWND と USER32 lifecycle、
+  `native-video-render` 上の core が D3D11 swap chain + DComp/GPU resource を所有する。
+  Drop は cancel を共有し、detached join helper が pump を先に join してから render を join するため、
+  render が driver call で停止しても HWND owner/UI は join を待たない。
+- **D3d11Frame の所有権**: native-video-render thread が channel から受信して自身の Drop
   まで保持。次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する
   (= 描画中の HANDLE が close される race を防ぐ)
 - **z-order 復旧**: PrintScreen / Snipping Tool などで foreground が一時的に外部へ
   移った後、egui 側の黒 backdrop が presenter より前に残る場合がある。UI thread から
   `SetWindowPos` / `SetForegroundWindow` を直接呼ばず、App が外部 foreground を観測
   した後に mIV foreground へ戻ったエッジで `RaisePresenterToFront` command を
-  rate-limit 送信し、presenter 所有スレッド側で `HWND_TOP` と foreground / active /
+  rate-limit 送信し、pump 所有スレッド側で `HWND_TOP` と foreground / active /
   focus を再アサートする。また startup 競合などで foreground が同一プロセス内の
   fullscreen 黒 backdrop / main HWND に残った場合も、presenter / HUD 以外が foreground
   なら同じ rate-limit 経路で presenter 所有スレッドへ復旧を依頼する。
@@ -1644,7 +1742,7 @@ always-new 窓と同じく no-op として扱う。
   は Fullscreen と MainWindow の間だけを切り替える。detached 中の F11 は no-op。
 - F12 の detached mode 切替や main 側同期による host migration は、
   `switch_native_video_viewer_presentation` が `request_id` 付きの
-  `NativeVideoOutputCommand::SwitchPlacement` を presenter スレッドへ送る。
+  `NativeVideoOutputCommand::SwitchPlacement` を render orchestration へ送る。
 - `detached_viewer_open_images_in_window` ON 中の動画 / 音声 F12 は、現在のメディアだけを
   MainWindow / Fullscreen と DetachedWindow の間で一時移動する。次に動画 / 音声を明示 open した場合は、
   永続設定に従って再び DetachedWindow へ戻る。
@@ -1652,10 +1750,14 @@ always-new 窓と同じく no-op として扱う。
   `find_visible_thread_window_matching_rect` で捕捉する。host が未取得なら open / placement
   switch は `NativeVideoOpenPending` / `pending_detached_video_host_switch` で保留し、
   動画用 top-level HWND へはフォールバックしない。
-- presenter スレッド (`run_native_video_output` in [src/video/mod.rs](../src/video/mod.rs))
-  が hidden な新 window + presenter を組み立て、状態 (再生位置 / overlay / VST /
-  checked / SAR) を移してから旧 window と入れ替え、`PlacementSwitched`
-  / `PlacementSwitchFailed` を `request_id` 付きで返す。
+- pump が hidden な新 window を生成し、render (`run_native_video_output` in
+  [src/video/mod.rs](../src/video/mod.rs)) が新 core へ状態 (再生位置 / overlay / VST /
+  checked / SAR) と `FramePresentationState` が所有する現 frame を prime する。
+  `present_retire` / `source.queue` は prime fallback に使わない。prime 失敗時は typed state を
+  旧 core 側に保持したまま staging を破棄する。`TargetReady` 後に pump が新 HWND を
+  publish して旧 HWND を破棄し、`PlacementSwitched` を `request_id` 付きで返す。
+  attach/state restore/prime の失敗は staging だけを破棄して旧 host/core を維持し、
+  `PlacementSwitchFailed` を返す。
 - App は `request_id` で遅延 / 連打イベントを弾く。`native_video_in_window_active`
   と `viewer_presentation` は切り替え進行中は据え置き、`PlacementSwitched` の
   `request_id` が pending と一致 (または presenter が pending target へ収束) した
@@ -1664,7 +1766,7 @@ always-new 窓と同じく no-op として扱う。
 - 切り替え進行中 (`native_video_mode_switch` Some) は `ensure_native_video_front` /
   VST owner 同期 / VST availability を全停止する。
 - **close の世代タグ化 (旧 HWND teardown 由来の stale close 対策)**: window を
-  rebuild するたびに presenter スレッドが単調増加の `cur_generation` を採番し
+  rebuild するたびに render orchestration が単調増加の `cur_generation` を採番し
   (初回 1、rebuild ごとに `saturating_add(1)`)、その値を新 window の
   `WindowState.generation` に焼き込む。`WM_CLOSE` は
   `NativeVideoWindowEvent::CloseRequested { generation }` を、overlay × / presenter
@@ -1686,8 +1788,8 @@ always-new 窓と同じく no-op として扱う。
 
 detached の egui viewport の OS window (host HWND) は main⇔detached 切替をまたぐと
 **作り直される**ことがある。presenter child (`DetachedViewerChild`, `WS_CHILD`) を旧 host の
-子のまま放置すると、旧 host 破棄で child が道連れ WM_DESTROY → WM_QUIT で presenter スレッド
-ごと死に、動画再生が終了してしまう (2026-07-01 実機バグ)。**常に現在の detached host へ
+子のまま放置すると、旧 host 破棄で child が道連れ WM_DESTROY → per-window WM_QUIT となり旧
+presenter loop ごと死んで動画再生が終了していた (2026-07-01 実機バグ)。**常に現在の detached host へ
 child を追従させる**ことで防ぐ:
 
 - `show_viewport_*` 前後の生成差分 registry が host HWND の変化を lifecycle event として扱い、
@@ -1704,12 +1806,11 @@ child を追従させる**ことで防ぐ:
   `poll_detached_video_host_resync` が再試行する。適用可否は「detached で再生中 **または**
   detached へ切替中」で判定し (`detached_video_presentation_active_or_targeted`)、
   initial main→detached の switch 進行中の host 変更も取りこぼさない。
-- **安全網**: `DetachedViewerChild` の window だけ `post_quit_on_destroy=false` で生成する。
-  この child は borderless で正当な user close を受けず、正当な終了は
-  `NativeVideoOutput::Drop → cancel` (loop 冒頭の `while !cancel.load()`) 経由なので WM_QUIT は
-  不要。host teardown が再親付けより先に child を壊しても presenter を死なせず、次の rebuild で
-  回収する。fullscreen / main-window-child は host (`main_hwnd`) が安定なので従来どおり
-  `post_quit_on_destroy=true`。
+- **typed lifecycle**: 全 placement で個別 HWND の `WM_DESTROY` は `Destroyed(epoch)` を
+  pump reducer へ通知するだけで thread termination を兼ねない。`post_quit_on_destroy` は廃止し、
+  explicit `Shutdown` / `Close` が全 pump-owned HWND の destroy を完了した後だけ pump 自身へ
+  最終 `WM_QUIT` を post する。detached host teardown が再親付けより先に child を壊しても、
+  stale epoch は reducer が棄却し、render ack/join を待たず HWND close を完了できる。
 - 再親付け rebuild が失敗した (`PlacementSwitchFailed`) ときは
   `revert_failed_video_presentation_switch` が `pending_detached_video_host_resync` を再セット
   して retry する (WM_QUIT で回収されなくなった分の保険)。
@@ -1757,14 +1858,24 @@ D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{vi
 `SW_HIDE` して生かしたままにする。理由:
 
 - **映像を止めない**。demux / decode は通常どおり回り、hidden presenter は届いたフレームを
-  consume して present 成功時の bookkeeping (FirstFrameReady 等) を出し続ける。これで音声モード
-  中に seek しても、生きた presenter が FirstFrameReady を発行するので engine の readiness latch が
-  Buffering→Playing に復帰できる (映像を止める旧案では runtime の映像 OFF フラグで latch を
-  合成する必要があったが、この方式では不要。step 9 で当該フラグは削除済み)。
+  consume して `last_displayed_pts_bits` / `displayed_frame_seq` / FirstFrameReady などの
+  bookkeeping を更新する。ただし FirstFrameReady は hidden 音声モードの**再生開始条件ではない**。
+  `EngineActor` は既存 `MediaVisualMode` から `ReadinessRequirements` を導出し、通常の Video 表示
+  (`has_audio=true, has_video=true`) では従来どおり FirstFrameReady + BufferReady、Music 表示では
+  timed video の有無にかかわらず BufferReady + audio anchor を要求する。これにより音声ファイル単体
+  (`has_video=false`) と動画の hidden 音声モード (`has_video=true`) は同じ readiness を通る。
+  音声モード維持 source-swap は新 player が decoder event を取り込む前に Music を設定し、
+  ♪ / Z で動画へ戻るときは show / placement 復帰前に Video へ戻す。新しい runtime bool や
+  timeout は持たず、通常動画の遷移条件は変えない。
 - **音切れを作らない**。presenter を drop して作り直すと音声パイプラインも一度畳む必要があり
   数百 ms の無音が入る。hide/show だけならオーディオリングは無停止。
 - **exit race を避ける**。presenter HWND を生かすことで、hide→show の順序と owner / focus guard の
   再取得を決定的に扱える。
+
+hide 中の最新映像は native output context の `FramePresentationState::Hidden` が 1 枚だけ
+所有する。新フレームを選択すると旧 `Hidden` を producer-side recovery へ返し、show 時は同じ
+frame を最新 grade で present して `Visible` へ移してから HWND を表示する。grade 変更は hidden
+中に再提示しない。
 
 hide 中は HUD overlay HWND も明示 hide し、overlay tick / cursor polling / HUD raise burst を
 抑止する。音声モードの owner 同期・focus guard・`ensure_native_video_front` は
@@ -1776,6 +1887,12 @@ presenter の source だけを差し替える keep-audio-mode の source-swap �
 動画でも映像を出さずに音声モードのまま連続再生する。**VST は引き継ぐ**。動画→音声モードでも
 VST チェーンは `dsp_bridge` 共有で維持され、音声モード中に VST GUI を出すときだけ hidden
 presenter を一時的に un-hide して VST ホスト化する (音効果自体は元から通っている)。
+
+この source-swap では pump-owned の `WindowHostState` と、その output-lifetime projection
+`NativePresenterVisibility` は交換しない。新 source の `video_rx` も最初の source と同じ hidden
+drain policy を直ちに使うため、seek 直後を含め `video_tx` の back-pressure で demux EOF を塞がない。
+swap 完了後の音声モード再確立は hide を再要求するが、Hidden→Hidden でも pump が completion を返す。
+音声モード終了時だけ typed show transition が projection を visible に戻す。
 
 実装の詳細な段階計画 (10 ステップ)・Codex 設計レビュー履歴は
 [music-integration-plan.md](music-integration-plan.md) § 5.7 を参照。
@@ -2263,8 +2380,8 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
 | `engine/` | typed state / readiness / master clock を実装済み | `EngineActor` は `Arc<Mutex<_>>` を UI tick が駆動し、`AvClock` と actor の clock ownership が並存する。専用 actor thread は現行仕様ではない |
 | `decoder.rs` | demux / video / audio の 3 worker、packet/control 分離は安定 | 3 worker の codec、HW、seek、pacing helper が同居し、責務分離点がファイル境界になっていない |
 | `video/mod.rs` | `VideoPlayer` API と native output lifecycle の owner | UI tick event drain、output loop、source swap、native presenter orchestration が集中する |
-| `native_window_host` / `native_presenter/` | HWND owner と GPU/DComp core を Stage 2 で分離済み。legacy eframe video path は撤去済み | production pump/render thread と channel/reducer は Stage 4。overlay state/input policy の細分化は後続負債 |
-| `native_window.rs` | presenter HWND wndproc / event translation。RAII owner は `NativeWindowHost` の下位型 | main child resize subclass、`post_quit_on_destroy`、pump cutover は Stage 4 の境界 |
+| `native_window_pump` / `native_window_host` / `native_presenter/` | Stage 4 で全 HWND owner/pump と GPU/DComp render を別 thread に分離し、typed channel/reducer、二相 placement switch、typed shutdown/quarantine を production 接続。legacy eframe video path は撤去済み | Stage 5 の VST owner-applied ack/hidden anchor、Stage 6 の source/EOF 全 sequence、overlay state/input policy の細分化は後続負債 |
+| `native_window.rs` | presenter/HUD wndproc の decode/enqueue。RAII owner は `NativeWindowHost` の下位型、event は latest-value と bounded lossless に分類 | main child resize subclassは pump host request/reflowへ接続済み。health watchdog は Stage 7 |
 | `gpu_renderer/` | D3D11/FFmpeg interop と unsafe 境界 | 境界は比較的明確。presenter/decoder との resource lifetime は引き続き横断監査が必要 |
 | `audio.rs` / `dsp/` | device-rate playback、stretch、chain bridge を統合 | pump、RT callback、VST IPC/back-pressure の ownership が近接し、DSP 側も chain/GUI/persistence/hot path が混在する |
 
