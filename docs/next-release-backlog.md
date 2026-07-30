@@ -310,6 +310,46 @@
 - 規模 / 優先度: Medium / P2 candidate。現在の重なりだけを座標ずらしで直す症状パッチは
   入れず、まず左上レーンの単一所有化から着手する。
 
+### 2.3 スマートフォルダへ戻るたびに一覧を作り直している
+
+- 出典: v2.9.0 公開後のユーザー報告 (2026-07-31)。スマートフォルダの結果から下位フォルダや
+  PDF を開き、戻ってくると全体の再構築が始まったように見える。通常は同じ結果になるはずで、
+  待たされるのが体感を損ねている。
+- **着手前に、どちらが起きているか計測で確定する (推測で直さない)**。走査結果の cache は
+  既にあるので、症状は 2 通りのどちらか:
+  1. ファイル走査からやり直している
+  2. 走査結果は再利用できているが、prepare 段階を丸ごと再実行している
+  切り分け = 当該操作の `--perf-log` を取り、`SmartFolderPhase::Scanning` が出るかを見る。
+  出れば 1、`Ratings` 以降しか出なければ 2。perf event は
+  [src/app/smart_folder.rs](../src/app/smart_folder.rs) に既にある。
+- 現状の構造 (source inspection 済み):
+  - `App::smart_folder_snapshots: HashMap<Uuid, SmartFolderSnapshot>` が定義ごとに
+    **ファイル走査の結果**を持つ。
+  - `open_smart_folder()` は **cache を一切見ずに必ず `spawn_smart_folder_scan` を起動する**。
+    ここを通る経路は毎回フルスキャンになる。
+  - `restore_smart_folder_for_synthetic_path()` は `smart_folder_scan_rules_match` が成立すれば
+    cache 済み snapshot を再利用し、不成立なら `open_smart_folder` へフォールバックする。
+  - **ただし再利用側も `start_smart_folder_prepare` を呼ぶ**。prepare は snapshot 全体に対して
+    Ratings → Tags → Adjustments → Bookmarks → Filtering → Sorting → Building を再実行し、
+    進捗表示も出す。結果が大きいとフルスキャンと区別が付かない。
+  - `smart_folder_metadata_refresh_due` は、cache 済み snapshot から定期的に prepare し直す。
+- 対応方針 (計測結果で分岐):
+  - 1 だった場合: 戻り経路が `restore_smart_folder_for_synthetic_path` に乗っていないか、
+    ルール一致判定が落ちている。まず**なぜ一致しないか**を突き止める。経路を増やして
+    片側だけ cache を見るような分岐は足さない。
+  - 2 だった場合: prepare の**成果物**を cache する。キーは (snapshot 世代, ソート順,
+    絞り込み状態, `smart_folder_metadata_revision`)。`smart_folder_resort_metadata` が
+    部分的に同じことをしているので、**並行する別 cache を作らず拡張する**。
+- **無効化の正しさが最優先** (ここを外すと古い一覧を見せる実害になる):
+  - 下位フォルダを見ている間にレーティング / タグ / 補正を変更すると、**構成メンバー自体が
+    変わり得る**。`smart_folder_metadata_revision` がその足がかり。
+  - 削除 tombstone (`remove_paths_from_smart_folder_snapshots`)、定義の編集、グルーピング
+    変更、`smart_folder_removed_paths` の既存無効化を維持する。
+  - 「速いが古い」は「遅いが正しい」より悪い。cache hit の条件は保守的に始める。
+- 確認項目: 戻ったときにスクロール位置とカーソルが保たれること。下位フォルダで★を付けて
+  戻ると一覧へ反映されること。定義を編集して戻ると再走査されること。
+- 規模 / 優先度: Medium / P2 candidate。
+
 ## 3. 補正 / AI
 
 ### 3.1 local-adjust layers の入場時同期 DB 読み
