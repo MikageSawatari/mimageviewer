@@ -4183,6 +4183,12 @@ impl Default for LazyColumnState {
 }
 
 const DETAILS_LAZY_META_STALE_CAP: usize = 50_000;
+/// 詳細遅延メタの target 構築を UI thread で 1 frame に進める上限。
+///
+/// 50 万件の smart folder でも全件 clone + 判定を 1 frame に集中させず、約 1us/item の
+/// 実機報告なら 4ms 前後の slice へ抑える。走査 session は cursor を保持し、scroll 時は
+/// worker の priority queue だけを更新するため先頭から数え直さない。
+const DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME: usize = 4_096;
 
 #[derive(Clone, Default)]
 pub(crate) struct DetailsLazyMeta {
@@ -4249,13 +4255,27 @@ impl DetailsLazyMeta {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct DetailsLazyFieldFlags {
     page_count: bool,
     created_at: bool,
     ai_metadata: bool,
     image_dims: bool,
     video_meta: bool,
+}
+
+impl DetailsLazyFieldFlags {
+    fn any(self) -> bool {
+        self.page_count || self.created_at || self.ai_metadata || self.image_dims || self.video_meta
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.page_count |= other.page_count;
+        self.created_at |= other.created_at;
+        self.ai_metadata |= other.ai_metadata;
+        self.image_dims |= other.image_dims;
+        self.video_meta |= other.video_meta;
+    }
 }
 
 /// 詳細列の表示文字列が変化した世代。
@@ -4304,7 +4324,66 @@ struct DetailsMetaPending {
     selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<DetailsMetaEvent>,
+    phase: DetailsMetaPendingPhase,
+}
+
+enum DetailsMetaPendingPhase {
+    Planning(DetailsMetaTargetPlan),
+    Loading {
+        rx: mpsc::Receiver<DetailsMetaEvent>,
+        priority_tx: mpsc::Sender<Vec<DetailsMetaTarget>>,
+    },
+}
+
+enum DetailsMetaScanOrder {
+    Explicit {
+        indices: Vec<usize>,
+        cursor: usize,
+    },
+    CurrentGrid {
+        cursor: usize,
+        len: usize,
+        order_revision: u64,
+    },
+}
+
+impl DetailsMetaScanOrder {
+    fn scanned(&self) -> usize {
+        match self {
+            Self::Explicit { cursor, .. } | Self::CurrentGrid { cursor, .. } => *cursor,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Explicit { indices, .. } => indices.len(),
+            Self::CurrentGrid { len, .. } => *len,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.scanned() >= self.len()
+    }
+
+    fn is_incremental(&self) -> bool {
+        matches!(self, Self::CurrentGrid { .. })
+    }
+}
+
+struct DetailsMetaTargetPlan {
+    generation: u64,
+    order: DetailsMetaScanOrder,
+    visible_near: HashSet<usize>,
+    load_all_page_counts: bool,
+    ai_facet_load: bool,
+    page_count_config: DetailsPageCountConfig,
+    visible_targets: Vec<DetailsMetaTarget>,
+    background_targets: Vec<DetailsMetaTarget>,
+    cached_done: usize,
+    cached_failed: usize,
+    total: usize,
+    scan_slices: usize,
+    scan_started_at: Option<std::time::Instant>,
 }
 
 fn details_meta_reprioritize_candidate(
@@ -4355,6 +4434,7 @@ enum DetailsMetaEvent {
 
 #[derive(Clone)]
 struct DetailsMetaTarget {
+    idx: usize,
     key: String,
     item: GridItem,
     relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
@@ -4371,6 +4451,26 @@ struct DetailsMetaTarget {
     load_image_dims: bool,
     load_video_meta: bool,
     priority: crate::io_semaphore::IoPriority,
+}
+
+impl DetailsMetaTarget {
+    fn requested_fields(&self) -> DetailsLazyFieldFlags {
+        DetailsLazyFieldFlags {
+            page_count: self.load_page_count,
+            created_at: self.load_created_at,
+            ai_metadata: self.load_ai_metadata,
+            image_dims: self.load_image_dims,
+            video_meta: self.load_video_meta,
+        }
+    }
+
+    fn remove_processed_fields(&mut self, processed: DetailsLazyFieldFlags) {
+        self.load_page_count &= !processed.page_count;
+        self.load_created_at &= !processed.created_at;
+        self.load_ai_metadata &= !processed.ai_metadata;
+        self.load_image_dims &= !processed.image_dims;
+        self.load_video_meta &= !processed.video_meta;
+    }
 }
 
 #[derive(Clone)]
@@ -40605,6 +40705,20 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
+        // filter / 表示集合変更は target membership を変える。scroll は revision を変えないので、
+        // この境界でだけ plan / worker を破棄して新しい走査 session を開始する。
+        let requirements_stale = self
+            .details_meta_pending
+            .as_ref()
+            .is_some_and(|pending| pending.visible_revision != self.details_lazy_visible_revision);
+        if requirements_stale {
+            if let Some(pending) = self.details_meta_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+            ctx.request_repaint();
+        }
+
         // ページ数ソート以外は画面外の全コンテナを開かず、可視範囲 + 先読み範囲だけを
         // 段階取得する。前の範囲が Ready でもスクロール先に未取得行があれば次ジョブを開始。
         if self.details_page_count_uses_visible_stages()
@@ -40615,15 +40729,12 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
-        // ZIP/PDF のページ数は画像寸法より1件あたりのI/Oが重い。大きくスクロールして
-        // 現在の可視近傍が起動時の Normal 優先集合と完全に離れたら、完了済みcacheを
-        // 保ったまま worker を組み直して新しい可視行を先に処理する。少しずつの
-        // スクロールは集合が重なるため再起動しない。大きなドラッグ中も既存の
-        // prefetch idle gate を共有し、静止するまでは cancel / respawn しない。
+        // 大きく scroll して可視近傍が移ったら、全件 plan / worker を作り直さず、現在の
+        // 可視 target だけを priority queue へ差し込む。idle gate は従来どおり共有する。
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && self.details_meta_pending.is_some()
         {
-            let current_visible: HashSet<String> = self
+            let current_visible_order: Vec<usize> = self
                 .details_tag_prewarm_indices
                 .iter()
                 .copied()
@@ -40633,6 +40744,12 @@ impl App {
                             .details_lazy_meta_for_idx(idx)
                             .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
                 })
+                .collect();
+            let current_visible_indices: HashSet<usize> =
+                current_visible_order.iter().copied().collect();
+            let current_visible: HashSet<String> = current_visible_indices
+                .iter()
+                .copied()
                 .filter_map(|idx| self.details_lazy_cache_key(idx))
                 .collect();
             let reprioritize_candidate =
@@ -40661,12 +40778,36 @@ impl App {
                 }
             }
             if reprioritize {
-                if let Some(pending) = self.details_meta_pending.take() {
-                    pending.cancel.store(true, Ordering::Relaxed);
+                let priority_targets: Vec<DetailsMetaTarget> = current_visible_order
+                    .iter()
+                    .copied()
+                    .filter_map(|idx| {
+                        self.details_meta_target_for_idx(idx, &current_visible_indices, true)
+                    })
+                    .collect();
+                let priority_count = priority_targets.len();
+                if let Some(pending) = self.details_meta_pending.as_mut() {
+                    pending.normal_target_keys = current_visible;
+                    match &mut pending.phase {
+                        DetailsMetaPendingPhase::Planning(plan) => {
+                            plan.visible_near = current_visible_indices;
+                        }
+                        DetailsMetaPendingPhase::Loading { priority_tx, .. } => {
+                            if !priority_targets.is_empty() {
+                                let _ = priority_tx.send(priority_targets);
+                            }
+                        }
+                    }
                 }
-                self.details_lazy_visible_revision =
-                    self.details_lazy_visible_revision.wrapping_add(1);
-                self.details_image_dims_state = LazyColumnState::NotRequested;
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "details_meta",
+                        "priority_update",
+                        None,
+                        self.items_generation,
+                        &[("targets", serde_json::Value::from(priority_count))],
+                    );
+                }
                 ctx.request_repaint();
             }
         }
@@ -40702,10 +40843,15 @@ impl App {
             }
         }
 
+        self.advance_details_meta_target_plan(ctx);
+
         let mut disconnected = false;
         loop {
             let event = match self.details_meta_pending.as_ref() {
-                Some(pending) => match pending.rx.try_recv() {
+                Some(DetailsMetaPending {
+                    phase: DetailsMetaPendingPhase::Loading { rx, .. },
+                    ..
+                }) => match rx.try_recv() {
                     Ok(event) => Some(event),
                     Err(mpsc::TryRecvError::Empty) => None,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -40713,6 +40859,10 @@ impl App {
                         None
                     }
                 },
+                Some(DetailsMetaPending {
+                    phase: DetailsMetaPendingPhase::Planning(_),
+                    ..
+                }) => None,
                 None => None,
             };
             let Some(event) = event else {
@@ -41288,100 +41438,275 @@ impl App {
             )),
             pdf_passwords: self.pdf_passwords.clone(),
         };
-        let (order, visible_near): (Vec<usize>, HashSet<usize>) = if selection_info_only {
+        let (order, visible_near) = if selection_info_only {
             let order: Vec<usize> = self.selection_info_lazy_target_idx().into_iter().collect();
-            let visible_near = order.iter().copied().collect();
-            (order, visible_near)
+            let visible_near: HashSet<usize> = order.iter().copied().collect();
+            (
+                DetailsMetaScanOrder::Explicit {
+                    indices: order,
+                    cursor: 0,
+                },
+                visible_near,
+            )
         } else if visible_page_count_stage_only {
             let mut order = self.details_tag_prewarm_indices.to_vec();
             order.sort_unstable();
-            let visible_near = order.iter().copied().collect();
-            (order, visible_near)
+            let visible_near: HashSet<usize> = order.iter().copied().collect();
+            (
+                DetailsMetaScanOrder::Explicit {
+                    indices: order,
+                    cursor: 0,
+                },
+                visible_near,
+            )
         } else {
             (
-                self.current_grid_order().to_vec(),
+                DetailsMetaScanOrder::CurrentGrid {
+                    cursor: 0,
+                    len: self.current_grid_order().len(),
+                    order_revision: self.details_order_revision,
+                },
                 self.details_tag_prewarm_indices.iter().copied().collect(),
             )
         };
-        let mut visible_targets = Vec::new();
-        let mut background_targets = Vec::new();
-        let mut cached_done = 0usize;
-        let mut cached_failed = 0usize;
-        let mut total = 0usize;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.details_meta_pending = Some(DetailsMetaPending {
+            visible_revision: self.details_lazy_visible_revision,
+            selection_target_key: selection_info_only
+                .then(|| self.selection_info_lazy_target_key())
+                .flatten(),
+            normal_target_keys: visible_near
+                .iter()
+                .filter_map(|&idx| self.details_lazy_cache_key(idx))
+                .collect(),
+            cancel,
+            phase: DetailsMetaPendingPhase::Planning(DetailsMetaTargetPlan {
+                generation,
+                order,
+                visible_near,
+                load_all_page_counts,
+                ai_facet_load,
+                page_count_config,
+                visible_targets: Vec::new(),
+                background_targets: Vec::new(),
+                cached_done: 0,
+                cached_failed: 0,
+                total: 0,
+                scan_slices: 0,
+                scan_started_at: crate::perf::is_enabled().then(std::time::Instant::now),
+            }),
+        });
+        self.advance_details_meta_target_plan(ctx);
+    }
 
-        for idx in order {
-            if !self.details_item_requires_lazy_meta(idx) {
-                continue;
-            }
-            if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-                if self.details_lazy_meta_satisfies_idx(idx, meta) {
-                    total += 1;
-                    cached_done += 1;
-                    cached_failed += usize::from(
-                        meta.page_count_failed
-                            || meta.image_dims_failed
-                            || meta.video_meta_failed
-                            || meta.created_at_failed,
-                    );
-                    continue;
-                }
-            }
-            if let Some(target) = self.details_meta_target_for_idx(
-                idx,
-                &visible_near,
-                load_all_page_counts || visible_near.contains(&idx),
-            ) {
-                total += 1;
-                if target.priority >= crate::io_semaphore::IoPriority::Normal {
-                    visible_targets.push(target);
-                } else {
-                    background_targets.push(target);
-                }
-            }
+    /// 全件対象の遅延列でも target 構築を 1 frame の予算内で進める。
+    /// Explicit は selection / 可視 page-count の小集合なので従来どおり同一 frame で完了する。
+    fn advance_details_meta_target_plan(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.details_meta_pending.take() else {
+            return;
+        };
+        if !matches!(&pending.phase, DetailsMetaPendingPhase::Planning(_)) {
+            self.details_meta_pending = Some(pending);
+            return;
         }
+        let DetailsMetaPending {
+            visible_revision,
+            selection_target_key,
+            normal_target_keys,
+            cancel,
+            phase,
+        } = pending;
+        let DetailsMetaPendingPhase::Planning(mut plan) = phase else {
+            unreachable!();
+        };
 
-        let normal_target_keys: HashSet<String> = visible_targets
-            .iter()
-            .map(|target| target.key.clone())
-            .collect();
-        let normal_targets = visible_targets.len();
-        let low_targets = background_targets.len();
-        visible_targets.extend(background_targets);
-        let targets = visible_targets;
-        let target_count = targets.len();
-        let ai_targets = targets
-            .iter()
-            .filter(|target| target.load_ai_metadata)
-            .count();
-        let created_targets = targets
-            .iter()
-            .filter(|target| target.load_created_at)
-            .count();
-        let page_count_targets = targets
-            .iter()
-            .filter(|target| target.load_page_count)
-            .count();
-        let image_dim_targets = targets
-            .iter()
-            .filter(|target| target.load_image_dims)
-            .count();
-        let video_meta_targets = targets
-            .iter()
-            .filter(|target| target.load_video_meta)
-            .count();
-
-        if total == 0 || targets.is_empty() {
-            self.finish_details_lazy_session(cached_failed);
+        let order_stale = matches!(
+            plan.order,
+            DetailsMetaScanOrder::CurrentGrid { order_revision, .. }
+                if order_revision != self.details_order_revision
+        );
+        if plan.generation != self.items_generation
+            || visible_revision != self.details_lazy_visible_revision
+            || order_stale
+        {
+            cancel.store(true, Ordering::Relaxed);
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+            ctx.request_repaint();
             return;
         }
 
-        self.details_image_dims_state = LazyColumnState::Loading {
-            done: cached_done,
-            total,
+        let scan_budget = if plan.order.is_incremental() {
+            DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME
+        } else {
+            usize::MAX
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let slice_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+        let slice_start = plan.order.scanned();
+        for _ in 0..scan_budget {
+            let idx = match &mut plan.order {
+                DetailsMetaScanOrder::Explicit { indices, cursor } => {
+                    let Some(idx) = indices.get(*cursor).copied() else {
+                        break;
+                    };
+                    *cursor += 1;
+                    idx
+                }
+                DetailsMetaScanOrder::CurrentGrid { cursor, len, .. } => {
+                    if *cursor >= *len {
+                        break;
+                    }
+                    let Some(idx) = self.current_grid_order().get(*cursor).copied() else {
+                        break;
+                    };
+                    *cursor += 1;
+                    idx
+                }
+            };
+
+            if !self.details_item_requires_lazy_meta(idx) {
+                continue;
+            }
+            if let Some(meta) = self.details_lazy_meta_for_idx(idx)
+                && self.details_lazy_meta_satisfies_idx(idx, meta)
+            {
+                plan.total += 1;
+                plan.cached_done += 1;
+                plan.cached_failed += usize::from(
+                    meta.page_count_failed
+                        || meta.image_dims_failed
+                        || meta.video_meta_failed
+                        || meta.created_at_failed,
+                );
+                continue;
+            }
+            if let Some(target) = self.details_meta_target_for_idx(
+                idx,
+                &plan.visible_near,
+                plan.load_all_page_counts || plan.visible_near.contains(&idx),
+            ) {
+                plan.total += 1;
+                if target.priority >= crate::io_semaphore::IoPriority::Normal {
+                    plan.visible_targets.push(target);
+                } else {
+                    plan.background_targets.push(target);
+                }
+            }
+        }
+        plan.scan_slices += 1;
+        let slice_items = plan.order.scanned().saturating_sub(slice_start);
+        let scan_complete = plan.order.is_complete();
+        if let Some(t0) = slice_t0 {
+            crate::perf::event(
+                "details_meta",
+                "target_scan_slice",
+                None,
+                plan.generation,
+                &[
+                    ("items", serde_json::Value::from(slice_items)),
+                    ("scanned", serde_json::Value::from(plan.order.scanned())),
+                    ("order_items", serde_json::Value::from(plan.order.len())),
+                    ("slices", serde_json::Value::from(plan.scan_slices)),
+                    ("complete", serde_json::Value::from(scan_complete)),
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
+
+        if !scan_complete {
+            self.details_image_dims_state = LazyColumnState::Loading {
+                done: plan.cached_done,
+                total: plan.total,
+            };
+            self.details_meta_pending = Some(DetailsMetaPending {
+                visible_revision,
+                selection_target_key,
+                normal_target_keys,
+                cancel,
+                phase: DetailsMetaPendingPhase::Planning(plan),
+            });
+            ctx.request_repaint();
+            return;
+        }
+
+        self.launch_details_meta_worker(ctx, visible_revision, selection_target_key, cancel, plan);
+    }
+
+    fn launch_details_meta_worker(
+        &mut self,
+        ctx: &egui::Context,
+        visible_revision: u64,
+        selection_target_key: Option<String>,
+        cancel: Arc<AtomicBool>,
+        plan: DetailsMetaTargetPlan,
+    ) {
+        let target_count = plan.visible_targets.len() + plan.background_targets.len();
+        if plan.total == 0 || target_count == 0 {
+            self.finish_details_lazy_session(plan.cached_failed);
+            return;
+        }
+
+        // target plan 中に scroll した場合も、起動時点の可視範囲を worker の先頭へ差し込む。
+        // 元の background target は idx bitmap で重複排除され、全件走査 cursor は巻き戻さない。
+        let current_visible_order: Vec<usize> = self
+            .details_tag_prewarm_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                self.details_item_requires_lazy_meta(idx)
+                    && self
+                        .details_lazy_meta_for_idx(idx)
+                        .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
+            })
+            .collect();
+        let current_visible_indices: HashSet<usize> =
+            current_visible_order.iter().copied().collect();
+        let initial_priority_targets: Vec<DetailsMetaTarget> = current_visible_order
+            .iter()
+            .copied()
+            .filter_map(|idx| self.details_meta_target_for_idx(idx, &current_visible_indices, true))
+            .collect();
+        let normal_target_keys = initial_priority_targets
+            .iter()
+            .map(|target| target.key.clone())
+            .collect();
+
+        let normal_targets = plan.visible_targets.len();
+        let low_targets = plan.background_targets.len();
+        let all_targets = plan
+            .visible_targets
+            .iter()
+            .chain(plan.background_targets.iter());
+        let ai_targets = all_targets
+            .clone()
+            .filter(|target| target.load_ai_metadata)
+            .count();
+        let created_targets = all_targets
+            .clone()
+            .filter(|target| target.load_created_at)
+            .count();
+        let page_count_targets = all_targets
+            .clone()
+            .filter(|target| target.load_page_count)
+            .count();
+        let image_dim_targets = all_targets
+            .clone()
+            .filter(|target| target.load_image_dims)
+            .count();
+        let video_meta_targets = all_targets.filter(|target| target.load_video_meta).count();
+
+        self.details_image_dims_state = LazyColumnState::Loading {
+            done: plan.cached_done,
+            total: plan.total,
+        };
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
+        let (priority_tx, priority_rx) = mpsc::channel();
+        if !initial_priority_targets.is_empty() {
+            let _ = priority_tx.send(initial_priority_targets);
+        }
         let cache_dir = crate::catalog::default_cache_dir();
         let io_sem = self
             .indexer_manager
@@ -41392,23 +41717,36 @@ impl App {
                     self.settings.indexer_speed_profile.io_permits().max(1),
                 ))
             });
-        let selection_target_key = if selection_info_only {
-            targets.first().map(|target| target.key.clone())
-        } else {
-            None
-        };
 
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "details_meta",
+                "target_scan_done",
+                None,
+                plan.generation,
+                &[
+                    ("items", serde_json::Value::from(plan.order.scanned())),
+                    ("slices", serde_json::Value::from(plan.scan_slices)),
+                    (
+                        "ms",
+                        serde_json::Value::from(
+                            plan.scan_started_at
+                                .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+                                .unwrap_or(0.0),
+                        ),
+                    ),
+                ],
+            );
+            crate::perf::event(
+                "details_meta",
                 "load_start",
                 None,
-                generation,
+                plan.generation,
                 &[
                     ("targets", serde_json::Value::from(target_count)),
-                    ("total", serde_json::Value::from(total)),
-                    ("cached_done", serde_json::Value::from(cached_done)),
-                    ("cached_failed", serde_json::Value::from(cached_failed)),
+                    ("total", serde_json::Value::from(plan.total)),
+                    ("cached_done", serde_json::Value::from(plan.cached_done)),
+                    ("cached_failed", serde_json::Value::from(plan.cached_failed)),
                     ("normal_targets", serde_json::Value::from(normal_targets)),
                     ("low_targets", serde_json::Value::from(low_targets)),
                     ("ai_targets", serde_json::Value::from(ai_targets)),
@@ -41425,7 +41763,7 @@ impl App {
                         "video_meta_targets",
                         serde_json::Value::from(video_meta_targets),
                     ),
-                    ("ai_facet_load", serde_json::Value::from(ai_facet_load)),
+                    ("ai_facet_load", serde_json::Value::from(plan.ai_facet_load)),
                     (
                         "grid_mode",
                         serde_json::Value::from(match self.settings.grid_view_mode {
@@ -41441,26 +41779,28 @@ impl App {
             .name("details-meta-load".to_string())
             .spawn(move || {
                 run_details_meta_load(
-                    generation,
-                    targets,
-                    cached_done,
-                    cached_failed,
-                    total,
+                    plan.generation,
+                    plan.visible_targets,
+                    plan.background_targets,
+                    plan.cached_done,
+                    plan.cached_failed,
+                    plan.total,
                     cache_dir,
                     io_sem,
                     cancel_w,
                     tx,
-                    page_count_config,
+                    priority_rx,
+                    plan.page_count_config,
                 );
             })
             .ok();
 
         self.details_meta_pending = Some(DetailsMetaPending {
-            visible_revision: self.details_lazy_visible_revision,
+            visible_revision,
             selection_target_key,
             normal_target_keys,
             cancel,
-            rx,
+            phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
         });
         ctx.request_repaint();
     }
@@ -41668,6 +42008,7 @@ impl App {
             return None;
         }
         Some(DetailsMetaTarget {
+            idx,
             key,
             item,
             relative_page_provenance: self.relative_page_provenance_for_idx(idx),

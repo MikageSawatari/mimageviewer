@@ -44745,12 +44745,13 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
         failed: 0,
     })
     .unwrap();
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
         cancel: Default::default(),
-        rx,
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
     });
     let ctx = egui::Context::default();
 
@@ -44887,6 +44888,148 @@ fn post_filter_visible_scope_starts_new_details_lazy_session() {
     ));
 }
 
+fn install_large_details_created_list(app: &mut App, count: usize) {
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_show_page_count = false;
+    app.settings.details_show_created = true;
+    app.settings.details_show_image_dimensions = false;
+    app.settings.details_show_video_duration = false;
+    app.settings.details_show_video_dimensions = false;
+    app.settings.details_show_video_codec = false;
+    let items = (0..count)
+        .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\Smart\item-{idx:06}.jpg"))))
+        .collect();
+    app.install_new_items(items, vec![Some((1, 1)); count]);
+    app.visible_indices = (0..count).collect();
+    app.details_order = app.visible_indices.clone();
+}
+
+fn details_meta_plan_progress(app: &App) -> (usize, usize, usize) {
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("details meta target plan");
+    let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
+        panic!("large target set must still be in the incremental planning phase");
+    };
+    (plan.order.scanned(), plan.order.len(), plan.scan_slices)
+}
+
+#[test]
+fn large_details_scroll_reprioritizes_without_restarting_full_target_scan() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2 + 17;
+    install_large_details_created_list(&mut app, count);
+    app.details_tag_prewarm_indices = (0..128).collect();
+    let ctx = egui::Context::default();
+
+    app.start_details_meta_load(&ctx);
+
+    assert_eq!(
+        details_meta_plan_progress(&app),
+        (DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME, count, 1)
+    );
+    let revision = app.details_lazy_visible_revision;
+
+    // scrollbar drag 後に一覧末尾が可視になった想定。scroll は target membership revision を
+    // 変えず、既存 cursor の次 slice だけを進める。
+    app.details_tag_prewarm_indices = (count - 128..count).collect();
+    app.last_prefetch_scroll_at = None;
+    app.poll_details_meta_load(&ctx);
+
+    assert_eq!(
+        details_meta_plan_progress(&app),
+        (DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2, count, 2)
+    );
+    assert_eq!(app.details_lazy_visible_revision, revision);
+    let pending = app.details_meta_pending.as_ref().unwrap();
+    let tail_key = app.details_lazy_cache_key(count - 1).unwrap();
+    assert!(pending.normal_target_keys.contains(&tail_key));
+}
+
+#[test]
+fn details_target_plan_rebuilds_after_filter_changes() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2 + 17;
+    install_large_details_created_list(&mut app, count);
+    app.details_tag_prewarm_indices = (0..128).collect();
+    let ctx = egui::Context::default();
+    app.start_details_meta_load(&ctx);
+    let old_cancel = Arc::clone(&app.details_meta_pending.as_ref().unwrap().cancel);
+    let old_revision = app.details_lazy_visible_revision;
+
+    let filtered_count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 9;
+    app.search_filter = Some((count - filtered_count..count).collect());
+    app.rebuild_visible_indices();
+    assert_ne!(app.details_lazy_visible_revision, old_revision);
+
+    app.poll_details_meta_load(&ctx);
+
+    assert!(old_cancel.load(Ordering::Relaxed));
+    assert_eq!(
+        details_meta_plan_progress(&app),
+        (DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME, filtered_count, 1)
+    );
+    assert_eq!(
+        app.details_meta_pending.as_ref().unwrap().visible_revision,
+        app.details_lazy_visible_revision
+    );
+}
+
+#[test]
+fn replacing_items_discards_incomplete_details_target_plan() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 9;
+    install_large_details_created_list(&mut app, count);
+    let ctx = egui::Context::default();
+    app.start_details_meta_load(&ctx);
+    let old_generation = app.items_generation;
+    let old_cancel = Arc::clone(&app.details_meta_pending.as_ref().unwrap().cancel);
+
+    install_large_details_created_list(&mut app, count + 1);
+
+    assert!(old_cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_ne!(app.items_generation, old_generation);
+    app.start_details_meta_load(&ctx);
+    let DetailsMetaPendingPhase::Planning(plan) = &app.details_meta_pending.as_ref().unwrap().phase
+    else {
+        panic!("replacement list should own a fresh target plan");
+    };
+    assert_eq!(plan.generation, app.items_generation);
+    assert_eq!(plan.order.len(), count + 1);
+}
+
+#[test]
+fn thumbnail_selection_info_keeps_single_target_fast_path() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
+    app.settings.thumb_tooltip_show_created = false;
+    app.settings.details_show_created = true;
+    app.install_new_items(
+        vec![GridItem::Image(PathBuf::from(r"C:\photos\created.jpg"))],
+        vec![Some((1, 1))],
+    );
+    app.selected = Some(0);
+
+    app.start_details_meta_load(&egui::Context::default());
+
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("selection metadata worker");
+    assert!(matches!(
+        pending.phase,
+        DetailsMetaPendingPhase::Loading { .. }
+    ));
+    assert_eq!(pending.selection_target_key, app.details_lazy_cache_key(0));
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { done: 0, total: 1 }
+    );
+}
+
 #[test]
 fn image_folder_page_count_is_available_without_auto_open() {
     let mut app = phase_c_support::setup_app();
@@ -45006,12 +45149,13 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (_tx, rx) = std::sync::mpsc::channel();
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
         cancel: std::sync::Arc::clone(&cancel),
-        rx,
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
     });
 
     app.set_details_sort_key(crate::settings::DetailsSortKey::Name);
@@ -45094,12 +45238,13 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
         failed: 0,
     })
     .expect("queue old Finished event");
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         visible_revision: old_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
         cancel: std::sync::Arc::clone(&cancel),
-        rx,
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
     });
 
     // 列設定ダイアログで、旧ジョブには含まれていない作成日時列を追加する。

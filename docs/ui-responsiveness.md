@@ -244,6 +244,29 @@ TextureIdで重複排除して見積もり、補正レイヤーの比較preview�
 詳細は `docs/file-drag-drop-design.md` §6.2。perf ログを汚さないよう、実行は
 `update` 末尾 (frame_total 計測の後) に置いている。
 
+### 4.3 大量一覧の target 構築も分割し、scroll では再走査しない
+
+2026-07-30 の実機報告では、50 万件のスマートフォルダを詳細表示した状態で scroll を始めると
+約 0.5 秒 UI が停止した。遅延列 worker 自体は非同期だったが、起動前の
+`App::start_details_meta_load` が UI thread で表示順 50 万件を clone し、要件判定・cache lookup・
+target clone を全件に行っていた。さらに可視優先範囲が移るたび worker を cancel / respawn し、
+この O(N) 構築を繰り返していた。
+
+詳細遅延メタでは次の不変条件を使う。
+
+- `DetailsMetaPendingPhase::Planning` が表示順 cursor と構築済み target を所有し、UI thread は
+  **1 frame 最大 4,096 件**だけ進める。50 万件なら 1 frame に 50 万件ではなく最大 4,096 件、
+  全 session では 50 万件を一度だけ exact に走査する。
+- scroll は対象集合 revision を変えず、100ms idle gate 後に現在の可視 target（通常は約 175 件以下）
+  だけを既存 worker の priority channel へ送る。target plan の cursor は 0 へ戻さない。
+- worker は idx ごとの取得済み field 集合を持つ。同じ target の二重 I/O は避ける一方、画面外で
+  作成日時を取得後に可視化されてページ数が追加要求された場合は、未取得 field だけを処理する。
+- items generation、表示集合 / filter revision、列要件の変更では旧 plan / worker を cancel して
+  新しい session を作る。表示順が planning 中に変わった場合も旧 cursor を別順序へ流用しない。
+- `--perf-log` では `details_meta.target_scan_slice`（slice 件数 / 累計 / ms）、
+  `target_scan_done`（session 総件数 / slice 数 / wall ms）、`priority_update`（可視 target 件数）を
+  記録する。scroll のたびに `target_scan_done.items=500000` が増えていないことを確認する。
+
 ---
 
 ## 5. 既知のパターン: Ctrl+↑↓ 引っかかり (2026-04 解決済み)

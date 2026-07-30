@@ -730,9 +730,17 @@ visible = search_filter AND effective_rating_filter AND facet_filter
 
 ```rust
 struct DetailsMetaPending {
-    generation: u64,
+    visible_revision: u64,
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<DetailsMetaEvent>,
+    phase: DetailsMetaPendingPhase,
+}
+
+enum DetailsMetaPendingPhase {
+    Planning(DetailsMetaTargetPlan), // 表示順 cursor + 構築済み target
+    Loading {
+        rx: mpsc::Receiver<DetailsMetaEvent>,
+        priority_tx: mpsc::Sender<Vec<DetailsMetaTarget>>,
+    },
 }
 
 enum DetailsMetaEvent {
@@ -759,7 +767,11 @@ worker のルール:
   変更前 worker の `Finished` が新しい列構成を `Ready` に確定できないようにする。
 - `GlobalIoSemaphore` を使う。可視行優先、画面外は低優先。
 - 高速スクロールで可視範囲が Normal 優先集合から離れても、既存 prefetch と同じ
-  100 ms のスクロール静止判定を通過するまで worker を cancel / respawn しない。
+  100 ms のスクロール静止判定を通過するまでは priority を更新しない。静止後は worker を
+  cancel / respawn せず、現在の可視 target だけを `priority_tx` へ追加する。
+- 全件 target の構築は `DetailsMetaTargetPlan` が表示順 cursor を保持し、UI thread では
+  1 frame 最大 4,096 件に分割する。scroll では cursor を巻き戻さない。items / filter / 列要件
+  （planning 中の表示順を含む）が変わった場合だけ旧 plan を破棄して先頭から作り直す。
 - 下部情報だけを遅延取得する経路では選択項目のキーだけを pending に保持する。全対象キーの
   `HashSet` を作って staleness 判定へ流用せず、詳細表示の大量項目で O(n) の複製を増やさない。
 - 既存キャッシュ/DB/メモリ値を先に使い、必要なものだけ I/O。
@@ -928,3 +940,24 @@ ClaudeCode 案の Ph1〜Ph5 をベースに、遅延列の枠組みを早める�
 | 遅延列 readiness が単一 state | 現行 MVP として維持。作成日時/画像/動画列を同時に ON にした場合は全遅延対象の完了まで sort ready にならない。列単位 readiness は後続改善 |
 | 可視優先が `IoPriority` だけで worker 自身の順序に効いていない | worker へ渡す targets を可視近傍 Normal → 画面外 Low の順に並べ、逐次処理自体も可視近傍優先に変更 |
 | FFmpeg probe 中のキャンセルが 10 秒 deadline のみ | interrupt callback に cancel flag を含め、フォルダ切替/停止時に in-flight probe も早く抜けられるように変更 |
+
+### 20. 50 万件スマートフォルダの scroll hitch 修正 (2026-07-30)
+
+ユーザー実機で、遅延列を表示した詳細一覧の scroll 開始時に約 0.5 秒 UI が停止した。
+`start_details_meta_load` が `current_grid_order().to_vec()` と全件 target 判定を UI thread で行い、
+可視優先の組み直しごとに 50 万件を再走査していたことが原因だった。サムネ一覧の
+selection-info-only 経路は選択中 1 件だけを使うため、この問題は起きていなかった。
+
+現行実装は次の構造に変更した。
+
+- 初回の全件走査は 4,096 件/frame の `Planning` phase で exact に 1 回だけ行う。
+- scroll は可視近傍（通常約 175 件以下）を既存 worker の先頭へ差し込み、全件走査を再実行しない。
+- worker は idx ごとの取得済み field flags で priority target と元 target を差分 merge する。
+  作成日時取得後にページ数が追加要求される等、同じ idx の未取得 field は必ず処理する。
+- items 差し替えは `items_generation`、filter は `details_lazy_visible_revision`、planning 中の
+  sort は `details_order_revision` で stale 判定し、列構成変更は既存の requirement invalidation で
+  cancel する。停止 / 再開と thumbnail selection-info-only の小集合経路は従来どおり。
+- perf event は `details_meta.target_scan_slice` / `target_scan_done` / `priority_update`。
+  50 万件時の走査量は「修正前: scroll 再優先化ごとに 500,000 件を 1 frame」から、
+  「修正後: 初回だけ 500,000 件を最大 4,096 件/frame、scroll ごとは全件走査 0 件 + 可視 target」
+  となる。
