@@ -26011,6 +26011,23 @@ mod still_window_mode_key_tests {
         }
     }
 
+    #[cfg(windows)]
+    fn install_video_audio_player_with_native_output(app: &mut App, idx: usize) {
+        let GridItem::Video(path) = app.items[idx].clone() else {
+            unreachable!()
+        };
+        let mut player = crate::video::VideoPlayer::disconnected_for_test(path, 0.0);
+        player.set_media_visual_mode(music_core::MediaVisualMode::Music);
+        player.attach_native_output(crate::video::NativeVideoOutput::disconnected_for_test());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: app.input_seq,
+            },
+        );
+    }
+
     fn poll_media_navigation_until_done_for_test(app: &mut App, ctx: &egui::Context) {
         for _ in 0..10_000 {
             app.poll_media_navigation_pending(ctx);
@@ -28179,6 +28196,90 @@ mod still_window_mode_key_tests {
             app.video_continuous_last_eof, None,
             "ガードは dedup 記録より前に効く (exit 完了後に同じ EOF を再判定できる)"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_mode_next_navigation_keeps_audio_readiness() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let _previous = push_video(&mut app, r"C:\clips\previous.mp4");
+        let current = push_video(&mut app, r"C:\clips\current.mp4");
+        let next = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(current);
+        app.video_audio_mode = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        install_video_audio_player_with_native_output(&mut app, current);
+
+        app.open_fullscreen_from_fs_navigation(&ctx, next);
+
+        let pending = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .expect("next navigation should queue a hidden-presenter source swap");
+        assert_eq!((pending.from_idx, pending.target_idx), (current, next));
+        assert!(pending.audio_mode_after_swap);
+        assert_eq!(pending.autoplay_override, Some(true));
+        assert!(pending.ignore_resume);
+        assert_eq!(app.fullscreen_idx, Some(next));
+        assert_eq!(app.video_audio_mode, Some(next));
+        assert!(!app.source_swap_keep_audio_mode, "one-shot must be cleared");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_mode_previous_navigation_keeps_audio_readiness() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let previous = push_video(&mut app, r"C:\clips\previous.mp4");
+        let current = push_video(&mut app, r"C:\clips\current.mp4");
+        let _next = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(current);
+        app.video_audio_mode = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        install_video_audio_player_with_native_output(&mut app, current);
+
+        app.open_fullscreen_from_fs_navigation(&ctx, previous);
+
+        let pending = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .expect("previous navigation should queue a hidden-presenter source swap");
+        assert_eq!((pending.from_idx, pending.target_idx), (current, previous));
+        assert!(pending.audio_mode_after_swap);
+        assert_eq!(pending.autoplay_override, Some(true));
+        assert!(pending.ignore_resume);
+        assert_eq!(app.fullscreen_idx, Some(previous));
+        assert_eq!(app.video_audio_mode, Some(previous));
+        assert!(!app.source_swap_keep_audio_mode, "one-shot must be cleared");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_mode_continuous_eof_keeps_audio_readiness() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let current = push_video(&mut app, r"C:\clips\current.mp4");
+        let next = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(current);
+        app.video_audio_mode = Some(current);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
+        app.video_continuous_last_eof = Some((current, 7));
+        install_video_audio_player_with_native_output(&mut app, current);
+
+        app.apply_video_audio_mode_continuous_eof_target(&ctx, current, 7, Some(next));
+
+        let pending = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .expect("continuous EOF should queue a hidden-presenter source swap");
+        assert_eq!((pending.from_idx, pending.target_idx), (current, next));
+        assert!(pending.audio_mode_after_swap);
+        assert_eq!(pending.autoplay_override, Some(true));
+        assert!(pending.ignore_resume);
+        assert_eq!(app.video_audio_mode, Some(next));
+        assert!(!app.source_swap_keep_audio_mode, "one-shot must be cleared");
     }
 
     #[test]

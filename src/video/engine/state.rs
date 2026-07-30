@@ -5,10 +5,9 @@
 //! ## 不変条件
 //! - `Loading` / `Buffering` / `Seeking` / `Paused` / `Eof` のとき MasterClock は
 //!   必ず `Frozen` source。**時間が暴走することがない**。
-//! - `Buffering` から `Playing` への遷移トリガは
-//!   `(NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)` の latch
-//!   (= `ReadinessLatch`)。audio-only ファイル (映像 decode thread 無し) では
-//!   FirstFrameReady が来ないので `NoVideo` 側で成立させる。両 readiness イベントは
+//! - `Buffering` から `Playing` への遷移トリガは `ReadinessRequirements` が要求する
+//!   output readiness の latch (= `ReadinessLatch`)。Video 表示は従来どおり映像 + 音声、
+//!   Music 表示は音声があれば audio buffer を要求する。両 readiness イベントは
 //!   seek_epoch スコープで管理する。
 //! - `Paused` / `Eof` 中は decoder thread が park している (= state を見て
 //!   condvar 待ちに入る)。
@@ -16,6 +15,7 @@
 //! Phase 1b ではここで型と遷移ヘルパだけを定義する。実際の遷移は Phase 1c の
 //! `EngineActor` が担当する。
 
+use music_core::MediaVisualMode;
 use std::time::Instant;
 
 /// state machine の各状態。
@@ -26,8 +26,8 @@ pub enum EngineState {
     /// open 中: decoder spawn 済み、info_rx 待ち。
     Loading,
     /// info 受領後 / seek 完了後の preroll 待ち。Clock は Frozen で時間進行なし。
-    /// readiness latch (`(no_video ∨ first_frame_ready) ∧ (no_audio ∨ buffer_ready)`)
-    /// が揃うと `Playing` (or `Paused` if !autoplay) に遷移。
+    /// `ReadinessRequirements` で選んだ readiness latch が揃うと `Playing`
+    /// (or `Paused` if !autoplay) に遷移。
     ///
     /// 設計 doc では `Buffering { resume_target: Option<f64> }` と書かれているが、
     /// `resume_target` は EngineActor の context (= seek 履歴) でカバーでき、
@@ -87,6 +87,32 @@ impl EngineState {
 /// stale 検出のため全 readiness/anchor events に必ず含める。
 pub type SeekEpoch = u64;
 
+/// `Buffering -> Playing` に必要な出力 readiness。
+///
+/// `MediaVisualMode` を要求へ正規化してから latch を評価することで、表示されない
+/// hidden presenter の実装詳細を再生開始条件から切り離す。通常の動画表示では従来どおり
+/// first frame を要求し、音声表示では audio-only ファイルと動画の音声モードを同じ
+/// audio buffer 要件で扱う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadinessRequirements {
+    pub first_frame: bool,
+    pub audio_buffer: bool,
+}
+
+impl ReadinessRequirements {
+    pub fn for_media(has_audio: bool, has_timed_video: bool, visual_mode: MediaVisualMode) -> Self {
+        Self {
+            // Music 表示でも音声が無い動画なら、再生可能な出力である映像を待つ。
+            first_frame: has_timed_video && (visual_mode == MediaVisualMode::Video || !has_audio),
+            audio_buffer: has_audio,
+        }
+    }
+
+    fn has_playable_output(self) -> bool {
+        self.first_frame || self.audio_buffer
+    }
+}
+
 /// EngineActor が受け取る decoder 由来の events。
 #[derive(Debug, Clone)]
 pub enum DecoderEvent {
@@ -97,8 +123,9 @@ pub enum DecoderEvent {
         has_audio: bool,
         /// timed playable video stream を持つか (= 映像 decode thread が走り
         /// FirstFrameReady が届くか)。audio-only ファイル (映像トラック無し /
-        /// 添付画像のみ) では false。`ReadinessLatch::is_ready` が first_frame を
-        /// 要求するかの gate。既定 (未設定時) は true で従来の動画経路と等価。
+        /// 添付画像のみ) では false。`MediaVisualMode` と合わせて
+        /// `ReadinessRequirements` を導出する metadata。既定 (未設定時) は true で
+        /// 従来の動画経路と等価。
         has_video: bool,
     },
     /// seek 完了 (= avformat_seek_file 後の最初の post-seek decode 直前)。
@@ -175,24 +202,23 @@ impl ReadinessLatch {
 
     /// `Buffering → Playing` の遷移条件を満たすか。
     ///
-    /// - `has_video = false` (audio-only ファイル / Inc 7 の映像 OFF) の場合は
-    ///   `FirstFrameReady` を待たない。映像 decode thread が無く FirstFrameReady が
-    ///   永久に来ないため、これを待つと Buffering から抜けられない。
-    /// - `has_audio = false` の場合は `BufferReady` を待たない (= 音声のみ / 無音動画)。
-    /// - `has_video` / `has_audio` がどちらも false のときは anchor source が無いので
-    ///   never ready (= 再生可能ストリーム皆無。通常は decoder 側で弾くが防御的に扱う)。
+    /// - `requirements.first_frame = false` の場合は `FirstFrameReady` を待たない。
+    /// - `requirements.audio_buffer = false` の場合は `BufferReady` を待たない。
+    /// - 両要件が false のときは anchor source が無いので never ready
+    ///   (= 再生可能ストリーム皆無。通常は decoder 側で弾くが防御的に扱う)。
     ///
     /// `is_ready=true` の必要十分条件として、anchor 構築に必要な `Option` (=
-    /// `has_video` なら `first_frame_pts`、`has_audio` なら `audio_anchor`) も同時に
+    /// first frame を要求するなら `first_frame_pts`、audio buffer を要求するなら
+    /// `audio_anchor`) も同時に
     /// 存在することを保証する (= 呼び出し側の `expect` を不要にする)。
-    pub fn is_ready(&self, has_audio: bool, has_video: bool) -> bool {
-        if !has_video && !has_audio {
+    pub fn is_ready(&self, requirements: ReadinessRequirements) -> bool {
+        if !requirements.has_playable_output() {
             return false;
         }
-        if has_video && (!self.first_frame || self.first_frame_pts.is_none()) {
+        if requirements.first_frame && (!self.first_frame || self.first_frame_pts.is_none()) {
             return false;
         }
-        if has_audio && (!self.buffer_ready || self.audio_anchor.is_none()) {
+        if requirements.audio_buffer && (!self.buffer_ready || self.audio_anchor.is_none()) {
             return false;
         }
         true
@@ -202,6 +228,10 @@ impl ReadinessLatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn video_requirements(has_audio: bool, has_video: bool) -> ReadinessRequirements {
+        ReadinessRequirements::for_media(has_audio, has_video, MediaVisualMode::Video)
+    }
 
     #[test]
     fn frozen_clock_states_classified_correctly() {
@@ -237,8 +267,8 @@ mod tests {
     #[test]
     fn latch_not_ready_when_no_events() {
         let l = ReadinessLatch::new(0);
-        assert!(!l.is_ready(true, true));
-        assert!(!l.is_ready(false, true));
+        assert!(!l.is_ready(video_requirements(true, true)));
+        assert!(!l.is_ready(video_requirements(false, true)));
     }
 
     #[test]
@@ -247,12 +277,12 @@ mod tests {
         l.first_frame = true;
         l.first_frame_pts = Some(0.0);
         assert!(
-            l.is_ready(false, true),
+            l.is_ready(video_requirements(false, true)),
             "video-only: first_frame alone should suffice"
         );
         // has_audio=true ではまだ不足
         assert!(
-            !l.is_ready(true, true),
+            !l.is_ready(video_requirements(true, true)),
             "with audio: buffer_ready also required"
         );
     }
@@ -263,12 +293,15 @@ mod tests {
         l.buffer_ready = true;
         l.audio_anchor = Some((10.0, Instant::now()));
         assert!(
-            !l.is_ready(true, true),
+            !l.is_ready(video_requirements(true, true)),
             "buffer_ready alone: not ready (need first_frame)"
         );
         l.first_frame = true;
         l.first_frame_pts = Some(10.0);
-        assert!(l.is_ready(true, true), "first_frame + buffer_ready: ready");
+        assert!(
+            l.is_ready(video_requirements(true, true)),
+            "first_frame + buffer_ready: ready"
+        );
     }
 
     #[test]
@@ -326,13 +359,13 @@ mod tests {
         l.first_frame = true;
         l.first_frame_pts = Some(0.0);
         assert!(
-            !l.is_ready(true, true),
+            !l.is_ready(video_requirements(true, true)),
             "first_frame alone w/ audio: not ready"
         );
         l.buffer_ready = true;
         l.audio_anchor = Some((0.05, Instant::now()));
         assert!(
-            l.is_ready(true, true),
+            l.is_ready(video_requirements(true, true)),
             "first_frame then buffer_ready: ready"
         );
     }
@@ -342,11 +375,14 @@ mod tests {
         let mut l = ReadinessLatch::new(4);
         l.buffer_ready = true;
         l.audio_anchor = Some((0.05, Instant::now()));
-        assert!(!l.is_ready(true, true), "buffer_ready alone: not ready");
+        assert!(
+            !l.is_ready(video_requirements(true, true)),
+            "buffer_ready alone: not ready"
+        );
         l.first_frame = true;
         l.first_frame_pts = Some(0.0);
         assert!(
-            l.is_ready(true, true),
+            l.is_ready(video_requirements(true, true)),
             "buffer_ready then first_frame: ready"
         );
     }
@@ -359,11 +395,11 @@ mod tests {
         l.first_frame = true;
         l.first_frame_pts = Some(0.0);
         assert!(
-            !l.is_ready(true, true),
+            !l.is_ready(video_requirements(true, true)),
             "has_audio=true, no buffer_ready: not ready"
         );
         assert!(
-            l.is_ready(false, true),
+            l.is_ready(video_requirements(false, true)),
             "has_audio=false (audio inactive): ready"
         );
     }
@@ -374,13 +410,13 @@ mod tests {
         // 来ないので、first_frame を待たず BufferReady + anchor だけで ready になる。
         let mut l = ReadinessLatch::new(6);
         assert!(
-            !l.is_ready(true, false),
+            !l.is_ready(video_requirements(true, false)),
             "audio-only: buffer_ready 未達なら not ready"
         );
         l.buffer_ready = true;
         l.audio_anchor = Some((3.0, Instant::now()));
         assert!(
-            l.is_ready(true, false),
+            l.is_ready(video_requirements(true, false)),
             "audio-only: first_frame 無しでも buffer_ready + anchor で ready"
         );
         // first_frame が来ないことは audio-only では ready を妨げない
@@ -388,17 +424,46 @@ mod tests {
     }
 
     #[test]
+    fn audio_file_and_video_audio_mode_share_audio_only_requirements() {
+        let audio_file = ReadinessRequirements::for_media(true, false, MediaVisualMode::Music);
+        let video_audio_mode = ReadinessRequirements::for_media(true, true, MediaVisualMode::Music);
+
+        assert_eq!(audio_file, video_audio_mode);
+        assert_eq!(
+            audio_file,
+            ReadinessRequirements {
+                first_frame: false,
+                audio_buffer: true,
+            }
+        );
+    }
+
+    #[test]
+    fn video_mode_keeps_first_frame_requirement() {
+        assert_eq!(
+            ReadinessRequirements::for_media(true, true, MediaVisualMode::Video),
+            ReadinessRequirements {
+                first_frame: true,
+                audio_buffer: true,
+            }
+        );
+    }
+
+    #[test]
     fn latch_never_ready_without_any_stream() {
         // has_video=false かつ has_audio=false は anchor source が無いので never ready
         // (= 再生可能ストリーム皆無。防御的挙動)。
         let mut l = ReadinessLatch::new(7);
-        assert!(!l.is_ready(false, false), "no video/no audio: not ready");
+        assert!(
+            !l.is_ready(video_requirements(false, false)),
+            "no video/no audio: not ready"
+        );
         l.first_frame = true;
         l.first_frame_pts = Some(0.0);
         l.buffer_ready = true;
         l.audio_anchor = Some((0.0, Instant::now()));
         assert!(
-            !l.is_ready(false, false),
+            !l.is_ready(video_requirements(false, false)),
             "no video/no audio: latch 全埋めでも not ready"
         );
     }

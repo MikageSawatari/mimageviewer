@@ -45699,6 +45699,8 @@ impl App {
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)
         );
+        // 音声ファイルは動画の hidden 音声モードと同じ readiness 要件を使う。
+        player.set_media_visual_mode(music_core::MediaVisualMode::Music);
         player.set_playback_speed(self.video_playback_speed);
         if self.video_session_muted {
             player.set_muted(true);

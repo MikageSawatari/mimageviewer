@@ -1838,10 +1838,15 @@ D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{vi
 `SW_HIDE` して生かしたままにする。理由:
 
 - **映像を止めない**。demux / decode は通常どおり回り、hidden presenter は届いたフレームを
-  consume して present 成功時の bookkeeping (FirstFrameReady 等) を出し続ける。これで音声モード
-  中に seek しても、生きた presenter が FirstFrameReady を発行するので engine の readiness latch が
-  Buffering→Playing に復帰できる (映像を止める旧案では runtime の映像 OFF フラグで latch を
-  合成する必要があったが、この方式では不要。step 9 で当該フラグは削除済み)。
+  consume して `last_displayed_pts_bits` / `displayed_frame_seq` / FirstFrameReady などの
+  bookkeeping を更新する。ただし FirstFrameReady は hidden 音声モードの**再生開始条件ではない**。
+  `EngineActor` は既存 `MediaVisualMode` から `ReadinessRequirements` を導出し、通常の Video 表示
+  (`has_audio=true, has_video=true`) では従来どおり FirstFrameReady + BufferReady、Music 表示では
+  timed video の有無にかかわらず BufferReady + audio anchor を要求する。これにより音声ファイル単体
+  (`has_video=false`) と動画の hidden 音声モード (`has_video=true`) は同じ readiness を通る。
+  音声モード維持 source-swap は新 player が decoder event を取り込む前に Music を設定し、
+  ♪ / Z で動画へ戻るときは show / placement 復帰前に Video へ戻す。新しい runtime bool や
+  timeout は持たず、通常動画の遷移条件は変えない。
 - **音切れを作らない**。presenter を drop して作り直すと音声パイプラインも一度畳む必要があり
   数百 ms の無音が入る。hide/show だけならオーディオリングは無停止。
 - **exit race を避ける**。presenter HWND を生かすことで、hide→show の順序と owner / focus guard の

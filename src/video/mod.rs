@@ -5332,6 +5332,12 @@ impl VideoPlayer {
         self.engine.lock().unwrap().autoplay_intent()
     }
 
+    /// 再生時に提供する視覚モードを engine readiness へ反映する。
+    /// Video は従来どおり初回映像提示を待ち、Music は音声バッファを再生開始条件にする。
+    pub(crate) fn set_media_visual_mode(&self, mode: music_core::MediaVisualMode) {
+        self.engine.lock().unwrap().set_media_visual_mode(mode);
+    }
+
     pub fn playback_speed(&self) -> f64 {
         self.clock.playback_speed()
     }

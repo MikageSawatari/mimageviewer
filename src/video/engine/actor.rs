@@ -25,8 +25,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
+use music_core::MediaVisualMode;
+
 use super::clock::{ClockAnchor, MasterClock};
-use super::state::{AudioEvent, DecoderEvent, EngineState, ReadinessLatch, SeekEpoch};
+use super::state::{
+    AudioEvent, DecoderEvent, EngineState, ReadinessLatch, ReadinessRequirements, SeekEpoch,
+};
 
 /// 外部 (TransportController) から EngineActor への命令。
 #[derive(Debug, Clone)]
@@ -92,10 +96,14 @@ pub struct EngineActor {
     has_audio: bool,
     /// timed playable video stream を持つか。`InfoReceived` で確定。
     /// 既定 true (= 従来の動画経路と等価)。audio-only ファイル (映像トラック無し /
-    /// 添付画像のみ) では false になり、`ReadinessLatch::is_ready` が FirstFrameReady を
-    /// 待たなくなる (映像 decode thread が無く FirstFrameReady が永久に来ないため)。
+    /// 添付画像のみ) では false になり、`ReadinessRequirements` が FirstFrameReady を
+    /// 要求しなくなる (映像 decode thread が無く FirstFrameReady が永久に来ないため)。
     /// これは **ファイルの metadata** (timed video stream の有無) を表す。
     has_video: bool,
+
+    /// 現在ユーザーに提供している視覚モード。再生可能 stream の有無とは分離し、
+    /// `ReadinessRequirements` へ正規化して Buffering の完了条件を決める。
+    visual_mode: MediaVisualMode,
 
     /// 現在の seek 世代。`AvClock::request_seek` で bump され、`SeekCompleted` /
     /// `enter_buffering` では進めない。
@@ -169,6 +177,7 @@ impl EngineActor {
             has_audio: false,
             // 既定 true: `InfoReceived` 到着までは従来の動画経路と等価に振る舞う。
             has_video: true,
+            visual_mode: MediaVisualMode::Video,
             seek_serial,
             av_clock,
             last_observed_serial: initial_serial,
@@ -224,6 +233,20 @@ impl EngineActor {
     /// 判定をするには **intent** を読む必要がある。
     pub fn autoplay_intent(&self) -> bool {
         self.opts.autoplay
+    }
+
+    /// 表示モードを切り替え、Buffering 中なら同じ latch を新しい要求で再評価する。
+    pub fn set_media_visual_mode(&mut self, mode: MediaVisualMode) {
+        if self.visual_mode == mode {
+            return;
+        }
+        self.visual_mode = mode;
+        self.try_transition_from_buffering();
+    }
+
+    #[cfg(test)]
+    pub(super) fn media_visual_mode(&self) -> MediaVisualMode {
+        self.visual_mode
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -648,8 +671,8 @@ impl EngineActor {
             AudioEvent::AudioInactive => {
                 // audio 出力起動失敗 → wall master に変更
                 self.has_audio = false;
-                // Buffering 中なら latch 再評価 (= has_audio=false で latch.is_ready が
-                // first_frame だけで true になる可能性)
+                // Buffering 中なら latch 再評価 (= has_audio=false で requirements が
+                // first_frame だけになる可能性)
                 if matches!(self.state, EngineState::Buffering) {
                     self.try_transition_from_buffering();
                 }
@@ -664,7 +687,9 @@ impl EngineActor {
         if self.state != EngineState::Buffering {
             return;
         }
-        if !self.latch.is_ready(self.has_audio, self.has_video) {
+        let requirements =
+            ReadinessRequirements::for_media(self.has_audio, self.has_video, self.visual_mode);
+        if !self.latch.is_ready(requirements) {
             return;
         }
         // anchor source の選択: audio あり → Audio anchor、なし → Wall anchor。
@@ -678,7 +703,7 @@ impl EngineActor {
         // 「Playing 開始の今」にする。fill_output の最初の drain 直後に set_audio_pts
         // で再 anchor されるため、この瞬間の anchor が短時間使われるだけで済む。
         let now = Instant::now();
-        let anchor = if self.has_audio {
+        let anchor = if requirements.audio_buffer {
             let (pts, _wall) = self
                 .latch
                 .audio_anchor
@@ -852,6 +877,75 @@ mod tests {
     }
 
     #[test]
+    fn video_audio_mode_buffer_ready_starts_without_first_frame() {
+        let mut a = fresh_actor();
+        a.set_media_visual_mode(MediaVisualMode::Music);
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+            has_video: true,
+        });
+
+        // hidden presenter の FirstFrameReady が無くても、音声出力に必要な buffer が
+        // 揃えば audio-only ファイルと同じ条件で再生を開始する。
+        a.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.05,
+            wall_now: Instant::now(),
+        });
+
+        assert_eq!(a.state, EngineState::Playing);
+        assert_eq!(a.clock().anchor().source, ClockSource::Audio);
+        assert_eq!(a.media_visual_mode(), MediaVisualMode::Music);
+        assert!(!a.latch.first_frame);
+    }
+
+    #[test]
+    fn video_mode_still_waits_for_first_frame_after_audio_buffer_ready() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+            has_video: true,
+        });
+        a.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.05,
+            wall_now: Instant::now(),
+        });
+
+        assert_eq!(a.state, EngineState::Buffering);
+        assert_eq!(a.media_visual_mode(), MediaVisualMode::Video);
+    }
+
+    #[test]
+    fn returning_from_video_audio_mode_restores_first_frame_requirement() {
+        let mut a = fresh_actor();
+        a.set_media_visual_mode(MediaVisualMode::Music);
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+            has_video: true,
+        });
+        a.set_media_visual_mode(MediaVisualMode::Video);
+        a.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.05,
+            wall_now: Instant::now(),
+        });
+
+        assert_eq!(a.state, EngineState::Buffering);
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        assert_eq!(a.state, EngineState::Playing);
+    }
+
+    #[test]
     fn info_received_sets_has_video_false_for_audio_only() {
         let mut a = fresh_actor();
         a.begin_loading();
@@ -950,26 +1044,28 @@ mod tests {
 
     #[test]
     fn is_ready_requires_option_payloads() {
+        let video_only = ReadinessRequirements::for_media(false, true, MediaVisualMode::Video);
+        let video_with_audio = ReadinessRequirements::for_media(true, true, MediaVisualMode::Video);
         // first_frame=true でも first_frame_pts=None なら ready とは見なさない
         let mut l = ReadinessLatch::new(0);
         l.first_frame = true;
         l.first_frame_pts = None;
         assert!(
-            !l.is_ready(false, true),
+            !l.is_ready(video_only),
             "first_frame_pts=None blocks readiness"
         );
         l.first_frame_pts = Some(0.0);
-        assert!(l.is_ready(false, true));
+        assert!(l.is_ready(video_only));
 
         // has_audio=true で buffer_ready=true でも audio_anchor=None なら blocked
         l.buffer_ready = true;
         l.audio_anchor = None;
         assert!(
-            !l.is_ready(true, true),
+            !l.is_ready(video_with_audio),
             "audio_anchor=None blocks readiness with audio"
         );
         l.audio_anchor = Some((0.05, std::time::Instant::now()));
-        assert!(l.is_ready(true, true));
+        assert!(l.is_ready(video_with_audio));
     }
 
     #[test]
