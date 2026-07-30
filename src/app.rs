@@ -4661,6 +4661,222 @@ use crate::thumb_loader::{
     read_exif_orientation_from_bytes,
 };
 
+const PRE_GRID_PERF_STAGE_COUNT: usize = 14;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreGridPerfStage {
+    SearchBar,
+    FavSearchBar,
+    GlobalSearchBar,
+    TagViewBar,
+    FacetFilterBar,
+    DetailsLazyStatusBar,
+    SelectionInfoBar,
+    FolderPane,
+    CheckedSelectionOverlay,
+    DetailsColumnMenuCheck,
+    PopupWheelSuppression,
+    FolderPaneScrollGuard,
+    ProcessScroll,
+    StackReconcile,
+}
+
+impl PreGridPerfStage {
+    const ALL: [Self; PRE_GRID_PERF_STAGE_COUNT] = [
+        Self::SearchBar,
+        Self::FavSearchBar,
+        Self::GlobalSearchBar,
+        Self::TagViewBar,
+        Self::FacetFilterBar,
+        Self::DetailsLazyStatusBar,
+        Self::SelectionInfoBar,
+        Self::FolderPane,
+        Self::CheckedSelectionOverlay,
+        Self::DetailsColumnMenuCheck,
+        Self::PopupWheelSuppression,
+        Self::FolderPaneScrollGuard,
+        Self::ProcessScroll,
+        Self::StackReconcile,
+    ];
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::SearchBar => "search",
+            Self::FavSearchBar => "favsearch",
+            Self::GlobalSearchBar => "global_search",
+            Self::TagViewBar => "tag_view",
+            Self::FacetFilterBar => "facet",
+            Self::DetailsLazyStatusBar => "details_status",
+            Self::SelectionInfoBar => "selection_info",
+            Self::FolderPane => "folder_pane",
+            Self::CheckedSelectionOverlay => "checked_overlay",
+            Self::DetailsColumnMenuCheck => "column_menu_check",
+            Self::PopupWheelSuppression => "popup_wheel",
+            Self::FolderPaneScrollGuard => "scroll_guard",
+            Self::ProcessScroll => "scroll",
+            Self::StackReconcile => "stack_reconcile",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreGridPerfRecorder {
+    started_at: std::time::Instant,
+    last_mark_at: std::time::Instant,
+    stage_ms: [f64; PRE_GRID_PERF_STAGE_COUNT],
+    next_stage: usize,
+}
+
+impl PreGridPerfRecorder {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            last_mark_at: started_at,
+            stage_ms: [0.0; PRE_GRID_PERF_STAGE_COUNT],
+            next_stage: 0,
+        }
+    }
+
+    fn mark(&mut self, stage: PreGridPerfStage) {
+        debug_assert_eq!(stage as usize, self.next_stage);
+        let now = std::time::Instant::now();
+        self.stage_ms[stage as usize] =
+            now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.last_mark_at = now;
+        self.next_stage += 1;
+    }
+
+    fn finish(
+        self,
+        details_column_menu_open: bool,
+        folder_pane_blocks_grid_scroll: bool,
+    ) -> PreGridPerfBreakdown {
+        debug_assert_eq!(self.next_stage, PRE_GRID_PERF_STAGE_COUNT);
+        PreGridPerfBreakdown {
+            total_ms: self
+                .last_mark_at
+                .duration_since(self.started_at)
+                .as_secs_f64()
+                * 1000.0,
+            stage_ms: self.stage_ms,
+            details_column_menu_open,
+            popup_wheel_suppression_ran: !details_column_menu_open,
+            folder_pane_blocks_grid_scroll,
+            process_scroll_ran: !folder_pane_blocks_grid_scroll && !details_column_menu_open,
+        }
+    }
+}
+
+#[inline]
+fn pre_grid_perf_start_with(
+    perf_on: bool,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<PreGridPerfRecorder> {
+    perf_on.then(now).map(PreGridPerfRecorder::new)
+}
+
+#[inline]
+fn mark_pre_grid_perf(recorder: &mut Option<PreGridPerfRecorder>, stage: PreGridPerfStage) {
+    if let Some(recorder) = recorder {
+        recorder.mark(stage);
+    }
+}
+
+#[derive(Debug)]
+struct PreGridPerfBreakdown {
+    total_ms: f64,
+    stage_ms: [f64; PRE_GRID_PERF_STAGE_COUNT],
+    details_column_menu_open: bool,
+    popup_wheel_suppression_ran: bool,
+    folder_pane_blocks_grid_scroll: bool,
+    process_scroll_ran: bool,
+}
+
+impl PreGridPerfBreakdown {
+    const EVENT_FIELDS: [(&'static str, PreGridPerfStage); PRE_GRID_PERF_STAGE_COUNT] = [
+        ("search_bar_ms", PreGridPerfStage::SearchBar),
+        ("favsearch_bar_ms", PreGridPerfStage::FavSearchBar),
+        ("global_search_bar_ms", PreGridPerfStage::GlobalSearchBar),
+        ("tag_view_bar_ms", PreGridPerfStage::TagViewBar),
+        ("facet_filter_bar_ms", PreGridPerfStage::FacetFilterBar),
+        (
+            "details_lazy_status_bar_ms",
+            PreGridPerfStage::DetailsLazyStatusBar,
+        ),
+        ("selection_info_bar_ms", PreGridPerfStage::SelectionInfoBar),
+        ("folder_pane_ms", PreGridPerfStage::FolderPane),
+        (
+            "checked_selection_overlay_ms",
+            PreGridPerfStage::CheckedSelectionOverlay,
+        ),
+        (
+            "details_column_menu_check_ms",
+            PreGridPerfStage::DetailsColumnMenuCheck,
+        ),
+        (
+            "popup_wheel_suppression_ms",
+            PreGridPerfStage::PopupWheelSuppression,
+        ),
+        (
+            "folder_pane_scroll_guard_ms",
+            PreGridPerfStage::FolderPaneScrollGuard,
+        ),
+        ("process_scroll_ms", PreGridPerfStage::ProcessScroll),
+        ("stack_reconcile_ms", PreGridPerfStage::StackReconcile),
+    ];
+
+    fn emit(&self, frame_number: u64) {
+        let mut extras = Vec::with_capacity(PRE_GRID_PERF_STAGE_COUNT + 6);
+        extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        for (field, stage) in Self::EVENT_FIELDS {
+            extras.push((
+                field,
+                serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+        }
+        extras.push((
+            "details_column_menu_open",
+            serde_json::Value::from(self.details_column_menu_open),
+        ));
+        extras.push((
+            "popup_wheel_suppression_ran",
+            serde_json::Value::from(self.popup_wheel_suppression_ran),
+        ));
+        extras.push((
+            "folder_pane_blocks_grid_scroll",
+            serde_json::Value::from(self.folder_pane_blocks_grid_scroll),
+        ));
+        extras.push((
+            "process_scroll_ran",
+            serde_json::Value::from(self.process_scroll_ran),
+        ));
+        crate::perf::event("ui", "pre_grid_breakdown", None, 0, &extras);
+    }
+
+    fn dominant_summary(&self) -> String {
+        let mut first = (PreGridPerfStage::SearchBar, f64::NEG_INFINITY);
+        let mut second = first;
+        for stage in PreGridPerfStage::ALL {
+            let candidate = (stage, self.stage_ms[stage as usize]);
+            if candidate.1 > first.1 {
+                second = first;
+                first = candidate;
+            } else if candidate.1 > second.1 {
+                second = candidate;
+            }
+        }
+        format!(
+            "{}:{:.1}ms,{}:{:.1}ms",
+            first.0.short_label(),
+            first.1,
+            second.0.short_label(),
+            second.1
+        )
+    }
+}
+
 /// 消しゴムモードのツール種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EraseTool {
@@ -61247,30 +61463,45 @@ impl eframe::App for App {
         }
         let t_toolbar_input = frame_t0.elapsed();
 
+        let perf_on = crate::perf::is_enabled();
+        let mut pre_grid_perf = pre_grid_perf_start_with(perf_on, std::time::Instant::now);
+
         // ── 検索バー ─────────────────────────────────────────────────
         self.render_search_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::SearchBar);
 
         // ── お気に入り検索バー (ツールバー直下の 2 行目相当) ─────────
         self.render_favsearch_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FavSearchBar);
 
         // ── Ctrl+G グローバルメタ検索バー (docs §10.3) ────────────────
         self.render_global_search_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::GlobalSearchBar);
 
         // ── Ctrl+T タグビュー ───────────────────────────────────────
         self.render_tag_view_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::TagViewBar);
 
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
         self.render_facet_filter_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FacetFilterBar);
         self.render_details_lazy_status_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::DetailsLazyStatusBar);
 
         // 下部情報バーは CentralPanel のグリッドより先に確保する。egui が残り領域を
         // render_grid へ渡すため、last_viewport_h と仮想スクロール範囲にも反映される。
         self.render_selection_info_bar(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::SelectionInfoBar);
         let (folder_pane_nav, folder_pane_rect) = self.render_folder_pane(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FolderPane);
 
         // チェック件数は一覧の右上へ常時表示する。Foreground Area をグリッドより先に
         // 登録し、解除クリックが背面セルの選択操作へ漏れないようにする。
         self.render_checked_selection_overlay(ctx);
+        mark_pre_grid_perf(
+            &mut pre_grid_perf,
+            PreGridPerfStage::CheckedSelectionOverlay,
+        );
 
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
@@ -61278,9 +61509,11 @@ impl eframe::App for App {
         // 詳細一覧ヘッダの列メニューだけは render_grid 内でこの後に描かれるため、一覧処理を
         // スキップしつつ raw wheel を残し、メニュー内 ScrollArea の処理後に消費する。
         let details_column_menu_open = Self::details_column_context_menu_is_open(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::DetailsColumnMenuCheck);
         if !details_column_menu_open {
             self.suppress_popup_wheel_before_grid(ctx);
         }
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::PopupWheelSuppression);
         // フォルダツリーの ScrollArea を描いた frame でも raw wheel input は残り得る。
         // ポインタが SidePanel の実矩形内なら、内容が短くツリー側にスクロール余地がない
         // 場合も含めて背面グリッドへ適用しない。矩形外では従来どおりグリッドを動かす。
@@ -61290,13 +61523,19 @@ impl eframe::App for App {
                 folder_pane_rect,
                 ctx.pointer_latest_pos(),
             );
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FolderPaneScrollGuard);
         if !folder_pane_blocks_grid_scroll && !details_column_menu_open {
             self.process_scroll(ctx);
         }
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::ProcessScroll);
 
         // ファイル名スタック: フラット読書フルスクリーンを閉じたら集約グリッドへ戻す
         // (render_grid の直前で reconcile して、閉じた瞬間に集約表示が出るようにする)。
         self.stack_reconcile_after_fullscreen_close();
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::StackReconcile);
+        let pre_grid_perf = pre_grid_perf.map(|recorder| {
+            recorder.finish(details_column_menu_open, folder_pane_blocks_grid_scroll)
+        });
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();
@@ -61761,8 +62000,12 @@ impl eframe::App for App {
         // フレーム計測: 8 ms (≈120 fps) 超えた場合のみログに出力
         let frame_total = frame_t0.elapsed();
         if frame_total.as_millis() > 8 {
+            let pre_grid_dominant = pre_grid_perf
+                .as_ref()
+                .map(|breakdown| format!("  pg_top={}", breakdown.dominant_summary()))
+                .unwrap_or_default();
             crate::logger::log(format!(
-                "  [SLOW FRAME] {:.1}ms  poll={:.1}ms keep={:.1}ms pre_grid={:.1}ms grid={:.1}ms  backlog={} requested={}",
+                "  [SLOW FRAME] {:.1}ms  poll={:.1}ms keep={:.1}ms pre_grid={:.1}ms grid={:.1}ms  backlog={} requested={}{}",
                 frame_total.as_secs_f64() * 1000.0,
                 t_poll.as_secs_f64() * 1000.0,
                 (t_keep - t_poll).as_secs_f64() * 1000.0,
@@ -61770,7 +62013,11 @@ impl eframe::App for App {
                 (t_grid - t_pre_grid).as_secs_f64() * 1000.0,
                 self.texture_backlog.len(),
                 self.requested.len(),
+                pre_grid_dominant,
             ));
+        }
+        if let Some(pre_grid_perf) = pre_grid_perf.as_ref() {
+            pre_grid_perf.emit(self.frame_counter);
         }
         if crate::perf::is_enabled() && frame_total.as_millis() > 30 {
             let video_playing = self

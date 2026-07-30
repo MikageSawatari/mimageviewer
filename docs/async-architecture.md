@@ -933,6 +933,9 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 - `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`。アイドル高画質化の最終判定は `idle_upgrade_enqueue` / `idle_upgrade_ineligible` に `key` / `idx` / `items_gen` を載せ、同一状態の反復を検出できるようにする
 - `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `inproc_*` / `enumerate_send`
 - `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`
+- `ui`     — UI フレーム: `tail_repaint` / `slow_frame_breakdown` / `pre_grid_breakdown`。
+  `pre_grid_breakdown` は `n` / `total_ms` と、検索・お気に入り・タグ・ファセット・遅延状態・
+  下部情報・フォルダペイン・選択 overlay・scroll routing・stack reconcile の各 `*_ms` を持つ
 - `folder_pane` — 左フォルダツリーペイン: `scan_subfolders` (子ディレクトリ列挙の ms / 件数 / cancel)
 
 ### 7.4 解析
@@ -945,6 +948,7 @@ python scripts/analyze_perf.py <path>/perf_events.jsonl latency   # seq → read
 python scripts/analyze_perf.py <path>/perf_events.jsonl priority  # 優先度違反検出
 python scripts/analyze_perf.py <path>/perf_events.jsonl thumbs    # decode 時間分布
 python scripts/analyze_perf.py <path>/perf_events.jsonl colorize  # カラー化の解像度・方式別時間
+python scripts/analyze_perf.py <path>/perf_events.jsonl pre-grid  # グリッド直前の要素別時間
 python scripts/analyze_perf.py <path>/perf_events.jsonl dump 42   # 特定 seq の全イベント
 python scripts/analyze_perf.py <path>/perf_events.jsonl timeline  # ガントチャート (matplotlib)
 python scripts/analyze_perf.py <path>/perf_events.jsonl idle-health --start-t 10 --end-t 25

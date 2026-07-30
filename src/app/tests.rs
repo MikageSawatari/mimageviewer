@@ -1,5 +1,6 @@
 use super::*;
 use crate::archive_converter::ArchiveFormat;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -56,6 +57,21 @@ fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
     ] {
         assert_eq!(settings_boot_problem_source(source), None);
     }
+}
+
+#[test]
+fn pre_grid_perf_timer_does_not_read_clock_when_disabled() {
+    let clock_called = Cell::new(false);
+    let mut recorder = pre_grid_perf_start_with(false, || {
+        clock_called.set(true);
+        std::time::Instant::now()
+    });
+    for stage in PreGridPerfStage::ALL {
+        mark_pre_grid_perf(&mut recorder, stage);
+    }
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
 }
 
 #[test]

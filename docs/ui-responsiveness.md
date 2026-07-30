@@ -332,11 +332,52 @@ JIT コンパイル + 初回テクスチャアップロードがある。`t=0.98
 $Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
 python scripts\analyze_perf.py $Perf startup   # 起動時間ブレークダウン
 python scripts\analyze_perf.py $Perf nav       # Ctrl+↑↓ 区間別統計
+python scripts\analyze_perf.py $Perf pre-grid  # グリッド直前のバー/ペイン/scroll 内訳
 python scripts\analyze_perf.py $Perf hitches --ms 100  # 100ms 超フレームギャップ
 python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベント列
 ```
 
-### 7.1 判定基準
+### 7.1 `pre_grid` 区間の内訳
+
+`App::update` の `t_toolbar_input` 直後から `t_pre_grid` 直前までは、perf 有効時に
+`cat="ui"`, `kind="pre_grid_breakdown"` をメイン UI フレームごとに 1 件出す。`n` は
+フレーム番号、`total_ms` はこの区間全体で、内訳は次の属性に入る。
+
+| 属性 | 対象処理 |
+| --- | --- |
+| `search_bar_ms` | `render_search_bar` |
+| `favsearch_bar_ms` | `render_favsearch_bar` |
+| `global_search_bar_ms` | `render_global_search_bar` |
+| `tag_view_bar_ms` | `render_tag_view_bar` |
+| `facet_filter_bar_ms` | `render_facet_filter_bar` |
+| `details_lazy_status_bar_ms` | `render_details_lazy_status_bar` |
+| `selection_info_bar_ms` | `render_selection_info_bar` |
+| `folder_pane_ms` | `render_folder_pane` |
+| `checked_selection_overlay_ms` | `render_checked_selection_overlay` |
+| `details_column_menu_check_ms` | 詳細列コンテキストメニューの open 判定 |
+| `popup_wheel_suppression_ms` | `suppress_popup_wheel_before_grid` の条件判定と実行 |
+| `folder_pane_scroll_guard_ms` | フォルダペイン hover によるグリッド scroll 抑止判定 |
+| `process_scroll_ms` | `process_scroll` の条件判定と実行 |
+| `stack_reconcile_ms` | `stack_reconcile_after_fullscreen_close` |
+
+条件分岐の状態は `details_column_menu_open`, `popup_wheel_suppression_ran`,
+`folder_pane_blocks_grid_scroll`, `process_scroll_ran` で判別できる。通常ログの SLOW FRAME には
+perf 有効時だけ内訳上位 2 件を `pg_top=folder_pane:12.3ms,scroll:2.1ms` のように付記する。
+
+```powershell
+python scripts\analyze_perf.py $Perf pre-grid
+python scripts\analyze_perf.py $Perf pre-grid --min-ms 8
+```
+
+`pre-grid` は各属性の mean / p50 / p95 / max / 全 `total_ms` に対する比率と、遅い
+10 フレームの上位 2 項目を出す。既存 SLOW FRAME 行の `pre_grid` は `t_keep` から
+`t_pre_grid` までの広い値であり、このイベントの `total_ms` はその末尾にある
+`t_toolbar_input` から `t_pre_grid` まで（既存 `ui.slow_frame_breakdown.bars_ms` 相当）である。
+
+計測開始と各境界の `Instant::now()` は `crate::perf::is_enabled()` が true の場合だけ実行する。
+false のときは recorder を作らず、イベント属性の `Vec` や通常ログの `pg_top` 文字列も作らない。
+
+### 7.2 判定基準
 
 問題なしとみなせる目安 (2026-04 実測を基準):
 
@@ -348,7 +389,7 @@ python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベン
 
 悪化した場合は `hitches` の直前 nav イベントで原因区間を特定し、§4 チェックリストを通す。
 
-### 7.2 静止中・背面表示中の健全性
+### 7.3 静止中・背面表示中の健全性
 
 `hitches` は遅いフレームを探すため、短い処理を高速で再投入して CPU 1 コアとログを消費する
 ループは別検査にする。release verification binary を `--perf-log` 付きで起動し、PowerShell
@@ -365,7 +406,7 @@ python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベン
 [idle-health-check.md](idle-health-check.md) を参照する。新しい polling / retry / idle work を
 追加するときは、同じ安定状態を複数回評価して最終的に work 0 へ収束する単体テストも追加する。
 
-### 7.3 UI フォント設定
+### 7.4 UI フォント設定
 
 v2.7.0 の UI フォント設定では、`fontdb::Database::load_system_fonts`、font file 読み込み、
 TTC/OTC face ごとの glyph coverage 判定、`ab_glyph` プレビュー生成、egui font definitions の

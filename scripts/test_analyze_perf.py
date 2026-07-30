@@ -9,8 +9,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from analyze_perf import analyze_idle_health, cmd_colorize, cmd_idle_health
+from analyze_perf import (
+    analyze_idle_health,
+    cmd_colorize,
+    cmd_idle_health,
+    cmd_pre_grid,
+    load_events,
+)
 
 
 def frame(t: float, n: int) -> dict:
@@ -294,6 +301,61 @@ class ColorizeReportTests(unittest.TestCase):
         self.assertIn("段階別フィールドがありません", report)
         self.assertIn("worker", report)
         self.assertNotIn("colorize total", report)
+
+
+class PreGridReportTests(unittest.TestCase):
+    def test_sample_jsonl_is_grouped_and_ranked_by_component(self) -> None:
+        sample_events = [
+            {
+                "t": 1.0,
+                "cat": "ui",
+                "kind": "pre_grid_breakdown",
+                "n": 10,
+                "total_ms": 10.0,
+                "search_bar_ms": 1.0,
+                "folder_pane_ms": 7.0,
+                "process_scroll_ms": 2.0,
+            },
+            {
+                "t": 2.0,
+                "cat": "ui",
+                "kind": "pre_grid_breakdown",
+                "n": 11,
+                "total_ms": 20.0,
+                "search_bar_ms": 4.0,
+                "folder_pane_ms": 12.0,
+                "process_scroll_ms": 4.0,
+            },
+            {"t": 2.1, "cat": "frame", "kind": "begin", "n": 12},
+        ]
+        sample_jsonl = (
+            "\n".join(json.dumps(event) for event in sample_events) + "\n"
+        )
+        with mock.patch.object(
+            Path,
+            "open",
+            return_value=io.StringIO(sample_jsonl),
+        ):
+            events = load_events(Path("pre_grid_sample.jsonl"))
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_pre_grid(events)
+
+        report = output.getvalue()
+        self.assertIn("pre_grid breakdown: frames=2 / 2", report)
+        self.assertIn("render_folder_pane", report)
+        self.assertIn("63.3%", report)
+        self.assertIn("n=    11", report)
+        self.assertLess(
+            report.index("render_folder_pane"),
+            report.index("process_scroll"),
+        )
+
+        filtered_output = io.StringIO()
+        with contextlib.redirect_stdout(filtered_output):
+            cmd_pre_grid(events, min_ms=15.0)
+        self.assertIn("frames=1 / 2", filtered_output.getvalue())
 
 
 if __name__ == "__main__":

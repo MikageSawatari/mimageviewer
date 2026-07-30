@@ -19,6 +19,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     colorize            カラー化 / final effect の段階別時間を解像度・方式別に集計
     nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
                         start_loading_items / close_fullscreen) を集計
+    pre-grid            App::update のグリッド直前区間を要素別に集計
     hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
                         表示 (デフォルト 33ms = 30fps 閾値)
     idle-health         静止区間の update 頻度、repaint 理由の継続、同一 work の
@@ -615,6 +616,106 @@ def cmd_startup(events: list[dict]) -> None:
     if final and final.get("total_ms") is not None:
         print()
         print(f"=> 起動から初回フレームまで: {float(final['total_ms']):.0f} ms")
+
+
+# -----------------------------------------------------------------------
+# pre-grid — App::update のグリッド直前区間
+# -----------------------------------------------------------------------
+
+PRE_GRID_COMPONENTS: list[tuple[str, str]] = [
+    ("search_bar_ms", "render_search_bar"),
+    ("favsearch_bar_ms", "render_favsearch_bar"),
+    ("global_search_bar_ms", "render_global_search_bar"),
+    ("tag_view_bar_ms", "render_tag_view_bar"),
+    ("facet_filter_bar_ms", "render_facet_filter_bar"),
+    ("details_lazy_status_bar_ms", "render_details_lazy_status_bar"),
+    ("selection_info_bar_ms", "render_selection_info_bar"),
+    ("folder_pane_ms", "render_folder_pane"),
+    ("checked_selection_overlay_ms", "render_checked_selection_overlay"),
+    ("details_column_menu_check_ms", "details_column_menu_check"),
+    ("popup_wheel_suppression_ms", "suppress_popup_wheel_before_grid"),
+    ("folder_pane_scroll_guard_ms", "folder_pane_scroll_guard"),
+    ("process_scroll_ms", "process_scroll"),
+    ("stack_reconcile_ms", "stack_reconcile_after_fullscreen_close"),
+]
+
+
+def cmd_pre_grid(events: list[dict], min_ms: float = 0.0) -> None:
+    """ui.pre_grid_breakdown を要素別に集計する。"""
+    all_samples = [
+        event
+        for event in events
+        if event.get("cat") == "ui"
+        and event.get("kind") == "pre_grid_breakdown"
+    ]
+    if not all_samples:
+        print("(ui.pre_grid_breakdown イベントなし — --perf-log 有効で再測定してください)")
+        return
+
+    samples = [
+        event
+        for event in all_samples
+        if float(event.get("total_ms", 0.0)) >= min_ms
+    ]
+    if not samples:
+        print(
+            f"(pre_grid total >= {min_ms:.1f}ms のイベントなし; "
+            f"全イベント {len(all_samples)} 件)"
+        )
+        return
+
+    totals = [float(event.get("total_ms", 0.0)) for event in samples]
+    total_component_ms = sum(totals)
+    print(
+        f"pre_grid breakdown: frames={len(samples)} / {len(all_samples)} "
+        f"(total >= {min_ms:.1f}ms)"
+    )
+    print(
+        f"total: mean={sum(totals) / len(totals):.2f}ms "
+        f"p50={_percentile(totals, 50):.2f}ms "
+        f"p95={_percentile(totals, 95):.2f}ms max={max(totals):.2f}ms"
+    )
+    print()
+    print(
+        f"{'component':<42} {'n':>5} {'mean':>9} {'p50':>9} "
+        f"{'p95':>9} {'max':>9} {'share':>8}"
+    )
+    print("-" * 102)
+
+    rows: list[tuple[float, str, list[float]]] = []
+    for field, label in PRE_GRID_COMPONENTS:
+        values = [float(event[field]) for event in samples if field in event]
+        if values:
+            rows.append((sum(values), label, values))
+    for component_sum, label, values in sorted(rows, key=lambda row: -row[0]):
+        share = (
+            component_sum / total_component_ms * 100.0
+            if total_component_ms > 0.0
+            else 0.0
+        )
+        print(
+            f"{label:<42} {len(values):>5} "
+            f"{sum(values) / len(values):>8.2f}ms "
+            f"{_percentile(values, 50):>8.2f}ms "
+            f"{_percentile(values, 95):>8.2f}ms "
+            f"{max(values):>8.2f}ms {share:>7.1f}%"
+        )
+
+    print("\nslowest frames (top 10):")
+    for event in sorted(samples, key=lambda item: -float(item.get("total_ms", 0.0)))[:10]:
+        dominant = sorted(
+            (
+                (label, float(event[field]))
+                for field, label in PRE_GRID_COMPONENTS
+                if field in event
+            ),
+            key=lambda item: -item[1],
+        )[:2]
+        top = ", ".join(f"{label}={value:.2f}ms" for label, value in dominant)
+        print(
+            f"  n={event.get('n', '?'):>6} t={float(event.get('t', 0.0)):>8.3f}s "
+            f"total={float(event.get('total_ms', 0.0)):>7.2f}ms  {top}"
+        )
 
 
 # -----------------------------------------------------------------------
@@ -1636,6 +1737,13 @@ def main() -> None:
     subs.add_parser("colorize")
     subs.add_parser("nav")
     subs.add_parser("startup")
+    p_pre_grid = subs.add_parser("pre-grid")
+    p_pre_grid.add_argument(
+        "--min-ms",
+        type=float,
+        default=0.0,
+        help="pre_grid total の下限 (ms、既定 0.0)",
+    )
     p_hit = subs.add_parser("hitches")
     p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
     p_idle = subs.add_parser("idle-health")
@@ -1702,6 +1810,8 @@ def main() -> None:
         cmd_nav(events)
     elif args.cmd == "startup":
         cmd_startup(events)
+    elif args.cmd == "pre-grid":
+        cmd_pre_grid(events, args.min_ms)
     elif args.cmd == "hitches":
         cmd_hitches(events, args.ms)
     elif args.cmd == "idle-health":
