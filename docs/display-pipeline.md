@@ -288,24 +288,30 @@ ui_fullscreen.rs::render_fullscreen_viewport
 Ctrl+↑↓ のフォルダ横断とページ単位表示のカラー化待ちは、単一 field
 `fs_holdover_tex: Option<FsHoldover>` を共有する。値は typed state で相互排他になっている:
 
-- `FolderNavigation(texture)`: 遷移開始時に旧ページのテクスチャを保持する。ページごとの
-  fallback ではなく、直前に見ていた**ビュー単位**の hold であり、カラー化の有無とは
-  無関係に `capture_fs_nav_holdover` が作る。
-- `ColorizeDisplayUnit { target_idx, previous }`: `previous.pages` に画面順の 1 ページ、または
+- `FolderNavigation(previous)`: `previous.pages` に画面順の 1 ページ、または `[left, right]` の
+  見開き 2 ページをまとめて保持する。ページごとの fallback ではなく、直前に見ていた
+  **表示ユニット単位**の hold であり、カラー化の有無とは無関係に
+  `capture_fs_nav_holdover` が作る。各 page は texture に加えて capture 時点の rotation、
+  canonical source size、実表示に使った単ページ / 見開き側別 content bbox を所有する。
+- `ColorizeDisplayUnit { target_idx, previous, started_at }`: `previous.pages` に画面順の 1 ページ、または
   `[left, right]` の見開き 2 ページをまとめて保持する。`capture_colorize_page_transition_holdover` /
-  `capture_colorize_source_reload_holdover` だけがカラー化条件で作る。左右別 slot は持たない。
+  `capture_colorize_source_reload_holdover` だけがカラー化条件で作る。左右別 slot は持たず、
+  `started_at` は作業中表示の 400ms UX 閾値を variant 自身に持たせる。
 
-`fs_nav_holdover_tex_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
-gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、`image_rect` に
-1 枚だけ中央 contain フィットで重ねる。移動先ページの回転、表示トリム
-(`content_bbox`)、透過背景スタイルは適用しない。
+`fs_nav_holdover_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
+gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、カラー化側と共通の
+`draw_fs_display_unit_holdover` で旧単ページまたは旧見開き全体を `image_rect` に重ねる。
+画面順を payload に保存するため、LTR は `[小 idx, 大 idx]`、RTL は `[大 idx, 小 idx]` の
+物理的な左右順を items 差し替え後も維持する。texture handle と geometry snapshot を unit
+自身が所有するため、旧 `fs_cache` が drop されても描画寿命は変わらず、同じ数値 idx が
+新フォルダの別 item を指し始めても rotation / source size / trim を再解決しない。
 
 フォルダ横断後、新しい `items_generation` のページで full / final / edit / thumbnail の
-いずれかを一度でも表示候補に選べたら、`fs_nav_holdover_tex_for_draw` は
-`FolderNavigation` の handle 自体を破棄して一方向にラッチする。表示確定待ち世代を持つ
+いずれかを一度でも表示候補に選べたら、`fs_nav_holdover_for_draw` は
+`FolderNavigation` の unit と全 handle を破棄して一方向にラッチする。表示確定待ち世代を持つ
 `fs_nav_locked_gen` は `poll_fs_nav_lock` が別途解除するため、両者の寿命は同一でなくてよい。
 AI final の invalidation / install の過渡フレームで表示解決が再び `None` になっても、
-旧フォルダの handle は既に存在せず、nav holdover が復活することはない。
+旧フォルダの unit は既に存在せず、nav holdover が復活することはない。
 
 `fs_nav_locked_gen` は入力を拒否する lock ではなく、どの `items_generation` の表示確定まで
 旧ビューの holdover を維持するかを表す presentation generation である。Ctrl+↑↓ と
@@ -825,10 +831,11 @@ generation と erase / local-adjust / conceal の各編集世代を含むため�
 
 ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
 `continuous_page_transition_texture` → サムネイル → `読込中...` である。
-`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` は上記のビュー単位 overlay、
-`ColorizeDisplayUnit` はページ画像と編集 overlay の後に、黒背景 + 旧単ページ / 旧見開き全体を
-重ねる。新しい表示ユニットの全ページで final-effect 適用済み表示（または終端の読込失敗）が
-揃った描画フレームだけ state を解放するため、「新しい左 + 古い右」や片側だけ黒にはならない。
+`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` / `ColorizeDisplayUnit` とも
+ページ画像と編集 overlay の後に、共通描画で黒背景 + 旧単ページ / 旧見開き全体を重ねる。
+ただし解放条件は統合しない。フォルダ移動は `fs_nav_locked_gen` と新 anchor の表示 readiness、
+カラー化は新しい表示ユニットの全ページで final-effect 適用済み表示（または終端の読込失敗）が
+揃った描画フレームを使う。後者は「新しい左 + 古い右」や片側だけ黒になるのを防ぐ。
 
 Ctrl+↑↓ の nav lock 解放判定も、描画側と同じ
 `fs_display_bypasses_final_pipeline` を使う。通常表示でカラー化が有効なページは
@@ -1239,6 +1246,9 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
      新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
      final AI 到着後も同一 key の cache entry として維持し、AI 後の完成結果で直接上書きする。
      `complete=true` の final だけが holdover / nav lock を解放する。
+     `ColorizeDisplayUnit` が 400ms 続いた場合だけ、中央の暗いラウンド矩形に
+     「カラー化中…」を表示する。通常ページ送りで即時表示を繰り返さないための実機調整値で、
+     フォルダ移動の `FolderNavigation` では表示しない。
    ↓
 10. Creative 3D LUT
    → 環境設定で登録した `.cube` を適用量付きで最終表示へ適用する。
@@ -1280,8 +1290,10 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   stale 結果を `FinalCompositeKey` と items 世代で拒否する。AI 先読みと同じ前後枚数の
   `final_composite_cache` を背景で 1 枚ずつ作る。先読み中は provisional texture を upload
   せず、同ページが表示対象になったときは進行中 job を昇格して再利用する。通常ページ送りでは
-  完成まで直前ページを保持し、生画像・サムネイルへフォールバックしない。`open_fullscreen` は
-  ページ入場だけでは final composite / worker を無効化しない。サムネイル自体には反映しない。
+  完成まで直前ページを保持し、生画像・サムネイルへフォールバックしない。待ちが 400ms を
+  超えた場合だけ「カラー化中…」を表示する。`open_fullscreen` はページ入場だけでは final
+  composite / worker を無効化しない。サムネイル自体には反映しない。連結読みは
+  `ColorizeDisplayUnit` を通らないため、このインジケータの対象外とする。
 - **Creative LUT**: カラー化後・ポストフィルタ前に適用する。登録済み `.cube` の parse 済み
   table を worker へ `Arc` で渡し、ファイル I/O は UI thread と final-effect worker の外で行う。
   LUT の選択・適用量は final composite key に含め、変更時も edit / final AI cache は保持する。

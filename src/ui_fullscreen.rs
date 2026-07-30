@@ -46,11 +46,43 @@ use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
+// Tuned on real hardware to avoid a brief status flash on normal page turns.
+const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 enum FsNavHoldoverDecision {
     Unavailable,
     TargetReady,
-    Draw(egui::TextureHandle),
+    Draw(FsDisplayUnitHoldover),
+}
+
+fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time::Instant) -> bool {
+    holdover
+        .and_then(FsHoldover::colorize_wait_started_at)
+        .is_some_and(|started_at| {
+            now.saturating_duration_since(started_at) >= COLORIZE_WAIT_INDICATOR_DELAY
+        })
+}
+
+fn paint_centered_dark_status_overlay(ui: &egui::Ui, full_rect: egui::Rect, text: &str) {
+    let font = egui::FontId::proportional(20.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
+    let padding = egui::vec2(28.0, 18.0);
+    let box_size = galley.size() + padding * 2.0;
+    let rect = egui::Rect::from_center_size(full_rect.center(), box_size);
+    ui.painter().rect_filled(
+        rect,
+        10.0,
+        egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        egui::Color32::WHITE,
+    );
 }
 
 fn compare_indicator_size(width: u32, height: u32) -> Option<(u32, u32)> {
@@ -1544,27 +1576,6 @@ fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui:
     egui::Rect::from_center_size(rect.center(), display_size * fit_scale)
 }
 
-fn fs_nav_holdover_overlay_rect(rect: egui::Rect, texture_size: egui::Vec2) -> Option<egui::Rect> {
-    (rect.width() > 0.0 && rect.height() > 0.0 && texture_size.x > 0.0 && texture_size.y > 0.0)
-        .then(|| fit_display_size_in_rect(rect, texture_size))
-}
-
-fn paint_fs_nav_holdover_overlay(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    texture: &egui::TextureHandle,
-) {
-    let Some(image_rect) = fs_nav_holdover_overlay_rect(rect, texture.size_vec2()) else {
-        return;
-    };
-    painter.with_clip_rect(rect).image(
-        texture.id(),
-        image_rect,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
-}
-
 fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(
@@ -2045,7 +2056,7 @@ impl App {
     /// 優先順: Animated 現フレーム → final composite cache → edit cache → fs_cache (Static)
     /// → サムネ (`include_thumb=true` のときのみ)。
     ///
-    /// `prepare_fullscreen_state` の高解像度 tex 解決と `current_fs_tex_for_holdover`
+    /// `prepare_fullscreen_state` の高解像度 tex 解決と `capture_fs_display_unit`
     /// が同じチェーンを 2 回書いていた重複を集約する。ここでは既存 cache の lookup
     /// だけを行い、MI-GAN や隠蔽合成の新規生成は走らせない。生成を伴う通常描画は
     /// `resolve_fs_processed_texture` を使う。
@@ -2270,16 +2281,71 @@ impl App {
     }
 
     pub(crate) fn capture_fs_display_unit(&mut self, idx: usize) -> Option<FsDisplayUnitHoldover> {
-        let page_indices = self.fs_display_unit_page_indices(idx);
-        let mut pages = Vec::with_capacity(page_indices.len());
-        for page_idx in page_indices {
-            let texture = self.resolve_fs_display_tex(page_idx, true)?;
-            pages.push(FsDisplayUnitHoldoverPage {
-                idx: page_idx,
-                texture,
-            });
+        match self.resolve_spread_pair(idx) {
+            SpreadPair::Single => {
+                let rotation = self.get_rotation(idx);
+                let content_bbox = if rotation.is_none() {
+                    self.view_trim_single_content_bbox(idx)
+                } else {
+                    None
+                };
+                let page = self.capture_fs_display_unit_page(idx, rotation, content_bbox)?;
+                Some(FsDisplayUnitHoldover { pages: vec![page] })
+            }
+            SpreadPair::Double { left, right } => {
+                let left_rotation = self.get_rotation(left);
+                let right_rotation = self.get_rotation(right);
+                let (left_content_bbox, right_content_bbox) =
+                    if left_rotation.is_none() && right_rotation.is_none() {
+                        self.view_trim_spread_content_bboxes(left, right)
+                    } else {
+                        (
+                            if left_rotation.is_none() {
+                                self.view_trim_spread_content_bbox(
+                                    left,
+                                    crate::view_trim::ViewTrimSpreadSide::Left,
+                                )
+                            } else {
+                                None
+                            },
+                            if right_rotation.is_none() {
+                                self.view_trim_spread_content_bbox(
+                                    right,
+                                    crate::view_trim::ViewTrimSpreadSide::Right,
+                                )
+                            } else {
+                                None
+                            },
+                        )
+                    };
+                let left_page =
+                    self.capture_fs_display_unit_page(left, left_rotation, left_content_bbox)?;
+                let right_page =
+                    self.capture_fs_display_unit_page(right, right_rotation, right_content_bbox)?;
+                Some(FsDisplayUnitHoldover {
+                    pages: vec![left_page, right_page],
+                })
+            }
         }
-        Some(FsDisplayUnitHoldover { pages })
+    }
+
+    fn capture_fs_display_unit_page(
+        &self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        content_bbox: Option<egui::Rect>,
+    ) -> Option<FsDisplayUnitHoldoverPage> {
+        let texture = self.resolve_fs_display_tex(idx, true)?;
+        let source_size = self
+            .source_dims_for_idx(idx)
+            .map(|(width, height)| egui::vec2(width, height));
+        Some(FsDisplayUnitHoldoverPage {
+            idx,
+            texture,
+            rotation,
+            source_size,
+            content_bbox,
+        })
     }
 
     fn clear_colorize_display_unit_holdover(&mut self) {
@@ -2316,8 +2382,10 @@ impl App {
             return;
         }
 
-        let existing_previous = match self.fs_holdover_tex.as_ref() {
-            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => Some(holdover.previous.clone()),
+        let existing_holdover = match self.fs_holdover_tex.as_ref() {
+            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => {
+                Some((holdover.previous.clone(), holdover.started_at))
+            }
             _ => None,
         };
         let current_previous = match self.fullscreen_idx {
@@ -2326,11 +2394,18 @@ impl App {
             }
             _ => None,
         };
-        if let Some(previous) = current_previous.or(existing_previous) {
+        if let Some(previous) = current_previous.or_else(|| {
+            existing_holdover
+                .as_ref()
+                .map(|(previous, _)| previous.clone())
+        }) {
             self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
                 ColorizeDisplayUnitHoldover {
                     target_idx,
                     previous,
+                    started_at: existing_holdover
+                        .map(|(_, started_at)| started_at)
+                        .unwrap_or_else(std::time::Instant::now),
                 },
             ));
         }
@@ -2607,12 +2682,6 @@ impl App {
         self.resolve_fs_pre_overlay_texture(idx)
     }
 
-    /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
-    /// `resolve_fs_display_tex` を `include_thumb=true` で呼んで「最良の表示物」を取る。
-    pub(crate) fn current_fs_tex_for_holdover(&self, fs_idx: usize) -> Option<egui::TextureHandle> {
-        self.resolve_fs_display_tex(fs_idx, true)
-    }
-
     /// `fs_nav_locked_gen.is_some()` の薄いラッパー。
     /// 入力ハンドラ・描画パスから「現在 nav ロック中か」を簡潔に問い合わせるため。
     pub(crate) fn fs_nav_is_locked(&self) -> bool {
@@ -2627,8 +2696,8 @@ impl App {
     /// 描画側で使ってよい Ctrl+↑↓ nav holdover を返す。
     ///
     /// `fs_holdover_tex` は旧ページの見た目を一時的に残すビュー単位の状態。
-    /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ 1 枚だけ
-    /// contain オーバーレイする。
+    /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ旧単ページ、または
+    /// 画面順の旧見開き 2 ページを 1 unit としてオーバーレイする。
     fn fs_nav_holdover_decision(&self) -> FsNavHoldoverDecision {
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return FsNavHoldoverDecision::Unavailable;
@@ -2645,7 +2714,7 @@ impl App {
             //
             // 新 idx の表示物が用意できた / デコード失敗が確定した時点で
             // ビュー単位の holdover overlay を止める。それまでは旧ビューを
-            // 1 枚だけ維持して黒を挟まず滑らかに繋ぐ。
+            // 1 display unit として維持して黒を挟まず滑らかに繋ぐ。
             let new_content_ready = self.resolve_fs_display_tex(idx, true).is_some();
             let new_content_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
             if new_content_ready || new_content_failed {
@@ -2654,16 +2723,16 @@ impl App {
         }
         self.fs_holdover_tex
             .as_ref()
-            .and_then(FsHoldover::folder_navigation_texture)
+            .and_then(FsHoldover::folder_navigation_display_unit)
             .cloned()
             .map(FsNavHoldoverDecision::Draw)
             .unwrap_or(FsNavHoldoverDecision::Unavailable)
     }
 
     /// 描画直前の呼び出しでは `TargetReady` を一方向ラッチへ変換する。
-    /// readiness probe は `fs_nav_holdover_tex_without_latching` を使い、実描画前に
-    /// handle を破棄しない。
-    pub(crate) fn fs_nav_holdover_tex_for_draw(&mut self) -> Option<egui::TextureHandle> {
+    /// readiness probe は `fs_nav_holdover_without_latching` を使い、実描画前に
+    /// unit が所有する handle を破棄しない。
+    pub(crate) fn fs_nav_holdover_for_draw(&mut self) -> Option<FsDisplayUnitHoldover> {
         match self.fs_nav_holdover_decision() {
             FsNavHoldoverDecision::TargetReady => {
                 // 一方向ラッチ: 新 generation の表示物を選べた描画フレームで旧フォルダの
@@ -2672,14 +2741,14 @@ impl App {
                 self.fs_holdover_tex = None;
                 None
             }
-            FsNavHoldoverDecision::Draw(texture) => Some(texture),
+            FsNavHoldoverDecision::Draw(unit) => Some(unit),
             FsNavHoldoverDecision::Unavailable => None,
         }
     }
 
-    fn fs_nav_holdover_tex_without_latching(&self) -> Option<egui::TextureHandle> {
+    fn fs_nav_holdover_without_latching(&self) -> Option<FsDisplayUnitHoldover> {
         match self.fs_nav_holdover_decision() {
-            FsNavHoldoverDecision::Draw(texture) => Some(texture),
+            FsNavHoldoverDecision::Draw(unit) => Some(unit),
             FsNavHoldoverDecision::Unavailable | FsNavHoldoverDecision::TargetReady => None,
         }
     }
@@ -2706,7 +2775,7 @@ impl App {
     /// 「items が入れ替わる前にロックを解除しない」判定に使う。
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
         self.fs_holdover_tex = self
-            .current_fs_tex_for_holdover(fs_idx)
+            .capture_fs_display_unit(fs_idx)
             .map(FsHoldover::FolderNavigation);
         self.fs_nav_locked_gen = Some(self.items_generation);
     }
@@ -7211,7 +7280,7 @@ impl App {
         // Ctrl+↑↓ の deferred reopen、または active detached の PDF/ZIP 列挙・scan・password
         // 待ちでは fullscreen_idx が None のまま内部遷移の完了を待つ。この間ビューポートを
         // 隠すとその下のグリッドが見えてちらつくので維持しつつ、ナビロックの holdover
-        // (= 直前ページのテクスチャ) があればそれを表示して「黒画面で待たされる」
+        // (= 直前の単ページ / 見開き unit) があればそれを表示して「黒画面で待たされる」
         // 体感を緩和する。terminal intent は finalize と同じ唯一の述語
         // detached_active_window_alive_wanted() で判断し、main context では従来の
         // deferred reopen だけを対象にする。
@@ -7224,15 +7293,17 @@ impl App {
             #[cfg(not(windows))]
             let fs_builder = self.build_fullscreen_viewport_builder();
             let mut cancel = false;
-            // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
-            let holdover = self.fs_nav_holdover_tex_for_draw();
-            if let Some(handle) = holdover.as_ref() {
-                self.trace_fs_texture_choice(
-                    "deferred_keep_alive",
-                    "nav_holdover",
-                    self.fullscreen_idx,
-                    handle,
-                );
+            // holdover unit を旧レイアウトで描くため、クロージャ前に clone する。
+            let holdover = self.fs_nav_holdover_for_draw();
+            if let Some(unit) = holdover.as_ref() {
+                for page in &unit.pages {
+                    self.trace_fs_texture_choice(
+                        "deferred_keep_alive",
+                        "nav_holdover",
+                        Some(page.idx),
+                        &page.texture,
+                    );
+                }
             }
             #[cfg(windows)]
             let keep_alive_window_id = self.active_detached_hwnd_window_id();
@@ -7256,8 +7327,9 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
-                        if let Some(handle) = holdover.as_ref() {
-                            paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
+                        if let Some(unit) = holdover.as_ref() {
+                            let image_rect = ui.max_rect();
+                            self.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
                         }
                     });
             });
@@ -7414,43 +7486,51 @@ impl App {
             .and_then(|idx| self.resolve_fs_display_tex(idx, true));
         // live が選べたフレームでも draw gate を必ず評価し、旧 holdover の
         // 一方向ラッチを backstop 経路にも適用する。
-        let holdover = self.fs_nav_holdover_tex_for_draw();
-        let (tex, texture_source) = if let Some(live_tex) = live_tex {
-            let source = if crate::perf::is_enabled() {
+        let holdover = self.fs_nav_holdover_for_draw();
+        let texture_source = if let Some(live_tex) = live_tex.as_ref() {
+            if crate::perf::is_enabled() {
                 self.fullscreen_idx.map_or("processed_other", |idx| {
-                    self.fs_texture_source_for_trace(idx, &live_tex)
+                    self.fs_texture_source_for_trace(idx, live_tex)
                 })
             } else {
                 "live_display"
-            };
-            (Some(live_tex), source)
+            }
         } else {
-            (holdover, "nav_holdover")
+            "nav_holdover"
         };
         // 保険 (Codex #3): live ページも holdover も無い (fullscreen_idx=None && tex=None) なら、
         // 描くべき中身が無い = もはや生かす意味のない空ウィンドウ。session close 漏れなどで
         // ここに来ても、空の小窓を描き続けない (= 閉じられない症状の二重防止)。正規の
         // 列挙待ち gap では holdover が在るのでこの早期 return には入らない。
-        if self.fullscreen_idx.is_none() && tex.is_none() {
+        if self.fullscreen_idx.is_none() && live_tex.is_none() && holdover.is_none() {
             self.log_detached_image_window_debug(
                 "keepalive_backstop skip: no content (fs_idx=None, no holdover)".to_string(),
             );
             return;
         }
         self.log_detached_image_window_debug(format!(
-            "keepalive_backstop window_id={:?} fs_idx={:?} has_tex={} host={}",
+            "keepalive_backstop window_id={:?} fs_idx={:?} has_content={} host={}",
             self.active_detached_session.map(|s| s.window_id),
             self.fullscreen_idx,
-            tex.is_some(),
+            live_tex.is_some() || holdover.is_some(),
             self.detached_viewer_host_debug_state()
         ));
-        if let Some(handle) = tex.as_ref() {
+        if let Some(handle) = live_tex.as_ref() {
             self.trace_fs_texture_choice(
                 "detached_backstop",
                 texture_source,
                 self.fullscreen_idx,
                 handle,
             );
+        } else if let Some(unit) = holdover.as_ref() {
+            for page in &unit.pages {
+                self.trace_fs_texture_choice(
+                    "detached_backstop",
+                    texture_source,
+                    Some(page.idx),
+                    &page.texture,
+                );
+            }
         }
         let backstop_window_id = self.active_detached_session.map(|s| s.window_id);
         let hwnd_before = backstop_window_id.and_then(|window_id| {
@@ -7464,7 +7544,7 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(vp_ctx, |ui| {
-                    if let Some(handle) = tex.as_ref() {
+                    if let Some(handle) = live_tex.as_ref() {
                         let avail = ui.available_size();
                         let tex_size = handle.size_vec2();
                         if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
@@ -7483,6 +7563,9 @@ impl App {
                                 egui::Color32::WHITE,
                             );
                         }
+                    } else if let Some(unit) = holdover.as_ref() {
+                        let image_rect = ui.max_rect();
+                        self.draw_fs_display_unit_holdover(ui, vp_ctx, image_rect, unit);
                     }
                 });
         });
@@ -7513,14 +7596,16 @@ impl App {
     /// (viewport モードの defer 分岐と同じ挙動)。
     #[cfg(windows)]
     fn render_embedded_fs_nav_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_nav_holdover_tex_for_draw();
-        if let Some(handle) = holdover.as_ref() {
-            self.trace_fs_texture_choice(
-                "embedded_deferred",
-                "nav_holdover",
-                self.fullscreen_idx,
-                handle,
-            );
+        let holdover = self.fs_nav_holdover_for_draw();
+        if let Some(unit) = holdover.as_ref() {
+            for page in &unit.pages {
+                self.trace_fs_texture_choice(
+                    "embedded_deferred",
+                    "nav_holdover",
+                    Some(page.idx),
+                    &page.texture,
+                );
+            }
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         let escape_pressed = !self.ime_input_active()
@@ -7530,8 +7615,9 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                if let Some(handle) = holdover.as_ref() {
-                    paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
+                if let Some(unit) = holdover.as_ref() {
+                    let image_rect = ui.max_rect();
+                    self.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
                 }
             });
 
@@ -7579,20 +7665,23 @@ impl App {
     /// 背面のグリッドが見えないようにする。
     #[cfg(windows)]
     pub(crate) fn render_still_fullscreen_viewport_enter_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_nav_holdover_tex_without_latching();
-        if let Some(handle) = holdover.as_ref() {
-            self.trace_fs_texture_choice(
-                "viewport_enter",
-                "nav_holdover",
-                self.fullscreen_idx,
-                handle,
-            );
+        let holdover = self.fs_nav_holdover_without_latching();
+        if let Some(unit) = holdover.as_ref() {
+            for page in &unit.pages {
+                self.trace_fs_texture_choice(
+                    "viewport_enter",
+                    "nav_holdover",
+                    Some(page.idx),
+                    &page.texture,
+                );
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                if let Some(handle) = holdover.as_ref() {
-                    paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
+                if let Some(unit) = holdover.as_ref() {
+                    let image_rect = ui.max_rect();
+                    self.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
                 }
             });
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -7824,7 +7913,7 @@ impl App {
                 cache_state,
                 thumb_ready,
                 self.fs_pending.contains_key(&fs_idx),
-                self.fs_nav_holdover_tex_without_latching().is_some(),
+                self.fs_nav_holdover_without_latching().is_some(),
             )
         } else {
             (false, "not-detached", false, false, false)
@@ -8914,7 +9003,7 @@ impl App {
                                     &page.texture,
                                 );
                             }
-                            self.draw_colorize_display_unit_holdover(
+                            self.draw_fs_display_unit_holdover(
                                 ui,
                                 ctx,
                                 image_rect,
@@ -8924,14 +9013,21 @@ impl App {
 
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
                         // 移動先ページの矩形を旧ビューの上に重ねない。
-                        if let Some(holdover) = self.fs_nav_holdover_tex_for_draw() {
-                            self.trace_fs_texture_choice(
-                                "fullscreen_overlay",
-                                "nav_holdover",
-                                Some(fs_idx),
-                                &holdover,
+                        if let Some(unit) = self.fs_nav_holdover_for_draw() {
+                            for page in &unit.pages {
+                                self.trace_fs_texture_choice(
+                                    "fullscreen_overlay",
+                                    "nav_holdover",
+                                    Some(page.idx),
+                                    &page.texture,
+                                );
+                            }
+                            self.draw_fs_display_unit_holdover(
+                                ui,
+                                ctx,
+                                image_rect,
+                                &unit,
                             );
-                            paint_fs_nav_holdover_overlay(ui.painter(), image_rect, &holdover);
                         }
 
                         // ── 透過背景インジケータ (Shift+B 変更直後のみフェード表示) ──
@@ -9469,6 +9565,8 @@ impl App {
                             ctx,
                             crate::app::ActionSurface::Viewer,
                         );
+
+                        self.draw_colorize_wait_overlay(ui, full_rect, ctx);
 
                         // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
                         self.draw_stamp_embed_overlay(ui, full_rect, ctx);
@@ -18513,7 +18611,7 @@ impl App {
         }
     }
 
-    fn draw_colorize_display_unit_holdover(
+    fn draw_fs_display_unit_holdover(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
@@ -18524,19 +18622,10 @@ impl App {
             .rect_filled(image_rect, 0.0, egui::Color32::BLACK);
         match unit.pages.as_slice() {
             [page] => {
-                let rotation = self.get_rotation(page.idx);
-                let source_size = self
-                    .source_dims_for_idx(page.idx)
-                    .map(|(w, h)| egui::vec2(w, h));
                 let zoom_pan = self.fs_zoom_pan();
                 let free_rotation = self.fs_free_rotation;
                 let fit_mode = self.effective_fullscreen_fit_mode();
                 let fit_scale_limits = self.fullscreen_fit_scale_limits();
-                let content_bbox = if rotation.is_none() {
-                    self.view_trim_single_content_bbox(page.idx)
-                } else {
-                    None
-                };
                 self.fullscreen_page_layout
                     .begin(FullscreenPageLayoutKind::Single);
                 let transform = {
@@ -18545,14 +18634,14 @@ impl App {
                         ui,
                         image_rect,
                         page.idx,
-                        source_size,
+                        page.source_size,
                         None,
                         Some(&page.texture),
                         None,
                         false,
                         false,
                         false,
-                        rotation,
+                        page.rotation,
                         zoom_pan,
                         free_rotation,
                         &bg_style,
@@ -18560,7 +18649,7 @@ impl App {
                         false,
                         fit_mode,
                         fit_scale_limits,
-                        content_bbox,
+                        page.content_bbox,
                     )
                 };
                 if let Some(transform) = transform {
@@ -18574,7 +18663,7 @@ impl App {
                 left.idx,
                 right.idx,
                 false,
-                Some((&left.texture, &right.texture)),
+                Some((left, right)),
             ),
             _ => debug_assert!(false, "display unit must contain one or two pages"),
         }
@@ -18590,20 +18679,24 @@ impl App {
         left_idx: usize,
         right_idx: usize,
         original_preview_active: bool,
-        display_override: Option<(&egui::TextureHandle, &egui::TextureHandle)>,
+        display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
     ) {
         self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = self.effective_fullscreen_fit_mode();
         let fit_scale_limits = self.fullscreen_fit_scale_limits();
-        let left_rot = self.get_rotation(left_idx);
-        let right_rot = self.get_rotation(right_idx);
+        let (left_rot, right_rot) = match display_override {
+            Some((left, right)) => (left.rotation, right.rotation),
+            None => (self.get_rotation(left_idx), self.get_rotation(right_idx)),
+        };
         // 表示トリム / 自動余白カット (見開き): 各ページの content bbox を取得し、
         // 後で左右セットをフィットさせる。回転ページは対象外 (single 同様)。
-        let (content_left, content_right) = if left_rot.is_none() && right_rot.is_none() {
-            self.view_trim_spread_content_bboxes(left_idx, right_idx)
-        } else {
-            (
+        let (content_left, content_right) = match display_override {
+            Some((left, right)) => (left.content_bbox, right.content_bbox),
+            None if left_rot.is_none() && right_rot.is_none() => {
+                self.view_trim_spread_content_bboxes(left_idx, right_idx)
+            }
+            None => (
                 if left_rot.is_none() {
                     self.view_trim_spread_content_bbox(
                         left_idx,
@@ -18620,17 +18713,23 @@ impl App {
                 } else {
                     None
                 },
-            )
+            ),
         };
         // ZipPla ズーム中もトリムを維持する。ズームのパン/clamp を「トリム後合成ページ」
         // (fit_w × fit_h) 座標で行い (下記)、layout_spread_page_rects のトリム配置と座標系を
         // 一致させることで、トリム後コンテンツだけを拡大表示する (= 余白を見せない)。
         // 各ページが読込中ブランチに落ちたときに出すパス。steady state では空文字列になり
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。
-        let left_location = self.location_display_for_loading(left_idx);
-        let right_location = self.location_display_for_loading(right_idx);
+        let (left_location, right_location) = if display_override.is_some() {
+            (String::new(), String::new())
+        } else {
+            (
+                self.location_display_for_loading(left_idx),
+                self.location_display_for_loading(right_idx),
+            )
+        };
         let (left_display_tex, right_display_tex) = match display_override {
-            Some((left, right)) => (Some(left.clone()), Some(right.clone())),
+            Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
             None => (
                 self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active),
                 self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active),
@@ -18685,6 +18784,19 @@ impl App {
             ui.painter().with_clip_rect(image_rect)
         } else {
             ui.painter().clone()
+        };
+        let left_allow_thumbnail = display_override.is_none()
+            && (original_preview_active || !self.colorize_display_requires_final_effect(left_idx));
+        let right_allow_thumbnail = display_override.is_none()
+            && (original_preview_active || !self.colorize_display_requires_final_effect(right_idx));
+        let (left_source_size, right_source_size) = match display_override {
+            Some((left, right)) => (left.source_size, right.source_size),
+            None => (
+                self.source_dims_for_idx(left_idx)
+                    .map(|(w, h)| egui::vec2(w, h)),
+                self.source_dims_for_idx(right_idx)
+                    .map(|(w, h)| egui::vec2(w, h)),
+            ),
         };
 
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
@@ -18823,16 +18935,22 @@ impl App {
                 content_active,
             );
 
-            let left_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
-            let right_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(right_idx);
             self.fullscreen_page_layout
                 .begin(FullscreenPageLayoutKind::Spread);
-            for (rect, idx, rot, location, display_tex, allow_thumbnail, content_bbox) in [
+            for (
+                rect,
+                idx,
+                source_size,
+                rot,
+                location,
+                display_tex,
+                allow_thumbnail,
+                content_bbox,
+            ) in [
                 (
                     spread_rects.left_rect,
                     left_idx,
+                    left_source_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -18842,6 +18960,7 @@ impl App {
                 (
                     spread_rects.right_rect,
                     right_idx,
+                    right_source_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -18849,7 +18968,6 @@ impl App {
                     content_right,
                 ),
             ] {
-                let source_size = self.source_dims_for_idx(idx).map(|(w, h)| egui::vec2(w, h));
                 if let Some(transform) = Self::draw_fs_spread_page(
                     &painter,
                     image_rect,
@@ -18893,14 +19011,20 @@ impl App {
                 egui::pos2(image_rect.min.x + half_w + spread_gap, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
-            let left_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
-            let right_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(right_idx);
-            for (rect, idx, rot, location, display_tex, allow_thumbnail, content_bbox) in [
+            for (
+                rect,
+                idx,
+                source_size,
+                rot,
+                location,
+                display_tex,
+                allow_thumbnail,
+                content_bbox,
+            ) in [
                 (
                     left_rect,
                     left_idx,
+                    left_source_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -18910,6 +19034,7 @@ impl App {
                 (
                     right_rect,
                     right_idx,
+                    right_source_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -18917,7 +19042,6 @@ impl App {
                     content_right,
                 ),
             ] {
-                let source_size = self.source_dims_for_idx(idx).map(|(w, h)| egui::vec2(w, h));
                 Self::draw_fs_spread_page(
                     &painter,
                     image_rect,
@@ -20548,6 +20672,30 @@ impl App {
 }
 
 impl App {
+    fn draw_colorize_wait_overlay(
+        &self,
+        ui: &egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) {
+        let Some(started_at) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::colorize_wait_started_at)
+        else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if !colorize_wait_indicator_visible(self.fs_holdover_tex.as_ref(), now) {
+            ctx.request_repaint_after(
+                COLORIZE_WAIT_INDICATOR_DELAY
+                    .saturating_sub(now.saturating_duration_since(started_at)),
+            );
+            return;
+        }
+        paint_centered_dark_status_overlay(ui, full_rect, "カラー化中…");
+    }
+
     /// スタンプ埋め込み worker (R2-6) の進行を画面中央に表示する。worker が完了していれば
     /// `poll_stamp_embed` がここで適用し、まだ処理中なら中央に「スタンプ読み込み中…」を出して
     /// 再描画を要求する (UI は固まらない)。
@@ -20561,26 +20709,7 @@ impl App {
         if !self.poll_stamp_embed() {
             return;
         }
-        let text = "スタンプ読み込み中…";
-        let font = egui::FontId::proportional(20.0);
-        let galley =
-            ui.painter()
-                .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
-        let padding = egui::vec2(28.0, 18.0);
-        let box_size = galley.size() + padding * 2.0;
-        let rect = egui::Rect::from_center_size(full_rect.center(), box_size);
-        ui.painter().rect_filled(
-            rect,
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
-        );
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font,
-            egui::Color32::WHITE,
-        );
+        paint_centered_dark_status_overlay(ui, full_rect, "スタンプ読み込み中…");
         // worker 完了を取りこぼさないよう毎フレーム再描画。
         ctx.request_repaint();
     }
@@ -24513,6 +24642,57 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn colorize_wait_indicator_requires_colorize_state_and_full_delay() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "colorize_wait_indicator",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let started_at = std::time::Instant::now();
+        let colorize = FsHoldover::ColorizeDisplayUnit(ColorizeDisplayUnitHoldover {
+            target_idx: 0,
+            previous: FsDisplayUnitHoldover {
+                pages: vec![FsDisplayUnitHoldoverPage {
+                    idx: 0,
+                    texture: texture.clone(),
+                    rotation: crate::rotation_db::Rotation::None,
+                    source_size: None,
+                    content_bbox: None,
+                }],
+            },
+            started_at,
+        });
+
+        assert!(!colorize_wait_indicator_visible(
+            Some(&colorize),
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY - std::time::Duration::from_millis(1),
+        ));
+        assert!(colorize_wait_indicator_visible(
+            Some(&colorize),
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY,
+        ));
+
+        let folder_navigation = FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
+            pages: vec![FsDisplayUnitHoldoverPage {
+                idx: 0,
+                texture,
+                rotation: crate::rotation_db::Rotation::None,
+                source_size: None,
+                content_bbox: None,
+            }],
+        });
+        assert!(!colorize_wait_indicator_visible(
+            Some(&folder_navigation),
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY * 10,
+        ));
+        assert!(!colorize_wait_indicator_visible(
+            None,
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY,
+        ));
+    }
+
+    #[test]
     fn continuous_reading_drag_splits_scroll_and_cross_axis_pan() {
         let pointer_delta = egui::vec2(7.0, -11.0);
 
@@ -24740,24 +24920,6 @@ mod tests {
         assert_eq!(compare_indicator_size(4096, 8192), Some((27, 54)));
         assert_eq!(compare_indicator_size(32, 24), Some((32, 24)));
         assert_eq!(compare_indicator_size(0, 24), None);
-    }
-
-    #[test]
-    fn fs_nav_holdover_overlay_rect_centers_portrait_landscape_and_square() {
-        let viewport = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
-
-        for texture_size in [
-            egui::vec2(100.0, 200.0),
-            egui::vec2(300.0, 100.0),
-            egui::vec2(100.0, 100.0),
-        ] {
-            let fitted = fs_nav_holdover_overlay_rect(viewport, texture_size).unwrap();
-            assert_eq!(fitted.center(), viewport.center());
-            assert!(fitted.left() >= viewport.left());
-            assert!(fitted.right() <= viewport.right());
-            assert!(fitted.top() >= viewport.top());
-            assert!(fitted.bottom() <= viewport.bottom());
-        }
     }
 
     #[test]

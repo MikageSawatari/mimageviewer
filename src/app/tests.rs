@@ -4,6 +4,18 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
+    FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
+        pages: vec![FsDisplayUnitHoldoverPage {
+            idx: page_idx,
+            texture,
+            rotation: crate::rotation_db::Rotation::None,
+            source_size: None,
+            content_bbox: None,
+        }],
+    })
+}
+
 #[cfg(windows)]
 fn paused_test_window(
     ctx: &egui::Context,
@@ -16027,14 +16039,14 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(idx, holdover));
         // capture 時点の generation を lock。その後フォルダ移動で items_generation が進む。
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.items_generation = app.items_generation.wrapping_add(1);
 
         // 新 idx の full もサムネもまだ無い → holdover overlay で黒を防ぐ。
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "new content not ready yet -> keep showing the previous frame (no black flicker)"
         );
 
@@ -16057,9 +16069,165 @@ mod favorite_adjustment_defaults_tests {
             },
         );
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_none(),
+            app.fs_nav_holdover_for_draw().is_none(),
             "once new content is ready the holdover must stop so no stale image lingers"
         );
+    }
+
+    #[test]
+    fn capture_fs_nav_holdover_keeps_single_page_as_one_display_unit() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\single.jpg");
+        let texture = ctx.load_texture(
+            "folder_nav_single_unit",
+            egui::ColorImage::filled([2, 3], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let texture_id = texture.id();
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: texture,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((2, 3)),
+        };
+        app.visible_indices = vec![idx];
+        app.spread_mode = crate::settings::SpreadMode::Single;
+
+        app.capture_fs_nav_holdover(idx);
+
+        let FsHoldover::FolderNavigation(unit) =
+            app.fs_holdover_tex.as_ref().expect("holdover captured")
+        else {
+            panic!("folder navigation must own its own release state");
+        };
+        assert_eq!(unit.pages.len(), 1);
+        assert_eq!(unit.pages[0].idx, idx);
+        assert_eq!(unit.pages[0].texture.id(), texture_id);
+    }
+
+    #[test]
+    fn folder_nav_holdover_geometry_survives_index_reuse_after_items_advance() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\old.jpg");
+        let texture = ctx.load_texture(
+            "folder_nav_geometry_old",
+            egui::ColorImage::filled([4, 7], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 7], egui::Color32::WHITE)),
+                source_dims: Some([400, 700]),
+                load_seq: 0,
+            },
+        );
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::Cw90);
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+
+        app.capture_fs_nav_holdover(idx);
+
+        // Folder replacement reuses idx=0 for a different identity. The new item has a
+        // different rotation and no display texture yet, so the old unit must keep drawing.
+        app.items[idx] = crate::grid_item::GridItem::Image(PathBuf::from(r"C:\pics\new.jpg"));
+        app.fs_cache.clear();
+        app.thumbnails[idx] = ThumbnailState::Pending;
+        app.rotation_cache.clear();
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::Cw270);
+        app.items_generation = app.items_generation.wrapping_add(1);
+
+        assert_eq!(
+            app.get_rotation(idx),
+            crate::rotation_db::Rotation::Cw270,
+            "the reused index must now resolve geometry for the new item"
+        );
+        let held = app
+            .fs_nav_holdover_for_draw()
+            .expect("old display unit remains until the new texture is ready");
+        assert_eq!(held.pages.len(), 1);
+        assert_eq!(
+            held.pages[0].rotation,
+            crate::rotation_db::Rotation::Cw90,
+            "holdover geometry must be the capture-time old-item geometry"
+        );
+        assert_eq!(held.pages[0].source_size, Some(egui::vec2(400.0, 700.0)));
+    }
+
+    #[test]
+    fn capture_fs_nav_holdover_keeps_ltr_and_rtl_physical_spread_order() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = push_image(&mut app, "C:/pics/001.jpg");
+        let second = push_image(&mut app, "C:/pics/002.jpg");
+        let first_texture = ctx.load_texture(
+            "folder_nav_spread_first",
+            egui::ColorImage::filled([2, 3], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let second_texture = ctx.load_texture(
+            "folder_nav_spread_second",
+            egui::ColorImage::filled([2, 3], egui::Color32::BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        let first_texture_id = first_texture.id();
+        let second_texture_id = second_texture.id();
+        app.thumbnails[first] = ThumbnailState::Loaded {
+            tex: first_texture,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((2, 3)),
+        };
+        app.thumbnails[second] = ThumbnailState::Loaded {
+            tex: second_texture,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((2, 3)),
+        };
+        app.visible_indices = vec![first, second];
+        app.cached_nav_indices = None;
+
+        for (mode, expected_indices, expected_textures) in [
+            (
+                crate::settings::SpreadMode::Ltr,
+                vec![first, second],
+                vec![first_texture_id, second_texture_id],
+            ),
+            (
+                crate::settings::SpreadMode::Rtl,
+                vec![second, first],
+                vec![second_texture_id, first_texture_id],
+            ),
+        ] {
+            app.spread_mode = mode;
+            app.capture_fs_nav_holdover(first);
+            let FsHoldover::FolderNavigation(unit) = app
+                .fs_holdover_tex
+                .as_ref()
+                .expect("spread holdover captured")
+            else {
+                panic!("folder navigation must retain a display unit");
+            };
+            assert_eq!(
+                unit.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
+                expected_indices,
+            );
+            assert_eq!(
+                unit.pages
+                    .iter()
+                    .map(|page| page.texture.id())
+                    .collect::<Vec<_>>(),
+                expected_textures,
+            );
+        }
     }
 
     #[test]
@@ -17363,10 +17531,10 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(old_tex));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, old_tex));
 
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "新 target がまだ入る前は旧ページ holdover を使ってよい"
         );
 
@@ -17389,7 +17557,7 @@ mod favorite_adjustment_defaults_tests {
         // ここで None にすると新画像デコード完了までの数フレームが黒になり、装飾付き
         // detached window で「次のファイルへ移るたびにちらつく」症状になる。
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "新 target の表示物が未準備の間は holdover で黒を防ぐ (滑らかに繋ぐ)"
         );
 
@@ -17408,7 +17576,7 @@ mod favorite_adjustment_defaults_tests {
             source_dims: None,
         }];
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_none(),
+            app.fs_nav_holdover_for_draw().is_none(),
             "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
         );
         assert!(
@@ -17423,11 +17591,14 @@ mod favorite_adjustment_defaults_tests {
         // Reproduce the transient empty display resolution during an AI-final swap.
         // Once the new page has been selected, the old-folder holdover must not return.
         app.thumbnails = vec![ThumbnailState::Pending];
-        let resurfaced = app.fs_nav_holdover_tex_for_draw();
+        let resurfaced = app.fs_nav_holdover_for_draw();
         assert!(
             resurfaced.is_none(),
             "old holdover resurfaced after the new page was shown: old_tex_id={old_tex_id:?}, selected={:?}",
-            resurfaced.as_ref().map(egui::TextureHandle::id)
+            resurfaced
+                .as_ref()
+                .and_then(|unit| unit.pages.first())
+                .map(|page| page.texture.id())
         );
     }
 
@@ -17445,7 +17616,7 @@ mod favorite_adjustment_defaults_tests {
 
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(old_tex));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, old_tex));
         app.fullscreen_idx = None;
         app.items_generation = locked_gen + 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
@@ -17457,7 +17628,7 @@ mod favorite_adjustment_defaults_tests {
         });
 
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "deferred enumerate 中は旧ページ holdover で待機画面を維持する"
         );
     }
@@ -18178,7 +18349,7 @@ mod favorite_adjustment_defaults_tests {
             egui::TextureOptions::LINEAR,
         );
         let holdover_id = holdover.id();
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, holdover));
 
         app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
 
@@ -18265,7 +18436,7 @@ mod favorite_adjustment_defaults_tests {
         // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
         let lock_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(lock_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, dummy_tex.clone()));
 
         // ① items_generation が進んでいない (= まだナビが完了していない) →
         //    現ページが Loaded でもロック解除されない (主要バグの回帰防止)。
@@ -18284,7 +18455,7 @@ mod favorite_adjustment_defaults_tests {
         // ③ フルスクリーン抜け (fs_idx None) でも、items_generation 進行が必要。
         //    そうしないとナビ最中の close_fullscreen 経路で誤解除される。
         app.fs_nav_locked_gen = Some(app.items_generation);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, dummy_tex.clone()));
         app.fullscreen_idx = None;
         app.poll_fs_nav_lock(&ctx);
         assert!(
@@ -18321,7 +18492,7 @@ mod favorite_adjustment_defaults_tests {
         // ナビ発火時に lock + holdover を確保した状態を再現。
         let lock_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(lock_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, dummy_tex.clone()));
         // close_fullscreen → load_pdf_as_folder → placeholder install と進んで、
         // fullscreen_idx は None、items_generation は進んだが、async enumerate は
         // まだ pending という状態。
@@ -19490,8 +19661,12 @@ mod pipeline_cache_refactor_tests {
                 pages: vec![FsDisplayUnitHoldoverPage {
                     idx: page_idx,
                     texture,
+                    rotation: crate::rotation_db::Rotation::None,
+                    source_size: None,
+                    content_bbox: None,
                 }],
             },
+            started_at: std::time::Instant::now(),
         })
     }
 
@@ -21015,11 +21190,14 @@ mod pipeline_cache_refactor_tests {
                 load_seq: 1,
             },
         );
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(ctx.load_texture(
-            format!("{label}_holdover"),
-            egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
-            egui::TextureOptions::LINEAR,
-        )));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(
+            idx,
+            ctx.load_texture(
+                format!("{label}_holdover"),
+                egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+                egui::TextureOptions::LINEAR,
+            ),
+        ));
     }
 
     fn install_colorize_summary_edit_result(
@@ -26351,7 +26529,7 @@ mod still_window_mode_key_tests {
             });
             bundle.items_generation = 5;
             bundle.fs_nav_locked_gen = Some(4);
-            bundle.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
+            bundle.fs_holdover_tex = Some(single_folder_navigation_holdover(0, holdover));
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);

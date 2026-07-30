@@ -2702,7 +2702,7 @@ impl App {
         } else {
             if let Some(fs_idx) = self.fullscreen_idx {
                 self.fs_holdover_tex = self
-                    .current_fs_tex_for_holdover(fs_idx)
+                    .capture_fs_display_unit(fs_idx)
                     .map(crate::app::FsHoldover::FolderNavigation);
             }
             self.still_fullscreen_viewport_enter_suppress_until =

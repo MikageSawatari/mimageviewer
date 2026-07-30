@@ -5864,27 +5864,39 @@ pub(crate) struct ContinuousPageTransition {
 
 /// フルスクリーンの一時表示を 1 フィールドで所有する typed state。
 ///
-/// フォルダ横断は従来どおり旧ビューの単一 texture を overlay として保持する。
-/// 同一 viewer 内のカラー化待ちは、旧ページを個別 slot に分けず、画面上の
-/// 1 表示ユニット（単ページまたは見開き）を一体で保持する。
+/// フォルダ横断と同一 viewer 内のカラー化待ちは、どちらも旧ページを個別 slot に
+/// 分けず、画面上の 1 表示ユニット（単ページまたは見開き）を一体で保持する。
+/// variant は保持する理由と解放条件を分離するために維持する。
 #[derive(Clone)]
 pub(crate) enum FsHoldover {
-    FolderNavigation(egui::TextureHandle),
+    FolderNavigation(FsDisplayUnitHoldover),
     ColorizeDisplayUnit(ColorizeDisplayUnitHoldover),
 }
 
 impl FsHoldover {
-    pub(crate) fn folder_navigation_texture(&self) -> Option<&egui::TextureHandle> {
+    pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(texture) => Some(texture),
+            Self::FolderNavigation(unit) => Some(unit),
             Self::ColorizeDisplayUnit(_) => None,
+        }
+    }
+
+    pub(crate) fn colorize_wait_started_at(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::FolderNavigation(_) => None,
+            Self::ColorizeDisplayUnit(holdover) => Some(holdover.started_at),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
         match self {
-            Self::FolderNavigation(texture) => texture.id(),
+            Self::FolderNavigation(unit) => unit
+                .pages
+                .first()
+                .expect("folder navigation display unit must contain at least one page")
+                .texture
+                .id(),
             Self::ColorizeDisplayUnit(holdover) => holdover
                 .previous
                 .pages
@@ -5901,6 +5913,8 @@ pub(crate) struct ColorizeDisplayUnitHoldover {
     /// `open_fullscreen` 後にこの idx が current である間だけ previous を公開する。
     pub(crate) target_idx: usize,
     pub(crate) previous: FsDisplayUnitHoldover,
+    /// The UX delay belongs to the typed colorize wait state, not to a separate flag.
+    pub(crate) started_at: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -5911,8 +5925,14 @@ pub(crate) struct FsDisplayUnitHoldover {
 
 #[derive(Clone)]
 pub(crate) struct FsDisplayUnitHoldoverPage {
+    /// Capture-time index retained for tracing and `fullscreen_page_layout` identity only.
+    /// Geometry must never be re-derived from it because folder navigation can replace items
+    /// while the holdover remains visible.
     pub(crate) idx: usize,
     pub(crate) texture: egui::TextureHandle,
+    pub(crate) rotation: crate::rotation_db::Rotation,
+    pub(crate) source_size: Option<egui::Vec2>,
+    pub(crate) content_bbox: Option<egui::Rect>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -10798,8 +10818,8 @@ pub struct App {
     /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
     /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
-    /// 旧表示を保持する単一 typed state。`FolderNavigation` は従来どおり旧ビューの
-    /// 1 texture、`ColorizeDisplayUnit` は単ページ / 見開き全体を 1 unit として持つ。
+    /// 旧表示を保持する単一 typed state。`FolderNavigation` / `ColorizeDisplayUnit` とも
+    /// 単ページ / 見開き全体を 1 unit として持ち、variant ごとに解放条件を分離する。
     /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
     pub(crate) fs_holdover_tex: Option<FsHoldover>,
 
@@ -48017,7 +48037,7 @@ impl App {
         //   中の黒画面抑止や連続入力抑止が効かなくなるため、`poll_fs_nav_lock` 側で
         //   新ページの tex 準備、またはフルスクリーンが本当に閉じたことを確認してから
         //   解除する。実ページ描画で旧 holdover を使うかどうかは
-        //   `fs_nav_holdover_tex_for_draw` が別途判定する。
+        //   `fs_nav_holdover_for_draw` が別途判定する。
         // PDF pool の Critical 予約は v1.0.0 から常時 ON 方針なので、ここで切替えない。
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
         self.clear_meta_undo();
@@ -51444,6 +51464,7 @@ impl App {
                     ColorizeDisplayUnitHoldover {
                         target_idx: fs_idx,
                         previous,
+                        started_at: std::time::Instant::now(),
                     },
                 ));
             }

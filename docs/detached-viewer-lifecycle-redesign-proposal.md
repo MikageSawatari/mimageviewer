@@ -55,8 +55,8 @@ Phase A1/A2/B の関連ドキュメント:
 - **手術-2 (BA-2)**: detached の inactive builder
   (`build_inactive_fullscreen_viewport_builder`) は **host 未捕捉 (= 新規生成相当) のときだけ**
   placement を seed する。既存 window へは geometry を触らない。
-- **手術-2b (BA-2 + 内容ブリッジ)**: `fs_nav_holdover_tex_for_draw` は新 idx の表示物
-  (full / サムネ) が用意できる / デコード失敗が確定するまで holdover (前フレーム) を維持し、
+- **手術-2b (BA-2 + 内容ブリッジ)**: `fs_nav_holdover_for_draw` は新 idx の表示物
+  (full / サムネ) が用意できる / デコード失敗が確定するまで holdover (前の単ページ / 見開き unit) を維持し、
   folder-nav の数フレームが黒にならないようにする。`poll_fs_nav_lock` は Failed でも lock 解放。
 - **手術-3 (BA-4 の folder-nav 部分、実機動画 2026-06-28 で確定)**: detached + 「常に別ウィンドウ」
   モードで folder-nav (Ctrl+↑↓) すると、`load_folder → start_loading_items` が new items 導入前に
