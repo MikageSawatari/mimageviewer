@@ -24,6 +24,10 @@ pub struct VersionHighlights {
     pub highlights: &'static [HighlightItem],
 }
 
+/// 一覧のクリック選択をエクスプローラー方式へ切り替える告知エントリの版。
+/// テーブルと移行判定が別々の版文字列を持たないための単一の定義元。
+pub const GRID_CLICK_SELECTION_EXPLORER_VERSION: &str = "2.9.0";
+
 /// バージョン文字列を `(major, minor, patch)` に緩くパースする。
 /// `v` 接頭辞と `-pre` / `+meta` 接尾辞は無視する。パースできなければ `None`
 /// (= 呼び出し側は fail-safe にスキップする)。
@@ -82,6 +86,14 @@ pub fn highlights_to_show<'a>(
         .collect();
     out.sort_by_key(|e| parse_version(e.version).unwrap_or((0, 0, 0)));
     out
+}
+
+/// v2.9.0 の告知と同じ更新範囲に入った初回起動かを返す。
+/// 独自の版比較は持たず、実際に表示対象となるエントリ集合から直接導出する。
+pub fn grid_click_selection_explorer_upgrade_required(prev: Option<&str>, current: &str) -> bool {
+    highlights_to_show(prev, current, table())
+        .iter()
+        .any(|entry| entry.version == GRID_CLICK_SELECTION_EXPLORER_VERSION)
 }
 
 /// 指定バージョン (= 通常は現行版) のエントリを返す。ヘルプメニューからの再表示用。
@@ -424,6 +436,16 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: GRID_CLICK_SELECTION_EXPLORER_VERSION,
+        must_read: &[HighlightItem {
+            title: "クリックで以前のチェックを解除します",
+            body: "一覧で項目をクリックすると、それまでのチェックが解除され、クリックした項目だけが\
+                   選ばれるようになりました（エクスプローラーと同じ動作）。従来の動作に戻すには、\
+                   環境設定の「表示 → サムネイル → 一覧のクリック選択」で「チェック方式」を選べます。",
+        }],
+        highlights: &[],
+    },
 ];
 
 #[cfg(test)]
@@ -543,6 +565,43 @@ mod tests {
             Some("2.2.0")
         );
         assert_eq!(latest_not_newer_than("garbage", T).map(|e| e.version), None);
+    }
+
+    #[test]
+    fn v2_9_grid_selection_upgrade_uses_the_highlight_selection_condition() {
+        for (prev, current) in [
+            (None, "2.9.0"),
+            (Some("2.8.0"), "2.8.1"),
+            (Some("2.8.0"), "2.9.0"),
+            (Some("2.8.0"), "3.0.0"),
+            (Some("2.9.0"), "3.0.0"),
+            (Some("3.0.0"), "2.9.0"),
+            (Some("invalid"), "2.9.0"),
+        ] {
+            let highlight_selected = highlights_to_show(prev, current, table())
+                .iter()
+                .any(|entry| entry.version == GRID_CLICK_SELECTION_EXPLORER_VERSION);
+            assert_eq!(
+                grid_click_selection_explorer_upgrade_required(prev, current),
+                highlight_selected,
+                "prev={prev:?}, current={current}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_9_0_must_read_entry() {
+        let entries = for_version(GRID_CLICK_SELECTION_EXPLORER_VERSION, table());
+        assert_eq!(versions(&entries), [GRID_CLICK_SELECTION_EXPLORER_VERSION]);
+        let entry = entries[0];
+        assert_eq!(entry.must_read.len(), 1);
+        assert!(entry.must_read[0].title.contains("チェックを解除"));
+        assert!(
+            entry.must_read[0]
+                .body
+                .contains("エクスプローラーと同じ動作")
+        );
+        assert!(entry.must_read[0].body.contains("チェック方式"));
     }
 
     #[test]

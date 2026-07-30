@@ -477,8 +477,8 @@ impl GridViewMode {
 /// 既存動作の `Check` へ正規化する。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GridClickSelectionMode {
-    #[default]
     Check,
+    #[default]
     Explorer,
     #[serde(other)]
     Unknown,
@@ -5778,6 +5778,24 @@ impl Settings {
         Self::load_with_meta().settings
     }
 
+    /// v2.9.0 の「重要な変更点」が表示対象になる更新で、クリック選択方式を一度だけ
+    /// Explorer へ切り替える。判定は告知エントリ集合から導出し、独自の版比較を持たない。
+    fn migrate_grid_click_selection_to_explorer(
+        &mut self,
+        previous_last_seen_version: Option<&str>,
+        current_version: &str,
+    ) -> bool {
+        if !crate::version_highlights::grid_click_selection_explorer_upgrade_required(
+            previous_last_seen_version,
+            current_version,
+        ) {
+            return false;
+        }
+        let changed = self.grid_click_selection_mode != GridClickSelectionMode::Explorer;
+        self.grid_click_selection_mode = GridClickSelectionMode::Explorer;
+        changed
+    }
+
     /// `Settings::load()` と同じロードを行い、起動経路など load-time の判定材料も返す。
     ///
     /// 通常は `load()` を使う。main thread の起動処理だけが、リリース済み入力挙動の
@@ -5870,6 +5888,10 @@ impl Settings {
         // - 旧版は `settings.json` を `settings.json.preupgrade-v<old>` に std::fs::copy
         // - 新版は `settings.db` を `settings.db.preupgrade-v<old>` に `VACUUM INTO` snapshot
         let current_version = env!("CARGO_PKG_VERSION");
+        let grid_click_selection_mode_migrated = settings.migrate_grid_click_selection_to_explorer(
+            previous_last_seen_version.as_deref(),
+            current_version,
+        );
         let prev_version = settings.last_seen_version.clone();
         let version_changed = prev_version.as_deref() != Some(current_version);
         if version_changed && db_loaded {
@@ -5917,6 +5939,7 @@ impl Settings {
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || mouse_nav_clean_install_defaulted
+            || grid_click_selection_mode_migrated
             || legacy_keymap_import.changed
             || version_changed;
         let bootstrap_saved = if bootstrap_save_needed {
@@ -7087,17 +7110,87 @@ mod tests {
     }
 
     #[test]
-    fn grid_click_selection_mode_defaults_to_check() {
+    fn grid_click_selection_mode_defaults_to_explorer() {
         assert_eq!(
             Settings::default().grid_click_selection_mode,
-            GridClickSelectionMode::Check
+            GridClickSelectionMode::Explorer
         );
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(
             loaded.grid_click_selection_mode,
-            GridClickSelectionMode::Check,
-            "旧設定でフィールドが欠けていても従来のチェック方式を維持する"
+            GridClickSelectionMode::Explorer,
+            "新規インストールとフィールド欠落時はエクスプローラー方式を使う"
         );
+    }
+
+    #[test]
+    fn pre_v2_9_upgrade_switches_grid_click_selection_to_explorer() {
+        let mut settings = Settings::default();
+        settings.grid_click_selection_mode = GridClickSelectionMode::Check;
+
+        assert!(settings.migrate_grid_click_selection_to_explorer(Some("2.8.9"), "2.9.0"));
+        assert_eq!(
+            settings.grid_click_selection_mode,
+            GridClickSelectionMode::Explorer
+        );
+    }
+
+    #[test]
+    fn v2_9_or_newer_previous_version_preserves_user_grid_selection_choice() {
+        for (previous, current) in [("2.9.0", "2.9.1"), ("3.0.0", "3.1.0")] {
+            let mut settings = Settings::default();
+            settings.grid_click_selection_mode = GridClickSelectionMode::Check;
+
+            assert!(!settings.migrate_grid_click_selection_to_explorer(Some(previous), current));
+            assert_eq!(
+                settings.grid_click_selection_mode,
+                GridClickSelectionMode::Check,
+                "previous={previous}, current={current}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_selection_upgrade_runs_only_once_after_user_restores_check_mode() {
+        let mut settings = Settings::default();
+        settings.grid_click_selection_mode = GridClickSelectionMode::Check;
+        assert!(settings.migrate_grid_click_selection_to_explorer(Some("2.8.0"), "2.9.0"));
+
+        settings.grid_click_selection_mode = GridClickSelectionMode::Check;
+        assert!(!settings.migrate_grid_click_selection_to_explorer(Some("2.9.0"), "2.9.0"));
+        assert_eq!(
+            settings.grid_click_selection_mode,
+            GridClickSelectionMode::Check
+        );
+    }
+
+    #[test]
+    fn grid_selection_upgrade_condition_matches_v2_9_highlight_condition() {
+        for (previous, current) in [
+            (None, "2.9.0"),
+            (Some("2.8.0"), "2.8.1"),
+            (Some("2.8.0"), "2.9.0"),
+            (Some("2.8.0"), "3.0.0"),
+            (Some("2.9.0"), "3.0.0"),
+            (Some("3.0.0"), "2.9.0"),
+        ] {
+            let highlight_selected = crate::version_highlights::highlights_to_show(
+                previous,
+                current,
+                crate::version_highlights::table(),
+            )
+            .iter()
+            .any(|entry| {
+                entry.version == crate::version_highlights::GRID_CLICK_SELECTION_EXPLORER_VERSION
+            });
+            let mut settings = Settings::default();
+            settings.grid_click_selection_mode = GridClickSelectionMode::Check;
+            let migrated = settings.migrate_grid_click_selection_to_explorer(previous, current);
+            assert_eq!(
+                migrated, highlight_selected,
+                "previous={previous:?}, current={current}"
+            );
+        }
     }
 
     #[test]
