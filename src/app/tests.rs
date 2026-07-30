@@ -25907,6 +25907,27 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
+    fn install_playing_test_media(app: &mut App, idx: usize, path: PathBuf, position_secs: f64) {
+        let player = crate::video::VideoPlayer::disconnected_for_test(path, position_secs);
+        player.set_playing(true);
+        assert!(player.intent_playing());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+    }
+
+    fn assert_test_media_paused_at(app: &App, idx: usize, position_secs: f64) {
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
+            panic!("test media player was dropped");
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), position_secs);
+    }
+
     fn parked_bundle_snapshot(
         ctx: &egui::Context,
         id: u64,
@@ -30711,6 +30732,199 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn tray_hide_pauses_mounted_video_presentations_and_resumes_from_same_position() {
+        for (case, presentation) in [
+            ("fullscreen", ViewerPresentation::Fullscreen),
+            ("in_window", ViewerPresentation::MainWindow),
+            ("f12", ViewerPresentation::DetachedWindow),
+        ] {
+            let mut app = setup_app();
+            let path = app.tmp.path().join(format!("tray-{case}.mp4"));
+            let video = push_video(&mut app, path.to_str().unwrap());
+            app.fullscreen_idx = Some(video);
+            app.selected = Some(video);
+            app.viewer_presentation = presentation;
+            if matches!(presentation, ViewerPresentation::DetachedWindow) {
+                app.detached_viewer_window_id = Some(200);
+            }
+            install_playing_test_media(&mut app, video, path.clone(), 30.0);
+
+            assert!(app.pause_media_playback_for_tray());
+            assert_test_media_paused_at(&app, video, 30.0);
+            assert_eq!(app.fullscreen_idx, Some(video));
+            assert_eq!(app.viewer_presentation, presentation);
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&crate::adjustment_db::normalize_path(&path)),
+                Some(&30.0)
+            );
+
+            let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&video) else {
+                unreachable!();
+            };
+            player.set_playing(true);
+            assert!(player.intent_playing());
+            assert_eq!(player.position(), 30.0, "{case} must resume in place");
+        }
+    }
+
+    #[test]
+    fn tray_hide_pauses_video_audio_mode_and_standalone_music() {
+        for (case, standalone_audio) in [("video_audio_mode", false), ("music", true)] {
+            let mut app = setup_app();
+            let extension = if standalone_audio { "flac" } else { "mp4" };
+            let path = app.tmp.path().join(format!("tray-{case}.{extension}"));
+            let media = if standalone_audio {
+                push_audio(&mut app, path.to_str().unwrap())
+            } else {
+                push_video(&mut app, path.to_str().unwrap())
+            };
+            app.fullscreen_idx = Some(media);
+            app.selected = Some(media);
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            if !standalone_audio {
+                app.video_audio_mode = Some(media);
+            }
+            install_playing_test_media(&mut app, media, path.clone(), 42.0);
+
+            assert!(app.pause_media_playback_for_tray());
+            assert_test_media_paused_at(&app, media, 42.0);
+            assert_eq!(
+                app.video_audio_mode,
+                (!standalone_audio).then_some(media),
+                "{case} mode must remain intact while paused"
+            );
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&crate::adjustment_db::normalize_path(&path)),
+                Some(&42.0)
+            );
+
+            let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&media) else {
+                unreachable!();
+            };
+            player.set_playing(true);
+            assert!(player.intent_playing());
+            assert_eq!(player.position(), 42.0, "{case} must resume in place");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_hide_pauses_active_and_parked_detached_media_contexts() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let active_path = PathBuf::from(r"C:\clips\tray-active.mp4");
+        let parked_path = PathBuf::from(r"C:\clips\tray-parked.mp4");
+
+        let mut active = ViewerContextBundle::empty();
+        active.items.push(GridItem::Video(active_path.clone()));
+        active.fullscreen_idx = Some(0);
+        let active_player =
+            crate::video::VideoPlayer::disconnected_for_test(active_path.clone(), 51.0);
+        active_player.set_playing(true);
+        active.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(active_player),
+                load_seq: 0,
+            },
+        );
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: active });
+
+        let mut parked = ViewerContextBundle::empty();
+        parked.items.push(GridItem::Video(parked_path.clone()));
+        parked.fullscreen_idx = Some(0);
+        let parked_player =
+            crate::video::VideoPlayer::disconnected_for_test(parked_path.clone(), 63.0);
+        parked_player.set_playing(true);
+        parked.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(parked_player),
+                load_seq: 0,
+            },
+        );
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 201, parked));
+
+        assert!(
+            !app.pause_media_playback_for_tray(),
+            "the return value describes the mounted context only"
+        );
+        let active = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+            unreachable!();
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), 51.0);
+        let parked = app.detached_image_windows[0]
+            .paused_bundle
+            .as_deref()
+            .unwrap();
+        let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
+            unreachable!();
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), 63.0);
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&active_path)),
+            Some(&51.0)
+        );
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&parked_path)),
+            Some(&63.0)
+        );
+    }
+
+    #[test]
+    fn tray_restore_main_focus_does_not_close_media_paused_on_hide() {
+        for (case, standalone_audio, audio_mode) in [
+            ("video", false, false),
+            ("video_audio_mode", false, true),
+            ("music", true, false),
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let extension = if standalone_audio { "flac" } else { "mp4" };
+            let path = app
+                .tmp
+                .path()
+                .join(format!("tray-restore-{case}.{extension}"));
+            let media = if standalone_audio {
+                push_audio(&mut app, path.to_str().unwrap())
+            } else {
+                push_video(&mut app, path.to_str().unwrap())
+            };
+            app.fullscreen_idx = Some(media);
+            app.selected = Some(media);
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            app.video_audio_mode = audio_mode.then_some(media);
+            app.fs_viewport_shown = true;
+            app.fs_focus_grace_elapsed = true;
+            install_playing_test_media(&mut app, media, path, 75.0);
+
+            assert!(app.pause_media_playback_for_tray());
+            app.window_visible = false;
+            app.sync_after_restore(&ctx);
+            app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(media),
+                "{case} must not be closed on the restore frame"
+            );
+            assert_test_media_paused_at(&app, media, 75.0);
+        }
+    }
+
+    #[test]
     #[cfg(windows)]
     fn tray_restore_external_refresh_preserves_detaching_video_session() {
         let mut app = setup_app();
@@ -30749,7 +30963,7 @@ mod still_window_mode_key_tests {
         app.window_visible = false;
 
         assert!(app.viewer_session_is_detached_or_switching());
-        app.sync_after_restore();
+        app.sync_after_restore(&ctx);
         app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
 
         assert!(app.window_visible);
@@ -30802,7 +31016,7 @@ mod still_window_mode_key_tests {
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
-        app.sync_after_restore();
+        app.sync_after_restore(&ctx);
         app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
 
         assert!(app.window_visible);
@@ -30847,7 +31061,7 @@ mod still_window_mode_key_tests {
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
-        app.sync_after_restore();
+        app.sync_after_restore(&ctx);
         app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
 
         assert_eq!(app.fullscreen_idx, Some(video));
@@ -30865,7 +31079,7 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         app.window_visible = false;
 
-        app.sync_after_restore();
+        app.sync_after_restore(&ctx);
         app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
 
         assert!(app.window_visible);

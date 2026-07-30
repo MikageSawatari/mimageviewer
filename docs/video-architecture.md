@@ -1574,30 +1574,30 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   D3D11 device 自体は残しつつ、`hw_frames_pool`、`in_use=false` の `shared_output_pool` slot、
   `processor_cache` を解放する。次回動画再生時は通常の acquire 経路で lazy に再作成される。
   VST3 bridge / plugin chain は停止しない。
-- **タスクトレイ常駐と detached session**: 通常の fullscreen / in-window session は格納時に
-  `close_fullscreen()` へ流すが、確定済み detached session と detached への placement switch 中は
-  `viewer_session_is_detached_or_switching()` を共通の維持述語として decoder / audio / clock / native
-  output を保持する。復帰時の `check_external_folder_changes()` が items を再構築する場合も、
-  `start_loading_items()` の main-context change 境界が同じ述語から detached media context への
-  promotion を決定する。これにより外部追加・削除はメイン一覧へ従来どおり反映しつつ、保持した
-  `VideoPlayer` と進行中の typed placement request / completion は drop しない。動画→音声モードと
-  detached 音声ファイルも同じ media context ownership に従う。
-- **トレイ復帰フレームの close 経路**: `sync_after_restore()` 先頭の smart-folder editor 遅延確定は
-  presentation 更新または非同期 scan / prepare の開始までで、同期的には session を閉じない。後者の
-  完了時の items 導入は `start_loading_items_inner()` の同じ context promotion 境界へ合流する。
-  同期的に session close へ到達し得るのは上記の外部フォルダ再読込だけである。同じ update の後段では、
-  focus-edge の外部変更確認と folder watcher も同じ再読込境界へ合流し、thumbnail queue 更新は items / viewer
-  lifecycle を変更しない。続いて Win32 `ShowWindow` が main
-  viewport に与えた focus を `reconcile_fullscreen_after_main_focus()` が処理する。この consumer も
-  `current_viewer_session_is_detached_or_switching()` を使い、確定前で `viewer_presentation` が旧
-  fullscreen のままでも、detached host 待ち / placement switch 中を close しない。App-global の
-  `viewer_session_is_detached_or_switching()` は別の active detached context も含むが、main focus 判定は
-  current context だけを見るため、別メディア窓と同時に開いた main fullscreen は従来どおり block
-  する。`poll_video()` の close は明示 close event または native output の terminal close、
-  `cleanup_visible_false` は `fullscreen_idx=None` が既に成立した後の terminal consumer であり、復帰
-  自体を close に変換する producer ではない。cleanup ログの `host=hwnd=0` はログ出力前に
-  `finish_active_detached_session_close()` が runtime を除去した結果なので、それ自体を host-loss 判定に
-  使わない。
+- **タスクトレイ格納時の media pause**: `hide_to_tray()` は Win32 `SW_HIDE` より前に、mounted
+  context、active detached context、全 ParkedLive bundle が所有する既存 `FsCacheEntry::Video` を走査する。
+  再生 intent がある `VideoPlayer` へ `set_playing(false)` を送り、engine transport、音声出力、clock を
+  一緒に pause する。動画、動画→音声モード、単体音楽ファイルは同じ owner / pause 経路を通る。
+  live player の clock / 最終表示 PTS を保持したまま `video_resume_positions` にも保存するため、復帰後の
+  Play は同じ位置から始まる。tray 専用 bool は持たず、自動再生もしない。
+- **tray residency 中の session / cache ownership**: mounted context で再生中だった session は pause 済みの
+  `VideoPlayer` / native output として保持し、それ以外の画像 texture cache は解放する。格納前から再生して
+  いなかった通常 fullscreen / in-window session の close は従来どおり。detached / switching context は
+  既存 lifecycle predicate どおり active / ParkedLive owner に残すが、再生継続ではなく pause 済みである。
+  process-wide D3D11 device と VST3 bridge / plugin chain は残し、idle GPU pool は
+  `GpuVideoDevice::release_idle_pools()` で解放する。
+- **トレイ復帰フレームの close 経路**: `sync_after_restore(ctx)` は Play を送らない。mounted fullscreen media
+  が残っている場合は既存の focus grace / `restore_fullscreen_focus_from_main()` で surface の focus / raise
+  だけを再要求し、同じフレームの main-focus guard が `close_fullscreen()` を実行する競合を避ける。
+  復帰時の `check_external_folder_changes()` が items を再構築する場合は、
+  `start_loading_items()` の main-context change 境界が既存の
+  `viewer_session_is_detached_or_switching()` から detached media context への promotion を決定する。
+  main-focus consumer も `current_viewer_session_is_detached_or_switching()` を使うため、host 待ち / placement
+  switch 中の paused session と typed request を閉じない。これらは前 2 件の lifecycle 述語統一を保つための
+  context ownership であり、トレイ中の再生維持を意味しない。`poll_video()` の close は明示 close event または
+  native output の genuine terminal close に限り、tray restore 自体は terminal producer にならない。
+  `cleanup_visible_false` の `host=hwnd=0` は、ログ出力前に runtime を除去した後の値であり、host-loss 判定には
+  使用しない。
 - **NativeWindowHost / NativeRenderCore** (= `VideoPlayer::open` 時に 1 組生成、`VideoPlayer` Drop で停止):
   `native-video-window-pump` 上の host が presenter/HUD HWND と USER32 lifecycle、
   `native-video-render` 上の core が D3D11 swap chain + DComp/GPU resource を所有する。

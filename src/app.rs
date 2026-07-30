@@ -7502,6 +7502,21 @@ fn viewer_context_media_teardown_plan(
 }
 
 #[cfg(windows)]
+fn pause_viewer_context_bundle_media_for_tray(bundle: &ViewerContextBundle) -> usize {
+    let mut paused = 0;
+    for entry in bundle.fs_cache.values() {
+        let FsCacheEntry::Video { player, .. } = entry else {
+            continue;
+        };
+        if player.intent_playing() {
+            player.set_playing(false);
+            paused += 1;
+        }
+    }
+    paused
+}
+
+#[cfg(windows)]
 fn apply_viewer_context_media_resume_updates(
     map: &mut std::collections::HashMap<String, f64>,
     updates: &[ViewerContextMediaResumeUpdate],
@@ -33630,6 +33645,30 @@ impl App {
         }
     }
 
+    /// トレイ復帰イベントで、保持中の通常 fullscreen media surface を再び前面化する。
+    /// tray 専用の状態は持たず、現在 mount されている media owner だけを見る。
+    /// 再生 transport には触れないため、格納時に pause した intent と位置はそのまま残る。
+    pub(crate) fn restore_media_surface_after_tray(&mut self, ctx: &egui::Context) {
+        if self.current_viewer_session_is_detached_or_switching()
+            || !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
+        {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        if !matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. })) {
+            return;
+        }
+
+        // ShowWindow(main) の直後は fullscreen/native surface への Focus/raise が非同期で
+        // 反映される。open 直後と同じ既存 grace を再始動して、その反映前に main-focus
+        // guard が session を閉じないようにする。
+        self.fs_focus_grace_elapsed = false;
+        self.fs_opened_at = Some(std::time::Instant::now());
+        self.restore_fullscreen_focus_from_main(ctx);
+    }
+
     fn main_window_should_draw_export_dialogs(&self) -> bool {
         !self.viewer_session_blocks_main_window() && !self.viewer_session_is_detached_or_switching()
     }
@@ -35616,6 +35655,24 @@ impl App {
                 );
             }
         }
+    }
+
+    /// トレイ格納時に mount 外の active detached / ParkedLive media transport も止める。
+    /// bundle が所有する既存 VideoPlayer だけを対象にし、detached runtime は変更しない。
+    #[cfg(windows)]
+    pub(crate) fn pause_detached_media_playback_for_tray(&self) -> usize {
+        let active = self
+            .active_detached_viewer_context
+            .as_ref()
+            .map(|active| pause_viewer_context_bundle_media_for_tray(&active.bundle))
+            .unwrap_or(0);
+        let parked = self
+            .detached_image_windows
+            .iter()
+            .filter_map(|window| window.paused_bundle.as_deref())
+            .map(pause_viewer_context_bundle_media_for_tray)
+            .sum::<usize>();
+        active + parked
     }
 
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
@@ -60214,7 +60271,7 @@ impl eframe::App for App {
                     crate::logger::log(
                         "tray: detected external ShowWindow — running sync_after_restore",
                     );
-                    self.sync_after_restore();
+                    self.sync_after_restore(ctx);
                 } else if !is_visible_now && self.window_visible {
                     let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
                     self.window_visible = false;
@@ -60232,7 +60289,7 @@ impl eframe::App for App {
 
             // 設定変更反映 + メニューイベントをポーリング + 閉じるボタンの乗っ取り。
             self.sync_tray_with_settings(ctx);
-            self.poll_tray_events();
+            self.poll_tray_events(ctx);
             if self.maybe_intercept_close(ctx) {
                 return;
             }

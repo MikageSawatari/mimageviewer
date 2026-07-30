@@ -535,11 +535,11 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   Enter / ダブルクリックなどの明示 open で再表示する。既に同じ項目を表示中の場合、メイン一覧側の
   Enter は再オープンせず、必要に応じて別ウィンドウを前面化する。F12 linked の見開き表示中は、同時表示中の相方ページが
   メイン一覧の可視範囲内にある場合だけ破線のサブカーソルを描画する。
-  タスクトレイ常駐へ格納したときは、確定済みまたは切替中の detached session を閉じず、動画 / 音声の
-  decoder、音声出力、native presenter を維持する。復帰時に現在フォルダの外部変更を反映する場合も、同じ
-  detached lifecycle 判定で再生 context をメイン一覧から切り離してから items を更新し、再生を継続する。
-  detached host の登録待ち / placement switch 中に復帰した場合も、`ShowWindow` でメイン窓へ一時的に
-  focus が来たことを一覧へ戻る操作とは扱わず、再生 session と切替要求を維持する。
+  タスクトレイ常駐へ格納したときは、確定済み / 切替中を含む detached session の動画・音声も格納前に
+  pause する。active / ParkedLive context と再生位置は保持し、復帰後に Play を押すと同じ位置から再開する
+  (自動再生はしない)。復帰時に現在フォルダの外部変更を反映する場合も、既存 detached lifecycle 判定で
+  paused media context をメイン一覧から切り離してから items を更新する。detached host の登録待ち /
+  placement switch 中に `ShowWindow` でメイン窓へ一時的に focus が来ても、session と切替要求を閉じない。
 - **ビューワモードの複数ウィンドウ設定**: 通常画像 / ZIP 内画像 / PDF ページは、開くたびに
   現在の active 画像ビューアを表示専用の別ウィンドウとして残し、
   次の画像を新しい active 別ウィンドウで開く。動画 / 音声は複数窓化せず、専用のメディア別ウィンドウを再利用する。
@@ -1560,7 +1560,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、長尺では約 10 分ぶん測れた時点で仮 gain により再生を開始、確定値が出たら DB 保存して数秒かけて gain を追従する。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
-| `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。通常の動画 / フルスクリーンセッションは終了経路で閉じ、再生位置を保存して動画デコーダ・音声出力・native presenter・アイドル状態の GPU 動画プールなどを解放する。確定済みまたは切替中の detached session は例外として再生資源を維持し、復帰時の外部フォルダ変更も session を detached context へ退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても、host 待ち / placement switch 中の session は閉じない。VST3 プラグインチェーンは停止しない |
+| `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。格納前に通常 fullscreen / in-window / F12 別窓 / ParkedLive の動画、動画→音声モード、単体音楽を同じ transport 経路で pause し、再生位置を保存する。再生中だった session は player / native output を保持し、復帰後の Play で同じ位置から再開する (自動再生なし)。格納前から再生していなかった通常 session の close は従来どおり。detached / switching session は paused context と typed placement request を維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。画像 texture とアイドル GPU 動画プールは解放し、VST3 プラグインチェーンは停止しない |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |
