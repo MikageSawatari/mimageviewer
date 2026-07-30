@@ -706,6 +706,12 @@ tests。
 > `FramePresentationState` が paused grade refresh / placement prime の共通 source になり、
 > re-arm 用 `AcquireSync` は追加せず producer-side key recovery へ接続した。これは Stage 6 の
 > source/EOF/device-loss 全 lifecycle hardening が完了したことを意味しない。
+>
+> 2026-07-30 追記: hidden consume-and-hold の frame drain slice も先行修正した。hidden は
+> visible の pacing queue cap を使わず、到着済み frame を全件消費して最新 1 枚だけを typed
+> `Hidden` state に残す。これにより video decoder が demux EOF まで進む。window lifecycle、
+> source generation、EOF policy は結合せず、Stage 6 の全 sequence / failure hardening は引き続き
+> 未完了である。
 
 ### Stage 7: legacy path 除去、health detection、最終実機 gate
 

@@ -1869,6 +1869,26 @@ fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFr
     queue.clear();
 }
 
+/// Hidden native presenters do not pace frames against the display clock. Drain both the
+/// already-paced queue and the decoder channel so the decoder can continue through demux EOF.
+///
+/// `drained` is caller-owned scratch storage; production reuses it for the lifetime of the
+/// presenter thread. The caller still validates seek serials and reduces the batch to the one
+/// latest `FramePresentationState::Hidden` owner.
+#[cfg(any(windows, test))]
+fn drain_hidden_available_frames<F>(
+    queue: &mut std::collections::VecDeque<F>,
+    receiver: &crossbeam_channel::Receiver<F>,
+    drained: &mut Vec<F>,
+) -> usize {
+    drained.clear();
+    drained.extend(queue.drain(..));
+    while let Ok(frame) = receiver.try_recv() {
+        drained.push(frame);
+    }
+    drained.len()
+}
+
 // Fence-stall fallback cap. The shared pool also retains at most one typed
 // Visible/Hidden frame, so retire stays bounded independently of the current
 // presentation owner.
@@ -2683,12 +2703,14 @@ fn run_native_video_output(
     /// pool / cache 合算で adapter memory が枯渇し wgpu OOM していた。queue を 8 で
     /// cap し、超えたら decoder 側に back-pressure を返す (= video_tx (cap=8) が満杯に
     /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
-    /// 30fps で約 270ms 分 = pacing 上は十分。
+    /// 30fps で約 270ms 分 = pacing 上は十分。これは visible の display pacing 専用で、
+    /// hidden は EOF まで decoder を進めるため全件 drain する。
     const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
     // Inc 7 hidden presenter (動画→音声モード): `SetWindowVisible{visible:false}` で
     // presenter を「consume-and-hold」モードに入れる。hidden 中は present() を呼ばず、
     // typed state の `Hidden` が最新フレームを 1 枚だけ所有する。
     let mut presenter_hidden = false;
+    let mut hidden_frame_scratch = Vec::with_capacity(MAX_NATIVE_SOURCE_QUEUE.saturating_mul(2));
     emit_native_vram_trace(
         "native_presenter_started",
         "after_presenter_init",
@@ -4068,28 +4090,61 @@ fn run_native_video_output(
             source.pending_first_frame_event = None;
             source.last_present_source_pts = None;
         }
-        // `video_rx` を drain して `source.queue` に積む。Codex 助言 (2026-05-15) で、
-        // queue が `MAX_NATIVE_SOURCE_QUEUE` を超えた時点で drain を **停止**する。
-        // 旧コードは `video_rx` を空になるまで drain して queue を 23 frame まで
-        // 肥大化させ、shared pool + cache + retired_video_surfaces 合算で adapter memory
-        // を枯渇させ wgpu OOM を発生させていた。drain を止めると `video_tx` (cap=8) が
-        // 満杯になり、decoder 側で `try_send` 失敗 → 古い frame を drop または park
-        // することで自然な back-pressure が成立する。
-        while source.queue.len() < MAX_NATIVE_SOURCE_QUEUE {
-            let Ok(frame) = source.video_rx.try_recv() else {
-                break;
-            };
-            if frame.seek_serial < clock_serial {
-                native_reset_unpresented_frame(frame);
-                continue;
+        let mut latest_hidden_frame: Option<VideoFrame> = None;
+        if presenter_hidden {
+            // A hidden presenter has no display pacing consumer. Applying the visible queue cap
+            // here fills both source.queue and decoder video_tx, preventing the video decoder
+            // from reaching demux EOF while audio and the wall clock keep advancing. Drain every
+            // frame already available and reduce the batch to the newest valid frame; the typed
+            // Hidden state remains the sole long-lived owner.
+            drain_hidden_available_frames(
+                &mut source.queue,
+                &source.video_rx,
+                &mut hidden_frame_scratch,
+            );
+            for frame in hidden_frame_scratch.drain(..) {
+                if frame.seek_serial < clock_serial {
+                    native_reset_unpresented_frame(frame);
+                    continue;
+                }
+                if frame.seek_serial > source.last_seen_serial {
+                    if let Some(previous) = latest_hidden_frame.take() {
+                        native_reset_unpresented_frame(previous);
+                    }
+                    source.last_seen_serial = frame.seek_serial;
+                    source.first_frame_event_last_epoch = None;
+                    source.pending_first_frame_event = None;
+                    source.last_present_source_pts = None;
+                }
+                if let Some(previous) = latest_hidden_frame.replace(frame) {
+                    native_reset_unpresented_frame(previous);
+                }
             }
-            if frame.seek_serial > source.last_seen_serial {
-                native_drain_unpresented_queue(&mut source.queue);
-                source.last_seen_serial = frame.seek_serial;
-                source.first_frame_event_last_epoch = None;
-                source.pending_first_frame_event = None;
-                source.last_present_source_pts = None;
+        } else {
+            // Visible playback remains display-paced. Stop draining when source.queue reaches
+            // `MAX_NATIVE_SOURCE_QUEUE`: this bounds shared GPU-frame ownership and lets the
+            // decoder's existing full-channel policy provide back-pressure.
+            while source.queue.len() < MAX_NATIVE_SOURCE_QUEUE {
+                let Ok(frame) = source.video_rx.try_recv() else {
+                    break;
+                };
+                if frame.seek_serial < clock_serial {
+                    native_reset_unpresented_frame(frame);
+                    continue;
+                }
+                if frame.seek_serial > source.last_seen_serial {
+                    native_drain_unpresented_queue(&mut source.queue);
+                    source.last_seen_serial = frame.seek_serial;
+                    source.first_frame_event_last_epoch = None;
+                    source.pending_first_frame_event = None;
+                    source.last_present_source_pts = None;
+                }
+                source.queue.push_back(frame);
             }
+        }
+        if let Some(frame) = latest_hidden_frame {
+            debug_assert!(presenter_hidden);
+            debug_assert!(source.queue.is_empty());
             source.queue.push_back(frame);
         }
 
@@ -4147,7 +4202,11 @@ fn run_native_video_output(
                 ],
             );
         }
-        if !source.clock.is_playing() && !source.clock.is_seeking() && !waiting_for_first_frame {
+        if !presenter_hidden
+            && !source.clock.is_playing()
+            && !source.clock.is_seeking()
+            && !waiting_for_first_frame
+        {
             source.last_present_wall = None;
             source.last_present_source_pts = None;
             // message 対応待機: 一時停止中でもリサイズ等のメッセージで即起床する。
@@ -4164,15 +4223,26 @@ fn run_native_video_output(
                 seek_serial: f.seek_serial,
             })
             .collect();
-        let selection = frame_selection::select_frame_for_present(
-            &candidates,
-            now,
-            source.clock.current_seek_serial(),
-            source.last_seen_serial,
-            waiting_for_first_frame,
-            source.clock.is_seeking(),
-            clock::DISPLAY_LEAD_TOLERANCE_SECS,
-        );
+        let selection = if presenter_hidden {
+            frame_selection::FrameSelection {
+                actions: if candidates.is_empty() {
+                    Vec::new()
+                } else {
+                    debug_assert_eq!(candidates.len(), 1);
+                    vec![frame_selection::PopAction::Display]
+                },
+            }
+        } else {
+            frame_selection::select_frame_for_present(
+                &candidates,
+                now,
+                source.clock.current_seek_serial(),
+                source.last_seen_serial,
+                waiting_for_first_frame,
+                source.clock.is_seeking(),
+                clock::DISPLAY_LEAD_TOLERANCE_SECS,
+            )
+        };
         drop(candidates);
         let mut latest_renderable: Option<VideoFrame> = None;
         let mut late_drop_delta = 0u32;
@@ -4708,6 +4778,12 @@ fn frame_step_waiting_for_display(
     pending_step_base.is_some()
         && issued_display_seq != FRAME_STEP_NO_PENDING_SEQ
         && issued_display_seq == current_display_seq
+}
+
+fn eof_freeze_position(known_duration_secs: Option<f64>, current_secs: f64) -> f64 {
+    known_duration_secs
+        .filter(|duration| *duration > 0.0)
+        .unwrap_or_else(|| current_secs.max(0.0))
 }
 
 impl VideoPlayer {
@@ -6682,12 +6758,10 @@ impl VideoPlayer {
                     // EofReached を発火していると engine.state が Playing のまま残り、
                     // tick が無限に回り続ける退行になる。`duration_secs == 0` の場合は
                     // 現在位置 (= AvClock.now_secs) で freeze する。
-                    let duration_for_eof = self
-                        .info
-                        .as_ref()
-                        .map(|info| info.duration_secs)
-                        .filter(|d| *d > 0.0)
-                        .unwrap_or_else(|| self.clock.now_secs().max(0.0));
+                    let duration_for_eof = eof_freeze_position(
+                        self.info.as_ref().map(|info| info.duration_secs),
+                        self.clock.now_secs(),
+                    );
                     let mut g = self.engine.lock().unwrap();
                     let cur_epoch = g.current_seek_epoch();
                     g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
@@ -6864,12 +6938,10 @@ impl VideoPlayer {
                 // AvClock freeze(duration) + playing=false を atomic に確定する。
                 // native 経路と同じ理由・処理 (詳細はそちらの doc コメント参照)。
                 // duration_secs == 0 の fallback も同じ。
-                let duration_for_eof = self
-                    .info
-                    .as_ref()
-                    .map(|info| info.duration_secs)
-                    .filter(|d| *d > 0.0)
-                    .unwrap_or_else(|| self.clock.now_secs().max(0.0));
+                let duration_for_eof = eof_freeze_position(
+                    self.info.as_ref().map(|info| info.duration_secs),
+                    self.clock.now_secs(),
+                );
                 let mut g = self.engine.lock().unwrap();
                 let cur_epoch = g.current_seek_epoch();
                 g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
@@ -7414,6 +7486,58 @@ mod tests {
         assert!(state.is_hidden());
         assert!(!state.should_represent_for_grade_change(true));
         assert_eq!(state.frame(), Some(&"visible"));
+    }
+
+    #[test]
+    fn hidden_presenter_drains_decoder_channel_and_holds_latest_frame() {
+        let mut paced_queue = std::collections::VecDeque::from([0, 1, 2, 3, 4, 5, 6, 7]);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        for frame in 8..16 {
+            tx.try_send(frame).expect("fill decoder video channel");
+        }
+        let mut drained = Vec::new();
+
+        assert_eq!(
+            super::drain_hidden_available_frames(&mut paced_queue, &rx, &mut drained),
+            16
+        );
+        assert!(paced_queue.is_empty());
+        assert!(rx.is_empty());
+        tx.try_send(16)
+            .expect("hidden drain must release decoder channel capacity");
+
+        let mut state = super::FramePresentationState::Empty;
+        let mut displaced = Vec::new();
+        for frame in drained {
+            if let Some(previous) = state.replace_hidden(frame) {
+                match previous {
+                    super::DisplacedPresentation::Hidden { frame } => displaced.push(frame),
+                    super::DisplacedPresentation::Visible { .. } => {
+                        panic!("hidden burst must not create visible presentation ownership")
+                    }
+                }
+            }
+        }
+        assert_eq!(state.frame(), Some(&15));
+        assert_eq!(displaced, (0..15).collect::<Vec<_>>());
+        assert!(state.mark_current_visible(19));
+        assert!(state.is_visible());
+        assert_eq!(state.visible_frame(), Some(&15));
+    }
+
+    #[test]
+    fn audio_mode_eof_freeze_does_not_exceed_known_duration() {
+        let overrun_clock = 273.0;
+        let duration = 264.0;
+
+        assert_eq!(
+            super::eof_freeze_position(Some(duration), overrun_clock),
+            duration
+        );
+        assert!(
+            super::eof_freeze_position(Some(duration), overrun_clock) <= duration,
+            "native EOF must freeze the position display at the media duration"
+        );
     }
 
     #[test]

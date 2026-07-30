@@ -321,6 +321,15 @@ stale なまま返してしまう** (= 動画切替直後に前動画のフレ�
 提示成功時は旧 `Visible` を retire へ移し、新フレームを唯一の `Visible` にする。source switch /
 close でも同じ state を drain するため、別 source の最近フレームは fallback に残らない。
 
+hidden (`動画→音声モード`) は display clock による pacing を行わない。visible 専用の
+`MAX_NATIVE_SOURCE_QUEUE=8` を適用すると `source.queue` と `video_tx=8` が同時に満杯になり、
+video decoder が demux EOF より前で停止するため、hidden 中は既存 queue と `video_rx` の到着済み
+frame を毎 loop 全件 drain する。seek serial を検証したうえで途中 frame を即時解放し、最後の 1 枚
+だけで `Hidden { frame }` を置換する。これにより映像経路が EOF まで進み、ループ OFF では既存の
+`EofReached` が表示位置を既知 duration に凍結する。映像表示へ戻すときは同じ最新 `Hidden` を
+`Visible` にして即時再提示する。通常の visible playback は従来どおり queue cap と decoder
+back-pressure を使う。
+
 GPU frame は producer が writer key 0 で書き、`ReleaseSync(1)` で reader へ渡す。render は
 `AcquireSync(1)` で読み取ったあと、成功したコピーでは **そのまま `ReleaseSync(1)`** して
 reader-ready に保つ。したがって held frame の再提示に `AcquireSync(0)` を追加する必要はない。
@@ -865,7 +874,8 @@ fast-swap 連発時 (= 解像度違い動画をホイールで連射) に `wgpu 
 **`source.queue` の back-pressure**: 旧コードは `video_rx.try_recv()` を空になるまで
 drain して queue に積み込んでいたため queue が 23 frame まで肥大化。`MAX_NATIVE_SOURCE_QUEUE`
 で cap し、超えたら drain を停止することで `video_tx` (cap=8) に逆圧をかける。decoder
-側は `try_send` 失敗で古い frame を drop / 待機して自然に pacing する。
+側は `try_send` 失敗で古い frame を drop / 待機して自然に pacing する。この cap は visible
+playback のみの規則であり、hidden 中は上記の consume-and-hold 全件 drain を使う。
 
 **Paused/Eof 中の GPU 出力前 park** (2026-06-24):
 GPU 経路では `try_gpu_blit_path` 成功後の pacing loop に pause park があるが、この時点では
