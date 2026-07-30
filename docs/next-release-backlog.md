@@ -189,6 +189,52 @@
   (`docs/video-architecture.md` の `FramePresentationState` 節参照)。
 - 規模 / 優先度: Medium〜Large / **P1** (ハード ハングのため)。
 
+### 1.28 トレイ格納をまたいで再生を継続し、復帰で動画を再開する
+
+- 出典: 2026-07-30 のユーザー実機検証。**v2.9.0 では「格納時に一時停止」で出荷した**
+  (復帰の瞬間に止まる不自然さを消すことを優先)。将来ここへ再挑戦したい、というユーザー要望。
+- ほしい挙動: トレイ常駐中も再生を続け (少なくとも音声)、復帰したら動画表示も再開する。
+  複数ウィンドウで画像を見ているときは各ウィンドウが復元されるので、動画も同様に戻るのが望ましい。
+
+#### 2026-07-30 に判明していること (ゼロから調べ直さないこと)
+
+- **トレイ格納中、native presenter は実際に破棄されている。** ログの
+  `presenter stopped: native window visibility cancelled` がそれ。音声だけは別系統で
+  鳴り続けるため「再生が続いている」ように見えていた。
+- 復帰時に `poll_video` の `native_presenter_closed()` 終端処理が `close_fullscreen()` を
+  呼ぶ。これは破棄済みという**実態に即した**動作であって、単体では誤りではない。
+- 同じ症状で先に 2 本の経路を潰してある。**再挑戦時に元へ戻さないこと**:
+  - `5f2e37b5` `check_external_folder_changes` → items 再読み込み → detached context
+    promotion 失敗 → close
+  - `43dec1a2` `ShowWindow` による main focus → focus guard が
+    「detached host 登録待ちの `viewer_presentation` が旧 `Fullscreen` のまま」を
+    通常 fullscreen と誤認 → close
+
+#### 有望な方向
+
+**トレイ格納を「破棄」ではなく「hidden presenter」として扱う。**
+
+`d3545b0c` で hidden presenter は pacing queue と decoder channel を drain し、最新 1 枚を
+`Hidden { frame }` に保持するようになった。したがって hidden のままならパイプラインは
+健全に回り、EOF も通常どおり流れる。復帰は「音声モード → 動画表示へ戻す」と同じ経路に
+なり、その仕組みは既にある (placement 切替も `primed=true` で presenter を作り直せている)。
+
+確認が要る点:
+
+- 親 (detached host / メイン窓) を `SW_HIDE` した状態で、子の presenter 窓を生かしたまま
+  にできるか。`native window visibility cancelled` を出している箇所が、意図的な資源節約
+  なのか副作用なのかを先に特定する
+- 格納中の GPU / VRAM 保持コストが許容できるか (§1.9 の parked 窓の資源制御と関係する)
+- 復帰時に音声クロックへ映像を同期し直す必要があるか
+
+#### 注意
+
+- **実機確認が必須の領域**。通常フルスクリーン / in-window / F12 別窓 / 複数ウィンドウ /
+  音声モードの組み合わせで確認する。2026-07-30 はこの領域で 3 回続けて原因を外している
+  (推測で 1 経路ずつ塞ぐと当たらない。**close へ至る道を先に列挙**すること)
+- 出荷済みの「格納時に一時停止」を変えることになるので、挙動変更としてユーザー判断を取る
+- 規模 / 優先度: Medium / P2 candidate。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
