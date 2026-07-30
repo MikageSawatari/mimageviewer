@@ -164,6 +164,31 @@ fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn checked_selection_overlay_label(checked_count: usize) -> Option<String> {
+    (checked_count > 0).then(|| format!("チェック {checked_count} 件"))
+}
+
+/// チェック件数をメイン一覧の右上へ表示する。クリックされたら true を返す。
+fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> bool {
+    let Some(label) = checked_selection_overlay_label(checked_count) else {
+        return false;
+    };
+    let top_offset = ctx.available_rect().top() + 8.0;
+    let mut clear_clicked = false;
+    egui::Area::new(egui::Id::new("checked_selection_count_overlay"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top_offset))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                clear_clicked = ui
+                    .button(egui::RichText::new(label).strong())
+                    .on_hover_text("クリックでチェックをすべて解除 (Ctrl+D)")
+                    .clicked();
+            });
+        });
+    clear_clicked
+}
+
 /// 📌 ボタン描画用の状態スナップショット。`render_address_bar` 入口で 1 度算出する。
 pub(crate) struct FolderPinButtonState {
     /// ボタンを enable にして良いか (false なら disabled + tooltip 表示)
@@ -6458,6 +6483,22 @@ impl App {
         }
         if close {
             self.book_reorder = None;
+        }
+    }
+
+    // ── 選択件数 ─────────────────────────────────────────────────────
+
+    /// チェック済みがある間だけ、メイン一覧の右上に件数と解除操作を表示する。
+    pub(crate) fn render_checked_selection_overlay(&mut self, ctx: &egui::Context) {
+        let checked_count = self.checked.len();
+        if checked_count == 0 {
+            return;
+        }
+        if self.viewer_session_blocks_main_window() || self.any_dialog_open() {
+            return;
+        }
+        if show_checked_selection_overlay(ctx, checked_count) {
+            self.checked.clear();
         }
     }
 
@@ -18016,6 +18057,57 @@ mod toolbar_reorder_tests {
         let order = vec![TS::Cols, TS::Aspect, TS::Sort, TS::Tags];
         let got = reorder_toolbar_section(&order, TS::Sort, Some(TS::Cols), None).unwrap();
         assert_eq!(got, vec![TS::Sort, TS::Cols, TS::Aspect, TS::Tags]);
+    }
+}
+
+#[cfg(test)]
+mod checked_selection_overlay_tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn checked_selection_overlay_is_absent_when_no_items_are_checked() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(|ctx| {
+                let _ = show_checked_selection_overlay(ctx, 0);
+            });
+
+        harness.run();
+        assert!(harness.query_by_label("チェック 0 件").is_none());
+    }
+
+    #[test]
+    fn checked_selection_overlay_shows_the_exact_checked_count() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(|ctx| {
+                let _ = show_checked_selection_overlay(ctx, 1);
+            });
+
+        harness.run();
+        assert!(harness.query_by_label("チェック 1 件").is_some());
+    }
+
+    #[test]
+    fn checked_selection_overlay_click_requests_deselect() {
+        let clicked = Arc::new(AtomicBool::new(false));
+        let clicked_in_ui = Arc::clone(&clicked);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(move |ctx| {
+                if show_checked_selection_overlay(ctx, 2) {
+                    clicked_in_ui.store(true, Ordering::Relaxed);
+                }
+            });
+
+        harness.get_by_label("チェック 2 件").click();
+        harness.run();
+        assert!(clicked.load(Ordering::Relaxed));
     }
 }
 

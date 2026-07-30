@@ -53,17 +53,39 @@ struct DeleteConfirmModalResponse {
     cancel_clicked: bool,
 }
 
+const DELETE_CONFIRM_VISIBLE_TARGET_LIMIT: usize = 10;
+
 /// 削除確認をモーダル表示し、背面 UI への pointer 入力を backdrop で遮断する。
 ///
 /// backdrop のクリックは閉じる操作にせず吸収する。破壊的操作の確認結果は、明示的な
 /// ボタンまたは `consume_delete_confirm_action` が扱う Y / N / Esc だけで決める。
 fn show_delete_confirm_modal(ctx: &egui::Context, label: &str) -> DeleteConfirmModalResponse {
     let mut response = DeleteConfirmModalResponse::default();
+    let content_rect = ctx.content_rect();
+    let dialog_width = (content_rect.width() - 32.0).clamp(240.0, 520.0);
+    let target_list_height = (content_rect.height() - 180.0).clamp(100.0, 320.0);
+    let has_target_list = label.contains("\n\n対象:");
     egui::Modal::new(egui::Id::new("delete_confirm_modal")).show(ctx, |ui| {
-        ui.set_min_width(320.0);
+        ui.set_min_width(dialog_width.min(320.0));
+        ui.set_max_width(dialog_width);
         ui.heading("削除の確認");
         ui.add_space(8.0);
-        ui.label(label);
+        if has_target_list {
+            ui.scope(|ui| {
+                ui.spacing_mut().scroll =
+                    super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
+                egui::ScrollArea::vertical()
+                    .id_salt("delete_confirm_targets")
+                    .max_height(target_list_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.add(egui::Label::new(label).wrap());
+                    });
+            });
+        } else {
+            ui.add(egui::Label::new(label).wrap());
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("削除[Y]").clicked() {
@@ -193,7 +215,23 @@ fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)]) -> String {
             .and_then(|n| n.to_str())
             .unwrap_or("?")
     });
-    build_delete_confirm_label(count, single_name, kind)
+    let mut label = build_delete_confirm_label(count, single_name, kind);
+    if count > 1 {
+        label.push_str("\n\n対象:");
+        for (_, path) in targets.iter().take(DELETE_CONFIRM_VISIBLE_TARGET_LIMIT) {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_else(|| path.as_os_str().to_string_lossy());
+            label.push_str("\n・");
+            label.push_str(&name);
+        }
+        let remaining = count.saturating_sub(DELETE_CONFIRM_VISIBLE_TARGET_LIMIT);
+        if remaining > 0 {
+            label.push_str(&format!("\n・他 {remaining} 件"));
+        }
+    }
+    label
 }
 
 fn build_delete_confirm_label(
@@ -2802,6 +2840,40 @@ mod delete_confirm_tests {
             label.contains("ゴミ箱に移動できない場所"),
             "multi-target warning should mention non-recyclable locations: {label}"
         );
+    }
+
+    #[test]
+    fn delete_confirm_lists_first_ten_targets_then_remaining_count() {
+        let targets = (0..13)
+            .map(|idx| {
+                (
+                    idx,
+                    PathBuf::from(format!(r"C:\pictures\image_{idx:02}.jpg")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let label = delete_confirm_label_for_targets(&targets);
+
+        for idx in 0..DELETE_CONFIRM_VISIBLE_TARGET_LIMIT {
+            assert!(
+                label.contains(&format!("image_{idx:02}.jpg")),
+                "先頭 10 件の名前を列挙する: {label}"
+            );
+        }
+        assert!(!label.contains("image_10.jpg"));
+        assert_eq!(label.matches("\n・").count(), 11);
+        assert!(label.contains("・他 3 件"));
+    }
+
+    #[test]
+    fn delete_confirm_single_target_keeps_natural_filename_wording() {
+        let targets = vec![(0, PathBuf::from(r"C:\pictures\only_one.jpg"))];
+
+        let label = delete_confirm_label_for_targets(&targets);
+
+        assert!(label.contains("only_one.jpg"));
+        assert!(!label.contains("\n\n対象:"));
     }
 
     fn begin_key_pass(ctx: &egui::Context, key: egui::Key) {

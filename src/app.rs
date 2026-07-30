@@ -61268,6 +61268,10 @@ impl eframe::App for App {
         self.render_selection_info_bar(ctx);
         let (folder_pane_nav, folder_pane_rect) = self.render_folder_pane(ctx);
 
+        // チェック件数は一覧の右上へ常時表示する。Foreground Area をグリッドより先に
+        // 登録し、解除クリックが背面セルの選択操作へ漏れないようにする。
+        self.render_checked_selection_overlay(ctx);
+
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
         // wheel が背面のサムネイル一覧にも通り抜ける。
