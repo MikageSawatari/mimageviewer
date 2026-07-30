@@ -25,22 +25,23 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 [ブラウザ]  ──HTTP──▶  [mimageviewer-remote.exe]  ──IPC──▶  [mimageviewer-core.exe]
                          (crates/remote-web)                   (本体・単一 writer)
                               │
-                              └─ read-only で直接読む: 実ファイル / catalog DB / settings DB
+                              └─ read-only で直接読む: 実ファイル / settings DB
 ```
 
 ### 2.1 読み書きの分離 (重要な不変条件)
 
 | 種別 | 担当 | 理由 |
 |---|---|---|
-| 読み取り (サムネ・画像・動画バイト・一覧) | remote-web が **直接** read-only で読む | サムネ一覧は 1 画面で数百リクエスト。IPC 中継すると本体のフレーム予算を食う |
+| 読み取り (画像・動画バイト・一覧) | remote-web が **直接** read-only で読む | HTTP の range / 一覧走査を本体 UI から分離する |
+| サムネイル参照・生成 | **IPC → 本体** | catalog の実態が当初想定と異なったため。本体の既存生成経路とキャッシュ方針を一元利用する (§9) |
 | 書き込み (読書履歴・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
 | 重い生成 (PDF レンダ・AI アップスケール・カラー化・補正合成) | **IPC → 本体** | PDFium プール・ONNX セッション・GPU をステートフルに保持しているのは本体 |
 
 SQLite は WAL なので「本体が唯一の writer / remote-web は reader」は安全に成立する。
 **この境界を崩す変更を入れないこと。**
 
-PoC の remote-web 専用サムネイルキャッシュはこの表の mIV 永続ストアには含めない診断用成果物で、
-外部パスにだけ書く。settings / catalog の単一 writer 境界は変えない。
+remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去した。settings / catalog の writer は
+引き続き本体だけであり、remote-web はこれらへ書き込まない。
 
 ### 2.2 セッションと排他
 
@@ -57,7 +58,7 @@ PoC の remote-web 専用サムネイルキャッシュはこの表の mIV 永�
 
 | 対象 | 状況 |
 |---|---|
-| サムネイル | catalog に存在する WebP (`folderthumb:` を含む) は無変換で返す。ただし個別画像行は通常ほとんど永続化されていないため、欠落時は remote-web 専用キャッシュへオンデマンド生成する |
+| サムネイル | remote-web は `favorite_id + relative_path + target_px` を本体へ IPC 中継する。本体が catalog 参照、既存生成経路、`CachePolicy` に従う保存を担当する (§9) |
 | お気に入り | `settings.rs` の `FavoriteEntry` (安定 UUID + root path)。**そのまま公開 allowlist として使う** |
 | 補正・回転・トリム・モザイク・消しゴム・ローカル調整・コミック注釈 | `books::BookPageSource::Composited` + `BakedEditSnapshot` に**ヘッドレス合成が既にある**。入力も File / ZipEntry / PdfPage をカバー済み |
 | AI アップスケール・カラー化 | `page_requires_full_composite` から display-only として**意図的に除外**されている。ヘッドレス経路への追加は**新規作業** |
@@ -106,9 +107,9 @@ PoC の remote-web 専用サムネイルキャッシュはこの表の mIV 永�
   バンドラ / TypeScript の採用可否は PoC 完了後に判断する
 - 新規コードは新規ファイルに置く。既存ファイルへの変更は最小のフック点に留める
   (master が 1 日 5,000 行ペースで動くため、衝突面積を構造的に減らす)
-- read-only 不変条件は mIV の settings / catalog 等を変更しないことを指す。PoC の診断ログ、認証
-  ファイル、remote-web 専用サムネイルキャッシュだけは `--log` / `--auth-file` / `--thumb-cache`
-  で指定した `%APPDATA%\mimageviewer` および `--data-dir` 配下ではない別パスへ出力する
+- read-only 不変条件は remote-web が mIV の settings / catalog 等を変更しないことを指す。PoC の
+  診断ログと認証ファイルだけは `--log` / `--auth-file` で指定した
+  `%APPDATA%\mimageviewer` および `--data-dir` 配下ではない別パスへ出力する
 
 ## 4. PoC のスコープ (現在のフェーズ)
 
@@ -125,19 +126,15 @@ PoC の remote-web 専用サムネイルキャッシュはこの表の mIV 永�
 |---|---|
 | `GET /api/favorites` | お気に入り一覧 (id, 表示名) を JSON で返す |
 | `GET /api/list?fav=<uuid>&path=<rel>` | 指定フォルダの直下と、そのフォルダでの実効サムネイル高さ比を JSON で返す。各要素は種別 (dir / image / video / audio / zip / pdf / other)・表示名・相対パス・サイズ・mtime |
-| `GET /api/thumb?fav=<uuid>&path=<rel>` | 画像・フォルダのサムネイルを返す。catalog WebP → remote-web 専用 SQLite → オンデマンド生成の順に参照する |
+| `GET /api/thumb?fav=<uuid>&path=<rel>&w=<px>` | 画像・フォルダのサムネイルを本体へ IPC 中継し WebP で返す。本体未接続時は 503 と利用者向け理由を返す |
 | `GET /api/image-info?fav=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
 | `GET /api/image?fav=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
 | `GET /` および静的ファイル | フロントエンドを配信 |
 
-- catalog DB は `catalog::db_path_for` でフォルダごとに解決し、**`mode=ro` で開く**
-- catalog の画像キーと `folderthumb:auto-v2:numeric:d3:<name>` (pin 派生を含む) は無変換で
-  再利用する。catalog miss 時だけ remote-web 専用 SQLite へ生成し、mIV catalog には書かない。
-  専用キーは source path + mtime(ns) + file size + 生成サイズを SHA-256 化する
-- サムネイル生成は HTTP ワーカー間で並列実行するが最大 4 本に制限し、同じキーの生成中は
-  共有 flight + Condvar で待ち合わせて重複デコード / エンコードを防ぐ
-- サムネイルのキーは `grid_item.rs` の既存規約 (`image_full_path_cache_key` /
-  `zipdir_cache_key` / `pdf_page_cache_key` 等) に従う。PoC で扱うのは通常の画像ファイルのみ
+- サムネイルの catalog 参照・キー生成・生成・保存判定は本体の既存経路に集約する。remote-web は
+  catalog の内部構造を知らず、専用サムネイル DB も持たない。今回扱う source は通常画像と
+  フォルダ代表で、ZIP / PDF / 動画 / 音声は後続増分とする
+- 本体側でも favorite allowlist と canonical path の包含を検証し、remote-web の検証結果を信頼しない
 - 一覧の走査は `entry.file_type()` を使う (`Path::is_dir()` を per-entry で呼ばない)
 
 #### フロントエンド (`crates/remote-web/web/`)
@@ -357,15 +354,12 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 
 ### 7.2 対応が必要な事項
 
-- **F1 (構造・中)**: 本体 lib に依存せず、catalog のキー規約を remote-web 内に複製している。
-  理由 (FFmpeg の import library リンクにより Windows ローダが exe ロード時に DLL を要求し、
-  単体サーバにも 6 個の DLL 同居が必要になる) は妥当だが、**master 側で規約が変わっても
-  気付けない**。`src/path_key.rs` (約 40 行) と cache key helper を依存ゼロの小クレートに
-  切り出し、本体と remote-web の双方が参照する形にする。**次フェーズの冒頭で実施する**
+- **F1 (解消済み、§9)**: remote-web の catalog 直読みとキー規約複製を撤去し、サムネイルは
+  catalog 参照を含めて本体へ IPC 中継する。プロトコル型は共有クレートへ集約した
 - **F2 (解消済み)**: PIN 認証への変更時に、通常のセッション Cookie を Max-Age 90 日とした。
   端末に残したくない場合は画面からセッション Cookie を選べる
-- **F3 (小)**: catalog の blob が WebP でない行 (旧形式で JPEG が入っている可能性) は 404 に
-  なる。実機でサムネイル欠けが多発したらこれを疑う。content-type の出し分けで救える
+- **F3 (解消済み、§9 の副次効果)**: catalog blob の解釈も本体の既存 decoder へ戻したため、
+  旧 JPEG 行を remote-web が WebP と誤認して 404 にする分岐自体を撤去した
 - **F4 (解消済み)**: PIN 入力画面へ移行し、`?t=` 認証とリダイレクト自体を廃止した
 - **F5 (計画どおりの省略)**: リサイズが必要な画像のサーバ側キャッシュは無く、リクエストごとに
   フルデコードする。F8 の素通し条件外でどこまで実用になるかは引き続き実機測定の対象
@@ -400,9 +394,9 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 `folderthumb:auto-v2:numeric:d3:<name>` が中心だった。個々の画像サムネイルは主にメモリ上で
 生成・破棄され、永続 catalog に常在するという当初前提は成立しない。
 
-このため §4.2 からオンデマンド生成を外し、参照順を catalog → remote-web 専用 SQLite → 生成に
-変更した。専用 DB の既定はカレントディレクトリの `remote-web-thumbs.db`、変更は
-`--thumb-cache <path>`。mIV の settings / catalog は従来どおりすべて read-only である。
+このため一時的に §4.2 からオンデマンド生成を外し、参照順を catalog → remote-web 専用 SQLite
+→ 生成へ変更した。その暫定実装と `--thumb-cache` は §9 の縦串増分で撤去済みである。現在は
+catalog 参照を含む全サムネイル処理を IPC 経由で本体へ委譲する。
 
 ### 8.3 スマートフォンのグリッド寸法と描画 (2026-07-30)
 
@@ -520,12 +514,28 @@ remote-web 側で生成すると、本体が持つ以下をすべて複製する
 にする。これにより **F1 が解消する** (remote-web が catalog の内部構造を知らなくなる)。
 副次的に、リモート閲覧が本体のキャッシュを温めるため、次にローカルで開いたときも速くなる。
 
-### 9.3 暫定措置 (撤去予定)
+### 9.3 暫定措置 (撤去済み)
 
-commit `865d9c2a` で `crates/remote-web/src/thumb_cache.rs` にオンデマンド生成と専用
-SQLite を入れた。**これは IPC が入るまでの暫定であり、縦串フェーズで撤去する。**
-撤去対象: `thumb_cache.rs` 全体、`--thumb-cache` オプション、`store.rs` の生成経路、
-`image_support.rs` の生成用デコード。catalog 直読みの fast path も本体へ移す。
+commit `865d9c2a` で導入した remote-web 側のオンデマンド生成と専用 SQLite は、縦串増分で
+撤去した。`thumb_cache.rs` 全体、`--thumb-cache`、`store.rs` のサムネイル生成・catalog 直読み、
+`image_support.rs` のサムネイル用 helper は残していない。
+
+IPC の型と版数は GUI / native runtime 非依存の `crates/remote-ipc` に集約する。接続時に
+`PROTOCOL_VERSION` を照合し、不一致なら接続を拒否して client / server の双方の版数をログへ出す。
+本体は `--remote-ipc` がある場合だけローカル named pipe を開き、受信と生成を UI thread 外の
+上限制御された worker で処理する。同名 pipe が既に存在する場合は二重起動せずエラーを記録する。
+
+`ThumbnailRequest { favorite_id, relative_path, target_px }` は本体側で再度 allowlist と canonical
+path containment を検証する。通常画像とフォルダ代表は `thumb_loader::process_load_request`
+(`load_one_cached`) へ渡し、catalog 参照、DCT / WIC / Susie、回転 DB、利用者のサイズ・画質、
+`CacheDecision::from_settings` による保存判断を既存経路へ揃える。同一要求の同時到着は flight を
+共有して重複生成しない。remote-web の `/api/thumb` はこの要求・応答を中継するだけで、IPC 往復
+時間を `ipc_ms` として診断ログへ記録する。
+
+本体未起動・pipe 未接続時も HTTP サーバ自体は起動する。`/api/thumb` は 503 と機械可読な
+`miv_not_running` を返し、フロントは「mIV 本体が起動していません」と画面内に表示する。
+仮想グリッドの tile は binding 世代と相対 path を応答時に照合し、破棄時は fetch を abort する。
+これにより scroll で detach / 再表示された tile に古い in-flight 応答を適用しない。
 
 ### 9.4 この発見の位置づけ
 

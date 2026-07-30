@@ -340,6 +340,17 @@ button {
   -webkit-overflow-scrolling: touch;
 }
 
+.thumbnail-service-notice {
+  z-index: 4;
+  margin: 0;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgb(255 190 90 / 30%);
+  background: #3a2b18;
+  color: #ffd99a;
+  font-size: 0.88rem;
+  line-height: 1.4;
+}
+
 .virtual-space {
   position: relative;
   min-height: 100%;

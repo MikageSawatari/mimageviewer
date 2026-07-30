@@ -137,6 +137,7 @@ pub mod rar_loader;
 pub mod rating_db;
 pub mod rating_view;
 pub mod rating_write_worker;
+mod remote_ipc;
 pub mod rename_key_migration;
 pub mod ring_shortcut;
 pub mod rotation_db;
@@ -704,7 +705,8 @@ fn maybe_handle_version_or_help() -> bool {
              \n\
              Options:\n  \
              -V, --version  Print version and exit\n  \
-             -h, --help     Print this help and exit\n\
+             -h, --help     Print this help and exit\n  \
+                 --remote-ipc  Enable the local remote-thumbnail IPC server\n\
              \n\
              PATH  Open the given image file or folder on startup.\n",
             ver = env!("CARGO_PKG_VERSION"),
@@ -1043,6 +1045,22 @@ pub fn run() -> eframe::Result {
         viewport,
         wgpu_options,
         ..Default::default()
+    };
+
+    // 縦串フェーズの thumbnail IPC は明示指定時だけ有効。受信・生成はすべて
+    // remote_ipc 配下の専用スレッドで行い、通常起動の App / UI thread には触れない。
+    // guard は run_native が戻るまで保持し、Drop で listener と worker を閉じる。
+    let _remote_ipc_server = if has_arg("--remote-ipc") {
+        match remote_ipc::RemoteIpcServer::start(saved.clone()) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                eprintln!("remote IPC を開始できません: {error}");
+                logger::log(format!("remote_ipc: startup failed: {error}"));
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // eframe::run_native に入る手前までを 1 つの marker として記録する。

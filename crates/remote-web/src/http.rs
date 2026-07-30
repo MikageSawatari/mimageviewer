@@ -14,10 +14,8 @@ use uuid::Uuid;
 
 use crate::auth::{AuthDecision, AuthInput, AuthService, PinVerification};
 use crate::diagnostics::{DiagnosticsLogger, RequestLog};
-use crate::store::{Library, StoreError, ThumbnailLookup, ThumbnailMissReason};
-use crate::thumb_cache::{
-    GENERATED_THUMB_SIZE, ThumbnailService, ThumbnailServiceError, thumbnail_cache_key,
-};
+use crate::ipc_client::{ClientError as IpcClientError, ThumbnailClient};
+use crate::store::{Library, StoreError};
 
 const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
 const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
@@ -28,7 +26,7 @@ const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 pub struct AppState {
     pub auth: AuthService,
     pub library: Library,
-    pub thumb_service: ThumbnailService,
+    pub thumbnail_client: ThumbnailClient,
     pub logger: DiagnosticsLogger,
     pub telemetry_limiter: TelemetryLimiter,
     pub request_sequence: AtomicU64,
@@ -353,97 +351,91 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     let Some((favorite, path)) = favorite_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
     };
-    match state.library.thumbnail_lookup(favorite, path) {
-        Ok(ThumbnailLookup::Catalog(bytes)) => {
+    let target_px = match required_query_value(query, "w").and_then(|value| {
+        value
+            .parse::<u32>()
+            .map_err(|_| ())
+            .and_then(|width| (width > 0).then_some(width).ok_or(()))
+    }) {
+        Ok(width) => width,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let started = Instant::now();
+    match state
+        .thumbnail_client
+        .thumbnail(&favorite.to_string(), path, target_px)
+    {
+        Ok(bytes) => {
+            let ipc_ms = crate::diagnostics::duration_ms(started.elapsed());
             let blob_bytes = bytes.len();
             HttpResponse::bytes(200, "image/webp", bytes)
                 .with_header("Cache-Control", "private, max-age=60")
                 .with_log_details(json!({
                     "thumb": {
-                        "hit": true,
-                        "catalog_hit": true,
-                        "remote_cache_hit": null,
-                        "cache_tier": "catalog",
-                        "miss_reason": null,
-                        "generated": false,
+                        "cache_tier": "miv_ipc",
+                        "ipc_status": "ok",
+                        "ipc_ms": ipc_ms,
+                        "target_px": target_px,
                         "blob_bytes": blob_bytes,
                     }
                 }))
         }
-        Ok(ThumbnailLookup::Generate(source)) => {
-            let key = thumbnail_cache_key(
-                &source.cache_identity,
-                source.mtime_ns,
-                source.size,
-                GENERATED_THUMB_SIZE,
-            );
-            match state.thumb_service.load_or_generate(
-                &key,
-                &source.path,
-                source.mtime_ns,
-                source.size,
-                GENERATED_THUMB_SIZE,
-            ) {
-                Ok(value) => {
-                    let blob_bytes = value.bytes.len();
-                    let generated = value.generation.is_some() && !value.waited_for_generation;
-                    let cache_tier = if value.remote_cache_hit {
-                        "remote"
-                    } else if value.waited_for_generation {
-                        "generated_shared"
-                    } else {
-                        "generated"
-                    };
-                    let miss_reason = (!value.remote_cache_hit).then_some("remote_cache_miss");
-                    HttpResponse::bytes(200, "image/webp", value.bytes.as_ref().clone())
-                        .with_header("Cache-Control", "private, max-age=60")
-                        .with_log_details(json!({
-                            "thumb": {
-                                "hit": value.remote_cache_hit,
-                                "catalog_hit": false,
-                                "remote_cache_hit": value.remote_cache_hit,
-                                "cache_tier": cache_tier,
-                                "miss_reason": miss_reason,
-                                "catalog_miss_reason": source.catalog_miss,
-                                "generated": generated,
-                                "waited_for_generation": value.waited_for_generation,
-                                "blob_bytes": blob_bytes,
-                                "generation": value.generation,
-                            }
-                        }))
-                }
-                Err(ThumbnailServiceError::Decode) => {
-                    HttpResponse::text(415, "Unsupported Media Type").with_log_details(json!({
-                        "thumb": {
-                            "hit": false,
-                            "cache_tier": "generation_failed",
-                            "catalog_miss_reason": source.catalog_miss,
-                            "miss_reason": "decode_failed",
-                            "blob_bytes": 0,
-                        }
-                    }))
-                }
-                Err(ThumbnailServiceError::Db(error)) => {
-                    eprintln!("remote-web: thumbnail cache failed: {error}");
-                    HttpResponse::text(500, "Internal Server Error")
-                }
-                Err(ThumbnailServiceError::Synchronization) => {
-                    eprintln!("remote-web: thumbnail generation synchronization failed");
-                    HttpResponse::text(500, "Internal Server Error")
-                }
-            }
+        Err(error) => ipc_error_response(error, started.elapsed(), target_px),
+    }
+}
+
+fn ipc_error_response(error: IpcClientError, elapsed: Duration, target_px: u32) -> HttpResponse {
+    use mimageviewer_ipc::ThumbnailErrorCode;
+
+    let ipc_ms = crate::diagnostics::duration_ms(elapsed);
+    let (status, code, message) = match error {
+        IpcClientError::Unavailable => (
+            503,
+            "miv_not_running",
+            "mIV 本体が起動していません。mIV を --remote-ipc 付きで起動してください。".to_owned(),
+        ),
+        IpcClientError::VersionMismatch { client, server } => (
+            503,
+            "protocol_version_mismatch",
+            format!(
+                "mIV 本体と remote-web の IPC 版が一致しません (remote-web={client}, mIV={server})。"
+            ),
+        ),
+        IpcClientError::Protocol(detail) => {
+            eprintln!("remote-web: thumbnail IPC protocol error: {detail}");
+            (
+                502,
+                "ipc_protocol_error",
+                "mIV 本体との通信に失敗しました。".to_owned(),
+            )
         }
-        Err(StoreError::ThumbnailMiss(reason)) => {
-            HttpResponse::text(404, "Not Found").with_log_details(thumbnail_miss_details(reason))
+        IpcClientError::Remote(remote) => {
+            let status = match remote.code {
+                ThumbnailErrorCode::BadRequest => 400,
+                ThumbnailErrorCode::FavoriteNotFound
+                | ThumbnailErrorCode::PathRejected
+                | ThumbnailErrorCode::NotFound => 404,
+                ThumbnailErrorCode::Unsupported => 415,
+                ThumbnailErrorCode::Busy => 503,
+                ThumbnailErrorCode::GenerationFailed => 422,
+                ThumbnailErrorCode::Internal => 500,
+            };
+            (status, "miv_thumbnail_error", remote.message)
         }
-        Err(error) => store_error_response(error).with_log_details(json!({
+    };
+    let body = serde_json::to_vec(&json!({"error": code, "message": message}))
+        .unwrap_or_else(|_| b"{\"error\":\"ipc_error\"}".to_vec());
+    HttpResponse::bytes(status, "application/json; charset=utf-8", body)
+        .with_header("Cache-Control", "no-store")
+        .with_log_details(json!({
             "thumb": {
-                "hit": false,
-                "miss_reason": "request_error",
+                "cache_tier": "miv_ipc",
+                "ipc_status": code,
+                "ipc_ms": ipc_ms,
+                "target_px": target_px,
                 "blob_bytes": 0,
             }
-        })),
-    }
+        }))
 }
 
 fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse {
@@ -478,16 +470,6 @@ fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
             .with_log_details(json!({"image": value.metrics})),
         Err(error) => store_error_response(error),
     }
-}
-
-fn thumbnail_miss_details(reason: ThumbnailMissReason) -> Value {
-    json!({
-        "thumb": {
-            "hit": false,
-            "miss_reason": reason,
-            "blob_bytes": 0,
-        }
-    })
 }
 
 #[derive(Deserialize)]
@@ -584,7 +566,6 @@ fn store_error_response(error: StoreError) -> HttpResponse {
     match error {
         StoreError::BadRequest => HttpResponse::text(400, "Bad Request"),
         StoreError::NotFound => HttpResponse::text(404, "Not Found"),
-        StoreError::ThumbnailMiss(_) => HttpResponse::text(404, "Not Found"),
         StoreError::Decode => HttpResponse::text(415, "Unsupported Media Type"),
         StoreError::Io(error) => {
             eprintln!("remote-web: filesystem request failed: {error}");
@@ -739,12 +720,7 @@ mod tests {
         AppState {
             auth,
             library: Library::empty_for_test(temp.path().join("cache")),
-            thumb_service: ThumbnailService::open(
-                &temp.path().join("thumb-cache.db"),
-                &[protected.clone()],
-                2,
-            )
-            .unwrap(),
+            thumbnail_client: ThumbnailClient::new(),
             logger: DiagnosticsLogger::open(
                 &temp.path().join("request.jsonl"),
                 &[protected],
@@ -811,6 +787,20 @@ mod tests {
         let response = route(&mut request, &state);
         assert_eq!(response.status, 401);
         assert_eq!(response.body, b"Unauthorized");
+    }
+
+    #[test]
+    fn disconnected_thumbnail_ipc_returns_a_user_visible_service_error() {
+        let response =
+            ipc_error_response(IpcClientError::Unavailable, Duration::from_millis(12), 256);
+        assert_eq!(response.status, 503);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "miv_not_running");
+        assert!(body["message"].as_str().unwrap().contains("mIV 本体"));
+        let details = response.log_details.unwrap();
+        assert_eq!(details["thumb"]["ipc_status"], "miv_not_running");
+        assert_eq!(details["thumb"]["target_px"], 256);
     }
 
     #[test]

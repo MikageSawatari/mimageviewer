@@ -224,6 +224,18 @@ export function snappedGridOffset(scrollTop, rowPitch, maxOffset) {
   return Math.max(0, Math.min(maximum, Math.round(offset / pitch) * pitch));
 }
 
+export function thumbnailBindingMatches(
+  currentGeneration,
+  currentPath,
+  responseGeneration,
+  responsePath
+) {
+  return (
+    Number(currentGeneration) === Number(responseGeneration) &&
+    String(currentPath ?? "") === String(responsePath ?? "")
+  );
+}
+
 export function reduceViewerTransform(current, requested) {
   let scale = current.scale;
   let panX = current.panX;

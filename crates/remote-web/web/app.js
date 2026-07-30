@@ -9,6 +9,7 @@ import {
   nextFitMode,
   reduceViewerTransform,
   snappedGridOffset,
+  thumbnailBindingMatches,
   viewerTapCommand,
   viewerImageLayout,
   viewerWheelCommand,
@@ -50,6 +51,7 @@ const state = {
   thumbnailTracker: null,
   viewer: null,
   commandMenu: null,
+  thumbnailNotice: null,
   screenContext: "loading",
   gridIndex: 0,
   authCountdownTimer: 0,
@@ -519,6 +521,7 @@ function cleanupScreen() {
   state.virtualGrid = null;
   state.thumbnailTracker?.destroy();
   state.thumbnailTracker = null;
+  state.thumbnailNotice = null;
   state.commandMenu?.destroy();
   state.commandMenu = null;
   state.viewer?.destroy();
@@ -643,11 +646,14 @@ function renderFolder() {
   topbar.append(back, buildBreadcrumbs(), createMenuButton("操作メニュー"));
 
   const scroll = element("div", "grid-scroll");
+  const thumbnailNotice = textElement("p", "", "thumbnail-service-notice");
+  thumbnailNotice.hidden = true;
+  state.thumbnailNotice = thumbnailNotice;
   const space = element("div", "virtual-space");
   const windowElement = element("div", "virtual-window");
   space.append(windowElement);
   scroll.append(space);
-  screen.append(topbar, scroll);
+  screen.append(topbar, thumbnailNotice, scroll);
   screen.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     dispatchCommand(command(CommandName.TOGGLE_MENU), {
@@ -679,7 +685,8 @@ function renderFolder() {
     space,
     windowElement,
     state.entries,
-    (entry, index) => createGridTile(entry, index, imageIndexes, state.thumbnailTracker),
+    (entry, index, cellWidth) =>
+      createGridTile(entry, index, imageIndexes, state.thumbnailTracker, cellWidth),
     (initialItems) => state.thumbnailTracker?.begin(initialItems),
     state.thumbAspectHeightRatio
   );
@@ -720,7 +727,13 @@ function buildBreadcrumbs() {
   return breadcrumbs;
 }
 
-function createGridTile(entry, entryIndex, imageIndexes, thumbnailTracker) {
+function createGridTile(
+  entry,
+  entryIndex,
+  imageIndexes,
+  thumbnailTracker,
+  cellWidth
+) {
   const tile = element("button", "grid-tile");
   tile.type = "button";
   tile.title = entry.name;
@@ -744,7 +757,7 @@ function createGridTile(entry, entryIndex, imageIndexes, thumbnailTracker) {
     preview.append(textElement("span", "◆", "folder-glyph"));
     preview.append(image);
     preview.append(textElement("span", "folder", "type-badge"));
-    loadThumbnail(image, entry, thumbnailTracker);
+    bindThumbnail(image, entry, thumbnailTracker, cellWidth);
     tile.addEventListener("click", (event) => {
       dispatchCommand(
         command(CommandName.OPEN, {
@@ -758,8 +771,8 @@ function createGridTile(entry, entryIndex, imageIndexes, thumbnailTracker) {
     });
   } else {
     preview.append(textElement("span", "◇", "file-glyph"));
-    loadThumbnail(image, entry, thumbnailTracker);
     preview.append(image);
+    bindThumbnail(image, entry, thumbnailTracker, cellWidth);
     tile.addEventListener("click", (event) => {
       const index = imageIndexes.get(entry.path);
       if (index !== undefined) {
@@ -940,17 +953,84 @@ function imageInfo(path) {
   return state.imageInfoCache.get(key);
 }
 
-async function loadThumbnail(image, entry, tracker) {
+function bindThumbnail(image, entry, tracker, cellWidth) {
+  disposeThumbnailBinding(image);
+  const generation = (Number(image._thumbnailGeneration) || 0) + 1;
+  image._thumbnailGeneration = generation;
+  image._thumbnailPath = entry.path;
+  image.classList.remove("thumb-ready", "thumb-missing");
+  image.parentElement?.classList.remove("thumb-loaded");
+  const controller = new AbortController();
+  image._thumbnailController = controller;
+  const targetPx = clamp(
+    Math.ceil(Math.max(1, Number(cellWidth) || 1) * (window.devicePixelRatio || 1)),
+    32,
+    4096
+  );
+  loadThumbnail(image, entry, tracker, generation, targetPx, controller.signal);
+}
+
+function thumbnailResponseIsCurrent(image, generation, path) {
+  return thumbnailBindingMatches(
+    image._thumbnailGeneration,
+    image._thumbnailPath,
+    generation,
+    path
+  );
+}
+
+function disposeThumbnailBinding(image) {
+  image._thumbnailController?.abort();
+  image._thumbnailController = null;
+  if (image._thumbnailObjectUrl) {
+    URL.revokeObjectURL(image._thumbnailObjectUrl);
+    image._thumbnailObjectUrl = null;
+  }
+  image.removeAttribute("src");
+}
+
+function disposeGridTile(tile) {
+  const image = tile?.querySelector(".tile-preview img");
+  if (!image) return;
+  image._thumbnailGeneration = (Number(image._thumbnailGeneration) || 0) + 1;
+  disposeThumbnailBinding(image);
+}
+
+function showThumbnailServiceNotice(message) {
+  if (!state.thumbnailNotice) return;
+  state.thumbnailNotice.textContent = message;
+  state.thumbnailNotice.hidden = false;
+}
+
+function clearThumbnailServiceNotice() {
+  if (!state.thumbnailNotice) return;
+  state.thumbnailNotice.hidden = true;
+  state.thumbnailNotice.textContent = "";
+}
+
+async function loadThumbnail(image, entry, tracker, generation, targetPx, signal) {
   const url = apiUrl("/api/thumb", {
     fav: state.favoriteId,
     path: entry.path,
+    w: targetPx,
   });
   try {
     const response = await observedFetch(url, {
       credentials: "same-origin",
       cache: "force-cache",
+      signal,
     });
     if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      if (
+        response.status === 503 &&
+        ["miv_not_running", "protocol_version_mismatch"].includes(detail.error)
+      ) {
+        showThumbnailServiceNotice(
+          detail.message || "mIV 本体が起動していません。"
+        );
+      }
+      if (!thumbnailResponseIsCurrent(image, generation, entry.path)) return;
       image.classList.add("thumb-missing");
       image.parentElement?.classList.remove("thumb-loaded");
       tracker?.settled(entry.path, { notFound: response.status === 404 });
@@ -958,18 +1038,28 @@ async function loadThumbnail(image, entry, tracker) {
     }
     const blob = await response.blob();
     const objectUrl = URL.createObjectURL(blob);
-    image.src = objectUrl;
-    try {
-      await image.decode();
-      await nextFrame();
-      image.classList.remove("thumb-missing");
-      image.classList.add("thumb-ready");
-      image.parentElement?.classList.add("thumb-loaded");
-      tracker?.settled(entry.path);
-    } finally {
+    if (!thumbnailResponseIsCurrent(image, generation, entry.path)) {
       URL.revokeObjectURL(objectUrl);
+      return;
     }
+    if (image._thumbnailObjectUrl) URL.revokeObjectURL(image._thumbnailObjectUrl);
+    image._thumbnailObjectUrl = objectUrl;
+    image.src = objectUrl;
+    await image.decode();
+    await nextFrame();
+    if (!thumbnailResponseIsCurrent(image, generation, entry.path)) {
+      URL.revokeObjectURL(objectUrl);
+      if (image._thumbnailObjectUrl === objectUrl) image._thumbnailObjectUrl = null;
+      return;
+    }
+    image.classList.remove("thumb-missing");
+    image.classList.add("thumb-ready");
+    image.parentElement?.classList.add("thumb-loaded");
+    clearThumbnailServiceNotice();
+    tracker?.settled(entry.path);
   } catch (error) {
+    if (error?.name === "AbortError") return;
+    if (!thumbnailResponseIsCurrent(image, generation, entry.path)) return;
     image.classList.remove("thumb-ready");
     image.classList.add("thumb-missing");
     image.parentElement?.classList.remove("thumb-loaded");
@@ -1003,6 +1093,7 @@ class VirtualGrid {
     this.rowHeight = 1;
     this.tileHeight = 1;
     this.previewHeight = 1;
+    this.cellWidth = 1;
     this.labelHeight = 1;
     this.gap = 0;
     this.maxScrollOffset = 0;
@@ -1065,6 +1156,7 @@ class VirtualGrid {
     }
     this.tileHeight = layout.tileHeight;
     this.previewHeight = layout.previewHeight;
+    this.cellWidth = layout.cellWidth;
     this.labelHeight = layout.labelHeight;
     this.gap = layout.gap;
     const rows = Math.ceil(this.items.length / this.columns);
@@ -1175,7 +1267,7 @@ class VirtualGrid {
     for (let index = startIndex; index < endIndex; index += 1) {
       let cell = this.cells.get(index);
       if (!cell) {
-        cell = this.renderCell(this.items[index], index);
+        cell = this.renderCell(this.items[index], index, this.cellWidth);
         this.cells.set(index, cell);
       }
       fragment.append(cell);
@@ -1188,7 +1280,9 @@ class VirtualGrid {
         .filter((index) => index < startIndex || index >= endIndex)
         .sort((left, right) => Math.abs(right - center) - Math.abs(left - center));
       while (this.cells.size > cacheLimit && candidates.length) {
-        this.cells.delete(candidates.shift());
+        const index = candidates.shift();
+        disposeGridTile(this.cells.get(index));
+        this.cells.delete(index);
       }
     }
   }
@@ -1238,6 +1332,7 @@ class VirtualGrid {
     this.scroller.removeEventListener("pointerup", this.onPointerEnd);
     this.scroller.removeEventListener("pointercancel", this.onPointerEnd);
     this.resizeObserver.disconnect();
+    for (const cell of this.cells.values()) disposeGridTile(cell);
     this.cells.clear();
   }
 }

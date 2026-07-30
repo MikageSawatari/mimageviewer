@@ -15,6 +15,7 @@ getrandom = "0.3"
 fast_image_resize = { version = "5", features = ["image"] }
 hmac = "0.12"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
+mimageviewer-ipc = { path = "../remote-ipc" }
 percent-encoding = "2"
 qrcode = { version = "0.14", default-features = false }
 rexif = "0.7"
@@ -31,8 +32,12 @@ webp = "0.3"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Imaging",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_Variant",
 ] }
 

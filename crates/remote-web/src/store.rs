@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
@@ -22,30 +21,6 @@ pub enum StoreError {
     Io(std::io::Error),
     Db(rusqlite::Error),
     Decode,
-    ThumbnailMiss(ThumbnailMissReason),
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThumbnailMissReason {
-    DatabaseMissing,
-    RowMissing,
-    MtimeMismatch,
-    NotWebp,
-    RepresentativeMissing,
-}
-
-pub enum ThumbnailLookup {
-    Catalog(Vec<u8>),
-    Generate(ThumbnailGenerationSource),
-}
-
-pub struct ThumbnailGenerationSource {
-    pub path: PathBuf,
-    pub cache_identity: String,
-    pub mtime_ns: u128,
-    pub size: u64,
-    pub catalog_miss: ThumbnailMissReason,
 }
 
 impl From<std::io::Error> for StoreError {
@@ -158,7 +133,6 @@ pub struct ImageMetrics {
 pub struct Library {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
-    cache_dir: PathBuf,
     thumb_aspect: StoredThumbAspect,
     thumb_aspect_auto: bool,
     auto_aspect_cache_path: PathBuf,
@@ -219,11 +193,10 @@ fn resolve_thumb_aspect_height_ratio(
 
 impl Library {
     #[cfg(test)]
-    pub fn empty_for_test(cache_dir: PathBuf) -> Self {
+    pub fn empty_for_test(_cache_dir: PathBuf) -> Self {
         Self {
             favorites: Vec::new(),
             by_id: HashMap::new(),
-            cache_dir,
             thumb_aspect: StoredThumbAspect::Square,
             thumb_aspect_auto: false,
             auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
@@ -268,7 +241,6 @@ impl Library {
         Ok(Self {
             favorites,
             by_id,
-            cache_dir: data_dir.join("cache"),
             thumb_aspect,
             thumb_aspect_auto,
             auto_aspect_cache_path: data_dir.join("auto_aspect_cache.db"),
@@ -369,72 +341,6 @@ impl Library {
                 scan_ms,
             },
         })
-    }
-
-    pub fn thumbnail_lookup(
-        &self,
-        favorite_id: Uuid,
-        relative: &str,
-    ) -> Result<ThumbnailLookup, StoreError> {
-        let favorite = self.favorite(favorite_id)?;
-        let target = resolve_existing(&favorite.path, relative)?;
-        let target_metadata = std::fs::metadata(&target)?;
-        let is_folder = target_metadata.is_dir();
-        if !is_folder && !(target_metadata.is_file() && classify_path(&target) == EntryKind::Image)
-        {
-            return Err(StoreError::NotFound);
-        }
-
-        // Catalog identity follows the configured/logical favorite path. The
-        // canonical path above is only for the security boundary and file read;
-        // its Windows verbatim spelling would miss the main application's DB.
-        let logical_path = favorite.path.join(relative);
-        let parent = logical_path.parent().ok_or(StoreError::NotFound)?;
-        let filename = logical_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(StoreError::NotFound)?;
-        let catalog_path = image_support::catalog_db_path(&self.cache_dir, parent);
-        let catalog_result = if is_folder {
-            catalog_folder_thumbnail(&catalog_path, parent, &logical_path, filename)
-        } else {
-            catalog_image_thumbnail(
-                &catalog_path,
-                parent,
-                &logical_path,
-                filename,
-                &target_metadata,
-            )
-        }?;
-        match catalog_result {
-            Ok(bytes) => return Ok(ThumbnailLookup::Catalog(bytes)),
-            Err(catalog_miss) => {
-                let source_path = if is_folder {
-                    find_folder_representative(&target, 3).ok_or(StoreError::ThumbnailMiss(
-                        ThumbnailMissReason::RepresentativeMissing,
-                    ))?
-                } else {
-                    target
-                };
-                let source_metadata = require_image_file(&source_path)?;
-                let requested_relative = normalize_relative_for_url(relative);
-                // This identity is hashed before it is persisted. Keeping the
-                // canonical source path in the hash input prevents a folder
-                // representative change with coincidentally identical metadata
-                // from reusing the old generated thumbnail.
-                let cache_identity = format!(
-                    "{favorite_id}/{requested_relative}/source/{}",
-                    source_path.to_string_lossy()
-                );
-                Ok(ThumbnailLookup::Generate(ThumbnailGenerationSource {
-                    path: source_path,
-                    cache_identity,
-                    mtime_ns: mtime_ns(&source_metadata),
-                    size: source_metadata.len(),
-                    catalog_miss,
-                }))
-            }
-        }
     }
 
     pub fn image(
@@ -589,181 +495,6 @@ fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn catalog_image_thumbnail(
-    catalog_path: &Path,
-    parent: &Path,
-    logical_path: &Path,
-    filename: &str,
-    metadata: &std::fs::Metadata,
-) -> Result<Result<Vec<u8>, ThumbnailMissReason>, StoreError> {
-    let Some(catalog) = open_catalog_if_present(catalog_path)? else {
-        return Ok(Err(ThumbnailMissReason::DatabaseMissing));
-    };
-    let entry = catalog
-        .query_row(
-            "SELECT mtime, file_size, thumb_data
-             FROM thumbnails WHERE filename = ?1",
-            params![catalog_image_key(parent, logical_path, filename)],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((mtime, size, bytes)) = entry else {
-        return Ok(Err(ThumbnailMissReason::RowMissing));
-    };
-    if mtime != mtime_secs(metadata) || size != metadata.len() as i64 {
-        return Ok(Err(ThumbnailMissReason::MtimeMismatch));
-    }
-    if !is_webp(&bytes) {
-        return Ok(Err(ThumbnailMissReason::NotWebp));
-    }
-    Ok(Ok(bytes))
-}
-
-fn catalog_folder_thumbnail(
-    catalog_path: &Path,
-    parent: &Path,
-    logical_path: &Path,
-    filename: &str,
-) -> Result<Result<Vec<u8>, ThumbnailMissReason>, StoreError> {
-    let Some(catalog) = open_catalog_if_present(catalog_path)? else {
-        return Ok(Err(ThumbnailMissReason::DatabaseMissing));
-    };
-    let identity = if parent.parent().is_none() {
-        logical_path.to_string_lossy().into_owned()
-    } else {
-        filename.to_owned()
-    };
-    let base_key = format!("folderthumb:auto-v2:numeric:d3:{identity}");
-    let pin_prefix = format!("{base_key}#pin:");
-    let legacy_key = format!("folderthumb:{identity}");
-    let legacy_pin_prefix = format!("{legacy_key}#pin:");
-    let bytes = catalog
-        .query_row(
-            "SELECT thumb_data FROM thumbnails
-             WHERE filename = ?1 OR instr(filename, ?2) = 1
-                OR filename = ?3 OR instr(filename, ?4) = 1
-             ORDER BY CASE
-                WHEN instr(filename, ?2) = 1 THEN 0
-                WHEN filename = ?1 THEN 1
-                WHEN instr(filename, ?4) = 1 THEN 2
-                ELSE 3
-             END, filename DESC
-             LIMIT 1",
-            params![base_key, pin_prefix, legacy_key, legacy_pin_prefix],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?;
-    let Some(bytes) = bytes else {
-        return Ok(Err(ThumbnailMissReason::RowMissing));
-    };
-    if !is_webp(&bytes) {
-        return Ok(Err(ThumbnailMissReason::NotWebp));
-    }
-    Ok(Ok(bytes))
-}
-
-fn open_catalog_if_present(path: &Path) -> Result<Option<Connection>, StoreError> {
-    match path.try_exists() {
-        Ok(true) => Ok(Some(open_read_only(path)?)),
-        Ok(false) => Ok(None),
-        Err(error) => Err(StoreError::Io(error)),
-    }
-}
-
-fn find_folder_representative(folder: &Path, depth: u32) -> Option<PathBuf> {
-    find_folder_representative_inner(folder, folder, "", depth)
-}
-
-fn find_folder_representative_inner(
-    root: &Path,
-    folder: &Path,
-    relative: &str,
-    depth: u32,
-) -> Option<PathBuf> {
-    let mut subdirs = Vec::new();
-    let mut images = Vec::new();
-    for entry in std::fs::read_dir(folder).ok()?.flatten() {
-        // Use cached FindFirstFile data for classification. Containment is
-        // canonicalized only for directories before recursion, not via
-        // Path::is_dir/is_file per entry.
-        let file_type = entry.file_type().ok()?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let child_relative = join_relative(relative, &name);
-        if file_type.is_dir() {
-            if let Ok(resolved) = resolve_existing(root, &child_relative) {
-                subdirs.push((name, resolved, child_relative));
-            }
-        } else if file_type.is_file() && classify_path(&entry.path()) == EntryKind::Image {
-            images.push((name, entry.path()));
-        }
-    }
-    subdirs.sort_by(|left, right| natural_cmp(&left.0, &right.0));
-    images.sort_by(|left, right| natural_cmp(&left.0, &right.0));
-    if depth > 0 {
-        for (_, path, child_relative) in subdirs {
-            if let Some(image) =
-                find_folder_representative_inner(root, &path, &child_relative, depth - 1)
-            {
-                return Some(image);
-            }
-        }
-    }
-    images.into_iter().next().map(|(_, path)| path)
-}
-
-fn natural_cmp(left: &str, right: &str) -> Ordering {
-    let left = left.to_lowercase();
-    let right = right.to_lowercase();
-    let a = left.as_bytes();
-    let b = right.as_bytes();
-    let (mut ai, mut bi) = (0, 0);
-    while ai < a.len() && bi < b.len() {
-        if a[ai].is_ascii_digit() && b[bi].is_ascii_digit() {
-            let (a_start, b_start) = (ai, bi);
-            while ai < a.len() && a[ai].is_ascii_digit() {
-                ai += 1;
-            }
-            while bi < b.len() && b[bi].is_ascii_digit() {
-                bi += 1;
-            }
-            let a_trim = a[a_start..ai]
-                .iter()
-                .skip_while(|byte| **byte == b'0')
-                .copied()
-                .collect::<Vec<_>>();
-            let b_trim = b[b_start..bi]
-                .iter()
-                .skip_while(|byte| **byte == b'0')
-                .copied()
-                .collect::<Vec<_>>();
-            let order = a_trim
-                .len()
-                .cmp(&b_trim.len())
-                .then_with(|| a_trim.cmp(&b_trim));
-            if order != Ordering::Equal {
-                return order;
-            }
-        } else {
-            let order = a[ai].cmp(&b[bi]);
-            if order != Ordering::Equal {
-                return order;
-            }
-            ai += 1;
-            bi += 1;
-        }
-    }
-    a.len().cmp(&b.len()).then_with(|| left.cmp(&right))
-}
-
 fn require_image_file(path: &Path) -> Result<std::fs::Metadata, StoreError> {
     let metadata = std::fs::metadata(path)?;
     if metadata.is_file() && classify_path(path) == EntryKind::Image {
@@ -853,19 +584,6 @@ fn mtime_secs(metadata: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn mtime_ns(metadata: &std::fs::Metadata) -> u128 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
-}
-
-fn is_webp(bytes: &[u8]) -> bool {
-    bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
-}
-
 #[cfg(windows)]
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -877,14 +595,6 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
     false
-}
-
-fn catalog_image_key(parent: &Path, logical_path: &Path, filename: &str) -> String {
-    if parent.parent().is_none() {
-        format!("imgthumb:{}", logical_path.to_string_lossy())
-    } else {
-        filename.to_owned()
-    }
 }
 
 #[cfg(test)]
@@ -985,26 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn webp_detection_does_not_mislabel_legacy_jpeg() {
-        assert!(is_webp(b"RIFF\x10\x00\x00\x00WEBPdata"));
-        assert!(!is_webp(b"\xff\xd8\xff\xe0legacy jpeg"));
-    }
-
-    #[test]
-    fn drive_root_images_use_existing_full_path_cache_key_convention() {
-        let root = Path::new("C:/");
-        let image = root.join("cover.jpg");
-        assert_eq!(
-            catalog_image_key(root, &image, "cover.jpg"),
-            "imgthumb:C:/cover.jpg"
-        );
-        assert_eq!(
-            catalog_image_key(Path::new("C:/Photos"), &image, "cover.jpg"),
-            "cover.jpg"
-        );
-    }
-
-    #[test]
     fn read_only_connection_rejects_writes() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("settings.db");
@@ -1030,7 +720,6 @@ mod tests {
                 path: PathBuf::from("C:/Users/example/Private"),
             }],
             by_id: HashMap::from([(id, 0)]),
-            cache_dir: PathBuf::from("cache"),
             thumb_aspect: StoredThumbAspect::Square,
             thumb_aspect_auto: false,
             auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
@@ -1068,7 +757,6 @@ mod tests {
                 path: favorite_root,
             }],
             by_id: HashMap::from([(id, 0)]),
-            cache_dir: temp.path().join("cache"),
             thumb_aspect: StoredThumbAspect::Square,
             thumb_aspect_auto: false,
             auto_aspect_cache_path: temp.path().join("auto_aspect_cache.db"),
@@ -1088,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn library_reads_temp_settings_catalog_and_image_without_db_mutation() {
+    fn library_reads_settings_aspect_and_image_without_db_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
         let favorite_root = temp.path().join("favorite");
@@ -1163,46 +851,7 @@ mod tests {
             .unwrap();
         }
 
-        let thumbnail = {
-            let pixels = RgbaImage::from_pixel(8, 4, Rgba([30, 80, 160, 255]));
-            webp::Encoder::from_rgba(pixels.as_raw(), 8, 4)
-                .encode(75.0)
-                .to_vec()
-        };
-        let catalog_path = image_support::catalog_db_path(&data_dir.join("cache"), &favorite_root);
-        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
-        {
-            let conn = Connection::open(&catalog_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE thumbnails (
-                    filename TEXT NOT NULL PRIMARY KEY,
-                    mtime INTEGER NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    thumb_data BLOB NOT NULL
-                 );",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO thumbnails (filename, mtime, file_size, thumb_data)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    "page.png",
-                    mtime_secs(&image_metadata),
-                    image_metadata.len() as i64,
-                    &thumbnail
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO thumbnails (filename, mtime, file_size, thumb_data)
-                 VALUES (?1, 0, 0, ?2)",
-                params!["folderthumb:auto-v2:numeric:d3:album", &thumbnail],
-            )
-            .unwrap();
-        }
-
         let settings_before = std::fs::read(&settings_path).unwrap();
-        let catalog_before = std::fs::read(&catalog_path).unwrap();
         let auto_aspect_cache_before = std::fs::read(&auto_aspect_cache_path).unwrap();
         let library = Library::load(&data_dir).unwrap();
 
@@ -1230,50 +879,6 @@ mod tests {
             Err(StoreError::BadRequest)
         ));
 
-        match library.thumbnail_lookup(favorite_id, "page.png").unwrap() {
-            ThumbnailLookup::Catalog(bytes) => assert_eq!(bytes, thumbnail),
-            ThumbnailLookup::Generate(_) => panic!("catalog image should be reused"),
-        }
-        match library.thumbnail_lookup(favorite_id, "album").unwrap() {
-            ThumbnailLookup::Catalog(bytes) => assert_eq!(bytes, thumbnail),
-            ThumbnailLookup::Generate(_) => panic!("folderthumb row should be reused"),
-        }
-
-        let uncached_path = favorite_root.join("uncached.png");
-        RgbaImage::from_pixel(24, 36, Rgba([180, 50, 20, 255]))
-            .save(&uncached_path)
-            .unwrap();
-        let source = match library
-            .thumbnail_lookup(favorite_id, "uncached.png")
-            .unwrap()
-        {
-            ThumbnailLookup::Generate(source) => source,
-            ThumbnailLookup::Catalog(_) => panic!("uncached image should be generated"),
-        };
-        let remote_cache_path = temp.path().join("remote-thumbs.db");
-        let service = crate::thumb_cache::ThumbnailService::open(
-            &remote_cache_path,
-            std::slice::from_ref(&data_dir),
-            2,
-        )
-        .unwrap();
-        let key = crate::thumb_cache::thumbnail_cache_key(
-            &source.cache_identity,
-            source.mtime_ns,
-            source.size,
-            crate::thumb_cache::GENERATED_THUMB_SIZE,
-        );
-        let generated = service
-            .load_or_generate(
-                &key,
-                &source.path,
-                source.mtime_ns,
-                source.size,
-                crate::thumb_cache::GENERATED_THUMB_SIZE,
-            )
-            .unwrap();
-        assert!(is_webp(generated.bytes.as_slice()));
-        assert_eq!(std::fs::read(&catalog_path).unwrap(), catalog_before);
         let resized_webp = library.image(favorite_id, "page.png", 10).unwrap();
         let resized = image::load_from_memory(&resized_webp.bytes).unwrap();
         assert_eq!(resized.dimensions(), (10, 5));
@@ -1289,7 +894,6 @@ mod tests {
         assert_eq!(passthrough.metrics.webp_encode_ms, 0.0);
 
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
-        assert_eq!(std::fs::read(&catalog_path).unwrap(), catalog_before);
         assert_eq!(
             std::fs::read(&auto_aspect_cache_path).unwrap(),
             auto_aspect_cache_before

@@ -5,9 +5,9 @@ mod console_qr;
 mod diagnostics;
 mod http;
 mod image_support;
+mod ipc_client;
 mod path_guard;
 mod store;
-mod thumb_cache;
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -19,8 +19,8 @@ use config::{Config, default_data_dir};
 use connection_url::choose_connection_url;
 use diagnostics::DiagnosticsLogger;
 use http::{AppState, TelemetryLimiter};
+use ipc_client::ThumbnailClient;
 use store::Library;
-use thumb_cache::ThumbnailService;
 use tiny_http::Server;
 
 fn main() {
@@ -51,18 +51,11 @@ fn run() -> Result<(), String> {
     }
     let library = Library::load(&config.data_dir)
         .map_err(|error| format!("settings.db を read-only で読み込めません: {error:?}"))?;
-    let thumb_parallelism = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .clamp(2, 4);
-    let thumb_service = ThumbnailService::open(
-        &config.thumb_cache_path,
-        &protected_roots,
-        thumb_parallelism,
-    )?;
-    if thumb_service.path() == logger.path() || thumb_service.path() == loaded_auth.path {
-        return Err("--thumb-cache は --log / --auth-file と別のファイルにしてください".to_owned());
-    }
+    let thumbnail_client = ThumbnailClient::new();
+    let ipc_status = match thumbnail_client.probe() {
+        Ok(()) => "接続済み".to_owned(),
+        Err(error) => format!("未接続 ({error})"),
+    };
     let address = SocketAddr::new(config.bind, config.port);
     let connection = choose_connection_url(config.public_url.as_deref(), address)?;
     let server = Arc::new(
@@ -72,11 +65,7 @@ fn run() -> Result<(), String> {
     println!("mIV remote PoC bind: http://{address}");
     println!("計測ログ: {}", logger.path().display());
     println!("認証ファイル: {}", loaded_auth.path.display());
-    println!(
-        "remote-web サムネイルキャッシュ: {} (生成並列数 {})",
-        thumb_service.path().display(),
-        thumb_service.parallelism()
-    );
+    println!("mIV サムネイル IPC: {ipc_status}");
     println!("デバッグ用 Bearer トークン: {}", auth.bearer_printable());
     println!("接続 URL の決定元: {}", connection.source.label());
     println!(
@@ -93,7 +82,7 @@ fn run() -> Result<(), String> {
     let state = Arc::new(AppState {
         auth,
         library,
-        thumb_service,
+        thumbnail_client,
         logger,
         telemetry_limiter: TelemetryLimiter::new(),
         request_sequence: AtomicU64::new(1),

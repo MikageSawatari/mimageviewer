@@ -12,6 +12,7 @@ import {
   viewerTapCommand,
   nextFitMode,
   snappedGridOffset,
+  thumbnailBindingMatches,
   viewerImageLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
@@ -156,6 +157,12 @@ test("grid scroll extent and snapping stay on whole row boundaries", () => {
     maxOffset: 0,
     totalHeight: 700,
   });
+});
+
+test("thumbnail responses apply only to the tile generation and item that requested them", () => {
+  assert.equal(thumbnailBindingMatches(4, "album/a.jpg", 4, "album/a.jpg"), true);
+  assert.equal(thumbnailBindingMatches(5, "album/a.jpg", 4, "album/a.jpg"), false);
+  assert.equal(thumbnailBindingMatches(4, "album/b.jpg", 4, "album/a.jpg"), false);
 });
 
 test("viewer transform commands dispatch through one pure state transition", () => {

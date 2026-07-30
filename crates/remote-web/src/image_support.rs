@@ -1,8 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::{DynamicImage, RgbImage, RgbaImage};
-use sha2::{Digest, Sha256};
 
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "bmp", "gif", "heic", "heif", "avif", "jxl", "tiff", "tif",
@@ -28,24 +27,6 @@ impl ImageProbe {
             (self.raw_width, self.raw_height)
         }
     }
-}
-
-/// Keep the catalog v2 location convention identical to
-/// `mimageviewer::catalog::db_path_for` without linking the GUI/native runtime.
-pub fn catalog_db_path(cache_dir: &Path, folder_path: &Path) -> PathBuf {
-    let raw = folder_path.to_string_lossy();
-    let normalized = if folder_path.parent().is_none() {
-        raw.to_lowercase().replace('\\', "/")
-    } else {
-        let no_drive = if raw.len() >= 2 && raw.chars().nth(1) == Some(':') {
-            &raw[2..]
-        } else {
-            &raw
-        };
-        no_drive.to_lowercase().replace('\\', "/")
-    };
-    let hash = format!("{:x}", Sha256::digest(normalized.as_bytes()));
-    cache_dir.join(&hash[..2]).join(format!("{hash}.db"))
 }
 
 pub fn decode_oriented(path: &Path) -> Option<DynamicImage> {
@@ -371,18 +352,6 @@ impl Drop for ComScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn catalog_path_uses_two_level_sha256_layout() {
-        let cache = Path::new("cache");
-        let path = catalog_db_path(cache, Path::new(r"C:\Photos\Summer"));
-        assert_eq!(
-            path,
-            cache
-                .join("11")
-                .join("115509654a9d88d89064533af04ffe209b0635a1f9865ca8e670734eaa3c5586.db")
-        );
-    }
 
     #[test]
     fn passthrough_boundary_requires_full_width_identity_and_browser_format() {
