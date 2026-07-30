@@ -1102,9 +1102,11 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 ### 7.1 サムネイル表示モード
 
 `checked` が 1 件以上ある間は、下部情報バーとは別にメイン一覧の残り表示領域の右上へ
-`チェック N 件` の Foreground overlay を常時表示する。overlay はクリックで `checked.clear()`
-（`GridDeselect` / Ctrl+D 相当）を実行し、グリッドより先に登録して背面セルへ pointer 入力を
-漏らさない。0 件では文字列生成と `Area` 構築の前に return する。
+`チェック` / `N 件` / `選択解除` ボタンを縦に並べた Foreground overlay を常時表示する。
+白い一覧に埋もれないよう、下地はテーマ別の淡い注意色、文字と枠は `warn_fg_color` を使う。
+`checked.clear()`（`GridDeselect` / Ctrl+D 相当）を実行するのはボタンだけで、件数表示自体は
+押しても何も起きない。overlay はグリッドより先に登録して背面セルへ pointer 入力を漏らさない。
+0 件では文字列生成と `Area` 構築の前に return する。
 
 | キー | 動作 |
 |------|------|

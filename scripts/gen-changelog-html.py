@@ -10,7 +10,10 @@ page.
 changelog.html is a GENERATED ARTIFACT. Do not edit it by hand — edit README.md
 and re-run this script (see the release checklist in CLAUDE.md, Phase 1).
 
-The page chrome (header / breadcrumb / footer) is templated here, but the sidebar
+The page chrome (header / breadcrumb / footer) and the SEO meta block are templated
+here. The meta block must stay in the template: every other manual page carries a
+hand-written one, and a generated page that only copied the chrome would silently
+drop its description / canonical / OpenGraph tags on the next release. The sidebar
 nav is copied verbatim from a sibling manual page (getting-started.html) so that
 adding a new manual page and re-running this script keeps changelog.html's
 sidebar in sync automatically. That sibling page must already contain the
@@ -164,6 +167,23 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>更新履歴 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="mImageViewer のバージョンごとの変更点の一覧。新機能・改善・修正をリリース順にまとめています。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/changelog.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/changelog.html">
+  <meta property="og:title" content="更新履歴｜mImageViewer">
+  <meta property="og:description" content="mImageViewer のバージョンごとの変更点の一覧。新機能・改善・修正をリリース順にまとめています。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="更新履歴｜mImageViewer">
+  <meta name="twitter:description" content="mImageViewer のバージョンごとの変更点の一覧。新機能・改善・修正をリリース順にまとめています。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
   <link rel="stylesheet" href="style.css">
 </head>
 <body>

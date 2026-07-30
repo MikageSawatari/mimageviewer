@@ -165,12 +165,21 @@ fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
 }
 
 fn checked_selection_overlay_label(checked_count: usize) -> Option<String> {
-    (checked_count > 0).then(|| format!("チェック {checked_count} 件"))
+    (checked_count > 0).then(|| format!("{checked_count} 件"))
 }
 
-/// チェック件数をメイン一覧の右上へ表示する。クリックされたら true を返す。
+/// オーバーレイの下地色。文字と枠は `warn_fg_color` を載せるので、それが読める明度にする。
+/// 白い一覧の上で埋もれないことが目的なので、`Frame::popup` の既定 fill は使わない。
+fn checked_selection_overlay_fill(dark_mode: bool) -> egui::Color32 {
+    match dark_mode {
+        false => egui::Color32::from_rgb(255, 243, 209),
+        true => egui::Color32::from_rgb(66, 50, 20),
+    }
+}
+
+/// チェック件数をメイン一覧の右上へ表示する。「選択解除」が押されたら true を返す。
 fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> bool {
-    let Some(label) = checked_selection_overlay_label(checked_count) else {
+    let Some(count_label) = checked_selection_overlay_label(checked_count) else {
         return false;
     };
     let top_offset = ctx.available_rect().top() + 8.0;
@@ -179,12 +188,27 @@ fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> 
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top_offset))
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                clear_clicked = ui
-                    .button(egui::RichText::new(label).strong())
-                    .on_hover_text("クリックでチェックをすべて解除 (Ctrl+D)")
-                    .clicked();
-            });
+            let accent = ui.visuals().warn_fg_color;
+            egui::Frame::popup(ui.style())
+                .fill(checked_selection_overlay_fill(ui.visuals().dark_mode))
+                .stroke(egui::Stroke::new(1.5, accent))
+                .show(ui, |ui| {
+                    // Area の幅は自動なので、中央寄せ系のレイアウトは available_width を
+                    // 画面端まで取ってしまう。縦積みだけに留める。
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("チェック").color(accent));
+                        ui.label(
+                            egui::RichText::new(count_label)
+                                .strong()
+                                .size(18.0)
+                                .color(accent),
+                        );
+                        clear_clicked = ui
+                            .button("選択解除")
+                            .on_hover_text("チェックをすべて解除 (Ctrl+D)")
+                            .clicked();
+                    });
+                });
         });
     clear_clicked
 }
@@ -18078,7 +18102,8 @@ mod checked_selection_overlay_tests {
             });
 
         harness.run();
-        assert!(harness.query_by_label("チェック 0 件").is_none());
+        assert!(harness.query_by_label("チェック").is_none());
+        assert!(harness.query_by_label("選択解除").is_none());
     }
 
     #[test]
@@ -18090,7 +18115,8 @@ mod checked_selection_overlay_tests {
             });
 
         harness.run();
-        assert!(harness.query_by_label("チェック 1 件").is_some());
+        assert!(harness.query_by_label("チェック").is_some());
+        assert!(harness.query_by_label("1 件").is_some());
     }
 
     #[test]
@@ -18105,9 +18131,27 @@ mod checked_selection_overlay_tests {
                 }
             });
 
-        harness.get_by_label("チェック 2 件").click();
+        harness.get_by_label("選択解除").click();
         harness.run();
         assert!(clicked.load(Ordering::Relaxed));
+    }
+
+    /// 件数表示そのものは押しても解除しない。解除操作はボタンだけが持つ。
+    #[test]
+    fn checked_selection_overlay_count_text_does_not_deselect() {
+        let clicked = Arc::new(AtomicBool::new(false));
+        let clicked_in_ui = Arc::clone(&clicked);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build(move |ctx| {
+                if show_checked_selection_overlay(ctx, 2) {
+                    clicked_in_ui.store(true, Ordering::Relaxed);
+                }
+            });
+
+        harness.get_by_label("2 件").click();
+        harness.run();
+        assert!(!clicked.load(Ordering::Relaxed));
     }
 }
 

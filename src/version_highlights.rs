@@ -438,13 +438,43 @@ const TABLE: &[VersionHighlights] = &[
     },
     VersionHighlights {
         version: GRID_CLICK_SELECTION_EXPLORER_VERSION,
-        must_read: &[HighlightItem {
-            title: "クリックで以前のチェックを解除します",
-            body: "一覧で項目をクリックすると、それまでのチェックが解除され、クリックした項目だけが\
-                   選ばれるようになりました（エクスプローラーと同じ動作）。従来の動作に戻すには、\
-                   環境設定の「表示 → サムネイル → 一覧のクリック選択」で「チェック方式」を選べます。",
-        }],
-        highlights: &[],
+        must_read: &[
+            HighlightItem {
+                title: "クリックで以前のチェックを解除します",
+                body: "一覧で項目をクリックすると、それまでのチェックが解除され、クリックした項目だけが\
+                       選ばれるようになりました（エクスプローラーと同じ動作）。従来の動作に戻すには、\
+                       環境設定の「表示 → サムネイル → 一覧のクリック選択」で「チェック方式」を選べます。",
+            },
+            HighlightItem {
+                title: "画像補正はまず「その場所の標準」に効きます",
+                body: "個別設定を持たないページで補正スライダーを動かすと、そのページだけでなく、\
+                       その場所の標準が変わり、同じ標準を使うページすべてに反映されます。\
+                       このページだけに効かせたいときは、パネル上部の適用範囲で「このページ」を選びます。\
+                       お気に入りごとに標準を分けたいときは「このお気に入り用に標準を分ける」を有効にします。",
+            },
+        ],
+        highlights: &[
+            HighlightItem {
+                title: "連結読みでも左パネルが使えます",
+                body: "スクロールしながら読んでいる途中でも、画像補正・表示トリミング・ブックマークを\
+                       開けます。編集対象のページは枠で示します。",
+            },
+            HighlightItem {
+                title: "詳細表示の下部バーに独自の列",
+                body: "下部バーに出す列を、一覧と同じ列・専用の列・非表示から選べます。\
+                       列の追加や幅の調整はバーからもできます。",
+            },
+            HighlightItem {
+                title: "動画にも画像補正の保存スロット",
+                body: "明るさや Creative LUT などの設定をスロットへ保存し、\
+                       Ctrl+1〜Ctrl+0 で呼び出せます。",
+            },
+            HighlightItem {
+                title: "PDF のページ表示が速くなりました",
+                body: "表示に必要な大きさでページを描くようにしました。\
+                       CPU のコア数が少ない環境ほど効果があります。",
+            },
+        ],
     },
 ];
 
@@ -594,14 +624,16 @@ mod tests {
         let entries = for_version(GRID_CLICK_SELECTION_EXPLORER_VERSION, table());
         assert_eq!(versions(&entries), [GRID_CLICK_SELECTION_EXPLORER_VERSION]);
         let entry = entries[0];
-        assert_eq!(entry.must_read.len(), 1);
-        assert!(entry.must_read[0].title.contains("チェックを解除"));
-        assert!(
-            entry.must_read[0]
-                .body
-                .contains("エクスプローラーと同じ動作")
-        );
-        assert!(entry.must_read[0].body.contains("チェック方式"));
+        // 選択方式の一度きりの切替はこの must_read の存在で告知される (settings.rs の移行判定と
+        // 対になる)。同じバージョンに別の must_read が増えても壊れないよう、件数ではなく
+        // 「その項目があること」を固定する。
+        let selection_notice = entry
+            .must_read
+            .iter()
+            .find(|item| item.title.contains("チェックを解除"))
+            .expect("v2.9.0 must announce the grid click selection switch");
+        assert!(selection_notice.body.contains("エクスプローラーと同じ動作"));
+        assert!(selection_notice.body.contains("チェック方式"));
     }
 
     #[test]
