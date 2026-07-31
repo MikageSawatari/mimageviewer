@@ -217,6 +217,10 @@ use pdfium_render::prelude::*;
 /// ワーカープロセス起動時の引数。main.rs と pdf_loader.rs の両方で参照。
 pub const PDF_WORKER_ARG: &str = "--pdf-worker";
 
+const PDF_WORKER_READY_PREFIX: &str = "MIV_PDF_WORKER_READY_V1";
+const PDF_WORKER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PDF_PASSWORD_REQUIRED_MARKER: &str = "MIV_PDF_PASSWORD_REQUIRED";
+
 /// Windows: ワーカープロセスがコンソールウィンドウを表示しないようにするフラグ。
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -377,7 +381,7 @@ fn core_enumerate(
 
     let doc = pdfium
         .load_pdf_from_file(path, password)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+        .map_err(pdfium_open_error)?;
 
     let count = doc.pages().len() as u32;
     Ok((0..count)
@@ -387,6 +391,28 @@ fn core_enumerate(
             file_size,
         })
         .collect())
+}
+
+fn pdfium_open_error(error: PdfiumError) -> std::io::Error {
+    if matches!(
+        &error,
+        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)
+    ) {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            PDF_PASSWORD_REQUIRED_MARKER,
+        )
+    } else {
+        std::io::Error::other(format!("{error}"))
+    }
+}
+
+/// subprocess IPC 後も失われない marker を正本にし、旧 worker の英語 Display も許容する。
+pub(crate) fn is_password_required_error(error: &std::io::Error) -> bool {
+    let message = error.to_string();
+    message.contains(PDF_PASSWORD_REQUIRED_MARKER)
+        || message.contains("Password")
+        || message.contains("password")
 }
 
 // (旧 `core_render` は `core_render_with_count` (v1.0.0 で page_count も返す)
@@ -699,6 +725,17 @@ pub fn run_worker_process() {
 
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
+    let data_dir = crate::data_dir::get();
+    let ready = format!("{PDF_WORKER_READY_PREFIX}\n{}", data_dir.display());
+    if let Err(error) = write_msg(&mut stdout, ready.as_bytes()) {
+        eprintln!("pdf-worker: readiness write failed: {error}");
+        return;
+    }
+    eprintln!(
+        "pdf-worker: ready data_dir={} dll={}",
+        data_dir.display(),
+        dll_path.display()
+    );
 
     loop {
         let msg = match read_msg(&mut stdin) {
@@ -788,7 +825,7 @@ fn core_get_info(
 
     let doc = pdfium
         .load_pdf_from_file(path, password)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+        .map_err(pdfium_open_error)?;
     let metadata = doc.metadata();
     let extract = |tag: PdfDocumentMetadataTagType| -> Option<String> {
         metadata.get(tag).and_then(|t| {
@@ -869,7 +906,7 @@ fn core_render_with_count(
 ) -> std::io::Result<(image::DynamicImage, PdfPageContentType, u32)> {
     let doc = pdfium
         .load_pdf_from_file(path, password)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+        .map_err(pdfium_open_error)?;
     let page_count = doc.pages().len() as u32;
     let page = doc
         .pages()
@@ -914,20 +951,14 @@ struct ProcessWorkerIo {
     stdout: std::io::BufReader<std::process::ChildStdout>,
 }
 
-fn spawn_worker_process(exe_path: &Path) -> std::io::Result<(Child, ProcessWorkerIo)> {
-    let mut cmd = Command::new(exe_path);
-    cmd.arg(PDF_WORKER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
+fn spawn_worker_process(
+    exe_path: &Path,
+    data_dir: &Path,
+    worker_id: usize,
+) -> std::io::Result<(Child, ProcessWorkerIo)> {
+    let mut cmd = pdf_worker_command(exe_path, data_dir);
     let mut child = cmd.spawn()?;
+
     let stdin = child
         .stdin
         .take()
@@ -936,13 +967,145 @@ fn spawn_worker_process(exe_path: &Path) -> std::io::Result<(Child, ProcessWorke
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout"))?;
-    Ok((
-        child,
-        ProcessWorkerIo {
-            stdin,
-            stdout: std::io::BufReader::new(stdout),
-        },
-    ))
+    if let Some(stderr) = child.stderr.take() {
+        let pid = child.id();
+        let _ = std::thread::Builder::new()
+            .name(format!("pdf-worker-stderr-{worker_id}"))
+            .spawn(move || {
+                use std::io::BufRead as _;
+                for line in std::io::BufReader::new(stderr).lines() {
+                    match line {
+                        Ok(line) => crate::logger::log(format!(
+                            "pdf-pool: worker {worker_id} stderr pid={pid}: {line}"
+                        )),
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "pdf-pool: worker {worker_id} stderr read failed pid={pid}: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            });
+    }
+
+    let io = ProcessWorkerIo {
+        stdin,
+        stdout: std::io::BufReader::new(stdout),
+    };
+    await_worker_ready(child, io, data_dir, worker_id)
+}
+
+fn pdf_worker_command(exe_path: &Path, data_dir: &Path) -> Command {
+    let mut cmd = Command::new(exe_path);
+    cmd.arg(PDF_WORKER_ARG)
+        .arg("--data-dir")
+        .arg(data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+fn await_worker_ready(
+    mut child: Child,
+    mut io: ProcessWorkerIo,
+    data_dir: &Path,
+    worker_id: usize,
+) -> std::io::Result<(Child, ProcessWorkerIo)> {
+    let expected_data_dir = data_dir.to_string_lossy().into_owned();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let reader = std::thread::Builder::new()
+        .name(format!("pdf-worker-ready-{worker_id}"))
+        .spawn(move || {
+            let result = read_msg(&mut io.stdout)
+                .and_then(|message| validate_worker_ready(&message, &expected_data_dir));
+            let _ = ready_tx.send((result, io));
+        })
+        .map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            std::io::Error::other(format!("readiness thread spawn failed: {error}"))
+        })?;
+
+    match ready_rx.recv_timeout(PDF_WORKER_READY_TIMEOUT) {
+        Ok((Ok(()), io)) => {
+            let _ = reader.join();
+            Ok((child, io))
+        }
+        Ok((Err(error), _io)) => {
+            let status = terminate_failed_worker(&mut child);
+            let _ = reader.join();
+            Err(std::io::Error::new(
+                error.kind(),
+                format!("readiness failed ({status}): {error}"),
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let status = terminate_failed_worker(&mut child);
+            let _ = reader.join();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "readiness timed out after {} ms ({status})",
+                    PDF_WORKER_READY_TIMEOUT.as_millis()
+                ),
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let status = terminate_failed_worker(&mut child);
+            let _ = reader.join();
+            Err(std::io::Error::other(format!(
+                "readiness channel disconnected ({status})"
+            )))
+        }
+    }
+}
+
+fn validate_worker_ready(message: &[u8], expected_data_dir: &str) -> std::io::Result<()> {
+    let text = std::str::from_utf8(message)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let Some((prefix, actual_data_dir)) = text.split_once('\n') else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing readiness data directory",
+        ));
+    };
+    if prefix != PDF_WORKER_READY_PREFIX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected readiness protocol: {prefix}"),
+        ));
+    }
+    if !actual_data_dir.eq_ignore_ascii_case(expected_data_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "worker data_dir mismatch: expected={expected_data_dir}, actual={actual_data_dir}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn terminate_failed_worker(child: &mut Child) -> String {
+    match child.try_wait() {
+        Ok(Some(status)) => format!("exit_status={status}"),
+        Ok(None) => {
+            let _ = child.kill();
+            match child.wait() {
+                Ok(status) => format!("killed exit_status={status}"),
+                Err(error) => format!("kill wait failed: {error}"),
+            }
+        }
+        Err(error) => format!("status unavailable: {error}"),
+    }
 }
 
 fn send_recv_io(io: &mut ProcessWorkerIo, request: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -1021,7 +1184,26 @@ impl PdfWorkerPool {
     fn start() -> Self {
         let exe_path =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));
-        let _ = ensure_dll_extracted();
+        let data_dir = crate::data_dir::get();
+        crate::logger::log(format!(
+            "pdf-pool: init begin exe={} data_dir={} requested_workers={POOL_SIZE}",
+            exe_path.display(),
+            data_dir.display()
+        ));
+        let dll_ready = match ensure_dll_extracted() {
+            Ok(path) => {
+                let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+                crate::logger::log(format!(
+                    "pdf-pool: DLL ready path={} bytes={size}",
+                    path.display()
+                ));
+                true
+            }
+            Err(error) => {
+                crate::logger::log(format!("pdf-pool: DLL initialization failed: {error}"));
+                false
+            }
+        };
 
         let queue = Arc::new((
             Mutex::new(JobQueue {
@@ -1044,23 +1226,35 @@ impl PdfWorkerPool {
         let mut pending_workers: Vec<(usize, Child, ProcessWorkerIo)> =
             Vec::with_capacity(POOL_SIZE);
         for i in 0..POOL_SIZE {
-            match spawn_worker_process(&exe_path) {
+            if !dll_ready {
+                break;
+            }
+            match spawn_worker_process(&exe_path, &data_dir, i) {
                 Ok((child, io)) => {
                     let pid = child.id();
-                    crate::logger::log(format!("pdf-pool: worker {i} started (pid={pid})"));
+                    crate::logger::log(format!(
+                        "pdf-pool: worker {i} ready pid={pid} data_dir={}",
+                        data_dir.display()
+                    ));
                     pending_workers.push((i, child, io));
                 }
                 Err(e) => {
-                    crate::logger::log(format!("pdf-pool: worker {i} spawn failed: {e}"));
+                    crate::logger::log(format!(
+                        "pdf-pool: worker {i} startup failed stage=spawn_or_readiness error={e}"
+                    ));
                 }
             }
         }
         let worker_count = pending_workers.len();
 
         if worker_count == 0 {
-            crate::logger::log("pdf-pool: WARNING: no workers spawned, falling back to in-process");
+            crate::logger::log(
+                "pdf-pool: startup complete ready=0; falling back to in-process worker",
+            );
         } else {
-            crate::logger::log(format!("pdf-pool: {worker_count} workers ready"));
+            crate::logger::log(format!(
+                "pdf-pool: startup complete ready={worker_count} requested={POOL_SIZE}"
+            ));
         }
 
         let mut dispatcher_threads = Vec::with_capacity(worker_count);
@@ -2704,6 +2898,42 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_worker_command_inherits_the_parent_data_directory() {
+        let command = pdf_worker_command(
+            Path::new(r"C:\miv\mimageviewer-core.exe"),
+            Path::new(r"C:\isolated\miv-data"),
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [PDF_WORKER_ARG, "--data-dir", r"C:\isolated\miv-data"]
+        );
+    }
+
+    #[test]
+    fn pdf_worker_readiness_requires_the_expected_data_directory() {
+        let ready = format!(
+            r#"{PDF_WORKER_READY_PREFIX}
+C:\isolated\miv-data"#
+        );
+        assert!(validate_worker_ready(ready.as_bytes(), r"C:\isolated\miv-data").is_ok());
+        assert!(validate_worker_ready(ready.as_bytes(), r"C:\other-data").is_err());
+        assert!(validate_worker_ready(b"not-ready", r"C:\isolated\miv-data").is_err());
+    }
+
+    #[test]
+    fn password_required_marker_survives_the_worker_protocol() {
+        let error = std::io::Error::other(format!("worker error: {PDF_PASSWORD_REQUIRED_MARKER}"));
+        assert!(is_password_required_error(&error));
+        assert!(!is_password_required_error(&std::io::Error::other(
+            "broken document"
+        )));
+    }
 
     fn vector_target() -> PdfPageContentType {
         PdfPageContentType::Vector

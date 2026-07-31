@@ -931,9 +931,10 @@ function collectionRequestParams(route) {
 }
 
 async function showFolder(favoriteId, path) {
+  const startedAt = performance.now();
   renderLoading("フォルダを読み込んでいます");
-  await loadFolder(favoriteId, path);
-  renderFolder();
+  const metrics = await loadFolder(favoriteId, path, startedAt);
+  renderFolder(metrics);
 }
 
 async function showContainer(address) {
@@ -975,7 +976,8 @@ async function loadContainer(address) {
   state.gridReturnHash = containerParentHash(address);
 }
 
-async function loadFolder(favoriteId, path) {
+async function loadFolder(favoriteId, path, interactionStartedAt = performance.now()) {
+  const fetchStartedAt = performance.now();
   const requestedPath = path ?? "";
   const sameFolder =
     state.favoriteId === favoriteId && state.folderPath === requestedPath;
@@ -988,7 +990,7 @@ async function loadFolder(favoriteId, path) {
     controller.signal
   );
   if (controller.signal.aborted) {
-    return;
+    return null;
   }
   state.requestController = null;
   state.collection = null;
@@ -1015,9 +1017,17 @@ async function loadFolder(favoriteId, path) {
   state.gridIndex = sameFolder
     ? clamp(state.gridIndex, 0, Math.max(0, state.entries.length - 1))
     : 0;
+  return {
+    interactionStartedAt,
+    fetchMs: performance.now() - fetchStartedAt,
+    entryCount: state.entries.length,
+    containerCount: state.entries.filter((entry) =>
+      ["zip", "pdf"].includes(entry.kind)
+    ).length,
+  };
 }
 
-function renderFolder() {
+function renderFolder(listMetrics = null) {
   const renderStartedAt = performance.now();
   cleanupScreen();
   state.screenContext = "grid";
@@ -1098,6 +1108,21 @@ function renderFolder() {
     (initialItems) => state.thumbnailTracker?.begin(initialItems),
     state.thumbAspectHeightRatio
   );
+  if (listMetrics) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        enqueueTelemetry({
+          type: "folder_list",
+          fetch_ms: roundMs(listMetrics.fetchMs),
+          first_paint_ms: roundMs(
+            performance.now() - listMetrics.interactionStartedAt
+          ),
+          entry_count: listMetrics.entryCount,
+          container_count: listMetrics.containerCount,
+        });
+      });
+    });
+  }
 }
 
 function buildBreadcrumbs() {
@@ -1583,6 +1608,7 @@ function imageRequest(entry, info, stage) {
       layout,
       fitMode: state.fitMode,
       dynamicInfo: true,
+      infoCacheKey: mediaImageInfoKey(entry.address),
     };
   }
   const layout = viewerImageLayout({
@@ -1609,6 +1635,8 @@ function imageRequest(entry, info, stage) {
 
 function imageInfo(entry) {
   if (entry.address) {
+    const key = mediaImageInfoKey(entry.address);
+    if (state.imageInfoCache.has(key)) return state.imageInfoCache.get(key);
     return Promise.resolve({
       width: Math.max(1, window.innerWidth),
       height: Math.max(1, window.innerHeight),
@@ -1629,6 +1657,10 @@ function imageInfo(entry) {
   return state.imageInfoCache.get(key);
 }
 
+function mediaImageInfoKey(address) {
+  return `media\n${addressIdentity(address)}`;
+}
+
 function bindThumbnail(image, entry, tracker, cellWidth) {
   disposeThumbnailBinding(image);
   const generation = (Number(image._thumbnailGeneration) || 0) + 1;
@@ -1645,7 +1677,14 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
     32,
     4096
   );
-  loadThumbnail(image, entry, tracker, generation, targetPx, controller.signal);
+  // VirtualGrid 自身が requestAnimationFrame 内でセルを materialize するため、
+  // 次 frame まで thumbnail fetch を遅らせると、ラベルだけの初回 paint が必ず先行する。
+  image._thumbnailStartFrame = requestAnimationFrame(() => {
+    image._thumbnailStartFrame = 0;
+    if (!controller.signal.aborted) {
+      loadThumbnail(image, entry, tracker, generation, targetPx, controller.signal);
+    }
+  });
 }
 
 function thumbnailResponseIsCurrent(image, generation, path) {
@@ -1658,6 +1697,8 @@ function thumbnailResponseIsCurrent(image, generation, path) {
 }
 
 function disposeThumbnailBinding(image) {
+  cancelAnimationFrame(image._thumbnailStartFrame || 0);
+  image._thumbnailStartFrame = 0;
   image._thumbnailController?.abort();
   image._thumbnailController = null;
   if (image._thumbnailObjectUrl) {
@@ -2372,7 +2413,6 @@ class ImageViewer {
 
   load({ name, request, info, fitMode, index, count, interactionStartedAt }) {
     this.resetTransform();
-    this.setLayout(fitMode, request.layout, info);
     this.title.textContent = name;
     this.image.alt = name;
     this.counter.textContent = `${index + 1} / ${count}`;
@@ -2381,15 +2421,15 @@ class ImageViewer {
     this.loadMeasuredImage(request, interactionStartedAt, name);
   }
 
-  setLayout(fitMode, layout, info) {
+  setLayout(fitMode, layout, info, image = this.image) {
     this.fitMode = fitMode;
     this.stage.dataset.fitMode = fitMode;
-    this.image.style.width = `${layout.cssWidth}px`;
-    this.image.style.height = "auto";
-    this.image.style.maxWidth = "none";
-    this.image.style.maxHeight = "none";
-    this.image.dataset.sourceWidth = String(info.width);
-    this.image.dataset.sourceHeight = String(info.height);
+    image.style.width = `${layout.cssWidth}px`;
+    image.style.height = "auto";
+    image.style.maxWidth = "none";
+    image.style.maxHeight = "none";
+    image.dataset.sourceWidth = String(info.width);
+    image.dataset.sourceHeight = String(info.height);
     this.stage.scrollTop = 0;
     this.stage.scrollLeft = 0;
   }
@@ -2419,16 +2459,22 @@ class ImageViewer {
       if (sequence !== this.loadSequence) return;
 
       pendingObjectUrl = URL.createObjectURL(blob);
-      this.image.src = pendingObjectUrl;
+      const decodedImage = element("img", "viewer-image");
+      decodedImage.alt = name;
+      decodedImage.draggable = false;
+      decodedImage.dataset.telemetryObserved = "true";
+      decodedImage.src = pendingObjectUrl;
       const decodeStartedAt = performance.now();
-      await this.image.decode();
+      await decodedImage.decode();
       const decodeMs = performance.now() - decodeStartedAt;
-      if (request.dynamicInfo && this.image.naturalWidth && this.image.naturalHeight) {
+      let resolvedInfo = info;
+      let resolvedLayout = request.layout;
+      if (request.dynamicInfo && decodedImage.naturalWidth && decodedImage.naturalHeight) {
         const actualInfo = {
-          width: this.image.naturalWidth,
-          height: this.image.naturalHeight,
+          width: decodedImage.naturalWidth,
+          height: decodedImage.naturalHeight,
         };
-        const actualLayout = viewerImageLayout({
+        resolvedLayout = viewerImageLayout({
           mode: request.fitMode,
           sourceWidth: actualInfo.width,
           sourceHeight: actualInfo.height,
@@ -2437,17 +2483,27 @@ class ImageViewer {
           devicePixelRatio: request.dpr,
           maxRequestWidth: 8192,
         });
-        request.cssWidth = actualLayout.cssWidth;
-        this.setLayout(request.fitMode, actualLayout, actualInfo);
+        resolvedInfo = actualInfo;
+        request.cssWidth = resolvedLayout.cssWidth;
+        if (request.infoCacheKey) {
+          state.imageInfoCache.set(request.infoCacheKey, Promise.resolve(actualInfo));
+        }
       }
-      await nextFrame();
       if (sequence !== this.loadSequence) {
         URL.revokeObjectURL(pendingObjectUrl);
         return;
       }
-      if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+      this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage);
+      decodedImage.style.transform =
+        `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
+      const previousObjectUrl = this.objectUrl;
+      this.image.replaceWith(decodedImage);
+      this.image = decodedImage;
       this.objectUrl = pendingObjectUrl;
       pendingObjectUrl = null;
+      if (previousObjectUrl) URL.revokeObjectURL(previousObjectUrl);
+      await nextFrame();
+      if (sequence !== this.loadSequence) return;
 
       const event = {
         type: "image",

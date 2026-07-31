@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::time::Instant;
 
 use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerPayload, ContainerRequest,
@@ -45,14 +46,25 @@ impl ContainerEngine {
     }
 
     pub(super) fn container(&self, request: ContainerRequest) -> ContainerResponse {
+        let started = Instant::now();
+        let source_kind = media_source_kind(&request.address);
         let resolved = match self.resolve(&request.address) {
             Ok(resolved) => resolved,
             Err(error) => return ContainerResponse::Error(error),
         };
-        match self.enumerate(&request.address, &resolved) {
+        let response = match self.enumerate(&request.address, &resolved) {
             Ok(payload) => ContainerResponse::Success(payload),
             Err(error) => ContainerResponse::Error(error),
-        }
+        };
+        let (outcome, entry_count) = match &response {
+            ContainerResponse::Success(payload) => ("ok", payload.entries.len()),
+            ContainerResponse::Error(_) => ("error", 0),
+        };
+        crate::logger::log(format!(
+            "remote_ipc: media_operation operation=container source_kind={source_kind} outcome={outcome} duration_ms={:.1} entry_count={entry_count}",
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+        response
     }
 
     pub(super) fn thumbnail(
@@ -60,11 +72,13 @@ impl ContainerEngine {
         request: &mimageviewer_ipc::ThumbnailRequest,
         context: &WorkerContext,
     ) -> ThumbnailResponse {
+        let started = Instant::now();
+        let source_kind = media_source_kind(&request.address);
         let resolved = match self.resolve(&request.address) {
             Ok(resolved) => resolved,
             Err(error) => return thumbnail_error_from_media(error),
         };
-        match self.load_image(
+        let response = match self.load_image(
             &request.address,
             &resolved,
             request.target_px,
@@ -84,10 +98,21 @@ impl ContainerEngine {
                 )
             }),
             Err(error) => thumbnail_error_from_media(error),
-        }
+        };
+        let (outcome, output_bytes) = match &response {
+            ThumbnailResponse::Success { webp_bytes } => ("ok", webp_bytes.len()),
+            ThumbnailResponse::Error(_) => ("error", 0),
+        };
+        crate::logger::log(format!(
+            "remote_ipc: media_operation operation=thumbnail source_kind={source_kind} outcome={outcome} duration_ms={:.1} output_bytes={output_bytes}",
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+        response
     }
 
     pub(super) fn page(&self, request: PageRequest, context: &WorkerContext) -> PageResponse {
+        let started = Instant::now();
+        let source_kind = media_source_kind(&request.address);
         if request.target_px == 0 || request.target_px > MAX_PAGE_RENDER_PX {
             return PageResponse::Error(media_error(
                 MediaErrorCode::BadRequest,
@@ -98,7 +123,7 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
         };
-        match self.load_image(
+        let response = match self.load_image(
             &request.address,
             &resolved,
             request.target_px,
@@ -122,7 +147,16 @@ impl ContainerEngine {
                 )),
             },
             Err(error) => PageResponse::Error(error),
-        }
+        };
+        let (outcome, output_bytes) = match &response {
+            PageResponse::Success(payload) => ("ok", payload.bytes.len()),
+            PageResponse::Error(_) => ("error", 0),
+        };
+        crate::logger::log(format!(
+            "remote_ipc: media_operation operation=page source_kind={source_kind} outcome={outcome} duration_ms={:.1} output_bytes={output_bytes}",
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+        response
     }
 
     fn resolve(&self, address: &RemoteAddress) -> Result<ResolvedFavoritePath, MediaError> {
@@ -177,11 +211,17 @@ impl ContainerEngine {
                 ));
             }
         };
+        let enumeration_started = Instant::now();
         let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&resolved.logical)
             .map_err(|error| {
                 crate::logger::log(format!("remote_ipc: zip_enumerate_failed error={error}"));
                 media_error(MediaErrorCode::RenderFailed, "ZIP を列挙できませんでした")
             })?;
+        crate::logger::log(format!(
+            "remote_ipc: zip_enumerate_complete duration_ms={:.1} raw_entry_count={}",
+            enumeration_started.elapsed().as_secs_f64() * 1000.0,
+            enumeration.entries.len()
+        ));
         let safe_entries = enumeration
             .entries
             .into_iter()
@@ -636,9 +676,26 @@ fn is_pdf_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+fn media_source_kind(address: &RemoteAddress) -> &'static str {
+    match address.subresource {
+        RemoteSubresource::ZipDirectory { .. } | RemoteSubresource::ZipEntry { .. } => "zip",
+        RemoteSubresource::PdfPage { .. } => "pdf",
+        RemoteSubresource::File => {
+            let path = Path::new(&address.relative_path);
+            if is_zip_path(path) {
+                "zip"
+            } else if is_pdf_path(path) {
+                "pdf"
+            } else {
+                "file"
+            }
+        }
+    }
+}
+
 fn pdf_error(error: std::io::Error) -> MediaError {
     let message = error.to_string();
-    if message.contains("Password") || message.contains("password") {
+    if crate::pdf_loader::is_password_required_error(&error) {
         media_error(
             MediaErrorCode::PasswordRequired,
             "この PDF はパスワード保護されているため Web から開けません",
@@ -707,6 +764,15 @@ mod tests {
             })
         ));
         assert!(validate_page_number(0, 0).is_err());
+    }
+
+    #[test]
+    fn password_protected_pdf_is_reported_distinctly() {
+        let error = pdf_error(std::io::Error::other(
+            "worker error: MIV_PDF_PASSWORD_REQUIRED",
+        ));
+        assert_eq!(error.code, MediaErrorCode::PasswordRequired);
+        assert!(error.message.contains("パスワード保護"));
     }
 
     #[test]

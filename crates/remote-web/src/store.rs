@@ -80,6 +80,8 @@ pub struct ListResult {
 pub struct ListMetrics {
     pub entry_count: usize,
     pub scanned_count: usize,
+    pub zip_count: usize,
+    pub pdf_count: usize,
     pub scan_ms: f64,
 }
 
@@ -357,6 +359,14 @@ impl Library {
         });
 
         let entry_count = entries.len();
+        let zip_count = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Zip)
+            .count();
+        let pdf_count = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Pdf)
+            .count();
         Ok(ListResult {
             response: ListResponse {
                 favorite_id,
@@ -367,6 +377,8 @@ impl Library {
             metrics: ListMetrics {
                 entry_count,
                 scanned_count,
+                zip_count,
+                pdf_count,
                 scan_ms,
             },
         })

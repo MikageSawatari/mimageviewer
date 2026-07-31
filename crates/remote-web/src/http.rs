@@ -731,6 +731,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         Ok(width) => width,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
+    let source_kind = remote_source_kind(&address);
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
         state
@@ -738,7 +739,9 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
             .thumbnail_address(address.clone(), target_px)
     }) {
         Ok(result) => result,
-        Err(busy) => return thumbnail_admission_busy_response(busy, target_px),
+        Err(busy) => {
+            return thumbnail_admission_busy_response(busy, target_px, source_kind);
+        }
     };
     match result {
         Ok(result) => {
@@ -756,6 +759,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
                         "ipc_connection_id": result.connection_id,
                         "target_px": target_px,
                         "address_kind": remote_address_kind(&address),
+                        "source_kind": source_kind,
                         "blob_bytes": blob_bytes,
                     }
                 }))
@@ -766,6 +770,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
             failure.retry_statuses,
             started.elapsed(),
             target_px,
+            source_kind,
         ),
     }
 }
@@ -934,7 +939,11 @@ fn media_ipc_error_response(
     }))
 }
 
-fn thumbnail_admission_busy_response(busy: AdmissionBusy, target_px: u32) -> HttpResponse {
+fn thumbnail_admission_busy_response(
+    busy: AdmissionBusy,
+    target_px: u32,
+    source_kind: &str,
+) -> HttpResponse {
     HttpResponse::bytes(
         503,
         "application/json; charset=utf-8",
@@ -958,6 +967,7 @@ fn thumbnail_admission_busy_response(busy: AdmissionBusy, target_px: u32) -> Htt
             "ipc_heavy_in_flight": busy.heavy_in_flight,
             "ipc_heavy_limit": busy.heavy_limit,
             "target_px": target_px,
+            "source_kind": source_kind,
             "blob_bytes": 0,
         }
     }))
@@ -969,6 +979,7 @@ fn ipc_error_response(
     retry_statuses: Vec<String>,
     elapsed: Duration,
     target_px: u32,
+    source_kind: &str,
 ) -> HttpResponse {
     use mimageviewer_ipc::ThumbnailErrorCode;
 
@@ -1051,6 +1062,7 @@ fn ipc_error_response(
             "ipc_error_kind": protocol_error_kind,
             "ipc_os_error": protocol_os_error,
             "target_px": target_px,
+            "source_kind": source_kind,
             "blob_bytes": 0,
         }
     }))
@@ -1217,6 +1229,21 @@ fn remote_address_kind(address: &RemoteAddress) -> &'static str {
         RemoteSubresource::ZipDirectory { .. } => "zip_directory",
         RemoteSubresource::ZipEntry { .. } => "zip_entry",
         RemoteSubresource::PdfPage { .. } => "pdf_page",
+    }
+}
+
+fn remote_source_kind(address: &RemoteAddress) -> &'static str {
+    match address.subresource {
+        RemoteSubresource::ZipDirectory { .. } | RemoteSubresource::ZipEntry { .. } => "zip",
+        RemoteSubresource::PdfPage { .. } => "pdf",
+        RemoteSubresource::File => match PathBuf::from(&address.relative_path)
+            .extension()
+            .and_then(|value| value.to_str())
+        {
+            Some(extension) if extension.eq_ignore_ascii_case("zip") => "zip",
+            Some(extension) if extension.eq_ignore_ascii_case("pdf") => "pdf",
+            _ => "file",
+        },
     }
 }
 
@@ -1497,6 +1524,7 @@ mod tests {
             ],
             Duration::from_millis(12),
             256,
+            "zip",
         );
         assert_eq!(response.status, 503);
         assert_eq!(response.content_type, "application/json; charset=utf-8");
@@ -1513,6 +1541,36 @@ mod tests {
         assert_eq!(details["thumb"]["ipc_stage"], "connect");
         assert_eq!(details["thumb"]["ipc_error_kind"], "not_found");
         assert_eq!(details["thumb"]["target_px"], 256);
+    }
+
+    #[test]
+    fn media_password_required_is_preserved_as_http_423() {
+        let response = media_ipc_error_response(
+            crate::ipc_client::ClientFailure {
+                error: IpcClientError::MediaRemote(mimageviewer_ipc::MediaError::new(
+                    MediaErrorCode::PasswordRequired,
+                    "この PDF はパスワード保護されています",
+                )),
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            },
+            Duration::from_millis(5),
+            "page",
+            Some(2048),
+        );
+        assert_eq!(response.status, 423);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(body["message"].as_str().unwrap().contains("パスワード保護"));
+    }
+
+    #[test]
+    fn thumbnail_diagnostics_distinguish_container_source_without_logging_a_path() {
+        let favorite_id = Uuid::nil().to_string();
+        let zip = RemoteAddress::file(favorite_id.clone(), "books/volume.ZIP");
+        let pdf = RemoteAddress::file(favorite_id, "books/volume.pdf");
+        assert_eq!(remote_source_kind(&zip), "zip");
+        assert_eq!(remote_source_kind(&pdf), "pdf");
+        assert_eq!(remote_address_kind(&zip), "file");
     }
 
     #[test]
@@ -1579,7 +1637,7 @@ mod tests {
             Err(busy) => busy,
         };
         assert!(started.elapsed() < Duration::from_millis(50));
-        let response = thumbnail_admission_busy_response(busy, 256);
+        let response = thumbnail_admission_busy_response(busy, 256, "zip");
         assert_eq!(response.status, 503);
         assert!(
             response
@@ -1627,6 +1685,7 @@ mod tests {
             Vec::new(),
             Duration::from_secs(10),
             256,
+            "file",
         );
         assert_eq!(response.status, 503);
         assert!(

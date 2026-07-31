@@ -775,6 +775,9 @@ pub fn run() -> eframe::Result {
 
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
     if std::env::args().any(|a| a == pdf_loader::PDF_WORKER_ARG) {
+        // 親が `--data-dir` を継承させる。worker 分岐は通常 GUI 初期化より前なので、
+        // ここで明示的に初期化しないと既定 APPDATA の pdfium.dll を見てしまう。
+        data_dir::init();
         pdf_loader::run_worker_process();
         std::process::exit(0);
     }

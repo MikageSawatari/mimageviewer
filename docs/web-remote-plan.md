@@ -746,3 +746,36 @@ PDF cold render 1.441 秒、通常の page render 0.7〜3 秒であり、remote 
 RAR / 7z / LZH の変換、リモートからの PDF password 入力、コンテナの 1000 件超のページング、
 読書履歴・rating・bookmark 等の書き込みは含めない。nested ZIP は本体の列挙文字列と
 `read_entry_bytes` をそのまま使うため対応するが、nested RAR / 7z / LZH は変換増分まで扱わない。
+
+### 12.5 実機で判明した PDF worker と初回表示の修正 (2026-07-31)
+
+隔離 `--data-dir` の本体では PDFium pool の子が存在せず、PDF 要求が 1〜12 ms で
+`ERROR_NO_DATA` (os error 232) になった。原因は pool が子を `--pdf-worker` だけで起動し、親の
+`--data-dir` を継承していなかったことと、worker mode が通常の `data_dir::init` より前に分岐して
+いたことだった。確認時の既定 APPDATA の DLL は 7,231,064 bytes、隔離 directory / 現 build の
+DLL は 7,220,736 bytes で異なっていた。子は通常版の 5 worker が load 中の既定 DLL を現 build の
+埋め込み DLL へ atomic replace しようとして失敗し、`run_worker_process` から即 return していた。
+旧 pool は process spawn の成功だけで ready と数え、この終了を検知していなかった。
+
+子へ `--data-dir <親の解決済み directory>` を明示し、worker 分岐でも最初に `data_dir::init` を
+行う。さらに PDFium bind 完了後に worker が readiness protocol と実 data directory を stdout へ
+返し、親は 5 秒以内に一致を確認できた子だけを pool へ登録する。`pdf-pool: init begin`、DLL の
+成否、各 worker の stderr / ready / startup failure、最終 ready 数を本体 log に記録するため、
+子の spawn、DLL bind、data directory 不一致を process 一覧なしで判別できる。
+
+同時期の `remote-web-log.jsonl` を集計すると、`/api/list` 200 は 139 件で total p50 0.826 ms、
+p95 7.611 ms、scan p50 0.100 ms、p95 0.231 msだった。73 項目の実例も total 1.200 ms / scan
+0.090 msであり、folder 列挙は ZIP を開いていなかった。一方、visible thumbnail grid 82 件は
+p50 69 ms、p95 687 ms、最大 34.011 秒、成功した thumbnail IPC 606 件は p50 28.959 ms、
+p95 1.453 秒、最大 15.772 秒で、利用者が感じた待ちは後続の代表 thumbnail 生成だった。
+folder grid は label DOM を先に作り、その次の animation frame から thumbnail fetch を始める。
+`/api/list` log には ZIP / PDF 件数、`/api/thumb` log には path を出さない `source_kind`、client
+telemetry には `folder_list` の fetch / first paint 時間を追加し、次回は container 別に測定する。
+
+ZIP page の切替時は、元寸法未取得の address に viewport 寸法を仮定し、その暫定 layout をまだ
+表示中の旧 `<img>` へ適用していたため、旧 page が一瞬拡大されていた。新 page は非表示の別
+`<img>` で fetch / decode し、natural size から最終 layout を決定した後だけ旧 page と原子的に
+差し替える。取得した寸法は address 単位で cache し、以後の要求幅計算にも使う。
+
+PDFium の `PasswordError` は subprocess protocol を通しても失われない専用 marker に変換し、
+本体 IPC の `PasswordRequired`、HTTP 423、画面の「パスワード保護」表示まで区別を維持する。
