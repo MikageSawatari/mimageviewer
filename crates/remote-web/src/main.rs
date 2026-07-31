@@ -24,6 +24,7 @@ use http::{
     SessionActivityNotifier, TelemetryLimiter,
 };
 use ipc_client::ThumbnailClient;
+use mimageviewer_ipc::RemoteWebConnectionInfo;
 use store::Library;
 use tiny_http::Server;
 
@@ -55,13 +56,18 @@ fn run() -> Result<(), String> {
     }
     let library = Library::load(&config.data_dir)
         .map_err(|error| format!("settings.db を read-only で読み込めません: {error:?}"))?;
+    let address = SocketAddr::new(config.bind, config.port);
+    let connection = choose_connection_url(config.public_url.as_deref(), address)?;
     let thumbnail_client = Arc::new(ThumbnailClient::new());
+    thumbnail_client.set_remote_web_connection_info(RemoteWebConnectionInfo {
+        public_url: connection.base.clone(),
+        tailscale_serve: connection.tailscale_serve,
+        pin_configured: true,
+    });
     let ipc_status = match thumbnail_client.probe() {
         Ok(()) => "接続済み".to_owned(),
         Err(error) => format!("未接続 ({error})"),
     };
-    let address = SocketAddr::new(config.bind, config.port);
-    let connection = choose_connection_url(config.public_url.as_deref(), address)?;
     let server = Arc::new(
         Server::http(address).map_err(|error| format!("HTTP bind に失敗しました: {error}"))?,
     );

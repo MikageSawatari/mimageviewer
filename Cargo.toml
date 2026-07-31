@@ -247,6 +247,7 @@ wgpu = "27"
 wgpu-hal = { version = "27", features = ["dx12"] }
 pollster = "0.4"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
+qrcode = { version = "0.14", default-features = false }
 # SIMD (SSE4.1/AVX2) 実装のリサイズ。image crate の imageops::resize はスカラー実装で
 # 7K-9K クラスの画像で秒単位かかるため、clamp_dynamic_for_gpu とサムネイル生成で使用。
 fast_image_resize = { version = "5", features = ["image"] }

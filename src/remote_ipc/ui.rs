@@ -1,12 +1,16 @@
-use mimageviewer_ipc::SessionConnectionKind;
+use mimageviewer_ipc::{RemoteWebFeatureStatus, SessionConnectionKind};
+use qrcode::{Color, QrCode};
 
 use super::session::{ActiveSessionSnapshot, SessionHandle};
 
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
     handle: Option<SessionHandle>,
+    last_acquisition_sequence: u64,
     last_control_return_sequence: u64,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
+    paused_animation_restore_key: Option<String>,
+    show_connection_dialog: bool,
 }
 
 struct PendingFullscreenRestore {
@@ -26,9 +30,40 @@ enum ReloadedView {
 
 impl crate::app::App {
     pub(crate) fn set_remote_session_handle(&mut self, handle: SessionHandle) {
-        self.remote_session_ui.last_control_return_sequence =
-            handle.snapshot().control_return_sequence;
+        let snapshot = handle.snapshot();
+        self.remote_session_ui.last_acquisition_sequence = if snapshot.active.is_some() {
+            snapshot.acquisition_sequence.wrapping_sub(1)
+        } else {
+            snapshot.acquisition_sequence
+        };
+        self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
         self.remote_session_ui.handle = Some(handle);
+    }
+
+    pub(crate) fn open_remote_connection_dialog(&mut self) {
+        self.remote_session_ui.show_connection_dialog = true;
+    }
+
+    pub(crate) fn remote_connection_dialog_open(&self) -> bool {
+        self.remote_session_ui.show_connection_dialog
+    }
+
+    pub(crate) fn consume_remote_animation_pause_restore(&mut self, index: usize) -> bool {
+        let Some(expected) = self
+            .remote_session_ui
+            .paused_animation_restore_key
+            .as_deref()
+        else {
+            return false;
+        };
+        let matches = self
+            .items
+            .get(index)
+            .is_some_and(|item| item.perf_key() == expected);
+        if matches {
+            self.remote_session_ui.paused_animation_restore_key = None;
+        }
+        matches
     }
 
     pub(crate) fn remote_session_active(&self) -> bool {
@@ -50,6 +85,16 @@ impl crate::app::App {
         let active = snapshot
             .as_ref()
             .is_some_and(|value| value.active.is_some());
+        if let Some(snapshot) = snapshot.as_ref()
+            && snapshot.acquisition_sequence != self.remote_session_ui.last_acquisition_sequence
+        {
+            self.remote_session_ui.last_acquisition_sequence = snapshot.acquisition_sequence;
+            let (media, slideshow, animations, continuous) =
+                self.pause_local_progress_for_remote_session();
+            crate::logger::log(format!(
+                "remote_ipc: local playback paused on session acquire media={media} slideshow={slideshow} animations={animations} continuous_pending={continuous}"
+            ));
+        }
         if let Some(snapshot) = snapshot
             && snapshot.control_return_sequence
                 != self.remote_session_ui.last_control_return_sequence
@@ -110,7 +155,68 @@ impl crate::app::App {
         }
     }
 
+    pub(crate) fn show_remote_connection_dialog(&mut self, ctx: &egui::Context) {
+        if !self.remote_session_ui.show_connection_dialog {
+            return;
+        }
+        let info = self
+            .remote_session_ui
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.snapshot().remote_web);
+        let ipc_enabled = self.remote_session_ui.handle.is_some();
+        let mut open = true;
+        egui::Window::new("リモート接続")
+            .id(egui::Id::new("remote_connection_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if !ipc_enabled {
+                    ui.heading("リモート接続は無効です");
+                    ui.label("mIV 本体を --remote-ipc 付きで起動してください。");
+                    return;
+                }
+                let Some(info) = info.as_ref() else {
+                    ui.heading("remote-web を待っています");
+                    ui.label("接続状態: remote-web 未接続");
+                    ui.label("remote-web を起動すると、ここに接続 URL と QR コードを表示します。");
+                    return;
+                };
+
+                ui.label("接続状態: remote-web 接続済み");
+                ui.label(format!(
+                    "tailscale serve: {}",
+                    remote_feature_status_label(info.tailscale_serve)
+                ));
+                ui.label(format!(
+                    "PIN: {}",
+                    if info.pin_configured {
+                        "設定済み"
+                    } else {
+                        "未設定"
+                    }
+                ));
+                ui.add_space(6.0);
+                paint_qr(ui, &info.public_url);
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(&info.public_url);
+                    if ui.button("コピー").clicked() {
+                        ui.ctx().copy_text(info.public_url.clone());
+                    }
+                });
+                ui.small("QR コードには URL だけを含み、PIN や Bearer トークンは含みません。");
+            });
+        self.remote_session_ui.show_connection_dialog = open;
+    }
+
     fn reload_after_remote_session_release(&mut self) {
+        let paused_animation_key = self
+            .fullscreen_idx
+            .filter(|index| self.fs_entry_is_animated(*index))
+            .and_then(|index| self.items.get(index))
+            .map(crate::grid_item::GridItem::perf_key);
         let fullscreen_key = self
             .fullscreen_idx
             .and_then(|index| self.items.get(index))
@@ -147,6 +253,7 @@ impl crate::app::App {
                 view,
                 wait_frames: 0,
             });
+        self.remote_session_ui.paused_animation_restore_key = paused_animation_key;
         crate::logger::log("remote_ipc: local control restored; current view reload requested");
     }
 
@@ -175,6 +282,12 @@ impl crate::app::App {
                 .position(|item| item.perf_key() == pending.item_key)
             {
                 self.selected = Some(index);
+                if matches!(
+                    self.items.get(index),
+                    Some(crate::grid_item::GridItem::Video(_))
+                ) {
+                    self.fs_video_open_autoplay_override = Some(false);
+                }
                 self.open_fullscreen(index);
                 crate::logger::log(
                     "remote_ipc: fullscreen position restored after session release",
@@ -188,6 +301,43 @@ impl crate::app::App {
         } else {
             self.remote_session_ui.pending_fullscreen_restore = Some(pending);
         }
+    }
+}
+
+fn remote_feature_status_label(status: RemoteWebFeatureStatus) -> &'static str {
+    match status {
+        RemoteWebFeatureStatus::Configured => "設定済み",
+        RemoteWebFeatureStatus::NotConfigured => "未設定",
+        RemoteWebFeatureStatus::Unknown => "確認できません",
+    }
+}
+
+fn paint_qr(ui: &mut egui::Ui, url: &str) {
+    let Ok(code) = QrCode::new(url.as_bytes()) else {
+        ui.colored_label(egui::Color32::RED, "QR コードを生成できませんでした");
+        return;
+    };
+    const QUIET_ZONE: usize = 4;
+    const DISPLAY_PX: f32 = 240.0;
+    let width = code.width();
+    let modules = width + QUIET_ZONE * 2;
+    let module_px = (DISPLAY_PX / modules as f32).floor().max(1.0);
+    let side = module_px * modules as f32;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+    for (index, color) in code.to_colors().into_iter().enumerate() {
+        if color != Color::Dark {
+            continue;
+        }
+        let x = index % width + QUIET_ZONE;
+        let y = index / width + QUIET_ZONE;
+        let min = rect.min + egui::vec2(x as f32 * module_px, y as f32 * module_px);
+        painter.rect_filled(
+            egui::Rect::from_min_size(min, egui::vec2(module_px, module_px)),
+            0.0,
+            egui::Color32::BLACK,
+        );
     }
 }
 

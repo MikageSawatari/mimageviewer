@@ -4334,6 +4334,9 @@ impl App {
         let help_open_manual_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::HelpOpenManual);
+        let help_remote_connection_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::HelpRemoteConnection);
         let help_open_logs_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpOpenLogs);
         let help_show_whats_new_menu_label = self
             .keymap
@@ -5182,6 +5185,15 @@ impl App {
                                                 let url =
                                                     crate::ui_helpers::manual_url("index.html", None);
                                                 crate::ui_helpers::open_url(&url);
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::HelpRemoteConnection => {
+                                            if ui
+                                                .button(&help_remote_connection_menu_label)
+                                                .clicked()
+                                            {
+                                                self.open_remote_connection_dialog();
                                                 ui.close();
                                             }
                                         }

@@ -342,6 +342,13 @@ fn worker_loop(
                         id,
                         response: container_engine.page(request, &context),
                     },
+                    ClientMessage::RemoteWebConnectionInfo { id, .. } => {
+                        ServerMessage::RemoteWebConnectionInfo {
+                            id,
+                            accepted: false,
+                            message: "connection information was routed to a worker".to_owned(),
+                        }
+                    }
                     ClientMessage::SessionAcquire { id, .. }
                     | ClientMessage::SessionPing { id, .. }
                     | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
@@ -439,6 +446,7 @@ fn execute_work(
 
 fn request_kind(message: &ClientMessage) -> &'static str {
     match message {
+        ClientMessage::RemoteWebConnectionInfo { .. } => "connection_info",
         ClientMessage::SessionAcquire { .. } => "session_acquire",
         ClientMessage::SessionPing { .. } => "session_ping",
         ClientMessage::SessionActivity { .. } => "session_activity",
@@ -455,6 +463,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
 
 fn message_client_id(message: &ClientMessage) -> Option<&str> {
     match message {
+        ClientMessage::RemoteWebConnectionInfo { .. } => None,
         ClientMessage::Thumbnail { client_id, .. }
         | ClientMessage::Home { client_id, .. }
         | ClientMessage::Collection { client_id, .. }
@@ -468,6 +477,7 @@ fn message_client_id(message: &ClientMessage) -> Option<&str> {
 
 fn operation_description(message: &ClientMessage) -> String {
     match message {
+        ClientMessage::RemoteWebConnectionInfo { .. } => "接続情報を更新中".to_owned(),
         ClientMessage::Thumbnail { request, .. } => match request.address.subresource {
             mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
                 format!("PDF {} ページ目のサムネイルを生成中", page_number + 1)
@@ -504,7 +514,8 @@ fn session_response(status: SessionStatus, message: impl Into<String>) -> Sessio
 
 fn response_outcome(response: &ServerMessage) -> &'static str {
     match response {
-        ServerMessage::Session {
+        ServerMessage::RemoteWebConnectionInfo { accepted: true, .. }
+        | ServerMessage::Session {
             response:
                 SessionResponse {
                     status: SessionStatus::Active,
@@ -532,7 +543,8 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: PageResponse::Success(_),
             ..
         } => "ok",
-        ServerMessage::Session { .. }
+        ServerMessage::RemoteWebConnectionInfo { .. }
+        | ServerMessage::Session { .. }
         | ServerMessage::Thumbnail {
             response: ThumbnailResponse::Error(_),
             ..
@@ -733,6 +745,24 @@ fn handle_connection(
             "remote_ipc: request_received connection_id={connection_id} request_id={request_id} kind={kind}"
         ));
         match &message {
+            ClientMessage::RemoteWebConnectionInfo { id, info } => {
+                let accepted = session.announce_remote_web(connection_id, info.clone());
+                crate::logger::log(format!(
+                    "remote_ipc: connection_info connection_id={connection_id} accepted={accepted} tailscale_serve={:?} pin_configured={}",
+                    info.tailscale_serve, info.pin_configured
+                ));
+                let message = if accepted {
+                    "remote-web connection information accepted"
+                } else {
+                    "remote-web connection URL was rejected"
+                };
+                let _ = reply_tx.send(ServerMessage::RemoteWebConnectionInfo {
+                    id: *id,
+                    accepted,
+                    message: message.to_owned(),
+                });
+                continue;
+            }
             ClientMessage::SessionAcquire { id, request } => {
                 let response = session.acquire(request.clone());
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
@@ -839,6 +869,7 @@ fn handle_connection(
             Err(mpsc::TrySendError::Disconnected(Work::Stop)) => unreachable!(),
         }
     }
+    session.remote_web_disconnected(connection_id);
     drop(reply_tx);
     let _ = writer.join();
 }
@@ -886,6 +917,13 @@ fn try_acquire_prefetch(
 
 fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
     match message {
+        ClientMessage::RemoteWebConnectionInfo { id, .. } => {
+            ServerMessage::RemoteWebConnectionInfo {
+                id: *id,
+                accepted: false,
+                message: "mIV 本体のリモートサービスが停止しています".to_owned(),
+            }
+        }
         ClientMessage::SessionAcquire { id, .. }
         | ClientMessage::SessionPing { id, .. }
         | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
@@ -935,6 +973,13 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
 
 fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
     match message {
+        ClientMessage::RemoteWebConnectionInfo { id, .. } => {
+            ServerMessage::RemoteWebConnectionInfo {
+                id: *id,
+                accepted: false,
+                message: "mIV 本体のリモートサービスが混み合っています".to_owned(),
+            }
+        }
         ClientMessage::SessionAcquire { id, .. }
         | ClientMessage::SessionPing { id, .. }
         | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {

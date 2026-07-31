@@ -2158,6 +2158,7 @@ pub enum MenuCommandId {
     SettingsOperationCustomize,
     SettingsPreferences,
     HelpOpenManual,
+    HelpRemoteConnection,
     HelpOpenLogs,
     HelpShowWhatsNew,
     HelpAbout,
@@ -2201,6 +2202,7 @@ impl MenuCommandId {
         Self::SettingsOperationCustomize,
         Self::SettingsPreferences,
         Self::HelpOpenManual,
+        Self::HelpRemoteConnection,
         Self::HelpOpenLogs,
         Self::HelpShowWhatsNew,
         Self::HelpAbout,
@@ -2244,6 +2246,7 @@ impl MenuCommandId {
             MenuCommandId::SettingsOperationCustomize => "SettingsOperationCustomize",
             MenuCommandId::SettingsPreferences => "SettingsPreferences",
             MenuCommandId::HelpOpenManual => "HelpOpenManual",
+            MenuCommandId::HelpRemoteConnection => "HelpRemoteConnection",
             MenuCommandId::HelpOpenLogs => "HelpOpenLogs",
             MenuCommandId::HelpShowWhatsNew => "HelpShowWhatsNew",
             MenuCommandId::HelpAbout => "HelpAbout",
@@ -2489,6 +2492,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::HelpOpenManual,
         parent: TopMenuId::Help,
         label: "ヘルプサイトを開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::HelpRemoteConnection,
+        parent: TopMenuId::Help,
+        label: "リモート接続…",
         action: None,
     },
     MenuCommandSpec {
@@ -7779,6 +7788,7 @@ mod tests {
             vec![
                 MenuCommandId::HelpAbout,
                 MenuCommandId::HelpOpenManual,
+                MenuCommandId::HelpRemoteConnection,
                 MenuCommandId::HelpShowWhatsNew,
             ]
         );
@@ -7967,6 +7977,7 @@ mod tests {
             ),
             (MenuCommandId::SettingsPreferences, "環境設定…"),
             (MenuCommandId::HelpOpenManual, "ヘルプサイトを開く"),
+            (MenuCommandId::HelpRemoteConnection, "リモート接続…"),
             (MenuCommandId::HelpOpenLogs, "ログフォルダを開く"),
             (MenuCommandId::HelpShowWhatsNew, "重要な変更点を表示"),
             (MenuCommandId::HelpAbout, "バージョン情報"),

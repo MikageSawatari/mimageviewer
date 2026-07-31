@@ -24,11 +24,12 @@ const hudElement = document.querySelector("#telemetry-hud");
 const TELEMETRY_ENABLED = true;
 const THUMBNAIL_MAX_CONCURRENCY = 4;
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
-// 3 ページなら実測中央値 605 KiB で約 1.8 MiB を先行保持でき、通常の読書速度で
-// 次ページを間に合わせやすい。逆方向は戻る 1 回分、全体は 6 Blob に制限する。
-const PAGE_PREFETCH_AHEAD = 3;
+// 要求幅是正後の実測約 457 KiB/ページなら、進行方向 8 ページで約 3.6 MiB。
+// 逆方向 1 ページと表示中を含めても 12 件なら約 5.4 MiB で、32 MiB 上限に十分余裕がある。
+// prefetch は直列かつ foreground が active request を abort するため表示要求を待たせない。
+const PAGE_PREFETCH_AHEAD = 8;
 const PAGE_PREFETCH_BEHIND = 1;
-const PAGE_RESOURCE_CACHE_LIMIT = 6;
+const PAGE_RESOURCE_CACHE_LIMIT = 12;
 const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const SESSION_PING_INTERVAL_MS = 30_000;
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
@@ -416,7 +417,7 @@ async function pingRemoteSession() {
   const result = await response.json().catch(() => ({}));
   if (!response.ok || result.status !== "active") {
     setRemoteSessionStatus(
-      sessionStatusFromHttp(response.status),
+      sessionStatusFromResponse(result.status, response.status),
       result.message || "リモートセッションが切断されました。操作すると再接続します。"
     );
   }
@@ -441,6 +442,11 @@ function sessionStatusFromHttp(status) {
   if (status === 409) return "local_in_use";
   if (status === 428) return "expired";
   return "unavailable";
+}
+
+function sessionStatusFromResponse(sessionStatus, httpStatus) {
+  if (sessionStatus === "superseded") return "other_device";
+  return sessionStatusFromHttp(httpStatus);
 }
 
 function renderPinLogin(initialRemainingSeconds = 0) {
@@ -3293,7 +3299,7 @@ async function observedFetch(url, options = {}) {
     if (response.status === 409 || response.status === 428) {
       const detail = await response.clone().json().catch(() => ({}));
       setRemoteSessionStatus(
-        sessionStatusFromHttp(response.status),
+        sessionStatusFromResponse(detail.status, response.status),
         detail.message || "操作権がありません。次の操作時に再接続します。"
       );
     }

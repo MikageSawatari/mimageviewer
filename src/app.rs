@@ -4752,9 +4752,9 @@ pub(crate) use crate::thumb_loader::{
 };
 
 use crate::fs_animation::{
-    FsCacheEntry, FsLoadResult, decode_apng_frames, decode_apng_frames_from_bytes,
-    decode_gif_frames, decode_gif_frames_from_bytes, decode_webp_frames,
-    decode_webp_frames_from_bytes,
+    AnimationPlayback, FsCacheEntry, FsLoadResult, decode_apng_frames,
+    decode_apng_frames_from_bytes, decode_gif_frames, decode_gif_frames_from_bytes,
+    decode_webp_frames, decode_webp_frames_from_bytes,
 };
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
@@ -13618,6 +13618,7 @@ impl App {
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
     fn common_modal_dialog_open(&self) -> bool {
         self.remote_session_active()
+            || self.remote_connection_dialog_open()
             || self.show_stats_dialog
             || self.show_favorites_editor
             || self.show_smart_folder_editor
@@ -35781,6 +35782,65 @@ impl App {
         active + parked
     }
 
+    /// リモートが操作権を取得した瞬間に、ローカル側で時間とともに進む状態を停止する。
+    /// 既存の media/slideshow pause 入口を使い、viewer context や表示位置は破棄しない。
+    pub(crate) fn pause_local_progress_for_remote_session(&mut self) -> (bool, bool, usize, bool) {
+        let media_paused = self.pause_media_playback_for_tray();
+        let slideshow_paused = self.stop_slideshow_playback();
+        let mut animations_paused = self
+            .fs_cache
+            .values_mut()
+            .map(|entry| usize::from(entry.pause_animation()))
+            .sum();
+        #[cfg(windows)]
+        {
+            if let Some(active) = self.active_detached_viewer_context.as_mut() {
+                animations_paused += active
+                    .bundle
+                    .fs_cache
+                    .values_mut()
+                    .map(|entry| usize::from(entry.pause_animation()))
+                    .sum::<usize>();
+            }
+            for bundle in self
+                .detached_image_windows
+                .iter_mut()
+                .filter_map(|window| window.paused_bundle.as_deref_mut())
+            {
+                animations_paused += bundle
+                    .fs_cache
+                    .values_mut()
+                    .map(|entry| usize::from(entry.pause_animation()))
+                    .sum::<usize>();
+            }
+
+            // EOF から既に始まった source swap も既存の owner-scoped cancel 入口で止める。
+            // window/runtime 自体は閉じず、現在の player と停止位置を残す。
+            let mut pending_owner_ids = self.parked_live_media_window_ids();
+            if let Some(session) = self.active_detached_session {
+                pending_owner_ids.push(session.window_id);
+            }
+            pending_owner_ids.sort_unstable();
+            pending_owner_ids.dedup();
+            for window_id in pending_owner_ids {
+                self.discard_parked_native_video_pending_for_window(
+                    window_id,
+                    "remote_session_acquired",
+                );
+            }
+            self.clear_mounted_native_video_pending();
+        }
+        let continuous_pending_cancelled =
+            self.discard_media_navigation_pending("remote_session_acquired");
+        self.video_continuous_last_eof = None;
+        (
+            media_paused,
+            slideshow_paused,
+            animations_paused,
+            continuous_pending_cancelled,
+        )
+    }
+
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
     /// bundle は所有権を移さず、teardown plan の read-only 部分だけを再利用する。
     /// (review-v2.3.0 追補6: R1-2 detached exit resume)
@@ -46271,6 +46331,7 @@ impl App {
         &self,
         path: PathBuf,
         from_grid: bool,
+        autoplay: bool,
     ) -> (crate::video::VideoPlayer, bool) {
         let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
         // 音量ノーマライズ (D13、「映像なし動画」パリティ): グローバル ON なら DB を引き、
@@ -46290,7 +46351,6 @@ impl App {
             .as_ref()
             .map(|r| 10.0_f64.powf(r.gain_db as f64 / 20.0))
             .unwrap_or(1.0);
-        let autoplay = true;
         // ON + 未測定 + autoplay のときだけ再生前スキャンする (動画 build_video_player_for_open と同型)。
         let start_normalize_scan_before_play = {
             #[cfg(windows)]
@@ -46410,7 +46470,12 @@ impl App {
             }
             if !self.fs_cache.contains_key(&idx) {
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let autoplay_override = self.fs_video_open_autoplay_override.take();
+                let autoplay_override = if self.remote_session_active() {
+                    self.fs_video_open_autoplay_override = None;
+                    Some(false)
+                } else {
+                    self.fs_video_open_autoplay_override.take()
+                };
                 let ignore_resume = std::mem::take(&mut self.fs_video_open_ignore_resume_once);
                 #[cfg(windows)]
                 if self.defer_native_video_open_if_decoder_busy(
@@ -46556,7 +46621,7 @@ impl App {
                 // (動画分岐と同じ std::mem::take 規約)。resume 設定の選択に使う。
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
                 let (player, start_normalize_scan_before_play) =
-                    self.build_audio_player_for_open(ap, from_grid);
+                    self.build_audio_player_for_open(ap, from_grid, !self.remote_session_active());
                 self.fs_cache.insert(
                     idx,
                     FsCacheEntry::Video {
@@ -58651,11 +58716,20 @@ impl App {
                         .collect();
                     let now = ctx.input(|i| i.time);
                     let first_delay = textures.first().map(|(_, d)| *d).unwrap_or(0.1);
+                    let playback = if self.remote_session_active()
+                        || self.consume_remote_animation_pause_restore(key)
+                    {
+                        AnimationPlayback::Paused
+                    } else {
+                        AnimationPlayback::Playing {
+                            next_frame_at: now + first_delay,
+                        }
+                    };
                     FsCacheEntry::Animated {
                         frames: textures,
                         frame_pixels,
                         current_frame: 0,
-                        next_frame_at: now + first_delay,
+                        playback,
                         load_seq,
                     }
                 }
@@ -62827,6 +62901,7 @@ impl eframe::App for App {
         #[cfg(windows)]
         crate::key_debug::render_overlay(ctx);
         self.show_remote_session_dialog(ctx);
+        self.show_remote_connection_dialog(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

@@ -196,15 +196,15 @@ test("thumbnail retry policy retries only transient failures with a bounded back
 test("page prefetch follows reading direction and accepts a future spread", () => {
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [10], itemCount: 20, direction: 1 }),
-    [11, 12, 13, 9]
+    [11, 12, 13, 14, 15, 16, 17, 18, 9]
   );
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [10], itemCount: 20, direction: -1 }),
-    [9, 8, 7, 11]
+    [9, 8, 7, 6, 5, 4, 3, 2, 11]
   );
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [10, 11], itemCount: 20, direction: 1 }),
-    [12, 13, 14, 9]
+    [12, 13, 14, 15, 16, 17, 18, 19, 9]
   );
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [0], itemCount: 3, direction: -1 }),

@@ -56,7 +56,12 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - ローカルの「切断する」は常に即時解放する。以後の IPC/API は「ローカルで使用中」を返すが、
   ブラウザで次のコマンドが発火すると acquire を自動実行して確認なしに再取得する
 - ブラウザごとのランダム client ID を各 API から IPC まで運び、別端末の要求を同じ
-  remote-web process の owner として混同しない。client ID は認証 credential には使わない
+  remote-web process の owner として混同しない。保持できる owner は常に 1 client だけで、
+  2 台目の操作は確認なしに owner を置き換える。旧 owner は「別の端末で使用中です」と表示し、
+  次の操作で acquire を送り直して奪い返す。client ID は認証 credential には使わない
+- session owner が変わった時、本体は既存の media pause、slideshow stop、owner-scoped native
+  pending cancel を通して動画・音声・音楽ビュー・スライドショー・GIF/APNG・連続送りを停止する。
+  player、停止位置、main/fullscreen/detached の window 構成は保持し、操作権返却時も自動再開しない
 - ブラウザは 30 秒ごとに `POST /api/session/ping` を送り、直近の利用者入力と video/audio 再生中を
   通知する。通常の IPC 要求と remote-web が直接処理する一覧/画像 API も活動として数える
 - 生存タイムアウトは ping/API が 60 秒無い場合、放置タイムアウトは「利用者操作なし、かつ
@@ -65,7 +70,8 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   `ES_CONTINUOUS` へ戻す
 - ローカルへ操作権が戻った瞬間、読書履歴・レーティング・ブックマーク・スマートフォルダ・
   通常フォルダの既存「再読み込み」入口を 1 回呼ぶ。fullscreen 中は item identity を保持し、
-  一覧再構築後に同じ item を既存 `open_fullscreen` 経路で開き直す
+  一覧再構築後に同じ item を既存 `open_fullscreen` 経路で開き直す。再 open する media / animated
+  image には paused 状態を引き継ぎ、利用者が再生操作を行うまで動かさない
 
 ### 2.3 既存資産の再利用状況
 
@@ -105,7 +111,9 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - curl 等の診断用には起動時生成の 256bit `Authorization: Bearer <token>` も残す。Bearer は
   定数時間比較し、PIN・hash・セッション署名値・Bearer をログへ出さない。認証失敗本文に内部情報を出さない
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
-  `--json` 状態、bind 先の順で決める
+  `--json` 状態、bind 先の順で決める。remote-web は確定 URL、`tailscale serve` 状態、PIN 設定済み
+  bool だけを protocol v8 の接続情報として本体へ通知する。本体は独自検出せず、ヘルプの
+  「リモート接続…」に QR、URL、接続状態を表示する。`--remote-ipc` 無しでは無効理由を表示する
 
 ### 3.3 バインドアドレス
 
@@ -800,9 +808,11 @@ PDFium の `PasswordError` は subprocess protocol を通しても失われな�
 取得開始直後に参照を保持しない `new Image()` へ次の1枚を設定するだけで、方向、abort、保持上限、
 foreground との優先度を持っていなかった。
 
-表示完了後、最後の操作方向へ3ページ、逆方向へ1ページを順次先読みする。計画関数は現在の
+表示完了後、最後の操作方向へ8ページ、逆方向へ1ページを順次先読みする。要求幅是正後の実測
+約457 KiB/ページでは進行方向8ページが約3.6 MiBなので、帯域と待ち時間の均衡点として採用した。
+計画関数は現在の
 `visibleIndexes` を受けるため、次の見開き増分では `[left, right]` を渡すだけで同じ境界計算を
-利用できる。先読み通信は同時1件、圧縮 Blob の LRU は最大6件かつ32 MiBとし、viewer を離れた時、
+利用できる。先読み通信は同時1件、圧縮 Blob の LRU は最大12件かつ32 MiBとし、viewer を離れた時、
 別方向の foreground を要求した時、または計画から外れた時は `AbortController` で不要な fetch を
 中断する。ready Blob は foreground が直接使い、network / IPC 待ちなしで decode と原子的差替えへ
 進む。

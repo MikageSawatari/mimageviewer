@@ -3960,6 +3960,7 @@ dependencies = [
  "pdfium-render",
  "png 0.18.1",
  "pollster",
+ "qrcode",
  "quick-xml",
  "rayon",
  "regex",

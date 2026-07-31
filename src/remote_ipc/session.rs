@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
-    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus,
+    RemoteWebConnectionInfo, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest,
+    SessionResponse, SessionStatus,
 };
 
 pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -56,6 +57,7 @@ struct SessionStateMachine {
     last_release_reason: Option<ReleaseReason>,
     generation: u64,
     next_operation: u64,
+    acquisition_sequence: u64,
     control_return_sequence: u64,
 }
 
@@ -67,6 +69,7 @@ impl Default for SessionStateMachine {
             last_release_reason: None,
             generation: 0,
             next_operation: 1,
+            acquisition_sequence: 0,
             control_return_sequence: 0,
         }
     }
@@ -93,6 +96,7 @@ impl SessionStateMachine {
             self.last_release_reason = Some(ReleaseReason::Superseded);
         }
         self.generation = self.generation.wrapping_add(1);
+        self.acquisition_sequence = self.acquisition_sequence.wrapping_add(1);
         self.last_owner = Some(request.client_id.clone());
         self.last_release_reason = None;
         self.active = Some(ActiveSession {
@@ -119,7 +123,7 @@ impl SessionStateMachine {
         if active.client_id != request.client_id {
             return status_response(
                 SessionStatus::Superseded,
-                "別のリモート接続が操作権を保持しています。",
+                "別の端末で使用中です。操作すると操作権を取得します。",
             );
         }
         active.last_ping = now;
@@ -143,7 +147,7 @@ impl SessionStateMachine {
         if active.client_id != client_id {
             return Err(status_response(
                 SessionStatus::Superseded,
-                "別のリモート接続が操作権を保持しています。",
+                "別の端末で使用中です。操作すると操作権を取得します。",
             ));
         }
         active.last_ping = now;
@@ -263,7 +267,9 @@ impl SessionStateMachine {
         });
         SessionSnapshot {
             active,
+            acquisition_sequence: self.acquisition_sequence,
             control_return_sequence: self.control_return_sequence,
+            remote_web: None,
         }
     }
 }
@@ -280,7 +286,7 @@ fn release_message(reason: ReleaseReason) -> &'static str {
         ReleaseReason::Local => "ローカルで使用中です。操作すると再接続します。",
         ReleaseReason::LivenessTimeout => "接続の生存確認が途絶えました。再接続してください。",
         ReleaseReason::IdleTimeout => "放置時間を超えたため切断されました。再接続してください。",
-        ReleaseReason::Superseded => "別のリモート接続が操作権を取得しました。",
+        ReleaseReason::Superseded => "別の端末で使用中です。操作すると操作権を取得します。",
     }
 }
 
@@ -300,7 +306,9 @@ pub(crate) struct ActiveSessionSnapshot {
 #[derive(Clone, Debug)]
 pub(crate) struct SessionSnapshot {
     pub(crate) active: Option<ActiveSessionSnapshot>,
+    pub(crate) acquisition_sequence: u64,
     pub(crate) control_return_sequence: u64,
+    pub(crate) remote_web: Option<RemoteWebConnectionInfo>,
 }
 
 #[derive(Clone)]
@@ -308,14 +316,16 @@ pub(crate) struct SessionHandle {
     inner: Arc<Mutex<SessionStateMachine>>,
     origin: Instant,
     repaint: Arc<Mutex<Option<egui::Context>>>,
+    remote_web_connections: Arc<Mutex<BTreeMap<u64, RemoteWebConnectionInfo>>>,
 }
 
 impl SessionHandle {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SessionStateMachine::default())),
             origin: Instant::now(),
             repaint: Arc::new(Mutex::new(None)),
+            remote_web_connections: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -389,7 +399,41 @@ impl SessionHandle {
         if let Some(active) = snapshot.active.as_mut() {
             active.elapsed = self.now().saturating_sub(active.elapsed);
         }
+        snapshot.remote_web = self
+            .remote_web_connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .last_key_value()
+            .map(|(_, info)| info.clone());
         snapshot
+    }
+
+    pub(crate) fn announce_remote_web(
+        &self,
+        connection_id: u64,
+        info: RemoteWebConnectionInfo,
+    ) -> bool {
+        if !validate_remote_web_connection_info(&info) {
+            return false;
+        }
+        self.remote_web_connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(connection_id, info);
+        self.notify_ui();
+        true
+    }
+
+    pub(crate) fn remote_web_disconnected(&self, connection_id: u64) {
+        let removed = self
+            .remote_web_connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&connection_id)
+            .is_some();
+        if removed {
+            self.notify_ui();
+        }
     }
 
     pub(crate) fn local_disconnect(&self) {
@@ -425,6 +469,23 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner())
             .expire(self.now())
     }
+}
+
+fn validate_remote_web_connection_info(info: &RemoteWebConnectionInfo) -> bool {
+    let url = info.public_url.trim();
+    let lower = url.to_ascii_lowercase();
+    let remainder = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    let Some(remainder) = remainder else {
+        return false;
+    };
+    let authority = remainder.split('/').next().unwrap_or_default();
+    url.len() <= 2048
+        && !authority.is_empty()
+        && !authority.contains('@')
+        && !url.contains(['?', '#'])
+        && !url.chars().any(char::is_control)
 }
 
 pub(crate) struct SessionOperation {
@@ -719,5 +780,49 @@ mod tests {
             SessionStatus::Superseded
         );
         assert!(handle.begin_operation("client-b", "new".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn acquisition_sequence_changes_only_when_the_owner_changes() {
+        let handle = SessionHandle::new();
+        let request = |client_id: &str| SessionAcquireRequest {
+            client_id: client_id.to_owned(),
+            peer: peer(),
+        };
+        handle.acquire(request("client-a"));
+        let first = handle.snapshot().acquisition_sequence;
+        handle.acquire(request("client-a"));
+        assert_eq!(handle.snapshot().acquisition_sequence, first);
+        handle.acquire(request("client-b"));
+        assert_eq!(handle.snapshot().acquisition_sequence, first + 1);
+        assert_eq!(
+            handle
+                .ping(&SessionPingRequest {
+                    client_id: "client-a".to_owned(),
+                    user_active: true,
+                    media_playing: false,
+                })
+                .status,
+            SessionStatus::Superseded
+        );
+    }
+
+    #[test]
+    fn remote_web_connection_url_rejects_credentials_and_query_values() {
+        let handle = SessionHandle::new();
+        let info = |url: &str| RemoteWebConnectionInfo {
+            public_url: url.to_owned(),
+            tailscale_serve: mimageviewer_ipc::RemoteWebFeatureStatus::Configured,
+            pin_configured: true,
+        };
+        assert!(handle.announce_remote_web(1, info("https://viewer.example/")));
+        assert!(!handle.announce_remote_web(2, info("https://viewer.example/?t=secret")));
+        assert!(!handle.announce_remote_web(3, info("https://user:secret@viewer.example/")));
+        assert_eq!(
+            handle.snapshot().remote_web.unwrap().public_url,
+            "https://viewer.example/"
+        );
+        handle.remote_web_disconnected(1);
+        assert!(handle.snapshot().remote_web.is_none());
     }
 }

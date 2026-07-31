@@ -10,10 +10,10 @@ use mimageviewer_ipc::{
     CollectionPayload, CollectionRequest, CollectionResponse, ContainerPayload, ContainerRequest,
     ContainerResponse, FrameError, HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload,
-    PagePriority, PageRequest, PageResponse, RemoteAddress, RequestId, ServerMessage,
-    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, read_frame,
-    write_frame,
+    PagePriority, PageRequest, PageResponse, RemoteAddress, RemoteWebConnectionInfo, RequestId,
+    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
+    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
+    read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -27,6 +27,7 @@ pub struct ThumbnailClient {
     connection: Mutex<Option<Arc<Connection>>>,
     next_request_id: AtomicU64,
     next_connection_id: AtomicU64,
+    remote_web_info: Mutex<Option<RemoteWebConnectionInfo>>,
 }
 
 pub struct ThumbnailSuccess {
@@ -186,7 +187,15 @@ impl ThumbnailClient {
             connection: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             next_connection_id: AtomicU64::new(1),
+            remote_web_info: Mutex::new(None),
         }
+    }
+
+    pub fn set_remote_web_connection_info(&self, info: RemoteWebConnectionInfo) {
+        *self
+            .remote_web_info
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(info);
     }
 
     pub fn session_acquire(
@@ -535,6 +544,34 @@ impl ThumbnailClient {
         handshake(&mut pipe)?;
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let connection = Connection::start(connection_id, pipe).map_err(ClientError::Protocol)?;
+        if let Some(info) = self
+            .remote_web_info
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            match connection.request(id, ClientMessage::RemoteWebConnectionInfo { id, info }) {
+                Ok(ServerMessage::RemoteWebConnectionInfo { accepted: true, .. }) => {}
+                Ok(ServerMessage::RemoteWebConnectionInfo { message, .. }) => {
+                    return Err(ClientError::Protocol(protocol_failure(
+                        "connection_info",
+                        "rejected",
+                        None,
+                        message,
+                    )));
+                }
+                Ok(_) => {
+                    return Err(ClientError::Protocol(protocol_failure(
+                        "connection_info",
+                        "response_type_mismatch",
+                        None,
+                        "connection information received another response type",
+                    )));
+                }
+                Err(error) => return Err(ClientError::Protocol(error)),
+            }
+        }
         *slot = Some(Arc::clone(&connection));
         Ok(connection)
     }
@@ -1330,6 +1367,7 @@ mod tests {
             connection: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             next_connection_id: AtomicU64::new(1),
+            remote_web_info: Mutex::new(None),
         });
         let first_client = Arc::clone(&client);
         let first = std::thread::spawn(move || {

@@ -266,7 +266,7 @@ export function pagePrefetchPlan({
   visibleIndexes,
   itemCount,
   direction,
-  ahead = 3,
+  ahead = 8,
   behind = 1,
 }) {
   const count = Math.max(0, Math.floor(Number(itemCount) || 0));

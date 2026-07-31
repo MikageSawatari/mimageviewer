@@ -57,6 +57,11 @@ pub enum FsLoadResult {
 }
 
 /// フルスクリーンキャッシュエントリ。
+pub enum AnimationPlayback {
+    Playing { next_frame_at: f64 },
+    Paused,
+}
+
 pub enum FsCacheEntry {
     /// 静止画。GPU テクスチャと CPU 側ピクセルデータ（分析パネル用）を保持する。
     Static {
@@ -75,7 +80,7 @@ pub enum FsCacheEntry {
         frames: Vec<(egui::TextureHandle, f64)>, // (texture, delay_secs)
         frame_pixels: Vec<std::sync::Arc<egui::ColorImage>>,
         current_frame: usize,
-        next_frame_at: f64, // ctx.input(|i| i.time) 基準
+        playback: AnimationPlayback,
         /// Static と同じく perf 相関用の load_seq。
         load_seq: u64,
     },
@@ -92,6 +97,51 @@ pub enum FsCacheEntry {
 }
 
 impl FsCacheEntry {
+    pub fn pause_animation(&mut self) -> bool {
+        match self {
+            FsCacheEntry::Animated { playback, .. }
+                if matches!(playback, AnimationPlayback::Playing { .. }) =>
+            {
+                *playback = AnimationPlayback::Paused;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn toggle_animation(&mut self, now: f64) -> bool {
+        let FsCacheEntry::Animated {
+            frames,
+            current_frame,
+            playback,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        *playback = match playback {
+            AnimationPlayback::Playing { .. } => AnimationPlayback::Paused,
+            AnimationPlayback::Paused => AnimationPlayback::Playing {
+                next_frame_at: now
+                    + frames
+                        .get(*current_frame)
+                        .map(|(_, delay)| delay.max(0.02))
+                        .unwrap_or(0.1),
+            },
+        };
+        true
+    }
+
+    pub fn animation_is_playing(&self) -> bool {
+        matches!(
+            self,
+            FsCacheEntry::Animated {
+                playback: AnimationPlayback::Playing { .. },
+                ..
+            }
+        )
+    }
+
     /// perf 相関用。Static / Animated / Video なら load_seq、Failed は 0。
     pub fn load_seq(&self) -> u64 {
         match self {

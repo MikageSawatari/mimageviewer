@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use mimageviewer_ipc::{SessionConnectionKind, SessionPeerInfo};
+use mimageviewer_ipc::{RemoteWebFeatureStatus, SessionConnectionKind, SessionPeerInfo};
 use serde_json::Value;
 
 const PREFERRED_TAILSCALE_EXE: &str = r"C:\Program Files\Tailscale\tailscale.exe";
@@ -32,6 +32,7 @@ impl UrlSource {
 pub struct ConnectionUrl {
     pub base: String,
     pub source: UrlSource,
+    pub tailscale_serve: RemoteWebFeatureStatus,
 }
 
 pub fn choose_connection_url(
@@ -42,20 +43,26 @@ pub fn choose_connection_url(
         return Ok(ConnectionUrl {
             base: normalize_base_url(requested)?,
             source: UrlSource::CommandLine,
+            tailscale_serve: detect_tailscale_serve_status(),
         });
     }
 
+    let mut tailscale_serve = RemoteWebFeatureStatus::Unknown;
     if let Some(executable) = tailscale_executable() {
-        if let Some(base) = tailscale_serve_url(&executable) {
+        let (serve_status, serve_url) = tailscale_serve_status(&executable);
+        tailscale_serve = serve_status;
+        if let Some(base) = serve_url {
             return Ok(ConnectionUrl {
                 base,
                 source: UrlSource::TailscaleServe,
+                tailscale_serve: serve_status,
             });
         }
         if let Some(base) = tailscale_status_url(&executable) {
             return Ok(ConnectionUrl {
                 base,
                 source: UrlSource::TailscaleStatus,
+                tailscale_serve: serve_status,
             });
         }
     }
@@ -63,6 +70,7 @@ pub fn choose_connection_url(
     Ok(ConnectionUrl {
         base: format!("http://{address}/"),
         source: UrlSource::BindFallback,
+        tailscale_serve,
     })
 }
 
@@ -172,9 +180,24 @@ fn command_json(executable: &Path, arguments: &[&str]) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn tailscale_serve_url(executable: &Path) -> Option<String> {
-    let value = command_json(executable, &["serve", "status", "--json"])?;
-    serve_hostname(&value).and_then(|host| normalize_base_url(&format!("https://{host}/")).ok())
+fn detect_tailscale_serve_status() -> RemoteWebFeatureStatus {
+    tailscale_executable()
+        .map(|executable| tailscale_serve_status(&executable).0)
+        .unwrap_or(RemoteWebFeatureStatus::Unknown)
+}
+
+fn tailscale_serve_status(executable: &Path) -> (RemoteWebFeatureStatus, Option<String>) {
+    let Some(value) = command_json(executable, &["serve", "status", "--json"]) else {
+        return (RemoteWebFeatureStatus::Unknown, None);
+    };
+    let url = serve_hostname(&value)
+        .and_then(|host| normalize_base_url(&format!("https://{host}/")).ok());
+    let status = if url.is_some() {
+        RemoteWebFeatureStatus::Configured
+    } else {
+        RemoteWebFeatureStatus::NotConfigured
+    };
+    (status, url)
 }
 
 fn tailscale_status_url(executable: &Path) -> Option<String> {

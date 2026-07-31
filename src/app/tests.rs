@@ -3242,7 +3242,7 @@ mod animated_playback_only_pipeline_tests {
                 frames: vec![(tex0, 0.1), (tex1, 0.1)],
                 frame_pixels: vec![Arc::new(frame0), Arc::new(frame1)],
                 current_frame: 0,
-                next_frame_at: 0.0,
+                playback: crate::fs_animation::AnimationPlayback::Playing { next_frame_at: 0.0 },
                 load_seq: 0,
             },
         );
@@ -30767,6 +30767,55 @@ mod still_window_mode_key_tests {
             assert!(player.intent_playing());
             assert_eq!(player.position(), 30.0, "{case} must resume in place");
         }
+    }
+
+    #[test]
+    fn remote_session_acquire_pauses_local_progress_without_auto_resume() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video_path = app.tmp.path().join("remote-session.mp4");
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        let animated = push_image(&mut app, "remote-session.gif");
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.slideshow_playing = true;
+        install_playing_test_media(&mut app, video, video_path, 17.5);
+        let pixels = egui::ColorImage::filled([1, 1], egui::Color32::WHITE);
+        let texture = ctx.load_texture(
+            "remote_session_animation",
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            animated,
+            FsCacheEntry::Animated {
+                frames: vec![(texture, 0.1)],
+                frame_pixels: vec![std::sync::Arc::new(pixels)],
+                current_frame: 0,
+                playback: crate::fs_animation::AnimationPlayback::Playing { next_frame_at: 1.0 },
+                load_seq: 0,
+            },
+        );
+
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: Some("phone".to_owned()),
+            },
+        });
+        app.poll_remote_session(&ctx);
+
+        assert_test_media_paused_at(&app, video, 17.5);
+        assert!(!app.slideshow_playing);
+        assert!(!app.fs_cache[&animated].animation_is_playing());
+
+        handle.local_disconnect();
+        // 操作権返却そのものは transport へ Play を送らない。再開は利用者操作だけ。
+        assert_test_media_paused_at(&app, video, 17.5);
+        assert!(!app.fs_cache[&animated].animation_is_playing());
     }
 
     #[test]

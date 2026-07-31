@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -370,6 +370,24 @@ pub struct SessionPeerInfo {
     pub device_name: Option<String>,
 }
 
+/// remote-web が確定した公開 URL と、その接続準備状態。
+///
+/// URL の意味づけは remote-web が所有し、本体はこの値を再検出せず表示だけに使う。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteWebConnectionInfo {
+    pub public_url: String,
+    pub tailscale_serve: RemoteWebFeatureStatus,
+    pub pin_configured: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteWebFeatureStatus {
+    Configured,
+    NotConfigured,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SessionAcquireRequest {
     pub client_id: String,
@@ -411,6 +429,10 @@ impl SessionResponse {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    RemoteWebConnectionInfo {
+        id: RequestId,
+        info: RemoteWebConnectionInfo,
+    },
     SessionAcquire {
         id: RequestId,
         request: SessionAcquireRequest,
@@ -453,7 +475,8 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::SessionAcquire { id, .. }
+            Self::RemoteWebConnectionInfo { id, .. }
+            | Self::SessionAcquire { id, .. }
             | Self::SessionPing { id, .. }
             | Self::SessionActivity { id, .. }
             | Self::Thumbnail { id, .. }
@@ -468,6 +491,11 @@ impl ClientMessage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    RemoteWebConnectionInfo {
+        id: RequestId,
+        accepted: bool,
+        message: String,
+    },
     Session {
         id: RequestId,
         response: SessionResponse,
@@ -497,7 +525,8 @@ pub enum ServerMessage {
 impl ServerMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::Session { id, .. }
+            Self::RemoteWebConnectionInfo { id, .. }
+            | Self::Session { id, .. }
             | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
@@ -634,6 +663,26 @@ mod tests {
         let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn remote_web_connection_info_round_trips_without_credentials() {
+        let expected = ClientMessage::RemoteWebConnectionInfo {
+            id: 10,
+            info: RemoteWebConnectionInfo {
+                public_url: "https://viewer.example.ts.net/".to_owned(),
+                tailscale_serve: RemoteWebFeatureStatus::Configured,
+                pin_configured: true,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        let actual: ClientMessage =
+            read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual, expected);
+        let encoded = String::from_utf8(bytes[4..].to_vec()).unwrap();
+        assert!(!encoded.contains("pin="));
+        assert!(!encoded.contains("bearer"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
     FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform, ZTransformInput,
 };
-use crate::fs_animation::FsCacheEntry;
+use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
@@ -9810,7 +9810,7 @@ impl App {
         if let Some(FsCacheEntry::Animated {
             frames,
             current_frame,
-            next_frame_at,
+            playback: AnimationPlayback::Playing { next_frame_at },
             ..
         }) = self.fs_cache.get_mut(&fs_idx)
         {
@@ -11518,6 +11518,19 @@ impl App {
             player.toggle_play();
         }
 
+        // GIF / APNG / animated WebP は動画と同じ既存の再生トグル操作を使う。
+        // remote session 取得時の pause 後も、位置を保ったまま利用者が明示再開できる。
+        let animated_playback_active = self.fs_entry_is_animated(fs_idx);
+        if animated_playback_active
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
+            && let Some(entry) = self.fs_cache.get_mut(&fs_idx)
+        {
+            entry.toggle_animation(ctx.input(|input| input.time));
+        }
+
         // 音楽ビュー (Inc 5): B キーで現在の再生位置にブックマークを追加する
         // (動画の `KeyAction::VideoBookmark` を共有)。ブックマーク改名 / インポート /
         // タグピッカーの TextEdit にフォーカスがあるとき・IME 変換中・コンテキスト
@@ -11723,8 +11736,9 @@ impl App {
         }
         // 動画・音声は Enter を再生/一時停止 (VideoPlayPause) に使うので image 用 FsClose
         // 経路で閉じさせない (音声も current_item_is_audio で除外、Codex P2 / 「映像なし動画」)。
-        let is_media_item =
-            matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) || current_item_is_audio;
+        let is_media_item = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            || current_item_is_audio
+            || animated_playback_active;
         let enter_consume_ok = should_close_fullscreen_on_enter(
             is_media_item,
             self.ime_input_active(),
@@ -11902,6 +11916,7 @@ impl App {
         // (Codex Phase 1 P2 指摘)。
         let key_space = !current_item_is_video
             && !fs_music_view_active
+            && !animated_playback_active
             && self.keymap.consume_action(ctx, KeyAction::FsSpaceCheck);
         let key_ctrl_s_capture = !is_video_fs
             && !fs_music_view_active
@@ -12777,10 +12792,7 @@ impl App {
         if key_s {
             self.slideshow_popup_open = false;
             if self.slideshow_playing {
-                self.slideshow_playing = false;
-                self.slideshow_anchor_idx = None;
-                self.slideshow_scroll_anim = None;
-                self.slideshow_scroll_range_cache = None;
+                self.stop_slideshow_playback();
             } else if matches!(
                 self.items.get(fs_idx),
                 Some(GridItem::Image(_))
@@ -12800,11 +12812,7 @@ impl App {
         // (ZipImage / PdfPage は静止画扱いのため従来通りチェック可能。)
         if key_space {
             if self.slideshow_playing {
-                self.slideshow_playing = false;
-                self.slideshow_anchor_idx = None;
-                self.slideshow_scroll_anim = None;
-                self.slideshow_scroll_range_cache = None;
-                self.slideshow_popup_open = false;
+                self.stop_slideshow_playback();
             } else {
                 match self.items.get(fs_idx) {
                     Some(GridItem::Image(_))
@@ -14133,6 +14141,18 @@ impl App {
         }
     }
 
+    /// 既存の手動停止と remote session lock が共有する停止入口。
+    /// 表示位置と fullscreen/window 構成は保持し、タイマーだけを止める。
+    pub(crate) fn stop_slideshow_playback(&mut self) -> bool {
+        let was_playing = self.slideshow_playing;
+        self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
+        self.slideshow_scroll_anim = None;
+        self.slideshow_scroll_range_cache = None;
+        self.slideshow_popup_open = false;
+        was_playing
+    }
+
     /// フォルダ内の先頭の静止画系アイテム (Video 除外) へ折り返す。
     /// 静止画系が一つも無ければスライドショーを停止する。
     fn loop_slideshow_to_first(&mut self, ctx: &egui::Context) {
@@ -15023,7 +15043,11 @@ impl App {
 
         // アニメーション: 次フレームの時刻まで待ってから再描画
         if !is_video {
-            if let Some(FsCacheEntry::Animated { next_frame_at, .. }) = self.fs_cache.get(&fs_idx) {
+            if let Some(FsCacheEntry::Animated {
+                playback: AnimationPlayback::Playing { next_frame_at },
+                ..
+            }) = self.fs_cache.get(&fs_idx)
+            {
                 let delay = (next_frame_at - ctx.input(|i| i.time)).max(0.0);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             }
