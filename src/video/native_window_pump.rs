@@ -1093,6 +1093,7 @@ fn active_epoch(state: WindowHostState) -> Option<WindowEpoch> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::NativeVideoInitialVisibility;
     use super::*;
     use std::process::Command;
     use std::sync::mpsc;
@@ -1161,7 +1162,8 @@ mod tests {
         let hwnd_out = Arc::new(AtomicU64::new(0));
         let hud_out = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
-        let presenter_visibility = NativePresenterVisibility::new_visible();
+        let presenter_visibility =
+            NativePresenterVisibility::new(NativeVideoInitialVisibility::Visible);
         let source_epoch = Arc::new(AtomicU64::new(0));
         let init_error = Arc::new(Mutex::new(None));
         let channel_fault = Arc::new(AtomicBool::new(false));
@@ -1190,6 +1192,7 @@ mod tests {
             hud_overlay_enabled: false,
             placement: NativeVideoPlacement::MainWindowChild,
             activate_on_show: false,
+            initial_visibility: NativeVideoInitialVisibility::Visible,
             in_main_window: true,
             audio_only: false,
         };

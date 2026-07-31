@@ -748,10 +748,10 @@ impl GpuVideoDevice {
 
     /// Release idle video GPU pools while keeping the process-wide D3D11 device alive.
     ///
-    /// Used when the app is hidden to the task tray: active decoder / presenter resources
-    /// are closed first through `close_fullscreen`, then this drops reusable caches that
-    /// otherwise stay resident until process exit. Slots still marked `in_use` are left
-    /// alone because their corresponding frame/presenter ownership has not been returned.
+    /// Used when the app is hidden to the task tray. Active decoder / presenter leases remain
+    /// alive for uninterrupted playback; this drops only reusable cache ownership that would
+    /// otherwise stay resident until process exit. Slots still marked `in_use` are left alone
+    /// because their corresponding frame/presenter ownership has not been returned.
     pub fn release_idle_pools(&self) {
         match self.hw_frames_pool.lock() {
             Ok(mut pool) => pool.clear("tray_hide"),

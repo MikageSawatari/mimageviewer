@@ -7622,18 +7622,22 @@ fn viewer_context_media_teardown_plan(
 }
 
 #[cfg(windows)]
-fn pause_viewer_context_bundle_media_for_tray(bundle: &ViewerContextBundle) -> usize {
-    let mut paused = 0;
-    for entry in bundle.fs_cache.values() {
+fn sync_viewer_context_bundle_presenters_for_tray(
+    bundle: &ViewerContextBundle,
+    app_visible: bool,
+) -> usize {
+    let mut routed = 0;
+    let music_consumer = viewer_context_bundle_is_music_consumer(bundle);
+    for (idx, entry) in &bundle.fs_cache {
         let FsCacheEntry::Video { player, .. } = entry else {
             continue;
         };
-        if player.intent_playing() {
-            player.set_playing(false);
-            paused += 1;
-        }
+        let presenter_visible =
+            app_visible && bundle.fullscreen_idx == Some(*idx) && !music_consumer;
+        player.set_native_window_visible(presenter_visible);
+        routed += 1;
     }
-    paused
+    routed
 }
 
 #[cfg(windows)]
@@ -33767,7 +33771,7 @@ impl App {
 
     /// トレイ復帰イベントで、保持中の通常 fullscreen media surface を再び前面化する。
     /// tray 専用の状態は持たず、現在 mount されている media owner だけを見る。
-    /// 再生 transport には触れないため、格納時に pause した intent と位置はそのまま残る。
+    /// 再生 transport には触れないため、running / paused / EOF の intent と位置はそのまま残る。
     pub(crate) fn restore_media_surface_after_tray(&mut self, ctx: &egui::Context) {
         if self.current_viewer_session_is_detached_or_switching()
             || !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
@@ -35777,22 +35781,55 @@ impl App {
         }
     }
 
-    /// トレイ格納時に mount 外の active detached / ParkedLive media transport も止める。
-    /// bundle が所有する既存 VideoPlayer だけを対象にし、detached runtime は変更しない。
+    /// Tray hide/restore の presenter visibility を全 viewer context へ同じ ownership で配る。
+    /// Transport は変更せず、native output の typed visibility queue だけを遷移させる。
     #[cfg(windows)]
-    pub(crate) fn pause_detached_media_playback_for_tray(&self) -> usize {
+    pub(crate) fn sync_media_presenter_visibility_for_tray(&self, app_visible: bool) -> usize {
+        let mounted_music_consumer = self.fullscreen_idx.is_some_and(|idx| {
+            let standalone_audio_without_vst =
+                matches!(self.items.get(idx), Some(GridItem::Audio(_)))
+                    && !self
+                        .music_vst_shell
+                        .as_ref()
+                        .is_some_and(|shell| shell.fs_idx == idx);
+            let video_audio_mode_without_vst = self.video_audio_mode == Some(idx)
+                && !self
+                    .video_audio_vst
+                    .as_ref()
+                    .is_some_and(|state| state.fs_idx == idx);
+            standalone_audio_without_vst || video_audio_mode_without_vst
+        });
+        let mut routed = 0;
+        for (idx, entry) in &self.fs_cache {
+            let FsCacheEntry::Video { player, .. } = entry else {
+                continue;
+            };
+            let presenter_visible =
+                app_visible && self.fullscreen_idx == Some(*idx) && !mounted_music_consumer;
+            player.set_native_window_visible(presenter_visible);
+            routed += 1;
+        }
         let active = self
             .active_detached_viewer_context
             .as_ref()
-            .map(|active| pause_viewer_context_bundle_media_for_tray(&active.bundle))
+            .map(|active| {
+                sync_viewer_context_bundle_presenters_for_tray(&active.bundle, app_visible)
+            })
             .unwrap_or(0);
         let parked = self
             .detached_image_windows
             .iter()
             .filter_map(|window| window.paused_bundle.as_deref())
-            .map(pause_viewer_context_bundle_media_for_tray)
+            .map(|bundle| sync_viewer_context_bundle_presenters_for_tray(bundle, app_visible))
             .sum::<usize>();
-        active + parked
+        routed += active + parked;
+        if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+            pending
+                .native_output
+                .set_window_visible(app_visible && !pending.audio_mode_after_swap);
+            routed += 1;
+        }
+        routed
     }
 
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
@@ -46463,6 +46500,7 @@ impl App {
                             rect,
                             placement,
                             activate_on_show,
+                            self.window_visible,
                             vp.file_name()
                                 .and_then(|name| name.to_str())
                                 .unwrap_or("video")
@@ -60652,9 +60690,11 @@ impl eframe::App for App {
             // 設定変更反映 + メニューイベントをポーリング + 閉じるボタンの乗っ取り。
             self.sync_tray_with_settings(ctx);
             self.poll_tray_events(ctx);
-            if self.maybe_intercept_close(ctx) {
-                return;
-            }
+            // A tray-intercepted CloseRequested must finish this frame. Immediate/deferred
+            // viewports are registered below; returning here omits them from egui's frame and
+            // destroys their host HWNDs (and any WS_CHILD native presenter). hide_to_tray has
+            // already made each retained viewport explicit Hidden, so normal registration is safe.
+            let _tray_hide_started = self.maybe_intercept_close(ctx);
         }
 
         // フォーカス復帰検出 (Alt+Tab で他アプリから mIV に戻った等) で、
@@ -64634,6 +64674,7 @@ fn native_video_presenter_config(
     rect: windows::Win32::Foundation::RECT,
     placement: crate::video::NativeVideoPlacement,
     activate_on_show: bool,
+    initially_visible: bool,
     fallback_file_name: String,
     perf_overlay_visible: bool,
     initial_tile_overlay: bool,
@@ -64684,6 +64725,11 @@ fn native_video_presenter_config(
         hud_overlay_enabled: placement.is_fullscreen_borderless(),
         placement,
         activate_on_show,
+        initial_visibility: if initially_visible {
+            crate::video::NativeVideoInitialVisibility::Visible
+        } else {
+            crate::video::NativeVideoInitialVisibility::Hidden
+        },
         in_main_window,
         audio_only,
     })

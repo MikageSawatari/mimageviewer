@@ -6358,7 +6358,8 @@ impl App {
                 window_placement,
                 apply_initial_placement,
                 self.settings.ui_scale_factor,
-            );
+            )
+            .with_visible(self.window_visible);
             let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
                 window,
                 window_placement,
@@ -6471,7 +6472,8 @@ impl App {
                 window_placement,
                 apply_initial_placement,
                 self.settings.ui_scale_factor,
-            );
+            )
+            .with_visible(self.window_visible);
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
             let mut placement_update = None;
@@ -7473,13 +7475,15 @@ impl App {
         } else {
             None
         };
-        let builder = self.build_detached_viewer_viewport_builder(
-            title_idx,
-            None,
-            apply_placement,
-            builder_placement,
-            "keepalive_backstop",
-        );
+        let builder = self
+            .build_detached_viewer_viewport_builder(
+                title_idx,
+                None,
+                apply_placement,
+                builder_placement,
+                "keepalive_backstop",
+            )
+            .with_visible(self.window_visible);
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
         let live_tex = self
             .fullscreen_idx
@@ -7948,8 +7952,9 @@ impl App {
             // builder に寄せる (taskbar 属性を音声ファイルと揃える、Codex 7d 検証)。
             self.build_still_fullscreen_viewport_builder()
         };
-        if need_show && !embedded {
-            // 新規 viewport は hidden で作り、DWM transition 抑止属性を当ててから
+        if !embedded && (need_show || !self.window_visible) {
+            // 新規 viewport と tray residency 中の内部 recreate は hidden で作り、
+            // DWM transition 抑止属性を当ててから
             // Visible(true) にする。初期 white client、最大化アニメーション、detached
             // window の表示フェード露出を動画 backdrop と同じ手順で避ける。
             fs_builder = fs_builder.with_visible(false);
@@ -8147,7 +8152,7 @@ impl App {
                     }
                 }
                 #[cfg(windows)]
-                if detached_focus_existing {
+                if detached_focus_existing && self.window_visible {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -9630,7 +9635,7 @@ impl App {
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
                 #[cfg(windows)]
-                if need_show && !embedded {
+                if need_show && !embedded && self.window_visible {
                     // The viewport was created hidden above. Release visibility only after
                     // this frame has painted either real content (full/thumb/holdover) or the
                     // dark loading surface. This keeps DWM from ever presenting the unpainted
@@ -10433,7 +10438,7 @@ impl App {
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
         let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
-        let fs_builder = if need_show {
+        let fs_builder = if need_show || !self.window_visible {
             // Create the fullscreen backdrop HWND hidden first. The DWM
             // transition flag can only be applied after the HWND exists, so a
             // visible initial create can animate before the attribute lands.
@@ -10447,7 +10452,7 @@ impl App {
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
             // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
-            if need_show {
+            if need_show && self.window_visible {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

@@ -1581,30 +1581,39 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 - **VideoPlayer.shutdown() の用途**: 動画切替時に Drop より早く audio を切るため (= 残音を防ぐ)
 - **GpuVideoDevice の Drop**: D3D11 リソース全解放、fence の NT shared handle を `CloseHandle`
 - **GpuVideoDevice::release_idle_pools()**: タスクトレイ格納時の residency 削減用。process-wide
-  D3D11 device 自体は残しつつ、`hw_frames_pool`、`in_use=false` の `shared_output_pool` slot、
-  `processor_cache` を解放する。次回動画再生時は通常の acquire 経路で lazy に再作成される。
-  VST3 bridge / plugin chain は停止しない。
-- **タスクトレイ格納時の media pause**: `hide_to_tray()` は Win32 `SW_HIDE` より前に、mounted
-  context、active detached context、全 ParkedLive bundle が所有する既存 `FsCacheEntry::Video` を走査する。
-  再生 intent がある `VideoPlayer` へ `set_playing(false)` を送り、engine transport、音声出力、clock を
-  一緒に pause する。動画、動画→音声モード、単体音楽ファイルは同じ owner / pause 経路を通る。
-  live player の clock / 最終表示 PTS を保持したまま `video_resume_positions` にも保存するため、復帰後の
-  Play は同じ位置から始まる。tray 専用 bool は持たず、自動再生もしない。
-- **tray residency 中の session / cache ownership**: mounted context で再生中だった session は pause 済みの
-  `VideoPlayer` / native output として保持し、それ以外の画像 texture cache は解放する。格納前から再生して
-  いなかった通常 fullscreen / in-window session の close は従来どおり。detached / switching context は
-  既存 lifecycle predicate どおり active / ParkedLive owner に残すが、再生継続ではなく pause 済みである。
-  process-wide D3D11 device と VST3 bridge / plugin chain は残し、idle GPU pool は
-  `GpuVideoDevice::release_idle_pools()` で解放する。
-- **トレイ復帰フレームの close 経路**: `sync_after_restore(ctx)` は Play を送らない。mounted fullscreen media
-  が残っている場合は既存の focus grace / `restore_fullscreen_focus_from_main()` で surface の focus / raise
-  だけを再要求し、同じフレームの main-focus guard が `close_fullscreen()` を実行する競合を避ける。
+  D3D11 device 自体は残しつつ、cache 所有の `hw_frames_pool` ref、`in_use=false` の
+  `shared_output_pool` slot、`processor_cache` を解放する。稼働中 decoder / presenter が持つ lease と
+  frame は解放せず、必要な cache は通常の acquire 経路で lazy に再作成される。VST3 bridge /
+  plugin chain は停止しない。
+- **タスクトレイ格納時の hidden lifecycle**: `hide_to_tray()` は transport を変更しない。mounted
+  context、active detached context、全 ParkedLive bundle と source-swap pending が所有する native output へ
+  `SetWindowVisible(false)` を FIFO で送り、既存 `WindowHostState::Hidden` へ遷移させる。動画→音声モードと
+  tray residency は同じ typed visibility owner を使う。動画は pacing queue / decoder channel を drain し続け、
+  最新 frame 1 枚を hold する。単体音楽には presenter が無いので transport だけがそのまま走る。格納前から
+  pause / EOF ならその状態も変更しない。resume 位置は hide 時点にも保存するが、再生制御には使わない。
+- **tray residency 中の host / session ownership**: `maybe_intercept_close()` が close を tray hide に変換した
+  フレームも `App::update` を最後まで進め、active fullscreen/F12 と passive/ParkedLive の immediate/deferred
+  viewport を同じ ID で登録する。各 viewport には `Visible(false)` を明示し、tray 中の internal recreate も
+  hidden で開始する。従来の early return はこの登録を省略して egui host HWND を teardown し、その WS_CHILD
+  presenter も `WM_DESTROY` にしていた。`native window visibility cancelled` はその terminal teardown が output
+  cancel を立てた後、visibility ack 待ちが返す結果であり、資源節約ポリシーの producer ではない。
+  media/pending/detached session は play intent に関係なく同じ owner に残し、plain still fullscreen だけは閉じる。
+- **tray residency の資源コスト**: decoder、audio clock、native window pump/render thread、presenter HWND、
+  DComp/swap chain、in-use D3D11VA/shared texture と最新 frame 1 枚を保持し、decode は full rate で継続する。
+  したがって不可視中も動画 decode の CPU/GPU/電力コストを負う。代わりに EOF と audio clock を通常経路で
+  進め、復帰時の seek/reopen を不要にする。mounted context の非 media texture と未使用 pool/cache は解放するが、
+  detached session は既存 keepalive policy どおり active viewer cache も保持する。decode 停止・低レート化は audio clock
+  追従と EOF semantics を別 state にするため本変更には含めず、必要なら §1.9 の resource policy として扱う。
+- **トレイ復帰フレームの close 経路**: `sync_after_restore(ctx)` は retained viewport へ `Visible(true)`、
+  visual media presenter へ `SetWindowVisible(true)` を送り、hidden 中に hold した最新 frame を一度 present してから
+  既存の focus grace / `restore_fullscreen_focus_from_main()` で surface の focus / raise だけを再要求する。Play / seek /
+  recreate は送らないため、running / paused / EOF の transport state はそのままである。
   復帰時の `check_external_folder_changes()` が items を再構築する場合は、
   `start_loading_items()` の main-context change 境界が既存の
   `viewer_session_is_detached_or_switching()` から detached media context への promotion を決定する。
   main-focus consumer も `current_viewer_session_is_detached_or_switching()` を使うため、host 待ち / placement
-  switch 中の paused session と typed request を閉じない。これらは前 2 件の lifecycle 述語統一を保つための
-  context ownership であり、トレイ中の再生維持を意味しない。`poll_video()` の close は明示 close event または
+  switch 中の session と typed request を閉じない。これらは前 2 件の lifecycle 述語統一をそのまま維持する。
+  `poll_video()` の close は明示 close event または
   native output の genuine terminal close に限り、tray restore 自体は terminal producer にならない。
   `cleanup_visible_false` の `host=hwnd=0` は、ログ出力前に runtime を除去した後の値であり、host-loss 判定には
   使用しない。

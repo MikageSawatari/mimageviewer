@@ -7203,6 +7203,7 @@ impl App {
             rect,
             placement,
             true, // activate_on_show (fullscreen)
+            self.window_visible,
             file_name,
             self.video_perf_overlay_visible,
             false, // initial_tile_overlay: 音声は preparing タイルを出さない
@@ -7718,6 +7719,7 @@ impl App {
                 rect,
                 placement,
                 true,
+                self.window_visible,
                 file_name,
                 self.video_perf_overlay_visible,
                 false,

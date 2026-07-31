@@ -1869,6 +1869,60 @@ mod tests {
     }
 
     #[test]
+    fn tray_visibility_round_trip_preserves_host_and_session_identity() {
+        let host = presenter(7, 30, 0x4321, 70, NativeVideoPlacement::DetachedViewerChild);
+        let visible = WindowHostState::Visible {
+            request: WindowRequestId(7),
+            host,
+        };
+        let hide = reduce_window_host(
+            visible,
+            WindowHostInput::Command(WindowHostCommand::SetVisibility {
+                epoch: host.epoch,
+                visibility: WindowVisibility::Hidden,
+            }),
+        );
+        assert_eq!(hide.status, WindowHostTransitionStatus::Applied);
+        assert_eq!(
+            hide.effects,
+            vec![WindowHostEffect::ApplyVisibility {
+                host,
+                visibility: WindowVisibility::Hidden,
+            }]
+        );
+        assert!(matches!(
+            hide.state,
+            WindowHostState::Hidden {
+                request: WindowRequestId(7),
+                host: retained,
+            } if retained == host
+        ));
+
+        let show = reduce_window_host(
+            hide.state,
+            WindowHostInput::Command(WindowHostCommand::SetVisibility {
+                epoch: host.epoch,
+                visibility: WindowVisibility::Visible,
+            }),
+        );
+        assert_eq!(show.status, WindowHostTransitionStatus::Applied);
+        assert_eq!(
+            show.effects,
+            vec![WindowHostEffect::ApplyVisibility {
+                host,
+                visibility: WindowVisibility::Visible,
+            }]
+        );
+        assert!(matches!(
+            show.state,
+            WindowHostState::Visible {
+                request: WindowRequestId(7),
+                host: retained,
+            } if retained == host
+        ));
+    }
+
+    #[test]
     fn close_cancels_staging_with_the_original_request_identity() {
         let transition = reduce_window_host(
             WindowHostState::Preparing {

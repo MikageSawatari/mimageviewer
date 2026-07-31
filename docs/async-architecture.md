@@ -810,20 +810,22 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
   `hide_to_tray` から `ActivityGate::set_paused(true)`。既存の `wait_until_idle` は
   paused 中ループブロックし、`show_from_tray` で解除されると通常動作に戻る。
   **cancel は paused を貫通** させる (アプリ終了時に supervisor スレッドが固まらないため)。
-- **media pause / GPU リソース解放**: `hide_to_tray` は `SW_HIDE` より先に
-  `pause_media_playback_for_tray` を呼ぶ。mounted `fs_cache`、active detached bundle、全 ParkedLive
-  bundle が所有する `FsCacheEntry::Video` のうち再生 intent がある player へ Pause を送り、動画、
-  動画→音声モード、単体音楽の clock と音声を同じ transport state machine で止める。各 owner の現在位置は
-  live player と `video_resume_positions` の両方に保持する。mounted context で再生中だった session と
-  detached / switching context は pause 済み player / native output を保持し、格納前から非再生だった通常
-  session は従来の `close_fullscreen()` cleanup を通す。その後 `App::release_gpu_resources` は media entry
-  以外の `TextureHandle` を drop し、Windows では `GpuVideoDevice::release_idle_pools()` で D3D11VA
-  frames pool / idle shared output pool / video processor cache を空にする。VST3 bridge / plugin chain は
-  停止しない。
-- **media restore**: `sync_after_restore(ctx)` は Play を送らず、保持中の mounted fullscreen media surface
-  に既存 focus grace / focus restore を再適用するだけである。したがって復帰後は pause のままで、ユーザーの
-  Play 操作が同じ位置から再開する。復帰時の外部フォルダ変更と main-focus consumer は既存の
-  detached / switching 述語を共有し、paused context と typed placement completion を閉じない。
+- **media / viewport hide**: `hide_to_tray` は transport を変更せず、mounted `fs_cache`、active detached
+  bundle、全 ParkedLive bundle、source-swap pending の native output へ FIFO の
+  `SetWindowVisible(false)` を送る。presenter は typed `WindowHostState::Hidden` と consume-and-hold へ入り、
+  decoder channel を drain して最新 frame を保持する。close を横取りした `App::update` は早期 return せず、
+  active fullscreen/F12 と passive/ParkedLive viewport を同じ ID で登録したうえで `Visible(false)` にする。
+  これにより egui host HWND とその WS_CHILD presenter を teardown しない。単体音楽は presenter 無しで同じ
+  transport を継続し、元から paused / EOF ならその intent も維持する。
+- **GPU リソース**: `App::release_gpu_resources` は media entry、稼働中 decoder/presenter lease、DComp/swap
+  chain、最新 frame を保持する一方、mounted context の非 media `TextureHandle` と cache 所有の D3D11VA
+  frames ref、idle shared output slot、video processor cache を解放する。detached session は既存 keepalive policy
+  どおり active viewer cache も保持する。不可視中も decode は full rate で続くため CPU/GPU/電力コストを負う。
+  VST3 bridge / plugin chain は停止しない。
+- **media restore**: `sync_after_restore(ctx)` は retained viewport と visual presenter を Visible へ戻し、
+  hold した最新 frame を present して既存 focus grace / focus restore を再適用する。Play / Pause / seek / recreate
+  は送らない。復帰時の外部フォルダ変更と main-focus consumer は既存の detached / switching 述語を共有し、
+  running / paused / EOF context と typed placement completion を閉じない。
 - **UI heartbeat watchdog**: `App::update` は SW_HIDE 中に止まるため、`hide_to_tray` で
   watchdog を suspended にし、復帰時に resume する。これにより正常なトレイ常駐を
   `panic.log` の `UI THREAD HANG suspected` として記録し続けない。detached viewer
