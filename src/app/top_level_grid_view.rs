@@ -65,11 +65,8 @@ impl SmartFolderViewState {
         }
     }
 
-    /// `path` 自体が root entry、またはその子孫なら、その entry の scoped drill を開始する。
-    /// 親子の entry が両方 root にある場合は exact match、次に最も深い祖先を優先する。
-    pub(crate) fn enter_containing_path(&mut self, path: &Path) -> bool {
-        let entry_index = self
-            .folder_entries
+    fn containing_entry_index(&self, path: &Path) -> Option<usize> {
+        self.folder_entries
             .iter()
             .position(|entry| crate::folder_tree::path_eq(entry, path))
             .or_else(|| {
@@ -79,8 +76,21 @@ impl SmartFolderViewState {
                     .filter(|(_, entry)| crate::search_index_db::is_under(path, entry))
                     .max_by_key(|(_, entry)| entry.components().count())
                     .map(|(index, _)| index)
-            });
-        let Some(entry_index) = entry_index else {
+            })
+    }
+
+    /// synthetic root から見た直下の entry を返す。scoped current がさらに深い子孫でも、
+    /// 通常フォルダの親復帰でいう「戻り先直下の子」に相当する entry root を解決する。
+    pub(crate) fn containing_entry(&self, path: &Path) -> Option<&Path> {
+        self.containing_entry_index(path)
+            .and_then(|index| self.folder_entries.get(index))
+            .map(PathBuf::as_path)
+    }
+
+    /// `path` 自体が root entry、またはその子孫なら、その entry の scoped drill を開始する。
+    /// 親子の entry が両方 root にある場合は exact match、次に最も深い祖先を優先する。
+    pub(crate) fn enter_containing_path(&mut self, path: &Path) -> bool {
+        let Some(entry_index) = self.containing_entry_index(path) else {
             return false;
         };
         let entry_root = self.folder_entries[entry_index].clone();

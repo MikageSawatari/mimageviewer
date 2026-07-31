@@ -504,6 +504,17 @@ impl SmartFolderSession {
         self.active_child = None;
     }
 
+    fn active_root_entry(
+        &self,
+        state: &super::top_level_grid_view::SmartFolderViewState,
+    ) -> Option<PathBuf> {
+        (state.definition_id == self.definition_id)
+            .then_some(self.active_child.as_deref())
+            .flatten()
+            .and_then(|active_child| state.containing_entry(active_child))
+            .map(Path::to_path_buf)
+    }
+
     fn root_parent_target(&self) -> bool {
         self.active_child.is_some()
     }
@@ -3269,7 +3280,11 @@ impl App {
         true
     }
 
-    fn restore_prepared_smart_folder_session(&mut self, definition_id: uuid::Uuid) -> bool {
+    fn restore_prepared_smart_folder_session(
+        &mut self,
+        definition_id: uuid::Uuid,
+        returned_root_entry: Option<&Path>,
+    ) -> bool {
         let Some(mut session) = self.top_level_grid_view.take_smart_folder_session() else {
             return false;
         };
@@ -3434,6 +3449,27 @@ impl App {
             .unwrap_or("?");
         self.address = format!("スマートフォルダ: {definition_name}");
         self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        if let Some(returned_root_entry) = returned_root_entry {
+            let returned_index = self.items.iter().position(|item| {
+                item.drag_source_path()
+                    .is_some_and(|path| crate::folder_tree::path_eq(path, returned_root_entry))
+            });
+            match returned_index {
+                Some(index)
+                    if self.selected != Some(index)
+                        || self.visible_indices.binary_search(&index).is_err() =>
+                {
+                    self.select_item_after_load(index);
+                }
+                Some(_) => {}
+                None => {
+                    // The active entry was deleted or ceased to belong to the frozen root.
+                    // Match ordinary select-after-load's miss behavior: keep the prepared
+                    // selection, repairing it only if that row is no longer visible.
+                    self.redirect_selected_to_visible();
+                }
+            }
+        }
         session.returned_to_root();
         self.top_level_grid_view
             .install_smart_folder_session(session);
@@ -3664,6 +3700,15 @@ impl App {
             .filter(|state| state.definition_id == definition_id)
             .map(|state| state.folder_entries.as_ref().clone())
             .unwrap_or_default();
+        let returned_root_entry = self
+            .top_level_grid_view
+            .smart_folder()
+            .filter(|state| state.definition_id == definition_id)
+            .and_then(|state| {
+                self.top_level_grid_view
+                    .smart_folder_session()
+                    .and_then(|session| session.active_root_entry(state))
+            });
         let root_state = super::top_level_grid_view::SmartFolderViewState::root(
             definition_id,
             retained_folder_entries,
@@ -3680,7 +3725,10 @@ impl App {
                 smart_folder_prepared_definition_matches(&snapshot.definition, &definition)
             });
         if prepared_definition_matches {
-            if self.restore_prepared_smart_folder_session(definition_id) {
+            if self.restore_prepared_smart_folder_session(
+                definition_id,
+                returned_root_entry.as_deref(),
+            ) {
                 return true;
             }
             if self.items_are_smart_folder_view

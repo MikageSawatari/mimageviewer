@@ -43041,6 +43041,41 @@ mod smart_folder_transition_tests {
         assert!(!app.is_snapshot_active(), "Snapshot Lock must be released");
     }
 
+    fn selected_real_path(app: &App) -> Option<&Path> {
+        app.selected
+            .and_then(|index| app.items.get(index))
+            .and_then(GridItem::drag_source_path)
+    }
+
+    fn select_real_path(app: &mut App, path: &Path) -> usize {
+        let index = app
+            .items
+            .iter()
+            .position(|item| {
+                item.drag_source_path()
+                    .is_some_and(|candidate| crate::folder_tree::path_eq(candidate, path))
+            })
+            .expect("root entry must be materialized");
+        app.selected = Some(index);
+        index
+    }
+
+    fn drain_smart_folder_nav(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.folder_nav_pending.is_some() {
+            if let Some(result) = app.poll_folder_nav() {
+                app.apply_folder_nav_result(ctx, result);
+            } else {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "smart-folder navigation did not finish before the deadline"
+                );
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(app.pending_folder_nav_steps, 0);
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum SyntheticSearchOrigin {
         DriveList,
@@ -43182,6 +43217,172 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn smart_folder_plain_open_and_return_selects_the_opened_root_entry() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-plain-origin");
+        let source = app.tmp.path().join("smart-return-plain-source");
+        let entry = source.join("entry-a");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Return Plain", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entry);
+        app.scroll_offset_y = 234.0;
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry))
+        );
+        assert_eq!(app.scroll_offset_y, 234.0);
+        assert!(
+            !app.scroll_to_selected,
+            "returning to the already-selected visible entry must preserve the exact offset"
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_ctrl_down_from_entry_a_to_c_returns_cursor_to_c() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-nav-origin");
+        let source = app.tmp.path().join("smart-return-nav-source");
+        let entries = ["entry-a", "entry-b", "entry-c"].map(|name| source.join(name));
+        std::fs::create_dir_all(&origin).unwrap();
+        for entry in &entries {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), []).unwrap();
+        }
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Return Nav", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entries[0]);
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(&entries[0]));
+        app.load_folder(entries[0].clone());
+        assert!(app.start_smart_folder_scope_nav(true, false));
+        assert!(app.start_smart_folder_scope_nav(true, false));
+        drain_smart_folder_nav(&mut app, &ctx);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current())
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &entries[2]))
+        );
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entries[2]))
+        );
+        assert!(
+            app.scroll_to_selected,
+            "the shared parent-return path must ensure the newly selected entry is visible"
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_nested_child_return_selects_its_containing_root_entry() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-nested-origin");
+        let source = app.tmp.path().join("smart-return-nested-source");
+        let entry = source.join("entry-a");
+        let child = entry.join("child");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let mut definition = definition("Smart Return Nested", source);
+        definition.rules[0].filter.name_contains = "entry-a".into();
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entry);
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+        assert!(app.start_smart_folder_scope_nav(true, false));
+        drain_smart_folder_nav(&mut app, &ctx);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current())
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &child))
+        );
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry))
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_missing_return_entry_keeps_the_prepared_root_selection() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-missing-origin");
+        let source = app.tmp.path().join("smart-return-missing-source");
+        let entry_a = source.join("entry-a");
+        let entry_c = source.join("entry-c");
+        std::fs::create_dir_all(&origin).unwrap();
+        for entry in [&entry_a, &entry_c] {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), []).unwrap();
+        }
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Return Missing", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entry_a);
+        assert!(app.begin_smart_folder_drill(&entry_c));
+        app.load_folder(entry_c.clone());
+        std::fs::remove_dir_all(&entry_c).unwrap();
+        app.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(&entry_c));
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry_a))
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
     fn smart_folder_session_return_restores_offset_with_its_auto_aspect_without_prepare() {
         use crate::settings::ThumbAspect;
 
@@ -43205,8 +43406,8 @@ mod smart_folder_transition_tests {
         let selected = app
             .items
             .iter()
-            .position(|item| item.drag_source_path() == Some(page.as_path()))
-            .expect("prepared page");
+            .position(|item| item.drag_source_path() == Some(entry.as_path()))
+            .expect("opened root entry");
         app.settings.thumb_aspect_auto = true;
         let saved_aspect = ThumbAspect::Portrait2x3;
         let saved_offset = 900.0;
@@ -43275,12 +43476,16 @@ mod smart_folder_transition_tests {
         app.active_quick_folder_slot = None;
         let origin = app.tmp.path().join("smart-session-layout-origin");
         let source = app.tmp.path().join("smart-session-layout-source");
-        let entry = source.join("entry");
         std::fs::create_dir_all(&origin).unwrap();
-        std::fs::create_dir_all(&entry).unwrap();
-        for index in 0..30 {
-            std::fs::write(entry.join(format!("page-{index:02}.jpg")), []).unwrap();
-        }
+        let entries = (0..30)
+            .map(|index| {
+                let entry = source.join(format!("entry-{index:02}"));
+                std::fs::create_dir_all(&entry).unwrap();
+                std::fs::write(entry.join("page.jpg"), []).unwrap();
+                entry
+            })
+            .collect::<Vec<_>>();
+        let entry = entries.last().expect("last root entry").clone();
         app.current_folder = Some(origin);
         let definition = definition("Smart Session Layout", source);
         let id = definition.id;
@@ -43294,7 +43499,11 @@ mod smart_folder_transition_tests {
         let cell_h = 100.0;
         let viewport_h = 300.0;
         app.settings.grid_cols = saved_cols;
-        let selected = *app.current_grid_order().last().expect("prepared items");
+        let selected = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(entry.as_path()))
+            .expect("opened root entry");
         let selected_position = app
             .current_grid_order()
             .iter()

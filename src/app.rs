@@ -43696,6 +43696,15 @@ impl App {
         v
     }
 
+    /// 親復帰で解決済みの item を選択し、通常の ensure-visible 経路へ渡す。
+    /// 名前ヒントと smart-folder の exact root-entry 解決が同じ適用規則を共有する。
+    fn select_item_after_load(&mut self, idx: usize) {
+        debug_assert!(idx < self.items.len());
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+        self.redirect_selected_to_visible();
+    }
+
     /// `select_after_load` のヒントで items 内をケース無視で検索し、見つかれば
     /// selected を更新して true を返す。フィルタで隠れていれば直近の可視 idx に逃がす
     /// (`redirect_selected_to_visible` と同じ WYSIWYG 不変条件)。
@@ -43711,9 +43720,7 @@ impl App {
         else {
             return false;
         };
-        self.selected = Some(idx);
-        self.scroll_to_selected = true;
-        self.redirect_selected_to_visible();
+        self.select_item_after_load(idx);
         true
     }
 

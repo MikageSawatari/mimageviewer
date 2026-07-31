@@ -37,6 +37,16 @@ snapshot、sort 用 metadata、root の materialize 済み grid を保持する�
 root へ戻ると同じ items・サムネイル・選択・スクロール位置を move で戻す。この復帰では
 scan も prepare も開始せず、進捗 UI も出さない。
 
+root 復帰時の選択は、退避時の選択を無条件に戻すのではなく、session の最新
+`active_child` を包含する root-level entry で置き換える。子孫へ深く降りている場合も、
+通常フォルダの親復帰が「戻り先直下の子」を選ぶのと同様に、その子孫を所有する最深の
+root entry を選ぶ。選択の適用は通常の parent navigation と同じ select-after-load /
+`scroll_to_selected` / ensure-visible 経路を使う。entry が削除されて root items から消えた
+場合は退避済み選択を維持し、その選択も非表示なら既存の可視選択補正（直前優先、なければ
+直後）へ委ねる。entry 自体は残るがローカル絞り込みで非表示の場合も同じ可視選択補正を使う。
+退避済み選択が既に同じ可視 entry なら不要な scroll request は立てず、同一レイアウトの
+pixel offset をそのまま保つ。
+
 The scroll offset and the complete `AutoAspectState` that determined its row height belong to one
 layout snapshot. The resolved aspect, index-keyed samples, cache gate, and switch history all
 belong to the root items. Restore those samples together and rebind only `items_generation` to the
