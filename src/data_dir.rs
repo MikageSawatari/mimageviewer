@@ -161,9 +161,22 @@ fn default() -> PathBuf {
     // APPDATA に逃げず、常にポータブル配下を指す。
     #[cfg(all(not(test), feature = "portable"))]
     {
-        crate::native_assets::bundled_root().join("data")
+        flavor_default()
     }
     #[cfg(all(not(test), not(feature = "portable")))]
+    {
+        flavor_default()
+    }
+}
+
+/// 現在の build flavor が `--data-dir` 無指定時に使う data directory。
+/// single-instance 名前空間は、解決済みの `get()` がこの path と異なる場合だけ分離する。
+pub(crate) fn flavor_default() -> PathBuf {
+    #[cfg(feature = "portable")]
+    {
+        crate::native_assets::bundled_root().join("data")
+    }
+    #[cfg(not(feature = "portable"))]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(appdata).join("mimageviewer")

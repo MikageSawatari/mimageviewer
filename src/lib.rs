@@ -805,6 +805,12 @@ pub fn run() -> eframe::Result {
         run_trt_smoke_test();
     }
 
+    // single-instance の実行時 namespace は、解決済み data_dir から導出する。
+    // perf::init も logs_dir を使うため、従来どおり通常 logger より先に初期化する。
+    let t0 = Instant::now();
+    data_dir::init();
+    let data_dir_elapsed = t0.elapsed();
+
     // シングルインスタンス検出 (Windows): Named Mutex で 2 重起動を排除する。
     // インストーラの AppMutex と名前を合わせることでアップデート時の「閉じてください」
     // ダイアログ自動連携も兼ねる (`single_instance::MUTEX_NAME` 参照)。
@@ -834,10 +840,6 @@ pub fn run() -> eframe::Result {
         Some(guard)
     };
 
-    // data_dir::init() は perf::init が logs_dir を使うため先行させる必要がある。
-    let t0 = Instant::now();
-    data_dir::init();
-    let data_dir_elapsed = t0.elapsed();
     install_panic_log_hook();
     #[cfg(windows)]
     install_native_exception_log_hook();

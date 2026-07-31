@@ -77,8 +77,10 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    // `--data-dir` 指定時の mutex / event / open-path pipe 名は core が解決済み path から
+    // 導出する。launcher は基底名しか埋め込んでいないため、ここでは先回りせず core に渡す。
     #[cfg(windows)]
-    if try_activate_existing(&user_args) {
+    if !has_data_dir_option(&user_args) && try_activate_existing(&user_args) {
         return Ok(());
     }
 
@@ -109,6 +111,12 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
 
     Ok(())
+}
+
+fn has_data_dir_option(args: &[OsString]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_os_str() != std::ffi::OsStr::new("--"))
+        .any(|arg| arg.as_os_str() == std::ffi::OsStr::new("--data-dir"))
 }
 
 /// `--version` / `-V` / `--help` / `-h` を処理する。該当すれば文面を親コンソールへ
@@ -486,6 +494,20 @@ fn show_error(msg: &str) {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::ffi::OsString;
+
+    #[test]
+    fn data_dir_option_defers_single_instance_routing_to_core() {
+        assert!(super::has_data_dir_option(&[
+            OsString::from("--data-dir"),
+            OsString::from(r"D:\isolated")
+        ]));
+        assert!(!super::has_data_dir_option(&[
+            OsString::from("--"),
+            OsString::from("--data-dir")
+        ]));
+    }
+
     #[test]
     fn embedded_open_path_pipe_name_keeps_named_pipe_prefix() {
         assert_eq!(

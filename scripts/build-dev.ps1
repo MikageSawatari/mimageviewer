@@ -128,7 +128,8 @@ try {
     Write-Host ("  data (default): {0}" -f $normalDataDir)
     Write-Host ("  isolated override: --data-dir `"{0}`"" -f
         (Join-Path $outputDir 'data'))
-    Write-Host '  launch note: close the installed/resident mImageViewer first (shared single-instance mutex)'
+    Write-Host '  default launch: close the installed/resident mImageViewer first (same data-dir namespace)'
+    Write-Host '  isolated launch: may run beside the installed/resident mImageViewer'
 } finally {
     Pop-Location
 }

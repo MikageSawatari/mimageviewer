@@ -599,3 +599,32 @@ HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加す�
 フォルダは既存 `/api/thumb?fav=<UUID>&path=<relative>&w=<px>` をそのまま使う。ZIP / PDF / 動画・
 音声・変換アーカイブはこの増分では一覧に種別付きで表示するまでとし、中身の閲覧や再生、
 読書履歴・レーティング・ブックマーク等への書き込みは後続のセッションロック設計と一緒に行う。
+
+## 11. 通常運用と並行する検証用インスタンス (2026-07-31)
+
+単一インスタンスの意味は「1 build flavor につき1プロセス」ではなく、**1 data directory につき
+1プロセス**とする。解決・正規化した data directory が通常版または portable 版の既定値と一致する
+場合、mutex、activate event、open-path pipe、installer shutdown event は従来のリテラル名を
+そのまま使う。異なる場合だけ、正規化 path の SHA-256 先頭64bitを `_data_<16 hex>` として4名
+すべてへ付加する。これにより `--data-dir` だけで通常運用中のmIVと検証用mIVを同時起動でき、
+同じ隔離data directoryを指定した2プロセスは従来どおり既存側をactivateして後発側が終了する。
+
+検証用 core は次のように起動する。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
+  -ArgumentList '--data-dir', '.\target\dev-runtime\data', '--remote-ipc'
+```
+
+remote-webにも同じdata directoryを渡し、同じお気に入り・設定を読む。
+
+```powershell
+Start-Process -FilePath .\target\remote-home-release\release\mimageviewer-remote.exe `
+  -ArgumentList '--data-dir', '.\target\dev-runtime\data'
+```
+
+remote thumbnail IPC の `\\.\pipe\mimageviewer-remote-thumbnail` はremote-web側の接続先との互換性を
+保つため固定のままとする。2つの本体へ同時に `--remote-ipc` を付けると、後発側は
+`FILE_FLAG_FIRST_PIPE_INSTANCE` による作成失敗を「同名サーバが既に存在する可能性」と stderr と
+各data directoryの `logs/mimageviewer.log` に記録し、GUI本体自体は起動を継続する。通常運用側には
+`--remote-ipc` を付けず、検証側だけをremote-webの接続先にする。

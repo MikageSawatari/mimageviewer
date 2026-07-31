@@ -90,4 +90,25 @@ mod tests {
             Some(r"\\.\pipe\name")
         );
     }
+
+    #[test]
+    fn real_core_source_and_installer_keep_legacy_base_names() {
+        let core = include_str!("../../../src/single_instance.rs");
+        assert_eq!(
+            extract_const(core, "MUTEX_NAME").as_deref(),
+            Some(r"Global\mImageViewerInstance_v1")
+        );
+        assert_eq!(
+            extract_const(core, "ACTIVATE_EVENT_NAME").as_deref(),
+            Some(r"Global\mImageViewerActivate_v1")
+        );
+        assert_eq!(
+            extract_const(core, "OPEN_PATH_PIPE_NAME").as_deref(),
+            Some(r"\\.\pipe\mImageViewerOpenPath_v1")
+        );
+
+        let installer = include_str!("../../../installer/mimageviewer.iss");
+        assert!(installer.contains("ShutdownEventName = 'Global\\mImageViewerShutdown_v1';"));
+        assert!(installer.contains("AppMutexName = 'Global\\mImageViewerInstance_v1';"));
+    }
 }

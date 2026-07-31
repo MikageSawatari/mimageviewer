@@ -52,6 +52,10 @@ static ACTIVATE_EVENT_RAW: std::sync::OnceLock<isize> = std::sync::OnceLock::new
 #[cfg(windows)]
 static SHUTDOWN_EVENT_RAW: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 
+/// `data_dir` ごとに分離した実行時名。`SingleInstanceGuard::acquire` より前に
+/// `data_dir::init()` が済んでいることを前提に、プロセス内では一度だけ確定する。
+static PROCESS_NAMES: std::sync::OnceLock<ProcessNames> = std::sync::OnceLock::new();
+
 /// インストーラの `AppMutex` と一致させる mutex 名。
 ///
 /// - `Global\` プレフィックス: ターミナルサービス (リモートデスクトップ) 配下でも
@@ -78,7 +82,8 @@ impl SingleInstanceGuard {
             use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
             use windows::core::PCWSTR;
 
-            let mutex_name: Vec<u16> = MUTEX_NAME.encode_utf16().chain([0]).collect();
+            let names = process_names();
+            let mutex_name: Vec<u16> = names.mutex.encode_utf16().chain([0]).collect();
             let (mutex_handle, is_first) =
                 match unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) } {
                     Ok(h) => {
@@ -100,7 +105,7 @@ impl SingleInstanceGuard {
             // `OpenEventW` するので、こちらも同時に作る。
             if is_first {
                 let activate_wide: Vec<u16> =
-                    ACTIVATE_EVENT_NAME.encode_utf16().chain([0]).collect();
+                    names.activate_event.encode_utf16().chain([0]).collect();
                 // auto-reset (`bManualReset=false`) + 初期 non-signaled
                 match unsafe { CreateEventW(None, false, false, PCWSTR(activate_wide.as_ptr())) } {
                     Ok(h) => {
@@ -113,7 +118,7 @@ impl SingleInstanceGuard {
                     }
                 }
                 let shutdown_wide: Vec<u16> =
-                    SHUTDOWN_EVENT_NAME.encode_utf16().chain([0]).collect();
+                    names.shutdown_event.encode_utf16().chain([0]).collect();
                 match unsafe { CreateEventW(None, false, false, PCWSTR(shutdown_wide.as_ptr())) } {
                     Ok(h) => {
                         let _ = SHUTDOWN_EVENT_RAW.set(h.0 as isize);
@@ -187,6 +192,90 @@ pub const SHUTDOWN_EVENT_NAME: &str = "Global\\mImageViewerShutdown_v1";
 #[cfg(feature = "portable")]
 pub const SHUTDOWN_EVENT_NAME: &str = "Global\\mImageViewerShutdown_portable_v1";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcessNames {
+    mutex: String,
+    activate_event: String,
+    open_path_pipe: String,
+    shutdown_event: String,
+}
+
+impl ProcessNames {
+    fn for_data_dir(data_dir: &std::path::Path, flavor_default: &std::path::Path) -> Self {
+        let suffix = data_dir_namespace_suffix(data_dir, flavor_default).unwrap_or_default();
+        Self {
+            mutex: format!("{MUTEX_NAME}{suffix}"),
+            activate_event: format!("{ACTIVATE_EVENT_NAME}{suffix}"),
+            open_path_pipe: format!("{OPEN_PATH_PIPE_NAME}{suffix}"),
+            shutdown_event: format!("{SHUTDOWN_EVENT_NAME}{suffix}"),
+        }
+    }
+}
+
+fn process_names() -> &'static ProcessNames {
+    PROCESS_NAMES.get_or_init(|| {
+        ProcessNames::for_data_dir(&crate::data_dir::get(), &crate::data_dir::flavor_default())
+    })
+}
+
+fn data_dir_namespace_suffix(
+    data_dir: &std::path::Path,
+    flavor_default: &std::path::Path,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let data_key = resolved_data_dir_key(data_dir);
+    if data_key == resolved_data_dir_key(flavor_default) {
+        return None;
+    }
+    let digest = Sha256::digest(data_key.as_bytes());
+    let mut short = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(short, "{byte:02x}");
+    }
+    Some(format!("_data_{short}"))
+}
+
+/// 相対 path、`.` / `..`、既存 symlink/junction、Windows verbatim prefix、区切り文字、
+/// 大文字小文字の表記差を同じ名前空間キーへ寄せる。data directory 自体がまだ無い場合は、
+/// 最も深い既存の親だけ canonicalize して、未作成の末尾を戻す。
+fn resolved_data_dir_key(path: &std::path::Path) -> String {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let resolved = canonicalize_existing_prefix(&absolute);
+    let mut key = resolved.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = key.strip_prefix("//?/UNC/") {
+        key = format!("//{rest}");
+    } else if let Some(rest) = key.strip_prefix("//?/") {
+        key = rest.to_owned();
+    }
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    key.to_lowercase()
+}
+
+fn canonicalize_existing_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let mut cursor = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(cursor) {
+            for component in missing.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        let Some(name) = cursor.file_name() else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        cursor = parent;
+    }
+}
+
 /// 既存インスタンスに「ウィンドウを復帰させろ」と通知する。Windows 専用。
 /// 2 重起動検出時に呼び、既存プロセスが応答してから自プロセスを終了する想定。
 pub fn signal_activate_existing() -> bool {
@@ -196,7 +285,11 @@ pub fn signal_activate_existing() -> bool {
         use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
         use windows::core::PCWSTR;
 
-        let name_wide: Vec<u16> = ACTIVATE_EVENT_NAME.encode_utf16().chain([0]).collect();
+        let name_wide: Vec<u16> = process_names()
+            .activate_event
+            .encode_utf16()
+            .chain([0])
+            .collect();
         unsafe {
             match OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name_wide.as_ptr())) {
                 Ok(handle) => {
@@ -296,7 +389,11 @@ fn decode_open_path_message(message: &[u8]) -> Option<std::path::PathBuf> {
 
 #[cfg(windows)]
 fn open_path_pipe_name_wide() -> Vec<u16> {
-    OPEN_PATH_PIPE_NAME.encode_utf16().chain([0]).collect()
+    process_names()
+        .open_path_pipe
+        .encode_utf16()
+        .chain([0])
+        .collect()
 }
 
 #[cfg(windows)]
@@ -732,6 +829,63 @@ impl Drop for ActivationListener {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_data_dir_keeps_all_legacy_names_exactly() {
+        let default = std::path::Path::new(r"C:\Users\tester\AppData\Roaming\mimageviewer");
+        let names = ProcessNames::for_data_dir(default, default);
+        assert_eq!(names.mutex, MUTEX_NAME);
+        assert_eq!(names.activate_event, ACTIVATE_EVENT_NAME);
+        assert_eq!(names.open_path_pipe, OPEN_PATH_PIPE_NAME);
+        assert_eq!(names.shutdown_event, SHUTDOWN_EVENT_NAME);
+    }
+
+    #[test]
+    fn isolated_data_dir_changes_all_four_names() {
+        let default = std::path::Path::new(r"C:\Users\tester\AppData\Roaming\mimageviewer");
+        let isolated = std::path::Path::new(r"C:\work\miv-verification-data");
+        let names = ProcessNames::for_data_dir(isolated, default);
+        assert_ne!(names.mutex, MUTEX_NAME);
+        assert_ne!(names.activate_event, ACTIVATE_EVENT_NAME);
+        assert_ne!(names.open_path_pipe, OPEN_PATH_PIPE_NAME);
+        assert_ne!(names.shutdown_event, SHUTDOWN_EVENT_NAME);
+
+        let suffix = names.mutex.strip_prefix(MUTEX_NAME).unwrap();
+        assert!(suffix.starts_with("_data_"));
+        assert_eq!(suffix.len(), "_data_".len() + 16);
+        assert_eq!(
+            names.activate_event,
+            format!("{ACTIVATE_EVENT_NAME}{suffix}")
+        );
+        assert_eq!(
+            names.open_path_pipe,
+            format!("{OPEN_PATH_PIPE_NAME}{suffix}")
+        );
+        assert_eq!(
+            names.shutdown_event,
+            format!("{SHUTDOWN_EVENT_NAME}{suffix}")
+        );
+    }
+
+    #[test]
+    fn data_dir_names_are_stable_and_distinguish_directories() {
+        let default = std::path::Path::new(r"C:\Users\tester\AppData\Roaming\mimageviewer");
+        let first_path = std::path::Path::new(r"C:\work\miv-verification-data");
+        let second_path = std::path::Path::new(r"C:\work\miv-other-data");
+        let first = ProcessNames::for_data_dir(first_path, default);
+        assert_eq!(first, ProcessNames::for_data_dir(first_path, default));
+        assert_ne!(first, ProcessNames::for_data_dir(second_path, default));
+    }
+
+    #[test]
+    fn namespace_key_is_stable_when_data_dir_is_created_after_first_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("future-data");
+        let before = resolved_data_dir_key(&data_dir);
+        std::fs::create_dir(&data_dir).unwrap();
+        let after = resolved_data_dir_key(&data_dir);
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn open_path_message_round_trips_unicode_path() {
