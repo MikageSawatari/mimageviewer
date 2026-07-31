@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
@@ -9,13 +9,15 @@ use mimageviewer_ipc::{
     ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    GetLastError, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
+use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
@@ -36,8 +38,66 @@ enum Work {
     Request {
         message: ClientMessage,
         reply: mpsc::Sender<ServerMessage>,
+        enqueued_at: Instant,
     },
     Stop,
+}
+
+struct QueueMetrics {
+    name: &'static str,
+    queued: AtomicUsize,
+    active: AtomicUsize,
+}
+
+impl QueueMetrics {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            queued: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn reserve(&self) {
+        self.queued.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn rollback(&self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn started(&self) -> (usize, usize) {
+        let queued = self.queued.fetch_sub(1, Ordering::AcqRel) - 1;
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        (queued, active)
+    }
+
+    fn finished(&self) -> (usize, usize) {
+        let active = self.active.fetch_sub(1, Ordering::AcqRel) - 1;
+        (self.queued.load(Ordering::Acquire), active)
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        (
+            self.queued.load(Ordering::Acquire),
+            self.active.load(Ordering::Acquire),
+        )
+    }
+}
+
+struct ConnectionLifecycle {
+    id: u64,
+    started_at: Instant,
+}
+
+impl Drop for ConnectionLifecycle {
+    fn drop(&mut self) {
+        crate::logger::log(format!(
+            "remote_ipc: connection_disconnected connection_id={} duration_ms={:.1}",
+            self.id,
+            self.started_at.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
 }
 
 pub(super) struct ServerGuard {
@@ -74,30 +134,48 @@ impl ServerGuard {
         let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
         let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
+        let heavy_metrics = Arc::new(QueueMetrics::new("heavy"));
+        let home_metrics = Arc::new(QueueMetrics::new("home"));
         let home_collection_engine = Arc::clone(&collection_engine);
+        let home_worker_metrics = Arc::clone(&home_metrics);
         let home_worker = std::thread::Builder::new()
             .name("remote-home".to_owned())
-            .spawn(move || home_worker_loop(home_work_rx, &home_collection_engine))
+            .spawn(move || {
+                home_worker_loop(home_work_rx, &home_collection_engine, &home_worker_metrics)
+            })
             .map_err(|error| format!("remote IPC home worker を開始できません: {error}"))?;
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let work_rx = Arc::clone(&heavy_work_rx);
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
             let collection_engine = Arc::clone(&collection_engine);
+            let worker_metrics = Arc::clone(&heavy_metrics);
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("remote-thumb-{index}"))
-                    .spawn(move || worker_loop(&work_rx, &thumbnail_engine, &collection_engine))
+                    .spawn(move || {
+                        worker_loop(
+                            &work_rx,
+                            &thumbnail_engine,
+                            &collection_engine,
+                            &worker_metrics,
+                            index,
+                        )
+                    })
                     .map_err(|error| format!("remote IPC worker を開始できません: {error}"))?,
             );
         }
 
         let stop = Arc::new(AtomicBool::new(false));
+        let next_connection_id = Arc::new(AtomicU64::new(1));
         let mut listeners = Vec::with_capacity(ACCEPTOR_COUNT);
         for (index, initial_pipe) in initial_pipes.into_iter().enumerate() {
             let listener_stop = Arc::clone(&stop);
             let listener_heavy_tx = heavy_work_tx.clone();
             let listener_home_tx = home_work_tx.clone();
+            let listener_heavy_metrics = Arc::clone(&heavy_metrics);
+            let listener_home_metrics = Arc::clone(&home_metrics);
+            let listener_next_connection_id = Arc::clone(&next_connection_id);
             match std::thread::Builder::new()
                 .name(format!("remote-ipc-listener-{index}"))
                 .spawn(move || {
@@ -105,6 +183,9 @@ impl ServerGuard {
                         listener_stop,
                         listener_heavy_tx,
                         listener_home_tx,
+                        listener_heavy_metrics,
+                        listener_home_metrics,
+                        listener_next_connection_id,
                         initial_pipe,
                         index,
                     )
@@ -178,7 +259,13 @@ fn worker_loop(
     work_rx: &Mutex<mpsc::Receiver<Work>>,
     thumbnail_engine: &ThumbnailEngine,
     collection_engine: &CollectionEngine,
+    metrics: &QueueMetrics,
+    worker_index: usize,
 ) {
+    crate::logger::log(format!(
+        "remote_ipc: worker_started queue={} worker={worker_index}",
+        metrics.name
+    ));
     let context = WorkerContext::open();
     loop {
         let work = {
@@ -186,8 +273,17 @@ fn worker_loop(
             receiver.recv()
         };
         match work {
-            Ok(Work::Request { message, reply }) => {
-                let response = match message {
+            Ok(Work::Request {
+                message,
+                reply,
+                enqueued_at,
+            }) => execute_work(
+                message,
+                reply,
+                enqueued_at,
+                metrics,
+                &format!("heavy-{worker_index}"),
+                |message| match message {
                     ClientMessage::Thumbnail { id, request } => ServerMessage::Thumbnail {
                         id,
                         response: thumbnail_engine.handle(request, &context),
@@ -200,29 +296,113 @@ fn worker_loop(
                         id,
                         response: collection_engine.collection(request),
                     },
-                };
-                let _ = reply.send(response);
+                },
+            ),
+            Ok(Work::Stop) | Err(_) => break,
+        }
+    }
+    crate::logger::log(format!(
+        "remote_ipc: worker_stopped queue={} worker={worker_index}",
+        metrics.name
+    ));
+}
+
+fn home_worker_loop(
+    work_rx: mpsc::Receiver<Work>,
+    collection_engine: &CollectionEngine,
+    metrics: &QueueMetrics,
+) {
+    crate::logger::log("remote_ipc: worker_started queue=home worker=home-0".to_owned());
+    loop {
+        match work_rx.recv() {
+            Ok(Work::Request {
+                message,
+                reply,
+                enqueued_at,
+            }) => {
+                execute_work(
+                    message,
+                    reply,
+                    enqueued_at,
+                    metrics,
+                    "home-0",
+                    |message| match message {
+                        ClientMessage::Home { id, .. } => ServerMessage::Home {
+                            id,
+                            response: collection_engine.home(),
+                        },
+                        other => service_stopped_response(&other),
+                    },
+                )
             }
             Ok(Work::Stop) | Err(_) => break,
         }
     }
+    crate::logger::log("remote_ipc: worker_stopped queue=home worker=home-0".to_owned());
 }
 
-fn home_worker_loop(work_rx: mpsc::Receiver<Work>, collection_engine: &CollectionEngine) {
-    loop {
-        match work_rx.recv() {
-            Ok(Work::Request { message, reply }) => {
-                let response = match message {
-                    ClientMessage::Home { id, .. } => ServerMessage::Home {
-                        id,
-                        response: collection_engine.home(),
-                    },
-                    other => service_stopped_response(&other),
-                };
-                let _ = reply.send(response);
-            }
-            Ok(Work::Stop) | Err(_) => break,
+fn execute_work(
+    message: ClientMessage,
+    reply: mpsc::Sender<ServerMessage>,
+    enqueued_at: Instant,
+    metrics: &QueueMetrics,
+    worker: &str,
+    handler: impl FnOnce(ClientMessage) -> ServerMessage,
+) {
+    let request_id = message.id();
+    let request_kind = request_kind(&message);
+    let (queued, active) = metrics.started();
+    crate::logger::log(format!(
+        "remote_ipc: worker_start request_id={request_id} kind={request_kind} queue={} worker={worker} queue_wait_ms={:.1} queued={queued} active={active}",
+        metrics.name,
+        enqueued_at.elapsed().as_secs_f64() * 1000.0
+    ));
+    let started_at = Instant::now();
+    let response = handler(message);
+    let outcome = response_outcome(&response);
+    let reply_ok = reply.send(response).is_ok();
+    let (queued, active) = metrics.finished();
+    crate::logger::log(format!(
+        "remote_ipc: worker_complete request_id={request_id} kind={request_kind} queue={} worker={worker} outcome={outcome} duration_ms={:.1} reply_ok={reply_ok} queued={queued} active={active}",
+        metrics.name,
+        started_at.elapsed().as_secs_f64() * 1000.0
+    ));
+}
+
+fn request_kind(message: &ClientMessage) -> &'static str {
+    match message {
+        ClientMessage::Thumbnail { .. } => "thumbnail",
+        ClientMessage::Home { .. } => "home",
+        ClientMessage::Collection { .. } => "collection",
+    }
+}
+
+fn response_outcome(response: &ServerMessage) -> &'static str {
+    match response {
+        ServerMessage::Thumbnail {
+            response: ThumbnailResponse::Success { .. },
+            ..
         }
+        | ServerMessage::Home {
+            response: HomeResponse::Success(_),
+            ..
+        }
+        | ServerMessage::Collection {
+            response: CollectionResponse::Success(_),
+            ..
+        } => "ok",
+        ServerMessage::Thumbnail {
+            response: ThumbnailResponse::Error(_),
+            ..
+        }
+        | ServerMessage::Home {
+            response: HomeResponse::Error(_),
+            ..
+        }
+        | ServerMessage::Collection {
+            response: CollectionResponse::Error(_),
+            ..
+        } => "error",
     }
 }
 
@@ -230,6 +410,9 @@ fn acceptor_loop(
     stop: Arc<AtomicBool>,
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
+    heavy_metrics: Arc<QueueMetrics>,
+    home_metrics: Arc<QueueMetrics>,
+    next_connection_id: Arc<AtomicU64>,
     initial_pipe: PipeStream,
     index: usize,
 ) {
@@ -250,17 +433,14 @@ fn acceptor_loop(
                 }
             },
         };
-        let connected = unsafe {
-            match ConnectNamedPipe(pipe.handle(), None) {
-                Ok(()) => true,
-                Err(_) if GetLastError() == ERROR_PIPE_CONNECTED => true,
-                Err(error) => {
-                    crate::logger::log(format!(
-                        "remote_ipc: stage=accept_connect acceptor={index} os_error={:?} error={error}",
-                        GetLastError()
-                    ));
-                    false
-                }
+        let connected = match connect_server_pipe(&pipe) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: stage=accept_connect acceptor={index} os_error={:?} error={error}",
+                    error.raw_os_error()
+                ));
+                false
             }
         };
         if !connected {
@@ -269,13 +449,30 @@ fn acceptor_loop(
         if stop.load(Ordering::Acquire) {
             break;
         }
+        let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
+        crate::logger::log(format!(
+            "remote_ipc: connection_accepted connection_id={connection_id} acceptor={index}"
+        ));
         let heavy_work_tx = heavy_work_tx.clone();
         let home_work_tx = home_work_tx.clone();
+        let heavy_metrics = Arc::clone(&heavy_metrics);
+        let home_metrics = Arc::clone(&home_metrics);
         if let Err(error) = std::thread::Builder::new()
-            .name("remote-ipc-connection".to_owned())
-            .spawn(move || handle_connection(pipe, heavy_work_tx, home_work_tx))
+            .name(format!("remote-ipc-connection-{connection_id}"))
+            .spawn(move || {
+                handle_connection(
+                    connection_id,
+                    pipe,
+                    heavy_work_tx,
+                    home_work_tx,
+                    heavy_metrics,
+                    home_metrics,
+                )
+            })
         {
-            crate::logger::log(format!("remote_ipc: stage=connection_spawn error={error}"));
+            crate::logger::log(format!(
+                "remote_ipc: stage=connection_spawn connection_id={connection_id} error={error}"
+            ));
         }
         // この接続を処理する thread を起こした直後に次の instance を作る。
         // 他の acceptor も並行して待機しているため、再接続 burst に空白を作らない。
@@ -284,15 +481,22 @@ fn acceptor_loop(
 }
 
 fn handle_connection(
+    connection_id: u64,
     mut pipe: PipeStream,
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
+    heavy_metrics: Arc<QueueMetrics>,
+    home_metrics: Arc<QueueMetrics>,
 ) {
+    let _lifecycle = ConnectionLifecycle {
+        id: connection_id,
+        started_at: Instant::now(),
+    };
     let hello: ClientHello = match read_frame(&mut pipe, MAX_CONTROL_FRAME_BYTES) {
         Ok(hello) => hello,
         Err(error) => {
             crate::logger::log(format!(
-                "remote_ipc: stage=handshake_read error_kind={} error={error}",
+                "remote_ipc: stage=handshake_read connection_id={connection_id} error_kind={} error={error}",
                 frame_error_kind(&error)
             ));
             return;
@@ -301,18 +505,22 @@ fn handle_connection(
     let response = negotiate(hello.protocol_version);
     if let Err(error) = write_frame(&mut pipe, &response) {
         crate::logger::log(format!(
-            "remote_ipc: stage=handshake_write error_kind={} error={error}",
+            "remote_ipc: stage=handshake_write connection_id={connection_id} error_kind={} error={error}",
             frame_error_kind(&error)
         ));
         return;
     }
     if !response.accepted {
         crate::logger::log(format!(
-            "remote_ipc: protocol mismatch rejected client={} server={}",
+            "remote_ipc: protocol mismatch rejected connection_id={connection_id} client={} server={}",
             hello.protocol_version, response.protocol_version
         ));
         return;
     }
+    crate::logger::log(format!(
+        "remote_ipc: handshake_accepted connection_id={connection_id} protocol={}",
+        response.protocol_version
+    ));
 
     let (reply_tx, reply_rx) = mpsc::channel::<ServerMessage>();
     let mut response_pipe = pipe.clone();
@@ -322,7 +530,8 @@ fn handle_connection(
             for response in reply_rx {
                 if let Err(error) = write_frame(&mut response_pipe, &response) {
                     crate::logger::log(format!(
-                        "remote_ipc: stage=response_write error_kind={} error={error}",
+                        "remote_ipc: stage=response_write connection_id={connection_id} request_id={} error_kind={} error={error}",
+                        response.id(),
                         frame_error_kind(&error)
                     ));
                     break;
@@ -351,28 +560,46 @@ fn handle_connection(
             }
             Err(error) => {
                 crate::logger::log(format!(
-                    "remote_ipc: stage=request_read error_kind={} error={error}",
+                    "remote_ipc: stage=request_read connection_id={connection_id} error_kind={} error={error}",
                     frame_error_kind(&error)
                 ));
                 break;
             }
         };
+        let request_id = message.id();
+        let kind = request_kind(&message);
+        crate::logger::log(format!(
+            "remote_ipc: request_received connection_id={connection_id} request_id={request_id} kind={kind}"
+        ));
         // Home は専用 worker へ分離する。重い queue が満杯でも connection reader を
         // 塞がず、後続 Home を読めるよう Busy を明示応答する。
-        let work_tx = if matches!(message, ClientMessage::Home { .. }) {
-            &home_work_tx
+        let (work_tx, metrics) = if matches!(message, ClientMessage::Home { .. }) {
+            (&home_work_tx, &home_metrics)
         } else {
-            &heavy_work_tx
+            (&heavy_work_tx, &heavy_metrics)
         };
-        match work_tx.try_send(Work::Request {
-            message,
-            reply: reply_tx.clone(),
-        }) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(Work::Request { message, reply })) => {
+        match enqueue_work(work_tx, metrics, message, reply_tx.clone()) {
+            Ok(()) => {
+                let (queued, active) = metrics.snapshot();
+                crate::logger::log(format!(
+                    "remote_ipc: request_enqueued connection_id={connection_id} request_id={request_id} kind={kind} queue={} queued={queued} active={active}",
+                    metrics.name
+                ));
+            }
+            Err(mpsc::TrySendError::Full(Work::Request { message, reply, .. })) => {
+                let (queued, active) = metrics.snapshot();
+                crate::logger::log(format!(
+                    "remote_ipc: queue_full connection_id={connection_id} request_id={request_id} kind={kind} queue={} queued={queued} active={active}",
+                    metrics.name
+                ));
                 let _ = reply.send(queue_busy_response(&message));
             }
-            Err(mpsc::TrySendError::Disconnected(Work::Request { message, reply })) => {
+            Err(mpsc::TrySendError::Disconnected(Work::Request { message, reply, .. })) => {
+                let (queued, active) = metrics.snapshot();
+                crate::logger::log(format!(
+                    "remote_ipc: queue_stopped connection_id={connection_id} request_id={request_id} kind={kind} queue={} queued={queued} active={active}",
+                    metrics.name
+                ));
                 let _ = reply.send(service_stopped_response(&message));
                 break;
             }
@@ -382,6 +609,24 @@ fn handle_connection(
     }
     drop(reply_tx);
     let _ = writer.join();
+}
+
+fn enqueue_work(
+    work_tx: &mpsc::SyncSender<Work>,
+    metrics: &QueueMetrics,
+    message: ClientMessage,
+    reply: mpsc::Sender<ServerMessage>,
+) -> Result<(), mpsc::TrySendError<Work>> {
+    metrics.reserve();
+    let result = work_tx.try_send(Work::Request {
+        message,
+        reply,
+        enqueued_at: Instant::now(),
+    });
+    if result.is_err() {
+        metrics.rollback();
+    }
+    result
 }
 
 fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
@@ -453,10 +698,7 @@ fn frame_error_kind(error: &mimageviewer_ipc::FrameError) -> &'static str {
 
 fn create_server_pipe(first: bool) -> Result<PipeStream, std::io::Error> {
     let name = wide_nul(PIPE_NAME);
-    let mut access = PIPE_ACCESS_DUPLEX;
-    if first {
-        access = FILE_FLAGS_AND_ATTRIBUTES(access.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0);
-    }
+    let access = server_pipe_access(first);
     let mode = NAMED_PIPE_MODE(
         PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0,
     );
@@ -477,6 +719,33 @@ fn create_server_pipe(first: bool) -> Result<PipeStream, std::io::Error> {
     } else {
         Ok(PipeStream::new(handle, true))
     }
+}
+
+fn server_pipe_access(first: bool) -> FILE_FLAGS_AND_ATTRIBUTES {
+    let mut flags = PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0;
+    if first {
+        flags |= FILE_FLAG_FIRST_PIPE_INSTANCE.0;
+    }
+    FILE_FLAGS_AND_ATTRIBUTES(flags)
+}
+
+fn connect_server_pipe(pipe: &PipeStream) -> Result<(), std::io::Error> {
+    let event = OverlappedEvent::new()?;
+    let mut overlapped = OVERLAPPED {
+        hEvent: event.0,
+        ..Default::default()
+    };
+    let started = unsafe { ConnectNamedPipe(pipe.handle(), Some(&mut overlapped)) };
+    if started.is_err() {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_PIPE_CONNECTED {
+            return Ok(());
+        }
+        if error != ERROR_IO_PENDING {
+            return Err(std::io::Error::from_raw_os_error(error.0 as i32));
+        }
+    }
+    complete_overlapped(pipe.handle(), &overlapped, started).map(|_| ())
 }
 
 fn poke_listener() {
@@ -523,6 +792,43 @@ struct PipeHandle {
     server_side: bool,
 }
 
+struct OverlappedEvent(HANDLE);
+
+impl OverlappedEvent {
+    fn new() -> std::io::Result<Self> {
+        use windows::Win32::System::Threading::CreateEventW;
+
+        unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map(Self)
+            .map_err(|_| std::io::Error::last_os_error())
+    }
+}
+
+impl Drop for OverlappedEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn complete_overlapped(
+    handle: HANDLE,
+    overlapped: &OVERLAPPED,
+    started: windows::core::Result<()>,
+) -> std::io::Result<u32> {
+    if started.is_err() {
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            return Err(std::io::Error::from_raw_os_error(error.0 as i32));
+        }
+    }
+    let mut transferred = 0_u32;
+    unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, true) }
+        .map_err(|_| std::io::Error::last_os_error())?;
+    Ok(transferred)
+}
+
 unsafe impl Send for PipeHandle {}
 unsafe impl Sync for PipeHandle {}
 
@@ -559,23 +865,32 @@ impl PipeStream {
 
 impl Read for PipeStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let mut read = 0_u32;
-        unsafe { ReadFile(self.handle(), Some(buffer), Some(&mut read), None) }
-            .map_err(|_| std::io::Error::last_os_error())?;
-        Ok(read as usize)
+        let event = OverlappedEvent::new()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        };
+        let started = unsafe { ReadFile(self.handle(), Some(buffer), None, Some(&mut overlapped)) };
+        complete_overlapped(self.handle(), &overlapped, started).map(|read| read as usize)
     }
 }
 
 impl Write for PipeStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let mut written = 0_u32;
-        unsafe { WriteFile(self.handle(), Some(buffer), Some(&mut written), None) }
-            .map_err(|_| std::io::Error::last_os_error())?;
-        Ok(written as usize)
+        let event = OverlappedEvent::new()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        };
+        let started =
+            unsafe { WriteFile(self.handle(), Some(buffer), None, Some(&mut overlapped)) };
+        complete_overlapped(self.handle(), &overlapped, started).map(|written| written as usize)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        unsafe { FlushFileBuffers(self.handle()) }.map_err(|_| std::io::Error::last_os_error())
+        // Persistent pipe では overlapped WriteFile の完了が framing の境界になる。
+        // FlushFileBuffers は同じ handle の pending read と直列化するため使わない。
+        Ok(())
     }
 }
 
@@ -586,6 +901,52 @@ fn wide_nul(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapped_transport_and_home_queue_complete_round_trip() {
+        // Persistent connection は reader と writer が同じ duplex handle を同時利用する。
+        // 同期 handle に戻すと handshake 後の pending read が request write を塞ぐ。
+        assert_ne!(
+            server_pipe_access(false).0 & FILE_FLAG_OVERLAPPED.0,
+            0,
+            "persistent pipe の同時 read/write には overlapped handle が必要"
+        );
+
+        // 実 named pipe に依存せず、本番と同じ dispatcher helper -> Home queue ->
+        // worker -> request-id 付き response の往復を固定する。
+        let (work_tx, work_rx) = mpsc::sync_channel(2);
+        let metrics = Arc::new(QueueMetrics::new("home-test"));
+        let worker_metrics = Arc::clone(&metrics);
+        let collection_engine = CollectionEngine::new(crate::settings::Settings::default());
+        let worker = std::thread::spawn(move || {
+            home_worker_loop(work_rx, &collection_engine, &worker_metrics)
+        });
+        let (reply_tx, reply_rx) = mpsc::channel();
+        enqueue_work(
+            &work_tx,
+            &metrics,
+            ClientMessage::Home {
+                id: 73,
+                request: mimageviewer_ipc::HomeRequest,
+            },
+            reply_tx,
+        )
+        .expect("Home request must enter its dedicated queue");
+
+        let response = reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("handshake 後の最初の要求が worker を通って応答すること");
+        assert!(matches!(
+            response,
+            ServerMessage::Home {
+                id: 73,
+                response: HomeResponse::Success(_),
+            }
+        ));
+        work_tx.send(Work::Stop).unwrap();
+        worker.join().unwrap();
+        assert_eq!(metrics.snapshot(), (0, 0));
+    }
 
     #[test]
     fn full_heavy_queue_rejects_immediately_and_home_lane_remains_available() {

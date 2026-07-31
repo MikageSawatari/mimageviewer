@@ -691,8 +691,8 @@ impl PipeStream {
     fn connect(pipe_name: &str, timeout: Duration) -> Result<Self, std::io::Error> {
         use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError};
         use windows::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
         };
         use windows::Win32::System::Pipes::WaitNamedPipeW;
         use windows::core::PCWSTR;
@@ -707,7 +707,7 @@ impl PipeStream {
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     None,
                     OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
+                    client_pipe_attributes(),
                     None,
                 )
             };
@@ -742,6 +742,60 @@ impl PipeStream {
     }
 }
 
+#[cfg(windows)]
+fn client_pipe_attributes() -> windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED};
+
+    windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(
+        FILE_ATTRIBUTE_NORMAL.0 | FILE_FLAG_OVERLAPPED.0,
+    )
+}
+
+#[cfg(windows)]
+struct OverlappedEvent(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl OverlappedEvent {
+    fn new() -> std::io::Result<Self> {
+        use windows::Win32::System::Threading::CreateEventW;
+        use windows::core::PCWSTR;
+
+        unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map(Self)
+            .map_err(|_| std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OverlappedEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn complete_overlapped(
+    handle: windows::Win32::Foundation::HANDLE,
+    overlapped: &windows::Win32::System::IO::OVERLAPPED,
+    started: windows::core::Result<()>,
+) -> std::io::Result<u32> {
+    use windows::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
+    use windows::Win32::System::IO::GetOverlappedResult;
+
+    if started.is_err() {
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            return Err(std::io::Error::from_raw_os_error(error.0 as i32));
+        }
+    }
+    let mut transferred = 0_u32;
+    unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, true) }
+        .map_err(|_| std::io::Error::last_os_error())?;
+    Ok(transferred)
+}
+
 #[cfg(not(windows))]
 #[derive(Clone)]
 struct PipeStream;
@@ -762,10 +816,16 @@ impl PipeStream {
 impl Read for PipeStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         use windows::Win32::Storage::FileSystem::ReadFile;
-        let mut read = 0_u32;
-        unsafe { ReadFile(self.inner.handle, Some(buffer), Some(&mut read), None) }
-            .map_err(|_| std::io::Error::last_os_error())?;
-        Ok(read as usize)
+        use windows::Win32::System::IO::OVERLAPPED;
+
+        let event = OverlappedEvent::new()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        };
+        let started =
+            unsafe { ReadFile(self.inner.handle, Some(buffer), None, Some(&mut overlapped)) };
+        complete_overlapped(self.inner.handle, &overlapped, started).map(|read| read as usize)
     }
 }
 
@@ -780,15 +840,22 @@ impl Read for PipeStream {
 impl Write for PipeStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         use windows::Win32::Storage::FileSystem::WriteFile;
-        let mut written = 0_u32;
-        unsafe { WriteFile(self.inner.handle, Some(buffer), Some(&mut written), None) }
-            .map_err(|_| std::io::Error::last_os_error())?;
-        Ok(written as usize)
+        use windows::Win32::System::IO::OVERLAPPED;
+
+        let event = OverlappedEvent::new()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        };
+        let started =
+            unsafe { WriteFile(self.inner.handle, Some(buffer), None, Some(&mut overlapped)) };
+        complete_overlapped(self.inner.handle, &overlapped, started).map(|written| written as usize)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        use windows::Win32::Storage::FileSystem::FlushFileBuffers;
-        unsafe { FlushFileBuffers(self.inner.handle) }.map_err(|_| std::io::Error::last_os_error())
+        // Persistent pipe では overlapped WriteFile の完了が framing の境界になる。
+        // FlushFileBuffers は同じ handle の pending read と直列化するため使わない。
+        Ok(())
     }
 }
 
@@ -849,6 +916,18 @@ mod tests {
                 response: ThumbnailResponse::Success { webp_bytes }, ..
             }) if webp_bytes == vec![2]
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_client_pipe_enables_overlapped_io() {
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
+        assert_ne!(
+            client_pipe_attributes().0 & FILE_FLAG_OVERLAPPED.0,
+            0,
+            "reader thread と request writer が同じ pipe handle を同時使用するため必須"
+        );
     }
 
     #[test]

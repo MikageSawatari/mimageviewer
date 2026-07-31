@@ -597,6 +597,25 @@ remote IPC は UI thread を使わず、ローカル表示用 worker とも別�
 追加消費しない。heavy queue 満杯時は pipe connection を切断も block もせず、プロトコル上の
 `Busy` を返す。
 
+### 9.6 持続接続の同期 I/O デッドロックとライフサイクル観測 (2026-07-31)
+
+実機では handshake 成功後に Home / thumbnail の全要求が timeout し、本体は CPU idle、かつ要求
+受信ログも無かった。原因は queue 分離ではなく、持続接続化した named pipe の同じ同期 handle を
+reader thread と writer thread から使っていたことだった。handshake 後に reader の同期 `ReadFile`
+が応答待ちへ入ると、その handle の `WriteFile` が直列化され、最初の要求自体が本体へ届かなかった。
+
+サーバの `CreateNamedPipeW` と remote-web の `CreateFileW` はともに
+`FILE_FLAG_OVERLAPPED` で開き、接続・read・write を要求ごとの `OVERLAPPED` + event で完了待ちする。
+持続接続上では `WriteFile` の完了を送信完了とし、pending read と直列化し得る
+`FlushFileBuffers` は使わない。Home 専用 1 worker、heavy 最大 2 worker、bounded queue と満杯時の
+`Busy` 応答は維持する。
+
+本体ログには connection id 付きの受理 / handshake / 切断、request id と種別、投入 queue、
+worker の開始 / 完了 / outcome / 所要時間、queue wait、queued / active 件数、read / write の失敗段階
+を記録する。実 pipe を使わない回帰テストでも、本番の dispatcher helper から Home queue、専用
+worker、request id 付き応答までを往復させ、両端の pipe 作成 flag が overlapped のままであることを
+固定する。
+
 ## 10. ホームと読み取り専用の集約ビュー (2026-07-31)
 
 ホームは「お気に入り」「スマートフォルダ」「場所」の 3 タブとする。「場所」を初期表示にし、
