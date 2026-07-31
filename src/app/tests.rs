@@ -30961,6 +30961,106 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn tray_resident_continuous_eof_advances_parked_audio() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let current_path = app.tmp.path().join("resident-current.flac");
+        let next_path = app.tmp.path().join("resident-next.flac");
+        let current = push_audio(&mut app, current_path.to_str().unwrap());
+        let next = push_audio(&mut app, next_path.to_str().unwrap());
+        app.fullscreen_idx = Some(current);
+        app.selected = Some(current);
+        app.window_visible = false;
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
+        app.native_video_parked_live_input_window_id = Some(82);
+        install_playing_test_media(&mut app, current, current_path, 30.0);
+        app.fs_cache.insert(
+            next,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    next_path, 0.0,
+                )),
+                load_seq: 0,
+            },
+        );
+
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        app.media_navigation_resolver = Some(MediaNavigationResolver {
+            request_tx,
+            result_rx,
+            next_request_id: 0,
+        });
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&current) else {
+            unreachable!();
+        };
+        player.mark_eof_for_test(30.0);
+        assert!(
+            app.tray_resident_media_updates_needed(),
+            "an unhandled continuous EOF must keep the hidden loop alive until poll_video owns it"
+        );
+
+        app.poll_video(&ctx);
+
+        let request = request_rx
+            .recv()
+            .expect("resident EOF must start next-item resolution");
+        assert!(
+            app.tray_resident_media_updates_needed(),
+            "the hidden loop must stay awake while the EOF handoff owns a pending decision"
+        );
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        app.poll_media_navigation_pending(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(next));
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&next) else {
+            unreachable!();
+        };
+        assert!(player.intent_playing(), "the next track must start playing");
+        assert!(app.tray_resident_media_updates_needed());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_resident_wake_excludes_paused_media_and_non_media() {
+        let mut app = setup_app();
+        app.window_visible = false;
+        assert!(
+            !app.tray_resident_media_updates_needed(),
+            "tray residency without media must remain fully idle"
+        );
+
+        let paused_path = app.tmp.path().join("resident-paused.mp4");
+        let paused = push_video(&mut app, paused_path.to_str().unwrap());
+        app.fullscreen_idx = Some(paused);
+        app.fs_cache.insert(
+            paused,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    paused_path,
+                    12.0,
+                )),
+                load_seq: 0,
+            },
+        );
+
+        assert!(
+            !app.tray_resident_media_updates_needed(),
+            "a paused resident player must not enable the hidden-window wake"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn tray_residency_preserves_mounted_video_transport_and_session() {
         for (case, presentation) in [
             ("fullscreen", ViewerPresentation::Fullscreen),

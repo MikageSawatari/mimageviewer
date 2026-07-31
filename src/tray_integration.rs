@@ -117,6 +117,33 @@ impl App {
         }
     }
 
+    /// Publish the latest media-owner projection to the existing tray thread.
+    /// No App-side wake state is stored: visible/hidden, player transport, EOF navigation,
+    /// and source-swap ownership remain the sources of truth.
+    pub(crate) fn sync_tray_resident_media_wake(&self) {
+        let Some(controller) = self.tray_controller.as_ref() else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            let enabled = self.tray_resident_media_updates_needed();
+            if controller.set_resident_media_wake_enabled(enabled) {
+                crate::set_ui_heartbeat_suspended(
+                    !self.window_visible && !enabled,
+                    if enabled {
+                        "App::update heartbeat resumed for active tray media".to_string()
+                    } else if self.window_visible {
+                        "App::update heartbeat follows visible window".to_string()
+                    } else {
+                        "App::update heartbeat suspended for idle tray residency".to_string()
+                    },
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = controller.set_resident_media_wake_enabled(false);
+    }
+
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
@@ -145,9 +172,10 @@ impl App {
 
     /// ウィンドウを非表示にしてタスクトレイ状態へ遷移する。
     ///
-    /// **重要**: `ViewportCommand::Visible(false)` は使わない。それを使うと eframe/winit が
-    /// `App::update` を呼ばなくなり、トレイメニューから復帰できなくなる (request_repaint が
-    /// 効かない)。代わりに Win32 `ShowWindow(hwnd, SW_HIDE)` を直接呼ぶ。
+    /// **重要**: `ViewportCommand::Visible(false)` は使わない。どちらの hide でも通常の
+    /// `App::update` は止まるが、Win32 `ShowWindow(hwnd, SW_HIDE)` を直接使えばトレイスレッドが
+    /// App を経由せず復帰できる。active media だけは同スレッドの bounded WM_PAINT bridge が
+    /// UI-owned EOF state machine を進める。
     ///
     /// サイズ保存について: hide の直前に `GetWindowPlacement` で rect を丸ごと捕獲しておき、
     /// 復帰時に `SetWindowPlacement` で完全復元する。eframe/winit の DPI 丸めを完全に
@@ -162,12 +190,14 @@ impl App {
         let retained_viewports = self.sync_retained_viewport_visibility_for_tray(ctx, false);
         let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
         self.window_visible = false;
+        self.sync_tray_resident_media_wake();
+        let keep_resident_media_awake = self.tray_resident_media_updates_needed();
         crate::set_ui_heartbeat_suspended(
-            !keep_detached_viewer_alive,
-            if keep_detached_viewer_alive {
-                "App::update heartbeat kept alive for detached viewer while hidden to tray"
+            !keep_resident_media_awake,
+            if keep_resident_media_awake {
+                "App::update heartbeat kept alive for active media while hidden to tray"
             } else {
-                "App::update heartbeat suspended while hidden to tray"
+                "App::update heartbeat suspended for idle tray residency"
             }
             .to_string(),
         );
@@ -224,6 +254,7 @@ impl App {
             return;
         }
         self.window_visible = true;
+        self.sync_tray_resident_media_wake();
         let restored_viewports = self.sync_retained_viewport_visibility_for_tray(ctx, true);
         crate::set_ui_heartbeat_suspended(
             false,

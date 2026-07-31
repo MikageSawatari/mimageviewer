@@ -7641,6 +7641,44 @@ fn sync_viewer_context_bundle_presenters_for_tray(
 }
 
 #[cfg(windows)]
+fn player_needs_resident_media_updates(
+    player: &crate::video::VideoPlayer,
+    fs_idx: usize,
+    continuous_mode: crate::video::VideoContinuousMode,
+    continuous_last_eof: Option<(usize, u64)>,
+) -> bool {
+    if player.error().is_some() || !player.intent_playing() {
+        return false;
+    }
+    if !player.is_at_eof() {
+        return true;
+    }
+
+    continuous_mode.is_enabled()
+        && continuous_last_eof != Some((fs_idx, player.current_seek_serial()))
+}
+
+#[cfg(windows)]
+fn viewer_context_bundle_needs_resident_media_updates(
+    bundle: &ViewerContextBundle,
+    continuous_mode: crate::video::VideoContinuousMode,
+    continuous_last_eof: Option<(usize, u64)>,
+) -> bool {
+    bundle
+        .fullscreen_idx
+        .and_then(|idx| bundle.fs_cache.get(&idx).map(|entry| (idx, entry)))
+        .is_some_and(|(idx, entry)| {
+            matches!(entry, FsCacheEntry::Video { player, .. }
+            if player_needs_resident_media_updates(
+                player,
+                idx,
+                continuous_mode,
+                continuous_last_eof,
+            ))
+        })
+}
+
+#[cfg(windows)]
 fn apply_viewer_context_media_resume_updates(
     map: &mut std::collections::HashMap<String, f64>,
     updates: &[ViewerContextMediaResumeUpdate],
@@ -35851,6 +35889,66 @@ impl App {
         routed
     }
 
+    /// Project the existing media owners into the tray thread's hidden-window wake gate.
+    ///
+    /// `VideoPlayer::tick` and the continuous EOF navigation decision are UI-owned, while
+    /// Windows does not deliver the normal repaint WM_PAINT to a hidden root HWND. Keep the
+    /// bridge active only for a current player with live play intent, an unhandled continuous
+    /// EOF, an EOF candidate resolver, or the typed media handoff started by that EOF.
+    /// Paused/handled-terminal players, cached but non-current players, still images, and tray
+    /// residency by itself do not qualify.
+    #[cfg(windows)]
+    pub(crate) fn tray_resident_media_updates_needed(&self) -> bool {
+        if self.window_visible {
+            return false;
+        }
+
+        let mounted = self
+            .fullscreen_idx
+            .and_then(|idx| self.fs_cache.get(&idx).map(|entry| (idx, entry)))
+            .is_some_and(|(idx, entry)| {
+                matches!(entry, FsCacheEntry::Video { player, .. }
+                if player_needs_resident_media_updates(
+                    player,
+                    idx,
+                    self.video_continuous_mode,
+                    self.video_continuous_last_eof,
+                ))
+            });
+        let active_detached = self
+            .active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| {
+                viewer_context_bundle_needs_resident_media_updates(
+                    &active.bundle,
+                    self.video_continuous_mode,
+                    self.video_continuous_last_eof,
+                )
+            });
+        let parked = self
+            .detached_image_windows
+            .iter()
+            .filter_map(|window| window.paused_bundle.as_deref())
+            .any(|bundle| {
+                viewer_context_bundle_needs_resident_media_updates(
+                    bundle,
+                    self.video_continuous_mode,
+                    self.video_continuous_last_eof,
+                )
+            });
+        let eof_resolution = self
+            .media_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| Self::media_navigation_eof_key(&pending.action).is_some());
+        let eof_handoff = self.video_continuous_last_eof.is_some()
+            && (self.native_video_open_pending.is_some()
+                || self.native_video_source_swap_pending.is_some()
+                || self.native_video_fast_swap_pending.is_some()
+                || self.video_tile_swap_pending.is_some());
+
+        mounted || active_detached || parked || eof_resolution || eof_handoff
+    }
+
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
     /// bundle は所有権を移さず、teardown plan の read-only 部分だけを再利用する。
     /// (review-v2.3.0 追補6: R1-2 detached exit resume)
@@ -60715,6 +60813,10 @@ impl eframe::App for App {
             // already made each retained viewport explicit Hidden, so normal registration is safe.
             let _tray_hide_started = self.maybe_intercept_close(ctx);
         }
+        // request_repaint cannot wake a hidden Win32 root window. Publish the current media
+        // ownership projection near the top of every pass so the tray thread can continue (or
+        // stop) its 50ms WM_PAINT bridge even when later update paths return early.
+        self.sync_tray_resident_media_wake();
 
         // フォーカス復帰検出 (Alt+Tab で他アプリから mIV に戻った等) で、
         // 外部 (ComfyUI 等) による current_folder のファイル追加を自動反映する。

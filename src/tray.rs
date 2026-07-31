@@ -6,8 +6,10 @@
 //! ## 設計上の要点 (eframe 0.33 + tray-icon 0.20 の制約)
 //!
 //! eframe/winit は **ウィンドウが非表示の間 `App::update` を呼ばない**。
-//! `ViewportCommand::Visible(false)` でも Win32 `SW_HIDE` でも同じ。したがって
-//! 「トレイメニューをクリック → App::update で処理」という素直な流れは**成立しない**。
+//! `ViewportCommand::Visible(false)` でも Win32 `SW_HIDE` でも同じ。`request_repaint`
+//! は最終的に hidden HWND への `RedrawWindow(..., RDW_INTERNALPAINT)` となるが、Windows は
+//! hidden window へ `WM_PAINT` を配送しない。したがって「トレイメニューをクリック →
+//! App::update で処理」という素直な流れは**成立しない**。
 //!
 //! 解決策: トレイスレッド自身が Win32 を直接叩く。
 //!
@@ -21,6 +23,10 @@
 //! - **終了**: `quit_flag` を立てた後 `ShowWindow(SW_SHOW)` (update 再開保証) +
 //!   `PostMessageW(hwnd, WM_CLOSE)`。winit が `CloseRequested` を発火 → `maybe_intercept_close`
 //!   が `quit_flag=true` を見て interception をスキップ → 通常の close flow で `on_exit` 実行。
+//! - **常駐中の再生**: App が既存 media owner から「再生 intent または連続 EOF 遷移中」を
+//!   projection している間だけ、トレイスレッドの既存 50ms pump が hidden main HWND へ
+//!   `WM_PAINT` を 1 件 post する。これは winit の `RedrawRequested` を明示的に起こすための
+//!   Windows bridge であり、paused / EOF 停止 / still / 可視 window では post しない。
 //!
 //! ## スレッドモデル
 //!
@@ -134,6 +140,10 @@ pub struct TrayController {
     /// App 側は `TogglePauseRequested` イベントの取りこぼし対策としてこれを reconcile
     /// ソースに使う (bounded(16) で drop されても設定が stale にならない)。
     pause_checked: Arc<AtomicBool>,
+    /// hidden residency 中に UI-owned media state machine を進める必要があるか。
+    /// App の既存 player / EOF transition owner から導出した projection であり、
+    /// tray residency 自体や detached window の有無を wake 条件にはしない。
+    resident_media_wake_enabled: Arc<AtomicBool>,
 }
 
 impl TrayController {
@@ -164,6 +174,8 @@ impl TrayController {
         let quit_flag_th = Arc::clone(&quit_flag);
         let pause_checked = Arc::new(AtomicBool::new(false));
         let pause_checked_th = Arc::clone(&pause_checked);
+        let resident_media_wake_enabled = Arc::new(AtomicBool::new(false));
+        let resident_media_wake_enabled_th = Arc::clone(&resident_media_wake_enabled);
 
         let thread = std::thread::Builder::new()
             .name("mimv-tray".into())
@@ -182,6 +194,7 @@ impl TrayController {
                     quit_flag_th,
                     placement_slot,
                     pause_checked_th,
+                    resident_media_wake_enabled_th,
                 );
             })
             .ok()?;
@@ -193,6 +206,7 @@ impl TrayController {
             thread: Some(thread),
             quit_flag,
             pause_checked,
+            resident_media_wake_enabled,
         })
     }
 
@@ -246,6 +260,22 @@ impl TrayController {
     pub fn is_quit_requested(&self) -> bool {
         self.quit_flag.load(Ordering::SeqCst)
     }
+
+    /// UI-owned media state machine needs explicit hidden-window ticks only while playback or
+    /// its continuous-EOF handoff is active. This is a latest-value projection; the tray thread
+    /// samples it from its existing 50ms pump without adding another timer or worker.
+    pub(crate) fn set_resident_media_wake_enabled(&self, enabled: bool) -> bool {
+        self.resident_media_wake_enabled
+            .swap(enabled, Ordering::AcqRel)
+            != enabled
+    }
+}
+
+fn should_post_resident_media_wake(
+    main_window_visible: bool,
+    resident_media_wake_enabled: bool,
+) -> bool {
+    !main_window_visible && resident_media_wake_enabled
 }
 
 #[cfg(test)]
@@ -265,6 +295,7 @@ impl TrayController {
             thread: None,
             quit_flag: Arc::new(AtomicBool::new(false)),
             pause_checked: Arc::new(AtomicBool::new(false)),
+            resident_media_wake_enabled: Arc::new(AtomicBool::new(false)),
         };
         (ctrl, cmd_rx, event_tx)
     }
@@ -309,13 +340,14 @@ fn run_tray_thread(
     quit_flag: Arc<AtomicBool>,
     placement_slot: PlacementSlot,
     pause_checked: Arc<AtomicBool>,
+    resident_media_wake_enabled: Arc<AtomicBool>,
 ) {
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_SHOW,
-        SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow, TranslateMessage, WM_CLOSE,
+        SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow, TranslateMessage, WM_CLOSE, WM_PAINT,
     };
 
     // HWND (`*mut c_void`) は Send/Sync ではないので、クロージャでキャプチャするときは
@@ -562,6 +594,21 @@ fn run_tray_thread(
             }
         }
 
+        // winit turns WM_PAINT into RedrawRequested, which is the only normal entry to
+        // eframe::App::update. RedrawWindow/request_repaint cannot create WM_PAINT for a hidden
+        // HWND, so active resident playback needs this explicit bridge. The App publishes the
+        // latest projection from the existing media owners; checking IsWindowVisible here also
+        // closes the hide/show race without another App flag.
+        let main_window_visible = unsafe { IsWindowVisible(make_hwnd(main_hwnd)).as_bool() };
+        if should_post_resident_media_wake(
+            main_window_visible,
+            resident_media_wake_enabled.load(Ordering::Acquire),
+        ) {
+            unsafe {
+                let _ = PostMessageW(Some(make_hwnd(main_hwnd)), WM_PAINT, WPARAM(0), LPARAM(0));
+            }
+        }
+
         // 30 秒に 1 回「生きている」ログ (iter * 50ms = 600 で 30 秒)
         if iter.is_multiple_of(600) {
             crate::logger::log(format!("tray: thread alive (iter={iter})"));
@@ -612,6 +659,14 @@ mod tests {
             Ok(TrayCommand::SetPausedCheck(false)) => {}
             other => panic!("SetPausedCheck(false) が届かない: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resident_media_wake_is_bounded_to_hidden_active_playback() {
+        assert!(should_post_resident_media_wake(false, true));
+        assert!(!should_post_resident_media_wake(true, true));
+        assert!(!should_post_resident_media_wake(false, false));
+        assert!(!should_post_resident_media_wake(true, false));
     }
 
     /// 同じ値で 2 回叩いても冪等 (atomic への二重 store は無害、command 2 通は届く)。

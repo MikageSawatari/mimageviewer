@@ -1591,6 +1591,17 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   tray residency は同じ typed visibility owner を使う。動画は pacing queue / decoder channel を drain し続け、
   最新 frame 1 枚を hold する。単体音楽には presenter が無いので transport だけがそのまま走る。格納前から
   pause / EOF ならその状態も変更しない。resume 位置は hide 時点にも保存するが、再生制御には使わない。
+- **tray residency 中の App cadence / EOF advance**: Win32 `SW_HIDE` 後は通常の eframe repaint が
+  hidden HWND へ `WM_PAINT` を配送できないため、追加の入力がなければ `App::update` は 0 Hz になる。
+  decoder / audio / native render thread は継続し、demux EOF も clock までは届くが、audio drain 後の
+  `EngineState::Eof` 確定 (`VideoPlayer::tick`) と次 item 選択 (`poll_video`) は UI owner に残る。そこで既存
+  `mimv-tray` thread の 50ms pump は、mounted / active detached / ParkedLive の current player が error / EOF
+  でなく play intent を持つ間、未処理の continuous EOF、またはその candidate resolver / typed source
+  handoff 中だけ hidden main HWND へ `WM_PAINT` を post し、winit の `RedrawRequested` を最大 20 Hz で起こす。
+  paused player、処理済み terminal EOF、still、current でない cache、tray residency 自体は gate を立てない。
+  可視性は毎回 `IsWindowVisible` でも確認するため、restore race 用の App flag / delay / retry はない。音声
+  ファイルと動画→音声モードも同じ `FsCacheEntry::Video` transport owner / continuous EOF action を通るため、
+  別 wake 経路を持たない。
 - **tray residency 中の host / session ownership**: `maybe_intercept_close()` が close を tray hide に変換した
   フレームも `App::update` を最後まで進め、active fullscreen/F12 と passive/ParkedLive の immediate/deferred
   viewport を同じ ID で登録する。各 viewport には `Visible(false)` を明示し、tray 中の internal recreate も

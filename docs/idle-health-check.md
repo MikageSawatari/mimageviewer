@@ -75,6 +75,11 @@ ZIP / PDF / スマートフォルダ、AI、動画・音楽などの非同期経
 ロード・解析が完了した状態も追加する。動画再生中、スライドショー中、索引・解析中は継続
 処理が正当なので、静止シナリオへ混ぜない。
 
+タスクトレイ常駐中の active media は continuous EOF を進めるため最大 20 Hz の UI tick を明示的に
+維持するが、これは再生中シナリオであり本チェックの静止上限とは分ける。paused media / still の
+tray residency は wake gate 対象外で、完全 sleep が期待値。`video-pin-background` は動画サムネイルの
+pin / keep-range を測るシナリオで `VideoPlayer` を生成しないため、この active-media 例外には入らない。
+
 ## 4. 判定値
 
 正本は `scripts/idle_health_thresholds.json`。初期値は、今回観測した 1 論理コア相当の
