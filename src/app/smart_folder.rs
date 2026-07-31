@@ -2818,6 +2818,14 @@ impl App {
         }
     }
 
+    /// テスト専用: snapshot から prepare 済み状態を組み立てるセットアップ helper。
+    ///
+    /// production はセッション復帰で prepare をやり直さなくなったため、この既定引数の
+    /// 入口を呼ぶ経路は残っていない (`start_smart_folder_prepare_inner` を各文脈が
+    /// 直接呼ぶ)。`_inner` は private なので tests から直接は呼べず、この薄い wrapper を
+    /// `#[cfg(test)]` で残す。**production から呼びたくなったら、それは
+    /// 「セッションを無視して prepare し直している」合図なので、まず §2.3 の方針を確認する。**
+    #[cfg(test)]
     pub(crate) fn start_smart_folder_prepare(
         &mut self,
         snapshot: SmartFolderSnapshot,
