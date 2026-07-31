@@ -533,8 +533,9 @@ response read / decode error になる。これは mIV ログに write failure �
 502 になること、reload ごとに成功分だけ catalog が温まることと一致する。
 `ERROR_PIPE_BUSY` を含む connect 失敗は 503、worker queue 満杯も明示 503 なので、この 2 つは
 502 の直接原因ではなかった。pipe の `Write::flush` は `FlushFileBuffers` を呼ぶ実装へ直した。
-是正後の protocol v4 は 1 本の長寿命 duplex 接続上で
-`Thumbnail` / `Home` / `Collection` の各 request / response を共通の request id で多重化する。
+是正後の protocol v5 は 1 本の長寿命 duplex 接続上で
+`Thumbnail` / `Home` / `Collection` / `Container` / `Page` の各 request / response を共通の
+request id で多重化する。
 remote-web は pending 要求を id で解決し、接続断では全 pending を失敗させて
 自動再接続する。本体は 4 pipe instance を accept 待ちとして先に用意し、1 本を受け付けた直後に
 補充する。worker queue 満杯時は接続を切らず、request id に対応する `Busy` を即時応答して
@@ -543,7 +544,8 @@ remote-web は pending 要求を id で解決し、接続断では全 pending �
 `ipc_retry_count` / `ipc_retry_statuses` / `ipc_connection_id` を残し、次回測定では
 復旧した一時エラーを含めて失敗段階を直接集計できる。
 
-`ThumbnailRequest { favorite_id, relative_path, target_px }` は本体側で再度 allowlist と canonical
+`ThumbnailRequest { address, target_px }` の `address` は §12 の共通アドレス型であり、本体側で
+再度 allowlist と canonical
 path containment を検証する。通常画像とフォルダ代表は `thumb_loader::process_load_request`
 (`load_one_cached`) へ渡し、catalog 参照、DCT / WIC / Susie、回転 DB、利用者のサイズ・画質、
 `CacheDecision::from_settings` による保存判断を既存経路へ揃える。同一要求の同時到着は flight を
@@ -651,8 +653,8 @@ UUID、相対 path、canonical containment を再検証する。したがって�
 レーティングが含まれていてもブラウザへは出ない。
 
 HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加する。集約一覧の通常画像・
-フォルダは既存 `/api/thumb?fav=<UUID>&path=<relative>&w=<px>` をそのまま使う。ZIP / PDF / 動画・
-音声・変換アーカイブはこの増分では一覧に種別付きで表示するまでとし、中身の閲覧や再生、
+フォルダは既存 `/api/thumb?fav=<UUID>&path=<relative>&w=<px>` を使う。ZIP / PDF は §12 の増分で
+コンテナ内ページまで閲覧可能になった。動画・音声・変換アーカイブの再生、および
 読書履歴・レーティング・ブックマーク等への書き込みは後続のセッションロック設計と一緒に行う。
 
 ## 11. 通常運用と並行する検証用インスタンス (2026-07-31)
@@ -683,3 +685,64 @@ remote thumbnail IPC の `\\.\pipe\mimageviewer-remote-thumbnail` はremote-web�
 `FILE_FLAG_FIRST_PIPE_INSTANCE` による作成失敗を「同名サーバが既に存在する可能性」と stderr と
 各data directoryの `logs/mimageviewer.log` に記録し、GUI本体自体は起動を継続する。通常運用側には
 `--remote-ipc` を付けず、検証側だけをremote-webの接続先にする。
+
+## 12. ZIP / PDF のリモート閲覧 (2026-07-31)
+
+### 12.1 共通アドレスと境界検証
+
+`crates/remote-ipc` の `RemoteAddress` を本体と remote-web の唯一のアドレス表現とする。
+実ファイルは常に `favorite_id` と favorite root からの `relative_path` で表し、
+`RemoteSubresource` に `File`、`ZipDirectory { prefix }`、
+`ZipEntry { entry_name }`、`PdfPage { page_number }` を持つ。ZIP entry / prefix は
+`/` 区切りの相対表現だけを許し、先頭 slash、drive 指定、backslash、NUL、
+`..` component を両プロセスの共通検証で拒否する。PDF page は 0-origin とし、本体が実際に
+列挙した page count 未満であることを確認してからレンダリングする。
+
+remote-web は IPC 前に favorite UUID、実コンテナの canonical containment、内部アドレス構文を
+検証する。本体も同じ構文検証の後に `remote_ipc::path_guard::resolve_existing` を通す。
+したがって remote-web の検証を迂回しても、favorite 外のコンテナ、junction / symlink 脱出、
+悪性 ZIP entry、範囲外 PDF page は本体境界で再度拒否される。絶対 path は IPC 応答にも
+HTTP / hash route にも含めない。
+
+### 12.2 本体既存経路の再利用
+
+コンテナ列挙とページ生成は新規 `src/remote_ipc/container.rs` から次へ接続する。
+
+- ZIP: `zip_loader::enumerate_image_entries_detailed` →
+  `ZipTree::build` / `collapse_redundant` / `materialize_level(BOOK_READING_PAGE_ORDER)`
+- nested ZIP のページ読み出し: `zip_loader::read_entry_bytes` に到達する
+  `thumb_loader::process_load_request`
+- PDF: 本体 PDF 一覧と同じ catalog `pdf_meta` (mtime / file size / password flag 一致時)
+  → miss 時だけ `pdf_loader::enumerate_pages`、描画は `process_load_request` 内の
+  `pdf_loader::render_page` (`container_page_meta` は ZIP / folder / converted archive 用)
+- ZIP / PDF page thumbnail: `thumb_loader::process_load_request` と本体 catalog
+
+remote-web は ZIP/PDF の列挙、ソート、decoder、catalog key を実装しない。PDF の remote 要求は
+`LoadRequest.priority=false`、`context_epoch=0` として PDFium pool の `Normal` lane へ入り、
+`Critical` 予約 worker を消費しない。保存済み PDF password が本体にあれば read-only で利用する。
+保存値が無い、または復号値で開けない保護 PDF は `PasswordRequired` (HTTP 423) とし、
+Web からの password 入力・保存は行わない。
+
+### 12.3 HTTP / UI と件数・時間上限
+
+認証必須の `GET /api/container` がコンテナの 1 階層を返し、`GET /api/page` がページを
+WebP で返す。`GET /api/thumb` は同じ address query (`entry` / `prefix` / `page` のいずれか)
+へ拡張する。コンテナは最大 1000 項目を返し、超過時は `truncated=true` と `entry_limit` を
+画面に表示する。ページングはこの増分では行わない。
+
+フロントは ZIP/PDF を通常フォルダと同じ仮想グリッドで表示し、ページを既存の swipe、
+pinch zoom、表示モード、keyboard / mouse command layer へ渡す。hash route は
+`RemoteAddress` の JSON を percent encode した相対情報だけを保持する。パンくずは favorite、
+実フォルダ、コンテナ、ZIP 内 prefix を 1 DOM 上で組み立て、親の実フォルダへ戻れる。
+
+HTTP heavy admission は従来どおり最大 4、IPC 応答期限は 10 秒とする。本体の既存実測は
+PDF cold render 1.441 秒、通常の page render 0.7〜3 秒であり、remote heavy worker 2 本へ
+同時要求 4 件を制限した条件では 10 秒以内に収まる見積もりである。remote は Critical 予約枠を
+使わないため、ローカル UI の現在ページを優先できる。診断 JSONL には `container` / `page`
+別に `ipc_ms`、`ipc_status`、retry 回数、entry 数、target / output 寸法、応答 byte 数を残す。
+
+### 12.4 明示的な非スコープ
+
+RAR / 7z / LZH の変換、リモートからの PDF password 入力、コンテナの 1000 件超のページング、
+読書履歴・rating・bookmark 等の書き込みは含めない。nested ZIP は本体の列挙文字列と
+`read_entry_bytes` をそのまま使うため対応するが、nested RAR / 7z / LZH は変換増分まで扱わない。

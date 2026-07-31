@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionKind,
-    CollectionPayload, CollectionRequest, CollectionResponse, FrameError, HomePayload, HomeRequest,
-    HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PIPE_NAME, PROTOCOL_VERSION,
-    RequestId, ServerMessage, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest,
-    ThumbnailResponse, read_frame, write_frame,
+    CollectionPayload, CollectionRequest, CollectionResponse, ContainerPayload, ContainerRequest,
+    ContainerResponse, FrameError, HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES,
+    MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload,
+    PageRequest, PageResponse, RemoteAddress, RequestId, ServerMessage, ThumbnailError,
+    ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -73,6 +74,7 @@ pub enum ClientError {
     Protocol(ProtocolFailure),
     Remote(ThumbnailError),
     CollectionRemote(CollectionError),
+    MediaRemote(MediaError),
 }
 
 impl ClientError {
@@ -85,6 +87,7 @@ impl ClientError {
             )
             || matches!(self, Self::Remote(error) if error.code == ThumbnailErrorCode::Busy)
             || matches!(self, Self::CollectionRemote(error) if error.code == CollectionErrorCode::Busy)
+            || matches!(self, Self::MediaRemote(error) if error.code == MediaErrorCode::Busy)
     }
 
     pub fn ipc_status(&self) -> String {
@@ -101,7 +104,22 @@ impl ClientError {
                 ThumbnailErrorCode::Unsupported => "miv_unsupported",
                 ThumbnailErrorCode::GenerationFailed => "miv_generation_failed",
                 ThumbnailErrorCode::Busy => "miv_busy",
+                ThumbnailErrorCode::PasswordRequired => "miv_password_required",
+                ThumbnailErrorCode::PageOutOfRange => "miv_page_out_of_range",
                 ThumbnailErrorCode::Internal => "miv_internal",
+            }
+            .to_owned(),
+            Self::MediaRemote(error) => match error.code {
+                MediaErrorCode::BadRequest => "miv_media_bad_request",
+                MediaErrorCode::FavoriteNotFound => "miv_media_favorite_not_found",
+                MediaErrorCode::PathRejected => "miv_media_path_rejected",
+                MediaErrorCode::NotFound => "miv_media_not_found",
+                MediaErrorCode::Unsupported => "miv_media_unsupported",
+                MediaErrorCode::PasswordRequired => "miv_media_password_required",
+                MediaErrorCode::PageOutOfRange => "miv_media_page_out_of_range",
+                MediaErrorCode::Busy => "miv_media_busy",
+                MediaErrorCode::RenderFailed => "miv_media_render_failed",
+                MediaErrorCode::Internal => "miv_media_internal",
             }
             .to_owned(),
             Self::CollectionRemote(error) => match error.code {
@@ -147,6 +165,9 @@ impl fmt::Display for ClientError {
                     error.message
                 )
             }
+            Self::MediaRemote(error) => {
+                write!(f, "mIV 本体がコンテナ要求を拒否しました: {}", error.message)
+            }
         }
     }
 }
@@ -165,17 +186,12 @@ impl ThumbnailClient {
         self.get_connection().map(|_| ())
     }
 
-    pub fn thumbnail(
+    pub fn thumbnail_address(
         &self,
-        favorite_id: &str,
-        relative_path: &str,
+        address: RemoteAddress,
         target_px: u32,
     ) -> Result<ThumbnailSuccess, ClientFailure> {
-        let request = ThumbnailRequest {
-            favorite_id: favorite_id.to_owned(),
-            relative_path: relative_path.to_owned(),
-            target_px,
-        };
+        let request = ThumbnailRequest { address, target_px };
         run_with_retry(|| {
             let connection = self.get_connection()?;
             let connection_id = connection.id;
@@ -294,6 +310,90 @@ impl ThumbnailClient {
                     "response_type_mismatch",
                     None,
                     "collection request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn container(
+        &self,
+        address: RemoteAddress,
+    ) -> Result<IpcSuccess<ContainerPayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::Container {
+            id,
+            request: ContainerRequest {
+                address: address.clone(),
+            },
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::Container {
+                response: ContainerResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::Container {
+                response: ContainerResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::MediaRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "container request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn page(
+        &self,
+        address: RemoteAddress,
+        target_px: u32,
+    ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::Page {
+            id,
+            request: PageRequest {
+                address: address.clone(),
+                target_px,
+            },
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::Page {
+                response: PageResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::Page {
+                response: PageResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::MediaRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "page request received another response type",
                 )),
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,
@@ -1124,7 +1224,7 @@ mod tests {
                 let ClientMessage::Thumbnail { id, request } = message else {
                     panic!("unexpected request type")
                 };
-                let marker = request.relative_path.as_bytes()[0];
+                let marker = request.address.relative_path.as_bytes()[0];
                 write_frame(
                     &mut pipe,
                     &ServerMessage::Thumbnail {
@@ -1151,14 +1251,20 @@ mod tests {
         let first_client = Arc::clone(&client);
         let first = std::thread::spawn(move || {
             first_client
-                .thumbnail("00000000-0000-0000-0000-000000000000", "a.jpg", 128)
+                .thumbnail_address(
+                    RemoteAddress::file("00000000-0000-0000-0000-000000000000", "a.jpg"),
+                    128,
+                )
                 .map(|result| result.bytes)
                 .map_err(|failure| failure.error.to_string())
         });
         let second_client = Arc::clone(&client);
         let second = std::thread::spawn(move || {
             second_client
-                .thumbnail("00000000-0000-0000-0000-000000000000", "b.jpg", 128)
+                .thumbnail_address(
+                    RemoteAddress::file("00000000-0000-0000-0000-000000000000", "b.jpg"),
+                    128,
+                )
                 .map(|result| result.bytes)
                 .map_err(|failure| failure.error.to_string())
         });

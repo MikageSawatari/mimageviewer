@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
 use image::GenericImageView;
-use mimageviewer_ipc::RemoteEntry;
+use mimageviewer_ipc::{ContainerEntry, RemoteAddress, RemoteEntry};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -273,6 +273,20 @@ impl Library {
             };
             resolve_existing(&favorite.path, &entry.relative_path).is_ok()
         });
+    }
+
+    pub fn validate_remote_address(&self, address: &RemoteAddress) -> Result<(), StoreError> {
+        address
+            .validate_syntax()
+            .map_err(|_| StoreError::BadRequest)?;
+        let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
+        let favorite = self.favorite(id)?;
+        resolve_existing(&favorite.path, &address.relative_path)?;
+        Ok(())
+    }
+
+    pub fn retain_allowed_container_entries(&self, entries: &mut Vec<ContainerEntry>) {
+        entries.retain(|entry| self.validate_remote_address(&entry.address).is_ok());
     }
 
     pub fn list(&self, favorite_id: Uuid, relative: &str) -> Result<ListResult, StoreError> {

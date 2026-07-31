@@ -519,6 +519,17 @@ button {
   font-size: 0.68rem;
 }
 
+.tile-preview[data-unavailable]::after {
+  content: attr(data-unavailable);
+  align-self: end;
+  margin: 0 0 8px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  color: #f2d5d5;
+  background: rgb(112 34 38 / 88%);
+  font-size: 0.68rem;
+}
+
 .folder-glyph,
 .file-glyph {
   color: #f6c75d;

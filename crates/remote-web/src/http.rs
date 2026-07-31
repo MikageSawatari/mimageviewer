@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mimageviewer_ipc::{CollectionErrorCode, CollectionKind};
+use mimageviewer_ipc::{
+    CollectionErrorCode, CollectionKind, MediaErrorCode, RemoteAddress, RemoteSubresource,
+};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -304,9 +306,11 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/api/home") => api_home(state),
         (Method::Get, "/api/collection") => api_collection(state, &query),
         (Method::Get, "/api/list") => api_list(state, &query),
+        (Method::Get, "/api/container") => api_container(state, &query),
         (Method::Get, "/api/thumb") => api_thumb(state, &query),
         (Method::Get, "/api/image-info") => api_image_info(state, &query),
         (Method::Get, "/api/image") => api_image(state, &query),
+        (Method::Get, "/api/page") => api_page(state, &query),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
         (Method::Get, _) => HttpResponse::text(404, "Not Found"),
         (_, "/api/telemetry") => HttpResponse::text(405, "Method Not Allowed")
@@ -617,6 +621,7 @@ fn collection_ipc_error_response(
             };
             (status, "miv_collection_error", error.message)
         }
+        IpcClientError::MediaRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
     };
     let mut response = HttpResponse::bytes(
@@ -660,16 +665,69 @@ fn api_list(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     }
 }
 
-fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
-    let Some((favorite, path)) = favorite_and_path(query) else {
-        return HttpResponse::text(400, "Bad Request");
+fn api_container(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+    let address = match remote_address_from_query(query) {
+        Ok(address)
+            if matches!(
+                address.subresource,
+                RemoteSubresource::File | RemoteSubresource::ZipDirectory { .. }
+            ) =>
+        {
+            address
+        }
+        _ => return HttpResponse::text(400, "Bad Request"),
     };
-    let target_px = match required_query_value(query, "w").and_then(|value| {
-        value
-            .parse::<u32>()
-            .map_err(|_| ())
-            .and_then(|width| (width > 0).then_some(width).ok_or(()))
+    if let Err(error) = state.library.validate_remote_address(&address) {
+        return store_error_response(error);
+    }
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state.thumbnail_client.container(address.clone())
     }) {
+        Ok(result) => result,
+        Err(busy) => return media_admission_busy_response(busy, "container"),
+    };
+    match result {
+        Ok(mut result) => {
+            if state
+                .library
+                .validate_remote_address(&result.value.effective_address)
+                .is_err()
+            {
+                return HttpResponse::text(502, "Bad Gateway");
+            }
+            state
+                .library
+                .retain_allowed_container_entries(&mut result.value.entries);
+            let entry_count = result.value.entries.len();
+            HttpResponse::json(&result.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+                .with_log_details(json!({
+                    "container": {
+                        "ipc_status": "ok",
+                        "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                        "ipc_retry_count": result.retry_count,
+                        "ipc_retry_statuses": result.retry_statuses,
+                        "ipc_connection_id": result.connection_id,
+                        "entry_count": entry_count,
+                        "truncated": result.value.truncated,
+                    }
+                }))
+        }
+        Err(failure) => media_ipc_error_response(failure, started.elapsed(), "container", None),
+    }
+}
+
+fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+    let address = match remote_address_from_query(query) {
+        Ok(address) => address,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if let Err(error) = state.library.validate_remote_address(&address) {
+        return store_error_response(error);
+    }
+    let target_px = match requested_width(query) {
         Ok(width) => width,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
@@ -677,7 +735,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
         state
             .thumbnail_client
-            .thumbnail(&favorite.to_string(), path, target_px)
+            .thumbnail_address(address.clone(), target_px)
     }) {
         Ok(result) => result,
         Err(busy) => return thumbnail_admission_busy_response(busy, target_px),
@@ -697,6 +755,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
                         "ipc_retry_statuses": result.retry_statuses,
                         "ipc_connection_id": result.connection_id,
                         "target_px": target_px,
+                        "address_kind": remote_address_kind(&address),
                         "blob_bytes": blob_bytes,
                     }
                 }))
@@ -709,6 +768,170 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
             target_px,
         ),
     }
+}
+
+fn api_page(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+    let address = match remote_address_from_query(query) {
+        Ok(address)
+            if matches!(
+                address.subresource,
+                RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. }
+            ) =>
+        {
+            address
+        }
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    if let Err(error) = state.library.validate_remote_address(&address) {
+        return store_error_response(error);
+    }
+    let target_px = match requested_width(query) {
+        Ok(width) => width,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state.thumbnail_client.page(address.clone(), target_px)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return media_admission_busy_response(busy, "page"),
+    };
+    match result {
+        Ok(result) => {
+            let payload = result.value;
+            let blob_bytes = payload.bytes.len();
+            HttpResponse::bytes(200, "image/webp", payload.bytes)
+                .with_header("Cache-Control", "private, max-age=60")
+                .with_log_details(json!({
+                    "page": {
+                        "ipc_status": "ok",
+                        "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                        "ipc_retry_count": result.retry_count,
+                        "ipc_retry_statuses": result.retry_statuses,
+                        "ipc_connection_id": result.connection_id,
+                        "address_kind": remote_address_kind(&address),
+                        "target_px": target_px,
+                        "output_width": payload.width,
+                        "output_height": payload.height,
+                        "content_type": payload.content_type,
+                        "blob_bytes": blob_bytes,
+                    }
+                }))
+        }
+        Err(failure) => {
+            media_ipc_error_response(failure, started.elapsed(), "page", Some(target_px))
+        }
+    }
+}
+
+fn media_admission_busy_response(busy: AdmissionBusy, operation: &str) -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": "ipc_busy",
+            "message": "mIV 本体への要求が混み合っています。自動的に再試行します。",
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        (operation): {
+            "ipc_status": "admission_busy",
+            "ipc_ms": 0,
+            "ipc_retry_count": 0,
+            "ipc_all_in_flight": busy.all_in_flight,
+            "ipc_all_limit": busy.all_limit,
+            "ipc_heavy_in_flight": busy.heavy_in_flight,
+            "ipc_heavy_limit": busy.heavy_limit,
+        }
+    }))
+}
+
+fn media_ipc_error_response(
+    failure: crate::ipc_client::ClientFailure,
+    elapsed: Duration,
+    operation: &str,
+    target_px: Option<u32>,
+) -> HttpResponse {
+    let ipc_status = failure.error.ipc_status();
+    let protocol_stage = failure
+        .error
+        .protocol_failure()
+        .map(|detail| detail.stage.to_owned());
+    let protocol_error_kind = failure
+        .error
+        .protocol_failure()
+        .map(|detail| detail.kind.to_owned());
+    let mut retryable = failure
+        .error
+        .protocol_failure()
+        .is_some_and(|detail| detail.kind == "timeout");
+    let (status, code, message) = match failure.error {
+        IpcClientError::Unavailable(_) => (
+            503,
+            "miv_not_running",
+            "mIV 本体が起動していません。mIV を --remote-ipc 付きで起動してください。".to_owned(),
+        ),
+        IpcClientError::VersionMismatch { client, server } => (
+            503,
+            "protocol_version_mismatch",
+            format!(
+                "mIV 本体と remote-web の IPC 版が一致しません (remote-web={client}, mIV={server})。"
+            ),
+        ),
+        IpcClientError::Protocol(detail) if detail.kind == "timeout" => (
+            503,
+            "ipc_timeout",
+            "mIV 本体の応答が時間内に完了しませんでした。自動的に再試行します。".to_owned(),
+        ),
+        IpcClientError::Protocol(_) => (
+            502,
+            "ipc_protocol_error",
+            "mIV 本体との通信に失敗しました。".to_owned(),
+        ),
+        IpcClientError::MediaRemote(error) => {
+            let status = match error.code {
+                MediaErrorCode::BadRequest => 400,
+                MediaErrorCode::FavoriteNotFound
+                | MediaErrorCode::PathRejected
+                | MediaErrorCode::NotFound => 404,
+                MediaErrorCode::Unsupported => 415,
+                MediaErrorCode::PasswordRequired => 423,
+                MediaErrorCode::PageOutOfRange => 416,
+                MediaErrorCode::Busy => {
+                    retryable = true;
+                    503
+                }
+                MediaErrorCode::RenderFailed => 422,
+                MediaErrorCode::Internal => 500,
+            };
+            (status, "miv_media_error", error.message)
+        }
+        IpcClientError::Remote(error) => (500, "miv_media_error", error.message),
+        IpcClientError::CollectionRemote(error) => (500, "miv_media_error", error.message),
+    };
+    let mut response = HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({"error": code, "message": message})).unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store");
+    if retryable {
+        response = response.with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string());
+    }
+    response.with_log_details(json!({
+        (operation): {
+            "ipc_status": ipc_status,
+            "ipc_ms": crate::diagnostics::duration_ms(elapsed),
+            "ipc_retry_count": failure.retry_count,
+            "ipc_retry_statuses": failure.retry_statuses,
+            "ipc_stage": protocol_stage,
+            "ipc_error_kind": protocol_error_kind,
+            "target_px": target_px,
+        }
+    }))
 }
 
 fn thumbnail_admission_busy_response(busy: AdmissionBusy, target_px: u32) -> HttpResponse {
@@ -801,11 +1024,14 @@ fn ipc_error_response(
                 ThumbnailErrorCode::Unsupported => 415,
                 ThumbnailErrorCode::Busy => 503,
                 ThumbnailErrorCode::GenerationFailed => 422,
+                ThumbnailErrorCode::PasswordRequired => 423,
+                ThumbnailErrorCode::PageOutOfRange => 416,
                 ThumbnailErrorCode::Internal => 500,
             };
             (status, "miv_thumbnail_error", remote.message)
         }
         IpcClientError::CollectionRemote(remote) => (500, "miv_thumbnail_error", remote.message),
+        IpcClientError::MediaRemote(remote) => (500, "miv_thumbnail_error", remote.message),
     };
     let body = serde_json::to_vec(&json!({"error": code, "message": message}))
         .unwrap_or_else(|_| b"{\"error\":\"ipc_error\"}".to_vec());
@@ -940,6 +1166,58 @@ fn favorite_and_path(query: &[(String, String)]) -> Option<(Uuid, &str)> {
         .ok()?;
     let path = required_query_value(query, "path").ok()?;
     Some((favorite, path))
+}
+
+fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress, ()> {
+    let (favorite, path) = favorite_and_path(query).ok_or(())?;
+    let entry = query_value(query, "entry")?;
+    let prefix = query_value(query, "prefix")?;
+    let page = query_value(query, "page")?;
+    if usize::from(entry.is_some()) + usize::from(prefix.is_some()) + usize::from(page.is_some())
+        > 1
+    {
+        return Err(());
+    }
+    let subresource = if let Some(entry_name) = entry {
+        RemoteSubresource::ZipEntry {
+            entry_name: entry_name.to_owned(),
+        }
+    } else if let Some(prefix) = prefix {
+        RemoteSubresource::ZipDirectory {
+            prefix: prefix.to_owned(),
+        }
+    } else if let Some(page) = page {
+        RemoteSubresource::PdfPage {
+            page_number: page.parse::<u32>().map_err(|_| ())?,
+        }
+    } else {
+        RemoteSubresource::File
+    };
+    let address = RemoteAddress {
+        favorite_id: favorite.to_string(),
+        relative_path: path.to_owned(),
+        subresource,
+    };
+    address.validate_syntax().map_err(|_| ())?;
+    Ok(address)
+}
+
+fn requested_width(query: &[(String, String)]) -> Result<u32, ()> {
+    required_query_value(query, "w").and_then(|value| {
+        value
+            .parse::<u32>()
+            .map_err(|_| ())
+            .and_then(|width| (width > 0).then_some(width).ok_or(()))
+    })
+}
+
+fn remote_address_kind(address: &RemoteAddress) -> &'static str {
+    match address.subresource {
+        RemoteSubresource::File => "file",
+        RemoteSubresource::ZipDirectory { .. } => "zip_directory",
+        RemoteSubresource::ZipEntry { .. } => "zip_entry",
+        RemoteSubresource::PdfPage { .. } => "pdf_page",
+    }
 }
 
 fn static_file(state: &AppState, name: &str, content_type: &'static str) -> HttpResponse {
@@ -1155,6 +1433,27 @@ mod tests {
     }
 
     #[test]
+    fn remote_address_query_rejects_zip_traversal_and_mixed_targets() {
+        let id = "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2";
+        let traversal =
+            parse_query(&format!("fav={id}&path=book.zip&entry=..%2Fsecret.jpg")).unwrap();
+        assert!(remote_address_from_query(&traversal).is_err());
+
+        let mixed = parse_query(&format!("fav={id}&path=book.pdf&page=1&entry=page.jpg")).unwrap();
+        assert!(remote_address_from_query(&mixed).is_err());
+
+        let valid = parse_query(&format!(
+            "fav={id}&path=book.zip&entry=chapter.zip%2F001.jpg"
+        ))
+        .unwrap();
+        assert!(matches!(
+            remote_address_from_query(&valid).unwrap().subresource,
+            RemoteSubresource::ZipEntry { entry_name }
+                if entry_name == "chapter.zip/001.jpg"
+        ));
+    }
+
+    #[test]
     fn command_core_module_is_public_for_the_pin_screen_bootstrap() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
@@ -1292,6 +1591,11 @@ mod tests {
             response.log_details.unwrap()["thumb"]["ipc_status"],
             "admission_busy"
         );
+
+        let response = media_admission_busy_response(busy, "container");
+        let details = response.log_details.unwrap();
+        assert_eq!(details["container"]["ipc_status"], "admission_busy");
+        assert!(details.get("operation").is_none());
         drop(permits);
     }
 
@@ -1335,6 +1639,26 @@ mod tests {
             response.log_details.unwrap()["thumb"]["ipc_status"],
             "response_read_timeout"
         );
+
+        let response = media_ipc_error_response(
+            crate::ipc_client::ClientFailure {
+                error: IpcClientError::Protocol(crate::ipc_client::ProtocolFailure::new(
+                    "response_read",
+                    "timeout",
+                    None,
+                    "test timeout",
+                )),
+                retry_count: 2,
+                retry_statuses: vec!["response_read_timeout".to_owned()],
+            },
+            Duration::from_secs(10),
+            "page",
+            Some(2048),
+        );
+        let details = response.log_details.unwrap();
+        assert_eq!(details["page"]["ipc_status"], "response_read_timeout");
+        assert_eq!(details["page"]["target_px"], 2048);
+        assert!(details.get("operation").is_none());
     }
 
     #[test]

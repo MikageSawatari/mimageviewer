@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
-    HomeResponse, MAX_CONTROL_FRAME_BYTES, PIPE_NAME, PROTOCOL_VERSION, ServerMessage,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame, write_frame,
+    ContainerResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode,
+    PIPE_NAME, PROTOCOL_VERSION, PageResponse, ServerMessage, ThumbnailError, ThumbnailErrorCode,
+    ThumbnailResponse, negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -25,6 +26,7 @@ use windows::Win32::System::Pipes::{
 use windows::core::PCWSTR;
 
 use super::collections::CollectionEngine;
+use super::container::ContainerEngine;
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
@@ -130,6 +132,7 @@ impl ServerGuard {
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
         let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
+        let container_engine = Arc::new(ContainerEngine::new(settings.clone()));
         let collection_engine = Arc::new(CollectionEngine::new(settings));
         let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
         let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));
@@ -148,6 +151,7 @@ impl ServerGuard {
         for index in 0..worker_count {
             let work_rx = Arc::clone(&heavy_work_rx);
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
+            let container_engine = Arc::clone(&container_engine);
             let collection_engine = Arc::clone(&collection_engine);
             let worker_metrics = Arc::clone(&heavy_metrics);
             workers.push(
@@ -157,6 +161,7 @@ impl ServerGuard {
                         worker_loop(
                             &work_rx,
                             &thumbnail_engine,
+                            &container_engine,
                             &collection_engine,
                             &worker_metrics,
                             index,
@@ -258,6 +263,7 @@ fn remote_heavy_worker_count(configured_worker_count: usize) -> usize {
 fn worker_loop(
     work_rx: &Mutex<mpsc::Receiver<Work>>,
     thumbnail_engine: &ThumbnailEngine,
+    container_engine: &ContainerEngine,
     collection_engine: &CollectionEngine,
     metrics: &QueueMetrics,
     worker_index: usize,
@@ -286,7 +292,7 @@ fn worker_loop(
                 |message| match message {
                     ClientMessage::Thumbnail { id, request } => ServerMessage::Thumbnail {
                         id,
-                        response: thumbnail_engine.handle(request, &context),
+                        response: thumbnail_engine.handle(request, &context, container_engine),
                     },
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
@@ -295,6 +301,14 @@ fn worker_loop(
                     ClientMessage::Collection { id, request } => ServerMessage::Collection {
                         id,
                         response: collection_engine.collection(request),
+                    },
+                    ClientMessage::Container { id, request } => ServerMessage::Container {
+                        id,
+                        response: container_engine.container(request),
+                    },
+                    ClientMessage::Page { id, request } => ServerMessage::Page {
+                        id,
+                        response: container_engine.page(request, &context),
                     },
                 },
             ),
@@ -374,6 +388,8 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Thumbnail { .. } => "thumbnail",
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
+        ClientMessage::Container { .. } => "container",
+        ClientMessage::Page { .. } => "page",
     }
 }
 
@@ -390,6 +406,14 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         | ServerMessage::Collection {
             response: CollectionResponse::Success(_),
             ..
+        }
+        | ServerMessage::Container {
+            response: ContainerResponse::Success(_),
+            ..
+        }
+        | ServerMessage::Page {
+            response: PageResponse::Success(_),
+            ..
         } => "ok",
         ServerMessage::Thumbnail {
             response: ThumbnailResponse::Error(_),
@@ -401,6 +425,14 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::Collection {
             response: CollectionResponse::Error(_),
+            ..
+        }
+        | ServerMessage::Container {
+            response: ContainerResponse::Error(_),
+            ..
+        }
+        | ServerMessage::Page {
+            response: PageResponse::Error(_),
             ..
         } => "error",
     }
@@ -652,6 +684,20 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体の集約ビューワーカーが停止しています",
             )),
         },
+        ClientMessage::Container { id, .. } => ServerMessage::Container {
+            id: *id,
+            response: ContainerResponse::Error(MediaError::new(
+                MediaErrorCode::Internal,
+                "mIV 本体のコンテナワーカーが停止しています",
+            )),
+        },
+        ClientMessage::Page { id, .. } => ServerMessage::Page {
+            id: *id,
+            response: PageResponse::Error(MediaError::new(
+                MediaErrorCode::Internal,
+                "mIV 本体のページワーカーが停止しています",
+            )),
+        },
     }
 }
 
@@ -676,6 +722,20 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             response: CollectionResponse::Error(CollectionError::new(
                 CollectionErrorCode::Busy,
                 "mIV 本体のリモート集約ビュー queue が混み合っています",
+            )),
+        },
+        ClientMessage::Container { id, .. } => ServerMessage::Container {
+            id: *id,
+            response: ContainerResponse::Error(MediaError::new(
+                MediaErrorCode::Busy,
+                "mIV 本体のリモートコンテナ queue が混み合っています",
+            )),
+        },
+        ClientMessage::Page { id, .. } => ServerMessage::Page {
+            id: *id,
+            response: PageResponse::Error(MediaError::new(
+                MediaErrorCode::Busy,
+                "mIV 本体のリモートページ queue が混み合っています",
             )),
         },
     }
@@ -969,8 +1029,10 @@ mod tests {
         let message = ClientMessage::Thumbnail {
             id: 42,
             request: mimageviewer_ipc::ThumbnailRequest {
-                favorite_id: "00000000-0000-0000-0000-000000000000".to_owned(),
-                relative_path: "page.jpg".to_owned(),
+                address: mimageviewer_ipc::RemoteAddress::file(
+                    "00000000-0000-0000-0000-000000000000",
+                    "page.jpg",
+                ),
                 target_px: 256,
             },
         };

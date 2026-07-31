@@ -92,7 +92,9 @@ const state = {
   homeLoadError: "",
   homeTab: "places",
   collection: null,
+  container: null,
   gridReturnHash: "#home/places",
+  gridHash: "#home/places",
   thumbAspectHeightRatio: 1,
   favoriteId: null,
   favoriteName: "",
@@ -292,6 +294,21 @@ async function dispatchRoute() {
       await showFolder(route.favoriteId, route.path);
       return;
     }
+    if (route.kind === "container") {
+      await showContainer(route.address);
+      return;
+    }
+    if (route.kind === "media") {
+      await loadContainer(parentContainerAddress(route.address));
+      const index = state.images.findIndex(
+        (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(route.address)
+      );
+      if (index < 0) {
+        throw new Error("コンテナ内のページが見つかりませんでした。");
+      }
+      renderImageViewer(index, performance.now());
+      return;
+    }
     if (route.kind === "image") {
       const separator = route.path.lastIndexOf("/");
       const folderPath = separator >= 0 ? route.path.slice(0, separator) : "";
@@ -330,6 +347,14 @@ function parseRoute(hash) {
       value: collection[2] ?? "",
     };
   }
+  const addressed = hash.match(/^#(container|media)\/(.*)$/);
+  if (addressed) {
+    try {
+      return { kind: addressed[1], address: decodeAddress(addressed[2]) };
+    } catch {
+      return { kind: "home", tab: "places" };
+    }
+  }
   const match = hash.match(/^#(folder|image)\/([^/]+)\/(.*)$/);
   if (!match) {
     return { kind: "home", tab: "places" };
@@ -359,6 +384,32 @@ function folderHash(favoriteId, path) {
 
 function imageHash(favoriteId, path) {
   return `#image/${favoriteId}/${encodeURIComponent(path)}`;
+}
+
+function containerHash(address) {
+  return "#container/" + encodeAddress(address);
+}
+
+function mediaHash(address) {
+  return "#media/" + encodeAddress(address);
+}
+
+function encodeAddress(address) {
+  return encodeURIComponent(JSON.stringify(address));
+}
+
+function decodeAddress(encoded) {
+  const address = JSON.parse(decodeURIComponent(encoded));
+  if (
+    !address ||
+    typeof address.favorite_id !== "string" ||
+    typeof address.relative_path !== "string" ||
+    !address.subresource ||
+    typeof address.subresource.kind !== "string"
+  ) {
+    throw new Error("invalid address");
+  }
+  return address;
 }
 
 function navigate(hash, routeState = {}) {
@@ -395,7 +446,7 @@ function dispatchCommand(requested, meta = {}) {
         history.replaceState(
           { mivRoute: true },
           "",
-          folderHash(state.favoriteId, state.folderPath)
+          state.gridHash
         );
         dispatchRoute();
       }
@@ -419,7 +470,9 @@ function dispatchCommand(requested, meta = {}) {
     requested.name === CommandName.PARENT_FOLDER &&
     state.screenContext === "grid"
   ) {
-    const target = state.collection
+    const target = state.container
+      ? state.gridReturnHash
+      : state.collection
       ? state.gridReturnHash
       : state.folderPath
         ? folderHash(state.favoriteId, parentPath(state.folderPath))
@@ -489,6 +542,31 @@ function executeOpenCommand(payload, meta) {
     navigate(folderHash(payload.favoriteId, payload.path ?? ""));
     return true;
   }
+  if (payload.kind === "container" && payload.address) {
+    navigate(containerHash(payload.address));
+    return true;
+  }
+  if (payload.kind === "media" && payload.address) {
+    const imageIndex = state.images.findIndex(
+      (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(payload.address)
+    );
+    if (imageIndex < 0) return false;
+    if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
+    tryEnterBrowserFullscreen();
+    history.pushState(
+      {
+        mivRoute: true,
+        navigatedInApp: true,
+        viewerFromGrid: true,
+        viewerDepth: 1,
+        returnHash: state.gridHash,
+      },
+      "",
+      mediaHash(payload.address)
+    );
+    renderImageViewer(imageIndex, meta.at ?? performance.now());
+    return true;
+  }
   if (
     payload.kind !== "image" ||
     !Number.isInteger(payload.imageIndex) ||
@@ -536,12 +614,26 @@ function openGridEntry(index, meta) {
       meta
     );
   }
+  if (entry.kind === "zip" || entry.kind === "pdf") {
+    return executeOpenCommand(
+      { kind: "container", address: entryAddress(entry), entryIndex: index },
+      meta
+    );
+  }
+  if (entry.kind === "directory" && entry.address) {
+    return executeOpenCommand(
+      { kind: "container", address: entry.address, entryIndex: index },
+      meta
+    );
+  }
   if (entry.kind !== "image") return false;
   const imageIndex = state.images.findIndex(
     (image) => entryIdentity(image) === entryIdentity(entry)
   );
   return executeOpenCommand(
-    { kind: "image", favoriteId, path, imageIndex, entryIndex: index },
+    entry.address
+      ? { kind: "media", address: entry.address, imageIndex, entryIndex: index }
+      : { kind: "image", favoriteId, path, imageIndex, entryIndex: index },
     meta
   );
 }
@@ -645,6 +737,7 @@ function renderHome(tab = "places") {
   state.screenContext = "home";
   state.homeTab = ["favorites", "smart", "places"].includes(tab) ? tab : "places";
   state.collection = null;
+  state.container = null;
   exitBrowserFullscreen();
   document.title = "mIV Remote";
 
@@ -809,9 +902,11 @@ async function showCollection(route) {
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
   };
+  state.container = null;
   state.gridReturnHash =
     route.collectionKind === "smart" ? homeHash("smart") : homeHash("places");
   state.favoriteId = null;
+  state.gridHash = location.hash;
   state.favoriteName = data.title ?? "一覧";
   state.folderPath = "";
   state.thumbAspectHeightRatio =
@@ -841,6 +936,45 @@ async function showFolder(favoriteId, path) {
   renderFolder();
 }
 
+async function showContainer(address) {
+  renderLoading("コンテナを読み込んでいます");
+  await loadContainer(address);
+  renderFolder();
+}
+
+async function loadContainer(address) {
+  state.requestController?.abort();
+  const controller = new AbortController();
+  state.requestController = controller;
+  const data = await apiJson(
+    "/api/container",
+    addressQueryParams(address),
+    controller.signal
+  );
+  if (controller.signal.aborted) return;
+  state.requestController = null;
+  const effectiveAddress = data.effective_address ?? address;
+  state.collection = null;
+  state.container = {
+    kind: data.kind,
+    title: data.title ?? "コンテナ",
+    address: effectiveAddress,
+    requestedAddress: address,
+    truncated: Boolean(data.truncated),
+    entryLimit: Number(data.entry_limit) || 0,
+  };
+  state.favoriteId = effectiveAddress.favorite_id;
+  state.favoriteName =
+    state.favorites.find((favorite) => favorite.id === state.favoriteId)?.name ??
+    "お気に入り";
+  state.folderPath = effectiveAddress.relative_path;
+  state.entries = data.entries ?? [];
+  state.images = state.entries.filter((entry) => entry.kind === "image");
+  state.gridIndex = 0;
+  state.gridHash = containerHash(effectiveAddress);
+  state.gridReturnHash = containerParentHash(address);
+}
+
 async function loadFolder(favoriteId, path) {
   const requestedPath = path ?? "";
   const sameFolder =
@@ -858,20 +992,24 @@ async function loadFolder(favoriteId, path) {
   }
   state.requestController = null;
   state.collection = null;
+  state.container = null;
   state.gridReturnHash = homeHash("favorites");
   state.favoriteId = favoriteId;
   state.favoriteName =
     state.favorites.find((favorite) => favorite.id === favoriteId)?.name ?? "お気に入り";
   state.folderPath = data.path ?? "";
+  state.gridHash = folderHash(favoriteId, state.folderPath);
   state.thumbAspectHeightRatio =
     Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
     Number(data.thumb_aspect_height_ratio) > 0
       ? Number(data.thumb_aspect_height_ratio)
       : 1;
-  // ZIP/PDF/video/audio remain API classifications only in this PoC. The
-  // browsing UI intentionally exposes directories and ordinary images.
   state.entries = (data.entries ?? []).filter(
-    (entry) => entry.kind === "dir" || entry.kind === "image"
+    (entry) =>
+      entry.kind === "dir" ||
+      entry.kind === "image" ||
+      entry.kind === "zip" ||
+      entry.kind === "pdf"
   );
   state.images = state.entries.filter((entry) => entry.kind === "image");
   state.gridIndex = sameFolder
@@ -884,7 +1022,9 @@ function renderFolder() {
   cleanupScreen();
   state.screenContext = "grid";
   exitBrowserFullscreen();
-  document.title = `${state.collection?.title ?? state.favoriteName} — mIV Remote`;
+  document.title =
+    (state.collection?.title ?? state.container?.title ?? state.favoriteName) +
+    " — mIV Remote";
 
   const screen = element("section", "screen");
   const topbar = element("header", "topbar");
@@ -905,12 +1045,14 @@ function renderFolder() {
   state.thumbnailNotice = thumbnailNotice;
   const collectionLimitNotice = textElement(
     "p",
-    state.collection?.truncated
-      ? `件数が多いため先頭 ${state.collection.entryLimit} 件を表示しています。`
+    (state.collection ?? state.container)?.truncated
+      ? "件数が多いため先頭 " +
+        (state.collection ?? state.container).entryLimit +
+        " 件を表示しています。"
       : "",
     "thumbnail-service-notice"
   );
-  collectionLimitNotice.hidden = !state.collection?.truncated;
+  collectionLimitNotice.hidden = !(state.collection ?? state.container)?.truncated;
   const space = element("div", "virtual-space");
   const windowElement = element("div", "virtual-window");
   space.append(windowElement);
@@ -933,7 +1075,9 @@ function renderFolder() {
   if (!state.entries.length) {
     const empty = textElement(
       "p",
-      "このフォルダには表示できるサブフォルダまたは画像がありません。",
+      state.container
+        ? "このコンテナには表示できるページがありません。"
+        : "このフォルダには表示できるサブフォルダまたは画像がありません。",
       "empty-state center-status"
     );
     scroll.replaceChildren(empty);
@@ -961,6 +1105,77 @@ function buildBreadcrumbs() {
   breadcrumbs.setAttribute("aria-label", "パンくず");
   if (state.collection) {
     breadcrumbs.append(textElement("h1", state.collection.title));
+    return breadcrumbs;
+  }
+  if (state.container) {
+    const relativeSegments = state.container.address.relative_path
+      .split("/")
+      .filter(Boolean);
+    const fileName = relativeSegments.pop() ?? state.container.title;
+    const crumbs = [
+      {
+        label: state.favoriteName,
+        command: {
+          kind: "folder",
+          favoriteId: state.favoriteId,
+          path: "",
+        },
+      },
+    ];
+    let folderPath = "";
+    for (const segment of relativeSegments) {
+      folderPath = folderPath ? folderPath + "/" + segment : segment;
+      crumbs.push({
+        label: segment,
+        command: {
+          kind: "folder",
+          favoriteId: state.favoriteId,
+          path: folderPath,
+        },
+      });
+    }
+    const rootAddress = {
+      favorite_id: state.favoriteId,
+      relative_path: state.container.address.relative_path,
+      subresource: { kind: "file" },
+    };
+    crumbs.push({
+      label: fileName,
+      command: { kind: "container", address: rootAddress },
+    });
+    const subresource = state.container.address.subresource;
+    if (subresource.kind === "zip_directory") {
+      let prefix = "";
+      for (const segment of subresource.prefix.split("/").filter(Boolean)) {
+        prefix += segment + "/";
+        crumbs.push({
+          label: segment,
+          command: {
+            kind: "container",
+            address: {
+              favorite_id: state.favoriteId,
+              relative_path: state.container.address.relative_path,
+              subresource: { kind: "zip_directory", prefix },
+            },
+          },
+        });
+      }
+    }
+    crumbs.forEach((crumb, index) => {
+      if (index) breadcrumbs.append(textElement("span", "›", "crumb-separator"));
+      const button = textElement("button", crumb.label, "crumb");
+      button.type = "button";
+      button.addEventListener("click", (event) => {
+        dispatchCommand(command(CommandName.OPEN, crumb.command), {
+          source: inputSourceFromEvent(event),
+          detail: "breadcrumb",
+        });
+      });
+      breadcrumbs.append(button);
+    });
+    requestAnimationFrame(() => {
+      breadcrumbs.scrollLeft = breadcrumbs.scrollWidth;
+    });
     return breadcrumbs;
   }
   const segments = state.folderPath ? state.folderPath.split("/") : [];
@@ -1045,15 +1260,37 @@ function createGridTile(
       preview.append(textElement("span", entryTypeLabel(entry.kind), "type-badge"));
     }
     bindThumbnail(image, entry, thumbnailTracker, cellWidth);
-    if (entry.kind === "image") tile.addEventListener("click", (event) => {
-      const index = imageIndexes.get(entryIdentity(entry));
-      if (index !== undefined) {
+    if (entry.kind === "image") {
+      tile.addEventListener("click", (event) => {
+        const index = imageIndexes.get(entryIdentity(entry));
+        if (index !== undefined) {
+          const payload = entry.address
+            ? {
+                kind: "media",
+                address: entry.address,
+                imageIndex: index,
+                entryIndex,
+              }
+            : {
+                kind: "image",
+                favoriteId,
+                path: entryPath(entry),
+                imageIndex: index,
+                entryIndex,
+              };
+          dispatchCommand(command(CommandName.OPEN, payload), {
+            source: inputSourceFromEvent(event),
+            detail: "grid_tile",
+            at: performance.now(),
+          });
+        }
+      });
+    } else if (["zip", "pdf", "directory"].includes(entry.kind)) {
+      tile.addEventListener("click", (event) => {
         dispatchCommand(
           command(CommandName.OPEN, {
-            kind: "image",
-            favoriteId,
-            path: entryPath(entry),
-            imageIndex: index,
+            kind: "container",
+            address: entryAddress(entry),
             entryIndex,
           }),
           {
@@ -1062,8 +1299,8 @@ function createGridTile(
             at: performance.now(),
           }
         );
-      }
-    });
+      });
+    }
   }
   if (entry.detail || entry.rating) {
     preview.append(
@@ -1080,8 +1317,90 @@ function entryPath(entry) {
   return entry.relative_path ?? entry.path ?? "";
 }
 
+function entryAddress(entry) {
+  if (entry.address) return entry.address;
+  return {
+    favorite_id: entry.favorite_id ?? state.favoriteId,
+    relative_path: entryPath(entry),
+    subresource: { kind: "file" },
+  };
+}
+
+function addressIdentity(address) {
+  const target = address?.subresource ?? {};
+  const inner =
+    target.kind === "zip_entry"
+      ? target.entry_name
+      : target.kind === "zip_directory"
+        ? target.prefix
+        : target.kind === "pdf_page"
+          ? String(target.page_number)
+          : "";
+  return [
+    address?.favorite_id ?? "",
+    address?.relative_path ?? "",
+    target.kind ?? "",
+    inner,
+  ].join("\n");
+}
+
 function entryIdentity(entry) {
-  return `${entry.favorite_id ?? state.favoriteId ?? ""}\n${entryPath(entry)}`;
+  return entry.address
+    ? addressIdentity(entry.address)
+    : `${entry.favorite_id ?? state.favoriteId ?? ""}\n${entryPath(entry)}`;
+}
+
+function addressQueryParams(address, extra = {}) {
+  const params = {
+    fav: address.favorite_id,
+    path: address.relative_path,
+    ...extra,
+  };
+  const target = address.subresource;
+  if (target.kind === "zip_entry") params.entry = target.entry_name;
+  else if (target.kind === "zip_directory") params.prefix = target.prefix;
+  else if (target.kind === "pdf_page") params.page = target.page_number;
+  return params;
+}
+
+function parentContainerAddress(address) {
+  if (address.subresource.kind === "pdf_page") {
+    return {
+      favorite_id: address.favorite_id,
+      relative_path: address.relative_path,
+      subresource: { kind: "file" },
+    };
+  }
+  const segments = address.subresource.entry_name.split("/");
+  segments.pop();
+  const prefix = segments.length ? segments.join("/") + "/" : "";
+  return {
+    favorite_id: address.favorite_id,
+    relative_path: address.relative_path,
+    subresource: prefix
+      ? { kind: "zip_directory", prefix }
+      : { kind: "file" },
+  };
+}
+
+function containerParentHash(requestedAddress) {
+  if (requestedAddress.subresource.kind === "zip_directory") {
+    const segments = requestedAddress.subresource.prefix.split("/").filter(Boolean);
+    segments.pop();
+    const prefix = segments.length ? segments.join("/") + "/" : "";
+    const parentAddress = {
+      favorite_id: requestedAddress.favorite_id,
+      relative_path: requestedAddress.relative_path,
+      subresource: prefix
+        ? { kind: "zip_directory", prefix }
+        : { kind: "file" },
+    };
+    return containerHash(parentAddress);
+  }
+  const separator = requestedAddress.relative_path.lastIndexOf("/");
+  const parentPath =
+    separator >= 0 ? requestedAddress.relative_path.slice(0, separator) : "";
+  return folderHash(requestedAddress.favorite_id, parentPath);
 }
 
 function entryIsFolder(entry) {
@@ -1094,6 +1413,7 @@ function entryTypeLabel(kind) {
     audio: "audio",
     zip: "zip",
     pdf: "pdf",
+    directory: "folder",
     archive: "archive",
     other: "file",
   }[kind] ?? kind;
@@ -1179,6 +1499,9 @@ function changeImageTo(nextIndex) {
   state.imageIndex = nextIndex;
   const entry = state.images[nextIndex];
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
+  const targetHash = entry.address
+    ? mediaHash(entry.address)
+    : imageHash(state.favoriteId, entry.path);
   history.pushState(
     {
       ...(history.state ?? {}),
@@ -1187,7 +1510,7 @@ function changeImageTo(nextIndex) {
       viewerDepth,
     },
     "",
-    imageHash(state.favoriteId, entry.path)
+    targetHash
   );
   updateViewerImage(performance.now()).catch(renderError);
   return true;
@@ -1198,9 +1521,15 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
   const viewer = state.viewer;
   if (!entry || !viewer) return;
   document.title = `${entry.name} — mIV Remote`;
-  const info = await imageInfo(entry.path);
-  if (state.viewer !== viewer || state.images[state.imageIndex]?.path !== entry.path) return;
-  const request = imageRequest(entry.path, info, viewer.stage);
+  const identity = entryIdentity(entry);
+  const info = await imageInfo(entry);
+  if (
+    state.viewer !== viewer ||
+    entryIdentity(state.images[state.imageIndex] ?? {}) !== identity
+  ) {
+    return;
+  }
+  const request = imageRequest(entry, info, viewer.stage);
   viewer.load({
     name: entry.name,
     request,
@@ -1212,17 +1541,50 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
   });
   const nextEntry = state.images[state.imageIndex + 1];
   if (nextEntry) {
-    imageInfo(nextEntry.path).then((nextInfo) => {
+    imageInfo(nextEntry).then((nextInfo) => {
       if (state.viewer !== viewer) return;
       const preload = new Image();
       preload.decoding = "async";
-      preload.src = imageRequest(nextEntry.path, nextInfo, viewer.stage).url;
+      preload.src = imageRequest(nextEntry, nextInfo, viewer.stage).url;
     }).catch(() => {});
   }
 }
 
-function imageRequest(path, info, stage) {
+function imageRequest(entry, info, stage) {
   const dpr = window.devicePixelRatio || 1;
+  if (entry.address) {
+    const targetPx = clamp(
+      Math.ceil(
+        Math.max(
+          stage.clientWidth || window.innerWidth,
+          stage.clientHeight || window.innerHeight
+        ) * dpr
+      ),
+      256,
+      8192
+    );
+    const layout = viewerImageLayout({
+      mode: state.fitMode,
+      sourceWidth: info.width,
+      sourceHeight: info.height,
+      viewportWidth: stage.clientWidth || window.innerWidth,
+      viewportHeight: stage.clientHeight || window.innerHeight,
+      devicePixelRatio: dpr,
+      maxRequestWidth: 8192,
+    });
+    return {
+      url: apiUrl(
+        "/api/page",
+        addressQueryParams(entry.address, { w: targetPx })
+      ),
+      width: targetPx,
+      cssWidth: layout.cssWidth,
+      dpr,
+      layout,
+      fitMode: state.fitMode,
+      dynamicInfo: true,
+    };
+  }
   const layout = viewerImageLayout({
     mode: state.fitMode,
     sourceWidth: info.width,
@@ -1232,7 +1594,11 @@ function imageRequest(path, info, stage) {
     devicePixelRatio: dpr,
   });
   return {
-    url: apiUrl("/api/image", { fav: state.favoriteId, path, w: layout.requestWidth }),
+    url: apiUrl("/api/image", {
+      fav: state.favoriteId,
+      path: entry.path,
+      w: layout.requestWidth,
+    }),
     width: layout.requestWidth,
     cssWidth: layout.cssWidth,
     dpr,
@@ -1241,8 +1607,15 @@ function imageRequest(path, info, stage) {
   };
 }
 
-function imageInfo(path) {
-  const entry = state.images.find((candidate) => candidate.path === path);
+function imageInfo(entry) {
+  if (entry.address) {
+    return Promise.resolve({
+      width: Math.max(1, window.innerWidth),
+      height: Math.max(1, window.innerHeight),
+      dynamic: true,
+    });
+  }
+  const path = entry.path;
   const key = `${state.favoriteId}\n${path}\n${entry?.mtime ?? ""}\n${entry?.size ?? ""}`;
   if (!state.imageInfoCache.has(key)) {
     const pending = apiJson("/api/image-info", { fav: state.favoriteId, path }).catch(
@@ -1264,6 +1637,7 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
   image.classList.remove("thumb-ready", "thumb-missing", "thumb-retry-exhausted");
   image.parentElement?.classList.remove("thumb-loaded");
   image.parentElement?.removeAttribute("data-retry-exhausted");
+  image.parentElement?.removeAttribute("data-unavailable");
   const controller = new AbortController();
   image._thumbnailController = controller;
   const targetPx = clamp(
@@ -1314,11 +1688,10 @@ function clearThumbnailServiceNotice() {
 
 async function loadThumbnail(image, entry, tracker, generation, targetPx, signal) {
   const bindingKey = entryIdentity(entry);
-  const url = apiUrl("/api/thumb", {
-    fav: entry.favorite_id ?? state.favoriteId,
-    path: entryPath(entry),
-    w: targetPx,
-  });
+  const url = apiUrl(
+    "/api/thumb",
+    addressQueryParams(entryAddress(entry), { w: targetPx })
+  );
   try {
     const result = await fetchThumbnailWithRetry(url, signal);
     const { response, detail, exhausted } = result;
@@ -1332,6 +1705,9 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
         );
       }
       if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) return;
+      if (response.status === 423) {
+        image.parentElement?.setAttribute("data-unavailable", "パスワード保護");
+      }
       image.classList.add("thumb-missing");
       image.classList.toggle("thumb-retry-exhausted", exhausted);
       if (exhausted) {
@@ -1359,6 +1735,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     }
     image.classList.remove("thumb-missing", "thumb-retry-exhausted");
     image.parentElement?.removeAttribute("data-retry-exhausted");
+    image.parentElement?.removeAttribute("data-unavailable");
     image.classList.add("thumb-ready");
     image.parentElement?.classList.add("thumb-loaded");
     clearThumbnailServiceNotice();
@@ -2030,7 +2407,11 @@ class ImageViewer {
         credentials: "same-origin",
       });
       if (!response.ok) {
-        throw new Error(`画像取得に失敗しました (HTTP ${response.status})。`);
+        const detail = await response.clone().json().catch(() => ({}));
+        throw new Error(
+          detail.message ||
+            `画像取得に失敗しました (HTTP ${response.status})。`
+        );
       }
       const blob = await response.blob();
       const fetchMs = performance.now() - fetchStartedAt;
@@ -2042,6 +2423,23 @@ class ImageViewer {
       const decodeStartedAt = performance.now();
       await this.image.decode();
       const decodeMs = performance.now() - decodeStartedAt;
+      if (request.dynamicInfo && this.image.naturalWidth && this.image.naturalHeight) {
+        const actualInfo = {
+          width: this.image.naturalWidth,
+          height: this.image.naturalHeight,
+        };
+        const actualLayout = viewerImageLayout({
+          mode: request.fitMode,
+          sourceWidth: actualInfo.width,
+          sourceHeight: actualInfo.height,
+          viewportWidth: this.stage.clientWidth || window.innerWidth,
+          viewportHeight: this.stage.clientHeight || window.innerHeight,
+          devicePixelRatio: request.dpr,
+          maxRequestWidth: 8192,
+        });
+        request.cssWidth = actualLayout.cssWidth;
+        this.setLayout(request.fitMode, actualLayout, actualInfo);
+      }
       await nextFrame();
       if (sequence !== this.loadSequence) {
         URL.revokeObjectURL(pendingObjectUrl);
@@ -2073,6 +2471,9 @@ class ImageViewer {
       if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
       if (sequence !== this.loadSequence) return;
       if (error?.name === "AbortError") return;
+      this.title.textContent =
+        error instanceof Error ? error.message : "ページを表示できませんでした。";
+      this.root.classList.remove("viewer-ui-hidden");
       recordClientError("image_load_error", error, {
         resource: safeResourcePath(request.url),
       });
@@ -2310,7 +2711,10 @@ async function apiJson(path, params = {}, signal) {
     throw new AuthenticationRequiredError("PIN 認証が必要です。");
   }
   if (!response.ok) {
-    throw new Error(`読み込みに失敗しました (HTTP ${response.status})。`);
+    const detail = await response.clone().json().catch(() => ({}));
+    throw new Error(
+      detail.message || `読み込みに失敗しました (HTTP ${response.status})。`
+    );
   }
   return response.json();
 }

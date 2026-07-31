@@ -4,8 +4,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 
-use mimageviewer_ipc::{ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse};
+use mimageviewer_ipc::{
+    RemoteAddress, RemoteSubresource, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest,
+    ThumbnailResponse,
+};
 
+use super::container::ContainerEngine;
 use super::path_guard::{
     ResolveError, ResolvedFavoritePath, canonicalize_within, resolve_existing,
 };
@@ -17,9 +21,9 @@ pub(super) struct ThumbnailEngine {
 }
 
 pub(super) struct WorkerContext {
-    folder_pin_db: Option<crate::folder_thumb_pins::FolderThumbPinDb>,
+    pub(super) folder_pin_db: Option<crate::folder_thumb_pins::FolderThumbPinDb>,
     rotation_db: Option<crate::rotation_db::RotationDb>,
-    adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
+    pub(super) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
 }
 
 impl WorkerContext {
@@ -34,23 +38,19 @@ impl WorkerContext {
 
 #[derive(Clone, Eq)]
 struct RequestKey {
-    favorite_id: String,
-    relative_path: String,
+    address: RemoteAddress,
     target_px: u32,
 }
 
 impl PartialEq for RequestKey {
     fn eq(&self, other: &Self) -> bool {
-        self.favorite_id == other.favorite_id
-            && self.relative_path == other.relative_path
-            && self.target_px == other.target_px
+        self.address == other.address && self.target_px == other.target_px
     }
 }
 
 impl Hash for RequestKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.favorite_id.hash(state);
-        self.relative_path.hash(state);
+        self.address.hash(state);
         self.target_px.hash(state);
     }
 }
@@ -74,10 +74,10 @@ impl ThumbnailEngine {
         &self,
         request: ThumbnailRequest,
         context: &WorkerContext,
+        container_engine: &ContainerEngine,
     ) -> ThumbnailResponse {
         let key = RequestKey {
-            favorite_id: request.favorite_id.clone(),
-            relative_path: request.relative_path.clone(),
+            address: request.address.clone(),
             target_px: request.target_px,
         };
         let (flight, owner) = {
@@ -112,7 +112,7 @@ impl ThumbnailEngine {
         }
 
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.generate(&request, context)
+            self.generate(&request, context, container_engine)
         }))
         .unwrap_or_else(|_| {
             error_response(
@@ -135,17 +135,27 @@ impl ThumbnailEngine {
         response
     }
 
-    fn generate(&self, request: &ThumbnailRequest, context: &WorkerContext) -> ThumbnailResponse {
+    fn generate(
+        &self,
+        request: &ThumbnailRequest,
+        context: &WorkerContext,
+        container_engine: &ContainerEngine,
+    ) -> ThumbnailResponse {
         if request.target_px == 0 || request.target_px > 4096 {
             return error_response(
                 ThumbnailErrorCode::BadRequest,
                 "サムネイルサイズが範囲外です",
             );
         }
+        if !matches!(request.address.subresource, RemoteSubresource::File)
+            || is_container_path(Path::new(&request.address.relative_path))
+        {
+            return container_engine.thumbnail(request, context);
+        }
         let resolved = match resolve_existing(
             &self.settings.favorites,
-            &request.favorite_id,
-            &request.relative_path,
+            &request.address.favorite_id,
+            &request.address.relative_path,
         ) {
             Ok(path) => path,
             Err(error) => return resolve_error_response(error),
@@ -432,6 +442,15 @@ fn is_supported_image(path: &Path) -> bool {
         })
 }
 
+fn is_container_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            let extension = extension.to_ascii_lowercase();
+            extension == "pdf" || crate::folder_tree::is_zip_extension(&extension)
+        })
+}
+
 fn resolve_error_response(error: ResolveError) -> ThumbnailResponse {
     match error {
         ResolveError::InvalidFavoriteId | ResolveError::InvalidRelativePath => error_response(
@@ -463,8 +482,7 @@ mod tests {
     #[test]
     fn identical_requests_share_one_flight() {
         let key = RequestKey {
-            favorite_id: "a".to_owned(),
-            relative_path: "b.jpg".to_owned(),
+            address: RemoteAddress::file("a", "b.jpg"),
             target_px: 128,
         };
         let mut map = HashMap::new();

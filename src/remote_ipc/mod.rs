@@ -1,4 +1,5 @@
 mod collections;
+mod container;
 mod path_guard;
 mod thumbnail;
 

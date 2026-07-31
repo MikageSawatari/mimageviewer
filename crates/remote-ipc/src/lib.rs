@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
-pub const MAX_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ClientHello {
@@ -43,13 +43,187 @@ pub fn negotiate(client_version: u32) -> ServerHello {
     }
 }
 
+/// Web クライアントへ公開できるコンテンツアドレス。
+///
+/// 実ファイル部分は常に favorite UUID + favorite root からの相対パスで表し、
+/// ZIP/PDF 内の位置だけを `subresource` へ追加する。絶対パスをこの型に載せない。
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+pub struct RemoteAddress {
+    pub favorite_id: String,
+    pub relative_path: String,
+    pub subresource: RemoteSubresource,
+}
+
+impl RemoteAddress {
+    pub fn file(favorite_id: impl Into<String>, relative_path: impl Into<String>) -> Self {
+        Self {
+            favorite_id: favorite_id.into(),
+            relative_path: relative_path.into(),
+            subresource: RemoteSubresource::File,
+        }
+    }
+
+    /// トランスポート両端で共通に実行する構文検証。
+    /// 実在確認・favorite allowlist・junction 境界は各プロセスが別途検証する。
+    pub fn validate_syntax(&self) -> Result<(), AddressError> {
+        validate_relative_component_path(&self.relative_path, true)?;
+        match &self.subresource {
+            RemoteSubresource::File | RemoteSubresource::PdfPage { .. } => Ok(()),
+            RemoteSubresource::ZipEntry { entry_name } => validate_zip_path(entry_name, false),
+            RemoteSubresource::ZipDirectory { prefix } => validate_zip_path(prefix, true),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteSubresource {
+    File,
+    ZipDirectory {
+        prefix: String,
+    },
+    ZipEntry {
+        entry_name: String,
+    },
+    /// 0-origin のページ番号。
+    PdfPage {
+        page_number: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressError {
+    InvalidRelativePath,
+    InvalidZipPath,
+}
+
+fn validate_relative_component_path(value: &str, allow_empty: bool) -> Result<(), AddressError> {
+    if (!allow_empty && value.is_empty())
+        || value.contains('\0')
+        || looks_absolute_or_drive_qualified(value)
+        || value.split(['/', '\\']).any(|part| part == "..")
+    {
+        return Err(AddressError::InvalidRelativePath);
+    }
+    Ok(())
+}
+
+fn validate_zip_path(value: &str, directory: bool) -> Result<(), AddressError> {
+    if value.contains('\\')
+        || validate_relative_component_path(value, directory).is_err()
+        || (!directory && value.ends_with('/'))
+        || (directory && !value.is_empty() && !value.ends_with('/'))
+    {
+        return Err(AddressError::InvalidZipPath);
+    }
+    Ok(())
+}
+
+fn looks_absolute_or_drive_qualified(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with(['/', '\\'])
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ThumbnailRequest {
-    /// UUID の文字列表現。解釈とお気に入り照合は本体側で行う。
-    pub favorite_id: String,
-    /// お気に入り root からの相対パス。絶対パスはプロトコルに載せない。
-    pub relative_path: String,
+    pub address: RemoteAddress,
     pub target_px: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ContainerRequest {
+    pub address: RemoteAddress,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerKind {
+    Zip,
+    Pdf,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerEntryKind {
+    Directory,
+    Image,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ContainerEntry {
+    pub address: RemoteAddress,
+    pub name: String,
+    pub kind: ContainerEntryKind,
+    pub page_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ContainerPayload {
+    pub title: String,
+    pub kind: ContainerKind,
+    /// ZIP の単一ラッパー自動降下後など、実際に表示している位置。
+    pub effective_address: RemoteAddress,
+    pub entries: Vec<ContainerEntry>,
+    pub entry_limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum ContainerResponse {
+    Success(ContainerPayload),
+    Error(MediaError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageRequest {
+    pub address: RemoteAddress,
+    /// 表示用ラスタの長辺上限。
+    pub target_px: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PagePayload {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum PageResponse {
+    Success(PagePayload),
+    Error(MediaError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MediaError {
+    pub code: MediaErrorCode,
+    pub message: String,
+}
+
+impl MediaError {
+    pub fn new(code: MediaErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaErrorCode {
+    BadRequest,
+    FavoriteNotFound,
+    PathRejected,
+    NotFound,
+    Unsupported,
+    PasswordRequired,
+    PageOutOfRange,
+    Busy,
+    RenderFailed,
+    Internal,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -187,12 +361,24 @@ pub enum ClientMessage {
         id: RequestId,
         request: CollectionRequest,
     },
+    Container {
+        id: RequestId,
+        request: ContainerRequest,
+    },
+    Page {
+        id: RequestId,
+        request: PageRequest,
+    },
 }
 
 impl ClientMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::Thumbnail { id, .. } | Self::Home { id, .. } | Self::Collection { id, .. } => *id,
+            Self::Thumbnail { id, .. }
+            | Self::Home { id, .. }
+            | Self::Collection { id, .. }
+            | Self::Container { id, .. }
+            | Self::Page { id, .. } => *id,
         }
     }
 }
@@ -212,12 +398,24 @@ pub enum ServerMessage {
         id: RequestId,
         response: CollectionResponse,
     },
+    Container {
+        id: RequestId,
+        response: ContainerResponse,
+    },
+    Page {
+        id: RequestId,
+        response: PageResponse,
+    },
 }
 
 impl ServerMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::Thumbnail { id, .. } | Self::Home { id, .. } | Self::Collection { id, .. } => *id,
+            Self::Thumbnail { id, .. }
+            | Self::Home { id, .. }
+            | Self::Collection { id, .. }
+            | Self::Container { id, .. }
+            | Self::Page { id, .. } => *id,
         }
     }
 }
@@ -253,6 +451,8 @@ pub enum ThumbnailErrorCode {
     Unsupported,
     GenerationFailed,
     Busy,
+    PasswordRequired,
+    PageOutOfRange,
     Internal,
 }
 
@@ -335,8 +535,10 @@ mod tests {
         let expected = ClientMessage::Thumbnail {
             id: 42,
             request: ThumbnailRequest {
-                favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-                relative_path: "album/page.jpg".to_owned(),
+                address: RemoteAddress::file(
+                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+                    "album/page.jpg",
+                ),
                 target_px: 384,
             },
         };
@@ -420,5 +622,50 @@ mod tests {
                 maximum: 1024
             })
         ));
+    }
+
+    #[test]
+    fn zip_entry_address_rejects_traversal_and_windows_aliases() {
+        for entry_name in [
+            "../secret.jpg",
+            "pages/../../secret.jpg",
+            r"pages\..\secret.jpg",
+            "/absolute.jpg",
+            r"C:\secret.jpg",
+        ] {
+            let address = RemoteAddress {
+                favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                relative_path: "books/volume.zip".to_owned(),
+                subresource: RemoteSubresource::ZipEntry {
+                    entry_name: entry_name.to_owned(),
+                },
+            };
+            assert!(address.validate_syntax().is_err(), "{entry_name:?}");
+        }
+    }
+
+    #[test]
+    fn valid_nested_zip_and_pdf_addresses_round_trip() {
+        let addresses = [
+            RemoteAddress {
+                favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                relative_path: "books/volume.zip".to_owned(),
+                subresource: RemoteSubresource::ZipEntry {
+                    entry_name: "chapter.zip/pages/001.jpg".to_owned(),
+                },
+            },
+            RemoteAddress {
+                favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                relative_path: "books/volume.pdf".to_owned(),
+                subresource: RemoteSubresource::PdfPage { page_number: 42 },
+            },
+        ];
+        for address in addresses {
+            address.validate_syntax().unwrap();
+            let encoded = serde_json::to_vec(&address).unwrap();
+            let decoded: RemoteAddress = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, address);
+            assert!(!String::from_utf8(encoded).unwrap().contains("C:"));
+        }
     }
 }
