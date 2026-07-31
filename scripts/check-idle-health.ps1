@@ -2,6 +2,7 @@
 param(
     [ValidateSet("static-foreground", "static-background", "video-pin-background")]
     [string]$Scenario = "static-foreground",
+    [string]$TargetKey = "",
     [string]$ExePath = "",
     [int]$ProcessId = 0,
     [switch]$NoLaunch,
@@ -12,6 +13,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
+
+if ($Scenario -eq "video-pin-background") {
+    if ([string]::IsNullOrWhiteSpace($TargetKey)) {
+        throw ("video-pin-background requires -TargetKey. Pass the path of the " +
+            "folder whose representative image is pinned to a video. The value " +
+            "is matched as a case-insensitive substring of perf-log thumbnail keys.")
+    }
+}
+elseif ($PSBoundParameters.ContainsKey("TargetKey")) {
+    throw "-TargetKey is valid only with -Scenario video-pin-background"
+}
 
 if (-not ("MivIdleHealthNative" -as [type])) {
     Add-Type -TypeDefinition @'
@@ -162,8 +174,8 @@ $Process = Get-LiveProcess -Id $Process.Id
 $EvidenceStartWall = Get-Date
 $EvidenceStartProcessElapsed = ($EvidenceStartWall - $Process.StartTime).TotalSeconds
 if ($Scenario -eq "video-pin-background") {
-    Write-Host "During setup, open/reload the folder so the pinned-video tile enters the keep range."
-    Write-Host "The gate requires a fresh idle_upgrade_ineligible event before measurement ends."
+    Write-Host "During setup, open/reload the target folder and ensure its tile enters the keep range."
+    Write-Host "The gate requires thumbnail work whose key contains TargetKey before measurement ends."
 }
 if (-not $SkipPrompt) {
     Read-Host "Press Enter when the scenario is ready" | Out-Null
@@ -225,7 +237,7 @@ $AnalyzerArgs = @(
 if ($Scenario -eq "video-pin-background") {
     $AnalyzerArgs += @(
         "--evidence-start-t", (Format-Invariant -Value $EvidenceStartProcessElapsed),
-        "--require-idle-upgrade-ineligible"
+        "--require-work-key", $TargetKey
     )
 }
 

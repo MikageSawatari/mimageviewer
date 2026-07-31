@@ -747,7 +747,7 @@ def analyze_idle_health(
     expected_pid: int | None = None,
     allow_sleeping_window: bool = False,
     evidence_start_t: float | None = None,
-    require_idle_upgrade_ineligible: bool = False,
+    require_work_key: str | None = None,
 ) -> dict:
     """静止測定区間を解析し、JSON 化可能な report を返す。
 
@@ -758,6 +758,12 @@ def analyze_idle_health(
     duration = end_t - start_t
     if duration <= 0.0:
         raise ValueError("end_t は start_t より大きくしてください")
+    # 空文字はあらゆる key に部分一致するため、ゲートが常に通る「嘘の PASS」になる。
+    # 判定を無効化したい場合は None を渡すこと。
+    if require_work_key is not None and not require_work_key.strip():
+        raise ValueError(
+            "require_work_key が空です。判定を無効化するなら None を渡してください"
+        )
 
     selected = [
         e
@@ -844,6 +850,22 @@ def analyze_idle_health(
 
     failures: list[str] = []
     warnings: list[str] = []
+    evidence_start = start_t if evidence_start_t is None else evidence_start_t
+    matched_evidence: list[dict] = []
+    if require_work_key is not None:
+        required_key = require_work_key.casefold()
+        matched_evidence = [
+            e
+            for e in events
+            if evidence_start <= float(e.get("t", 0.0)) <= end_t
+            and e.get("cat") == "thumb"
+            and required_key in str(e.get("key") or "").casefold()
+        ]
+        matched_evidence.sort(key=lambda e: float(e.get("t", 0.0)))
+    matched_kinds: dict[str, int] = defaultdict(int)
+    for event in matched_evidence:
+        matched_kinds[str(event.get("kind", "?"))] += 1
+
     session_events = [
         e
         for e in events
@@ -876,19 +898,23 @@ def analyze_idle_health(
                 "測定区間は完全に sleep しており perf event は 0 件です "
                 "(同一 session PID は確認済み)"
             )
-    if require_idle_upgrade_ineligible:
-        evidence_start = start_t if evidence_start_t is None else evidence_start_t
-        evidence = [
-            e
-            for e in events
-            if evidence_start <= float(e.get("t", 0.0)) <= end_t
-            and e.get("cat") == "thumb"
-            and e.get("kind") == "idle_upgrade_ineligible"
-        ]
-        if not evidence:
+    if require_work_key is not None:
+        if not matched_evidence:
             failures.append(
-                "動画ピン由来の thumb.idle_upgrade_ineligible が準備・測定区間に無く、"
-                "シナリオ成立を確認できません"
+                f'対象タイル (key に "{require_work_key}" を含む) の thumbnail work が'
+                "準備・測定区間に無く、keep 範囲へ入った証拠がありません"
+            )
+        elif not any(
+            event.get("kind")
+            in {"idle_upgrade_enqueue", "idle_upgrade_ineligible"}
+            for event in matched_evidence
+        ):
+            warnings.append(
+                "対象タイルの thumbnail work はありましたが、idle_upgrade_enqueue / "
+                "idle_upgrade_ineligible が無く、アイドル高画質化パスがこのタイルを"
+                "評価していません。ピン作成直後のサムネイルは "
+                "from_cache=false で対象にならないため、キャッシュから読み直される状態 "
+                "(アプリ再起動後など) で測り直してください"
             )
     if not any(e.get("cat") == "frame" and e.get("kind") == "begin" for e in events):
         failures.append("perf log に frame.begin が無く、測定が有効か確認できません")
@@ -953,7 +979,22 @@ def analyze_idle_health(
             "expected_pid": expected_pid,
             "allow_sleeping_window": allow_sleeping_window,
             "evidence_start_t": evidence_start_t,
-            "require_idle_upgrade_ineligible": require_idle_upgrade_ineligible,
+            "require_work_key": require_work_key,
+        },
+        "setup_evidence": {
+            "require_work_key": require_work_key,
+            "matched_events": len(matched_evidence),
+            "matched_kinds": dict(sorted(matched_kinds.items())),
+            "first_match_t": (
+                float(matched_evidence[0].get("t", 0.0))
+                if matched_evidence
+                else None
+            ),
+            "last_match_t": (
+                float(matched_evidence[-1].get("t", 0.0))
+                if matched_evidence
+                else None
+            ),
         },
         "action_counts": dict(sorted(action_counts.items())),
         "reason_counts": dict(sorted(reason_counts.items())),
@@ -979,7 +1020,7 @@ def cmd_idle_health(
     expected_pid: int | None = None,
     allow_sleeping_window: bool = False,
     evidence_start_t: float | None = None,
-    require_idle_upgrade_ineligible: bool = False,
+    require_work_key: str | None = None,
 ) -> int:
     if not events:
         print("ERROR: perf event が 0 件です", file=sys.stderr)
@@ -1001,7 +1042,7 @@ def cmd_idle_health(
             expected_pid=expected_pid,
             allow_sleeping_window=allow_sleeping_window,
             evidence_start_t=evidence_start_t,
-            require_idle_upgrade_ineligible=require_idle_upgrade_ineligible,
+            require_work_key=require_work_key,
         )
     except ValueError as error:
         print(f"ERROR: {error}", file=sys.stderr)
@@ -1029,6 +1070,14 @@ def cmd_idle_health(
         for reason, count in report["reason_counts"].items():
             streak = report["max_reason_streaks_secs"].get(reason, 0.0)
             print(f"  {reason}: {count} / {streak:.2f}s")
+    setup = report["setup_evidence"]
+    if setup["require_work_key"] is not None:
+        kinds = ", ".join(f"{k}={v}" for k, v in setup["matched_kinds"].items())
+        print(
+            f"setup evidence: key={fmt_key(setup['require_work_key'])} "
+            f"matched={setup['matched_events']}"
+            + (f" ({kinds})" if kinds else "")
+        )
     if report["repeated_work"]:
         print("repeated thumbnail work (top 20):")
         for work in report["repeated_work"]:
@@ -1764,9 +1813,10 @@ def main() -> None:
     p_idle.add_argument("--allow-sleeping-window", action="store_true")
     p_idle.add_argument("--evidence-start-t", type=float, default=None)
     p_idle.add_argument(
-        "--require-idle-upgrade-ineligible",
-        action="store_true",
-        help="準備開始から測定終了までに動画ピン完成キャッシュ除外の証拠を要求",
+        "--require-work-key",
+        type=str,
+        default=None,
+        help="準備開始から測定終了までに key が指定文字列を含む thumbnail work を要求",
     )
     p_idle.add_argument("--json-out", type=Path, default=None)
     p_avd = subs.add_parser("av_drift")
@@ -1830,7 +1880,7 @@ def main() -> None:
                 args.expected_pid,
                 args.allow_sleeping_window,
                 args.evidence_start_t,
-                args.require_idle_upgrade_ineligible,
+                args.require_work_key,
             )
         )
     elif args.cmd == "av_drift":

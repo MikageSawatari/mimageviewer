@@ -396,33 +396,13 @@
 - 規模 / 優先度: Small〜Medium / P2。いずれも製品 runtime の品質問題ではなく、
   同一 worktree で複数セッションを使うリリース運用とクリーン再現性の改善。
 
-### 5.4 idle health の video-pin シナリオが手順どおりでも成立しない
+### 5.4 idle health の video-pin シナリオ成立判定 (対応済み)
 
-- 出典: v2.9.0 リリース前確認 (2026-07-30)。`static-foreground` / `static-background` は
-  PASS したが、`video-pin-background` は 3 回続けて
-  「動画ピン由来の `thumb.idle_upgrade_ineligible` が準備・測定区間に無く、シナリオ成立を
-  確認できません」で FAIL。**製品側の異常ではないと判断してリリースした**。
-- 判断の根拠 (次に見るときのために残す):
-  - 3 回とも測定区間は「完全 sleep・perf event 0 件・CPU one-core ratio 0.004〜0.006」。
-    このシナリオが探している「静止中に 1 コアを使い続けるループ」は起きていない
-  - 同じセッションの perf ログには `idle_upgrade_ineligible` が **2 件実在**した
-    (最後は t=531.7)。失敗した測定窓 (t=330..345 / t=406..421) の外で発生している
-  - 同セッションの `idle_upgrade_enqueue` は 52 件。大半のタイルは upgrade 対象で、
-    `ineligible` になるのは稀 = ゲートは出にくい方のイベントを必須にしている
-- 疑わしい点 (未確認、着手時に切り分ける):
-  - アイドル高画質化のパスが走るまでの遅延と、evidence 窓 (Enter 前の準備開始〜測定終了) が
-    噛み合っていない。準備中に開き直しても、判定が下りるのが窓の後になる可能性
-  - `ineligible` は「完成済み派生キャッシュがある」ときにしか出ない。ピンを作った直後は
-    その場で生成された新しいサムネイルなので `from_cache` が立たず、そもそも候補にならない
-    ことがある。キャッシュから読み直される状態 (再起動後など) を要求する必要があるかも
-  - ゲートのメッセージが「動画ピン由来の」と言い切るのに、実際の判定は cat/kind だけで
-    ピン由来かを見ていない ([analyze_perf.py](../scripts/analyze_perf.py) の
-    `require_idle_upgrade_ineligible`)。成立条件と検査条件がずれている
-- 直す方向: セットアップ成立の判定を、出にくい 1 イベントの有無ではなく「対象 key の
-  タイルが keep 範囲に入ったこと」で取る。あわせて手順書 ([idle-health-check.md](idle-health-check.md))
-  に、ピン作成直後では成立しない条件を書く。
-- 規模 / 優先度: Small / P2。検査ハーネスの問題で製品挙動ではないが、毎リリース必須の
-  チェックが「必ず落ちる」状態だと、本物の退行を見落とす。
+`idle_upgrade_ineligible` は memo により `(idx, items 世代)` ごとに最大 1 回で、ピン作成直後の
+`from_cache=false` サムネイルでは高画質化候補にもならないため、出にくい 1 イベントの必須判定を
+廃止した。操作者が `-TargetKey` で指定した対象キーの thumbnail work が準備・測定区間にあり、
+タイルが keep 範囲へ入ったことを必須に変更し、高画質化パスが未評価なら FAIL ではなく warning
+とした。回帰テストと [idle health 手順](idle-health-check.md) も新しい成立条件へ更新済み。
 
 ---
 
