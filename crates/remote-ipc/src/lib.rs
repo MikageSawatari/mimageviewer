@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -180,6 +180,16 @@ pub struct PageRequest {
     pub address: RemoteAddress,
     /// 表示用ラスタの長辺上限。
     pub target_px: u32,
+    pub priority: PagePriority,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PagePriority {
+    /// 利用者が現在待っているページ。ローカル UI 用 Critical 枠は使用しない。
+    Foreground,
+    /// 有界な先読み。foreground より後ろの Normal lane へ入れる。
+    Prefetch,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -540,6 +550,27 @@ mod tests {
                     "album/page.jpg",
                 ),
                 target_px: 384,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        let actual: ClientMessage =
+            read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn page_priority_round_trips_with_the_request() {
+        let expected = ClientMessage::Page {
+            id: 43,
+            request: PageRequest {
+                address: RemoteAddress {
+                    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                    relative_path: "books/volume.pdf".to_owned(),
+                    subresource: RemoteSubresource::PdfPage { page_number: 7 },
+                },
+                target_px: 1805,
+                priority: PagePriority::Prefetch,
             },
         };
         let mut bytes = Vec::new();

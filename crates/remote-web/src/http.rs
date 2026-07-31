@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
-    CollectionErrorCode, CollectionKind, MediaErrorCode, RemoteAddress, RemoteSubresource,
+    CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
+    RemoteSubresource,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -28,6 +29,7 @@ const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 pub const HTTP_WORKER_COUNT: usize = 12;
 pub const MAX_CONCURRENT_IPC: usize = 6;
 pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
+pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 1;
 const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 
 pub struct AppState {
@@ -44,12 +46,14 @@ pub struct AppState {
 pub struct IpcAdmission {
     all: TrySemaphore,
     heavy: TrySemaphore,
+    prefetch: TrySemaphore,
 }
 
 #[derive(Clone, Copy)]
 enum IpcClass {
     Home,
     Heavy,
+    Prefetch,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +62,8 @@ struct AdmissionBusy {
     all_limit: usize,
     heavy_in_flight: usize,
     heavy_limit: usize,
+    prefetch_in_flight: usize,
+    prefetch_limit: usize,
 }
 
 struct TrySemaphore {
@@ -72,6 +78,7 @@ struct TryPermit<'a> {
 struct IpcPermit<'a> {
     _all: TryPermit<'a>,
     _heavy: Option<TryPermit<'a>>,
+    _prefetch: Option<TryPermit<'a>>,
 }
 
 impl IpcAdmission {
@@ -81,16 +88,41 @@ impl IpcAdmission {
         Self {
             all: TrySemaphore::new(MAX_CONCURRENT_IPC),
             heavy: TrySemaphore::new(MAX_CONCURRENT_HEAVY_IPC),
+            prefetch: TrySemaphore::new(MAX_CONCURRENT_PAGE_PREFETCH),
         }
     }
 
     fn try_enter(&self, class: IpcClass) -> Result<IpcPermit<'_>, AdmissionBusy> {
-        let all = self.all.try_acquire().ok_or_else(|| self.busy())?;
-        let heavy = if matches!(class, IpcClass::Heavy) {
-            match self.heavy.try_acquire() {
+        let prefetch = if matches!(class, IpcClass::Prefetch) {
+            Some(self.prefetch.try_acquire().ok_or_else(|| self.busy())?)
+        } else {
+            None
+        };
+        // 先読みは all/heavy の最終 1 枠を使用しない。表示要求が queue 待ちではなく
+        // admission を即取得できる余地を remote-web 側でも固定する。
+        let all_limit = if matches!(class, IpcClass::Prefetch) {
+            self.all.limit - 1
+        } else {
+            self.all.limit
+        };
+        let all = match self.all.try_acquire_below(all_limit) {
+            Some(permit) => permit,
+            None => {
+                drop(prefetch);
+                return Err(self.busy());
+            }
+        };
+        let heavy = if matches!(class, IpcClass::Heavy | IpcClass::Prefetch) {
+            let heavy_limit = if matches!(class, IpcClass::Prefetch) {
+                self.heavy.limit - 1
+            } else {
+                self.heavy.limit
+            };
+            match self.heavy.try_acquire_below(heavy_limit) {
                 Some(permit) => Some(permit),
                 None => {
                     drop(all);
+                    drop(prefetch);
                     return Err(self.busy());
                 }
             }
@@ -100,6 +132,7 @@ impl IpcAdmission {
         Ok(IpcPermit {
             _all: all,
             _heavy: heavy,
+            _prefetch: prefetch,
         })
     }
 
@@ -114,6 +147,8 @@ impl IpcAdmission {
             all_limit: self.all.limit,
             heavy_in_flight: self.heavy.in_flight(),
             heavy_limit: self.heavy.limit,
+            prefetch_in_flight: self.prefetch.in_flight(),
+            prefetch_limit: self.prefetch.limit,
         }
     }
 }
@@ -128,9 +163,13 @@ impl TrySemaphore {
     }
 
     fn try_acquire(&self) -> Option<TryPermit<'_>> {
+        self.try_acquire_below(self.limit)
+    }
+
+    fn try_acquire_below(&self, limit: usize) -> Option<TryPermit<'_>> {
         let mut current = self.in_flight.load(Ordering::Acquire);
         loop {
-            if current >= self.limit {
+            if current >= limit {
                 return None;
             }
             match self.in_flight.compare_exchange_weak(
@@ -794,9 +833,21 @@ fn api_page(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         Ok(width) => width,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
+    let priority = match query_value(query, "prefetch") {
+        Ok(None) => PagePriority::Foreground,
+        Ok(Some("1")) => PagePriority::Prefetch,
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    let ipc_class = if priority == PagePriority::Prefetch {
+        IpcClass::Prefetch
+    } else {
+        IpcClass::Heavy
+    };
     let started = Instant::now();
-    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
-        state.thumbnail_client.page(address.clone(), target_px)
+    let result = match state.ipc_admission.run(ipc_class, || {
+        state
+            .thumbnail_client
+            .page(address.clone(), target_px, priority)
     }) {
         Ok(result) => result,
         Err(busy) => return media_admission_busy_response(busy, "page"),
@@ -807,6 +858,8 @@ fn api_page(state: &AppState, query: &[(String, String)]) -> HttpResponse {
             let blob_bytes = payload.bytes.len();
             HttpResponse::bytes(200, "image/webp", payload.bytes)
                 .with_header("Cache-Control", "private, max-age=60")
+                .with_header("X-mIV-Image-Width", payload.width.to_string())
+                .with_header("X-mIV-Image-Height", payload.height.to_string())
                 .with_log_details(json!({
                     "page": {
                         "ipc_status": "ok",
@@ -815,6 +868,7 @@ fn api_page(state: &AppState, query: &[(String, String)]) -> HttpResponse {
                         "ipc_retry_statuses": result.retry_statuses,
                         "ipc_connection_id": result.connection_id,
                         "address_kind": remote_address_kind(&address),
+                        "priority": if priority == PagePriority::Prefetch { "prefetch" } else { "foreground" },
                         "target_px": target_px,
                         "output_width": payload.width,
                         "output_height": payload.height,
@@ -850,6 +904,8 @@ fn media_admission_busy_response(busy: AdmissionBusy, operation: &str) -> HttpRe
             "ipc_all_limit": busy.all_limit,
             "ipc_heavy_in_flight": busy.heavy_in_flight,
             "ipc_heavy_limit": busy.heavy_limit,
+            "ipc_prefetch_in_flight": busy.prefetch_in_flight,
+            "ipc_prefetch_limit": busy.prefetch_limit,
         }
     }))
 }
@@ -1655,6 +1711,21 @@ mod tests {
         assert_eq!(details["container"]["ipc_status"], "admission_busy");
         assert!(details.get("operation").is_none());
         drop(permits);
+    }
+
+    #[test]
+    fn page_prefetch_keeps_one_heavy_slot_for_foreground() {
+        let admission = IpcAdmission::new();
+        let existing = (0..MAX_CONCURRENT_HEAVY_IPC - 2)
+            .map(|_| admission.try_enter(IpcClass::Heavy).unwrap())
+            .collect::<Vec<_>>();
+        let prefetch = admission.try_enter(IpcClass::Prefetch).unwrap();
+        assert!(admission.try_enter(IpcClass::Prefetch).is_err());
+        let foreground = admission.try_enter(IpcClass::Heavy).unwrap();
+        assert!(admission.try_enter(IpcClass::Heavy).is_err());
+        drop(foreground);
+        drop(prefetch);
+        drop(existing);
     }
 
     #[test]

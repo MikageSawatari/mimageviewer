@@ -5,15 +5,18 @@ import {
   CommandName,
   FitMode,
   commandFromKey,
+  containerPageTargetPx,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
   reduceViewerTransform,
   viewerTapCommand,
   nextFitMode,
+  pagePrefetchPlan,
   snappedGridOffset,
   thumbnailBindingMatches,
   thumbnailRetryDecision,
+  shouldShowLoadingIndicator,
   viewerImageLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
@@ -188,6 +191,50 @@ test("thumbnail retry policy retries only transient failures with a bounded back
     thumbnailRetryDecision(503, "protocol_version_mismatch", 0).retry,
     false
   );
+});
+
+test("page prefetch follows reading direction and accepts a future spread", () => {
+  assert.deepEqual(
+    pagePrefetchPlan({ visibleIndexes: [10], itemCount: 20, direction: 1 }),
+    [11, 12, 13, 9]
+  );
+  assert.deepEqual(
+    pagePrefetchPlan({ visibleIndexes: [10], itemCount: 20, direction: -1 }),
+    [9, 8, 7, 11]
+  );
+  assert.deepEqual(
+    pagePrefetchPlan({ visibleIndexes: [10, 11], itemCount: 20, direction: 1 }),
+    [12, 13, 14, 9]
+  );
+  assert.deepEqual(
+    pagePrefetchPlan({ visibleIndexes: [0], itemCount: 3, direction: -1 }),
+    [1]
+  );
+});
+
+test("container page target uses the rendered width and source aspect", () => {
+  assert.equal(
+    containerPageTargetPx({
+      requestWidth: 1250,
+      sourceWidth: 2665,
+      sourceHeight: 3840,
+    }),
+    1802
+  );
+  assert.equal(
+    containerPageTargetPx({
+      requestWidth: 2400,
+      sourceWidth: 1600,
+      sourceHeight: 900,
+    }),
+    2400
+  );
+});
+
+test("loading indicator appears only after the stable delay threshold", () => {
+  assert.equal(shouldShowLoadingIndicator(true, 224, 225), false);
+  assert.equal(shouldShowLoadingIndicator(true, 225, 225), true);
+  assert.equal(shouldShowLoadingIndicator(false, 500, 225), false);
 });
 
 test("viewer transform commands dispatch through one pure state transition", () => {

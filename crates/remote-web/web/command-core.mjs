@@ -262,6 +262,63 @@ export function thumbnailRetryDecision(
   };
 }
 
+export function pagePrefetchPlan({
+  visibleIndexes,
+  itemCount,
+  direction,
+  ahead = 3,
+  behind = 1,
+}) {
+  const count = Math.max(0, Math.floor(Number(itemCount) || 0));
+  const visible = [...new Set((visibleIndexes ?? [])
+    .map((value) => Math.floor(Number(value)))
+    .filter((value) => Number.isInteger(value) && value >= 0 && value < count))]
+    .sort((left, right) => left - right);
+  if (!visible.length) return [];
+  const step = Number(direction) < 0 ? -1 : 1;
+  const forwardEdge = step > 0 ? visible[visible.length - 1] : visible[0];
+  const backwardEdge = step > 0 ? visible[0] : visible[visible.length - 1];
+  const result = [];
+  const push = (index) => {
+    if (index >= 0 && index < count && !visible.includes(index) && !result.includes(index)) {
+      result.push(index);
+    }
+  };
+  for (let offset = 1; offset <= Math.max(0, Math.floor(Number(ahead) || 0)); offset += 1) {
+    push(forwardEdge + step * offset);
+  }
+  for (let offset = 1; offset <= Math.max(0, Math.floor(Number(behind) || 0)); offset += 1) {
+    push(backwardEdge - step * offset);
+  }
+  return result;
+}
+
+export function containerPageTargetPx({
+  requestWidth,
+  sourceWidth,
+  sourceHeight,
+  minimum = 256,
+  maximum = 8192,
+}) {
+  const width = Math.max(1, Number(sourceWidth) || 1);
+  const height = Math.max(1, Number(sourceHeight) || 1);
+  const physicalWidth = Math.max(1, Number(requestWidth) || 1);
+  const physicalHeight = physicalWidth * height / width;
+  return Math.max(
+    minimum,
+    Math.min(maximum, Math.ceil(Math.max(physicalWidth, physicalHeight)))
+  );
+}
+
+export function shouldShowLoadingIndicator(
+  pending,
+  elapsedMs,
+  thresholdMs = 225
+) {
+  return Boolean(pending) &&
+    Number(elapsedMs) >= Math.max(0, Number(thresholdMs) || 0);
+}
+
 export function reduceViewerTransform(current, requested) {
   let scale = current.scale;
   let panX = current.panX;

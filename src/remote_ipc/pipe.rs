@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
     ContainerResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode,
-    PIPE_NAME, PROTOCOL_VERSION, PageResponse, ServerMessage, ThumbnailError, ThumbnailErrorCode,
-    ThumbnailResponse, negotiate, read_frame, write_frame,
+    PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, ServerMessage, ThumbnailError,
+    ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -41,8 +41,19 @@ enum Work {
         message: ClientMessage,
         reply: mpsc::Sender<ServerMessage>,
         enqueued_at: Instant,
+        _prefetch_permit: Option<PrefetchPermit>,
     },
     Stop,
+}
+
+struct PrefetchPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for PrefetchPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct QueueMetrics {
@@ -139,6 +150,7 @@ impl ServerGuard {
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
         let heavy_metrics = Arc::new(QueueMetrics::new("heavy"));
         let home_metrics = Arc::new(QueueMetrics::new("home"));
+        let prefetch_in_flight = Arc::new(AtomicUsize::new(0));
         let home_collection_engine = Arc::clone(&collection_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
         let home_worker = std::thread::Builder::new()
@@ -181,6 +193,7 @@ impl ServerGuard {
             let listener_heavy_metrics = Arc::clone(&heavy_metrics);
             let listener_home_metrics = Arc::clone(&home_metrics);
             let listener_next_connection_id = Arc::clone(&next_connection_id);
+            let listener_prefetch_in_flight = Arc::clone(&prefetch_in_flight);
             match std::thread::Builder::new()
                 .name(format!("remote-ipc-listener-{index}"))
                 .spawn(move || {
@@ -191,6 +204,8 @@ impl ServerGuard {
                         listener_heavy_metrics,
                         listener_home_metrics,
                         listener_next_connection_id,
+                        listener_prefetch_in_flight,
+                        worker_count,
                         initial_pipe,
                         index,
                     )
@@ -218,7 +233,8 @@ impl ServerGuard {
         }
 
         crate::logger::log(format!(
-            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 acceptors={ACCEPTOR_COUNT} multiplexed=true"
+            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 prefetch_limit={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
+            usize::from(worker_count >= 2)
         ));
         Ok(Self {
             stop,
@@ -283,6 +299,7 @@ fn worker_loop(
                 message,
                 reply,
                 enqueued_at,
+                _prefetch_permit,
             }) => execute_work(
                 message,
                 reply,
@@ -333,6 +350,7 @@ fn home_worker_loop(
                 message,
                 reply,
                 enqueued_at,
+                _prefetch_permit,
             }) => {
                 execute_work(
                     message,
@@ -389,7 +407,10 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
         ClientMessage::Container { .. } => "container",
-        ClientMessage::Page { .. } => "page",
+        ClientMessage::Page { request, .. } => match request.priority {
+            PagePriority::Foreground => "page_foreground",
+            PagePriority::Prefetch => "page_prefetch",
+        },
     }
 }
 
@@ -445,6 +466,8 @@ fn acceptor_loop(
     heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
     next_connection_id: Arc<AtomicU64>,
+    prefetch_in_flight: Arc<AtomicUsize>,
+    heavy_worker_count: usize,
     initial_pipe: PipeStream,
     index: usize,
 ) {
@@ -489,6 +512,7 @@ fn acceptor_loop(
         let home_work_tx = home_work_tx.clone();
         let heavy_metrics = Arc::clone(&heavy_metrics);
         let home_metrics = Arc::clone(&home_metrics);
+        let prefetch_in_flight = Arc::clone(&prefetch_in_flight);
         if let Err(error) = std::thread::Builder::new()
             .name(format!("remote-ipc-connection-{connection_id}"))
             .spawn(move || {
@@ -499,6 +523,8 @@ fn acceptor_loop(
                     home_work_tx,
                     heavy_metrics,
                     home_metrics,
+                    prefetch_in_flight,
+                    heavy_worker_count,
                 )
             })
         {
@@ -519,6 +545,8 @@ fn handle_connection(
     home_work_tx: mpsc::SyncSender<Work>,
     heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
+    prefetch_in_flight: Arc<AtomicUsize>,
+    heavy_worker_count: usize,
 ) {
     let _lifecycle = ConnectionLifecycle {
         id: connection_id,
@@ -603,6 +631,30 @@ fn handle_connection(
         crate::logger::log(format!(
             "remote_ipc: request_received connection_id={connection_id} request_id={request_id} kind={kind}"
         ));
+        let prefetch_permit = if matches!(
+            message,
+            ClientMessage::Page {
+                request: mimageviewer_ipc::PageRequest {
+                    priority: PagePriority::Prefetch,
+                    ..
+                },
+                ..
+            }
+        ) {
+            let (queued, active) = heavy_metrics.snapshot();
+            match try_acquire_prefetch(&prefetch_in_flight, heavy_worker_count, queued, active) {
+                Some(permit) => Some(permit),
+                None => {
+                    crate::logger::log(format!(
+                        "remote_ipc: prefetch_busy connection_id={connection_id} request_id={request_id} heavy_workers={heavy_worker_count} queued={queued} active={active}"
+                    ));
+                    let _ = reply_tx.send(queue_busy_response(&message));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         // Home は専用 worker へ分離する。重い queue が満杯でも connection reader を
         // 塞がず、後続 Home を読めるよう Busy を明示応答する。
         let (work_tx, metrics) = if matches!(message, ClientMessage::Home { .. }) {
@@ -610,7 +662,7 @@ fn handle_connection(
         } else {
             (&heavy_work_tx, &heavy_metrics)
         };
-        match enqueue_work(work_tx, metrics, message, reply_tx.clone()) {
+        match enqueue_work(work_tx, metrics, message, reply_tx.clone(), prefetch_permit) {
             Ok(()) => {
                 let (queued, active) = metrics.snapshot();
                 crate::logger::log(format!(
@@ -648,17 +700,38 @@ fn enqueue_work(
     metrics: &QueueMetrics,
     message: ClientMessage,
     reply: mpsc::Sender<ServerMessage>,
+    prefetch_permit: Option<PrefetchPermit>,
 ) -> Result<(), mpsc::TrySendError<Work>> {
     metrics.reserve();
     let result = work_tx.try_send(Work::Request {
         message,
         reply,
         enqueued_at: Instant::now(),
+        _prefetch_permit: prefetch_permit,
     });
     if result.is_err() {
         metrics.rollback();
     }
     result
+}
+
+fn try_acquire_prefetch(
+    in_flight: &Arc<AtomicUsize>,
+    heavy_worker_count: usize,
+    queued: usize,
+    active: usize,
+) -> Option<PrefetchPermit> {
+    // prefetch 開始後も foreground 用 worker を 1 本空ける。queue が既にある時も
+    // FIFO の前後関係で表示要求を遅らせ得るため受け付けない。
+    if heavy_worker_count < 2 || queued > 0 || active >= heavy_worker_count - 1 {
+        return None;
+    }
+    in_flight
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| PrefetchPermit {
+            in_flight: Arc::clone(in_flight),
+        })
 }
 
 fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
@@ -990,6 +1063,7 @@ mod tests {
                 request: mimageviewer_ipc::HomeRequest,
             },
             reply_tx,
+            None,
         )
         .expect("Home request must enter its dedicated queue");
 
@@ -1006,6 +1080,18 @@ mod tests {
         work_tx.send(Work::Stop).unwrap();
         worker.join().unwrap();
         assert_eq!(metrics.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn prefetch_uses_at_most_one_remote_worker_and_is_disabled_with_one_worker() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        assert!(try_acquire_prefetch(&in_flight, 1, 0, 0).is_none());
+        assert!(try_acquire_prefetch(&in_flight, 2, 1, 0).is_none());
+        assert!(try_acquire_prefetch(&in_flight, 2, 0, 1).is_none());
+        let first = try_acquire_prefetch(&in_flight, 2, 0, 0).expect("first prefetch permit");
+        assert!(try_acquire_prefetch(&in_flight, 2, 0, 0).is_none());
+        drop(first);
+        assert!(try_acquire_prefetch(&in_flight, 2, 0, 0).is_some());
     }
 
     #[test]

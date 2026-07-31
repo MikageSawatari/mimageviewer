@@ -10,8 +10,9 @@ use mimageviewer_ipc::{
     CollectionPayload, CollectionRequest, CollectionResponse, ContainerPayload, ContainerRequest,
     ContainerResponse, FrameError, HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload,
-    PageRequest, PageResponse, RemoteAddress, RequestId, ServerMessage, ThumbnailError,
-    ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, read_frame, write_frame,
+    PagePriority, PageRequest, PageResponse, RemoteAddress, RequestId, ServerMessage,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, read_frame,
+    write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -362,12 +363,14 @@ impl ThumbnailClient {
         &self,
         address: RemoteAddress,
         target_px: u32,
+        priority: PagePriority,
     ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Page {
             id,
             request: PageRequest {
                 address: address.clone(),
                 target_px,
+                priority,
             },
         })
         .and_then(|success| match success.value {

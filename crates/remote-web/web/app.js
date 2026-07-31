@@ -3,23 +3,34 @@ import {
   FitMode,
   command,
   commandFromKey,
+  containerPageTargetPx,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
   nextFitMode,
+  pagePrefetchPlan,
   reduceViewerTransform,
   snappedGridOffset,
   thumbnailBindingMatches,
   thumbnailRetryDecision,
+  shouldShowLoadingIndicator,
   viewerTapCommand,
   viewerImageLayout,
   viewerWheelCommand,
-} from "/command-core.mjs";
+} from "./command-core.mjs";
 
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const TELEMETRY_ENABLED = true;
 const THUMBNAIL_MAX_CONCURRENCY = 4;
+const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
+// 3 ページなら実測中央値 605 KiB で約 1.8 MiB を先行保持でき、通常の読書速度で
+// 次ページを間に合わせやすい。逆方向は戻る 1 回分、全体は 6 Blob に制限する。
+const PAGE_PREFETCH_AHEAD = 3;
+const PAGE_PREFETCH_BEHIND = 1;
+const PAGE_RESOURCE_CACHE_LIMIT = 6;
+const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
 
 class AuthenticationRequiredError extends Error {}
 
@@ -70,7 +81,149 @@ class RequestLimiter {
   }
 }
 
+class PageResourceCache {
+  constructor(
+    limit = PAGE_RESOURCE_CACHE_LIMIT,
+    byteLimit = PAGE_RESOURCE_CACHE_MAX_BYTES
+  ) {
+    this.limit = Math.max(1, Number(limit) || 1);
+    this.byteLimit = Math.max(1, Number(byteLimit) || 1);
+    this.ready = new Map();
+    this.pending = [];
+    this.active = null;
+  }
+
+  async loadForeground(request, signal) {
+    const cached = this.ready.get(request.cacheKey);
+    if (cached) {
+      this.ready.delete(request.cacheKey);
+      this.ready.set(request.cacheKey, cached);
+      return { ...cached, prefetchStatus: "hit" };
+    }
+    if (this.active?.key === request.cacheKey) {
+      const resource = await awaitWithAbort(this.active.promise, signal);
+      return { ...resource, prefetchStatus: "in_flight" };
+    }
+    if (this.active) this.active.controller.abort();
+    this.pending = this.pending.filter((item) => item.cacheKey !== request.cacheKey);
+    const resource = await fetchPageResource(request, signal, false);
+    this.remember(request.cacheKey, resource);
+    return { ...resource, prefetchStatus: "miss" };
+  }
+
+  schedule(requests) {
+    const unique = [];
+    const seen = new Set();
+    for (const request of requests) {
+      if (!request?.cacheKey || seen.has(request.cacheKey) || this.ready.has(request.cacheKey)) {
+        continue;
+      }
+      seen.add(request.cacheKey);
+      unique.push(request);
+    }
+    this.pending = unique;
+    if (this.active && !seen.has(this.active.key)) this.active.controller.abort();
+    this.pump();
+  }
+
+  pump() {
+    if (this.active) return;
+    const request = this.pending.shift();
+    if (!request) return;
+    if (this.ready.has(request.cacheKey)) {
+      this.pump();
+      return;
+    }
+    const controller = new AbortController();
+    const active = {
+      key: request.cacheKey,
+      controller,
+      promise: null,
+    };
+    active.promise = fetchPageResource(request, controller.signal, true)
+      .then((resource) => {
+        if (!controller.signal.aborted) {
+          this.remember(request.cacheKey, resource);
+          rememberMediaImageInfo(request, resource.info);
+          enqueueTelemetry({
+            type: "page_prefetch",
+            status: "ready",
+            fetch_ms: roundMs(resource.fetchMs),
+            bytes: resource.blob.size,
+            requested_width: request.width,
+          });
+        }
+        return resource;
+      })
+      .catch((error) => {
+        if (error?.status === 503) this.pending = [];
+        if (error?.name !== "AbortError") {
+          enqueueTelemetry({
+            type: "page_prefetch",
+            status: "failed",
+            message: limitText(error instanceof Error ? error.message : error, 240),
+          });
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (this.active === active) {
+          this.active = null;
+          this.pump();
+        }
+      });
+    // A rejected background promise must be observed even when no foreground load joins it.
+    active.promise.catch(() => {});
+    this.active = active;
+  }
+
+  remember(key, resource) {
+    this.ready.delete(key);
+    this.ready.set(key, resource);
+    while (
+      this.ready.size > this.limit ||
+      [...this.ready.values()].reduce((sum, value) => sum + value.blob.size, 0) >
+        this.byteLimit
+    ) {
+      this.ready.delete(this.ready.keys().next().value);
+    }
+  }
+
+  clear() {
+    this.pending = [];
+    this.active?.controller.abort();
+    this.active = null;
+    this.ready.clear();
+  }
+}
+
+function awaitWithAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(abortError());
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      }
+    );
+  });
+}
+
+function abortError() {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
 const thumbnailRequestLimiter = new RequestLimiter(THUMBNAIL_MAX_CONCURRENCY);
+const pageResourceCache = new PageResourceCache();
 
 const telemetryState = {
   queue: [],
@@ -104,6 +257,8 @@ const state = {
   imageIndex: -1,
   fitMode: FitMode.PAGE,
   imageInfoCache: new Map(),
+  containerImageInfoHints: new Map(),
+  pageDirection: 1,
   requestController: null,
   virtualGrid: null,
   thumbnailTracker: null,
@@ -115,27 +270,28 @@ const state = {
   authCountdownTimer: 0,
 };
 
-window.addEventListener("popstate", () => dispatchRoute());
-window.addEventListener("keydown", onGlobalKeyDown);
-
 let recentPointerSource = { source: "mouse", at: 0 };
-window.addEventListener(
-  "pointerdown",
-  (event) => {
-    recentPointerSource = {
-      source: pointerInputSource(event.pointerType),
-      at: performance.now(),
-    };
-  },
-  true
-);
+if (!RUNTIME_TEST_MODE) {
+  window.addEventListener("popstate", () => dispatchRoute());
+  window.addEventListener("keydown", onGlobalKeyDown);
+  window.addEventListener(
+    "pointerdown",
+    (event) => {
+      recentPointerSource = {
+        source: pointerInputSource(event.pointerType),
+        at: performance.now(),
+      };
+    },
+    true
+  );
 
-if (TELEMETRY_ENABLED) {
-  installTelemetry();
-} else {
-  hudElement.hidden = true;
+  if (TELEMETRY_ENABLED) {
+    installTelemetry();
+  } else {
+    hudElement.hidden = true;
+  }
+  boot();
 }
-boot();
 
 async function boot() {
   renderLoading("接続を確認しています");
@@ -281,6 +437,7 @@ function renderPinLogin(initialRemainingSeconds = 0) {
 async function dispatchRoute() {
   if (!state.authenticated) return;
   const route = parseRoute(location.hash);
+  if (route.kind !== "media") pageResourceCache.clear();
   try {
     if (route.kind === "home") {
       renderHome(route.tab);
@@ -1445,8 +1602,12 @@ function entryTypeLabel(kind) {
 }
 
 function renderImageViewer(index, interactionStartedAt = performance.now()) {
+  const previousIndex = state.imageIndex;
   cleanupScreen();
   state.screenContext = "viewer";
+  if (previousIndex >= 0 && previousIndex !== index) {
+    state.pageDirection = index > previousIndex ? 1 : -1;
+  }
   state.imageIndex = index;
   const imageEntry = state.images[index];
   document.title = `${imageEntry.name} — mIV Remote`;
@@ -1457,7 +1618,12 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   image.alt = imageEntry.name;
   image.draggable = false;
   image.dataset.telemetryObserved = "true";
-  stage.append(image);
+  const loadingIndicator = element("div", "viewer-loading-indicator");
+  loadingIndicator.hidden = true;
+  loadingIndicator.setAttribute("role", "progressbar");
+  loadingIndicator.setAttribute("aria-label", "次のページを読み込んでいます");
+  loadingIndicator.append(element("span", "viewer-loading-indicator-bar"));
+  stage.append(image, loadingIndicator);
 
   const top = element("div", "viewer-ui top");
   const close = textElement("button", "×", "viewer-button");
@@ -1487,6 +1653,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     counter,
     previous,
     next,
+    loadingIndicator,
   });
   close.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -1521,6 +1688,7 @@ function changeImageTo(nextIndex) {
     return false;
   }
   if (nextIndex === state.imageIndex) return false;
+  state.pageDirection = nextIndex > state.imageIndex ? 1 : -1;
   state.imageIndex = nextIndex;
   const entry = state.images[nextIndex];
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
@@ -1555,7 +1723,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     return;
   }
   const request = imageRequest(entry, info, viewer.stage);
-  viewer.load({
+  const displayed = await viewer.load({
     name: entry.name,
     request,
     info,
@@ -1564,6 +1732,11 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     count: state.images.length,
     interactionStartedAt,
   });
+  if (!displayed || state.viewer !== viewer) return;
+  if (entry.address) {
+    schedulePagePrefetch(viewer).catch(() => {});
+    return;
+  }
   const nextEntry = state.images[state.imageIndex + 1];
   if (nextEntry) {
     imageInfo(nextEntry).then((nextInfo) => {
@@ -1575,19 +1748,35 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
   }
 }
 
-function imageRequest(entry, info, stage) {
+async function schedulePagePrefetch(viewer) {
+  const currentIdentity = entryIdentity(state.images[state.imageIndex] ?? {});
+  const indexes = pagePrefetchPlan({
+    visibleIndexes: [state.imageIndex],
+    itemCount: state.images.length,
+    direction: state.pageDirection,
+    ahead: PAGE_PREFETCH_AHEAD,
+    behind: PAGE_PREFETCH_BEHIND,
+  });
+  const requests = await Promise.all(
+    indexes.map(async (index) => {
+      const entry = state.images[index];
+      if (!entry?.address) return null;
+      const info = await imageInfo(entry);
+      return imageRequest(entry, info, viewer.stage, { prefetch: true });
+    })
+  );
+  if (
+    state.viewer !== viewer ||
+    entryIdentity(state.images[state.imageIndex] ?? {}) !== currentIdentity
+  ) {
+    return;
+  }
+  pageResourceCache.schedule(requests.filter(Boolean));
+}
+
+function imageRequest(entry, info, stage, { prefetch = false } = {}) {
   const dpr = window.devicePixelRatio || 1;
   if (entry.address) {
-    const targetPx = clamp(
-      Math.ceil(
-        Math.max(
-          stage.clientWidth || window.innerWidth,
-          stage.clientHeight || window.innerHeight
-        ) * dpr
-      ),
-      256,
-      8192
-    );
     const layout = viewerImageLayout({
       mode: state.fitMode,
       sourceWidth: info.width,
@@ -1597,18 +1786,32 @@ function imageRequest(entry, info, stage) {
       devicePixelRatio: dpr,
       maxRequestWidth: 8192,
     });
+    const targetPx = containerPageTargetPx({
+      requestWidth: layout.requestWidth,
+      sourceWidth: info.width,
+      sourceHeight: info.height,
+      minimum: 256,
+      maximum: 8192,
+    });
+    const infoCacheKey = mediaImageInfoKey(entry.address);
     return {
       url: apiUrl(
         "/api/page",
-        addressQueryParams(entry.address, { w: targetPx })
+        addressQueryParams(entry.address, {
+          w: targetPx,
+          ...(prefetch ? { prefetch: 1 } : {}),
+        })
       ),
+      cacheKey: `${infoCacheKey}\n${targetPx}`,
       width: targetPx,
       cssWidth: layout.cssWidth,
       dpr,
       layout,
       fitMode: state.fitMode,
       dynamicInfo: true,
-      infoCacheKey: mediaImageInfoKey(entry.address),
+      infoCacheKey,
+      containerInfoKey: mediaContainerInfoKey(entry.address),
+      prefetch,
     };
   }
   const layout = viewerImageLayout({
@@ -1637,6 +1840,8 @@ function imageInfo(entry) {
   if (entry.address) {
     const key = mediaImageInfoKey(entry.address);
     if (state.imageInfoCache.has(key)) return state.imageInfoCache.get(key);
+    const hint = state.containerImageInfoHints.get(mediaContainerInfoKey(entry.address));
+    if (hint) return Promise.resolve({ ...hint, dynamic: true, estimated: true });
     return Promise.resolve({
       width: Math.max(1, window.innerWidth),
       height: Math.max(1, window.innerHeight),
@@ -1659,6 +1864,21 @@ function imageInfo(entry) {
 
 function mediaImageInfoKey(address) {
   return `media\n${addressIdentity(address)}`;
+}
+
+function mediaContainerInfoKey(address) {
+  return `${address.favorite_id}\n${address.relative_path}`;
+}
+
+function rememberMediaImageInfo(request, info) {
+  if (!info?.width || !info?.height) return;
+  const resolved = { width: info.width, height: info.height };
+  if (request.infoCacheKey) {
+    state.imageInfoCache.set(request.infoCacheKey, Promise.resolve(resolved));
+  }
+  if (request.containerInfoKey) {
+    state.containerImageInfoHints.set(request.containerInfoKey, resolved);
+  }
 }
 
 function bindThumbnail(image, entry, tracker, cellWidth) {
@@ -2360,8 +2580,8 @@ class CommandMenu {
   }
 }
 
-class ImageViewer {
-  constructor({ root, stage, image, title, counter, previous, next }) {
+export class ImageViewer {
+  constructor({ root, stage, image, title, counter, previous, next, loadingIndicator }) {
     this.root = root;
     this.stage = stage;
     this.image = image;
@@ -2369,6 +2589,7 @@ class ImageViewer {
     this.counter = counter;
     this.previous = previous;
     this.next = next;
+    this.loadingIndicator = loadingIndicator;
     this.scale = 1;
     this.panX = 0;
     this.panY = 0;
@@ -2382,6 +2603,7 @@ class ImageViewer {
     this.loadSequence = 0;
     this.fetchController = null;
     this.objectUrl = null;
+    this.loadingTimer = 0;
 
     this.pointerDown = (event) => this.onPointerDown(event);
     this.pointerMove = (event) => this.onPointerMove(event);
@@ -2418,7 +2640,7 @@ class ImageViewer {
     this.counter.textContent = `${index + 1} / ${count}`;
     this.previous.disabled = index === 0;
     this.next.disabled = index === count - 1;
-    this.loadMeasuredImage(request, interactionStartedAt, name, info);
+    return this.loadMeasuredImage(request, interactionStartedAt, name, info);
   }
 
   setLayout(fitMode, layout, info, image = this.image) {
@@ -2440,22 +2662,33 @@ class ImageViewer {
     const controller = new AbortController();
     this.fetchController = controller;
     const fetchStartedAt = performance.now();
+    this.beginLoadingIndicator(sequence, fetchStartedAt);
     let pendingObjectUrl = null;
     try {
-      const response = await observedFetch(request.url, {
-        signal: controller.signal,
-        credentials: "same-origin",
-      });
-      if (!response.ok) {
-        const detail = await response.clone().json().catch(() => ({}));
-        throw new Error(
-          detail.message ||
-            `画像取得に失敗しました (HTTP ${response.status})。`
-        );
+      let resource;
+      if (request.cacheKey) {
+        resource = await pageResourceCache.loadForeground(request, controller.signal);
+      } else {
+        const response = await observedFetch(request.url, {
+          signal: controller.signal,
+          credentials: "same-origin",
+        });
+        if (!response.ok) {
+          const detail = await response.clone().json().catch(() => ({}));
+          throw new Error(
+            detail.message ||
+              `画像取得に失敗しました (HTTP ${response.status})。`
+          );
+        }
+        resource = {
+          blob: await response.blob(),
+          requestId: response.headers.get("X-mIV-Request-Id"),
+          prefetchStatus: "not_applicable",
+        };
       }
-      const blob = await response.blob();
+      const blob = resource.blob;
       const fetchMs = performance.now() - fetchStartedAt;
-      const requestId = response.headers.get("X-mIV-Request-Id");
+      const requestId = resource.requestId;
       if (sequence !== this.loadSequence) return;
 
       pendingObjectUrl = URL.createObjectURL(blob);
@@ -2485,9 +2718,7 @@ class ImageViewer {
         });
         resolvedInfo = actualInfo;
         request.cssWidth = resolvedLayout.cssWidth;
-        if (request.infoCacheKey) {
-          state.imageInfoCache.set(request.infoCacheKey, Promise.resolve(actualInfo));
-        }
+        rememberMediaImageInfo(request, actualInfo);
       }
       if (sequence !== this.loadSequence) {
         URL.revokeObjectURL(pendingObjectUrl);
@@ -2502,8 +2733,9 @@ class ImageViewer {
       this.objectUrl = pendingObjectUrl;
       pendingObjectUrl = null;
       if (previousObjectUrl) URL.revokeObjectURL(previousObjectUrl);
+      this.endLoadingIndicator(sequence);
       await nextFrame();
-      if (sequence !== this.loadSequence) return;
+      if (sequence !== this.loadSequence) return false;
 
       const event = {
         type: "image",
@@ -2517,23 +2749,51 @@ class ImageViewer {
         css_width: roundMs(request.cssWidth),
         device_pixel_ratio: roundMs(request.dpr),
         fit_mode: request.fitMode,
+        prefetch_status: resource.prefetchStatus,
       };
       enqueueTelemetry(event);
       hudState.lastImage = event;
       hudState.displayDurations.push(event.tap_to_display_ms);
       if (hudState.displayDurations.length > 20) hudState.displayDurations.shift();
       updateHud();
+      return true;
     } catch (error) {
       if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
-      if (sequence !== this.loadSequence) return;
-      if (error?.name === "AbortError") return;
+      this.endLoadingIndicator(sequence);
+      if (sequence !== this.loadSequence) return false;
+      if (error?.name === "AbortError") return false;
       this.title.textContent =
         error instanceof Error ? error.message : "ページを表示できませんでした。";
       this.root.classList.remove("viewer-ui-hidden");
       recordClientError("image_load_error", error, {
         resource: safeResourcePath(request.url),
       });
+      return false;
     }
+  }
+
+  beginLoadingIndicator(sequence, startedAt) {
+    clearTimeout(this.loadingTimer);
+    this.loadingIndicator.hidden = true;
+    this.loadingTimer = setTimeout(() => {
+      if (
+        sequence === this.loadSequence &&
+        shouldShowLoadingIndicator(
+          true,
+          performance.now() - startedAt,
+          PAGE_LOADING_INDICATOR_DELAY_MS
+        )
+      ) {
+        this.loadingIndicator.hidden = false;
+      }
+    }, PAGE_LOADING_INDICATOR_DELAY_MS);
+  }
+
+  endLoadingIndicator(sequence) {
+    if (sequence !== this.loadSequence) return;
+    clearTimeout(this.loadingTimer);
+    this.loadingTimer = 0;
+    this.loadingIndicator.hidden = true;
   }
 
   resetTransform() {
@@ -2739,6 +2999,8 @@ class ImageViewer {
 
   destroy() {
     clearTimeout(this.resizeTimer);
+    clearTimeout(this.loadingTimer);
+    this.loadingIndicator.hidden = true;
     this.loadSequence += 1;
     this.fetchController?.abort();
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
@@ -2920,6 +3182,39 @@ async function observedFetch(url, options = {}) {
     );
   }
   return response;
+}
+
+async function fetchPageResource(request, signal, prefetch) {
+  const startedAt = performance.now();
+  const options = {
+    signal,
+    credentials: "same-origin",
+    headers: { Accept: "image/*" },
+    ...(prefetch ? { priority: "low" } : {}),
+  };
+  const response = prefetch
+    ? await fetch(request.url, options)
+    : await observedFetch(request.url, options);
+  if (!response.ok) {
+    const detail = await response.clone().json().catch(() => ({}));
+    const error = new Error(
+      detail.message || `画像取得に失敗しました (HTTP ${response.status})。`
+    );
+    error.status = response.status;
+    error.code = detail.error;
+    throw error;
+  }
+  const width = Number(response.headers.get("X-mIV-Image-Width"));
+  const height = Number(response.headers.get("X-mIV-Image-Height"));
+  return {
+    blob: await response.blob(),
+    requestId: response.headers.get("X-mIV-Request-Id"),
+    fetchMs: performance.now() - startedAt,
+    info:
+      Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0
+        ? { width, height }
+        : null,
+  };
 }
 
 function enqueueTelemetry(event) {

@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerPayload, ContainerRequest,
-    ContainerResponse, MediaError, MediaErrorCode, PagePayload, PageRequest, PageResponse,
-    RemoteAddress, RemoteSubresource, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
+    ContainerResponse, MediaError, MediaErrorCode, PagePayload, PagePriority, PageRequest,
+    PageResponse, RemoteAddress, RemoteSubresource, ThumbnailError, ThumbnailErrorCode,
+    ThumbnailResponse,
 };
 
 use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
@@ -83,6 +84,7 @@ impl ContainerEngine {
             &resolved,
             request.target_px,
             false,
+            false,
             context,
         ) {
             Ok(loaded) => crate::catalog::encode_thumb_webp(
@@ -113,6 +115,7 @@ impl ContainerEngine {
     pub(super) fn page(&self, request: PageRequest, context: &WorkerContext) -> PageResponse {
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
+        let priority = request.priority;
         if request.target_px == 0 || request.target_px > MAX_PAGE_RENDER_PX {
             return PageResponse::Error(media_error(
                 MediaErrorCode::BadRequest,
@@ -128,6 +131,7 @@ impl ContainerEngine {
             &resolved,
             request.target_px,
             true,
+            priority == PagePriority::Foreground,
             context,
         ) {
             Ok(loaded) => match crate::catalog::encode_thumb_webp(
@@ -153,7 +157,12 @@ impl ContainerEngine {
             PageResponse::Error(_) => ("error", 0),
         };
         crate::logger::log(format!(
-            "remote_ipc: media_operation operation=page source_kind={source_kind} outcome={outcome} duration_ms={:.1} output_bytes={output_bytes}",
+            "remote_ipc: media_operation operation=page source_kind={source_kind} priority={} outcome={outcome} duration_ms={:.1} output_bytes={output_bytes}",
+            if priority == PagePriority::Prefetch {
+                "prefetch"
+            } else {
+                "foreground"
+            },
             started.elapsed().as_secs_f64() * 1000.0
         ));
         response
@@ -340,6 +349,7 @@ impl ContainerEngine {
         resolved: &ResolvedFavoritePath,
         target_px: u32,
         full_page: bool,
+        foreground: bool,
         context: &WorkerContext,
     ) -> Result<LoadedImage, MediaError> {
         if target_px == 0 || target_px > MAX_PAGE_RENDER_PX {
@@ -363,8 +373,9 @@ impl ContainerEngine {
             mtime,
             file_size,
             skip_cache: full_page,
-            // remote は PDF pool の Normal lane を使い、Critical 予約枠を消費しない。
-            priority: false,
+            // foreground でも HighNormal までとし、ローカル UI 用 Critical 予約枠は
+            // 消費しない。prefetch は Normal lane へ分離する。
+            priority: foreground,
             context_epoch: 0,
             ..Default::default()
         };

@@ -779,3 +779,39 @@ ZIP page の切替時は、元寸法未取得の address に viewport 寸法を�
 
 PDFium の `PasswordError` は subprocess protocol を通しても失われない専用 marker に変換し、
 本体 IPC の `PasswordRequired`、HTTP 423、画面の「パスワード保護」表示まで区別を維持する。
+
+### 12.6 ページ先読みと表示待ちの短縮 (2026-07-31)
+
+実機 `/api/page` 56 件は p50 938 ms、p95 1,740 ms、最大 1,973 ms、応答 p50 605 KiB で、
+待ちの大部分は IPC 内の render + WebP encode だった。既存の container 先読みは現在ページの
+取得開始直後に参照を保持しない `new Image()` へ次の1枚を設定するだけで、方向、abort、保持上限、
+foreground との優先度を持っていなかった。
+
+表示完了後、最後の操作方向へ3ページ、逆方向へ1ページを順次先読みする。計画関数は現在の
+`visibleIndexes` を受けるため、次の見開き増分では `[left, right]` を渡すだけで同じ境界計算を
+利用できる。先読み通信は同時1件、圧縮 Blob の LRU は最大6件かつ32 MiBとし、viewer を離れた時、
+別方向の foreground を要求した時、または計画から外れた時は `AbortController` で不要な fetch を
+中断する。ready Blob は foreground が直接使い、network / IPC 待ちなしで decode と原子的差替えへ
+進む。
+
+protocol v6 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
+prefetch admission を1件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
+prefetch queued + active を1件に制限し、remote heavy worker が1本しかない設定では prefetch を
+`Busy` で拒否する。2 worker 時も heavy queue / active が空の時だけ先読みを開始し、最大1本なので
+もう1本を foreground に残す。既存 heavy 処理があれば先読みは待たせず `Busy` にする。PDF pool
+では foreground を `HighNormal`、prefetch を `Normal` に送り、ローカル UI の `Critical` 予約枠は
+リモート要求に使用しない。
+
+旧 container page の要求長辺は `max(viewport width, viewport height) * DPR` で、縦長ページを
+全体 fit する場合も不要な viewport 高さを要求していた。実ログの PDF target 3,840 群 (n=38) は
+IPC p50 1,323 ms / p95 1,712 ms、blob p50 2.36 MiBだったのに対し、target 1,805 以下群 (n=16) は
+IPC p50 371 ms / p95 696 ms、blob p50 457 KiBだった。修正後は
+`rendered physical width × source aspect` の長辺を `w` とする。最初のページで得た実縦横比を
+container hint として後続ページと先読みに利用し、全体 fit の同一実機例では target 3,840 から
+約1,802へ下がる。先頭ページだけは実寸未取得なので従来の安全な viewport 推定を使う。
+
+foreground が225 msを超えた時だけ、表示中の旧ページ中央へ高さ3 pxの半透明 indeterminate barを
+重ねる。完了、失敗、abort で必ず消し、速い cache hit では一瞬も表示しない。閾値判定と先読み順、
+要求長辺は `command-core.mjs` の純粋関数としてテストする。また `web/package.json` の ESM 指定と
+Node 標準 `node:test` だけを使う最小 fake DOM テストを追加し、viewer の fetch → blob → decode →
+layout → atomic replace を実行する。bundler、TypeScript、追加 package、build step は導入しない。

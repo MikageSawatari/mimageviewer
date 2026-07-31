@@ -647,6 +647,39 @@ button {
   user-select: none;
 }
 
+.viewer-loading-indicator {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  left: 50%;
+  overflow: hidden;
+  width: min(42vw, 190px);
+  height: 3px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 18%);
+  box-shadow: 0 1px 5px rgb(0 0 0 / 55%);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.viewer-loading-indicator[hidden] {
+  display: none;
+}
+
+.viewer-loading-indicator-bar {
+  display: block;
+  width: 38%;
+  height: 100%;
+  border-radius: inherit;
+  background: rgb(216 229 255 / 82%);
+  animation: viewer-loading-slide 1s ease-in-out infinite;
+}
+
+@keyframes viewer-loading-slide {
+  from { transform: translateX(-115%); }
+  to { transform: translateX(300%); }
+}
+
 .viewer-stage[data-fit-mode="page"] {
   display: grid;
   overflow: hidden;
