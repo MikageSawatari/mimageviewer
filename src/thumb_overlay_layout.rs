@@ -460,20 +460,32 @@ pub fn layout_thumbnail_overlays(
     if let Some(rating_text) = input.rating_text {
         let style = rating_badge_style();
         let size = measured_badge_size(rating_text, style, &mut measure);
-        let row_top = bottom_left
+        // The rating belongs in the corner. It only moves up when something already in the
+        // bottom row would sit under it: a container badge is anchored to the same corner and
+        // always does, a filename plate is centred and usually does not. Lifting it
+        // unconditionally left the stars floating over the picture on a plain video cell.
+        let corner = egui::Rect::from_min_size(egui::pos2(left_x, bottom_y - size.y), size);
+        let blocked = bottom_left
             .container
             .iter()
             .chain(bottom_left.filename.iter())
-            .map(|placement| placement.rect.min.y)
-            .reduce(f32::min)
-            .unwrap_or(bottom_y);
+            .any(|placement| placement.rect.intersects(corner));
+        let rect = if blocked {
+            let row_top = bottom_left
+                .container
+                .iter()
+                .chain(bottom_left.filename.iter())
+                .map(|placement| placement.rect.min.y)
+                .reduce(f32::min)
+                .unwrap_or(bottom_y);
+            egui::Rect::from_min_size(egui::pos2(left_x, row_top - BOTTOM_ITEM_GAP - size.y), size)
+        } else {
+            corner
+        };
         bottom_left.rating = Some(BadgePlacement {
             kind: BadgeKind::Rating,
             priority: BadgePriority::Rating,
-            rect: egui::Rect::from_min_size(
-                egui::pos2(left_x, row_top - BOTTOM_ITEM_GAP - size.y),
-                size,
-            ),
+            rect,
             text: rating_text.to_owned(),
             style,
         });
@@ -702,6 +714,95 @@ mod tests {
         );
         assert!(layout.top_left.tag.is_some());
         assert_pairwise_non_intersecting(layout.top_left.placements());
+    }
+
+    /// A plain video cell has no container badge, and its filename plate is centred, so the
+    /// rating stays in the corner where it has always been. Lifting it there left the stars
+    /// floating in the middle of the picture (reported on the build of 2026-07-31).
+    #[test]
+    fn rating_stays_in_the_corner_when_only_a_centred_filename_shares_the_row() {
+        let (cell_rect, inner) = cell(240.0);
+        let layout = layout_thumbnail_overlays(
+            ThumbnailOverlayLayoutInput {
+                cell: cell_rect,
+                inner,
+                bookmark_time: None,
+                upscaled_video: false,
+                edit_badges: EditBadgeFlags::default(),
+                tags: &[],
+                bottom_container: None,
+                rating_text: Some("★★★"),
+                filename: Some("clip.mp4"),
+            },
+            measure,
+        );
+
+        let rating = layout.bottom_left.rating.as_ref().unwrap();
+        let filename = layout.bottom_left.filename.as_ref().unwrap();
+        assert!(!rating.rect.intersects(filename.rect));
+        assert!(
+            (rating.rect.max.y - filename.rect.max.y).abs() < f32::EPSILON,
+            "the rating should share the bottom row with the plate, not sit above it"
+        );
+    }
+
+    /// A container badge is anchored to the same corner, so the rating has to move up - this is
+    /// the "the folder name overlaps the stars" report the lift exists for.
+    #[test]
+    fn rating_lifts_above_a_container_badge_in_the_same_corner() {
+        let (cell_rect, inner) = cell(240.0);
+        let layout = layout_thumbnail_overlays(
+            ThumbnailOverlayLayoutInput {
+                cell: cell_rect,
+                inner,
+                bookmark_time: None,
+                upscaled_video: false,
+                edit_badges: EditBadgeFlags::default(),
+                tags: &[],
+                bottom_container: Some(BottomContainerInput {
+                    kind: BottomContainerKind::Folder,
+                    label: "album",
+                }),
+                rating_text: Some("📁★★★"),
+                filename: None,
+            },
+            measure,
+        );
+
+        let rating = layout.bottom_left.rating.as_ref().unwrap();
+        let container = layout.bottom_left.container.as_ref().unwrap();
+        assert!(!rating.rect.intersects(container.rect));
+        assert!(rating.rect.max.y <= container.rect.min.y);
+    }
+
+    /// A filename long enough to reach the corner pushes the rating up as well - the rule is
+    /// "something is actually under it", not "which kind of badge it is".
+    #[test]
+    fn rating_lifts_when_a_wide_filename_reaches_the_corner() {
+        let (cell_rect, inner) = cell(240.0);
+        let layout = layout_thumbnail_overlays(
+            ThumbnailOverlayLayoutInput {
+                cell: cell_rect,
+                inner,
+                bookmark_time: None,
+                upscaled_video: false,
+                edit_badges: EditBadgeFlags::default(),
+                tags: &[],
+                bottom_container: None,
+                rating_text: Some("★★★★★"),
+                filename: Some("非常に長い日本語のファイル名がここに入ります.mp4"),
+            },
+            measure,
+        );
+
+        let rating = layout.bottom_left.rating.as_ref().unwrap();
+        let filename = layout.bottom_left.filename.as_ref().unwrap();
+        assert!(
+            filename.rect.min.x <= rating.rect.max.x,
+            "設定した前提が崩れている"
+        );
+        assert!(!rating.rect.intersects(filename.rect));
+        assert!(rating.rect.max.y <= filename.rect.min.y);
     }
 
     #[test]

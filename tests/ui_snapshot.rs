@@ -562,6 +562,54 @@ fn compact_file_format_badges_light() {
     );
 }
 
+/// 動画セルはコンテナバッジを持たず、ファイル名プレートは中央寄せなので、評価は左下の角に
+/// 残る。無条件に 1 段上げると星が絵の中に浮いて見える (2026-07-31 の実機報告)。
+#[test]
+fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
+    snapshot_with_theme(
+        "rating_with_centred_filename_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            let (response, painter) =
+                ui.allocate_painter(egui::vec2(300.0, 170.0), egui::Sense::hover());
+            let cell = response.rect;
+            let inner = cell.shrink(4.0);
+            painter.rect_filled(inner, 3.0, egui::Color32::from_gray(58));
+            let empty_tags = Vec::new();
+            let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
+                mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    bookmark_time: Some("0:25"),
+                    upscaled_video: false,
+                    edit_badges: Default::default(),
+                    tags: &empty_tags,
+                    bottom_container: None,
+                    rating_text: Some("★★★"),
+                    filename: Some("「名探偵」エンディング.mp4"),
+                },
+                |text, style| {
+                    mimageviewer::ui_helpers::measure_thumbnail_badge_text(&painter, text, style)
+                },
+            );
+            if let Some(time) = layout.top_left.bookmark_time.as_ref() {
+                mimageviewer::ui_helpers::draw_overlay_bookmark_time_badge(&painter, time, false);
+            }
+            if let Some(filename) = layout.bottom_left.filename.as_ref() {
+                mimageviewer::ui_helpers::draw_cell_filename(
+                    &painter,
+                    filename,
+                    egui::Color32::from_gray(230),
+                    true,
+                );
+            }
+            if let Some(rating) = layout.bottom_left.rating.as_ref() {
+                mimageviewer::ui_helpers::draw_overlay_rating_badge(&painter, rating, false);
+            }
+        },
+    );
+}
+
 #[test]
 fn bookmark_time_and_tag_badges_dark() {
     snapshot_with_theme(
