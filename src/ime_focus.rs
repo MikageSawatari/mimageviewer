@@ -74,7 +74,9 @@ fn ime_focus_key_pressed(ctx: &egui::Context) -> bool {
 /// `focus_request` は、呼び出し側が初回フォーカス等に使う request latch があれば渡す。
 /// 復帰時は同 latch を次 frame 用に立て直す。latch を持たない欄では widget ID ごとの
 /// 一時 latch をこのモジュールが所有する。IME 中でもマウスクリック等、対象キーの event を
-/// 伴わない正当なフォーカス移動は復帰しない。IME 非入力時の通常の Tab traversal も維持する。
+/// 伴わない正当なフォーカス移動は復帰しない。アプリ全体の Tab traversal 無効化は
+/// `crate::egui_focus_policy` の別責務であり、この field-level lock は IME 候補選択中の
+/// focus 保持を独立して保証する。
 /// `ime_active` は必ず `TextEdit` 構築前にこのモジュールで採取する。egui は focus 遷移と
 /// 同じ pass の Ime event を `TextEdit` 内部で queue から除去することがあり、描画後に読むと
 /// fullscreen viewport や native overlay を含む全 context で composition 開始を取り逃がすため。
@@ -379,8 +381,9 @@ mod tests {
     }
 
     #[test]
-    fn tab_without_ime_keeps_normal_text_field_traversal() {
+    fn tab_without_ime_keeps_editing_field_focus_and_input_working() {
         let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
         let first_id = egui::Id::new("plain_tab_first");
         let second_id = egui::Id::new("plain_tab_second");
         let mut first = String::new();
@@ -423,7 +426,33 @@ mod tests {
             },
         );
 
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second_id));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Text("x".to_owned()),
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                    egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                draw_text_fields(
+                    ctx,
+                    first_id,
+                    second_id,
+                    &mut first,
+                    &mut second,
+                    &mut focus_request,
+                );
+            },
+        );
+
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
+        assert_eq!(first, "xあ");
+        assert!(second.is_empty());
     }
 
     #[test]
@@ -602,13 +631,13 @@ mod tests {
             path: "src/egui_focus_policy.rs",
             line_anchor: "singleline(first)",
             expected_occurrences: 1,
-            reason: "通常 Tab traversal 自体を検証する低レベル test fixture",
+            reason: "アプリ全体の Tab focus policy を直接検証する低レベル test fixture",
         },
         RawTextEditExemption {
             path: "src/egui_focus_policy.rs",
             line_anchor: "singleline(second)",
             expected_occurrences: 1,
-            reason: "通常 Tab traversal 自体を検証する低レベル test fixture",
+            reason: "アプリ全体の Tab focus policy を直接検証する低レベル test fixture",
         },
         RawTextEditExemption {
             path: "src/keymap.rs",
@@ -620,13 +649,13 @@ mod tests {
             path: "src/keymap.rs",
             line_anchor: "singleline(&mut first)",
             expected_occurrences: 2,
-            reason: "keymap と通常 Tab traversal の境界を直接検証する test fixture",
+            reason: "keymap とアプリ全体の Tab focus policy の境界を直接検証する test fixture",
         },
         RawTextEditExemption {
             path: "src/keymap.rs",
             line_anchor: "singleline(&mut second)",
             expected_occurrences: 2,
-            reason: "keymap と通常 Tab traversal の境界を直接検証する test fixture",
+            reason: "keymap とアプリ全体の Tab focus policy の境界を直接検証する test fixture",
         },
         RawTextEditExemption {
             path: "src/ui_main.rs",

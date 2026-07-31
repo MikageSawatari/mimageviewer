@@ -79,16 +79,17 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 Windows の egui 経路では、KeySlot でショートカットを所有した押下を egui event queue からも
 同時に除去する。ただし egui 0.33 は UI 実行前の `begin_pass` で <kbd>Tab</kbd> から focus
 方向を確定するため、event 除去だけでは traversal を止められない。各 egui Context に登録した
-`on_begin_pass` ポリシーが、viewport ごとに直前 pass の `PlatformOutput::ime` と focus ID の
-`TextEdit::load_state` を参照し、実際の TextEdit 編集中でない <kbd>Tab</kbd> の focus 方向を
-最初の focusable widget 登録前に
-`FocusDirection::None` へ戻す。event 自体はこの段階では残し、後段の Keymap が通常どおり
-consume する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
+`on_begin_pass` ポリシーが、TextEdit や IME の状態にかかわらず、すべての <kbd>Tab</kbd> の
+focus 方向を最初の focusable widget 登録前に `FocusDirection::None` へ戻す。これは
+「<kbd>Tab</kbd> はアプリ内の keyboard focus を一切移動しない」という固定ルールであり、
+操作カスタマイズの対象外。event 自体はこの段階では残すため、<kbd>Tab</kbd> chord は引き続き
+`FsToggleMetadata` などの `KeyAction` へ割り当て可能で、後段の Keymap が通常どおり consume
+する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
 IME 変換中の <kbd>Tab</kbd> は候補選択キーなので、`ime_focus` が対象 TextEdit の focus-lock を
-有効にして traversal を止める。IME 非入力時はこの lock を外し、TextEdit 間の通常 Tab traversal を
-そのまま許可する。Enter / Escape / Tab による IME focus 復帰と keymap の操作発火抑止は別責務である。
+有効にして対象 field の focus を保持・復帰する。アプリ全体の traversal 無効化、IME field の
+focus 保持、keymap の操作発火抑止は別責務であり、同じ event をそれぞれの ownership 境界で扱う。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
@@ -130,6 +131,7 @@ edge の寿命は 1 フレームのままにする。Action が消費しなか�
 | 分類 | 固定扱いの入力 | 理由 / 備考 |
 |---|---|---|
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
+| keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
 | モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>Enter</kbd> = 無効 | 誤操作防止のため keymap 対象外の固定入力。ダイアログ表示中に Y / N / Esc を消費し、背面の KeyAction へ漏らさない。IME 変換中は Y / N / Esc の確認操作を行わない |
 | 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
