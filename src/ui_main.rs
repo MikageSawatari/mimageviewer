@@ -11659,6 +11659,7 @@ impl App {
         ctx: &egui::Context,
         cell_rect: egui::Rect,
         idx: usize,
+        overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
     ) -> Option<PathBuf> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
@@ -11710,7 +11711,7 @@ impl App {
         if response.clicked() || response.double_clicked() || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
         }
-        let tag_badge_target = self.grid_tag_badge_target(ui, cell_rect, idx);
+        let tag_badge_target = self.grid_tag_badge_target(idx, overlay_layout);
         if let Some((tag_name, badge_rect)) = tag_badge_target.as_ref() {
             if response.hovered()
                 && ctx
@@ -11973,27 +11974,15 @@ impl App {
 
     fn grid_tag_badge_target(
         &self,
-        ui: &egui::Ui,
-        cell_rect: egui::Rect,
         idx: usize,
+        overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
     ) -> Option<(String, egui::Rect)> {
         if self.items_are_drive_list {
             return None;
         }
         let tags = self.cell_tag_list(idx);
         let tag_name = crate::app::primary_grid_tag_for_badge(tags)?.to_owned();
-        let badges = self.grid_edit_badges(idx);
-        let badge_rect = crate::app::grid_tag_badge_hit_rect(
-            ui,
-            cell_rect,
-            badges.page_override,
-            badges.local_adjust,
-            badges.mask,
-            badges.conceal,
-            badges.comic,
-            self.cell_has_pin_badge(idx),
-            tags,
-        )?;
+        let badge_rect = crate::app::grid_tag_badge_hit_rect(overlay_layout)?;
         Some((tag_name, badge_rect))
     }
 
@@ -12300,7 +12289,15 @@ impl App {
 
                             primary_click_hit_cell |=
                                 primary_click_pos.is_some_and(|pos| row_rect.contains(pos));
-                            if let Some(n) = self.handle_cell_interaction(ui, ctx, row_rect, idx) {
+                            let no_thumbnail_overlays =
+                                crate::thumb_overlay_layout::ThumbnailOverlayLayout::default();
+                            if let Some(n) = self.handle_cell_interaction(
+                                ui,
+                                ctx,
+                                row_rect,
+                                idx,
+                                &no_thumbnail_overlays,
+                            ) {
                                 nav = Some(n);
                             }
                             if idx >= self.items.len() {
@@ -12637,37 +12634,23 @@ impl App {
         });
     }
 
-    fn draw_bookmark_view_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize) {
+    fn draw_bookmark_view_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        idx: usize,
+        overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
+    ) {
         let Some(row) = self.bookmark_view_row(idx) else {
             return;
         };
-        let badge = if row.missing {
-            format!("! {}", row.badge_label())
-        } else {
-            row.badge_label()
-        };
-        let font = egui::FontId::proportional(11.0);
-        let text_size = ui
-            .painter()
-            .layout_no_wrap(badge.clone(), font.clone(), egui::Color32::WHITE)
-            .size();
-        let badge_rect = egui::Rect::from_min_size(
-            rect.left_top() + egui::vec2(5.0, 5.0),
-            text_size + egui::vec2(10.0, 5.0),
-        );
-        let fill = if row.missing {
-            egui::Color32::from_rgb(180, 70, 50)
-        } else {
-            egui::Color32::from_black_alpha(190)
-        };
-        ui.painter().rect_filled(badge_rect, 4.0, fill);
-        ui.painter().text(
-            badge_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            badge,
-            font,
-            egui::Color32::WHITE,
-        );
+        if let Some(placement) = overlay_layout.top_left.bookmark_time.as_ref() {
+            crate::ui_helpers::draw_overlay_bookmark_time_badge(
+                ui.painter(),
+                placement,
+                row.missing,
+            );
+        }
         if let Some(title) = row.title() {
             let font = crate::ui_fonts::user_text_font(13.0);
             let max_text_width = (rect.width() - 28.0).max(0.0);
@@ -12694,17 +12677,28 @@ impl App {
                     }
                 }
                 if galley.size().x <= max_text_width {
-                    let plate_rect = egui::Rect::from_center_size(
+                    let centered_rect = egui::Rect::from_center_size(
                         rect.center(),
                         galley.size() + egui::vec2(14.0, 8.0),
                     );
-                    ui.painter()
-                        .rect_filled(plate_rect, 4.0, egui::Color32::from_black_alpha(190));
-                    ui.painter().galley(
-                        plate_rect.center() - galley.size() * 0.5,
-                        galley,
-                        egui::Color32::WHITE,
-                    );
+                    let lane_bottom = overlay_layout.top_left.lane_bottom().unwrap_or(rect.min.y);
+                    let min_title_y = lane_bottom + 4.0;
+                    let plate_rect = centered_rect.translate(egui::vec2(
+                        0.0,
+                        (min_title_y - centered_rect.min.y).max(0.0),
+                    ));
+                    if plate_rect.max.y <= rect.max.y - 4.0 {
+                        ui.painter().rect_filled(
+                            plate_rect,
+                            4.0,
+                            egui::Color32::from_black_alpha(190),
+                        );
+                        ui.painter().galley(
+                            plate_rect.center() - galley.size() * 0.5,
+                            galley,
+                            egui::Color32::WHITE,
+                        );
+                    }
                 }
             }
         }
@@ -14133,11 +14127,49 @@ impl App {
                                     egui::vec2(cell_w, cell_h),
                                 );
 
+                                let badges = self.grid_edit_badges(idx);
+                                let rating = if self.items_are_drive_list {
+                                    0
+                                } else {
+                                    self.get_rating(idx)
+                                };
+                                let tags = self.cell_tag_list(idx).to_vec();
+                                let has_pin = self.cell_has_pin_badge(idx);
+                                let bookmark_time = self.bookmark_view_row(idx).map(|row| {
+                                    if row.missing {
+                                        format!("! {}", row.badge_label())
+                                    } else {
+                                        row.badge_label()
+                                    }
+                                });
+                                let overlay_layout = crate::app::layout_cell_overlays(
+                                    ui.painter(),
+                                    cell_rect,
+                                    crate::thumb_overlay_layout::EditBadgeFlags {
+                                        page_override: badges.page_override,
+                                        local_adjust: badges.local_adjust,
+                                        mask: badges.mask,
+                                        conceal: badges.conceal,
+                                        comic: badges.comic,
+                                        pin: has_pin,
+                                    },
+                                    rating,
+                                    &self.items[idx],
+                                    &self.thumbnails[idx],
+                                    &tags,
+                                    bookmark_time.as_deref(),
+                                    self.items_are_drive_list,
+                                );
+
                                 primary_click_hit_cell |=
                                     primary_click_pos.is_some_and(|pos| cell_rect.contains(pos));
-                                if let Some(n) =
-                                    self.handle_cell_interaction(ui, ctx, cell_rect, idx)
-                                {
+                                if let Some(n) = self.handle_cell_interaction(
+                                    ui,
+                                    ctx,
+                                    cell_rect,
+                                    idx,
+                                    &overlay_layout,
+                                ) {
                                     nav = Some(n);
                                 }
                                 // handle_cell_interaction 内で同期的に items が差し替わる
@@ -14153,12 +14185,6 @@ impl App {
                                 }
 
                                 let rot = self.get_rotation(idx);
-                                let badges = self.grid_edit_badges(idx);
-                                let rating = if self.items_are_drive_list {
-                                    0
-                                } else {
-                                    self.get_rating(idx)
-                                };
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                 // process_thumb_adjust_budget が逐次処理する。
                                 // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
@@ -14171,7 +14197,6 @@ impl App {
                                 } else {
                                     self.thumb_adjust_tex.get(&idx)
                                 };
-                                let tags = self.cell_tag_list(idx).to_vec();
                                 let filter_match = if self.items_are_drive_list {
                                     None
                                 } else {
@@ -14189,26 +14214,18 @@ impl App {
                                 // で対応させる)。
                                 // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
                                 // (ルート = zip_path / 本の中 = 実効 prefix)。
-                                let has_pin = self.cell_has_pin_badge(idx);
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
                                     spread_pair_cursor_idx == Some(idx),
-                                    badges.page_override,
-                                    badges.local_adjust,
-                                    badges.mask,
-                                    badges.conceal,
-                                    badges.comic,
-                                    rating,
+                                    &overlay_layout,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
                                     rot,
                                     adjusted_tex,
-                                    &tags,
                                     filter_match_count,
-                                    has_pin,
                                     self.items_are_drive_list,
                                 );
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
@@ -14237,7 +14254,12 @@ impl App {
                                 }
 
                                 self.draw_reading_history_tooltip(ui, cell_rect, idx);
-                                self.draw_bookmark_view_overlay(ui, cell_rect, idx);
+                                self.draw_bookmark_view_overlay(
+                                    ui,
+                                    cell_rect,
+                                    idx,
+                                    &overlay_layout,
+                                );
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
                                 if self.selected == Some(idx) {

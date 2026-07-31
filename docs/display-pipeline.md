@@ -179,7 +179,17 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 3. **フォルダ / ZIP / PDF / アーカイブアイコン fallback** — 中身が空 / 全部エラーで上 2 段が失敗
    したときの最終フォールバック。`grid_item.rs` の draw_cell でアイコン表示。ZIP / PDF /
    RAR 等の形式は中央アイコンと独立した左下バッジでも示す。形式バッジは従来サイズの約
-   70%（小さいセルでは可読性のため 7pt を下限）で、フォルダ名バッジは従来サイズを保つ。
+   70%（小さいセルでは可読性のため 7pt を下限）とする。フォルダ名バッジは可変長 CJK の
+   可読性を残す専用スタイルで、旧サイズの 85%、8.5pt 下限・13.5pt 上限、横 padding
+   0.30em・縦 padding 0.12em とする。形式バッジと機械的に同じ 70% にはしない。
+
+サムネイル四隅 overlay の計測・padding・配置は `src/thumb_overlay_layout.rs` の
+`ThumbnailOverlayLayout` が所有する。v2.9.1 では左上と左下を移行済み。左上は
+ブックマーク時刻 → 動画 `UP` → 編集状態 / pin → タグの順に実測幅を予約し、幅不足時は
+タグだけを省略または非表示にする。描画とタグ hover / click は同じ `BadgePlacement.rect` を
+使う。左下はフォルダ名または形式バッジとファイル名プレートを同じ下段へ配置し、その実測行の
+上へ評価を積む。色・角丸・フォントなど各要素の見た目は `ui_helpers.rs` の個別描画関数が持つ。
+右上のチェック / スタック枚数と右下の絞り込み件数は未移行で、バックログ §2.2 第3段階に残す。
 
 **Video ピンの特殊経路**: pin source が動画の場合は `seed_folder_video_pin_thumbs`
 が起動時に `video_pins` DB の抽出済み WebP を pinned cache key として catalog にミラー

@@ -633,104 +633,59 @@ pub fn truncate_name(name: &str, max_chars: usize) -> String {
     }
 }
 
-/// グリッドセル底部にファイル名を描画する。文字の後ろに半透明の角丸プレートを敷いて、
-/// 動画サムネの黒帯のような暗部に重なってもファイル名が読めるようにする。
-///
-/// - 文字幅は `layout_no_wrap` で実測 (CJK / 絵文字混在でも正確)。プレート全体が
-///   `inner` を超える場合は `truncate_name` の 18 文字 soft cap から末尾を `…` で
-///   削って実幅に収める。極小セル (`MIN_CELL_PX = 32`) で `…` も入らないなら描画諦め
-/// - `reserve_left_w` は `draw_zip_badge` / `draw_pdf_badge` / `draw_archive_badge`
-///   が左下に描く ASCII 3 文字バッジ分の予約幅 (`estimated_file_badge_width` を渡す)。
-///   バッジの無いセル (Folder / Video) では 0.0
-/// - プレートは dark mode で半透明黒、light mode で半透明白
-/// - 位置は `Align2::CENTER_BOTTOM` 相当、`inner.max.y - 4.0` を底とする
+pub fn thumbnail_badge_font(style: crate::thumb_overlay_layout::BadgeTextStyle) -> egui::FontId {
+    match style.family {
+        crate::thumb_overlay_layout::BadgeFontFamily::Proportional => {
+            egui::FontId::proportional(style.font_size)
+        }
+        crate::thumb_overlay_layout::BadgeFontFamily::UserText => {
+            crate::ui_fonts::user_text_font(style.font_size)
+        }
+    }
+}
+
+pub fn measure_thumbnail_badge_text(
+    painter: &egui::Painter,
+    text: &str,
+    style: crate::thumb_overlay_layout::BadgeTextStyle,
+) -> egui::Vec2 {
+    painter
+        .layout_no_wrap(
+            text.to_owned(),
+            thumbnail_badge_font(style),
+            egui::Color32::WHITE,
+        )
+        .size()
+}
+
+fn draw_badge_text(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+    color: egui::Color32,
+) {
+    let galley = painter.layout_no_wrap(
+        placement.text.clone(),
+        thumbnail_badge_font(placement.style),
+        color,
+    );
+    painter.galley(placement.text_pos(), galley, color);
+}
+
+/// Draw a pre-laid-out filename plate. Width reservation and truncation are owned by
+/// `ThumbnailOverlayLayout`; this function preserves only the filename plate's visual style.
 pub fn draw_cell_filename(
     painter: &egui::Painter,
-    inner: egui::Rect,
-    name: &str,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
     text_color: egui::Color32,
     dark: bool,
-    reserve_left_w: f32,
 ) {
-    let font = crate::ui_fonts::user_text_font(11.0);
-    let plate_pad_x = 4.0;
-    let plate_top_pad = 4.0;
-    let plate_bottom_pad = 1.0;
-    let outer_margin = 3.0;
-
-    // プレート利用可能領域: 左は max(outer_margin, バッジ予約幅) ぶんだけ右に寄せる。
-    let avail_left = inner.min.x + reserve_left_w.max(outer_margin);
-    let avail_right = inner.max.x - outer_margin;
-    let max_text_w = (avail_right - avail_left - plate_pad_x * 2.0).max(0.0);
-    if max_text_w < 4.0 {
-        return; // 領域不足 → 描画諦め
-    }
-    let center_x = (avail_left + avail_right) * 0.5;
-
-    // 18 文字までで初回 layout、はみ出していたら末尾を `…` で 1 文字ずつ削って再 layout。
-    // CJK と ASCII で文字幅が大きく違うので平均幅近似は使えない (`draw_tag_badges` と同じ手法)。
-    let initial = truncate_name(name, 18);
-    let mut galley = painter.layout_no_wrap(initial.clone(), font.clone(), text_color);
-    if galley.size().x > max_text_w {
-        let chars: Vec<char> = initial.chars().collect();
-        for take in (1..chars.len()).rev() {
-            let candidate: String = chars[..take].iter().collect::<String>() + "…";
-            let g = painter.layout_no_wrap(candidate, font.clone(), text_color);
-            if g.size().x <= max_text_w {
-                galley = g;
-                break;
-            }
-        }
-        if galley.size().x > max_text_w {
-            galley = painter.layout_no_wrap("…".to_string(), font.clone(), text_color);
-            if galley.size().x > max_text_w {
-                return; // `…` も入らない極小セル → 諦め
-            }
-        }
-    }
-
-    let text_size = galley.size();
-    let bg_h = text_size.y + plate_top_pad + plate_bottom_pad;
-    let bg_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            center_x - (text_size.x + plate_pad_x * 2.0) / 2.0,
-            inner.max.y - 3.0 - bg_h,
-        ),
-        egui::vec2(text_size.x + plate_pad_x * 2.0, bg_h),
-    );
-    let text_pos = bg_rect.left_top() + egui::vec2(plate_pad_x, plate_top_pad);
     let bg_color = if dark {
         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)
     } else {
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220)
     };
-    painter.rect_filled(bg_rect, 3.0, bg_color);
-    painter.galley(text_pos, galley, text_color);
-}
-
-const FILE_BADGE_SCALE: f32 = 0.70;
-const FILE_BADGE_MIN_FONT_SIZE: f32 = 7.0;
-
-/// ZIP / PDF / RAR 等の形式バッジに使う文字サイズ。
-///
-/// 従来のバッジに対して約 70% とし、小さいセルでは可読性を保つため 7pt を下限にする。
-/// フォルダ名バッジは対象外で、従来どおりのサイズを維持する。
-fn file_badge_font_size(cell_rect: egui::Rect) -> f32 {
-    ((cell_rect.height() * 0.10).clamp(9.0, 16.0) * FILE_BADGE_SCALE).max(FILE_BADGE_MIN_FONT_SIZE)
-}
-
-fn folder_badge_font_size(cell_rect: egui::Rect) -> f32 {
-    (cell_rect.height() * 0.10).clamp(9.0, 16.0)
-}
-
-/// `draw_zip_badge` / `draw_pdf_badge` / `draw_archive_badge` が左下に描く ASCII 3 文字
-/// バッジの幅を pessimistic に見積もって、`draw_cell_filename` の `reserve_left_w`
-/// に渡す値を返す。`draw_file_badge` と同じ縮小後の文字サイズに合わせて
-/// `badge_w ≈ font_size * 2.65` (3 文字 ASCII 大文字 + pad_h*2) を `font_size * 3.0`
-/// に余裕を持たせ、左マージン 3.0 と視覚的隙間 4.0 を加算する。
-pub fn estimated_file_badge_width(inner: egui::Rect) -> f32 {
-    let font_size = file_badge_font_size(inner);
-    3.0 + font_size * 3.0 + 4.0
+    painter.rect_filled(placement.rect, 3.0, bg_color);
+    draw_badge_text(painter, placement, text_color);
 }
 
 // -----------------------------------------------------------------------
@@ -909,132 +864,111 @@ pub fn draw_rating_stars(ui: &mut egui::Ui, current: u8) -> Option<u8> {
     result
 }
 
-/// サムネイル左下にファイル種別バッジを描画する共通関数。
-fn draw_file_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str, bg: egui::Color32) {
-    let font_size = file_badge_font_size(cell_rect);
-    let pad_h = font_size * 0.35;
-    let pad_v = font_size * 0.2;
-    let galley = painter.layout_no_wrap(
-        label.to_string(),
-        egui::FontId::proportional(font_size),
-        egui::Color32::WHITE,
-    );
-    let text_size = galley.size();
-    let badge_w = text_size.x + pad_h * 2.0;
-    let badge_h = text_size.y + pad_v * 2.0;
-    let badge_rect = egui::Rect::from_min_size(
-        egui::pos2(cell_rect.min.x + 3.0, cell_rect.max.y - badge_h - 3.0),
-        egui::vec2(badge_w, badge_h),
-    );
-    painter.rect_filled(badge_rect, 3.0, bg);
-    painter.galley(
-        egui::pos2(badge_rect.min.x + pad_h, badge_rect.min.y + pad_v),
-        galley,
-        egui::Color32::WHITE,
-    );
+/// Draw a pre-laid-out ZIP/PDF/converted-archive format badge.
+pub fn draw_overlay_format_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    let bg = match placement.text.as_str() {
+        "ZIP" => egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
+        "PDF" => egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
+        _ => egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
+    };
+    painter.rect_filled(placement.rect, 3.0, bg);
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
 }
 
-/// ZIP アーカイブ内画像のサムネイルに表示するバッジ（左下、青系）。
-pub fn draw_zip_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
-    draw_file_badge(
-        painter,
-        cell_rect,
-        "ZIP",
-        egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
+/// Draw a pre-laid-out folder-name badge with its dedicated compact style.
+pub fn draw_overlay_folder_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    painter.rect_filled(
+        placement.rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(40, 130, 60, 200),
     );
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
 }
 
-/// PDF ページのサムネイルに表示するバッジ（左下、赤系）。
-pub fn draw_pdf_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
-    draw_file_badge(
-        painter,
-        cell_rect,
-        "PDF",
-        egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
+pub fn draw_overlay_rating_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+    is_container: bool,
+) {
+    let color = if is_container {
+        egui::Color32::from_rgb(180, 220, 255)
+    } else {
+        egui::Color32::from_rgb(255, 215, 50)
+    };
+    painter.rect_filled(
+        placement.rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
     );
+    draw_badge_text(painter, placement, color);
 }
 
-/// 変換対象アーカイブ (RAR / 7z / LZH) のサムネイルに表示するバッジ（左下、橙系）。
-/// `label` は "RAR" / "7z" / "LZH" など形式表示。
-pub fn draw_archive_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str) {
-    draw_file_badge(
-        painter,
-        cell_rect,
-        label,
-        egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
-    );
-}
-
-/// 左下に描く ZIP / PDF / RAR 等の形式バッジの標準的な高さ。
-///
-/// `draw_file_badge` と同じ縮小後の文字サイズ・余白に追従し、`galley.size().y` を
-/// `font_size * 1.4` で安全側に近似する (= painter を持たない呼び出し元から呼べるよう
-/// text metric を見ない)。
-///
-/// 用途: レーティング ★ バッジなど **左下に並ぶ別オーバーレイ** を、コンテナバッジに
-/// 重ねず縦に積むときの y オフセット計算。1 バッジぶん分の高さを取りたいときに使う。
-///
-/// ⚠ **`cell_rect` 引数には `draw_*_badge` と同じ `inner` (= 外周 padding を引いた
-/// 内側 rect) を渡すこと**。outer rect を渡すと `cell.height` がわずかに大きく見えて
-/// `font_size` が `draw_*_badge` 側と乖離し、レーティング配置に 1-2 px の食い込みが
-/// 発生する (実機フィードバックで判明)。
-pub fn file_badge_height(cell_rect: egui::Rect) -> f32 {
-    let font_size = file_badge_font_size(cell_rect);
-    let pad_v = font_size * 0.2;
-    font_size * 1.4 + pad_v * 2.0
-}
-
-/// 左下に描くフォルダ名バッジの標準的な高さ。
-///
-/// 形式バッジだけを縮小しても、フォルダ名バッジとその上の評価表示の間隔は従来どおり
-/// 維持するため、専用の高さ計算として分けている。
-pub fn folder_badge_height(cell_rect: egui::Rect) -> f32 {
-    let font_size = folder_badge_font_size(cell_rect);
-    let pad_v = font_size * 0.2;
-    font_size * 1.4 + pad_v * 2.0
-}
-
-/// フォルダサムネイルに表示するバッジ（左下、緑系、フォルダ名表示）。
-pub fn draw_folder_badge(painter: &egui::Painter, cell_rect: egui::Rect, folder_name: &str) {
-    let font_size = folder_badge_font_size(cell_rect);
-    let pad_h = font_size * 0.35;
-    let pad_v = font_size * 0.2;
-    let max_badge_w = cell_rect.width() * 0.80;
-    // フォルダ名が長い場合は切り詰める
-    let mut label = folder_name.to_string();
-    let bg = egui::Color32::from_rgba_unmultiplied(40, 130, 60, 200);
-    loop {
-        let galley = painter.layout_no_wrap(
-            label.clone(),
-            egui::FontId::proportional(font_size),
-            egui::Color32::WHITE,
-        );
-        let badge_w = galley.size().x + pad_h * 2.0;
-        // 終了条件は **文字数** で見る。byte 長で `label.len() <= 2` を見てしまうと
-        // `"…"` が UTF-8 3 バイトなので `"X…"` の `label.len()` が常に 4 となり、極端に狭い
-        // セルでは同じ `"X…"` を作り続けて無限ループになる (`painter.layout_no_wrap` が
-        // `egui::Context::write` を毎反復取得して UI が固まる)。
-        let chars_count = label.chars().count();
-        if badge_w <= max_badge_w || chars_count <= 2 {
-            let badge_h = galley.size().y + pad_v * 2.0;
-            let badge_rect = egui::Rect::from_min_size(
-                egui::pos2(cell_rect.min.x + 3.0, cell_rect.max.y - badge_h - 3.0),
-                egui::vec2(badge_w, badge_h),
-            );
-            painter.rect_filled(badge_rect, 3.0, bg);
-            painter.galley(
-                egui::pos2(badge_rect.min.x + pad_h, badge_rect.min.y + pad_v),
-                galley,
-                egui::Color32::WHITE,
-            );
-            return;
+pub fn draw_overlay_edit_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+    kind: crate::thumb_overlay_layout::EditBadgeKind,
+) {
+    use crate::thumb_overlay_layout::EditBadgeKind;
+    let (bg, fg) = match kind {
+        EditBadgeKind::PageOverride => {
+            (egui::Color32::from_rgb(50, 120, 220), egui::Color32::WHITE)
         }
-        // chars_count > 2 を上で確認済みなので `keep < chars_count` が保証され、
-        // chars_count が必ず減って次反復で停止条件に到達する (= 進捗保証)。
-        let chars: Vec<char> = label.chars().collect();
-        let keep = chars.len().saturating_sub(2).max(1);
-        label = chars[..keep].iter().collect::<String>() + "…";
-    }
+        EditBadgeKind::LocalAdjust => (egui::Color32::from_rgb(60, 150, 130), egui::Color32::WHITE),
+        EditBadgeKind::Mask => (egui::Color32::from_rgb(200, 80, 40), egui::Color32::WHITE),
+        EditBadgeKind::Conceal => (egui::Color32::from_rgb(153, 102, 204), egui::Color32::WHITE),
+        EditBadgeKind::Comic => (egui::Color32::from_rgb(210, 90, 160), egui::Color32::WHITE),
+        EditBadgeKind::Pin => (
+            egui::Color32::from_rgb(230, 180, 90),
+            egui::Color32::from_rgb(60, 40, 10),
+        ),
+    };
+    painter.rect_filled(placement.rect, 3.0, bg);
+    draw_badge_text(painter, placement, fg);
+}
+
+pub fn draw_overlay_tag_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    let color = egui::Color32::from_rgb(180, 255, 180);
+    painter.rect_filled(
+        placement.rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(0, 40, 20, 170),
+    );
+    draw_badge_text(painter, placement, color);
+}
+
+pub fn draw_overlay_upscaled_video_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    painter.rect_filled(
+        placement.rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(20, 120, 130, 215),
+    );
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
+}
+
+pub fn draw_overlay_bookmark_time_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+    missing: bool,
+) {
+    let fill = if missing {
+        egui::Color32::from_rgb(180, 70, 50)
+    } else {
+        egui::Color32::from_black_alpha(190)
+    };
+    painter.rect_filled(placement.rect, 4.0, fill);
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
 }
 
 /// 統計ダイアログのヒストグラムを ASCII バー + 件数で描画する。
@@ -1617,21 +1551,6 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
-    }
-
-    #[test]
-    fn file_badge_geometry_is_compact_without_shrinking_folder_badges() {
-        let large = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 180.0));
-        let small = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 40.0));
-
-        assert!((file_badge_font_size(large) - 11.2).abs() < f32::EPSILON);
-        assert!((file_badge_font_size(small) - FILE_BADGE_MIN_FONT_SIZE).abs() < f32::EPSILON);
-        assert!((folder_badge_font_size(large) - 16.0).abs() < f32::EPSILON);
-        assert!(
-            (file_badge_height(large) / folder_badge_height(large) - FILE_BADGE_SCALE).abs()
-                < 0.001
-        );
-        assert!(estimated_file_badge_width(large) < 3.0 + 16.0 * 3.0 + 4.0);
     }
 
     #[test]

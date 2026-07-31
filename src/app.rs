@@ -135,11 +135,9 @@ pub(crate) use folder_scan::{
     ScannedDir, scan_directory_with_convertible_archives, scan_directory_with_settings,
     signature_from_scan,
 };
-#[cfg(test)]
-pub(crate) use grid_paint::cell_has_lower_left_container_badge;
 pub(crate) use grid_paint::{
-    draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, primary_grid_tag_for_badge,
-    tq_draw_preview,
+    draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
+    primary_grid_tag_for_badge, tq_draw_preview,
 };
 pub(crate) use metadata_ops::FacetField;
 use metadata_ops::{

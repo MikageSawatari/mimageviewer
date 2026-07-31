@@ -167,6 +167,7 @@ mod tag_view;
 pub mod tag_write_worker;
 pub mod tags_db;
 pub mod thumb_loader;
+pub mod thumb_overlay_layout;
 pub mod tray;
 mod tray_integration;
 mod ui_adjustment_panel;
