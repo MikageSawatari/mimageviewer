@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
@@ -21,6 +21,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// 無期限に保持しない。HTTP 側の入場制限とブラウザ再試行を前提にする。
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u32 = 2;
+/// 本体を後から起動しても QR 用接続情報を自動通知できるよう、接続を常時監視する。
+/// 500 ms polling は named pipe の blocking reader とは別で、CPU / I/O を発生させない。
+const CONNECTION_HEALTH_POLL: Duration = Duration::from_millis(500);
+/// 初回は素早く追従し、常時停止中の本体へ過剰に接続しないよう 5 秒で頭打ちにする。
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 pub struct ThumbnailClient {
     pipe_name: String,
@@ -28,6 +34,22 @@ pub struct ThumbnailClient {
     next_request_id: AtomicU64,
     next_connection_id: AtomicU64,
     remote_web_info: Mutex<Option<RemoteWebConnectionInfo>>,
+}
+
+pub struct ConnectionMaintainer {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ConnectionMaintainer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub struct ThumbnailSuccess {
@@ -196,6 +218,53 @@ impl ThumbnailClient {
             .remote_web_info
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(info);
+    }
+
+    pub fn start_connection_maintainer(self: &Arc<Self>) -> Result<ConnectionMaintainer, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let worker_client = Arc::clone(self);
+        let worker_stop = Arc::clone(&stop);
+        let worker_wake = Arc::clone(&wake);
+        let thread = std::thread::Builder::new()
+            .name("remote-ipc-maintainer".to_owned())
+            .spawn(move || {
+                run_connection_maintainer(
+                    &worker_stop,
+                    || {
+                        worker_client
+                            .get_connection()
+                            .map_err(|error| error.to_string())
+                    },
+                    |connection| connection.is_broken(),
+                    |delay| wait_for_maintainer(&worker_stop, &worker_wake, delay),
+                    |event| match event {
+                        ConnectionMaintenanceEvent::ConnectFailed { error, retry_after } => {
+                            eprintln!(
+                                "remote-web: mIV IPC へ接続できません。{} ms 後に再試行します ({error})",
+                                retry_after.as_millis()
+                            );
+                        }
+                        ConnectionMaintenanceEvent::Connected { recovered: true } => {
+                            println!(
+                                "remote-web: mIV IPC に再接続し、接続 URL を通知しました"
+                            );
+                        }
+                        ConnectionMaintenanceEvent::Connected { recovered: false } => {}
+                        ConnectionMaintenanceEvent::Disconnected => {
+                            eprintln!(
+                                "remote-web: mIV IPC 接続が切断されました。自動再接続します"
+                            );
+                        }
+                    },
+                );
+            })
+            .map_err(|error| format!("IPC 常時接続 worker を開始できません: {error}"))?;
+        Ok(ConnectionMaintainer {
+            stop,
+            wake,
+            thread: Some(thread),
+        })
     }
 
     pub fn session_acquire(
@@ -551,25 +620,24 @@ impl ThumbnailClient {
             .clone()
         {
             let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            match connection.request(id, ClientMessage::RemoteWebConnectionInfo { id, info }) {
-                Ok(ServerMessage::RemoteWebConnectionInfo { accepted: true, .. }) => {}
-                Ok(ServerMessage::RemoteWebConnectionInfo { message, .. }) => {
-                    return Err(ClientError::Protocol(protocol_failure(
-                        "connection_info",
-                        "rejected",
-                        None,
-                        message,
-                    )));
-                }
-                Ok(_) => {
-                    return Err(ClientError::Protocol(protocol_failure(
+            let announcement =
+                match connection.request(id, ClientMessage::RemoteWebConnectionInfo { id, info }) {
+                    Ok(ServerMessage::RemoteWebConnectionInfo { accepted: true, .. }) => Ok(()),
+                    Ok(ServerMessage::RemoteWebConnectionInfo { message, .. }) => Err(
+                        protocol_failure("connection_info", "rejected", None, message),
+                    ),
+                    Ok(_) => Err(protocol_failure(
                         "connection_info",
                         "response_type_mismatch",
                         None,
                         "connection information received another response type",
-                    )));
-                }
-                Err(error) => return Err(ClientError::Protocol(error)),
+                    )),
+                    Err(error) => Err(error),
+                };
+            if let Err(error) = announcement {
+                // URL を持たない half-open 接続を本体 UI に残さず、次の retry を新規接続にする。
+                connection.fail(error.clone(), true);
+                return Err(ClientError::Protocol(error));
             }
         }
         *slot = Some(Arc::clone(&connection));
@@ -588,6 +656,85 @@ impl ThumbnailClient {
             *slot = None;
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectionMaintenanceEvent {
+    ConnectFailed {
+        error: String,
+        retry_after: Duration,
+    },
+    Connected {
+        recovered: bool,
+    },
+    Disconnected,
+}
+
+/// `connect_and_announce` の成功は、handshake と接続情報の応答確認まで完了したことを表す。
+/// transport を差し替えたテストでも「本体の後起動」と「切断後の再通知」を同じ loop で固定する。
+fn run_connection_maintainer<C>(
+    stop: &AtomicBool,
+    mut connect_and_announce: impl FnMut() -> Result<C, String>,
+    mut is_broken: impl FnMut(&C) -> bool,
+    mut wait: impl FnMut(Duration),
+    mut report: impl FnMut(ConnectionMaintenanceEvent),
+) {
+    let mut consecutive_failures = 0_u32;
+    let mut reported_max_delay = false;
+    let mut recovering = false;
+    while !stop.load(Ordering::Acquire) {
+        match connect_and_announce() {
+            Ok(connection) => {
+                report(ConnectionMaintenanceEvent::Connected {
+                    recovered: recovering,
+                });
+                consecutive_failures = 0;
+                reported_max_delay = false;
+                while !stop.load(Ordering::Acquire) && !is_broken(&connection) {
+                    wait(CONNECTION_HEALTH_POLL);
+                }
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                report(ConnectionMaintenanceEvent::Disconnected);
+                recovering = true;
+            }
+            Err(error) => {
+                recovering = true;
+                let retry_after = reconnect_delay(consecutive_failures);
+                // 最初の失敗と上限到達時だけ出す。5 秒上限で同じログを繰り返さない。
+                if consecutive_failures == 0
+                    || (retry_after == RECONNECT_MAX_DELAY && !reported_max_delay)
+                {
+                    report(ConnectionMaintenanceEvent::ConnectFailed { error, retry_after });
+                    reported_max_delay |= retry_after == RECONNECT_MAX_DELAY;
+                }
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                wait(retry_after);
+            }
+        }
+    }
+}
+
+fn reconnect_delay(consecutive_failures: u32) -> Duration {
+    let multiplier = 1_u32 << consecutive_failures.min(8);
+    RECONNECT_INITIAL_DELAY
+        .saturating_mul(multiplier)
+        .min(RECONNECT_MAX_DELAY)
+}
+
+fn wait_for_maintainer(stop: &AtomicBool, wake: &(Mutex<()>, Condvar), duration: Duration) {
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
+    let guard = wake.0.lock().unwrap_or_else(|error| error.into_inner());
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = wake
+        .1
+        .wait_timeout(guard, duration)
+        .unwrap_or_else(|error| error.into_inner());
 }
 
 fn handshake(pipe: &mut PipeStream) -> Result<(), ClientError> {
@@ -1095,7 +1242,66 @@ impl Write for PipeStream {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
     use super::*;
+
+    #[test]
+    fn maintainer_connects_after_server_start_and_reannounces_after_disconnect() {
+        #[derive(Clone, Copy)]
+        struct FakeConnection {
+            generation: u32,
+        }
+
+        let stop = AtomicBool::new(false);
+        let server_running = Cell::new(false);
+        let attempts = Cell::new(0_u32);
+        let announcements = Cell::new(0_u32);
+        let events = RefCell::new(Vec::new());
+
+        run_connection_maintainer(
+            &stop,
+            || {
+                attempts.set(attempts.get() + 1);
+                if !server_running.get() {
+                    return Err("pipe not found".to_owned());
+                }
+                let generation = announcements.get() + 1;
+                announcements.set(generation);
+                if generation == 2 {
+                    stop.store(true, Ordering::Release);
+                }
+                Ok(FakeConnection { generation })
+            },
+            |connection| connection.generation == 1,
+            |_| server_running.set(true),
+            |event| events.borrow_mut().push(event),
+        );
+
+        assert_eq!(attempts.get(), 3, "停止中1回 + 初回接続 + 再接続");
+        assert_eq!(announcements.get(), 2, "接続ごとに URL を再通知する");
+        assert_eq!(
+            events.into_inner(),
+            [
+                ConnectionMaintenanceEvent::ConnectFailed {
+                    error: "pipe not found".to_owned(),
+                    retry_after: RECONNECT_INITIAL_DELAY,
+                },
+                ConnectionMaintenanceEvent::Connected { recovered: true },
+                ConnectionMaintenanceEvent::Disconnected,
+                ConnectionMaintenanceEvent::Connected { recovered: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(reconnect_delay(0), Duration::from_millis(250));
+        assert_eq!(reconnect_delay(1), Duration::from_millis(500));
+        assert_eq!(reconnect_delay(4), Duration::from_secs(4));
+        assert_eq!(reconnect_delay(5), RECONNECT_MAX_DELAY);
+        assert_eq!(reconnect_delay(u32::MAX), RECONNECT_MAX_DELAY);
+    }
 
     #[test]
     fn responses_are_routed_by_id_even_when_they_arrive_out_of_order() {

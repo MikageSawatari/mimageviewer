@@ -17,11 +17,24 @@ import {
   thumbnailBindingMatches,
   thumbnailRetryDecision,
   shouldShowLoadingIndicator,
+  sessionOwnerBadge,
   viewerImageLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
 
 const key = (value, extra = {}) => ({ key: value, ...extra });
+
+test("session owner badge keeps the two non-blocking ownership states explicit", () => {
+  assert.deepEqual(sessionOwnerBadge("active"), {
+    owner: "active",
+    label: "操作中",
+  });
+  assert.deepEqual(sessionOwnerBadge("other_device"), {
+    owner: "other_device",
+    label: "別の端末が操作中 (操作すると取得します)",
+  });
+  assert.deepEqual(sessionOwnerBadge("acquiring"), sessionOwnerBadge("active"));
+});
 
 test("viewer keys map to the shared page and menu commands", () => {
   assert.equal(commandFromKey(key("ArrowRight"), "viewer").name, CommandName.NEXT_PAGE);

@@ -10,6 +10,7 @@ import {
   nextFitMode,
   pagePrefetchPlan,
   reduceViewerTransform,
+  sessionOwnerBadge,
   snappedGridOffset,
   thumbnailBindingMatches,
   thumbnailRetryDecision,
@@ -21,6 +22,9 @@ import {
 
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
+const sessionOwnerBadgeElement = document.querySelector(
+  "#remote-session-owner-badge"
+);
 const TELEMETRY_ENABLED = true;
 const THUMBNAIL_MAX_CONCURRENCY = 4;
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
@@ -272,6 +276,7 @@ const state = {
   gridIndex: 0,
   authCountdownTimer: 0,
   remoteSessionStatus: "inactive",
+  remoteSessionOwner: null,
   remoteSessionMessage: "",
   remoteSessionAcquirePromise: null,
   remoteSessionUserActive: false,
@@ -426,6 +431,10 @@ async function pingRemoteSession() {
 function setRemoteSessionStatus(status, message) {
   state.remoteSessionStatus = status;
   state.remoteSessionMessage = message;
+  if (status === "active" || status === "other_device") {
+    state.remoteSessionOwner = status;
+  }
+  updateRemoteSessionOwnerBadge();
   let element = document.querySelector("#remote-session-status");
   if (!element) {
     element = document.createElement("div");
@@ -436,6 +445,15 @@ function setRemoteSessionStatus(status, message) {
   element.hidden = status === "active" || status === "inactive";
   element.dataset.status = status;
   element.textContent = message;
+}
+
+function updateRemoteSessionOwnerBadge() {
+  sessionOwnerBadgeElement.hidden =
+    !state.authenticated || state.remoteSessionOwner === null;
+  if (sessionOwnerBadgeElement.hidden) return;
+  const presentation = sessionOwnerBadge(state.remoteSessionOwner);
+  sessionOwnerBadgeElement.dataset.owner = presentation.owner;
+  sessionOwnerBadgeElement.textContent = presentation.label;
 }
 
 function sessionStatusFromHttp(status) {
@@ -453,7 +471,9 @@ function renderPinLogin(initialRemainingSeconds = 0) {
   cleanupScreen();
   state.screenContext = "pin";
   state.authenticated = false;
+  state.remoteSessionOwner = null;
   telemetryState.authenticated = false;
+  updateRemoteSessionOwnerBadge();
   hudElement.hidden = true;
   document.title = "PIN 認証 — mIV Remote";
 

@@ -319,6 +319,16 @@ export function shouldShowLoadingIndicator(
     Number(elapsedMs) >= Math.max(0, Number(thresholdMs) || 0);
 }
 
+export function sessionOwnerBadge(status) {
+  if (status === "other_device") {
+    return {
+      owner: "other_device",
+      label: "別の端末が操作中 (操作すると取得します)",
+    };
+  }
+  return { owner: "active", label: "操作中" };
+}
+
 export function reduceViewerTransform(current, requested) {
   let scale = current.scale;
   let panX = current.panX;

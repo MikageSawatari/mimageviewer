@@ -717,6 +717,9 @@ fn handle_connection(
             return;
         }
     };
+    // handshake 済み接続を接続情報の受信前から可視化する。これにより UI は
+    // 「remote-web 自体が未接続」と「接続済みだが URL 未着」を区別できる。
+    session.remote_web_connected(connection_id);
 
     loop {
         let message: ClientMessage = match read_frame(&mut pipe, MAX_CONTROL_FRAME_BYTES) {

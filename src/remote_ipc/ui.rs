@@ -159,12 +159,16 @@ impl crate::app::App {
         if !self.remote_session_ui.show_connection_dialog {
             return;
         }
-        let info = self
+        let ipc_enabled = self.remote_session_ui.handle.is_some();
+        let snapshot = self
             .remote_session_ui
             .handle
             .as_ref()
-            .and_then(|handle| handle.snapshot().remote_web);
-        let ipc_enabled = self.remote_session_ui.handle.is_some();
+            .map(SessionHandle::snapshot);
+        let remote_web_connected = snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.remote_web_connected);
+        let info = snapshot.and_then(|snapshot| snapshot.remote_web);
         let mut open = true;
         egui::Window::new("リモート接続")
             .id(egui::Id::new("remote_connection_dialog"))
@@ -178,9 +182,21 @@ impl crate::app::App {
                     return;
                 }
                 let Some(info) = info.as_ref() else {
-                    ui.heading("remote-web を待っています");
-                    ui.label("接続状態: remote-web 未接続");
-                    ui.label("remote-web を起動すると、ここに接続 URL と QR コードを表示します。");
+                    if remote_web_connected {
+                        ui.heading("remote-web は起動しています");
+                        ui.label("接続状態: IPC 接続済み / 接続情報を受信中");
+                        ui.label("通常は間もなく URL と QR コードが表示されます。");
+                        ui.small(
+                            "この表示が続く場合は remote-web と本体の版が一致しているか確認してください。",
+                        );
+                    } else {
+                        ui.heading("remote-web が起動していません");
+                        ui.label("接続状態: 本体への IPC 接続なし");
+                        ui.label("mimageviewer-remote.exe を起動してください。");
+                        ui.small(
+                            "既に起動済みなら、自動再接続のため最大 5 秒ほど待ってください。",
+                        );
+                    }
                     return;
                 };
 

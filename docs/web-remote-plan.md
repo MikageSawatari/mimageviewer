@@ -58,7 +58,9 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - ブラウザごとのランダム client ID を各 API から IPC まで運び、別端末の要求を同じ
   remote-web process の owner として混同しない。保持できる owner は常に 1 client だけで、
   2 台目の操作は確認なしに owner を置き換える。旧 owner は「別の端末で使用中です」と表示し、
-  次の操作で acquire を送り直して奪い返す。client ID は認証 credential には使わない
+  次の操作で acquire を送り直して奪い返す。client ID は認証 credential には使わない。
+  認証後の全画面では左上の小さな badge に「操作中」または
+  「別の端末が操作中 (操作すると取得します)」を常時表示し、確認や入力 blocking は行わない
 - session owner が変わった時、本体は既存の media pause、slideshow stop、owner-scoped native
   pending cancel を通して動画・音声・音楽ビュー・スライドショー・GIF/APNG・連続送りを停止する。
   player、停止位置、main/fullscreen/detached の window 構成は保持し、操作権返却時も自動再開しない
@@ -113,7 +115,11 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
   `--json` 状態、bind 先の順で決める。remote-web は確定 URL、`tailscale serve` 状態、PIN 設定済み
   bool だけを protocol v8 の接続情報として本体へ通知する。本体は独自検出せず、ヘルプの
-  「リモート接続…」に QR、URL、接続状態を表示する。`--remote-ipc` 無しでは無効理由を表示する
+  「リモート接続…」に QR、URL、接続状態を表示する。`--remote-ipc` 無しでは無効理由を表示する。
+  remote-web はブラウザ要求と独立した常駐 worker で IPC を維持し、250 ms から 5 秒上限の指数
+  backoff で再接続する。接続 / 再接続の handshake 完了時に接続情報を必ず再通知する。本体 UI は
+  handshake 済み接続を URL 受信前から追跡し、「remote-web が起動していない」と
+  「remote-web は起動済みだが接続情報を受信中」を区別する
 
 ### 3.3 バインドアドレス
 

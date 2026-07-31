@@ -269,6 +269,7 @@ impl SessionStateMachine {
             active,
             acquisition_sequence: self.acquisition_sequence,
             control_return_sequence: self.control_return_sequence,
+            remote_web_connected: false,
             remote_web: None,
         }
     }
@@ -308,6 +309,7 @@ pub(crate) struct SessionSnapshot {
     pub(crate) active: Option<ActiveSessionSnapshot>,
     pub(crate) acquisition_sequence: u64,
     pub(crate) control_return_sequence: u64,
+    pub(crate) remote_web_connected: bool,
     pub(crate) remote_web: Option<RemoteWebConnectionInfo>,
 }
 
@@ -316,7 +318,7 @@ pub(crate) struct SessionHandle {
     inner: Arc<Mutex<SessionStateMachine>>,
     origin: Instant,
     repaint: Arc<Mutex<Option<egui::Context>>>,
-    remote_web_connections: Arc<Mutex<BTreeMap<u64, RemoteWebConnectionInfo>>>,
+    remote_web_connections: Arc<Mutex<BTreeMap<u64, Option<RemoteWebConnectionInfo>>>>,
 }
 
 impl SessionHandle {
@@ -399,13 +401,24 @@ impl SessionHandle {
         if let Some(active) = snapshot.active.as_mut() {
             active.elapsed = self.now().saturating_sub(active.elapsed);
         }
-        snapshot.remote_web = self
+        let remote_web_connections = self
             .remote_web_connections
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .last_key_value()
-            .map(|(_, info)| info.clone());
+            .unwrap_or_else(|error| error.into_inner());
+        snapshot.remote_web_connected = !remote_web_connections.is_empty();
+        snapshot.remote_web = remote_web_connections
+            .iter()
+            .rev()
+            .find_map(|(_, info)| info.clone());
         snapshot
+    }
+
+    pub(crate) fn remote_web_connected(&self, connection_id: u64) {
+        self.remote_web_connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(connection_id, None);
+        self.notify_ui();
     }
 
     pub(crate) fn announce_remote_web(
@@ -416,10 +429,15 @@ impl SessionHandle {
         if !validate_remote_web_connection_info(&info) {
             return false;
         }
-        self.remote_web_connections
+        let mut connections = self
+            .remote_web_connections
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(connection_id, info);
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(connection) = connections.get_mut(&connection_id) else {
+            return false;
+        };
+        *connection = Some(info);
+        drop(connections);
         self.notify_ui();
         true
     }
@@ -815,7 +833,12 @@ mod tests {
             tailscale_serve: mimageviewer_ipc::RemoteWebFeatureStatus::Configured,
             pin_configured: true,
         };
+        handle.remote_web_connected(1);
+        assert!(handle.snapshot().remote_web_connected);
+        assert!(handle.snapshot().remote_web.is_none());
         assert!(handle.announce_remote_web(1, info("https://viewer.example/")));
+        handle.remote_web_connected(2);
+        handle.remote_web_connected(3);
         assert!(!handle.announce_remote_web(2, info("https://viewer.example/?t=secret")));
         assert!(!handle.announce_remote_web(3, info("https://user:secret@viewer.example/")));
         assert_eq!(
@@ -824,5 +847,9 @@ mod tests {
         );
         handle.remote_web_disconnected(1);
         assert!(handle.snapshot().remote_web.is_none());
+        assert!(handle.snapshot().remote_web_connected);
+        handle.remote_web_disconnected(2);
+        handle.remote_web_disconnected(3);
+        assert!(!handle.snapshot().remote_web_connected);
     }
 }

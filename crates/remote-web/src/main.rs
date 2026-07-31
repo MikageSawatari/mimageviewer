@@ -68,6 +68,7 @@ fn run() -> Result<(), String> {
         Ok(()) => "接続済み".to_owned(),
         Err(error) => format!("未接続 ({error})"),
     };
+    let _ipc_maintainer = thumbnail_client.start_connection_maintainer()?;
     let server = Arc::new(
         Server::http(address).map_err(|error| format!("HTTP bind に失敗しました: {error}"))?,
     );
