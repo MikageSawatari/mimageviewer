@@ -243,12 +243,50 @@ pub(crate) struct ReusedSmartFolderMetadata {
 /// The already-materialized root grid is moved here while the user is inside a folder, PDF, or
 /// archive opened from the smart folder. Moving (rather than cloning) keeps million-row sessions
 /// bounded, and restoring this state does not run the metadata/filter/sort/build pipeline again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmartFolderPreparedGridMode {
+    Thumbnail { cols: usize },
+    Details,
+}
+
+impl SmartFolderPreparedGridMode {
+    fn current(settings: &crate::settings::Settings) -> Self {
+        match settings.grid_view_mode {
+            crate::settings::GridViewMode::Thumbnail => Self::Thumbnail {
+                cols: settings.grid_cols.max(1),
+            },
+            crate::settings::GridViewMode::Details => Self::Details,
+        }
+    }
+}
+
 struct SmartFolderPreparedGridLayout {
     /// The offset and the auto-aspect state that determined its row height are one snapshot.
     /// `AutoAspectState::samples` is also index-keyed, so moving only the resolved aspect would
     /// leave the restored grid with another context's decision inputs.
     scroll_offset_y: f32,
     auto_aspect: crate::auto_aspect::AutoAspectState,
+    /// This is comparison-only: changed user settings are never restored. A mismatch asks the
+    /// ordinary folder-navigation scroll owner to keep `selected` visible in the new layout.
+    mode: SmartFolderPreparedGridMode,
+    window_inner_size: Option<[f32; 2]>,
+}
+
+impl SmartFolderPreparedGridLayout {
+    fn matches_current_layout(&self, app: &App) -> bool {
+        fn size_matches(left: Option<[f32; 2]>, right: Option<[f32; 2]>) -> bool {
+            match (left, right) {
+                (Some(left), Some(right)) => {
+                    (left[0] - right[0]).abs() <= 0.5 && (left[1] - right[1]).abs() <= 0.5
+                }
+                (None, None) => true,
+                _ => false,
+            }
+        }
+
+        self.mode == SmartFolderPreparedGridMode::current(&app.settings)
+            && size_matches(self.window_inner_size, app.last_inner_size)
+    }
 }
 
 pub(crate) struct SmartFolderPreparedGrid {
@@ -3197,6 +3235,8 @@ impl App {
                 layout: SmartFolderPreparedGridLayout {
                     scroll_offset_y: std::mem::take(&mut self.scroll_offset_y),
                     auto_aspect: std::mem::take(&mut self.auto_aspect),
+                    mode: SmartFolderPreparedGridMode::current(&self.settings),
+                    window_inner_size: self.last_inner_size,
                 },
                 scroll_to_selected: std::mem::take(&mut self.scroll_to_selected),
                 pending_grid_scroll: self.pending_grid_scroll.take(),
@@ -3291,9 +3331,11 @@ impl App {
             color_cache_map,
             color_catalog,
         } = grid;
+        let layout_changed = !layout.matches_current_layout(self);
         let SmartFolderPreparedGridLayout {
             scroll_offset_y,
             mut auto_aspect,
+            ..
         } = layout;
         let synthetic = smart_folder_synthetic_path(definition_id);
         self.current_folder = Some(synthetic.clone());
@@ -3314,7 +3356,7 @@ impl App {
         self.grid_click_selection_anchor = grid_click_selection_anchor_index
             .map(|index| super::GridClickSelectionAnchor::new(index, self.items_generation));
         self.scroll_offset_y = scroll_offset_y;
-        self.scroll_to_selected = scroll_to_selected;
+        self.scroll_to_selected = scroll_to_selected || layout_changed;
         self.pending_grid_scroll = pending_grid_scroll;
         self.checked = checked;
         self.visible_indices = visible_indices;

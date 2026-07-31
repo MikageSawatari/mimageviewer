@@ -43241,6 +43241,10 @@ mod smart_folder_transition_tests {
         assert!(app.smart_folder_pending.is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
         assert_eq!(app.selected, Some(selected));
+        assert!(
+            !app.scroll_to_selected,
+            "an unchanged layout must keep the exact saved offset without an ensure-visible pass"
+        );
         assert_eq!(
             (app.scroll_offset_y, app.effective_thumb_aspect()),
             (saved_offset, saved_aspect),
@@ -43263,6 +43267,76 @@ mod smart_folder_transition_tests {
                 .iter()
                 .any(|item| item.drag_source_path() == Some(page.as_path()))
         );
+    }
+
+    #[test]
+    fn smart_folder_session_return_keeps_selected_visible_when_columns_change_without_prepare() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-session-layout-origin");
+        let source = app.tmp.path().join("smart-session-layout-source");
+        let entry = source.join("entry");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        for index in 0..30 {
+            std::fs::write(entry.join(format!("page-{index:02}.jpg")), []).unwrap();
+        }
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Session Layout", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        let saved_cols = 6;
+        let changed_cols = 2;
+        let cell_h = 100.0;
+        let viewport_h = 300.0;
+        app.settings.grid_cols = saved_cols;
+        let selected = *app.current_grid_order().last().expect("prepared items");
+        let selected_position = app
+            .current_grid_order()
+            .iter()
+            .position(|&index| index == selected)
+            .unwrap();
+        assert!(selected_position >= 12, "test needs a multi-row grid");
+        let saved_offset = (selected_position / saved_cols) as f32 * cell_h;
+        app.selected = Some(selected);
+        app.scroll_offset_y = saved_offset;
+        app.scroll_to_selected = false;
+
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        app.settings.grid_cols = changed_cols;
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert_eq!(app.settings.grid_cols, changed_cols);
+        assert_eq!(app.selected, Some(selected));
+        assert_eq!(
+            app.scroll_offset_y, saved_offset,
+            "restore installs the saved snapshot before the shared ensure-visible pass"
+        );
+        assert!(
+            app.scroll_to_selected,
+            "changed layout must reuse ordinary folder navigation's ensure-visible path"
+        );
+
+        app.last_viewport_h = viewport_h;
+        app.apply_scroll_to_selected(changed_cols, cell_h);
+        let selected_position = app
+            .current_grid_order()
+            .iter()
+            .position(|&index| index == selected)
+            .unwrap();
+        let selected_row_top = (selected_position / changed_cols) as f32 * cell_h;
+        let selected_row_bottom = selected_row_top + cell_h;
+        assert_ne!(app.scroll_offset_y, saved_offset);
+        assert!(selected_row_top >= app.scroll_offset_y);
+        assert!(selected_row_bottom <= app.scroll_offset_y + viewport_h);
     }
 
     #[test]
