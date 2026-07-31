@@ -526,6 +526,12 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   Keymap ownership 境界で一緒に consume する。no-repeat の Tab repeat も発火させず除去する。
   TextEdit / IME の keyboard owner gate は先に維持し、IME 中の field-level focus lock / 復帰と
   直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
+  Hover side panel 内の helper field が実 focus を持つ間は panel lifetime も維持し、widget を描かなかった
+  ことによる egui end-pass の dead-man focus clear を起こさない。これは非 IME の focus recovery ではなく、
+  focus が別 widget へ移れば解除される。`[text-input-key]` の通常ログには helper field の id 継続、focus 前後、
+  owner / phase、side-panel close call site を恒久的に残す。無修飾の文字 key / physical key は
+  `Char` へマスクして入力内容を残さない。通常 record は process あたり 1 MiB で抑止し、id / focus /
+  owner / close の異常 record は上限後も残す。helper focus contract がない pass は event list を走査しない。
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
   FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsFixedJumpNext/Prev `Shift+→/←` /
   FsHome/End (予約候補)

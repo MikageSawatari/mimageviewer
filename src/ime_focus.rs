@@ -1,11 +1,18 @@
 //! IME composition focus policy for egui text fields.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const IME_STATE_ID: &str = "miv_ime_focus_state";
 const IME_FOCUS_RETRY_ID: &str = "miv_ime_focus_retry";
 const IME_TEXT_FOCUS_CONTRACT_ID: &str = "miv_ime_text_focus_contract";
+const TEXT_INPUT_KEY_DIAGNOSTIC_ID: &str = "miv_text_input_key_diagnostic";
+const TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID: &str = "miv_text_input_key_diagnostic_started";
+const TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BUDGET_BYTES: usize = 1024 * 1024;
+const TEXT_INPUT_KEY_DIAGNOSTIC_LOG_OVERHEAD_BYTES: usize = 64;
 const IME_EVENT_GRACE: Duration = Duration::from_millis(300);
+static TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static TEXT_INPUT_KEY_DIAGNOSTIC_BUDGET_NOTICE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ImeFocusState {
@@ -28,6 +35,81 @@ impl Default for ImeTextFocusContract {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticKeyIdentity {
+    Char,
+    Named(egui::Key),
+}
+
+impl DiagnosticKeyIdentity {
+    fn log_label(self) -> String {
+        match self {
+            Self::Char => "Char".to_owned(),
+            Self::Named(key) => format!("{key:?}"),
+        }
+    }
+
+    fn optional_log_label(key: Option<Self>) -> String {
+        match key {
+            Some(key) => format!("Some({})", key.log_label()),
+            None => "None".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiagnosticKeyPress {
+    key: DiagnosticKeyIdentity,
+    physical_key: Option<DiagnosticKeyIdentity>,
+    modifiers: egui::Modifiers,
+    repeat: bool,
+}
+
+impl DiagnosticKeyPress {
+    fn from_event(
+        key: egui::Key,
+        physical_key: Option<egui::Key>,
+        modifiers: egui::Modifiers,
+        repeat: bool,
+    ) -> Self {
+        Self {
+            key: diagnostic_key_identity(key, modifiers),
+            physical_key: physical_key.map(|key| diagnostic_key_identity(key, modifiers)),
+            modifiers,
+            repeat,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TextInputKeyDiagnostic {
+    pass: u64,
+    viewport: egui::ViewportId,
+    field_id_before: egui::Id,
+    field_id_after: Option<egui::Id>,
+    field_seen_after: bool,
+    focused_before: Option<egui::Id>,
+    owner: Option<crate::keyboard_input::KeyboardOwner>,
+    keys: Vec<DiagnosticKeyPress>,
+    side_panel_close_sites: Vec<&'static str>,
+}
+
+impl Default for TextInputKeyDiagnostic {
+    fn default() -> Self {
+        Self {
+            pass: 0,
+            viewport: egui::ViewportId::ROOT,
+            field_id_before: egui::Id::NULL,
+            field_id_after: None,
+            field_seen_after: false,
+            focused_before: None,
+            owner: None,
+            keys: Vec::new(),
+            side_panel_close_sites: Vec::new(),
+        }
+    }
+}
+
 fn ime_state_id(viewport_id: egui::ViewportId) -> egui::Id {
     egui::Id::new((IME_STATE_ID, viewport_id))
 }
@@ -40,7 +122,337 @@ fn text_focus_contract_id(viewport_id: egui::ViewportId) -> egui::Id {
     egui::Id::new((IME_TEXT_FOCUS_CONTRACT_ID, viewport_id))
 }
 
+fn text_input_key_diagnostic_id(viewport_id: egui::ViewportId) -> egui::Id {
+    egui::Id::new((TEXT_INPUT_KEY_DIAGNOSTIC_ID, viewport_id))
+}
+
+fn text_input_key_diagnostic_started_id(viewport_id: egui::ViewportId) -> egui::Id {
+    egui::Id::new((TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID, viewport_id))
+}
+
+fn diagnostic_owner_phase(owner: Option<crate::keyboard_input::KeyboardOwner>) -> &'static str {
+    match owner {
+        Some(crate::keyboard_input::KeyboardOwner::TextInput { phase, .. }) => match phase {
+            crate::keyboard_input::TextInputPhase::PendingFocus => "PendingFocus",
+            crate::keyboard_input::TextInputPhase::Focused => "Focused",
+            crate::keyboard_input::TextInputPhase::FocusRecovery => "FocusRecovery",
+            crate::keyboard_input::TextInputPhase::ImeGrace => "ImeGrace",
+        },
+        Some(crate::keyboard_input::KeyboardOwner::Modal) => "Modal",
+        Some(crate::keyboard_input::KeyboardOwner::FocusedUi { .. }) => "FocusedUi",
+        Some(crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }) => {
+            "ApplicationShortcut"
+        }
+        Some(crate::keyboard_input::KeyboardOwner::Unclaimed) => "Unclaimed",
+        None => "Unresolved",
+    }
+}
+
+fn key_is_non_character(key: egui::Key) -> bool {
+    use egui::Key;
+
+    // This is deliberately a non-character allowlist: any future key variant
+    // is masked by default until it is explicitly classified as non-text.
+    matches!(
+        key,
+        Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::ArrowUp
+            | Key::Escape
+            | Key::Tab
+            | Key::Backspace
+            | Key::Enter
+            | Key::Insert
+            | Key::Delete
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Copy
+            | Key::Cut
+            | Key::Paste
+            | Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+            | Key::F13
+            | Key::F14
+            | Key::F15
+            | Key::F16
+            | Key::F17
+            | Key::F18
+            | Key::F19
+            | Key::F20
+            | Key::F21
+            | Key::F22
+            | Key::F23
+            | Key::F24
+            | Key::F25
+            | Key::F26
+            | Key::F27
+            | Key::F28
+            | Key::F29
+            | Key::F30
+            | Key::F31
+            | Key::F32
+            | Key::F33
+            | Key::F34
+            | Key::F35
+            | Key::BrowserBack
+    )
+}
+
+fn diagnostic_key_identity(key: egui::Key, modifiers: egui::Modifiers) -> DiagnosticKeyIdentity {
+    if modifiers.is_none() && !key_is_non_character(key) {
+        DiagnosticKeyIdentity::Char
+    } else {
+        DiagnosticKeyIdentity::Named(key)
+    }
+}
+
+fn diagnostic_is_anomalous(
+    diagnostic: &TextInputKeyDiagnostic,
+    focused_after: Option<egui::Id>,
+) -> bool {
+    diagnostic.field_id_after != Some(diagnostic.field_id_before)
+        || !diagnostic.field_seen_after
+        || focused_after != Some(diagnostic.field_id_before)
+        || diagnostic.owner.is_none()
+        || matches!(
+            diagnostic.owner,
+            Some(
+                crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+                    | crate::keyboard_input::KeyboardOwner::Unclaimed
+            )
+        )
+        || !diagnostic.side_panel_close_sites.is_empty()
+}
+
+fn reserve_routine_diagnostic_bytes(line_bytes: usize) -> bool {
+    TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            routine_diagnostic_bytes_after(used, line_bytes)
+        })
+        .is_ok()
+}
+
+fn routine_diagnostic_bytes_after(used: usize, line_bytes: usize) -> Option<usize> {
+    used.checked_add(line_bytes)
+        .and_then(|used| used.checked_add(TEXT_INPUT_KEY_DIAGNOSTIC_LOG_OVERHEAD_BYTES))
+        .filter(|next| *next <= TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BUDGET_BYTES)
+}
+
+fn log_key_diagnostic(diagnostic: &TextInputKeyDiagnostic, focused_after: Option<egui::Id>) {
+    let anomalous = diagnostic_is_anomalous(diagnostic, focused_after);
+    for line in format_key_diagnostic(diagnostic, focused_after) {
+        if anomalous || reserve_routine_diagnostic_bytes(line.len()) {
+            crate::logger::log(line);
+        } else if !TEXT_INPUT_KEY_DIAGNOSTIC_BUDGET_NOTICE_LOGGED.swap(true, Ordering::Relaxed) {
+            crate::logger::log(
+                "[text-input-key] routine diagnostic budget exhausted; further routine records \
+                 are suppressed, anomaly records remain enabled",
+            );
+        }
+    }
+}
+
+fn format_key_diagnostic(
+    diagnostic: &TextInputKeyDiagnostic,
+    focused_after: Option<egui::Id>,
+) -> Vec<String> {
+    let field_id_changed = diagnostic.field_id_after != Some(diagnostic.field_id_before);
+    let close_site = if diagnostic.side_panel_close_sites.is_empty() {
+        "none".to_owned()
+    } else {
+        diagnostic.side_panel_close_sites.join("|")
+    };
+    diagnostic
+        .keys
+        .iter()
+        .map(|key| {
+            format!(
+                "[text-input-key] viewport={:?} pass={} key={} physical_key={} \
+                 modifiers={:?} repeat={} field_id={:?} field_id_after={:?} \
+                 field_id_changed={} field_seen_after={} focused_before={:?} \
+                 focused_after={:?} owner={:?} phase={} side_panel_close={}",
+                diagnostic.viewport,
+                diagnostic.pass,
+                key.key.log_label(),
+                DiagnosticKeyIdentity::optional_log_label(key.physical_key),
+                key.modifiers,
+                key.repeat,
+                diagnostic.field_id_before,
+                diagnostic.field_id_after,
+                field_id_changed,
+                diagnostic.field_seen_after,
+                diagnostic.focused_before,
+                focused_after,
+                diagnostic.owner,
+                diagnostic_owner_phase(diagnostic.owner),
+                close_site,
+            )
+        })
+        .collect()
+}
+
+/// Start the helper-managed text-input diagnostic for this pass.
+///
+/// A record is created only for key presses when the helper focus contract says
+/// that the field is focused now or was focused in the immediately preceding
+/// pass. The next pass supplies the post-`end_pass` focus state, after egui's
+/// dead-man switch has removed focus from widgets that disappeared.
+pub(crate) fn begin_pass_diagnostics(ctx: &egui::Context) {
+    let viewport = ctx.viewport_id();
+    let pass = ctx.cumulative_pass_nr();
+    let mut previous = None;
+    let mut contract = None;
+    let already_started = ctx.data_mut(|data| {
+        let started_id = text_input_key_diagnostic_started_id(viewport);
+        if data.get_temp::<u64>(started_id) == Some(pass) {
+            return true;
+        }
+        data.insert_temp(started_id, pass);
+        previous =
+            data.remove_temp::<TextInputKeyDiagnostic>(text_input_key_diagnostic_id(viewport));
+        contract = data.get_temp::<ImeTextFocusContract>(text_focus_contract_id(viewport));
+        false
+    });
+    if already_started {
+        return;
+    }
+
+    let previous_focused_after = previous
+        .as_ref()
+        .map(|_| ctx.memory(|memory| memory.focused()));
+    if let Some(previous) = previous {
+        log_key_diagnostic(&previous, previous_focused_after.flatten());
+    }
+
+    let Some(contract) = contract else {
+        return;
+    };
+    if pass.saturating_sub(contract.focused_pass) > 1 {
+        return;
+    }
+
+    // Do not inspect or allocate the event list unless a helper-managed field
+    // is focused now or was focused in the immediately preceding pass.
+    let keys = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                } => Some(DiagnosticKeyPress::from_event(
+                    *key,
+                    *physical_key,
+                    *modifiers,
+                    *repeat,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    if keys.is_empty() {
+        return;
+    }
+    let focused_before =
+        previous_focused_after.unwrap_or_else(|| ctx.memory(|memory| memory.focused()));
+
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            text_input_key_diagnostic_id(viewport),
+            TextInputKeyDiagnostic {
+                pass,
+                viewport,
+                field_id_before: contract.widget_id,
+                field_id_after: None,
+                field_seen_after: false,
+                focused_before,
+                owner: None,
+                keys,
+                side_panel_close_sites: Vec::new(),
+            },
+        );
+    });
+    // The next pass finalizes `focused_after` after egui's end-pass focus
+    // validation, even if this key did not otherwise request another repaint.
+    ctx.request_repaint();
+}
+
+fn observe_helper_widget(ctx: &egui::Context, widget_id: egui::Id) {
+    let viewport = ctx.viewport_id();
+    let pass = ctx.cumulative_pass_nr();
+    let has_focus = ctx.memory(|memory| memory.has_focus(widget_id));
+    ctx.data_mut(|data| {
+        let id = text_input_key_diagnostic_id(viewport);
+        let Some(mut diagnostic) = data.get_temp::<TextInputKeyDiagnostic>(id) else {
+            return;
+        };
+        if diagnostic.pass != pass {
+            return;
+        }
+        if widget_id == diagnostic.field_id_before {
+            diagnostic.field_seen_after = true;
+            diagnostic.field_id_after = Some(widget_id);
+        } else if has_focus {
+            diagnostic.field_id_after = Some(widget_id);
+        }
+        data.insert_temp(id, diagnostic);
+    });
+}
+
+pub(crate) fn record_keyboard_owner(
+    ctx: &egui::Context,
+    owner: crate::keyboard_input::KeyboardOwner,
+) {
+    let viewport = ctx.viewport_id();
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| {
+        let id = text_input_key_diagnostic_id(viewport);
+        let Some(mut diagnostic) = data.get_temp::<TextInputKeyDiagnostic>(id) else {
+            return;
+        };
+        if diagnostic.pass != pass {
+            return;
+        }
+        diagnostic.owner = Some(owner);
+        data.insert_temp(id, diagnostic);
+    });
+}
+
+pub(crate) fn record_side_panel_close(ctx: &egui::Context, call_site: &'static str) {
+    let viewport = ctx.viewport_id();
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| {
+        let id = text_input_key_diagnostic_id(viewport);
+        let Some(mut diagnostic) = data.get_temp::<TextInputKeyDiagnostic>(id) else {
+            return;
+        };
+        if diagnostic.pass != pass || diagnostic.side_panel_close_sites.contains(&call_site) {
+            return;
+        }
+        diagnostic.side_panel_close_sites.push(call_site);
+        data.insert_temp(id, diagnostic);
+    });
+}
+
 fn ime_input_active(ctx: &egui::Context) -> bool {
+    begin_pass_diagnostics(ctx);
     let ime_events: Vec<egui::ImeEvent> = ctx.input(|input| {
         input
             .events
@@ -205,6 +617,7 @@ pub(crate) fn restore_focus_for_ime_key(
         ctx.request_repaint();
     }
 
+    observe_helper_widget(ctx, response.id);
     if ctx.memory(|memory| memory.has_focus(response.id)) || restored {
         remember_text_focus(ctx, response.id);
     } else if response.lost_focus() {
@@ -283,6 +696,115 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn key_diagnostic_reports_identity_focus_owner_and_close_site_per_press() {
+        let field_id = egui::Id::new("diagnostic-field");
+        let diagnostic = TextInputKeyDiagnostic {
+            pass: 7,
+            viewport: egui::ViewportId::ROOT,
+            field_id_before: field_id,
+            field_id_after: Some(field_id),
+            field_seen_after: true,
+            focused_before: Some(field_id),
+            owner: Some(crate::keyboard_input::KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: field_id,
+                phase: crate::keyboard_input::TextInputPhase::Focused,
+            }),
+            keys: vec![
+                DiagnosticKeyPress::from_event(
+                    egui::Key::Backspace,
+                    Some(egui::Key::Backspace),
+                    egui::Modifiers::NONE,
+                    false,
+                ),
+                DiagnosticKeyPress::from_event(
+                    egui::Key::A,
+                    Some(egui::Key::A),
+                    egui::Modifiers::NONE,
+                    false,
+                ),
+            ],
+            side_panel_close_sites: vec![
+                "ui_fullscreen::handle_fs_wheel_and_click:hover_auto_dismiss",
+            ],
+        };
+
+        let lines = format_key_diagnostic(&diagnostic, Some(field_id));
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.contains("field_id_changed=false"));
+            assert!(line.contains("field_seen_after=true"));
+            assert!(line.contains("phase=Focused"));
+            assert!(line.contains("focused_before=Some("));
+            assert!(line.contains("focused_after=Some("));
+            assert!(line.contains(
+                "side_panel_close=ui_fullscreen::handle_fs_wheel_and_click:hover_auto_dismiss"
+            ));
+        }
+        assert!(lines[0].contains("key=Backspace physical_key=Some(Backspace)"));
+        assert!(lines[1].contains("key=Char physical_key=Some(Char)"));
+        assert!(!lines[1].contains("key=A"));
+    }
+
+    #[test]
+    fn diagnostic_masks_plain_characters_but_keeps_shortcut_and_non_character_keys() {
+        for key in [
+            egui::Key::A,
+            egui::Key::Num7,
+            egui::Key::Space,
+            egui::Key::Questionmark,
+        ] {
+            let press =
+                DiagnosticKeyPress::from_event(key, Some(key), egui::Modifiers::NONE, false);
+            assert_eq!(press.key, DiagnosticKeyIdentity::Char);
+            assert_eq!(press.physical_key, Some(DiagnosticKeyIdentity::Char));
+        }
+
+        let modified = DiagnosticKeyPress::from_event(
+            egui::Key::A,
+            Some(egui::Key::A),
+            egui::Modifiers::CTRL,
+            false,
+        );
+        assert_eq!(modified.key, DiagnosticKeyIdentity::Named(egui::Key::A));
+        assert_eq!(
+            modified.physical_key,
+            Some(DiagnosticKeyIdentity::Named(egui::Key::A))
+        );
+
+        let non_character = DiagnosticKeyPress::from_event(
+            egui::Key::Backspace,
+            Some(egui::Key::Backspace),
+            egui::Modifiers::NONE,
+            false,
+        );
+        assert_eq!(
+            non_character.key,
+            DiagnosticKeyIdentity::Named(egui::Key::Backspace)
+        );
+        assert_eq!(
+            non_character.physical_key,
+            Some(DiagnosticKeyIdentity::Named(egui::Key::Backspace))
+        );
+    }
+
+    #[test]
+    fn routine_diagnostic_budget_accepts_the_boundary_and_rejects_overflow() {
+        let line_bytes = 400;
+        let charge = line_bytes + TEXT_INPUT_KEY_DIAGNOSTIC_LOG_OVERHEAD_BYTES;
+        let used_at_boundary = TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BUDGET_BYTES - charge;
+        assert_eq!(
+            routine_diagnostic_bytes_after(used_at_boundary, line_bytes),
+            Some(TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BUDGET_BYTES)
+        );
+        assert_eq!(
+            routine_diagnostic_bytes_after(used_at_boundary + 1, line_bytes),
+            None
+        );
+        assert_eq!(routine_diagnostic_bytes_after(usize::MAX, line_bytes), None);
     }
 
     fn draw_text_fields(

@@ -13451,6 +13451,7 @@ impl App {
     /// `show_viewport_immediate` で別ビューポートを出している場合は、その closure の
     /// 先頭でも呼ばないと、そのビューポート内の IME を取り逃がす。
     pub(crate) fn update_ime_state(&mut self, ctx: &egui::Context) {
+        crate::ime_focus::begin_pass_diagnostics(ctx);
         ctx.input(|i| {
             for event in &i.events {
                 if let egui::Event::Ime(ime) = event {
@@ -13589,11 +13590,13 @@ impl App {
         ctx: &egui::Context,
     ) -> crate::keyboard_input::KeyboardOwner {
         if let Some(owner) = crate::keyboard_input::cached_keyboard_owner(ctx) {
+            crate::ime_focus::record_keyboard_owner(ctx, owner);
             return owner;
         }
         let owner =
             crate::keyboard_input::decide_keyboard_owner(self.keyboard_ownership_snapshot(ctx));
         crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+        crate::ime_focus::record_keyboard_owner(ctx, owner);
         owner
     }
 

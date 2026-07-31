@@ -9003,7 +9003,7 @@ mod creative_lut_ui_tests {
     }
 }
 
-fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
+pub(crate) fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
     egui::Id::new("book_bookmark_title_edit").with(bookmark_id)
 }
 
@@ -9051,12 +9051,16 @@ mod bookmark_title_edit_tests {
     use super::draw_bookmark_title_edit;
 
     fn key_event(key: egui::Key) -> egui::Event {
+        key_event_with_modifiers(key, egui::Modifiers::NONE)
+    }
+
+    fn key_event_with_modifiers(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
         }
     }
 
@@ -9156,6 +9160,57 @@ mod bookmark_title_edit_tests {
         });
 
         assert_eq!(submit_count, 1);
+    }
+
+    #[test]
+    fn clearing_title_keeps_the_same_widget_and_focus_before_plain_text() {
+        let ctx = egui::Context::default();
+        let mut title = String::from("bookmark");
+        let mut request_focus = true;
+        let mut ids = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+        });
+
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                events: vec![key_event_with_modifiers(
+                    egui::Key::A,
+                    egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                )],
+                ..Default::default()
+            },
+            |ctx| {
+                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::Backspace)],
+                ..Default::default()
+            },
+            |ctx| {
+                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            },
+        );
+
+        assert!(title.is_empty());
+        assert_eq!(ctx.memory(|memory| memory.focused()), ids.last().copied());
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
+                ..Default::default()
+            },
+            |ctx| {
+                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            },
+        );
+
+        assert_eq!(title, "a");
+        assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(ctx.memory(|memory| memory.focused()), ids.last().copied());
     }
 
     fn editor_id_for_row_order(order: &[i64], target: i64) -> egui::Id {
@@ -13453,6 +13508,10 @@ impl App {
             child.ctx().request_repaint();
         }
         if close_clicked {
+            crate::ime_focus::record_side_panel_close(
+                child.ctx(),
+                "ui_adjustment_panel::draw_adjustment_panel:close_button",
+            );
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
             child.ctx().request_repaint();
@@ -13612,30 +13671,54 @@ impl App {
             // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
             // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
             if activate_local_adjust {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_local_adjust",
+                );
                 self.enter_local_adjust_mode();
                 return;
             }
             if activate_erase {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_erase",
+                );
                 self.adjustment_mode = false;
                 self.enter_erase_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_conceal {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
+                );
                 self.adjustment_mode = false;
                 self.enter_conceal_mode(fs_root_idx);
                 return;
             }
             if activate_crop {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_crop",
+                );
                 self.adjustment_mode = false;
                 self.enter_export_crop_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_text {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_text",
+                );
                 self.adjustment_mode = false;
                 self.enter_text_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_export {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:open_export",
+                );
                 self.adjustment_mode = false;
                 let ctx = child.ctx().clone();
                 self.open_export_dialog_for_current(&ctx, fs_idx);

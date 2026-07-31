@@ -44746,6 +44746,41 @@ fn fullscreen_i_key_toggles_side_panel_mode() {
 }
 
 #[test]
+fn plain_a_has_no_bookmark_panel_fullscreen_action() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Image(PathBuf::from("C:/photos/panel-a.jpg")));
+    app.fullscreen_idx = Some(idx);
+    app.adjustment_mode = true;
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+
+    let action = app.handle_fs_key_input(&ctx, idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(action.page_nav.is_none());
+    assert!(!action.close);
+    assert!(!action.close_to_page_list);
+    assert!(app.adjustment_mode);
+    assert!(!app.local_adjust_mode);
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+}
+
+#[test]
 fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() {
     let _input_guard = crate::key_input::TEST_INPUT_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))

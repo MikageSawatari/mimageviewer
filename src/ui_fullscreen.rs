@@ -607,6 +607,20 @@ fn adjustment_panel_hover_active_at(
     })
 }
 
+fn adjustment_panel_should_auto_close(
+    mode: crate::settings::FsSidePanelMode,
+    panel_open: bool,
+    dragging: bool,
+    hover_active: bool,
+    bookmark_title_focused: bool,
+) -> bool {
+    mode.normalized() == crate::settings::FsSidePanelMode::Hover
+        && panel_open
+        && !dragging
+        && !hover_active
+        && !bookmark_title_focused
+}
+
 fn should_handle_fullscreen_wheel(
     cursor_in_panel: bool,
     in_video_tile: bool,
@@ -6954,6 +6968,12 @@ impl App {
 
     fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
         if self.fullscreen_idx != Some(target_idx) {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::seek_to_continuous_page:file_change",
+                );
+            }
             self.reset_fs_side_panel_runtime_for_file_change();
         }
         self.fullscreen_idx = Some(target_idx);
@@ -9433,6 +9453,12 @@ impl App {
                                 ctx.request_repaint();
                             }
                             if side_panel_mode_pressed {
+                                if self.adjustment_mode {
+                                    crate::ime_focus::record_side_panel_close(
+                                        ctx,
+                                        "ui_fullscreen::draw_fs_hover_bar:side_panel_mode_button",
+                                    );
+                                }
                                 self.cycle_fs_side_panel_mode();
                             }
                             if copy_capture_pressed {
@@ -12647,6 +12673,7 @@ impl App {
             self.toggle_compare_diff_mode(ctx, fs_idx);
         }
 
+        let adjustment_open_before_escape = self.adjustment_mode;
         if esc && self.compare_view_mode.is_overlay() {
             self.compare_view_mode = crate::app::CompareViewMode::Off;
             self.clear_compare_gpu_pair();
@@ -12654,6 +12681,12 @@ impl App {
             self.show_feedback_toast("[比較: Normal]".to_string());
         } else if esc && !pano_active_now && self.close_click_side_panels() {
             // ClickToShow の明示オープンは Esc で先に閉じる。
+            if adjustment_open_before_escape {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_key_input:close_click_side_panels",
+                );
+            }
         } else if esc {
             action.close = true;
         }
@@ -12676,6 +12709,12 @@ impl App {
         }
         // I / Tab は左右パネルの呼び出しモードを切り替える。
         if key_i {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_key_input:FsToggleMetadata",
+                );
+            }
             self.cycle_fs_side_panel_mode();
         }
         // V: 360 度パノラマビューモード トグル。
@@ -12685,6 +12724,12 @@ impl App {
             self.toggle_panorama_mode(fs_idx);
         }
         if key_z && !is_spread_double {
+            if !self.analysis_mode && self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_key_input:FsImageAnalysis",
+                );
+            }
             self.toggle_analysis_mode();
         }
         if self.analysis_mode && !is_spread_double {
@@ -13389,25 +13434,53 @@ impl App {
         // 強制的に落とす。
         if compare_wipe_active {
             if self.adjustment_mode && !self.adjustment_dragging {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:compare_wipe",
+                );
                 self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
             }
         } else if self.is_overlay_edit_mode_active() {
             // 消しゴム / 補正レイヤー / 隠蔽加工モード中は補正パネルを強制 OFF
             // (編集中に色補正バーが画面端ホバーで開かないように)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:overlay_edit",
+                );
+            }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self.view_trim_mode {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:view_trim",
+                );
+            }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_entry_is_animated(idx))
         {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:animated_item",
+                );
+            }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self.fs_zoom_mode_engaged() {
             // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:zoom_mode",
+                );
+            }
             self.adjustment_mode = false;
         } else if self
             .fullscreen_idx
@@ -13416,9 +13489,23 @@ impl App {
             // 音楽ビュー: 画面端ホバーで画像用の補正パネルを開かない。パネル描画自体は
             // 抑制済みだが、adjustment_mode フラグを立てると画像に戻った瞬間まで残るので
             // ここで OFF に固定する (Inc 3 パネル漏れ修正)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:music_view",
+                );
+            }
             self.adjustment_mode = false;
         } else {
             let mode = self.settings.fullscreen_side_panel_mode.normalized();
+            let bookmark_title_focused =
+                self.book_bookmark_title_edit.as_ref().is_some_and(|edit| {
+                    ctx.memory(|memory| {
+                        memory.has_focus(
+                            crate::ui_adjustment_panel::book_bookmark_title_edit_widget_id(edit.id),
+                        )
+                    })
+                });
             let left_panel_hover_active = passive_hover_enabled
                 && crate::ui_helpers::edge_summons_adjustment(
                     mode,
@@ -13431,13 +13518,19 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     self.adjustment_mode,
                 );
-            if left_panel_hover_active {
+            if left_panel_hover_active || bookmark_title_focused {
                 self.adjustment_mode = true;
-            } else if !left_panel_hover_active
-                && self.adjustment_mode
-                && !self.adjustment_dragging
-                && mode == crate::settings::FsSidePanelMode::Hover
-            {
+            } else if adjustment_panel_should_auto_close(
+                mode,
+                self.adjustment_mode,
+                self.adjustment_dragging,
+                left_panel_hover_active,
+                bookmark_title_focused,
+            ) {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:hover_auto_dismiss",
+                );
                 self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
             }
@@ -14444,6 +14537,12 @@ impl App {
             }
             // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
             let cursor_state = self.fullscreen_cursor_state();
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
+                );
+            }
             self.open_fullscreen(idx);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
             return;
@@ -14470,6 +14569,12 @@ impl App {
         }
 
         let cursor_state = self.fullscreen_cursor_state();
+        if self.adjustment_mode {
+            crate::ime_focus::record_side_panel_close(
+                ctx,
+                "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
+            );
+        }
         self.open_fullscreen(idx);
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
@@ -14936,6 +15041,12 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_navigation:close_fullscreen",
+                );
+            }
             let detached = self.viewer_session_is_detached();
             self.handle_fullscreen_close_request();
             if !detached {
@@ -14948,6 +15059,12 @@ impl App {
         } else if close_to_page_list {
             // BS: 階層を 1 段戻す = コンテナのページ一覧 (L2) へ。close_fullscreen は
             // current_folder=ZIP/PDF のまま閉じるので L2 が出る (設定で分岐しない)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_navigation:close_to_page_list",
+                );
+            }
             self.close_fullscreen();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.request_repaint();
@@ -25630,6 +25747,28 @@ mod tests {
             true,
         ));
         assert!(!adjustment_panel_hover_active_at(viewport, None, true));
+    }
+
+    #[test]
+    fn focused_bookmark_title_owns_hover_panel_lifetime() {
+        let mode = crate::settings::FsSidePanelMode::Hover;
+        assert!(adjustment_panel_should_auto_close(
+            mode, true, false, false, false,
+        ));
+        assert!(
+            !adjustment_panel_should_auto_close(mode, true, false, false, true),
+            "a focused bookmark title must keep its containing hover panel registered"
+        );
+        assert!(!adjustment_panel_should_auto_close(
+            mode, true, false, true, false,
+        ));
+        assert!(!adjustment_panel_should_auto_close(
+            crate::settings::FsSidePanelMode::ClickToShow,
+            true,
+            false,
+            false,
+            false,
+        ));
     }
 
     #[test]

@@ -193,6 +193,10 @@ pub enum FsSidePanelMode {
 
 共通ルール (3 面同一):
 - **Hover モード**: 左端ホバー→左パネル / 右端ホバー→右パネル / 上端ホバー→上バー (分離)。
+  左パネルのブックマーク名 TextEdit が実際に keyboard focus を持つ間は、pointer hover が一時的に
+  失われても左パネルを登録し続ける。field の id は bookmark DB id 由来で、空タイトルの hint 表示、
+  行追加・削除・並べ替えでは変えない。focus を別 widget へ移す処理ではなく、正当な focus 移動後は
+  次 pass から通常の transient hover lifetime に戻る。
   動画・音楽は既に分離済みなので Hover は現状維持。静止画のみ分離が新規 (決定 A)。
 - **ClickToShow モード**: 端ホバーで開かない。左 `▶` / 右 `◀` 呼び出しバーのクリックで開く。
   - **右パネル (◀) = per-file** (`fs_click_info_open`、3 面共通の App runtime bool)。ON なら

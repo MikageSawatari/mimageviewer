@@ -92,6 +92,16 @@ IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が
 この owner は TextEdit の再描画前から keymap を抑止し、同じ pass で field の focus を復帰する。
 pointer 入力を伴う focus 移動は優先して復帰しない。アプリ全体の Tab traversal 無効化、IME field の
 focus 保持、keymap の操作発火抑止は別責務であり、同じ event をそれぞれの ownership 境界で扱う。
+Hover で出す side panel 内の helper-managed field が実際に focus を持つ間は、その field を次 pass
+にも登録できるよう panel lifetime を keyboard focus でも維持する。これは focus を取り戻す処理ではなく、
+pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻る。IME を条件にした 1-pass
+`FocusRecovery` の条件と上限は変更しない。
+
+診断は通常 logger の `[text-input-key]` として恒久的に残す。helper field が focused または直前 pass で
+focused だった各 key press について、前後の widget id / egui focus、id 変化、resolved keyboard owner / phase、
+同 pass で左 side panel を閉じた call site を記録する。無修飾の文字 key と physical key は `Char` に
+マスクし、入力内容を復元できない形にする。通常 record は process あたり 1 MiB で抑止し、id / focus /
+owner / close の異常 record は上限後も記録する。helper focus contract がない pass は key event を走査しない。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
