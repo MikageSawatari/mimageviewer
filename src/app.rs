@@ -35959,6 +35959,15 @@ impl App {
         mounted || active_detached || parked || eof_resolution || eof_handoff
     }
 
+    /// Non-Windows builds have no tray residency and no hidden-root wake bridge, so nothing
+    /// can be owed an update. The platform difference lives here rather than at each caller:
+    /// `hide_to_tray` reads this outside any `cfg` block, and gating it there instead would
+    /// leave the next caller to rediscover the same break.
+    #[cfg(not(windows))]
+    pub(crate) fn tray_resident_media_updates_needed(&self) -> bool {
+        false
+    }
+
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
     /// bundle は所有権を移さず、teardown plan の read-only 部分だけを再利用する。
     /// (review-v2.3.0 追補6: R1-2 detached exit resume)
