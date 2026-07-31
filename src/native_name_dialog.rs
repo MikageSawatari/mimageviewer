@@ -1,9 +1,30 @@
 //! Windows standard single-line name input dialog.
 //!
+//! Used for the two inputs that become filesystem names - rename and new folder. The point is
+//! delegating correctness to the OS rather than reimplementing it: the grapheme, IME, clipboard
+//! and undo matrix is not something we can verify ourselves. Export keeps its egui dialog (it has
+//! checkboxes and enough other parts that moving it would cost more than it returns), and tag and
+//! bookmark names are not filesystem names.
+//!
 //! The dialog is deliberately synchronous: `DialogBoxIndirectParamW` owns the
 //! nested modal message loop, including IME, clipboard, undo, Tab, Enter, and
 //! Escape behavior. Callers must not hold application locks across
-//! [`prompt_name`].
+//! [`prompt_name`] - a re-entrant window proc is how `95b75fd5` deadlocked.
+//!
+//! # The EDIT control does not delete by grapheme cluster
+//!
+//! Verified on the machine, 2026-07-31. It steps **one code point per Backspace**, exactly as
+//! egui did, so 👨‍👩‍👧‍👦 loses one member at a time and ❤️ drops its variation selector and turns
+//! monochrome. Explorer's rename field behaves the same way. The assumption that "EDIT is the OS
+//! text stack, so graphemes come with it" was wrong.
+//!
+//! **Do not add grapheme-aware deletion.** A subclass widening the Backspace selection to the
+//! cluster boundary was written and removed on 2026-07-31. Matching the platform is the point of
+//! this module; being better than it is not, and custom editing behaviour layered on top is
+//! itself the kind of unintended change moving to a native dialog was meant to avoid.
+//!
+//! Also unchanged by this module: how ZWJ sequences are **drawn**. egui does not do full text
+//! shaping, so the grid's filename labels do not join family emoji either.
 
 /// Parameters for a filesystem name prompt.
 pub(crate) struct NameInputRequest<'a> {
