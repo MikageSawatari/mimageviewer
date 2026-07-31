@@ -381,16 +381,17 @@ Delete の選択範囲をクラスタ境界へ広げる実装は一度作った�
   リリース処理の完了後、同じコミットを競合プロセスなしで再実行すると正式ゲートは
   `[test-full] PASS` で完走したため、製品テストの並列不具合ではなくリリースツール間の
   干渉と判定。v2.8.0 の出荷は止めず、次版でツールを堅牢化する。
-- **P2: `build-release.ps1` の停止対象が広すぎる**:
-  - 現状はリポジトリ配下のプロセス名 `mimageviewer*` を列挙して
-    `Stop-Process -Force` する。Cargo のテストハーネスも
-    `target\debug\deps\mimageviewer-<hash>.exe` なので、別セッションのテストまで
-    強制終了し得る。
-  - 対応案 = 停止対象を launcher / core / helper の正確な実行ファイル名と想定配置へ
-    allowlist 化する。必要なら test / release の同時実行を検知するリポジトリ単位の
-    mutex またはロックも追加し、黙って相手を終了せず明示的に待機または失敗させる。
-  - 完了条件 = 実行中のダミー `mimageviewer-<hash>.exe` を停止せず、repo の launcher /
-    core と APPDATA に展開された対象 helper だけを従来どおり停止できること。
+- **P2: `build-release.ps1` の停止対象が広すぎる (v2.9.1 対応済み)**:
+  - 原因はプロセス名の前方一致 `mimageviewer*`。Cargo のテストハーネスは
+    `target\debug\deps\mimageviewer-<hash>.exe` で、**リポジトリ配下にあるため path 判定も
+    通過**し、別セッションの `cargo test` ごと `Stop-Process -Force` していた。
+  - 停止対象を `mimageviewer` / `mimageviewer-core` / `mimageviewer-vst3-host` /
+    `mimageviewer-susie32` の完全名 allowlist に変更した。`build-portable.ps1` も同じ
+    欠陥を持っていたので揃えた (`build-dev.ps1` は元から完全名指定で影響なし)。
+  - path を読めないプロセス (昇格 / 保護) は従来どおり停止するが、allowlist を通った
+    ものだけになったのでテストハーネスは対象外。
+  - リポジトリ単位の test / release 相互排他ロックは**入れていない**。名前の取り違えが
+    原因だったので、まず allowlist だけで様子を見る。再発したらロックを検討する。
 - **P2: クリーン環境の正式テストゲートが release core に依存する**:
   - `scripts/test-full.ps1` の workspace test には launcher が含まれるが、launcher の
     build script は既存の `target\release\mimageviewer-core.exe` を要求する。このため

@@ -63,8 +63,17 @@ Write-Host "[portable] version = $version"
 # Only repo-built ones (path under repo root) are touched.
 # ---------------------------------------------------------------------------
 $repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
+# Exact names only. "mimageviewer*" also matches Cargo's test harnesses
+# (target\debug\deps\mimageviewer-<hash>.exe), which live under the repo root and so pass
+# the path check - stopping those killed another session's `cargo test` (backlog 5.3).
+$stoppableProcessNames = @(
+    'mimageviewer',
+    'mimageviewer-core',
+    'mimageviewer-vst3-host',
+    'mimageviewer-susie32'
+)
 Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -like 'mimageviewer*' } |
+    Where-Object { $stoppableProcessNames -contains $_.Name } |
     ForEach-Object {
         $p = $null
         try { $p = $_.Path } catch { $p = $null }
