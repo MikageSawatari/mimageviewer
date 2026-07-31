@@ -1538,8 +1538,18 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    ```
    - `--perf-log` 付きで mImageViewer を起動 → 手動で起動・Ctrl+↓ 連打・Ctrl+G 検索を実行
      → スクリプトが `analyze_perf.py hitches` で 16ms 超のフレーム間隔を集計。
-   - 「ヒッチ: 0 件」または既知の長時間 nav (PDF cold open ~700ms 等) のみなら OK。
-     nav イベント無しのヒッチは UI スレッド同期 I/O 退行の疑い (docs/ui-responsiveness.md §4)。
+   - **`hitches` の件数をそのまま合否にしない**。mIV は静止時に意図的に就寝するので、
+     操作の合間の sleep がすべて「ヒッチ」として数えられる (実測: 通常操作 55 秒で 108 件、
+     最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
+     - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
+     - `request_repaint_after_idle_upgrade` 等の遅延 wake → **正常** (予定どおりの起床)
+     - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
+       (docs/ui-responsiveness.md §4)
+   - 全体の目安は「16ms 未満のギャップが 97% 以上」。v2.9.1 実測は 4723 フレーム中
+     97.7%、100ms 超の 24 件はすべて就寝または遅延 wake 由来だった。
+   - bash が PATH に無い環境では `"C:\Program Files\Git\bin\bash.exe" scripts/perf_smoke.sh`。
+     スクリプトの実体は「FFmpeg DLL を target/release へコピー → perf log を退避 →
+     core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
    ```powershell
