@@ -1067,6 +1067,9 @@ pub fn run() -> eframe::Result {
     } else {
         None
     };
+    let remote_session_handle = _remote_ipc_server
+        .as_ref()
+        .map(remote_ipc::RemoteIpcServer::session_handle);
 
     // eframe::run_native に入る手前までを 1 つの marker として記録する。
     // これ以降は eframe (winit + wgpu) の初期化が走り、creator closure が呼ばれる。
@@ -1104,6 +1107,9 @@ pub fn run() -> eframe::Result {
                 saved.clone(),
                 settings_load_meta.clone(),
             );
+            if let Some(handle) = remote_session_handle.clone() {
+                app.set_remote_session_handle(handle);
+            }
             emit_startup("app_default", Some(t));
             if let Some(path) = startup_open_path.clone() {
                 app.set_startup_open_path(path);

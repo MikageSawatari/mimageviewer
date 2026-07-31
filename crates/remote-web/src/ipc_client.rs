@@ -11,6 +11,7 @@ use mimageviewer_ipc::{
     ContainerResponse, FrameError, HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload,
     PagePriority, PageRequest, PageResponse, RemoteAddress, RequestId, ServerMessage,
+    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus,
     ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, read_frame,
     write_frame,
 };
@@ -76,6 +77,7 @@ pub enum ClientError {
     Remote(ThumbnailError),
     CollectionRemote(CollectionError),
     MediaRemote(MediaError),
+    SessionRemote(SessionResponse),
 }
 
 impl ClientError {
@@ -97,6 +99,9 @@ impl ClientError {
                 format!("{}_{}", failure.stage, failure.kind)
             }
             Self::VersionMismatch { .. } => "protocol_version_mismatch".to_owned(),
+            Self::SessionRemote(response) => {
+                format!("session_{:?}", response.status).to_lowercase()
+            }
             Self::Remote(error) => match error.code {
                 ThumbnailErrorCode::BadRequest => "miv_bad_request",
                 ThumbnailErrorCode::FavoriteNotFound => "miv_favorite_not_found",
@@ -169,6 +174,7 @@ impl fmt::Display for ClientError {
             Self::MediaRemote(error) => {
                 write!(f, "mIV 本体がコンテナ要求を拒否しました: {}", error.message)
             }
+            Self::SessionRemote(response) => write!(f, "{}", response.message),
         }
     }
 }
@@ -183,12 +189,70 @@ impl ThumbnailClient {
         }
     }
 
+    pub fn session_acquire(
+        &self,
+        client_id: &str,
+        peer: SessionPeerInfo,
+    ) -> Result<SessionResponse, ClientFailure> {
+        self.session_request(|id| ClientMessage::SessionAcquire {
+            id,
+            request: SessionAcquireRequest {
+                client_id: client_id.to_owned(),
+                peer: peer.clone(),
+            },
+        })
+    }
+
+    pub fn session_ping(
+        &self,
+        client_id: &str,
+        user_active: bool,
+        media_playing: bool,
+    ) -> Result<SessionResponse, ClientFailure> {
+        self.session_request(|id| ClientMessage::SessionPing {
+            id,
+            request: SessionPingRequest {
+                client_id: client_id.to_owned(),
+                user_active,
+                media_playing,
+            },
+        })
+    }
+
+    pub fn session_activity(&self, client_id: &str) -> Result<SessionResponse, ClientFailure> {
+        self.session_request(|id| ClientMessage::SessionActivity {
+            id,
+            client_id: client_id.to_owned(),
+        })
+    }
+
+    fn session_request(
+        &self,
+        request: impl Fn(RequestId) -> ClientMessage,
+    ) -> Result<SessionResponse, ClientFailure> {
+        self.collection_request(request)
+            .and_then(|success| match success.value {
+                ServerMessage::Session { response, .. } => Ok(response),
+                _ => Err(ClientFailure {
+                    error: ClientError::Protocol(protocol_failure(
+                        "response_route",
+                        "response_type_mismatch",
+                        None,
+                        "session request received another response type",
+                    )),
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                }),
+            })
+    }
+
     pub fn probe(&self) -> Result<(), ClientError> {
         self.get_connection().map(|_| ())
     }
 
     pub fn thumbnail_address(
         &self,
+        client_id: &str,
         address: RemoteAddress,
         target_px: u32,
     ) -> Result<ThumbnailSuccess, ClientFailure> {
@@ -201,6 +265,7 @@ impl ThumbnailClient {
                 id,
                 ClientMessage::Thumbnail {
                     id,
+                    client_id: client_id.to_owned(),
                     request: request.clone(),
                 },
             ) {
@@ -212,6 +277,9 @@ impl ThumbnailClient {
                     response: ThumbnailResponse::Error(error),
                     ..
                 }) => Err(ClientError::Remote(error)),
+                Ok(ServerMessage::Session { response, .. }) => {
+                    Err(ClientError::SessionRemote(response))
+                }
                 Ok(_) => Err(ClientError::Protocol(protocol_failure(
                     "response_route",
                     "response_type_mismatch",
@@ -243,9 +311,10 @@ impl ThumbnailClient {
         })
     }
 
-    pub fn home(&self) -> Result<IpcSuccess<HomePayload>, ClientFailure> {
+    pub fn home(&self, client_id: &str) -> Result<IpcSuccess<HomePayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Home {
             id,
+            client_id: client_id.to_owned(),
             request: HomeRequest,
         })
         .and_then(|success| match success.value {
@@ -281,10 +350,12 @@ impl ThumbnailClient {
 
     pub fn collection(
         &self,
+        client_id: &str,
         kind: CollectionKind,
     ) -> Result<IpcSuccess<CollectionPayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Collection {
             id,
+            client_id: client_id.to_owned(),
             request: CollectionRequest { kind: kind.clone() },
         })
         .and_then(|success| match success.value {
@@ -320,10 +391,12 @@ impl ThumbnailClient {
 
     pub fn container(
         &self,
+        client_id: &str,
         address: RemoteAddress,
     ) -> Result<IpcSuccess<ContainerPayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Container {
             id,
+            client_id: client_id.to_owned(),
             request: ContainerRequest {
                 address: address.clone(),
             },
@@ -361,12 +434,14 @@ impl ThumbnailClient {
 
     pub fn page(
         &self,
+        client_id: &str,
         address: RemoteAddress,
         target_px: u32,
         priority: PagePriority,
     ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Page {
             id,
+            client_id: client_id.to_owned(),
             request: PageRequest {
                 address: address.clone(),
                 target_px,
@@ -413,6 +488,11 @@ impl ThumbnailClient {
             let connection_id = connection.id;
             let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
             match connection.request(id, request(id)) {
+                Ok(ServerMessage::Session { response, .. })
+                    if response.status != SessionStatus::Active =>
+                {
+                    Err(ClientError::SessionRemote(response))
+                }
                 Ok(response) => Ok((response, connection_id)),
                 Err(error) => {
                     self.invalidate_connection(connection_id);
@@ -1224,7 +1304,7 @@ mod tests {
             let first: ClientMessage = read_frame(&mut pipe, MAX_CONTROL_FRAME_BYTES).unwrap();
             let second: ClientMessage = read_frame(&mut pipe, MAX_CONTROL_FRAME_BYTES).unwrap();
             for message in [second, first] {
-                let ClientMessage::Thumbnail { id, request } = message else {
+                let ClientMessage::Thumbnail { id, request, .. } = message else {
                     panic!("unexpected request type")
                 };
                 let marker = request.address.relative_path.as_bytes()[0];
@@ -1255,6 +1335,7 @@ mod tests {
         let first = std::thread::spawn(move || {
             first_client
                 .thumbnail_address(
+                    "test-client",
                     RemoteAddress::file("00000000-0000-0000-0000-000000000000", "a.jpg"),
                     128,
                 )
@@ -1265,6 +1346,7 @@ mod tests {
         let second = std::thread::spawn(move || {
             second_client
                 .thumbnail_address(
+                    "test-client",
                     RemoteAddress::file("00000000-0000-0000-0000-000000000000", "b.jpg"),
                     128,
                 )

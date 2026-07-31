@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
-    RemoteSubresource,
+    RemoteSubresource, SessionResponse, SessionStatus,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -35,12 +35,39 @@ const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 pub struct AppState {
     pub auth: AuthService,
     pub library: Library,
-    pub thumbnail_client: ThumbnailClient,
+    pub thumbnail_client: Arc<ThumbnailClient>,
+    pub session_activity: SessionActivityNotifier,
     pub ipc_admission: IpcAdmission,
     pub logger: DiagnosticsLogger,
     pub telemetry_limiter: TelemetryLimiter,
     pub request_sequence: AtomicU64,
     pub web_root: PathBuf,
+    pub session_peers: Mutex<HashMap<std::net::IpAddr, mimageviewer_ipc::SessionPeerInfo>>,
+}
+
+pub struct SessionActivityNotifier {
+    tx: std::sync::mpsc::SyncSender<String>,
+}
+
+impl SessionActivityNotifier {
+    pub fn start(client: Arc<ThumbnailClient>) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        std::thread::Builder::new()
+            .name("remote-session-activity".to_owned())
+            .spawn(move || {
+                while let Ok(client_id) = rx.recv() {
+                    let _ = client.session_activity(&client_id);
+                }
+            })
+            .map_err(|error| format!("session activity worker を開始できません: {error}"))?;
+        Ok(Self { tx })
+    }
+
+    fn note(&self, client_id: &str) {
+        // Cheap HTTP routes must never wait for IPC. One pending notification is enough because
+        // all notifications mean the same monotonic "active now" transition.
+        let _ = self.tx.try_send(client_id.to_owned());
+    }
 }
 
 pub struct IpcAdmission {
@@ -323,6 +350,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     };
 
     let method = request.method().clone();
+    let remote_client_id = remote_client_id(request).to_owned();
     let auth = state.auth.authorize(AuthInput {
         authorization: header_value(request, "Authorization"),
         cookie: header_value(request, "Cookie"),
@@ -341,20 +369,34 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             HttpResponse::text(405, "Method Not Allowed").with_header("Cache-Control", "no-store")
         }
         _ if auth == AuthDecision::Unauthorized => unauthorized(),
-        (Method::Get, "/api/favorites") => api_favorites(state),
-        (Method::Get, "/api/home") => api_home(state),
-        (Method::Get, "/api/collection") => api_collection(state, &query),
-        (Method::Get, "/api/list") => api_list(state, &query),
-        (Method::Get, "/api/container") => api_container(state, &query),
-        (Method::Get, "/api/thumb") => api_thumb(state, &query),
-        (Method::Get, "/api/image-info") => api_image_info(state, &query),
-        (Method::Get, "/api/image") => api_image(state, &query),
-        (Method::Get, "/api/page") => api_page(state, &query),
+        (Method::Post, "/api/session/acquire") => {
+            api_session_acquire(request, state, &remote_client_id)
+        }
+        (Method::Post, "/api/session/ping") => api_session_ping(request, state, &remote_client_id),
+        (Method::Get, "/api/favorites") => {
+            with_session_activity(state, &remote_client_id, || api_favorites(state))
+        }
+        (Method::Get, "/api/home") => api_home(state, &remote_client_id),
+        (Method::Get, "/api/collection") => api_collection(state, &query, &remote_client_id),
+        (Method::Get, "/api/list") => {
+            with_session_activity(state, &remote_client_id, || api_list(state, &query))
+        }
+        (Method::Get, "/api/container") => api_container(state, &query, &remote_client_id),
+        (Method::Get, "/api/thumb") => api_thumb(state, &query, &remote_client_id),
+        (Method::Get, "/api/image-info") => {
+            with_session_activity(state, &remote_client_id, || api_image_info(state, &query))
+        }
+        (Method::Get, "/api/image") => {
+            with_session_activity(state, &remote_client_id, || api_image(state, &query))
+        }
+        (Method::Get, "/api/page") => api_page(state, &query, &remote_client_id),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
         (Method::Get, _) => HttpResponse::text(404, "Not Found"),
-        (_, "/api/telemetry") => HttpResponse::text(405, "Method Not Allowed")
-            .with_header("Allow", "POST")
-            .with_header("Cache-Control", "no-store"),
+        (_, "/api/telemetry" | "/api/session/acquire" | "/api/session/ping") => {
+            HttpResponse::text(405, "Method Not Allowed")
+                .with_header("Allow", "POST")
+                .with_header("Cache-Control", "no-store")
+        }
         _ => HttpResponse::text(405, "Method Not Allowed")
             .with_header("Allow", "GET")
             .with_header("Cache-Control", "no-store"),
@@ -363,6 +405,114 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     response
         .with_header("X-Content-Type-Options", "nosniff")
         .with_header("Referrer-Policy", "no-referrer")
+}
+
+#[derive(Deserialize)]
+struct SessionPingBody {
+    #[serde(default)]
+    user_active: bool,
+    #[serde(default)]
+    media_playing: bool,
+}
+
+fn api_session_acquire(request: &Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let source_ip =
+        forwarded_source_ip(request).or_else(|| request.remote_addr().map(|address| address.ip()));
+    let peer = source_ip
+        .and_then(|source_ip| {
+            state
+                .session_peers
+                .lock()
+                .ok()
+                .and_then(|peers| peers.get(&source_ip).cloned())
+                .or_else(|| {
+                    let peer = crate::connection_url::detect_peer_info(Some(source_ip));
+                    if let Ok(mut peers) = state.session_peers.lock() {
+                        peers.insert(source_ip, peer.clone());
+                    }
+                    Some(peer)
+                })
+        })
+        .unwrap_or_else(|| crate::connection_url::detect_peer_info(None));
+    match state.thumbnail_client.session_acquire(client_id, peer) {
+        Ok(response) => session_response_http(response),
+        Err(failure) => session_failure_response(failure),
+    }
+}
+
+fn api_session_ping(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_PIN_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let body: SessionPingBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    match state
+        .thumbnail_client
+        .session_ping(client_id, body.user_active, body.media_playing)
+    {
+        Ok(response) => session_response_http(response),
+        Err(failure) => session_failure_response(failure),
+    }
+}
+
+fn with_session_activity(
+    state: &AppState,
+    client_id: &str,
+    operation: impl FnOnce() -> HttpResponse,
+) -> HttpResponse {
+    state.session_activity.note(client_id);
+    operation()
+}
+
+fn session_response_http(response: SessionResponse) -> HttpResponse {
+    let status = session_http_status(response.status);
+    HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "status": response.status,
+            "message": response.message,
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "session": { "status": response.status }
+    }))
+}
+
+fn session_http_status(status: SessionStatus) -> u16 {
+    match status {
+        SessionStatus::Active => 200,
+        SessionStatus::LocalInUse | SessionStatus::Superseded => 409,
+        SessionStatus::NotAcquired | SessionStatus::Expired => 428,
+    }
+}
+
+fn session_failure_response(failure: crate::ipc_client::ClientFailure) -> HttpResponse {
+    match failure.error {
+        IpcClientError::SessionRemote(response) => session_response_http(response),
+        IpcClientError::Unavailable(_) => HttpResponse::bytes(
+            503,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&json!({
+                "status": "unavailable",
+                "message": "mIV 本体が起動していません。",
+            }))
+            .unwrap_or_default(),
+        ),
+        IpcClientError::VersionMismatch { .. } | IpcClientError::Protocol(_) => {
+            HttpResponse::text(503, "Service Unavailable")
+        }
+        IpcClientError::Remote(_)
+        | IpcClientError::CollectionRemote(_)
+        | IpcClientError::MediaRemote(_) => HttpResponse::text(502, "Bad Gateway"),
+    }
+    .with_header("Cache-Control", "no-store")
 }
 
 fn unauthorized() -> HttpResponse {
@@ -495,11 +645,11 @@ fn api_favorites(state: &AppState) -> HttpResponse {
     }
 }
 
-fn api_home(state: &AppState) -> HttpResponse {
+fn api_home(state: &AppState, client_id: &str) -> HttpResponse {
     let started = Instant::now();
     let result = match state
         .ipc_admission
-        .run(IpcClass::Home, || state.thumbnail_client.home())
+        .run(IpcClass::Home, || state.thumbnail_client.home(client_id))
     {
         Ok(result) => result,
         Err(busy) => return collection_admission_busy_response(busy, "home"),
@@ -522,7 +672,7 @@ fn api_home(state: &AppState) -> HttpResponse {
     }
 }
 
-fn api_collection(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+fn api_collection(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
     let kind_name = match required_query_value(query, "kind") {
         Ok(value) => value,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
@@ -550,10 +700,9 @@ fn api_collection(state: &AppState, query: &[(String, String)]) -> HttpResponse 
         _ => return HttpResponse::text(400, "Bad Request"),
     };
     let started = Instant::now();
-    let result = match state
-        .ipc_admission
-        .run(IpcClass::Heavy, || state.thumbnail_client.collection(kind))
-    {
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state.thumbnail_client.collection(client_id, kind)
+    }) {
         Ok(result) => result,
         Err(busy) => return collection_admission_busy_response(busy, kind_name),
     };
@@ -662,6 +811,11 @@ fn collection_ipc_error_response(
         }
         IpcClientError::MediaRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required",
+            response.message,
+        ),
     };
     let mut response = HttpResponse::bytes(
         status,
@@ -704,7 +858,7 @@ fn api_list(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     }
 }
 
-fn api_container(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
     let address = match remote_address_from_query(query) {
         Ok(address)
             if matches!(
@@ -721,7 +875,7 @@ fn api_container(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     }
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
-        state.thumbnail_client.container(address.clone())
+        state.thumbnail_client.container(client_id, address.clone())
     }) {
         Ok(result) => result,
         Err(busy) => return media_admission_busy_response(busy, "container"),
@@ -758,7 +912,7 @@ fn api_container(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     }
 }
 
-fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+fn api_thumb(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
     let address = match remote_address_from_query(query) {
         Ok(address) => address,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
@@ -775,7 +929,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
         state
             .thumbnail_client
-            .thumbnail_address(address.clone(), target_px)
+            .thumbnail_address(client_id, address.clone(), target_px)
     }) {
         Ok(result) => result,
         Err(busy) => {
@@ -814,7 +968,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     }
 }
 
-fn api_page(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
     let address = match remote_address_from_query(query) {
         Ok(address)
             if matches!(
@@ -847,7 +1001,7 @@ fn api_page(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     let result = match state.ipc_admission.run(ipc_class, || {
         state
             .thumbnail_client
-            .page(address.clone(), target_px, priority)
+            .page(client_id, address.clone(), target_px, priority)
     }) {
         Ok(result) => result,
         Err(busy) => return media_admission_busy_response(busy, "page"),
@@ -972,6 +1126,11 @@ fn media_ipc_error_response(
         }
         IpcClientError::Remote(error) => (500, "miv_media_error", error.message),
         IpcClientError::CollectionRemote(error) => (500, "miv_media_error", error.message),
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required",
+            response.message,
+        ),
     };
     let mut response = HttpResponse::bytes(
         status,
@@ -1099,6 +1258,11 @@ fn ipc_error_response(
         }
         IpcClientError::CollectionRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::MediaRemote(remote) => (500, "miv_thumbnail_error", remote.message),
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required",
+            response.message,
+        ),
     };
     let body = serde_json::to_vec(&json!({"error": code, "message": message}))
         .unwrap_or_else(|_| b"{\"error\":\"ipc_error\"}".to_vec());
@@ -1356,11 +1520,32 @@ fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
     })
 }
 
+fn remote_client_id(request: &Request) -> &str {
+    const FALLBACK: &str = "legacy-client";
+    header_value(request, "X-mIV-Remote-Client")
+        .filter(|value| {
+            (8..=128).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .unwrap_or(FALLBACK)
+}
+
 fn request_is_https(request: &Request) -> bool {
     request.secure()
         || header_value(request, "X-Forwarded-Proto")
             .and_then(|value| value.split(',').next())
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
+}
+
+fn forwarded_source_ip(request: &Request) -> Option<std::net::IpAddr> {
+    header_value(request, "X-Forwarded-For")?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn request_proxy_details(request: &Request) -> Value {
@@ -1470,10 +1655,14 @@ mod tests {
         )
         .unwrap();
         let log_secrets = auth.permanent_log_secrets();
+        let thumbnail_client = Arc::new(ThumbnailClient::new());
+        let session_activity =
+            SessionActivityNotifier::start(Arc::clone(&thumbnail_client)).unwrap();
         AppState {
             auth,
             library: Library::empty_for_test(temp.path().join("cache")),
-            thumbnail_client: ThumbnailClient::new(),
+            thumbnail_client,
+            session_activity,
             ipc_admission: IpcAdmission::new(),
             logger: DiagnosticsLogger::open(
                 &temp.path().join("request.jsonl"),
@@ -1484,6 +1673,7 @@ mod tests {
             telemetry_limiter: TelemetryLimiter::new(),
             request_sequence: AtomicU64::new(1),
             web_root: temp.path().to_owned(),
+            session_peers: Mutex::new(HashMap::new()),
         }
     }
 

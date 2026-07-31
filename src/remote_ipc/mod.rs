@@ -5,6 +5,8 @@ mod thumbnail;
 
 #[cfg(windows)]
 mod pipe;
+pub(crate) mod session;
+pub(crate) mod ui;
 
 pub(crate) struct RemoteIpcServer {
     #[cfg(windows)]
@@ -21,6 +23,17 @@ impl RemoteIpcServer {
         {
             let _ = settings;
             Err("--remote-ipc は Windows の名前付きパイプ専用です".to_owned())
+        }
+    }
+
+    pub(crate) fn session_handle(&self) -> session::SessionHandle {
+        #[cfg(windows)]
+        {
+            self._guard.session_handle()
+        }
+        #[cfg(not(windows))]
+        {
+            unreachable!("remote IPC server is Windows-only")
         }
     }
 }

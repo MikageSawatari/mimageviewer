@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -356,27 +356,96 @@ pub enum CollectionErrorCode {
 /// 1 本の長寿命接続上で要求と応答を対応付ける識別子。
 pub type RequestId = u64;
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionConnectionKind {
+    Direct,
+    Relay,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SessionPeerInfo {
+    pub connection_kind: SessionConnectionKind,
+    pub device_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SessionAcquireRequest {
+    pub client_id: String,
+    pub peer: SessionPeerInfo,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SessionPingRequest {
+    pub client_id: String,
+    pub user_active: bool,
+    pub media_playing: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Active,
+    NotAcquired,
+    LocalInUse,
+    Expired,
+    Superseded,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SessionResponse {
+    pub status: SessionStatus,
+    pub message: String,
+}
+
+impl SessionResponse {
+    pub fn active() -> Self {
+        Self {
+            status: SessionStatus::Active,
+            message: "remote session active".to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    SessionAcquire {
+        id: RequestId,
+        request: SessionAcquireRequest,
+    },
+    SessionPing {
+        id: RequestId,
+        request: SessionPingRequest,
+    },
+    SessionActivity {
+        id: RequestId,
+        client_id: String,
+    },
     Thumbnail {
         id: RequestId,
+        client_id: String,
         request: ThumbnailRequest,
     },
     Home {
         id: RequestId,
+        client_id: String,
         request: HomeRequest,
     },
     Collection {
         id: RequestId,
+        client_id: String,
         request: CollectionRequest,
     },
     Container {
         id: RequestId,
+        client_id: String,
         request: ContainerRequest,
     },
     Page {
         id: RequestId,
+        client_id: String,
         request: PageRequest,
     },
 }
@@ -384,7 +453,10 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::Thumbnail { id, .. }
+            Self::SessionAcquire { id, .. }
+            | Self::SessionPing { id, .. }
+            | Self::SessionActivity { id, .. }
+            | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
             | Self::Container { id, .. }
@@ -396,6 +468,10 @@ impl ClientMessage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    Session {
+        id: RequestId,
+        response: SessionResponse,
+    },
     Thumbnail {
         id: RequestId,
         response: ThumbnailResponse,
@@ -421,7 +497,8 @@ pub enum ServerMessage {
 impl ServerMessage {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::Thumbnail { id, .. }
+            Self::Session { id, .. }
+            | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
             | Self::Container { id, .. }
@@ -541,9 +618,29 @@ mod tests {
     }
 
     #[test]
+    fn session_acquire_round_trips_peer_metadata() {
+        let expected = ClientMessage::SessionAcquire {
+            id: 9,
+            request: SessionAcquireRequest {
+                client_id: "browser-instance".to_owned(),
+                peer: SessionPeerInfo {
+                    connection_kind: SessionConnectionKind::Relay,
+                    device_name: Some("iphone".to_owned()),
+                },
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        let actual: ClientMessage =
+            read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn thumbnail_message_round_trips_through_a_length_delimited_frame() {
         let expected = ClientMessage::Thumbnail {
             id: 42,
+            client_id: "test-client".to_owned(),
             request: ThumbnailRequest {
                 address: RemoteAddress::file(
                     "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
@@ -563,6 +660,7 @@ mod tests {
     fn page_priority_round_trips_with_the_request() {
         let expected = ClientMessage::Page {
             id: 43,
+            client_id: "test-client".to_owned(),
             request: PageRequest {
                 address: RemoteAddress {
                     favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),

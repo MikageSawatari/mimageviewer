@@ -205,6 +205,7 @@ windows = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Power",
     "Win32_System_Performance",
     "Win32_System_IO",
     "Win32_System_Pipes",

@@ -30,7 +30,9 @@ const PAGE_PREFETCH_AHEAD = 3;
 const PAGE_PREFETCH_BEHIND = 1;
 const PAGE_RESOURCE_CACHE_LIMIT = 6;
 const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const SESSION_PING_INTERVAL_MS = 30_000;
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
+const REMOTE_CLIENT_ID = loadRemoteClientId();
 
 class AuthenticationRequiredError extends Error {}
 
@@ -268,15 +270,25 @@ const state = {
   screenContext: "loading",
   gridIndex: 0,
   authCountdownTimer: 0,
+  remoteSessionStatus: "inactive",
+  remoteSessionMessage: "",
+  remoteSessionAcquirePromise: null,
+  remoteSessionUserActive: false,
+  remoteSessionTimer: 0,
 };
 
 let recentPointerSource = { source: "mouse", at: 0 };
 if (!RUNTIME_TEST_MODE) {
-  window.addEventListener("popstate", () => dispatchRoute());
+  window.addEventListener("popstate", () => {
+    acquireRemoteSession("browser_history")
+      .then(() => dispatchRoute())
+      .catch(() => {});
+  });
   window.addEventListener("keydown", onGlobalKeyDown);
   window.addEventListener(
     "pointerdown",
     (event) => {
+      state.remoteSessionUserActive = true;
       recentPointerSource = {
         source: pointerInputSource(event.pointerType),
         at: performance.now(),
@@ -290,6 +302,11 @@ if (!RUNTIME_TEST_MODE) {
   } else {
     hudElement.hidden = true;
   }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && state.authenticated) {
+      acquireRemoteSession("visibility_resume").catch(() => {});
+    }
+  });
   boot();
 }
 
@@ -315,6 +332,9 @@ async function boot() {
 async function enterAuthenticatedApp() {
   state.authenticated = true;
   telemetryState.authenticated = true;
+  renderLoading("リモートセッションを取得しています");
+  await acquireRemoteSession("authenticated");
+  startSessionPing();
   renderLoading("お気に入りを読み込んでいます");
   const data = await apiJson("/api/favorites");
   state.favorites = data.favorites ?? [];
@@ -332,6 +352,95 @@ async function enterAuthenticatedApp() {
     history.replaceState({ ...(history.state ?? {}), mivRoute: true }, "", location.href);
   }
   await dispatchRoute();
+}
+
+async function acquireRemoteSession(reason = "operation") {
+  if (state.remoteSessionAcquirePromise) return state.remoteSessionAcquirePromise;
+  if (state.remoteSessionStatus !== "active") {
+    setRemoteSessionStatus("acquiring", "操作権を取得しています…");
+  }
+  state.remoteSessionAcquirePromise = (async () => {
+    try {
+      const response = await fetch("/api/session/acquire", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: remoteHeaders({ Accept: "application/json" }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.status !== "active") {
+        throw new Error(result.message || `操作権を取得できません (HTTP ${response.status})。`);
+      }
+      setRemoteSessionStatus("active", "");
+      state.remoteSessionUserActive = false;
+      enqueueTelemetry({ type: "remote_session", action: "acquire", reason });
+      return true;
+    } catch (error) {
+      setRemoteSessionStatus(
+        "unavailable",
+        error instanceof Error ? error.message : "操作権を取得できません。"
+      );
+      throw error;
+    } finally {
+      state.remoteSessionAcquirePromise = null;
+    }
+  })();
+  return state.remoteSessionAcquirePromise;
+}
+
+function startSessionPing() {
+  if (state.remoteSessionTimer) return;
+  state.remoteSessionTimer = window.setInterval(() => {
+    pingRemoteSession().catch(() => {});
+  }, SESSION_PING_INTERVAL_MS);
+}
+
+async function pingRemoteSession() {
+  if (
+    !state.authenticated ||
+    state.remoteSessionStatus !== "active" ||
+    document.visibilityState === "hidden"
+  ) {
+    return;
+  }
+  const userActive = state.remoteSessionUserActive;
+  state.remoteSessionUserActive = false;
+  const mediaPlaying = [...document.querySelectorAll("video, audio")].some(
+    (media) => !media.paused && !media.ended
+  );
+  const response = await fetch("/api/session/ping", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: remoteHeaders({ "Content-Type": "application/json", Accept: "application/json" }),
+    body: JSON.stringify({ user_active: userActive, media_playing: mediaPlaying }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.status !== "active") {
+    setRemoteSessionStatus(
+      sessionStatusFromHttp(response.status),
+      result.message || "リモートセッションが切断されました。操作すると再接続します。"
+    );
+  }
+}
+
+function setRemoteSessionStatus(status, message) {
+  state.remoteSessionStatus = status;
+  state.remoteSessionMessage = message;
+  let element = document.querySelector("#remote-session-status");
+  if (!element) {
+    element = document.createElement("div");
+    element.id = "remote-session-status";
+    element.className = "remote-session-status";
+    document.body.append(element);
+  }
+  element.hidden = status === "active" || status === "inactive";
+  element.dataset.status = status;
+  element.textContent = message;
+}
+
+function sessionStatusFromHttp(status) {
+  if (status === 409) return "local_in_use";
+  if (status === 428) return "expired";
+  return "unavailable";
 }
 
 function renderPinLogin(initialRemainingSeconds = 0) {
@@ -585,6 +694,13 @@ function navigate(hash, routeState = {}) {
 function dispatchCommand(requested, meta = {}) {
   if (!requested?.name || !state.authenticated) return false;
   const source = meta.source ?? "mouse";
+  state.remoteSessionUserActive = true;
+  if (meta.sessionRetry !== true) {
+    acquireRemoteSession("command")
+      .then(() => dispatchCommand(requested, { ...meta, sessionRetry: true }))
+      .catch(() => {});
+    return true;
+  }
   const context = state.screenContext;
   let handled = false;
 
@@ -811,6 +927,7 @@ function executeGridNavigation(name) {
 }
 
 function onGlobalKeyDown(event) {
+  state.remoteSessionUserActive = true;
   if (!state.authenticated || event.isComposing) return;
   if (
     isCommandInteractiveTarget(event.target) &&
@@ -3160,6 +3277,7 @@ function installTelemetry() {
 }
 
 async function observedFetch(url, options = {}) {
+  options = { ...options, headers: remoteHeaders(options.headers) };
   let response;
   try {
     response = await fetch(url, options);
@@ -3172,6 +3290,13 @@ async function observedFetch(url, options = {}) {
     throw error;
   }
   if (!response.ok) {
+    if (response.status === 409 || response.status === 428) {
+      const detail = await response.clone().json().catch(() => ({}));
+      setRemoteSessionStatus(
+        sessionStatusFromHttp(response.status),
+        detail.message || "操作権がありません。次の操作時に再接続します。"
+      );
+    }
     recordClientError(
       "fetch_non_2xx",
       new Error(`HTTP ${response.status} ${response.statusText}`),
@@ -3189,7 +3314,7 @@ async function fetchPageResource(request, signal, prefetch) {
   const options = {
     signal,
     credentials: "same-origin",
-    headers: { Accept: "image/*" },
+    headers: remoteHeaders({ Accept: "image/*" }),
     ...(prefetch ? { priority: "low" } : {}),
   };
   const response = prefetch
@@ -3215,6 +3340,27 @@ async function fetchPageResource(request, signal, prefetch) {
         ? { width, height }
         : null,
   };
+}
+
+function remoteHeaders(initial = {}) {
+  const headers = new Headers(initial);
+  headers.set("X-mIV-Remote-Client", REMOTE_CLIENT_ID);
+  return headers;
+}
+
+function loadRemoteClientId() {
+  const key = "miv-remote-client-id";
+  try {
+    const existing = globalThis.localStorage?.getItem(key);
+    if (existing && /^[A-Za-z0-9_-]{8,128}$/.test(existing)) return existing;
+  } catch {}
+  const generated =
+    globalThis.crypto?.randomUUID?.() ??
+    `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  try {
+    globalThis.localStorage?.setItem(key, generated);
+  } catch {}
+  return generated;
 }
 
 function enqueueTelemetry(event) {

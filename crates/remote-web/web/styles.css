@@ -32,6 +32,26 @@ body {
   overscroll-behavior: contain;
 }
 
+.remote-session-status {
+  position: fixed;
+  z-index: 10000;
+  inset: auto 12px 12px 12px;
+  max-width: 34rem;
+  margin-inline: auto;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent, #7da7ff) 55%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, #111 88%, transparent);
+  color: #fff;
+  box-shadow: 0 4px 20px #0008;
+  text-align: center;
+  pointer-events: none;
+}
+
+.remote-session-status[data-status="acquiring"] {
+  border-color: #d6a94c;
+}
+
 button {
   color: inherit;
   font: inherit;

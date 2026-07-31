@@ -7918,6 +7918,7 @@ pub(crate) enum MetadataTransferTagDbReleaseState {
 }
 
 pub struct App {
+    pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
     pub(crate) navigation_scope: ViewerNavigationScope,
@@ -12682,6 +12683,7 @@ impl App {
             snapshot: None,
             snapshot_next_generation_id: 1,
             snapshot_internal_nav: false,
+            remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState::default(),
         };
 
         #[cfg(windows)]
@@ -13615,7 +13617,8 @@ impl App {
     /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
     fn common_modal_dialog_open(&self) -> bool {
-        self.show_stats_dialog
+        self.remote_session_active()
+            || self.show_stats_dialog
             || self.show_favorites_editor
             || self.show_smart_folder_editor
             || self.smart_folder_create_name.is_some()
@@ -33701,6 +33704,9 @@ impl App {
         main_viewport_focused: bool,
         fullscreen_root_key_handled: bool,
     ) {
+        if self.remote_session_active() {
+            return;
+        }
         if !self.viewer_session_blocks_main_window() {
             return;
         }
@@ -60468,6 +60474,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
+        self.poll_remote_session(ctx);
         // Select and cache the root viewport owner before any shortcut path.
         // This also ages a root PendingFocus claim on every pass, including
         // passes that return before the normal keyboard handler.
@@ -62819,6 +62826,7 @@ impl eframe::App for App {
 
         #[cfg(windows)]
         crate::key_debug::render_overlay(ctx);
+        self.show_remote_session_dialog(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

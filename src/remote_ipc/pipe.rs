@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
     ContainerResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode,
-    PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, ServerMessage, ThumbnailError,
-    ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame, write_frame,
+    PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, ServerMessage, SessionResponse,
+    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame,
+    write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -27,6 +28,7 @@ use windows::core::PCWSTR;
 
 use super::collections::CollectionEngine;
 use super::container::ContainerEngine;
+use super::session::{SessionHandle, SessionOperation, SessionRuntime};
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
@@ -42,6 +44,7 @@ enum Work {
         reply: mpsc::Sender<ServerMessage>,
         enqueued_at: Instant,
         _prefetch_permit: Option<PrefetchPermit>,
+        session_operation: SessionOperation,
     },
     Stop,
 }
@@ -120,6 +123,7 @@ pub(super) struct ServerGuard {
     home_worker: Option<std::thread::JoinHandle<()>>,
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
+    session_runtime: SessionRuntime,
 }
 
 impl ServerGuard {
@@ -140,6 +144,8 @@ impl ServerGuard {
             );
         }
 
+        let session_runtime = SessionRuntime::start()?;
+        let session_handle = session_runtime.handle();
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
         let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
@@ -194,6 +200,7 @@ impl ServerGuard {
             let listener_home_metrics = Arc::clone(&home_metrics);
             let listener_next_connection_id = Arc::clone(&next_connection_id);
             let listener_prefetch_in_flight = Arc::clone(&prefetch_in_flight);
+            let listener_session = session_handle.clone();
             match std::thread::Builder::new()
                 .name(format!("remote-ipc-listener-{index}"))
                 .spawn(move || {
@@ -206,6 +213,7 @@ impl ServerGuard {
                         listener_next_connection_id,
                         listener_prefetch_in_flight,
                         worker_count,
+                        listener_session,
                         initial_pipe,
                         index,
                     )
@@ -243,7 +251,12 @@ impl ServerGuard {
             home_worker: Some(home_worker),
             heavy_work_tx,
             home_work_tx,
+            session_runtime,
         })
+    }
+
+    pub(super) fn session_handle(&self) -> SessionHandle {
+        self.session_runtime.handle()
     }
 }
 
@@ -300,14 +313,16 @@ fn worker_loop(
                 reply,
                 enqueued_at,
                 _prefetch_permit,
+                session_operation,
             }) => execute_work(
                 message,
                 reply,
                 enqueued_at,
                 metrics,
                 &format!("heavy-{worker_index}"),
+                session_operation,
                 |message| match message {
-                    ClientMessage::Thumbnail { id, request } => ServerMessage::Thumbnail {
+                    ClientMessage::Thumbnail { id, request, .. } => ServerMessage::Thumbnail {
                         id,
                         response: thumbnail_engine.handle(request, &context, container_engine),
                     },
@@ -315,17 +330,26 @@ fn worker_loop(
                         id,
                         response: collection_engine.home(),
                     },
-                    ClientMessage::Collection { id, request } => ServerMessage::Collection {
+                    ClientMessage::Collection { id, request, .. } => ServerMessage::Collection {
                         id,
                         response: collection_engine.collection(request),
                     },
-                    ClientMessage::Container { id, request } => ServerMessage::Container {
+                    ClientMessage::Container { id, request, .. } => ServerMessage::Container {
                         id,
                         response: container_engine.container(request),
                     },
-                    ClientMessage::Page { id, request } => ServerMessage::Page {
+                    ClientMessage::Page { id, request, .. } => ServerMessage::Page {
                         id,
                         response: container_engine.page(request, &context),
+                    },
+                    ClientMessage::SessionAcquire { id, .. }
+                    | ClientMessage::SessionPing { id, .. }
+                    | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
+                        id,
+                        response: session_response(
+                            SessionStatus::NotAcquired,
+                            "session control request was routed to a worker",
+                        ),
                     },
                 },
             ),
@@ -351,22 +375,22 @@ fn home_worker_loop(
                 reply,
                 enqueued_at,
                 _prefetch_permit,
-            }) => {
-                execute_work(
-                    message,
-                    reply,
-                    enqueued_at,
-                    metrics,
-                    "home-0",
-                    |message| match message {
-                        ClientMessage::Home { id, .. } => ServerMessage::Home {
-                            id,
-                            response: collection_engine.home(),
-                        },
-                        other => service_stopped_response(&other),
+                session_operation,
+            }) => execute_work(
+                message,
+                reply,
+                enqueued_at,
+                metrics,
+                "home-0",
+                session_operation,
+                |message| match message {
+                    ClientMessage::Home { id, .. } => ServerMessage::Home {
+                        id,
+                        response: collection_engine.home(),
                     },
-                )
-            }
+                    other => service_stopped_response(&other),
+                },
+            ),
             Ok(Work::Stop) | Err(_) => break,
         }
     }
@@ -379,6 +403,7 @@ fn execute_work(
     enqueued_at: Instant,
     metrics: &QueueMetrics,
     worker: &str,
+    session_operation: SessionOperation,
     handler: impl FnOnce(ClientMessage) -> ServerMessage,
 ) {
     let request_id = message.id();
@@ -390,8 +415,19 @@ fn execute_work(
         enqueued_at.elapsed().as_secs_f64() * 1000.0
     ));
     let started_at = Instant::now();
+    session_operation.started();
     let response = handler(message);
+    let ownership = session_operation.ownership_response();
+    let response = if ownership.status == SessionStatus::Active {
+        response
+    } else {
+        ServerMessage::Session {
+            id: request_id,
+            response: ownership,
+        }
+    };
     let outcome = response_outcome(&response);
+    session_operation.finish(outcome == "ok");
     let reply_ok = reply.send(response).is_ok();
     let (queued, active) = metrics.finished();
     crate::logger::log(format!(
@@ -403,6 +439,9 @@ fn execute_work(
 
 fn request_kind(message: &ClientMessage) -> &'static str {
     match message {
+        ClientMessage::SessionAcquire { .. } => "session_acquire",
+        ClientMessage::SessionPing { .. } => "session_ping",
+        ClientMessage::SessionActivity { .. } => "session_activity",
         ClientMessage::Thumbnail { .. } => "thumbnail",
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
@@ -414,9 +453,66 @@ fn request_kind(message: &ClientMessage) -> &'static str {
     }
 }
 
+fn message_client_id(message: &ClientMessage) -> Option<&str> {
+    match message {
+        ClientMessage::Thumbnail { client_id, .. }
+        | ClientMessage::Home { client_id, .. }
+        | ClientMessage::Collection { client_id, .. }
+        | ClientMessage::Container { client_id, .. }
+        | ClientMessage::Page { client_id, .. }
+        | ClientMessage::SessionActivity { client_id, .. } => Some(client_id),
+        ClientMessage::SessionAcquire { request, .. } => Some(&request.client_id),
+        ClientMessage::SessionPing { request, .. } => Some(&request.client_id),
+    }
+}
+
+fn operation_description(message: &ClientMessage) -> String {
+    match message {
+        ClientMessage::Thumbnail { request, .. } => match request.address.subresource {
+            mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
+                format!("PDF {} ページ目のサムネイルを生成中", page_number + 1)
+            }
+            mimageviewer_ipc::RemoteSubresource::ZipEntry { .. } => {
+                "ZIP ページのサムネイルを生成中".to_owned()
+            }
+            _ => "サムネイルを生成中".to_owned(),
+        },
+        ClientMessage::Home { .. } => "ホームを読み込み中".to_owned(),
+        ClientMessage::Collection { .. } => "集約ビューを読み込み中".to_owned(),
+        ClientMessage::Container { .. } => "コンテナを列挙中".to_owned(),
+        ClientMessage::Page { request, .. } => match request.address.subresource {
+            mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
+                format!("PDF {} ページ目をレンダリング中", page_number + 1)
+            }
+            mimageviewer_ipc::RemoteSubresource::ZipEntry { .. } => {
+                "ZIP ページをレンダリング中".to_owned()
+            }
+            _ => "ページをレンダリング中".to_owned(),
+        },
+        ClientMessage::SessionAcquire { .. }
+        | ClientMessage::SessionPing { .. }
+        | ClientMessage::SessionActivity { .. } => "接続を確認中".to_owned(),
+    }
+}
+
+fn session_response(status: SessionStatus, message: impl Into<String>) -> SessionResponse {
+    SessionResponse {
+        status,
+        message: message.into(),
+    }
+}
+
 fn response_outcome(response: &ServerMessage) -> &'static str {
     match response {
-        ServerMessage::Thumbnail {
+        ServerMessage::Session {
+            response:
+                SessionResponse {
+                    status: SessionStatus::Active,
+                    ..
+                },
+            ..
+        }
+        | ServerMessage::Thumbnail {
             response: ThumbnailResponse::Success { .. },
             ..
         }
@@ -436,7 +532,8 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: PageResponse::Success(_),
             ..
         } => "ok",
-        ServerMessage::Thumbnail {
+        ServerMessage::Session { .. }
+        | ServerMessage::Thumbnail {
             response: ThumbnailResponse::Error(_),
             ..
         }
@@ -468,6 +565,7 @@ fn acceptor_loop(
     next_connection_id: Arc<AtomicU64>,
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
+    session: SessionHandle,
     initial_pipe: PipeStream,
     index: usize,
 ) {
@@ -513,6 +611,7 @@ fn acceptor_loop(
         let heavy_metrics = Arc::clone(&heavy_metrics);
         let home_metrics = Arc::clone(&home_metrics);
         let prefetch_in_flight = Arc::clone(&prefetch_in_flight);
+        let session = session.clone();
         if let Err(error) = std::thread::Builder::new()
             .name(format!("remote-ipc-connection-{connection_id}"))
             .spawn(move || {
@@ -525,6 +624,7 @@ fn acceptor_loop(
                     home_metrics,
                     prefetch_in_flight,
                     heavy_worker_count,
+                    session,
                 )
             })
         {
@@ -547,6 +647,7 @@ fn handle_connection(
     home_metrics: Arc<QueueMetrics>,
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
+    session: SessionHandle,
 ) {
     let _lifecycle = ConnectionLifecycle {
         id: connection_id,
@@ -631,6 +732,45 @@ fn handle_connection(
         crate::logger::log(format!(
             "remote_ipc: request_received connection_id={connection_id} request_id={request_id} kind={kind}"
         ));
+        match &message {
+            ClientMessage::SessionAcquire { id, request } => {
+                let response = session.acquire(request.clone());
+                let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
+                continue;
+            }
+            ClientMessage::SessionPing { id, request } => {
+                let response = session.ping(request);
+                let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
+                continue;
+            }
+            ClientMessage::SessionActivity { id, client_id } => {
+                let response =
+                    match session.begin_operation(client_id, "API 要求を処理中".to_owned()) {
+                        Ok(operation) => {
+                            operation.started();
+                            operation.finish(true);
+                            SessionResponse::active()
+                        }
+                        Err(response) => response,
+                    };
+                let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
+                continue;
+            }
+            _ => {}
+        }
+        let client_id =
+            message_client_id(&message).expect("non-control remote IPC requests carry a client id");
+        let session_operation =
+            match session.begin_operation(client_id, operation_description(&message)) {
+                Ok(operation) => operation,
+                Err(response) => {
+                    let _ = reply_tx.send(ServerMessage::Session {
+                        id: request_id,
+                        response,
+                    });
+                    continue;
+                }
+            };
         let prefetch_permit = if matches!(
             message,
             ClientMessage::Page {
@@ -649,6 +789,7 @@ fn handle_connection(
                         "remote_ipc: prefetch_busy connection_id={connection_id} request_id={request_id} heavy_workers={heavy_worker_count} queued={queued} active={active}"
                     ));
                     let _ = reply_tx.send(queue_busy_response(&message));
+                    drop(session_operation);
                     continue;
                 }
             }
@@ -662,7 +803,14 @@ fn handle_connection(
         } else {
             (&heavy_work_tx, &heavy_metrics)
         };
-        match enqueue_work(work_tx, metrics, message, reply_tx.clone(), prefetch_permit) {
+        match enqueue_work(
+            work_tx,
+            metrics,
+            message,
+            reply_tx.clone(),
+            prefetch_permit,
+            session_operation,
+        ) {
             Ok(()) => {
                 let (queued, active) = metrics.snapshot();
                 crate::logger::log(format!(
@@ -701,6 +849,7 @@ fn enqueue_work(
     message: ClientMessage,
     reply: mpsc::Sender<ServerMessage>,
     prefetch_permit: Option<PrefetchPermit>,
+    session_operation: SessionOperation,
 ) -> Result<(), mpsc::TrySendError<Work>> {
     metrics.reserve();
     let result = work_tx.try_send(Work::Request {
@@ -708,6 +857,7 @@ fn enqueue_work(
         reply,
         enqueued_at: Instant::now(),
         _prefetch_permit: prefetch_permit,
+        session_operation,
     });
     if result.is_err() {
         metrics.rollback();
@@ -736,6 +886,15 @@ fn try_acquire_prefetch(
 
 fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
     match message {
+        ClientMessage::SessionAcquire { id, .. }
+        | ClientMessage::SessionPing { id, .. }
+        | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
+            id: *id,
+            response: session_response(
+                SessionStatus::NotAcquired,
+                "mIV 本体のリモートサービスが停止しています",
+            ),
+        },
         ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
             id: *id,
             response: ThumbnailResponse::Error(ThumbnailError::new(
@@ -776,6 +935,15 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
 
 fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
     match message {
+        ClientMessage::SessionAcquire { id, .. }
+        | ClientMessage::SessionPing { id, .. }
+        | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
+            id: *id,
+            response: session_response(
+                SessionStatus::NotAcquired,
+                "mIV 本体のリモートサービスが混み合っています",
+            ),
+        },
         ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
             id: *id,
             response: ThumbnailResponse::Error(ThumbnailError::new(
@@ -1055,15 +1223,28 @@ mod tests {
             home_worker_loop(work_rx, &collection_engine, &worker_metrics)
         });
         let (reply_tx, reply_rx) = mpsc::channel();
+        let session = SessionHandle::new();
+        session.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "test-client".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Unknown,
+                device_name: None,
+            },
+        });
+        let session_operation = session
+            .begin_operation("test-client", "ホームを読み込み中".to_owned())
+            .unwrap();
         enqueue_work(
             &work_tx,
             &metrics,
             ClientMessage::Home {
                 id: 73,
+                client_id: "test-client".to_owned(),
                 request: mimageviewer_ipc::HomeRequest,
             },
             reply_tx,
             None,
+            session_operation,
         )
         .expect("Home request must enter its dedicated queue");
 
@@ -1114,6 +1295,7 @@ mod tests {
     fn queue_full_is_an_explicit_retryable_response() {
         let message = ClientMessage::Thumbnail {
             id: 42,
+            client_id: "test-client".to_owned(),
             request: mimageviewer_ipc::ThumbnailRequest {
                 address: mimageviewer_ipc::RemoteAddress::file(
                     "00000000-0000-0000-0000-000000000000",

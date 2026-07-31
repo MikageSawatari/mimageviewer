@@ -12,6 +12,7 @@ mod store;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 use auth::{AuthService, AuthToken, load_pin_file, set_pin_file};
@@ -20,7 +21,7 @@ use connection_url::choose_connection_url;
 use diagnostics::DiagnosticsLogger;
 use http::{
     AppState, HTTP_WORKER_COUNT, IpcAdmission, MAX_CONCURRENT_HEAVY_IPC, MAX_CONCURRENT_IPC,
-    TelemetryLimiter,
+    SessionActivityNotifier, TelemetryLimiter,
 };
 use ipc_client::ThumbnailClient;
 use store::Library;
@@ -54,7 +55,7 @@ fn run() -> Result<(), String> {
     }
     let library = Library::load(&config.data_dir)
         .map_err(|error| format!("settings.db を read-only で読み込めません: {error:?}"))?;
-    let thumbnail_client = ThumbnailClient::new();
+    let thumbnail_client = Arc::new(ThumbnailClient::new());
     let ipc_status = match thumbnail_client.probe() {
         Ok(()) => "接続済み".to_owned(),
         Err(error) => format!("未接続 ({error})"),
@@ -82,15 +83,18 @@ fn run() -> Result<(), String> {
         .flush()
         .map_err(|error| format!("起動情報をコンソールへ出力できません: {error}"))?;
 
+    let session_activity = SessionActivityNotifier::start(Arc::clone(&thumbnail_client))?;
     let state = Arc::new(AppState {
         auth,
         library,
         thumbnail_client,
+        session_activity,
         ipc_admission: IpcAdmission::new(),
         logger,
         telemetry_limiter: TelemetryLimiter::new(),
         request_sequence: AtomicU64::new(1),
         web_root: config.web_root,
+        session_peers: Mutex::new(std::collections::HashMap::new()),
     });
     let workers = HTTP_WORKER_COUNT;
     println!(

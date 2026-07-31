@@ -1786,6 +1786,9 @@ impl App {
     }
 
     fn gamepad_dispatch_allowed(&self, ctx: &egui::Context) -> bool {
+        if self.remote_session_active() {
+            return false;
+        }
         // gilrs はグローバル入力 (ウィンドウフォーカス非依存) なので、mIV が前面に
         // 無いときにバックグラウンドのコントローラ入力で操作されないよう OS の前面
         // プロセスでゲートする。フルスクリーンは別ウィンドウ (別ビューポート) なので

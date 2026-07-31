@@ -3074,6 +3074,14 @@ impl App {
             ));
             return;
         }
+        if self.remote_session_active()
+            && Self::native_video_output_event_blocked_while_parked_live(&event)
+        {
+            crate::logger::log(
+                "[native-video] user input ignored while remote session owns local controls",
+            );
+            return;
+        }
         if let Some(window_id) = self.native_video_parked_live_input_window_id {
             if Self::native_video_output_event_is_parked_live_left_button(&event, true) {
                 self.native_video_parked_live_left_down_window_id = Some(window_id);

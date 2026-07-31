@@ -6504,6 +6504,7 @@ impl App {
                             );
                         }
                     });
+                self.show_remote_session_dialog(vp_ctx);
             });
             #[cfg(windows)]
             self.register_detached_window_hwnd_after_show(
@@ -6585,14 +6586,16 @@ impl App {
                 ));
             }
             let mut activation_armed = window.activation_armed;
-            if Self::detached_passive_window_update_activation(
-                can_activate,
-                window.activation_ready_frame,
-                self.frame_counter,
-                &mut activation_armed,
-                pointer_pressed,
-                pointer_released,
-            ) {
+            if !self.remote_session_active()
+                && Self::detached_passive_window_update_activation(
+                    can_activate,
+                    window.activation_ready_frame,
+                    self.frame_counter,
+                    &mut activation_armed,
+                    pointer_pressed,
+                    pointer_released,
+                )
+            {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_queued id={} via=pointer passive_windows={} active_context={}",
                     window.id,
@@ -9640,6 +9643,12 @@ impl App {
                 // `?` ヘルプは押された viewport 上に出す。専用フルスクリーン viewport では
                 // メイン側に描くと背面へ隠れるため、フルスクリーン中はこちらで描く。
                 self.show_context_shortcuts_dialog(ctx);
+
+                // 専用 viewer viewport 上にも同じ session modal を描く。embedded は
+                // main update 終端で描くため、同じ Context/Id への二重 show を避ける。
+                if !embedded {
+                    self.show_remote_session_dialog(ctx);
+                }
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;

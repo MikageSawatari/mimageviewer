@@ -1,9 +1,10 @@
 use std::io::Read;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use mimageviewer_ipc::{SessionConnectionKind, SessionPeerInfo};
 use serde_json::Value;
 
 const PREFERRED_TAILSCALE_EXE: &str = r"C:\Program Files\Tailscale\tailscale.exe";
@@ -62,6 +63,63 @@ pub fn choose_connection_url(
     Ok(ConnectionUrl {
         base: format!("http://{address}/"),
         source: UrlSource::BindFallback,
+    })
+}
+
+/// Tailscale proxy が付けた X-Forwarded-For (無ければ TCP peer) を status JSON の
+/// Peer.TailscaleIPs と照合する。CLI が無い/失敗/未照合でもセッション取得自体は止めない。
+pub fn detect_peer_info(source_ip: Option<IpAddr>) -> SessionPeerInfo {
+    let Some(source_ip) = source_ip else {
+        return unknown_peer();
+    };
+    tailscale_executable()
+        .and_then(|executable| command_json(&executable, &["status", "--json"]))
+        .and_then(|value| peer_info_from_status(&value, source_ip))
+        .unwrap_or_else(unknown_peer)
+}
+
+fn unknown_peer() -> SessionPeerInfo {
+    SessionPeerInfo {
+        connection_kind: SessionConnectionKind::Unknown,
+        device_name: None,
+    }
+}
+
+fn peer_info_from_status(value: &Value, source_ip: IpAddr) -> Option<SessionPeerInfo> {
+    let peers = value.get("Peer")?.as_object()?;
+    let peer = peers.values().find(|peer| {
+        peer.get("TailscaleIPs")
+            .and_then(Value::as_array)
+            .is_some_and(|ips| {
+                ips.iter().any(|ip| {
+                    ip.as_str().and_then(|value| value.parse::<IpAddr>().ok()) == Some(source_ip)
+                })
+            })
+    })?;
+    let direct = peer
+        .get("CurAddr")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    let relay = peer
+        .get("Relay")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    let connection_kind = if direct {
+        SessionConnectionKind::Direct
+    } else if relay {
+        SessionConnectionKind::Relay
+    } else {
+        SessionConnectionKind::Unknown
+    };
+    let device_name = peer
+        .get("HostName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| peer.get("DNSName").and_then(Value::as_str))
+        .map(|value| value.trim_end_matches('.').to_owned());
+    Some(SessionPeerInfo {
+        connection_kind,
+        device_name,
     })
 }
 
@@ -201,6 +259,23 @@ mod tests {
         assert_eq!(
             normalize_base_url("http://127.0.0.1:8787").unwrap(),
             "http://127.0.0.1:8787/"
+        );
+    }
+
+    #[test]
+    fn peer_ip_resolves_direct_and_relay_from_status_json() {
+        let value: Value = serde_json::from_str(
+            r#"{"Peer":{"a":{"TailscaleIPs":["100.64.0.2"],"HostName":"phone","CurAddr":"192.0.2.1:123","Relay":""},"b":{"TailscaleIPs":["100.64.0.3"],"DNSName":"laptop.taild260d0.ts.net.","CurAddr":"","Relay":"tok"}}}"#,
+        )
+        .unwrap();
+        let direct = peer_info_from_status(&value, "100.64.0.2".parse().unwrap()).unwrap();
+        assert_eq!(direct.connection_kind, SessionConnectionKind::Direct);
+        assert_eq!(direct.device_name.as_deref(), Some("phone"));
+        let relay = peer_info_from_status(&value, "100.64.0.3".parse().unwrap()).unwrap();
+        assert_eq!(relay.connection_kind, SessionConnectionKind::Relay);
+        assert_eq!(
+            relay.device_name.as_deref(),
+            Some("laptop.taild260d0.ts.net")
         );
     }
 }
