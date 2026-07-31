@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
-    RemoteSubresource, SessionResponse, SessionStatus,
+    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, SessionResponse, SessionStatus,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -873,9 +873,27 @@ fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) 
     if let Err(error) = state.library.validate_remote_address(&address) {
         return store_error_response(error);
     }
+    let spread_mode = match parse_spread_mode(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let force_single_page = match parse_force_single_page(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let reading_direction = match parse_reading_direction(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
-        state.thumbnail_client.container(client_id, address.clone())
+        state.thumbnail_client.container(
+            client_id,
+            address.clone(),
+            spread_mode,
+            reading_direction,
+            force_single_page,
+        )
     }) {
         Ok(result) => result,
         Err(busy) => return media_admission_busy_response(busy, "container"),
@@ -892,6 +910,18 @@ fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) 
             state
                 .library
                 .retain_allowed_container_entries(&mut result.value.entries);
+            if result.value.page_groups.iter().any(|group| {
+                state
+                    .library
+                    .validate_remote_address(&group.anchor)
+                    .is_err()
+                    || group
+                        .pages
+                        .iter()
+                        .any(|address| state.library.validate_remote_address(address).is_err())
+            }) {
+                return HttpResponse::text(502, "Bad Gateway");
+            }
             let entry_count = result.value.entries.len();
             HttpResponse::json(&result.value)
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
@@ -904,6 +934,11 @@ fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) 
                         "ipc_retry_statuses": result.retry_statuses,
                         "ipc_connection_id": result.connection_id,
                         "entry_count": entry_count,
+                        "group_count": result.value.page_groups.len(),
+                        "configured_spread": result.value.configured_spread_mode,
+                        "effective_spread": result.value.effective_spread_mode,
+                        "reading_direction": result.value.reading_direction,
+                        "force_single_page": force_single_page,
                         "truncated": result.value.truncated,
                     }
                 }))
@@ -1443,6 +1478,37 @@ fn requested_width(query: &[(String, String)]) -> Result<u32, ()> {
     })
 }
 
+fn parse_spread_mode(query: &[(String, String)]) -> Result<Option<RemoteSpreadMode>, ()> {
+    match query_value(query, "spread")? {
+        None => Ok(None),
+        Some("single") => Ok(Some(RemoteSpreadMode::Single)),
+        Some("ltr") => Ok(Some(RemoteSpreadMode::Ltr)),
+        Some("ltr_cover") => Ok(Some(RemoteSpreadMode::LtrCover)),
+        Some("rtl") => Ok(Some(RemoteSpreadMode::Rtl)),
+        Some("rtl_cover") => Ok(Some(RemoteSpreadMode::RtlCover)),
+        Some(_) => Err(()),
+    }
+}
+
+fn parse_force_single_page(query: &[(String, String)]) -> Result<bool, ()> {
+    match query_value(query, "single")? {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(()),
+    }
+}
+
+fn parse_reading_direction(
+    query: &[(String, String)],
+) -> Result<Option<RemoteReadingDirection>, ()> {
+    match query_value(query, "direction")? {
+        None => Ok(None),
+        Some("ltr") => Ok(Some(RemoteReadingDirection::Ltr)),
+        Some("rtl") => Ok(Some(RemoteReadingDirection::Rtl)),
+        Some(_) => Err(()),
+    }
+}
+
 fn remote_address_kind(address: &RemoteAddress) -> &'static str {
     match address.subresource {
         RemoteSubresource::File => "file",
@@ -1703,6 +1769,24 @@ mod tests {
     fn duplicate_security_parameters_are_rejected() {
         let query = parse_query("fav=a&fav=b").unwrap();
         assert!(query_value(&query, "fav").is_err());
+    }
+
+    #[test]
+    fn container_spread_query_accepts_only_protocol_modes_and_explicit_orientation() {
+        let query = parse_query("spread=rtl_cover&direction=rtl&single=1").unwrap();
+        assert_eq!(
+            parse_spread_mode(&query).unwrap(),
+            Some(RemoteSpreadMode::RtlCover)
+        );
+        assert_eq!(
+            parse_reading_direction(&query).unwrap(),
+            Some(RemoteReadingDirection::Rtl)
+        );
+        assert!(parse_force_single_page(&query).unwrap());
+        assert!(parse_spread_mode(&parse_query("spread=vertical").unwrap()).is_err());
+        assert!(parse_force_single_page(&parse_query("single=true").unwrap()).is_err());
+        assert!(parse_reading_direction(&parse_query("direction=vertical").unwrap()).is_err());
+        assert!(parse_spread_mode(&parse_query("spread=ltr&spread=rtl").unwrap()).is_err());
     }
 
     #[test]

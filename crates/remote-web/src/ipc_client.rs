@@ -471,12 +471,18 @@ impl ThumbnailClient {
         &self,
         client_id: &str,
         address: RemoteAddress,
+        spread_mode: Option<mimageviewer_ipc::RemoteSpreadMode>,
+        reading_direction: Option<mimageviewer_ipc::RemoteReadingDirection>,
+        force_single_page: bool,
     ) -> Result<IpcSuccess<ContainerPayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Container {
             id,
             client_id: client_id.to_owned(),
             request: ContainerRequest {
                 address: address.clone(),
+                spread_mode,
+                reading_direction,
+                force_single_page,
             },
         })
         .and_then(|success| match success.value {

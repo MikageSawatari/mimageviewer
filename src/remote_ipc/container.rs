@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerPayload, ContainerRequest,
-    ContainerResponse, MediaError, MediaErrorCode, PagePayload, PagePriority, PageRequest,
-    PageResponse, RemoteAddress, RemoteSubresource, ThumbnailError, ThumbnailErrorCode,
-    ThumbnailResponse,
+    ContainerResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
+    PageRequest, PageResponse, RemoteAddress, RemoteReadingDirection, RemoteSpreadMode,
+    RemoteSubresource, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
 };
 
 use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
@@ -23,6 +23,7 @@ pub(super) struct ContainerEngine {
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
+    spread_db: Mutex<Option<crate::spread_db::SpreadDb>>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -36,13 +37,32 @@ struct LoadedImage {
     image: image::DynamicImage,
 }
 
+struct SpreadPayload {
+    configured: RemoteSpreadMode,
+    effective: RemoteSpreadMode,
+    reading_direction: RemoteReadingDirection,
+    groups: Vec<PageGroup>,
+}
+
 impl ContainerEngine {
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
+        let spread_db_path = crate::data_dir::get().join("spread.db");
+        let spread_db =
+            match crate::spread_db::SpreadDb::open_existing_read_only_at(&spread_db_path) {
+                Ok(db) => db,
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: spread DB read-only open failed: {error}"
+                    ));
+                    None
+                }
+            };
         Self {
             settings: Arc::new(settings),
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
+            spread_db: Mutex::new(spread_db),
         }
     }
 
@@ -53,16 +73,24 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return ContainerResponse::Error(error),
         };
-        let response = match self.enumerate(&request.address, &resolved) {
+        let response = match self.enumerate(&request, &resolved) {
             Ok(payload) => ContainerResponse::Success(payload),
             Err(error) => ContainerResponse::Error(error),
         };
-        let (outcome, entry_count) = match &response {
-            ContainerResponse::Success(payload) => ("ok", payload.entries.len()),
-            ContainerResponse::Error(_) => ("error", 0),
+        let (outcome, entry_count, group_count, configured, effective, direction) = match &response
+        {
+            ContainerResponse::Success(payload) => (
+                "ok",
+                payload.entries.len(),
+                payload.page_groups.len(),
+                remote_spread_mode_name(payload.configured_spread_mode),
+                remote_spread_mode_name(payload.effective_spread_mode),
+                remote_reading_direction_name(payload.reading_direction),
+            ),
+            ContainerResponse::Error(_) => ("error", 0, 0, "none", "none", "none"),
         };
         crate::logger::log(format!(
-            "remote_ipc: media_operation operation=container source_kind={source_kind} outcome={outcome} duration_ms={:.1} entry_count={entry_count}",
+            "remote_ipc: media_operation operation=container source_kind={source_kind} outcome={outcome} duration_ms={:.1} entry_count={entry_count} group_count={group_count} configured_spread={configured} effective_spread={effective} reading_direction={direction}",
             started.elapsed().as_secs_f64() * 1000.0
         ));
         response
@@ -182,7 +210,7 @@ impl ContainerEngine {
 
     fn enumerate(
         &self,
-        address: &RemoteAddress,
+        request: &ContainerRequest,
         resolved: &ResolvedFavoritePath,
     ) -> Result<ContainerPayload, MediaError> {
         let metadata = std::fs::metadata(&resolved.canonical)
@@ -194,9 +222,9 @@ impl ContainerEngine {
             ));
         }
         if is_zip_path(&resolved.logical) {
-            self.enumerate_zip(address, resolved)
+            self.enumerate_zip(request, resolved)
         } else if is_pdf_path(&resolved.logical) {
-            self.enumerate_pdf(address, resolved, &metadata)
+            self.enumerate_pdf(request, resolved, &metadata)
         } else {
             Err(media_error(
                 MediaErrorCode::Unsupported,
@@ -207,9 +235,10 @@ impl ContainerEngine {
 
     fn enumerate_zip(
         &self,
-        address: &RemoteAddress,
+        request: &ContainerRequest,
         resolved: &ResolvedFavoritePath,
     ) -> Result<ContainerPayload, MediaError> {
+        let address = &request.address;
         let requested_prefix = match &address.subresource {
             RemoteSubresource::File => String::new(),
             RemoteSubresource::ZipDirectory { prefix } => prefix.clone(),
@@ -259,9 +288,12 @@ impl ContainerEngine {
         let (items, _) =
             tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
         let total = items.len();
-        let entries = items
+        let items = items
             .into_iter()
             .take(CONTAINER_ENTRY_LIMIT)
+            .collect::<Vec<_>>();
+        let entries = items
+            .iter()
             .filter_map(|item| {
                 let name = item.name().into_owned();
                 match item {
@@ -271,7 +303,9 @@ impl ContainerEngine {
                         address: RemoteAddress {
                             favorite_id: address.favorite_id.clone(),
                             relative_path: address.relative_path.clone(),
-                            subresource: RemoteSubresource::ZipDirectory { prefix: dir_prefix },
+                            subresource: RemoteSubresource::ZipDirectory {
+                                prefix: dir_prefix.clone(),
+                            },
                         },
                         kind: ContainerEntryKind::Directory,
                     }),
@@ -279,14 +313,20 @@ impl ContainerEngine {
                         Some(ContainerEntry {
                             name,
                             page_count: None,
-                            address: zip_entry_address(address, &entry_name),
+                            address: zip_entry_address(address, entry_name),
                             kind: ContainerEntryKind::Image,
                         })
                     }
                     _ => None,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let spread = self.spread_payload(
+            request,
+            resolved,
+            &items,
+            Some((&effective_segments, &resolved.logical)),
+        );
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
             kind: ContainerKind::Zip,
@@ -302,6 +342,11 @@ impl ContainerEngine {
                 },
             },
             entries,
+            configured_spread_mode: spread.configured,
+            effective_spread_mode: spread.effective,
+            reading_direction: spread.reading_direction,
+            spread_page_gap_px: self.settings.spread_page_gap_px,
+            page_groups: spread.groups,
             entry_limit: CONTAINER_ENTRY_LIMIT,
             truncated: total > CONTAINER_ENTRY_LIMIT,
         })
@@ -309,10 +354,11 @@ impl ContainerEngine {
 
     fn enumerate_pdf(
         &self,
-        address: &RemoteAddress,
+        request: &ContainerRequest,
         resolved: &ResolvedFavoritePath,
         metadata: &std::fs::Metadata,
     ) -> Result<ContainerPayload, MediaError> {
+        let address = &request.address;
         if !matches!(address.subresource, RemoteSubresource::File) {
             return Err(media_error(
                 MediaErrorCode::BadRequest,
@@ -320,8 +366,19 @@ impl ContainerEngine {
             ));
         }
         let page_count = self.pdf_page_count(resolved, metadata)?;
-        let entries = (0..page_count)
+        let page_numbers = (0..page_count)
             .take(CONTAINER_ENTRY_LIMIT)
+            .collect::<Vec<_>>();
+        let items = page_numbers
+            .iter()
+            .map(|page_number| crate::grid_item::GridItem::PdfPage {
+                pdf_path: resolved.logical.clone(),
+                page_num: *page_number,
+                content_type: None,
+            })
+            .collect::<Vec<_>>();
+        let entries = page_numbers
+            .into_iter()
             .map(|page_number| ContainerEntry {
                 address: RemoteAddress {
                     favorite_id: address.favorite_id.clone(),
@@ -332,15 +389,138 @@ impl ContainerEngine {
                 kind: ContainerEntryKind::Image,
                 page_count: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let spread = self.spread_payload(request, resolved, &items, None);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
             kind: ContainerKind::Pdf,
             effective_address: address.clone(),
             entries,
+            configured_spread_mode: spread.configured,
+            effective_spread_mode: spread.effective,
+            reading_direction: spread.reading_direction,
+            spread_page_gap_px: self.settings.spread_page_gap_px,
+            page_groups: spread.groups,
             entry_limit: CONTAINER_ENTRY_LIMIT,
             truncated: page_count as usize > CONTAINER_ENTRY_LIMIT,
         })
+    }
+
+    fn spread_payload(
+        &self,
+        request: &ContainerRequest,
+        resolved: &ResolvedFavoritePath,
+        items: &[crate::grid_item::GridItem],
+        zip_context: Option<(&[String], &Path)>,
+    ) -> SpreadPayload {
+        let (key, fallback) = if let Some((segments, root)) = zip_context {
+            let mut key = root.to_path_buf();
+            for segment in segments {
+                key.push(segment);
+            }
+            let fallback = (!segments.is_empty()).then_some(root);
+            (key, fallback)
+        } else {
+            (resolved.logical.clone(), None)
+        };
+        let (stored_mode, stored_direction) = self.stored_spread_state(&key, fallback);
+        let (configured, effective, reading_direction) = resolve_spread_state(
+            request.spread_mode,
+            request.reading_direction,
+            stored_mode,
+            stored_direction,
+            self.settings.default_spread_mode,
+            self.settings.default_reading_direction,
+            request.force_single_page,
+        );
+        let landscape = self.cached_landscape_flags(&resolved.logical, items);
+        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups(
+            items,
+            core_spread_mode(effective),
+            &landscape,
+        );
+        let groups = index_groups
+            .into_iter()
+            .filter_map(|indices| {
+                let pages = indices
+                    .into_iter()
+                    .filter_map(|index| grid_item_address(&request.address, items.get(index)?))
+                    .collect::<Vec<_>>();
+                let anchor = if effective.is_rtl() && pages.len() == 2 {
+                    pages.get(1).cloned()
+                } else {
+                    pages.first().cloned()
+                }?;
+                Some(PageGroup { anchor, pages })
+            })
+            .collect::<Vec<_>>();
+        SpreadPayload {
+            configured,
+            effective,
+            reading_direction,
+            groups,
+        }
+    }
+
+    fn stored_spread_state(
+        &self,
+        key: &Path,
+        fallback: Option<&Path>,
+    ) -> (
+        Option<crate::settings::SpreadMode>,
+        Option<crate::settings::ReadingDirection>,
+    ) {
+        let db = self
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mode = db
+            .as_ref()
+            .and_then(|db| db.get(key))
+            .or_else(|| fallback.and_then(|path| db.as_ref().and_then(|db| db.get(path))));
+        let direction = db
+            .as_ref()
+            .and_then(|db| db.get_direction(key))
+            .or_else(|| {
+                fallback.and_then(|path| db.as_ref().and_then(|db| db.get_direction(path)))
+            });
+        (mode, direction)
+    }
+
+    fn cached_landscape_flags(
+        &self,
+        container_path: &Path,
+        items: &[crate::grid_item::GridItem],
+    ) -> Vec<bool> {
+        let cached = crate::catalog::CatalogDb::open_existing_read_only(
+            &crate::catalog::default_cache_dir(),
+            container_path,
+        )
+        .ok()
+        .flatten()
+        .and_then(|catalog| catalog.load_all().ok())
+        .unwrap_or_default();
+        items
+            .iter()
+            .map(|item| {
+                let key = match item {
+                    crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
+                        Some(entry_name.clone())
+                    }
+                    crate::grid_item::GridItem::PdfPage { page_num, .. } => {
+                        Some(crate::grid_item::pdf_page_cache_key(*page_num))
+                    }
+                    _ => None,
+                };
+                key.and_then(|key| cached.get(&key))
+                    .and_then(|entry| {
+                        entry
+                            .source_dims
+                            .or_else(|| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
+                    })
+                    .is_some_and(|(width, height)| width > height)
+            })
+            .collect()
     }
 
     fn load_image(
@@ -644,6 +824,102 @@ fn zip_entry_address(container: &RemoteAddress, entry_name: &str) -> RemoteAddre
     }
 }
 
+fn grid_item_address(
+    container: &RemoteAddress,
+    item: &crate::grid_item::GridItem,
+) -> Option<RemoteAddress> {
+    match item {
+        crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
+            Some(zip_entry_address(container, entry_name))
+        }
+        crate::grid_item::GridItem::PdfPage { page_num, .. } => Some(RemoteAddress {
+            favorite_id: container.favorite_id.clone(),
+            relative_path: container.relative_path.clone(),
+            subresource: RemoteSubresource::PdfPage {
+                page_number: *page_num,
+            },
+        }),
+        _ => None,
+    }
+}
+
+fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
+    match mode {
+        RemoteSpreadMode::Single => crate::settings::SpreadMode::Single,
+        RemoteSpreadMode::Ltr => crate::settings::SpreadMode::Ltr,
+        RemoteSpreadMode::LtrCover => crate::settings::SpreadMode::LtrCover,
+        RemoteSpreadMode::Rtl => crate::settings::SpreadMode::Rtl,
+        RemoteSpreadMode::RtlCover => crate::settings::SpreadMode::RtlCover,
+    }
+}
+
+fn remote_spread_mode(mode: crate::settings::SpreadMode) -> RemoteSpreadMode {
+    match mode {
+        crate::settings::SpreadMode::Ltr => RemoteSpreadMode::Ltr,
+        crate::settings::SpreadMode::LtrCover => RemoteSpreadMode::LtrCover,
+        crate::settings::SpreadMode::Rtl => RemoteSpreadMode::Rtl,
+        crate::settings::SpreadMode::RtlCover => RemoteSpreadMode::RtlCover,
+        crate::settings::SpreadMode::Single | crate::settings::SpreadMode::Vertical => {
+            RemoteSpreadMode::Single
+        }
+    }
+}
+
+fn remote_spread_mode_name(mode: RemoteSpreadMode) -> &'static str {
+    match mode {
+        RemoteSpreadMode::Single => "single",
+        RemoteSpreadMode::Ltr => "ltr",
+        RemoteSpreadMode::LtrCover => "ltr_cover",
+        RemoteSpreadMode::Rtl => "rtl",
+        RemoteSpreadMode::RtlCover => "rtl_cover",
+    }
+}
+
+fn remote_reading_direction(
+    direction: crate::settings::ReadingDirection,
+) -> RemoteReadingDirection {
+    match direction {
+        crate::settings::ReadingDirection::Ltr => RemoteReadingDirection::Ltr,
+        crate::settings::ReadingDirection::Rtl => RemoteReadingDirection::Rtl,
+    }
+}
+
+fn remote_reading_direction_name(direction: RemoteReadingDirection) -> &'static str {
+    match direction {
+        RemoteReadingDirection::Ltr => "ltr",
+        RemoteReadingDirection::Rtl => "rtl",
+    }
+}
+
+fn resolve_spread_state(
+    requested: Option<RemoteSpreadMode>,
+    requested_direction: Option<RemoteReadingDirection>,
+    stored_mode: Option<crate::settings::SpreadMode>,
+    stored_direction: Option<crate::settings::ReadingDirection>,
+    default_mode: crate::settings::SpreadMode,
+    default_direction: crate::settings::ReadingDirection,
+    force_single_page: bool,
+) -> (RemoteSpreadMode, RemoteSpreadMode, RemoteReadingDirection) {
+    let configured =
+        requested.unwrap_or_else(|| remote_spread_mode(stored_mode.unwrap_or(default_mode)));
+    let mut reading_direction = requested_direction
+        .unwrap_or_else(|| remote_reading_direction(stored_direction.unwrap_or(default_direction)));
+    if configured.is_rtl() {
+        reading_direction = RemoteReadingDirection::Rtl;
+    } else if matches!(
+        configured,
+        RemoteSpreadMode::Ltr | RemoteSpreadMode::LtrCover
+    ) {
+        reading_direction = RemoteReadingDirection::Ltr;
+    }
+    let effective = if force_single_page {
+        RemoteSpreadMode::Single
+    } else {
+        configured
+    };
+    (configured, effective, reading_direction)
+}
+
 fn zip_prefix_segments(prefix: &str) -> Vec<String> {
     prefix
         .split('/')
@@ -849,5 +1125,114 @@ mod tests {
             .map(|item| item.name().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, ["2.jpg", "10.jpg"]);
+    }
+
+    #[test]
+    fn portrait_forces_single_without_changing_the_configured_mode() {
+        assert_eq!(
+            resolve_spread_state(
+                None,
+                None,
+                Some(crate::settings::SpreadMode::RtlCover),
+                Some(crate::settings::ReadingDirection::Ltr),
+                crate::settings::SpreadMode::Ltr,
+                crate::settings::ReadingDirection::Ltr,
+                true,
+            ),
+            (
+                RemoteSpreadMode::RtlCover,
+                RemoteSpreadMode::Single,
+                RemoteReadingDirection::Rtl,
+            )
+        );
+        assert_eq!(
+            resolve_spread_state(
+                Some(RemoteSpreadMode::LtrCover),
+                Some(RemoteReadingDirection::Rtl),
+                Some(crate::settings::SpreadMode::Rtl),
+                Some(crate::settings::ReadingDirection::Rtl),
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingDirection::Rtl,
+                false,
+            ),
+            (
+                RemoteSpreadMode::LtrCover,
+                RemoteSpreadMode::LtrCover,
+                RemoteReadingDirection::Ltr,
+            )
+        );
+        assert_eq!(
+            resolve_spread_state(
+                None,
+                None,
+                Some(crate::settings::SpreadMode::Single),
+                Some(crate::settings::ReadingDirection::Rtl),
+                crate::settings::SpreadMode::Ltr,
+                crate::settings::ReadingDirection::Ltr,
+                false,
+            ),
+            (
+                RemoteSpreadMode::Single,
+                RemoteSpreadMode::Single,
+                RemoteReadingDirection::Rtl,
+            )
+        );
+    }
+
+    #[test]
+    fn spread_mode_resolution_uses_stored_then_default_and_never_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let book = temp.path().join("book.zip");
+        let writable = crate::spread_db::SpreadDb::open_at(&path).unwrap();
+        writable
+            .set(
+                &book,
+                crate::settings::SpreadMode::Rtl,
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingFlow::Paged,
+                crate::settings::ReadingDirection::Ltr,
+            )
+            .unwrap();
+        drop(writable);
+        let read_only = crate::spread_db::SpreadDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        let stored = read_only.get(&book);
+        let stored_direction = read_only.get_direction(&book);
+        assert_eq!(
+            resolve_spread_state(
+                Some(RemoteSpreadMode::Ltr),
+                None,
+                stored,
+                stored_direction,
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingDirection::Rtl,
+                false,
+            ),
+            (
+                RemoteSpreadMode::Ltr,
+                RemoteSpreadMode::Ltr,
+                RemoteReadingDirection::Ltr,
+            )
+        );
+        assert_eq!(read_only.get(&book), Some(crate::settings::SpreadMode::Rtl));
+        assert_eq!(
+            read_only.get_direction(&book),
+            Some(crate::settings::ReadingDirection::Rtl)
+        );
+        assert_eq!(
+            resolve_spread_state(
+                None,
+                None,
+                None,
+                None,
+                crate::settings::SpreadMode::LtrCover,
+                crate::settings::ReadingDirection::Rtl,
+                false,
+            )
+            .0,
+            RemoteSpreadMode::LtrCover
+        );
     }
 }

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::path_key;
 use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+use rusqlite::OpenFlags;
 
 /// 表示モード DB ハンドル
 pub struct SpreadDb {
@@ -35,6 +36,15 @@ impl SpreadDb {
         ensure_column(&conn, "flow", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "direction", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Self { conn })
+    }
+
+    /// 既存 DB を read-only で開く。remote IPC の表示設定参照用で、schema 作成や更新は行わない。
+    pub fn open_existing_read_only_at(path: &Path) -> Result<Option<Self>, rusqlite::Error> {
+        if !path.try_exists().unwrap_or(false) {
+            return Ok(None);
+        }
+        let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Some(Self { conn }))
     }
 
     /// DB ファイルのパス

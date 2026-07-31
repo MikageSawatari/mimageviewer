@@ -4,11 +4,18 @@ import assert from "node:assert/strict";
 import {
   CommandName,
   FitMode,
+  ReadingDirection,
+  SpreadMode,
   commandFromKey,
   containerPageTargetPx,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
+  isPortraitViewport,
+  isRtlReadingDirection,
+  isRtlSpread,
+  nextSpreadMode,
+  readingDirectionForSpreadMode,
   reduceViewerTransform,
   viewerTapCommand,
   nextFitMode,
@@ -19,6 +26,7 @@ import {
   shouldShowLoadingIndicator,
   sessionOwnerBadge,
   viewerImageLayout,
+  viewerSpreadLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
 
@@ -48,6 +56,45 @@ test("viewer keys map to the shared page and menu commands", () => {
   assert.equal(commandFromKey(key("i"), "viewer"), null);
   assert.equal(commandFromKey(key("+"), "viewer").name, CommandName.ZOOM_IN);
   assert.equal(commandFromKey(key("0"), "viewer").name, CommandName.FIT_CYCLE);
+  assert.equal(commandFromKey(key("1"), "viewer").name, CommandName.SPREAD_SINGLE);
+  assert.equal(commandFromKey(key("5"), "viewer").name, CommandName.SPREAD_RTL_COVER);
+});
+
+test("RTL reverses only physical horizontal viewer keys and tap zones", () => {
+  assert.equal(
+    commandFromKey(key("ArrowLeft", { rtl: true }), "viewer").name,
+    CommandName.NEXT_PAGE
+  );
+  assert.equal(
+    commandFromKey(key("ArrowRight", { rtl: true }), "viewer").name,
+    CommandName.PREV_PAGE
+  );
+  assert.equal(commandFromKey(key("PageDown", { rtl: true }), "viewer").name, CommandName.NEXT_PAGE);
+  assert.equal(viewerTapCommand(10, 300, true).name, CommandName.NEXT_PAGE);
+  assert.equal(viewerTapCommand(290, 300, true).name, CommandName.PREV_PAGE);
+});
+
+test("spread cycle, RTL predicate and portrait fallback match the viewer contract", () => {
+  assert.equal(nextSpreadMode(SpreadMode.SINGLE), SpreadMode.LTR);
+  assert.equal(nextSpreadMode(SpreadMode.LTR), SpreadMode.LTR_COVER);
+  assert.equal(nextSpreadMode(SpreadMode.LTR_COVER), SpreadMode.RTL);
+  assert.equal(nextSpreadMode(SpreadMode.RTL), SpreadMode.RTL_COVER);
+  assert.equal(nextSpreadMode(SpreadMode.RTL_COVER), SpreadMode.SINGLE);
+  assert.equal(isRtlSpread(SpreadMode.RTL_COVER), true);
+  assert.equal(isRtlSpread(SpreadMode.LTR), false);
+  assert.equal(isRtlReadingDirection(ReadingDirection.RTL), true);
+  assert.equal(isRtlReadingDirection(ReadingDirection.LTR), false);
+  assert.equal(
+    readingDirectionForSpreadMode(SpreadMode.SINGLE, ReadingDirection.RTL),
+    ReadingDirection.RTL
+  );
+  assert.equal(
+    readingDirectionForSpreadMode(SpreadMode.LTR_COVER, ReadingDirection.RTL),
+    ReadingDirection.LTR
+  );
+  assert.equal(isPortraitViewport(430, 932), true);
+  assert.equal(isPortraitViewport(932, 430), false);
+  assert.equal(isPortraitViewport(800, 800), false);
 });
 
 test("fit mode cycle and request width use the actual rendered image width", () => {
@@ -83,6 +130,36 @@ test("fit mode cycle and request width use the actual rendered image width", () 
   });
   assert.equal(original.cssWidth, 1000);
   assert.equal(original.requestWidth, 1000);
+});
+
+test("spread layout fits the combined pages and preserves the configured gap", () => {
+  const layout = viewerSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [
+      { width: 1200, height: 1800 },
+      { width: 1200, height: 1800 },
+    ],
+    viewportWidth: 1600,
+    viewportHeight: 1000,
+    devicePixelRatio: 2,
+    gap: 12,
+  });
+  assert.equal(layout.gap, 12);
+  assert.equal(Math.round(layout.pages[0].cssWidth), 667);
+  assert.equal(Math.round(layout.pages[0].cssHeight), 1000);
+  assert.equal(layout.pages[0].requestWidth, 1334);
+  assert.equal(layout.pages[1].requestWidth, 1334);
+
+  const single = viewerSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [{ width: 1200, height: 1800 }],
+    viewportWidth: 430,
+    viewportHeight: 932,
+    devicePixelRatio: 2,
+    gap: 20,
+  });
+  assert.equal(single.gap, 0);
+  assert.equal(single.pages[0].requestWidth, 860);
 });
 
 test("grid keys mirror parent, history, selection and page defaults", () => {

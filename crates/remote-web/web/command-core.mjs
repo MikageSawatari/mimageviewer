@@ -10,6 +10,12 @@ export const CommandName = Object.freeze({
   FIT_PAGE: "fit_page",
   FIT_WIDTH: "fit_width",
   FIT_ORIGINAL: "fit_original",
+  SPREAD_CYCLE: "spread_cycle",
+  SPREAD_SINGLE: "spread_single",
+  SPREAD_LTR: "spread_ltr",
+  SPREAD_LTR_COVER: "spread_ltr_cover",
+  SPREAD_RTL: "spread_rtl",
+  SPREAD_RTL_COVER: "spread_rtl_cover",
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
@@ -36,6 +42,19 @@ export const FitMode = Object.freeze({
   ORIGINAL: "original",
 });
 
+export const SpreadMode = Object.freeze({
+  SINGLE: "single",
+  LTR: "ltr",
+  LTR_COVER: "ltr_cover",
+  RTL: "rtl",
+  RTL_COVER: "rtl_cover",
+});
+
+export const ReadingDirection = Object.freeze({
+  LTR: "ltr",
+  RTL: "rtl",
+});
+
 export function command(name, payload = {}) {
   return { name, payload };
 }
@@ -57,10 +76,16 @@ export function commandFromKey(input, context) {
   }
 
   if (context === "viewer") {
-    if (plain && ["ArrowRight", "ArrowDown", "PageDown"].includes(key)) {
+    if (plain && key === "ArrowRight") {
+      return command(input.rtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
+    }
+    if (plain && key === "ArrowLeft") {
+      return command(input.rtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
+    }
+    if (plain && ["ArrowDown", "PageDown"].includes(key)) {
       return command(CommandName.NEXT_PAGE);
     }
-    if (plain && ["ArrowLeft", "ArrowUp", "PageUp"].includes(key)) {
+    if (plain && ["ArrowUp", "PageUp"].includes(key)) {
       return command(CommandName.PREV_PAGE);
     }
     if (plain && key === "Home") return command(CommandName.FIRST_PAGE);
@@ -71,6 +96,11 @@ export function commandFromKey(input, context) {
     if (plain && ["+", "="].includes(key)) return command(CommandName.ZOOM_IN);
     if (plain && key === "-") return command(CommandName.ZOOM_OUT);
     if (plain && key === "0") return command(CommandName.FIT_CYCLE);
+    if (plain && key === "1") return command(CommandName.SPREAD_SINGLE);
+    if (plain && key === "2") return command(CommandName.SPREAD_LTR);
+    if (plain && key === "3") return command(CommandName.SPREAD_LTR_COVER);
+    if (plain && key === "4") return command(CommandName.SPREAD_RTL);
+    if (plain && key === "5") return command(CommandName.SPREAD_RTL_COVER);
     return null;
   }
 
@@ -109,6 +139,43 @@ export function nextFitMode(mode) {
   return FitMode.PAGE;
 }
 
+export function nextSpreadMode(mode) {
+  const cycle = [
+    SpreadMode.SINGLE,
+    SpreadMode.LTR,
+    SpreadMode.LTR_COVER,
+    SpreadMode.RTL,
+    SpreadMode.RTL_COVER,
+  ];
+  const index = cycle.indexOf(mode);
+  return cycle[(index < 0 ? 0 : index + 1) % cycle.length];
+}
+
+export function isRtlSpread(mode) {
+  return mode === SpreadMode.RTL || mode === SpreadMode.RTL_COVER;
+}
+
+export function isRtlReadingDirection(direction) {
+  return direction === ReadingDirection.RTL;
+}
+
+export function readingDirectionForSpreadMode(mode, currentDirection) {
+  if (mode === SpreadMode.RTL || mode === SpreadMode.RTL_COVER) {
+    return ReadingDirection.RTL;
+  }
+  if (mode === SpreadMode.LTR || mode === SpreadMode.LTR_COVER) {
+    return ReadingDirection.LTR;
+  }
+  return currentDirection === ReadingDirection.RTL
+    ? ReadingDirection.RTL
+    : ReadingDirection.LTR;
+}
+
+/// 正方形は横持ち側に倒し、縦が横を 1px でも上回ると表示限定 Single にする。
+export function isPortraitViewport(width, height) {
+  return Math.max(0, Number(height) || 0) > Math.max(0, Number(width) || 0);
+}
+
 export function viewerImageLayout({
   mode,
   sourceWidth,
@@ -142,10 +209,69 @@ export function viewerImageLayout({
   };
 }
 
-export function viewerTapCommand(clientX, width) {
+export function viewerSpreadLayout({
+  mode,
+  pages,
+  viewportWidth,
+  viewportHeight,
+  devicePixelRatio,
+  gap = 0,
+  maxRequestWidth = 8192,
+}) {
+  const sources = (pages ?? []).map((page) => ({
+    width: Math.max(1, Number(page?.width) || 1),
+    height: Math.max(1, Number(page?.height) || 1),
+  }));
+  if (!sources.length) return { pages: [], gap: 0 };
+  if (sources.length === 1) {
+    return {
+      pages: [viewerImageLayout({
+        mode,
+        sourceWidth: sources[0].width,
+        sourceHeight: sources[0].height,
+        viewportWidth,
+        viewportHeight,
+        devicePixelRatio,
+        maxRequestWidth,
+      })],
+      gap: 0,
+    };
+  }
+  const availableWidth = Math.max(1, Number(viewportWidth) || 1);
+  const availableHeight = Math.max(1, Number(viewportHeight) || 1);
+  const resolvedGap = Math.max(0, Number(gap) || 0);
+  const contentWidth = Math.max(1, availableWidth - resolvedGap);
+  const sourceHeight = Math.max(...sources.map((page) => page.height));
+  const normalizedWidths = sources.map(
+    (page) => page.width * sourceHeight / page.height
+  );
+  const sourceWidth = normalizedWidths.reduce((sum, width) => sum + width, 0);
+  const scale = mode === FitMode.ORIGINAL
+    ? 1
+    : mode === FitMode.WIDTH
+      ? contentWidth / sourceWidth
+      : Math.min(contentWidth / sourceWidth, availableHeight / sourceHeight);
+  const dpr = Math.max(0.25, Number(devicePixelRatio) || 1);
+  return {
+    pages: sources.map((page, index) => {
+      const cssWidth = normalizedWidths[index] * scale;
+      return {
+        cssWidth,
+        cssHeight: sourceHeight * scale,
+        requestWidth: Math.max(
+          1,
+          Math.min(maxRequestWidth, Math.ceil(cssWidth * (mode === FitMode.ORIGINAL ? 1 : dpr)))
+        ),
+      };
+    }),
+    gap: resolvedGap,
+  };
+}
+
+export function viewerTapCommand(clientX, width, rtl = false) {
   const ratio = Math.max(0, Math.min(1, clientX / Math.max(1, width)));
-  if (ratio < 0.34) return command(CommandName.PREV_PAGE);
-  if (ratio > 0.66) return command(CommandName.NEXT_PAGE);
+  if (ratio < 0.34) return command(rtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
+  if (ratio > 0.66) return command(rtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
   return command(CommandName.TOGGLE_MENU);
 }
 

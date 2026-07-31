@@ -4097,6 +4097,36 @@ fn build_spread_display_units_with_predicates(
     units
 }
 
+/// remote IPC 用に、本体と同じ表示単位を画面上の左→右ページ列へ解決する。
+///
+/// ペア可能種別、表紙位相、横長ページ境界、RTL の左右反転を fullscreen と同じ
+/// `SpreadDisplayUnit::spread_pair` へ通す。`is_landscape` は一覧生成側が既存 catalog の
+/// source dimensions から解決し、未確定は fullscreen と同じく縦長扱いにする。
+pub(crate) fn build_remote_spread_page_groups(
+    items: &[GridItem],
+    spread_mode: SpreadMode,
+    is_landscape: &[bool],
+) -> Vec<Vec<usize>> {
+    let visible = (0..items.len()).collect::<Vec<_>>();
+    let nav = build_image_reading_indices(items, &visible);
+    if !spread_mode.is_spread() {
+        return nav.into_iter().map(|idx| vec![idx]).collect();
+    }
+    build_spread_display_units_with_predicates(
+        &nav,
+        spread_mode,
+        None,
+        |idx| is_landscape.get(idx).copied().unwrap_or(false),
+        |idx| is_spread_pairable_item(items.get(idx)),
+    )
+    .into_iter()
+    .map(|unit| match unit.spread_pair(spread_mode) {
+        SpreadPair::Single => vec![unit.anchor_idx()],
+        SpreadPair::Double { left, right } => vec![left, right],
+    })
+    .collect()
+}
+
 fn append_spread_display_units_until(
     nav: &[usize],
     units: &mut Vec<SpreadDisplayUnit>,
@@ -26312,6 +26342,39 @@ mod tests {
             assert_eq!(units[2].anchor_idx(), 3);
             assert_eq!(units[4].anchor_idx(), 6);
         }
+    }
+
+    #[test]
+    fn remote_spread_groups_share_cover_rtl_and_landscape_rules() {
+        let items = (0..7)
+            .map(|page_num| GridItem::PdfPage {
+                pdf_path: "book.pdf".into(),
+                page_num,
+                content_type: None,
+            })
+            .collect::<Vec<_>>();
+        let landscape = [false, false, false, true, false, false, false];
+
+        assert_eq!(
+            build_remote_spread_page_groups(&items, SpreadMode::Ltr, &landscape),
+            vec![vec![0, 1], vec![2], vec![3], vec![4, 5], vec![6]]
+        );
+        assert_eq!(
+            build_remote_spread_page_groups(&items, SpreadMode::LtrCover, &landscape),
+            vec![vec![0], vec![1, 2], vec![3], vec![4, 5], vec![6]]
+        );
+        assert_eq!(
+            build_remote_spread_page_groups(&items, SpreadMode::Rtl, &landscape),
+            vec![vec![1, 0], vec![2], vec![3], vec![5, 4], vec![6]]
+        );
+        assert_eq!(
+            build_remote_spread_page_groups(&items, SpreadMode::RtlCover, &landscape),
+            vec![vec![0], vec![2, 1], vec![3], vec![5, 4], vec![6]]
+        );
+        assert_eq!(
+            build_remote_spread_page_groups(&items, SpreadMode::Single, &landscape),
+            (0..7).map(|index| vec![index]).collect::<Vec<_>>()
+        );
     }
 
     #[test]

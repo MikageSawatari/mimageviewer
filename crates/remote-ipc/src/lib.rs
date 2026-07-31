@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -134,6 +134,42 @@ pub struct ThumbnailRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ContainerRequest {
     pub address: RemoteAddress,
+    /// `None` はコンテナの spread.db 設定、`Some` は Web セッション中だけの上書き。
+    pub spread_mode: Option<RemoteSpreadMode>,
+    /// Single でも本体の綴じ方向を維持するための session-only 上書き。
+    pub reading_direction: Option<RemoteReadingDirection>,
+    /// 縦長 viewport 用の表示限定 Single。保存済みモードは変更しない。
+    pub force_single_page: bool,
+}
+
+/// Web へ公開するページ構成。旧 DB 互換用 `Vertical` は本体側で `Single` へ解決してから返す。
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSpreadMode {
+    Single,
+    Ltr,
+    LtrCover,
+    Rtl,
+    RtlCover,
+}
+
+impl RemoteSpreadMode {
+    pub fn is_rtl(self) -> bool {
+        matches!(self, Self::Rtl | Self::RtlCover)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteReadingDirection {
+    Ltr,
+    Rtl,
+}
+
+impl RemoteReadingDirection {
+    pub fn is_rtl(self) -> bool {
+        matches!(self, Self::Rtl)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -158,6 +194,14 @@ pub struct ContainerEntry {
     pub page_count: Option<u32>,
 }
 
+/// `pages` は画面上の左→右順。グループ列そのものは本の読み進める順に並ぶ。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageGroup {
+    /// 読み順でこの表示単位の先頭になるページ。履歴 URL とグループ移動の identity。
+    pub anchor: RemoteAddress,
+    pub pages: Vec<RemoteAddress>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ContainerPayload {
     pub title: String,
@@ -165,6 +209,14 @@ pub struct ContainerPayload {
     /// ZIP の単一ラッパー自動降下後など、実際に表示している位置。
     pub effective_address: RemoteAddress,
     pub entries: Vec<ContainerEntry>,
+    /// spread.db または session override から解決したモード。縦持ちでも保持する。
+    pub configured_spread_mode: RemoteSpreadMode,
+    /// 実際に `page_groups` を構成したモード。縦持ちは `Single`。
+    pub effective_spread_mode: RemoteSpreadMode,
+    /// Single を含む物理的なページ送り方向。spread.db の reading direction を反映する。
+    pub reading_direction: RemoteReadingDirection,
+    pub spread_page_gap_px: u32,
+    pub page_groups: Vec<PageGroup>,
     pub entry_limit: usize,
     pub truncated: bool,
 }
@@ -725,6 +777,51 @@ mod tests {
         let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn container_spread_request_and_groups_round_trip() {
+        let container = RemoteAddress::file("favorite", "books/book.pdf");
+        let page = |page_number| RemoteAddress {
+            favorite_id: "favorite".to_owned(),
+            relative_path: "books/book.pdf".to_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number },
+        };
+        let expected = ServerMessage::Container {
+            id: 44,
+            response: ContainerResponse::Success(ContainerPayload {
+                title: "book.pdf".to_owned(),
+                kind: ContainerKind::Pdf,
+                effective_address: container,
+                entries: Vec::new(),
+                configured_spread_mode: RemoteSpreadMode::RtlCover,
+                effective_spread_mode: RemoteSpreadMode::RtlCover,
+                reading_direction: RemoteReadingDirection::Rtl,
+                spread_page_gap_px: 8,
+                page_groups: vec![PageGroup {
+                    anchor: page(0),
+                    pages: vec![page(1), page(0)],
+                }],
+                entry_limit: 1000,
+                truncated: false,
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        let actual: ServerMessage =
+            read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+        assert_eq!(actual, expected);
+
+        let request = ContainerRequest {
+            address: RemoteAddress::file("favorite", "books/book.pdf"),
+            spread_mode: Some(RemoteSpreadMode::Ltr),
+            reading_direction: Some(RemoteReadingDirection::Ltr),
+            force_single_page: true,
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"spread_mode\":\"ltr\""));
+        assert!(encoded.contains("\"reading_direction\":\"ltr\""));
+        assert!(encoded.contains("\"force_single_page\":true"));
     }
 
     #[test]

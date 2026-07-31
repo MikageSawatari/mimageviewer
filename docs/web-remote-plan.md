@@ -823,7 +823,7 @@ foreground との優先度を持っていなかった。
 中断する。ready Blob は foreground が直接使い、network / IPC 待ちなしで decode と原子的差替えへ
 進む。
 
-protocol v6 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
+現行 protocol v10 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
 prefetch admission を1件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
 prefetch queued + active を1件に制限し、remote heavy worker が1本しかない設定では prefetch を
 `Busy` で拒否する。2 worker 時も heavy queue / active が空の時だけ先読みを開始し、最大1本なので
@@ -844,3 +844,53 @@ foreground が225 msを超えた時だけ、表示中の旧ページ中央へ高
 要求長辺は `command-core.mjs` の純粋関数としてテストする。また `web/package.json` の ESM 指定と
 Node 標準 `node:test` だけを使う最小 fake DOM テストを追加し、viewer の fetch → blob → decode →
 layout → atomic replace を実行する。bundler、TypeScript、追加 package、build step は導入しない。
+
+### 12.7 見開き表示 (2026-08-01)
+
+見開きのページ組みは remote-web に複製しない。protocol v10 の `ContainerRequest` は、Web
+セッション中だけの `spread_mode` / `reading_direction` 上書きと、縦持ち表示用の
+`force_single_page` を本体へ渡す。
+本体は `spread.db` を read-only で参照し、コンテナ合成 key と root fallback を
+`App::spread_container_key` / `App::apply_spread_for_key_with_fallback` と同じ規則で解決する。
+初期値はコンテナ行、行が無ければ `Settings::default_spread_mode` とし、Web からの変更は DB へ
+保存しない。
+
+本体のグループ列生成は `ui_fullscreen::build_image_reading_indices`、
+`build_spread_display_units_with_predicates`、`is_spread_pairable_item`、
+`SpreadDisplayUnit::spread_pair` を通す。したがって表紙の `has_cover` / `prefix_end` 位相、
+画像として組めない item、横長ページの単独境界、RTL の左右配置を fullscreen と共有する。
+横長判定は本体 catalog の既存 `source_dims`（無い場合は既存 thumbnail の寸法）を read-only で
+参照し、寸法未確定時は fullscreen と同じく非横長として扱う。応答の `page_groups` はグループ列を
+読み進める順に並べ、各 `pages` は画面上の左→右順、`anchor` はそのグループの読み順先頭とする。
+remote-web は受信した各 address を favorite allowlist で再検証し、組み直しや独自 sort をしない。
+
+モードと固定キーは本体既定に合わせる。
+
+| キー | モード |
+|---|---|
+| `1` | Single |
+| `2` | Ltr |
+| `3` | LtrCover |
+| `4` | Rtl |
+| `5` | RtlCover |
+
+メニューの巡回順も `SpreadMode::next_in_spread_cycle` と同じ
+Single → Ltr → LtrCover → Rtl → RtlCover とする。`spread_page_gap_px` は本体 settings から応答し、
+CSS page gap へ反映する。viewport は `height > width` を縦持ちとし（正方形は横持ち側）、本体へ
+`force_single_page=1` を再要求する。応答は保存由来の `configured_spread_mode` と描画に使う
+`effective_spread_mode=Single` を分けるため、向き変更で保存設定は変わらない。resize / orientation
+change は 180 ms debounce 後にこの判定を再実行する。
+
+`spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
+LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
+RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
+右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
+前後という意味を維持する。見開きの2画像は両方を別 DOM で fetch / decode し、最終寸法から
+共通高さの layout を確定してから page layer を1回で差し替えるため、片側だけの表示や暫定倍率を
+見せない。
+
+先読みには現在グループの左右両 index を `visibleIndexes` として渡す。既存の進行方向8ページ、
+逆方向1ページ、同時1件、LRU 12件 / 32 MiB、foreground 優先と abort 条件は維持する。
+次の対象が2ページ組なら同じグループ寸法で各ページの要求幅を計算するため、先読み cache key と
+foreground 要求が一致する。

@@ -1,14 +1,20 @@
 import {
   CommandName,
   FitMode,
+  ReadingDirection,
+  SpreadMode,
   command,
   commandFromKey,
   containerPageTargetPx,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
+  isPortraitViewport,
+  isRtlReadingDirection,
   nextFitMode,
+  nextSpreadMode,
   pagePrefetchPlan,
+  readingDirectionForSpreadMode,
   reduceViewerTransform,
   sessionOwnerBadge,
   snappedGridOffset,
@@ -17,6 +23,7 @@ import {
   shouldShowLoadingIndicator,
   viewerTapCommand,
   viewerImageLayout,
+  viewerSpreadLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
 
@@ -262,6 +269,14 @@ const state = {
   entries: [],
   images: [],
   imageIndex: -1,
+  pageGroups: [],
+  pageGroupIndex: -1,
+  spreadMode: SpreadMode.SINGLE,
+  effectiveSpreadMode: SpreadMode.SINGLE,
+  readingDirection: ReadingDirection.LTR,
+  spreadPageGapPx: 0,
+  forceSinglePage: false,
+  spreadOverrides: new Map(),
   fitMode: FitMode.PAGE,
   imageInfoCache: new Map(),
   containerImageInfoHints: new Map(),
@@ -802,7 +817,18 @@ function dispatchCommand(requested, meta = {}) {
     else if (requested.name === CommandName.PREV_PAGE) handled = changeImage(-1);
     else if (requested.name === CommandName.FIRST_PAGE) handled = changeImageTo(0);
     else if (requested.name === CommandName.LAST_PAGE) {
-      handled = changeImageTo(state.images.length - 1);
+      handled = changeImageTo(state.pageGroups.length - 1);
+    } else if (requested.name === CommandName.SPREAD_CYCLE) {
+      handled = requestSpreadMode(nextSpreadMode(state.spreadMode));
+    } else if (requested.name.startsWith("spread_")) {
+      const spreadModes = {
+        [CommandName.SPREAD_SINGLE]: SpreadMode.SINGLE,
+        [CommandName.SPREAD_LTR]: SpreadMode.LTR,
+        [CommandName.SPREAD_LTR_COVER]: SpreadMode.LTR_COVER,
+        [CommandName.SPREAD_RTL]: SpreadMode.RTL,
+        [CommandName.SPREAD_RTL_COVER]: SpreadMode.RTL_COVER,
+      };
+      handled = requestSpreadMode(spreadModes[requested.name]);
     } else {
       let fitMode = null;
       if (requested.name === CommandName.FIT_CYCLE) {
@@ -972,6 +998,7 @@ function onGlobalKeyDown(event) {
       repeat: event.repeat,
       editable: isShortcutBlockedTarget(event.target),
       menuOpen: Boolean(state.commandMenu?.isOpen()),
+      rtl: isRtlReadingDirection(state.readingDirection),
     },
     state.screenContext
   );
@@ -1216,6 +1243,7 @@ async function showCollection(route) {
       : 1;
   state.entries = data.entries ?? [];
   state.images = state.entries.filter((entry) => entry.kind === "image");
+  setSinglePageGroups();
   state.gridIndex = 0;
   renderFolder();
 }
@@ -1243,16 +1271,26 @@ async function showContainer(address) {
   renderFolder();
 }
 
-async function loadContainer(address) {
+async function loadContainer(address, options = {}) {
+  const override = state.spreadOverrides.get(addressIdentity(address)) ?? null;
+  const spreadMode = options.spreadMode ?? override?.mode ?? null;
+  const readingDirection =
+    options.readingDirection ?? override?.readingDirection ?? null;
+  const forceSinglePage = options.forceSinglePage ??
+    isPortraitViewport(window.innerWidth, window.innerHeight);
   state.requestController?.abort();
   const controller = new AbortController();
   state.requestController = controller;
   const data = await apiJson(
     "/api/container",
-    addressQueryParams(address),
+    addressQueryParams(address, {
+      ...(spreadMode ? { spread: spreadMode } : {}),
+      ...(readingDirection ? { direction: readingDirection } : {}),
+      single: forceSinglePage ? 1 : 0,
+    }),
     controller.signal
   );
-  if (controller.signal.aborted) return;
+  if (controller.signal.aborted) return false;
   state.requestController = null;
   const effectiveAddress = data.effective_address ?? address;
   state.collection = null;
@@ -1263,7 +1301,19 @@ async function loadContainer(address) {
     requestedAddress: address,
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
+    configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
+    effectiveSpreadMode: data.effective_spread_mode ?? SpreadMode.SINGLE,
+    readingDirection: data.reading_direction ?? ReadingDirection.LTR,
+    forceSinglePage,
   };
+  if (spreadMode) {
+    const resolvedOverride = {
+      mode: spreadMode,
+      readingDirection: state.container.readingDirection,
+    };
+    state.spreadOverrides.set(addressIdentity(address), resolvedOverride);
+    state.spreadOverrides.set(addressIdentity(effectiveAddress), resolvedOverride);
+  }
   state.favoriteId = effectiveAddress.favorite_id;
   state.favoriteName =
     state.favorites.find((favorite) => favorite.id === state.favoriteId)?.name ??
@@ -1271,9 +1321,90 @@ async function loadContainer(address) {
   state.folderPath = effectiveAddress.relative_path;
   state.entries = data.entries ?? [];
   state.images = state.entries.filter((entry) => entry.kind === "image");
+  state.spreadMode = state.container.configuredSpreadMode;
+  state.effectiveSpreadMode = state.container.effectiveSpreadMode;
+  state.readingDirection = state.container.readingDirection;
+  state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
+  state.forceSinglePage = forceSinglePage;
+  setContainerPageGroups(data.page_groups ?? []);
   state.gridIndex = 0;
   state.gridHash = containerHash(effectiveAddress);
   state.gridReturnHash = containerParentHash(address);
+  return true;
+}
+
+function setSinglePageGroups() {
+  state.pageGroups = state.images.map((entry) => ({
+    anchor: entry,
+    entries: [entry],
+  }));
+  state.pageGroupIndex = -1;
+  state.spreadMode = SpreadMode.SINGLE;
+  state.effectiveSpreadMode = SpreadMode.SINGLE;
+  state.readingDirection = ReadingDirection.LTR;
+  state.spreadPageGapPx = 0;
+  state.forceSinglePage = false;
+}
+
+function setContainerPageGroups(groups) {
+  const byAddress = new Map(
+    state.images.map((entry) => [addressIdentity(entryAddress(entry)), entry])
+  );
+  state.pageGroups = groups
+    .map((group) => {
+      const entries = (group.pages ?? [])
+        .map((address) => byAddress.get(addressIdentity(address)))
+        .filter(Boolean);
+      const anchor = byAddress.get(addressIdentity(group.anchor));
+      if (!anchor || entries.length !== (group.pages ?? []).length) return null;
+      return { anchor, entries };
+    })
+    .filter(Boolean);
+  if (!state.pageGroups.length && state.images.length) {
+    state.pageGroups = state.images.map((entry) => ({ anchor: entry, entries: [entry] }));
+  }
+  state.pageGroupIndex = -1;
+}
+
+function pageGroupIndexForEntry(entry) {
+  const identity = entryIdentity(entry);
+  return state.pageGroups.findIndex((group) =>
+    group.entries.some((page) => entryIdentity(page) === identity)
+  );
+}
+
+function currentPageGroup() {
+  return state.pageGroups[state.pageGroupIndex] ?? null;
+}
+
+function requestSpreadMode(mode) {
+  if (!state.container || !Object.values(SpreadMode).includes(mode)) return false;
+  const readingDirection = readingDirectionForSpreadMode(mode, state.readingDirection);
+  refreshContainerSpread(mode, undefined, readingDirection).catch(renderError);
+  return true;
+}
+
+async function refreshContainerSpread(
+  mode = state.spreadMode,
+  forceSinglePage = isPortraitViewport(window.innerWidth, window.innerHeight),
+  readingDirection = state.readingDirection
+) {
+  if (!state.container) return;
+  const viewer = state.viewer;
+  const current = currentPageGroup()?.anchor ?? state.images[state.imageIndex];
+  const currentIdentity = current ? entryIdentity(current) : "";
+  const address = state.container.requestedAddress;
+  const loaded = await loadContainer(address, {
+    spreadMode: mode,
+    readingDirection,
+    forceSinglePage,
+  });
+  if (!loaded) return;
+  if (!viewer || !currentIdentity) return;
+  const imageIndex = state.images.findIndex(
+    (entry) => entryIdentity(entry) === currentIdentity
+  );
+  if (imageIndex >= 0) renderImageViewer(imageIndex, performance.now());
 }
 
 async function loadFolder(favoriteId, path, interactionStartedAt = performance.now()) {
@@ -1314,6 +1445,7 @@ async function loadFolder(favoriteId, path, interactionStartedAt = performance.n
       entry.kind === "pdf"
   );
   state.images = state.entries.filter((entry) => entry.kind === "image");
+  setSinglePageGroups();
   state.gridIndex = sameFolder
     ? clamp(state.gridIndex, 0, Math.max(0, state.entries.length - 1))
     : 0;
@@ -1746,17 +1878,25 @@ function entryTypeLabel(kind) {
 
 function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const previousIndex = state.imageIndex;
+  const requestedEntry = state.images[index];
+  const groupIndex = pageGroupIndexForEntry(requestedEntry);
+  if (!requestedEntry || groupIndex < 0) return;
   cleanupScreen();
   state.screenContext = "viewer";
   if (previousIndex >= 0 && previousIndex !== index) {
     state.pageDirection = index > previousIndex ? 1 : -1;
   }
-  state.imageIndex = index;
-  const imageEntry = state.images[index];
+  state.pageGroupIndex = groupIndex;
+  const group = currentPageGroup();
+  const imageEntry = group.anchor;
+  state.imageIndex = state.images.findIndex(
+    (entry) => entryIdentity(entry) === entryIdentity(imageEntry)
+  );
   document.title = `${imageEntry.name} — mIV Remote`;
 
   const viewerRoot = element("section", "image-viewer");
   const stage = element("div", "viewer-stage");
+  const pageLayer = element("div", "viewer-pages");
   const image = element("img", "viewer-image");
   image.alt = imageEntry.name;
   image.draggable = false;
@@ -1766,7 +1906,8 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   loadingIndicator.setAttribute("role", "progressbar");
   loadingIndicator.setAttribute("aria-label", "次のページを読み込んでいます");
   loadingIndicator.append(element("span", "viewer-loading-indicator-bar"));
-  stage.append(image, loadingIndicator);
+  pageLayer.append(image);
+  stage.append(pageLayer, loadingIndicator);
 
   const top = element("div", "viewer-ui top");
   const close = textElement("button", "×", "viewer-button");
@@ -1791,6 +1932,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   state.viewer = new ImageViewer({
     root: viewerRoot,
     stage,
+    pageLayer,
     image,
     title,
     counter,
@@ -1807,14 +1949,18 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   });
   previous.addEventListener("click", (event) => {
     event.stopPropagation();
-    dispatchCommand(command(CommandName.PREV_PAGE), {
+    dispatchCommand(command(isRtlReadingDirection(state.readingDirection)
+      ? CommandName.NEXT_PAGE
+      : CommandName.PREV_PAGE), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
   });
   next.addEventListener("click", (event) => {
     event.stopPropagation();
-    dispatchCommand(command(CommandName.NEXT_PAGE), {
+    dispatchCommand(command(isRtlReadingDirection(state.readingDirection)
+      ? CommandName.PREV_PAGE
+      : CommandName.NEXT_PAGE), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
@@ -1823,17 +1969,20 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
 }
 
 function changeImage(delta) {
-  return changeImageTo(state.imageIndex + delta);
+  return changeImageTo(state.pageGroupIndex + delta);
 }
 
-function changeImageTo(nextIndex) {
-  if (nextIndex < 0 || nextIndex >= state.images.length) {
+function changeImageTo(nextGroupIndex) {
+  if (nextGroupIndex < 0 || nextGroupIndex >= state.pageGroups.length) {
     return false;
   }
-  if (nextIndex === state.imageIndex) return false;
-  state.pageDirection = nextIndex > state.imageIndex ? 1 : -1;
-  state.imageIndex = nextIndex;
-  const entry = state.images[nextIndex];
+  if (nextGroupIndex === state.pageGroupIndex) return false;
+  state.pageDirection = nextGroupIndex > state.pageGroupIndex ? 1 : -1;
+  state.pageGroupIndex = nextGroupIndex;
+  const entry = state.pageGroups[nextGroupIndex].anchor;
+  state.imageIndex = state.images.findIndex(
+    (image) => entryIdentity(image) === entryIdentity(entry)
+  );
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
   const targetHash = entry.address
     ? mediaHash(entry.address)
@@ -1853,30 +2002,44 @@ function changeImageTo(nextIndex) {
 }
 
 async function updateViewerImage(interactionStartedAt = performance.now()) {
-  const entry = state.images[state.imageIndex];
+  const group = currentPageGroup();
   const viewer = state.viewer;
-  if (!entry || !viewer) return;
-  document.title = `${entry.name} — mIV Remote`;
-  const identity = entryIdentity(entry);
-  const info = await imageInfo(entry);
+  if (!group || !viewer) return;
+  const identity = group.entries.map(entryIdentity).join("\n");
+  const infos = await Promise.all(group.entries.map(imageInfo));
   if (
     state.viewer !== viewer ||
-    entryIdentity(state.images[state.imageIndex] ?? {}) !== identity
+    currentPageGroup()?.entries.map(entryIdentity).join("\n") !== identity
   ) {
     return;
   }
-  const request = imageRequest(entry, info, viewer.stage);
-  const displayed = await viewer.load({
-    name: entry.name,
-    request,
-    info,
+  const layout = viewerSpreadLayout({
+    mode: state.fitMode,
+    pages: infos,
+    viewportWidth: viewer.stage.clientWidth || window.innerWidth,
+    viewportHeight: viewer.stage.clientHeight || window.innerHeight,
+    devicePixelRatio: window.devicePixelRatio || 1,
+    gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
+  });
+  const pages = group.entries.map((entry, pageIndex) => ({
+    entry,
+    info: infos[pageIndex],
+    request: imageRequest(entry, infos[pageIndex], viewer.stage, {
+      layout: layout.pages[pageIndex],
+    }),
+  }));
+  document.title = `${group.anchor.name} — mIV Remote`;
+  const displayed = await viewer.loadGroup({
+    pages,
+    name: group.entries.map((entry) => entry.name).join(" / "),
     fitMode: state.fitMode,
-    index: state.imageIndex,
-    count: state.images.length,
+    gap: layout.gap,
+    index: state.pageGroupIndex,
+    count: state.pageGroups.length,
     interactionStartedAt,
   });
   if (!displayed || state.viewer !== viewer) return;
-  if (entry.address) {
+  if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
     return;
   }
@@ -1892,9 +2055,13 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
 }
 
 async function schedulePagePrefetch(viewer) {
-  const currentIdentity = entryIdentity(state.images[state.imageIndex] ?? {});
+  const group = currentPageGroup();
+  const currentIdentity = group?.entries.map(entryIdentity).join("\n") ?? "";
+  const visibleIndexes = (group?.entries ?? [])
+    .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
+    .filter((index) => index >= 0);
   const indexes = pagePrefetchPlan({
-    visibleIndexes: [state.imageIndex],
+    visibleIndexes,
     itemCount: state.images.length,
     direction: state.pageDirection,
     ahead: PAGE_PREFETCH_AHEAD,
@@ -1904,33 +2071,50 @@ async function schedulePagePrefetch(viewer) {
     indexes.map(async (index) => {
       const entry = state.images[index];
       if (!entry?.address) return null;
-      const info = await imageInfo(entry);
-      return imageRequest(entry, info, viewer.stage, { prefetch: true });
+      const groupIndex = pageGroupIndexForEntry(entry);
+      const targetGroup = state.pageGroups[groupIndex];
+      if (!targetGroup) return null;
+      const infos = await Promise.all(targetGroup.entries.map(imageInfo));
+      const layout = viewerSpreadLayout({
+        mode: state.fitMode,
+        pages: infos,
+        viewportWidth: viewer.stage.clientWidth || window.innerWidth,
+        viewportHeight: viewer.stage.clientHeight || window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        gap: targetGroup.entries.length > 1 ? state.spreadPageGapPx : 0,
+      });
+      const pageIndex = targetGroup.entries.findIndex(
+        (page) => entryIdentity(page) === entryIdentity(entry)
+      );
+      return imageRequest(entry, infos[pageIndex], viewer.stage, {
+        prefetch: true,
+        layout: layout.pages[pageIndex],
+      });
     })
   );
   if (
     state.viewer !== viewer ||
-    entryIdentity(state.images[state.imageIndex] ?? {}) !== currentIdentity
+    currentPageGroup()?.entries.map(entryIdentity).join("\n") !== currentIdentity
   ) {
     return;
   }
   pageResourceCache.schedule(requests.filter(Boolean));
 }
 
-function imageRequest(entry, info, stage, { prefetch = false } = {}) {
+function imageRequest(entry, info, stage, { prefetch = false, layout = null } = {}) {
   const dpr = window.devicePixelRatio || 1;
   if (entry.address) {
-    const layout = viewerImageLayout({
-      mode: state.fitMode,
-      sourceWidth: info.width,
-      sourceHeight: info.height,
-      viewportWidth: stage.clientWidth || window.innerWidth,
-      viewportHeight: stage.clientHeight || window.innerHeight,
-      devicePixelRatio: dpr,
-      maxRequestWidth: 8192,
-    });
+    const resolvedLayout = layout ?? viewerImageLayout({
+        mode: state.fitMode,
+        sourceWidth: info.width,
+        sourceHeight: info.height,
+        viewportWidth: stage.clientWidth || window.innerWidth,
+        viewportHeight: stage.clientHeight || window.innerHeight,
+        devicePixelRatio: dpr,
+        maxRequestWidth: 8192,
+      });
     const targetPx = containerPageTargetPx({
-      requestWidth: layout.requestWidth,
+      requestWidth: resolvedLayout.requestWidth,
       sourceWidth: info.width,
       sourceHeight: info.height,
       minimum: 256,
@@ -1947,9 +2131,9 @@ function imageRequest(entry, info, stage, { prefetch = false } = {}) {
       ),
       cacheKey: `${infoCacheKey}\n${targetPx}`,
       width: targetPx,
-      cssWidth: layout.cssWidth,
+      cssWidth: resolvedLayout.cssWidth,
       dpr,
-      layout,
+      layout: resolvedLayout,
       fitMode: state.fitMode,
       dynamicInfo: true,
       infoCacheKey,
@@ -1957,24 +2141,24 @@ function imageRequest(entry, info, stage, { prefetch = false } = {}) {
       prefetch,
     };
   }
-  const layout = viewerImageLayout({
-    mode: state.fitMode,
-    sourceWidth: info.width,
-    sourceHeight: info.height,
-    viewportWidth: stage.clientWidth || window.innerWidth,
-    viewportHeight: stage.clientHeight || window.innerHeight,
-    devicePixelRatio: dpr,
-  });
+  const resolvedLayout = layout ?? viewerImageLayout({
+      mode: state.fitMode,
+      sourceWidth: info.width,
+      sourceHeight: info.height,
+      viewportWidth: stage.clientWidth || window.innerWidth,
+      viewportHeight: stage.clientHeight || window.innerHeight,
+      devicePixelRatio: dpr,
+    });
   return {
     url: apiUrl("/api/image", {
       fav: state.favoriteId,
       path: entry.path,
-      w: layout.requestWidth,
+      w: resolvedLayout.requestWidth,
     }),
-    width: layout.requestWidth,
-    cssWidth: layout.cssWidth,
+    width: resolvedLayout.requestWidth,
+    cssWidth: resolvedLayout.cssWidth,
     dpr,
-    layout,
+    layout: resolvedLayout,
     fitMode: state.fitMode,
   };
 }
@@ -2578,6 +2762,16 @@ function createMenuButton(label, extraClass = "icon-button") {
 
 function menuDefinition(context) {
   if (context === "viewer") {
+    const spreadActions = state.container
+      ? [
+          [CommandName.SPREAD_CYCLE, "見開きモードを切替", "メニュー"],
+          [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
+          [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
+          [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
+          [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
+          [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
+        ]
+      : [];
     return {
       title: "画像の操作",
       actions: [
@@ -2589,6 +2783,7 @@ function menuDefinition(context) {
         [CommandName.FIT_PAGE, "全体フィット", "0 で切替"],
         [CommandName.FIT_WIDTH, "幅フィット", "0 で切替"],
         [CommandName.FIT_ORIGINAL, "原寸 (100%)", "0 で切替"],
+        ...spreadActions,
         [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
         [CommandName.LAST_PAGE, "最後の画像", "End"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
@@ -2598,6 +2793,7 @@ function menuDefinition(context) {
         ["前 / 次", "← ↑ PageUp / → ↓ PageDown"],
         ["ズーム", "+ / −"],
         ["表示モード", "0 (全体 → 幅 → 原寸)"],
+        ...(state.container ? [["見開き", "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]] : []),
         ["操作メニュー", "?"],
         ["先頭 / 最後", "Home / End"],
         ["一覧へ戻る", "Backspace / Enter / Esc"],
@@ -2724,10 +2920,16 @@ class CommandMenu {
 }
 
 export class ImageViewer {
-  constructor({ root, stage, image, title, counter, previous, next, loadingIndicator }) {
+  constructor({ root, stage, pageLayer, image, title, counter, previous, next, loadingIndicator }) {
     this.root = root;
     this.stage = stage;
+    this.pageLayer = pageLayer ?? element("div", "viewer-pages");
+    if (!pageLayer) {
+      this.pageLayer.append(image);
+      this.stage.append(this.pageLayer);
+    }
     this.image = image;
+    this.images = [image];
     this.title = title;
     this.counter = counter;
     this.previous = previous;
@@ -2746,6 +2948,7 @@ export class ImageViewer {
     this.loadSequence = 0;
     this.fetchController = null;
     this.objectUrl = null;
+    this.objectUrls = [];
     this.loadingTimer = 0;
 
     this.pointerDown = (event) => this.onPointerDown(event);
@@ -2763,6 +2966,15 @@ export class ImageViewer {
     this.resize = () => {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = setTimeout(() => {
+        const forceSinglePage = isPortraitViewport(window.innerWidth, window.innerHeight);
+        if (state.container && forceSinglePage !== state.forceSinglePage) {
+          refreshContainerSpread(
+            state.spreadMode,
+            forceSinglePage,
+            state.readingDirection
+          ).catch(renderError);
+          return;
+        }
         updateViewerImage(performance.now()).catch(renderError);
       }, 180);
     };
@@ -2786,9 +2998,30 @@ export class ImageViewer {
     return this.loadMeasuredImage(request, interactionStartedAt, name, info);
   }
 
+  loadGroup({ pages, name, fitMode, gap, index, count, interactionStartedAt }) {
+    if (pages.length === 1) {
+      return this.load({
+        name,
+        request: pages[0].request,
+        info: pages[0].info,
+        fitMode,
+        index,
+        count,
+        interactionStartedAt,
+      });
+    }
+    this.resetTransform();
+    this.title.textContent = name;
+    this.counter.textContent = `${index + 1} / ${count}`;
+    this.previous.disabled = index === 0;
+    this.next.disabled = index === count - 1;
+    return this.loadMeasuredSpread(pages, fitMode, gap, interactionStartedAt);
+  }
+
   setLayout(fitMode, layout, info, image = this.image) {
     this.fitMode = fitMode;
     this.stage.dataset.fitMode = fitMode;
+    this.pageLayer.style.gap = "0px";
     image.style.width = `${layout.cssWidth}px`;
     image.style.height = "auto";
     image.style.maxWidth = "none";
@@ -2868,14 +3101,15 @@ export class ImageViewer {
         return;
       }
       this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage);
-      decodedImage.style.transform =
-        `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
-      const previousObjectUrl = this.objectUrl;
-      this.image.replaceWith(decodedImage);
+      decodedImage.style.transform = "none";
+      const previousUrls = this.objectUrls.slice();
+      this.pageLayer.replaceChildren(decodedImage);
       this.image = decodedImage;
+      this.images = [decodedImage];
       this.objectUrl = pendingObjectUrl;
+      this.objectUrls = [pendingObjectUrl];
       pendingObjectUrl = null;
-      if (previousObjectUrl) URL.revokeObjectURL(previousObjectUrl);
+      previousUrls.forEach((url) => URL.revokeObjectURL(url));
       this.endLoadingIndicator(sequence);
       await nextFrame();
       if (sequence !== this.loadSequence) return false;
@@ -2911,6 +3145,135 @@ export class ImageViewer {
       recordClientError("image_load_error", error, {
         resource: safeResourcePath(request.url),
       });
+      return false;
+    }
+  }
+
+  async loadMeasuredSpread(pages, fitMode, gap, interactionStartedAt) {
+    const sequence = ++this.loadSequence;
+    this.fetchController?.abort();
+    const controller = new AbortController();
+    this.fetchController = controller;
+    const startedAt = performance.now();
+    this.beginLoadingIndicator(sequence, startedAt);
+    const pendingUrls = [];
+    try {
+      const resources = await Promise.all(pages.map(async ({ request }) => {
+        if (request.cacheKey) {
+          return pageResourceCache.loadForeground(request, controller.signal);
+        }
+        const fetchStartedAt = performance.now();
+        const response = await observedFetch(request.url, {
+          signal: controller.signal,
+          credentials: "same-origin",
+        });
+        if (!response.ok) {
+          const detail = await response.clone().json().catch(() => ({}));
+          throw new Error(detail.message || `画像取得に失敗しました (HTTP ${response.status})。`);
+        }
+        return {
+          blob: await response.blob(),
+          requestId: response.headers.get("X-mIV-Request-Id"),
+          fetchMs: performance.now() - fetchStartedAt,
+          prefetchStatus: "not_applicable",
+        };
+      }));
+      if (sequence !== this.loadSequence) return false;
+
+      const decodedImages = await Promise.all(resources.map(async (resource, index) => {
+        const decodedImage = element("img", "viewer-image");
+        decodedImage.alt = pages[index].entry.name;
+        decodedImage.draggable = false;
+        decodedImage.dataset.telemetryObserved = "true";
+        const objectUrl = URL.createObjectURL(resource.blob);
+        pendingUrls.push(objectUrl);
+        decodedImage.src = objectUrl;
+        const decodeStartedAt = performance.now();
+        await decodedImage.decode();
+        return {
+          image: decodedImage,
+          decodeMs: performance.now() - decodeStartedAt,
+          info: decodedImage.naturalWidth && decodedImage.naturalHeight
+            ? { width: decodedImage.naturalWidth, height: decodedImage.naturalHeight }
+            : pages[index].info,
+        };
+      }));
+      if (sequence !== this.loadSequence) {
+        pendingUrls.forEach((url) => URL.revokeObjectURL(url));
+        return false;
+      }
+
+      const resolvedLayout = viewerSpreadLayout({
+        mode: fitMode,
+        pages: decodedImages.map((decoded) => decoded.info),
+        viewportWidth: this.stage.clientWidth || window.innerWidth,
+        viewportHeight: this.stage.clientHeight || window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        gap,
+      });
+      this.fitMode = fitMode;
+      this.stage.dataset.fitMode = fitMode;
+      this.pageLayer.style.gap = `${resolvedLayout.gap}px`;
+      decodedImages.forEach((decoded, index) => {
+        const layout = resolvedLayout.pages[index];
+        decoded.image.style.width = `${layout.cssWidth}px`;
+        decoded.image.style.height = "auto";
+        decoded.image.style.maxWidth = "none";
+        decoded.image.style.maxHeight = "none";
+        decoded.image.style.transform = "none";
+        decoded.image.dataset.sourceWidth = String(decoded.info.width);
+        decoded.image.dataset.sourceHeight = String(decoded.info.height);
+        pages[index].request.cssWidth = layout.cssWidth;
+        rememberMediaImageInfo(pages[index].request, decoded.info);
+      });
+      this.stage.scrollTop = 0;
+      this.stage.scrollLeft = 0;
+      const previousUrls = this.objectUrls.slice();
+      this.pageLayer.replaceChildren(...decodedImages.map((decoded) => decoded.image));
+      this.images = decodedImages.map((decoded) => decoded.image);
+      this.image = this.images[0];
+      this.objectUrls = pendingUrls.slice();
+      this.objectUrl = null;
+      previousUrls.forEach((url) => URL.revokeObjectURL(url));
+      this.applyTransform();
+      this.endLoadingIndicator(sequence);
+      await nextFrame();
+      if (sequence !== this.loadSequence) return false;
+
+      decodedImages.forEach((decoded, index) => {
+        const resource = resources[index];
+        const request = pages[index].request;
+        const event = {
+          type: "image",
+          request_id: resource.requestId,
+          name: limitText(pages[index].entry.name, 240),
+          fetch_ms: roundMs(resource.fetchMs ?? performance.now() - startedAt),
+          bytes: resource.blob.size,
+          decode_ms: roundMs(decoded.decodeMs),
+          tap_to_display_ms: roundMs(performance.now() - interactionStartedAt),
+          requested_width: request.width,
+          css_width: roundMs(request.cssWidth),
+          device_pixel_ratio: roundMs(request.dpr),
+          fit_mode: request.fitMode,
+          prefetch_status: resource.prefetchStatus,
+          spread_pages: pages.length,
+        };
+        enqueueTelemetry(event);
+        hudState.lastImage = event;
+        hudState.displayDurations.push(event.tap_to_display_ms);
+      });
+      while (hudState.displayDurations.length > 20) hudState.displayDurations.shift();
+      updateHud();
+      return true;
+    } catch (error) {
+      pendingUrls.forEach((url) => URL.revokeObjectURL(url));
+      this.endLoadingIndicator(sequence);
+      if (sequence !== this.loadSequence || error?.name === "AbortError") return false;
+      this.title.textContent = error instanceof Error
+        ? error.message
+        : "見開きを表示できませんでした。";
+      this.root.classList.remove("viewer-ui-hidden");
+      recordClientError("spread_load_error", error);
       return false;
     }
   }
@@ -2960,7 +3323,7 @@ export class ImageViewer {
   }
 
   applyTransform() {
-    this.image.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
+    this.pageLayer.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
   }
 
   onPointerDown(event) {
@@ -3074,11 +3437,23 @@ export class ImageViewer {
         Math.abs(dx) > Math.abs(dy) * 1.25
       ) {
         dispatchCommand(
-          command(dx < 0 ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE),
+          command(
+            dx < 0
+              ? (isRtlReadingDirection(state.readingDirection)
+                  ? CommandName.PREV_PAGE
+                  : CommandName.NEXT_PAGE)
+              : (isRtlReadingDirection(state.readingDirection)
+                  ? CommandName.NEXT_PAGE
+                  : CommandName.PREV_PAGE)
+          ),
           { source, detail: "swipe" }
         );
       } else if (!single.moved && Math.hypot(dx, dy) < 12 && elapsed < 450) {
-        dispatchCommand(viewerTapCommand(event.clientX, this.root.clientWidth), {
+        dispatchCommand(viewerTapCommand(
+          event.clientX,
+          this.root.clientWidth,
+          isRtlReadingDirection(state.readingDirection)
+        ), {
           source,
           detail: "tap_zone",
         });
@@ -3147,7 +3522,11 @@ export class ImageViewer {
     this.loadSequence += 1;
     this.fetchController?.abort();
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+    for (const objectUrl of this.objectUrls) {
+      if (objectUrl !== this.objectUrl) URL.revokeObjectURL(objectUrl);
+    }
     this.objectUrl = null;
+    this.objectUrls = [];
     this.stage.removeEventListener("pointerdown", this.pointerDown);
     this.stage.removeEventListener("pointermove", this.pointerMove);
     this.stage.removeEventListener("pointerup", this.pointerUp);

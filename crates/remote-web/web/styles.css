@@ -701,11 +701,19 @@ button {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
-  transform-origin: center;
-  will-change: transform;
   -webkit-touch-callout: none;
   -webkit-user-drag: none;
   user-select: none;
+}
+
+.viewer-pages {
+  display: flex;
+  width: max-content;
+  max-width: none;
+  align-items: center;
+  justify-content: center;
+  transform-origin: center;
+  will-change: transform;
 }
 
 .viewer-loading-indicator {
@@ -755,6 +763,11 @@ button {
 
 .viewer-stage[data-fit-mode="width"] .viewer-image,
 .viewer-stage[data-fit-mode="original"] .viewer-image {
+  margin: 0;
+}
+
+.viewer-stage[data-fit-mode="width"] .viewer-pages,
+.viewer-stage[data-fit-mode="original"] .viewer-pages {
   margin: 0 auto;
 }
 

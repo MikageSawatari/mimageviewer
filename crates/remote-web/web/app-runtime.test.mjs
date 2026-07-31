@@ -20,6 +20,7 @@ class FakeElement {
   removeEventListener() {}
   setAttribute() {}
   append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = nodes; }
   replaceWith(node) { this.replacedWith = node; }
   async decode() {}
 }
@@ -97,9 +98,74 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
   });
 
   assert.equal(displayed, true);
-  assert.equal(initialImage.replacedWith, viewer.image);
+  assert.equal(viewer.pageLayer.children.length, 1);
+  assert.equal(viewer.pageLayer.children[0], viewer.image);
   assert.equal(viewer.image.style.width, "430px");
   assert.equal(viewer.image.dataset.sourceWidth, "1200");
   assert.equal(loadingIndicator.hidden, true);
+  viewer.destroy();
+});
+
+test("spread waits for both pages and atomically replaces the page layer", async () => {
+  const stage = new FakeElement("div");
+  stage.clientWidth = 1600;
+  stage.clientHeight = 1000;
+  const pageLayer = new FakeElement("div");
+  const initialImage = new FakeElement("img");
+  pageLayer.append(initialImage);
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage,
+    pageLayer,
+    image: initialImage,
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  const page = (number) => ({
+    entry: { name: `Page ${number}` },
+    info: { width: 1200, height: 1800 },
+    request: {
+      url: `/api/page?test=${number}`,
+      cacheKey: `page-${number}@1334`,
+      width: 1334,
+      cssWidth: 667,
+      dpr: 2,
+      layout: { cssWidth: 667 },
+      fitMode: "page",
+      dynamicInfo: true,
+      infoCacheKey: `page-${number}`,
+      containerInfoKey: "book-1",
+    },
+  });
+  const displayed = await viewer.loadGroup({
+    pages: [page(1), page(2)],
+    name: "Page 1 / Page 2",
+    fitMode: "page",
+    gap: 12,
+    index: 0,
+    count: 3,
+    interactionStartedAt: performance.now(),
+  });
+
+  assert.equal(displayed, true);
+  assert.equal(pageLayer.children.length, 2);
+  assert.equal(viewer.images.length, 2);
+  assert.equal(pageLayer.style.gap, "12px");
+
+  const singleDisplayed = await viewer.loadGroup({
+    pages: [page(3)],
+    name: "Page 3",
+    fitMode: "page",
+    gap: 0,
+    index: 1,
+    count: 3,
+    interactionStartedAt: performance.now(),
+  });
+  assert.equal(singleDisplayed, true);
+  assert.equal(pageLayer.children.length, 1);
+  assert.equal(viewer.images.length, 1);
   viewer.destroy();
 });
