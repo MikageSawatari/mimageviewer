@@ -1604,6 +1604,13 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   進め、復帰時の seek/reopen を不要にする。mounted context の非 media texture と未使用 pool/cache は解放するが、
   detached session は既存 keepalive policy どおり active viewer cache も保持する。decode 停止・低レート化は audio clock
   追従と EOF semantics を別 state にするため本変更には含めず、必要なら §1.9 の resource policy として扱う。
+- **このコストは承知のうえで受け入れる (ユーザー裁定 2026-07-31)**。動画 decode が負担になる PC は
+  想定ターゲットではない。**処理の流れを変えず、画面に出さないだけ**にするのが方針で、理由は資源より
+  安定性にある。decode を止めれば復帰時に reopen/seek が要り、途切れない再生という目的そのものを失う。
+  presenter / swap chain を解放して復帰時に作り直す案も、**viewport の再生成は BA-5 (early return や
+  discard pass で egui が保持中の窓を破棄する系統) の火元**であり、2026-07-31 時点で 5 回実害を出している。
+  したがって「不可視中も生かしたままにする」ことが、この領域では最も安全な選択になる。
+  後から資源最適化を検討する場合は、この判断を覆す根拠 (実測された実害) を先に示すこと。
 - **トレイ復帰フレームの close 経路**: `sync_after_restore(ctx)` は retained viewport へ `Visible(true)`、
   visual media presenter へ `SetWindowVisible(true)` を送り、hidden 中に hold した最新 frame を一度 present してから
   既存の focus grace / `restore_fullscreen_focus_from_main()` で surface の focus / raise だけを再要求する。Play / seek /

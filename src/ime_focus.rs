@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 const IME_STATE_ID: &str = "miv_ime_focus_state";
 const IME_FOCUS_RETRY_ID: &str = "miv_ime_focus_retry";
+const IME_TEXT_FOCUS_CONTRACT_ID: &str = "miv_ime_text_focus_contract";
 const IME_EVENT_GRACE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -12,12 +13,31 @@ struct ImeFocusState {
     last_event_at: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ImeTextFocusContract {
+    widget_id: egui::Id,
+    focused_pass: u64,
+}
+
+impl Default for ImeTextFocusContract {
+    fn default() -> Self {
+        Self {
+            widget_id: egui::Id::NULL,
+            focused_pass: 0,
+        }
+    }
+}
+
 fn ime_state_id(viewport_id: egui::ViewportId) -> egui::Id {
     egui::Id::new((IME_STATE_ID, viewport_id))
 }
 
 fn focus_retry_id(viewport_id: egui::ViewportId, widget_id: egui::Id) -> egui::Id {
     egui::Id::new((IME_FOCUS_RETRY_ID, viewport_id, widget_id))
+}
+
+fn text_focus_contract_id(viewport_id: egui::ViewportId) -> egui::Id {
+    egui::Id::new((IME_TEXT_FOCUS_CONTRACT_ID, viewport_id))
 }
 
 fn ime_input_active(ctx: &egui::Context) -> bool {
@@ -54,27 +74,68 @@ fn ime_input_active(ctx: &egui::Context) -> bool {
     })
 }
 
-fn ime_focus_key_pressed(ctx: &egui::Context) -> bool {
+fn keyboard_focus_recovery_input(ctx: &egui::Context) -> bool {
     ctx.input(|input| {
-        input.events.iter().any(|event| {
+        let key_pressed = input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }));
+        let pointer_pressed = input.events.iter().any(|event| {
             matches!(
                 event,
-                egui::Event::Key {
-                    key: egui::Key::Enter | egui::Key::Escape | egui::Key::Tab,
-                    pressed: true,
-                    ..
-                }
+                egui::Event::PointerButton { pressed: true, .. } | egui::Event::Touch { .. }
             )
-        })
+        });
+        key_pressed && !pointer_pressed
     })
 }
 
-/// IME の Enter / Escape / Tab による `TextEdit` のフォーカス離脱を防止・復帰する。
+fn remember_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
+    let contract = ImeTextFocusContract {
+        widget_id,
+        focused_pass: ctx.cumulative_pass_nr(),
+    };
+    let id = text_focus_contract_id(ctx.viewport_id());
+    ctx.data_mut(|data| data.insert_temp(id, contract));
+}
+
+fn forget_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
+    let id = text_focus_contract_id(ctx.viewport_id());
+    ctx.data_mut(|data| {
+        if data
+            .get_temp::<ImeTextFocusContract>(id)
+            .is_some_and(|contract| contract.widget_id == widget_id)
+        {
+            data.remove_temp::<ImeTextFocusContract>(id);
+        }
+    });
+}
+
+/// Return the helper-managed field whose keyboard-driven IME focus loss is
+/// recoverable in this pass.
+///
+/// Ownership is deliberately limited to the pass immediately after the field
+/// was observed focused. Pointer input wins, so clicks remain legitimate focus
+/// changes.
+pub(crate) fn recovering_text_input(ctx: &egui::Context) -> Option<egui::Id> {
+    if !keyboard_focus_recovery_input(ctx) || !ime_input_active(ctx) {
+        return None;
+    }
+    let pass = ctx.cumulative_pass_nr();
+    let id = text_focus_contract_id(ctx.viewport_id());
+    ctx.data(|data| {
+        data.get_temp::<ImeTextFocusContract>(id)
+            .filter(|contract| pass.saturating_sub(contract.focused_pass) <= 1)
+            .map(|contract| contract.widget_id)
+    })
+}
+
+/// IME 中のキー入力による `TextEdit` の一時的なフォーカス離脱を防止・復帰する。
 ///
 /// `focus_request` は、呼び出し側が初回フォーカス等に使う request latch があれば渡す。
 /// 復帰時は同 latch を次 frame 用に立て直す。latch を持たない欄では widget ID ごとの
-/// 一時 latch をこのモジュールが所有する。IME 中でもマウスクリック等、対象キーの event を
-/// 伴わない正当なフォーカス移動は復帰しない。アプリ全体の Tab traversal 無効化は
+/// 一時 latch をこのモジュールが所有する。IME 中でもマウスクリック等、pointer event を
+/// 伴う正当なフォーカス移動は復帰しない。アプリ全体の Tab traversal 無効化は
 /// `crate::egui_focus_policy` の別責務であり、この field-level lock は IME 候補選択中の
 /// focus 保持を独立して保証する。
 /// `ime_active` は必ず `TextEdit` 構築前にこのモジュールで採取する。egui は focus 遷移と
@@ -133,21 +194,24 @@ pub(crate) fn restore_focus_for_ime_key(
         });
     }
 
-    if !response.lost_focus() || !ime_active {
-        return false;
-    }
-    if !ime_focus_key_pressed(ctx) {
-        return false;
+    let restored = response.lost_focus() && ime_active && keyboard_focus_recovery_input(ctx);
+    if restored {
+        response.request_focus();
+        if let Some(request) = focus_request {
+            *request = true;
+        } else {
+            ctx.data_mut(|data| data.insert_temp(retry_id, true));
+        }
+        ctx.request_repaint();
     }
 
-    response.request_focus();
-    if let Some(request) = focus_request {
-        *request = true;
-    } else {
-        ctx.data_mut(|data| data.insert_temp(retry_id, true));
+    if ctx.memory(|memory| memory.has_focus(response.id)) || restored {
+        remember_text_focus(ctx, response.id);
+    } else if response.lost_focus() {
+        forget_text_focus(ctx, response.id);
     }
-    ctx.request_repaint();
-    true
+
+    restored
 }
 
 pub(crate) fn show_singleline<'text>(
@@ -200,6 +264,8 @@ pub(crate) fn add_enabled_singleline<'text>(
     let response = ui.add_enabled(enabled, configure(egui::TextEdit::singleline(text)));
     if enabled {
         let _ = restore_focus_for_ime_key(ui.ctx(), &response, ime_active, focus_request);
+    } else {
+        forget_text_focus(ui.ctx(), response.id);
     }
     response
 }

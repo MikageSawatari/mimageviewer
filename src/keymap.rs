@@ -7251,9 +7251,7 @@ mod tests {
                 viewport: ctx.viewport_id(),
                 viewport_focused: true,
                 modal: false,
-                focused_text_input: None,
-                pending_text_input: None,
-                ime_grace: false,
+                text_input: None,
                 focused_ui: ctx
                     .wants_keyboard_input()
                     .then_some(focused_widget.unwrap_or(egui::Id::NULL)),

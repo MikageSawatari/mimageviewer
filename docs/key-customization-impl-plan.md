@@ -524,8 +524,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   `None` へ戻す。Tab traversal はアプリ全体で無効だが event は後段の Keymap まで残すため、
   Tab chord は引き続き任意の KeyAction へ割り当て可能。KeySlot と egui event queue の同一押下は
   Keymap ownership 境界で一緒に consume する。no-repeat の Tab repeat も発火させず除去する。
-  TextEdit / IME の `wants_keyboard_input()` gate は先に維持し、IME 候補選択中の field-level
-  focus lock / 復帰は `ime_focus` が別に所有する。
+  TextEdit / IME の keyboard owner gate は先に維持し、IME 中の field-level focus lock / 復帰と
+  直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
   FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsFixedJumpNext/Prev `Shift+→/←` /
   FsHome/End (予約候補)

@@ -401,7 +401,10 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
 
 上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
 single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
-Enter / Escape / **Tab** による focus loss の復帰と IME 候補選択中の Tab traversal 抑止を所有する。
+キー処理由来の一時的な focus loss の復帰と IME 候補選択中の Tab traversal 抑止を所有する。
+helper-managed field が直前の pass で持っていた focus は 1 pass の typed recovery claim として
+keyboard owner にも渡し、TextEdit の復帰前に同じキーがアプリ shortcut へ漏れるのを防ぐ。
+pointer 入力を伴う正当な focus 移動は復帰しない。
 raw TextEdit は理由付き allowlist を検査する unit test で禁止している。TSF を採用しない理由、
 IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](src/ime_focus.rs) の helper doc comment を参照。
 

@@ -44746,6 +44746,105 @@ fn fullscreen_i_key_toggles_side_panel_mode() {
 }
 
 #[test]
+fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() {
+    let _input_guard = crate::key_input::TEST_INPUT_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("IME focus regression test lock poisoned");
+    crate::key_input::clear_test_frame();
+
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::from(
+        "C:/photos/ime-bookmark-panel.jpg",
+    )));
+    app.fullscreen_idx = Some(idx);
+    app.adjustment_mode = true;
+    let ctx = egui::Context::default();
+    let field_id = egui::Id::new("ime-bookmark-title-focus-contract");
+    let mut title = String::new();
+    let mut request_focus = true;
+    let draw_field = |ctx: &egui::Context, title: &mut String, request_focus: &mut bool| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
+                edit.id(field_id)
+            });
+        });
+    };
+
+    ctx.begin_pass(Default::default());
+    draw_field(&ctx, &mut title, &mut request_focus);
+    let _ = ctx.end_pass();
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+
+    ctx.begin_pass(egui::RawInput {
+        events: vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+        ],
+        ..Default::default()
+    });
+    draw_field(&ctx, &mut title, &mut request_focus);
+    let _ = ctx.end_pass();
+
+    let alt = egui::Modifiers {
+        alt: true,
+        ..Default::default()
+    };
+    ctx.begin_pass(egui::RawInput {
+        modifiers: alt,
+        events: vec![
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+            egui::Event::Key {
+                key: egui::Key::J,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: alt,
+            },
+        ],
+        ..Default::default()
+    });
+    // Windows Alt/IME processing can remove egui's focused widget before the
+    // App samples the pass owner. Model that platform transition directly.
+    ctx.memory_mut(|memory| memory.surrender_focus(field_id));
+    assert_eq!(
+        app.keyboard_owner_for_pass(&ctx),
+        crate::keyboard_input::KeyboardOwner::TextInput {
+            viewport: egui::ViewportId::ROOT,
+            widget_id: field_id,
+            phase: crate::keyboard_input::TextInputPhase::FocusRecovery,
+        }
+    );
+    draw_field(&ctx, &mut title, &mut request_focus);
+    let _ = ctx.end_pass();
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::I,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(
+        app.adjustment_mode,
+        "the default FsToggleMetadata key must remain owned by the bookmark TextEdit"
+    );
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
 fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();

@@ -13492,7 +13492,7 @@ impl App {
         ctx: &egui::Context,
     ) -> crate::keyboard_input::KeyboardOwnershipSnapshot {
         use crate::keyboard_input::{
-            PendingFocusEvent, ShortcutScope, ShortcutSurface, TextInputPhase,
+            PendingFocusEvent, ShortcutScope, ShortcutSurface, TextInputClaim, TextInputPhase,
             transition_pending_focus_claim,
         };
 
@@ -13536,6 +13536,24 @@ impl App {
             .or(claimed_focused_text_input);
         let wants_keyboard_input = ctx.wants_keyboard_input();
         let focused_ui = wants_keyboard_input.then_some(focused_widget.unwrap_or(egui::Id::NULL));
+        let text_input = focused_text_input
+            .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::Focused))
+            .or_else(|| {
+                crate::ime_focus::recovering_text_input(ctx)
+                    .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::FocusRecovery))
+            })
+            .or_else(|| {
+                self.ime_input_active().then(|| {
+                    TextInputClaim::new(
+                        focused_ui.unwrap_or(egui::Id::NULL),
+                        TextInputPhase::ImeGrace,
+                    )
+                })
+            })
+            .or_else(|| {
+                pending_text_input
+                    .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::PendingFocus))
+            });
 
         let fullscreen_surface = !is_root
             || self.viewer_session_blocks_main_window()
@@ -13558,9 +13576,7 @@ impl App {
             viewport,
             viewport_focused,
             modal,
-            focused_text_input,
-            pending_text_input,
-            ime_grace: self.ime_input_active(),
+            text_input,
             focused_ui,
             shortcut_scope,
         }

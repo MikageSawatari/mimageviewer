@@ -87,8 +87,10 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
-IME 変換中の <kbd>Tab</kbd> は候補選択キーなので、`ime_focus` が対象 TextEdit の focus-lock を
-有効にして対象 field の focus を保持・復帰する。アプリ全体の traversal 無効化、IME field の
+IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が一時的に外れる場合があるため、
+`ime_focus` が直前 pass の helper-managed field を 1 pass の `FocusRecovery` owner として保持する。
+この owner は TextEdit の再描画前から keymap を抑止し、同じ pass で field の focus を復帰する。
+pointer 入力を伴う focus 移動は優先して復帰しない。アプリ全体の Tab traversal 無効化、IME field の
 focus 保持、keymap の操作発火抑止は別責務であり、同じ event をそれぞれの ownership 境界で扱う。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
