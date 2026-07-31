@@ -2418,7 +2418,7 @@ class ImageViewer {
     this.counter.textContent = `${index + 1} / ${count}`;
     this.previous.disabled = index === 0;
     this.next.disabled = index === count - 1;
-    this.loadMeasuredImage(request, interactionStartedAt, name);
+    this.loadMeasuredImage(request, interactionStartedAt, name, info);
   }
 
   setLayout(fitMode, layout, info, image = this.image) {
@@ -2434,7 +2434,7 @@ class ImageViewer {
     this.stage.scrollLeft = 0;
   }
 
-  async loadMeasuredImage(request, interactionStartedAt, name) {
+  async loadMeasuredImage(request, interactionStartedAt, name, info) {
     const sequence = ++this.loadSequence;
     this.fetchController?.abort();
     const controller = new AbortController();
