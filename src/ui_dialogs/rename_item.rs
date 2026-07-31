@@ -1,4 +1,4 @@
-//! Rename dialog for real filesystem items selected from the grid.
+//! Rename flow for real filesystem items selected from the grid.
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -6,27 +6,27 @@ use std::sync::mpsc;
 use eframe::egui;
 
 use crate::app::App;
+use crate::native_name_dialog::{NameInputRequest, NamePromptOutcome};
 
 pub(crate) type RenameResult = crate::shell_file_ops::ShellRenameResult;
 pub(crate) type RenameReceiver = mpsc::Receiver<RenameResult>;
 
+const DIALOG_TITLE: &str = "名前の変更";
+
 impl App {
     pub(crate) fn request_rename_dialog(&mut self, target: PathBuf) {
-        let Some(name) = target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned)
-        else {
+        if self.rename_pending.is_some() {
+            self.show_feedback_toast("名前の変更が完了するまでお待ちください".to_owned());
+            return;
+        }
+        let Some(_name) = target.file_name().and_then(|name| name.to_str()) else {
             self.show_feedback_toast("この項目は名前を変更できません".to_owned());
             return;
         };
-        // 対象種別はダイアログを開く時に一度だけ確認し、描画中は filesystem に触れない。
+        // The request is created from a context-menu closure. Only snapshot the
+        // item kind here; the synchronous native modal opens from App::update.
         self.rename_target_is_file = target.is_file();
         self.rename_target = Some(target);
-        self.rename_input = name;
-        self.rename_error = None;
-        self.rename_initial_selection_pending = true;
-        self.rename_extension_confirm = false;
         self.show_rename_dialog = true;
     }
 
@@ -34,174 +34,74 @@ impl App {
         if !self.show_rename_dialog {
             return;
         }
-
         let Some(target) = self.rename_target.clone() else {
             self.clear_rename_dialog_state();
             return;
         };
+        let Some(old_name) = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+        else {
+            self.clear_rename_dialog_state();
+            return;
+        };
 
-        let pending = self.rename_pending.is_some();
-        let mut open = true;
-        let mut apply = false;
-        let mut apply_confirmed = false;
-        let mut cancel = false;
-        let mut back_to_edit = false;
-        let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
-        let dialog_pos = ctx.content_rect().min + egui::vec2(90.0, 70.0);
+        let owner = self.main_hwnd;
+        let target_is_file = self.rename_target_is_file;
+        let caption = format!("対象: {}", target.display());
+        let mut input = old_name.clone();
+        // This flag is a queued request, not a flag that remains true while the
+        // native dialog is open. DialogBoxIndirectParamW owns that modal span.
+        self.show_rename_dialog = false;
 
-        egui::Window::new("名前の変更")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_pos(dialog_pos)
-            .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                ui.label(format!("対象: {}", target.display()));
-                ui.add_space(4.0);
-
-                if self.rename_extension_confirm {
-                    let old_name = target
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default();
-                    ui.label(extension_change_confirmation_message(
-                        old_name,
-                        &self.rename_input,
-                    ));
-                } else {
-                    let resp = crate::ime_focus::add_enabled_singleline(
-                        ui,
-                        !pending,
-                        &mut self.rename_input,
-                        None,
-                        |edit| edit.desired_width(f32::INFINITY),
-                    );
-                    if !pending && self.rename_initial_selection_pending {
-                        resp.request_focus();
-                        if let Some(mut state) =
-                            egui::text_edit::TextEditState::load(ui.ctx(), resp.id)
-                        {
-                            let end = if self.rename_target_is_file {
-                                rename_stem_char_count(&self.rename_input)
-                            } else {
-                                self.rename_input.chars().count()
-                            };
-                            state
-                                .cursor
-                                .set_char_range(Some(egui::text::CCursorRange::two(
-                                    egui::text::CCursor::new(0),
-                                    egui::text::CCursor::new(end),
-                                )));
-                            state.store(ui.ctx(), resp.id);
-                        }
-                        self.rename_initial_selection_pending = false;
-                    } else if !pending && !resp.has_focus() && !ui.memory(|m| m.focused().is_some())
-                    {
-                        resp.request_focus();
-                    }
-                    if !pending && enter_pressed && (resp.has_focus() || resp.lost_focus()) {
-                        apply = true;
-                    }
+        loop {
+            let select_utf16 = target_is_file.then(|| (0, rename_stem_utf16_len(&input)));
+            let request = NameInputRequest {
+                owner,
+                title: DIALOG_TITLE,
+                caption: &caption,
+                initial: &input,
+                select_utf16,
+            };
+            let entered = match crate::native_name_dialog::prompt_name(&request) {
+                NamePromptOutcome::Accepted(entered) => entered,
+                NamePromptOutcome::Cancelled => {
+                    self.clear_rename_dialog_state();
+                    return;
                 }
-
-                if let Some(ref err) = self.rename_error {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(err)
-                            .color(crate::ui_helpers::ERROR_TEXT_COLOR)
-                            .size(crate::ui_helpers::ERROR_TEXT_SIZE),
-                    );
+                NamePromptOutcome::Failed => {
+                    self.clear_rename_dialog_state();
+                    self.show_feedback_toast("名前の変更画面を開けませんでした".to_owned());
+                    return;
                 }
-
-                if pending {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("変更中...");
-                    });
+            };
+            let name = match validate_rename_item_name(&entered) {
+                Ok(name) => name,
+                Err(message) => {
+                    crate::native_name_dialog::show_warning(owner, DIALOG_TITLE, &message);
+                    input = entered;
+                    continue;
                 }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if self.rename_extension_confirm {
-                        if ui.button("変更する").clicked() {
-                            apply_confirmed = true;
-                        }
-                        if ui.button("戻す").clicked() {
-                            back_to_edit = true;
-                        }
-                    } else {
-                        let can_apply = !pending && !self.rename_input.trim().is_empty();
-                        if ui
-                            .add_enabled(can_apply, egui::Button::new("  変更  "))
-                            .clicked()
-                        {
-                            apply = true;
-                        }
-                        if ui
-                            .add_enabled(!pending, egui::Button::new("キャンセル"))
-                            .clicked()
-                        {
-                            cancel = true;
-                        }
-                    }
-                });
-
-                if !pending && escape_pressed {
-                    if self.rename_extension_confirm {
-                        back_to_edit = true;
-                    } else {
-                        cancel = true;
-                    }
-                }
-                if self.rename_extension_confirm && enter_pressed {
-                    apply_confirmed = true;
-                }
-            });
-
-        if back_to_edit {
-            self.rename_extension_confirm = false;
-        } else if apply || apply_confirmed {
-            match validate_rename_item_name(&self.rename_input) {
-                Ok(name) => {
-                    if target
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|old| old == name)
-                    {
-                        self.clear_rename_dialog_state();
-                        return;
-                    }
-                    self.rename_input = name.clone();
-                    self.rename_error = None;
-                    let old_name = target
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default();
-                    if !apply_confirmed
-                        && self.rename_target_is_file
-                        && rename_extension_changed(old_name, &name)
-                    {
-                        self.rename_extension_confirm = true;
-                        return;
-                    }
-                    self.rename_extension_confirm = false;
-                    self.rename_pending = Some(crate::shell_file_ops::rename_item_async(
-                        self.main_hwnd,
-                        target,
-                        name,
-                    ));
-                    ctx.request_repaint();
-                }
-                Err(err) => {
-                    self.rename_error = Some(err);
+            };
+            if name == old_name {
+                self.clear_rename_dialog_state();
+                return;
+            }
+            if target_is_file && rename_extension_changed(&old_name, &name) {
+                let message = extension_change_confirmation_message(&old_name, &name);
+                if !crate::native_name_dialog::confirm_warning(owner, DIALOG_TITLE, &message) {
+                    input = name;
+                    continue;
                 }
             }
-        } else if !pending && (cancel || !open) {
+
             self.clear_rename_dialog_state();
+            self.rename_pending = Some(crate::shell_file_ops::rename_item_async(
+                owner, target, name,
+            ));
+            ctx.request_repaint();
+            return;
         }
     }
 
@@ -216,43 +116,32 @@ impl App {
                     self.show_feedback_toast("名前の変更をキャンセルしました".to_owned());
                     return;
                 }
-                // 旧 path を表示・再生中の窓を閉じる (review-v2.3.0 角度④ (A):
-                // parked bundle が旧 path のまま生き残ると再生位置やメタデータ書込が
-                // 旧名キーへ流れる)。
+                // Keep all post-rename cleanup unchanged: each path-keyed
+                // subsystem must observe the same old -> new transition.
                 self.release_viewer_surfaces_for_removed_paths(
                     ctx,
                     std::slice::from_ref(&outcome.target),
                     "rename_old_path",
                 );
-                // 旧 path キーの永続データ (★ / タグ / 回転 / 編集レイヤー / マスク /
-                // ブックマーク / 続き位置 / サイドカー等) を新 path へ移行する
-                // (`rename_key_migration`、worker)。in-memory 側 (再生位置 / 編集済み
-                // バッジの presence set) はここで同期的に付け替える。
                 self.migrate_video_resume_positions_for_renamed_path(
                     &outcome.target,
                     &outcome.new_path,
                 );
                 self.rewrite_page_edit_presence_for_rename(&outcome.target, &outcome.new_path);
-                // 合成一覧には旧 path を残さない。新 path の採用は path-keyed メタデータ
-                // 移行完了後の authoritative scan に任せる。
                 self.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(
                     &outcome.target,
                 ));
                 self.spawn_rename_key_migration(outcome.target.clone(), outcome.new_path.clone());
-                // 再読み込み判定は「お気に入りへ追加できる場所」ではなく、一覧を実際に
-                // 列挙した current_folder と比較する。current_favorite_target() は ZIP/PDF の
-                // enumerate 中や archive_source_override が残る遷移フレームでは None を返すため、
-                // 直前に ZIP を閲覧した通常フォルダで rename 成功を取りこぼし得る。
                 let current_matches_parent = outcome.target.parent().is_some_and(|parent| {
                     self.current_folder
                         .as_ref()
-                        .is_some_and(|cur| crate::folder_tree::path_eq(cur, parent))
+                        .is_some_and(|current| crate::folder_tree::path_eq(current, parent))
                 });
                 if current_matches_parent {
                     self.select_after_load = outcome
                         .new_path
                         .file_name()
-                        .and_then(|n| n.to_str())
+                        .and_then(|name| name.to_str())
                         .map(str::to_owned);
                     self.pending_reload = true;
                 }
@@ -261,17 +150,21 @@ impl App {
                     outcome.new_path.display()
                 ));
             }
-            Ok(Err(err)) => {
-                self.rename_error = Some(err);
-                self.show_rename_dialog = true;
+            Ok(Err(message)) => {
+                self.clear_rename_dialog_state();
+                crate::native_name_dialog::show_warning(self.main_hwnd, DIALOG_TITLE, &message);
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.rename_pending = Some(rx);
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.rename_error = Some("名前変更 worker が終了しました".to_owned());
-                self.show_rename_dialog = true;
+                self.clear_rename_dialog_state();
+                crate::native_name_dialog::show_warning(
+                    self.main_hwnd,
+                    DIALOG_TITLE,
+                    "名前変更 worker が終了しました",
+                );
             }
         }
     }
@@ -279,26 +172,25 @@ impl App {
     fn clear_rename_dialog_state(&mut self) {
         self.show_rename_dialog = false;
         self.rename_target = None;
-        self.rename_input.clear();
-        self.rename_error = None;
         self.rename_target_is_file = false;
-        self.rename_initial_selection_pending = false;
-        self.rename_extension_confirm = false;
     }
 }
 
-/// 最終拡張子を除いた stem の文字数。拡張子なし・dotfile は名前全体を返す。
-fn rename_stem_char_count(name: &str) -> usize {
-    let Some(ext) = final_extension(name) else {
-        return name.chars().count();
+/// UTF-16 code units in the stem before the final extension.
+/// Extensionless names and dotfiles select the whole name.
+fn rename_stem_utf16_len(name: &str) -> usize {
+    let Some(extension) = final_extension(name) else {
+        return name.encode_utf16().count();
     };
-    name[..name.len() - ext.len() - 1].chars().count()
+    name[..name.len() - extension.len() - 1]
+        .encode_utf16()
+        .count()
 }
 
 fn final_extension(name: &str) -> Option<&str> {
     std::path::Path::new(name)
         .extension()
-        .and_then(|ext| ext.to_str())
+        .and_then(|extension| extension.to_str())
 }
 
 fn rename_extension_changed(old_name: &str, new_name: &str) -> bool {
@@ -310,8 +202,8 @@ fn rename_extension_changed(old_name: &str, new_name: &str) -> bool {
 }
 
 fn extension_change_confirmation_message(old_name: &str, new_name: &str) -> String {
-    let display = |ext: Option<&str>| match ext {
-        Some(ext) => format!("\".{ext}\""),
+    let display = |extension: Option<&str>| match extension {
+        Some(extension) => format!("\".{extension}\""),
         None => "\"(なし)\"".to_owned(),
     };
     format!(
@@ -332,8 +224,12 @@ fn validate_rename_item_name(input: &str) -> Result<String, String> {
     if name.ends_with('.') || name.ends_with(' ') {
         return Err("末尾がピリオドまたは空白の名前は使えません".to_owned());
     }
-    if name.chars().any(|c| {
-        c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    if name.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
     }) {
         return Err("名前に使えない文字が含まれています".to_owned());
     }
@@ -364,20 +260,27 @@ fn matches_reserved_numbered_device(stem: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{rename_extension_changed, rename_stem_char_count, validate_rename_item_name};
+    use super::{rename_extension_changed, rename_stem_utf16_len, validate_rename_item_name};
 
     #[test]
-    fn rename_stem_char_count_handles_extensions_dotfiles_and_unicode() {
-        assert_eq!(rename_stem_char_count("a.tar.gz"), "a.tar".chars().count());
-        assert_eq!(rename_stem_char_count("README"), "README".chars().count());
+    fn rename_stem_utf16_len_handles_extensions_dotfiles_and_unicode() {
         assert_eq!(
-            rename_stem_char_count(".gitignore"),
-            ".gitignore".chars().count()
+            rename_stem_utf16_len("a.tar.gz"),
+            "a.tar".encode_utf16().count()
         );
         assert_eq!(
-            rename_stem_char_count("日本語画像.jpg"),
-            "日本語画像".chars().count()
+            rename_stem_utf16_len("README"),
+            "README".encode_utf16().count()
         );
+        assert_eq!(
+            rename_stem_utf16_len(".gitignore"),
+            ".gitignore".encode_utf16().count()
+        );
+        assert_eq!(
+            rename_stem_utf16_len("日本語画像.jpg"),
+            "日本語画像".encode_utf16().count()
+        );
+        assert_eq!(rename_stem_utf16_len("🎬movie.mp4"), 7);
     }
 
     #[test]

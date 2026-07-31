@@ -1,4 +1,4 @@
-//! New folder dialog shown from the grid background context menu.
+//! New folder flow started from the grid background context menu.
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -6,7 +6,9 @@ use std::sync::mpsc;
 use eframe::egui;
 
 use crate::app::App;
+use crate::native_name_dialog::{NameInputRequest, NamePromptOutcome};
 
+const DIALOG_TITLE: &str = "新しいフォルダ";
 const DEFAULT_NEW_FOLDER_NAME: &str = "新しいフォルダー";
 
 pub(crate) type NewFolderResult = Result<NewFolderCreated, String>;
@@ -19,9 +21,11 @@ pub(crate) struct NewFolderCreated {
 
 impl App {
     pub(crate) fn request_new_folder_dialog(&mut self, parent: PathBuf) {
+        if self.new_folder_pending.is_some() {
+            self.show_feedback_toast("フォルダ作成が完了するまでお待ちください".to_owned());
+            return;
+        }
         self.new_folder_parent = Some(parent);
-        self.new_folder_input = DEFAULT_NEW_FOLDER_NAME.to_owned();
-        self.new_folder_error = None;
         self.show_new_folder_dialog = true;
     }
 
@@ -29,107 +33,50 @@ impl App {
         if !self.show_new_folder_dialog {
             return;
         }
-
         let Some(parent) = self.new_folder_parent.clone() else {
-            self.show_new_folder_dialog = false;
-            self.new_folder_input.clear();
-            self.new_folder_error = None;
+            self.clear_new_folder_dialog_state();
             return;
         };
 
-        let pending = self.new_folder_pending.is_some();
-        let mut open = true;
-        let mut apply = false;
-        let mut cancel = false;
-        let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
-        let dialog_pos = ctx.content_rect().min + egui::vec2(90.0, 70.0);
+        let owner = self.main_hwnd;
+        let caption = format!("作成先: {}", parent.display());
+        let mut input = DEFAULT_NEW_FOLDER_NAME.to_owned();
+        // This flag queues one native modal launch. No egui window remains
+        // visible while the filesystem worker runs.
+        self.show_new_folder_dialog = false;
 
-        egui::Window::new("新しいフォルダ")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_pos(dialog_pos)
-            .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                ui.label(format!("作成先: {}", parent.display()));
-                ui.add_space(4.0);
-
-                let resp = crate::ime_focus::add_enabled_singleline(
-                    ui,
-                    !pending,
-                    &mut self.new_folder_input,
-                    None,
-                    |edit| {
-                        edit.desired_width(f32::INFINITY)
-                            .hint_text(DEFAULT_NEW_FOLDER_NAME)
-                    },
-                );
-                if !pending && !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
-                    resp.request_focus();
+        loop {
+            let request = NameInputRequest {
+                owner,
+                title: DIALOG_TITLE,
+                caption: &caption,
+                initial: &input,
+                select_utf16: None,
+            };
+            let entered = match crate::native_name_dialog::prompt_name(&request) {
+                NamePromptOutcome::Accepted(entered) => entered,
+                NamePromptOutcome::Cancelled => {
+                    self.clear_new_folder_dialog_state();
+                    return;
                 }
-                if !pending && enter_pressed && (resp.has_focus() || resp.lost_focus()) {
-                    apply = true;
+                NamePromptOutcome::Failed => {
+                    self.clear_new_folder_dialog_state();
+                    self.show_feedback_toast("フォルダ作成画面を開けませんでした".to_owned());
+                    return;
                 }
-
-                if let Some(ref err) = self.new_folder_error {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(err)
-                            .color(crate::ui_helpers::ERROR_TEXT_COLOR)
-                            .size(crate::ui_helpers::ERROR_TEXT_SIZE),
-                    );
-                }
-
-                if pending {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("作成中…");
-                    });
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let can_apply = !pending && !self.new_folder_input.trim().is_empty();
-                    if ui
-                        .add_enabled(can_apply, egui::Button::new("  作成  "))
-                        .clicked()
-                    {
-                        apply = true;
-                    }
-                    if ui
-                        .add_enabled(!pending, egui::Button::new("キャンセル"))
-                        .clicked()
-                    {
-                        cancel = true;
-                    }
-                });
-
-                if !pending && escape_pressed {
-                    cancel = true;
-                }
-            });
-
-        if apply {
-            match validate_new_folder_name(&self.new_folder_input) {
+            };
+            match validate_new_folder_name(&entered) {
                 Ok(name) => {
-                    self.new_folder_input = name.clone();
-                    self.new_folder_error = None;
+                    self.clear_new_folder_dialog_state();
                     self.new_folder_pending = Some(spawn_new_folder(parent, name));
                     ctx.request_repaint();
+                    return;
                 }
-                Err(err) => {
-                    self.new_folder_error = Some(err);
+                Err(message) => {
+                    crate::native_name_dialog::show_warning(owner, DIALOG_TITLE, &message);
+                    input = entered;
                 }
             }
-        } else if !pending && (cancel || !open) {
-            self.show_new_folder_dialog = false;
-            self.new_folder_parent = None;
-            self.new_folder_input.clear();
-            self.new_folder_error = None;
         }
     }
 
@@ -139,19 +86,16 @@ impl App {
         };
         match rx.try_recv() {
             Ok(Ok(created)) => {
-                self.show_new_folder_dialog = false;
-                self.new_folder_parent = None;
-                self.new_folder_input.clear();
-                self.new_folder_error = None;
+                self.clear_new_folder_dialog_state();
                 let current_matches_parent = self
                     .current_favorite_target()
                     .as_ref()
-                    .is_some_and(|cur| crate::folder_tree::path_eq(cur, &created.parent));
+                    .is_some_and(|current| crate::folder_tree::path_eq(current, &created.parent));
                 if current_matches_parent {
                     self.select_after_load = created
                         .path
                         .file_name()
-                        .and_then(|n| n.to_str())
+                        .and_then(|name| name.to_str())
                         .map(str::to_owned);
                     self.pending_reload = true;
                 }
@@ -160,19 +104,28 @@ impl App {
                     created.path.display()
                 ));
             }
-            Ok(Err(err)) => {
-                self.new_folder_error = Some(err);
-                self.show_new_folder_dialog = true;
+            Ok(Err(message)) => {
+                self.clear_new_folder_dialog_state();
+                crate::native_name_dialog::show_warning(self.main_hwnd, DIALOG_TITLE, &message);
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.new_folder_pending = Some(rx);
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.new_folder_error = Some("フォルダ作成 worker が終了しました".to_owned());
-                self.show_new_folder_dialog = true;
+                self.clear_new_folder_dialog_state();
+                crate::native_name_dialog::show_warning(
+                    self.main_hwnd,
+                    DIALOG_TITLE,
+                    "フォルダ作成 worker が終了しました",
+                );
             }
         }
+    }
+
+    fn clear_new_folder_dialog_state(&mut self) {
+        self.show_new_folder_dialog = false;
+        self.new_folder_parent = None;
     }
 }
 
@@ -185,17 +138,19 @@ fn spawn_new_folder(parent: PathBuf, name: String) -> NewFolderReceiver {
             let path = parent.join(&name);
             let result = std::fs::create_dir(&path)
                 .map(|()| NewFolderCreated { parent, path })
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
                         format!("同名のファイルまたはフォルダが既にあります: {name}")
                     } else {
-                        format!("フォルダを作成できません: {e}")
+                        format!("フォルダを作成できません: {error}")
                     }
                 });
             let _ = tx.send(result);
         });
-    if let Err(e) = spawn_result {
-        let _ = tx_on_spawn_error.send(Err(format!("フォルダ作成 worker を開始できません: {e}")));
+    if let Err(error) = spawn_result {
+        let _ = tx_on_spawn_error.send(Err(format!(
+            "フォルダ作成 worker を開始できません: {error}"
+        )));
     }
     rx
 }
@@ -211,8 +166,12 @@ fn validate_new_folder_name(input: &str) -> Result<String, String> {
     if name.ends_with('.') || name.ends_with(' ') {
         return Err("末尾がピリオドまたは空白の名前は使えません".to_owned());
     }
-    if name.chars().any(|c| {
-        c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    if name.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
     }) {
         return Err("フォルダ名に使えない文字が含まれています".to_owned());
     }

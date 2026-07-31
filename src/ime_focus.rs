@@ -666,23 +666,6 @@ pub(crate) fn add_sized_singleline<'text>(
     response
 }
 
-pub(crate) fn add_enabled_singleline<'text>(
-    ui: &mut egui::Ui,
-    enabled: bool,
-    text: &'text mut dyn egui::TextBuffer,
-    focus_request: Option<&mut bool>,
-    configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
-) -> egui::Response {
-    let ime_active = enabled && ime_input_active(ui.ctx());
-    let response = ui.add_enabled(enabled, configure(egui::TextEdit::singleline(text)));
-    if enabled {
-        let _ = restore_focus_for_ime_key(ui.ctx(), &response, ime_active, focus_request);
-    } else {
-        forget_text_focus(ui.ctx(), response.id);
-    }
-    response
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,12 +1189,6 @@ mod tests {
         RawTextEditExemption {
             path: "src/ime_focus.rs",
             line_anchor: "let response = ui.add_sized(size, configure(",
-            expected_occurrences: 1,
-            reason: "共有 helper 自身が raw TextEdit を構築する境界",
-        },
-        RawTextEditExemption {
-            path: "src/ime_focus.rs",
-            line_anchor: "let response = ui.add_enabled(enabled, configure(",
             expected_occurrences: 1,
             reason: "共有 helper 自身が raw TextEdit を構築する境界",
         },

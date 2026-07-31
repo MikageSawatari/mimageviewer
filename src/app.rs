@@ -8543,22 +8543,14 @@ pub struct App {
     // ── 新規フォルダ作成ダイアログ ───────────────────────────────
     pub(crate) show_new_folder_dialog: bool,
     pub(crate) new_folder_parent: Option<PathBuf>,
-    pub(crate) new_folder_input: String,
-    pub(crate) new_folder_error: Option<String>,
     pub(crate) new_folder_pending: Option<crate::ui_dialogs::new_folder::NewFolderReceiver>,
 
     // ── 実ファイル/実フォルダの名前変更ダイアログ ───────────────
     pub(crate) show_rename_dialog: bool,
     pub(crate) rename_target: Option<PathBuf>,
-    pub(crate) rename_input: String,
-    pub(crate) rename_error: Option<String>,
     pub(crate) rename_pending: Option<crate::ui_dialogs::rename_item::RenameReceiver>,
-    /// ダイアログを開いた時点で対象が実ファイルだったか。毎フレームの stat を避ける。
+    /// ダイアログ要求時点で対象が実ファイルだったか。
     pub(crate) rename_target_is_file: bool,
-    /// TextEdit の初回フォーカス時に Explorer 風の選択範囲を設定する one-shot。
-    pub(crate) rename_initial_selection_pending: bool,
-    /// ファイルの拡張子変更を実行する前の確認画面を表示中か。
-    pub(crate) rename_extension_confirm: bool,
     /// リネーム移行 (`rename_key_migration`) のジョブキュー (FIFO)。連続リネーム
     /// A→B→C を並列 worker にすると逆順実行で中間 path にデータが取り残されるため、
     /// 必ず 1 本ずつ直列実行する (Sol rename-mig P1。根拠テスト =
@@ -11803,17 +11795,11 @@ impl App {
             open_folder_error: None,
             show_new_folder_dialog: false,
             new_folder_parent: None,
-            new_folder_input: String::new(),
-            new_folder_error: None,
             new_folder_pending: None,
             show_rename_dialog: false,
             rename_target: None,
-            rename_input: String::new(),
-            rename_error: None,
             rename_pending: None,
             rename_target_is_file: false,
-            rename_initial_selection_pending: false,
-            rename_extension_confirm: false,
             rename_migration_queue: std::collections::VecDeque::new(),
             rename_migration_in_flight: None,
             rename_migration_boot_retry: Vec::new(),
@@ -13698,10 +13684,12 @@ impl App {
             || self.fullscreen_tag_picker_open
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
+            // Native name dialogs stop App::update while their OS modal loop is
+            // active. Keep only the queued-launch flags here so the triggering
+            // frame cannot leak input to the grid. Their async workers are not
+            // visible dialogs and therefore do not belong in this predicate.
             || self.show_new_folder_dialog
-            || self.new_folder_pending.is_some()
             || self.show_rename_dialog
-            || self.rename_pending.is_some()
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences

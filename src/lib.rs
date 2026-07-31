@@ -115,6 +115,7 @@ pub mod monitor;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;
 pub mod native_context_menu;
+mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
 pub mod panorama;
