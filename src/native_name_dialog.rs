@@ -67,17 +67,20 @@ mod windows_impl {
     use std::mem::{align_of, size_of};
 
     use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
     use windows::Win32::System::SystemServices::SS_PATHELLIPSIS;
     use windows::Win32::UI::Controls::{EM_LIMITTEXT, EM_SETSEL};
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
         BS_DEFPUSHBUTTON, BS_PUSHBUTTON, DLGPROC, DLGTEMPLATE, DS_MODALFRAME, DS_SETFONT,
         DialogBoxIndirectParamW, ES_AUTOHSCROLL, EndDialog, GetDlgItem, GetWindowLongPtrW,
-        GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK,
-        MB_OKCANCEL, MessageBoxW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-        SetWindowLongPtrW, SetWindowPos, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND,
-        WM_INITDIALOG, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
-        WS_VISIBLE,
+        GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HWND_TOP, IDCANCEL, IDOK,
+        MB_ICONWARNING, MB_OK, MB_OKCANCEL, MessageBoxW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_INITDIALOG, WS_BORDER, WS_CAPTION,
+        WS_CHILD, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
     };
     use windows::core::PCWSTR;
 
@@ -204,7 +207,7 @@ mod windows_impl {
                 unsafe {
                     SetWindowLongPtrW(dialog, dialog_user_index(), state_ptr as isize);
                     let state = &mut *state_ptr;
-                    center_on_owner(dialog, state.owner);
+                    place_over_owner(dialog, state.owner);
                     if let Ok(edit) = GetDlgItem(Some(dialog), NAME_EDIT_ID) {
                         let _ =
                             SendMessageW(edit, EM_LIMITTEXT, Some(WPARAM(MAX_NAME_UTF16)), None);
@@ -271,32 +274,71 @@ mod windows_impl {
         String::from_utf16(&buffer[..copied as usize]).ok()
     }
 
-    unsafe fn center_on_owner(dialog: HWND, owner: Option<isize>) {
-        let Some(owner) = hwnd_from_raw(owner) else {
-            return;
-        };
-        let mut owner_rect = RECT::default();
+    /// Place the dialog over its owner and put it in front.
+    ///
+    /// Only the owner is disabled by the dialog manager, and this application keeps other
+    /// top-level windows of its own - the fullscreen viewport and the native video window -
+    /// alive beside it. If the dialog is not raised and focused, the application looks frozen
+    /// while the modal waits somewhere behind them. The position is clamped to the owner's
+    /// monitor so a centred dialog cannot land off-screen either.
+    unsafe fn place_over_owner(dialog: HWND, owner: Option<isize>) {
         let mut dialog_rect = RECT::default();
-        if unsafe { GetWindowRect(owner, &mut owner_rect) }.is_err()
-            || unsafe { GetWindowRect(dialog, &mut dialog_rect) }.is_err()
-        {
+        if unsafe { GetWindowRect(dialog, &mut dialog_rect) }.is_err() {
             return;
         }
         let width = dialog_rect.right - dialog_rect.left;
         let height = dialog_rect.bottom - dialog_rect.top;
-        let x = owner_rect.left + ((owner_rect.right - owner_rect.left - width) / 2);
-        let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top - height) / 2);
+
+        if let Some(owner) = hwnd_from_raw(owner) {
+            let mut owner_rect = RECT::default();
+            if unsafe { GetWindowRect(owner, &mut owner_rect) }.is_ok() {
+                let mut x = owner_rect.left + ((owner_rect.right - owner_rect.left - width) / 2);
+                let mut y = owner_rect.top + ((owner_rect.bottom - owner_rect.top - height) / 2);
+                if let Some(work) = unsafe { owner_work_area(owner) } {
+                    x = x.clamp(work.left, (work.right - width).max(work.left));
+                    y = y.clamp(work.top, (work.bottom - height).max(work.top));
+                }
+                let _ = unsafe {
+                    SetWindowPos(
+                        dialog,
+                        Some(HWND_TOP),
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    )
+                };
+            }
+        }
+
+        // Raise and focus explicitly. A sibling window of ours that re-asserts foreground
+        // would otherwise leave the modal unreachable except through Alt+Tab.
         let _ = unsafe {
             SetWindowPos(
                 dialog,
-                None,
-                x,
-                y,
+                Some(HWND_TOP),
                 0,
                 0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
             )
         };
+        let _ = unsafe { SetForegroundWindow(dialog) };
+    }
+
+    unsafe fn owner_work_area(owner: HWND) -> Option<RECT> {
+        let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            Some(info.rcWork)
+        } else {
+            None
+        }
     }
 
     fn dialog_user_index() -> WINDOW_LONG_PTR_INDEX {
