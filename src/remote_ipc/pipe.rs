@@ -29,7 +29,8 @@ const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const PIPE_MAX_INSTANCES: u32 = 16;
 /// 再接続が集中しても待機中 instance を切らさないため、常時この本数を accept 待ちにする。
 const ACCEPTOR_COUNT: usize = 4;
-const WORK_QUEUE_CAPACITY: usize = 256;
+const HEAVY_WORK_QUEUE_CAPACITY: usize = 16;
+const HOME_WORK_QUEUE_CAPACITY: usize = 8;
 
 enum Work {
     Request {
@@ -43,7 +44,9 @@ pub(super) struct ServerGuard {
     stop: Arc<AtomicBool>,
     listeners: Vec<std::thread::JoinHandle<()>>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    work_tx: mpsc::SyncSender<Work>,
+    home_worker: Option<std::thread::JoinHandle<()>>,
+    heavy_work_tx: mpsc::SyncSender<Work>,
+    home_work_tx: mpsc::SyncSender<Work>,
 }
 
 impl ServerGuard {
@@ -64,14 +67,21 @@ impl ServerGuard {
             );
         }
 
-        let worker_count = settings.parallelism.thread_count().clamp(1, 8);
+        let configured_worker_count = settings.parallelism.thread_count();
+        let worker_count = remote_heavy_worker_count(configured_worker_count);
         let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
         let collection_engine = Arc::new(CollectionEngine::new(settings));
-        let (work_tx, work_rx) = mpsc::sync_channel::<Work>(WORK_QUEUE_CAPACITY);
-        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
+        let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));
+        let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
+        let home_collection_engine = Arc::clone(&collection_engine);
+        let home_worker = std::thread::Builder::new()
+            .name("remote-home".to_owned())
+            .spawn(move || home_worker_loop(home_work_rx, &home_collection_engine))
+            .map_err(|error| format!("remote IPC home worker を開始できません: {error}"))?;
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
-            let work_rx = Arc::clone(&work_rx);
+            let work_rx = Arc::clone(&heavy_work_rx);
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
             let collection_engine = Arc::clone(&collection_engine);
             workers.push(
@@ -86,11 +96,19 @@ impl ServerGuard {
         let mut listeners = Vec::with_capacity(ACCEPTOR_COUNT);
         for (index, initial_pipe) in initial_pipes.into_iter().enumerate() {
             let listener_stop = Arc::clone(&stop);
-            let listener_tx = work_tx.clone();
+            let listener_heavy_tx = heavy_work_tx.clone();
+            let listener_home_tx = home_work_tx.clone();
             match std::thread::Builder::new()
                 .name(format!("remote-ipc-listener-{index}"))
-                .spawn(move || acceptor_loop(listener_stop, listener_tx, initial_pipe, index))
-            {
+                .spawn(move || {
+                    acceptor_loop(
+                        listener_stop,
+                        listener_heavy_tx,
+                        listener_home_tx,
+                        initial_pipe,
+                        index,
+                    )
+                }) {
                 Ok(listener) => listeners.push(listener),
                 Err(error) => {
                     stop.store(true, Ordering::Release);
@@ -101,24 +119,28 @@ impl ServerGuard {
                         let _ = listener.join();
                     }
                     for _ in 0..worker_count {
-                        let _ = work_tx.send(Work::Stop);
+                        let _ = heavy_work_tx.send(Work::Stop);
                     }
+                    let _ = home_work_tx.send(Work::Stop);
                     for worker in workers {
                         let _ = worker.join();
                     }
+                    let _ = home_worker.join();
                     return Err(format!("remote IPC listener を開始できません: {error}"));
                 }
             }
         }
 
         crate::logger::log(format!(
-            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} workers={worker_count} acceptors={ACCEPTOR_COUNT} multiplexed=true"
+            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 acceptors={ACCEPTOR_COUNT} multiplexed=true"
         ));
         Ok(Self {
             stop,
             listeners,
             workers,
-            work_tx,
+            home_worker: Some(home_worker),
+            heavy_work_tx,
+            home_work_tx,
         })
     }
 }
@@ -133,13 +155,23 @@ impl Drop for ServerGuard {
             let _ = listener.join();
         }
         for _ in 0..self.workers.len() {
-            let _ = self.work_tx.send(Work::Stop);
+            let _ = self.heavy_work_tx.send(Work::Stop);
         }
+        let _ = self.home_work_tx.send(Work::Stop);
         for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.home_worker.take() {
             let _ = worker.join();
         }
         crate::logger::log("remote_ipc: stopped".to_owned());
     }
+}
+
+fn remote_heavy_worker_count(configured_worker_count: usize) -> usize {
+    // IPC decode がローカル表示用 worker と CPU / disk を奪い合わないよう、
+    // 利用者設定の半分かつ最大 2 本だけを remote 専用にする。
+    (configured_worker_count / 2).clamp(1, 2)
 }
 
 fn worker_loop(
@@ -176,9 +208,28 @@ fn worker_loop(
     }
 }
 
+fn home_worker_loop(work_rx: mpsc::Receiver<Work>, collection_engine: &CollectionEngine) {
+    loop {
+        match work_rx.recv() {
+            Ok(Work::Request { message, reply }) => {
+                let response = match message {
+                    ClientMessage::Home { id, .. } => ServerMessage::Home {
+                        id,
+                        response: collection_engine.home(),
+                    },
+                    other => service_stopped_response(&other),
+                };
+                let _ = reply.send(response);
+            }
+            Ok(Work::Stop) | Err(_) => break,
+        }
+    }
+}
+
 fn acceptor_loop(
     stop: Arc<AtomicBool>,
-    work_tx: mpsc::SyncSender<Work>,
+    heavy_work_tx: mpsc::SyncSender<Work>,
+    home_work_tx: mpsc::SyncSender<Work>,
     initial_pipe: PipeStream,
     index: usize,
 ) {
@@ -218,10 +269,11 @@ fn acceptor_loop(
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let work_tx = work_tx.clone();
+        let heavy_work_tx = heavy_work_tx.clone();
+        let home_work_tx = home_work_tx.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("remote-ipc-connection".to_owned())
-            .spawn(move || handle_connection(pipe, work_tx))
+            .spawn(move || handle_connection(pipe, heavy_work_tx, home_work_tx))
         {
             crate::logger::log(format!("remote_ipc: stage=connection_spawn error={error}"));
         }
@@ -231,7 +283,11 @@ fn acceptor_loop(
     crate::logger::log(format!("remote_ipc: listener exiting acceptor={index}"));
 }
 
-fn handle_connection(mut pipe: PipeStream, work_tx: mpsc::SyncSender<Work>) {
+fn handle_connection(
+    mut pipe: PipeStream,
+    heavy_work_tx: mpsc::SyncSender<Work>,
+    home_work_tx: mpsc::SyncSender<Work>,
+) {
     let hello: ClientHello = match read_frame(&mut pipe, MAX_CONTROL_FRAME_BYTES) {
         Ok(hello) => hello,
         Err(error) => {
@@ -301,19 +357,27 @@ fn handle_connection(mut pipe: PipeStream, work_tx: mpsc::SyncSender<Work>) {
                 break;
             }
         };
-        let stopped = service_stopped_response(&message);
-        // queue が満杯ならここで待つ。接続を切断したり、要求を捨てたりしない。
-        if send_with_backpressure(
-            &work_tx,
-            Work::Request {
-                message,
-                reply: reply_tx.clone(),
-            },
-        )
-        .is_err()
-        {
-            let _ = reply_tx.send(stopped);
-            break;
+        // Home は専用 worker へ分離する。重い queue が満杯でも connection reader を
+        // 塞がず、後続 Home を読めるよう Busy を明示応答する。
+        let work_tx = if matches!(message, ClientMessage::Home { .. }) {
+            &home_work_tx
+        } else {
+            &heavy_work_tx
+        };
+        match work_tx.try_send(Work::Request {
+            message,
+            reply: reply_tx.clone(),
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(Work::Request { message, reply })) => {
+                let _ = reply.send(queue_busy_response(&message));
+            }
+            Err(mpsc::TrySendError::Disconnected(Work::Request { message, reply })) => {
+                let _ = reply.send(service_stopped_response(&message));
+                break;
+            }
+            Err(mpsc::TrySendError::Full(Work::Stop)) => unreachable!(),
+            Err(mpsc::TrySendError::Disconnected(Work::Stop)) => unreachable!(),
         }
     }
     drop(reply_tx);
@@ -346,11 +410,30 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
     }
 }
 
-fn send_with_backpressure<T>(
-    sender: &mpsc::SyncSender<T>,
-    value: T,
-) -> Result<(), mpsc::SendError<T>> {
-    sender.send(value)
+fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
+    match message {
+        ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
+            id: *id,
+            response: ThumbnailResponse::Error(ThumbnailError::new(
+                ThumbnailErrorCode::Busy,
+                "mIV 本体のリモートサムネイル queue が混み合っています",
+            )),
+        },
+        ClientMessage::Home { id, .. } => ServerMessage::Home {
+            id: *id,
+            response: HomeResponse::Error(CollectionError::new(
+                CollectionErrorCode::Busy,
+                "mIV 本体のリモートホーム queue が混み合っています",
+            )),
+        },
+        ClientMessage::Collection { id, .. } => ServerMessage::Collection {
+            id: *id,
+            response: CollectionResponse::Error(CollectionError::new(
+                CollectionErrorCode::Busy,
+                "mIV 本体のリモート集約ビュー queue が混み合っています",
+            )),
+        },
+    }
 }
 
 fn frame_error_kind(error: &mimageviewer_ipc::FrameError) -> &'static str {
@@ -505,19 +588,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_work_queue_waits_instead_of_dropping_the_connection() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        tx.send(1_u8).unwrap();
-        let sender = tx.clone();
-        let (done_tx, done_rx) = mpsc::channel();
-        let waiting = std::thread::spawn(move || {
-            let result = send_with_backpressure(&sender, 2_u8);
-            let _ = done_tx.send(result.is_ok());
-        });
-        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
-        assert_eq!(rx.recv().unwrap(), 1);
-        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
-        assert_eq!(rx.recv().unwrap(), 2);
-        waiting.join().unwrap();
+    fn full_heavy_queue_rejects_immediately_and_home_lane_remains_available() {
+        let (heavy_tx, _heavy_rx) = mpsc::sync_channel(1);
+        heavy_tx.try_send(Work::Stop).unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            heavy_tx.try_send(Work::Stop),
+            Err(mpsc::TrySendError::Full(Work::Stop))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        let (home_tx, home_rx) = mpsc::sync_channel(1);
+        home_tx.try_send(Work::Stop).unwrap();
+        assert!(matches!(home_rx.try_recv(), Ok(Work::Stop)));
+    }
+
+    #[test]
+    fn queue_full_is_an_explicit_retryable_response() {
+        let message = ClientMessage::Thumbnail {
+            id: 42,
+            request: mimageviewer_ipc::ThumbnailRequest {
+                favorite_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+                relative_path: "page.jpg".to_owned(),
+                target_px: 256,
+            },
+        };
+        assert!(matches!(
+            queue_busy_response(&message),
+            ServerMessage::Thumbnail {
+                id: 42,
+                response: ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::Busy,
+                    ..
+                }),
+            }
+        ));
+    }
+
+    #[test]
+    fn remote_workers_leave_capacity_for_local_operations() {
+        assert_eq!(remote_heavy_worker_count(1), 1);
+        assert_eq!(remote_heavy_worker_count(2), 1);
+        assert_eq!(remote_heavy_worker_count(4), 2);
+        assert_eq!(remote_heavy_worker_count(8), 2);
+        assert_eq!(remote_heavy_worker_count(64), 2);
     }
 }

@@ -18,7 +18,10 @@ use auth::{AuthService, AuthToken, load_pin_file, set_pin_file};
 use config::{Config, default_data_dir};
 use connection_url::choose_connection_url;
 use diagnostics::DiagnosticsLogger;
-use http::{AppState, TelemetryLimiter};
+use http::{
+    AppState, HTTP_WORKER_COUNT, IpcAdmission, MAX_CONCURRENT_HEAVY_IPC, MAX_CONCURRENT_IPC,
+    TelemetryLimiter,
+};
 use ipc_client::ThumbnailClient;
 use store::Library;
 use tiny_http::Server;
@@ -83,16 +86,16 @@ fn run() -> Result<(), String> {
         auth,
         library,
         thumbnail_client,
+        ipc_admission: IpcAdmission::new(),
         logger,
         telemetry_limiter: TelemetryLimiter::new(),
         request_sequence: AtomicU64::new(1),
         web_root: config.web_root,
     });
-    let workers = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .clamp(2, 8);
-    println!("HTTP workers: {workers}");
+    let workers = HTTP_WORKER_COUNT;
+    println!(
+        "HTTP workers: {workers} (IPC max: {MAX_CONCURRENT_IPC}, heavy IPC max: {MAX_CONCURRENT_HEAVY_IPC})"
+    );
 
     let mut threads = Vec::with_capacity(workers);
     for index in 0..workers {

@@ -11,6 +11,8 @@ use crate::settings::{FavoriteEntry, Settings};
 
 use super::path_guard::map_existing_to_favorite;
 
+const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
+
 pub(super) struct CollectionEngine {
     settings: Settings,
 }
@@ -241,12 +243,22 @@ impl CollectionEngine {
     }
 
     fn payload(&self, title: &str, candidates: Vec<CandidateEntry>) -> CollectionPayload {
+        let entries = to_remote_entries(&self.settings.favorites, candidates);
+        let (entries, truncated) = bound_remote_entries(entries);
         CollectionPayload {
             title: title.to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
-            entries: to_remote_entries(&self.settings.favorites, candidates),
+            entries,
+            entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
+            truncated,
         }
     }
+}
+
+fn bound_remote_entries(mut entries: Vec<RemoteEntry>) -> (Vec<RemoteEntry>, bool) {
+    let truncated = entries.len() > MAX_REMOTE_COLLECTION_ENTRIES;
+    entries.truncate(MAX_REMOTE_COLLECTION_ENTRIES);
+    (entries, truncated)
 }
 
 fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
@@ -425,5 +437,24 @@ mod tests {
         assert!(!Path::new(&entries[0].relative_path).is_absolute());
         let json = serde_json::to_string(&entries).unwrap();
         assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn aggregate_payload_is_bounded_to_one_thousand_entries() {
+        let entries = (0..=MAX_REMOTE_COLLECTION_ENTRIES)
+            .map(|index| RemoteEntry {
+                favorite_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+                relative_path: format!("entry-{index}"),
+                name: format!("entry-{index}"),
+                kind: RemoteEntryKind::Image,
+                detail: None,
+                progress_current: None,
+                progress_total: None,
+                rating: None,
+            })
+            .collect();
+        let (entries, truncated) = bound_remote_entries(entries);
+        assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
+        assert!(truncated);
     }
 }

@@ -533,12 +533,13 @@ response read / decode error になる。これは mIV ログに write failure �
 502 になること、reload ごとに成功分だけ catalog が温まることと一致する。
 `ERROR_PIPE_BUSY` を含む connect 失敗は 503、worker queue 満杯も明示 503 なので、この 2 つは
 502 の直接原因ではなかった。pipe の `Write::flush` は `FlushFileBuffers` を呼ぶ実装へ直した。
-是正後の protocol v3 は 1 本の長寿命 duplex 接続上で
+是正後の protocol v4 は 1 本の長寿命 duplex 接続上で
 `Thumbnail` / `Home` / `Collection` の各 request / response を共通の request id で多重化する。
 remote-web は pending 要求を id で解決し、接続断では全 pending を失敗させて
 自動再接続する。本体は 4 pipe instance を accept 待ちとして先に用意し、1 本を受け付けた直後に
-補充する。worker queue 満杯時は接続を切らず、queue に空きができるまで受信側を backpressure
-する。診断ログには `ipc_stage` / `ipc_error_kind` / `ipc_os_error` /
+補充する。worker queue 満杯時は接続を切らず、request id に対応する `Busy` を即時応答して
+同じ接続上の後続要求 (特に軽量な Home) の読み取りを止めない。診断ログには
+`ipc_stage` / `ipc_error_kind` / `ipc_os_error` /
 `ipc_retry_count` / `ipc_retry_statuses` / `ipc_connection_id` を残し、次回測定では
 復旧した一時エラーを含めて失敗段階を直接集計できる。
 
@@ -553,7 +554,7 @@ path containment を検証する。通常画像とフォルダ代表は `thumb_l
 `miv_not_running` を返し、フロントは「mIV 本体が起動していません」と画面内に表示する。
 仮想グリッドの tile は binding 世代と相対 path を応答時に照合し、破棄時は fetch を abort する。
 これにより scroll で detach / 再表示された tile に古い in-flight 応答を適用しない。
-ブラウザからのサムネイル HTTP 要求は同時 6 件に制限し、ネットワーク失敗・502・一時的な 503
+ブラウザからのサムネイル HTTP 要求は同時 4 件に制限し、ネットワーク失敗・502・一時的な 503
 だけを 200 / 400 / 800 ms の指数 backoff で最大 3 回再試行する。404 / 422 と protocol 版不一致は
 再試行しない。上限到達時は tile に「再試行上限」を表示する。
 
@@ -567,6 +568,34 @@ Web 独自探索を持たず `thumb_loader::process_load_request` 内の
 
 PoC の目的は「実回線で実用になるか」の確認だったが、**設計前提の誤りを実装が深くなる前に
 発見できた**点が最大の収穫となった。縦串フェーズを IPC から始める根拠でもある。
+
+### 9.5 HTTP worker 枯渇と負荷分離 (2026-07-31)
+
+実機で Home が「お気に入りを読み込んでいます」から進まなくなった。再起動直後の
+`/api/favorites` は 27ms であり、停止の原因は DB ではなかった。HTTP worker 8 本すべてが
+サムネイル IPC 待ちに入り、IPC を使わない要求まで受信後に処理できない worker 枯渇だった。
+本体側では RAW (`.ORF`) 1.7 秒、JPEG 0.8 秒の decode が観測され、remote-web 側の IPC 応答期限も
+120 秒だったため、重い依存先が HTTP server 全体を長時間止め得る構造になっていた。
+
+remote-web の HTTP worker は 12 本とし、非待機型 admission gate で IPC 全体を 6、うち
+サムネイルと集約一覧の重い要求を 4 に制限する。したがって IPC がすべて待機中でも少なくとも
+6 worker は `/api/favorites` / `/api/list` / 認証等へ使え、重い IPC が上限でも Home 用 IPC
+2 枠が残る。上限超過は queue 待ちせず HTTP 503 + `Retry-After: 1` と
+`ipc_status=admission_busy` を返す。ブラウザの thumbnail 再試行がこの応答を処理する。
+
+IPC 応答期限は 10 秒とする。実測の最も遅い単発 RAW decode 1.7 秒に約 6 倍の余裕があり、
+本体側の remote heavy worker 2 本に Web 側の重い要求 4 件が並んでも通常は期限内に収まる一方、
+異常要求が HTTP worker を分単位で保持しない値である。timeout は 503 +
+`Retry-After: 1`、`ipc_status=response_read_timeout` として記録し、同じ HTTP worker 内では
+再試行しない。多重化接続では期限切れ request id を tombstone として保持し、遅着応答だけを
+読み捨てるため、1 件の timeout が他の進行中要求や接続全体を巻き添えにしない。
+
+本体 IPC は Home を専用 queue + 1 worker に分離した。サムネイルと集約評価は別の heavy queue で
+処理し、利用者設定 worker 数の半分かつ最大 2 worker (`clamp(configured/2, 1, 2)`) に制限する。
+remote IPC は UI thread を使わず、ローカル表示用 worker とも別である。CPU / disk の物理競合は
+残るが、remote 由来の decode を最大 2 本に抑え、1 クライアントが利用者設定上限の全 worker を
+追加消費しない。heavy queue 満杯時は pipe connection を切断も block もせず、プロトコル上の
+`Busy` を返す。
 
 ## 10. ホームと読み取り専用の集約ビュー (2026-07-31)
 
@@ -587,6 +616,13 @@ PoC の目的は「実回線で実用になるか」の確認だったが、**�
   `BookmarkViewSort::CreatedAtDesc` を共有する。内部 DB だけ read-only open に切り替える
 - スマートフォルダ: `app::smart_folder` の候補走査、metadata filter、表示順計算をそのまま使う
 - 本棚: `Settings::books_root_path` に対して `books::list_books` を使う
+
+`/api/home` は保存済みスマートフォルダの ID / 名前と `show_location_*` の表示対象だけを
+返し、ファイルシステム走査や各集約ビューの内容取得は行わない。`scan_smart_folder` は利用者が
+該当スマートフォルダを開いて `/api/collection` を要求した時だけ実行する。読書履歴は本体設定
+由来の上限 (最大 1000) を既に持つ。他のレーティング・本棚・ブックマーク・スマートフォルダも
+IPC 応答をお気に入り境界で絞り込んだ後に最大 1000 件へ制限し、`truncated` /
+`entry_limit` を返して Web 画面に打ち切りを表示する。現段階ではページングは実装しない。
 
 IPC の `RemoteEntry` は `favorite_id`、お気に入り root からの `relative_path`、表示名、種別、
 進捗・レーティング等の表示用メタデータだけを持つ。候補の絶対 path は本体内で canonicalize し、

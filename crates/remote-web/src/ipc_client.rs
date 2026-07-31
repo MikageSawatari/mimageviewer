@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,7 +14,9 @@ use mimageviewer_ipc::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 実測 1.7 秒の RAW decode に約 6 倍の余裕を持たせつつ、HTTP worker を
+/// 無期限に保持しない。HTTP 側の入場制限とブラウザ再試行を前提にする。
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u32 = 2;
 
 pub struct ThumbnailClient {
@@ -74,8 +76,13 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Unavailable(_) | Self::Protocol(_))
+    fn should_retry_internally(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+            || matches!(
+                self,
+                Self::Protocol(failure)
+                    if !(failure.stage == "response_read" && failure.kind == "timeout")
+            )
             || matches!(self, Self::Remote(error) if error.code == ThumbnailErrorCode::Busy)
             || matches!(self, Self::CollectionRemote(error) if error.code == CollectionErrorCode::Busy)
     }
@@ -381,7 +388,13 @@ type PendingReply = mpsc::SyncSender<Result<ServerMessage, ProtocolFailure>>;
 
 #[derive(Default)]
 struct PendingRequests {
-    entries: Mutex<HashMap<RequestId, PendingReply>>,
+    state: Mutex<PendingState>,
+}
+
+#[derive(Default)]
+struct PendingState {
+    entries: HashMap<RequestId, PendingReply>,
+    expired: HashSet<RequestId>,
 }
 
 impl PendingRequests {
@@ -391,10 +404,7 @@ impl PendingRequests {
         reply: PendingReply,
         broken: &AtomicBool,
     ) -> Result<(), ProtocolFailure> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if broken.load(Ordering::Acquire) {
             return Err(protocol_failure(
                 "request_write",
@@ -403,29 +413,49 @@ impl PendingRequests {
                 "connection already closed",
             ));
         }
-        entries.insert(id, reply);
+        state.entries.insert(id, reply);
         Ok(())
     }
 
     fn remove(&self, id: RequestId) -> Option<PendingReply> {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .entries
             .remove(&id)
     }
 
+    fn expire(&self, id: RequestId) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.entries.remove(&id).is_some() {
+            state.expired.insert(id);
+        }
+    }
+
     fn resolve(&self, id: RequestId, response: ServerMessage) -> bool {
-        self.remove(id)
-            .is_some_and(|reply| reply.send(Ok(response)).is_ok())
+        let reply = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let reply = state.entries.remove(&id);
+            if reply.is_none() && state.expired.remove(&id) {
+                return true;
+            }
+            reply
+        };
+        if let Some(reply) = reply {
+            return reply.send(Ok(response)).is_ok();
+        }
+        false
     }
 
     fn fail_all(&self, failure: ProtocolFailure) {
         let pending = {
-            let mut entries = self
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.expired.clear();
+            state
                 .entries
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            entries.drain().map(|(_, reply)| reply).collect::<Vec<_>>()
+                .drain()
+                .map(|(_, reply)| reply)
+                .collect::<Vec<_>>()
         };
         for reply in pending {
             let _ = reply.send(Err(failure.clone()));
@@ -492,14 +522,9 @@ impl Connection {
         match reply_rx.recv_timeout(RESPONSE_TIMEOUT) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending.remove(id);
-                let failure = protocol_failure(
-                    "response_read",
-                    "timeout",
-                    None,
-                    "thumbnail response timed out",
-                );
-                self.fail(failure.clone(), true);
+                self.pending.expire(id);
+                let failure =
+                    protocol_failure("response_read", "timeout", None, "IPC response timed out");
                 Err(failure)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(protocol_failure(
@@ -574,7 +599,7 @@ fn run_with_retry<T>(
                     retry_statuses,
                 });
             }
-            Err(error) if error.is_transient() && retry_count < MAX_RETRIES => {
+            Err(error) if error.should_retry_internally() && retry_count < MAX_RETRIES => {
                 retry_statuses.push(error.ipc_status());
                 std::thread::sleep(retry_delay(retry_count));
                 retry_count += 1;
@@ -861,6 +886,70 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn response_timeout_is_returned_to_http_without_internal_retry() {
+        let mut calls = 0;
+        let result = run_with_retry(|| {
+            calls += 1;
+            Err::<(), _>(ClientError::Protocol(protocol_failure(
+                "response_read",
+                "timeout",
+                None,
+                "deadline",
+            )))
+        });
+        assert!(matches!(
+            result,
+            Err(RetryFailure {
+                error: ClientError::Protocol(ProtocolFailure {
+                    stage: "response_read",
+                    kind: "timeout",
+                    ..
+                }),
+                retry_count: 0,
+                ..
+            })
+        ));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn late_response_for_an_expired_request_is_ignored_without_breaking_routing() {
+        let pending = PendingRequests::default();
+        let broken = AtomicBool::new(false);
+        let (expired_tx, _expired_rx) = mpsc::sync_channel(1);
+        pending.register(10, expired_tx, &broken).unwrap();
+        pending.expire(10);
+        assert!(pending.resolve(
+            10,
+            ServerMessage::Thumbnail {
+                id: 10,
+                response: ThumbnailResponse::Success {
+                    webp_bytes: vec![1],
+                },
+            }
+        ));
+
+        let (current_tx, current_rx) = mpsc::sync_channel(1);
+        pending.register(20, current_tx, &broken).unwrap();
+        assert!(pending.resolve(
+            20,
+            ServerMessage::Thumbnail {
+                id: 20,
+                response: ThumbnailResponse::Success {
+                    webp_bytes: vec![2],
+                },
+            }
+        ));
+        assert!(matches!(
+            current_rx.recv().unwrap(),
+            Ok(ServerMessage::Thumbnail {
+                response: ThumbnailResponse::Success { webp_bytes },
+                ..
+            }) if webp_bytes == vec![2]
+        ));
     }
 
     #[cfg(windows)]

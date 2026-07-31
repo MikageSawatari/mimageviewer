@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,15 +23,135 @@ const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
+pub const HTTP_WORKER_COUNT: usize = 12;
+pub const MAX_CONCURRENT_IPC: usize = 6;
+pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
+const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 
 pub struct AppState {
     pub auth: AuthService,
     pub library: Library,
     pub thumbnail_client: ThumbnailClient,
+    pub ipc_admission: IpcAdmission,
     pub logger: DiagnosticsLogger,
     pub telemetry_limiter: TelemetryLimiter,
     pub request_sequence: AtomicU64,
     pub web_root: PathBuf,
+}
+
+pub struct IpcAdmission {
+    all: TrySemaphore,
+    heavy: TrySemaphore,
+}
+
+#[derive(Clone, Copy)]
+enum IpcClass {
+    Home,
+    Heavy,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdmissionBusy {
+    all_in_flight: usize,
+    all_limit: usize,
+    heavy_in_flight: usize,
+    heavy_limit: usize,
+}
+
+struct TrySemaphore {
+    in_flight: AtomicUsize,
+    limit: usize,
+}
+
+struct TryPermit<'a> {
+    semaphore: &'a TrySemaphore,
+}
+
+struct IpcPermit<'a> {
+    _all: TryPermit<'a>,
+    _heavy: Option<TryPermit<'a>>,
+}
+
+impl IpcAdmission {
+    pub fn new() -> Self {
+        assert!(MAX_CONCURRENT_HEAVY_IPC < MAX_CONCURRENT_IPC);
+        assert!(MAX_CONCURRENT_IPC < HTTP_WORKER_COUNT);
+        Self {
+            all: TrySemaphore::new(MAX_CONCURRENT_IPC),
+            heavy: TrySemaphore::new(MAX_CONCURRENT_HEAVY_IPC),
+        }
+    }
+
+    fn try_enter(&self, class: IpcClass) -> Result<IpcPermit<'_>, AdmissionBusy> {
+        let all = self.all.try_acquire().ok_or_else(|| self.busy())?;
+        let heavy = if matches!(class, IpcClass::Heavy) {
+            match self.heavy.try_acquire() {
+                Some(permit) => Some(permit),
+                None => {
+                    drop(all);
+                    return Err(self.busy());
+                }
+            }
+        } else {
+            None
+        };
+        Ok(IpcPermit {
+            _all: all,
+            _heavy: heavy,
+        })
+    }
+
+    fn run<T>(&self, class: IpcClass, operation: impl FnOnce() -> T) -> Result<T, AdmissionBusy> {
+        let _permit = self.try_enter(class)?;
+        Ok(operation())
+    }
+
+    fn busy(&self) -> AdmissionBusy {
+        AdmissionBusy {
+            all_in_flight: self.all.in_flight(),
+            all_limit: self.all.limit,
+            heavy_in_flight: self.heavy.in_flight(),
+            heavy_limit: self.heavy.limit,
+        }
+    }
+}
+
+impl TrySemaphore {
+    fn new(limit: usize) -> Self {
+        assert!(limit > 0);
+        Self {
+            in_flight: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<TryPermit<'_>> {
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= self.limit {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(TryPermit { semaphore: self }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for TryPermit<'_> {
+    fn drop(&mut self) {
+        self.semaphore.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub struct TelemetryLimiter {
@@ -334,7 +454,14 @@ fn api_favorites(state: &AppState) -> HttpResponse {
 
 fn api_home(state: &AppState) -> HttpResponse {
     let started = Instant::now();
-    match state.thumbnail_client.home() {
+    let result = match state
+        .ipc_admission
+        .run(IpcClass::Home, || state.thumbnail_client.home())
+    {
+        Ok(result) => result,
+        Err(busy) => return collection_admission_busy_response(busy, "home"),
+    };
+    match result {
         Ok(result) => HttpResponse::json(&result.value)
             .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
             .with_header("Cache-Control", "no-store")
@@ -380,7 +507,14 @@ fn api_collection(state: &AppState, query: &[(String, String)]) -> HttpResponse 
         _ => return HttpResponse::text(400, "Bad Request"),
     };
     let started = Instant::now();
-    match state.thumbnail_client.collection(kind) {
+    let result = match state
+        .ipc_admission
+        .run(IpcClass::Heavy, || state.thumbnail_client.collection(kind))
+    {
+        Ok(result) => result,
+        Err(busy) => return collection_admission_busy_response(busy, kind_name),
+    };
+    match result {
         Ok(mut result) => {
             state
                 .library
@@ -405,6 +539,34 @@ fn api_collection(state: &AppState, query: &[(String, String)]) -> HttpResponse 
     }
 }
 
+fn collection_admission_busy_response(busy: AdmissionBusy, kind: &str) -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": "ipc_busy",
+            "message": "mIV 本体への要求が混み合っています。しばらく待って再試行してください。",
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "collection": {
+            "kind": kind,
+            "ipc_status": "admission_busy",
+            "ipc_ms": 0,
+            "ipc_retry_count": 0,
+            "ipc_retry_statuses": [],
+            "ipc_all_in_flight": busy.all_in_flight,
+            "ipc_all_limit": busy.all_limit,
+            "ipc_heavy_in_flight": busy.heavy_in_flight,
+            "ipc_heavy_limit": busy.heavy_limit,
+            "entry_count": 0,
+        }
+    }))
+}
+
 fn collection_ipc_error_response(
     failure: crate::ipc_client::ClientFailure,
     elapsed: Duration,
@@ -419,6 +581,10 @@ fn collection_ipc_error_response(
         .error
         .protocol_failure()
         .map(|detail| detail.kind.to_owned());
+    let timed_out = failure
+        .error
+        .protocol_failure()
+        .is_some_and(|detail| detail.kind == "timeout");
     let (status, code, message) = match failure.error {
         IpcClientError::Unavailable(_) => (
             503,
@@ -431,6 +597,11 @@ fn collection_ipc_error_response(
             format!(
                 "mIV 本体と remote-web の IPC 版が一致しません (remote-web={client}, mIV={server})。"
             ),
+        ),
+        IpcClientError::Protocol(detail) if detail.kind == "timeout" => (
+            503,
+            "ipc_timeout",
+            "mIV 本体の応答が時間内に完了しませんでした。再試行してください。".to_owned(),
         ),
         IpcClientError::Protocol(_) => (
             502,
@@ -448,13 +619,16 @@ fn collection_ipc_error_response(
         }
         IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
     };
-    HttpResponse::bytes(
+    let mut response = HttpResponse::bytes(
         status,
         "application/json; charset=utf-8",
         serde_json::to_vec(&json!({"error": code, "message": message})).unwrap_or_default(),
     )
-    .with_header("Cache-Control", "no-store")
-    .with_log_details(json!({
+    .with_header("Cache-Control", "no-store");
+    if timed_out {
+        response = response.with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string());
+    }
+    response.with_log_details(json!({
         "collection": {
             "kind": kind,
             "ipc_status": ipc_status,
@@ -500,10 +674,15 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
     let started = Instant::now();
-    match state
-        .thumbnail_client
-        .thumbnail(&favorite.to_string(), path, target_px)
-    {
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state
+            .thumbnail_client
+            .thumbnail(&favorite.to_string(), path, target_px)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return thumbnail_admission_busy_response(busy, target_px),
+    };
+    match result {
         Ok(result) => {
             let ipc_ms = crate::diagnostics::duration_ms(started.elapsed());
             let blob_bytes = result.bytes.len();
@@ -532,6 +711,35 @@ fn api_thumb(state: &AppState, query: &[(String, String)]) -> HttpResponse {
     }
 }
 
+fn thumbnail_admission_busy_response(busy: AdmissionBusy, target_px: u32) -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": "ipc_busy",
+            "message": "サムネイル生成が混み合っています。自動的に再試行します。",
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "thumb": {
+            "cache_tier": "miv_ipc",
+            "ipc_status": "admission_busy",
+            "ipc_ms": 0,
+            "ipc_retry_count": 0,
+            "ipc_retry_statuses": [],
+            "ipc_all_in_flight": busy.all_in_flight,
+            "ipc_all_limit": busy.all_limit,
+            "ipc_heavy_in_flight": busy.heavy_in_flight,
+            "ipc_heavy_limit": busy.heavy_limit,
+            "target_px": target_px,
+            "blob_bytes": 0,
+        }
+    }))
+}
+
 fn ipc_error_response(
     error: IpcClientError,
     retry_count: u32,
@@ -552,6 +760,9 @@ fn ipc_error_response(
     let protocol_os_error = error
         .protocol_failure()
         .and_then(|failure| failure.os_error);
+    let timed_out = error
+        .protocol_failure()
+        .is_some_and(|failure| failure.kind == "timeout");
     let (status, code, message) = match error {
         IpcClientError::Unavailable(_) => (
             503,
@@ -564,6 +775,11 @@ fn ipc_error_response(
             format!(
                 "mIV 本体と remote-web の IPC 版が一致しません (remote-web={client}, mIV={server})。"
             ),
+        ),
+        IpcClientError::Protocol(detail) if detail.kind == "timeout" => (
+            503,
+            "ipc_timeout",
+            "mIV 本体の応答が時間内に完了しませんでした。自動的に再試行します。".to_owned(),
         ),
         IpcClientError::Protocol(detail) => {
             eprintln!(
@@ -593,22 +809,25 @@ fn ipc_error_response(
     };
     let body = serde_json::to_vec(&json!({"error": code, "message": message}))
         .unwrap_or_else(|_| b"{\"error\":\"ipc_error\"}".to_vec());
-    HttpResponse::bytes(status, "application/json; charset=utf-8", body)
-        .with_header("Cache-Control", "no-store")
-        .with_log_details(json!({
-            "thumb": {
-                "cache_tier": "miv_ipc",
-                "ipc_status": ipc_status,
-                "ipc_ms": ipc_ms,
-                "ipc_retry_count": retry_count,
-                "ipc_retry_statuses": retry_statuses,
-                "ipc_stage": protocol_stage,
-                "ipc_error_kind": protocol_error_kind,
-                "ipc_os_error": protocol_os_error,
-                "target_px": target_px,
-                "blob_bytes": 0,
-            }
-        }))
+    let mut response = HttpResponse::bytes(status, "application/json; charset=utf-8", body)
+        .with_header("Cache-Control", "no-store");
+    if timed_out {
+        response = response.with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string());
+    }
+    response.with_log_details(json!({
+        "thumb": {
+            "cache_tier": "miv_ipc",
+            "ipc_status": ipc_status,
+            "ipc_ms": ipc_ms,
+            "ipc_retry_count": retry_count,
+            "ipc_retry_statuses": retry_statuses,
+            "ipc_stage": protocol_stage,
+            "ipc_error_kind": protocol_error_kind,
+            "ipc_os_error": protocol_os_error,
+            "target_px": target_px,
+            "blob_bytes": 0,
+        }
+    }))
 }
 
 fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse {
@@ -894,6 +1113,7 @@ mod tests {
             auth,
             library: Library::empty_for_test(temp.path().join("cache")),
             thumbnail_client: ThumbnailClient::new(),
+            ipc_admission: IpcAdmission::new(),
             logger: DiagnosticsLogger::open(
                 &temp.path().join("request.jsonl"),
                 &[protected],
@@ -994,6 +1214,127 @@ mod tests {
         assert_eq!(details["thumb"]["ipc_stage"], "connect");
         assert_eq!(details["thumb"]["ipc_error_kind"], "not_found");
         assert_eq!(details["thumb"]["target_px"], 256);
+    }
+
+    #[test]
+    fn saturated_ipc_does_not_block_an_ipc_free_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(test_state(&temp));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut blocked = Vec::new();
+        for index in 0..MAX_CONCURRENT_IPC {
+            let state = Arc::clone(&state);
+            let release = Arc::clone(&release);
+            let ready_tx = ready_tx.clone();
+            blocked.push(std::thread::spawn(move || {
+                let class = if index < MAX_CONCURRENT_HEAVY_IPC {
+                    IpcClass::Heavy
+                } else {
+                    IpcClass::Home
+                };
+                state
+                    .ipc_admission
+                    .run(class, || {
+                        ready_tx.send(()).unwrap();
+                        let (lock, ready) = &*release;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = ready.wait(released).unwrap();
+                        }
+                    })
+                    .unwrap();
+            }));
+        }
+        for _ in 0..MAX_CONCURRENT_IPC {
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/api/favorites")
+            .with_header(cookie_header(&state))
+            .into();
+        let started = Instant::now();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 200);
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        for thread in blocked {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn excess_thumbnail_ipc_is_rejected_immediately_as_retryable() {
+        let admission = IpcAdmission::new();
+        let permits = (0..MAX_CONCURRENT_HEAVY_IPC)
+            .map(|_| admission.try_enter(IpcClass::Heavy).unwrap())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let busy = match admission.try_enter(IpcClass::Heavy) {
+            Ok(_) => panic!("heavy IPC admission unexpectedly succeeded"),
+            Err(busy) => busy,
+        };
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let response = thumbnail_admission_busy_response(busy, 256);
+        assert_eq!(response.status, 503);
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| *name == "Retry-After" && value == "1")
+        );
+        assert_eq!(
+            response.log_details.unwrap()["thumb"]["ipc_status"],
+            "admission_busy"
+        );
+        drop(permits);
+    }
+
+    #[test]
+    fn ipc_timeout_is_retryable_and_releases_the_admission_slot() {
+        let admission = IpcAdmission::new();
+        let result = admission.run(IpcClass::Heavy, || {
+            Err::<(), _>(IpcClientError::Protocol(
+                crate::ipc_client::ProtocolFailure::new(
+                    "response_read",
+                    "timeout",
+                    None,
+                    "test timeout",
+                ),
+            ))
+        });
+        assert!(matches!(result, Ok(Err(IpcClientError::Protocol(_)))));
+        let permit = admission.try_enter(IpcClass::Heavy).unwrap();
+        drop(permit);
+
+        let response = ipc_error_response(
+            IpcClientError::Protocol(crate::ipc_client::ProtocolFailure::new(
+                "response_read",
+                "timeout",
+                None,
+                "test timeout",
+            )),
+            0,
+            Vec::new(),
+            Duration::from_secs(10),
+            256,
+        );
+        assert_eq!(response.status, 503);
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| *name == "Retry-After" && value == "1")
+        );
+        assert_eq!(
+            response.log_details.unwrap()["thumb"]["ipc_status"],
+            "response_read_timeout"
+        );
     }
 
     #[test]

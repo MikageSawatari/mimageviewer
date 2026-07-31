@@ -19,7 +19,7 @@ import {
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const TELEMETRY_ENABLED = true;
-const THUMBNAIL_MAX_CONCURRENCY = 6;
+const THUMBNAIL_MAX_CONCURRENCY = 4;
 
 class AuthenticationRequiredError extends Error {}
 
@@ -806,6 +806,8 @@ async function showCollection(route) {
     kind: route.collectionKind,
     value: route.value,
     title: data.title ?? "一覧",
+    truncated: Boolean(data.truncated),
+    entryLimit: Number(data.entry_limit) || 0,
   };
   state.gridReturnHash =
     route.collectionKind === "smart" ? homeHash("smart") : homeHash("places");
@@ -901,11 +903,19 @@ function renderFolder() {
   const thumbnailNotice = textElement("p", "", "thumbnail-service-notice");
   thumbnailNotice.hidden = true;
   state.thumbnailNotice = thumbnailNotice;
+  const collectionLimitNotice = textElement(
+    "p",
+    state.collection?.truncated
+      ? `件数が多いため先頭 ${state.collection.entryLimit} 件を表示しています。`
+      : "",
+    "thumbnail-service-notice"
+  );
+  collectionLimitNotice.hidden = !state.collection?.truncated;
   const space = element("div", "virtual-space");
   const windowElement = element("div", "virtual-window");
   space.append(windowElement);
   scroll.append(space);
-  screen.append(topbar, thumbnailNotice, scroll);
+  screen.append(topbar, collectionLimitNotice, thumbnailNotice, scroll);
   screen.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     dispatchCommand(command(CommandName.TOGGLE_MENU), {
@@ -1426,7 +1436,12 @@ async function fetchThumbnailWithRetry(url, signal) {
       retry_count: retryCount + 1,
     });
     response.body?.cancel().catch(() => {});
-    await abortableDelay(decision.delayMs, signal);
+    const retryAfterSeconds = Number(response.headers.get("Retry-After"));
+    const retryAfterMs =
+      Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+        ? Math.min(10000, retryAfterSeconds * 1000)
+        : 0;
+    await abortableDelay(Math.max(decision.delayMs, retryAfterMs), signal);
     retryCount += 1;
   }
 }

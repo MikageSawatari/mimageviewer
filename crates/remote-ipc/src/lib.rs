@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -134,6 +134,9 @@ pub struct CollectionPayload {
     pub title: String,
     pub thumb_aspect_height_ratio: f64,
     pub entries: Vec<RemoteEntry>,
+    /// 応答サイズと初回 thumbnail burst を抑える読み取り専用上限。
+    pub entry_limit: usize,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -351,6 +354,8 @@ mod tests {
             response: CollectionResponse::Success(CollectionPayload {
                 title: "最近読んだ本".to_owned(),
                 thumb_aspect_height_ratio: 1.0,
+                entry_limit: 1000,
+                truncated: false,
                 entries: vec![RemoteEntry {
                     favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
                     relative_path: "books/volume-1".to_owned(),
