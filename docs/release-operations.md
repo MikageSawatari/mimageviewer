@@ -117,6 +117,29 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
 - **落とし穴**: SimplySign の**セッション認証が切れていると、証明書ストアに証明書が見えて
   いても (`Assert-MivSignReady` は通っても) `signtool sign` が「No certificates were found」で
   落ちる**。→ **ビルド前に捨て PE へ試し署名して鍵の利用可否を確認**してから本ビルドに入る。
+
+  ```powershell
+  . (Join-Path (Resolve-Path 'scripts').Path 'sign-files.ps1')
+  Assert-MivSignReady
+  $tmp = Join-Path $env:TEMP 'miv-sign-probe.exe'
+  Copy-Item 'vendor\susie-worker\mimageviewer-susie32.exe' $tmp -Force
+  Invoke-MivSign -Files @($tmp) -Verify
+  Remove-Item $tmp -Force
+  ```
+
+- **落とし穴 2: `SCardSvr` と SimplySign の鶏卵問題** (v2.9.1 で 30 分溶かした)。症状は
+  「No certificates」ではなく **`SignTool Error: The specified CSP could not be found.`**。
+  証明書は前セッションのぶんがストアに残るので `Assert-MivSignReady` は通ってしまう。
+  - 原因: SimplySign の仮想リーダーは**ユーザーモードで `SCardSvr` に登録する**方式だが、
+    `SCardSvr` の起動トリガーは「**物理**リーダーの DEVICE INTERFACE ARRIVAL」しかない。
+    サービスが止まっていると登録できず、登録が無いのでサービスも起動しない。しかも
+    `SCardSvr` はリーダー 0 件だと数分で自動停止するため、先に手動起動しても間に合わない。
+  - **順序が重要**: ① 管理者 PowerShell で `Start-Service SCardSvr` → ② `Running` を確認したら
+    **続けてすぐ** SimplySign Desktop を起動し直してログイン。仮想カードが登録されると
+    サービスも起動したままになる。
+  - 準備完了の判定はトレイ通知「SimplySign connected / Amount of cards available: 1」、
+    または `certutil -scinfo` に Reader Name が出ること。
+  - 毎回避けたければ `Set-Service SCardSvr -StartupType Automatic` (管理者)。
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
   vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL) → core → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
