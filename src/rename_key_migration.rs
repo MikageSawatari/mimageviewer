@@ -3,7 +3,7 @@
 //! アプリ内リネーム (`ui_dialogs/rename_item.rs`) の成功後に、旧 path をキーにした
 //! ユーザーデータ (★ / タグ / 回転 / 補正 / マスク / 隠蔽 / ローカル調整 / テキスト注釈 /
 //! 出力範囲 / 動画ピン / 動画・音楽ブックマーク / 本ページブックマーク / 代表サムネピン / 本 resume / 見開き /
-//! 読書履歴 / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
+//! 読書履歴 / 編集プレビュー / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
 //! (docs/next-release-backlog.md §1.8 の段階 1+2、review-v2.3.0 角度④ (C))。
 //!
 //! 方式は [`crate::zip_key_migration`] と同じ:
@@ -26,8 +26,10 @@
 //! - **代表サムネピンの親フォルダ側 `source_rel`**: 親ピンが改名した子を container 相対
 //!   パスで指しているケース。大文字小文字を保った照合が SQL では難しく、壊れても
 //!   自動サムネへのフォールバック + 1 操作で付け直せるため見送り。
-//! - **サムネイルカタログ / 検索索引 / 変換アーカイブ対応表など rebuildable なキャッシュ**:
-//!   再生成に任せる (フォルダ改名直後はサムネが再生成される)。
+//! - **通常のサムネイルカタログ / 検索索引 / 変換アーカイブ対応表など rebuildable なキャッシュ**:
+//!   再生成に任せる (フォルダ改名直後はサムネが再生成される)。通常サムネイルは mtime / size
+//!   を含む catalog identity なので移行しない。一方、フルスクリーン編集経路だけが生成できる
+//!   `edit_preview_cache.db/edit_previews.item_key` は再生成可能な通常キャッシュではないため移行する。
 //! - **エクスプローラー等アプリ外でのリネーム**: このモジュールはアプリ内リネームの
 //!   成功ハンドラからしか呼ばれない (外部リネームの検知は将来課題)。
 
@@ -193,6 +195,13 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "export_crop.db",
         "export_crop_pages",
         "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "edit_preview_cache.db",
+        "edit_previews",
+        "item_key",
         true,
         StoreKeyNormalization::KeepDrive,
     ),
@@ -1565,6 +1574,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unrelated, 1, "% をワイルドカード扱いしない (substr 等値)");
+    }
+
+    /// 永続 edit preview は通常 catalog と別の page-key 行だけを移す。exact / folder prefix /
+    /// archive entry の 3 面、新キー優先、再実行時の冪等性を同時に固定する。
+    #[test]
+    fn migrates_edit_preview_keys_without_touching_adjacent_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"D:\Comics\Old");
+        let new = PathBuf::from(r"D:\Comics\New");
+        let old_k = crate::adjustment_db::normalize_path(&old);
+        let new_k = crate::adjustment_db::normalize_path(&new);
+        {
+            let conn = open(dir.path(), "edit_preview_cache.db");
+            conn.execute_batch(
+                "CREATE TABLE edit_previews (
+                    item_key TEXT PRIMARY KEY,
+                    cached_path TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+            for (key, cached_path) in [
+                (old_k.clone(), "exact-old"),
+                (format!("{old_k}/sub/page.jpg"), "prefix-old"),
+                (format!("{old_k}::pages/p1.jpg"), "archive-old"),
+                (format!("{old_k}::pages/p2.jpg"), "archive-old-2"),
+                (format!("{new_k}::pages/p1.jpg"), "archive-new"),
+                (format!("{old_k}2/keep.jpg"), "adjacent"),
+            ] {
+                conn.execute(
+                    "INSERT INTO edit_previews (item_key, cached_path) VALUES (?1, ?2)",
+                    rusqlite::params![key, cached_path],
+                )
+                .unwrap();
+            }
+        }
+
+        let report = run_at(dir.path(), &old, &new);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.rows, 3,
+            "exact / folder prefix / archive prefix の更新行を report に加算する"
+        );
+
+        let conn = open(dir.path(), "edit_preview_cache.db");
+        for (key, expected_path) in [
+            (new_k.clone(), "exact-old"),
+            (format!("{new_k}/sub/page.jpg"), "prefix-old"),
+            (format!("{new_k}::pages/p1.jpg"), "archive-new"),
+            (format!("{new_k}::pages/p2.jpg"), "archive-old-2"),
+            (format!("{old_k}2/keep.jpg"), "adjacent"),
+        ] {
+            let cached_path: String = conn
+                .query_row(
+                    "SELECT cached_path FROM edit_previews WHERE item_key = ?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cached_path, expected_path, "{key}");
+        }
+        let old_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edit_previews
+                 WHERE item_key = ?1
+                    OR substr(item_key, 1, ?2) = ?3
+                    OR substr(item_key, 1, ?4) = ?5",
+                rusqlite::params![
+                    old_k,
+                    format!("{old_k}/").chars().count() as i64,
+                    format!("{old_k}/"),
+                    format!("{old_k}::").chars().count() as i64,
+                    format!("{old_k}::"),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_rows, 0, "旧 exact / prefix / archive 行を残さない");
+
+        drop(conn);
+        let again = run_at(dir.path(), &old, &new);
+        assert_eq!(again.rows, 0, "ジャーナル再実行相当は no-op");
+        assert!(again.errors.is_empty());
     }
 
     /// 読書履歴は exact のみ: key と raw path が新 path へ更新される。

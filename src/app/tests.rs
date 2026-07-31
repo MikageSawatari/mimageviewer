@@ -24215,6 +24215,26 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    #[test]
+    fn pending_same_key_final_effect_skips_the_repeated_cpu_build() {
+        assert!(
+            should_return_cached_final_composite(false, true, false, true),
+            "AI ready + same-key final-effect pending must reuse the incomplete texture"
+        );
+        assert!(
+            !should_return_cached_final_composite(false, true, false, false),
+            "a missing or different-key job must continue into the CPU build path"
+        );
+        assert!(
+            !should_return_cached_final_composite(false, false, true, true),
+            "AI failure must still reach the complete=true promotion path"
+        );
+        assert!(
+            should_return_cached_final_composite(false, false, false, false),
+            "the existing AI-wait provisional cache behavior remains unchanged"
+        );
+    }
+
     /// Codex P2 第 2 ラウンド: 最初の ensure 呼び出しの**中**で AI が起動できない
     /// (同フレームで failed 直接 insert / runtime 初期化失敗・モデル不在で何も
     /// 立てずに return) 場合も、stuck な incomplete entry を残さないこと。
@@ -32421,6 +32441,42 @@ mod still_window_mode_key_tests {
                 .any(|k| k.starts_with(&format!("{old_k}/"))),
             "旧キーは残らない"
         );
+    }
+
+    #[test]
+    fn rename_migration_completion_reloads_only_matching_edit_preview_thumbnails() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old = std::path::Path::new(r"D:\Comics\old.zip");
+        let new = std::path::Path::new(r"D:\Comics\new.zip");
+        let new_k = crate::adjustment_db::normalize_path(new);
+        let target = push_image(&mut app, "D:/Comics/target.jpg");
+        let unrelated = push_image(&mut app, "D:/Comics/unrelated.jpg");
+        let loaded = |name: &str| ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                name,
+                egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
+                egui::TextureOptions::LINEAR,
+            ),
+            from_cache: true,
+            from_edit_preview: false,
+            rendered_at_px: 1,
+            source_dims: Some((1, 1)),
+        };
+        app.thumbnails[target] = loaded("rename_preview_target");
+        app.thumbnails[unrelated] = loaded("rename_preview_unrelated");
+        app.thumb_edit_preview_keys
+            .insert(target, format!("{new_k}::pages/p1.jpg"));
+        app.thumb_edit_preview_keys
+            .insert(unrelated, "d:/comics/new.zip2::pages/p1.jpg".to_string());
+
+        app.refresh_edit_preview_thumbnails_after_rename(old, new);
+
+        assert!(matches!(app.thumbnails[target], ThumbnailState::Evicted));
+        assert!(matches!(
+            app.thumbnails[unrelated],
+            ThumbnailState::Loaded { .. }
+        ));
     }
 
     #[test]

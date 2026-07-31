@@ -5852,6 +5852,20 @@ pub(crate) struct FinalCompositeEntry {
     pub(crate) complete: bool,
 }
 
+/// 既存 final composite を返して、このフレームの同期 CPU 合成を省略できるか。
+///
+/// final-effect worker 待ちは AI 結果到着後だけを対象にする。AI 失敗時や AI 未起動時まで
+/// pending を理由に抜けると、complete 昇格・PDF rerender・`maybe_start_final_ai` の各経路を
+/// 遅延させるため、それらは従来どおり呼び出し側の state transition へ流す。
+fn should_return_cached_final_composite(
+    entry_complete: bool,
+    ai_ready: bool,
+    ai_failed: bool,
+    same_key_final_effect_pending: bool,
+) -> bool {
+    entry_complete || (!ai_ready && !ai_failed) || (ai_ready && same_key_final_effect_pending)
+}
+
 /// 連結読みで表示済みのページを、同ページの新しい final composite が完成するまで
 /// 保持する表示専用状態。idx と texture だけを別々に持つと一覧差し替え後の同じ idx に
 /// 誤適用できるため、所有する items 世代と一体で管理する。
@@ -25545,7 +25559,9 @@ impl App {
     /// (Sol rename-mig P2)。worker が空になるまで移行開始を遅らせれば、残ジョブが先に
     /// 旧キーへ着地し、その後の移行がまとめて新キーへ運ぶので順序が正しくなる。
     ///
-    /// タグ側は `is_busy()` ではなく **`has_unconsumed_batch()`** を使う: is_busy は
+    /// 編集 preview も save/delete worker の FIFO が空になるまで待ち、移行後に旧 key 行が
+    /// 復活しないようにする。タグ側は `is_busy()` ではなく
+    /// **`has_unconsumed_batch()`** を使う: is_busy は
     /// worker の DB 書込完了で false になるが、UI 側の結果消費 (`poll_tag_write_results` の
     /// sidecar ミラー書込) はさらに後のフレーム後半に走るため、is_busy だけだと移行開始後に
     /// 旧 path のサイドカーが書き直される (Sol rename-mig R2 P2)。
@@ -25562,7 +25578,14 @@ impl App {
             .rating_write_handle
             .as_ref()
             .is_some_and(|h| h.is_busy());
-        tag_busy || rating_busy || !self.book_bookmark_pending_requests.is_empty()
+        let edit_preview_busy = self
+            .edit_preview_cache
+            .as_ref()
+            .is_some_and(|cache| cache.has_pending_commands());
+        tag_busy
+            || rating_busy
+            || edit_preview_busy
+            || !self.book_bookmark_pending_requests.is_empty()
     }
 
     /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
@@ -25694,6 +25717,11 @@ impl App {
                     self.rating_cache.clear();
                     self.invalidate_rating_counts_cache();
                     self.clear_tags_cache();
+                    // rename 直後の folder reload が DB migration より先に完了すると、
+                    // 新 key で preview miss した raw thumbnail が Loaded のまま残る。
+                    // 移行対象の preview identity を持つセルだけ Evicted に戻し、移行済み
+                    // edit_previews 行を通常 worker 経路で読み直す。
+                    self.refresh_edit_preview_thumbnails_after_rename(&job.old_path, &job.new_path);
                     // idx キーのページ編集 state は「リネームに関係する文脈」だけ再構築する。
                     // 旧実装の全文脈 clear_page_edit_state は、無関係な画像の編集中ドラッグ値
                     // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
@@ -25831,6 +25859,28 @@ impl App {
         self.rating_cache.clear();
         self.current_folder_rating_cache = None;
         self.clear_tags_cache();
+    }
+
+    /// rename DB migration より先に raw thumbnail が着地した場合の対象限定 refresh。
+    ///
+    /// `thumb_edit_preview_keys` は直接ページだけでなく、編集 preview を継承する手動 pin
+    /// 親セルの canonical page key も保持する。exact / folder prefix / archive entry の
+    /// 3 面で旧・新どちらかに属するセルだけを再要求し、通常 catalog 行は触らない。
+    fn refresh_edit_preview_thumbnails_after_rename(
+        &mut self,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) {
+        let matches_key =
+            removed_path_key_matcher(&[old_path.to_path_buf(), new_path.to_path_buf()]);
+        let affected = self
+            .thumb_edit_preview_keys
+            .iter()
+            .filter_map(|(&idx, key)| matches_key(key).then_some(idx))
+            .collect::<Vec<_>>();
+        for idx in affected {
+            self.evict_thumbnail_for_edit_preview_refresh(idx);
+        }
     }
 
     /// リネームに合わせて、編集済みバッジ用の presence set (起動時に全 DB キーを読み込む
@@ -53922,7 +53972,13 @@ impl App {
         // に流す。
         let ai_failed = ai_key.is_some_and(|key| self.final_ai_failed.contains(&key));
         if let Some(entry) = self.final_composite_cache.get(&final_key) {
-            if entry.complete || (ai_ready.is_none() && !ai_failed) {
+            let same_key_final_effect_pending = self.final_effect_pending.contains_key(&final_key);
+            if should_return_cached_final_composite(
+                entry.complete,
+                ai_ready.is_some(),
+                ai_failed,
+                same_key_final_effect_pending,
+            ) {
                 return Some(entry.texture.clone());
             }
         }
