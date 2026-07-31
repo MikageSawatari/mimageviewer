@@ -313,6 +313,7 @@ impl App {
                     .is_some_and(|target| target.matches_loaded_container(&src))
             })
             .cloned();
+        self.authorize_smart_folder_session_alias(&src, &cached_zip);
         self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
         // 変わらない (load_zip_as_folder が current_folder = cache_zip を同期セットする前に
@@ -849,6 +850,9 @@ impl App {
                 let open_owner = completion
                     .open_owner()
                     .expect("pending cache navigation must have an open policy");
+                if let Some(source) = src.as_deref() {
+                    self.authorize_smart_folder_session_alias(source, &nav);
+                }
                 self.load_folder_with_scan_owned(nav.clone(), None, open_owner);
                 // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
                 // current_folder は変わらない。その場合は override / address / recent を

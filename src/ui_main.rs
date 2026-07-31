@@ -11811,6 +11811,7 @@ impl App {
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
                     self.record_rating_view_nav_open(&p);
+                    self.begin_smart_folder_drill(&p);
                     // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
                     if auto_fs {
                         self.pending_auto_fs_open = true;
@@ -11851,6 +11852,7 @@ impl App {
                 }
                 Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
+                    self.begin_smart_folder_drill(&pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let search_rollback = if self.favsearch.active
                         || self.tag_view.active

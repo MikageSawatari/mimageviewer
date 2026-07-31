@@ -43094,15 +43094,13 @@ mod smart_folder_transition_tests {
         let definition = definition("Smart Scope", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
-
-        let state = super::top_level_grid_view::SmartFolderViewState::root(id, vec![entry.clone()]);
-        app.top_level_grid_view
-            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state));
-        app.items_are_smart_folder_view = true;
-        app.current_smart_folder_id = Some(id);
-        app.current_folder = Some(crate::app::smart_folder::smart_folder_synthetic_path(id));
+        app.current_folder = Some(normal.clone());
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
         assert!(app.begin_smart_folder_drill(&entry));
         app.load_folder(entry.clone());
+        assert!(app.begin_smart_folder_drill(&child));
         app.load_folder(child.clone());
         assert_eq!(
             app.top_level_grid_view
@@ -43126,6 +43124,7 @@ mod smart_folder_transition_tests {
                 if crate::folder_tree::path_eq(&path, &synthetic)
         ));
 
+        assert!(app.begin_smart_folder_drill(&child));
         app.load_folder(child.clone());
         app.open_global_search();
         app.close_global_search();
@@ -43175,15 +43174,195 @@ mod smart_folder_transition_tests {
             .expect("history forward");
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&forward),
-            super::SyntheticFolderHistoryDispatch::Restored
+            super::SyntheticFolderHistoryDispatch::NotSynthetic
         );
-        assert_eq!(
+        app.load_folder(forward);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(app.top_level_grid_view.smart_folder().is_none());
+    }
+
+    #[test]
+    fn smart_folder_session_return_restores_prepared_grid_and_position_without_prepare() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-session-origin");
+        let source = app.tmp.path().join("smart-session-source");
+        let entry = source.join("entry");
+        let page = entry.join("page.jpg");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(&page, []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Session", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        let selected = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(page.as_path()))
+            .expect("prepared page");
+        app.selected = Some(selected);
+        app.scroll_offset_y = 321.5;
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.has_prepared_grid())
+        );
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert_eq!(app.selected, Some(selected));
+        assert!((app.scroll_offset_y - 321.5).abs() < f32::EPSILON);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(page.as_path()))
+        );
+    }
+
+    #[test]
+    fn leaving_smart_folder_session_discards_result_and_synthetic_return_rescans() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-leave-origin");
+        let source = app.tmp.path().join("smart-leave-source");
+        let entry = source.join("entry");
+        let outside = app.tmp.path().join("smart-leave-outside");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Leave", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        app.load_folder(outside);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn explicit_smart_folder_reopen_discards_session_and_rescans() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-reopen-origin");
+        let source = app.tmp.path().join("smart-reopen-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Reopen", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+
+        app.open_smart_folder(id, true);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn deleted_item_does_not_survive_resident_smart_folder_return() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-delete-origin");
+        let source = app.tmp.path().join("smart-delete-source");
+        let entry = source.join("entry");
+        let deleted = entry.join("deleted.jpg");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(&deleted, []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Delete", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(deleted.as_path()))
+        );
+
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        std::fs::remove_file(&deleted).unwrap();
+        app.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(&deleted));
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert!(
+            !app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(deleted.as_path()))
+        );
+    }
+
+    #[test]
+    fn smart_folder_grouping_and_definition_edits_rebuild_resident_session() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-edit-origin");
+        let source = app.tmp.path().join("smart-edit-source");
+        let entry = source.join("entry");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Edit", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition.clone()];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+
+        let mut grouped = definition;
+        grouped.grouping = crate::settings::SubfolderExpansionOrder::FolderGrouped;
+        app.settings.smart_folders[0] = grouped.clone();
+        app.update_smart_folder_presentation(grouped);
+        assert!(app.smart_folder_prepare_pending.is_some());
+        assert!(app.smart_folder_pending.is_none());
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.items_are_smart_folder_view);
+        assert!(matches!(
             app.top_level_grid_view
                 .smart_folder()
-                .and_then(|state| state.scoped_current()),
-            Some(child.as_path()),
-            "history forward must restore the entire smart-folder scope"
-        );
+                .map(|state| &state.position),
+            Some(super::top_level_grid_view::SmartFolderPosition::Root)
+        ));
+
+        app.settings.smart_folders[0].rules[0].include_descendants = false;
+        app.invalidate_smart_folder_definition(id);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(app.smart_folder_pending.is_some());
     }
 
     #[test]
@@ -43253,12 +43432,12 @@ mod smart_folder_transition_tests {
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
-        let state = super::top_level_grid_view::SmartFolderViewState::root(id, vec![entry.clone()]);
-        app.top_level_grid_view
-            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state));
-        app.items_are_smart_folder_view = true;
-        app.current_smart_folder_id = Some(id);
-        app.current_folder = Some(synthetic.clone());
+        let origin = app.tmp.path().join("smart-history-origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        app.current_folder = Some(origin);
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
 
         assert!(app.begin_smart_folder_drill(&entry));
         app.load_folder(entry.clone());
@@ -43668,9 +43847,10 @@ mod smart_folder_transition_tests {
         app.open_favsearch();
         app.current_folder = Some(super::search_results_synthetic_path());
         app.open_local_metadata_search();
-        assert!(app.smart_folder_prepare_pending.is_some());
+        assert!(app.smart_folder_pending.is_some());
         app.open_global_search();
 
+        assert!(app.smart_folder_pending.is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
         assert_eq!(app.global_search.saved_folder.as_ref(), Some(&smart_path));
     }
@@ -44061,7 +44241,7 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
-    fn smart_folder_metadata_writes_invalidate_resort_generation() {
+    fn smart_folder_metadata_writes_keep_resident_session_frozen() {
         use crate::app::smart_folder::{
             SmartFolderDiag, SmartFolderEntry, SmartFolderEntryKind, SmartFolderSnapshot,
         };
@@ -44096,91 +44276,28 @@ mod smart_folder_transition_tests {
         app.smart_folder_generation = app.smart_folder_generation.wrapping_add(1);
         app.start_smart_folder_prepare(snapshot, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert!(app.smart_folder_resort_metadata.contains_key(&id));
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.has_reused_metadata())
+        );
 
         let revision = app.smart_folder_metadata_revision;
         app.set_rating(0, 4);
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.rating_cache.get(&0), Some(&4));
-
+        assert_eq!(app.smart_folder_metadata_revision, revision);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.has_reused_metadata())
+        );
         app.schedule_current_smart_folder_metadata_refresh(
-            crate::app::smart_folder::SmartFolderMetadataDependency::Tags,
+            crate::app::smart_folder::SmartFolderMetadataDependency::Rating,
         );
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-
-        let mut params = crate::adjustment::AdjustParams::default();
-        params.brightness = 12.0;
-        app.set_page_params(0, params.clone());
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.adjustment_page_params.get(&0), Some(&params));
-
-        let crop = crate::export_crop::CropSettings {
-            rect: crate::export_crop::CropRect {
-                min_x: 10.0,
-                min_y: 10.0,
-                max_x: 90.0,
-                max_y: 90.0,
-            },
-            aspect_mode: crate::export_crop::CropAspectMode::Free,
-        };
-        app.set_export_crop_for_idx(0, Some(crop), [100, 100]);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.export_crop_page_settings.get(&0), Some(&crop));
-
-        let trim = crate::view_trim::ViewTrimPageOverride::from_margins(
-            crate::view_trim::ViewTrimMargins {
-                left: 0.1,
-                top: 0.1,
-                right: 0.1,
-                bottom: 0.1,
-            },
-        );
-        app.view_trim_page_overrides.insert(0, trim);
-        app.persist_view_trim_page_override(0, trim);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.view_trim_page_overrides.get(&0), Some(&trim));
-
-        let revision = app.smart_folder_metadata_revision;
-        app.apply_tag_legacy_seed_result(crate::tag_legacy_seed_worker::LegacySeedResult {
-            report: Default::default(),
-            cache_updates: vec![(source.join("page.jpg"), vec!["legacy".into()])],
-        });
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        app.items_are_smart_folder_view = false;
-        app.current_smart_folder_id = None;
-        app.current_folder = Some(source.clone());
-        let revision = app.smart_folder_metadata_revision;
-        assert!(app.set_current_folder_rating(3).unwrap());
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-
-        app.items_are_smart_folder_view = true;
-        app.current_smart_folder_id = Some(id);
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        let xmp_path = source.join("xmp-only.jpg");
-        app.items.push(GridItem::Image(xmp_path.clone()));
-        let revision = app.smart_folder_metadata_revision;
-        let rating_generation =
-            app.rating_session_generation_for_key(&crate::adjustment_db::normalize_path(&xmp_path));
-        app.hydrate_ratings_from_xmp(vec![(xmp_path, 2, rating_generation)]);
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
+        assert!(app.smart_folder_metadata_refresh_due.is_none());
+        app.smart_folder_metadata_refresh_due = Some(std::time::Instant::now());
+        app.poll_smart_folder_metadata_refresh(&ctx);
+        assert!(app.smart_folder_metadata_refresh_due.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
     }
 
     #[test]

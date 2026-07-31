@@ -6057,6 +6057,7 @@ impl App {
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {
+                self.begin_smart_folder_drill(&path);
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);

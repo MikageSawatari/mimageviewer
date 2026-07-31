@@ -6,7 +6,7 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SMART_FOLDER_MAX_DEPTH: u32 = 40;
@@ -238,6 +238,270 @@ pub(crate) struct ReusedSmartFolderMetadata {
     comic_paths: HashSet<String>,
     folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     converted_archive_cache_paths: HashMap<String, PathBuf>,
+}
+
+/// The already-materialized root grid is moved here while the user is inside a folder, PDF, or
+/// archive opened from the smart folder. Moving (rather than cloning) keeps million-row sessions
+/// bounded, and restoring this state does not run the metadata/filter/sort/build pipeline again.
+pub(crate) struct SmartFolderPreparedGrid {
+    items: Vec<GridItem>,
+    thumbnails: Vec<ThumbnailState>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    video_thumb_overrides: HashMap<String, PathBuf>,
+    selected: Option<usize>,
+    grid_click_selection_anchor_index: Option<usize>,
+    scroll_offset_y: f32,
+    scroll_to_selected: bool,
+    pending_grid_scroll: Option<super::GridScrollIntent>,
+    checked: HashSet<usize>,
+    visible_indices: Vec<usize>,
+    details_order: Vec<usize>,
+    show_search_bar: bool,
+    search_query: String,
+    search_filter: Option<HashSet<usize>>,
+    search_filter_origin_folder: Option<PathBuf>,
+    rating_cache: HashMap<usize, u8>,
+    tags_cache: HashMap<String, Vec<String>>,
+    local_adjust_pages: HashSet<usize>,
+    adjustment_page_params: HashMap<usize, crate::adjustment::AdjustParams>,
+    export_crop_page_settings: HashMap<usize, crate::export_crop::CropSettings>,
+    view_trim_page_overrides: HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
+    mask_pages: HashSet<usize>,
+    conceal_pages: HashSet<usize>,
+    comic_pages: HashSet<usize>,
+    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    converted_archive_cache_paths: HashMap<String, PathBuf>,
+    color_cache_map: Option<Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>>,
+    color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
+}
+
+fn remap_smart_folder_grid_index(index: usize, removed: &[usize]) -> Option<usize> {
+    if removed.binary_search(&index).is_ok() {
+        return None;
+    }
+    Some(index - removed.partition_point(|removed_index| *removed_index < index))
+}
+
+fn remap_smart_folder_grid_set(values: &mut HashSet<usize>, removed: &[usize]) {
+    *values = values
+        .drain()
+        .filter_map(|index| remap_smart_folder_grid_index(index, removed))
+        .collect();
+}
+
+fn remap_smart_folder_grid_map<T>(values: &mut HashMap<usize, T>, removed: &[usize]) {
+    *values = values
+        .drain()
+        .filter_map(|(index, value)| {
+            remap_smart_folder_grid_index(index, removed).map(|index| (index, value))
+        })
+        .collect();
+}
+
+impl SmartFolderPreparedGrid {
+    fn remove_paths(&mut self, removed_paths: &HashSet<String>) -> bool {
+        let removed = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let path = item.drag_source_path()?;
+                smart_folder_path_is_removed(
+                    &crate::path_key::normalize_keep_drive(path),
+                    removed_paths,
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return false;
+        }
+        for &index in removed.iter().rev() {
+            self.items.remove(index);
+            self.thumbnails.remove(index);
+            self.image_metas.remove(index);
+        }
+        let remap_indices = |values: &mut Vec<usize>| {
+            *values = values
+                .drain(..)
+                .filter_map(|index| remap_smart_folder_grid_index(index, &removed))
+                .collect();
+        };
+        remap_indices(&mut self.visible_indices);
+        remap_indices(&mut self.details_order);
+        remap_smart_folder_grid_set(&mut self.checked, &removed);
+        if let Some(filter) = self.search_filter.as_mut() {
+            remap_smart_folder_grid_set(filter, &removed);
+        }
+        remap_smart_folder_grid_set(&mut self.local_adjust_pages, &removed);
+        remap_smart_folder_grid_set(&mut self.mask_pages, &removed);
+        remap_smart_folder_grid_set(&mut self.conceal_pages, &removed);
+        remap_smart_folder_grid_set(&mut self.comic_pages, &removed);
+        remap_smart_folder_grid_map(&mut self.rating_cache, &removed);
+        remap_smart_folder_grid_map(&mut self.adjustment_page_params, &removed);
+        remap_smart_folder_grid_map(&mut self.export_crop_page_settings, &removed);
+        remap_smart_folder_grid_map(&mut self.view_trim_page_overrides, &removed);
+        self.grid_click_selection_anchor_index = self
+            .grid_click_selection_anchor_index
+            .and_then(|index| remap_smart_folder_grid_index(index, &removed));
+        if let Some(index) = self.selected {
+            self.selected = remap_smart_folder_grid_index(index, &removed).or_else(|| {
+                (!self.items.is_empty()).then_some(
+                    (index - removed.partition_point(|removed_index| *removed_index < index))
+                        .min(self.items.len() - 1),
+                )
+            });
+        }
+        self.tags_cache
+            .retain(|path, _| !smart_folder_path_is_removed(path, removed_paths));
+        self.video_thumb_overrides.retain(|video_path, image_path| {
+            !smart_folder_path_is_removed(video_path, removed_paths)
+                && !smart_folder_path_is_removed(
+                    &crate::path_key::normalize_keep_drive(image_path),
+                    removed_paths,
+                )
+        });
+        self.folder_pin_map
+            .retain(|path, _| !smart_folder_path_is_removed(path, removed_paths));
+        self.converted_archive_cache_paths
+            .retain(|path, cache_path| {
+                !smart_folder_path_is_removed(path, removed_paths)
+                    && !smart_folder_path_is_removed(
+                        &crate::path_key::normalize_keep_drive(cache_path),
+                        removed_paths,
+                    )
+            });
+        true
+    }
+}
+
+/// One owner for the settled session boundary. `TopLevelGridView` drops this value on every
+/// explicit top-level transition (`begin`) and preserves it only for same-smart-folder scoped
+/// navigation (`replace_surface`). History can still retain `SmartFolderViewState`, but it cannot
+/// retain this snapshot/result owner after the session has been left.
+pub(crate) struct SmartFolderSession {
+    definition_id: uuid::Uuid,
+    snapshot: Option<SmartFolderSnapshot>,
+    resort_metadata: Option<Arc<ReusedSmartFolderMetadata>>,
+    prepared_grid: Option<SmartFolderPreparedGrid>,
+    authorized_open: Option<PathBuf>,
+    active_child: Option<PathBuf>,
+}
+
+impl SmartFolderSession {
+    fn new(snapshot: SmartFolderSnapshot, resort_metadata: Arc<ReusedSmartFolderMetadata>) -> Self {
+        Self {
+            definition_id: snapshot.definition.id,
+            snapshot: Some(snapshot),
+            resort_metadata: Some(resort_metadata),
+            prepared_grid: None,
+            authorized_open: None,
+            active_child: None,
+        }
+    }
+
+    pub(crate) fn definition_id(&self) -> uuid::Uuid {
+        self.definition_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_reused_metadata(&self) -> bool {
+        self.resort_metadata.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_prepared_grid(&self) -> bool {
+        self.prepared_grid.is_some()
+    }
+
+    fn authorize_open(&mut self, path: &Path) {
+        self.authorized_open = Some(path.to_path_buf());
+    }
+
+    fn authorize_alias(&mut self, original: &Path, alias: &Path) -> bool {
+        if self
+            .authorized_open
+            .as_deref()
+            .is_some_and(|target| crate::folder_tree::path_eq(target, original))
+        {
+            self.authorized_open = Some(alias.to_path_buf());
+            return true;
+        }
+        false
+    }
+
+    fn consume_authorized_open(&mut self, path: &Path, source_alias: Option<&Path>) -> bool {
+        let matches_load = |target: &Path| {
+            crate::folder_tree::path_eq(target, path)
+                || source_alias.is_some_and(|alias| crate::folder_tree::path_eq(target, alias))
+        };
+        let authorized = self
+            .authorized_open
+            .take()
+            .filter(|target| matches_load(target));
+        let active = self
+            .active_child
+            .as_deref()
+            .filter(|target| matches_load(target));
+        let accepted = authorized.as_deref().or(active).map(Path::to_path_buf);
+        if let Some(target) = accepted {
+            self.active_child = Some(target);
+            return true;
+        }
+        false
+    }
+
+    fn returned_to_root(&mut self) {
+        self.authorized_open = None;
+        self.active_child = None;
+    }
+
+    fn root_parent_target(&self) -> bool {
+        self.active_child.is_some()
+    }
+}
+
+static SMART_FOLDER_SESSION_DROP_BACKLOG: OnceLock<Mutex<Vec<RetiredSmartFolderPayload>>> =
+    OnceLock::new();
+
+fn retire_smart_folder_session_payloads(values: Vec<RetiredSmartFolderPayload>) {
+    let backlog = SMART_FOLDER_SESSION_DROP_BACKLOG.get_or_init(|| Mutex::new(Vec::new()));
+    let mut retired = std::mem::take(&mut *backlog.lock().unwrap());
+    retired.extend(values);
+    if retired.is_empty() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel::<Vec<RetiredSmartFolderPayload>>();
+    let spawn = std::thread::Builder::new()
+        .name("smart-folder-session-drop".into())
+        .spawn(move || {
+            if let Ok(retired) = rx.recv() {
+                drop(retired);
+            }
+        });
+    if let Ok(_thread) = spawn {
+        if let Err(error) = tx.send(retired) {
+            backlog.lock().unwrap().extend(error.0);
+        }
+        return;
+    }
+    backlog.lock().unwrap().extend(retired);
+}
+
+impl Drop for SmartFolderSession {
+    fn drop(&mut self) {
+        let mut retired = Vec::with_capacity(3);
+        if let Some(snapshot) = self.snapshot.take() {
+            retired.push(Box::new(snapshot) as RetiredSmartFolderPayload);
+        }
+        if let Some(metadata) = self.resort_metadata.take() {
+            retired.push(Box::new(metadata) as RetiredSmartFolderPayload);
+        }
+        if let Some(grid) = self.prepared_grid.take() {
+            retired.push(Box::new(grid) as RetiredSmartFolderPayload);
+        }
+        retire_smart_folder_session_payloads(retired);
+    }
 }
 
 enum SmartFolderPrepareEvent {
@@ -2142,6 +2406,13 @@ fn smart_folder_scan_rules_match(
     left.id == right.id && left.rules == right.rules
 }
 
+fn smart_folder_prepared_definition_matches(
+    left: &crate::settings::SmartFolderDefinition,
+    right: &crate::settings::SmartFolderDefinition,
+) -> bool {
+    left.id == right.id && left.rules == right.rules && left.grouping == right.grouping
+}
+
 fn adopt_smart_folder_presentation(
     target: &mut crate::settings::SmartFolderDefinition,
     current: &crate::settings::SmartFolderDefinition,
@@ -2309,17 +2580,6 @@ impl App {
         }
     }
 
-    fn retire_smart_folder_resort_metadata(
-        &mut self,
-        values: impl IntoIterator<Item = Arc<ReusedSmartFolderMetadata>>,
-    ) {
-        self.retire_smart_folder_payloads(
-            values
-                .into_iter()
-                .map(|value| Box::new(value) as RetiredSmartFolderPayload),
-        );
-    }
-
     fn retire_prepared_smart_folder(&mut self, prepared: PreparedSmartFolder) {
         self.retire_smart_folder_payloads(std::iter::once(
             Box::new(prepared) as RetiredSmartFolderPayload
@@ -2349,15 +2609,14 @@ impl App {
         self.retire_smart_folder_payloads(std::iter::once(payload));
     }
 
-    /// Invalidate all installed sort metadata after a path-keyed metadata write. A cached smart
-    /// snapshot may be opened later even when it is not the current view, so clearing only the
-    /// current definition is insufficient.
+    /// Reject an in-flight prepare after a path-keyed metadata write. An installed session is a
+    /// deliberately frozen result: direct cell state may still update, but membership/order and
+    /// its reusable metadata remain unchanged until an explicit reopen.
     pub(crate) fn invalidate_smart_folder_resort_metadata(&mut self) {
+        if self.top_level_grid_view.smart_folder_session().is_some() {
+            return;
+        }
         self.smart_folder_metadata_revision = self.smart_folder_metadata_revision.wrapping_add(1);
-        let retired = std::mem::take(&mut self.smart_folder_resort_metadata)
-            .into_values()
-            .collect::<Vec<_>>();
-        self.retire_smart_folder_resort_metadata(retired);
     }
 
     /// A smart-folder scan/prepare owns the top-level grid.  Search modes and Snapshot Lock own
@@ -2434,6 +2693,10 @@ impl App {
         // Even when this metadata kind is not part of the definition's filter, the prepared grid
         // owns badges/adjustments/crops/pins that a later sort would otherwise roll back.
         self.invalidate_smart_folder_resort_metadata();
+        if self.top_level_grid_view.smart_folder_session().is_some() {
+            self.smart_folder_metadata_refresh_due = None;
+            return;
+        }
         // `current_smart_folder_id` belongs to the main aggregate view even while a detached
         // fullscreen context is temporarily mounted. Remember the invalidation globally and
         // apply it after the main context is restored instead of losing detached edits.
@@ -2458,6 +2721,10 @@ impl App {
         let Some(due) = self.smart_folder_metadata_refresh_due else {
             return;
         };
+        if self.top_level_grid_view.smart_folder_session().is_some() {
+            self.smart_folder_metadata_refresh_due = None;
+            return;
+        }
         if !self.items_are_smart_folder_view {
             self.smart_folder_metadata_refresh_due = None;
             return;
@@ -2475,12 +2742,6 @@ impl App {
             return;
         }
         self.smart_folder_metadata_refresh_due = None;
-        let Some(id) = self.current_smart_folder_id else {
-            return;
-        };
-        if let Some(snapshot) = self.smart_folder_snapshots.get(&id).cloned() {
-            self.start_smart_folder_prepare(snapshot, false);
-        }
     }
 
     pub(crate) fn open_smart_folder(&mut self, definition_id: uuid::Uuid, refresh: bool) {
@@ -2797,10 +3058,14 @@ impl App {
                 .iter()
                 .find(|definition| definition.id == state.definition_id)
                 .and_then(|definition| {
-                    self.smart_folder_snapshots
-                        .get(&state.definition_id)
+                    self.top_level_grid_view
+                        .smart_folder_session()
+                        .and_then(|session| session.snapshot.as_ref())
                         .filter(|snapshot| {
-                            smart_folder_scan_rules_match(&snapshot.definition, definition)
+                            smart_folder_prepared_definition_matches(
+                                &snapshot.definition,
+                                definition,
+                            )
                         })
                 })
                 .is_some();
@@ -2824,9 +3089,8 @@ impl App {
 
     /// 定義変更時に古い snapshot / 進行中 worker を無効化する。
     fn invalidate_smart_folder_definition_state(&mut self, definition_id: uuid::Uuid) {
-        self.smart_folder_snapshots.remove(&definition_id);
-        let retired = self.smart_folder_resort_metadata.remove(&definition_id);
-        self.retire_smart_folder_resort_metadata(retired);
+        self.top_level_grid_view
+            .discard_smart_folder_session(definition_id);
         self.smart_folder_removed_paths.remove(&definition_id);
         let pending_matches = self
             .smart_folder_pending
@@ -2890,11 +3154,245 @@ impl App {
         }
     }
 
-    pub(crate) fn begin_smart_folder_drill(&mut self, path: &Path) -> bool {
-        if !self.items_are_smart_folder_view {
+    /// Consume the one typed authorization created by an in-session grid/parent/Ctrl-navigation
+    /// action. An ordinary address/favourite/folder load has no authorization and therefore lets
+    /// the `TopLevelGridView` owner discard the session at the common load boundary.
+    pub(crate) fn preserve_smart_folder_session_for_load(&mut self, path: &Path) -> bool {
+        let Some(mut session) = self.top_level_grid_view.take_smart_folder_session() else {
+            return false;
+        };
+        if !session.consume_authorized_open(path, self.archive_source_override.as_deref()) {
             return false;
         }
-        self.prepare_smart_folder_nav_target(path)
+        if self.items_are_smart_folder_view && session.prepared_grid.is_none() {
+            self.persist_pending_view_trim_state();
+            let anchor_index = self
+                .grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(self.items_generation));
+            session.prepared_grid = Some(SmartFolderPreparedGrid {
+                items: std::mem::take(&mut self.items),
+                thumbnails: std::mem::take(&mut self.thumbnails),
+                image_metas: std::mem::take(&mut self.image_metas),
+                video_thumb_overrides: std::mem::take(&mut self.video_thumb_overrides),
+                selected: self.selected.take(),
+                grid_click_selection_anchor_index: anchor_index,
+                scroll_offset_y: std::mem::take(&mut self.scroll_offset_y),
+                scroll_to_selected: std::mem::take(&mut self.scroll_to_selected),
+                pending_grid_scroll: self.pending_grid_scroll.take(),
+                checked: std::mem::take(&mut self.checked),
+                visible_indices: std::mem::take(&mut self.visible_indices),
+                details_order: std::mem::take(&mut self.details_order),
+                show_search_bar: std::mem::take(&mut self.show_search_bar),
+                search_query: std::mem::take(&mut self.search_query),
+                search_filter: self.search_filter.take(),
+                search_filter_origin_folder: self.search_filter_origin_folder.take(),
+                rating_cache: std::mem::take(&mut self.rating_cache),
+                tags_cache: std::mem::take(&mut self.tags_cache),
+                local_adjust_pages: std::mem::take(&mut self.local_adjust_pages),
+                adjustment_page_params: std::mem::take(&mut self.adjustment_page_params),
+                export_crop_page_settings: std::mem::take(&mut self.export_crop_page_settings),
+                view_trim_page_overrides: std::mem::take(&mut self.view_trim_page_overrides),
+                mask_pages: std::mem::take(&mut self.mask_pages),
+                conceal_pages: std::mem::take(&mut self.conceal_pages),
+                comic_pages: std::mem::take(&mut self.comic_pages),
+                folder_pin_map: std::mem::take(&mut self.folder_pin_map),
+                converted_archive_cache_paths: std::mem::take(
+                    &mut self.converted_archive_cache_paths,
+                ),
+                color_cache_map: self.current_color_cache_map.take(),
+                color_catalog: self.current_color_catalog.take(),
+            });
+        }
+        self.top_level_grid_view
+            .install_smart_folder_session(session);
+        true
+    }
+
+    fn restore_prepared_smart_folder_session(&mut self, definition_id: uuid::Uuid) -> bool {
+        let Some(mut session) = self.top_level_grid_view.take_smart_folder_session() else {
+            return false;
+        };
+        if session.definition_id != definition_id {
+            self.top_level_grid_view
+                .install_smart_folder_session(session);
+            return false;
+        }
+        let Some(grid) = session.prepared_grid.take() else {
+            self.top_level_grid_view
+                .install_smart_folder_session(session);
+            return false;
+        };
+
+        self.cancel_media_navigation_pending_for_current_context(
+            "restore_prepared_smart_folder_session",
+        );
+        self.close_fullscreen();
+        self.bump_full_context_for_load();
+        self.cancel_pending_folder_nav();
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.pdf_placeholder_count = None;
+        self.virtual_folder_writeback = None;
+        self.pdf_prefetch_grace_until = None;
+        self.zip_nav = None;
+        self.archive_source_override = None;
+        crate::zip_loader::clear_nested_cache();
+
+        let SmartFolderPreparedGrid {
+            items,
+            thumbnails,
+            image_metas,
+            video_thumb_overrides,
+            selected,
+            grid_click_selection_anchor_index,
+            scroll_offset_y,
+            scroll_to_selected,
+            pending_grid_scroll,
+            checked,
+            visible_indices,
+            details_order,
+            show_search_bar,
+            search_query,
+            search_filter,
+            search_filter_origin_folder,
+            rating_cache,
+            tags_cache,
+            local_adjust_pages,
+            adjustment_page_params,
+            export_crop_page_settings,
+            view_trim_page_overrides,
+            mask_pages,
+            conceal_pages,
+            comic_pages,
+            folder_pin_map,
+            converted_archive_cache_paths,
+            color_cache_map,
+            color_catalog,
+        } = grid;
+        let synthetic = smart_folder_synthetic_path(definition_id);
+        self.current_folder = Some(synthetic.clone());
+        self.current_folder_last_mtime = None;
+        self.current_folder_signature = None;
+        self.items = items;
+        self.thumbnails = thumbnails;
+        self.image_metas = image_metas;
+        self.items_generation = self.items_generation.wrapping_add(1);
+        self.invalidate_idx_state_and_queues();
+
+        self.video_thumb_overrides = video_thumb_overrides;
+        self.selected = selected;
+        self.grid_click_selection_anchor = grid_click_selection_anchor_index
+            .map(|index| super::GridClickSelectionAnchor::new(index, self.items_generation));
+        self.scroll_offset_y = scroll_offset_y;
+        self.scroll_to_selected = scroll_to_selected;
+        self.pending_grid_scroll = pending_grid_scroll;
+        self.checked = checked;
+        self.visible_indices = visible_indices;
+        self.details_order = details_order;
+        self.show_search_bar = show_search_bar;
+        self.search_query = search_query;
+        self.search_filter = search_filter;
+        self.search_filter_origin_folder = search_filter_origin_folder;
+        self.rating_cache = rating_cache;
+        self.replace_tags_cache(tags_cache);
+        self.local_adjust_pages = local_adjust_pages;
+        self.adjustment_page_params = adjustment_page_params;
+        self.export_crop_page_settings = export_crop_page_settings;
+        self.export_crop_pages = self.export_crop_page_settings.keys().copied().collect();
+        self.view_trim_page_overrides = view_trim_page_overrides;
+        self.mask_pages = mask_pages;
+        self.conceal_pages = conceal_pages;
+        self.comic_pages = comic_pages;
+        self.folder_pin_map = folder_pin_map;
+        self.converted_archive_cache_paths = converted_archive_cache_paths;
+        self.current_color_cache_map = color_cache_map;
+        self.current_color_catalog = color_catalog;
+
+        let (tx, rx) = mpsc::channel();
+        self.tx = tx.clone();
+        self.rx = rx;
+        if let Some(cache_map) = self.current_color_cache_map.clone() {
+            let reload_queue: Arc<NotifyQueue> =
+                Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+            let heavy_io_queue: Arc<NotifyQueue> =
+                Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+            self.reload_queue = Some(Arc::clone(&reload_queue));
+            self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+            self.spawn_thumbnail_workers(
+                &tx,
+                Arc::clone(&self.cancel_token),
+                reload_queue,
+                heavy_io_queue,
+                cache_map,
+                self.current_color_catalog.clone(),
+                self.folder_thumb_pin_db.clone(),
+            );
+        } else {
+            self.reload_queue = None;
+            self.heavy_io_queue = None;
+        }
+        let video_items =
+            crate::filename_stack_ui::stack_video_items(&self.items, &self.image_metas);
+        if !video_items.is_empty() {
+            self.spawn_video_thread(
+                tx,
+                Arc::clone(&self.cancel_token),
+                video_items,
+                self.video_thumb_overrides.clone(),
+                HashMap::new(),
+            );
+        }
+        self.items_are_global_search_view = false;
+        self.items_are_tag_view = false;
+        self.items_are_reading_history_view = false;
+        self.items_are_bookmark_view = false;
+        self.items_are_rating_view = false;
+        self.items_are_subfolder_expansion_view = false;
+        self.items_are_drive_list = false;
+        self.items_are_smart_folder_view = true;
+        self.current_smart_folder_id = Some(definition_id);
+        self.smart_folder_progress = None;
+
+        let definition_name = self
+            .settings
+            .smart_folders
+            .iter()
+            .find(|definition| definition.id == definition_id)
+            .map(|definition| definition.name.as_str())
+            .unwrap_or("?");
+        self.address = format!("スマートフォルダ: {definition_name}");
+        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        session.returned_to_root();
+        self.top_level_grid_view
+            .install_smart_folder_session(session);
+        true
+    }
+
+    pub(crate) fn begin_smart_folder_drill(&mut self, path: &Path) -> bool {
+        if self.top_level_grid_view.smart_folder_session().is_none() {
+            return false;
+        }
+        let session_authorized = self.authorize_smart_folder_session_open(path);
+        self.prepare_smart_folder_nav_target(path) || session_authorized
+    }
+
+    pub(crate) fn authorize_smart_folder_session_open(&mut self, path: &Path) -> bool {
+        let Some(session) = self.top_level_grid_view.smart_folder_session_mut() else {
+            return false;
+        };
+        session.authorize_open(path);
+        true
+    }
+
+    pub(crate) fn authorize_smart_folder_session_alias(
+        &mut self,
+        original: &Path,
+        alias: &Path,
+    ) -> bool {
+        self.top_level_grid_view
+            .smart_folder_session_mut()
+            .is_some_and(|session| session.authorize_alias(original, alias))
     }
 
     /// スマートフォルダ内ナビの着地先を scope state へ反映する。
@@ -2912,15 +3410,13 @@ impl App {
         if !accepted {
             return false;
         }
+        self.authorize_smart_folder_session_open(path);
         self.record_smart_folder_scope_transition(&next_state);
         let definition_id = next_state.definition_id;
         if let Some(state) = self.top_level_grid_view.smart_folder_mut() {
             *state = next_state;
         }
         self.current_smart_folder_id = Some(definition_id);
-        // `start_loading_items` は root snapshot 以外を通常一覧として描画する。scope の正本は
-        // TopLevelGridView に残るため、この presentation flag だけ先に倒して clear を防ぐ。
-        self.items_are_smart_folder_view = false;
         if let Some(top) = self.facet_filter_suppression_stack.last_mut() {
             top.anchor = path.to_path_buf();
         }
@@ -2948,7 +3444,18 @@ impl App {
 
     pub(crate) fn smart_folder_parent_nav_target(&self) -> Option<crate::ui_main::AddressBarNav> {
         let state = self.top_level_grid_view.smart_folder()?;
-        match state.parent_target()? {
+        let target = state.parent_target();
+        if target.is_none()
+            && self
+                .top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(SmartFolderSession::root_parent_target)
+        {
+            return Some(crate::ui_main::AddressBarNav::Direct(
+                smart_folder_synthetic_path(state.definition_id),
+            ));
+        }
+        match target? {
             super::top_level_grid_view::SmartFolderParentTarget::Root => {
                 Some(crate::ui_main::AddressBarNav::Direct(
                     smart_folder_synthetic_path(state.definition_id),
@@ -3002,19 +3509,31 @@ impl App {
             }
             super::top_level_grid_view::SmartFolderPosition::Scoped { current, .. } => {
                 self.cancel_smart_folder_pending();
-                self.current_smart_folder_id = Some(definition_id);
-                self.items_are_smart_folder_view = false;
-                self.top_level_grid_view.replace_surface(
-                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state),
-                );
+                let has_resident_session = self
+                    .top_level_grid_view
+                    .smart_folder_session()
+                    .is_some_and(|session| session.definition_id == definition_id);
+                self.suppress_nav_record_for_search_restore = true;
+                if has_resident_session {
+                    self.top_level_grid_view.replace_surface(
+                        super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state.clone()),
+                    );
+                    self.authorize_smart_folder_session_open(&current);
+                    self.load_folder(current.clone());
+                } else {
+                    self.load_folder(current.clone());
+                    self.current_smart_folder_id = Some(definition_id);
+                    self.items_are_smart_folder_view = false;
+                    self.top_level_grid_view.replace_surface(
+                        super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state),
+                    );
+                }
                 if let Some(top) = self.facet_filter_suppression_stack.last_mut() {
                     top.anchor = current.clone();
                 }
                 if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_mut() {
                     *anchor = current.clone();
                 }
-                self.suppress_nav_record_for_search_restore = true;
-                self.load_folder(current);
                 self.update_smart_folder_scoped_address();
             }
         }
@@ -3082,18 +3601,28 @@ impl App {
         self.top_level_grid_view.replace_surface(
             super::top_level_grid_view::TopLevelGridSurface::SmartFolder(root_state),
         );
-        if let Some(mut snapshot) = self
-            .smart_folder_snapshots
-            .get(&definition_id)
-            .filter(|snapshot| smart_folder_scan_rules_match(&snapshot.definition, &definition))
-            .cloned()
-        {
-            adopt_smart_folder_presentation(&mut snapshot.definition, &definition);
-            self.current_smart_folder_id = Some(definition_id);
-            self.start_smart_folder_prepare(snapshot, false);
+        let prepared_definition_matches = self
+            .top_level_grid_view
+            .smart_folder_session()
+            .and_then(|session| session.snapshot.as_ref())
+            .is_some_and(|snapshot| {
+                smart_folder_prepared_definition_matches(&snapshot.definition, &definition)
+            });
+        if prepared_definition_matches {
+            if self.restore_prepared_smart_folder_session(definition_id) {
+                return true;
+            }
+            if self.items_are_smart_folder_view
+                && self.current_smart_folder_id == Some(definition_id)
+            {
+                self.address = format!("スマートフォルダ: {}", definition.name);
+                return true;
+            }
         } else {
-            self.open_smart_folder(definition_id, false);
+            self.top_level_grid_view
+                .discard_smart_folder_session(definition_id);
         }
+        self.open_smart_folder(definition_id, false);
         true
     }
 
@@ -3500,9 +4029,6 @@ impl App {
             }
         }
         let open_origin = self.smart_folder_open_origin.take();
-        // worker 起動元の旧 snapshot を先に手放し、共有が解けた完成 snapshot へ
-        // その世代の tombstone を実体化してから cache へ戻す。
-        self.smart_folder_snapshots.remove(&definition_id);
         let tombstones_compacted = if authoritative_rescan {
             false
         } else {
@@ -3585,11 +4111,8 @@ impl App {
         self.top_level_grid_view.replace_surface(
             super::top_level_grid_view::TopLevelGridSurface::SmartFolder(top_level_state),
         );
-        self.smart_folder_snapshots.insert(definition_id, snapshot);
-        let retired = self
-            .smart_folder_resort_metadata
-            .insert(definition_id, resort_metadata);
-        self.retire_smart_folder_resort_metadata(retired);
+        self.top_level_grid_view
+            .install_smart_folder_session(SmartFolderSession::new(snapshot, resort_metadata));
         self.smart_folder_progress = None;
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
@@ -3664,8 +4187,17 @@ impl App {
         };
         // 通常一覧と同じグローバルなソート順を使う。スマートフォルダ定義へは
         // 書き戻さず、保存済み snapshot を現在の設定で prepare し直すだけにする。
-        if let Some(snapshot) = self.smart_folder_snapshots.get(&id).cloned() {
-            let reused_metadata = self.smart_folder_resort_metadata.get(&id).cloned();
+        if let Some((snapshot, reused_metadata)) = self
+            .top_level_grid_view
+            .smart_folder_session()
+            .filter(|session| session.definition_id == id)
+            .and_then(|session| {
+                Some((
+                    session.snapshot.as_ref()?.clone(),
+                    session.resort_metadata.clone(),
+                ))
+            })
+        {
             self.start_smart_folder_prepare_inner(
                 snapshot,
                 false,
@@ -3685,12 +4217,15 @@ impl App {
         definition: &crate::settings::SmartFolderDefinition,
     ) -> bool {
         let grouping_changed = self
-            .smart_folder_snapshots
-            .get(&definition.id)
-            .is_some_and(|snapshot| snapshot.definition.grouping != definition.grouping);
-        if let Some(snapshot) = self.smart_folder_snapshots.get_mut(&definition.id) {
-            adopt_smart_folder_presentation(&mut snapshot.definition, definition);
-        }
+            .top_level_grid_view
+            .smart_folder_session_mut()
+            .filter(|session| session.definition_id == definition.id)
+            .and_then(|session| session.snapshot.as_mut())
+            .is_some_and(|snapshot| {
+                let changed = snapshot.definition.grouping != definition.grouping;
+                adopt_smart_folder_presentation(&mut snapshot.definition, definition);
+                changed
+            });
         if self.current_smart_folder_id == Some(definition.id) {
             self.address = format!("スマートフォルダ: {}", definition.name);
             self.update_smart_folder_scoped_address();
@@ -3710,18 +4245,51 @@ impl App {
         definition: crate::settings::SmartFolderDefinition,
     ) {
         let grouping_changed = self.apply_smart_folder_presentation(&definition);
-        if self.current_smart_folder_id == Some(definition.id)
-            && grouping_changed
-            && let Some(snapshot) = self.smart_folder_snapshots.get(&definition.id).cloned()
-        {
-            self.start_smart_folder_prepare(snapshot, false);
+        if self.current_smart_folder_id == Some(definition.id) && grouping_changed {
+            if let Some(folder_entries) = self
+                .top_level_grid_view
+                .smart_folder()
+                .filter(|state| state.definition_id == definition.id)
+                .map(|state| state.folder_entries.as_ref().clone())
+            {
+                self.top_level_grid_view.replace_surface(
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(
+                        super::top_level_grid_view::SmartFolderViewState::root(
+                            definition.id,
+                            folder_entries,
+                        ),
+                    ),
+                );
+            }
+            let prepared = self
+                .top_level_grid_view
+                .smart_folder_session()
+                .and_then(|session| {
+                    Some((
+                        session.snapshot.as_ref()?.clone(),
+                        session.resort_metadata.clone(),
+                    ))
+                });
+            if let Some((snapshot, reused_metadata)) = prepared {
+                self.start_smart_folder_prepare_inner(
+                    snapshot,
+                    false,
+                    false,
+                    HashSet::new(),
+                    None,
+                    reused_metadata,
+                );
+            } else {
+                self.open_smart_folder(definition.id, true);
+            }
         }
     }
 
-    /// 削除済み実パスを全 snapshot から除外する。prepare worker が Arc を共有中なら
-    /// UI スレッドで巨大 Vec を複製せず tombstone を渡し、worker を再起動する。
+    /// Delete tombstones are part of the resident session. The prepared root grid is edited in
+    /// place so an immediate return cannot resurrect an unusable cell; the scan snapshot keeps
+    /// its indices stable for reusable metadata and applies the tombstone on later rebuilds.
     pub(crate) fn remove_paths_from_smart_folder_snapshots(&mut self, paths: &[PathBuf]) {
-        if paths.is_empty() || self.smart_folder_snapshots.is_empty() {
+        if paths.is_empty() {
             return;
         }
         let removed: HashSet<String> = paths
@@ -3732,45 +4300,54 @@ impl App {
             return;
         }
 
-        // A filesystem scan does not share the old snapshot Arc, so strong_count alone cannot
-        // prove that a tombstone is safe to retire. Keep it while any result for the same
-        // definition can still arrive and reintroduce the deleted path.
-        let mut in_flight_ids = HashSet::new();
-        if let Some(pending) = self.smart_folder_pending.as_ref() {
-            in_flight_ids.insert(pending.definition_id);
-        }
-        if let Some(pending) = self.smart_folder_prepare_pending.as_ref() {
-            in_flight_ids.insert(pending.definition_id);
-        }
-        if let Some(pending) = self.smart_folder_confirm_pending.as_ref() {
-            in_flight_ids.insert(pending.snapshot.definition.id);
-        }
-
-        let mut affected_ids = Vec::new();
-        let mut compacted_ids = Vec::new();
-        for (id, snapshot) in &mut self.smart_folder_snapshots {
-            if snapshot.entries.iter().any(|entry| {
-                smart_folder_path_is_removed(
-                    &crate::path_key::normalize_keep_drive(&entry.path),
-                    &removed,
-                )
-            }) {
-                affected_ids.push(*id);
-                let tombstones = self.smart_folder_removed_paths.entry(*id).or_default();
-                tombstones.extend(removed.iter().cloned());
-                if !in_flight_ids.contains(id)
-                    && compact_smart_folder_tombstones_if_unique(snapshot, tombstones)
-                {
-                    compacted_ids.push(*id);
-                }
+        let resident_id = self
+            .top_level_grid_view
+            .smart_folder_session()
+            .and_then(|session| {
+                let snapshot = session.snapshot.as_ref()?;
+                snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| {
+                        smart_folder_path_is_removed(
+                            &crate::path_key::normalize_keep_drive(&entry.path),
+                            &removed,
+                        )
+                    })
+                    .then_some(session.definition_id)
+            });
+        if let Some(id) = resident_id {
+            self.smart_folder_removed_paths
+                .entry(id)
+                .or_default()
+                .extend(removed.iter().cloned());
+            if let Some(grid) = self
+                .top_level_grid_view
+                .smart_folder_session_mut()
+                .and_then(|session| session.prepared_grid.as_mut())
+            {
+                grid.remove_paths(&removed);
             }
         }
-        for id in compacted_ids {
-            self.smart_folder_removed_paths.remove(&id);
-        }
+
+        let confirm_affected = self
+            .smart_folder_confirm_pending
+            .as_ref()
+            .is_some_and(|confirm| {
+                confirm.snapshot.entries.iter().any(|entry| {
+                    smart_folder_path_is_removed(
+                        &crate::path_key::normalize_keep_drive(&entry.path),
+                        &removed,
+                    )
+                })
+            });
         if let Some(confirm) = self.smart_folder_confirm_pending.as_mut()
-            && affected_ids.contains(&confirm.snapshot.definition.id)
+            && confirm_affected
         {
+            self.smart_folder_removed_paths
+                .entry(confirm.snapshot.definition.id)
+                .or_default()
+                .extend(removed.iter().cloned());
             if remove_paths_from_smart_folder_snapshot(&mut confirm.snapshot, &removed) {
                 // Entry indices in the exact-count membership belong to the pre-removal snapshot.
                 // A confirmed continuation can safely re-evaluate the now-smaller candidate set.
@@ -3782,7 +4359,7 @@ impl App {
         let pending_affected = self
             .smart_folder_prepare_pending
             .as_ref()
-            .is_some_and(|pending| affected_ids.contains(&pending.definition_id));
+            .is_some_and(|pending| Some(pending.definition_id) == resident_id);
         if pending_affected {
             let retired = cancelled_smart_folder_payloads(
                 None,
@@ -3790,11 +4367,24 @@ impl App {
                 None,
             );
             self.retire_smart_folder_payloads(retired);
-            if let Some(id) = self.current_smart_folder_id
-                && affected_ids.contains(&id)
-                && let Some(snapshot) = self.smart_folder_snapshots.get(&id).cloned()
-            {
-                self.start_smart_folder_prepare(snapshot, false);
+            let restart = self
+                .top_level_grid_view
+                .smart_folder_session()
+                .and_then(|session| {
+                    Some((
+                        session.snapshot.as_ref()?.clone(),
+                        session.resort_metadata.clone(),
+                    ))
+                });
+            if let Some((snapshot, reused_metadata)) = restart {
+                self.start_smart_folder_prepare_inner(
+                    snapshot,
+                    false,
+                    false,
+                    HashSet::new(),
+                    None,
+                    reused_metadata,
+                );
             }
         }
     }
@@ -3804,11 +4394,6 @@ impl App {
     pub(crate) fn refresh_smart_folders_after_rename(&mut self) {
         let reopen = self.current_smart_folder_id;
         self.cancel_smart_folder_pending();
-        self.smart_folder_snapshots.clear();
-        let retired = std::mem::take(&mut self.smart_folder_resort_metadata)
-            .into_values()
-            .collect::<Vec<_>>();
-        self.retire_smart_folder_resort_metadata(retired);
         self.smart_folder_removed_paths.clear();
         if let Some(id) = reopen {
             self.open_smart_folder(id, true);

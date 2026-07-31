@@ -9825,12 +9825,6 @@ pub struct App {
     // ── スマートフォルダ snapshot view ───────────────────────────
     pub(crate) current_smart_folder_id: Option<uuid::Uuid>,
     pub(crate) smart_folder_saved_folder: Option<PathBuf>,
-    pub(crate) smart_folder_snapshots:
-        std::collections::HashMap<uuid::Uuid, smart_folder::SmartFolderSnapshot>,
-    /// Completed generation metadata keyed by real item path. Sort-only rebuilds clone only the
-    /// Arc and remap on the prepare worker; the UI thread never reconstructs this O(N) state.
-    pub(crate) smart_folder_resort_metadata:
-        std::collections::HashMap<uuid::Uuid, Arc<smart_folder::ReusedSmartFolderMetadata>>,
     /// A thread-spawn failure must not make invalidation synchronously destroy a million-item
     /// result on the UI thread. Such rare handoff failures are retained here and retried at the
     /// next retirement boundary (or dropped during application shutdown).
@@ -12285,8 +12279,6 @@ impl App {
             subfolder_expansion_diag: None,
             current_smart_folder_id: None,
             smart_folder_saved_folder: None,
-            smart_folder_snapshots: std::collections::HashMap::new(),
-            smart_folder_resort_metadata: std::collections::HashMap::new(),
             smart_folder_retired_payloads: Vec::new(),
             smart_folder_metadata_revision: 0,
             smart_folder_open_origin: None,
@@ -14669,6 +14661,7 @@ impl App {
             if let crate::ui_main::AddressBarNav::Direct(path) = &nav
                 && !smart_folder::is_smart_folder_synthetic_path(path)
             {
+                self.authorize_smart_folder_session_open(path);
                 self.select_after_load = self
                     .effective_folder()
                     .and_then(|current| current.file_name().map(|name| name.to_os_string()))
@@ -14734,6 +14727,11 @@ impl App {
             return Some(nav);
         }
         if let Some(nav) = self.smart_folder_parent_nav_target() {
+            if let crate::ui_main::AddressBarNav::Direct(path) = &nav
+                && !smart_folder::is_smart_folder_synthetic_path(path)
+            {
+                self.authorize_smart_folder_session_open(path);
+            }
             return Some(nav);
         }
         if self.items_are_smart_folder_view {
@@ -16660,6 +16658,21 @@ impl App {
         owner: OpenRequestOwner,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&path) {
+            let preserve_smart_folder_session = self.preserve_smart_folder_session_for_load(&path);
+            if self.smart_folder_pending.is_some()
+                || self.smart_folder_prepare_pending.is_some()
+                || self.smart_folder_confirm_pending.is_some()
+            {
+                self.cancel_smart_folder_pending();
+            }
+            if !preserve_smart_folder_session
+                && (self.items_are_smart_folder_view
+                    || self.top_level_grid_view.smart_folder().is_some())
+            {
+                self.clear_smart_folder_view_state();
+            }
+        }
         // 別経路の load が走ったら、この bundle の in-flight folder open scan は stale なので
         // 破棄する。poll_folder_pane_open は pending を take してから適用するため、自分自身の
         // 完了結果を pre-scan 付きで load する場合は no-op。
@@ -21260,6 +21273,9 @@ impl App {
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        let preserve_smart_folder_session = !detached_physical
+            && !smart_folder::is_smart_folder_synthetic_path(&source_path)
+            && self.preserve_smart_folder_session_for_load(&source_path);
         self.cancel_media_navigation_pending_for_current_context("start_loading_items");
         if !detached_physical {
             self.clear_color_filter_for_new_items();
@@ -21304,8 +21320,16 @@ impl App {
             self.clear_subfolder_expansion_view_state();
         }
         if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&source_path) {
-            self.cancel_smart_folder_pending();
-            if self.items_are_smart_folder_view {
+            if self.smart_folder_pending.is_some()
+                || self.smart_folder_prepare_pending.is_some()
+                || self.smart_folder_confirm_pending.is_some()
+            {
+                self.cancel_smart_folder_pending();
+            }
+            if !preserve_smart_folder_session
+                && (self.items_are_smart_folder_view
+                    || self.top_level_grid_view.smart_folder().is_some())
+            {
                 self.clear_smart_folder_view_state();
             }
         }
@@ -23444,13 +23468,8 @@ impl App {
                 self.start_subfolder_expansion_scan_roots(root, roots);
             }
         } else if self.items_are_smart_folder_view {
-            if let Some(snapshot) = self
-                .current_smart_folder_id
-                .and_then(|id| self.smart_folder_snapshots.get(&id))
-                .cloned()
-            {
-                self.start_smart_folder_prepare(snapshot, false);
-            }
+            // A resident smart-folder result is frozen for the session. The explicit toolbar /
+            // menu / gamepad reopen is the refresh gesture for path-keyed metadata and pins.
         } else if let Some(cur) = self.current_folder.clone()
             && !is_synthetic_view_path(&cur)
         {
@@ -31432,6 +31451,7 @@ impl App {
                         }
                         Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
+                            self.begin_smart_folder_drill(&pf);
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
@@ -32454,9 +32474,11 @@ impl App {
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 self.record_rating_view_nav_open(&p);
+                self.begin_smart_folder_drill(&p);
                 Some(crate::ui_main::AddressBarNav::Direct(p))
             }
             GridItem::ConvertibleArchive { path, .. } => {
+                self.begin_smart_folder_drill(&path);
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 let search_rollback = if self.favsearch.active
