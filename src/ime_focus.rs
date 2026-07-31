@@ -75,6 +75,9 @@ fn ime_focus_key_pressed(ctx: &egui::Context) -> bool {
 /// 復帰時は同 latch を次 frame 用に立て直す。latch を持たない欄では widget ID ごとの
 /// 一時 latch をこのモジュールが所有する。IME 中でもマウスクリック等、対象キーの event を
 /// 伴わない正当なフォーカス移動は復帰しない。IME 非入力時の通常の Tab traversal も維持する。
+/// `ime_active` は必ず `TextEdit` 構築前にこのモジュールで採取する。egui は focus 遷移と
+/// 同じ pass の Ime event を `TextEdit` 内部で queue から除去することがあり、描画後に読むと
+/// fullscreen viewport や native overlay を含む全 context で composition 開始を取り逃がすため。
 ///
 /// # mImageViewer の IME 対応範囲
 ///
@@ -99,6 +102,7 @@ fn ime_focus_key_pressed(ctx: &egui::Context) -> bool {
 pub(crate) fn restore_focus_for_ime_key(
     ctx: &egui::Context,
     response: &egui::Response,
+    ime_active: bool,
     mut focus_request: Option<&mut bool>,
 ) -> bool {
     let viewport_id = ctx.viewport_id();
@@ -113,7 +117,6 @@ pub(crate) fn restore_focus_for_ime_key(
         response.request_focus();
     }
 
-    let ime_active = ime_input_active(ctx);
     if ctx.memory(|memory| memory.has_focus(response.id)) {
         ctx.memory_mut(|memory| {
             memory.set_focus_lock_filter(
@@ -151,8 +154,11 @@ pub(crate) fn show_singleline<'text>(
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::widgets::text_edit::TextEditOutput {
+    // `TextEdit` は focus 遷移と同じ pass の Ime event を内部で除去することがある。
+    // 必ず widget を描く前に、この viewport の event queue を共有 state へ取り込む。
+    let ime_active = ime_input_active(ui.ctx());
     let output = configure(egui::TextEdit::singleline(text)).show(ui);
-    let _ = restore_focus_for_ime_key(ui.ctx(), &output.response, focus_request);
+    let _ = restore_focus_for_ime_key(ui.ctx(), &output.response, ime_active, focus_request);
     output
 }
 
@@ -162,8 +168,9 @@ pub(crate) fn add_singleline<'text>(
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::Response {
+    let ime_active = ime_input_active(ui.ctx());
     let response = ui.add(configure(egui::TextEdit::singleline(text)));
-    let _ = restore_focus_for_ime_key(ui.ctx(), &response, focus_request);
+    let _ = restore_focus_for_ime_key(ui.ctx(), &response, ime_active, focus_request);
     response
 }
 
@@ -174,8 +181,9 @@ pub(crate) fn add_sized_singleline<'text>(
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::Response {
+    let ime_active = ime_input_active(ui.ctx());
     let response = ui.add_sized(size, configure(egui::TextEdit::singleline(text)));
-    let _ = restore_focus_for_ime_key(ui.ctx(), &response, focus_request);
+    let _ = restore_focus_for_ime_key(ui.ctx(), &response, ime_active, focus_request);
     response
 }
 
@@ -186,9 +194,10 @@ pub(crate) fn add_enabled_singleline<'text>(
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::Response {
+    let ime_active = enabled && ime_input_active(ui.ctx());
     let response = ui.add_enabled(enabled, configure(egui::TextEdit::singleline(text)));
     if enabled {
-        let _ = restore_focus_for_ime_key(ui.ctx(), &response, focus_request);
+        let _ = restore_focus_for_ime_key(ui.ctx(), &response, ime_active, focus_request);
     }
     response
 }
@@ -281,6 +290,92 @@ mod tests {
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
         assert!(ctx.wants_keyboard_input());
+    }
+
+    #[test]
+    fn ime_start_is_sampled_before_text_edit_consumes_events() {
+        let ctx = egui::Context::default();
+        let viewport_id = egui::ViewportId::from_hash_of("ime_focus_fullscreen_viewport");
+        let first_id = egui::Id::new("ime_start_focus_gain_first");
+        let second_id = egui::Id::new("ime_start_focus_gain_second");
+        let mut first = String::new();
+        let mut second = String::new();
+        let mut focus_request = true;
+        let raw_input = |events| {
+            let mut input = egui::RawInput {
+                viewport_id,
+                events,
+                ..Default::default()
+            };
+            input.viewports.insert(
+                viewport_id,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            input
+        };
+
+        let _ = ctx.run(raw_input(Vec::new()), |ctx| {
+            draw_text_fields(
+                ctx,
+                first_id,
+                second_id,
+                &mut first,
+                &mut second,
+                &mut focus_request,
+            );
+        });
+        let mut ime_events_remained_after_text_edit = true;
+        let _ = ctx.run(
+            raw_input(vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+            ]),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let event_queue = ctx.clone();
+                    let _ = show_singleline(ui, &mut first, Some(&mut focus_request), |edit| {
+                        // egui TextEdit removes Ime events on a focus transition. Keep that
+                        // behavior explicit in this fixture so the helper's sampling order is
+                        // tested independently of egui's private focus-history timing.
+                        event_queue.input_mut(|input| {
+                            input
+                                .events
+                                .retain(|event| !matches!(event, egui::Event::Ime(_)));
+                        });
+                        edit.id(first_id)
+                    });
+                    let _ = show_singleline(ui, &mut second, None, |edit| edit.id(second_id));
+                });
+                ime_events_remained_after_text_edit = ctx.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Ime(_)))
+                });
+            },
+        );
+
+        assert!(
+            !ime_events_remained_after_text_edit,
+            "fixture must reproduce TextEdit consuming the IME-start events"
+        );
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
+
+        let _ = ctx.run(raw_input(vec![key_event(egui::Key::Tab)]), |ctx| {
+            draw_text_fields(
+                ctx,
+                first_id,
+                second_id,
+                &mut first,
+                &mut second,
+                &mut focus_request,
+            );
+        });
+
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 
     #[test]

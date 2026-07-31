@@ -16,6 +16,64 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
     })
 }
 
+#[test]
+#[cfg(windows)]
+fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let fs_idx = 0;
+    app.fullscreen_idx = Some(fs_idx);
+
+    // Reproduce a composition flag left in the winit/App context. The native video HWND has
+    // its own IME state and `NativeOverlayInputRouting` has already filtered text-field keys,
+    // so this unrelated flag must not discard native pointer or semantic command traffic.
+    app.ime_composing = true;
+    app.native_video_last_move_client = None;
+    app.handle_native_video_window_event(
+        &ctx,
+        fs_idx,
+        crate::video::native_window::NativeVideoWindowEvent::MouseMove(
+            crate::video::native_window::NativeVideoMouseEvent {
+                x: 640,
+                y: 360,
+                shift: false,
+                ctrl: false,
+            },
+        ),
+    );
+    assert_eq!(app.native_video_last_move_client, Some((640, 360)));
+
+    app.cursor_last_activity = None;
+    app.handle_native_video_add_bookmark_command(&ctx, fs_idx, 12.5);
+    assert!(
+        app.cursor_last_activity.is_some(),
+        "AddBookmarkAt must reach the App command handler even if another viewport has IME state"
+    );
+
+    let path = app.tmp.path().join("native-bookmark-command.mp4");
+    let bookmark_id = app
+        .video_bookmark_db
+        .as_ref()
+        .expect("video bookmark db")
+        .add(&path, 12.5, Some("before"), &[])
+        .expect("seed bookmark");
+    app.handle_native_video_set_bookmark_title_command(
+        &ctx,
+        fs_idx,
+        bookmark_id,
+        "日本語タイトル".to_owned(),
+    );
+    let bookmark = app
+        .video_bookmark_db
+        .as_ref()
+        .expect("video bookmark db")
+        .list(&path)
+        .into_iter()
+        .find(|bookmark| bookmark.id == bookmark_id)
+        .expect("updated bookmark");
+    assert_eq!(bookmark.title.as_deref(), Some("日本語タイトル"));
+}
+
 #[cfg(windows)]
 fn paused_test_window(
     ctx: &egui::Context,
