@@ -43182,7 +43182,9 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
-    fn smart_folder_session_return_restores_prepared_grid_and_position_without_prepare() {
+    fn smart_folder_session_return_restores_offset_with_its_auto_aspect_without_prepare() {
+        use crate::settings::ThumbAspect;
+
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
         let origin = app.tmp.path().join("smart-session-origin");
@@ -43205,8 +43207,21 @@ mod smart_folder_transition_tests {
             .iter()
             .position(|item| item.drag_source_path() == Some(page.as_path()))
             .expect("prepared page");
+        app.settings.thumb_aspect_auto = true;
+        let saved_aspect = ThumbAspect::Portrait2x3;
+        let saved_offset = 900.0;
+        let saved_switch_at = std::time::Instant::now();
+        app.auto_aspect.items_generation = app.items_generation;
+        app.auto_aspect
+            .samples
+            .insert(selected, saved_aspect.height_ratio());
+        app.auto_aspect.current = Some(saved_aspect);
+        app.auto_aspect.cached_sample_gate = Some(7);
+        app.auto_aspect.switches_done = 1;
+        app.auto_aspect.last_switch_at = Some(saved_switch_at);
+        app.auto_aspect.streak = Some((saved_aspect, saved_switch_at, 1));
         app.selected = Some(selected);
-        app.scroll_offset_y = 321.5;
+        app.scroll_offset_y = saved_offset;
         app.scroll_to_selected = false;
         assert!(app.begin_smart_folder_drill(&entry));
         app.load_folder(entry);
@@ -43215,13 +43230,34 @@ mod smart_folder_transition_tests {
                 .smart_folder_session()
                 .is_some_and(|session| session.has_prepared_grid())
         );
+        assert_eq!(
+            app.effective_thumb_aspect(),
+            ThumbAspect::Square,
+            "the child owns a separate auto-aspect state"
+        );
 
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
         assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
         assert!(app.smart_folder_pending.is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
         assert_eq!(app.selected, Some(selected));
-        assert!((app.scroll_offset_y - 321.5).abs() < f32::EPSILON);
+        assert_eq!(
+            (app.scroll_offset_y, app.effective_thumb_aspect()),
+            (saved_offset, saved_aspect),
+            "the offset and the row-height dependency it was measured against must travel together"
+        );
+        assert_eq!(app.auto_aspect.items_generation, app.items_generation);
+        assert_eq!(
+            app.auto_aspect.samples.get(&selected).copied(),
+            Some(saved_aspect.height_ratio())
+        );
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(7));
+        assert_eq!(app.auto_aspect.switches_done, 1);
+        assert_eq!(app.auto_aspect.last_switch_at, Some(saved_switch_at));
+        assert_eq!(
+            app.auto_aspect.streak,
+            Some((saved_aspect, saved_switch_at, 1))
+        );
         assert!(
             app.items
                 .iter()

@@ -243,6 +243,14 @@ pub(crate) struct ReusedSmartFolderMetadata {
 /// The already-materialized root grid is moved here while the user is inside a folder, PDF, or
 /// archive opened from the smart folder. Moving (rather than cloning) keeps million-row sessions
 /// bounded, and restoring this state does not run the metadata/filter/sort/build pipeline again.
+struct SmartFolderPreparedGridLayout {
+    /// The offset and the auto-aspect state that determined its row height are one snapshot.
+    /// `AutoAspectState::samples` is also index-keyed, so moving only the resolved aspect would
+    /// leave the restored grid with another context's decision inputs.
+    scroll_offset_y: f32,
+    auto_aspect: crate::auto_aspect::AutoAspectState,
+}
+
 pub(crate) struct SmartFolderPreparedGrid {
     items: Vec<GridItem>,
     thumbnails: Vec<ThumbnailState>,
@@ -250,7 +258,7 @@ pub(crate) struct SmartFolderPreparedGrid {
     video_thumb_overrides: HashMap<String, PathBuf>,
     selected: Option<usize>,
     grid_click_selection_anchor_index: Option<usize>,
-    scroll_offset_y: f32,
+    layout: SmartFolderPreparedGridLayout,
     scroll_to_selected: bool,
     pending_grid_scroll: Option<super::GridScrollIntent>,
     checked: HashSet<usize>,
@@ -341,6 +349,8 @@ impl SmartFolderPreparedGrid {
         remap_smart_folder_grid_map(&mut self.adjustment_page_params, &removed);
         remap_smart_folder_grid_map(&mut self.export_crop_page_settings, &removed);
         remap_smart_folder_grid_map(&mut self.view_trim_page_overrides, &removed);
+        remap_smart_folder_grid_map(&mut self.layout.auto_aspect.samples, &removed);
+        self.layout.auto_aspect.streak = None;
         self.grid_click_selection_anchor_index = self
             .grid_click_selection_anchor_index
             .and_then(|index| remap_smart_folder_grid_index(index, &removed));
@@ -3184,7 +3194,10 @@ impl App {
                 video_thumb_overrides: std::mem::take(&mut self.video_thumb_overrides),
                 selected: self.selected.take(),
                 grid_click_selection_anchor_index: anchor_index,
-                scroll_offset_y: std::mem::take(&mut self.scroll_offset_y),
+                layout: SmartFolderPreparedGridLayout {
+                    scroll_offset_y: std::mem::take(&mut self.scroll_offset_y),
+                    auto_aspect: std::mem::take(&mut self.auto_aspect),
+                },
                 scroll_to_selected: std::mem::take(&mut self.scroll_to_selected),
                 pending_grid_scroll: self.pending_grid_scroll.take(),
                 checked: std::mem::take(&mut self.checked),
@@ -3254,7 +3267,7 @@ impl App {
             video_thumb_overrides,
             selected,
             grid_click_selection_anchor_index,
-            scroll_offset_y,
+            layout,
             scroll_to_selected,
             pending_grid_scroll,
             checked,
@@ -3278,6 +3291,10 @@ impl App {
             color_cache_map,
             color_catalog,
         } = grid;
+        let SmartFolderPreparedGridLayout {
+            scroll_offset_y,
+            mut auto_aspect,
+        } = layout;
         let synthetic = smart_folder_synthetic_path(definition_id);
         self.current_folder = Some(synthetic.clone());
         self.current_folder_last_mtime = None;
@@ -3287,6 +3304,10 @@ impl App {
         self.image_metas = image_metas;
         self.items_generation = self.items_generation.wrapping_add(1);
         self.invalidate_idx_state_and_queues();
+        // The restored samples still describe these moved items, but their installed App
+        // generation is new so stale child work cannot publish into the root.
+        auto_aspect.items_generation = self.items_generation;
+        self.auto_aspect = auto_aspect;
 
         self.video_thumb_overrides = video_thumb_overrides;
         self.selected = selected;

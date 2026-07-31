@@ -37,6 +37,21 @@ snapshot、sort 用 metadata、root の materialize 済み grid を保持する�
 root へ戻ると同じ items・サムネイル・選択・スクロール位置を move で戻す。この復帰では
 scan も prepare も開始せず、進捗 UI も出さない。
 
+The scroll offset and the complete `AutoAspectState` that determined its row height belong to one
+layout snapshot. The resolved aspect, index-keyed samples, cache gate, and switch history all
+belong to the root items. Restore those samples together and rebind only `items_generation` to the
+newly installed root generation; a child's auto-aspect state must never be paired with this offset.
+
+**残る露出 (意図して直していない、2026-07-31)**: 行の高さと 1 行あたりの数を決める入力のうち、
+`settings.grid_cols` と `grid_view_mode` は**ユーザーが明示的に変える全体設定**である。子を開いて
+いる間にこれらを変えたりウィンドウ幅を変えたりすると、復帰した offset は新しいレイアウト上の
+別の場所を指す。**これは直さない** —— 保存値を戻すと、子で行ったユーザー操作を巻き戻すことに
+なり、そちらの方が驚きが大きいため。auto-aspect と違うのは、あれが「勝手に再計算される内部の
+判定」なのに対し、これらは「ユーザーが自分で変えた設定」である点。もし将来ここへ手を入れるなら、
+設定を巻き戻すのではなく**同じアイテムが見える位置へ offset を取り直す**方向で検討すること。
+なお詳細表示の行高は `DETAILS_ROW_H` 固定、サムネイルの decode target はセル geometry の入力では
+ないので、いずれもこの露出には含まれない。
+
 セッション内 open はグリッド / 親移動 / Ctrl+上下の request が対象 path を型付きで許可し、
 共通の `load_folder_with_scan_claimed` / `start_loading_items_inner` 境界だけがその許可を消費する。
 アドレスバー、お気に入り、通常フォルダ、検索、別の最上位 surface には許可がないため、
