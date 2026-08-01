@@ -14,6 +14,7 @@ test("local settings use the current defaults when no value exists", () => {
   assert.deepEqual(parseLocalSettings(null), {
     version: 1,
     portraitSinglePage: true,
+    gestureHelpDismissed: false,
   });
 });
 
@@ -30,7 +31,11 @@ test("invalid local settings fall back without throwing", () => {
 });
 
 test("local settings serialize and restore as one versioned value", () => {
-  const settings = { version: 1, portraitSinglePage: false };
+  const settings = {
+    version: 1,
+    portraitSinglePage: false,
+    gestureHelpDismissed: true,
+  };
   assert.deepEqual(parseLocalSettings(serializeLocalSettings(settings)), settings);
 });
 
@@ -43,8 +48,16 @@ test("storage failures use in-memory defaults and never escape", () => {
     settings: defaultLocalSettings(),
     storageAvailable: false,
   });
-  assert.deepEqual(saveLocalSettings({ version: 1, portraitSinglePage: false }, unavailable), {
-    settings: { version: 1, portraitSinglePage: false },
+  assert.deepEqual(saveLocalSettings({
+    version: 1,
+    portraitSinglePage: false,
+    gestureHelpDismissed: true,
+  }, unavailable), {
+    settings: {
+      version: 1,
+      portraitSinglePage: false,
+      gestureHelpDismissed: true,
+    },
     saved: false,
   });
 });
@@ -55,9 +68,24 @@ test("storage helpers use one aggregate key", () => {
     getItem(key) { return values.get(key) ?? null; },
     setItem(key, value) { values.set(key, value); },
   };
-  const saved = saveLocalSettings({ version: 1, portraitSinglePage: false }, storage);
+  const saved = saveLocalSettings({
+    version: 1,
+    portraitSinglePage: false,
+    gestureHelpDismissed: true,
+  }, storage);
   assert.equal(saved.saved, true);
   assert.equal(values.size, 1);
   assert.ok(values.has(LOCAL_SETTINGS_STORAGE_KEY));
   assert.deepEqual(loadLocalSettings(storage).settings, saved.settings);
+});
+
+test("older version-one values add the gesture help default", () => {
+  assert.deepEqual(
+    parseLocalSettings(JSON.stringify({ version: 1, portraitSinglePage: false })),
+    {
+      version: 1,
+      portraitSinglePage: false,
+      gestureHelpDismissed: false,
+    }
+  );
 });

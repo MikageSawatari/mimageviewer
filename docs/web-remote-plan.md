@@ -320,7 +320,7 @@ remux と音声フォールバックはトランスコードの下位互換な�
 
 フロントエンドは `PointerEvent`、`keydown`、ホイール、ボタンを直接状態変更へ接続せず、
 すべて `next_page` / `prev_page` / `zoom_in` / `zoom_out` / `zoom_reset` /
-`toggle_menu` / `back` / `parent_folder` / `open` 等の共通コマンドへ変換する。コマンド実行時の
+`toggle_menu` / `toggle_viewer_bars` / `back` / `parent_folder` / `open` 等の共通コマンドへ変換する。コマンド実行時の
 telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳細を記録する。
 
 キーは `docs/keymap.ini.default` の次の既定値へ合わせる。Web に同じ概念がない操作は追加せず、
@@ -351,8 +351,8 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 
 | 入力経路 | 直接操作 | 共通コマンド |
 |---|---|---|
-| touch / pen | 左右 34% のタップ、中央タップ、左右スワイプ、ピンチ、拡大中パン | 前 / 次、メニュー、前 / 次、ズーム、パン |
-| mouse | 左右クリックゾーン、中央クリック、右クリック、通常ホイール、Ctrl/Cmd+ホイール | 前 / 次、メニュー、メニュー、前 / 次、ズーム |
+| touch / pen | 左右 34% のタップ、中央タップ、上下左右スワイプ、ピンチ、拡大中パン | 前 / 次、上下バー切替、一覧 / メニュー / 前 / 次、ズーム、パン |
+| mouse | 左右クリックゾーン、中央クリック、右クリック、通常ホイール、Ctrl/Cmd+ホイール | 前 / 次、上下バー切替、メニュー、前 / 次、ズーム |
 | keyboard | 上表の固定キー | 対応する同一コマンド |
 | 共通メニュー / ボタン | 各項目のクリックまたはタップ | 対応する同一コマンド |
 
@@ -950,12 +950,45 @@ fallback がある本で既定 mode を明示した場合も継承を上書き�
 `reload_after_remote_session_release` が現在 view を再読込するため、remote 保存値が本体表示へ反映される。
 
 端末ごとの設定は server へ送らず、localStorage の単一 key
-`miv-remote-local-settings` に JSON `{"version":1,"portraitSinglePage":boolean}` として保存する。
+`miv-remote-local-settings` に JSON
+`{"version":1,"portraitSinglePage":boolean,"gestureHelpDismissed":boolean}` として保存する。
 既定は `portraitSinglePage=true`。☰ の「端末の設定」で OFF にすると縦持ちでも保存済み見開きを
 維持する。parse / normalize / serialize は純粋関数とし、未知 version、壊れた JSON、型不正は
 安全な既定値へ戻す。localStorage の取得・保存例外は wrapper で捕捉し、そのタブ内のメモリ値で
 動作を継続する。項目追加時は version 方針を決め、`defaultLocalSettings`、
 `normalizeLocalSettings`、設定画面、round-trip / 不正値テストを同じ aggregate objectへ追加する。
+
+### 12.9 閲覧中の操作 UI (2026-08-01)
+
+上下バーの表示状態はファイルや localStorage ではなく、フロントのセッション状態
+`viewerBarsVisible` が所有する。初期値は表示で、中央 32% のタップとメニューの
+「上下バーを表示 / 隠す」が同じ `toggle_viewer_bars` コマンドを通る。ページ移動や一覧からの
+別画像オープンではリセットせず、タブを閉じると既定へ戻る。自動非表示 timer は持たない。
+
+下バーの range は通常フォルダと ZIP / PDF のどちらも `pageGroups` を入力にする。Single では
+1目盛り1ページ、見開きでは1目盛り1グループ（1見開き）とし、ラベルはグループ数でなく
+`state.images` 上の実ページ番号を `12-13 / 240` の形式で出す。LTR は物理左端を先頭グループ、
+RTL は range の物理値と読み順 group index の対応を反転して、物理左端を最終グループにする。
+range の `input` 中は thumb とラベルだけを更新し、`change` で確定した1回だけ
+`changeImageTo` を呼ぶため、ドラッグ途中の画像 fetch / decode は発生しない。実ページが1枚だけなら
+range だけを隠し、`1 / 1` の位置表示は維持する。位置、実ページラベル、LTR / RTL の物理値変換は
+`command-core.mjs` の純粋関数でテストする。
+
+上下左右 swipe は同じ純粋判定を使う。開始点から主軸が **52 CSS px を超え**、かつ直交軸の
+**1.25倍を超えた**場合だけ成立する。左端32pxの browser edge gesture guard も従来どおり適用する。
+上 swipe はメニュー、下 swipe は一覧、左右 swipe は綴じ方向に従う前後ページへ送る。
+`scale > 1.01` では1本指移動を常に pan とし、swipe を発火しない。幅フィットの縦 drag も
+scroll を優先する。一方、幅フィット中の明確な横 swipe は従来のページ送りを維持する。
+
+初回ヘルプは最初の画像表示完了後に modal で出し、左右 tap、中央 tap、上下 swipe と拡大中 pan を
+示す。閉じた時点で aggregate local setting の `gestureHelpDismissed=true` を保存する。この field は
+既存 version 1 への後方互換な加法とし、旧 JSON では既定 `false` を補う。localStorage が使えない
+場合もタブ内のメモリ値は更新する。ビューアの ☰ →「操作方法を見る」から保存値に関係なく再表示できる。
+
+メニューの操作ボタンは全画面サイズで2列にし、前後移動・ズーム・バー切替・fit を上、設定・ヘルプ・
+再読み込みを下に置く。キー表記は `shouldShowKeyboardShortcuts` で決める。`pointer: fine` は既定表示、
+`pointer: coarse` は既定非表示とし、そのセッションで実際の `keydown` を1回観測した後は action 内の
+キー hint と「有効なキー」一覧をともに表示する。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
@@ -1035,11 +1068,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 2. **通常フォルダの見開き対応** — 現在は ZIP / PDF の `/api/container` のみ
 3. **動画・音声のストリーミング** — 正本は
    [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
-4. **ジェスチャ** — 下スワイプ = 一覧へ / 上スワイプ = メニュー、中央タップでバー表示切替、
-   初回のジェスチャヘルプ、メニューの 2 列化、キー表示の出し分け
-5. **PWA** — アイコンと全画面起動
-6. **検索** (Ctrl+S / F / G 相当)、タグ
-7. 配布 (exe 埋め込み、接続診断ウィザード)
+4. **PWA** — アイコンと全画面起動
+5. **検索** (Ctrl+S / F / G 相当)、タグ
+6. 配布 (exe 埋め込み、接続診断ウィザード)
 
 ### 13.7 未消化の宿題
 

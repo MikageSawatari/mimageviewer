@@ -3,6 +3,7 @@ import {
   FitMode,
   ReadingDirection,
   SpreadMode,
+  ViewerGesture,
   command,
   commandFromKey,
   containerPageTargetPx,
@@ -20,9 +21,13 @@ import {
   thumbnailBindingMatches,
   thumbnailRetryDecision,
   shouldShowLoadingIndicator,
+  shouldShowKeyboardShortcuts,
+  viewerGestureDecision,
   viewerTapCommand,
   viewerImageLayout,
   viewerBoundaryMessage,
+  viewerSeekGroupIndex,
+  viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
@@ -276,6 +281,7 @@ const state = {
   images: [],
   imageIndex: -1,
   pageGroups: [],
+  seekPageGroups: [],
   pageGroupIndex: -1,
   spreadMode: SpreadMode.SINGLE,
   effectiveSpreadMode: SpreadMode.SINGLE,
@@ -285,6 +291,10 @@ const state = {
   localSettings: LOCAL_SETTINGS_LOAD.settings,
   localSettingsStorageAvailable: LOCAL_SETTINGS_LOAD.storageAvailable,
   localSettingsDialog: null,
+  gestureHelpDialog: null,
+  viewerBarsVisible: true,
+  coarsePointer: Boolean(globalThis.matchMedia?.("(pointer: coarse)")?.matches),
+  keyboardInputSeen: false,
   fitMode: FitMode.PAGE,
   imageInfoCache: new Map(),
   containerImageInfoHints: new Map(),
@@ -743,9 +753,16 @@ function navigate(hash, routeState = {}) {
 function dispatchCommand(requested, meta = {}) {
   if (!requested?.name || !state.authenticated) return false;
   const source = meta.source ?? "mouse";
-  if (requested.name === CommandName.OPEN_LOCAL_SETTINGS) {
+  if (
+    requested.name === CommandName.OPEN_LOCAL_SETTINGS ||
+    requested.name === CommandName.OPEN_GESTURE_HELP
+  ) {
     state.commandMenu?.close(false);
-    openLocalSettingsDialog();
+    if (requested.name === CommandName.OPEN_LOCAL_SETTINGS) {
+      openLocalSettingsDialog();
+    } else {
+      openGestureHelpDialog();
+    }
     if (meta.telemetry !== false) {
       enqueueTelemetry({
         type: "command",
@@ -840,7 +857,15 @@ function dispatchCommand(requested, meta = {}) {
   } else if (requested.name.startsWith("grid_") && state.screenContext === "grid") {
     handled = executeGridNavigation(requested.name);
   } else if (state.screenContext === "viewer") {
-    if (requested.name === CommandName.NEXT_PAGE) handled = changeImage(1);
+    if (requested.name === CommandName.TOGGLE_VIEWER_BARS) {
+      state.viewerBarsVisible = !state.viewerBarsVisible;
+      state.viewer?.setBarsVisible(state.viewerBarsVisible);
+      state.commandMenu?.setActionLabel(
+        CommandName.TOGGLE_VIEWER_BARS,
+        state.viewerBarsVisible ? "上下バーを隠す" : "上下バーを表示"
+      );
+      handled = true;
+    } else if (requested.name === CommandName.NEXT_PAGE) handled = changeImage(1);
     else if (requested.name === CommandName.PREV_PAGE) handled = changeImage(-1);
     else if (requested.name === CommandName.FIRST_PAGE) handled = changeImageTo(0);
     else if (requested.name === CommandName.LAST_PAGE) {
@@ -1007,6 +1032,15 @@ function executeGridNavigation(name) {
 
 function onGlobalKeyDown(event) {
   state.remoteSessionUserActive = true;
+  if (!state.keyboardInputSeen) {
+    state.keyboardInputSeen = true;
+    state.commandMenu?.setKeyboardAvailable(
+      shouldShowKeyboardShortcuts({
+        coarsePointer: state.coarsePointer,
+        keyboardUsed: true,
+      })
+    );
+  }
   if (!state.authenticated || event.isComposing) return;
   if (
     isCommandInteractiveTarget(event.target) &&
@@ -1082,6 +1116,8 @@ function cleanupScreen() {
   state.commandMenu = null;
   state.localSettingsDialog?.destroy();
   state.localSettingsDialog = null;
+  state.gestureHelpDialog?.destroy();
+  state.gestureHelpDialog = null;
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
@@ -1359,6 +1395,7 @@ function setSinglePageGroups() {
     anchor: entry,
     entries: [entry],
   }));
+  state.seekPageGroups = state.images.map((_, index) => [index]);
   state.pageGroupIndex = -1;
   state.spreadMode = SpreadMode.SINGLE;
   state.effectiveSpreadMode = SpreadMode.SINGLE;
@@ -1384,6 +1421,14 @@ function setContainerPageGroups(groups) {
   if (!state.pageGroups.length && state.images.length) {
     state.pageGroups = state.images.map((entry) => ({ anchor: entry, entries: [entry] }));
   }
+  const imageIndexes = new Map(
+    state.images.map((entry, index) => [entryIdentity(entry), index])
+  );
+  state.seekPageGroups = state.pageGroups.map((group) =>
+    group.entries
+      .map((entry) => imageIndexes.get(entryIdentity(entry)))
+      .filter((index) => Number.isInteger(index))
+  );
   state.pageGroupIndex = -1;
 }
 
@@ -1396,6 +1441,15 @@ function pageGroupIndexForEntry(entry) {
 
 function currentPageGroup() {
   return state.pageGroups[state.pageGroupIndex] ?? null;
+}
+
+function viewerSeekSnapshot(groupIndex = state.pageGroupIndex) {
+  return viewerSeekState({
+    groupPageIndexes: state.seekPageGroups,
+    currentGroupIndex: groupIndex,
+    pageCount: state.images.length,
+    rtl: isRtlReadingDirection(state.readingDirection),
+  });
 }
 
 let spreadWriteTail = Promise.resolve();
@@ -1959,6 +2013,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   document.title = `${imageEntry.name} — mIV Remote`;
 
   const viewerRoot = element("section", "image-viewer");
+  if (!state.viewerBarsVisible) viewerRoot.classList.add("viewer-bars-hidden");
   const stage = element("div", "viewer-stage");
   const pageLayer = element("div", "viewer-pages");
   const image = element("img", "viewer-image");
@@ -1988,11 +2043,17 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const previous = textElement("button", "‹", "viewer-button");
   previous.type = "button";
   previous.setAttribute("aria-label", "前の画像");
-  const counter = textElement("span", "", "viewer-counter");
+  const seek = element("div", "viewer-seek");
+  const counter = textElement("output", "", "viewer-counter");
+  const seekInput = element("input", "viewer-seek-input");
+  seekInput.type = "range";
+  seekInput.step = "1";
+  seekInput.setAttribute("aria-label", "ページ位置");
+  seek.append(counter, seekInput);
   const next = textElement("button", "›", "viewer-button");
   next.type = "button";
   next.setAttribute("aria-label", "次の画像");
-  bottom.append(previous, counter, next);
+  bottom.append(previous, seek, next);
   viewerRoot.append(stage, top, bottom);
   state.commandMenu = new CommandMenu(viewerRoot, "viewer", viewerRoot);
   app.append(viewerRoot);
@@ -2004,6 +2065,8 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     image,
     title,
     counter,
+    seek,
+    seekInput,
     previous,
     next,
     loadingIndicator,
@@ -2034,7 +2097,36 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
       detail: "toolbar",
     });
   });
-  updateViewerImage(interactionStartedAt).catch(renderError);
+  seekInput.addEventListener("input", (event) => {
+    event.stopPropagation();
+    const groupIndex = viewerSeekGroupIndex(
+      seekInput.value,
+      state.pageGroups.length,
+      isRtlReadingDirection(state.readingDirection)
+    );
+    state.viewer?.setSeekState(viewerSeekSnapshot(groupIndex));
+  });
+  seekInput.addEventListener("change", (event) => {
+    event.stopPropagation();
+    const groupIndex = viewerSeekGroupIndex(
+      seekInput.value,
+      state.pageGroups.length,
+      isRtlReadingDirection(state.readingDirection)
+    );
+    if (!changeImageTo(groupIndex)) {
+      state.viewer?.setSeekState(viewerSeekSnapshot());
+    }
+  });
+  const viewer = state.viewer;
+  updateViewerImage(interactionStartedAt).then(() => {
+    if (
+      state.viewer === viewer &&
+      !state.localSettings.gestureHelpDismissed &&
+      !state.gestureHelpDialog
+    ) {
+      openGestureHelpDialog();
+    }
+  }).catch(renderError);
 }
 
 function changeImage(delta) {
@@ -2059,6 +2151,7 @@ function changeImageTo(nextGroupIndex) {
   state.viewer?.hideBoundaryMessage();
   state.pageDirection = nextGroupIndex > state.pageGroupIndex ? 1 : -1;
   state.pageGroupIndex = nextGroupIndex;
+  state.viewer?.setSeekState(viewerSeekSnapshot(nextGroupIndex));
   const entry = state.pageGroups[nextGroupIndex].anchor;
   state.imageIndex = state.images.findIndex(
     (image) => entryIdentity(image) === entryIdentity(entry)
@@ -2116,6 +2209,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     gap: layout.gap,
     index: state.pageGroupIndex,
     count: state.pageGroups.length,
+    seekState: viewerSeekSnapshot(),
     interactionStartedAt,
   });
   if (!displayed || state.viewer !== viewer) return;
@@ -2860,15 +2954,21 @@ function menuDefinition(context) {
         [CommandName.ZOOM_IN, "拡大", "+"],
         [CommandName.ZOOM_OUT, "縮小", "−"],
         [CommandName.ZOOM_RESET, "ズームを戻す", "メニュー"],
+        [
+          CommandName.TOGGLE_VIEWER_BARS,
+          state.viewerBarsVisible ? "上下バーを隠す" : "上下バーを表示",
+          "中央タップ",
+        ],
         [CommandName.FIT_PAGE, "全体フィット", "0 で切替"],
         [CommandName.FIT_WIDTH, "幅フィット", "0 で切替"],
         [CommandName.FIT_ORIGINAL, "原寸 (100%)", "0 で切替"],
+        [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
         ...spreadActions,
         [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
         [CommandName.LAST_PAGE, "最後の画像", "End"],
-        [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
-        [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
         [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
+        [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
+        [CommandName.OPEN_GESTURE_HELP, "操作方法を見る", "メニュー"],
         [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
       ],
       shortcuts: [
@@ -2927,6 +3027,8 @@ class CommandMenu {
     this.owner = owner;
     this.opened = false;
     this.previousFocus = null;
+    this.actionLabels = new Map();
+    this.keyboardElements = [];
     const definition = menuDefinition(context);
     this.root = element("div", "command-menu-layer");
     this.root.hidden = true;
@@ -2954,7 +3056,11 @@ class CommandMenu {
       const button = element("button", "command-menu-action");
       button.type = "button";
       button.setAttribute("role", "menuitem");
-      button.append(textElement("span", label), textElement("kbd", keys));
+      const actionLabel = textElement("span", label);
+      const keyHint = textElement("kbd", keys);
+      this.actionLabels.set(name, actionLabel);
+      this.keyboardElements.push(keyHint);
+      button.append(actionLabel, keyHint);
       button.addEventListener("click", (event) => {
         this.close(false);
         menuCommand(event, name);
@@ -2967,6 +3073,11 @@ class CommandMenu {
     for (const [label, keys] of definition.shortcuts) {
       shortcuts.append(textElement("dt", label), textElement("dd", keys));
     }
+    this.keyboardElements.push(shortcutTitle, shortcuts);
+    this.setKeyboardAvailable(shouldShowKeyboardShortcuts({
+      coarsePointer: state.coarsePointer,
+      keyboardUsed: state.keyboardInputSeen,
+    }));
     panel.append(header, actions, shortcutTitle, shortcuts);
     this.root.append(scrim, panel);
     host.append(this.root);
@@ -2980,6 +3091,17 @@ class CommandMenu {
     if (this.opened) this.close();
     else this.open();
     return true;
+  }
+
+  setActionLabel(name, label) {
+    const target = this.actionLabels.get(name);
+    if (target) target.textContent = label;
+  }
+
+  setKeyboardAvailable(available) {
+    for (const target of this.keyboardElements) {
+      target.hidden = !available;
+    }
   }
 
   open() {
@@ -3004,6 +3126,94 @@ class CommandMenu {
   destroy() {
     this.close(false);
     this.root.remove();
+  }
+}
+
+function openGestureHelpDialog() {
+  state.gestureHelpDialog?.destroy();
+  state.gestureHelpDialog = new GestureHelpDialog(app);
+}
+
+class GestureHelpDialog {
+  constructor(host) {
+    this.previousFocus = document.activeElement;
+    this.root = element("div", "command-menu-layer gesture-help-layer");
+
+    const scrim = element("button", "command-menu-scrim");
+    scrim.type = "button";
+    scrim.setAttribute("aria-label", "操作方法を閉じる");
+    scrim.addEventListener("click", () => this.dismiss());
+
+    const panel = element("section", "command-menu gesture-help-dialog");
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", "画像の操作方法");
+
+    const header = element("header", "command-menu-header");
+    const close = textElement("button", "×", "command-menu-close");
+    close.type = "button";
+    close.setAttribute("aria-label", "操作方法を閉じる");
+    close.addEventListener("click", () => this.dismiss());
+    header.append(textElement("h2", "画像の操作方法"), close);
+
+    const guide = element("div", "gesture-help-grid");
+    const item = (symbol, title, description) => {
+      const card = element("div", "gesture-help-item");
+      card.append(
+        textElement("span", symbol, "gesture-help-symbol"),
+        textElement("strong", title),
+        textElement("small", description)
+      );
+      return card;
+    };
+    guide.append(
+      item("↔", "左右をタップ", "前後のページへ（綴じ方向に追従）"),
+      item("◎", "中央をタップ", "上下のバーを表示・非表示"),
+      item("↑", "上へスワイプ", "操作メニューを開く"),
+      item("↓", "下へスワイプ", "一覧へ戻る")
+    );
+    const note = textElement(
+      "p",
+      "拡大中は1本指で画像を動かせます。スワイプ操作よりパンを優先します。",
+      "gesture-help-note"
+    );
+    const done = textElement("button", "わかりました", "gesture-help-done");
+    done.type = "button";
+    done.addEventListener("click", () => this.dismiss());
+
+    panel.append(header, guide, note, done);
+    this.root.append(scrim, panel);
+    this.root.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.dismiss();
+      }
+    });
+    host.append(this.root);
+    requestAnimationFrame(() => close.focus());
+  }
+
+  dismiss() {
+    const saved = saveLocalSettings({
+      ...state.localSettings,
+      gestureHelpDismissed: true,
+    });
+    state.localSettings = saved.settings;
+    state.localSettingsStorageAvailable = saved.saved;
+    this.close();
+  }
+
+  close(restoreFocus = true) {
+    this.root.remove();
+    if (state.gestureHelpDialog === this) state.gestureHelpDialog = null;
+    if (restoreFocus && this.previousFocus instanceof HTMLElement) {
+      this.previousFocus.focus({ preventScroll: true });
+    }
+  }
+
+  destroy() {
+    this.close(false);
   }
 }
 
@@ -3111,6 +3321,8 @@ export class ImageViewer {
     image,
     title,
     counter,
+    seek,
+    seekInput,
     previous,
     next,
     loadingIndicator,
@@ -3127,6 +3339,8 @@ export class ImageViewer {
     this.images = [image];
     this.title = title;
     this.counter = counter;
+    this.seek = seek;
+    this.seekInput = seekInput;
     this.previous = previous;
     this.next = next;
     this.loadingIndicator = loadingIndicator;
@@ -3185,15 +3399,39 @@ export class ImageViewer {
     window.addEventListener("resize", this.resize);
   }
 
-  load({ name, request, info, fitMode, index, count, interactionStartedAt }) {
+  load({
+    name,
+    request,
+    info,
+    fitMode,
+    index,
+    count,
+    seekState,
+    interactionStartedAt,
+  }) {
     this.resetTransform();
     this.title.textContent = name;
     this.image.alt = name;
-    this.counter.textContent = `${index + 1} / ${count}`;
+    this.setSeekState(seekState ?? {
+      visible: count > 1,
+      min: 0,
+      max: Math.max(0, count - 1),
+      value: index,
+      label: `${index + 1} / ${count}`,
+    });
     return this.loadMeasuredImage(request, interactionStartedAt, name, info);
   }
 
-  loadGroup({ pages, name, fitMode, gap, index, count, interactionStartedAt }) {
+  loadGroup({
+    pages,
+    name,
+    fitMode,
+    gap,
+    index,
+    count,
+    seekState,
+    interactionStartedAt,
+  }) {
     if (pages.length === 1) {
       return this.load({
         name,
@@ -3202,13 +3440,37 @@ export class ImageViewer {
         fitMode,
         index,
         count,
+        seekState,
         interactionStartedAt,
       });
     }
     this.resetTransform();
     this.title.textContent = name;
-    this.counter.textContent = `${index + 1} / ${count}`;
+    this.setSeekState(seekState ?? {
+      visible: count > 1,
+      min: 0,
+      max: Math.max(0, count - 1),
+      value: index,
+      label: `${index + 1} / ${count}`,
+    });
     return this.loadMeasuredSpread(pages, fitMode, gap, interactionStartedAt);
+  }
+
+  setBarsVisible(visible) {
+    if (visible) this.root.classList.remove("viewer-bars-hidden");
+    else this.root.classList.add("viewer-bars-hidden");
+  }
+
+  setSeekState(seekState) {
+    if (!seekState) return;
+    this.counter.textContent = seekState.label;
+    if (!this.seek || !this.seekInput) return;
+    this.seekInput.hidden = !seekState.visible;
+    this.seekInput.min = String(seekState.min);
+    this.seekInput.max = String(seekState.max);
+    this.seekInput.value = String(seekState.value);
+    this.seekInput.disabled = seekState.max <= seekState.min;
+    this.seekInput.setAttribute("aria-valuetext", seekState.label);
   }
 
   setLayout(fitMode, layout, info, image = this.image) {
@@ -3642,19 +3904,28 @@ export class ImageViewer {
     if (this.pointers.size > 0) return;
 
     const source = pointerInputSource(event.pointerType);
-    if (!cancelled && !this.pinched && single) {
+    if (!this.pinched && single) {
       const dx = event.clientX - single.startX;
       const dy = event.clientY - single.startY;
       const elapsed = performance.now() - single.startedAt;
+      const gesture = viewerGestureDecision({
+        dx,
+        dy,
+        elapsedMs: elapsed,
+        moved: single.moved,
+        zoomed: this.scale > 1.01,
+        contentScrolled: this.fitMode === FitMode.WIDTH && single.moved,
+        edgeGuarded: single.edgeGuarded,
+        cancelled,
+      });
       if (
-        this.scale <= 1.01 &&
-        !single.edgeGuarded &&
-        Math.abs(dx) > 52 &&
-        Math.abs(dx) > Math.abs(dy) * 1.25
+        gesture === ViewerGesture.SWIPE_LEFT ||
+        gesture === ViewerGesture.SWIPE_RIGHT
       ) {
+        const swipeLeft = gesture === ViewerGesture.SWIPE_LEFT;
         dispatchCommand(
           command(
-            dx < 0
+            swipeLeft
               ? (isRtlReadingDirection(state.readingDirection)
                   ? CommandName.PREV_PAGE
                   : CommandName.NEXT_PAGE)
@@ -3662,9 +3933,19 @@ export class ImageViewer {
                   ? CommandName.NEXT_PAGE
                   : CommandName.PREV_PAGE)
           ),
-          { source, detail: "swipe" }
+          { source, detail: swipeLeft ? "swipe_left" : "swipe_right" }
         );
-      } else if (!single.moved && Math.hypot(dx, dy) < 12 && elapsed < 450) {
+      } else if (gesture === ViewerGesture.SWIPE_UP) {
+        dispatchCommand(command(CommandName.TOGGLE_MENU), {
+          source,
+          detail: "swipe_up",
+        });
+      } else if (gesture === ViewerGesture.SWIPE_DOWN) {
+        dispatchCommand(command(CommandName.BACK), {
+          source,
+          detail: "swipe_down",
+        });
+      } else if (gesture === ViewerGesture.TAP) {
         dispatchCommand(viewerTapCommand(
           event.clientX,
           this.root.clientWidth,
@@ -3673,7 +3954,7 @@ export class ImageViewer {
           source,
           detail: "tap_zone",
         });
-      } else if (single.moved) {
+      } else if (gesture === ViewerGesture.PAN) {
         dispatchCommand(command(CommandName.PAN_BY, { dx: 0, dy: 0 }), {
           source,
           detail: "pan",

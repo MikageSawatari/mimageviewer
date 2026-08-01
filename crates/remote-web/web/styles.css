@@ -823,6 +823,20 @@ button {
   background: linear-gradient(transparent, rgb(0 0 0 / 78%));
 }
 
+.viewer-bars-hidden .viewer-ui {
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+}
+
+.viewer-bars-hidden .viewer-ui.top {
+  transform: translateY(-20px);
+}
+
+.viewer-bars-hidden .viewer-ui.bottom {
+  transform: translateY(20px);
+}
+
 .viewer-title {
   overflow: hidden;
   flex: 1;
@@ -832,10 +846,37 @@ button {
 }
 
 .viewer-counter {
-  min-width: 72px;
+  min-width: 0;
   color: #d8dce5;
+  font-size: 0.82rem;
   text-align: center;
   text-shadow: 0 1px 4px #000;
+}
+
+.viewer-seek {
+  display: grid;
+  min-width: 0;
+  max-width: min(720px, calc(100vw - 132px));
+  flex: 1;
+  gap: 5px;
+}
+
+.viewer-seek-input {
+  width: 100%;
+  height: 24px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.viewer-seek-input[hidden] {
+  display: none;
+}
+
+.viewer-seek-input:disabled {
+  cursor: default;
+  opacity: 0.72;
 }
 
 .viewer-button:disabled {
@@ -911,6 +952,7 @@ button {
 
 .command-menu-actions {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 12px;
   gap: 8px;
 }
@@ -918,9 +960,11 @@ button {
 .command-menu-action {
   display: flex;
   min-height: 50px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 5px;
   padding: 10px 13px;
   border: 1px solid var(--line);
   border-radius: 13px;
@@ -934,7 +978,8 @@ button {
 .command-shortcuts dd {
   color: var(--muted);
   font: 600 0.76rem/1.35 ui-monospace, "SFMono-Regular", Consolas, monospace;
-  text-align: right;
+  overflow-wrap: anywhere;
+  text-align: left;
 }
 
 .command-shortcut-title {
@@ -959,6 +1004,65 @@ button {
 
 .local-settings-dialog {
   gap: 18px;
+}
+
+.gesture-help-dialog {
+  gap: 16px;
+}
+
+.gesture-help-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.gesture-help-item {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 3px 9px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-raised);
+}
+
+.gesture-help-item small {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.gesture-help-symbol {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  grid-row: 1 / span 2;
+  place-items: center;
+  border-radius: 50%;
+  color: #e8f0ff;
+  background: rgb(83 126 201 / 30%);
+  font-size: 1.15rem;
+  font-weight: 750;
+}
+
+.gesture-help-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.gesture-help-done {
+  min-height: 48px;
+  border: 1px solid rgb(115 157 226 / 72%);
+  border-radius: 13px;
+  color: #f4f7ff;
+  background: rgb(73 112 181 / 58%);
+  cursor: pointer;
+  touch-action: manipulation;
 }
 
 .local-settings-option {
@@ -1044,18 +1148,8 @@ button {
     pointer-events: auto;
   }
 
-  .image-viewer .viewer-ui {
-    pointer-events: none;
-    opacity: 0;
-    visibility: hidden;
-  }
-
-  .image-viewer .viewer-ui.top {
-    transform: translateY(-20px);
-  }
-
-  .image-viewer .viewer-ui.bottom {
-    transform: translateY(20px);
+  .gesture-help-grid {
+    grid-template-columns: 1fr;
   }
 }
 

@@ -19,6 +19,8 @@ export const CommandName = Object.freeze({
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
+  TOGGLE_VIEWER_BARS: "toggle_viewer_bars",
+  OPEN_GESTURE_HELP: "open_gesture_help",
   OPEN_LOCAL_SETTINGS: "open_local_settings",
   BACK: "back",
   FORWARD: "forward",
@@ -55,6 +57,15 @@ export const SpreadMode = Object.freeze({
 export const ReadingDirection = Object.freeze({
   LTR: "ltr",
   RTL: "rtl",
+});
+
+export const ViewerGesture = Object.freeze({
+  TAP: "tap",
+  SWIPE_LEFT: "swipe_left",
+  SWIPE_RIGHT: "swipe_right",
+  SWIPE_UP: "swipe_up",
+  SWIPE_DOWN: "swipe_down",
+  PAN: "pan",
 });
 
 export function command(name, payload = {}) {
@@ -325,7 +336,123 @@ export function viewerTapCommand(clientX, width, rtl = false) {
   const ratio = Math.max(0, Math.min(1, clientX / Math.max(1, width)));
   if (ratio < 0.34) return command(rtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
   if (ratio > 0.66) return command(rtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
-  return command(CommandName.TOGGLE_MENU);
+  return command(CommandName.TOGGLE_VIEWER_BARS);
+}
+
+export function viewerSeekGroupIndex(physicalValue, groupCount, rtl = false) {
+  const count = Math.max(0, Math.floor(Number(groupCount) || 0));
+  if (!count) return -1;
+  const physicalIndex = Math.max(
+    0,
+    Math.min(count - 1, Math.round(Number(physicalValue) || 0))
+  );
+  return rtl ? count - 1 - physicalIndex : physicalIndex;
+}
+
+export function viewerSeekState({
+  groupPageIndexes,
+  currentGroupIndex,
+  pageCount,
+  rtl = false,
+}) {
+  const groups = Array.isArray(groupPageIndexes) ? groupPageIndexes : [];
+  const total = Math.max(0, Math.floor(Number(pageCount) || 0));
+  if (!groups.length) {
+    return {
+      visible: false,
+      min: 0,
+      max: 0,
+      value: 0,
+      groupIndex: -1,
+      label: total ? `1 / ${total}` : "0 / 0",
+    };
+  }
+  const groupIndex = Math.max(
+    0,
+    Math.min(groups.length - 1, Math.floor(Number(currentGroupIndex) || 0))
+  );
+  const pages = [...new Set((groups[groupIndex] ?? [])
+    .map((value) => Math.floor(Number(value)))
+    .filter((value) => Number.isInteger(value) && value >= 0 && value < total))]
+    .sort((left, right) => left - right);
+  const consecutive = pages.every(
+    (page, index) => index === 0 || page === pages[index - 1] + 1
+  );
+  const pageLabel = pages.length === 1
+    ? String(pages[0] + 1)
+    : pages.length > 1 && consecutive
+      ? `${pages[0] + 1}-${pages[pages.length - 1] + 1}`
+      : pages.map((page) => page + 1).join(",");
+  return {
+    visible: total > 1,
+    min: 0,
+    max: groups.length - 1,
+    value: rtl ? groups.length - 1 - groupIndex : groupIndex,
+    groupIndex,
+    label: `${pageLabel || groupIndex + 1} / ${total}`,
+  };
+}
+
+export function viewerGestureDecision({
+  dx,
+  dy,
+  elapsedMs,
+  moved = false,
+  zoomed = false,
+  contentScrolled = false,
+  edgeGuarded = false,
+  cancelled = false,
+  pinched = false,
+  swipeThreshold = 52,
+  axisDominance = 1.25,
+  tapDistance = 12,
+  tapDurationMs = 450,
+}) {
+  if (cancelled || pinched) return null;
+  const horizontal = Number(dx) || 0;
+  const vertical = Number(dy) || 0;
+  const absX = Math.abs(horizontal);
+  const absY = Math.abs(vertical);
+  const distance = Math.hypot(horizontal, vertical);
+  const swipe = Math.max(0, Number(swipeThreshold) || 0);
+  const dominance = Math.max(1, Number(axisDominance) || 1);
+  const tapRadius = Math.max(0, Number(tapDistance) || 0);
+
+  if (zoomed && (moved || distance >= tapRadius)) return ViewerGesture.PAN;
+  if (
+    !edgeGuarded &&
+    absX > swipe &&
+    absX > absY * dominance
+  ) {
+    return horizontal < 0
+      ? ViewerGesture.SWIPE_LEFT
+      : ViewerGesture.SWIPE_RIGHT;
+  }
+  if (contentScrolled && moved) return ViewerGesture.PAN;
+  if (
+    !edgeGuarded &&
+    absY > swipe &&
+    absY > absX * dominance
+  ) {
+    return vertical < 0
+      ? ViewerGesture.SWIPE_UP
+      : ViewerGesture.SWIPE_DOWN;
+  }
+  if (
+    !moved &&
+    distance < tapRadius &&
+    Number(elapsedMs) < Math.max(0, Number(tapDurationMs) || 0)
+  ) {
+    return ViewerGesture.TAP;
+  }
+  return moved ? ViewerGesture.PAN : null;
+}
+
+export function shouldShowKeyboardShortcuts({
+  coarsePointer = false,
+  keyboardUsed = false,
+} = {}) {
+  return !coarsePointer || Boolean(keyboardUsed);
 }
 
 export function viewerWheelCommand(deltaY, zoomModifier) {

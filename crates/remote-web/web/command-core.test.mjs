@@ -6,6 +6,7 @@ import {
   FitMode,
   ReadingDirection,
   SpreadMode,
+  ViewerGesture,
   commandFromKey,
   containerPageTargetPx,
   gridLayoutForWidth,
@@ -25,9 +26,13 @@ import {
   thumbnailBindingMatches,
   thumbnailRetryDecision,
   shouldShowLoadingIndicator,
+  shouldShowKeyboardShortcuts,
   sessionOwnerBadge,
   viewerImageLayout,
   viewerBoundaryMessage,
+  viewerGestureDecision,
+  viewerSeekGroupIndex,
+  viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
@@ -335,10 +340,140 @@ test("escape closes the shared menu in every screen context", () => {
 
 test("viewer tap zones and wheel inputs emit the same commands", () => {
   assert.equal(viewerTapCommand(10, 300).name, CommandName.PREV_PAGE);
-  assert.equal(viewerTapCommand(150, 300).name, CommandName.TOGGLE_MENU);
+  assert.equal(viewerTapCommand(150, 300).name, CommandName.TOGGLE_VIEWER_BARS);
   assert.equal(viewerTapCommand(290, 300).name, CommandName.NEXT_PAGE);
   assert.equal(viewerWheelCommand(120, false).name, CommandName.NEXT_PAGE);
   assert.equal(viewerWheelCommand(-120, true).name, CommandName.ZOOM_IN);
+});
+
+test("viewer seek uses one physical tick per page group and real page labels", () => {
+  assert.deepEqual(
+    viewerSeekState({
+      groupPageIndexes: [[0], [1], [2]],
+      currentGroupIndex: 1,
+      pageCount: 3,
+    }),
+    {
+      visible: true,
+      min: 0,
+      max: 2,
+      value: 1,
+      groupIndex: 1,
+      label: "2 / 3",
+    }
+  );
+  assert.deepEqual(
+    viewerSeekState({
+      groupPageIndexes: [[0], [1, 2], [3, 4]],
+      currentGroupIndex: 1,
+      pageCount: 5,
+    }),
+    {
+      visible: true,
+      min: 0,
+      max: 2,
+      value: 1,
+      groupIndex: 1,
+      label: "2-3 / 5",
+    }
+  );
+});
+
+test("viewer seek reverses its physical endpoints for RTL books", () => {
+  const groups = [[0], [1, 2], [3, 4]];
+  assert.equal(viewerSeekState({
+    groupPageIndexes: groups,
+    currentGroupIndex: 0,
+    pageCount: 5,
+    rtl: true,
+  }).value, 2);
+  assert.equal(viewerSeekState({
+    groupPageIndexes: groups,
+    currentGroupIndex: 2,
+    pageCount: 5,
+    rtl: true,
+  }).value, 0);
+  assert.equal(viewerSeekGroupIndex(0, groups.length, true), 2);
+  assert.equal(viewerSeekGroupIndex(2, groups.length, true), 0);
+  assert.equal(viewerSeekGroupIndex(0, groups.length, false), 0);
+  assert.equal(viewerSeekGroupIndex(99, groups.length, false), 2);
+});
+
+test("viewer seek hides only its range for a one-image sequence", () => {
+  assert.deepEqual(
+    viewerSeekState({
+      groupPageIndexes: [[0]],
+      currentGroupIndex: 0,
+      pageCount: 1,
+    }),
+    {
+      visible: false,
+      min: 0,
+      max: 0,
+      value: 0,
+      groupIndex: 0,
+      label: "1 / 1",
+    }
+  );
+});
+
+test("viewer gesture separates vertical and horizontal swipes", () => {
+  assert.equal(
+    viewerGestureDecision({ dx: -80, dy: 40, elapsedMs: 180 }),
+    ViewerGesture.SWIPE_LEFT
+  );
+  assert.equal(
+    viewerGestureDecision({ dx: 40, dy: -80, elapsedMs: 180 }),
+    ViewerGesture.SWIPE_UP
+  );
+  assert.equal(
+    viewerGestureDecision({ dx: 40, dy: 80, elapsedMs: 180 }),
+    ViewerGesture.SWIPE_DOWN
+  );
+  assert.equal(
+    viewerGestureDecision({ dx: 60, dy: 50, elapsedMs: 180 }),
+    null
+  );
+});
+
+test("viewer gesture rejects sub-threshold motion and prioritizes pan", () => {
+  assert.equal(
+    viewerGestureDecision({ dx: 0, dy: -52, elapsedMs: 180 }),
+    null
+  );
+  assert.equal(
+    viewerGestureDecision({ dx: 0, dy: -53, elapsedMs: 180 }),
+    ViewerGesture.SWIPE_UP
+  );
+  assert.equal(
+    viewerGestureDecision({
+      dx: 0,
+      dy: -100,
+      elapsedMs: 180,
+      moved: true,
+      zoomed: true,
+    }),
+    ViewerGesture.PAN
+  );
+  assert.equal(
+    viewerGestureDecision({
+      dx: 0,
+      dy: -100,
+      elapsedMs: 180,
+      moved: true,
+      contentScrolled: true,
+    }),
+    ViewerGesture.PAN
+  );
+});
+
+test("keyboard help defaults to pointer capability and remembers real key input", () => {
+  assert.equal(shouldShowKeyboardShortcuts({ coarsePointer: false }), true);
+  assert.equal(shouldShowKeyboardShortcuts({ coarsePointer: true }), false);
+  assert.equal(
+    shouldShowKeyboardShortcuts({ coarsePointer: true, keyboardUsed: true }),
+    true
+  );
 });
 
 test("grid navigation uses columns, page rows and clamps to valid entries", () => {

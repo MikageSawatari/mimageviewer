@@ -5,6 +5,7 @@ export function defaultLocalSettings() {
   return {
     version: LOCAL_SETTINGS_VERSION,
     portraitSinglePage: true,
+    gestureHelpDismissed: false,
   };
 }
 
@@ -19,6 +20,10 @@ export function normalizeLocalSettings(value) {
       typeof value.portraitSinglePage === "boolean"
         ? value.portraitSinglePage
         : defaults.portraitSinglePage,
+    gestureHelpDismissed:
+      typeof value.gestureHelpDismissed === "boolean"
+        ? value.gestureHelpDismissed
+        : defaults.gestureHelpDismissed,
   };
 }
 
