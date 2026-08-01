@@ -4,3 +4,7 @@ models/*.onnx filter=lfs diff=lfs merge=lfs -text
 # armored signature must stay LF or signature verification breaks on checkout.
 htdocs/mimageviewer/ffmpeg-*-source.tar.xz binary
 htdocs/mimageviewer/ffmpeg-*-source.tar.xz.asc binary
+
+# Vendored hls.js — keep byte-exact so the sha256 in hls.VERSION.txt still
+# verifies after a fresh checkout on Windows.
+crates/remote-web/web/vendor/hls.min.js binary
