@@ -805,6 +805,11 @@ function dispatchCommand(requested, meta = {}) {
   } else if (requested.name === CommandName.TOGGLE_FULLSCREEN) {
     toggleBrowserFullscreen();
     handled = true;
+  } else if (requested.name === CommandName.RELOAD_APP) {
+    // ホーム画面から起動した iOS の単独ウィンドウにはブラウザの再読み込みが無い。
+    // 現在の hash を保ったまま読み直すので、開いているページへ戻ってくる。
+    window.location.reload();
+    handled = true;
   } else if (requested.name === CommandName.GRID_SELECT) {
     const index = Number(requested.payload.index);
     if (state.screenContext === "grid" && Number.isInteger(index)) {
@@ -2806,6 +2811,7 @@ function menuDefinition(context) {
         [CommandName.LAST_PAGE, "最後の画像", "End"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
         [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
+        [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
       ],
       shortcuts: [
         ["前 / 次", "← ↑ PageUp / → ↓ PageDown"],
@@ -2829,6 +2835,7 @@ function menuDefinition(context) {
         [CommandName.GRID_FIRST, "先頭へ", "Home"],
         [CommandName.GRID_LAST, "末尾へ", "End"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+        [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
       ],
       shortcuts: [
         ["項目を移動", "← ↑ → ↓"],
@@ -2844,7 +2851,10 @@ function menuDefinition(context) {
   }
   return {
     title: "操作",
-    actions: [[CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"]],
+    actions: [
+      [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+      [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
+    ],
     shortcuts: [
       ["操作メニュー", "?"],
       ["全画面", "F11"],

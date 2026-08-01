@@ -25,6 +25,7 @@ export const CommandName = Object.freeze({
   OPEN: "open",
   OPEN_SELECTED: "open_selected",
   TOGGLE_FULLSCREEN: "toggle_fullscreen",
+  RELOAD_APP: "reload_app",
   GRID_LEFT: "grid_left",
   GRID_RIGHT: "grid_right",
   GRID_UP: "grid_up",
