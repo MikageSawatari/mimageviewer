@@ -9,6 +9,8 @@ use super::playlist::{DEFAULT_SEGMENT_CAPACITY, SegmentLookup, SegmentRing, mast
 
 const AVIO_BUFFER_SIZE: usize = 32 * 1024;
 const AVERROR_ENOMEM: i32 = -12;
+const VIDEO_STREAM_INDEX: usize = 0;
+const AUDIO_STREAM_INDEX: usize = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Fmp4SegmenterError(String);
@@ -211,6 +213,26 @@ pub(crate) fn avc1_codecs_from_extradata(extradata: &[u8]) -> Result<String, Fmp
     ))
 }
 
+/// MPEG-4 AudioSpecificConfig の実出力から RFC 6381 `mp4a.40.AOT` を作る。
+pub(crate) fn mp4a_codecs_from_extradata(extradata: &[u8]) -> Result<String, Fmp4SegmenterError> {
+    let first = *extradata
+        .first()
+        .ok_or_else(|| Fmp4SegmenterError::new("AAC encoder extradata is empty"))?;
+    let mut audio_object_type = u16::from(first >> 3);
+    if audio_object_type == 31 {
+        let second = *extradata.get(1).ok_or_else(|| {
+            Fmp4SegmenterError::new("extended AAC AudioSpecificConfig is truncated")
+        })?;
+        audio_object_type = 32 + u16::from(((first & 0x07) << 3) | (second >> 5));
+    }
+    if audio_object_type == 0 {
+        return Err(Fmp4SegmenterError::new(
+            "AAC AudioSpecificConfig has object type zero",
+        ));
+    }
+    Ok(format!("mp4a.40.{audio_object_type}"))
+}
+
 fn packet_contains_idr(data: &[u8]) -> bool {
     h264_nals(data).any(|nal| !nal.is_empty() && nal[0] & 0x1f == 5)
 }
@@ -278,15 +300,16 @@ fn length_prefixed_nals(data: &[u8]) -> Option<Vec<&[u8]>> {
 
 fn encoder_extradata(
     context: *const ffmpeg::ffi::AVCodecContext,
+    stream_name: &str,
 ) -> Result<Vec<u8>, Fmp4SegmenterError> {
     if context.is_null() {
         return Err(Fmp4SegmenterError::new("encoder context is null"));
     }
     let context = unsafe { &*context };
     if context.extradata.is_null() || context.extradata_size <= 0 {
-        return Err(Fmp4SegmenterError::new(
-            "H.264 encoder did not publish SPS/PPS extradata",
-        ));
+        return Err(Fmp4SegmenterError::new(format!(
+            "{stream_name} encoder did not publish global extradata"
+        )));
     }
     Ok(unsafe {
         slice::from_raw_parts(context.extradata, context.extradata_size as usize).to_vec()
@@ -317,6 +340,48 @@ fn has_top_level_boxes(data: &[u8], required: &[[u8; 4]]) -> bool {
         offset += box_size;
     }
     offset == data.len() && required.iter().all(|kind| found.contains(kind))
+}
+
+fn split_delayed_init_and_first_media(
+    data: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), Fmp4SegmenterError> {
+    let mut init = Vec::new();
+    let mut media = Vec::new();
+    let mut offset = 0_usize;
+    while offset + 8 <= data.len() {
+        let size32 = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind: [u8; 4] = data[offset + 4..offset + 8].try_into().unwrap();
+        let box_size = match size32 {
+            0 => data.len() - offset,
+            1 if offset + 16 <= data.len() => {
+                let size64 = u64::from_be_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+                usize::try_from(size64)
+                    .map_err(|_| Fmp4SegmenterError::new("MP4 box size exceeds usize"))?
+            }
+            _ => size32,
+        };
+        if box_size < 8 || offset.saturating_add(box_size) > data.len() {
+            return Err(Fmp4SegmenterError::new(
+                "delayed MP4 output contains an invalid top-level box",
+            ));
+        }
+        let target = if kind == *b"ftyp" || kind == *b"moov" {
+            &mut init
+        } else {
+            &mut media
+        };
+        target.extend_from_slice(&data[offset..offset + box_size]);
+        offset += box_size;
+    }
+    if offset != data.len()
+        || !has_top_level_boxes(&init, &[*b"ftyp", *b"moov"])
+        || !has_top_level_boxes(&media, &[*b"moof", *b"mdat"])
+    {
+        return Err(Fmp4SegmenterError::new(
+            "delayed MP4 output did not contain complete init and media boxes",
+        ));
+    }
+    Ok((init, media))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,19 +429,34 @@ enum SegmenterLifecycle {
     Failed,
 }
 
+#[derive(Debug)]
+enum InitSegmentState {
+    /// `delay_moov` may emit an MP4 prefix before the first fragment is flushed.
+    Pending {
+        muxer_prefix: Vec<u8>,
+    },
+    Ready(Vec<u8>),
+}
+
 pub(crate) struct Fmp4Segmenter {
     muxer: MuxerResources,
-    init_segment: Vec<u8>,
+    init_segment: InitSegmentState,
     codecs: String,
     bandwidth_bps: u64,
     width: u32,
     height: u32,
-    source_time_base: ffmpeg::ffi::AVRational,
-    stream_time_base: ffmpeg::ffi::AVRational,
+    video_source_time_base: ffmpeg::ffi::AVRational,
+    video_stream_time_base: ffmpeg::ffi::AVRational,
+    audio_source_time_base: ffmpeg::ffi::AVRational,
+    audio_stream_time_base: ffmpeg::ffi::AVRational,
     keyint_frames: u32,
     fragment: FragmentState,
-    last_pts: Option<i64>,
-    last_dts: Option<i64>,
+    last_video_pts: Option<i64>,
+    last_video_dts: Option<i64>,
+    last_audio_pts: Option<i64>,
+    last_audio_dts: Option<i64>,
+    last_audio_end_dts: Option<i64>,
+    flushed_audio_before_dts: Option<i64>,
     stats: Fmp4SegmenterStats,
     ring: SegmentRing,
     lifecycle: SegmenterLifecycle,
@@ -386,14 +466,21 @@ unsafe impl Send for Fmp4Segmenter {}
 
 impl Fmp4Segmenter {
     pub(crate) fn new(
-        encoder: &ffmpeg::codec::encoder::video::Encoder,
+        video_encoder: &ffmpeg::codec::encoder::video::Encoder,
+        audio_encoder: &ffmpeg::codec::encoder::audio::Encoder,
         frame_rate: FrameRate,
     ) -> Result<Self, Fmp4SegmenterError> {
-        Self::with_capacity(encoder, frame_rate, DEFAULT_SEGMENT_CAPACITY)
+        Self::with_capacity(
+            video_encoder,
+            audio_encoder,
+            frame_rate,
+            DEFAULT_SEGMENT_CAPACITY,
+        )
     }
 
     pub(crate) fn with_capacity(
-        encoder: &ffmpeg::codec::encoder::video::Encoder,
+        video_encoder: &ffmpeg::codec::encoder::video::Encoder,
+        audio_encoder: &ffmpeg::codec::encoder::audio::Encoder,
         frame_rate: FrameRate,
         capacity: usize,
     ) -> Result<Self, Fmp4SegmenterError> {
@@ -401,11 +488,15 @@ impl Fmp4Segmenter {
             Fmp4SegmenterError::new(format!("FFmpeg initialization failed: {error}"))
         })?;
         let ring = SegmentRing::new(capacity).map_err(Fmp4SegmenterError::new)?;
-        let encoder_context = unsafe { encoder.as_ptr() };
-        let extradata = encoder_extradata(encoder_context)?;
-        let codecs = avc1_codecs_from_extradata(&extradata)?;
-        let (source_time_base, bandwidth_bps, width, height) = unsafe {
-            let context = &*encoder_context;
+        let video_encoder_context = unsafe { video_encoder.as_ptr() };
+        let audio_encoder_context = unsafe { audio_encoder.as_ptr() };
+        let video_extradata = encoder_extradata(video_encoder_context, "H.264")?;
+        let audio_extradata = encoder_extradata(audio_encoder_context, "AAC")?;
+        let video_codecs = avc1_codecs_from_extradata(&video_extradata)?;
+        let audio_codecs = mp4a_codecs_from_extradata(&audio_extradata)?;
+        let codecs = format!("{video_codecs},{audio_codecs}");
+        let (video_source_time_base, video_bitrate_bps, width, height) = unsafe {
+            let context = &*video_encoder_context;
             (
                 context.time_base,
                 context.bit_rate.max(1) as u64,
@@ -415,16 +506,26 @@ impl Fmp4Segmenter {
                     .map_err(|_| Fmp4SegmenterError::new("invalid encoder height"))?,
             )
         };
-        if width == 0 || height == 0 || source_time_base.num <= 0 || source_time_base.den <= 0 {
+        let (audio_source_time_base, audio_bitrate_bps) = unsafe {
+            let context = &*audio_encoder_context;
+            (context.time_base, context.bit_rate.max(1) as u64)
+        };
+        if width == 0
+            || height == 0
+            || video_source_time_base.num <= 0
+            || video_source_time_base.den <= 0
+            || audio_source_time_base.num <= 0
+            || audio_source_time_base.den <= 0
+        {
             return Err(Fmp4SegmenterError::new(
-                "encoder dimensions/time base are invalid",
+                "encoder dimensions or time bases are invalid",
             ));
         }
         let expected_time_base = ffmpeg::ffi::AVRational {
             num: frame_rate.denominator as i32,
             den: frame_rate.numerator as i32,
         };
-        if unsafe { ffmpeg::ffi::av_cmp_q(source_time_base, expected_time_base) } != 0 {
+        if unsafe { ffmpeg::ffi::av_cmp_q(video_source_time_base, expected_time_base) } != 0 {
             return Err(Fmp4SegmenterError::new(
                 "encoder time base does not match the segment frame rate",
             ));
@@ -433,24 +534,48 @@ impl Fmp4Segmenter {
             "remote-stream fMP4 muxer: codecs={codecs} output={width}x{height} keyint_frames={}",
             frame_rate.keyint_frames()
         ));
+        let bandwidth_bps = video_bitrate_bps.saturating_add(audio_bitrate_bps);
 
         let mut muxer = MuxerResources::allocate()?;
-        let stream = unsafe { ffmpeg::ffi::avformat_new_stream(muxer.context, ptr::null()) };
-        if stream.is_null() {
-            return Err(Fmp4SegmenterError::new("avformat_new_stream failed"));
+        let video_stream = unsafe { ffmpeg::ffi::avformat_new_stream(muxer.context, ptr::null()) };
+        if video_stream.is_null() {
+            return Err(Fmp4SegmenterError::new("video avformat_new_stream failed"));
         }
         let result = unsafe {
-            ffmpeg::ffi::avcodec_parameters_from_context((*stream).codecpar, encoder_context)
+            ffmpeg::ffi::avcodec_parameters_from_context(
+                (*video_stream).codecpar,
+                video_encoder_context,
+            )
         };
         if result < 0 {
             return Err(Fmp4SegmenterError::ffmpeg(
-                "avcodec_parameters_from_context",
+                "avcodec_parameters_from_context(video)",
                 result,
             ));
         }
         unsafe {
-            (*stream).time_base = source_time_base;
-            (*(*stream).codecpar).codec_tag = 0;
+            (*video_stream).time_base = video_source_time_base;
+            (*(*video_stream).codecpar).codec_tag = 0;
+        }
+        let audio_stream = unsafe { ffmpeg::ffi::avformat_new_stream(muxer.context, ptr::null()) };
+        if audio_stream.is_null() {
+            return Err(Fmp4SegmenterError::new("audio avformat_new_stream failed"));
+        }
+        let result = unsafe {
+            ffmpeg::ffi::avcodec_parameters_from_context(
+                (*audio_stream).codecpar,
+                audio_encoder_context,
+            )
+        };
+        if result < 0 {
+            return Err(Fmp4SegmenterError::ffmpeg(
+                "avcodec_parameters_from_context(audio)",
+                result,
+            ));
+        }
+        unsafe {
+            (*audio_stream).time_base = audio_source_time_base;
+            (*(*audio_stream).codecpar).codec_tag = 0;
         }
 
         let mut options = ptr::null_mut();
@@ -460,7 +585,7 @@ impl Fmp4Segmenter {
                 b"movflags\0".as_ptr().cast(),
                 // FFmpeg の movflag 名は default_base_moof。生成される tfhd の
                 // default-base-is-moof flag（ISO BMFF 名）に対応する。
-                b"frag_custom+empty_moov+default_base_moof+cmaf\0"
+                b"frag_custom+delay_moov+default_base_moof+cmaf\0"
                     .as_ptr()
                     .cast(),
                 0,
@@ -479,47 +604,58 @@ impl Fmp4Segmenter {
             return Err(Fmp4SegmenterError::ffmpeg("avformat_write_header", result));
         }
         muxer.lifecycle = MuxerLifecycle::HeaderWritten;
-        let stream_time_base = unsafe { (*stream).time_base };
-        let init_segment = muxer.take_output()?;
-        if !has_top_level_boxes(&init_segment, &[*b"ftyp", *b"moov"]) {
-            return Err(Fmp4SegmenterError::new(
-                "mp4 muxer header was not an ftyp+moov init segment",
-            ));
-        }
+        let video_stream_time_base = unsafe { (*video_stream).time_base };
+        let audio_stream_time_base = unsafe { (*audio_stream).time_base };
+        // AAC priming starts at DTS -1024. delay_moov lets the muxer build the edit list from
+        // real first packets; init bytes are emitted with the first fragment and split there.
+        let muxer_prefix = muxer.take_output()?;
 
         Ok(Self {
             muxer,
-            init_segment,
+            init_segment: InitSegmentState::Pending { muxer_prefix },
             codecs,
             bandwidth_bps,
             width,
             height,
-            source_time_base,
-            stream_time_base,
+            video_source_time_base,
+            video_stream_time_base,
+            audio_source_time_base,
+            audio_stream_time_base,
             keyint_frames: frame_rate.keyint_frames(),
             fragment: FragmentState::Empty,
-            last_pts: None,
-            last_dts: None,
+            last_video_pts: None,
+            last_video_dts: None,
+            last_audio_pts: None,
+            last_audio_dts: None,
+            last_audio_end_dts: None,
+            flushed_audio_before_dts: None,
             stats: Fmp4SegmenterStats::default(),
             ring,
             lifecycle: SegmenterLifecycle::Active,
         })
     }
 
-    pub(crate) fn init_segment(&self) -> &[u8] {
-        &self.init_segment
+    /// `delay_moov` のため、最初の media segment が確定するまでは `None`。
+    pub(crate) fn init_segment(&self) -> Option<&[u8]> {
+        match &self.init_segment {
+            InitSegmentState::Pending { .. } => None,
+            InitSegmentState::Ready(bytes) => Some(bytes),
+        }
     }
 
     pub(crate) fn codecs(&self) -> &str {
         &self.codecs
     }
 
-    pub(crate) fn master_playlist(&self) -> String {
-        master_playlist(&self.codecs, self.bandwidth_bps, self.width, self.height)
+    /// init と最初の media segment が同時に公開可能になってから返す。
+    pub(crate) fn master_playlist(&self) -> Option<String> {
+        self.init_segment()
+            .map(|_| master_playlist(&self.codecs, self.bandwidth_bps, self.width, self.height))
     }
 
-    pub(crate) fn media_playlist(&self) -> String {
-        self.ring.media_playlist()
+    /// `EXT-X-MAP` が指す init を取得できる状態になってから返す。
+    pub(crate) fn media_playlist(&self) -> Option<String> {
+        self.init_segment().map(|_| self.ring.media_playlist())
     }
 
     pub(crate) fn segment(&self, sequence: u64) -> SegmentLookup<'_> {
@@ -574,14 +710,92 @@ impl Fmp4Segmenter {
                 ));
             }
         }
-        let result = self.push_packet_inner(packet);
+        let result = self.push_video_packet_inner(packet);
         if result.is_err() {
             self.lifecycle = SegmenterLifecycle::Failed;
         }
         result
     }
 
-    fn push_packet_inner(
+    pub(crate) fn push_audio_packet(
+        &mut self,
+        packet: &ffmpeg::Packet,
+    ) -> Result<(), Fmp4SegmenterError> {
+        match self.lifecycle {
+            SegmenterLifecycle::Active => {}
+            SegmenterLifecycle::Finished => {
+                return Err(Fmp4SegmenterError::new(
+                    "cannot push audio after segmenter finish",
+                ));
+            }
+            SegmenterLifecycle::Failed => {
+                return Err(Fmp4SegmenterError::new(
+                    "cannot push audio after a segmenter failure",
+                ));
+            }
+        }
+        let result = self.push_audio_packet_inner(packet);
+        if result.is_err() {
+            self.lifecycle = SegmenterLifecycle::Failed;
+        }
+        result
+    }
+
+    fn push_audio_packet_inner(
+        &mut self,
+        packet: &ffmpeg::Packet,
+    ) -> Result<(), Fmp4SegmenterError> {
+        let pts = packet
+            .pts()
+            .ok_or_else(|| Fmp4SegmenterError::new("encoded audio packet has no PTS"))?;
+        let dts = packet
+            .dts()
+            .ok_or_else(|| Fmp4SegmenterError::new("encoded audio packet has no DTS"))?;
+        if let Some(last_dts) = self.last_audio_dts
+            && dts <= last_dts
+        {
+            return Err(Fmp4SegmenterError::new(format!(
+                "encoded audio DTS is not strictly increasing: {dts} <= {last_dts}"
+            )));
+        }
+        if let Some(last_pts) = self.last_audio_pts
+            && pts <= last_pts
+        {
+            return Err(Fmp4SegmenterError::new(format!(
+                "encoded audio PTS is not strictly increasing: {pts} <= {last_pts}"
+            )));
+        }
+        if let Some(floor) = self.flushed_audio_before_dts
+            && dts < floor
+        {
+            return Err(Fmp4SegmenterError::new(format!(
+                "audio packet DTS {dts} arrived after fragment containing timestamps before {floor} was flushed"
+            )));
+        }
+        let duration = packet.duration().max(1);
+        let mut mux_packet = packet.clone();
+        mux_packet.set_stream(AUDIO_STREAM_INDEX);
+        mux_packet.set_duration(duration);
+        mux_packet.rescale_ts(
+            ffmpeg::Rational::from(self.audio_source_time_base),
+            ffmpeg::Rational::from(self.audio_stream_time_base),
+        );
+        let result = unsafe {
+            ffmpeg::ffi::av_interleaved_write_frame(self.muxer.context, mux_packet.as_mut_ptr())
+        };
+        if result < 0 {
+            return Err(Fmp4SegmenterError::ffmpeg(
+                "av_interleaved_write_frame(audio)",
+                result,
+            ));
+        }
+        self.last_audio_pts = Some(pts);
+        self.last_audio_dts = Some(dts);
+        self.last_audio_end_dts = Some(dts.saturating_add(duration));
+        Ok(())
+    }
+
+    fn push_video_packet_inner(
         &mut self,
         packet: &ffmpeg::Packet,
     ) -> Result<Option<u64>, Fmp4SegmenterError> {
@@ -591,14 +805,14 @@ impl Fmp4Segmenter {
         let dts = packet
             .dts()
             .ok_or_else(|| Fmp4SegmenterError::new("encoded packet has no DTS"))?;
-        if let Some(last_dts) = self.last_dts
+        if let Some(last_dts) = self.last_video_dts
             && dts <= last_dts
         {
             return Err(Fmp4SegmenterError::new(format!(
                 "encoded packet DTS is not strictly increasing: {dts} <= {last_dts}"
             )));
         }
-        if let Some(last_pts) = self.last_pts
+        if let Some(last_pts) = self.last_video_pts
             && pts <= last_pts
         {
             return Err(Fmp4SegmenterError::new(format!(
@@ -641,11 +855,11 @@ impl Fmp4Segmenter {
 
         let packet_duration = packet.duration().max(1);
         let mut mux_packet = packet.clone();
-        mux_packet.set_stream(0);
+        mux_packet.set_stream(VIDEO_STREAM_INDEX);
         mux_packet.set_duration(packet_duration);
         mux_packet.rescale_ts(
-            ffmpeg::Rational::from(self.source_time_base),
-            ffmpeg::Rational::from(self.stream_time_base),
+            ffmpeg::Rational::from(self.video_source_time_base),
+            ffmpeg::Rational::from(self.video_stream_time_base),
         );
         let result = unsafe {
             ffmpeg::ffi::av_interleaved_write_frame(self.muxer.context, mux_packet.as_mut_ptr())
@@ -657,8 +871,8 @@ impl Fmp4Segmenter {
             ));
         }
 
-        self.last_pts = Some(pts);
-        self.last_dts = Some(dts);
+        self.last_video_pts = Some(pts);
+        self.last_video_dts = Some(dts);
         self.fragment = match self.fragment {
             FragmentState::Empty => FragmentState::Writing {
                 start_dts: dts,
@@ -706,25 +920,77 @@ impl Fmp4Segmenter {
                 "media segment duration is not positive",
             ));
         }
-        let result = unsafe { ffmpeg::ffi::av_write_frame(self.muxer.context, ptr::null_mut()) };
+        let audio_boundary_dts = boundary_dts.map(|video_dts| unsafe {
+            ffmpeg::ffi::av_rescale_q(
+                video_dts,
+                self.video_source_time_base,
+                self.audio_source_time_base,
+            )
+        });
+        if let (Some(audio_boundary), Some(last_audio_end)) =
+            (audio_boundary_dts, self.last_audio_end_dts)
+            && last_audio_end < audio_boundary
+        {
+            return Err(Fmp4SegmenterError::new(format!(
+                "audio packets only cover DTS {last_audio_end}, before video fragment boundary {audio_boundary}"
+            )));
+        }
+        // av_interleaved_write_frame may retain packets while waiting for the other stream.
+        // Drain that queue before frag_custom's explicit av_write_frame(NULL), otherwise the
+        // just-submitted tail audio packets can miss the fragment being finalized here.
+        let result =
+            unsafe { ffmpeg::ffi::av_interleaved_write_frame(self.muxer.context, ptr::null_mut()) };
         if result < 0 {
             return Err(Fmp4SegmenterError::ffmpeg(
-                "av_write_frame(fragment flush)",
+                "av_interleaved_write_frame(queue flush)",
                 result,
             ));
         }
-        let bytes = self.muxer.take_output()?;
+        // With delay_moov the first explicit flush publishes ftyp+moov; the following flush
+        // publishes the buffered first moof+mdat. Later boundaries need one flush as before.
+        let init_is_pending = matches!(self.init_segment, InitSegmentState::Pending { .. });
+        let flush_count = if init_is_pending { 2 } else { 1 };
+        for _ in 0..flush_count {
+            let result =
+                unsafe { ffmpeg::ffi::av_write_frame(self.muxer.context, ptr::null_mut()) };
+            if result < 0 {
+                return Err(Fmp4SegmenterError::ffmpeg(
+                    "av_write_frame(fragment flush)",
+                    result,
+                ));
+            }
+        }
+        let mut bytes = self.muxer.take_output()?;
+        let mut completed_init = None;
+        if let InitSegmentState::Pending { muxer_prefix } = &self.init_segment {
+            if !muxer_prefix.is_empty() {
+                let mut combined = Vec::with_capacity(muxer_prefix.len() + bytes.len());
+                combined.extend_from_slice(muxer_prefix);
+                combined.extend_from_slice(&bytes);
+                bytes = combined;
+            }
+            let (init, media) = split_delayed_init_and_first_media(&bytes)?;
+            completed_init = Some(init);
+            bytes = media;
+        }
         if !has_top_level_boxes(&bytes, &[*b"moof", *b"mdat"]) {
             return Err(Fmp4SegmenterError::new(
                 "mp4 muxer fragment was not a moof+mdat media segment",
             ));
         }
-        let duration_secs = (end_dts - start_dts) as f64 * f64::from(self.source_time_base.num)
-            / f64::from(self.source_time_base.den);
+        let duration_secs = (end_dts - start_dts) as f64
+            * f64::from(self.video_source_time_base.num)
+            / f64::from(self.video_source_time_base.den);
         let sequence = self
             .ring
             .push(duration_secs, bytes)
             .map_err(Fmp4SegmenterError::new)?;
+        if let Some(init) = completed_init {
+            self.init_segment = InitSegmentState::Ready(init);
+        }
+        if let Some(audio_boundary) = audio_boundary_dts {
+            self.flushed_audio_before_dts = Some(audio_boundary);
+        }
         self.fragment = FragmentState::Empty;
         Ok(Some(sequence))
     }
@@ -769,10 +1035,13 @@ mod tests {
     use std::io::SeekFrom;
 
     use super::*;
+    use crate::video::audio::ProcessedChunk;
+    use crate::video::stream::audio_encoder::{OpenedAacEncoder, open_aac_encoder};
     use crate::video::stream::encoder::{
-        EncoderPreference, H264EncoderKind, H264InputFormat, open_h264_encoder,
+        AUDIO_PROFILE_ID, EncoderPreference, H264EncoderKind, H264InputFormat, open_h264_encoder,
     };
     use crate::video::stream::quality::{OutputDimensions, StreamOutputParameters};
+    use crate::video::stream::timeline::StreamTimeline;
 
     const AVERROR_EOF: i32 = -0x2046_4f45;
     const FFMPEG_EAGAIN: i32 = 11;
@@ -791,6 +1060,15 @@ mod tests {
             "avc1.42c01f"
         );
         assert!(avc1_codecs_from_extradata(&[]).is_err());
+        assert_eq!(
+            mp4a_codecs_from_extradata(&[0x12, 0x10]).unwrap(),
+            "mp4a.40.2"
+        );
+        assert!(mp4a_codecs_from_extradata(&[]).is_err());
+    }
+
+    fn open_test_audio(bitrate_bps: u32) -> OpenedAacEncoder {
+        open_aac_encoder(48_000, bitrate_bps, 0, StreamTimeline::new(0.0).unwrap()).unwrap()
     }
 
     #[test]
@@ -851,8 +1129,12 @@ mod tests {
     }
 
     struct SegmentProbe {
-        codecs: String,
+        video_codecs: String,
+        audio_codecs: String,
+        audio_sample_rate: i32,
+        audio_profile: i32,
         packets: Vec<PacketProbe>,
+        audio_packet_pts_secs: Vec<f64>,
     }
 
     fn read_with_ffmpeg(init: &[u8], media: &[u8]) -> SegmentProbe {
@@ -902,18 +1184,40 @@ mod tests {
             "avformat_find_stream_info: {}",
             ffmpeg::Error::from(result)
         );
-        let stream = unsafe { *(*context_ref).streams };
-        let codec_parameters = unsafe { &*(*stream).codecpar };
-        let extradata = unsafe {
+        assert_eq!(unsafe { (*context_ref).nb_streams }, 2);
+        let video_stream = unsafe { *(*context_ref).streams.add(VIDEO_STREAM_INDEX) };
+        let audio_stream = unsafe { *(*context_ref).streams.add(AUDIO_STREAM_INDEX) };
+        let video_parameters = unsafe { &*(*video_stream).codecpar };
+        assert_eq!(
+            ffmpeg::codec::Id::from(video_parameters.codec_id),
+            ffmpeg::codec::Id::H264
+        );
+        let video_extradata = unsafe {
             slice::from_raw_parts(
-                codec_parameters.extradata,
-                codec_parameters.extradata_size as usize,
+                video_parameters.extradata,
+                video_parameters.extradata_size as usize,
             )
         };
-        let codecs = avc1_codecs_from_extradata(extradata).unwrap();
-        let time_base = unsafe { (*stream).time_base };
+        let video_codecs = avc1_codecs_from_extradata(video_extradata).unwrap();
+        let audio_parameters = unsafe { &*(*audio_stream).codecpar };
+        assert_eq!(
+            ffmpeg::codec::Id::from(audio_parameters.codec_id),
+            ffmpeg::codec::Id::AAC
+        );
+        let audio_extradata = unsafe {
+            slice::from_raw_parts(
+                audio_parameters.extradata,
+                audio_parameters.extradata_size as usize,
+            )
+        };
+        let audio_codecs = mp4a_codecs_from_extradata(audio_extradata).unwrap();
+        let audio_sample_rate = audio_parameters.sample_rate;
+        let audio_profile = audio_parameters.profile;
+        let video_time_base = unsafe { (*video_stream).time_base };
+        let audio_time_base = unsafe { (*audio_stream).time_base };
 
         let mut packets = Vec::new();
+        let mut audio_packet_pts_secs = Vec::new();
         loop {
             let mut packet = ffmpeg::Packet::empty();
             let result = unsafe { ffmpeg::ffi::av_read_frame(context_ref, packet.as_mut_ptr()) };
@@ -921,23 +1225,34 @@ mod tests {
                 assert_eq!(ffmpeg::Error::from(result), ffmpeg::Error::Eof);
                 break;
             }
-            if packet.stream() != 0 {
-                continue;
+            if packet.stream() == VIDEO_STREAM_INDEX {
+                let seconds_per_tick =
+                    f64::from(video_time_base.num) / f64::from(video_time_base.den);
+                packets.push(PacketProbe {
+                    pts_secs: packet.pts().unwrap() as f64 * seconds_per_tick,
+                    dts_secs: packet.dts().unwrap() as f64 * seconds_per_tick,
+                    key: packet.is_key(),
+                    idr: packet.data().is_some_and(packet_contains_idr),
+                });
+            } else if packet.stream() == AUDIO_STREAM_INDEX {
+                let seconds_per_tick =
+                    f64::from(audio_time_base.num) / f64::from(audio_time_base.den);
+                audio_packet_pts_secs.push(packet.pts().unwrap() as f64 * seconds_per_tick);
             }
-            let seconds_per_tick = f64::from(time_base.num) / f64::from(time_base.den);
-            packets.push(PacketProbe {
-                pts_secs: packet.pts().unwrap() as f64 * seconds_per_tick,
-                dts_secs: packet.dts().unwrap() as f64 * seconds_per_tick,
-                key: packet.is_key(),
-                idr: packet.data().is_some_and(packet_contains_idr),
-            });
         }
         unsafe {
             ffmpeg::ffi::avformat_close_input(&mut context_ref);
             free_avio_buffer_then_context(&mut avio);
             drop(Box::from_raw(state));
         }
-        SegmentProbe { codecs, packets }
+        SegmentProbe {
+            video_codecs,
+            audio_codecs,
+            audio_sample_rate,
+            audio_profile,
+            packets,
+            audio_packet_pts_secs,
+        }
     }
 
     fn fill_yuv420p(frame: &mut ffmpeg::util::frame::video::Video, index: u8) {
@@ -992,6 +1307,21 @@ mod tests {
         drain_encoder_filter(encoder, segmenter, completed, &mut |_| false);
     }
 
+    fn collect_video_packets(
+        encoder: &mut ffmpeg::codec::encoder::video::Encoder,
+        packets: &mut Vec<ffmpeg::Packet>,
+    ) {
+        loop {
+            let mut packet = ffmpeg::Packet::empty();
+            match encoder.receive_packet(&mut packet) {
+                Ok(()) => packets.push(packet),
+                Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
+                Err(ffmpeg::Error::Eof) => break,
+                Err(error) => panic!("receive_packet failed: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn missing_boundary_idr_extends_segment_to_next_idr_with_actual_duration() {
         let frame_rate = FrameRate::new(30, 1).unwrap();
@@ -1009,7 +1339,9 @@ mod tests {
             frame_rate,
         )
         .unwrap();
-        let mut segmenter = Fmp4Segmenter::with_capacity(&opened.encoder, frame_rate, 4).unwrap();
+        let audio = open_test_audio(output.audio_bitrate_bps);
+        let mut segmenter =
+            Fmp4Segmenter::with_capacity(&opened.encoder, &audio.encoder, frame_rate, 4).unwrap();
         let missing_boundary_dts = i64::from(frame_rate.keyint_frames());
         let mut dropped_boundary_idr = false;
         let mut drop_first_boundary_idr = |packet: &ffmpeg::Packet| {
@@ -1062,14 +1394,21 @@ mod tests {
             panic!("extended segment is absent");
         };
         assert!((extended.duration_secs - 4.0).abs() < 1e-6);
-        let playlist = segmenter.media_playlist();
+        let playlist = segmenter
+            .media_playlist()
+            .expect("playlist is ready with the completed init segment");
         assert!(playlist.contains("#EXT-X-TARGETDURATION:4\n"));
         assert!(playlist.contains("#EXTINF:4.000000,\n0.m4s\n"));
 
         let SegmentLookup::Found(after_gap) = segmenter.segment(1) else {
             panic!("segment after the missing boundary is absent");
         };
-        let probe = read_with_ffmpeg(segmenter.init_segment(), &after_gap.bytes);
+        let probe = read_with_ffmpeg(
+            segmenter
+                .init_segment()
+                .expect("init is ready with the first media segment"),
+            &after_gap.bytes,
+        );
         assert!(probe.packets[0].key);
         assert!(probe.packets[0].idr);
         assert!((probe.packets[0].dts_secs - 4.0).abs() < 1e-6);
@@ -1093,12 +1432,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.input_format, H264InputFormat::Yuv420p);
-        let mut segmenter = Fmp4Segmenter::with_capacity(&opened.encoder, frame_rate, 2).unwrap();
+        let audio = open_test_audio(output.audio_bitrate_bps);
+        let mut segmenter =
+            Fmp4Segmenter::with_capacity(&opened.encoder, &audio.encoder, frame_rate, 2).unwrap();
         assert!(segmenter.codecs().starts_with("avc1.42c0"));
-        assert!(has_top_level_boxes(
-            segmenter.init_segment(),
-            &[*b"ftyp", *b"moov"]
-        ));
+        assert!(segmenter.codecs().ends_with(",mp4a.40.2"));
+        assert!(segmenter.init_segment().is_none());
+        assert!(segmenter.master_playlist().is_none());
+        assert!(segmenter.media_playlist().is_none());
 
         let mut completed = Vec::new();
         let frame_count = frame_rate.keyint_frames() * 3;
@@ -1132,18 +1473,26 @@ mod tests {
         assert!(
             segmenter
                 .media_playlist()
+                .expect("media playlist is ready after the first segment")
                 .contains("#EXT-X-MEDIA-SEQUENCE:1\n")
         );
-        let master = segmenter.master_playlist();
+        let master = segmenter
+            .master_playlist()
+            .expect("master playlist is ready after the first segment");
         assert!(master.contains("CODECS="));
         assert!(master.contains(segmenter.codecs()));
+        let init = segmenter
+            .init_segment()
+            .expect("init is ready after the first media segment");
+        assert!(has_top_level_boxes(init, &[*b"ftyp", *b"moov"]));
 
         let mut all_packets = Vec::new();
         for (expected_sequence, (sequence, bytes)) in completed.iter().enumerate() {
             assert_eq!(*sequence, expected_sequence as u64);
             assert!(has_top_level_boxes(bytes, &[*b"moof", *b"mdat"]));
-            let probe = read_with_ffmpeg(segmenter.init_segment(), bytes);
-            assert_eq!(probe.codecs, segmenter.codecs());
+            let probe = read_with_ffmpeg(init, bytes);
+            assert!(segmenter.codecs().starts_with(&probe.video_codecs));
+            assert_eq!(probe.audio_codecs, "mp4a.40.2");
             assert_eq!(probe.packets.len(), frame_rate.keyint_frames() as usize);
             assert!(probe.packets[0].key);
             assert!(probe.packets[0].idr);
@@ -1158,5 +1507,150 @@ mod tests {
             assert!((pair[1].dts_secs - pair[0].dts_secs - 1.0 / 30.0).abs() < 1e-6);
         }
         println!("libopenh264 CMAF CODECS={}", segmenter.codecs());
+    }
+
+    #[test]
+    fn openh264_and_aac_fmp4_round_trip_keeps_every_audio_packet_at_flush() {
+        let frame_rate = FrameRate::new(30, 1).unwrap();
+        let output = StreamOutputParameters {
+            dimensions: OutputDimensions {
+                width: 320,
+                height: 180,
+            },
+            video_bitrate_bps: 400_000,
+            audio_bitrate_bps: 96_000,
+        };
+        let mut video = open_h264_encoder(
+            EncoderPreference::Encoder(H264EncoderKind::OpenH264),
+            output,
+            frame_rate,
+        )
+        .unwrap();
+        let mut audio = open_test_audio(output.audio_bitrate_bps);
+        let mut segmenter =
+            Fmp4Segmenter::with_capacity(&video.encoder, &audio.encoder, frame_rate, 4).unwrap();
+
+        let mut video_packets = Vec::new();
+        let frame_count = frame_rate.keyint_frames() * 2;
+        for index in 0..frame_count {
+            let mut frame = ffmpeg::util::frame::video::Video::new(
+                ffmpeg::format::Pixel::YUV420P,
+                output.dimensions.width,
+                output.dimensions.height,
+            );
+            fill_yuv420p(&mut frame, index as u8);
+            frame.set_pts(Some(i64::from(index)));
+            segmenter.prepare_video_frame(CfrTimelineFrameIndex::new(u64::from(index)), &mut frame);
+            video.encoder.send_frame(&frame).unwrap();
+            collect_video_packets(&mut video.encoder, &mut video_packets);
+        }
+        video.encoder.send_eof().unwrap();
+        collect_video_packets(&mut video.encoder, &mut video_packets);
+
+        let audio_sample_rate = audio.input_sample_rate();
+        let total_audio_samples = 4 * audio_sample_rate as usize;
+        let chunk_pattern = [333_usize, 777, 2_048, 511, 1_025];
+        let mut audio_packets = Vec::new();
+        let mut cursor = 0_usize;
+        let mut pattern_index = 0_usize;
+        while cursor < total_audio_samples {
+            let count = chunk_pattern[pattern_index % chunk_pattern.len()]
+                .min(total_audio_samples - cursor);
+            pattern_index += 1;
+            let mut samples = Vec::with_capacity(count * 2);
+            for sample_index in cursor..cursor + count {
+                let phase =
+                    sample_index as f32 * 440.0 * std::f32::consts::TAU / audio_sample_rate as f32;
+                let sample = phase.sin() * 0.1;
+                samples.extend_from_slice(&[sample, sample]);
+            }
+            audio_packets.extend(
+                audio
+                    .push_chunk(ProcessedChunk {
+                        samples,
+                        audible_pts_secs: cursor as f64 / f64::from(audio_sample_rate),
+                        duration_secs: count as f64 / f64::from(audio_sample_rate),
+                        source_secs_per_output_sec: 1.0,
+                        seek_serial: 0,
+                        pdc_latency_secs_at_process: 0.0,
+                    })
+                    .unwrap(),
+            );
+            cursor += count;
+        }
+        audio_packets.extend(audio.finish().unwrap());
+        let expected_audio_pts = audio_packets
+            .iter()
+            .map(|packet| packet.pts().unwrap() as f64 / f64::from(audio.output_sample_rate()))
+            .collect::<Vec<_>>();
+        struct TimedPacket {
+            dts_secs: f64,
+            audio: bool,
+            packet: ffmpeg::Packet,
+        }
+        let mut interleaved = video_packets
+            .into_iter()
+            .map(|packet| TimedPacket {
+                dts_secs: packet.dts().unwrap() as f64 / 30.0,
+                audio: false,
+                packet,
+            })
+            .chain(audio_packets.into_iter().map(|packet| TimedPacket {
+                dts_secs: packet.dts().unwrap() as f64 / f64::from(audio.output_sample_rate()),
+                audio: true,
+                packet,
+            }))
+            .collect::<Vec<_>>();
+        interleaved.sort_by(|left, right| {
+            left.dts_secs
+                .partial_cmp(&right.dts_secs)
+                .unwrap()
+                .then_with(|| right.audio.cmp(&left.audio))
+        });
+        let mut completed = Vec::new();
+        for timed in interleaved {
+            if timed.audio {
+                segmenter.push_audio_packet(&timed.packet).unwrap();
+            } else if let Some(sequence) = segmenter.push_packet(&timed.packet).unwrap() {
+                completed.push(sequence);
+            }
+        }
+        completed.push(segmenter.finish().unwrap().unwrap());
+        assert_eq!(completed, vec![0, 1]);
+        let mut observed_audio_pts = Vec::new();
+        let mut first_video_dts_secs = None;
+        for sequence in completed {
+            let SegmentLookup::Found(segment) = segmenter.segment(sequence) else {
+                panic!("completed segment {sequence} is absent");
+            };
+            let probe = read_with_ffmpeg(
+                segmenter
+                    .init_segment()
+                    .expect("init is ready with completed media segments"),
+                &segment.bytes,
+            );
+            assert!(!probe.packets.is_empty());
+            assert!(!probe.audio_packet_pts_secs.is_empty());
+            assert_eq!(probe.audio_codecs, "mp4a.40.2");
+            assert_eq!(probe.audio_sample_rate, audio.output_sample_rate() as i32);
+            assert_eq!(probe.audio_profile, AUDIO_PROFILE_ID);
+            if first_video_dts_secs.is_none() {
+                first_video_dts_secs = probe.packets.first().map(|packet| packet.dts_secs);
+            }
+            observed_audio_pts.extend(probe.audio_packet_pts_secs);
+        }
+        assert_eq!(observed_audio_pts.len(), expected_audio_pts.len());
+        let timestamp_shift = observed_audio_pts[0] - expected_audio_pts[0];
+        for (observed, expected) in observed_audio_pts.iter().zip(expected_audio_pts) {
+            assert!((observed - expected - timestamp_shift).abs() < 1.0e-9);
+        }
+        assert!(timestamp_shift.abs() < 1.0e-9);
+        assert!((observed_audio_pts[1] - first_video_dts_secs.unwrap()).abs() < 1.0 / 30.0);
+        assert!(
+            segmenter
+                .master_playlist()
+                .expect("master playlist is ready with completed media segments")
+                .contains("mp4a.40.2")
+        );
     }
 }

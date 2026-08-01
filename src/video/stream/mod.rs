@@ -5,10 +5,17 @@
 
 #![allow(dead_code)] // 後続増分で session/tap から接続する API を先に確定する。
 
+pub(crate) mod audio_encoder;
 pub(crate) mod encoder;
 pub(crate) mod playlist;
 pub(crate) mod quality;
 pub(crate) mod segmenter;
+pub(crate) mod timeline;
+
+#[allow(unused_imports)]
+pub(crate) use audio_encoder::{
+    AacEncoderError, AacEncoderStats, OpenedAacEncoder, open_aac_encoder,
+};
 
 #[allow(unused_imports)]
 pub(crate) use encoder::{
@@ -23,3 +30,5 @@ pub(crate) use quality::{
 pub(crate) use segmenter::{
     CfrTimelineFrameIndex, Fmp4Segmenter, Fmp4SegmenterError, Fmp4SegmenterStats,
 };
+#[allow(unused_imports)]
+pub(crate) use timeline::{StreamTimeline, StreamTimelineError};

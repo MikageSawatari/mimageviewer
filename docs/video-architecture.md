@@ -432,6 +432,7 @@ src/video/
 ├── normalize_scanner.rs    # Normalize 全尺 scan worker
 ├── normalize_types.rs      # Normalize scan の共有型
 ├── swscale_helpers.rs      # CPU pixel conversion 共通 helper
+├── stream/                 # mIV Remote H.264/AAC encoder、共有 timeline、fMP4/HLS segmenter
 ├── engine/                 # EngineActor / EngineState / MasterClock / audio bookkeeping
 ├── native_window.rs        # Win32 message loop + 入力イベント変換
 ├── native_presenter/       # DComp presenter、overlay、HUD window、grade pipeline

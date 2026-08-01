@@ -16,10 +16,10 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use super::audio_diagnostics::AudioDiagnostics;
 use super::audio_stretch::TimeStretcher;
@@ -47,6 +47,10 @@ pub struct AudioOutput {
     /// A/V sync drift 計装用 atomic bundle。`clear_buffer` で `audio_out.buffer_clear` を
     /// emit するために保持する (callback / pump へは spawn 時に Arc clone を渡す)。
     diagnostics: Arc<AudioDiagnostics>,
+    /// mIV Remote の streaming session が audio tap を着脱するための制御口。
+    /// producer は常に audio-pump であり、session は [`AudioTapLease`] を所有する。
+    #[allow(dead_code)] // 増分 5 で streaming session から接続する。
+    audio_tap: AudioTapController,
 }
 
 impl AudioOutput {
@@ -113,6 +117,15 @@ impl AudioOutput {
                 ],
             );
         }
+    }
+
+    /// audio-pump の post-processing tap を着脱するための controller を返す。
+    ///
+    /// controller 自体は音声を所有しない。streaming session が `attach` の戻り値である
+    /// [`AudioTapLease`] と receiver を所有し、lease drop で同じ owner だけを detach する。
+    #[allow(dead_code)] // 増分 5 で streaming session から接続する。
+    pub(crate) fn audio_tap_controller(&self) -> AudioTapController {
+        self.audio_tap.clone()
     }
 }
 
@@ -195,30 +208,163 @@ impl Drop for AudioOutput {
 /// - PDC 変化時に「どの latency で処理した output か」を追跡できる
 /// - seek 後の `audible_pts < target` を chunk 単位で trim できる (= pre-seek 漏れ防止)
 /// - BufferReady 判定が**post-VST の audible 秒数のみ**で計算できる (= raw を含めない)
-struct ProcessedChunk {
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessedChunk {
     /// post-VST interleaved stereo f32 サンプル。
-    samples: Vec<f32>,
+    pub(crate) samples: Vec<f32>,
     /// **audible PTS** = この chunk の最初のサンプルが「実際にスピーカーから聞こえる」
     /// PTS (秒)。`input_pts - pdc_latency_at_process` で計算。video clock 同期に使う。
-    /// 現状の fill_output は `buf.next_pts_secs` ベースで pts 進行を計算するため未参照だが、
-    /// 将来の PDC chunk-aware drain 実装で使用予定 (= 同期精度向上)。
-    #[allow(dead_code)]
-    audible_pts_secs: f64,
+    /// mIV Remote の AAC input PTS にもこの source timeline 値を使う。
+    pub(crate) audible_pts_secs: f64,
     /// chunk の音声時間 (秒) = `samples.len() / samples_per_sec`。
     /// BufferReady 判定や processed cap 比較で再計算を避けるためキャッシュ。
-    duration_secs: f64,
+    pub(crate) duration_secs: f64,
     /// output/wall 秒 1 秒に対応する source timeline 秒。
     /// 2.0x なら約 2.0。fill_output はこれで PTS を進める。
-    source_secs_per_output_sec: f64,
+    pub(crate) source_secs_per_output_sec: f64,
     /// この chunk がどの seek 世代で生成されたか (= stale 判定用)。
-    seek_serial: u64,
+    pub(crate) seek_serial: u64,
     /// VST / safety limiter / stretcher を含む処理時点の合計 latency (source 秒)。
     /// 後続 chunk と差があれば video clock jump で吸収
     /// (旧 `pdc_latency_secs_applied` 比較ロジックを chunk 単位に分離)。
-    /// 現状は fill_output が `buf.pdc_latency_secs` (= 最新 pump 更新値) を使うため
-    /// 未参照だが、将来の chunk-aware PDC jump 判定で使用予定。
-    #[allow(dead_code)]
-    pdc_latency_secs_at_process: f64,
+    /// mIV Remote は tap metadata の有限性も AAC input 前に検証する。
+    pub(crate) pdc_latency_secs_at_process: f64,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // 増分 5 で session owner が使用する。
+pub(crate) struct AudioTapController {
+    command_tx: Sender<AudioTapCommand>,
+    next_owner_id: Arc<AtomicU64>,
+}
+
+/// streaming session が所有する audio tap attachment。
+/// owner id により、古い session の Drop が新しい session の tap を外すことはない。
+#[allow(dead_code)] // 増分 5 で session owner が使用する。
+pub(crate) struct AudioTapLease {
+    owner_id: u64,
+    command_tx: Sender<AudioTapCommand>,
+    dropped: Arc<AtomicU64>,
+}
+
+#[allow(dead_code)] // Attach/Detach producer は増分 5 で接続する。
+enum AudioTapCommand {
+    Attach(ActiveAudioTap),
+    Detach(u64),
+}
+
+struct ActiveAudioTap {
+    owner_id: u64,
+    payload_tx: Sender<ProcessedChunk>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl AudioTapController {
+    #[allow(dead_code)] // 増分 5 で streaming session から呼ぶ。
+    pub(crate) fn attach(
+        &self,
+        capacity: usize,
+    ) -> Result<(AudioTapLease, Receiver<ProcessedChunk>), &'static str> {
+        if capacity == 0 {
+            return Err("audio tap capacity must be non-zero");
+        }
+        let owner_id = self.next_owner_id.fetch_add(1, Ordering::Relaxed);
+        let (payload_tx, payload_rx) = bounded(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        self.command_tx
+            .send(AudioTapCommand::Attach(ActiveAudioTap {
+                owner_id,
+                payload_tx,
+                dropped: Arc::clone(&dropped),
+            }))
+            .map_err(|_| "audio pump is no longer running")?;
+        Ok((
+            AudioTapLease {
+                owner_id,
+                command_tx: self.command_tx.clone(),
+                dropped,
+            },
+            payload_rx,
+        ))
+    }
+}
+
+impl AudioTapLease {
+    #[allow(dead_code)] // 増分 5 の session stats から読む。
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for AudioTapLease {
+    fn drop(&mut self) {
+        let _ = self
+            .command_tx
+            .try_send(AudioTapCommand::Detach(self.owner_id));
+    }
+}
+
+/// 唯一の production tap 点から呼ぶ。command と payload のどちらも non-blocking。
+/// 未接続時は chunk を変更せず allocation もしない。接続時だけ、PC 再生 queue と
+/// streaming worker の独立所有に必要な payload Vec の clone を 1 回行う。
+fn refresh_audio_tap(command_rx: &Receiver<AudioTapCommand>, active: &mut Option<ActiveAudioTap>) {
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            AudioTapCommand::Attach(tap) => *active = Some(tap),
+            AudioTapCommand::Detach(owner_id)
+                if active.as_ref().is_some_and(|tap| tap.owner_id == owner_id) =>
+            {
+                *active = None;
+            }
+            AudioTapCommand::Detach(_) => {}
+        }
+    }
+}
+
+enum PreparedAudioTapChunk {
+    NotConnected,
+    Full,
+    Payload(ProcessedChunk),
+}
+
+fn prepare_audio_tap_chunk(
+    active: &Option<ActiveAudioTap>,
+    chunk: &ProcessedChunk,
+) -> PreparedAudioTapChunk {
+    let Some(tap) = active.as_ref() else {
+        return PreparedAudioTapChunk::NotConnected;
+    };
+    if tap.payload_tx.is_full() {
+        return PreparedAudioTapChunk::Full;
+    }
+    PreparedAudioTapChunk::Payload(chunk.clone())
+}
+
+fn publish_prepared_audio_tap_chunk(
+    active: &mut Option<ActiveAudioTap>,
+    prepared: PreparedAudioTapChunk,
+) {
+    let Some(tap) = active.as_ref() else {
+        return;
+    };
+    let payload = match prepared {
+        PreparedAudioTapChunk::NotConnected => return,
+        PreparedAudioTapChunk::Full => {
+            tap.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        PreparedAudioTapChunk::Payload(payload) => payload,
+    };
+    match tap.payload_tx.try_send(payload) {
+        Ok(()) => {}
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            tap.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            tap.dropped.fetch_add(1, Ordering::Relaxed);
+            *active = None;
+        }
+    }
 }
 
 /// 共有 ring buffer (Mutex 保護)。**raw / processed 2 段構造** (Codex 助言 2026-05)。
@@ -570,6 +716,21 @@ fn normalize_db_to_linear(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
 
+/// output/wall 秒で測った DSP latency を source timeline 秒へ写し、先頭 sample の
+/// audible PTS を返す。time stretch、VST PDC、safety limiter の latency はすべて
+/// output 側で加算されるため、変速率を掛けてから source PTS から引く。
+fn audible_pts_after_latency(
+    input_pts_secs: f64,
+    latency_output_secs: f64,
+    source_secs_per_output_sec: f64,
+) -> (f64, f64) {
+    let latency_source_secs = latency_output_secs * source_secs_per_output_sec;
+    (
+        (input_pts_secs - latency_source_secs).max(0.0),
+        latency_source_secs,
+    )
+}
+
 /// 既定音声出力デバイスのサンプルレートを取得する (実際にはストリームは開かない)。
 ///
 /// デコーダー (swresample) と音声出力 (cpal) で **同じサンプルレート** を使わないと、
@@ -643,6 +804,11 @@ pub fn start(
 
     let cancel = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+    let (audio_tap_command_tx, audio_tap_command_rx) = unbounded();
+    let audio_tap = AudioTapController {
+        command_tx: audio_tap_command_tx,
+        next_owner_id: Arc::new(AtomicU64::new(1)),
+    };
 
     // ── pump thread: audio_rx → raw_pending → (VST process) → processed → buffer ──
     let pump_buffer = buffer.clone();
@@ -665,6 +831,7 @@ pub fn start(
                 pump_engine_event_tx,
                 pump_engine_state,
                 pump_diagnostics,
+                audio_tap_command_rx,
                 #[cfg(windows)]
                 pump_dsp_bridge,
             );
@@ -710,6 +877,7 @@ pub fn start(
         pump: Some(pump_handle),
         sample_rate,
         diagnostics,
+        audio_tap,
     })
 }
 
@@ -799,6 +967,7 @@ fn run_pump(
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     engine_state: Arc<AtomicU8>,
     diagnostics: Arc<AudioDiagnostics>,
+    audio_tap_command_rx: Receiver<AudioTapCommand>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
     let _ = engine_state; // 現状は logging 等で使う想定、API 互換のため受け取る
@@ -852,6 +1021,7 @@ fn run_pump(
     normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
 
     let mut activated = false;
+    let mut active_audio_tap = None;
     let mut last_seen_seek_serial: u64 = 0;
     // T07 (v0.9.0): VST3 bridge wedge auto-disable のための連続失敗カウンタ。
     // `process_block` が連続 N 回 (= 約 N * block_duration ms の停滞) 失敗したら
@@ -1321,8 +1491,11 @@ fn run_pump(
                 playback_speed
             };
             current_pdc_latency_secs += stretched.stretcher_latency_output_secs;
-            let current_latency_source_secs = current_pdc_latency_secs * source_secs_per_output_sec;
-            let audible_pts_secs = (raw.pts_secs - current_latency_source_secs).max(0.0);
+            let (audible_pts_secs, current_latency_source_secs) = audible_pts_after_latency(
+                raw.pts_secs,
+                current_pdc_latency_secs,
+                source_secs_per_output_sec,
+            );
 
             // ── pre-target trim (Codex P1-1: PDC plugin で早すぎる BufferReady 防止) ──
             //
@@ -1375,6 +1548,11 @@ fn run_pump(
                 pdc_latency_secs_at_process: current_latency_source_secs,
             };
 
+            refresh_audio_tap(&audio_tap_command_rx, &mut active_audio_tap);
+            // tap 接続時だけ samples を clone する。cpal callback と共有する AudioBuffer
+            // mutex の外なので、この allocation が PC 側の drain を待たせることはない。
+            let prepared_audio_tap = prepare_audio_tap_chunk(&active_audio_tap, &chunk);
+
             // ── lock 再取得して processed に push (= seek serial check) ──
             let mut buf = buffer.lock().unwrap();
             if chunk.seek_serial != target_serial || chunk.seek_serial != buf.pump_seek_serial {
@@ -1405,6 +1583,7 @@ fn run_pump(
                 ));
                 buf.pdc_latency_secs = current_latency_source_secs;
             }
+            publish_prepared_audio_tap_chunk(&mut active_audio_tap, prepared_audio_tap);
             buf.processed.push_back(chunk);
         }
 
@@ -2047,6 +2226,84 @@ mod tests {
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
         }
+    }
+
+    #[test]
+    fn audible_pts_uses_source_timeline_latency_and_clamps_at_zero() {
+        let (audible, latency_source) = audible_pts_after_latency(10.0, 0.125, 1.0);
+        assert!((audible - 9.875).abs() < 1.0e-12);
+        assert!((latency_source - 0.125).abs() < 1.0e-12);
+
+        let (audible_2x, latency_source_2x) = audible_pts_after_latency(10.0, 0.125, 2.0);
+        assert!((audible_2x - 9.75).abs() < 1.0e-12);
+        assert!((latency_source_2x - 0.25).abs() < 1.0e-12);
+
+        let (clamped, _) = audible_pts_after_latency(0.05, 0.125, 1.0);
+        assert_eq!(clamped, 0.0);
+    }
+
+    #[test]
+    fn disconnected_tap_preserves_playback_chunk_bit_for_bit_and_allocation() {
+        let (_command_tx, command_rx) = unbounded();
+        let mut active = None;
+        let samples = vec![0.0, -0.0, 0.25, -0.5, f32::from_bits(0x7fc0_0001)];
+        let expected_bits = samples
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect::<Vec<_>>();
+        let chunk = make_chunk(samples, 3.25, 96_000.0);
+        let samples_ptr = chunk.samples.as_ptr();
+        let samples_capacity = chunk.samples.capacity();
+
+        refresh_audio_tap(&command_rx, &mut active);
+        let prepared = prepare_audio_tap_chunk(&active, &chunk);
+        publish_prepared_audio_tap_chunk(&mut active, prepared);
+        let mut playback = std::collections::VecDeque::with_capacity(1);
+        playback.push_back(chunk);
+
+        let output = playback.pop_front().unwrap();
+        assert_eq!(output.samples.as_ptr(), samples_ptr);
+        assert_eq!(output.samples.capacity(), samples_capacity);
+        assert_eq!(
+            output
+                .samples
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>(),
+            expected_bits
+        );
+    }
+
+    #[test]
+    fn full_tap_never_blocks_playback_and_counts_drop() {
+        let (payload_tx, payload_rx) = bounded(1);
+        payload_tx
+            .try_send(make_chunk(vec![1.0, -1.0], 0.0, 96_000.0))
+            .unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let active = Some(ActiveAudioTap {
+            owner_id: 7,
+            payload_tx,
+            dropped: Arc::clone(&dropped),
+        });
+        let (done_tx, done_rx) = bounded(1);
+
+        std::thread::spawn(move || {
+            let mut active = active;
+            let chunk = make_chunk(vec![0.25, -0.25], 0.1, 96_000.0);
+            let prepared = prepare_audio_tap_chunk(&active, &chunk);
+            publish_prepared_audio_tap_chunk(&mut active, prepared);
+            let mut playback = std::collections::VecDeque::new();
+            playback.push_back(chunk);
+            done_tx.send(playback.pop_front().unwrap()).unwrap();
+        });
+
+        let playback_chunk = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("full tap path must not wait for receiver capacity");
+        assert_eq!(playback_chunk.samples, vec![0.25, -0.25]);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(payload_rx.len(), 1);
     }
 
     fn make_audio_frame(seek_serial: u64) -> AudioFrame {

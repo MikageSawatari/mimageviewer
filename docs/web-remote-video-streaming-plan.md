@@ -5,8 +5,8 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 2/7 実装済み** (encoder 抽象 / fallback / 画質
-  preset + fMP4 segmenter / ring / m3u8、2026-08-01)
+- 現在のフェーズ: **第 1 段 増分 3/7 実装済み** (encoder 抽象 / fallback / 画質
+  preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC、2026-08-01)
 
 ---
 
@@ -164,11 +164,24 @@ OBS 自身が GPLv2 だからであり、**OBS のコードも設定値の写経
 | `audible_pts_secs` | **A/V 同期の基準**。PDC (プラグイン遅延) 補正済みの source timeline |
 | `duration_secs` | セグメント長の計算 |
 | `seek_serial` | シーク世代。世代が変わった chunk は破棄する |
+| `source_secs_per_output_sec` | 変速判定。第 1 段は 1.0 以外を明示的に拒否する |
 
 tap は `Option<Sender<ProcessedChunk>>` を pump に渡す形とし、**tap が無いときは
 現行コードと完全に同一の経路を通る**こと。pump は realtime 制約下にあるので、
 tap の送信は非ブロッキング (満杯なら落として `dropped` を計上) とする。
 tap 側の詰まりが PC 側の音を絶対に途切れさせない、が不変条件。
+
+#### 増分 3 実装記録 (audio tap、2026-08-01)
+
+- `AudioOutput` が `AudioTapController` を所有し、将来の streaming session が bounded
+  receiver と owner-id 付き `AudioTapLease` を所有する。古い lease の Drop は新 owner を
+  detach しない。増分 3 では接続者を置かない
+- production の payload 分岐は `buf.processed.push_back(chunk)` の直前 1 箇所だけ。
+  command / payload とも `try_*` だけを使い、満杯は `dropped` を加算して PC 再生を優先する
+- 未接続時は samples に clone / 再確保 / 書き換えを行わず、元 `Vec` の pointer・capacity と
+  全 sample bit が push 後も一致する unit test で固定した。接続時だけ PC queue と worker の
+  独立所有に必要な `Vec<f32>` 1 clone を行うが、cpal と共有する mutex の外で実行する。
+  満杯が分かっている場合は clone 自体を行わない
 
 ### 4.2 映像 tap
 
@@ -203,13 +216,24 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
 変速再生 (`playback_speed != 1.0`) は第 1 段では**非対応**とし、ストリーミング中は等速に
 固定する (`source_secs_per_output_sec` の扱いが増えるため。§12)。
 
+#### 増分 3 実装記録 (音声 timestamp、2026-08-01)
+
+- `StreamTimeline` を音声・映像共通の写像 owner とし、session start の source PTS を
+  0 とする。増分 3 の AAC input PTS は `audible_pts_secs` をこの型で sample tick へ写し、
+  増分 4 の映像も同じ型を使う
+- `audible_pts_secs = input_pts - (DSP latency output 秒 × source/output 比)` と、
+  `pdc_latency_secs_at_process` に入る source 秒を同じ純関数から返すようにし、等速 / 2x /
+  0 秒 clamp を unit test で固定した。既存計算と一致し、異常は見つからなかった
+- `seek_serial` が session の期待世代と違う chunk は PCM assembler より前で捨てる。
+  `source_secs_per_output_sec != 1.0` は黙って連続音声として扱わず error にして session 側へ返す
+
 ### 4.4 セグメンタ
 
 - **fMP4 (CMAF)**: init segment (`ftyp` + `moov`) 1 個 + media segment (`moof` + `mdat`) 列
 - セグメント長の目標は **2 秒**、GOP も 2 秒 (`keyint = fps * 2`, `scenecut` 無効) とし、
   各セグメントを必ず IDR から始める。tap / encoder の frame skip で予定境界の IDR が
   欠けた場合は停止せず、次の IDR まで現在セグメントを延長する
-- avformat の mp4 muxer を `movflags=frag_custom+empty_moov+default_base_is_moof+cmaf` 相当で
+- avformat の mp4 muxer を `movflags=frag_custom+delay_moov+default_base_is_moof+cmaf` 相当で
   使い、出力は `avio_alloc_context` によるメモリ書き出しにする。
   raw FFI は `ffmpeg_the_third::ffi::` 経由で既に本体各所で使っており、新しい依存にはならない
 - 生成済みセグメントは**メモリ上のリングバッファ**に保持する。既定 30 本 = 60 秒
@@ -241,6 +265,38 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
   profile_idc / constraint flags / level_idc から生成する。libopenh264 の in-process
   fixture (320x180/30fps) での実測は avc1.42c00d (Constrained Baseline, Level 1.3)。
   level は解像度・fps 等で変わるため定数化しない
+
+#### 増分 3 実装記録 (AAC + 2-stream mux、2026-08-01)
+
+- `src/video/stream/audio_encoder.rs`: 増分 1 の `AUDIO_ENCODER_NAME` / `AUDIO_PROFILE_ID` と
+  preset の `audio_bitrate_bps` を使って AAC-LC を open する。encoder の対応 sample rate
+  に pump rate があれば同率のまま manual deinterleave、無ければ最寄りの対応 rate へ
+  swresample しながら fltp 化する。50kHz → 48kHz fixture で EOF delay まで 50,000 →
+  48,000 samples を回収することを固定した
+- chunk 境界は `PlanarPcmAssembler` に蓄積し、AAC 固定 1024 samples ごとにだけ frame を
+  送る。333 / 901 / 17 samples 等の不一致境界を跨いで、padding を除く全 sample が欠落・
+  重複なしで復元できる unit test を置いた
+- segmenter は video stream 0 + audio stream 1 を同じ fMP4 へ多重化する。master playlist の
+  `CODECS` は video SPS と AAC AudioSpecificConfig の実出力から
+  `avc1.PPCCLL,mp4a.40.2` を作り、bandwidth は両 encoder の実効 bitrate の和とする
+- AAC encoder の先頭 priming packet は DTS -1024 なので、増分 2 の `empty_moov` は
+  `delay_moov` へ置き換えた。最初の custom flush で確定する `ftyp+moov` を最初の
+  `moof+mdat` から top-level box 単位で分離する。したがって init segment は最初の media
+  segment 完成と同時に利用可能になる
+- init の状態は `InitSegmentState::Pending { muxer_prefix } / Ready(Vec<u8>)` に集約し、
+  `init_segment()` は `Option<&[u8]>` を返す。空 bytes を未確定 sentinel として扱わない。
+  最初の media segment の ring 追加が成功してから `Ready` へ遷移するため、外部から
+  init だけ、または media だけが先に見える状態は作らない
+- segmenter の master / media playlist accessor も同じ readiness で `Option<String>` を返す。
+  init 未確定中は両方とも `None`、`Some` なら init と最初の media segment を取得できることを
+  増分 3 が保証する。増分 6 はこの `None` を **200 + 空 body に変換してはならない**。
+  HTTP 503 を返すか、上限付きで ready を待ってから 200 を返すかは HTTP / IPC 層で決める
+- fragment 確定前に `av_interleaved_write_frame(ctx, NULL)` で interleave queue を drain
+  してから `av_write_frame(ctx, NULL)` を呼ぶ。さらに、すでに muxer へ渡した audio packet
+  の末尾が video boundary を覆うことを確認し、flush 済み境界より古い audio packet の
+  後着を error にする。libopenh264 + AAC の 4 秒 fixture を同じ FFmpeg avformat で
+  init+各 media segment として読み返し、全 AAC packet の個数と PTS 列が入力と一致する
+  ことを固定した
 
 ##### 後続増分への申し送り
 
@@ -332,6 +388,9 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
 - セグメントは `Cache-Control: no-store`、init segment だけ `immutable`
 - 未生成 / 存在しないセグメントは 404、ring から巻き取られたセグメントは 410 Gone、
   セッション不一致は 409、本体未接続は 503 と既存の `miv_not_running` を返す
+- generation 開始直後は init と master / media playlist がまだ未確定になり得る。増分 6 は
+  segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
+  必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
 ### 6.2 IPC (protocol v11)
 
@@ -536,6 +595,10 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
   `Gone` になること
 - 音声 tap: tap 未接続時に pump の出力が現行と 1 サンプルも変わらないこと。
   tap 側が詰まったとき pump がブロックせず `dropped` を計上すること
+- AAC: 1024 samples と一致しない chunk 列でも欠落・重複がなく、必要な sample rate 変換の
+  EOF delay まで回収し、異なる `seek_serial` と 1.0x 以外を assembler 前で拒否すること
+- A/V mux: libopenh264 + AAC の同一 fMP4 を同じ FFmpeg で in-process に読み返し、両 codec、
+  全 audio packet の個数・PTS、各 video IDR 境界での audio coverage が一致すること
 - A/V 同期: 既知の pts 列に対してセグメントのタイムスタンプが単調増加し、
   音声 `audible_pts_secs` と映像 pts のずれが 1 フレーム以内であること
 - セッション: 操作権喪失 / 生存タイムアウト / 放置タイムアウトでストリーミングが停止すること
