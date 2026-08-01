@@ -5,7 +5,8 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 1/7 実装済み** (encoder 抽象 / fallback / 画質 preset、2026-08-01)
+- 現在のフェーズ: **第 1 段 増分 2/7 実装済み** (encoder 抽象 / fallback / 画質
+  preset + fMP4 segmenter / ring / m3u8、2026-08-01)
 
 ---
 
@@ -205,14 +206,52 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
 ### 4.4 セグメンタ
 
 - **fMP4 (CMAF)**: init segment (`ftyp` + `moov`) 1 個 + media segment (`moof` + `mdat`) 列
-- セグメント長 **2 秒**、GOP も 2 秒 (`keyint = fps * 2`, `scenecut` 無効) に固定して
-  セグメント境界を必ず IDR にする
+- セグメント長の目標は **2 秒**、GOP も 2 秒 (`keyint = fps * 2`, `scenecut` 無効) とし、
+  各セグメントを必ず IDR から始める。tap / encoder の frame skip で予定境界の IDR が
+  欠けた場合は停止せず、次の IDR まで現在セグメントを延長する
 - avformat の mp4 muxer を `movflags=frag_custom+empty_moov+default_base_is_moof+cmaf` 相当で
   使い、出力は `avio_alloc_context` によるメモリ書き出しにする。
   raw FFI は `ffmpeg_the_third::ffi::` 経由で既に本体各所で使っており、新しい依存にはならない
 - 生成済みセグメントは**メモリ上のリングバッファ**に保持する。既定 30 本 = 60 秒
   (標準画質で約 12MB)。ディスクには書かない
-- m3u8 はライブ (`#EXT-X-PLAYLIST-TYPE` を出さない) とし、`#EXT-X-MEDIA-SEQUENCE` を進める
+- m3u8 はライブ (`#EXT-X-PLAYLIST-TYPE` を出さない) とし、`#EXT-X-MEDIA-SEQUENCE` を進める。
+  `#EXTINF` は packet DTS から得た実時間、`#EXT-X-TARGETDURATION` は保持中セグメントの
+  観測最大時間の切り上げ (最低 2 秒) とする
+
+#### 増分 2 実装記録 (2026-08-01)
+
+- src/video/stream/segmenter.rs: custom write AVIO + mp4 muxer。FFmpeg の実オプション名
+  default_base_moof が ISO BMFF の default-base-is-moof flag に対応するため、
+  frag_custom+empty_moov+default_base_moof+cmaf を指定する。header 書き込み直後を
+  init (ftyp+moov)、av_write_frame(ctx, NULL) の明示 fragment flush ごとの出力を
+  media (moof+mdat) として切り出す。ディスク I/O は持たない
+- 2 秒境界 frame は segmenter の prepare_video_frame が I frame 指定し、encoder の
+  forced-IDR 設定と組み合わせる。引数は submitted frame の連番ではなく、drop された
+  frame も位置を詰めない `CfrTimelineFrameIndex` とする。受け取った各 fragment 先頭
+  packet も key + IDR NAL であることを検証してから mux する
+- 予定境界の IDR が欠けた場合は次の IDR まで fragment を延長する。発生回数は
+  `Fmp4SegmenterStats::delayed_idr_boundaries` と通常ログに残し、延長後の実時間を
+  `#EXTINF` / `#EXT-X-TARGETDURATION` に反映する
+- src/video/stream/playlist.rs: 既定 30 本の ring。先頭要素の sequence を
+  EXT-X-MEDIA-SEQUENCE の唯一の source of truth とし、先頭より古い要求を Gone、
+  未生成を NotFound として型で分離する
+- HLS の CODECS は media playlist ではなく Master Playlist の
+  EXT-X-STREAM-INF 属性なので、index.m3u8 (master) → media.m3u8 (live media)
+  の 2 層とする。avc1.PPCCLL は encoder extradata の SPS にある
+  profile_idc / constraint flags / level_idc から生成する。libopenh264 の in-process
+  fixture (320x180/30fps) での実測は avc1.42c00d (Constrained Baseline, Level 1.3)。
+  level は解像度・fps 等で変わるため定数化しない
+
+##### 後続増分への申し送り
+
+- **作りかけの fragment には上限が無い。** 完成済みセグメントは ring が 30 本に
+  抑えるが、IDR を待っている最中の fragment はメモリ上で伸び続ける。GOP は固定なので
+  通常は 2 秒で IDR が来るが、encoder が過負荷で IDR を続けて落とした場合に歯止めが
+  無い。**増分 5 のセッション管理で、延長の上限 (時間かバイト数) と、超えたときの
+  扱い (セッションを畳む / 世代を切り替える) を決めること**
+- `CfrTimelineFrameIndex` は「落ちた frame も欠番として残す CFR source timeline 上の
+  位置」である。**増分 4 の映像 tap は、投入できた frame で番号を詰め直してはいけない**
+  (詰め直すと forced-IDR の位置が encoder の負荷次第でずれる)
 
 ---
 
@@ -283,15 +322,16 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
 | `POST /api/video/seek` | `{session, position_secs}` → 新 `generation` と `playlist` |
 | `GET /api/video/state` | 再生位置・尺・バッファ秒数・実効ビットレート・選択エンコーダ |
 | `POST /api/video/stop` | セッション終了。本体はストリーミングを止める |
-| `GET /stream/<session>/<gen>/index.m3u8` | プレイリスト |
+| `GET /stream/<session>/<gen>/index.m3u8` | CODECS を宣言する Master Playlist |
+| `GET /stream/<session>/<gen>/media.m3u8` | MEDIA-SEQUENCE を持つ live Media Playlist |
 | `GET /stream/<session>/<gen>/init.mp4` | init segment |
 | `GET /stream/<session>/<gen>/<n>.m4s` | media segment |
 
 - `/stream/` 配下も**認証必須**。同一オリジンなので Cookie は `<video>` / hls.js の
   どちらからも送られる
 - セグメントは `Cache-Control: no-store`、init segment だけ `immutable`
-- 存在しない / 破棄済みセグメントは 404、セッション不一致は 409、本体未接続は 503 と
-  既存の `miv_not_running` を返す
+- 未生成 / 存在しないセグメントは 404、ring から巻き取られたセグメントは 410 Gone、
+  セッション不一致は 409、本体未接続は 503 と既存の `miv_not_running` を返す
 
 ### 6.2 IPC (protocol v11)
 
@@ -305,7 +345,7 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 | `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, encoder, video_size }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
-| `VideoStreamPlaylist { session, generation }` | m3u8 本文 |
+| `VideoStreamPlaylist { session, generation, kind }` | master / media m3u8 本文 |
 | `VideoStreamSegment { session, generation, index }` | セグメントのバイト列 / `NotFound` / `Gone` |
 | `VideoStreamState { session }` | 再生位置・バッファ・ビットレート実績 |
 | `VideoStreamStop { session }` | — |
@@ -470,7 +510,7 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
 
 | 対象 | 検証手段 | 位置づけ |
 |---|---|---|
-| **HLS 出力の適合性** | 自動テスト (ffprobe でセグメントを読み、タイムスタンプ連続性・IDR 境界・コーデックパラメータを固定する) | 一次防衛線。ここが正しければクライアント差は小さい |
+| **HLS 出力の適合性** | 自動テスト (生成 bytes を custom read AVIO で同じ FFmpeg avformat へ戻し、タイムスタンプ連続性・IDR 境界・コーデックパラメータを固定する。外部 ffprobe 不要) | 一次防衛線。ここが正しければクライアント差は小さい |
 | **hls.js 経路** | **PC の Chrome / Edge / Firefox** | Android Chrome と同じ Blink + 同じ hls.js。開発中の主戦場でもある |
 | **iOS ネイティブ経路** | iPhone / iPad 実機 | ユーザーが実施 |
 | タッチ UI / PWA / バックグラウンド復帰 (Android 固有) | Android Studio の AVD (Pixel + Google Play イメージ) | 任意。優先度は低い |
@@ -490,8 +530,10 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
 
 - エンコーダ選択: 候補が無い / 一部 open 失敗 のときに正しく次段へ落ちること。
   全滅時は機械可読なエラーになること
-- セグメンタ: セグメント境界が必ず IDR で始まること、`EXT-X-MEDIA-SEQUENCE` が
-  リングバッファの巻き取りと一致すること、破棄済みセグメント要求が `Gone` になること
+- セグメンタ: セグメント境界が必ず IDR で始まること、PTS/DTS が単調増加して
+  segment 間でも連続すること、init の codec parameters と SPS 由来 CODECS が一致すること、
+  `EXT-X-MEDIA-SEQUENCE` がリングバッファの巻き取りと一致すること、破棄済み要求が
+  `Gone` になること
 - 音声 tap: tap 未接続時に pump の出力が現行と 1 サンプルも変わらないこと。
   tap 側が詰まったとき pump がブロックせず `dropped` を計上すること
 - A/V 同期: 既知の pts 列に対してセグメントのタイムスタンプが単調増加し、

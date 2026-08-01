@@ -328,15 +328,20 @@ pub(crate) fn open_h264_encoder(
         &mut FfmpegH264EncoderBackend,
     )?;
     let keyint_frames = frame_rate.keyint_frames();
+    let profile_request = if selected.kind == H264EncoderKind::OpenH264 {
+        "encoder-default"
+    } else {
+        H264_PROFILE
+    };
     crate::logger::log(format!(
-        "remote-stream encoder selected: encoder={} video_bitrate_bps={} audio_bitrate_bps={} output={}x{} input_format={} profile={} bit_depth={} color_space={} keyint_frames={}",
+        "remote-stream encoder selected: encoder={} video_bitrate_bps={} audio_bitrate_bps={} output={}x{} input_format={} profile_request={} bit_depth={} color_space={} keyint_frames={}",
         selected.kind,
         selected.effective_video_bitrate_bps,
         output.audio_bitrate_bps,
         output.dimensions.width,
         output.dimensions.height,
         selected.input_format.as_str(),
-        H264_PROFILE,
+        profile_request,
         H264_BIT_DEPTH,
         VIDEO_COLOR_SPACE,
         keyint_frames,
@@ -448,18 +453,29 @@ fn open_ffmpeg_encoder(
         frame_rate.denominator as i32,
     )));
     let keyint_frames = frame_rate.keyint_frames();
+    // fMP4 の empty_moov は最初の packet より前に SPS/PPS を必要とする。全候補で
+    // encoder extradata を確定させ、B-frame reorder を持たない live timeline にする。
+    context.set_max_b_frames(0);
 
-    // GOP は 2 秒セグメントと同じ長さに固定し、最小 keyint も同値にして scene change
-    // で短縮させない。後続セグメンタは各 2 秒境界の frame を明示的に key frame 指定する。
+    // GOP の目標を 2 秒セグメントと同じ長さに固定し、最小 keyint も同値にして scene change
+    // で短縮させない。後続セグメンタは CFR timeline 上の各 2 秒境界を明示的に key frame 指定する。
     // `forced-idr` 対応 encoder では、その指定を I-frame ではなく IDR にする。これにより
-    // 各 CMAF segment が必ず単独デコード可能な IDR から始まる、という前提を固定する。
+    // 各 CMAF segment は単独デコード可能な IDR から始まる。frame skip で予定 IDR が欠けた
+    // 場合はセグメンタが次の IDR まで延長し、実時間を playlist に反映する。
     context.set_gop(keyint_frames);
     context.set_colorspace(ffmpeg::color::Space::BT709);
     context.set_color_range(ffmpeg::color::Range::MPEG);
     unsafe {
         let raw = context.as_mut_ptr();
+        (*raw).flags |= ffmpeg::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
         (*raw).keyint_min = keyint_frames as i32;
-        (*raw).profile = ffmpeg::ffi::AV_PROFILE_H264_HIGH;
+        (*raw).profile = if encoder == H264EncoderKind::OpenH264 {
+            // FFmpeg の libopenh264 wrapper は profile 指定を受け付けず、実装既定の
+            // Constrained Baseline を出す。明示値を渡すと unsupported 警告になる。
+            ffmpeg::ffi::AV_PROFILE_UNKNOWN
+        } else {
+            ffmpeg::ffi::AV_PROFILE_H264_HIGH
+        };
         (*raw).bits_per_raw_sample = i32::from(H264_BIT_DEPTH);
         (*raw).color_primaries = ffmpeg::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
         (*raw).color_trc = ffmpeg::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
