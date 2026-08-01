@@ -79,7 +79,7 @@ static_assert(sizeof(ShmHeader) == 272,
 // 1 のままだと「無視されていた hello が黙って通る」状態だった。2 へ上げることで、
 // v0.8.x 以前の bridge exe (= version=1 を返すだけ) は新 Rust 側の比較で reject され、
 // stale bridge による IPC スキーマ不整合を検出できる。
-constexpr uint32_t PROTOCOL_VERSION = 3;
+constexpr uint32_t PROTOCOL_VERSION = 2;
 
 // 制御メッセージの最大長。
 // 通常は 1 KB 未満だが、`plugin_state` event (= IComponent::getState チャンク) は

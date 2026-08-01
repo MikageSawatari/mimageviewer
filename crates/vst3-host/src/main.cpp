@@ -904,12 +904,8 @@ private:
             return true;
         }
         if (cmd == "set_chain_owner") {
-            uint64_t request_id = extract_number_field(msg, "request_id");
             HWND owner_hwnd = reinterpret_cast<HWND>(extract_number_field(msg, "owner_hwnd"));
-            if (apply_chain_owner(owner_hwnd)) {
-                write_message(std::string(R"({"event":"owner_applied","request_id":)") +
-                              std::to_string(request_id) + "}");
-            }
+            apply_chain_owner(owner_hwnd);
             return true;
         }
         if (cmd == "set_bypass") {
@@ -1214,9 +1210,9 @@ private:
         return true;
     }
 
-    bool apply_chain_owner(HWND owner_hwnd) {
+    void apply_chain_owner(HWND owner_hwnd) {
         if (!owner_hwnd || !IsWindow(owner_hwnd)) {
-            return false;
+            return;
         }
         std::vector<PluginLoader*> loaders;
         {
@@ -1229,11 +1225,9 @@ private:
                 }
             }
         }
-        bool applied = true;
         for (PluginLoader* loader : loaders) {
-            applied = loader->set_gui_owner(owner_hwnd) && applied;
+            loader->set_gui_owner(owner_hwnd);
         }
-        return applied;
     }
 
     void apply_chain_z_order(const std::vector<uint64_t>& ordered_slots_top_to_bottom,

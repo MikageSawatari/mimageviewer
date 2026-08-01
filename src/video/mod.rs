@@ -38,7 +38,6 @@ pub mod ffmpeg_loader;
 mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
-pub(crate) mod native_cursor;
 #[cfg(windows)]
 pub mod native_presenter;
 #[cfg(windows)]
@@ -345,7 +344,6 @@ pub struct NativeVideoOutputConfig {
     /// 0 だと「mIV 既知 HWND」判定で main HWND が許可されなくなる (= presenter / HUD のみ
     /// 許可)。App が `self.main_hwnd` を渡す。
     pub main_hwnd_for_raise: u64,
-    pub owner_handoff: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
     /// CP7: HUD overlay HWND を有効化するか。`false` のとき従来の presenter HWND DComp tree
     /// に egui overlay を載せるフォールバック経路 (= CP4-6 の動作と等価)。
     /// `true` で HUD HWND を作成し、VST より前面に bars を出す。万が一の regression に備えて
@@ -800,7 +798,9 @@ enum NativeVideoOutputCommand {
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
     },
-    /// native HWND route を経由しない pointer 活動を pump-owned cursor reducer へ伝える。
+    /// native presenter HWND の `push_native_event` を経由しない pointer 活動を
+    /// 伝搬する。NativeEguiOverlay の cursor auto-hide タイマをリセットして
+    /// 即時にカーソルを再表示するため。
     MarkCursorActivity,
     /// キー操作後の HUD 更新など、カーソル auto-hide タイマには触れずに
     /// native overlay の再描画だけを要求する。
@@ -3097,7 +3097,6 @@ fn run_native_video_output(
                     presenter.set_overlay_navigation_preview(preview);
                 }
                 NativeVideoOutputCommand::MarkCursorActivity => {
-                    window_pump.mark_cursor_activity(cur_generation)?;
                     presenter.mark_overlay_cursor_activity();
                 }
                 NativeVideoOutputCommand::RequestOverlayRender => {

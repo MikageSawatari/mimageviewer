@@ -151,7 +151,7 @@ public:
     void set_gui_topmost(bool topmost);
     /// Update the owner HWND of the bridge-owned editor surface. Used when the
     /// active mIV viewport changes (main grid vs fullscreen viewport).
-    bool set_gui_owner(void* owner_hwnd);
+    void set_gui_owner(void* owner_hwnd);
     /// Relay mIV app activation to the bridge-owned plugin surface.
     void set_gui_app_active(bool active);
     void* gui_container_hwnd() const;

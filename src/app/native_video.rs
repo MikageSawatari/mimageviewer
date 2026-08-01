@@ -3546,7 +3546,7 @@ impl App {
                 // `cursor_move_is_activity` に委ねる: hidden 中の None は spurious とみなして抑制し、
                 // クリック入場 (= move 未転送) 直後の zero-delta nav でも復活しないようにする。
                 let pos = (mouse.x, mouse.y);
-                let moved = crate::video::native_cursor::cursor_move_is_activity(
+                let moved = crate::video::native_presenter::cursor_move_is_activity(
                     self.native_video_last_move_client,
                     pos,
                     self.cursor_hidden,
@@ -7215,7 +7215,6 @@ impl App {
             self.settings.fullscreen_cursor_hide_delay_secs,
             Some(self.dsp_bridge.editor_hwnds_snapshot()),
             self.main_hwnd.unwrap_or(0) as u64,
-            Some(std::sync::Arc::clone(&self.dsp_bridge)),
             self.creative_lut_library.video_snapshot(
                 &self.settings.creative_luts,
                 &self.settings.video_adjustments,
@@ -7732,7 +7731,6 @@ impl App {
                 self.settings.fullscreen_cursor_hide_delay_secs,
                 Some(self.dsp_bridge.editor_hwnds_snapshot()),
                 self.main_hwnd.unwrap_or(0) as u64,
-                Some(std::sync::Arc::clone(&self.dsp_bridge)),
                 self.creative_lut_library.video_snapshot(
                     &self.settings.creative_luts,
                     &self.settings.video_adjustments,

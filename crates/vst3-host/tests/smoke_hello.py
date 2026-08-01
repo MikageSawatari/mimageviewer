@@ -65,14 +65,14 @@ def main() -> int:
         stderr=subprocess.PIPE,
     )
     try:
-        # hello → ready  (Stage 5 owner-applied ack: protocol v3)
-        write_msg(proc, '{"cmd":"hello","version":3}')
+        # hello → ready  (T09 v0.9.0: PROTOCOL_VERSION は 2 に bump 済み)
+        write_msg(proc, '{"cmd":"hello","version":2}')
         reply = read_msg(proc)
         print(f"<- {reply}")
         if '"event":"ready"' not in reply:
             print(f"unexpected reply: {reply}", file=sys.stderr)
             return 2
-        if '"version":3' not in reply:
+        if '"version":2' not in reply:
             print(f"version mismatch: {reply}", file=sys.stderr)
             return 3
 

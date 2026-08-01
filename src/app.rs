@@ -46708,7 +46708,6 @@ impl App {
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                             Some(self.dsp_bridge.editor_hwnds_snapshot()),
                             self.main_hwnd.unwrap_or(0) as u64,
-                            Some(std::sync::Arc::clone(&self.dsp_bridge)),
                             self.creative_lut_library.video_snapshot(
                                 &self.settings.creative_luts,
                                 &self.settings.video_adjustments,
@@ -64937,7 +64936,6 @@ fn native_video_presenter_config(
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
     >,
     main_hwnd_for_raise: u64,
-    owner_handoff: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
     video_grade: crate::creative_lut::VideoGradeSnapshot,
     // 音声のみ native シェル (music Inc 6 ②) は true。present ループが frameless で回る
     // (§5.9 / Inc 6 ②-1)。動画経路は false。
@@ -64968,7 +64966,6 @@ fn native_video_presenter_config(
         ),
         editor_hwnds_snapshot,
         main_hwnd_for_raise,
-        owner_handoff,
         video_grade,
         // in-main-window / detached では topmost な HUD overlay HWND を使わず、
         // presenter の DComp tree に egui overlay を載せる。fullscreen だけ

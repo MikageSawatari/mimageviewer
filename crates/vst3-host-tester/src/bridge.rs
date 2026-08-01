@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// T09 (v0.9.0) bump 1 → 2: 本体 `src/video/dsp/bridge.rs::PROTOCOL_VERSION` および
 /// `crates/vst3-host/include/protocol.h::PROTOCOL_VERSION` と必ず同期させること。
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
