@@ -189,6 +189,45 @@
   (`docs/video-architecture.md` の `FramePresentationState` 節参照)。
 - 規模 / 優先度: Medium〜Large / **P1** (ハード ハングのため)。
 
+### 1.28 presenter の上に別の窓が乗るとカーソル auto-hide が解除されない
+
+- 出典: v2.9.1 リリース前の §7.2 実機確認 (2026-08-01)、シナリオ 5 (VST GUI) の最中。
+- 症状: フルスクリーンで動画を**再生中**に VST エディタを開こうとしたところ、マウスカーソルが
+  非表示のまま戻らなくなった。**mIV の動画ウィンドウの上でだけ**継続し、別モニタへ移すと
+  正常。動画ウィンドウ上へ戻すとまた消える。**クリックしても復帰しない** (ホイールは未試行)。
+  動画を閉じて再生し直すと解消した。
+- 壊れている前提: [native_window_host.rs](../src/video/native_window_host.rs) の
+  `observe()` が作る `cursor_within_client` は `GetCursorPos` → `ScreenToClient(presenter)` →
+  `GetClientRect` の **純粋な幾何判定**である。ところが
+  [render_core.rs](../src/video/native_presenter/render_core.rs) の
+  `cursor_within_focus_window()` はこれを「カーソルの入力を実際に受けている窓が presenter か」
+  という**所有権の判定として**使い、true の間だけ `SetCursor` intent を出す。
+  presenter の client 矩形の内側に別の top-level 窓 (VST エディタ) が乗ると、この 2 つの問いの
+  答えがずれる。
+- 成立する環:
+  1. エディタ窓は presenter の client 矩形の内側 → `cursor_within_client = true`。
+  2. 再生中なのでフレームが出続け、presenter は毎フレーム `SetCursor(Hidden)` を適用する。
+  3. mouse move / button はエディタ窓へ行き、`push_native_event` に届かない →
+     `cursor_last_activity` が更新されず `cursor_should_hide` が true に固定される。
+  4. `WM_SETCURSOR` は `LRESULT(1)` を返すだけで復帰させない (2026-06-06 に zero-delta move
+     での誤復帰を潰すため意図的に外した経路)。`restore_cursor_for_mouse_activity` は HUD の
+     wheel / button ハンドラからしか呼ばれないので、エディタ上のクリックでは発火しない。
+  → 3 つある復帰経路がすべて同時に閉じる。実機の「クリックでも戻らない」がこれを裏付ける。
+- 症状パッチにしないこと: `WM_SETCURSOR` での復帰と、タイマーによる強制復帰はどちらも
+  根本原因に対応せず、前者は 2026-06-06 の修正を再発させる。auto-hide 状態は現在
+  **producer が 3 つ (presenter frame intent / HUD wndproc / `push_native_event`) あって
+  所有者がいない**。reducer が単一の owner となり、placement / VST owner 切替の遷移で
+  明示的にリセットされる形へ集約する。`cursor_within_client` は幾何ではなく
+  「presenter または HUD が実際にそのカーソルの入力先か」を答える述語に置き換える
+  (判定不能時のフォールバックが現在 `_ => true` = 隠す側に倒れている点も含めて直す)。
+- 関連: [native-video-window-thread-plan.md](native-video-window-thread-plan.md) の Stage 5
+  (VST owner handoff と focus 境界) と Stage 6 (placement 切替の lifecycle hardening)。
+  VST 固有ではなく、presenter の上に別の窓が乗る全ケースで成立する。
+- 観測の欠落: 発生時点のログ (`mimageviewer.log` / perf log) に**カーソル関連の計装が無く**、
+  今回の発生は事後確認できなかった。§7.3 の health detection に `cursor_hidden` /
+  `cursor_within_client` / `cursor_last_activity` / 直近の placement 遷移を含める。
+- 規模 / 優先度: Medium / **P2**。データ喪失は無いが、再生を止めるまで操作感が壊れる。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断

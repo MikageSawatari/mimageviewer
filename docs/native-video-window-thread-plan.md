@@ -673,6 +673,10 @@ decoder/audio/frame queue ownership を変更していない。
   pump を待たせない。
 - `WM_MOUSEACTIVATE`、foreground claim、IME preedit/commit、HUD focus return の sequence test
   を追加する。
+- presenter の上に別 top-level 窓 (VST エディタ) が乗る間の cursor 所有を直す。現在
+  `cursor_within_client` は幾何判定なのに所有権判定として使われており、エディタ表示中に
+  auto-hide が解除不能になる実機事象がある (backlog §1.28、2026-08-01 の §7.2 シナリオ 5)。
+  auto-hide 状態の owner を reducer へ集約し、owner 切替の遷移でリセットする。
 
 変わらないもの:
 
