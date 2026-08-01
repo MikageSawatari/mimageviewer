@@ -918,3 +918,94 @@ layout 結果に含め、page layer と各 flex item の width / height を明�
 LTR は「先頭ページです」「最終ページです」。RTL はそれぞれ
 「先頭ページです（右→左綴じ：次は左をタップ）」、
 「最終ページです（右→左綴じ：前は右をタップ）」とし、overlay は pointer input を遮らない。
+
+## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
+
+この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。
+
+### 13.1 検証環境
+
+実利用中の `%APPDATA%\mimageviewer` を汚さないため、**隔離データディレクトリ**で検証する。
+
+```powershell
+# 本体 (ユーザーが実行する。エージェントは mIV 本体を起動しない)
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
+  -ArgumentList '--data-dir','.\target\dev-runtime\data','--remote-ipc'
+```
+
+- データディレクトリが既定と異なると、mutex / activate event / open-path pipe /
+  shutdown event の 4 つが別名前空間になるため、**通常版 mIV を起動したままでよい** (§11)
+- `--remote-ipc` は**検証側だけ**に付ける (IPC の pipe 名は固定のため、両方に付けると
+  後発側が拒否される)
+- 隔離データは `%APPDATA%\mimageviewer` から robocopy で作った。`fts_index` / `runtime` /
+  `tensorrt*` / `logs` / `_recovery` は除外して約 11.6GB (元は 113GB)
+
+### 13.2 ビルドと再起動
+
+```powershell
+.\scripts\restart-remote-web.ps1     # remote-web: 停止 → release ビルド → 隔離データで再起動
+.\scripts\build-dev.ps1              # 本体 (core) のビルド
+```
+
+- `restart-remote-web.ps1` は既定で隔離データディレクトリを使う。起動出力 (接続 URL / QR /
+  Bearer) は `remote-web-console.log` へ落ちる
+- **`.ps1` は ASCII のみで書く。** 日本語コメントを入れると Windows PowerShell 5.1 が
+  BOM 無しスクリプトを ANSI として読み、パースエラーになる
+- `crates/remote-web/web/` はディスクから直接配信される。**フロントだけの変更なら
+  ビルドも再起動も不要**で、ブラウザの再読み込みで反映される
+
+### 13.3 テスト実行時の注意
+
+- **フロントのテストは `crates/remote-web/web` から実行する。** リポジトリルートから
+  `node --test` を打つと相対 import が解決できず失敗する
+
+  ```bash
+  cd crates/remote-web/web && node --test
+  ```
+
+- **本体の lib テストは `target/debug/deps` に FFmpeg DLL のコピーが必要。**
+  無いと `STATUS_DLL_NOT_FOUND` で落ちる
+
+  ```bash
+  cp vendor/ffmpeg/bin/*.dll target/debug/deps/
+  cargo test -p mimageviewer --lib
+  ```
+
+- 本体 UI (`app.rs` / `ui_fullscreen.rs` 等) に触れた増分では、絞り込みではなく
+  **`cargo test -p mimageviewer --lib` を全件**流す (4,600 件前後 / 約 165 秒)
+
+### 13.4 Codex への依頼で毎回書くこと
+
+- **`scripts/build-dev.ps1` を実行させない。** 動作中の本体を停止させてしまう。
+  本体ビルドは ClaudeCode 側で行う
+- release ビルドは**別 target** へ出させる (稼働中プロセスが exe を掴んでいるため)
+- コミットはさせない。Codex のサンドボックスは worktree の Git 管理領域
+  (`C:\home\mimageviewer\.git\worktrees\...`) に書けず `index.lock` を作れない
+- 本体 `src/` に触れた場合は**全箇所と理由を報告**させる
+- detached / viewport 述語に触れる場合は `docs/detached-rework-plan.md` への記録も求める
+  (凍結ルール。§11 の判断例を参照)
+
+### 13.5 プロトコル版数
+
+`crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
+再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
+
+### 13.6 残タスク (2026-08-01 時点)
+
+1. **端末ローカル設定 + 書き込み系** — 見開きモード / 綴じ方向 (`spread.db` への書き込み)、
+   読書履歴、レーティング、ブックマーク。あわせて端末ローカル設定の置き場 (`localStorage`) を
+   新設し、「縦長画面では見開きを解除する」を入れる (既定 ON)
+2. **通常フォルダの見開き対応** — 現在は ZIP / PDF の `/api/container` のみ
+3. **動画・音声のストリーミング** — 正本は
+   [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
+4. **ジェスチャ** — 下スワイプ = 一覧へ / 上スワイプ = メニュー、中央タップでバー表示切替、
+   初回のジェスチャヘルプ、メニューの 2 列化、キー表示の出し分け
+5. **PWA** — アイコンと全画面起動
+6. **検索** (Ctrl+S / F / G 相当)、タグ
+7. 配布 (exe 埋め込み、接続診断ウィザード)
+
+### 13.7 未消化の宿題
+
+- `cargo test -p mimageviewer-launcher` が未実行。launcher の `build.rs` が
+  `target/release/mimageviewer-core.exe` を要求するため、release core をビルドしてから流す。
+  §11 の single-instance 名前空間の変更が配布経路を壊していないかの最終確認になる
