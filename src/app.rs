@@ -59694,13 +59694,17 @@ impl App {
         self.set_video_continuous_mode_common(ctx, fs_idx, mode);
     }
 
+    /// 入口は native overlay の `ToggleContinuous` とゲームパッドで、どちらも自分の入力を
+    /// 所有する。App viewport の `ime_input_active()` はここでは見ない
+    /// (`native_video.rs` の dispatch 先頭コメントと同じ理由: 別 viewport の composition が
+    /// 張り付くと、この窓の明示操作まで無関係に捨てられる)。target 検証だけを行う。
     pub(crate) fn set_video_continuous_mode_common(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
         mode: crate::video::VideoContinuousMode,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         self.video_continuous_mode = mode;
@@ -60086,9 +60090,13 @@ impl App {
     /// 音楽ビューのループモード切替 (L キー / HUD ループボタン)。共有 `video_loop_mode` を
     /// Off → Full → Bookmark → Off で循環 (音声はチャプター無しなので Chapter を自動スキップ)。
     /// 連続再生中は映像同様 no-op + トースト。
+    /// 入口は L キー / HUD ボタン / ゲームパッド。キー経路は呼び出し側
+    /// (`ui_fullscreen.rs` の `VideoLoop` consume) が `ime_input_active()` と
+    /// `wants_keyboard_input()` を見てから来るので、ここでは target 検証だけを行う
+    /// (二重チェックにすると HUD クリックとパッドが別 viewport の composition で死ぬ)。
     pub(crate) fn cycle_music_loop_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let _ = ctx;
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         if self.video_continuous_mode.is_enabled() {
@@ -60112,6 +60120,7 @@ impl App {
     }
 
     /// 映像 `set_video_continuous_mode_common` の音声版 (native overlay トースト無し)。
+    /// 入口は HUD の連続再生ボタンで、入力所有はその窓にある。target 検証だけを行う。
     pub(crate) fn set_music_continuous_mode(
         &mut self,
         ctx: &egui::Context,
@@ -60119,7 +60128,7 @@ impl App {
         mode: crate::video::VideoContinuousMode,
     ) {
         let _ = ctx;
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         self.video_continuous_mode = mode;

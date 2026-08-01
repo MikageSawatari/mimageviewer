@@ -476,6 +476,30 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "2.9.1",
+        must_read: &[
+            HighlightItem {
+                title: "Tab キーで入力欄が移動しなくなりました",
+                body: "文字を入力しているときに Tab キーを押しても、次の入力欄へ移らなくなりました。\
+                       入力中に背後の機能が誤って動くのを防ぐためです。\
+                       タグ編集・お気に入り編集・書き出しの画面で別の入力欄へ移るときは、\
+                       その欄をクリックしてください。",
+            },
+            HighlightItem {
+                title: "名前の変更と新しいフォルダーは Windows の画面になりました",
+                body: "ファイル名の変更と新しいフォルダーの作成は、Windows 標準の入力画面で行います。\
+                       文字の編集や日本語入力の扱いがエクスプローラーと同じになります。",
+            },
+            HighlightItem {
+                title: "タスクトレイへ格納しても再生が続きます",
+                body: "動画や音楽をタスクトレイへ格納しても、再生が止まらなくなりました。\
+                       格納中に再生が終わったときは次のファイルへ進みます。\
+                       これまでは格納すると一時停止していました。",
+            },
+        ],
+        highlights: &[],
+    },
 ];
 
 #[cfg(test)]
@@ -634,6 +658,34 @@ mod tests {
             .expect("v2.9.0 must announce the grid click selection switch");
         assert!(selection_notice.body.contains("エクスプローラーと同じ動作"));
         assert!(selection_notice.body.contains("チェック方式"));
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_9_1_must_read_entries() {
+        // v2.9.1 は修正リリースだが、既定動作が 3 つ変わっている (Tab / 名前ダイアログ /
+        // トレイ格納中の再生継続)。新機能が無いので `highlights` は空で、告知は must_read
+        // だけで成立することを固定する。
+        let entries = for_version("2.9.1", table());
+        assert_eq!(versions(&entries), ["2.9.1"]);
+        let entry = entries[0];
+        assert!(entry.highlights.is_empty());
+        for expected in ["Tab キー", "Windows の画面", "タスクトレイ"] {
+            assert!(
+                entry
+                    .must_read
+                    .iter()
+                    .any(|item| item.title.contains(expected)),
+                "v2.9.1 must announce the {expected} default change"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_9_1_is_announced_when_upgrading_from_v2_9_0() {
+        // patch 版でもテーブルに載せた以上は更新後初回起動で出ること (parse_version が
+        // patch を無視していないことの回帰ガード)。
+        let entries = highlights_to_show(Some("2.9.0"), "2.9.1", table());
+        assert_eq!(versions(&entries), ["2.9.1"]);
     }
 
     #[test]
