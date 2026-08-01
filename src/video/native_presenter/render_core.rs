@@ -38,6 +38,7 @@ use windows_numerics::Matrix3x2;
 use crate::settings::FsSidePanelMode;
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
+use crate::video::native_window_health::NativeRenderOperation;
 use crate::video::native_window_host::{
     NativeCursorIcon, NativeRenderTarget, NativeRenderTargets, NativeWindowIntent,
     NativeWindowObservation,
@@ -132,6 +133,8 @@ pub struct NativeRenderConfig {
     pub text_contrast: crate::settings::TextContrast,
     /// main UI と同じフォント指定と縦位置補正。
     pub ui_font: crate::settings::UiFontSettings,
+    pub(crate) health: Arc<crate::video::native_window_health::NativeWindowHealth>,
+    pub(crate) window_epoch: u64,
 }
 
 enum NativeOverlayCompositionTarget {
@@ -143,6 +146,8 @@ enum NativeOverlayCompositionTarget {
 }
 
 pub struct NativeRenderCore {
+    health: Arc<crate::video::native_window_health::NativeWindowHealth>,
+    window_epoch: u64,
     swap_chain: IDXGISwapChain1,
     waitable: HANDLE,
     d3d_device1: ID3D11Device1,
@@ -254,6 +259,8 @@ struct NativeTestOverlay {
 }
 
 struct NativeEguiOverlay {
+    health: Arc<crate::video::native_window_health::NativeWindowHealth>,
+    window_epoch: u64,
     surface: wgpu::Surface<'static>,
     visual: IDCompositionVisual,
     dcomp_device: IDCompositionDevice,
@@ -1530,6 +1537,12 @@ impl NativeRenderCore {
     pub(crate) fn new(
         config: NativeRenderConfig,
     ) -> Result<(Self, HostWindowTopology, Vec<NativeWindowIntent>), String> {
+        let health = Arc::clone(&config.health);
+        let window_epoch = config.window_epoch;
+        let _attach_operation = health.begin_render_operation(
+            crate::video::native_window_health::NativeRenderOperation::Attach,
+            window_epoch,
+        );
         unsafe {
             let (d3d_device, d3d_context) = create_present_d3d11_device()?;
             let d3d_device1: ID3D11Device1 = d3d_device
@@ -1683,6 +1696,8 @@ impl NativeRenderCore {
                         config.ui_scale,
                         config.text_contrast,
                         config.ui_font.clone(),
+                        Arc::clone(&health),
+                        window_epoch,
                     ) {
                         Ok(mut overlay) => {
                             match overlay.render_once() {
@@ -1740,6 +1755,8 @@ impl NativeRenderCore {
                         config.ui_scale,
                         config.text_contrast,
                         config.ui_font.clone(),
+                        Arc::clone(&health),
+                        window_epoch,
                     ) {
                         Ok(mut overlay) => {
                             match overlay.render_once() {
@@ -1857,6 +1874,8 @@ impl NativeRenderCore {
                 };
 
             let mut this = Self {
+                health: Arc::clone(&health),
+                window_epoch,
                 swap_chain,
                 waitable,
                 d3d_device1,
@@ -1898,6 +1917,7 @@ impl NativeRenderCore {
             };
             this.recreate_backbuffer(true)?;
             this.wait_for_initial_composition_ready();
+            this.publish_cursor_health();
             log_event(
                 "init",
                 &[
@@ -2075,7 +2095,12 @@ impl NativeRenderCore {
         let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
 
         let present_t0 = Instant::now();
-        let hr = unsafe { self.swap_chain.Present(sync_interval, Default::default()) };
+        let hr = {
+            let _operation = self
+                .health
+                .begin_render_operation(NativeRenderOperation::Present, self.window_epoch);
+            unsafe { self.swap_chain.Present(sync_interval, Default::default()) }
+        };
         if hr.is_err() {
             return Err(format!("IDXGISwapChain::Present: {hr:?}"));
         }
@@ -2153,9 +2178,14 @@ impl NativeRenderCore {
 
         // 3. 新 swap chain を Present (= 新 swap chain は「正しいフレーム投入済み」状態)。
         let present_t0 = Instant::now();
-        unsafe { new_swap_chain.Present(sync_interval, Default::default()) }
-            .ok()
-            .map_err(|e| format!("IDXGISwapChain::Present (new surface): {e:?}"))?;
+        {
+            let _operation = self
+                .health
+                .begin_render_operation(NativeRenderOperation::Present, self.window_epoch);
+            unsafe { new_swap_chain.Present(sync_interval, Default::default()) }
+                .ok()
+                .map_err(|e| format!("IDXGISwapChain::Present (new surface): {e:?}"))?;
+        }
         let present_call_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
 
         // 4. content + transform を 1 回の Commit で原子的に差し替える。旧 swap chain は
@@ -2185,6 +2215,9 @@ impl NativeRenderCore {
             M31: offset_x,
             M32: offset_y,
         };
+        let commit_operation = self
+            .health
+            .begin_render_operation(NativeRenderOperation::DCompCommit, self.window_epoch);
         unsafe {
             self._video_visual
                 .SetContent(&new_swap_chain)
@@ -2199,6 +2232,7 @@ impl NativeRenderCore {
 
         // 5. Commit が DWM の compositor tick まで反映され切るまで待つ。
         let commit_sync_ms = self.wait_for_video_transform_commit();
+        drop(commit_operation);
 
         // 6. Commit 成功。ここで初めて `self.*` を新 surface へ確定する (一括更新)。
         self.sar_num = new_sar_num;
@@ -2463,10 +2497,16 @@ impl NativeRenderCore {
                 let probe_this_frame = !grade_active && self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
-                unsafe {
-                    self.d3d_context4
-                        .Wait(&fence, gpu_frame.fence_value)
-                        .map_err(|e| format!("D3D11 fence wait: {e:?}"))?;
+                {
+                    let _operation = self.health.begin_render_operation(
+                        NativeRenderOperation::FenceWait,
+                        self.window_epoch,
+                    );
+                    unsafe {
+                        self.d3d_context4
+                            .Wait(&fence, gpu_frame.fence_value)
+                            .map_err(|e| format!("D3D11 fence wait: {e:?}"))?;
+                    }
                 }
                 metrics.fence_wait_ms = fence_t0.elapsed().as_secs_f64() * 1000.0;
                 let open_shared_t0 = Instant::now();
@@ -2639,6 +2679,22 @@ impl NativeRenderCore {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.window_observation = observation;
         }
+        self.publish_cursor_health();
+    }
+
+    fn publish_cursor_health(&self) {
+        let (hidden, within, last_activity) = self.egui_overlay.as_ref().map_or(
+            (false, self.window_observation.cursor_within_client, None),
+            |overlay| {
+                (
+                    overlay.cursor_hidden,
+                    overlay.window_observation.cursor_within_client,
+                    overlay.cursor_last_activity,
+                )
+            },
+        );
+        self.health
+            .record_cursor_state(self.window_epoch, hidden, within, last_activity);
     }
 
     /// **overlay (egui_wgpu) の surface だけ** を resize する。
@@ -2839,6 +2895,7 @@ impl NativeRenderCore {
         } else {
             NativeOverlayInputOutcome::empty()
         };
+        self.publish_cursor_health();
         Ok(outcome)
     }
 
@@ -3186,6 +3243,7 @@ impl NativeRenderCore {
         } else {
             NativeOverlayInputOutcome::empty()
         };
+        self.publish_cursor_health();
         // Codex CP5 P1 反映: tick 経路でも overlay UI が時間経過で表示/非表示に変わるので、
         // 必ず HUD region に反映する。漏らすと periodic 表示状態 (= toast / hover preview /
         // tile overlay refresh 等) と region がズレて VST にクリックが奪われる。
@@ -3325,6 +3383,9 @@ impl NativeRenderCore {
             M31: offset_x,
             M32: offset_y,
         };
+        let _operation = self
+            .health
+            .begin_render_operation(NativeRenderOperation::DCompCommit, self.window_epoch);
         unsafe {
             self._video_visual
                 .SetTransform2(&transform)
@@ -3366,10 +3427,15 @@ impl NativeRenderCore {
         };
         let cast_ms = cast_t0.elapsed().as_secs_f64() * 1000.0;
         let acquire_t0 = Instant::now();
-        unsafe {
-            mutex
-                .AcquireSync(1, 10)
-                .map_err(|e| format!("source keyed mutex AcquireSync(1): {e:?}"))?;
+        {
+            let _operation = self
+                .health
+                .begin_render_operation(NativeRenderOperation::AcquireSync, self.window_epoch);
+            unsafe {
+                mutex
+                    .AcquireSync(1, 10)
+                    .map_err(|e| format!("source keyed mutex AcquireSync(1): {e:?}"))?;
+            }
         }
         let acquire_ms = acquire_t0.elapsed().as_secs_f64() * 1000.0;
         Ok(SourceKeyedMutexAcquire {
@@ -3733,6 +3799,8 @@ impl NativeEguiOverlay {
         ui_scale: f32,
         text_contrast: crate::settings::TextContrast,
         ui_font: crate::settings::UiFontSettings,
+        health: Arc<crate::video::native_window_health::NativeWindowHealth>,
+        window_epoch: u64,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
@@ -3786,6 +3854,8 @@ impl NativeEguiOverlay {
         let cursor_hide_delay_secs =
             crate::settings::clamp_fullscreen_cursor_hide_delay_secs(cursor_hide_delay_secs);
         let this = Self {
+            health,
+            window_epoch,
             surface,
             visual,
             dcomp_device: dcomp_device.clone(),
@@ -3936,6 +4006,15 @@ impl NativeEguiOverlay {
             ],
         );
         Ok(this)
+    }
+
+    fn publish_cursor_health(&self) {
+        self.health.record_cursor_state(
+            self.window_epoch,
+            self.cursor_hidden,
+            self.window_observation.cursor_within_client,
+            self.cursor_last_activity,
+        );
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<Vec<NativeWindowIntent>, String> {
@@ -4105,6 +4184,7 @@ impl NativeEguiOverlay {
             self.cursor_last_activity = Some(Instant::now());
             self.cursor_hidden = false;
         }
+        self.publish_cursor_health();
         if self.hud_dimmed && Self::hud_dimmed_suppresses_overlay_pointer_event(&event) {
             let was_visible = self.dimmed_hover_chrome_visible();
             self.update_raw_hover_pos_from_native_event(&event);
@@ -4822,6 +4902,7 @@ impl NativeEguiOverlay {
         self.cursor_last_activity = Some(Instant::now());
         self.cursor_hidden = false;
         self.dirty = true;
+        self.publish_cursor_health();
     }
 
     fn request_render(&mut self) {
@@ -5818,6 +5899,9 @@ impl NativeEguiOverlay {
         if self.visual_attached == attached {
             return Ok(());
         }
+        let _operation = self
+            .health
+            .begin_render_operation(NativeRenderOperation::DCompCommit, self.window_epoch);
         unsafe {
             if attached {
                 // CP3 P1 #3 反映: `after_visual` が `Some(v)` なら presenter フォールバック経路
@@ -7786,6 +7870,7 @@ impl NativeEguiOverlay {
             )));
         }
         self.cursor_hidden = cursor_should_hide && cursor_over_presenter;
+        self.publish_cursor_health();
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {
@@ -7843,7 +7928,12 @@ impl NativeEguiOverlay {
         let mut submissions = user_cmds;
         submissions.push(encoder.finish());
         self.queue.submit(submissions);
-        surface_texture.present();
+        {
+            let _operation = self
+                .health
+                .begin_render_operation(NativeRenderOperation::Present, self.window_epoch);
+            surface_texture.present();
+        }
         if overlay_visible {
             self.set_visual_attached(true)?;
         }
@@ -8237,11 +8327,24 @@ impl NativeTestOverlay {
 
 impl Drop for NativeRenderCore {
     fn drop(&mut self) {
+        let _operation = self
+            .health
+            .begin_render_operation(NativeRenderOperation::Detach, self.window_epoch);
         if !self.waitable.is_invalid() {
             unsafe {
                 let _ = CloseHandle(self.waitable);
             }
         }
+    }
+}
+
+impl NativeRenderCore {
+    pub(crate) fn detach(self) {
+        let health = Arc::clone(&self.health);
+        let epoch = self.window_epoch;
+        let operation = health.begin_render_operation(NativeRenderOperation::Detach, epoch);
+        drop(self);
+        drop(operation);
     }
 }
 

@@ -144,6 +144,8 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             ui_scale: 1.0,
             text_contrast: crate::settings::TextContrast::Standard,
             ui_font: crate::settings::UiFontSettings::default(),
+            health: crate::video::native_window_health::NativeWindowHealth::new_registered(),
+            window_epoch: 0,
         })?;
     window = window.retain_render_topology(topology);
     window.apply_render_intents(&startup_window_intents);

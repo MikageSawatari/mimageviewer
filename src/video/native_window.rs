@@ -1025,16 +1025,37 @@ impl Drop for NativeVideoWindow {
 }
 
 pub fn pump_thread_messages() -> bool {
+    pump_thread_messages_inner(None)
+}
+
+pub(crate) fn pump_thread_messages_with_health(
+    health: &super::native_window_health::NativeWindowHealth,
+) -> bool {
+    pump_thread_messages_inner(Some(health))
+}
+
+fn pump_thread_messages_inner(
+    health: Option<&super::native_window_health::NativeWindowHealth>,
+) -> bool {
     let mut quit = false;
     unsafe {
         let mut msg = MSG::default();
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message == super::native_window_health::NATIVE_WINDOW_HEALTH_PING {
+                if let Some(health) = health {
+                    health.acknowledge_pump_ping(msg.lParam.0 as u64, msg.wParam.0 as u64);
+                }
+                continue;
+            }
             if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
                 quit = true;
                 break;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            if let Some(health) = health {
+                health.record_message_dispatched();
+            }
         }
     }
     quit

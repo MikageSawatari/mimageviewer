@@ -825,6 +825,32 @@ incident で判別できるよう、lock-free/latest-value の `NativeWindowHeal
 これにより今回の再発は「UI hang が続いた」だけでなく、pump も止まったのか、render だけが
 driver 内で止まったのか、どの HWND generation/operation だったかまで検知できる。
 
+#### health detection 実装記録 (2026-08-01)
+
+- `NativeWindowHealth` は native output ごとの `Arc` とし、pump/render が書く本体は atomic scalar
+  だけで構成した。pump thread id、presenter/HUD HWND + epoch、message dispatch sequence/time、
+  pump request received/completed、render operation の active/last started/last completed、placement
+  遷移、source generation、visibility、cursor hidden/within/last activity を latest value として保持する。
+  registry の `Mutex<Vec<Weak<_>>>` は既存 UI heartbeat watchdog だけが 1 秒 tick で短時間取得し、
+  pump/render は登録後に触れない。観測に path、タイトル、codec 等の media metadata は渡さない。
+- watchdog 専用 thread は増やさず、既存 `ui-heartbeat-watchdog` の 1 秒 tick を再利用した。watchdog
+  は pump OS thread queue へ generation/sequence 付き `PostThreadMessageW` を 1 件だけ outstanding
+  にして送り、pump の通常 `PeekMessageW` drain が atomic ack を返す。`SendMessage`、renderer
+  lock、pump→render wait は使用しない。UI hang 行にも同じ snapshot の pump ack age、active render
+  operation age、window epoch を併記する。
+- stall 閾値は pump/render とも **5 秒**。既存 UI heartbeat の hang 判定と同じ incident window に
+  揃え、通常の pump 4 ms tick、keyed mutex 10 ms timeout、frame-latency wait 100 ms に対して十分な
+  余裕を持たせ、startup の device/DComp 初期化や scheduler jitter を誤検知しない値とした。pump
+  ping が閾値超過なら render より優先して `NATIVE VIDEO WINDOW PUMP STALL`、pump の過去 ack が
+  あり ping が閾値内で active render operation だけが閾値超過なら `NATIVE VIDEO RENDER STALL`
+  と分類する。出力は state transition edge のみ、異なる stall への遷移も 10 秒 rate limit を通す。
+- publish 時の `GetWindowThreadProcessId` は debug/test で pump thread id と assert し、release の
+  不一致は atomic latch を経て `NATIVE VIDEO WINDOW OWNER MISMATCH` を一度だけ記録する。既存の
+  create/show/hide/placement/input/close reducer と channel ordering は変更していない。
+- 純関数 classification、同一状態で増えない log gate、nested render operation の外側復元、
+  atomic writer API の unit test を追加した。production render-stall parent-destroy gate は従来どおり
+  pump close/join の有界性を検証する。
+
 ## 8. 既存機能との相互作用
 
 | 機能 | 現行 interaction | 壊してはいけない挙動 / 設計上の処置 |
