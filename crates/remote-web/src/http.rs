@@ -377,6 +377,9 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/icons/icon-180.png") => {
             static_file(state, "icons/icon-180.png", "image/png")
         }
+        (Method::Get, "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png") => {
+            static_file(state, "icons/icon-180.png", "image/png")
+        }
         (Method::Get, "/icons/icon-192.png") => {
             static_file(state, "icons/icon-192.png", "image/png")
         }
@@ -1083,17 +1086,10 @@ fn api_thumb(state: &AppState, query: &[(String, String)], client_id: &str) -> H
 
 fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
     let address = match remote_address_from_query(query) {
-        Ok(address)
-            if matches!(
-                address.subresource,
-                RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. }
-            ) =>
-        {
-            address
-        }
+        Ok(address) => address,
         _ => return HttpResponse::text(400, "Bad Request"),
     };
-    if let Err(error) = state.library.validate_remote_address(&address) {
+    if let Err(error) = validate_page_address(&state.library, &address) {
         return store_error_response(error);
     }
     let target_px = match requested_width(query) {
@@ -1147,6 +1143,18 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
         Err(failure) => {
             media_ipc_error_response(failure, started.elapsed(), "page", Some(target_px))
         }
+    }
+}
+
+fn validate_page_address(library: &Library, address: &RemoteAddress) -> Result<(), StoreError> {
+    // Every accepted page, including an ordinary file, stays inside the existing favorite-root
+    // path guard. The core performs the format decode; remote-web only admits file kinds that the
+    // same list endpoint classifies as images.
+    library.validate_remote_address(address)?;
+    match &address.subresource {
+        RemoteSubresource::File => library.validate_remote_file_image(address),
+        RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => Ok(()),
+        RemoteSubresource::ZipDirectory { .. } => Err(StoreError::BadRequest),
     }
 }
 
@@ -2028,6 +2036,18 @@ mod tests {
                 b"png-180".as_slice(),
             ),
             (
+                "/apple-touch-icon.png",
+                "icons/icon-180.png",
+                "image/png",
+                b"png-180".as_slice(),
+            ),
+            (
+                "/apple-touch-icon-precomposed.png",
+                "icons/icon-180.png",
+                "image/png",
+                b"png-180".as_slice(),
+            ),
+            (
                 "/icons/icon-192.png",
                 "icons/icon-192.png",
                 "image/png",
@@ -2081,6 +2101,78 @@ mod tests {
             .with_path("/api/favorites")
             .into();
         assert_eq!(route(&mut protected_request, &state).status, 401);
+    }
+
+    #[test]
+    fn page_entry_guard_accepts_folder_zip_and_pdf_pages_but_rejects_non_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let favorite_id = Uuid::from_u128(0x1234567890abcdef1234567890abcdef);
+        for path in [
+            "page.jpg",
+            "book.zip",
+            "book.pdf",
+            "movie.mp4",
+            "song.mp3",
+            "notes.txt",
+        ] {
+            std::fs::write(temp.path().join(path), b"fixture").unwrap();
+        }
+        std::fs::create_dir(temp.path().join("not-a-page.jpg")).unwrap();
+        let library = Library::with_favorite_for_test(favorite_id, temp.path().to_owned());
+        let favorite_id = favorite_id.to_string();
+
+        let folder_page = RemoteAddress::file(favorite_id.clone(), "page.jpg");
+        let zip_page = RemoteAddress {
+            favorite_id: favorite_id.clone(),
+            relative_path: "book.zip".to_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "001.jpg".to_owned(),
+            },
+        };
+        let pdf_page = RemoteAddress {
+            favorite_id: favorite_id.clone(),
+            relative_path: "book.pdf".to_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+
+        assert!(validate_page_address(&library, &folder_page).is_ok());
+        assert!(validate_page_address(&library, &zip_page).is_ok());
+        assert!(validate_page_address(&library, &pdf_page).is_ok());
+        assert!(matches!(
+            validate_page_address(
+                &library,
+                &RemoteAddress::file(favorite_id.clone(), "movie.mp4")
+            ),
+            Err(StoreError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_page_address(
+                &library,
+                &RemoteAddress::file(favorite_id.clone(), "song.mp3")
+            ),
+            Err(StoreError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_page_address(
+                &library,
+                &RemoteAddress::file(favorite_id.clone(), "notes.txt")
+            ),
+            Err(StoreError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_page_address(
+                &library,
+                &RemoteAddress::file(favorite_id.clone(), "not-a-page.jpg")
+            ),
+            Err(StoreError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_page_address(
+                &library,
+                &RemoteAddress::file(favorite_id, "../outside.jpg")
+            ),
+            Err(StoreError::BadRequest)
+        ));
     }
 
     #[test]

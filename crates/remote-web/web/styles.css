@@ -272,6 +272,11 @@ button {
   touch-action: manipulation;
 }
 
+.topbar > .icon-button.navigation-icon {
+  font-size: 1.75rem;
+  line-height: 1;
+}
+
 .icon-button:active,
 .viewer-button:active,
 .favorite-card:active,
@@ -516,16 +521,17 @@ button {
 }
 
 .grid-tile {
-  display: flex;
+  position: relative;
+  display: grid;
   overflow: hidden;
   min-width: 0;
-  flex-direction: column;
+  grid-template-rows: var(--grid-preview-height) var(--grid-label-height);
   padding: 0;
   border: 0;
   border-radius: 14px;
   background: var(--surface);
   background-clip: padding-box;
-  box-shadow: inset 0 0 0 1px #303642, 0 5px 18px rgb(0 0 0 / 18%);
+  box-shadow: 0 5px 18px rgb(0 0 0 / 18%);
   text-align: left;
   cursor: pointer;
   touch-action: manipulation;
@@ -534,8 +540,18 @@ button {
   transition: none;
 }
 
-.grid-tile.grid-active {
-  box-shadow: inset 0 0 0 3px var(--accent), 0 5px 18px rgb(0 0 0 / 18%);
+.grid-tile::after {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px #303642;
+  content: "";
+  pointer-events: none;
+}
+
+.grid-tile.grid-active::after {
+  box-shadow: inset 0 0 0 3px var(--accent);
 }
 
 .tile-preview {
@@ -564,7 +580,7 @@ button {
   transition: none;
 }
 
-.grid-tile.page-tile .tile-preview img {
+.grid-tile.image-tile .tile-preview img {
   object-fit: contain;
 }
 
@@ -614,6 +630,8 @@ button {
 }
 
 .tile-label {
+  position: relative;
+  z-index: 1;
   display: block;
   overflow: hidden;
   height: var(--grid-label-height);
@@ -623,6 +641,7 @@ button {
   line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
+  background: var(--surface);
 }
 
 .type-badge {
@@ -1140,7 +1159,10 @@ button:not(.grid-tile):focus-visible {
 
 .grid-tile:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 3px var(--accent), 0 5px 18px rgb(0 0 0 / 18%);
+}
+
+.grid-tile:focus-visible::after {
+  box-shadow: inset 0 0 0 3px var(--accent);
 }
 
 @media (hover: hover) {

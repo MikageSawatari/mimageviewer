@@ -612,6 +612,22 @@ export function thumbnailBindingMatches(
   );
 }
 
+export function thumbnailRequestConcurrency(serverHeavyLimit, reservedHeavySlots = 1) {
+  const serverLimit = Math.max(1, Math.floor(Number(serverHeavyLimit) || 1));
+  const reserved = Math.max(
+    0,
+    Math.min(serverLimit - 1, Math.floor(Number(reservedHeavySlots) || 0))
+  );
+  return Math.max(1, serverLimit - reserved);
+}
+
+export function thumbnailRequestStartCount(activeCount, queuedCount, concurrencyLimit) {
+  const limit = Math.max(1, Math.floor(Number(concurrencyLimit) || 1));
+  const active = Math.max(0, Math.floor(Number(activeCount) || 0));
+  const queued = Math.max(0, Math.floor(Number(queuedCount) || 0));
+  return Math.min(queued, Math.max(0, limit - active));
+}
+
 export function thumbnailRetryDecision(
   status,
   errorCode,
@@ -619,22 +635,41 @@ export function thumbnailRetryDecision(
   maxRetries = 3
 ) {
   const numericStatus = Number(status) || 0;
+  if (numericStatus === 503 && errorCode === "ipc_busy") {
+    return {
+      retry: true,
+      exhausted: false,
+      delayMs: 0,
+      consumeRetryBudget: false,
+    };
+  }
   const transient =
     numericStatus === 0 ||
     numericStatus === 502 ||
     (numericStatus === 503 && errorCode !== "protocol_version_mismatch");
   if (!transient) {
-    return { retry: false, exhausted: false, delayMs: 0 };
+    return {
+      retry: false,
+      exhausted: false,
+      delayMs: 0,
+      consumeRetryBudget: false,
+    };
   }
   const retries = Math.max(0, Math.floor(Number(retryCount) || 0));
   const maximum = Math.max(0, Math.floor(Number(maxRetries) || 0));
   if (retries >= maximum) {
-    return { retry: false, exhausted: true, delayMs: 0 };
+    return {
+      retry: false,
+      exhausted: true,
+      delayMs: 0,
+      consumeRetryBudget: false,
+    };
   }
   return {
     retry: true,
     exhausted: false,
     delayMs: Math.min(4000, 200 * 2 ** retries),
+    consumeRetryBudget: true,
   };
 }
 

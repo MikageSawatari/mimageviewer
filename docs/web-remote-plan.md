@@ -1153,6 +1153,41 @@ viewer のメイン操作メニューは使用頻度順に、ブックマーク�
 `PageDown` / `+` / `-`) は維持する。coarse pointer 用の高さと余白を詰め、全 menu page の action 数を
 最大 11 件に固定するテストを持つ。
 
+### 12.14 実機指摘: page 入口・サムネイル admission・一覧タイル (2026-08-01)
+
+`GET /api/page` の入口は `ZipEntry` / `PdfPage` に加えて、通常フォルダ内画像の
+`RemoteSubresource::File` を受け付ける。File は実ファイルであり、かつ `/api/list` と同じ画像拡張子
+分類に一致する場合だけ許可し、動画・音声・テキスト、ZIP/PDF 本体、ディレクトリは page として 400 にする。3 種の許可対象も
+含め、全 address は従来の `Library::validate_remote_address` を通して favorite root 内の実在パスに
+限定する。入口の回帰テストは通常画像 / ZIP entry / PDF page の許可と、動画 / 音声 / テキスト /
+traversal の拒否を同じ guard に対して固定する。
+
+remote-web の `MAX_CONCURRENT_HEAVY_IPC=4` と `MAX_CONCURRENT_IPC=6` は変更しない。ブラウザの
+サムネイル fetch は pure policy から最大 3 件とし、共有 heavy 枠を page / container の foreground
+処理用に 1 件残す。VirtualGrid の表示用 overscan は維持するが、ネットワーク要求の所有範囲は実際に
+viewport と交差する行だけとする。未完了セルがその範囲を外れた時点で、そのセルの queued / active
+request を `AbortController` で取り下げる。取得済み object URL は保持し、再表示時の不要な再取得は
+行わない。
+
+`503` かつ body の `error="ipc_busy"` は通信失敗ではなく admission の順番待ち通知として扱う。
+`Retry-After` を待って同じ concurrency queue の末尾へ戻し、通常の network / 502 / service 503 用の
+3 回 retry budget は消費しない。画面外へ出た場合はこの待機中も abort できる。telemetry は通常 retry
+count と `admission_wait_count` を分離する。単一端末で他の heavy 処理がない定常一覧では、実機で
+観測された admission 503 比率 76% を 0% 近傍へ落とす設計であり、別端末や foreground 要求との瞬間的
+競合による 503 は Retry-After 待機へ戻して表示上の「再試行上限」にしない。
+
+ファイル一覧とページ一覧は同じ `button.grid-tile > .tile-preview + .tile-label` 構造を使う。タイルを
+CSS grid の preview 行 + label 行として明示し、ラベル背景を独立させるため、`Page 1` 等が画像へ
+重ならない。選択 / focus 枠は child より前面の `::after` inset shadow でタイル全体に描く。通常画像と
+コンテナページはいずれも `image-tile` として `object-fit: contain` を使い、設定されたタイル比率の箱を
+維持しつつ縦長 / 横長の全形状を letterbox 込みで見せる。フォルダ・ZIP・PDF の代表画像は従来どおり
+`cover` とする。
+
+topbar の親フォルダ / ホームだけに `navigation-icon` を付け、40〜42px の tap area は変えず字形を
+1.75rem に拡大する。iOS の慣例 route `/apple-touch-icon.png` と
+`/apple-touch-icon-precomposed.png` は既存 `icons/icon-180.png` を返し、manifest と同じく認証より
+前の static shell route に置く。
+
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
 この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。

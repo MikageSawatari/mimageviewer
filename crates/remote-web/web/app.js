@@ -21,6 +21,8 @@ import {
   sessionOwnerBadge,
   snappedGridOffset,
   thumbnailBindingMatches,
+  thumbnailRequestConcurrency,
+  thumbnailRequestStartCount,
   thumbnailRetryDecision,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
@@ -45,7 +47,11 @@ const sessionOwnerBadgeElement = document.querySelector(
   "#remote-session-owner-badge"
 );
 const TELEMETRY_ENABLED = true;
-const THUMBNAIL_MAX_CONCURRENCY = 4;
+const SERVER_HEAVY_IPC_LIMIT = 4;
+const THUMBNAIL_MAX_CONCURRENCY = thumbnailRequestConcurrency(
+  SERVER_HEAVY_IPC_LIMIT,
+  1
+);
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
 // 要求幅是正後の実測約 457 KiB/ページなら、進行方向 8 ページで約 3.6 MiB。
@@ -91,7 +97,7 @@ class RequestLimiter {
   }
 
   drain() {
-    while (this.active < this.limit && this.queue.length) {
+    while (thumbnailRequestStartCount(this.active, this.queue.length, this.limit) > 0) {
       const entry = this.queue.shift();
       if (entry.signal?.aborted) {
         entry.abort();
@@ -2082,6 +2088,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   const screen = element("section", "screen");
   const topbar = element("header", "topbar");
   const parent = textElement("button", "↑", "icon-button");
+  parent.classList.add("navigation-icon");
   parent.type = "button";
   parent.setAttribute("aria-label", "親フォルダへ");
   parent.addEventListener("click", (event) => {
@@ -2091,6 +2098,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
     });
   });
   const home = textElement("button", "⌂", "icon-button");
+  home.classList.add("navigation-icon");
   home.type = "button";
   home.setAttribute("aria-label", "ホームへ");
   home.addEventListener("click", (event) => {
@@ -2300,6 +2308,7 @@ function createGridTile(
   tile.title = entry.name;
   tile.dataset.entryIndex = String(entryIndex);
   tile.classList.toggle("page-tile", Boolean(state.container) && entry.kind === "image");
+  tile.classList.toggle("image-tile", entry.kind === "image");
   tile.classList.toggle("grid-active", entryIndex === state.gridIndex);
   tile.addEventListener("focus", () => {
     dispatchCommand(command(CommandName.GRID_SELECT, { index: entryIndex }), {
@@ -2320,7 +2329,6 @@ function createGridTile(
     preview.append(textElement("span", "◆", "folder-glyph"));
     preview.append(image);
     preview.append(textElement("span", "folder", "type-badge"));
-    bindThumbnail(image, entry, thumbnailTracker, cellWidth);
     tile.addEventListener("click", (event) => {
       dispatchCommand(
         command(CommandName.OPEN, {
@@ -2338,7 +2346,6 @@ function createGridTile(
     if (entry.kind !== "image") {
       preview.append(textElement("span", entryTypeLabel(entry.kind), "type-badge"));
     }
-    bindThumbnail(image, entry, thumbnailTracker, cellWidth);
     if (entry.kind === "image") {
       tile.addEventListener("click", (event) => {
         const index = imageIndexes.get(entryIdentity(entry));
@@ -2389,6 +2396,7 @@ function createGridTile(
   const label = textElement("span", entry.name, "tile-label");
   if (entry.detail) label.title = `${entry.name} — ${entry.detail}`;
   tile.append(preview, label);
+  tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
   return tile;
 }
 
@@ -2903,6 +2911,7 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
   const generation = (Number(image._thumbnailGeneration) || 0) + 1;
   image._thumbnailGeneration = generation;
   image._thumbnailPath = entryIdentity(entry);
+  image._thumbnailSettled = false;
   image.classList.remove("thumb-ready", "thumb-missing", "thumb-retry-exhausted");
   image.parentElement?.classList.remove("thumb-loaded");
   image.parentElement?.removeAttribute("data-retry-exhausted");
@@ -2922,6 +2931,26 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
       loadThumbnail(image, entry, tracker, generation, targetPx, controller.signal);
     }
   });
+}
+
+function setGridTileThumbnailVisible(tile, visible) {
+  const binding = tile?._thumbnailBinding;
+  if (!binding) return;
+  const { image, entry, tracker, cellWidth } = binding;
+  if (visible) {
+    if (
+      !image._thumbnailController &&
+      !image._thumbnailStartFrame &&
+      !image._thumbnailSettled
+    ) {
+      bindThumbnail(image, entry, tracker, cellWidth);
+    }
+    return;
+  }
+  if (image._thumbnailController || image._thumbnailStartFrame) {
+    image._thumbnailGeneration = (Number(image._thumbnailGeneration) || 0) + 1;
+    disposeThumbnailBinding(image);
+  }
 }
 
 function thumbnailResponseIsCurrent(image, generation, path) {
@@ -3032,11 +3061,20 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     recordClientError("image_load_error", error, {
       resource: safeResourcePath(url),
     });
+  } finally {
+    if (
+      thumbnailResponseIsCurrent(image, generation, bindingKey) &&
+      image._thumbnailController?.signal === signal
+    ) {
+      image._thumbnailController = null;
+      image._thumbnailSettled = true;
+    }
   }
 }
 
 async function fetchThumbnailWithRetry(url, signal) {
   let retryCount = 0;
+  let admissionWaitCount = 0;
   while (true) {
     let response;
     try {
@@ -3063,7 +3101,7 @@ async function fetchThumbnailWithRetry(url, signal) {
         retry_count: retryCount + 1,
       });
       await abortableDelay(decision.delayMs, signal);
-      retryCount += 1;
+      if (decision.consumeRetryBudget) retryCount += 1;
       continue;
     }
 
@@ -3084,11 +3122,13 @@ async function fetchThumbnailWithRetry(url, signal) {
         exhausted: decision.exhausted,
       };
     }
+    if (!decision.consumeRetryBudget) admissionWaitCount += 1;
     enqueueTelemetry({
       type: "thumbnail_retry",
       status: response.status,
       error: detail.error,
-      retry_count: retryCount + 1,
+      retry_count: retryCount + Number(decision.consumeRetryBudget),
+      admission_wait_count: admissionWaitCount,
     });
     response.body?.cancel().catch(() => {});
     const retryAfterSeconds = Number(response.headers.get("Retry-After"));
@@ -3097,7 +3137,7 @@ async function fetchThumbnailWithRetry(url, signal) {
         ? Math.min(10000, retryAfterSeconds * 1000)
         : 0;
     await abortableDelay(Math.max(decision.delayMs, retryAfterMs), signal);
-    retryCount += 1;
+    if (decision.consumeRetryBudget) retryCount += 1;
   }
 }
 
@@ -3307,17 +3347,29 @@ class VirtualGrid {
   render() {
     const overscan = 3;
     const visibleRows = Math.ceil(this.scroller.clientHeight / this.rowHeight);
-    const firstRow = Math.max(0, Math.floor(this.scroller.scrollTop / this.rowHeight) - overscan);
+    const firstVisibleRow = Math.max(
+      0,
+      Math.floor(this.scroller.scrollTop / this.rowHeight)
+    );
     const totalRows = Math.ceil(this.items.length / this.columns);
+    const endVisibleRow = Math.min(
+      totalRows,
+      Math.ceil(
+        (this.scroller.scrollTop + this.scroller.clientHeight) / this.rowHeight
+      )
+    );
+    const firstRow = Math.max(0, firstVisibleRow - overscan);
     const endRow = Math.min(totalRows, firstRow + visibleRows + overscan * 2);
     const startIndex = firstRow * this.columns;
     const endIndex = Math.min(this.items.length, endRow * this.columns);
-    const range = `${startIndex}:${endIndex}:${this.columns}`;
+    const visibleStartIndex = firstVisibleRow * this.columns;
+    const visibleEndIndex = Math.min(this.items.length, endVisibleRow * this.columns);
+    const range = `${startIndex}:${endIndex}:${visibleStartIndex}:${visibleEndIndex}:${this.columns}`;
     if (range === this.lastRange) return;
     this.lastRange = range;
     if (!this.initialItemsReported) {
       this.initialItemsReported = true;
-      this.onInitialItems?.(this.items.slice(startIndex, endIndex));
+      this.onInitialItems?.(this.items.slice(visibleStartIndex, visibleEndIndex));
     }
     this.windowElement.style.top = `${firstRow * this.rowHeight}px`;
     const fragment = document.createDocumentFragment();
@@ -3327,7 +3379,16 @@ class VirtualGrid {
         cell = this.renderCell(this.items[index], index, this.cellWidth);
         this.cells.set(index, cell);
       }
+      setGridTileThumbnailVisible(
+        cell,
+        index >= visibleStartIndex && index < visibleEndIndex
+      );
       fragment.append(cell);
+    }
+    for (const [index, cell] of this.cells) {
+      if (index < startIndex || index >= endIndex) {
+        setGridTileThumbnailVisible(cell, false);
+      }
     }
     this.windowElement.replaceChildren(fragment);
     const cacheLimit = Math.max(128, (endIndex - startIndex) * 4);

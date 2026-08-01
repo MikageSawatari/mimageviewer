@@ -26,6 +26,8 @@ import {
   planSpreadIntent,
   snappedGridOffset,
   thumbnailBindingMatches,
+  thumbnailRequestConcurrency,
+  thumbnailRequestStartCount,
   thumbnailRetryDecision,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
@@ -624,21 +626,35 @@ test("thumbnail responses apply only to the tile generation and item that reques
   assert.equal(thumbnailBindingMatches(4, "album/b.jpg", 4, "album/a.jpg"), false);
 });
 
+test("thumbnail concurrency leaves one shared heavy slot for page and container work", () => {
+  assert.equal(thumbnailRequestConcurrency(4), 3);
+  assert.equal(thumbnailRequestConcurrency(4, 0), 4);
+  assert.equal(thumbnailRequestConcurrency(1), 1);
+  assert.equal(thumbnailRequestConcurrency(Number.NaN), 1);
+  assert.equal(thumbnailRequestStartCount(0, 20, 3), 3);
+  assert.equal(thumbnailRequestStartCount(2, 20, 3), 1);
+  assert.equal(thumbnailRequestStartCount(3, 20, 3), 0);
+  assert.equal(thumbnailRequestStartCount(1, 0, 3), 0);
+});
+
 test("thumbnail retry policy retries only transient failures with a bounded backoff", () => {
   assert.deepEqual(thumbnailRetryDecision(502, "ipc_protocol_error", 0), {
     retry: true,
     exhausted: false,
     delayMs: 200,
+    consumeRetryBudget: true,
   });
   assert.deepEqual(thumbnailRetryDecision(503, "miv_not_running", 2), {
     retry: true,
     exhausted: false,
     delayMs: 800,
+    consumeRetryBudget: true,
   });
   assert.deepEqual(thumbnailRetryDecision(502, "ipc_protocol_error", 3), {
     retry: false,
     exhausted: true,
     delayMs: 0,
+    consumeRetryBudget: false,
   });
   assert.equal(thumbnailRetryDecision(404, "not_found", 0).retry, false);
   assert.equal(thumbnailRetryDecision(422, "generation_failed", 0).retry, false);
@@ -646,6 +662,15 @@ test("thumbnail retry policy retries only transient failures with a bounded back
     thumbnailRetryDecision(503, "protocol_version_mismatch", 0).retry,
     false
   );
+});
+
+test("thumbnail admission busy returns to the queue without spending retry budget", () => {
+  assert.deepEqual(thumbnailRetryDecision(503, "ipc_busy", 999), {
+    retry: true,
+    exhausted: false,
+    delayMs: 0,
+    consumeRetryBudget: false,
+  });
 });
 
 test("page prefetch follows reading direction and accepts a future spread", () => {

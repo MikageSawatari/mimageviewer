@@ -70,9 +70,13 @@ test("safe areas protect portrait bars and landscape side controls", async () =>
   assert.doesNotMatch(css, /\.screen > \.topbar > :not\(\.menu-trigger\)/);
 });
 
-test("container page tiles preserve the whole page shape", async () => {
+test("image tiles preserve portrait and landscape shape below a separate label row", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
-  assert.match(css, /\.grid-tile\.page-tile \.tile-preview img\s*\{[^}]*object-fit:\s*contain/);
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(css, /\.grid-tile\.image-tile \.tile-preview img\s*\{[^}]*object-fit:\s*contain/);
+  assert.match(css, /\.grid-tile\s*\{[^}]*grid-template-rows:\s*var\(--grid-preview-height\) var\(--grid-label-height\)/);
+  assert.match(css, /\.grid-tile\.grid-active::after\s*\{[^}]*inset 0 0 0 3px var\(--accent\)/);
+  assert.match(app, /tile\.append\(preview, label\)/);
 });
 
 async function pngDimensions(relativePath) {

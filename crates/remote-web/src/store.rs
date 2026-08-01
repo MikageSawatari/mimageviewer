@@ -206,6 +206,21 @@ impl Library {
         }
     }
 
+    #[cfg(test)]
+    pub fn with_favorite_for_test(id: Uuid, path: PathBuf) -> Self {
+        Self {
+            favorites: vec![FavoriteRoot {
+                id,
+                name: "Fixture".to_owned(),
+                path,
+            }],
+            by_id: HashMap::from([(id, 0)]),
+            thumb_aspect: StoredThumbAspect::Square,
+            thumb_aspect_auto: false,
+            auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
+        }
+    }
+
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
         let settings_path = data_dir.join("settings.db");
         let conn = open_read_only(&settings_path)?;
@@ -285,6 +300,27 @@ impl Library {
         let favorite = self.favorite(id)?;
         resolve_existing(&favorite.path, &address.relative_path)?;
         Ok(())
+    }
+
+    pub(crate) fn validate_remote_file_image(
+        &self,
+        address: &RemoteAddress,
+    ) -> Result<(), StoreError> {
+        if !matches!(
+            address.subresource,
+            mimageviewer_ipc::RemoteSubresource::File
+        ) {
+            return Err(StoreError::BadRequest);
+        }
+        let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
+        let favorite = self.favorite(id)?;
+        let path = resolve_existing(&favorite.path, &address.relative_path)?;
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_file() && classify_path(&path) == EntryKind::Image {
+            Ok(())
+        } else {
+            Err(StoreError::BadRequest)
+        }
     }
 
     pub fn retain_allowed_container_entries(&self, entries: &mut Vec<ContainerEntry>) {
