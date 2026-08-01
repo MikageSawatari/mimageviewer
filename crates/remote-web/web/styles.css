@@ -698,6 +698,7 @@ button {
 
 .viewer-image {
   display: block;
+  flex: 0 0 auto;
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
@@ -708,12 +709,35 @@ button {
 
 .viewer-pages {
   display: flex;
-  width: max-content;
+  flex: 0 0 auto;
   max-width: none;
   align-items: center;
   justify-content: center;
   transform-origin: center;
   will-change: transform;
+}
+
+.viewer-boundary-message {
+  position: absolute;
+  z-index: 3;
+  bottom: max(72px, calc(env(safe-area-inset-bottom) + 56px));
+  left: 50%;
+  max-width: min(88vw, 520px);
+  padding: 7px 12px;
+  border: 1px solid rgb(255 255 255 / 16%);
+  border-radius: 999px;
+  color: rgb(245 247 252 / 92%);
+  background: rgb(16 20 28 / 78%);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 38%);
+  font-size: 0.78rem;
+  line-height: 1.35;
+  text-align: center;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.viewer-boundary-message[hidden] {
+  display: none;
 }
 
 .viewer-loading-indicator {

@@ -23,6 +23,7 @@ import {
   shouldShowLoadingIndicator,
   viewerTapCommand,
   viewerImageLayout,
+  viewerBoundaryMessage,
   viewerSpreadLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
@@ -35,6 +36,7 @@ const sessionOwnerBadgeElement = document.querySelector(
 const TELEMETRY_ENABLED = true;
 const THUMBNAIL_MAX_CONCURRENCY = 4;
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
+const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
 // 要求幅是正後の実測約 457 KiB/ページなら、進行方向 8 ページで約 3.6 MiB。
 // 逆方向 1 ページと表示中を含めても 12 件なら約 5.4 MiB で、32 MiB 上限に十分余裕がある。
 // prefetch は直列かつ foreground が active request を abort するため表示要求を待たせない。
@@ -1906,8 +1908,12 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   loadingIndicator.setAttribute("role", "progressbar");
   loadingIndicator.setAttribute("aria-label", "次のページを読み込んでいます");
   loadingIndicator.append(element("span", "viewer-loading-indicator-bar"));
+  const boundaryMessage = element("div", "viewer-boundary-message");
+  boundaryMessage.hidden = true;
+  boundaryMessage.setAttribute("role", "status");
+  boundaryMessage.setAttribute("aria-live", "polite");
   pageLayer.append(image);
-  stage.append(pageLayer, loadingIndicator);
+  stage.append(pageLayer, loadingIndicator, boundaryMessage);
 
   const top = element("div", "viewer-ui top");
   const close = textElement("button", "×", "viewer-button");
@@ -1939,6 +1945,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     previous,
     next,
     loadingIndicator,
+    boundaryMessage,
   });
   close.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -1969,6 +1976,16 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
 }
 
 function changeImage(delta) {
+  const message = viewerBoundaryMessage({
+    currentIndex: state.pageGroupIndex,
+    count: state.pageGroups.length,
+    delta,
+    readingDirection: state.readingDirection,
+  });
+  if (message) {
+    state.viewer?.showBoundaryMessage(message);
+    return true;
+  }
   return changeImageTo(state.pageGroupIndex + delta);
 }
 
@@ -1977,6 +1994,7 @@ function changeImageTo(nextGroupIndex) {
     return false;
   }
   if (nextGroupIndex === state.pageGroupIndex) return false;
+  state.viewer?.hideBoundaryMessage();
   state.pageDirection = nextGroupIndex > state.pageGroupIndex ? 1 : -1;
   state.pageGroupIndex = nextGroupIndex;
   const entry = state.pageGroups[nextGroupIndex].anchor;
@@ -2920,7 +2938,18 @@ class CommandMenu {
 }
 
 export class ImageViewer {
-  constructor({ root, stage, pageLayer, image, title, counter, previous, next, loadingIndicator }) {
+  constructor({
+    root,
+    stage,
+    pageLayer,
+    image,
+    title,
+    counter,
+    previous,
+    next,
+    loadingIndicator,
+    boundaryMessage,
+  }) {
     this.root = root;
     this.stage = stage;
     this.pageLayer = pageLayer ?? element("div", "viewer-pages");
@@ -2935,6 +2964,11 @@ export class ImageViewer {
     this.previous = previous;
     this.next = next;
     this.loadingIndicator = loadingIndicator;
+    this.boundaryMessage = boundaryMessage ?? element("div", "viewer-boundary-message");
+    if (!boundaryMessage) {
+      this.boundaryMessage.hidden = true;
+      this.stage.append(this.boundaryMessage);
+    }
     this.scale = 1;
     this.panX = 0;
     this.panY = 0;
@@ -2950,6 +2984,7 @@ export class ImageViewer {
     this.objectUrl = null;
     this.objectUrls = [];
     this.loadingTimer = 0;
+    this.boundaryMessageTimer = 0;
 
     this.pointerDown = (event) => this.onPointerDown(event);
     this.pointerMove = (event) => this.onPointerMove(event);
@@ -2993,8 +3028,6 @@ export class ImageViewer {
     this.title.textContent = name;
     this.image.alt = name;
     this.counter.textContent = `${index + 1} / ${count}`;
-    this.previous.disabled = index === 0;
-    this.next.disabled = index === count - 1;
     return this.loadMeasuredImage(request, interactionStartedAt, name, info);
   }
 
@@ -3013,8 +3046,6 @@ export class ImageViewer {
     this.resetTransform();
     this.title.textContent = name;
     this.counter.textContent = `${index + 1} / ${count}`;
-    this.previous.disabled = index === 0;
-    this.next.disabled = index === count - 1;
     return this.loadMeasuredSpread(pages, fitMode, gap, interactionStartedAt);
   }
 
@@ -3023,13 +3054,19 @@ export class ImageViewer {
     this.stage.dataset.fitMode = fitMode;
     this.pageLayer.style.gap = "0px";
     image.style.width = `${layout.cssWidth}px`;
-    image.style.height = "auto";
+    image.style.height = `${layout.cssHeight}px`;
     image.style.maxWidth = "none";
     image.style.maxHeight = "none";
+    this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
     image.dataset.sourceWidth = String(info.width);
     image.dataset.sourceHeight = String(info.height);
     this.stage.scrollTop = 0;
     this.stage.scrollLeft = 0;
+  }
+
+  setPageLayerSize(width, height) {
+    this.pageLayer.style.width = `${Math.max(1, Number(width) || 1)}px`;
+    this.pageLayer.style.height = `${Math.max(1, Number(height) || 1)}px`;
   }
 
   async loadMeasuredImage(request, interactionStartedAt, name, info) {
@@ -3214,10 +3251,11 @@ export class ImageViewer {
       this.fitMode = fitMode;
       this.stage.dataset.fitMode = fitMode;
       this.pageLayer.style.gap = `${resolvedLayout.gap}px`;
+      this.setPageLayerSize(resolvedLayout.cssWidth, resolvedLayout.cssHeight);
       decodedImages.forEach((decoded, index) => {
         const layout = resolvedLayout.pages[index];
         decoded.image.style.width = `${layout.cssWidth}px`;
-        decoded.image.style.height = "auto";
+        decoded.image.style.height = `${layout.cssHeight}px`;
         decoded.image.style.maxWidth = "none";
         decoded.image.style.maxHeight = "none";
         decoded.image.style.transform = "none";
@@ -3300,6 +3338,22 @@ export class ImageViewer {
     clearTimeout(this.loadingTimer);
     this.loadingTimer = 0;
     this.loadingIndicator.hidden = true;
+  }
+
+  showBoundaryMessage(message) {
+    clearTimeout(this.boundaryMessageTimer);
+    this.boundaryMessage.textContent = message;
+    this.boundaryMessage.hidden = false;
+    this.boundaryMessageTimer = setTimeout(() => {
+      this.boundaryMessage.hidden = true;
+      this.boundaryMessageTimer = 0;
+    }, PAGE_BOUNDARY_MESSAGE_DURATION_MS);
+  }
+
+  hideBoundaryMessage() {
+    clearTimeout(this.boundaryMessageTimer);
+    this.boundaryMessageTimer = 0;
+    this.boundaryMessage.hidden = true;
   }
 
   resetTransform() {
@@ -3518,7 +3572,9 @@ export class ImageViewer {
   destroy() {
     clearTimeout(this.resizeTimer);
     clearTimeout(this.loadingTimer);
+    clearTimeout(this.boundaryMessageTimer);
     this.loadingIndicator.hidden = true;
+    this.boundaryMessage.hidden = true;
     this.loadSequence += 1;
     this.fetchController?.abort();
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);

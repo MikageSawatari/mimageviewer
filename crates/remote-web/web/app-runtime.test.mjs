@@ -101,6 +101,9 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
   assert.equal(viewer.pageLayer.children.length, 1);
   assert.equal(viewer.pageLayer.children[0], viewer.image);
   assert.equal(viewer.image.style.width, "430px");
+  assert.equal(viewer.image.style.height, "645px");
+  assert.equal(viewer.pageLayer.style.width, "430px");
+  assert.equal(viewer.pageLayer.style.height, "645px");
   assert.equal(viewer.image.dataset.sourceWidth, "1200");
   assert.equal(loadingIndicator.hidden, true);
   viewer.destroy();
@@ -154,6 +157,10 @@ test("spread waits for both pages and atomically replaces the page layer", async
   assert.equal(pageLayer.children.length, 2);
   assert.equal(viewer.images.length, 2);
   assert.equal(pageLayer.style.gap, "12px");
+  assert.equal(Math.round(parseFloat(pageLayer.style.width)), 1345);
+  assert.equal(Math.round(parseFloat(pageLayer.style.height)), 1000);
+  assert.equal(Math.round(parseFloat(viewer.images[0].style.width)), 667);
+  assert.equal(Math.round(parseFloat(viewer.images[0].style.height)), 1000);
 
   const singleDisplayed = await viewer.loadGroup({
     pages: [page(3)],
@@ -167,5 +174,13 @@ test("spread waits for both pages and atomically replaces the page layer", async
   assert.equal(singleDisplayed, true);
   assert.equal(pageLayer.children.length, 1);
   assert.equal(viewer.images.length, 1);
+  assert.equal(Math.round(parseFloat(pageLayer.style.width)), 667);
+  assert.equal(Math.round(parseFloat(pageLayer.style.height)), 1000);
+
+  viewer.showBoundaryMessage("先頭ページです");
+  assert.equal(viewer.boundaryMessage.hidden, false);
+  assert.equal(viewer.boundaryMessage.textContent, "先頭ページです");
+  viewer.hideBoundaryMessage();
+  assert.equal(viewer.boundaryMessage.hidden, true);
   viewer.destroy();
 });

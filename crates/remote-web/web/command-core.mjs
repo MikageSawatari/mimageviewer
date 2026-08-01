@@ -224,17 +224,20 @@ export function viewerSpreadLayout({
   }));
   if (!sources.length) return { pages: [], gap: 0 };
   if (sources.length === 1) {
+    const page = viewerImageLayout({
+      mode,
+      sourceWidth: sources[0].width,
+      sourceHeight: sources[0].height,
+      viewportWidth,
+      viewportHeight,
+      devicePixelRatio,
+      maxRequestWidth,
+    });
     return {
-      pages: [viewerImageLayout({
-        mode,
-        sourceWidth: sources[0].width,
-        sourceHeight: sources[0].height,
-        viewportWidth,
-        viewportHeight,
-        devicePixelRatio,
-        maxRequestWidth,
-      })],
+      pages: [page],
       gap: 0,
+      cssWidth: page.cssWidth,
+      cssHeight: page.cssHeight,
     };
   }
   const availableWidth = Math.max(1, Number(viewportWidth) || 1);
@@ -252,20 +255,45 @@ export function viewerSpreadLayout({
       ? contentWidth / sourceWidth
       : Math.min(contentWidth / sourceWidth, availableHeight / sourceHeight);
   const dpr = Math.max(0.25, Number(devicePixelRatio) || 1);
+  const pageLayouts = sources.map((page, index) => {
+    const cssWidth = normalizedWidths[index] * scale;
+    return {
+      cssWidth,
+      cssHeight: sourceHeight * scale,
+      requestWidth: Math.max(
+        1,
+        Math.min(maxRequestWidth, Math.ceil(cssWidth * (mode === FitMode.ORIGINAL ? 1 : dpr)))
+      ),
+    };
+  });
+  const cssHeight = sourceHeight * scale;
   return {
-    pages: sources.map((page, index) => {
-      const cssWidth = normalizedWidths[index] * scale;
-      return {
-        cssWidth,
-        cssHeight: sourceHeight * scale,
-        requestWidth: Math.max(
-          1,
-          Math.min(maxRequestWidth, Math.ceil(cssWidth * (mode === FitMode.ORIGINAL ? 1 : dpr)))
-        ),
-      };
-    }),
+    pages: pageLayouts,
     gap: resolvedGap,
+    cssWidth: pageLayouts.reduce((sum, page) => sum + page.cssWidth, 0) + resolvedGap,
+    cssHeight,
   };
+}
+
+export function viewerBoundaryMessage({
+  currentIndex,
+  count,
+  delta,
+  readingDirection = ReadingDirection.LTR,
+}) {
+  const index = Math.floor(Number(currentIndex));
+  const length = Math.max(0, Math.floor(Number(count) || 0));
+  const step = Math.sign(Number(delta) || 0);
+  if (!Number.isInteger(index) || index < 0 || index >= length || !step) return null;
+  const atStart = step < 0 && index === 0;
+  const atEnd = step > 0 && index === length - 1;
+  if (!atStart && !atEnd) return null;
+  if (readingDirection === ReadingDirection.RTL) {
+    return atStart
+      ? "先頭ページです（右→左綴じ：次は左をタップ）"
+      : "最終ページです（右→左綴じ：前は右をタップ）";
+  }
+  return atStart ? "先頭ページです" : "最終ページです";
 }
 
 export function viewerTapCommand(clientX, width, rtl = false) {

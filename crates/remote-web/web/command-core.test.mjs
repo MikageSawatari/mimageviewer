@@ -26,6 +26,7 @@ import {
   shouldShowLoadingIndicator,
   sessionOwnerBadge,
   viewerImageLayout,
+  viewerBoundaryMessage,
   viewerSpreadLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
@@ -149,6 +150,40 @@ test("spread layout fits the combined pages and preserves the configured gap", (
   assert.equal(Math.round(layout.pages[0].cssHeight), 1000);
   assert.equal(layout.pages[0].requestWidth, 1334);
   assert.equal(layout.pages[1].requestWidth, 1334);
+  assert.equal(Math.round(layout.cssWidth), 1345);
+  assert.equal(Math.round(layout.cssHeight), 1000);
+
+  const unequal = viewerSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [
+      { width: 1000, height: 2000 },
+      { width: 1200, height: 1200 },
+    ],
+    viewportWidth: 1000,
+    viewportHeight: 800,
+    devicePixelRatio: 2,
+    gap: 20,
+  });
+  assert.equal(Math.round(unequal.cssWidth), 1000);
+  assert.equal(Math.round(unequal.cssHeight), 653);
+  assert.equal(Math.round(unequal.pages[0].cssWidth), 327);
+  assert.equal(Math.round(unequal.pages[1].cssWidth), 653);
+  assert.equal(unequal.pages[0].requestWidth, 654);
+  assert.equal(unequal.pages[1].requestWidth, 1307);
+
+  const widthFit = viewerSpreadLayout({
+    mode: FitMode.WIDTH,
+    pages: [
+      { width: 1200, height: 1800 },
+      { width: 1200, height: 1800 },
+    ],
+    viewportWidth: 1600,
+    viewportHeight: 1000,
+    devicePixelRatio: 2,
+    gap: 12,
+  });
+  assert.equal(Math.round(widthFit.cssWidth), 1600);
+  assert.ok(widthFit.cssHeight > 1000);
 
   const single = viewerSpreadLayout({
     mode: FitMode.PAGE,
@@ -160,6 +195,76 @@ test("spread layout fits the combined pages and preserves the configured gap", (
   });
   assert.equal(single.gap, 0);
   assert.equal(single.pages[0].requestWidth, 860);
+  assert.equal(single.cssWidth, 430);
+  assert.equal(single.cssHeight, 645);
+
+  const landscapeSingle = viewerSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [{ width: 2000, height: 1000 }],
+    viewportWidth: 430,
+    viewportHeight: 932,
+    devicePixelRatio: 2,
+    gap: 20,
+  });
+  assert.equal(landscapeSingle.pages.length, 1);
+  assert.equal(landscapeSingle.cssWidth, 430);
+  assert.equal(landscapeSingle.cssHeight, 215);
+  assert.equal(landscapeSingle.gap, 0);
+
+  const singleNearSquareRequest = viewerSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [{ width: 1000, height: 1001 }],
+    viewportWidth: 1001,
+    viewportHeight: 1000,
+    devicePixelRatio: 2,
+  });
+  const spreadNearSquareRequest = viewerSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [
+      { width: 1000, height: 1001 },
+      { width: 1000, height: 1001 },
+    ],
+    viewportWidth: 1001,
+    viewportHeight: 1000,
+    devicePixelRatio: 2,
+    gap: 4,
+  });
+  assert.equal(singleNearSquareRequest.pages[0].requestWidth, 1999);
+  assert.equal(spreadNearSquareRequest.pages[0].requestWidth, 997);
+  assert.ok(
+    spreadNearSquareRequest.pages[0].requestWidth <
+      singleNearSquareRequest.pages[0].requestWidth * 0.51
+  );
+});
+
+test("page edge messages distinguish start, end and RTL guidance", () => {
+  assert.equal(
+    viewerBoundaryMessage({ currentIndex: 0, count: 5, delta: -1 }),
+    "先頭ページです"
+  );
+  assert.equal(
+    viewerBoundaryMessage({ currentIndex: 4, count: 5, delta: 1 }),
+    "最終ページです"
+  );
+  assert.equal(
+    viewerBoundaryMessage({
+      currentIndex: 0,
+      count: 5,
+      delta: -1,
+      readingDirection: ReadingDirection.RTL,
+    }),
+    "先頭ページです（右→左綴じ：次は左をタップ）"
+  );
+  assert.equal(
+    viewerBoundaryMessage({
+      currentIndex: 4,
+      count: 5,
+      delta: 1,
+      readingDirection: ReadingDirection.RTL,
+    }),
+    "最終ページです（右→左綴じ：前は右をタップ）"
+  );
+  assert.equal(viewerBoundaryMessage({ currentIndex: 2, count: 5, delta: 1 }), null);
 });
 
 test("grid keys mirror parent, history, selection and page defaults", () => {
